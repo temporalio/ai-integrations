@@ -1,0 +1,3 @@
+# No issue templates in this repository. This file overrides the org-level defaults
+# from temporalio/.github so only a blank issue form is offered.
+blank_issues_enabled: true

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+dist/
+junit/
+*.log
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local-only agent notes (see AGENTS.md)
+CLAUDE.local.md
+
+# NOTE: python/*/LICENSE is a committed relative symlink to the root LICENSE; do not ignore it.
