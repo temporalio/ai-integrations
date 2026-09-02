@@ -1,0 +1,125 @@
+[project]
+name = "__COORDINATE__"
+version = "__VERSION__"
+description = "__DESCRIPTION__"
+authors = [{ name = "Temporal Technologies Inc", email = "sdk@temporal.io" }]
+requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]   # committed relative symlink to the repository's root LICENSE
+keywords = ["temporal", "workflow", "durable-execution", "ai", "agents"]
+classifiers = [
+  "__MATURITY_CLASSIFIER__",   # maturity; must agree with plugin.toml (see AGENTS.md for the mapping)
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+dependencies = [
+  # TRANSITION(sdk-cutover): raise the floor to the SDK release that no longer ships this module before 1.0.0.
+  "temporalio>=1.32.0,<2",
+  # Add the integration's own dependencies here, declaring exactly what the package imports at module level.
+]
+
+[project.optional-dependencies]
+
+[project.urls]
+Homepage = "https://github.com/temporalio/ai-integrations/tree/main/python/__NAME__"
+Repository = "https://github.com/temporalio/ai-integrations"
+Documentation = "https://docs.temporal.io/develop/python/integrations/__DOCS_SLUG__"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# src/temporalio and src/temporalio/contrib must NOT contain __init__.py: the SDK wheel owns them.
+module-name = "__MODULE__"
+
+[dependency-groups]
+dev = [
+  "pyright==1.1.403",
+  "basedpyright==1.34.0",
+  "mypy==1.18.2",
+  "ruff>=0.15.12,<0.16",
+  "pydocstyle>=6.3,<7",
+  "pytest~=9.0",
+  "pytest-asyncio>=0.21,<0.22",
+  "pytest-timeout~=2.2",
+  "pytest-xdist>=3.6,<4",
+  "pytest-pretty>=1.3",
+  "pytest-rerunfailures>=16.1",
+  "pytest-recording>=0.13.4,<0.14",
+  "vcrpy>=8.3,<9",
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+required-version = ">=0.12.5,<0.13"              # same value in scripts/pyproject.toml; CI reads it via setup-uv version-file
+exclude-newer = "2 weeks"                        # org supply-chain cooldown for third-party packages
+exclude-newer-package = { temporalio = false }   # the SDK is exempt: cutover releases must be adoptable on day one
+link-mode = "copy"                               # TRANSITION(sdk-cutover): deterministic overwrites while temporalio<=1.32 ships the same files
+cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Do not use log_cli since this shows logging for all tests, not just the ones
+# that failed. Instead, show all logs for failed tests at the end.
+log_level = "DEBUG"
+log_format = "%(asctime)s [%(levelname)8s] %(message)s (%(filename)s:%(lineno)s)"
+testpaths = ["tests"]
+timeout = 60
+timeout_func_only = true
+filterwarnings = [
+  "error::temporalio.workflow.UnfinishedUpdateHandlersWarning",
+  "error::temporalio.workflow.UnfinishedSignalHandlersWarning",
+  "ignore::pytest.PytestDeprecationWarning",
+  "ignore::DeprecationWarning",
+]
+
+[tool.mypy]
+files = ["src", "tests"]
+mypy_path = "src"
+namespace_packages = true
+explicit_package_bases = true
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pyright]
+enableTypeIgnoreComments = true
+reportAny = "none"
+reportCallInDefaultInitializer = "none"
+reportExplicitAny = "none"
+reportIgnoreCommentWithoutRule = "none"
+reportImplicitAbstractClass = "none"
+reportImplicitOverride = "none"
+reportImplicitStringConcatenation = "none"
+reportImportCycles = "none"
+reportMissingTypeArgument = "none"
+reportPrivateUsage = "none"
+reportUnannotatedClassAttribute = "none"
+reportUnknownArgumentType = "none"
+reportUnknownMemberType = "none"
+reportUnknownParameterType = "none"
+reportUnknownVariableType = "none"
+reportUnnecessaryIsInstance = "none"
+reportUnnecessaryTypeIgnoreComment = "none"
+reportUnusedCallResult = "none"
+reportUnknownLambdaType = "none"
+include = ["src", "tests"]
+
+[tool.pydocstyle]
+convention = "google"
+add_ignore = [
+  # We like to wrap at a certain number of chars, even long summary sentences.
+  # https://github.com/PyCQA/pydocstyle/issues/184
+  "D205",
+  "D415",
+]
+
+[tool.ruff]
+target-version = "py310"
+src = [".", "src"]

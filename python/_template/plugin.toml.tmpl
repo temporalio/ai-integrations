@@ -1,0 +1,26 @@
+# Machine-readable plugin metadata, read by scripts/ci/*.py, scripts/release/release_tool.py and
+# the plugin's own test suite. Holds no secrets and no owners (CODEOWNERS covers ownership).
+# The conventions check asserts these values agree with pyproject.toml. See AGENTS.md.
+
+[plugin]
+name = "__NAME__"                  # equals the folder name; Python coordinate = "temporalio-" + name with "_" -> "-"
+language = "python"
+coordinate = "__COORDINATE__"      # package name on the registry
+registry = "pypi"
+root-api = "__MODULE__"            # importable root, always temporalio.contrib.<name> for Python
+maturity = "__MATURITY__"          # ga | preview | experimental; must agree with the Development Status classifier
+status = "active"                  # active | deprecated-forwarder (then also set forwards-to = "<coordinate>")
+docs = "https://docs.temporal.io/develop/python/integrations/__DOCS_SLUG__"
+upstream = "temporalio/sdk-python:temporalio/contrib/__NAME__"   # TRANSITION(sdk-cutover): source of truth until cutover
+
+[release]
+# TRANSITION(sdk-cutover): flip to true when the temporalio floor is the SDK release that no longer
+# ships this module and every TRANSITION marker in this plugin is gone. Until then only pre-releases
+# may be tagged, and the provenance guard tolerates the file overlap with temporalio<=1.32.
+allow-final = false
+
+[ci]
+runtime-versions = ["3.10", "3.14"]   # first entry must equal the requires-python floor
+
+[smoke]
+imports = []   # extra modules the isolated wheel check imports in addition to root-api
