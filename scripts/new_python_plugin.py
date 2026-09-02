@@ -99,6 +99,11 @@ def main(argv: list[str]) -> int:
             dest.write_text(text, encoding="utf-8")
         written.append(dest)
 
+    license_dest = target / "LICENSE"
+    if not license_dest.exists():
+        license_dest.write_bytes((REPO_ROOT / "LICENSE").read_bytes())  # committed copy; conventions keep it identical
+        written.append(license_dest)
+
     for path in written:
         print(f"wrote   {path.relative_to(REPO_ROOT)}")
     for path in skipped:
@@ -109,7 +114,7 @@ def main(argv: list[str]) -> int:
         f"""
 Next steps for python/{name} ({coordinate} {version}, maturity={args.maturity}):
   1. Fill in [project].dependencies in pyproject.toml (declare exactly what is imported).
-  2. cd python/{name} && make sync   # materializes LICENSE (gitignored), creates uv.lock; commit uv.lock
+  2. cd python/{name} && make sync   # creates uv.lock; commit it
   3. make lint && make test
   4. If any test talks to a provider API, record cassettes once: OPENAI_API_KEY=... make record
   5. Add a row to the plugin table in README.md.

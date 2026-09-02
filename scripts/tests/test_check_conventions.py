@@ -29,19 +29,18 @@ def test_namespace_init_files_are_forbidden(plugin_repo: Path) -> None:
     assert any("src/temporalio/__init__.py" in x for x in v) and any("src/temporalio/contrib/__init__.py" in x for x in v)
 
 
-def test_license_must_not_be_committed_or_symlinked(plugin_repo: Path) -> None:
+def test_license_is_a_committed_identical_copy(plugin_repo: Path) -> None:
     lic = plugin_repo / "python/fakeplug/LICENSE"
-    assert run(plugin_repo) == []  # a gitignored materialized copy is fine
+    assert run(plugin_repo) == []  # committed copy identical to the root file
+    lic.write_text("MIT\n")
+    assert any("differs from the root LICENSE" in x for x in run(plugin_repo))
     lic.unlink()
     os.symlink("../../LICENSE", lic)
-    assert any("must not be committed or symlinked" in x for x in run(plugin_repo))
+    assert any("must be a regular file, not a symlink" in x for x in run(plugin_repo))
     lic.unlink()
-    lic.write_text("MIT\n")
-    subprocess.run(["git", "-C", str(plugin_repo), "add", "-f", "python/fakeplug/LICENSE"], check=True)
-    assert any("must not be committed or symlinked" in x for x in run(plugin_repo))
     subprocess.run(["git", "-C", str(plugin_repo), "rm", "-q", "--cached", "python/fakeplug/LICENSE"], check=True)
-    lic.unlink()
-    assert run(plugin_repo) == []  # absent is fine too; make materializes it before any build
+    (plugin_repo / "LICENSE").read_bytes()  # root still there
+    assert any("must be committed" in x for x in run(plugin_repo))
 
 
 def test_changelog_and_smoke_test_files_are_forbidden(plugin_repo: Path) -> None:

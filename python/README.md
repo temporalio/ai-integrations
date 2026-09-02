@@ -48,10 +48,9 @@ lanes re-lock to the newest and lowest allowed versions without committing the l
 
 ## LICENSE
 
-The repository has one `LICENSE` at the root and nothing committed in plugin directories. Because
-the wheel and sdist must carry the license text and uv_build fails when a declared license file is
-missing, `make` copies the root file into the plugin directory (gitignored) before any command that
-may build. Run `make sync` once in a fresh clone before using `uv` directly.
+Every plugin directory carries a committed copy of the root `LICENSE`, because each wheel and sdist
+must ship the license text. The copy must stay byte-identical to the root file (the conventions
+check enforces it; refresh with `cp LICENSE python/<name>/LICENSE`). Symlinks are not used.
 
 ## Platform notes
 

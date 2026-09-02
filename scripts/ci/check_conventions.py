@@ -10,7 +10,7 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
   * every Python plugin has pyproject.toml, uv.lock, plugin.toml, Makefile, README.md,
     src/temporalio/contrib/<name>/{__init__.py,py.typed}
   * NO src/temporalio/__init__.py and NO src/temporalio/contrib/__init__.py (namespace invariant)
-  * no committed or symlinked LICENSE in the plugin dir (make materializes the root one); pyproject declares license = "MIT"
+  * LICENSE is a committed regular file byte-identical to the root LICENSE; pyproject declares license = "MIT"
     and license-files = ["LICENSE"]; no CHANGELOG*, no smoke_test.py in the plugin dir
   * plugin.toml schema and agreement with pyproject.toml (name/coordinate/root-api/
     maturity classifier/requires-python floor/module-name/required-version)
@@ -117,9 +117,15 @@ class Checker:
                 self.fail(f"{rel}: {forbidden} must not exist (namespace invariant; the SDK owns these packages)")
 
         tracked = {p.split("/", 2)[-1] for p in self.tracked_files(rel)}
-        # LICENSE: the root file is the only source; `make` materializes a gitignored copy for builds.
-        if "LICENSE" in tracked or os.path.islink(d / "LICENSE"):
-            self.fail(f"{rel}: LICENSE must not be committed or symlinked; make copies the root LICENSE here (gitignored)")
+        # LICENSE: every plugin ships the license text in its wheel and sdist, so each plugin directory
+        # carries a committed copy that must stay byte-identical to the root LICENSE (`cp LICENSE python/<name>/`).
+        license_path = d / "LICENSE"
+        if os.path.islink(license_path):
+            self.fail(f"{rel}: LICENSE must be a regular file, not a symlink")
+        elif "LICENSE" not in tracked:
+            self.fail(f"{rel}: LICENSE must be committed (copy the root LICENSE: `cp LICENSE {rel}/LICENSE`)")
+        elif license_path.read_bytes() != (self.root / "LICENSE").read_bytes():
+            self.fail(f"{rel}: LICENSE differs from the root LICENSE; re-copy it")
         for f in sorted(tracked):
             base = f.rsplit("/", 1)[-1]
             if "/" not in f and base.upper().startswith("CHANGELOG"):
@@ -213,7 +219,7 @@ class Checker:
         if project.get("license") != "MIT":
             self.fail(f"{rel}: pyproject [project] license must be the SPDX expression \"MIT\"")
         if project.get("license-files") != ["LICENSE"]:
-            self.fail(f"{rel}: pyproject [project] license-files must be [\"LICENSE\"] (the copy make materializes from the root license)")
+            self.fail(f"{rel}: pyproject [project] license-files must be [\"LICENSE\"]")
         if any(c.startswith("License ::") for c in project.get("classifiers", [])):
             self.fail(f"{rel}: drop License :: classifiers; PEP 639 uses the license expression instead")
         uv_cfg = pyproject.get("tool", {}).get("uv", {})

@@ -20,5 +20,3 @@ junit/
 # Local-only agent notes (see AGENTS.md)
 CLAUDE.local.md
 
-# Materialized by `make` from the root LICENSE (see python/_shared/python.mk); never committed.
-python/*/LICENSE

@@ -8,7 +8,7 @@
   * METADATA: Name == coordinate, Version == pyproject version, License-Expression
     MIT (or legacy License: MIT), Requires-Dist includes temporalio
   * <dist-info>/licenses/LICENSE and <sdist>/LICENSE are byte-identical to the
-    repository root LICENSE (catches a stale or missing materialized copy)
+    repository root LICENSE (catches a stale plugin copy)
   * sdist ships pyproject.toml, README.md, LICENSE and every .py under src/
 """
 
@@ -103,7 +103,7 @@ def check(plugin_dir: Path, dist: Path, root: Path | None = None) -> list[str]:
         if license_name not in names:
             problems.append(f"wheel missing {license_name}")
         elif whl.read(license_name) != license_bytes:
-            problems.append(f"wheel {license_name} differs from the repository root LICENSE (stale materialized copy?)")
+            problems.append(f"wheel {license_name} differs from the repository root LICENSE (stale plugin copy?)")
 
     with tarfile.open(sdists[0], "r:gz") as tar:
         members = {m.name: m for m in tar.getmembers()}

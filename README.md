@@ -36,4 +36,4 @@ are in [`AGENTS.md`](AGENTS.md); contributor workflow is in [`CONTRIBUTING.md`](
 
 ## License
 
-[MIT](LICENSE). Plugin builds package this file; nothing is duplicated in plugin directories.
+[MIT](LICENSE). Each plugin directory carries an identical copy so every published package ships the license text.
