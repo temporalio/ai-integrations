@@ -1,0 +1,9 @@
+# Files every Python plugin must keep byte-identical to python/_template (checked by
+# scripts/ci/check_conventions.py). A plugin that deliberately diverges adds a line containing
+# `# template-override` to its copy.
+tests/conftest.py
+tests/helpers/__init__.py
+tests/helpers/nexus.py
+tests/helpers/plugin_meta.py
+tests/helpers/provenance.py
+tests/test_installed_matches_source.py

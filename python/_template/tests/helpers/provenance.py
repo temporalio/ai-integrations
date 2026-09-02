@@ -71,10 +71,12 @@ def check_provenance(
     for record_path in files:
         if record_path.hash is None or str(record_path).endswith(".pyc"):
             continue
-        path = Path(record_path.locate())
+        path = Path(str(record_path.locate()))
         owned.add(os.path.normpath(str(path)))
         if not path.is_file():
-            raise ProvenanceError(f"{record_path} is in RECORD but missing on disk; run `make sync`")
+            raise ProvenanceError(
+                f"{record_path} is in RECORD but missing on disk; run `make sync`"
+            )
         digest = (
             base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest())
             .rstrip(b"=")
@@ -85,13 +87,15 @@ def check_provenance(
                 f"{record_path} differs from RECORD (overwritten by another distribution?); run `make sync`"
             )
 
-    pkg_dir = Path(dist.locate_file(pkg_rel))
+    pkg_dir = Path(str(dist.locate_file(pkg_rel)))
     if not pkg_dir.is_dir():
         raise ProvenanceError(f"{pkg_dir} does not exist; run `make sync`")
     extras = {
         os.path.normpath(str(path))
         for path in pkg_dir.rglob("*")
-        if path.is_file() and "__pycache__" not in path.parts and not path.name.endswith(".pyc")
+        if path.is_file()
+        and "__pycache__" not in path.parts
+        and not path.name.endswith(".pyc")
     } - owned
     if allow_overlap:
         # temporalio<=1.32 ships a README.md inside the package directory; this plugin keeps its
@@ -108,13 +112,18 @@ def check_provenance(
             other.metadata["Name"]
             for other in importlib_metadata.distributions()
             if _normalize(other.metadata["Name"]) != _normalize(dist_name)
-            and any(str(f).replace(os.sep, "/").startswith(prefix) for f in (other.files or []))
+            and any(
+                str(f).replace(os.sep, "/").startswith(prefix)
+                for f in (other.files or [])
+            )
         }
     )
     if others:
         message = f"{prefix} is also shipped by {others}"
         if allow_overlap:
-            emit(f"{message}; tolerated until the SDK cutover (plugin.toml [release] allow-final = false)")
+            emit(
+                f"{message}; tolerated until the SDK cutover (plugin.toml [release] allow-final = false)"
+            )
         else:
             raise ProvenanceError(message)
     return pkg_dir

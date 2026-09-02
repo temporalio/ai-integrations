@@ -81,10 +81,12 @@ def main(argv: list[str]) -> int:
         if rel.endswith(".tmpl"):
             rel = rel[: -len(".tmpl")]
         dest = target / rel
-        if src_exists and rel.startswith("src" + os.sep):
-            skipped.append(dest)  # never touch an imported package
-            continue
         if dest.exists() or dest.is_symlink():
+            skipped.append(dest)
+            continue
+        if src_exists and rel.startswith("src" + os.sep) and src.name != "py.typed":
+            # Never write into an imported package. The only file the template may add there is
+            # the py.typed marker, which upstream code does not carry.
             skipped.append(dest)
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -100,7 +102,8 @@ def main(argv: list[str]) -> int:
     for path in written:
         print(f"wrote   {path.relative_to(REPO_ROOT)}")
     for path in skipped:
-        print(f"skipped {path.relative_to(REPO_ROOT)} (exists)")
+        reason = "exists" if (path.exists() or path.is_symlink()) else "imported package; not touched"
+        print(f"skipped {path.relative_to(REPO_ROOT)} ({reason})")
 
     print(
         f"""

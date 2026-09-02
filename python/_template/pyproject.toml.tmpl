@@ -111,6 +111,20 @@ reportUnusedCallResult = "none"
 reportUnknownLambdaType = "none"
 include = ["src", "tests"]
 
+# TRANSITION(sdk-cutover): upstream code reaches sibling contrib packages with relative imports
+# (e.g. `from ..opentelemetry._id_generator import ...`), which pyright cannot resolve from a
+# split source tree although they work at runtime through site-packages. Silence only under src/
+# (basedpyright fails on warnings) until upstream switches to absolute imports of public names.
+[[tool.pyright.executionEnvironments]]
+root = "src"
+reportMissingImports = "none"
+
+# Everything else (tests, tooling) resolves from the project root, with src/ as an extra root so
+# the plugin's own modules are checked from source rather than from site-packages.
+[[tool.pyright.executionEnvironments]]
+root = "."
+extraPaths = ["src"]
+
 [tool.pydocstyle]
 convention = "google"
 add_ignore = [
@@ -123,3 +137,9 @@ add_ignore = [
 [tool.ruff]
 target-version = "py310"
 src = [".", "src"]
+
+[tool.ruff.lint.isort]
+# Upstream (sdk-python) has the whole `temporalio` package in-tree, so every temporalio.* import is
+# first-party there. Only our own subpackage exists under src/, so force the same classification
+# to keep imported files byte-identical to upstream.
+known-first-party = ["temporalio", "tests"]

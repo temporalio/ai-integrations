@@ -154,9 +154,11 @@ def pytest_configure(config: pytest.Config) -> None:
         os.environ["OPENAI_API_KEY"] = DUMMY_OPENAI_API_KEY
 
 
-def pytest_sessionstart(session: pytest.Session) -> None:
+def pytest_sessionstart(session: pytest.Session) -> None:  # type: ignore[reportUnusedParameter]
     """Abort unless the installed plugin is the non-editable build of this checkout."""
-    allow_overlap = (not PLUGIN.allow_final) or os.environ.get("ALLOW_OVERLAP_WITH_CORE") == "1"
+    allow_overlap = (not PLUGIN.allow_final) or os.environ.get(
+        "ALLOW_OVERLAP_WITH_CORE"
+    ) == "1"
     try:
         check_provenance(
             PLUGIN.coordinate,
@@ -168,7 +170,9 @@ def pytest_sessionstart(session: pytest.Session) -> None:
         pytest.exit(f"provenance guard failed: {exc}", returncode=1)
 
 
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
     replaying = _replaying()
     skip_local_only = pytest.mark.skip(
         reason="requires a local Temporal server, not the configured envconfig server"
@@ -179,7 +183,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(skip_local_only)
         base_name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
         if replaying and base_name in OFFLINE_SKIPS:
-            item.add_marker(pytest.mark.skip(reason=f"offline replay: {OFFLINE_SKIPS[base_name]}"))
+            item.add_marker(
+                pytest.mark.skip(reason=f"offline replay: {OFFLINE_SKIPS[base_name]}")
+            )
             continue
         # pytest-recording only wraps tests carrying the ``vcr`` marker; every test gets one so
         # any HTTP call is either replayed from its cassette or, when recording, captured into it.
