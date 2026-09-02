@@ -1,0 +1,22 @@
+# Organization SAST scan (Temporal's canonical caller). Differential: fails only
+# on findings introduced by the change. Also enforces SHA-pinned actions.
+name: SAST
+
+on: [pull_request, merge_group]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Do NOT use cancel-in-progress: it breaks required workflow checks.
+jobs:
+  scan:
+    name: opengrep/scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: temporalio/public-actions/sast/opengrep@main
+        with:
+          pr-comments: 'true'

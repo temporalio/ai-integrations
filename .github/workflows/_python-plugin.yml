@@ -1,0 +1,115 @@
+# Reusable per-language workflow for ONE Python plugin. Called with a matrix of
+# plugin names by ci.yml and with a single plugin by release-python.yml.
+# Plugin-specific behaviour is data (python/<plugin>/plugin.toml, pyproject.toml,
+# Makefile) — never edit this file for one plugin.
+name: Python plugin
+
+on:
+  workflow_call:
+    inputs:
+      plugin:
+        description: Plugin folder name under python/ (e.g. openai_agents)
+        type: string
+        required: true
+      profile:
+        description: "pr: ubuntu x {min,max} runtime; full: also macOS and Windows at max"
+        type: string
+        default: pr
+      deps:
+        description: "locked: uv.lock as committed; latest: uv lock --upgrade; lowest: --resolution lowest-direct"
+        type: string
+        default: locked
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  matrix:
+    name: matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - id: matrix
+        env:
+          PLUGIN: ${{ inputs.plugin }}
+          PROFILE: ${{ inputs.profile }}
+        run: uv run --project scripts --locked python scripts/ci/matrix.py --plugin-dir "python/$PLUGIN" --profile "$PROFILE" --github-output "$GITHUB_OUTPUT"
+
+  test:
+    name: ${{ inputs.plugin }} (${{ matrix.os }}, py${{ matrix.runtime }})
+    needs: matrix
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    env:
+      UV_NO_EDITABLE: "1" # editable installs cannot resolve temporalio.contrib.* from src/
+      UV_LINK_MODE: copy
+      COLUMNS: "120"
+    defaults:
+      run:
+        shell: bash
+        working-directory: python/${{ inputs.plugin }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: ${{ matrix.runtime }}
+          version-file: python/${{ inputs.plugin }}/pyproject.toml
+          enable-cache: true
+          cache-dependency-glob: python/${{ inputs.plugin }}/uv.lock
+      - name: Install GNU make (Windows)
+        if: runner.os == 'Windows'
+        run: choco install make -y --no-progress
+      - name: Sync environment
+        env:
+          DEPS: ${{ inputs.deps }}
+        run: |
+          case "$DEPS" in
+            locked) make sync ;;
+            latest) make sync-latest ;;
+            lowest) make sync-lowest ;;
+            *) echo "::error::unknown deps mode '$DEPS'"; exit 1 ;;
+          esac
+      - name: Lint and type-check
+        run: make lint
+      - name: Test
+        run: make test PYTEST_ARGS="-s --junit-xml=junit/test.xml"
+      - name: Test (time-skipping server)
+        if: matrix.time_skipping
+        run: make test-time-skipping PYTEST_ARGS="-s --junit-xml=junit/time-skipping.xml"
+      - name: Build, verify, and smoke-test distributions
+        uses: ./.github/actions/python-build-check
+        with:
+          plugin-dir: python/${{ inputs.plugin }}
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: junit-${{ inputs.plugin }}-${{ matrix.os }}-py${{ matrix.runtime }}
+          path: python/${{ inputs.plugin }}/junit
+          if-no-files-found: ignore
+      - name: Upload distributions
+        if: matrix.dist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ inputs.plugin }}
+          path: python/${{ inputs.plugin }}/dist
+          if-no-files-found: error

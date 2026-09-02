@@ -1,0 +1,34 @@
+name: Python build check
+description: >-
+  Build a Python plugin's wheel and sdist (make build), verify the wheel layout
+  and metadata (scripts/ci/check_wheel.py), and smoke-test both artifacts in
+  isolated environments (scripts/ci/smoke.py). Shared by CI and the release
+  pipeline so the same bytes are checked the same way.
+inputs:
+  plugin-dir:
+    description: Plugin directory relative to the repository root (e.g. python/openai_agents)
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Build wheel and sdist
+      shell: bash
+      working-directory: ${{ inputs.plugin-dir }}
+      run: make build
+    - name: Verify wheel and sdist
+      shell: bash
+      env:
+        PLUGIN_DIR: ${{ inputs.plugin-dir }}
+      run: >-
+        uv run --project "$GITHUB_WORKSPACE/scripts" --locked
+        python "$GITHUB_WORKSPACE/scripts/ci/check_wheel.py"
+        --plugin-dir "$GITHUB_WORKSPACE/$PLUGIN_DIR" --dist "$GITHUB_WORKSPACE/$PLUGIN_DIR/dist"
+        --repo-root "$GITHUB_WORKSPACE"
+    - name: Smoke-test artifacts in isolated environments
+      shell: bash
+      env:
+        PLUGIN_DIR: ${{ inputs.plugin-dir }}
+      run: >-
+        uv run --project "$GITHUB_WORKSPACE/scripts" --locked
+        python "$GITHUB_WORKSPACE/scripts/ci/smoke.py"
+        --plugin "$GITHUB_WORKSPACE/$PLUGIN_DIR" --dist "$GITHUB_WORKSPACE/$PLUGIN_DIR/dist"
