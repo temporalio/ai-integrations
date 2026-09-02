@@ -14,7 +14,7 @@ def test_matrix_is_ubuntu_min_max_plus_macos_and_windows_at_max() -> None:
         ("ubuntu-latest", "3.10"), ("ubuntu-latest", "3.14"), ("macos-latest", "3.14"), ("windows-latest", "3.14"),
     ]
     dist_cells = [e for e in m["include"] if e["dist"]]
-    assert dist_cells == [{"os": "ubuntu-latest", "runtime": "3.14", "time_skipping": True, "dist": True}]
+    assert dist_cells == [{"os": "ubuntu-latest", "runtime": "3.14", "dist": True}]
 
 
 def test_single_version_still_covers_three_operating_systems() -> None:

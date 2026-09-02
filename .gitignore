@@ -20,4 +20,5 @@ junit/
 # Local-only agent notes (see AGENTS.md)
 CLAUDE.local.md
 
-# NOTE: python/*/LICENSE is a committed relative symlink to the root LICENSE; do not ignore it.
+# Materialized by `make` from the root LICENSE (see python/_shared/python.mk); never committed.
+python/*/LICENSE

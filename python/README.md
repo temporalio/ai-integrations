@@ -18,7 +18,7 @@ owns those packages and the plugin installs into them. `scripts/ci/check_wheel.p
 
 Every plugin's `Makefile` is two lines that include `python/_shared/python.mk`; `make help`
 lists the targets. The important ones: `sync` (non-editable install; run it after pulling),
-`lint`, `test`, `test-time-skipping`, `build`, `record`.
+`lint`, `test`, `build`, `record`.
 
 Why non-editable: `temporalio` is a regular package, so an editable install of a plugin cannot be
 imported as `temporalio.contrib.<name>`. The make targets export `UV_NO_EDITABLE=1`, and the
@@ -28,14 +28,17 @@ message (`make sync`).
 
 ## Offline tests and cassettes
 
-Tests never need a real API key. `tests/conftest.py` records and replays HTTP traffic with vcrpy
-(through pytest-recording); cassettes live in `tests/contrib/<name>/cassettes/<module>/`. If a
-test fails with `CannotOverwriteExistingCassetteException`, it made a request that has no
-recording: run `OPENAI_API_KEY=<real key> make record` locally, review the new cassette for
-secrets (the conventions check also scans for them), and commit it. `make record` refuses to run
-in CI. Plugin-specific offline settings are data in `plugin.toml` `[offline]`: `dummy-env` holds placeholder
-values (never real secrets) exported during replay so upstream skip guards do not skip, and `skips`
-lists tests that cannot replay, with a reason.
+Tests never use a real API key, in CI or locally. Upstream tests that call a provider API are
+listed in `plugin.toml` `[offline] skips` (by function name or parametrized id) and are skipped;
+their offline twins, which use the SDK's test models, run. `dummy-env` in the same table holds
+placeholder values (never real secrets) exported during replay so upstream skip guards do not skip.
+
+Recording real traffic into cassettes is available as an opt-in for teams that want regression
+coverage of real provider responses: `tests/conftest.py` replays cassettes from
+`tests/contrib/<name>/cassettes/<module>/` with vcrpy (through pytest-recording), and
+`OPENAI_API_KEY=<real key> make record` records them locally (`make record` refuses to run in CI).
+A `CannotOverwriteExistingCassetteException` means a test made a request that has neither a
+cassette nor a skip entry.
 
 ## Dependency cooldown
 
@@ -45,9 +48,10 @@ lanes re-lock to the newest and lowest allowed versions without committing the l
 
 ## LICENSE
 
-Each plugin has a committed relative symlink to the root `LICENSE`, never a copy. On Windows
-checkouts without symlink support the link becomes a stub file; that is harmless for development
-but is why release builds run only on Linux and `check_wheel.py` verifies the wheel's LICENSE.
+The repository has one `LICENSE` at the root and nothing committed in plugin directories. Because
+the wheel and sdist must carry the license text and uv_build fails when a declared license file is
+missing, `make` copies the root file into the plugin directory (gitignored) before any command that
+may build. Run `make sync` once in a fresh clone before using `uv` directly.
 
 ## Platform notes
 

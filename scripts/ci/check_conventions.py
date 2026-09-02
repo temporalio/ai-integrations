@@ -10,7 +10,7 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
   * every Python plugin has pyproject.toml, uv.lock, plugin.toml, Makefile, README.md,
     src/temporalio/contrib/<name>/{__init__.py,py.typed}
   * NO src/temporalio/__init__.py and NO src/temporalio/contrib/__init__.py (namespace invariant)
-  * LICENSE is a committed symlink to ../../LICENSE; pyproject declares license = "MIT"
+  * no committed or symlinked LICENSE in the plugin dir (make materializes the root one); pyproject declares license = "MIT"
     and license-files = ["LICENSE"]; no CHANGELOG*, no smoke_test.py in the plugin dir
   * plugin.toml schema and agreement with pyproject.toml (name/coordinate/root-api/
     maturity classifier/requires-python floor/module-name/required-version)
@@ -116,16 +116,10 @@ class Checker:
             if (d / forbidden).exists():
                 self.fail(f"{rel}: {forbidden} must not exist (namespace invariant; the SDK owns these packages)")
 
-        # LICENSE: a committed symlink to the repository root license.
-        license_path = d / "LICENSE"
-        if not os.path.lexists(license_path):
-            self.fail(f"{rel}: LICENSE symlink missing (create with `ln -s ../../LICENSE LICENSE`)")
-        elif not os.path.islink(license_path):
-            self.fail(f"{rel}: LICENSE must be a symlink to ../../LICENSE, not a regular file")
-        elif os.readlink(license_path) != "../../LICENSE":
-            self.fail(f"{rel}: LICENSE symlink must point to ../../LICENSE (got {os.readlink(license_path)!r})")
-
         tracked = {p.split("/", 2)[-1] for p in self.tracked_files(rel)}
+        # LICENSE: the root file is the only source; `make` materializes a gitignored copy for builds.
+        if "LICENSE" in tracked or os.path.islink(d / "LICENSE"):
+            self.fail(f"{rel}: LICENSE must not be committed or symlinked; make copies the root LICENSE here (gitignored)")
         for f in sorted(tracked):
             base = f.rsplit("/", 1)[-1]
             if "/" not in f and base.upper().startswith("CHANGELOG"):
@@ -219,7 +213,7 @@ class Checker:
         if project.get("license") != "MIT":
             self.fail(f"{rel}: pyproject [project] license must be the SPDX expression \"MIT\"")
         if project.get("license-files") != ["LICENSE"]:
-            self.fail(f"{rel}: pyproject [project] license-files must be [\"LICENSE\"] (the symlink to the root license)")
+            self.fail(f"{rel}: pyproject [project] license-files must be [\"LICENSE\"] (the copy make materializes from the root license)")
         if any(c.startswith("License ::") for c in project.get("classifiers", [])):
             self.fail(f"{rel}: drop License :: classifiers; PEP 639 uses the license expression instead")
         uv_cfg = pyproject.get("tool", {}).get("uv", {})

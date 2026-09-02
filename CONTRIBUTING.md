@@ -11,8 +11,8 @@ workflow.
 
 ## Pull requests
 
-- Ordinary PRs are squash-merged. There are no issue or PR templates; write the description you
-  would want to read.
+- Ordinary PRs are squash-merged. Issue and PR templates are the organization defaults from
+  `temporalio/.github`.
 - PRs that import or re-sync history from an SDK repository are labelled `history-import` and are
   merged with **"Create a merge commit"**, never squash or rebase. Adaptation changes go in
   separate commits after the merge commit and never touch imported files.

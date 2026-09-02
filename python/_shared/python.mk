@@ -20,24 +20,30 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 PYTEST_ARGS ?=
 PYTEST := uv run pytest -n auto --dist=worksteal
 
-.PHONY: help sync sync-latest sync-lowest format lint test test-time-skipping build record clean
+.PHONY: help sync sync-latest sync-lowest format lint test build record clean
+
+# The wheel and sdist must carry the license text, but the repository keeps ONE LICENSE at the
+# root: make materializes a gitignored copy here (never committed, never a symlink) before any uv
+# command that may build the package.
+LICENSE: $(REPO_ROOT)/LICENSE
+	cp $< $@
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
 
 # TRANSITION(sdk-cutover): the second sync reinstalls this plugin last so its files win the
 # overlap with temporalio<=1.32, which still ships the same module. Delete it at cutover.
-sync: ## Install locked dependencies and this plugin (non-editable); creates uv.lock on first run
+sync: LICENSE ## Install locked dependencies and this plugin (non-editable); creates uv.lock on first run
 	@test -f uv.lock || uv lock
 	uv sync --locked
 	uv sync --locked --reinstall-package $(DIST)
 
-sync-latest: ## Re-lock to the newest allowed versions and install (nightly lane; lock not committed)
+sync-latest: LICENSE ## Re-lock to the newest allowed versions and install (nightly lane; lock not committed)
 	uv lock --upgrade
 	uv sync
 	uv sync --reinstall-package $(DIST)
 
-sync-lowest: ## Re-lock to the lowest allowed direct versions and install (nightly lane; lock not committed)
+sync-lowest: LICENSE ## Re-lock to the lowest allowed direct versions and install (nightly lane; lock not committed)
 	uv lock --upgrade --resolution lowest-direct
 	uv sync
 	uv sync --reinstall-package $(DIST)
@@ -46,7 +52,7 @@ format: ## Fix import order and formatting
 	uv run ruff check --select I --fix
 	uv run ruff format
 
-lint: ## Import order, formatting, pyright, mypy, basedpyright, docstrings
+lint: LICENSE ## Import order, formatting, pyright, mypy, basedpyright, docstrings
 	uv run ruff check --select I
 	uv run ruff format --check
 	uv run pyright
@@ -54,20 +60,17 @@ lint: ## Import order, formatting, pyright, mypy, basedpyright, docstrings
 	uv run basedpyright
 	uv run pydocstyle --ignore-decorators=overload src
 
-test: ## Run the suite against a local dev server (offline: HTTP is replayed from cassettes)
+test: LICENSE ## Run the suite against a local dev server (offline: HTTP is replayed from cassettes)
 	$(PYTEST) $(PYTEST_ARGS)
 
-test-time-skipping: ## Run the suite against the time-skipping test server
-	$(PYTEST) --workflow-environment time-skipping $(PYTEST_ARGS)
-
-build: ## Build sdist and wheel into dist/ (LICENSE is a committed symlink to the root file)
+build: LICENSE ## Build sdist and wheel into dist/ (with the materialized root LICENSE)
 	rm -rf dist
 	uv build --no-sources --out-dir dist
 
-record: ## Re-record HTTP cassettes with a real OPENAI_API_KEY (local only, never in CI)
+record: LICENSE ## Re-record HTTP cassettes with a real OPENAI_API_KEY (local only, never in CI)
 	@if [ -n "$$CI" ]; then echo "record: refusing to run in CI" >&2; exit 1; fi
 	@if [ -z "$$OPENAI_API_KEY" ] || [ "$$OPENAI_API_KEY" = "sk-cassette-replay" ]; then echo "record: export a real OPENAI_API_KEY first" >&2; exit 1; fi
 	RECORD_MODE=$${RECORD_MODE:-once} uv run pytest -n 0 $(PYTEST_ARGS)
 
-clean: ## Remove build and test artifacts and the virtualenv
-	rm -rf dist .venv junit
+clean: ## Remove build and test artifacts, the materialized LICENSE and the virtualenv
+	rm -rf dist .venv junit LICENSE

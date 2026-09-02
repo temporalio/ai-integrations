@@ -47,7 +47,8 @@ PLUGIN = load_plugin_meta(PLUGIN_ROOT)
 #   dummy-env  placeholder values exported during replay when unset (e.g. OPENAI_API_KEY =
 #              "sk-cassette-replay") so upstream ``if not os.environ.get(...)`` skip guards do not
 #              skip; never valid credentials, every request is answered from a cassette.
-#   skips      tests skipped while replaying (never while recording), test function name -> reason.
+#   skips      tests skipped while replaying (never while recording): test function name or a
+#              parametrized id such as "test_x[False]" -> reason.
 
 #: Request and response headers that must never land in a committed cassette.
 _SENSITIVE_HEADERS = (
@@ -184,13 +185,13 @@ def pytest_collection_modifyitems(
     for item in items:
         if envconfig and item.get_closest_marker("requires_local_server"):
             item.add_marker(skip_local_only)
+        # Skips may name a whole test function or one parametrized id such as "test_x[False]".
         base_name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
-        if replaying and base_name in PLUGIN.offline_skips:
-            item.add_marker(
-                pytest.mark.skip(
-                    reason=f"offline replay: {PLUGIN.offline_skips[base_name]}"
-                )
-            )
+        skip_reason = PLUGIN.offline_skips.get(item.name) or PLUGIN.offline_skips.get(
+            base_name
+        )
+        if replaying and skip_reason:
+            item.add_marker(pytest.mark.skip(reason=f"offline replay: {skip_reason}"))
             continue
         # pytest-recording only wraps tests carrying the ``vcr`` marker; every test gets one so
         # any HTTP call is either replayed from its cassette or, when recording, captured into it.
@@ -226,51 +227,10 @@ async def env(env_type: str) -> AsyncGenerator[WorkflowEnvironment, None]:
     if _uses_envconfig_server(env_type):
         env = await _create_env_from_envconfig()
     elif env_type == "local":
+        # No --dynamic-config-value flags: the dev server's defaults cover everything the plugin
+        # suites exercise (verified by running the full suite without any). Add a flag here only when a
+        # test needs a server feature that is off by default, and say which test needs it.
         env = await WorkflowEnvironment.start_local(
-            dev_server_extra_args=[
-                "--dynamic-config-value",
-                "system.forceSearchAttributesCacheRefreshOnRead=true",
-                "--dynamic-config-value",
-                f"limit.historyCount.suggestContinueAsNew={CONTINUE_AS_NEW_SUGGEST_HISTORY_COUNT}",
-                "--dynamic-config-value",
-                "system.enableEagerWorkflowStart=true",
-                "--dynamic-config-value",
-                "frontend.enableExecuteMultiOperation=true",
-                "--dynamic-config-value",
-                "frontend.workerVersioningWorkflowAPIs=true",
-                "--dynamic-config-value",
-                "frontend.workerVersioningDataAPIs=true",
-                "--dynamic-config-value",
-                "system.enableDeploymentVersions=true",
-                "--dynamic-config-value",
-                "frontend.activityAPIsEnabled=true",
-                "--dynamic-config-value",
-                "frontend.enableCancelWorkerPollsOnShutdown=true",
-                "--dynamic-config-value",
-                "component.nexusoperations.recordCancelRequestCompletionEvents=true",
-                "--dynamic-config-value",
-                "activity.enableStandalone=true",
-                "--dynamic-config-value",
-                "activity.startDelayEnabled=true",
-                "--dynamic-config-value",
-                "history.enableChasm=true",
-                "--dynamic-config-value",
-                "history.enableTransitionHistory=true",
-                "--dynamic-config-value",
-                "history.enableCHASMCallbacks=true",
-                "--dynamic-config-value",
-                "history.enableCHASMSignalBacklinks=true",
-                "--dynamic-config-value",
-                "nexusoperation.enableStandalone=true",
-                "--dynamic-config-value",
-                'system.system.refreshNexusEndpointsMinWait="0s"',
-                "--dynamic-config-value",
-                "history.enableSignalWithStartFromWorkflow=true",
-                "--dynamic-config-value",
-                "history.enableUpdateCallbacks=true",
-                "--dynamic-config-value",
-                "activity.enableCallbacks=true",
-            ],
             dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
         )
     elif env_type == "time-skipping":

@@ -29,6 +29,7 @@ imports = []   # extra modules the isolated wheel check imports in addition to r
 # Tests replay recorded HTTP traffic and never hold real credentials (tests/conftest.py).
 # dummy-env: placeholder values exported during replay when the variable is unset, so upstream
 #            `if not os.environ.get("...")` skip guards do not skip. Never a real secret.
-# skips:     tests skipped while replaying (never while recording), test function name -> reason.
+# skips:     tests skipped while replaying (never while recording): test function name or a parametrized
+#            id such as "test_x[False]" -> reason. Tests that need a real provider key belong here.
 dummy-env = {}
 skips = {}

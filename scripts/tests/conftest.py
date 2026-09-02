@@ -25,6 +25,7 @@ def init_repo(root: Path) -> Path:
     git(root, "config", "user.name", "CI")
     git(root, "config", "commit.gpgsign", "false")
     (root / "LICENSE").write_text(LICENSE_TEXT)
+    (root / ".gitignore").write_text("python/*/LICENSE\n.venv/\ndist/\n")
     (root / "README.md").write_text("# repo\n")
     (root / "scripts").mkdir(exist_ok=True)
     (root / "scripts" / "pyproject.toml").write_text(
@@ -110,10 +111,10 @@ def make_python_plugin(
     (d / "Makefile").write_text("DIST := " + coordinate + "\ninclude ../_shared/python.mk\n")
     (d / "README.md").write_text("# fake\n\nSee https://github.com/temporalio/ai-integrations for details.\n")
     (d / "uv.lock").write_text("version = 1\n")
-    lic = d / "LICENSE"
+    lic = d / "LICENSE"  # materialized copy, gitignored (what `make` does)
     if lic.exists() or lic.is_symlink():
         lic.unlink()
-    os.symlink("../../LICENSE", lic)
+    lic.write_text(LICENSE_TEXT)
     return d
 
 

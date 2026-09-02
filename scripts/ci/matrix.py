@@ -7,8 +7,8 @@ pull requests included:
 
   ubuntu-latest x {min, max}, macos-latest and windows-latest at max
 
-`time_skipping` and `dist` are true only for the ubuntu/max cell, which also
-builds and uploads the distributions. Output: matrix={"include":[...]}.
+`dist` is true only for the ubuntu/max cell, which also builds and uploads the
+distributions. Output: matrix={"include":[...]}.
 """
 
 from __future__ import annotations
@@ -28,10 +28,10 @@ def build_matrix(runtime_versions: list[str]) -> dict[str, list[dict[str, object
     lo, hi = versions[0], versions[-1]
     include: list[dict[str, object]] = []
     if lo != hi:
-        include.append({"os": "ubuntu-latest", "runtime": lo, "time_skipping": False, "dist": False})
-    include.append({"os": "ubuntu-latest", "runtime": hi, "time_skipping": True, "dist": True})
+        include.append({"os": "ubuntu-latest", "runtime": lo, "dist": False})
+    include.append({"os": "ubuntu-latest", "runtime": hi, "dist": True})
     for runner in ("macos-latest", "windows-latest"):
-        include.append({"os": runner, "runtime": hi, "time_skipping": False, "dist": False})
+        include.append({"os": runner, "runtime": hi, "dist": False})
     return {"include": include}
 
 

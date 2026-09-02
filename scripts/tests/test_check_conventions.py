@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -28,16 +29,19 @@ def test_namespace_init_files_are_forbidden(plugin_repo: Path) -> None:
     assert any("src/temporalio/__init__.py" in x for x in v) and any("src/temporalio/contrib/__init__.py" in x for x in v)
 
 
-def test_license_must_be_symlink_to_root(plugin_repo: Path) -> None:
+def test_license_must_not_be_committed_or_symlinked(plugin_repo: Path) -> None:
     lic = plugin_repo / "python/fakeplug/LICENSE"
+    assert run(plugin_repo) == []  # a gitignored materialized copy is fine
+    lic.unlink()
+    os.symlink("../../LICENSE", lic)
+    assert any("must not be committed or symlinked" in x for x in run(plugin_repo))
     lic.unlink()
     lic.write_text("MIT\n")
-    assert any("must be a symlink" in x for x in run(plugin_repo))
+    subprocess.run(["git", "-C", str(plugin_repo), "add", "-f", "python/fakeplug/LICENSE"], check=True)
+    assert any("must not be committed or symlinked" in x for x in run(plugin_repo))
+    subprocess.run(["git", "-C", str(plugin_repo), "rm", "-q", "--cached", "python/fakeplug/LICENSE"], check=True)
     lic.unlink()
-    os.symlink("../LICENSE", lic)
-    assert any("must point to ../../LICENSE" in x for x in run(plugin_repo))
-    lic.unlink()
-    assert any("LICENSE symlink missing" in x for x in run(plugin_repo))
+    assert run(plugin_repo) == []  # absent is fine too; make materializes it before any build
 
 
 def test_changelog_and_smoke_test_files_are_forbidden(plugin_repo: Path) -> None:

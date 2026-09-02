@@ -6,7 +6,7 @@ Usage:
         [--maturity ga|preview|experimental] [--version X.Y.Z] [--existing]
 
 ``--existing`` lets the scaffolder fill in the files a history import did not bring
-(pyproject.toml, plugin.toml, Makefile, LICENSE symlink, tests scaffolding) without touching
+(pyproject.toml, plugin.toml, Makefile, tests scaffolding) without touching
 anything that already exists, in particular ``src/``.
 
 Standard library only; Python 3.11+.
@@ -109,7 +109,7 @@ def main(argv: list[str]) -> int:
         f"""
 Next steps for python/{name} ({coordinate} {version}, maturity={args.maturity}):
   1. Fill in [project].dependencies in pyproject.toml (declare exactly what is imported).
-  2. cd python/{name} && make sync   # creates uv.lock; commit it
+  2. cd python/{name} && make sync   # materializes LICENSE (gitignored), creates uv.lock; commit uv.lock
   3. make lint && make test
   4. If any test talks to a provider API, record cassettes once: OPENAI_API_KEY=... make record
   5. Add a row to the plugin table in README.md.
