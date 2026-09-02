@@ -94,6 +94,9 @@ jobs:
         if: matrix.time_skipping
         run: cd "$PLUGIN_DIR" && make test-time-skipping PYTEST_ARGS="-s --junit-xml=junit/time-skipping.xml"
       - name: Build, verify, and smoke-test distributions
+        # Only on the designated dist cell: Windows checkouts turn the LICENSE symlink into a stub
+        # file, and the release pipeline publishes the ubuntu-built artifacts anyway.
+        if: matrix.dist
         uses: ./.github/actions/python-build-check
         with:
           plugin-dir: python/${{ inputs.plugin }}

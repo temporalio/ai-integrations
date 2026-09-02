@@ -135,3 +135,11 @@ def test_cli_exit_codes(plugin_repo: Path, capsys: pytest.CaptureFixture[str]) -
     (plugin_repo / "python/fakeplug/src/temporalio/__init__.py").write_text("")
     assert check_conventions.main(["--repo-root", str(plugin_repo)]) == 1
     assert "FAIL" in capsys.readouterr().out
+
+
+def test_offline_dummy_env_must_be_a_placeholder(plugin_repo: Path) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(meta.read_text() + '\n[offline]\ndummy-env = { OPENAI_API_KEY = "sk-abcdefghijklmnopqrstuvwxyz0123" }\nskips = { test_x = "reason" }\n')
+    assert any("dummy-env OPENAI_API_KEY must be an obvious placeholder" in v for v in run(plugin_repo))
+    meta.write_text(meta.read_text().replace("sk-abcdefghijklmnopqrstuvwxyz0123", "sk-cassette-replay"))
+    assert run(plugin_repo) == []

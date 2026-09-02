@@ -24,3 +24,11 @@ runtime-versions = ["3.10", "3.14"]   # first entry must equal the requires-pyth
 
 [smoke]
 imports = []   # extra modules the isolated wheel check imports in addition to root-api
+
+[offline]
+# Tests replay recorded HTTP traffic and never hold real credentials (tests/conftest.py).
+# dummy-env: placeholder values exported during replay when the variable is unset, so upstream
+#            `if not os.environ.get("...")` skip guards do not skip. Never a real secret.
+# skips:     tests skipped while replaying (never while recording), test function name -> reason.
+dummy-env = {}
+skips = {}

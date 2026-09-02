@@ -25,7 +25,6 @@ from typing import Any
 import opentelemetry.trace
 import pytest
 import pytest_asyncio
-from agents.tracing import set_trace_processors
 from opentelemetry.util._once import Once
 
 from temporalio.client import Client
@@ -43,14 +42,12 @@ PLUGIN = load_plugin_meta(PLUGIN_ROOT)
 # Offline mode: record/replay of HTTP traffic
 # ---------------------------------------------------------------------------
 
-#: Stands in for a real key while replaying, so upstream ``if not os.environ.get("OPENAI_API_KEY")``
-#: skip guards do not skip. Never valid; every request is answered from a cassette.
-DUMMY_OPENAI_API_KEY = "sk-cassette-replay"
-
-#: Tests skipped while replaying (never while recording), keyed by test function name.
-OFFLINE_SKIPS: dict[str, str] = {
-    "test_lite_llm": "third-party transport stack; already skipped upstream on Python 3.14",
-}
+# Plugin-specific offline settings live in plugin.toml ``[offline]`` (read by ``PLUGIN`` above), so
+# this file stays identical across plugins:
+#   dummy-env  placeholder values exported during replay when unset (e.g. OPENAI_API_KEY =
+#              "sk-cassette-replay") so upstream ``if not os.environ.get(...)`` skip guards do not
+#              skip; never valid credentials, every request is answered from a cassette.
+#   skips      tests skipped while replaying (never while recording), test function name -> reason.
 
 #: Request and response headers that must never land in a committed cassette.
 _SENSITIVE_HEADERS = (
@@ -62,12 +59,17 @@ _SENSITIVE_HEADERS = (
     "x-request-id",
 )
 
-# The Agents SDK registers BatchTraceProcessor(BackendSpanExporter) by default. With any
-# OPENAI_API_KEY set, including the dummy replay key, it would POST traces to api.openai.com from a
-# daemon thread outside every cassette. Drop it; tests that assert on traces install their own
-# processors. Do NOT set OPENAI_AGENTS_DISABLE_TRACING here: that turns every span into a no-op and
-# breaks the tracing tests.
-set_trace_processors([])
+# Plugins built on the OpenAI Agents SDK: it registers BatchTraceProcessor(BackendSpanExporter) by
+# default, and with any OPENAI_API_KEY set (including a dummy replay key) that exporter POSTs traces
+# to api.openai.com from a daemon thread outside every cassette. Drop it; tests that assert on traces
+# install their own processors. Do NOT set OPENAI_AGENTS_DISABLE_TRACING: that turns every span into a
+# no-op and breaks tracing tests. Plugins without the Agents SDK simply skip this.
+try:
+    from agents.tracing import set_trace_processors
+except ImportError:  # not an OpenAI Agents SDK plugin
+    pass
+else:
+    set_trace_processors([])
 
 
 def _record_mode() -> str:
@@ -150,8 +152,9 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "requires_local_server: test requires local-server-only behavior and cannot run against an envconfig server",
     )
-    if _replaying() and not os.environ.get("OPENAI_API_KEY"):
-        os.environ["OPENAI_API_KEY"] = DUMMY_OPENAI_API_KEY
+    if _replaying():
+        for name, value in PLUGIN.dummy_env.items():
+            os.environ.setdefault(name, value)
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:  # type: ignore[reportUnusedParameter]
@@ -182,9 +185,11 @@ def pytest_collection_modifyitems(
         if envconfig and item.get_closest_marker("requires_local_server"):
             item.add_marker(skip_local_only)
         base_name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
-        if replaying and base_name in OFFLINE_SKIPS:
+        if replaying and base_name in PLUGIN.offline_skips:
             item.add_marker(
-                pytest.mark.skip(reason=f"offline replay: {OFFLINE_SKIPS[base_name]}")
+                pytest.mark.skip(
+                    reason=f"offline replay: {PLUGIN.offline_skips[base_name]}"
+                )
             )
             continue
         # pytest-recording only wraps tests carrying the ``vcr`` marker; every test gets one so

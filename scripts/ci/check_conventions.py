@@ -51,6 +51,12 @@ RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
 SECRET_PATTERNS = (re.compile(r"sk-[A-Za-z0-9]"), re.compile(r"Bearer "))
 MAX_PR_COMMITS_WITHOUT_LABEL = 20
 HISTORY_IMPORT_LABEL = "history-import"
+PLACEHOLDER_WORDS = ("dummy", "cassette", "placeholder", "fake", "replay", "offline")
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    lowered = value.lower()
+    return any(word in lowered for word in PLACEHOLDER_WORDS)
 
 
 class Checker:
@@ -177,6 +183,14 @@ class Checker:
         if not isinstance(versions, list) or not versions:
             self.fail(f"{rel}: plugin.toml [ci] runtime-versions must be a non-empty list")
             versions = []
+        offline = meta.get("offline", {})
+        for key in ("dummy-env", "skips"):
+            table = offline.get(key, {})
+            if not isinstance(table, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in table.items()):
+                self.fail(f"{rel}: plugin.toml [offline] {key} must be a table of string -> string")
+        for name, value in (offline.get("dummy-env", {}) or {}).items():
+            if isinstance(value, str) and not _looks_like_placeholder(value):
+                self.fail(f"{rel}: plugin.toml [offline] dummy-env {name} must be an obvious placeholder (contain dummy/cassette/placeholder/fake/replay), never a real credential")
         smoke_imports = meta.get("smoke", {}).get("imports", [])
         if smoke_imports and not all(isinstance(i, str) and i.startswith(expected_root_api) for i in smoke_imports):
             self.fail(f"{rel}: plugin.toml [smoke] imports must be modules under {expected_root_api}")

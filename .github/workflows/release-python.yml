@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       publish-prerelease-to-pypi:
-        description: For a pre-release tag ref, also publish to PyPI (still gated by the pypi environment)
+        description: For a pre-release tag ref, also publish to PyPI (still gated by the pypi environment; ignored while plugin.toml [release] allow-final is false)
         type: boolean
         default: false
 
@@ -90,9 +90,12 @@ jobs:
         id: gate
         env:
           PRERELEASE: ${{ steps.tag.outputs.prerelease }}
+          ALLOW_FINAL: ${{ steps.tag.outputs.allow_final }}
           OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish-prerelease-to-pypi }}
         run: |
-          if [ "$PRERELEASE" = "false" ] || [ "$OVERRIDE" = "true" ]; then
+          # Finals reach PyPI; pre-releases only via the dispatch override, and never while the plugin
+          # is still in the SDK-cutover transition (allow-final = false).
+          if [ "$PRERELEASE" = "false" ] || { [ "$OVERRIDE" = "true" ] && [ "$ALLOW_FINAL" = "true" ]; }; then
             echo "publish_pypi=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish_pypi=false" >> "$GITHUB_OUTPUT"

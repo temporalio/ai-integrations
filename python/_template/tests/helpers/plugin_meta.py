@@ -17,6 +17,8 @@ class PluginMeta:
     coordinate: str
     root_api: str
     allow_final: bool
+    dummy_env: dict[str, str]
+    offline_skips: dict[str, str]
 
     @property
     def package_relpath(self) -> str:
@@ -28,9 +30,12 @@ def load_plugin_meta(plugin_root: Path) -> PluginMeta:
     data = tomllib.loads((plugin_root / "plugin.toml").read_text(encoding="utf-8"))
     plugin = data["plugin"]
     release = data.get("release", {})
+    offline = data.get("offline", {})
     return PluginMeta(
         name=plugin["name"],
         coordinate=plugin["coordinate"],
         root_api=plugin["root-api"],
         allow_final=bool(release.get("allow-final", False)),
+        dummy_env={str(k): str(v) for k, v in offline.get("dummy-env", {}).items()},
+        offline_skips={str(k): str(v) for k, v in offline.get("skips", {}).items()},
     )

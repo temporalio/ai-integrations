@@ -33,7 +33,9 @@ Tests never need a real API key. `tests/conftest.py` records and replays HTTP tr
 test fails with `CannotOverwriteExistingCassetteException`, it made a request that has no
 recording: run `OPENAI_API_KEY=<real key> make record` locally, review the new cassette for
 secrets (the conventions check also scans for them), and commit it. `make record` refuses to run
-in CI. Tests that cannot replay are listed in `OFFLINE_SKIPS` in the conftest with a reason.
+in CI. Plugin-specific offline settings are data in `plugin.toml` `[offline]`: `dummy-env` holds placeholder
+values (never real secrets) exported during replay so upstream skip guards do not skip, and `skips`
+lists tests that cannot replay, with a reason.
 
 ## Dependency cooldown
 

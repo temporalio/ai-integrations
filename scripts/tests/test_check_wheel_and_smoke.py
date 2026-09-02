@@ -102,3 +102,9 @@ def test_normalize_version() -> None:
     assert smoke.normalize_version("1.0.0.post1") == "1.0.0.post1"
     assert smoke.versions_equal("1.0.0rc1", "1.0.0-rc1")
     assert not smoke.versions_equal("1.0.0", "1.0.1")
+
+
+def test_requirement_name_is_exact_not_prefix() -> None:
+    assert check_wheel._requirement_name("temporalio[opentelemetry,pydantic]>=1.32.0,<2; python_version >= '3.10'") == "temporalio"
+    assert check_wheel._requirement_name("temporalio-mcp>=0.1,<0.2") == "temporalio-mcp"
+    assert check_wheel._requirement_name("not a requirement !!") == ""

@@ -20,11 +20,20 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import load_toml, repo_root  # noqa: E402
+
+
+def _requirement_name(requires_dist: str) -> str:
+    """Canonical project name of a Requires-Dist value ('' if unparsable)."""
+    try:
+        return canonicalize_name(Requirement(requires_dist).name)
+    except InvalidRequirement:
+        return ""
 
 
 def _metadata(text: str) -> dict[str, list[str]]:
@@ -88,7 +97,7 @@ def check(plugin_dir: Path, dist: Path, root: Path | None = None) -> list[str]:
             problems.append(f"METADATA Version unparsable: {exc}")
         if "MIT" not in headers.get("License-Expression", []) and "MIT" not in headers.get("License", []):
             problems.append("METADATA must declare License-Expression: MIT")
-        if not any(r.split(";")[0].strip().startswith("temporalio") for r in headers.get("Requires-Dist", [])):
+        if not any(_requirement_name(r) == "temporalio" for r in headers.get("Requires-Dist", [])):
             problems.append("METADATA Requires-Dist must include temporalio")
         license_name = f"{info}/licenses/LICENSE"
         if license_name not in names:

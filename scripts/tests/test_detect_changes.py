@@ -96,3 +96,11 @@ def test_github_output_format(repo: Path, tmp_path: Path) -> None:
     text = out.read_text()
     assert 'python=["alpha"]' in text and "typescript=[]" in text and "any=true" in text and "mode=diff" in text
     assert git(repo, "status", "--porcelain") == ""
+
+
+def test_root_license_fans_out_to_every_plugin(repo: Path) -> None:
+    base = _setup(repo)
+    (repo / "LICENSE").write_text("MIT\n")
+    commit_all(repo, "add license")
+    r = _run(repo, base, "LICENSE")
+    assert r["python"] == ["alpha", "beta"] and r["typescript"] == ["gamma"]

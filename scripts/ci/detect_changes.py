@@ -53,7 +53,9 @@ def select(
     for f in files:
         parts = f.split("/")
         top = parts[0]
-        if top == ".github":
+        if top == ".github" or f == "LICENSE":
+            # Workflow/tooling changes affect every plugin; so does the root LICENSE, which every
+            # plugin packages through its LICENSE symlink.
             return selected, True, False
         if top == "scripts":
             if len(parts) > 1 and parts[1] == "ci":
@@ -67,7 +69,7 @@ def select(
                 selected[top].update(plugins[top])
             other_touched = True
             continue
-        # Root-level files (README.md, AGENTS.md, LICENSE, ...) select nothing.
+        # Other root-level files (README.md, AGENTS.md, ...) select nothing.
     return selected, False, scripts_touched and not other_touched and not any(selected.values())
 
 
