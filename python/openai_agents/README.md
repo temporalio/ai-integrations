@@ -2,6 +2,18 @@
 
 We welcome questions and feedback in the [#python-sdk](https://temporalio.slack.com/archives/CTT84RS0P) Slack channel at [temporalio.slack.com](https://temporalio.slack.com/).
 
+## Install
+
+```bash
+uv add temporalio-openai-agents
+```
+
+> **Transition note.** Until the Temporal Python SDK release that stops bundling
+> `temporalio.contrib.openai_agents`, do not install this package next to `temporalio<=1.32`: both
+> ship the same files, and uninstalling this package then removes files the SDK still needs (repair
+> with a reinstall of `temporalio`). Pre-releases are published to TestPyPI only for that reason.
+> Source and issues: https://github.com/temporalio/ai-integrations/tree/main/python/openai_agents
+
 ## Introduction
 
 This integration combines [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) with [Temporal's durable execution](https://docs.temporal.io/evaluate/understanding-temporal#durable-execution).
@@ -702,7 +714,7 @@ agents-SDK `StreamEvent` union (so raw model events arrive as
 `RawResponsesStreamEvent.data`).
 
 External consumers (UIs, tracing pipelines, etc.) observe events as
-they arrive by hosting a [`WorkflowStream`](../workflow_streams/README.md)
+they arrive by hosting a [`WorkflowStream`](https://github.com/temporalio/sdk-python/blob/main/temporalio/contrib/workflow_streams/README.md)
 in the workflow and subscribing with `WorkflowStreamClient`. The
 streaming activity publishes each event to the topic configured on
 `ModelActivityParameters.streaming_topic`. The topic is required
@@ -733,7 +745,7 @@ class MyAgent:
 
 To publish raw model events to external subscribers, host a
 `WorkflowStream` in the workflow and configure
-`OpenAIAgentsPlugin(model_params=ModelActivityParameters(streaming_topic="events"))`. See [`temporalio.contrib.workflow_streams`](../workflow_streams/README.md) for the
+`OpenAIAgentsPlugin(model_params=ModelActivityParameters(streaming_topic="events"))`. See [`temporalio.contrib.workflow_streams`](https://github.com/temporalio/sdk-python/blob/main/temporalio/contrib/workflow_streams/README.md) for the
 publisher and subscriber API.
 
 `RunResultStreaming.stream_events()` yields the agents-SDK
@@ -755,7 +767,7 @@ retry attempt publishes a second sequence. `stream_events()` only sees
 the final successful attempt's collected events because it consumes the
 activity's return value. Workflow-stream subscribers should treat
 retries the same way as any other workflow_streams publisher — see
-[Delivery semantics](../workflow_streams/README.md) for the trade and
+[Delivery semantics](https://github.com/temporalio/sdk-python/blob/main/temporalio/contrib/workflow_streams/README.md) for the trade and
 the conventional `RETRY` event pattern for surfacing the transition to
 consumers.
 
