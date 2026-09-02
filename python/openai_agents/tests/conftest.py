@@ -25,7 +25,6 @@ from typing import Any
 import opentelemetry.trace
 import pytest
 import pytest_asyncio
-from agents.tracing import set_trace_processors
 from opentelemetry.util._once import Once
 
 from temporalio.client import Client
@@ -43,14 +42,13 @@ PLUGIN = load_plugin_meta(PLUGIN_ROOT)
 # Offline mode: record/replay of HTTP traffic
 # ---------------------------------------------------------------------------
 
-#: Stands in for a real key while replaying, so upstream ``if not os.environ.get("OPENAI_API_KEY")``
-#: skip guards do not skip. Never valid; every request is answered from a cassette.
-DUMMY_OPENAI_API_KEY = "sk-cassette-replay"
-
-#: Tests skipped while replaying (never while recording), keyed by test function name.
-OFFLINE_SKIPS: dict[str, str] = {
-    "test_lite_llm": "third-party transport stack; already skipped upstream on Python 3.14",
-}
+# Plugin-specific offline settings live in plugin.toml ``[offline]`` (read by ``PLUGIN`` above), so
+# this file stays identical across plugins:
+#   dummy-env  placeholder values exported during replay when unset (e.g. OPENAI_API_KEY =
+#              "sk-cassette-replay") so upstream ``if not os.environ.get(...)`` skip guards do not
+#              skip; never valid credentials, every request is answered from a cassette.
+#   skips      tests skipped while replaying (never while recording): test function name or a
+#              parametrized id such as "test_x[False]" -> reason.
 
 #: Request and response headers that must never land in a committed cassette.
 _SENSITIVE_HEADERS = (
@@ -62,12 +60,17 @@ _SENSITIVE_HEADERS = (
     "x-request-id",
 )
 
-# The Agents SDK registers BatchTraceProcessor(BackendSpanExporter) by default. With any
-# OPENAI_API_KEY set, including the dummy replay key, it would POST traces to api.openai.com from a
-# daemon thread outside every cassette. Drop it; tests that assert on traces install their own
-# processors. Do NOT set OPENAI_AGENTS_DISABLE_TRACING here: that turns every span into a no-op and
-# breaks the tracing tests.
-set_trace_processors([])
+# Plugins built on the OpenAI Agents SDK: it registers BatchTraceProcessor(BackendSpanExporter) by
+# default, and with any OPENAI_API_KEY set (including a dummy replay key) that exporter POSTs traces
+# to api.openai.com from a daemon thread outside every cassette. Drop it; tests that assert on traces
+# install their own processors. Do NOT set OPENAI_AGENTS_DISABLE_TRACING: that turns every span into a
+# no-op and breaks tracing tests. Plugins without the Agents SDK simply skip this.
+try:
+    from agents.tracing import set_trace_processors
+except ImportError:  # not an OpenAI Agents SDK plugin
+    pass
+else:
+    set_trace_processors([])
 
 
 def _record_mode() -> str:
@@ -150,8 +153,9 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "requires_local_server: test requires local-server-only behavior and cannot run against an envconfig server",
     )
-    if _replaying() and not os.environ.get("OPENAI_API_KEY"):
-        os.environ["OPENAI_API_KEY"] = DUMMY_OPENAI_API_KEY
+    if _replaying():
+        for name, value in PLUGIN.dummy_env.items():
+            os.environ.setdefault(name, value)
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:  # type: ignore[reportUnusedParameter]
@@ -181,11 +185,13 @@ def pytest_collection_modifyitems(
     for item in items:
         if envconfig and item.get_closest_marker("requires_local_server"):
             item.add_marker(skip_local_only)
+        # Skips may name a whole test function or one parametrized id such as "test_x[False]".
         base_name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
-        if replaying and base_name in OFFLINE_SKIPS:
-            item.add_marker(
-                pytest.mark.skip(reason=f"offline replay: {OFFLINE_SKIPS[base_name]}")
-            )
+        skip_reason = PLUGIN.offline_skips.get(item.name) or PLUGIN.offline_skips.get(
+            base_name
+        )
+        if replaying and skip_reason:
+            item.add_marker(pytest.mark.skip(reason=f"offline replay: {skip_reason}"))
             continue
         # pytest-recording only wraps tests carrying the ``vcr`` marker; every test gets one so
         # any HTTP call is either replayed from its cassette or, when recording, captured into it.
@@ -221,51 +227,10 @@ async def env(env_type: str) -> AsyncGenerator[WorkflowEnvironment, None]:
     if _uses_envconfig_server(env_type):
         env = await _create_env_from_envconfig()
     elif env_type == "local":
+        # No --dynamic-config-value flags: the dev server's defaults cover everything the plugin
+        # suites exercise (verified by running the full suite without any). Add a flag here only when a
+        # test needs a server feature that is off by default, and say which test needs it.
         env = await WorkflowEnvironment.start_local(
-            dev_server_extra_args=[
-                "--dynamic-config-value",
-                "system.forceSearchAttributesCacheRefreshOnRead=true",
-                "--dynamic-config-value",
-                f"limit.historyCount.suggestContinueAsNew={CONTINUE_AS_NEW_SUGGEST_HISTORY_COUNT}",
-                "--dynamic-config-value",
-                "system.enableEagerWorkflowStart=true",
-                "--dynamic-config-value",
-                "frontend.enableExecuteMultiOperation=true",
-                "--dynamic-config-value",
-                "frontend.workerVersioningWorkflowAPIs=true",
-                "--dynamic-config-value",
-                "frontend.workerVersioningDataAPIs=true",
-                "--dynamic-config-value",
-                "system.enableDeploymentVersions=true",
-                "--dynamic-config-value",
-                "frontend.activityAPIsEnabled=true",
-                "--dynamic-config-value",
-                "frontend.enableCancelWorkerPollsOnShutdown=true",
-                "--dynamic-config-value",
-                "component.nexusoperations.recordCancelRequestCompletionEvents=true",
-                "--dynamic-config-value",
-                "activity.enableStandalone=true",
-                "--dynamic-config-value",
-                "activity.startDelayEnabled=true",
-                "--dynamic-config-value",
-                "history.enableChasm=true",
-                "--dynamic-config-value",
-                "history.enableTransitionHistory=true",
-                "--dynamic-config-value",
-                "history.enableCHASMCallbacks=true",
-                "--dynamic-config-value",
-                "history.enableCHASMSignalBacklinks=true",
-                "--dynamic-config-value",
-                "nexusoperation.enableStandalone=true",
-                "--dynamic-config-value",
-                'system.system.refreshNexusEndpointsMinWait="0s"',
-                "--dynamic-config-value",
-                "history.enableSignalWithStartFromWorkflow=true",
-                "--dynamic-config-value",
-                "history.enableUpdateCallbacks=true",
-                "--dynamic-config-value",
-                "activity.enableCallbacks=true",
-            ],
             dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
         )
     elif env_type == "time-skipping":

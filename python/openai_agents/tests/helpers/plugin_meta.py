@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib  # type: ignore[no-redef]
+# Each branch is unreachable under one interpreter version; basedpyright fails on that warning.
+if sys.version_info >= (3, 11):
+    import tomllib  # type: ignore[reportUnreachable]
+else:  # Python 3.10: tomllib arrived in 3.11
+    import tomli as tomllib  # type: ignore[reportUnreachable]
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,8 @@ class PluginMeta:
     coordinate: str
     root_api: str
     allow_final: bool
+    dummy_env: dict[str, str]
+    offline_skips: dict[str, str]
 
     @property
     def package_relpath(self) -> str:
@@ -28,9 +32,12 @@ def load_plugin_meta(plugin_root: Path) -> PluginMeta:
     data = tomllib.loads((plugin_root / "plugin.toml").read_text(encoding="utf-8"))
     plugin = data["plugin"]
     release = data.get("release", {})
+    offline = data.get("offline", {})
     return PluginMeta(
         name=plugin["name"],
         coordinate=plugin["coordinate"],
         root_api=plugin["root-api"],
         allow_final=bool(release.get("allow-final", False)),
+        dummy_env={str(k): str(v) for k, v in offline.get("dummy-env", {}).items()},
+        offline_skips={str(k): str(v) for k, v in offline.get("skips", {}).items()},
     )
