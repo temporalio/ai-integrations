@@ -65,6 +65,7 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
 - The manifest version is static and is the only version source. A tag is valid only if `uv version --short` in the plugin directory equals the tag's version.
 - No changelog files. `scripts/release/release_tool.py release-notes` derives notes from commit subjects touching the plugin directory since its previous tag.
 - Every GitHub Action is pinned to a full commit SHA with a `# vN` comment (org opengrep rule).
+- Dependabot mirrors sdk-python: security advisories only (`open-pull-requests-limit: 0`) because its uv support is not yet mature enough for routine bumps; the nightly newest/lowest lanes are the dependency-drift signal.
 
 ## Python conventions
 
@@ -82,8 +83,8 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
 One entry workflow, one reusable workflow per language, plugin as a parameter, no secrets.
 
 - `.github/workflows/ci.yml` (`pull_request`, `merge_group`, push to `main`, nightly, dispatch). Job `changes` runs `scripts/ci/detect_changes.py`: plugins are discovered from `<language>/*/<manifest>` (ignoring `_*`); a changed file under a plugin selects that plugin; a non-plugin file under a language root selects every plugin of that language; `.github/**` and `scripts/ci/**` select everything; `scripts/release/**` and `scripts/migrate/**` select only the script tests; push to `main`, nightly and dispatch select everything. Job `conventions` checks repository invariants and runs the script tests. Job `python` calls `_python-plugin.yml` once per selected plugin. Job `ci-status` fans in and is the only required check (skipped upstream jobs count as success).
-- `.github/workflows/_python-plugin.yml`: job `matrix` reads `plugin.toml` `runtime-versions` and the `profile` input (`pr` = ubuntu at min and max versions; `full` = plus macOS and Windows at max); job `test` runs `make sync` (or `sync-latest` / `sync-lowest` on nightly lanes), `make lint`, `make test`, `make test-time-skipping` on ubuntu, then the `python-build-check` composite action (`make build`, `check_wheel.py`, isolated `smoke.py` on wheel and sdist). Windows runners install GNU make with choco.
-- Nightly `latest` and `lowest-direct` lanes are advisory: they open or update one issue per plugin and never block PRs.
+- `.github/workflows/_python-plugin.yml`: job `matrix` reads `plugin.toml` `runtime-versions` and emits the same matrix for every run, pull requests included (ubuntu at the min and max versions, macOS and Windows at max); job `test` runs `make sync` (or `sync-latest` / `sync-lowest`), `make lint`, `make test`, `make test-time-skipping` on ubuntu, then, on the ubuntu/max cell only, the `python-build-check` composite action (`make build`, `check_wheel.py`, isolated `smoke.py` on wheel and sdist). Windows runners install GNU make with choco.
+- Dependency lanes: nightly runs every plugin with the newest allowed dependencies (`sync-latest`) and with the lowest allowed direct dependencies (`sync-lowest`), opening or updating one issue per failing plugin. The lowest-direct lane also runs, and blocks, on pull requests that change a plugin's `pyproject.toml` or `uv.lock`, because that is when floors change.
 - Required checks on `main`: `ci-status`, plus the org-enforced required workflows that run automatically on every PR (`Check for CODEOWNERS`, `Opengrep SAST`), and `license/cla` once the CLA app is installed. Do not add a local opengrep caller; the org one already runs.
 
 ## Releases
@@ -95,7 +96,7 @@ Version policy (`release_tool.py check-version-policy`, evaluated against pypi.o
 Runbook for `python/<name>`:
 1. Open a release PR that sets `version` in `pyproject.toml` (re-sync from upstream first while the transition rules apply). Merge it.
 2. `git tag -a python/<name>/v<version> -m "python/<name> v<version>"` on the merged `main` commit and push the tag. Tags must match `<language>/<name>/v<version>` and are protected by a tag ruleset.
-3. `release-python.yml` validates the tag, runs the full test profile, builds once, publishes to TestPyPI (environment `testpypi`), smoke-installs from TestPyPI in a clean project, and for final versions publishes to PyPI (environment `pypi`, required reviewers confirm the tag SHA is on `main`) and smoke-installs again.
+3. `release-python.yml` validates the tag, runs the full test matrix, builds once, publishes to TestPyPI (environment `testpypi`), smoke-installs from TestPyPI in a clean project, and for final versions publishes to PyPI (environment `pypi`, required reviewers confirm the tag SHA is on `main`) and smoke-installs again.
 4. A draft GitHub Release is created idempotently with generated notes and the artifacts. Edit the notes and publish it by hand.
 5. If anything fails after upload, fix forward with the next `rcN`; uploaded files are immutable and tags are never moved.
 

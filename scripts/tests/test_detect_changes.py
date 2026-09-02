@@ -33,6 +33,14 @@ def _run(repo: Path, base: str, *touch: str, event: str = "pull_request") -> dic
     return detect_changes.main(["--repo-root", str(repo), "--event", event, "--base", base, "--dry-run"])
 
 
+def test_dependency_change_marks_plugin_for_the_lowest_lane(repo: Path) -> None:
+    base = _setup(repo)
+    r = _run(repo, base, "python/alpha/pyproject.toml")
+    assert r["python"] == ["alpha"] and r["python_deps"] == ["alpha"]
+    r = _run(repo, base, "python/beta/src/temporalio/contrib/beta/_impl.py")
+    assert r["python"] == ["alpha", "beta"] and r["python_deps"] == ["alpha"]  # cumulative diff vs base
+
+
 def test_plugin_file_selects_only_that_plugin(repo: Path) -> None:
     base = _setup(repo)
     r = _run(repo, base, "python/alpha/src/temporalio/contrib/alpha/_impl.py")

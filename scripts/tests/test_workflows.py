@@ -48,7 +48,7 @@ def test_ci_status_is_the_fan_in() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     status = doc["jobs"]["ci-status"]
     assert status["if"] == "always()"
-    assert set(status["needs"]) == {"changes", "conventions", "python"}
+    assert set(status["needs"]) == {"changes", "conventions", "python", "python-lowest"}
     assert doc["jobs"]["python"]["uses"] == "./.github/workflows/_python-plugin.yml"
     assert "needs.changes.result == 'success'" in doc["jobs"]["python"]["if"]
 

@@ -11,10 +11,6 @@ on:
         description: Plugin folder name under python/ (e.g. openai_agents)
         type: string
         required: true
-      profile:
-        description: "pr: ubuntu x {min,max} runtime; full: also macOS and Windows at max"
-        type: string
-        default: pr
       deps:
         description: "locked: uv.lock as committed; latest: uv lock --upgrade; lowest: --resolution lowest-direct"
         type: string
@@ -44,8 +40,7 @@ jobs:
       - id: matrix
         env:
           PLUGIN: ${{ inputs.plugin }}
-          PROFILE: ${{ inputs.profile }}
-        run: uv run --project scripts --locked python scripts/ci/matrix.py --plugin-dir "python/$PLUGIN" --profile "$PROFILE" --github-output "$GITHUB_OUTPUT"
+        run: uv run --project scripts --locked python scripts/ci/matrix.py --plugin-dir "python/$PLUGIN" --github-output "$GITHUB_OUTPUT"
 
   test:
     name: ${{ inputs.plugin }} (${{ matrix.os }}, py${{ matrix.runtime }})

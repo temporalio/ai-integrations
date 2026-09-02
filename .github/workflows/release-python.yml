@@ -1,7 +1,7 @@
 # Release pipeline for ONE Python plugin, triggered by a scoped tag such as
 # python/openai_agents/v1.0.0rc1. The plugin is a parameter parsed from the tag.
 #
-#   prepare -> test (reusable CI, full profile) + build (once) -> publish-testpypi
+#   prepare -> test (reusable CI, full matrix) + build (once) -> publish-testpypi
 #   -> smoke-testpypi -> [finals only] publish-pypi -> smoke-pypi -> github-release (draft)
 #
 # Publishing uses PyPI trusted publishing (OIDC): no stored credentials. The
@@ -109,7 +109,6 @@ jobs:
     uses: ./.github/workflows/_python-plugin.yml
     with:
       plugin: ${{ needs.prepare.outputs.plugin }}
-      profile: full
       deps: locked
 
   build:

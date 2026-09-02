@@ -13,7 +13,8 @@ Rules (see AGENTS.md, "CI architecture"):
   * anything else (root files)   -> nothing
 
 Outputs (GITHUB_OUTPUT and stdout): python, typescript, java, go (sorted JSON
-arrays, literal [] when empty), any, scripts_only, mode (all|diff|none).
+arrays, literal [] when empty), any, scripts_only, mode (all|diff|none), and python_deps
+(Python plugins whose pyproject.toml or uv.lock changed; drives the lowest-direct lane).
 """
 
 from __future__ import annotations
@@ -41,6 +42,16 @@ def changed_files(root: Path, base: str, head: str, three_dot: bool) -> list[str
     spec = f"{base}...{head}" if three_dot else f"{base} {head}"
     out = _git(root, "diff", "--name-only", "--no-renames", *spec.split(" "))
     return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def dependency_changed_plugins(files: list[str], python_plugins: list[str]) -> set[str]:
+    """Python plugins whose dependency declaration (pyproject.toml or uv.lock) is among the changed files."""
+    changed: set[str] = set()
+    for f in files:
+        parts = f.split("/")
+        if len(parts) == 3 and parts[0] == "python" and parts[1] in python_plugins and parts[2] in ("pyproject.toml", "uv.lock"):
+            changed.add(parts[1])
+    return changed
 
 
 def select(
@@ -124,11 +135,13 @@ def main(argv: list[str] | None = None) -> dict[str, object]:
             mode = "none"
 
     result: dict[str, object] = {lang: sorted(selected[lang]) for lang in LANGUAGES}
+    result["python_deps"] = sorted(dependency_changed_plugins(files, plugins.get("python", []))) if not run_all else []
     result["any"] = any(selected.values())
     result["scripts_only"] = scripts_only
     result["mode"] = mode
 
     outputs = {lang: compact_json(result[lang]) for lang in LANGUAGES}
+    outputs["python_deps"] = compact_json(result["python_deps"])
     outputs["any"] = "true" if result["any"] else "false"
     outputs["scripts_only"] = "true" if scripts_only else "false"
     outputs["mode"] = mode

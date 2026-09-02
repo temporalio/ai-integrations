@@ -3,7 +3,9 @@
 #
 #   changes      -> which plugins the event touches (scripts/ci/detect_changes.py)
 #   conventions  -> repository invariants + tooling tests (always)
-#   python       -> _python-plugin.yml once per changed Python plugin
+#   python       -> _python-plugin.yml once per changed Python plugin (locked deps; newest on nightly)
+#   python-lowest-> the same, resolved to the lowest allowed direct dependencies, for PRs that
+#                   change a plugin's dependency declaration and for every plugin nightly
 #   ci-status    -> the ONLY required status check; skipped jobs count as success
 #
 # No secrets are used anywhere in CI: the test suites run offline from recorded
@@ -39,6 +41,7 @@ jobs:
       contents: read
     outputs:
       python: ${{ steps.detect.outputs.python }}
+      python_deps: ${{ steps.detect.outputs.python_deps }}
       typescript: ${{ steps.detect.outputs.typescript }}
       java: ${{ steps.detect.outputs.java }}
       go: ${{ steps.detect.outputs.go }}
@@ -96,24 +99,24 @@ jobs:
     uses: ./.github/workflows/_python-plugin.yml
     with:
       plugin: ${{ matrix.plugin }}
-      profile: ${{ contains(fromJson('["pull_request","merge_group"]'), github.event_name) && 'pr' || 'full' }}
       deps: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.latest-deps)) && 'latest' || 'locked' }}
 
-  # Advisory nightly lane: lowest allowed direct dependencies. Never feeds ci-status.
+  # Lowest allowed direct dependencies. Floors only change when a PR edits a plugin's pyproject.toml
+  # or uv.lock, so that is when this lane runs and blocks; nightly it runs for every plugin because
+  # transitive dependencies still resolve to their newest versions.
   python-lowest:
-    name: Python (lowest-direct, advisory)
+    name: Python (lowest-direct)
     needs: changes
-    if: github.event_name == 'schedule' && needs.changes.result == 'success' && needs.changes.outputs.python != '[]'
+    if: needs.changes.result == 'success' && ((github.event_name == 'schedule' && needs.changes.outputs.python != '[]') || needs.changes.outputs.python_deps != '[]')
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        plugin: ${{ fromJson(needs.changes.outputs.python) }}
+        plugin: ${{ fromJson(github.event_name == 'schedule' && needs.changes.outputs.python || needs.changes.outputs.python_deps) }}
     uses: ./.github/workflows/_python-plugin.yml
     with:
       plugin: ${{ matrix.plugin }}
-      profile: pr
       deps: lowest
 
   nightly-report:
@@ -143,7 +146,7 @@ jobs:
 
   ci-status:
     name: ci-status
-    needs: [changes, conventions, python]
+    needs: [changes, conventions, python, python-lowest]
     if: always()
     runs-on: ubuntu-latest
     steps:
