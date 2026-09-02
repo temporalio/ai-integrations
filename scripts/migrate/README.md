@@ -1,0 +1,102 @@
+# Migrating a plugin with its history
+
+`extract-sdk-python.sh` rewrites a fresh clone of `temporalio/sdk-python` so that its `main`
+contains only one plugin's files, already at their paths in this repository, with every commit's
+author, date and message intact. The result is merged into this repository with an
+unrelated-histories merge commit. `git log --follow`, `git blame` and `git shortlog` then work on
+the imported files exactly as they did upstream.
+
+## Procedure
+
+```bash
+git checkout -b import/python-openai-agents main
+PLUGIN=openai_agents scripts/migrate/extract-sdk-python.sh     # prints SRC_SHA, WORK and the merge commands
+git remote add sdk-python-filtered "$WORK/src"
+git fetch --no-tags sdk-python-filtered main
+git merge --allow-unrelated-histories --no-ff -m "Import temporalio.contrib.openai_agents from temporalio/sdk-python@<SRC_SHA> (history preserved; git-filter-repo 2.47.0)" sdk-python-filtered/main
+git remote remove sdk-python-filtered
+```
+
+Then add the files the import does not bring, as **separate commits on top of the merge**
+(never amend the merge and never edit an imported file in the same PR):
+
+```bash
+python3 scripts/new_python_plugin.py openai_agents --existing --maturity ga --version 1.0.0rc1 \
+  --description "Temporal integration for the OpenAI Agents SDK"
+```
+
+Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merge it with
+**"Create a merge commit"**. Squash or rebase merging destroys the imported history.
+
+## What the script does
+
+- Clones with `--no-tags --single-branch` so no upstream release tags are imported.
+- Runs `git-filter-repo` pinned to 2.47.0 (`uvx`), with:
+  - four `--path` filters covering every location the plugin's files ever had upstream
+    (`temporalio/contrib/openai_agents/`, `tests/contrib/openai_agents/`,
+    `tests/contrib/test_openai.py`, `tests/contrib/research_agents/`);
+  - `--path-rename` rules into `python/openai_agents/...`; the package README is renamed to
+    the plugin root before the directory rename, and all filters precede all renames because
+    filter-repo evaluates later filters against already-renamed paths;
+  - `--replace-message` rewriting `#123` to `temporalio/sdk-python#123` so issue and PR links
+    keep pointing at the SDK repository;
+  - `--preserve-commit-hashes` so SHAs mentioned in messages keep referring to sdk-python;
+  - `--prune-empty always` so upstream's originally-empty commits (the 2022 "Initial commit",
+    a dependabot bump) do not survive as unrelated root commits;
+  - a commit callback appending `Migrated-From: temporalio/sdk-python@<original sha>` as a
+    trailer, placed contiguously with existing trailers such as `Co-authored-by:`;
+  - `--force`, needed only because the optional `SRC_REF` pin fails filter-repo's fresh-clone
+    check; the clone is a throwaway directory.
+
+## Expected verification output (openai_agents)
+
+- `git rev-list --count sdk-python-filtered/main` equals
+  `git log --oneline -- python/openai_agents | wc -l` and is at least 100 (grows with upstream).
+- `git shortlog -sne -- python/openai_agents` lists 18 author identities (grows as upstream
+  lands commits by new people; the plan's earlier count of 17 predates two later contributors).
+- `git log --follow --format=%h python/openai_agents/src/temporalio/contrib/openai_agents/__init__.py | tail -1`
+  and the same for `python/openai_agents/tests/contrib/openai_agents/research_agents/planner_agent.py`
+  print `53d9ace6` (2025-06-18, the first upstream commit).
+- `git log --format=%B -- python/openai_agents | grep -c Migrated-From` equals the commit count.
+- `git tag | wc -l` is 0 and `git log --merges -- python/openai_agents` shows only the import merge.
+- Running the script again against the same upstream state and merging prints
+  `Already up to date.`
+
+## Re-sync (bringing new upstream commits)
+
+`sdk-python` remains the source of truth for the plugin until the SDK cutover PR merges
+(AGENTS.md, "Transition rules"). To pick up upstream changes:
+
+1. Run the script unchanged, fetch, and `git merge sdk-python-filtered/main` on a new branch.
+   Only commits newer than the previous import arrive because the rewrite is byte-identical.
+2. Resolve conflicts only where adaptation commits touched imported files (there should be
+   none while the transition rules are followed).
+3. Diff the vendored test scaffolding against upstream and port relevant changes by hand:
+   `tests/conftest.py`, `tests/__init__.py`, `tests/helpers/__init__.py`, `tests/helpers/nexus.py`.
+4. If upstream changed request shapes or added network tests, re-record cassettes:
+   `OPENAI_API_KEY=... make record` (see python/README.md).
+5. Append a row to `IMPORTS.md`; open a `history-import` PR; merge with a merge commit.
+
+## Determinism breakers
+
+The rewrite stays byte-identical only if none of these change: the `--path`/`--path-rename`
+arguments, `replace-message.txt`, the commit callback, `--prune-empty`/`--preserve-commit-hashes`,
+the pinned git-filter-repo version, and upstream history itself (a force-push or a `SRC_REF`
+that is not a descendant of the previous import). If a rule must change, the plugin needs a
+one-time full re-import PR (delete `python/<plugin>`, import again, re-apply adaptation
+commits) and a note in `IMPORTS.md`.
+
+## Adding another plugin
+
+Find every historical path first:
+
+```bash
+cd /path/to/sdk-python
+git log --all --diff-filter=R --name-status --format='--%h %ad' -- temporalio/contrib/<name> tests/contrib/<name>
+git log --all --name-only --format= -- temporalio/contrib/<name> tests/contrib/<name> | sort -u
+git log --all --oneline --follow -- temporalio/contrib/<name>/__init__.py
+```
+
+Add a `case` entry to `extract-sdk-python.sh` with every path found (filters first, renames
+second, README rename before directory rename). Missing a historical path cannot be fixed later
+without rewriting every imported SHA.
