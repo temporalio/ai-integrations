@@ -58,13 +58,10 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
     env:
+      PLUGIN_DIR: python/${{ inputs.plugin }} # run steps `cd` here; never interpolate inputs into run blocks
       UV_NO_EDITABLE: "1" # editable installs cannot resolve temporalio.contrib.* from src/
       UV_LINK_MODE: copy
       COLUMNS: "120"
-    defaults:
-      run:
-        shell: bash
-        working-directory: python/${{ inputs.plugin }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,6 +79,7 @@ jobs:
         env:
           DEPS: ${{ inputs.deps }}
         run: |
+          cd "$PLUGIN_DIR"
           case "$DEPS" in
             locked) make sync ;;
             latest) make sync-latest ;;
@@ -89,12 +87,12 @@ jobs:
             *) echo "::error::unknown deps mode '$DEPS'"; exit 1 ;;
           esac
       - name: Lint and type-check
-        run: make lint
+        run: cd "$PLUGIN_DIR" && make lint
       - name: Test
-        run: make test PYTEST_ARGS="-s --junit-xml=junit/test.xml"
+        run: cd "$PLUGIN_DIR" && make test PYTEST_ARGS="-s --junit-xml=junit/test.xml"
       - name: Test (time-skipping server)
         if: matrix.time_skipping
-        run: make test-time-skipping PYTEST_ARGS="-s --junit-xml=junit/time-skipping.xml"
+        run: cd "$PLUGIN_DIR" && make test-time-skipping PYTEST_ARGS="-s --junit-xml=junit/time-skipping.xml"
       - name: Build, verify, and smoke-test distributions
         uses: ./.github/actions/python-build-check
         with:

@@ -27,7 +27,8 @@ help: ## Show available targets
 
 # TRANSITION(sdk-cutover): the second sync reinstalls this plugin last so its files win the
 # overlap with temporalio<=1.32, which still ships the same module. Delete it at cutover.
-sync: ## Install locked dependencies and this plugin (non-editable)
+sync: ## Install locked dependencies and this plugin (non-editable); creates uv.lock on first run
+	@test -f uv.lock || uv lock
 	uv sync --locked
 	uv sync --locked --reinstall-package $(DIST)
 

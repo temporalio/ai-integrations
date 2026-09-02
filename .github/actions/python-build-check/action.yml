@@ -13,8 +13,9 @@ runs:
   steps:
     - name: Build wheel and sdist
       shell: bash
-      working-directory: ${{ inputs.plugin-dir }}
-      run: make build
+      env:
+        PLUGIN_DIR: ${{ inputs.plugin-dir }}
+      run: cd "$GITHUB_WORKSPACE/$PLUGIN_DIR" && make build
     - name: Verify wheel and sdist
       shell: bash
       env:
