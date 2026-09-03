@@ -1,0 +1,30 @@
+# Repository tooling for temporalio/ai-integrations: CI helpers, release tooling,
+# and their tests. This is a plain uv project (not a package, never published)
+# and is deliberately NOT a workspace root for the plugins under python/.
+#
+# Run any script with:  uv run --project scripts --locked python scripts/ci/<name>.py ...
+# Run the tests with:   uv run --project scripts --locked pytest scripts/tests -q
+#
+# requires-python is 3.11+ because the scripts rely on `tomllib`; GitHub-hosted
+# runners always provide a newer interpreter. The one exception is
+# scripts/ci/smoke.py --in-env, which is stdlib-only and runs inside the
+# plugin's own (possibly 3.10) environment.
+[project]
+name = "ai-integrations-scripts"
+version = "0"
+description = "Repository tooling for temporalio/ai-integrations (not published)"
+requires-python = ">=3.11"
+dependencies = ["packaging>=26,<27"]
+
+[dependency-groups]
+dev = ["pytest>=9,<10", "pyyaml>=6,<7"]
+
+[tool.uv]
+package = false
+# Keep in sync with every python/*/pyproject.toml (asserted by scripts/ci/check_conventions.py).
+required-version = ">=0.12.5,<0.13"
+exclude-newer = "2 weeks"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["ci", "release"]

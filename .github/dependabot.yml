@@ -1,0 +1,21 @@
+# Mirrors temporalio/sdk-python: Dependabot opens PRs only for security advisories
+# (open-pull-requests-limit: 0) because its uv support is not yet mature enough for routine
+# version bumps. The nightly newest/lowest lanes in ci.yml provide the drift signal instead.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directories:
+      - "/python/*"
+      - "/scripts"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 0
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 0

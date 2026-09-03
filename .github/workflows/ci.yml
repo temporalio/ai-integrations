@@ -1,0 +1,162 @@
+# Repository CI entry point. One workflow for every language; the plugin is a
+# parameter of the per-language reusable workflow (never a per-plugin copy).
+#
+#   changes      -> which plugins the event touches (scripts/ci/detect_changes.py)
+#   conventions  -> repository invariants + tooling tests (always)
+#   python       -> _python-plugin.yml once per changed Python plugin (locked deps; newest on nightly)
+#   python-lowest-> the same, resolved to the lowest allowed direct dependencies, for PRs that
+#                   change a plugin's dependency declaration and for every plugin nightly
+#   ci-status    -> the ONLY required status check; skipped jobs count as success
+#
+# No secrets are used anywhere in CI: the test suites run offline from recorded
+# cassettes, so pull requests from forks get the full run.
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 7 * * *" # nightly: every plugin, newest and lowest allowed dependencies
+  workflow_dispatch:
+    inputs:
+      latest-deps:
+        description: Re-resolve the newest allowed dependencies (uv lock --upgrade) before testing
+        type: boolean
+        default: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      python: ${{ steps.detect.outputs.python }}
+      python_deps: ${{ steps.detect.outputs.python_deps }}
+      typescript: ${{ steps.detect.outputs.typescript }}
+      java: ${{ steps.detect.outputs.java }}
+      go: ${{ steps.detect.outputs.go }}
+      any: ${{ steps.detect.outputs.any }}
+      scripts_only: ${{ steps.detect.outputs.scripts_only }}
+      mode: ${{ steps.detect.outputs.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect changed plugins
+        id: detect
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: python3 scripts/ci/detect_changes.py --github-output "$GITHUB_OUTPUT"
+
+  conventions:
+    name: Conventions and tooling tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+          enable-cache: true
+          cache-dependency-glob: scripts/uv.lock
+      - name: Check repository conventions
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: uv run --project scripts --locked python scripts/ci/check_conventions.py
+      - name: Tooling unit tests
+        run: uv run --project scripts --locked pytest scripts/tests -q
+
+  python:
+    name: Python
+    needs: changes
+    if: needs.changes.result == 'success' && needs.changes.outputs.python != '[]'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJson(needs.changes.outputs.python) }}
+    uses: ./.github/workflows/_python-plugin.yml
+    with:
+      plugin: ${{ matrix.plugin }}
+      deps: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.latest-deps)) && 'latest' || 'locked' }}
+
+  # Lowest allowed direct dependencies. Floors only change when a PR edits a plugin's pyproject.toml
+  # or uv.lock, so that is when this lane runs and blocks; nightly it runs for every plugin because
+  # transitive dependencies still resolve to their newest versions.
+  python-lowest:
+    name: Python (lowest-direct)
+    needs: changes
+    if: needs.changes.result == 'success' && ((github.event_name == 'schedule' && needs.changes.outputs.python != '[]') || needs.changes.outputs.python_deps != '[]')
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJson(github.event_name == 'schedule' && needs.changes.outputs.python || needs.changes.outputs.python_deps) }}
+    uses: ./.github/workflows/_python-plugin.yml
+    with:
+      plugin: ${{ matrix.plugin }}
+      deps: lowest
+
+  nightly-report:
+    name: Nightly report
+    needs: [changes, python, python-lowest]
+    if: always() && github.event_name == 'schedule' && needs.changes.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Open, update, or close nightly issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: python3 scripts/ci/nightly_report.py
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - name: Name-squat watch for unreleased coordinates
+        run: uv run --project scripts --locked python scripts/ci/check_conventions.py --nightly
+
+  ci-status:
+    name: ci-status
+    needs: [changes, conventions, python, python-lowest]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate required jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS"
+          if echo "$NEEDS" | jq -e 'to_entries | map(.value.result) | any(. == "failure" or . == "cancelled")' > /dev/null; then
+            echo "::error::A required job failed or was cancelled"
+            exit 1
+          fi
+          echo "All required jobs succeeded or were skipped"
