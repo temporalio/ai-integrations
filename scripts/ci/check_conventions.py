@@ -42,7 +42,6 @@ MATURITY_CLASSIFIER = {
     "preview": "Development Status :: 4 - Beta",
     "experimental": "Development Status :: 3 - Alpha",
 }
-STATUSES = {"active", "deprecated-forwarder"}
 REGISTRIES = {"python": "pypi", "typescript": "npm", "java": "maven", "go": "goproxy"}
 LANGUAGE_LOCKFILES = ("uv.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "go.sum", "gradle.lockfile")
 RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
@@ -157,11 +156,6 @@ class Checker:
         maturity = p.get("maturity")
         if maturity not in MATURITY_CLASSIFIER:
             self.fail(f"{rel}: plugin.toml maturity must be one of {sorted(MATURITY_CLASSIFIER)}")
-        status = p.get("status")
-        if status not in STATUSES:
-            self.fail(f"{rel}: plugin.toml status must be one of {sorted(STATUSES)}")
-        if status == "deprecated-forwarder" and not p.get("forwards-to"):
-            self.fail(f"{rel}: deprecated-forwarder plugins must set forwards-to")
         for banned in ("owners", "live-secrets", "secrets"):
             if banned in p or banned in meta.get("ci", {}):
                 self.fail(f"{rel}: plugin.toml must not contain {banned!r} (ownership is CODEOWNERS; CI has no secrets)")

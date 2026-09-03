@@ -7,7 +7,6 @@ coordinate = "temporalio-openai-agents"
 registry = "pypi"
 root-api = "temporalio.contrib.openai_agents"
 maturity = "ga"
-status = "active"
 docs = "https://docs.temporal.io/develop/python/integrations/openai-agents"
 upstream = "temporalio/sdk-python:temporalio/contrib/openai_agents"
 

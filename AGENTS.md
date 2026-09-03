@@ -60,7 +60,7 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
 ## Repository invariants
 
 - Each plugin owns its manifest and lockfile (`pyproject.toml` + `uv.lock`); no lockfile at a language root, no root Python project. `scripts/` is a separate tooling project, not a root project.
-- Each plugin carries `plugin.toml` (metadata only: name, language, coordinate, registry, root API, maturity, status, docs, upstream, `[release] allow-final`, `[ci] runtime-versions`, `[smoke] imports`). It holds no secrets and no owners; `.github/CODEOWNERS` is `* @temporalio/ai-sdk`.
+- Each plugin carries `plugin.toml` (metadata only: name, language, coordinate, registry, root API, maturity, docs, upstream, `[release] allow-final`, `[ci] runtime-versions`, `[smoke] imports`). It holds no secrets and no owners; `.github/CODEOWNERS` is `* @temporalio/ai-sdk`.
 - The root `LICENSE` is the source of truth and every plugin directory carries a committed regular-file copy of it, because each wheel and sdist must ship the license text. The conventions check fails unless the plugin copy is committed and byte-identical to the root file (`cp LICENSE python/<name>/LICENSE` to refresh); `pyproject.toml` declares `license = "MIT"` and `license-files = ["LICENSE"]`; `check_wheel.py` verifies the packaged text equals the root file.
 - The manifest version is static and is the only version source. A tag is valid only if `uv version --short` in the plugin directory equals the tag's version.
 - No changelog files. `scripts/release/release_tool.py release-notes` derives notes from commit subjects touching the plugin directory since its previous tag.
