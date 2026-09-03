@@ -6,7 +6,7 @@ workflow.
 ## Set up
 
 - Python plugins: install [uv](https://docs.astral.sh/uv/) and GNU make (`brew install make` on
-  macOS if needed; `choco install make` on Windows, or use WSL). Node is needed for the MCP tests.
+  macOS if needed; `choco install make` on Windows, or use WSL).
 - `cd python/<plugin> && make sync && make lint && make test`.
 
 ## Pull requests

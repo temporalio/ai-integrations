@@ -57,7 +57,7 @@ from agents.items import (
     ToolCallOutputItem,
     TResponseStreamEvent,
 )
-from agents.mcp import MCPServer, MCPServerStdio
+from agents.mcp import MCPServer
 from agents.sandbox.capabilities.tools import SandboxApplyPatchTool
 from agents.tool import CustomTool
 from agents.tool_context import ToolContext
@@ -2696,17 +2696,7 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
 async def test_stateful_mcp_server_no_worker(client: Client):
     server = StatefulMCPServerProvider(
         "Filesystem-Server",
-        lambda _: MCPServerStdio(
-            name="Filesystem-Server",
-            params={
-                "command": "npx",
-                "args": [
-                    "-y",
-                    "@modelcontextprotocol/server-filesystem",
-                    os.path.dirname(os.path.abspath(__file__)),
-                ],
-            },
-        ),
+        lambda _: get_tracking_server("Filesystem-Server"),
     )
 
     # Override the connect activity to not actually start a worker

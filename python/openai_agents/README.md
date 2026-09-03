@@ -407,7 +407,7 @@ The code below gives an example of using a stateless MCP server.
 ```python
 import asyncio
 from datetime import timedelta
-from agents.mcp import MCPServerStdio
+from agents.mcp import MCPServerStreamableHttp
 from temporalio.client import Client
 from temporalio.contrib.openai_agents import (
     ModelActivityParameters,
@@ -420,12 +420,9 @@ from temporalio.worker import Worker
 async def main():
     # Create the MCP server provider
     filesystem_server = StatelessMCPServerProvider(
-        lambda: MCPServerStdio(
+        lambda: MCPServerStreamableHttp(
             name="FileSystemServer",
-            params={
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/files"],
-            },
+            params={"url": "http://localhost:8000/mcp"},
         )
     )
 
@@ -491,7 +488,7 @@ To recover from such failures, you need to implement your own application-level 
 
 Both `stateless_mcp_server()` and `stateful_mcp_server()` accept an optional `factory_argument`, which is passed to the registered server factory when the MCP server is created.
 
-A stateless factory that declares no parameters — like the `lambda: MCPServerStdio(...)` example above — ignores the value, but it is still recorded in history.
+A stateless factory that declares no parameters — like the `lambda: MCPServerStreamableHttp(...)` example above — ignores the value, but it is still recorded in history.
 
 **Do not pass secrets, credentials, or API keys through `factory_argument`.** It is an activity argument, so it is recorded in workflow history and, without a payload codec, visible in the web UI. Resolve credentials worker-side inside the server factory instead.
 
