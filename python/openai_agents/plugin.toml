@@ -1,38 +1,27 @@
-# Machine-readable plugin metadata, read by scripts/ci/*.py, scripts/release/release_tool.py and
-# the plugin's own test suite. Holds no secrets and no owners (CODEOWNERS covers ownership).
-# The conventions check asserts these values agree with pyproject.toml. See AGENTS.md.
+# Schema: ../../AGENTS.md#repository-invariants; TRANSITION(sdk-cutover): remove transitional fields at cutover.
 
 [plugin]
-name = "openai_agents"                  # equals the folder name; Python coordinate = "temporalio-" + name with "_" -> "-"
+name = "openai_agents"
 language = "python"
-coordinate = "temporalio-openai-agents"      # package name on the registry
+coordinate = "temporalio-openai-agents"
 registry = "pypi"
-root-api = "temporalio.contrib.openai_agents"            # importable root, always temporalio.contrib.<name> for Python
-maturity = "ga"          # ga | preview | experimental; must agree with the Development Status classifier
-status = "active"                  # active | deprecated-forwarder (then also set forwards-to = "<coordinate>")
+root-api = "temporalio.contrib.openai_agents"
+maturity = "ga"
+status = "active"
 docs = "https://docs.temporal.io/develop/python/integrations/openai-agents"
-upstream = "temporalio/sdk-python:temporalio/contrib/openai_agents"   # TRANSITION(sdk-cutover): source of truth until cutover
+upstream = "temporalio/sdk-python:temporalio/contrib/openai_agents"
 
 [release]
-# TRANSITION(sdk-cutover): flip to true when the temporalio floor is the SDK release that no longer
-# ships this module and every TRANSITION marker in this plugin is gone. Until then only pre-releases
-# may be tagged, and the provenance guard tolerates the file overlap with temporalio<=1.32.
 allow-final = false
 
 [ci]
-runtime-versions = ["3.10", "3.14"]   # first entry must equal the requires-python floor
+runtime-versions = ["3.10", "3.14"]
 
 [smoke]
-imports = ["temporalio.contrib.openai_agents.workflow", "temporalio.contrib.openai_agents.testing", "temporalio.contrib.openai_agents.sandbox"]   # extra modules the isolated wheel check imports in addition to root-api
+imports = ["temporalio.contrib.openai_agents.workflow", "temporalio.contrib.openai_agents.testing", "temporalio.contrib.openai_agents.sandbox"]
 
 [offline]
-# Tests replay recorded HTTP traffic and never hold real credentials (tests/conftest.py).
-# dummy-env: placeholder values exported during replay when the variable is unset, so upstream
-#            `if not os.environ.get("OPENAI_API_KEY")` skip guards do not skip. Never a real secret.
-# skips:     tests skipped while replaying (never while recording), test function name -> reason.
 dummy-env = { OPENAI_API_KEY = "sk-cassette-replay" }
-# Real-API arms of upstream tests: skipped by policy (no real provider key anywhere, not even for
-# recording). Each has an offline twin (`[True]`, SDK test model) that runs.
 [offline.skips]
 test_lite_llm = "third-party transport stack; already skipped upstream on Python 3.14"
 "test_hello_world_agent[False]" = "calls the real OpenAI API; the [True] arm covers the scenario offline"
