@@ -22,10 +22,12 @@ dependencies = [
   # opentelemetry and pydantic extras: the plugin imports temporalio.contrib.opentelemetry and
   # temporalio.contrib.pydantic at module level.
   "temporalio[opentelemetry,pydantic]>=1.32.0,<2",
-  "openai-agents>=0.19.2,<0.20",
+  "openai-agents>=0.20,<0.21",
   "openai>=2.45,<3",          # imports openai._models.construct_type and openai.types.responses
-  "mcp>=1.19,<2",
+  "mcp>=1.24,<3",
+  "mcp-types>=2,<3",          # imported by the MCP v2 adapter
   "pydantic>=2,<3",
+  "temporalio-mcp>=0.1.0,<0.2",
   "typing-extensions>=4.2,<5",
 ]
 
@@ -67,7 +69,7 @@ dev = [
   "rich>=13",
   "openinference-instrumentation-openai-agents>=0.1.0",
   "opentelemetry-sdk>=1.26,<2",
-  "openai-agents[litellm]>=0.19.2,<0.20; python_version < '3.14'",
+  "openai-agents[litellm]>=0.20,<0.21; python_version < '3.14'",
   "litellm>=1.83.0; python_version < '3.14'",
 ]
 
@@ -86,6 +88,9 @@ asyncio_mode = "auto"
 log_level = "DEBUG"
 log_format = "%(asctime)s [%(levelname)8s] %(message)s (%(filename)s:%(lineno)s)"
 testpaths = ["tests"]
+markers = [
+  "mcp_v1: must also run under MCP Python SDK v1",
+]
 timeout = 60
 timeout_func_only = true
 filterwarnings = [
