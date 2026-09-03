@@ -7,7 +7,6 @@ requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]   # committed relative symlink to the repository's root LICENSE
-keywords = ["temporal", "workflow", "durable-execution", "openai", "agents", "mcp"]
 classifiers = [
   "Development Status :: 5 - Production/Stable",   # maturity; must agree with plugin.toml (see AGENTS.md for the mapping)
   "Programming Language :: Python :: 3.10",
@@ -59,8 +58,6 @@ dev = [
   "pytest-xdist>=3.6,<4",
   "pytest-pretty>=1.3",
   "pytest-rerunfailures>=16.1",
-  "pytest-recording>=0.13.4,<0.14",
-  "vcrpy>=8.3,<9",
   "tomli>=2.0; python_version < '3.11'",
   # Used by the migrated test suite.
   "httpx>=0.28",

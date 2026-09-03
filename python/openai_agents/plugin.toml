@@ -19,21 +19,3 @@ runtime-versions = ["3.10", "3.14"]
 
 [smoke]
 imports = ["temporalio.contrib.openai_agents.workflow", "temporalio.contrib.openai_agents.testing", "temporalio.contrib.openai_agents.sandbox"]
-
-[offline]
-dummy-env = { OPENAI_API_KEY = "sk-cassette-replay" }
-[offline.skips]
-test_lite_llm = "third-party transport stack; already skipped upstream on Python 3.14"
-"test_hello_world_agent[False]" = "calls the real OpenAI API; the [True] arm covers the scenario offline"
-"test_tool_workflow[False]" = "calls the real OpenAI API; the [True] arm covers the scenario offline"
-"test_nexus_tool_workflow[False]" = "calls the real OpenAI API; the [True] arm covers the scenario offline"
-"test_research_workflow[False]" = "calls the real OpenAI API (hosted web search); the [True] arm covers the scenario offline"
-"test_agents_as_tools_workflow[False]" = "calls the real OpenAI API; the [True] arm covers the scenario offline"
-"test_customer_service_workflow[False]" = "calls the real OpenAI API; the [True] arm covers the scenario offline"
-"test_input_guardrail[False]" = "calls the real OpenAI API; the [True] arm covers the scenario offline"
-"test_output_guardrail[False]" = "calls the real OpenAI API; the [True] arm covers the scenario offline"
-"test_file_search_tool[False]" = "calls the real OpenAI API against an account-bound vector store; the [True] arm covers the scenario offline"
-"test_mcp_server[False-False-False]" = "calls the real OpenAI API; the use_local_model=True arms cover the scenario offline"
-"test_mcp_server[False-True-False]" = "calls the real OpenAI API; the use_local_model=True arms cover the scenario offline"
-"test_mcp_server[True-False-False]" = "calls the real OpenAI API; the use_local_model=True arms cover the scenario offline"
-test_chat_completions_model = "calls the real OpenAI API (chat completions endpoint); no offline twin upstream"

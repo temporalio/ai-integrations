@@ -73,8 +73,7 @@ Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merg
    none while the transition rules are followed).
 3. Diff the vendored test scaffolding against upstream and port relevant changes by hand:
    `tests/conftest.py`, `tests/__init__.py`, `tests/helpers/__init__.py`, `tests/helpers/nexus.py`.
-4. If upstream changed request shapes or added network tests, re-record cassettes:
-   `OPENAI_API_KEY=... make record` (see python/README.md).
+4. If upstream added provider-network tests, add deterministic local coverage without credentials.
 5. Append a row to `IMPORTS.md`; open a `history-import` PR; merge with a merge commit.
 
 ## Determinism breakers

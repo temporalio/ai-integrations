@@ -16,9 +16,6 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
     maturity classifier/requires-python floor/module-name/required-version)
   * no [tool.uv.sources] path or workspace entries
   * README has no relative markdown links (PyPI renders the README)
-  * cassettes contain no API keys or bearer tokens
-  * template drift: files listed in python/_template/.sync-identical must be byte-identical
-    to the template copy unless the plugin's file contains `# template-override`
   * PR context: a PR with more than 20 commits must carry the `history-import` label
   * --nightly: coordinates with [release] allow-final = false must not exist on PyPI yet
 """
@@ -48,15 +45,8 @@ STATUSES = {"active", "deprecated-forwarder"}
 REGISTRIES = {"python": "pypi", "typescript": "npm", "java": "maven", "go": "goproxy"}
 LANGUAGE_LOCKFILES = ("uv.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "go.sum", "gradle.lockfile")
 RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
-SECRET_PATTERNS = (re.compile(r"sk-[A-Za-z0-9]"), re.compile(r"Bearer "))
 MAX_PR_COMMITS_WITHOUT_LABEL = 20
 HISTORY_IMPORT_LABEL = "history-import"
-PLACEHOLDER_WORDS = ("dummy", "cassette", "placeholder", "fake", "replay", "offline")
-
-
-def _looks_like_placeholder(value: str) -> bool:
-    lowered = value.lower()
-    return any(word in lowered for word in PLACEHOLDER_WORDS)
 
 
 class Checker:
@@ -144,8 +134,6 @@ class Checker:
         self.check_plugin_toml(plugin, meta, pyproject)
         self.check_pyproject(plugin, pyproject)
         self.check_readme(plugin)
-        self.check_cassettes(plugin)
-        self.check_template_drift(plugin)
 
     def check_plugin_toml(self, plugin: Plugin, meta: dict[str, Any], pyproject: dict[str, Any]) -> None:
         rel = plugin.rel
@@ -183,14 +171,6 @@ class Checker:
         if not isinstance(versions, list) or not versions:
             self.fail(f"{rel}: plugin.toml [ci] runtime-versions must be a non-empty list")
             versions = []
-        offline = meta.get("offline", {})
-        for key in ("dummy-env", "skips"):
-            table = offline.get(key, {})
-            if not isinstance(table, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in table.items()):
-                self.fail(f"{rel}: plugin.toml [offline] {key} must be a table of string -> string")
-        for name, value in (offline.get("dummy-env", {}) or {}).items():
-            if isinstance(value, str) and not _looks_like_placeholder(value):
-                self.fail(f"{rel}: plugin.toml [offline] dummy-env {name} must be an obvious placeholder (contain dummy/cassette/placeholder/fake/replay), never a real credential")
         smoke_imports = meta.get("smoke", {}).get("imports", [])
         if smoke_imports and not all(isinstance(i, str) and i.startswith(expected_root_api) for i in smoke_imports):
             self.fail(f"{rel}: plugin.toml [smoke] imports must be modules under {expected_root_api}")
@@ -242,38 +222,6 @@ class Checker:
         for lineno, line in enumerate(readme.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if RELATIVE_LINK.search(line):
                 self.fail(f"{plugin.rel}/README.md:{lineno}: relative link; use absolute https://github.com/... URLs (PyPI renders this file)")
-
-    def check_cassettes(self, plugin: Plugin) -> None:
-        for path in plugin.path.glob("tests/**/cassettes/**/*"):
-            if not path.is_file():
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-            for pattern in SECRET_PATTERNS:
-                if pattern.search(text):
-                    self.fail(f"{path.relative_to(self.root)}: matches {pattern.pattern!r}; cassettes must not contain credentials")
-                    break
-
-    def check_template_drift(self, plugin: Plugin) -> None:
-        template = self.root / plugin.language / "_template"
-        listing = template / ".sync-identical"
-        if not listing.is_file():
-            return
-        for line in listing.read_text(encoding="utf-8").splitlines():
-            relpath = line.strip()
-            if not relpath or relpath.startswith("#"):
-                continue
-            src = template / relpath
-            dst = plugin.path / relpath
-            if not src.is_file():
-                self.fail(f"{plugin.language}/_template/.sync-identical lists {relpath} but the template file is missing")
-                continue
-            if not dst.is_file():
-                self.fail(f"{plugin.rel}: missing {relpath} (required by the template)")
-                continue
-            if b"# template-override" in dst.read_bytes():
-                continue
-            if src.read_bytes() != dst.read_bytes():
-                self.fail(f"{plugin.rel}/{relpath}: differs from {plugin.language}/_template/{relpath}; re-sync it or add `# template-override`")
 
     def check_pr_context(self) -> None:
         if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":

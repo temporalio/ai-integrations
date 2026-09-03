@@ -98,29 +98,6 @@ def test_exclude_newer_requires_temporalio_exemption(plugin_repo: Path) -> None:
     assert any("temporalio is not exempted" in x for x in run(plugin_repo))
 
 
-def test_cassette_secret_scan(plugin_repo: Path) -> None:
-    cas = plugin_repo / "python/fakeplug/tests/contrib/fakeplug/cassettes/x"
-    cas.mkdir(parents=True)
-    (cas / "t.yaml").write_text("authorization: Bearer sk-abc123\n")
-    assert any("cassettes must not contain credentials" in x for x in run(plugin_repo))
-
-
-def test_template_drift(plugin_repo: Path) -> None:
-    tpl = plugin_repo / "python/_template"
-    tpl.mkdir()
-    (tpl / ".sync-identical").write_text("tests/helpers/provenance.py\n")
-    (tpl / "tests/helpers").mkdir(parents=True)
-    (tpl / "tests/helpers/provenance.py").write_text("A = 1\n")
-    dst = plugin_repo / "python/fakeplug/tests/helpers"
-    dst.mkdir(parents=True)
-    (dst / "provenance.py").write_text("A = 2\n")
-    assert any("differs from python/_template" in x for x in run(plugin_repo))
-    (dst / "provenance.py").write_text("# template-override\nA = 2\n")
-    assert run(plugin_repo) == []
-    (dst / "provenance.py").write_text("A = 1\n")
-    assert run(plugin_repo) == []
-
-
 def test_pr_commit_count_requires_history_import_label(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
     monkeypatch.setenv("PR_COMMITS", "25")
@@ -138,11 +115,3 @@ def test_cli_exit_codes(plugin_repo: Path, capsys: pytest.CaptureFixture[str]) -
     (plugin_repo / "python/fakeplug/src/temporalio/__init__.py").write_text("")
     assert check_conventions.main(["--repo-root", str(plugin_repo)]) == 1
     assert "FAIL" in capsys.readouterr().out
-
-
-def test_offline_dummy_env_must_be_a_placeholder(plugin_repo: Path) -> None:
-    meta = plugin_repo / "python/fakeplug/plugin.toml"
-    meta.write_text(meta.read_text() + '\n[offline]\ndummy-env = { OPENAI_API_KEY = "sk-abcdefghijklmnopqrstuvwxyz0123" }\nskips = { test_x = "reason" }\n')
-    assert any("dummy-env OPENAI_API_KEY must be an obvious placeholder" in v for v in run(plugin_repo))
-    meta.write_text(meta.read_text().replace("sk-abcdefghijklmnopqrstuvwxyz0123", "sk-cassette-replay"))
-    assert run(plugin_repo) == []

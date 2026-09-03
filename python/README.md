@@ -26,19 +26,10 @@ imported as `temporalio.contrib.<name>`. The make targets export `UV_NO_EDITABLE
 A test session that finds an editable or stale install fails immediately with the fix in the
 message (`make sync`).
 
-## Offline tests and cassettes
+## Provider-independent tests
 
-Tests never use a real API key, in CI or locally. Upstream tests that call a provider API are
-listed in `plugin.toml` `[offline] skips` (by function name or parametrized id) and are skipped;
-their offline twins, which use the SDK's test models, run. `dummy-env` in the same table holds
-placeholder values (never real secrets) exported during replay so upstream skip guards do not skip.
-
-Recording real traffic into cassettes is available as an opt-in for teams that want regression
-coverage of real provider responses: `tests/conftest.py` replays cassettes from
-`tests/contrib/<name>/cassettes/<module>/` with vcrpy (through pytest-recording), and
-`OPENAI_API_KEY=<real key> make record` records them locally (`make record` refuses to run in CI).
-A `CannotOverwriteExistingCassetteException` means a test made a request that has neither a
-cassette nor a skip entry.
+Tests must not require provider credentials. Exercise provider behavior with deterministic local
+models, mock transports, or in-process servers so the same assertions run in every environment.
 
 ## Dependency cooldown
 
