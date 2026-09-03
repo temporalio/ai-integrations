@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -110,8 +111,8 @@ class Checker:
         # LICENSE: every plugin ships the license text in its wheel and sdist, so each plugin directory
         # carries a committed copy that must stay byte-identical to the root LICENSE (`cp LICENSE python/<name>/`).
         license_path = d / "LICENSE"
-        if os.path.islink(license_path):
-            self.fail(f"{rel}: LICENSE must be a regular file, not a symlink")
+        if not license_path.exists() or not stat.S_ISREG(license_path.lstat().st_mode):
+            self.fail(f"{rel}: LICENSE must be a regular file")
         elif "LICENSE" not in tracked:
             self.fail(f"{rel}: LICENSE must be committed (copy the root LICENSE: `cp LICENSE {rel}/LICENSE`)")
         elif license_path.read_bytes() != (self.root / "LICENSE").read_bytes():

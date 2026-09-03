@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
@@ -35,11 +34,11 @@ def test_license_is_a_committed_identical_copy(plugin_repo: Path) -> None:
     lic.write_text("MIT\n")
     assert any("differs from the root LICENSE" in x for x in run(plugin_repo))
     lic.unlink()
-    os.symlink("../../LICENSE", lic)
-    assert any("must be a regular file, not a symlink" in x for x in run(plugin_repo))
-    lic.unlink()
+    lic.mkdir()
+    assert any("must be a regular file" in x for x in run(plugin_repo))
+    lic.rmdir()
+    lic.write_bytes((plugin_repo / "LICENSE").read_bytes())
     subprocess.run(["git", "-C", str(plugin_repo), "rm", "-q", "--cached", "python/fakeplug/LICENSE"], check=True)
-    (plugin_repo / "LICENSE").read_bytes()  # root still there
     assert any("must be committed" in x for x in run(plugin_repo))
 
 

@@ -6,7 +6,7 @@ authors = [{ name = "Temporal Technologies Inc", email = "sdk@temporal.io" }]
 requires-python = ">=3.10"
 readme = "README.md"
 license = "MIT"
-license-files = ["LICENSE"]   # committed relative symlink to the repository's root LICENSE
+license-files = ["LICENSE"]   # committed copy of the repository's root LICENSE
 classifiers = [
   "Development Status :: 5 - Production/Stable",   # maturity; must agree with plugin.toml (see AGENTS.md for the mapping)
   "Programming Language :: Python :: 3.10",

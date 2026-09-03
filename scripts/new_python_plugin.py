@@ -90,7 +90,7 @@ def main(argv: list[str]) -> int:
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         if src.is_symlink():
-            os.symlink(os.readlink(src), dest)  # relative target, e.g. ../../LICENSE
+            os.symlink(os.readlink(src), dest)
         else:
             text = src.read_text(encoding="utf-8")
             for placeholder, value in substitutions.items():

@@ -6,7 +6,7 @@ Conventions specific to `python/`; the normative reference is [`AGENTS.md`](../A
 
 ```
 python/<name>/
-├── pyproject.toml  uv.lock  plugin.toml  Makefile  README.md  LICENSE -> ../../LICENSE
+├── pyproject.toml  uv.lock  plugin.toml  Makefile  README.md  LICENSE
 ├── src/temporalio/contrib/<name>/        # NO __init__.py in src/temporalio or src/temporalio/contrib
 └── tests/                                # conftest.py, helpers/, and the plugin's tests
 ```
@@ -39,9 +39,9 @@ lanes re-lock to the newest and lowest allowed versions without committing the l
 
 ## LICENSE
 
-Every plugin directory carries a committed copy of the root `LICENSE`, because each wheel and sdist
-must ship the license text. The copy must stay byte-identical to the root file (the conventions
-check enforces it; refresh with `cp LICENSE python/<name>/LICENSE`). Symlinks are not used.
+Every plugin directory carries a committed regular-file copy of the root `LICENSE`, because each
+wheel and sdist must ship the license text. The copy must stay byte-identical to the root file (the
+conventions check enforces it; refresh with `cp LICENSE python/<name>/LICENSE`).
 
 ## Platform notes
 
