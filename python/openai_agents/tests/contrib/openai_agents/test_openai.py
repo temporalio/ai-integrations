@@ -6,10 +6,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import (
-    Any,
-    cast,
-)
+from typing import Any, cast
 
 import nexusrpc
 import pydantic
@@ -2001,11 +1998,11 @@ def hosted_mcp_mock_model():
             ModelResponse(
                 output=[
                     McpApprovalRequest(
-                        arguments="",
-                        name="",
+                        arguments="{}",
+                        name="search",
                         server_label="gitmcp",
                         type="mcp_approval_request",
-                        id="id",
+                        id="approval-1",
                     )
                 ],
                 usage=Usage(),
@@ -2014,11 +2011,11 @@ def hosted_mcp_mock_model():
             ModelResponse(
                 output=[
                     McpCall(
-                        arguments="",
-                        name="",
-                        server_label="",
+                        arguments="{}",
+                        name="search",
+                        server_label="gitmcp",
                         type="mcp_call",
-                        id="id",
+                        id="call-1",
                         output="Mcp output",
                     ),
                     ResponseBuilders.response_output_message("Some language"),
@@ -2507,16 +2504,18 @@ def get_tracking_server(name: str):
         ) -> list[MCPTool]:
             self.calls.append("list_tools")
             return [
-                MCPTool(
-                    name="Say-Hello",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
+                MCPTool.model_validate(
+                    {
+                        "name": "Say-Hello",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                            },
+                            "required": ["name"],
+                            "$schema": "http://json-schema.org/draft-07/schema#",
                         },
-                        "required": ["name"],
-                        "$schema": "http://json-schema.org/draft-07/schema#",
-                    },
+                    }
                 )
             ]
 
@@ -2543,9 +2542,44 @@ def get_tracking_server(name: str):
     return TrackingMCPServer(name)
 
 
+@pytest.mark.mcp_v1
+def test_legacy_mcp_apis_are_deprecated():
+    with pytest.warns(DeprecationWarning, match="StatelessMCPServerProvider"):
+        stateless_provider = StatelessMCPServerProvider(
+            "deprecated-stateless",
+            lambda: cast(MCPServer, cast(object, None)),
+        )
+    with pytest.warns(DeprecationWarning, match="StatefulMCPServerProvider"):
+        StatefulMCPServerProvider(
+            "deprecated-stateful",
+            lambda _argument: cast(MCPServer, cast(object, None)),
+        )
+    with pytest.warns(DeprecationWarning, match="stateless_mcp_server"):
+        openai_agents.workflow.stateless_mcp_server("deprecated-stateless")
+    with pytest.warns(DeprecationWarning, match="stateful_mcp_server"):
+        openai_agents.workflow.stateful_mcp_server("deprecated-stateful")
+    with pytest.warns(DeprecationWarning, match="mcp_server_providers"):
+        openai_agents.OpenAIAgentsPlugin(mcp_server_providers=[stateless_provider])
+
+
+@pytest.mark.mcp_v1
+def test_mcp_servers_requires_v2():
+    from importlib.metadata import version
+
+    def factory() -> MCPServer:
+        return cast(MCPServer, cast(object, None))
+
+    if int(version("mcp").split(".", 1)[0]) < 2:
+        with pytest.raises(RuntimeError, match="requires MCP Python SDK v2"):
+            openai_agents.OpenAIAgentsPlugin(mcp_servers={"test": factory})
+    else:
+        openai_agents.OpenAIAgentsPlugin(mcp_servers={"test": factory})
+
+
 @pytest.mark.parametrize("use_local_model", [True, False])
 @pytest.mark.parametrize("stateful", [True, False])
 @pytest.mark.parametrize("caching", [True, False])
+@pytest.mark.mcp_v1
 async def test_mcp_server(
     client: Client, use_local_model: bool, stateful: bool, caching: bool
 ):
@@ -2647,6 +2681,7 @@ async def test_mcp_server(
 
 
 @pytest.mark.parametrize("stateful", [True, False])
+@pytest.mark.mcp_v1
 async def test_mcp_server_factory_argument(client: Client, stateful: bool):
     def factory(args: Any | None) -> MCPServer:
         print("Invoking factory: ", args)
@@ -2693,6 +2728,7 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
                 )
 
 
+@pytest.mark.mcp_v1
 async def test_stateful_mcp_server_no_worker(client: Client):
     server = StatefulMCPServerProvider(
         "Filesystem-Server",
