@@ -8,7 +8,6 @@ registry = "pypi"
 root-api = "temporalio.contrib.mcp"
 maturity = "experimental"
 status = "active"
-docs = "https://docs.temporal.io/develop/python/integrations/mcp"
 
 [release]
 allow-final = true
