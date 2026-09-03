@@ -268,9 +268,6 @@ class Checker:
                 self.fail(f"{plugin.language}/_template/.sync-identical lists {relpath} but the template file is missing")
                 continue
             if not dst.is_file():
-                directory_override = dst.parent / "__init__.py"
-                if directory_override.is_file() and b"# template-override" in directory_override.read_bytes():
-                    continue
                 self.fail(f"{plugin.rel}: missing {relpath} (required by the template)")
                 continue
             if b"# template-override" in dst.read_bytes():

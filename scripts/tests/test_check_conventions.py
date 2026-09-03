@@ -121,18 +121,6 @@ def test_template_drift(plugin_repo: Path) -> None:
     assert run(plugin_repo) == []
 
 
-def test_template_directory_override_allows_omitted_files(plugin_repo: Path) -> None:
-    tpl = plugin_repo / "python/_template"
-    tpl.mkdir()
-    (tpl / ".sync-identical").write_text("tests/helpers/nexus.py\n")
-    (tpl / "tests/helpers").mkdir(parents=True)
-    (tpl / "tests/helpers/nexus.py").write_text("A = 1\n")
-    helpers = plugin_repo / "python/fakeplug/tests/helpers"
-    helpers.mkdir(parents=True)
-    (helpers / "__init__.py").write_text("# template-override: plugin owns this directory.\n")
-    assert run(plugin_repo) == []
-
-
 def test_pr_commit_count_requires_history_import_label(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
     monkeypatch.setenv("PR_COMMITS", "25")
