@@ -24,6 +24,7 @@ from temporalio import activity
 from temporalio.contrib.mcp import _activities
 from temporalio.contrib.mcp._activities import _MCPActivities
 from temporalio.contrib.mcp._client import _MCPClientBackend
+from temporalio.exceptions import ApplicationError
 
 
 class FakeClient:
@@ -140,6 +141,19 @@ async def test_operations_are_plain_json_and_lists_are_fully_paginated() -> None
         assert client.metas == [{"trace": "value"}]
     finally:
         await support._pool.close()
+
+
+async def test_repeated_pagination_cursor_fails_without_retry() -> None:
+    class RepeatingCursorClient(FakeClient):
+        def _page(self, cursor: str | None) -> tuple[str, str | None]:
+            return "item", "repeated"
+
+    backend = _MCPClientBackend(cast(Any, RepeatingCursorClient()))
+    async with backend:
+        with pytest.raises(ApplicationError, match="repeated pagination cursor") as err:
+            await backend.list_tools()
+    assert err.value.type == "MCPProtocolError"
+    assert err.value.non_retryable is True
 
 
 async def test_shared_plugin_closes_after_last_run_context(

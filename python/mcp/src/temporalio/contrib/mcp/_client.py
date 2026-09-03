@@ -22,6 +22,7 @@ from temporalio.contrib.mcp._backend import (
     _FactoryInvoker,
     _MCPBackendFactory,
 )
+from temporalio.exceptions import ApplicationError
 
 
 class _MCPClientBackend:
@@ -61,7 +62,11 @@ class _MCPClientBackend:
             if next_cursor is None:
                 return values
             if next_cursor in seen_cursors:
-                raise ValueError("MCP server returned a repeated pagination cursor")
+                raise ApplicationError(
+                    "MCP server returned a repeated pagination cursor",
+                    type="MCPProtocolError",
+                    non_retryable=True,
+                )
             cursor = next_cursor
 
     async def list_tools(self) -> list[Tool]:

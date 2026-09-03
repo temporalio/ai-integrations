@@ -139,19 +139,33 @@ class _MCPConnectionPool:
             return
 
         key = self._key(server)
-        lock = self._locks.setdefault(key, asyncio.Lock())
         cached = False
-        async with lock:
-            record = self._records.get(key)
-            if record is None:
-                record = await self._new_record(server)
-                record_backend = await record.backend()
-                if record_backend.cacheable:
-                    self._records[key] = record
+        while True:
+            lock = self._locks.setdefault(key, asyncio.Lock())
+            stale_record: _ConnectionRecord | None = None
+            async with lock:
+                # close() detaches a loop's locks before awaiting transport
+                # shutdown. An acquisition that captured the old lock must join
+                # the replacement generation instead of reviving the old one.
+                if self._locks.get(key) is not lock:
+                    continue
+                record = self._records.get(key)
+                if record is None:
+                    record = await self._new_record(server)
+                    if self._locks.get(key) is not lock:
+                        stale_record = record
+                    else:
+                        record_backend = await record.backend()
+                        if record_backend.cacheable:
+                            self._records[key] = record
+                            cached = True
+                else:
                     cached = True
-            else:
-                cached = True
-            record.acquire()
+                if stale_record is None:
+                    record.acquire()
+            if stale_record is None:
+                break
+            await stale_record.close()
 
         failed = False
         try:
@@ -211,6 +225,12 @@ class _MCPConnectionPool:
         only_if_idle: bool = False,
     ) -> bool:
         """Drop the cached record, returning whether it may now be closed."""
+        # A pool close may already have detached this record's generation. Do
+        # not create or acquire a lock belonging to a replacement generation.
+        if only_if_idle and not record.idle:
+            return False
+        if self._records.get(key) is not record:
+            return True
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             # The idle check applies even when the record is no longer mapped:
@@ -235,14 +255,20 @@ class _MCPConnectionPool:
     async def close(self) -> None:
         loop = asyncio.get_running_loop()
         records = [
-            record
-            for (record_loop, _), record in list(self._records.items())
-            if record_loop is loop
+            (key, record)
+            for key, record in list(self._records.items())
+            if key[0] is loop
         ]
-        # Disarm timers before yielding so none can create a new eviction after
-        # the snapshot below.
-        for record in records:
+        locks = [key for key in self._locks if key[0] is loop]
+        # Detach this loop's generation before yielding. A worker that starts
+        # while transport shutdown is still in progress then creates fresh
+        # records and locks instead of acquiring a closing connection.
+        for key, record in records:
             record.cancel_idle()
+            if self._records.get(key) is record:
+                self._records.pop(key)
+        for key in locks:
+            self._locks.pop(key, None)
         evictions = [task for task in self._evictions if task.get_loop() is loop]
         # An eviction may already have unmapped its record, so let it finish
         # closing that record rather than cancelling it part way through.
@@ -250,12 +276,4 @@ class _MCPConnectionPool:
             await asyncio.gather(*evictions, return_exceptions=True)
             self._evictions.difference_update(evictions)
         if records:
-            await asyncio.gather(*(record.close() for record in records))
-        # Drop the locks along with the records only after eviction tasks have
-        # settled; _unmap() creates a lock when an eviction runs.
-        for key in list(self._records):
-            if key[0] is loop:
-                self._records.pop(key, None)
-        for key in list(self._locks):
-            if key[0] is loop:
-                self._locks.pop(key, None)
+            await asyncio.gather(*(record.close() for _, record in records))

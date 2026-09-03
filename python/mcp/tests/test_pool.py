@@ -321,3 +321,49 @@ async def test_close_leaves_no_state_for_the_loop(
     assert not pool._records
     assert not pool._locks
     assert not pool._evictions
+
+
+async def test_close_does_not_share_its_records_with_reentry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = echo_server()
+    created = 0
+
+    def factory() -> _MCPClientBackend:
+        nonlocal created
+        created += 1
+        return _MCPClientBackend(Client(server))
+
+    pool = _MCPConnectionPool({"echo": factory}, timedelta(minutes=5))
+    async with pool.backend("echo", factory_argument=None) as original_backend:
+        pass
+
+    original_record = next(iter(pool._records.values()))
+    original_close = original_record.close
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+
+    async def delayed_close() -> None:
+        close_started.set()
+        await allow_close.wait()
+        await original_close()
+
+    monkeypatch.setattr(original_record, "close", delayed_close)
+    close_task = asyncio.create_task(pool.close())
+    await close_started.wait()
+
+    try:
+        async with pool.backend("echo", factory_argument=None) as replacement_backend:
+            assert replacement_backend is not original_backend
+        assert created == 2
+
+        allow_close.set()
+        await close_task
+
+        # Finishing the old generation's close must not discard the replacement.
+        assert list(pool._records.values()) != [original_record]
+        assert len(pool._records) == 1
+    finally:
+        allow_close.set()
+        await close_task
+        await pool.close()
