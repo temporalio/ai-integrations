@@ -44,10 +44,9 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `go/googleadk` | `go.temporal.io/sdk/contrib/googleadk` | continues (v0.3.0 next) | preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
-version policy (below). `python/mcp` does not exist upstream yet (sdk-python PR #1793). The Go row
-has an unresolved problem: a module served by the static vanity site cannot live in a monorepo
-subdirectory under an unchanged import path; decide (split mirror repo, new import path, or
-staying in sdk-go) before that migration.
+version policy (below). The Go row has an unresolved problem: a module served by the static vanity
+site cannot live in a monorepo subdirectory under an unchanged import path; decide (split mirror
+repo, new import path, or staying in sdk-go) before that migration.
 
 Naming derivation, enforced by `scripts/ci/check_conventions.py`: folder name = `plugin.toml`
 `name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API =
@@ -75,7 +74,7 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
 - Provenance guard (`tests/helpers/provenance.py`, mirrored by `scripts/ci/smoke.py`) runs at every pytest session start and fails loudly if the install is editable, any file differs from the distribution's RECORD, files under the package directory are not owned by the distribution, or another distribution ships the same paths. While `plugin.toml` `[release] allow-final = false`, the SDK's overlap (`temporalio<=1.32` ships `temporalio/contrib/openai_agents/*`) is tolerated with a warning. `tests/test_installed_matches_source.py` additionally byte-compares the installed package with `src/`.
 - Dependency cooldown: `exclude-newer = "2 weeks"` (org supply-chain policy) with `exclude-newer-package = { temporalio = false }` so a new SDK release is adoptable the day it ships. Declare exactly what the package imports at module level; `openinference` and similar lazy imports go in an extra.
 - Tooling: ruff, pyright, basedpyright, mypy (`mypy_path = "src"`, `explicit_package_bases`), pydocstyle (google), pytest + xdist (`-n auto --dist=worksteal`; the `os._exit(0)` hook is xdist-aware). All invoked through `make` targets; see `make help`.
-- Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in the template conftest only when a test needs a server feature that is off by default. Upstream MCP tests currently spawn `npx`, so Node must be present (it is on GitHub-hosted runners) until those tests are rewritten upstream.
+- Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in the template conftest only when a test needs a server feature that is off by default. MCP transport tests currently spawn `npx`, so Node must be present (it is on GitHub-hosted runners) until those tests are rewritten.
 - Offline tests: `tests/conftest.py` marks every test with pytest-recording's `vcr` marker; HTTP traffic is replayed from `tests/contrib/<name>/cassettes/<module>/<test>.yaml` with body-inclusive matching and `allow_playback_repeats=True`. Policy: no real provider key anywhere, not even for recording; upstream tests that call a provider API are skipped through `plugin.toml` `[offline] skips` (function name or parametrized id, with a reason) while their offline twins run, and cassette recording (`make record`, local only) stays available as an opt-in for real-response regression coverage. Plugin-specific offline settings are data in `plugin.toml` `[offline]`, so the conftest stays identical across plugins: `dummy-env` holds placeholder values (never real secrets, e.g. `OPENAI_API_KEY = "sk-cassette-replay"`) exported during replay so upstream skip guards do not skip. For OpenAI Agents SDK plugins the conftest removes the SDK's default backend trace exporter with `set_trace_processors([])` (do not use `OPENAI_AGENTS_DISABLE_TRACING`, it breaks the tracing tests). A `CannotOverwriteExistingCassetteException` means a test made a request with no cassette: run `OPENAI_API_KEY=<real key> make record` locally (never in CI; `make record` refuses when `CI` is set) and commit the cassette. Cassettes must contain no secrets; the conventions check scans for them.
 
 ## CI
