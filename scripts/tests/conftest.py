@@ -95,7 +95,6 @@ def make_python_plugin(
         registry = "pypi"
         root-api = "temporalio.contrib.{name}"
         maturity = "{maturity}"
-        status = "active"
         docs = "https://docs.temporal.io/"
         upstream = "temporalio/sdk-python:temporalio/contrib/{name}"
 

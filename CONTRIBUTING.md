@@ -17,7 +17,7 @@ workflow.
   merged with **"Create a merge commit"**, never squash or rebase. Adaptation changes go in
   separate commits after the merge commit and never touch imported files.
 - CI runs only the plugins whose files changed (`.github/workflows/ci.yml`); `ci-status` is the
-  required check. No secrets are needed: tests run offline from recorded cassettes.
+  required check. No secrets are needed: provider behavior uses deterministic local test doubles.
 - During the SDK cutover transition, bug fixes for a migrated plugin land in the SDK repository
   first and reach this repository through a re-sync (AGENTS.md, "Transition rules").
 

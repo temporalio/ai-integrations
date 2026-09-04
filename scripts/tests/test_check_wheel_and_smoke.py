@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(not uv_available(), reason="uv is required to bu
 @pytest.fixture(scope="module")
 def built(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path, Path]:
     root = init_repo(tmp_path_factory.mktemp("built") / "repo")
-    plugin = make_python_plugin(root, "fakeplug", dependencies=[])  # no deps: smoke venvs stay tiny and offline-ish
+    plugin = make_python_plugin(root, "fakeplug", dependencies=[])  # no deps: smoke venvs stay tiny
     dist = build_plugin(plugin)
     return root, plugin, dist
 
