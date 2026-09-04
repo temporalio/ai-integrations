@@ -1806,10 +1806,10 @@ async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
     from litellm.llms.custom_llm import (  # pyright: ignore[reportMissingImports]
         CustomLLM,  # type:ignore[reportUnreachable]
     )
-    from litellm.types.llms.openai import (  # pyright: ignore[reportMissingImports]
+    from litellm.types.llms.openai import (  # pyright: ignore[reportMissingImports, reportMissingTypeStubs]
         ChatCompletionReasoningSummaryTextBlock,  # type:ignore[reportUnreachable]
     )
-    from litellm.types.utils import (  # pyright: ignore[reportMissingImports]
+    from litellm.types.utils import (  # pyright: ignore[reportMissingImports, reportMissingTypeStubs]
         Message as LiteLlmMessage,  # type:ignore[reportUnreachable]
     )
 
