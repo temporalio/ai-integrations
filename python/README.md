@@ -18,7 +18,7 @@ owns those packages and the plugin installs into them. `scripts/ci/check_wheel.p
 
 Every plugin's `Makefile` is two lines that include `python/_shared/python.mk`; `make help`
 lists the targets. The important ones: `sync` (non-editable install; run it after pulling),
-`lint`, `test`, `build`, `record`.
+`lint`, `test`, and `build`.
 
 Why non-editable: `temporalio` is a regular package, so an editable install of a plugin cannot be
 imported as `temporalio.contrib.<name>`. The make targets export `UV_NO_EDITABLE=1`, and the
