@@ -8,8 +8,8 @@
 #                   change a plugin's dependency declaration and for every plugin nightly
 #   ci-status    -> the ONLY required status check; skipped jobs count as success
 #
-# No secrets are used anywhere in CI: the test suites run offline from recorded
-# cassettes, so pull requests from forks get the full run.
+# No provider secrets are used in CI: tests use deterministic local models,
+# mock transports, or in-process servers, so pull requests from forks get the full run.
 name: CI
 
 on:

@@ -6,6 +6,7 @@ cadence, laid out as `<language>/<integration>/`.
 
 | Language | Plugin | Package | Root API | Maturity | Docs |
 |---|---|---|---|---|---|
+| Python | [`python/mcp`](python/mcp) | [`temporalio-mcp`](https://pypi.org/project/temporalio-mcp/) | `temporalio.contrib.mcp` | Experimental | [MCP](python/mcp#readme) |
 | Python | [`python/openai_agents`](python/openai_agents) | [`temporalio-openai-agents`](https://pypi.org/project/temporalio-openai-agents/) | `temporalio.contrib.openai_agents` | GA | [OpenAI Agents SDK](https://docs.temporal.io/develop/python/integrations/openai-agents) |
 
 More plugins are migrating here from the SDK repositories; see the target table in
@@ -14,7 +15,8 @@ More plugins are migrating here from the SDK repositories; see the target table 
 ## Install
 
 ```bash
-uv add temporalio-openai-agents
+uv add temporalio-mcp                 # native MCP clients
+uv add temporalio-openai-agents       # OpenAI Agents SDK
 ```
 
 Until the Temporal Python SDK release that stops bundling `temporalio.contrib.openai_agents`,
@@ -28,7 +30,7 @@ uninstalling the plugin then deletes files the SDK still needs (repair with a re
 cd python/openai_agents
 make sync    # non-editable install into .venv (see AGENTS.md for why)
 make lint
-make test    # offline: HTTP traffic is replayed from committed cassettes
+make test    # provider calls use deterministic local models and transports
 ```
 
 `make help` lists every target. Conventions, CI design, release process and migration procedure

@@ -5,9 +5,8 @@ Usage:
     python3 scripts/new_python_plugin.py NAME --description "..." [--coordinate NAME] \
         [--maturity ga|preview|experimental] [--version X.Y.Z] [--existing]
 
-``--existing`` lets the scaffolder fill in the files a history import did not bring
-(pyproject.toml, plugin.toml, Makefile, tests scaffolding) without touching
-anything that already exists, in particular ``src/``.
+``--existing`` lets the scaffolder fill in packaging files a history import did not
+bring without touching anything that already exists, in particular ``src/``.
 
 Standard library only; Python 3.11+.
 """
@@ -91,7 +90,7 @@ def main(argv: list[str]) -> int:
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         if src.is_symlink():
-            os.symlink(os.readlink(src), dest)  # relative target, e.g. ../../LICENSE
+            os.symlink(os.readlink(src), dest)
         else:
             text = src.read_text(encoding="utf-8")
             for placeholder, value in substitutions.items():
@@ -116,7 +115,7 @@ Next steps for python/{name} ({coordinate} {version}, maturity={args.maturity}):
   1. Fill in [project].dependencies in pyproject.toml (declare exactly what is imported).
   2. cd python/{name} && make sync   # creates uv.lock; commit it
   3. make lint && make test
-  4. If any test talks to a provider API, record cassettes once: OPENAI_API_KEY=... make record
+  4. Cover provider behavior with deterministic local models or transports; CI has no provider secrets.
   5. Add a row to the plugin table in README.md.
   6. Ask a PyPI org admin for pending trusted publishers for "{coordinate}" on test.pypi.org
      (environment testpypi) and pypi.org (environment pypi), both bound to

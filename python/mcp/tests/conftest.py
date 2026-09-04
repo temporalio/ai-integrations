@@ -1,26 +1,18 @@
-"""Shared pytest configuration for this plugin.
+"""Pytest configuration for temporalio-mcp.
 
-Vendored from temporalio/sdk-python ``tests/conftest.py`` (origin/main) and pruned to what this
-plugin's tests use. Re-sync it by hand when upstream changes (scripts/migrate/README.md).
-
-Added on top of upstream:
-
-* Provenance guard. The session aborts unless the installed plugin is the non-editable build of
-  this checkout (tests/helpers/provenance.py).
+The session aborts unless the installed plugin is the non-editable build of
+this checkout (tests/helpers/provenance.py).
 """
 
-from __future__ import annotations
+# template-override: MCP owns its pytest configuration.
 
 import asyncio
 import os
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
-import opentelemetry.trace
 import pytest
 import pytest_asyncio
-from agents.tracing import set_trace_processors
-from opentelemetry.util._once import Once
 
 from temporalio.client import Client
 from temporalio.envconfig import ClientConfigProfile
@@ -33,13 +25,9 @@ from . import DEV_SERVER_DOWNLOAD_VERSION
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = load_plugin_meta(PLUGIN_ROOT)
 
-# The Agents SDK installs a process-global exporter by default. Tests that
-# exercise tracing install their own processors, so begin with an empty set to
-# prevent unrelated test spans from being exported from background threads.
-set_trace_processors([])
 
 # ---------------------------------------------------------------------------
-# pytest hooks (upstream hooks plus the provenance guard)
+# pytest hooks
 # ---------------------------------------------------------------------------
 
 
@@ -163,31 +151,3 @@ def pytest_cmdline_main(config):  # type: ignore[reportMissingParameterType, rep
     if exit_code == 0 and not running_with_xdist:
         os._exit(0)
     return exit_code
-
-
-CONTINUE_AS_NEW_SUGGEST_HISTORY_COUNT = 50
-
-
-# OpenTelemetry's global providers are set-once per process with no public
-# way to unset them, so tests needing their own provider must reset the
-# globals directly -- the same isolation pattern OpenTelemetry's own test
-# suite uses (opentelemetry.test.globals_test). Isolation cannot be delegated
-# to scheduling: CI runs pytest-xdist with --dist=worksteal, which ignores
-# xdist_group pinning, so any test in the suite can share a worker process
-# with any other. Every test that installs a global provider must therefore
-# use these fixtures and leave the globals reset behind it.
-
-
-@pytest.fixture
-def reset_otel_tracer_provider():
-    """Isolate global OpenTelemetry tracer provider state around a test.
-
-    Proxy tracers bound to a real provider stay bound forever; OTel has no
-    rebind mechanism for tracers. Tests must install their provider before
-    any span is created through a proxy tracer they care about.
-    """
-    opentelemetry.trace._TRACER_PROVIDER_SET_ONCE = Once()
-    opentelemetry.trace._TRACER_PROVIDER = None
-    yield
-    opentelemetry.trace._TRACER_PROVIDER_SET_ONCE = Once()
-    opentelemetry.trace._TRACER_PROVIDER = None
