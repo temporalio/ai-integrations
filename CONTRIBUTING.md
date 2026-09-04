@@ -31,6 +31,11 @@ The scaffolder copies `python/_template`, prints the remaining manual steps, and
 edits are needed: CI discovers plugins from `plugin.toml`. To migrate an existing plugin with its
 history, follow [`scripts/migrate/README.md`](scripts/migrate/README.md).
 
+## Contributor License Agreement
+
+All contributors must complete the Temporal Contributor License Agreement (CLA)
+before changes can be merged. A link to the CLA will be posted in the pull request.
+
 ## Releasing
 
 Bump the version in a release PR, merge, tag `python/<name>/v<version>`, and follow the runbook
