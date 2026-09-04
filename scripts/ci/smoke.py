@@ -14,8 +14,8 @@ In-env (stdlib only; runs inside the target environment, Python 3.10+):
     smoke.py --in-env --coordinate C --root-api M [--imports a,b,c]
   Imports the root API (and extra modules), checks the installed version equals
   $EXPECTED_VERSION (PEP 440 comparison via `packaging` when available, else a
-  small normaliser), and runs the provenance guard shared with the plugins'
-  tests: not an editable install, every file in our RECORD matches its hash,
+  small normaliser), and checks provenance: not an editable install, every file
+  in our RECORD matches its hash,
   no files under our package directory that we do not own, and no other
   distribution ships our module path. $ALLOW_OVERLAP_WITH_CORE=1 downgrades the
   last two checks to warnings while the SDK still ships the same module
@@ -40,7 +40,7 @@ import tempfile
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Provenance guard.  # keep in sync with python/_template/tests/helpers/provenance.py
+# Provenance guard.
 # ---------------------------------------------------------------------------
 
 

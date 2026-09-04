@@ -5,26 +5,21 @@ plugin's tests use. Re-sync it by hand when upstream changes (scripts/migrate/RE
 
 Added on top of upstream:
 
-* Offline mode. Every test replays recorded HTTP traffic (vcrpy via pytest-recording) from
-  ``tests/contrib/<plugin>/cassettes/<test module>/<test node name>.yaml`` next to the test module.
-  CI never holds a real API key. Re-record locally with ``make record``, which sets
-  ``RECORD_MODE`` (see "Offline tests" in AGENTS.md and python/README.md).
 * Provenance guard. The session aborts unless the installed plugin is the non-editable build of
-  this checkout (tests/helpers/provenance.py, kept in sync with scripts/ci/smoke.py).
+  this checkout (tests/helpers/provenance.py).
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-import re
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Any
 
 import opentelemetry.trace
 import pytest
 import pytest_asyncio
+from agents.tracing import set_trace_processors
 from opentelemetry.util._once import Once
 
 from temporalio.client import Client
@@ -38,94 +33,13 @@ from . import DEV_SERVER_DOWNLOAD_VERSION
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = load_plugin_meta(PLUGIN_ROOT)
 
-# ---------------------------------------------------------------------------
-# Offline mode: record/replay of HTTP traffic
-# ---------------------------------------------------------------------------
-
-# Plugin-specific offline settings live in plugin.toml ``[offline]`` (read by ``PLUGIN`` above), so
-# this file stays identical across plugins:
-#   dummy-env  placeholder values exported during replay when unset (e.g. OPENAI_API_KEY =
-#              "sk-cassette-replay") so upstream ``if not os.environ.get(...)`` skip guards do not
-#              skip; never valid credentials, every request is answered from a cassette.
-#   skips      tests skipped while replaying (never while recording): test function name or a
-#              parametrized id such as "test_x[False]" -> reason.
-
-#: Request and response headers that must never land in a committed cassette.
-_SENSITIVE_HEADERS = (
-    "authorization",
-    "openai-organization",
-    "openai-project",
-    "cookie",
-    "set-cookie",
-    "x-request-id",
-)
-
-# Plugins built on the OpenAI Agents SDK: it registers BatchTraceProcessor(BackendSpanExporter) by
-# default, and with any OPENAI_API_KEY set (including a dummy replay key) that exporter POSTs traces
-# to api.openai.com from a daemon thread outside every cassette. Drop it; tests that assert on traces
-# install their own processors. Do NOT set OPENAI_AGENTS_DISABLE_TRACING: that turns every span into a
-# no-op and breaks tracing tests. Plugins without the Agents SDK simply skip this.
-try:
-    from agents.tracing import set_trace_processors
-except ImportError:  # not an OpenAI Agents SDK plugin
-    pass
-else:
-    set_trace_processors([])
-
-
-def _record_mode() -> str:
-    """``none`` (replay only, the default and what CI runs) or a vcrpy record mode.
-
-    Driven by the ``RECORD_MODE`` environment variable, which ``make record`` sets. It is placed in
-    ``vcr_config`` because that key overrides pytest-recording's ``--record-mode`` flag.
-    """
-    return os.environ.get("RECORD_MODE") or "none"
-
-
-def _replaying() -> bool:
-    return _record_mode() == "none"
-
-
-def _scrub_response(response: dict[str, Any]) -> dict[str, Any]:
-    headers = response.get("headers") or {}
-    for key in list(headers):
-        if key.lower() in _SENSITIVE_HEADERS:
-            del headers[key]
-    return response
-
-
-@pytest.fixture(scope="session")
-def vcr_config() -> dict[str, Any]:
-    return {
-        "record_mode": _record_mode(),
-        # Body matching pairs concurrent and out-of-order requests correctly; request bodies
-        # carry no timestamps or uuids, so they are stable across runs.
-        "match_on": ["method", "scheme", "host", "port", "path", "query", "body"],
-        "filter_headers": list(_SENSITIVE_HEADERS),
-        "before_record_response": _scrub_response,
-        # Model calls run inside Temporal activities, which retry. With this on, every replay of an
-        # identical request returns the first recorded interaction instead of consuming the next one.
-        # A test that needs two identical consecutive requests to get different responses would need
-        # its own handling.
-        "allow_playback_repeats": True,
-        "decode_compressed_response": True,
-        # Local servers (in-process MCP mocks, tooling on 127.0.0.1) are part of the test itself,
-        # not third-party traffic: let them through instead of recording them.
-        "ignore_localhost": True,
-    }
-
-
-@pytest.fixture
-def default_cassette_name(request: pytest.FixtureRequest) -> str:
-    """Cassette file stem: the test node name (including parameters), made filesystem-safe."""
-    name = request.node.name
-    if request.cls is not None:
-        name = f"{request.cls.__name__}.{name}"
-    return re.sub(r"[^A-Za-z0-9_.\[\]=,-]", "_", name)
-
+# The Agents SDK installs a process-global exporter by default. Tests that
+# exercise tracing install their own processors, so begin with an empty set to
+# prevent unrelated test spans from being exported from background threads.
+set_trace_processors([])
 
 # ---------------------------------------------------------------------------
-# pytest hooks (upstream hooks plus the offline and provenance additions)
+# pytest hooks (upstream hooks plus the provenance guard)
 # ---------------------------------------------------------------------------
 
 
@@ -153,9 +67,6 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "requires_local_server: test requires local-server-only behavior and cannot run against an envconfig server",
     )
-    if _replaying():
-        for name, value in PLUGIN.dummy_env.items():
-            os.environ.setdefault(name, value)
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:  # type: ignore[reportUnusedParameter]
@@ -177,7 +88,6 @@ def pytest_sessionstart(session: pytest.Session) -> None:  # type: ignore[report
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
-    replaying = _replaying()
     skip_local_only = pytest.mark.skip(
         reason="requires a local Temporal server, not the configured envconfig server"
     )
@@ -185,17 +95,6 @@ def pytest_collection_modifyitems(
     for item in items:
         if envconfig and item.get_closest_marker("requires_local_server"):
             item.add_marker(skip_local_only)
-        # Skips may name a whole test function or one parametrized id such as "test_x[False]".
-        base_name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
-        skip_reason = PLUGIN.offline_skips.get(item.name) or PLUGIN.offline_skips.get(
-            base_name
-        )
-        if replaying and skip_reason:
-            item.add_marker(pytest.mark.skip(reason=f"offline replay: {skip_reason}"))
-            continue
-        # pytest-recording only wraps tests carrying the ``vcr`` marker; every test gets one so
-        # any HTTP call is either replayed from its cassette or, when recording, captured into it.
-        item.add_marker(pytest.mark.vcr)
 
 
 async def _create_env_from_envconfig() -> WorkflowEnvironment:

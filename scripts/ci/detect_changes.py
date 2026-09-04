@@ -65,8 +65,8 @@ def select(
         parts = f.split("/")
         top = parts[0]
         if top == ".github" or f == "LICENSE":
-            # Workflow/tooling changes affect every plugin; so does the root LICENSE, which every
-            # plugin packages through its LICENSE symlink.
+            # Workflow/tooling changes affect every plugin; so does the root
+            # LICENSE, whose contents every plugin packages.
             return selected, True, False
         if top == "scripts":
             if len(parts) > 1 and parts[1] == "ci":

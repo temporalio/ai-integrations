@@ -6,7 +6,7 @@ Conventions specific to `python/`; the normative reference is [`AGENTS.md`](../A
 
 ```
 python/<name>/
-├── pyproject.toml  uv.lock  plugin.toml  Makefile  README.md  LICENSE -> ../../LICENSE
+├── pyproject.toml  uv.lock  plugin.toml  Makefile  README.md  LICENSE
 ├── src/temporalio/contrib/<name>/        # NO __init__.py in src/temporalio or src/temporalio/contrib
 └── tests/                                # conftest.py, helpers/, and the plugin's tests
 ```
@@ -18,7 +18,7 @@ owns those packages and the plugin installs into them. `scripts/ci/check_wheel.p
 
 Every plugin's `Makefile` is two lines that include `python/_shared/python.mk`; `make help`
 lists the targets. The important ones: `sync` (non-editable install; run it after pulling),
-`lint`, `test`, `build`, `record`.
+`lint`, `test`, and `build`.
 
 Why non-editable: `temporalio` is a regular package, so an editable install of a plugin cannot be
 imported as `temporalio.contrib.<name>`. The make targets export `UV_NO_EDITABLE=1`, and the
@@ -26,19 +26,10 @@ imported as `temporalio.contrib.<name>`. The make targets export `UV_NO_EDITABLE
 A test session that finds an editable or stale install fails immediately with the fix in the
 message (`make sync`).
 
-## Offline tests and cassettes
+## Provider-independent tests
 
-Tests never use a real API key, in CI or locally. Upstream tests that call a provider API are
-listed in `plugin.toml` `[offline] skips` (by function name or parametrized id) and are skipped;
-their offline twins, which use the SDK's test models, run. `dummy-env` in the same table holds
-placeholder values (never real secrets) exported during replay so upstream skip guards do not skip.
-
-Recording real traffic into cassettes is available as an opt-in for teams that want regression
-coverage of real provider responses: `tests/conftest.py` replays cassettes from
-`tests/contrib/<name>/cassettes/<module>/` with vcrpy (through pytest-recording), and
-`OPENAI_API_KEY=<real key> make record` records them locally (`make record` refuses to run in CI).
-A `CannotOverwriteExistingCassetteException` means a test made a request that has neither a
-cassette nor a skip entry.
+Tests must not require provider credentials. Exercise provider behavior with deterministic local
+models, mock transports, or in-process servers so the same assertions run in every environment.
 
 ## Dependency cooldown
 
@@ -48,9 +39,9 @@ lanes re-lock to the newest and lowest allowed versions without committing the l
 
 ## LICENSE
 
-Every plugin directory carries a committed copy of the root `LICENSE`, because each wheel and sdist
-must ship the license text. The copy must stay byte-identical to the root file (the conventions
-check enforces it; refresh with `cp LICENSE python/<name>/LICENSE`). Symlinks are not used.
+Every plugin directory carries a committed regular-file copy of the root `LICENSE`, because each
+wheel and sdist must ship the license text. The copy must stay byte-identical to the root file (the
+conventions check enforces it; refresh with `cp LICENSE python/<name>/LICENSE`).
 
 ## Platform notes
 
