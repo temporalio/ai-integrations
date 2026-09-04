@@ -59,7 +59,9 @@ class MCPPlugin(SimplePlugin):
             if isinstance(runner, SandboxedWorkflowRunner):
                 return dataclasses.replace(
                     runner,
-                    restrictions=runner.restrictions.with_passthrough_modules("mcp"),
+                    restrictions=runner.restrictions.with_passthrough_modules(
+                        "mcp", "mcp_types"
+                    ),
                 )
             return runner
 

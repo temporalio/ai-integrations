@@ -15,6 +15,7 @@ with workflow.unsafe.imports_passed_through():
     from mcp import Client, StdioServerParameters, stdio_client
     from mcp.server.mcpserver import MCPServer
     from mcp.types import TextContent, TextResourceContents
+    from mcp_types import TextContent as DirectTextContent
 
     from temporalio.client import Client as TemporalClient
     from temporalio.contrib.mcp import MCPPlugin
@@ -53,6 +54,7 @@ class NativeMCPWorkflow:
         # The second call is served from replay-safe workflow state.
         assert await client.list_tools() is tools
         tool_result = await client.call_tool("echo", {"value": "hello"})
+        assert isinstance(tool_result.content[0], DirectTextContent)
         prompts = await client.list_prompts()
         prompt = await client.get_prompt("greeting", {"name": "Temporal"})
         resources = await client.list_resources()
@@ -60,7 +62,7 @@ class NativeMCPWorkflow:
         resource = await client.read_resource("test://static")
         return (
             tools.tools[0].name,
-            cast(TextContent, tool_result.content[0]).text,
+            tool_result.content[0].text,
             prompts.prompts[0].name,
             cast(TextContent, prompt.messages[0].content).text,
             resources.resources[0].name,

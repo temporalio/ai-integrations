@@ -7,7 +7,12 @@ from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any, TypeVar
 
+from mcp import MCPError
 from mcp.types import (
+    INVALID_PARAMS,
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
     ListPromptsResult,
     ListResourcesResult,
     ListResourceTemplatesResult,
@@ -25,6 +30,7 @@ from temporalio.contrib.mcp._activity import (
 )
 from temporalio.contrib.mcp._backend import _MCPBackend, _MCPBackendFactory
 from temporalio.contrib.mcp._pool import _MCPConnectionPool
+from temporalio.exceptions import ApplicationError
 
 _Result = TypeVar("_Result")
 
@@ -32,6 +38,12 @@ logger = logging.getLogger(__name__)
 
 # Upper bound on how long worker shutdown waits for MCP transports to close.
 _CLOSE_TIMEOUT_SECONDS = 10.0
+_NON_RETRYABLE_PROTOCOL_ERRORS = {
+    PARSE_ERROR,
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    INVALID_PARAMS,
+}
 
 
 def _dump(model: BaseModel) -> dict[str, Any]:
@@ -58,11 +70,19 @@ class _MCPActivities:
         request: _MCPRequest,
         operation: Callable[[_MCPBackend], Awaitable[_Result]],
     ) -> _Result:
-        async with self._pool.backend(
-            server,
-            factory_argument=request.factory_argument,
-        ) as backend:
-            return await operation(backend)
+        try:
+            async with self._pool.backend(
+                server,
+                factory_argument=request.factory_argument,
+            ) as backend:
+                return await operation(backend)
+        except MCPError as err:
+            raise ApplicationError(
+                err.message,
+                err.code,
+                type="MCPProtocolError",
+                non_retryable=err.code in _NON_RETRYABLE_PROTOCOL_ERRORS,
+            ) from err
 
     def _build_activities(self) -> Sequence[Callable[..., Any]]:
         activities: list[Callable[..., Any]] = []

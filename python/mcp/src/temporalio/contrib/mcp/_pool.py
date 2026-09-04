@@ -103,7 +103,7 @@ class _MCPConnectionPool:
         idle_timeout: timedelta | None,
     ) -> None:
         if idle_timeout is not None and idle_timeout.total_seconds() < 0:
-            raise ValueError("mcp_connection_idle_timeout cannot be negative")
+            raise ValueError("connection_idle_timeout cannot be negative")
         self._factories = factories
         self._idle_timeout = idle_timeout
         self._records: dict[

@@ -3,7 +3,11 @@ from datetime import timedelta
 from typing import Any, cast
 
 import pytest
+from mcp import Client, MCPError
+from mcp.server.mcpserver import MCPServer
 from mcp.types import (
+    INTERNAL_ERROR,
+    INVALID_PARAMS,
     CallToolResult,
     GetPromptResult,
     ListPromptsResult,
@@ -97,6 +101,14 @@ class FakeClient:
         )
 
 
+def _activity_by_name(support: _MCPActivities, name: str) -> Any:
+    for fn in support.activities:
+        definition = activity._Definition.from_callable(fn)
+        if definition is not None and definition.name == name:
+            return fn
+    raise AssertionError(f"Activity {name!r} was not registered")
+
+
 async def test_operations_are_plain_json_and_lists_are_fully_paginated() -> None:
     client = FakeClient()
     support = _MCPActivities(
@@ -154,6 +166,60 @@ async def test_repeated_pagination_cursor_fails_without_retry() -> None:
             await backend.list_tools()
     assert err.value.type == "MCPProtocolError"
     assert err.value.non_retryable is True
+
+
+async def test_unknown_resource_protocol_error_fails_without_retry() -> None:
+    server = MCPServer("resources")
+
+    @server.resource("test://known", name="known")
+    def known_resource() -> str:  # type: ignore[reportUnusedFunction]
+        return "known"
+
+    support = _MCPActivities(
+        {"test": lambda: _MCPClientBackend(Client(server))},
+        idle_timeout=timedelta(minutes=5),
+    )
+    read_resource = _activity_by_name(
+        support,
+        "temporalio.contrib.mcp.test.read-resource",
+    )
+    try:
+        with pytest.raises(ApplicationError, match="Unknown resource") as err:
+            await read_resource({"factory_argument": None, "uri": "test://unknown"})
+    finally:
+        await support._pool.close()
+
+    assert err.value.type == "MCPProtocolError"
+    assert err.value.non_retryable is True
+    assert err.value.details == (INVALID_PARAMS,)
+
+
+async def test_internal_protocol_error_remains_retryable() -> None:
+    class InternalErrorClient(FakeClient):
+        async def get_prompt(
+            self, name: str, _arguments: dict[str, str] | None
+        ) -> GetPromptResult:
+            raise MCPError(INTERNAL_ERROR, f"Failed to get {name}")
+
+    support = _MCPActivities(
+        {"test": lambda: _MCPClientBackend(cast(Any, InternalErrorClient()))},
+        idle_timeout=timedelta(minutes=5),
+    )
+    get_prompt = _activity_by_name(
+        support,
+        "temporalio.contrib.mcp.test.get-prompt",
+    )
+    try:
+        with pytest.raises(ApplicationError, match="Failed to get prompt") as err:
+            await get_prompt(
+                {"factory_argument": None, "name": "prompt", "arguments": {}}
+            )
+    finally:
+        await support._pool.close()
+
+    assert err.value.type == "MCPProtocolError"
+    assert err.value.non_retryable is False
+    assert err.value.details == (INTERNAL_ERROR,)
 
 
 async def test_shared_plugin_closes_after_last_run_context(

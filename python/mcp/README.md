@@ -115,6 +115,10 @@ Activities have at-least-once execution semantics. An MCP tool can therefore
 run more than once when a worker loses its completion response. Tools with side
 effects should be idempotent, usually by accepting a stable idempotency key.
 
+MCP operations do not heartbeat. Do not set `heartbeat_timeout` in
+`activity_config`; cancellation cannot interrupt an in-flight MCP request and
+takes effect when its start-to-close timeout expires.
+
 ## Connections and configuration
 
 Parameterless factories reuse modern, sessionless MCP connections until they

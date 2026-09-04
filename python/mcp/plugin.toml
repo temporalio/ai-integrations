@@ -7,7 +7,6 @@ coordinate = "temporalio-mcp"
 registry = "pypi"
 root-api = "temporalio.contrib.mcp"
 maturity = "experimental"
-status = "active"
 
 [release]
 allow-final = true
