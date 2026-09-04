@@ -30,7 +30,7 @@ uninstalling the plugin then deletes files the SDK still needs (repair with a re
 cd python/openai_agents
 make sync    # non-editable install into .venv (see AGENTS.md for why)
 make lint
-make test    # offline: HTTP traffic is replayed from committed cassettes
+make test    # provider calls use deterministic local models and transports
 ```
 
 `make help` lists every target. Conventions, CI design, release process and migration procedure

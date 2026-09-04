@@ -35,7 +35,6 @@ from agents import (
     ModelSettings,
     ModelTracing,
     OpenAIChatCompletionsModel,
-    OpenAIResponsesModel,
     OutputGuardrailTripwireTriggered,
     RunConfig,
     RunContextWrapper,
@@ -135,14 +134,9 @@ class HelloWorldAgent:
         return result.final_output
 
 
-@pytest.mark.parametrize("use_local_model", [True, False])
-async def test_hello_world_agent(client: Client, use_local_model: bool):
-    if not use_local_model and not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
-
-    model = hello_mock_model() if use_local_model else None
+async def test_hello_world_agent(client: Client):
     async with AgentEnvironment(
-        model=model,
+        model=hello_mock_model(),
         model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=30),
         ),
@@ -157,8 +151,7 @@ async def test_hello_world_agent(client: Client, use_local_model: bool):
                 task_queue=worker.task_queue,
                 execution_timeout=timedelta(seconds=60),
             )
-            if use_local_model:
-                assert result == "test"
+            assert result == "test"
 
 
 @dataclass
@@ -322,14 +315,9 @@ class NexusToolsWorkflow:
         return result.final_output
 
 
-@pytest.mark.parametrize("use_local_model", [True, False])
-async def test_tool_workflow(client: Client, use_local_model: bool):
-    if not use_local_model and not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
-
-    model = weather_mock_model() if use_local_model else None
+async def test_tool_workflow(client: Client):
     async with AgentEnvironment(
-        model=model,
+        model=weather_mock_model(),
         model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=30),
         ),
@@ -356,81 +344,80 @@ async def test_tool_workflow(client: Client, use_local_model: bool):
             )
             result = await workflow_handle.result()
 
-            if use_local_model:
-                assert result == "Test weather result"
+            assert result == "Test weather result"
 
-                events = []
-                async for e in workflow_handle.fetch_history_events():
-                    if e.HasField("activity_task_completed_event_attributes"):
-                        events.append(e)
+            events = []
+            async for e in workflow_handle.fetch_history_events():
+                if e.HasField("activity_task_completed_event_attributes"):
+                    events.append(e)
 
-                assert len(events) == 11
-                assert (
-                    "function_call"
-                    in events[0]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "Sunny with wind"
-                    in events[1]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "function_call"
-                    in events[2]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "Sunny with wind"
-                    in events[3]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "function_call"
-                    in events[4]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "Sunny with wind"
-                    in events[5]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "function_call"
-                    in events[6]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "Stormy"
-                    in events[7]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "function_call"
-                    in events[8]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "Sunny with wind"
-                    in events[9]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "Test weather result"
-                    in events[10]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
+            assert len(events) == 11
+            assert (
+                "function_call"
+                in events[0]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Sunny with wind"
+                in events[1]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "function_call"
+                in events[2]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Sunny with wind"
+                in events[3]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "function_call"
+                in events[4]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Sunny with wind"
+                in events[5]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "function_call"
+                in events[6]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Stormy"
+                in events[7]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "function_call"
+                in events[8]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Sunny with wind"
+                in events[9]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Test weather result"
+                in events[10]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
 
 
 @activity.defn
@@ -479,20 +466,13 @@ async def test_tool_failure_workflow(client: Client):
             assert "Workflow failure exception in Agents Framework" in cause.message
 
 
-@pytest.mark.parametrize("use_local_model", [True, False])
 @pytest.mark.requires_local_server
-async def test_nexus_tool_workflow(
-    client: Client, env: WorkflowEnvironment, use_local_model: bool
-):
-    if not use_local_model and not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
-
+async def test_nexus_tool_workflow(client: Client, env: WorkflowEnvironment):
     if env.supports_time_skipping:
         pytest.skip("Nexus tests don't work with time-skipping server")
 
-    model = nexus_weather_mock_model() if use_local_model else None
     async with AgentEnvironment(
-        model=model,
+        model=nexus_weather_mock_model(),
         model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=30),
         ),
@@ -517,35 +497,34 @@ async def test_nexus_tool_workflow(
             )
             result = await workflow_handle.result()
 
-            if use_local_model:
-                assert result == "Test nexus weather result"
+            assert result == "Test nexus weather result"
 
-                events = []
-                async for e in workflow_handle.fetch_history_events():
-                    if e.HasField(
-                        "activity_task_completed_event_attributes"
-                    ) or e.HasField("nexus_operation_completed_event_attributes"):
-                        events.append(e)
+            events = []
+            async for e in workflow_handle.fetch_history_events():
+                if e.HasField("activity_task_completed_event_attributes") or e.HasField(
+                    "nexus_operation_completed_event_attributes"
+                ):
+                    events.append(e)
 
-                assert len(events) == 3
-                assert (
-                    "function_call"
-                    in events[0]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "Sunny with wind"
-                    in events[
-                        1
-                    ].nexus_operation_completed_event_attributes.result.data.decode()
-                )
-                assert (
-                    "Test nexus weather result"
-                    in events[2]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
+            assert len(events) == 3
+            assert (
+                "function_call"
+                in events[0]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Sunny with wind"
+                in events[
+                    1
+                ].nexus_operation_completed_event_attributes.result.data.decode()
+            )
+            assert (
+                "Test nexus weather result"
+                in events[2]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
 
 
 def research_mock_model():
@@ -587,15 +566,10 @@ class ResearchWorkflow:
         return await ResearchManager().run(query)
 
 
-@pytest.mark.parametrize("use_local_model", [True, False])
 @pytest.mark.timeout(120)
-async def test_research_workflow(client: Client, use_local_model: bool):
-    if not use_local_model and not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
-
-    model = research_mock_model() if use_local_model else None
+async def test_research_workflow(client: Client):
     async with AgentEnvironment(
-        model=model,
+        model=research_mock_model(),
         model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=120),
             schedule_to_close_timeout=timedelta(seconds=120),
@@ -616,35 +590,34 @@ async def test_research_workflow(client: Client, use_local_model: bool):
             )
             result = await workflow_handle.result()
 
-            if use_local_model:
-                assert result == "report"
+            assert result == "report"
 
-                events = []
-                async for e in workflow_handle.fetch_history_events():
-                    if e.HasField("activity_task_completed_event_attributes"):
-                        events.append(e)
+            events = []
+            async for e in workflow_handle.fetch_history_events():
+                if e.HasField("activity_task_completed_event_attributes"):
+                    events.append(e)
 
-                assert len(events) == 12
+            assert len(events) == 12
+            assert (
+                '"type":"output_text"'
+                in events[0]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            for i in range(1, 11):
                 assert (
-                    '"type":"output_text"'
-                    in events[0]
+                    "web_search_call"
+                    in events[i]
                     .activity_task_completed_event_attributes.result.payloads[0]
                     .data.decode()
                 )
-                for i in range(1, 11):
-                    assert (
-                        "web_search_call"
-                        in events[i]
-                        .activity_task_completed_event_attributes.result.payloads[0]
-                        .data.decode()
-                    )
 
-                assert (
-                    '"type":"output_text"'
-                    in events[11]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
+            assert (
+                '"type":"output_text"'
+                in events[11]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
 
 
 def orchestrator_agent() -> Agent:
@@ -739,14 +712,9 @@ def agent_as_tools_mock_model():
     )
 
 
-@pytest.mark.parametrize("use_local_model", [True, False])
-async def test_agents_as_tools_workflow(client: Client, use_local_model: bool):
-    if not use_local_model and not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
-
-    model = agent_as_tools_mock_model() if use_local_model else None
+async def test_agents_as_tools_workflow(client: Client):
     async with AgentEnvironment(
-        model=model,
+        model=agent_as_tools_mock_model(),
         model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=30),
         ),
@@ -766,39 +734,38 @@ async def test_agents_as_tools_workflow(client: Client, use_local_model: bool):
             )
             result = await workflow_handle.result()
 
-            if use_local_model:
-                assert result == 'The translation to Spanish is: "Estoy lleno."'
+            assert result == 'The translation to Spanish is: "Estoy lleno."'
 
-                events = []
-                async for e in workflow_handle.fetch_history_events():
-                    if e.HasField("activity_task_completed_event_attributes"):
-                        events.append(e)
+            events = []
+            async for e in workflow_handle.fetch_history_events():
+                if e.HasField("activity_task_completed_event_attributes"):
+                    events.append(e)
 
-                assert len(events) == 4
-                assert (
-                    "function_call"
-                    in events[0]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "Estoy lleno"
-                    in events[1]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "The translation to Spanish is:"
-                    in events[2]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "The translation to Spanish is:"
-                    in events[3]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
+            assert len(events) == 4
+            assert (
+                "function_call"
+                in events[0]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Estoy lleno"
+                in events[1]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "The translation to Spanish is:"
+                in events[2]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "The translation to Spanish is:"
+                in events[3]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
 
 
 class AirlineAgentContext(BaseModel):
@@ -1003,14 +970,9 @@ class CustomerServiceWorkflow:
             raise ValueError("Stale chat history. Please refresh the chat.")
 
 
-@pytest.mark.parametrize("use_local_model", [True, False])
-async def test_customer_service_workflow(client: Client, use_local_model: bool):
-    if not use_local_model and not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
-
-    model = customer_service_mock_model() if use_local_model else None
+async def test_customer_service_workflow(client: Client):
     async with AgentEnvironment(
-        model=model,
+        model=customer_service_mock_model(),
         model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=30),
         ),
@@ -1052,68 +1014,67 @@ async def test_customer_service_workflow(client: Client, use_local_model: bool):
                 await workflow_handle.result()
             assert isinstance(err.value.cause, CancelledError)
 
-            if use_local_model:
-                events = []
-                async for e in WorkflowHandle(
-                    client,
-                    workflow_handle.id,
-                    run_id=workflow_handle._first_execution_run_id,
-                ).fetch_history_events():
-                    if e.HasField("activity_task_completed_event_attributes"):
-                        events.append(e)
+            events = []
+            async for e in WorkflowHandle(
+                client,
+                workflow_handle.id,
+                run_id=workflow_handle._first_execution_run_id,
+            ).fetch_history_events():
+                if e.HasField("activity_task_completed_event_attributes"):
+                    events.append(e)
 
-                assert len(events) == 8
-                assert (
-                    "Hi there! How can I assist you today?"
-                    in events[0]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "transfer_to_seat_booking_agent"
-                    in events[1]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "Could you please provide your confirmation number?"
-                    in events[2]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "Thanks! What seat number would you like to change to?"
-                    in events[3]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "update_seat"
-                    in events[4]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "Your seat has been updated to a window seat. If there's anything else you need, feel free to let me know!"
-                    in events[5]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "transfer_to_triage_agent"
-                    in events[6]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
-                assert (
-                    "You're welcome!"
-                    in events[7]
-                    .activity_task_completed_event_attributes.result.payloads[0]
-                    .data.decode()
-                )
+            assert len(events) == 8
+            assert (
+                "Hi there! How can I assist you today?"
+                in events[0]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "transfer_to_seat_booking_agent"
+                in events[1]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Could you please provide your confirmation number?"
+                in events[2]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Thanks! What seat number would you like to change to?"
+                in events[3]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "update_seat"
+                in events[4]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Your seat has been updated to a window seat. If there's anything else you need, feel free to let me know!"
+                in events[5]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "transfer_to_triage_agent"
+                in events[6]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "You're welcome!"
+                in events[7]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
 
 
-class InputGuardrailModel(OpenAIResponsesModel):
+class InputGuardrailModel(Model):
     __test__ = False
     responses: list[ModelResponse] = [
         ResponseBuilders.output_message("The capital of California is Sacramento."),
@@ -1128,12 +1089,7 @@ class InputGuardrailModel(OpenAIResponsesModel):
         ),
     ]
 
-    def __init__(
-        self,
-        model: str,
-        openai_client: AsyncOpenAI,
-    ) -> None:
-        super().__init__(model, openai_client)
+    def __init__(self) -> None:
         self._responses = iter(self.responses)
         self._guardrail_responses = iter(self.guardrail_responses)
 
@@ -1149,6 +1105,7 @@ class InputGuardrailModel(OpenAIResponsesModel):
         previous_response_id: str | None = None,
         conversation_id: str | None = None,
         prompt: ResponsePromptParam | None = None,
+        **kwargs: Any,
     ) -> ModelResponse:
         if (
             system_instructions
@@ -1157,6 +1114,19 @@ class InputGuardrailModel(OpenAIResponsesModel):
             return next(self._guardrail_responses)
         else:
             return next(self._responses)
+
+    def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        raise NotImplementedError()
 
 
 ### 1. An agent-based guardrail that is triggered if the user is asking to do math homework
@@ -1230,18 +1200,9 @@ class InputGuardrailWorkflow:
         return results
 
 
-@pytest.mark.parametrize("use_local_model", [True, False])
-async def test_input_guardrail(client: Client, use_local_model: bool):
-    if not use_local_model and not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
-
-    model = (
-        InputGuardrailModel("", openai_client=AsyncOpenAI(api_key="Fake key"))
-        if use_local_model
-        else None
-    )
+async def test_input_guardrail(client: Client):
     async with AgentEnvironment(
-        model=model,
+        model=InputGuardrailModel(),
         model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=30),
         ),
@@ -1264,10 +1225,9 @@ async def test_input_guardrail(client: Client, use_local_model: bool):
             )
             result = await workflow_handle.result()
 
-            if use_local_model:
-                assert len(result) == 2
-                assert result[0] == "The capital of California is Sacramento."
-                assert result[1] == "Sorry, I can't help you with your math homework."
+            assert len(result) == 2
+            assert result[0] == "The capital of California is Sacramento."
+            assert result[1] == "Sorry, I can't help you with your math homework."
 
 
 def output_guardrail_mock_model():
@@ -1330,14 +1290,9 @@ class OutputGuardrailWorkflow:
             return False
 
 
-@pytest.mark.parametrize("use_local_model", [True, False])
-async def test_output_guardrail(client: Client, use_local_model: bool):
-    if not use_local_model and not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
-
-    model = output_guardrail_mock_model() if use_local_model else None
+async def test_output_guardrail(client: Client):
     async with AgentEnvironment(
-        model=model,
+        model=output_guardrail_mock_model(),
         model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=30),
         ),
@@ -1356,8 +1311,7 @@ async def test_output_guardrail(client: Client, use_local_model: bool):
             )
             result = await workflow_handle.result()
 
-            if use_local_model:
-                assert not result
+            assert not result
 
 
 def workflow_tool_mock_model():
@@ -1566,34 +1520,115 @@ def test_retry_after_ms_takes_precedence_over_retry_after():
 
 
 class CustomModelProvider(ModelProvider):
+    def __init__(self, client: AsyncOpenAI) -> None:
+        self.client = client
+
     def get_model(self, model_name: str | None) -> Model:
-        client = AsyncOpenAI(base_url="https://api.openai.com/v1")
-        return OpenAIChatCompletionsModel(model="gpt-4o", openai_client=client)
+        assert model_name == "gpt-4o"
+        return OpenAIChatCompletionsModel(model="gpt-4o", openai_client=self.client)
 
 
 async def test_chat_completions_model(client: Client):
-    if not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
+    import httpx
 
-    async with AgentEnvironment(
-        model_provider=CustomModelProvider(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
-    ) as env:
-        client = env.applied_on_client(client)
+    requests: list[dict[str, Any]] = []
+    responses = iter(
+        [
+            {
+                "id": "chatcmpl-tool",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "run_tool",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+            {
+                "id": "chatcmpl-final",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-4o",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Workflow tool was used",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        ]
+    )
 
-        async with new_worker(
-            client,
-            WorkflowToolWorkflow,
-        ) as worker:
-            workflow_handle = await client.start_workflow(
-                WorkflowToolWorkflow.run,
-                id=f"workflow-tool-{uuid.uuid4()}",
-                task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=10),
-            )
-            await workflow_handle.result()
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.host == "openai.invalid"
+        assert request.url.path == "/v1/chat/completions"
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=next(responses))
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle_request)
+    ) as http_client:
+        openai_client = AsyncOpenAI(
+            api_key="not-a-real-key",
+            base_url="https://openai.invalid/v1",
+            http_client=http_client,
+        )
+
+        async with AgentEnvironment(
+            model_provider=CustomModelProvider(openai_client),
+            model_params=ModelActivityParameters(
+                start_to_close_timeout=timedelta(seconds=30),
+            ),
+        ) as env:
+            client = env.applied_on_client(client)
+
+            async with new_worker(
+                client,
+                WorkflowToolWorkflow,
+            ) as worker:
+                workflow_handle = await client.start_workflow(
+                    WorkflowToolWorkflow.run,
+                    id=f"workflow-tool-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                    execution_timeout=timedelta(seconds=10),
+                )
+                await workflow_handle.result()
+
+    assert len(requests) == 2
+    assert requests[0]["model"] == "gpt-4o"
+    assert requests[0]["tools"][0]["function"]["name"] == "run_tool"
+    assert requests[1]["messages"][-1]["role"] == "tool"
 
 
 class WaitModel(Model):
@@ -1740,14 +1775,82 @@ async def test_session(client: Client):
             await assert_eventually(check)
 
 
-async def test_lite_llm(client: Client):
-    if not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
+@workflow.defn
+class LiteLlmAgent:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        agent = Agent[None](
+            name="Assistant",
+            instructions="You only respond in haikus.",
+            model="fake/test-model",
+        )
+        result = await Runner.run(starting_agent=agent, input=prompt)
+        return result.final_output
+
+
+async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
     if sys.version_info >= (3, 14):
         pytest.skip("Lite LLM does not yet support Python 3.14")  # type:ignore[reportUnreachable]
 
+    # LiteLLM fetches its model cost map at import time unless explicitly told to
+    # use the copy bundled in the package.
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+    import litellm as litellm_module  # type:ignore[reportMissingImports, reportUnreachable]
     from agents.extensions.models.litellm_provider import (
         LitellmProvider,  # type:ignore[reportUnreachable]
+    )
+    from litellm import (  # pyright: ignore[reportMissingImports]
+        ModelResponse as LiteLlmResponse,  # type:ignore[reportUnreachable]
+    )
+    from litellm.llms.custom_llm import (  # pyright: ignore[reportMissingImports]
+        CustomLLM,  # type:ignore[reportUnreachable]
+    )
+    from litellm.types.llms.openai import (  # pyright: ignore[reportMissingImports, reportMissingTypeStubs]
+        ChatCompletionReasoningSummaryTextBlock,  # type:ignore[reportUnreachable]
+    )
+    from litellm.types.utils import (  # pyright: ignore[reportMissingImports, reportMissingTypeStubs]
+        Message as LiteLlmMessage,  # type:ignore[reportUnreachable]
+    )
+
+    # LiteLLM 1.97 leaves this Pydantic model's nested forward reference
+    # unresolved on Python 3.10, before a custom provider can handle the call.
+    if not LiteLlmMessage.__pydantic_complete__:
+        LiteLlmMessage.model_rebuild(  # type:ignore[reportUnreachable]
+            _types_namespace={
+                "ChatCompletionReasoningSummaryTextBlock": ChatCompletionReasoningSummaryTextBlock
+            }
+        )
+
+    requested_models: list[str] = []
+
+    class FakeLiteLlmProvider(CustomLLM):
+        def completion(  # type:ignore[reportUnreachable]
+            self, *args: Any, **kwargs: Any
+        ) -> LiteLlmResponse:
+            model = args[0] if args else kwargs.get("model", "unknown")
+            requested_models.append(model)
+            return LiteLlmResponse(
+                choices=[
+                    {
+                        "message": {
+                            "content": "hello from litellm",
+                            "role": "assistant",
+                        },
+                        "index": 0,
+                        "finish_reason": "stop",
+                    }
+                ],
+                model=model,
+            )
+
+        async def acompletion(self, *args: Any, **kwargs: Any) -> LiteLlmResponse:
+            return self.completion(*args, **kwargs)
+
+    monkeypatch.setattr(
+        litellm_module,
+        "custom_provider_map",
+        [{"provider": "fake", "custom_handler": FakeLiteLlmProvider()}],
     )
 
     async with AgentEnvironment(
@@ -1760,16 +1863,18 @@ async def test_lite_llm(client: Client):
 
         async with new_worker(
             client,
-            HelloWorldAgent,
+            LiteLlmAgent,
         ) as worker:
-            workflow_handle = await client.start_workflow(  # type:ignore[reportUnreachable]
-                HelloWorldAgent.run,
+            result = await client.execute_workflow(  # type:ignore[reportUnreachable]
+                LiteLlmAgent.run,
                 "Tell me about recursion in programming",
                 id=f"lite-llm-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
                 execution_timeout=timedelta(seconds=10),
             )
-            await workflow_handle.result()
+
+    assert result == "hello from litellm"
+    assert requested_models == ["test-model"]
 
 
 def file_search_tool_mock_model():
@@ -1822,17 +1927,12 @@ class FileSearchToolWorkflow:
         return result.final_output
 
 
-@pytest.mark.parametrize("use_local_model", [True, False])
-async def test_file_search_tool(client: Client, use_local_model: bool):
-    if not use_local_model and not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
-
-    model = file_search_tool_mock_model() if use_local_model else None
+async def test_file_search_tool(client: Client):
     async with AgentEnvironment(
         model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=30)
         ),
-        model=model,
+        model=file_search_tool_mock_model(),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -1848,8 +1948,7 @@ async def test_file_search_tool(client: Client, use_local_model: bool):
                 execution_timeout=timedelta(seconds=30),
             )
             result = await workflow_handle.result()
-            if use_local_model:
-                assert result == "Patroclus"
+            assert result == "Patroclus"
 
 
 def image_generation_mock_model():
@@ -1895,18 +1994,12 @@ class ImageGenerationWorkflow:
         return result.final_output
 
 
-# Can't currently validate against real server, we aren't verified for image generation
-@pytest.mark.parametrize("use_local_model", [True])
-async def test_image_generation_tool(client: Client, use_local_model: bool):
-    if not use_local_model and not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
-
-    model = image_generation_mock_model() if use_local_model else None
+async def test_image_generation_tool(client: Client):
     async with AgentEnvironment(
         model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=30)
         ),
-        model=model,
+        model=image_generation_mock_model(),
     ) as env:
         client = env.applied_on_client(client)
 
@@ -2543,15 +2636,9 @@ def get_tracking_server(name: str):
     return TrackingMCPServer(name)
 
 
-@pytest.mark.parametrize("use_local_model", [True, False])
 @pytest.mark.parametrize("stateful", [True, False])
 @pytest.mark.parametrize("caching", [True, False])
-async def test_mcp_server(
-    client: Client, use_local_model: bool, stateful: bool, caching: bool
-):
-    if not use_local_model and not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("No openai API key")
-
+async def test_mcp_server(client: Client, stateful: bool, caching: bool):
     if stateful and caching:
         pytest.skip("Caching is only supported for stateless MCP servers")
 
@@ -2569,12 +2656,11 @@ async def test_mcp_server(
         else StatelessMCPServerProvider("HelloServer", lambda _: tracking_server)
     )
 
-    model = tracking_mcp_mock_model() if use_local_model else None
     async with AgentEnvironment(
         model_params=ModelActivityParameters(
             start_to_close_timeout=timedelta(seconds=120)
         ),
-        model=model,
+        model=tracking_mcp_mock_model(),
         mcp_server_providers=[server],
     ) as env:
         client = env.applied_on_client(client)
@@ -2598,52 +2684,50 @@ async def test_mcp_server(
                     task_queue=worker.task_queue,
                     execution_timeout=timedelta(seconds=30),
                 )
-        if use_local_model:
-            assert result == "Hi Tom and Tim!"
-    if use_local_model:
-        print(tracking_server.calls)
-        if stateful:
+        assert result == "Hi Tom and Tim!"
+    print(tracking_server.calls)
+    if stateful:
+        assert tracking_server.calls == [
+            "connect",
+            "list_tools",
+            "call_tool",
+            "list_tools",
+            "call_tool",
+            "list_tools",
+            "cleanup",
+        ]
+        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
+    else:
+        if caching:
             assert tracking_server.calls == [
                 "connect",
                 "list_tools",
+                "cleanup",
+                "connect",
                 "call_tool",
+                "cleanup",
+                "connect",
+                "call_tool",
+                "cleanup",
+            ]
+        else:
+            assert tracking_server.calls == [
+                "connect",
                 "list_tools",
+                "cleanup",
+                "connect",
                 "call_tool",
+                "cleanup",
+                "connect",
+                "list_tools",
+                "cleanup",
+                "connect",
+                "call_tool",
+                "cleanup",
+                "connect",
                 "list_tools",
                 "cleanup",
             ]
-            assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
-        else:
-            if caching:
-                assert tracking_server.calls == [
-                    "connect",
-                    "list_tools",
-                    "cleanup",
-                    "connect",
-                    "call_tool",
-                    "cleanup",
-                    "connect",
-                    "call_tool",
-                    "cleanup",
-                ]
-            else:
-                assert tracking_server.calls == [
-                    "connect",
-                    "list_tools",
-                    "cleanup",
-                    "connect",
-                    "call_tool",
-                    "cleanup",
-                    "connect",
-                    "list_tools",
-                    "cleanup",
-                    "connect",
-                    "call_tool",
-                    "cleanup",
-                    "connect",
-                    "list_tools",
-                    "cleanup",
-                ]
 
 
 @pytest.mark.parametrize("stateful", [True, False])
