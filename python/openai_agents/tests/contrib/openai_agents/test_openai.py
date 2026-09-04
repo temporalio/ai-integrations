@@ -1806,6 +1806,21 @@ async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
     from litellm.llms.custom_llm import (  # pyright: ignore[reportMissingImports]
         CustomLLM,  # type:ignore[reportUnreachable]
     )
+    from litellm.types.llms.openai import (  # pyright: ignore[reportMissingImports]
+        ChatCompletionReasoningSummaryTextBlock,  # type:ignore[reportUnreachable]
+    )
+    from litellm.types.utils import (  # pyright: ignore[reportMissingImports]
+        Message as LiteLlmMessage,  # type:ignore[reportUnreachable]
+    )
+
+    # LiteLLM 1.97 leaves this Pydantic model's nested forward reference
+    # unresolved on Python 3.10, before a custom provider can handle the call.
+    if not LiteLlmMessage.__pydantic_complete__:
+        LiteLlmMessage.model_rebuild(  # type:ignore[reportUnreachable]
+            _types_namespace={
+                "ChatCompletionReasoningSummaryTextBlock": ChatCompletionReasoningSummaryTextBlock
+            }
+        )
 
     requested_models: list[str] = []
 
