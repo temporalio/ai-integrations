@@ -34,13 +34,16 @@ sync: ## Install locked dependencies and this plugin (non-editable); creates uv.
 
 sync-latest: ## Re-lock to the newest allowed versions and install (nightly lane; lock not committed)
 	uv lock --upgrade
-	uv sync
-	uv sync --reinstall-package $(DIST)
+	uv sync --locked
+	uv sync --locked --reinstall-package $(DIST)
 
 sync-lowest: ## Re-lock to the lowest allowed direct versions and install (nightly lane; lock not committed)
 	uv lock --upgrade --resolution lowest-direct
-	uv sync
-	uv sync --reinstall-package $(DIST)
+# The lock records resolution-mode = "lowest-direct"; a sync without the same flag says
+# "Ignoring existing lockfile due to change in resolution mode" and silently re-resolves to
+# the newest versions, which is what this lane did until 2026-09-10. --locked makes that fatal.
+	uv sync --locked --resolution lowest-direct
+	uv sync --locked --resolution lowest-direct --reinstall-package $(DIST)
 
 format: ## Fix import order and formatting
 	uv run ruff check --select I --fix
