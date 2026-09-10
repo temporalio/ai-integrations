@@ -122,7 +122,7 @@ SDK side: remove the module, tests, the `openai-agents` extra, CODEOWNERS lines,
 
 ```bash
 cd python/<name> && make sync && make lint && make test && make build
-uv run --project scripts pytest                          # tooling script tests
+uv run --project scripts --locked pytest scripts/tests -q # tooling script tests
 uv run --project scripts python scripts/ci/check_conventions.py
 uv run --project scripts python scripts/ci/detect_changes.py --dry-run --base origin/main
 uv run --project scripts python scripts/ci/check_wheel.py --plugin-dir python/<name> --dist python/<name>/dist
