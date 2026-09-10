@@ -91,7 +91,11 @@ class _OpenAIMCPServerBackend:
             if next_cursor is None:
                 return values
             if next_cursor in seen_cursors:
-                raise ValueError("MCP server returned a repeated pagination cursor")
+                raise ApplicationError(
+                    "MCP server returned a repeated pagination cursor",
+                    type="MCPProtocolError",
+                    non_retryable=True,
+                )
             cursor = next_cursor
 
     async def read_resource(self, uri: str) -> ReadResourceResult:

@@ -238,15 +238,36 @@ class WeatherServiceHandler:
 def weather_mock_model():
     return TestModel.returning_responses(
         [
-            ResponseBuilders.tool_call('{"city":"Tokyo"}', "get_weather"),
             ResponseBuilders.tool_call(
-                '{"input":{"city":"Tokyo"}}', "get_weather_object"
+                '{"city":"Tokyo"}',
+                "get_weather",
+                call_id="call-get-weather",
+                item_id="item-get-weather",
             ),
             ResponseBuilders.tool_call(
-                '{"city":"Tokyo","country":"Japan"}', "get_weather_country"
+                '{"input":{"city":"Tokyo"}}',
+                "get_weather_object",
+                call_id="call-get-weather-object",
+                item_id="item-get-weather-object",
             ),
-            ResponseBuilders.tool_call('{"city":"Tokyo"}', "get_weather_context"),
-            ResponseBuilders.tool_call('{"city":"Tokyo"}', "get_weather_method"),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo","country":"Japan"}',
+                "get_weather_country",
+                call_id="call-get-weather-country",
+                item_id="item-get-weather-country",
+            ),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo"}',
+                "get_weather_context",
+                call_id="call-get-weather-context",
+                item_id="item-get-weather-context",
+            ),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo"}',
+                "get_weather_method",
+                call_id="call-get-weather-method",
+                item_id="item-get-weather-method",
+            ),
             ResponseBuilders.output_message("Test weather result"),
         ]
     )
@@ -892,7 +913,12 @@ def customer_service_mock_model():
     return TestModel.returning_responses(
         [
             ResponseBuilders.output_message("Hi there! How can I assist you today?"),
-            ResponseBuilders.tool_call("{}", "transfer_to_seat_booking_agent"),
+            ResponseBuilders.tool_call(
+                "{}",
+                "transfer_to_seat_booking_agent",
+                call_id="call-transfer-to-seat-booking-agent",
+                item_id="item-transfer-to-seat-booking-agent",
+            ),
             ResponseBuilders.output_message(
                 "Could you please provide your confirmation number?"
             ),
@@ -902,11 +928,18 @@ def customer_service_mock_model():
             ResponseBuilders.tool_call(
                 '{"confirmation_number":"11111","new_seat":"window seat"}',
                 "update_seat",
+                call_id="call-update-seat",
+                item_id="item-update-seat",
             ),
             ResponseBuilders.output_message(
                 "Your seat has been updated to a window seat. If there's anything else you need, feel free to let me know!"
             ),
-            ResponseBuilders.tool_call("{}", "transfer_to_triage_agent"),
+            ResponseBuilders.tool_call(
+                "{}",
+                "transfer_to_triage_agent",
+                call_id="call-transfer-to-triage-agent",
+                item_id="item-transfer-to-triage-agent",
+            ),
             ResponseBuilders.output_message("You're welcome!"),
         ]
     )
@@ -2565,10 +2598,14 @@ def tracking_mcp_mock_model():
             ResponseBuilders.tool_call(
                 arguments='{"name":"Tom"}',
                 name="Say-Hello",
+                call_id="call-say-hello-tom",
+                item_id="item-say-hello-tom",
             ),
             ResponseBuilders.tool_call(
                 arguments='{"name":"Tim"}',
                 name="Say-Hello",
+                call_id="call-say-hello-tim",
+                item_id="item-say-hello-tim",
             ),
             ResponseBuilders.output_message("Hi Tom and Tim!"),
         ]

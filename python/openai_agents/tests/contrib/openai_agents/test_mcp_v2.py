@@ -8,7 +8,13 @@ from agents import Agent, AgentBase, RunContextWrapper, Runner
 from agents.mcp import MCPServer as AgentsMCPServer
 from mcp import Client as MCPClient
 from mcp.server.mcpserver import MCPServer as SDKMCPServer
-from mcp.types import CallToolResult, GetPromptResult, ListPromptsResult, Tool
+from mcp.types import (
+    CallToolResult,
+    GetPromptResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    Tool,
+)
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -221,4 +227,23 @@ def test_static_worker_side_tool_filter_is_allowed() -> None:
         _mcp_server_backend_factory("hello", factory),
     )()
     assert isinstance(backend, _OpenAIMCPServerBackend)
-    assert backend._server.tool_filter == {"blocked_tool_names": ["say_hello"]}
+    assert backend._server.tool_filter == {  # type: ignore[attr-defined]
+        "blocked_tool_names": ["say_hello"]
+    }
+
+
+async def test_repeated_pagination_cursor_is_non_retryable() -> None:
+    class RepeatingCursorServer:
+        async def list_resources(
+            self, _cursor: str | None = None
+        ) -> ListResourcesResult:
+            return ListResourcesResult(resources=[], next_cursor="repeated")
+
+    backend = _OpenAIMCPServerBackend(
+        cast(AgentsMCPServer, cast(object, RepeatingCursorServer()))
+    )
+    with pytest.raises(ApplicationError) as err:
+        await backend.list_resources()
+
+    assert err.value.type == "MCPProtocolError"
+    assert err.value.non_retryable

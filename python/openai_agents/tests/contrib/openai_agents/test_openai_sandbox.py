@@ -1460,10 +1460,23 @@ async def test_sandbox_e2e_runner(client: Client):
 
     mock_model = TestModel.returning_responses(
         [
-            ResponseBuilders.tool_call('{"cmd": "echo hello"}', "run_command"),
-            ResponseBuilders.tool_call('{"path": "/tmp/test.txt"}', "read_file"),
             ResponseBuilders.tool_call(
-                '{"path": "/tmp/out.txt", "data": "hello"}', "write_file"
+                '{"cmd": "echo hello"}',
+                "run_command",
+                call_id="call-run-command",
+                item_id="item-run-command",
+            ),
+            ResponseBuilders.tool_call(
+                '{"path": "/tmp/test.txt"}',
+                "read_file",
+                call_id="call-read-file",
+                item_id="item-read-file",
+            ),
+            ResponseBuilders.tool_call(
+                '{"path": "/tmp/out.txt", "data": "hello"}',
+                "write_file",
+                call_id="call-write-file",
+                item_id="item-write-file",
             ),
             ResponseBuilders.output_message("Done."),
         ]
