@@ -6,6 +6,10 @@ author, date and message intact. The result is merged into this repository with 
 unrelated-histories merge commit. `git log --follow`, `git blame` and `git shortlog` then work on
 the imported files exactly as they did upstream.
 
+Imported history means commits reachable from the upstream repository's default branch. Never use
+this procedure, the `history-import` label or `IMPORTS.md` for work that exists only on an unmerged
+or closed upstream PR, feature branch or fork; port that work as ordinary local commits instead.
+
 ## Procedure
 
 ```bash
@@ -69,9 +73,9 @@ Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merg
 
 1. Run the script unchanged, fetch, and `git merge sdk-python-filtered/main` on a new branch.
    Only commits newer than the previous import arrive because the rewrite is byte-identical.
-2. Resolve conflicts only where adaptation commits touched imported files (there should be
-   none while the transition rules are followed, except in the `openai_agents` MCP v2 adapter
-   files listed in AGENTS.md, "Transition rules": keep both sides there).
+2. Resolve conflicts only where adaptation commits or documented local-only divergences touched
+   imported files. For the `openai_agents` MCP v2 adapter files listed in AGENTS.md, "Transition
+   rules", preserve both the new upstream changes and the local adapter.
 3. Diff the vendored test scaffolding against upstream and port relevant changes by hand:
    `tests/conftest.py`, `tests/__init__.py`, `tests/helpers/__init__.py`, `tests/helpers/nexus.py`.
 4. If upstream added provider-network tests, add deterministic local coverage without credentials.
@@ -81,12 +85,12 @@ Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merg
 
 The rewrite stays byte-identical only if none of these change: the `--path`/`--path-rename`
 arguments, `replace-message.txt`, the commit callback, `--prune-empty`/`--preserve-commit-hashes`,
-the pinned git-filter-repo version, and upstream history itself (a force-push or a `SRC_REF`
-that is not a descendant of the previous import). If a rule must change, the plugin needs a
-one-time full re-import PR (delete `python/<plugin>`, import again, re-apply adaptation
-commits) and a note in `IMPORTS.md`. A `SRC_REF` from a closed upstream PR is the exception
-that needs only the `IMPORTS.md` note: its filtered commits share byte-identical history with
-`main` up to the merge base, and they can never arrive from upstream a second time.
+the pinned git-filter-repo version, and upstream default-branch history itself. `SRC_REF` must be
+both reachable from the upstream default branch and a descendant of the previous import. Stop if
+either condition is false; a PR or feature-branch ref is not a history-import input and its changes
+must be ported as ordinary local commits. If a rewrite rule changes or upstream rewrites its default
+branch, the plugin needs a one-time full re-import PR (delete `python/<plugin>`, import again,
+re-apply adaptation and documented local-only commits) and a note in `IMPORTS.md`.
 
 ## Adding another plugin
 
