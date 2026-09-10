@@ -8,6 +8,10 @@ from typing import Any, Protocol
 from mcp.types import (
     CallToolResult,
     GetPromptResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
+    ListToolsResult,
     Prompt,
     ReadResourceResult,
     RequestParamsMeta,
@@ -40,7 +44,7 @@ class _MCPBackend(Protocol):
     @property
     def cacheable(self) -> bool: ...
 
-    async def list_tools(self) -> list[Tool]: ...
+    async def list_tools(self) -> ListToolsResult | list[Tool]: ...
 
     async def call_tool(
         self,
@@ -49,15 +53,17 @@ class _MCPBackend(Protocol):
         meta: RequestParamsMeta | None,
     ) -> CallToolResult: ...
 
-    async def list_prompts(self) -> list[Prompt]: ...
+    async def list_prompts(self) -> ListPromptsResult | list[Prompt]: ...
 
     async def get_prompt(
         self, name: str, arguments: dict[str, str] | None
     ) -> GetPromptResult: ...
 
-    async def list_resources(self) -> list[Resource]: ...
+    async def list_resources(self) -> ListResourcesResult | list[Resource]: ...
 
-    async def list_resource_templates(self) -> list[ResourceTemplate]: ...
+    async def list_resource_templates(
+        self,
+    ) -> ListResourceTemplatesResult | list[ResourceTemplate]: ...
 
     async def read_resource(self, uri: str) -> ReadResourceResult: ...
 

@@ -49,6 +49,14 @@ class FakeClient:
     def _page(self, cursor: str | None) -> tuple[str, str | None]:
         return ("one", "next") if cursor is None else ("two", None)
 
+    def _envelope(self, name: str) -> dict[str, Any]:
+        return {
+            "meta": {f"page-{name}": True},
+            "ttl_ms": 2000 if name == "one" else 1000,
+            "cache_scope": "public" if name == "one" else "private",
+            "result_type": "test/list",
+        }
+
     async def list_tools(
         self, *, cursor: str | None, cache_mode: str
     ) -> ListToolsResult:
@@ -57,6 +65,7 @@ class FakeClient:
         return ListToolsResult(
             tools=[Tool(name=name, input_schema={"type": "object"})],
             next_cursor=next_cursor,
+            **self._envelope(name),
         )
 
     async def list_prompts(
@@ -64,7 +73,11 @@ class FakeClient:
     ) -> ListPromptsResult:
         assert cache_mode == "bypass"
         name, next_cursor = self._page(cursor)
-        return ListPromptsResult(prompts=[Prompt(name=name)], next_cursor=next_cursor)
+        return ListPromptsResult(
+            prompts=[Prompt(name=name)],
+            next_cursor=next_cursor,
+            **self._envelope(name),
+        )
 
     async def list_resources(
         self, *, cursor: str | None, cache_mode: str
@@ -74,6 +87,7 @@ class FakeClient:
         return ListResourcesResult(
             resources=[Resource(name=name, uri=f"test://{name}")],
             next_cursor=next_cursor,
+            **self._envelope(name),
         )
 
     async def list_resource_templates(
@@ -86,6 +100,7 @@ class FakeClient:
                 ResourceTemplate(name=name, uri_template=f"test://{name}/{{id}}")
             ],
             next_cursor=next_cursor,
+            **self._envelope(name),
         )
 
     async def call_tool(
@@ -146,6 +161,10 @@ async def test_operations_are_plain_json_and_lists_are_fully_paginated() -> None
             )
             assert [item["name"] for item in result[result_key]] == ["one", "two"]
             assert result["next_cursor"] is None
+            assert result["meta"] == {"page-one": True, "page-two": True}
+            assert result["ttl_ms"] == 1000
+            assert result["cache_scope"] == "private"
+            assert result["result_type"] == "test/list"
 
         tool_result = await functions["temporalio.contrib.mcp.test.call-tool"](
             {**request, "name": "echo", "arguments": {}, "meta": {"trace": "value"}}

@@ -37,6 +37,7 @@ from temporalio.contrib.mcp._pool import _MCPConnectionPool
 from temporalio.exceptions import ApplicationError
 
 _Result = TypeVar("_Result")
+_ListResult = TypeVar("_ListResult", bound=BaseModel)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,15 @@ _NON_RETRYABLE_PROTOCOL_ERRORS = {
 
 def _dump(model: BaseModel) -> dict[str, Any]:
     return model.model_dump(mode="json")
+
+
+def _normalize_list_result(
+    value: BaseModel | list[Any], result_type: type[_ListResult], field: str
+) -> _ListResult:
+    """Wrap list-only compatibility backends in an MCP result envelope."""
+    if isinstance(value, result_type):
+        return value
+    return result_type.model_validate({field: value})
 
 
 class _MCPActivities:
@@ -115,15 +125,12 @@ class _MCPActivities:
                 request: dict[str, Any], server: str = server
             ) -> dict[str, Any]:
                 parsed = _MCPRequest(**request)
-                return _dump(
-                    ListToolsResult(
-                        tools=await self._run(
-                            server,
-                            parsed,
-                            lambda backend: backend.list_tools(),
-                        )
-                    )
+                result = await self._run(
+                    server,
+                    parsed,
+                    lambda backend: backend.list_tools(),
                 )
+                return _dump(_normalize_list_result(result, ListToolsResult, "tools"))
 
             @activity.defn(name=_activity_name(server, "call-tool"))
             async def call_tool(
@@ -146,14 +153,13 @@ class _MCPActivities:
                 request: dict[str, Any], server: str = server
             ) -> dict[str, Any]:
                 parsed = _MCPRequest(**request)
+                result = await self._run(
+                    server,
+                    parsed,
+                    lambda backend: backend.list_prompts(),
+                )
                 return _dump(
-                    ListPromptsResult(
-                        prompts=await self._run(
-                            server,
-                            parsed,
-                            lambda backend: backend.list_prompts(),
-                        )
-                    )
+                    _normalize_list_result(result, ListPromptsResult, "prompts")
                 )
 
             @activity.defn(name=_activity_name(server, "get-prompt"))
@@ -176,14 +182,13 @@ class _MCPActivities:
                 request: dict[str, Any], server: str = server
             ) -> dict[str, Any]:
                 parsed = _MCPRequest(**request)
+                result = await self._run(
+                    server,
+                    parsed,
+                    lambda backend: backend.list_resources(),
+                )
                 return _dump(
-                    ListResourcesResult(
-                        resources=await self._run(
-                            server,
-                            parsed,
-                            lambda backend: backend.list_resources(),
-                        )
-                    )
+                    _normalize_list_result(result, ListResourcesResult, "resources")
                 )
 
             @activity.defn(name=_activity_name(server, "list-resource-templates"))
@@ -191,13 +196,16 @@ class _MCPActivities:
                 request: dict[str, Any], server: str = server
             ) -> dict[str, Any]:
                 parsed = _MCPRequest(**request)
+                result = await self._run(
+                    server,
+                    parsed,
+                    lambda backend: backend.list_resource_templates(),
+                )
                 return _dump(
-                    ListResourceTemplatesResult(
-                        resource_templates=await self._run(
-                            server,
-                            parsed,
-                            lambda backend: backend.list_resource_templates(),
-                        )
+                    _normalize_list_result(
+                        result,
+                        ListResourceTemplatesResult,
+                        "resource_templates",
                     )
                 )
 

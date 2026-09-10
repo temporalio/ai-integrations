@@ -99,7 +99,9 @@ return a complete result with `next_cursor=None`. `list_tools()` is cached per
 schedule no further Activities (a new instance starts with an empty cache). Set
 `cache_tools_list=False` to schedule an Activity for every call. Every Activity
 asks the server directly; the MCP client's own response cache is bypassed
-because workflow history is the durable record.
+because workflow history is the durable record. For a multi-page result,
+response metadata is merged in page order, the shortest `ttl_ms` is retained,
+and `cache_scope` is `private` when any page is private.
 
 All operations default to a one-minute start-to-close timeout per Activity
 attempt. Override this with an `ActivityConfig`; the default is added only when
