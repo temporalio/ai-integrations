@@ -52,10 +52,12 @@ class _MCPClientBackend:
         cursor: str | None = None
         seen_cursors: set[str | None] = set()
         while True:
-            options: dict[str, Any] = {"cursor": cursor}
-            if method == "list_tools":
-                options["cache_mode"] = "bypass"
-            result = await getattr(self._client, method)(**options)
+            # Workflow history is the durable cache for every operation, so the
+            # client-side response cache (server ``ttlMs`` hints) is bypassed:
+            # each Activity must observe the server, not a worker-local copy.
+            result = await getattr(self._client, method)(
+                cursor=cursor, cache_mode="bypass"
+            )
             values.extend(getattr(result, field))
             seen_cursors.add(cursor)
             next_cursor = result.next_cursor
@@ -95,7 +97,7 @@ class _MCPClientBackend:
         return await self._list_all("list_resource_templates", "resource_templates")
 
     async def read_resource(self, uri: str) -> ReadResourceResult:
-        return await self._client.read_resource(uri)
+        return await self._client.read_resource(uri, cache_mode="bypass")
 
 
 _MCPClientFactory = Callable[[], Client] | Callable[[Any], Client]

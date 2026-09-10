@@ -94,12 +94,16 @@ The proxy exposes these MCP operations, each backed by a named Activity:
 | `read_resource()` | `read-resource` | `ReadResourceResult` |
 
 List operations follow every server pagination cursor within one Activity and
-return a complete result with `next_cursor=None`. `list_tools()` is cached in
-replay-safe workflow state by default. Set `cache_tools_list=False` to schedule
-an Activity for every call.
+return a complete result with `next_cursor=None`. `list_tools()` is cached per
+`TemporalMCPClient` instance by default, so repeated calls on the same object
+schedule no further Activities (a new instance starts with an empty cache). Set
+`cache_tools_list=False` to schedule an Activity for every call. Every Activity
+asks the server directly; the MCP client's own response cache is bypassed
+because workflow history is the durable record.
 
 All operations default to a one-minute start-to-close timeout. Override this
-with an `ActivityConfig`:
+with an `ActivityConfig`; the default is added only when the config sets
+neither `start_to_close_timeout` nor `schedule_to_close_timeout`:
 
 ```python
 from datetime import timedelta
@@ -118,6 +122,37 @@ effects should be idempotent, usually by accepting a stable idempotency key.
 MCP operations do not heartbeat. Do not set `heartbeat_timeout` in
 `activity_config`; cancellation cannot interrupt an in-flight MCP request and
 takes effect when its start-to-close timeout expires.
+
+## Errors and retries
+
+A tool that fails returns a normal `CallToolResult` with `is_error=True`; the
+workflow decides what to do with it. A JSON-RPC error response (an unknown
+tool, prompt or resource, invalid arguments, a server-side failure) fails the
+Activity with an `ApplicationError` of type `MCPProtocolError` whose
+`details[0]` is the JSON-RPC error code. Errors a retry cannot fix (parse and
+invalid-request errors, unknown methods, invalid params, protocol-version,
+header and capability mismatches, and URL elicitation) are non-retryable.
+Internal server errors, closed connections, request timeouts and transport
+exceptions stay retryable, and the default `activity_config` has no
+`retry_policy`, so they retry until the start-to-close timeout expires. Set a
+`retry_policy` when that is not what you want:
+
+```python
+from datetime import timedelta
+from temporalio.common import RetryPolicy
+from temporalio.contrib.mcp import TemporalMCPClient
+
+mcp = TemporalMCPClient(
+    "weather",
+    activity_config={
+        "start_to_close_timeout": timedelta(seconds=20),
+        "retry_policy": RetryPolicy(maximum_attempts=3),
+    },
+)
+```
+
+A JSON-RPC error response leaves the shared worker connection in place; only a
+closed connection or a request timeout makes the worker reconnect.
 
 ## Connections and configuration
 

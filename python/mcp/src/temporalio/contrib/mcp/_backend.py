@@ -20,7 +20,13 @@ from temporalio.exceptions import ApplicationError
 
 
 class _MCPBackend(Protocol):
-    """Normalized worker-side MCP operations used by the Activity layer."""
+    """Normalized worker-side MCP operations used by the Activity layer.
+
+    Implemented here by ``_client._MCPClientBackend`` and, in
+    ``temporalio-openai-agents``, by an adapter over the OpenAI Agents
+    ``MCPServer``. A change to this protocol, ``_FactoryInvoker`` or
+    ``_activities._MCPActivities`` is a coordinated release across both packages.
+    """
 
     async def __aenter__(self) -> "_MCPBackend": ...
 

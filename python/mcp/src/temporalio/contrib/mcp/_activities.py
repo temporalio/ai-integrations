@@ -9,10 +9,14 @@ from typing import Any, TypeVar
 
 from mcp import MCPError
 from mcp.types import (
+    HEADER_MISMATCH,
     INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
     PARSE_ERROR,
+    UNSUPPORTED_PROTOCOL_VERSION,
+    URL_ELICITATION_REQUIRED,
     ListPromptsResult,
     ListResourcesResult,
     ListResourceTemplatesResult,
@@ -38,11 +42,17 @@ logger = logging.getLogger(__name__)
 
 # Upper bound on how long worker shutdown waits for MCP transports to close.
 _CLOSE_TIMEOUT_SECONDS = 10.0
+# JSON-RPC errors that a retry of the same request cannot fix. INTERNAL_ERROR,
+# CONNECTION_CLOSED, REQUEST_TIMEOUT and unknown codes stay retryable.
 _NON_RETRYABLE_PROTOCOL_ERRORS = {
     PARSE_ERROR,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
     INVALID_PARAMS,
+    HEADER_MISMATCH,
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
+    UNSUPPORTED_PROTOCOL_VERSION,
+    URL_ELICITATION_REQUIRED,
 }
 
 
@@ -51,7 +61,11 @@ def _dump(model: BaseModel) -> dict[str, Any]:
 
 
 class _MCPActivities:
-    """Build framework-neutral MCP operation Activities for named backends."""
+    """Build framework-neutral MCP operation Activities for named backends.
+
+    ``temporalio-openai-agents`` builds on this class and on ``_backend``; a
+    change to either is a coordinated release across both packages.
+    """
 
     def __init__(
         self,

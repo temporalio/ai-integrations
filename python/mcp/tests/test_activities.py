@@ -8,6 +8,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.types import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
+    URL_ELICITATION_REQUIRED,
     CallToolResult,
     GetPromptResult,
     ListPromptsResult,
@@ -56,11 +57,17 @@ class FakeClient:
             next_cursor=next_cursor,
         )
 
-    async def list_prompts(self, *, cursor: str | None) -> ListPromptsResult:
+    async def list_prompts(
+        self, *, cursor: str | None, cache_mode: str
+    ) -> ListPromptsResult:
+        assert cache_mode == "bypass"
         name, next_cursor = self._page(cursor)
         return ListPromptsResult(prompts=[Prompt(name=name)], next_cursor=next_cursor)
 
-    async def list_resources(self, *, cursor: str | None) -> ListResourcesResult:
+    async def list_resources(
+        self, *, cursor: str | None, cache_mode: str
+    ) -> ListResourcesResult:
+        assert cache_mode == "bypass"
         name, next_cursor = self._page(cursor)
         return ListResourcesResult(
             resources=[Resource(name=name, uri=f"test://{name}")],
@@ -68,8 +75,9 @@ class FakeClient:
         )
 
     async def list_resource_templates(
-        self, *, cursor: str | None
+        self, *, cursor: str | None, cache_mode: str
     ) -> ListResourceTemplatesResult:
+        assert cache_mode == "bypass"
         name, next_cursor = self._page(cursor)
         return ListResourceTemplatesResult(
             resource_templates=[
@@ -95,7 +103,8 @@ class FakeClient:
             messages=[PromptMessage(role="user", content=TextContent(text=name))]
         )
 
-    async def read_resource(self, uri: str) -> ReadResourceResult:
+    async def read_resource(self, uri: str, *, cache_mode: str) -> ReadResourceResult:
+        assert cache_mode == "bypass"
         return ReadResourceResult(
             contents=[TextResourceContents(uri=uri, text="contents")]
         )
@@ -220,6 +229,40 @@ async def test_internal_protocol_error_remains_retryable() -> None:
     assert err.value.type == "MCPProtocolError"
     assert err.value.non_retryable is False
     assert err.value.details == (INTERNAL_ERROR,)
+
+
+async def test_permanent_protocol_error_fails_without_retry() -> None:
+    class ElicitingClient(FakeClient):
+        async def call_tool(
+            self,
+            name: str,
+            _arguments: dict[str, Any] | None,
+            *,
+            meta: dict[str, Any] | None,
+        ) -> CallToolResult:
+            raise MCPError(URL_ELICITATION_REQUIRED, f"{name} needs a browser")
+
+    support = _MCPActivities(
+        {"test": lambda: _MCPClientBackend(cast(Any, ElicitingClient()))},
+        idle_timeout=timedelta(minutes=5),
+    )
+    call_tool = _activity_by_name(support, "temporalio.contrib.mcp.test.call-tool")
+    try:
+        with pytest.raises(ApplicationError, match="needs a browser") as err:
+            await call_tool(
+                {
+                    "factory_argument": None,
+                    "name": "login",
+                    "arguments": {},
+                    "meta": None,
+                }
+            )
+    finally:
+        await support._pool.close()
+
+    assert err.value.type == "MCPProtocolError"
+    assert err.value.non_retryable is True
+    assert err.value.details == (URL_ELICITATION_REQUIRED,)
 
 
 async def test_shared_plugin_closes_after_last_run_context(
