@@ -3,7 +3,9 @@
 
 Subcommands:
   parse-tag TAG                 validate `<language>/<plugin>/v<version>` and emit its parts
-  check-version-policy          enforce the version policy against the production registry
+  check-version-policy          enforce the version policy against the production registry (and,
+                                with --check-testpypi, warn when the version is already staged there)
+  verify-index-files            prove the files an index serves for a version are the local artifacts
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
 
@@ -19,11 +21,13 @@ Policy (AGENTS.md, "Release runbook"):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -32,7 +36,14 @@ from pathlib import Path
 from packaging.version import InvalidVersion, Version
 
 TAG_RE = re.compile(r"^(?P<language>python|typescript|java|go)/(?P<plugin>[a-z0-9_.-]+)/v(?P<version>.+)$")
-REGISTRY_JSON = {"pypi": "https://pypi.org/pypi/{coordinate}/json"}
+REGISTRY_JSON = {
+    "pypi": "https://pypi.org/pypi/{coordinate}/json",
+    "testpypi": "https://test.pypi.org/pypi/{coordinate}/json",
+}
+RELEASE_JSON = {
+    "pypi": "https://pypi.org/pypi/{coordinate}/{version}/json",
+    "testpypi": "https://test.pypi.org/pypi/{coordinate}/{version}/json",
+}
 FIRST_VERSION = {"ga": Version("1.0.0"), "preview": Version("0.1.0"), "experimental": Version("0.1.0")}
 TRANSITION_MARKER = "TRANSITION(sdk-cutover)"
 DEFAULT_REPO = "temporalio/ai-integrations"
@@ -80,6 +91,7 @@ def parse_tag(tag: str) -> dict[str, str]:
     if str(version) != raw:
         raise PolicyError(f"tag version {raw!r} is not canonical PEP 440 (expected {version})")
     return {
+        "tag": tag,
         "language": m.group("language"),
         "plugin": m.group("plugin"),
         "version": raw,
@@ -104,22 +116,24 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- policy
 
 
+def _fetch_json(url: str, local: Path | None = None) -> dict | None:
+    """GET a registry JSON document; 404 -> None; anything else fails closed. `local` replaces the network (tests)."""
+    if local is not None:
+        return json.loads(local.read_text(encoding="utf-8")) if local.is_file() else None
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise PolicyError(f"registry returned HTTP {exc.code} for {url}; refusing to guess (fail closed)") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise PolicyError(f"registry unreachable ({exc}); refusing to guess (fail closed)") from exc
+
+
 def fetch_published_versions(coordinate: str, registry: str, registry_json: Path | None = None) -> list[Version]:
     """Return every published version (yanked included). 404 -> []. Anything else fails closed."""
-    if registry_json is not None:
-        data = json.loads(registry_json.read_text(encoding="utf-8")) if registry_json.is_file() else None
-    else:
-        url = REGISTRY_JSON[registry].format(coordinate=coordinate)
-        try:
-            with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                data = None
-            else:
-                raise PolicyError(f"registry returned HTTP {exc.code} for {url}; refusing to guess (fail closed)") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
-            raise PolicyError(f"registry unreachable ({exc}); refusing to guess (fail closed)") from exc
+    data = _fetch_json(REGISTRY_JSON[registry].format(coordinate=coordinate), registry_json)
     if not data:
         return []
     versions: list[Version] = []
@@ -147,13 +161,18 @@ def check_policy(version: Version, maturity: str, published: list[Version]) -> N
 
 
 def transition_markers(repo_root: Path, plugin_dir: str) -> list[str]:
+    """List plugin files containing the transition marker. Fails closed on any git error."""
     try:
         out = subprocess.run(
             ["git", "grep", "-l", TRANSITION_MARKER, "--", plugin_dir],
             capture_output=True, text=True, cwd=repo_root,
         )
-    except FileNotFoundError:
-        return []
+    except FileNotFoundError as exc:
+        raise PolicyError(f"git is required to check for {TRANSITION_MARKER} markers: {exc}") from exc
+    # git grep exits 1 for "no match"; anything else (not a repo, bad pathspec, ...) is an error
+    # and must not be mistaken for "no markers".
+    if out.returncode not in (0, 1):
+        raise PolicyError(f"git grep for {TRANSITION_MARKER} failed in {repo_root} ({out.returncode}): {out.stderr.strip()}")
     return [line for line in out.stdout.splitlines() if line.strip()]
 
 
@@ -167,6 +186,17 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     published = fetch_published_versions(coordinate, registry, Path(args.registry_json) if args.registry_json else None)
     check_policy(version, maturity, published)
     print(f"OK: {coordinate} {version} satisfies the version policy (published: {[str(v) for v in sorted(published)] or 'none'})")
+    if registry == "pypi" and (args.check_testpypi or args.testpypi_json):
+        # Every release is staged on TestPyPI first and uploads are immutable, so a re-run finds the
+        # version already there and skip-existing keeps the upload from failing. That is the normal
+        # recovery path (a rejected environment approval, a flaky smoke), so only warn here; the
+        # smoke job proves the served files are this run's artifacts (verify-index-files).
+        staged = fetch_published_versions(coordinate, "testpypi", Path(args.testpypi_json) if args.testpypi_json else None)
+        if version in staged:
+            print(f"::warning::{coordinate} {version} already exists on TestPyPI: the TestPyPI upload will be skipped "
+                  "and smoke-testpypi verifies that the served files are this run's artifacts")
+        else:
+            print(f"OK: {coordinate} {version} is not yet on TestPyPI")
     if not version.is_prerelease:
         if not meta.get("release", {}).get("allow-final"):
             raise PolicyError(
@@ -178,6 +208,62 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
         if markers:
             raise PolicyError(f"final release blocked: {TRANSITION_MARKER} markers remain in {markers}")
         print("OK: final-release gates satisfied (allow-final = true, no transition markers)")
+    return 0
+
+
+# --------------------------------------------------------------------------- index files
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def index_release_files(coordinate: str, version: str, registry: str, index_json: Path | None = None) -> dict[str, str]:
+    """Return {filename: sha256} for one version on the index (empty when the version is absent)."""
+    data = _fetch_json(RELEASE_JSON[registry].format(coordinate=coordinate, version=version), index_json)
+    if not data:
+        return {}
+    return {entry["filename"]: entry["digests"]["sha256"] for entry in data.get("urls", [])}
+
+
+def verify_index_files(coordinate: str, version: str, registry: str, dist: Path, *, attempts: int, delay: float, index_json: Path | None = None) -> None:
+    """Fail unless every local distribution file is served by the index with an identical sha256.
+
+    Uploads are immutable and the publish step skips files that already exist, so this is what
+    makes "the published bytes are the tested bytes" true on a re-run as well as on the first run.
+    """
+    local = {path.name: _sha256(path) for path in sorted(dist.iterdir()) if path.is_file()}
+    if not local:
+        raise PolicyError(f"no distribution files in {dist}")
+    remote: dict[str, str] = {}
+    for attempt in range(1, attempts + 1):
+        remote = index_release_files(coordinate, version, registry, index_json)
+        missing = sorted(set(local) - set(remote))
+        if not missing:
+            break
+        if attempt == attempts:
+            raise PolicyError(f"{registry} does not serve {missing} for {coordinate} {version} after {attempts} attempts")
+        print(f"{missing} not yet on {registry}; waiting for index propagation (attempt {attempt}/{attempts})")
+        time.sleep(delay)
+    mismatched = sorted(name for name, digest in local.items() if remote[name] != digest)
+    if mismatched:
+        raise PolicyError(
+            f"{registry} serves different bytes than this run built for {mismatched}: an earlier upload of "
+            f"{coordinate} {version} is what users get. Uploads are immutable; fix forward with the next version"
+        )
+    for name in sorted(local):
+        print(f"OK: {name} on {registry} matches the tested artifact (sha256 {local[name][:12]}...)")
+
+
+def cmd_verify_index_files(args: argparse.Namespace) -> int:
+    verify_index_files(
+        args.coordinate, args.version, args.index, Path(args.dist),
+        attempts=args.attempts, delay=args.delay, index_json=Path(args.index_json) if args.index_json else None,
+    )
     return 0
 
 
@@ -227,7 +313,8 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
                 f"from https://github.com/{up_repo}/commits/main/{up_path}.",
                 "",
             ]
-        lines += [f"**Source**: https://github.com/{repo}/tree/{tag}/{plugin_dir}", ""]
+        # refs/tags/ keeps GitHub from reading the slash-separated tag as a ref plus a path.
+        lines += [f"**Source**: https://github.com/{repo}/tree/refs/tags/{tag}/{plugin_dir}", ""]
     else:
         prev_tag, _ = prev
         log = _git("log", "--no-decorate", "--format=%h%x1f%s", f"{prev_tag}..{tag}", "--", plugin_dir, cwd=repo_root)
@@ -245,11 +332,15 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
             "## Pre-release notes",
             "",
             "- This pre-release is published to **TestPyPI only** to validate the release pipeline.",
-            f"- Do **not** install it alongside a `temporalio` release that still embeds `{root_api or coordinate}`; both distributions "
-            "write the same files and whichever installs last wins. Wait for the SDK cutover release.",
-            "- docs.temporal.io still describes the SDK-embedded install until the cutover.",
-            "",
         ]
+        if not meta.get("release", {}).get("allow-final", False):
+            # Only a plugin the SDK still bundles shares files with it.
+            lines += [
+                f"- Do **not** install it alongside a `temporalio` release that still embeds `{root_api or coordinate}`; both distributions "
+                "write the same files and whichever installs last wins. Wait for the SDK cutover release.",
+                "- docs.temporal.io still describes the SDK-embedded install until the cutover.",
+            ]
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -301,22 +392,23 @@ def cmd_draft_release(args: argparse.Namespace) -> int:
             raise PolicyError("release was created but could not be found afterwards")
         print(f"created draft release {release_id} for {args.tag}")
     else:
+        existing = json.loads(_gh("api", f"repos/{repo}/releases/{release_id}"))
+        if not existing.get("draft"):
+            # Runbook step 4 publishes the draft by hand; a later re-run must not un-publish it or
+            # swap its assets.
+            raise PolicyError(f"the release for {args.tag} is already published; refusing to modify it")
         body = Path(args.notes).read_text(encoding="utf-8")
         _gh("api", "-X", "PATCH", f"repos/{repo}/releases/{release_id}", "-f", f"name={args.title}",
             "-F", "draft=true", "-F", f"prerelease={'true' if args.prerelease else 'false'}", "-f", f"body={body}")
         print(f"updated existing release {release_id} for {args.tag}")
-    existing: list[dict] = []
-    for page in _json_documents(_gh("api", f"repos/{repo}/releases/{release_id}/assets?per_page=100", "--paginate")):
-        existing.extend(page if isinstance(page, list) else [page])
-    by_name = {a["name"]: a["id"] for a in existing}
-    for path in sorted(Path(args.dist).iterdir()):
-        if not path.is_file():
-            continue
-        if path.name in by_name:
-            _gh("api", "-X", "DELETE", f"repos/{repo}/releases/assets/{by_name[path.name]}")
-        upload_url = f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={path.name}"
-        _gh("api", "-X", "POST", "-H", "Content-Type: application/octet-stream", "--input", str(path), upload_url)
-        print(f"uploaded {path.name}")
+    assets = [str(path) for path in sorted(Path(args.dist).iterdir()) if path.is_file()]
+    if assets:
+        # gh resolves a draft by its pending tag and streams the binaries itself. --clobber deletes a
+        # same-name asset before re-uploading it (not atomic), which is fine for a draft nobody has
+        # downloaded yet; the published-release guard above keeps it away from anything final.
+        _gh("release", "upload", args.tag, *assets, "--repo", repo, "--clobber")
+        for asset in assets:
+            print(f"uploaded {Path(asset).name}")
     print(f"OK: draft release ready: https://github.com/{repo}/releases/tag/{args.tag}")
     return 0
 
@@ -338,7 +430,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--plugin-dir", required=True)
     p.add_argument("--version", required=True)
     p.add_argument("--registry-json", default=None, help="read published versions from this file instead of the registry (tests)")
+    p.add_argument("--check-testpypi", action="store_true", help="also warn when the version is already staged on TestPyPI")
+    p.add_argument("--testpypi-json", default=None, help="read TestPyPI versions from this file instead of the registry (tests)")
     p.set_defaults(func=cmd_check_version_policy)
+
+    p = sub.add_parser("verify-index-files", help="fail unless the index serves exactly the local distribution files")
+    p.add_argument("--coordinate", required=True)
+    p.add_argument("--version", required=True)
+    p.add_argument("--dist", required=True)
+    p.add_argument("--index", choices=sorted(RELEASE_JSON), default="testpypi")
+    p.add_argument("--attempts", type=int, default=10, help="index propagation retries (default 10)")
+    p.add_argument("--delay", type=float, default=30.0, help="seconds between retries (default 30)")
+    p.add_argument("--index-json", default=None, help="read the release JSON from this file instead of the index (tests)")
+    p.set_defaults(func=cmd_verify_index_files)
 
     p = sub.add_parser("release-notes", help="generate release notes from history")
     p.add_argument("--plugin-dir", required=True)

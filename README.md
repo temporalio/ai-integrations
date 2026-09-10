@@ -6,6 +6,7 @@ cadence, laid out as `<language>/<integration>/`.
 
 | Language | Plugin | Package | Root API | Maturity | Docs |
 |---|---|---|---|---|---|
+| Python | [`python/mcp`](python/mcp) | [`temporalio-mcp`](https://pypi.org/project/temporalio-mcp/) | `temporalio.contrib.mcp` | Experimental | [MCP](python/mcp#readme) |
 | Python | [`python/openai_agents`](python/openai_agents) | [`temporalio-openai-agents`](https://pypi.org/project/temporalio-openai-agents/) | `temporalio.contrib.openai_agents` | GA | [OpenAI Agents SDK](https://docs.temporal.io/develop/python/integrations/openai-agents) |
 
 More plugins are migrating here from the SDK repositories; see the target table in
@@ -14,13 +15,15 @@ More plugins are migrating here from the SDK repositories; see the target table 
 ## Install
 
 ```bash
-uv add temporalio-openai-agents
+uv add temporalio-mcp                 # native MCP clients
+uv add temporalio-openai-agents       # OpenAI Agents SDK
 ```
 
 Until the Temporal Python SDK release that stops bundling `temporalio.contrib.openai_agents`,
-do not install this package next to `temporalio<=1.32`: both ship the same files, and
-uninstalling the plugin then deletes files the SDK still needs (repair with a reinstall of
-`temporalio`). Pre-releases are published to TestPyPI only for that reason.
+do not install `temporalio-openai-agents` next to `temporalio<=1.32`: both ship the same files,
+and uninstalling the plugin then deletes files the SDK still needs (repair with a reinstall of
+`temporalio`). Its pre-releases are published to TestPyPI only for that reason. `temporalio-mcp`
+shares no files with the SDK and is released to PyPI.
 
 ## Develop
 

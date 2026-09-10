@@ -255,7 +255,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
         >>> from temporalio.client import Client
         >>> from temporalio.worker import Worker
         >>> from temporalio.contrib.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters, StatelessMCPServerProvider
-        >>> from agents.mcp import MCPServerStreamableHttp
+        >>> from agents.mcp import MCPServerStdio
         >>> from datetime import timedelta
         >>>
         >>> # Configure model parameters
@@ -265,9 +265,9 @@ class OpenAIAgentsPlugin(SimplePlugin):
         ... )
         >>>
         >>> # Create MCP servers
-        >>> filesystem_server = StatelessMCPServerProvider(MCPServerStreamableHttp(
+        >>> filesystem_server = StatelessMCPServerProvider(MCPServerStdio(
         ...     name="Filesystem Server",
-        ...     params={"url": "http://localhost:8000/mcp"}
+        ...     params={"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]}
         ... ))
         >>>
         >>> # Create plugin with MCP servers

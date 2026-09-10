@@ -44,10 +44,9 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `go/googleadk` | `go.temporal.io/sdk/contrib/googleadk` | continues (v0.3.0 next) | preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
-version policy (below). `python/mcp` does not exist upstream yet (sdk-python PR #1793). The Go row
-has an unresolved problem: a module served by the static vanity site cannot live in a monorepo
-subdirectory under an unchanged import path; decide (split mirror repo, new import path, or
-staying in sdk-go) before that migration.
+version policy (below). The Go row has an unresolved problem: a module served by the static vanity
+site cannot live in a monorepo subdirectory under an unchanged import path; decide (split mirror
+repo, new import path, or staying in sdk-go) before that migration.
 
 Naming derivation, enforced by `scripts/ci/check_conventions.py`: folder name = `plugin.toml`
 `name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API =
@@ -84,21 +83,23 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 
 - `.github/workflows/ci.yml` (`pull_request`, `merge_group`, push to `main`, nightly, dispatch). Job `changes` runs `scripts/ci/detect_changes.py`: plugins are discovered from `<language>/*/<manifest>` (ignoring `_*`); a changed file under a plugin selects that plugin; a non-plugin file under a language root selects every plugin of that language; `.github/**` and `scripts/ci/**` select everything; `scripts/release/**` and `scripts/migrate/**` select only the script tests; push to `main`, nightly and dispatch select everything. Job `conventions` checks repository invariants and runs the script tests. Job `python` calls `_python-plugin.yml` once per selected plugin. Job `ci-status` fans in and is the only required check (skipped upstream jobs count as success).
 - `.github/workflows/_python-plugin.yml`: job `matrix` reads `plugin.toml` `runtime-versions` and emits the same matrix for every run, pull requests included (ubuntu at the min and max versions, macOS and Windows at max); job `test` runs `make sync` (or `sync-latest` / `sync-lowest`), `make lint`, `make test`, then, on the ubuntu/max cell only, the `python-build-check` composite action (`make build`, `check_wheel.py`, isolated `smoke.py` on wheel and sdist). Windows runners install GNU make with choco.
-- Dependency lanes: nightly runs every plugin with the newest allowed dependencies (`sync-latest`) and with the lowest allowed direct dependencies (`sync-lowest`), opening or updating one issue per failing plugin. The lowest-direct lane also runs, and blocks, on pull requests that change a plugin's `pyproject.toml` or `uv.lock`, because that is when floors change.
-- Required checks on `main`: `ci-status`, plus the org-enforced required workflows that run automatically on every PR (`Check for CODEOWNERS`, `Opengrep SAST`), and `license/cla` once the CLA app is installed. Do not add a local opengrep caller; the org one already runs.
+- Dependency lanes: nightly runs every plugin with the newest allowed dependencies (`sync-latest`) and with the lowest allowed direct dependencies (`sync-lowest`; the sync repeats `--resolution lowest-direct`, otherwise uv discards the lowest lock and re-resolves to the newest versions), opening or updating one issue per failing plugin. The lowest-direct lane also runs, and blocks, on pull requests that change a plugin's `pyproject.toml` or `uv.lock`, because that is when floors change.
+- Required checks on `main`: `ci-status`, `Check for CODEOWNERS` and `opengrep/scan` (the last two are org-enforced workflows that run automatically on every PR), plus one approving review from a code owner; `license/cla` joins once the CLA app is installed. Do not add a local opengrep caller; the org one already runs. TRANSITION(sdk-cutover): branch protection, the `testpypi`/`pypi` environments (tag policy `python/*/v*`, `@temporalio/ai-sdk` reviewers on `pypi`) and the release-tag ruleset were configured by hand on 2026-09-09 and must be mirrored in `cicd-terraform` at onboarding.
+- Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing (lane, plugin) pair from the job names `Python (<plugin>) / ...` and `Python (lowest-direct) (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs.
 
 ## Releases
 
 Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
 
-Version policy (`release_tool.py check-version-policy`, evaluated against pypi.org only): a coordinate with no published release must start at exactly `1.0.0` (`ga`) or `0.1.0` (otherwise), pre-releases of that version allowed; an existing coordinate must be strictly greater than its highest published version, yanked releases included. Final versions additionally require `plugin.toml` `[release] allow-final = true` and no `TRANSITION(sdk-cutover)` marker in the plugin.
+Version policy (`release_tool.py check-version-policy`; version ordering is evaluated against pypi.org): a coordinate with no published release must start at exactly `1.0.0` (`ga`) or `0.1.0` (otherwise), pre-releases of that version allowed; an existing coordinate must be strictly greater than its highest published version, yanked releases included. A version already staged on TestPyPI only produces a warning (a re-run after a staged upload is the normal recovery path); each smoke job then proves the index serves exactly the artifacts this run built (`verify-index-files`). Final versions additionally require `plugin.toml` `[release] allow-final = true` and no `TRANSITION(sdk-cutover)` marker in the plugin.
 
 Runbook for `python/<name>`:
 1. Open a release PR that sets `version` in `pyproject.toml` (re-sync from upstream first while the transition rules apply). Merge it.
-2. `git tag -a python/<name>/v<version> -m "python/<name> v<version>"` on the merged `main` commit and push the tag. Tags must match `<language>/<name>/v<version>` and are protected by a tag ruleset.
-3. `release-python.yml` validates the tag, runs the full test matrix, builds once, publishes to TestPyPI (environment `testpypi`), smoke-installs from TestPyPI in a clean project, and for final versions publishes to PyPI (environment `pypi`, required reviewers confirm the tag SHA is on `main`) and smoke-installs again.
-4. A draft GitHub Release is created idempotently with generated notes and the artifacts. Edit the notes and publish it by hand.
-5. If anything fails after upload, fix forward with the next `rcN`; uploaded files are immutable and tags are never moved.
+2. Dry run on the merged `main`: `gh workflow run release-python.yml --ref main -f tag=python/<name>/v<version> -f skip-publish=true` runs the tag validation, the version policy, the full test matrix and the artifact build without uploading anything or consuming a tag (the manifest check needs the version bump to be on `main`).
+3. `git tag -a python/<name>/v<version> -m "python/<name> v<version>"` on the merged `main` commit and push the tag. Tags must match `<language>/<name>/v<version>` and are protected by a tag ruleset.
+4. `release-python.yml` validates the tag, runs the full test matrix (its ubuntu dist cell builds, checks and smoke-tests the wheel and sdist), publishes those tested artifacts to TestPyPI (environment `testpypi`), proves TestPyPI serves exactly those files, smoke-installs from TestPyPI in a clean project, and for final versions publishes to PyPI (environment `pypi`, required reviewers confirm the tag SHA is on `main`) and repeats the proof and the smoke there. The clean-project smoke tolerates file overlap with the SDK only while `allow-final = false`.
+5. A draft GitHub Release is created idempotently with generated notes and the artifacts. Edit the notes and publish it by hand; a later re-run refuses to touch a release that is already published.
+6. If a job fails after the TestPyPI upload, "Re-run failed jobs" (or a fresh dispatch on the tag) is safe: the upload is skipped and the smoke jobs verify the served files. If the artifacts themselves must change, fix forward with the next `rcN`; uploaded files are immutable and tags are never moved.
 
 ## Migration and re-sync
 

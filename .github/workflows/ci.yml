@@ -14,7 +14,9 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    # `edited` covers base-branch retargeting (a stacked PR whose base merged), so `changes`
+    # is recomputed against the new base instead of keeping the stale selection.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
   merge_group:
   push:
     branches: [main]

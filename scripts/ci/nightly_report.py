@@ -3,7 +3,7 @@
 
 Reads the jobs of the current workflow run through `gh api`, maps reusable
 workflow job names such as `Python (openai_agents) / openai_agents (ubuntu-latest, py3.14)`
-or `Python (lowest-direct, advisory) (openai_agents) / ...` to a (lane, plugin)
+or `Python (lowest-direct) (openai_agents) / ...` to a (lane, plugin)
 pair, and keeps exactly one open issue per failing pair labelled `nightly`.
 Passing pairs with an open issue get a comment and are closed.
 """
@@ -17,8 +17,10 @@ import re
 import subprocess
 import sys
 
-JOB_RE = re.compile(r"^(?P<lane>Python(?: \(lowest-direct, advisory\))?) \((?P<plugin>[^)]+)\) / ")
-LANE_KEY = {"Python": "latest", "Python (lowest-direct, advisory)": "lowest-direct"}
+# Job names come from ci.yml (`name: Python` and `name: Python (lowest-direct)`) joined with the
+# reusable workflow's job name; test_nightly_report.py asserts the two stay in step.
+JOB_RE = re.compile(r"^(?P<lane>Python(?: \(lowest-direct\))?) \((?P<plugin>[^)]+)\) / ")
+LANE_KEY = {"Python": "latest", "Python (lowest-direct)": "lowest-direct"}
 LABEL = "nightly"
 FAILED = {"failure", "timed_out"}
 
