@@ -77,10 +77,20 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
     gate = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "gate")
     assert '[ "$REF_TYPE" = "tag" ] && [ "$SKIP_PUBLISH" = "false" ]' in gate["run"], "publish only on the literal false"
     # The release job must act on the parsed tag, never on the ref name (they differ on a dry run).
-    release_text = yaml.dump(doc["jobs"]["github-release"])
-    assert "github.ref_name" not in release_text and "needs.prepare.outputs.tag" in release_text
+    tag_envs = [s["env"]["TAG"] for s in doc["jobs"]["github-release"]["steps"] if "TAG" in s.get("env", {})]
+    assert tag_envs and all(v == "${{ needs.prepare.outputs.tag }}" for v in tag_envs)
+    # Only prepare may look at the ref name (to check the dispatch inputs against it); every later job
+    # works from prepare's parsed outputs.
+    for name, job in doc["jobs"].items():
+        if name == "prepare":
+            continue
+        for step in job.get("steps", []):
+            assert "github.ref_name" not in yaml.dump(step.get("env", {})), f"{name}: read the parsed tag, not the ref name"
     assert doc["concurrency"]["group"] == "release-${{ inputs.tag || github.ref }}"
-    assert doc["jobs"]["github-release"]["if"].lstrip().startswith("!cancelled()")
+    release_if = doc["jobs"]["github-release"]["if"]
+    assert release_if.lstrip().startswith("!cancelled()")
+    # A skipped smoke-pypi also means "publish-pypi failed or was rejected"; a final must not draft then.
+    assert "(needs.prepare.outputs.publish_pypi != 'true' || needs.smoke-pypi.result == 'success')" in release_if
 
 
 def test_release_smoke_is_strict_unless_the_sdk_still_bundles_the_plugin() -> None:
@@ -111,6 +121,9 @@ def test_release_publishes_the_tested_artifacts() -> None:
     upload = next(s for s in steps if "upload-artifact" in s.get("uses", "") and s["with"]["name"].startswith("dist-"))
     assert upload["with"]["name"] == "dist-${{ inputs.plugin }}-${{ inputs.deps }}"
     assert upload["if"] == "matrix.dist" and upload["with"]["if-no-files-found"] == "error"
+    assert upload["with"]["overwrite"] is True, "a re-run of the test job must replace the artifact, not duplicate it"
+    junit = next(s for s in steps if "upload-artifact" in s.get("uses", "") and s["with"]["name"].startswith("junit-"))
+    assert "${{ inputs.deps }}" in junit["with"]["name"], "ci.yml runs two lanes for one plugin in one run"
     build_check = next(s for s in steps if s.get("uses") == "./.github/actions/python-build-check")
     assert build_check["if"] == "matrix.dist"
     assert steps.index(build_check) < steps.index(upload), "the artifact must be built and checked before it is uploaded"

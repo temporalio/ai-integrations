@@ -5,9 +5,9 @@
 #   -> publish-testpypi -> smoke-testpypi -> [finals only] publish-pypi -> smoke-pypi -> github-release (draft)
 #
 # The artifacts that were tested are the artifacts that get published. Dry run: dispatch on
-# main with the `tag` input set to the tag you intend to push and `skip-publish` on; everything
-# up to and including the tested build runs, nothing is uploaded and no tag is consumed.
-# Uploads and the draft release happen only for a real tag ref.
+# main with the `tag` input set to the tag you intend to push; everything up to and including the
+# tested build runs, nothing is uploaded and no tag is consumed. A dispatch from a branch can
+# never publish; `skip-publish` additionally turns a dispatch on a tag ref into a dry run.
 #
 # Publishing uses PyPI trusted publishing (OIDC): no stored credentials. The
 # publish jobs live INLINE here on purpose: PyPI rejects reusable workflows as
@@ -267,10 +267,12 @@ jobs:
   github-release:
     name: Draft GitHub release
     needs: [prepare, smoke-testpypi, smoke-pypi]
+    # A skipped smoke-pypi means either "PyPI not applicable" (pre-release) or "publish-pypi failed or
+    # was rejected"; only the first may draft a release.
     if: >-
       !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
       && needs.smoke-testpypi.result == 'success'
-      && (needs.smoke-pypi.result == 'success' || needs.smoke-pypi.result == 'skipped')
+      && (needs.prepare.outputs.publish_pypi != 'true' || needs.smoke-pypi.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
