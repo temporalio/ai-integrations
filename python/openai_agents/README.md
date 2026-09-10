@@ -386,8 +386,15 @@ Tools that run in the workflow can also update OpenAI Agents context, which is r
 
 ## MCP Support
 
-This integration uses MCP Python SDK v2. Register named OpenAI MCP server
-factories on the worker, then reference the same name from workflow code:
+The durable MCP integration uses MCP Python SDK v2 and the optional `mcp`
+dependencies:
+
+```bash
+uv add "temporalio-openai-agents[mcp]"
+```
+
+Register named OpenAI MCP server factories on the worker, then reference the
+same name from workflow code:
 
 ```python
 from agents.mcp import MCPServerStreamableHttp
@@ -428,6 +435,11 @@ idle minutes when it negotiates the modern, sessionless protocol. Set
 plugin shutdown, or `timedelta(0)` to close them as soon as they become idle.
 Connections that negotiate a legacy handshake are closed after the current
 Activity and are never shared across workflows.
+
+`OpenAIAgentsPlugin(mcp_servers={"x": ...})` and
+`MCPPlugin(clients={"x": ...})` both register Activities under
+`temporalio.contrib.mcp.x.*`. Do not register the same MCP server name through
+both plugins on one worker; Temporal rejects the duplicate Activity types.
 
 An optional `factory_argument` can select worker-side configuration such as a
 tenant endpoint:
@@ -477,10 +489,11 @@ def weather_server() -> MCPServerStreamableHttp:
 `StatelessMCPServerProvider`, `StatefulMCPServerProvider`, the plugin's
 `mcp_server_providers` option, `stateless_mcp_server()`, and
 `stateful_mcp_server()` are deprecated. They remain supported for source and
-workflow-history compatibility and can still run with MCP Python SDK v1. New
-integrations should use `mcp_servers` and `temporal_mcp_server()`, which require
-MCP Python SDK v2. The legacy stateful path retains its dedicated per-workflow
-worker and persistent-session behavior.
+workflow-history compatibility and can still run with MCP Python SDK v1 when
+the `mcp` extra is not installed. New integrations should use `mcp_servers` and
+`temporal_mcp_server()`, which require the `mcp` extra and MCP Python SDK v2.
+The legacy stateful path retains its dedicated per-workflow worker and
+persistent-session behavior.
 
 ### Hosted MCP Tool
 

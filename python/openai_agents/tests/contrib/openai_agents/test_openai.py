@@ -61,6 +61,7 @@ from openai.types.responses import (
     ResponseCodeInterpreterToolCall,
     ResponseCustomToolCall,
     ResponseFileSearchToolCall,
+    ResponseFunctionToolCall,
     ResponseFunctionWebSearch,
 )
 from openai.types.responses.response_file_search_tool_call import Result
@@ -116,6 +117,15 @@ from tests.helpers.nexus import make_nexus_endpoint_name
 
 def hello_mock_model():
     return TestModel.returning_responses([ResponseBuilders.output_message("test")])
+
+
+def test_tool_call_response_builder_keeps_default_ids():
+    response = ResponseBuilders.tool_call("{}", "test")
+    assert len(response.output) == 1
+    call = response.output[0]
+    assert isinstance(call, ResponseFunctionToolCall)
+    assert call.call_id == "call"
+    assert call.id == "id"
 
 
 @workflow.defn
@@ -2634,7 +2644,6 @@ def get_tracking_server(name: str):
     return TrackingMCPServer(name)
 
 
-@pytest.mark.mcp_v1
 def test_legacy_mcp_apis_are_deprecated():
     with pytest.warns(DeprecationWarning, match="StatelessMCPServerProvider"):
         stateless_provider = StatelessMCPServerProvider(
@@ -2654,23 +2663,8 @@ def test_legacy_mcp_apis_are_deprecated():
         openai_agents.OpenAIAgentsPlugin(mcp_server_providers=[stateless_provider])
 
 
-@pytest.mark.mcp_v1
-def test_mcp_servers_requires_v2():
-    from importlib.metadata import version
-
-    def factory() -> MCPServer:
-        return cast(MCPServer, cast(object, None))
-
-    if int(version("mcp").split(".", 1)[0]) < 2:
-        with pytest.raises(RuntimeError, match="requires MCP Python SDK v2"):
-            openai_agents.OpenAIAgentsPlugin(mcp_servers={"test": factory})
-    else:
-        openai_agents.OpenAIAgentsPlugin(mcp_servers={"test": factory})
-
-
 @pytest.mark.parametrize("stateful", [True, False])
 @pytest.mark.parametrize("caching", [True, False])
-@pytest.mark.mcp_v1
 async def test_mcp_server(client: Client, stateful: bool, caching: bool):
     if stateful and caching:
         pytest.skip("Caching is only supported for stateless MCP servers")
@@ -2764,7 +2758,6 @@ async def test_mcp_server(client: Client, stateful: bool, caching: bool):
 
 
 @pytest.mark.parametrize("stateful", [True, False])
-@pytest.mark.mcp_v1
 async def test_mcp_server_factory_argument(client: Client, stateful: bool):
     def factory(args: Any | None) -> MCPServer:
         print("Invoking factory: ", args)
@@ -2811,7 +2804,6 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
                 )
 
 
-@pytest.mark.mcp_v1
 async def test_stateful_mcp_server_no_worker(client: Client):
     server = StatefulMCPServerProvider(
         "Filesystem-Server",

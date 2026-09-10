@@ -1,6 +1,5 @@
 """Testing utilities for OpenAI agents."""
 
-import hashlib
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from datetime import timedelta
 from typing import Any
@@ -83,14 +82,13 @@ class ResponseBuilders:
         item_id: str | None = None,
     ) -> ModelResponse:
         """Create a ModelResponse with a function tool call."""
-        identity = hashlib.sha256(f"{name}\0{arguments}".encode()).hexdigest()[:16]
         return ResponseBuilders.model_response(
             ResponseFunctionToolCall(
                 arguments=arguments,
-                call_id=call_id or f"call-{identity}",
+                call_id="call" if call_id is None else call_id,
                 name=name,
                 type="function_call",
-                id=item_id or f"item-{identity}",
+                id="id" if item_id is None else item_id,
                 status="completed",
             )
         )

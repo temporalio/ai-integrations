@@ -16,6 +16,7 @@ from temporalio.contrib import openai_agents
 from temporalio.contrib.openai_agents import ModelActivityParameters
 from temporalio.contrib.openai_agents._mcp_backend import (
     _mcp_server_backend_factory,
+    _OpenAIMCPServerBackend,
 )
 from temporalio.contrib.openai_agents.testing import (
     AgentEnvironment,
@@ -215,4 +216,9 @@ def test_static_worker_side_tool_filter_is_allowed() -> None:
         value.tool_filter = {"blocked_tool_names": ["say_hello"]}  # type: ignore[attr-defined]
         return value
 
-    cast(Callable[[], Any], _mcp_server_backend_factory("hello", factory))()
+    backend = cast(
+        Callable[[], _OpenAIMCPServerBackend],
+        _mcp_server_backend_factory("hello", factory),
+    )()
+    assert isinstance(backend, _OpenAIMCPServerBackend)
+    assert backend._server.tool_filter == {"blocked_tool_names": ["say_hello"]}

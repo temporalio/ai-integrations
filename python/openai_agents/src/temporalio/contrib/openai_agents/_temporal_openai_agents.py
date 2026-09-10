@@ -388,8 +388,8 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 )
             except ImportError as err:
                 raise RuntimeError(
-                    "mcp_servers requires MCP Python SDK v2; use the deprecated "
-                    "mcp_server_providers API when running with MCP v1"
+                    "mcp_servers requires the 'mcp' extra and MCP Python SDK v2; "
+                    "install temporalio-openai-agents[mcp]"
                 ) from err
 
             mcp_activities = _MCPActivities(
