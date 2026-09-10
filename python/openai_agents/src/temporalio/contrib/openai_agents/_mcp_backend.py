@@ -6,15 +6,16 @@ from collections.abc import Callable
 from types import TracebackType
 from typing import Any, cast
 
+from agents import UserError
 from agents.mcp import MCPServer
 from mcp.types import (
     CallToolResult,
     GetPromptResult,
-    Prompt,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
     ReadResourceResult,
     RequestParamsMeta,
-    Resource,
-    ResourceTemplate,
     Tool,
 )
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
@@ -53,7 +54,11 @@ class _OpenAIMCPServerBackend:
         return getattr(session, "protocol_version", None) in MODERN_PROTOCOL_VERSIONS
 
     async def list_tools(self) -> list[Tool]:
-        return await self._server.list_tools()
+        try:
+            return await self._server.list_tools()
+        except UserError as err:
+            _raise_repeated_cursor_error(err)
+            raise
 
     async def call_tool(
         self,
@@ -65,31 +70,61 @@ class _OpenAIMCPServerBackend:
             name, arguments, cast(dict[str, Any] | None, meta)
         )
 
-    async def list_prompts(self) -> list[Prompt]:
-        return (await self._server.list_prompts()).prompts
+    async def list_prompts(self) -> ListPromptsResult:
+        try:
+            return await self._server.list_prompts()
+        except UserError as err:
+            _raise_repeated_cursor_error(err)
+            raise
 
     async def get_prompt(
         self, name: str, arguments: dict[str, str] | None
     ) -> GetPromptResult:
         return await self._server.get_prompt(name, arguments)
 
-    async def list_resources(self) -> list[Resource]:
-        return await self._list_all("list_resources", "resources")
+    async def list_resources(self) -> ListResourcesResult:
+        return await self._list_all("list_resources", "resources", ListResourcesResult)
 
-    async def list_resource_templates(self) -> list[ResourceTemplate]:
-        return await self._list_all("list_resource_templates", "resource_templates")
+    async def list_resource_templates(self) -> ListResourceTemplatesResult:
+        return await self._list_all(
+            "list_resource_templates",
+            "resource_templates",
+            ListResourceTemplatesResult,
+        )
 
-    async def _list_all(self, method: str, field: str) -> list[Any]:
+    async def _list_all(self, method: str, field: str, result_type: type[Any]) -> Any:
         values: list[Any] = []
         cursor: str | None = None
         seen_cursors: set[str | None] = set()
+        first_result: Any | None = None
+        meta: dict[str, Any] | None = None
+        ttl_ms: int | None = None
+        cache_scope = "public"
         while True:
             result = await getattr(self._server, method)(cursor)
+            if first_result is None:
+                first_result = result_type.model_validate(result)
             values.extend(getattr(result, field))
+            if result.meta is not None:
+                if meta is None:
+                    meta = {}
+                meta.update(result.meta)
+            ttl_ms = result.ttl_ms if ttl_ms is None else min(ttl_ms, result.ttl_ms)
+            if result.cache_scope == "private":
+                cache_scope = "private"
             seen_cursors.add(cursor)
             next_cursor = result.next_cursor
             if next_cursor is None:
-                return values
+                assert first_result is not None
+                return first_result.model_copy(
+                    update={
+                        field: values,
+                        "next_cursor": None,
+                        "meta": meta,
+                        "ttl_ms": ttl_ms,
+                        "cache_scope": cache_scope,
+                    }
+                )
             if next_cursor in seen_cursors:
                 raise ApplicationError(
                     "MCP server returned a repeated pagination cursor",
@@ -100,6 +135,16 @@ class _OpenAIMCPServerBackend:
 
     async def read_resource(self, uri: str) -> ReadResourceResult:
         return await self._server.read_resource(uri)
+
+
+def _raise_repeated_cursor_error(err: UserError) -> None:
+    """Convert the Agents SDK's repeated-cursor error to a terminal failure."""
+    if "returned a repeated cursor while listing " in str(err):
+        raise ApplicationError(
+            "MCP server returned a repeated pagination cursor",
+            type="MCPProtocolError",
+            non_retryable=True,
+        ) from err
 
 
 def _reject_dynamic_tool_filter(name: str, server: MCPServer) -> None:

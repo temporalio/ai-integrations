@@ -4,7 +4,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
-from agents import Agent, AgentBase, RunContextWrapper, Runner
+from agents import Agent, AgentBase, RunContextWrapper, Runner, UserError
 from agents.mcp import MCPServer as AgentsMCPServer
 from mcp import Client as MCPClient
 from mcp.server.mcpserver import MCPServer as SDKMCPServer
@@ -13,6 +13,10 @@ from mcp.types import (
     GetPromptResult,
     ListPromptsResult,
     ListResourcesResult,
+    ListResourceTemplatesResult,
+    Prompt,
+    Resource,
+    ResourceTemplate,
     Tool,
 )
 
@@ -247,3 +251,100 @@ async def test_repeated_pagination_cursor_is_non_retryable() -> None:
 
     assert err.value.type == "MCPProtocolError"
     assert err.value.non_retryable
+
+
+@pytest.mark.parametrize("method", ["list_tools", "list_prompts"])
+async def test_agents_repeated_pagination_cursor_is_non_retryable(
+    method: str,
+) -> None:
+    class RepeatingCursorServer:
+        async def list_tools(self) -> list[Tool]:
+            raise UserError(
+                "MCP server 'repeating' returned a repeated cursor while listing tools."
+            )
+
+        async def list_prompts(self) -> ListPromptsResult:
+            raise UserError(
+                "MCP server 'repeating' returned a repeated cursor while listing prompts."
+            )
+
+    backend = _OpenAIMCPServerBackend(
+        cast(AgentsMCPServer, cast(object, RepeatingCursorServer()))
+    )
+    with pytest.raises(ApplicationError) as err:
+        await getattr(backend, method)()
+
+    assert err.value.type == "MCPProtocolError"
+    assert err.value.non_retryable
+
+
+async def test_list_results_preserve_mcp_envelopes() -> None:
+    class MetadataServer:
+        async def list_prompts(self) -> ListPromptsResult:
+            return ListPromptsResult.model_validate(
+                {
+                    "prompts": [Prompt(name="prompt")],
+                    "_meta": {"prompt": "metadata"},
+                    "ttlMs": 300,
+                    "cacheScope": "private",
+                }
+            )
+
+        async def list_resources(
+            self, cursor: str | None = None
+        ) -> ListResourcesResult:
+            if cursor is None:
+                return ListResourcesResult.model_validate(
+                    {
+                        "resources": [Resource(name="one", uri="file:///one")],
+                        "nextCursor": "next",
+                        "_meta": {"first": 1, "shared": "first"},
+                        "ttlMs": 300,
+                    }
+                )
+            return ListResourcesResult.model_validate(
+                {
+                    "resources": [Resource(name="two", uri="file:///two")],
+                    "_meta": {"second": 2, "shared": "second"},
+                    "ttlMs": 200,
+                    "cacheScope": "private",
+                }
+            )
+
+        async def list_resource_templates(
+            self, cursor: str | None = None
+        ) -> ListResourceTemplatesResult:
+            return ListResourceTemplatesResult.model_validate(
+                {
+                    "resourceTemplates": [
+                        ResourceTemplate(name="template", uri_template="file:///{name}")
+                    ],
+                    "_meta": {"template": "metadata"},
+                    "ttlMs": 100,
+                    "cacheScope": "private",
+                }
+            )
+
+    backend = _OpenAIMCPServerBackend(
+        cast(AgentsMCPServer, cast(object, MetadataServer()))
+    )
+
+    prompts = await backend.list_prompts()
+    assert prompts.meta == {"prompt": "metadata"}
+    assert prompts.ttl_ms == 300
+    assert prompts.cache_scope == "private"
+
+    resources = await backend.list_resources()
+    assert [str(resource.uri) for resource in resources.resources] == [
+        "file:///one",
+        "file:///two",
+    ]
+    assert resources.next_cursor is None
+    assert resources.meta == {"first": 1, "shared": "second", "second": 2}
+    assert resources.ttl_ms == 200
+    assert resources.cache_scope == "private"
+
+    templates = await backend.list_resource_templates()
+    assert templates.meta == {"template": "metadata"}
+    assert templates.ttl_ms == 100
+    assert templates.cache_scope == "private"
