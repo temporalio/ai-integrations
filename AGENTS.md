@@ -44,10 +44,9 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `go/googleadk` | `go.temporal.io/sdk/contrib/googleadk` | continues (v0.3.0 next) | preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
-version policy (below). `python/mcp` does not exist upstream yet (sdk-python PR #1793). The Go row
-has an unresolved problem: a module served by the static vanity site cannot live in a monorepo
-subdirectory under an unchanged import path; decide (split mirror repo, new import path, or
-staying in sdk-go) before that migration.
+version policy (below). The Go row has an unresolved problem: a module served by the static vanity
+site cannot live in a monorepo subdirectory under an unchanged import path; decide (split mirror
+repo, new import path, or staying in sdk-go) before that migration.
 
 Naming derivation, enforced by `scripts/ci/check_conventions.py`: folder name = `plugin.toml`
 `name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API =
@@ -75,7 +74,7 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
 - Provenance guard (`tests/helpers/provenance.py`, mirrored by `scripts/ci/smoke.py`) runs at every pytest session start and fails loudly if the install is editable, any file differs from the distribution's RECORD, files under the package directory are not owned by the distribution, or another distribution ships the same paths. While `plugin.toml` `[release] allow-final = false`, the SDK's overlap (`temporalio<=1.32` ships `temporalio/contrib/openai_agents/*`) is tolerated with a warning. `tests/test_installed_matches_source.py` additionally byte-compares the installed package with `src/`.
 - Dependency cooldown: `exclude-newer = "2 weeks"` (org supply-chain policy) with `exclude-newer-package = { temporalio = false }` so a new SDK release is adoptable the day it ships. Declare exactly what the package imports at module level; `openinference` and similar lazy imports go in an extra.
 - Tooling: ruff, pyright, basedpyright, mypy (`mypy_path = "src"`, `explicit_package_bases`), pydocstyle (google), pytest + xdist (`-n auto --dist=worksteal`; the `os._exit(0)` hook is xdist-aware). All invoked through `make` targets; see `make help`.
-- Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in a plugin's conftest only when one of its tests needs a server feature that is off by default. Upstream MCP tests currently spawn `npx`, so Node must be present (it is on GitHub-hosted runners) until those tests are rewritten upstream.
+- Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in a plugin's conftest only when one of its tests needs a server feature that is off by default. One upstream `openai_agents` test still spawns `npx`, so Node must be present (it is on GitHub-hosted runners) until that test is rewritten; the `mcp` plugin's tests need no Node.
 - Provider tests: each plugin owns its `tests/conftest.py` and test helpers. Tests must not require real provider credentials; use deterministic local models, mock transports, or in-process servers to exercise provider behavior in CI.
 
 ## CI
