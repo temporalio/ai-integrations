@@ -22,7 +22,7 @@ from mcp.types import (
     ListResourceTemplatesResult,
     ListToolsResult,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from temporalio import activity
 from temporalio.contrib.mcp._activity import (
@@ -91,11 +91,19 @@ class _MCPActivities:
             ) as backend:
                 return await operation(backend)
         except MCPError as err:
+            details = (err.code,) if err.data is None else (err.code, err.data)
             raise ApplicationError(
                 err.message,
-                err.code,
+                *details,
                 type="MCPProtocolError",
                 non_retryable=err.code in _NON_RETRYABLE_PROTOCOL_ERRORS,
+            ) from err
+        except ValidationError as err:
+            raise ApplicationError(
+                "MCP server returned an invalid response",
+                err.errors(include_url=False, include_input=False),
+                type="MCPProtocolError",
+                non_retryable=True,
             ) from err
 
     def _build_activities(self) -> Sequence[Callable[..., Any]]:
@@ -232,7 +240,7 @@ class _MCPActivities:
                 self._run_contexts[loop] = remaining
             else:
                 self._run_contexts.pop(loop)
-                close_task = asyncio.create_task(self._pool.close())
+                close_task = asyncio.create_task(self._close_if_unused(loop))
                 try:
                     await self._finish_close(close_task)
                 except asyncio.CancelledError:
@@ -242,6 +250,13 @@ class _MCPActivities:
                     if not body_completed:
                         raise
                     await self._finish_close(close_task)
+
+    async def _close_if_unused(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Close this loop's connections unless another Worker has entered."""
+        if self._run_contexts.get(loop, 0) == 0:
+            # close() detaches the loop's pool generation before its first
+            # suspension, so a later entrant cannot inherit closing records.
+            await self._pool.close()
 
     async def _finish_close(self, close_task: asyncio.Task[None]) -> None:
         """Wait a bounded time for the connection pool to close."""

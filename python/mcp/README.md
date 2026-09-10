@@ -101,9 +101,10 @@ schedule no further Activities (a new instance starts with an empty cache). Set
 asks the server directly; the MCP client's own response cache is bypassed
 because workflow history is the durable record.
 
-All operations default to a one-minute start-to-close timeout. Override this
-with an `ActivityConfig`; the default is added only when the config sets
-neither `start_to_close_timeout` nor `schedule_to_close_timeout`:
+All operations default to a one-minute start-to-close timeout per Activity
+attempt. Override this with an `ActivityConfig`; the default is added only when
+both `start_to_close_timeout` and `schedule_to_close_timeout` are omitted or
+`None`:
 
 ```python
 from datetime import timedelta
@@ -120,8 +121,11 @@ run more than once when a worker loses its completion response. Tools with side
 effects should be idempotent, usually by accepting a stable idempotency key.
 
 MCP operations do not heartbeat. Do not set `heartbeat_timeout` in
-`activity_config`; cancellation cannot interrupt an in-flight MCP request and
-takes effect when its start-to-close timeout expires.
+`activity_config`: it does not make these Activities heartbeat or receive
+cancellation. Temporal records an Activity timeout in the service, but that
+timeout does not cancel an MCP request already running on a worker. Configure
+the MCP `Client`'s `read_timeout_seconds` when the request itself must be
+bounded.
 
 ## Errors and retries
 
@@ -129,13 +133,19 @@ A tool that fails returns a normal `CallToolResult` with `is_error=True`; the
 workflow decides what to do with it. A JSON-RPC error response (an unknown
 tool, prompt or resource, invalid arguments, a server-side failure) fails the
 Activity with an `ApplicationError` of type `MCPProtocolError` whose
-`details[0]` is the JSON-RPC error code. Errors a retry cannot fix (parse and
-invalid-request errors, unknown methods, invalid params, protocol-version,
-header and capability mismatches, and URL elicitation) are non-retryable.
+`details[0]` is the JSON-RPC error code. When the response includes JSON-RPC
+error data, `details[1]` preserves it. Schema-invalid server responses use the
+same error type, include Pydantic validation errors in `details[0]`, and are
+non-retryable. Errors a retry cannot fix (parse and invalid-request errors,
+unknown methods, invalid params, protocol-version, header and capability
+mismatches, and URL elicitation) are also non-retryable.
+
 Internal server errors, closed connections, request timeouts and transport
-exceptions stay retryable, and the default `activity_config` has no
-`retry_policy`, so they retry until the start-to-close timeout expires. Set a
-`retry_policy` when that is not what you want:
+exceptions stay retryable. The default start-to-close timeout limits each
+attempt, not the complete series of retries; with Temporal's default retry
+policy and no schedule-to-close timeout, retryable failures can retry
+indefinitely. Set `schedule_to_close_timeout` to bound the total time including
+retries, and/or set a `retry_policy` to bound the number of attempts:
 
 ```python
 from datetime import timedelta
@@ -146,13 +156,15 @@ mcp = TemporalMCPClient(
     "weather",
     activity_config={
         "start_to_close_timeout": timedelta(seconds=20),
+        "schedule_to_close_timeout": timedelta(minutes=1),
         "retry_policy": RetryPolicy(maximum_attempts=3),
     },
 )
 ```
 
-A JSON-RPC error response leaves the shared worker connection in place; only a
-closed connection or a request timeout makes the worker reconnect.
+Most JSON-RPC error responses leave the shared worker connection in place. A
+closed connection, request timeout or unsupported negotiated protocol version
+makes the worker reconnect before the next operation.
 
 ## Connections and configuration
 

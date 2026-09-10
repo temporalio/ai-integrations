@@ -5,7 +5,12 @@ from typing import Any, cast
 import pytest
 from mcp import Client, MCPError
 from mcp.server.mcpserver import MCPServer
-from mcp.types import CONNECTION_CLOSED, INVALID_PARAMS, REQUEST_TIMEOUT
+from mcp.types import (
+    CONNECTION_CLOSED,
+    INVALID_PARAMS,
+    REQUEST_TIMEOUT,
+    UNSUPPORTED_PROTOCOL_VERSION,
+)
 
 from temporalio.contrib.mcp._client import _MCPClientBackend
 from temporalio.contrib.mcp._pool import _MCPConnectionPool
@@ -189,8 +194,10 @@ async def test_protocol_error_response_keeps_connection() -> None:
         await pool.close()
 
 
-@pytest.mark.parametrize("code", [CONNECTION_CLOSED, REQUEST_TIMEOUT])
-async def test_transport_error_retires_connection(code: int) -> None:
+@pytest.mark.parametrize(
+    "code", [CONNECTION_CLOSED, REQUEST_TIMEOUT, UNSUPPORTED_PROTOCOL_VERSION]
+)
+async def test_unusable_connection_error_retires_connection(code: int) -> None:
     server = echo_server()
     created = 0
 

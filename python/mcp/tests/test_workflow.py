@@ -85,6 +85,12 @@ class ConfiguredMCPWorkflow:
             config: workflow.ActivityConfig = {
                 "retry_policy": RetryPolicy(maximum_attempts=1)
             }
+        elif mode == "explicit-none":
+            config = {
+                "start_to_close_timeout": None,
+                "schedule_to_close_timeout": None,
+                "retry_policy": RetryPolicy(maximum_attempts=1),
+            }
         else:
             config = {"schedule_to_close_timeout": timedelta(hours=1)}
         client = TemporalMCPClient("rich", activity_config=config)
@@ -154,7 +160,11 @@ async def test_activity_config_keeps_default_timeout_only_when_needed(
     server = rich_server()
     plugin = MCPPlugin({"rich": lambda: Client(server)})
     async with new_worker(client, ConfiguredMCPWorkflow, plugins=[plugin]) as worker:
-        for mode in ("retry-policy-only", "schedule-to-close-only"):
+        for mode in (
+            "retry-policy-only",
+            "explicit-none",
+            "schedule-to-close-only",
+        ):
             handle = await client.start_workflow(
                 ConfiguredMCPWorkflow.run,
                 mode,
@@ -163,7 +173,7 @@ async def test_activity_config_keeps_default_timeout_only_when_needed(
             )
             assert await handle.result() == mode
             [(start_to_close, schedule_to_close)] = await activity_timeouts(handle)
-            if mode == "retry-policy-only":
+            if mode in {"retry-policy-only", "explicit-none"}:
                 # The default start-to-close timeout was merged in.
                 assert (start_to_close, schedule_to_close) == (
                     timedelta(minutes=1),

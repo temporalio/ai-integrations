@@ -37,12 +37,14 @@ class FakeClient:
 
     def __init__(self) -> None:
         self.metas: list[dict[str, Any] | None] = []
+        self.closed = False
 
     async def __aenter__(self) -> "FakeClient":
+        self.closed = False
         return self
 
     async def __aexit__(self, *args: Any) -> None:
-        pass
+        self.closed = True
 
     def _page(self, cursor: str | None) -> tuple[str, str | None]:
         return ("one", "next") if cursor is None else ("two", None)
@@ -93,6 +95,8 @@ class FakeClient:
         *,
         meta: dict[str, Any] | None,
     ) -> CallToolResult:
+        if self.closed:
+            raise RuntimeError("MCP client is closed")
         self.metas.append(meta)
         return CallToolResult(content=[TextContent(text=name)])
 
@@ -200,7 +204,7 @@ async def test_unknown_resource_protocol_error_fails_without_retry() -> None:
 
     assert err.value.type == "MCPProtocolError"
     assert err.value.non_retryable is True
-    assert err.value.details == (INVALID_PARAMS,)
+    assert err.value.details == (INVALID_PARAMS, {"uri": "test://unknown"})
 
 
 async def test_internal_protocol_error_remains_retryable() -> None:
@@ -232,6 +236,10 @@ async def test_internal_protocol_error_remains_retryable() -> None:
 
 
 async def test_permanent_protocol_error_fails_without_retry() -> None:
+    error_data = {
+        "elicitations": [{"url": "https://example.test/login", "description": "Log in"}]
+    }
+
     class ElicitingClient(FakeClient):
         async def call_tool(
             self,
@@ -240,7 +248,11 @@ async def test_permanent_protocol_error_fails_without_retry() -> None:
             *,
             meta: dict[str, Any] | None,
         ) -> CallToolResult:
-            raise MCPError(URL_ELICITATION_REQUIRED, f"{name} needs a browser")
+            raise MCPError(
+                URL_ELICITATION_REQUIRED,
+                f"{name} needs a browser",
+                error_data,
+            )
 
     support = _MCPActivities(
         {"test": lambda: _MCPClientBackend(cast(Any, ElicitingClient()))},
@@ -262,7 +274,78 @@ async def test_permanent_protocol_error_fails_without_retry() -> None:
 
     assert err.value.type == "MCPProtocolError"
     assert err.value.non_retryable is True
-    assert err.value.details == (URL_ELICITATION_REQUIRED,)
+    assert err.value.details == (URL_ELICITATION_REQUIRED, error_data)
+
+
+async def test_invalid_server_response_fails_without_retry() -> None:
+    class InvalidResponseClient(FakeClient):
+        async def get_prompt(
+            self, name: str, _arguments: dict[str, str] | None
+        ) -> GetPromptResult:
+            return GetPromptResult.model_validate({"messages": "not-a-list"})
+
+    support = _MCPActivities(
+        {"test": lambda: _MCPClientBackend(cast(Any, InvalidResponseClient()))},
+        idle_timeout=timedelta(minutes=5),
+    )
+    get_prompt = _activity_by_name(
+        support,
+        "temporalio.contrib.mcp.test.get-prompt",
+    )
+    try:
+        with pytest.raises(ApplicationError, match="invalid response") as err:
+            await get_prompt(
+                {"factory_argument": None, "name": "prompt", "arguments": {}}
+            )
+    finally:
+        await support._pool.close()
+
+    assert err.value.type == "MCPProtocolError"
+    assert err.value.non_retryable is True
+    [validation_errors] = err.value.details
+    assert validation_errors[0]["loc"] == ("messages",)
+
+
+async def test_worker_reentry_before_close_starts_keeps_connection_open() -> None:
+    client = FakeClient()
+    support = _MCPActivities(
+        {"test": lambda: _MCPClientBackend(cast(Any, client))},
+        idle_timeout=None,
+    )
+    start_next_worker = asyncio.Event()
+    next_worker_entered = asyncio.Event()
+    release_next_worker = asyncio.Event()
+    next_worker: asyncio.Task[CallToolResult] | None = None
+
+    async def run_next_worker(first_backend: Any) -> CallToolResult:
+        await start_next_worker.wait()
+        async with support.run_context():
+            async with support._pool.backend("test", factory_argument=None) as backend:
+                # The next Worker entered before the prior Worker's queued
+                # close task, so it must retain this still-live generation.
+                assert backend is first_backend
+                next_worker_entered.set()
+                await release_next_worker.wait()
+                return await backend.call_tool("echo", {}, None)
+
+    try:
+        async with support.run_context():
+            async with support._pool.backend(
+                "test", factory_argument=None
+            ) as first_backend:
+                pass
+            next_worker = asyncio.create_task(run_next_worker(first_backend))
+            start_next_worker.set()
+
+        await next_worker_entered.wait()
+        release_next_worker.set()
+        result = await next_worker
+        assert cast(TextContent, result.content[0]).text == "echo"
+    finally:
+        release_next_worker.set()
+        if next_worker is not None:
+            await asyncio.gather(next_worker, return_exceptions=True)
+        await support._pool.close()
 
 
 async def test_shared_plugin_closes_after_last_run_context(

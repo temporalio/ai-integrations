@@ -60,8 +60,8 @@ class TemporalMCPClient:
             ActivityConfig(**activity_config) if activity_config else ActivityConfig()
         )
         if (
-            "start_to_close_timeout" not in config
-            and "schedule_to_close_timeout" not in config
+            config.get("start_to_close_timeout") is None
+            and config.get("schedule_to_close_timeout") is None
         ):
             config["start_to_close_timeout"] = timedelta(minutes=1)
         self._activity_config: ActivityConfig = config
