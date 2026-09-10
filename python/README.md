@@ -45,6 +45,5 @@ conventions check enforces it; refresh with `cp LICENSE python/<name>/LICENSE`).
 
 ## Platform notes
 
-- Node (`npx`) is required by the MCP tests; GitHub-hosted runners have it.
 - Windows: install GNU make (`choco install make`) or use WSL; CI installs it on Windows runners.
 - The dev server is downloaded on first run by the test suite (`tests/__init__.py` pins the version).
