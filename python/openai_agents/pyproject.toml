@@ -74,7 +74,7 @@ dev = [
 default-groups = ["dev"]
 required-version = ">=0.12.5,<0.13"              # same value in scripts/pyproject.toml; CI reads it via setup-uv version-file
 exclude-newer = "2 weeks"                        # org supply-chain cooldown for third-party packages
-exclude-newer-package = { temporalio = false }   # the SDK is exempt: cutover releases must be adoptable on day one
+exclude-newer-package = { temporalio = false, temporalio-mcp = false }   # first-party packages are exempt: SDK cutover releases and temporalio-mcp releases must be adoptable on day one
 link-mode = "copy"                               # TRANSITION(sdk-cutover): deterministic overwrites while temporalio<=1.32 ships the same files
 cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
 

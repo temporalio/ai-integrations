@@ -450,7 +450,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 return dataclasses.replace(
                     runner,
                     restrictions=runner.restrictions.with_passthrough_modules(
-                        "openai", "agents", "mcp"
+                        "openai", "agents", "mcp", "mcp_types"
                     ),
                 )
             return runner

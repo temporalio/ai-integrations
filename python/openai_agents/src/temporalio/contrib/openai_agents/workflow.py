@@ -412,7 +412,7 @@ def temporal_mcp_server(
             ``require_approval`` and ``failure_error_function``.
     """
     try:
-        from temporalio.contrib.mcp._workflow import TemporalMCPClient
+        from temporalio.contrib.mcp import TemporalMCPClient
         from temporalio.contrib.openai_agents._temporal_mcp_server import (
             _TemporalMCPServer,
         )
