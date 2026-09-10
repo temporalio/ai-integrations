@@ -65,7 +65,10 @@ dev = [
   "openinference-instrumentation-openai-agents>=0.1.0",
   "opentelemetry-sdk>=1.26,<2",
   "openai-agents[litellm]>=0.19.2,<0.20; python_version < '3.14'",
-  "litellm>=1.83.0; python_version < '3.14'",
+  # litellm 1.98.0 through 1.100.0 import typing.NotRequired (3.11+) and fail to import on 3.10;
+  # the fix is on litellm main but unreleased. Raise the 3.10 cap once a fixed release is out.
+  "litellm>=1.83.0,<1.98; python_version < '3.11'",
+  "litellm>=1.83.0; python_version >= '3.11' and python_version < '3.14'",
 ]
 
 [tool.uv]
