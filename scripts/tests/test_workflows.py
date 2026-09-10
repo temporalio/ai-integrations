@@ -64,8 +64,34 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
         assert any(s.startswith("pypa/gh-action-pypi-publish@") for s in steps)
     assert doc["jobs"]["publish-testpypi"]["environment"] == "testpypi"
     assert doc["jobs"]["publish-pypi"]["environment"] == "pypi"
-    assert doc["jobs"]["publish-pypi"]["if"] == "needs.prepare.outputs.publish_pypi == 'true'"
+    # Nothing is uploaded on a dry run or from a non-tag ref; PyPI additionally needs the policy gate.
+    assert doc["jobs"]["publish-testpypi"]["if"] == "needs.prepare.outputs.publish == 'true'"
+    assert doc["jobs"]["publish-pypi"]["if"] == "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'"
+    assert "needs.prepare.outputs.publish == 'true'" in doc["jobs"]["github-release"]["if"]
     assert doc[True]["push"]["tags"] == ["python/*/v*"]  # PyYAML parses the `on` key as boolean True
+    inputs = doc[True]["workflow_dispatch"]["inputs"]
+    assert inputs["skip-publish"]["type"] == "boolean" and inputs["tag"]["type"] == "string"
+
+
+def test_release_publishes_the_tested_artifacts() -> None:
+    doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
+    assert "build" not in doc["jobs"], "the test job's dist cell builds the artifacts; do not rebuild for publishing"
+    tested = "dist-${{ needs.prepare.outputs.plugin }}"
+    for job in ("publish-testpypi", "publish-pypi", "github-release"):
+        downloads = [s["with"]["name"] for s in doc["jobs"][job]["steps"] if "download-artifact" in s.get("uses", "")]
+        assert downloads == [tested], f"{job} must publish the artifact the test job produced"
+    assert "test" in doc["jobs"]["publish-testpypi"]["needs"]
+    plugin_wf = yaml.safe_load((REPO / ".github/workflows/_python-plugin.yml").read_text())
+    upload = [s for s in plugin_wf["jobs"]["test"]["steps"] if "upload-artifact" in s.get("uses", "") and s["with"]["name"].startswith("dist-")]
+    assert upload and upload[0]["with"]["name"] == "dist-${{ inputs.plugin }}"
+
+
+def test_release_checkouts_do_not_persist_credentials() -> None:
+    doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
+    for name, job in doc["jobs"].items():
+        for step in job.get("steps", []):
+            if "actions/checkout@" in step.get("uses", ""):
+                assert step["with"].get("persist-credentials") is False, f"{name}: checkout must set persist-credentials: false"
 
 
 def test_top_level_permissions_are_empty_or_read_only() -> None:

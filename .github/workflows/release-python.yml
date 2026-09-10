@@ -1,8 +1,13 @@
 # Release pipeline for ONE Python plugin, triggered by a scoped tag such as
 # python/openai_agents/v1.0.0rc1. The plugin is a parameter parsed from the tag.
 #
-#   prepare -> test (reusable CI, full matrix) + build (once) -> publish-testpypi
-#   -> smoke-testpypi -> [finals only] publish-pypi -> smoke-pypi -> github-release (draft)
+#   prepare -> test (reusable CI, full matrix; its ubuntu dist cell builds and checks the artifacts)
+#   -> publish-testpypi -> smoke-testpypi -> [finals only] publish-pypi -> smoke-pypi -> github-release (draft)
+#
+# The artifacts that were tested are the artifacts that get published. Dry run: dispatch on
+# main with the `tag` input set to the tag you intend to push and `skip-publish` on; everything
+# up to and including the tested build runs, nothing is uploaded and no tag is consumed.
+# Uploads and the draft release happen only for a real tag ref.
 #
 # Publishing uses PyPI trusted publishing (OIDC): no stored credentials. The
 # publish jobs live INLINE here on purpose: PyPI rejects reusable workflows as
@@ -16,6 +21,14 @@ on:
       - "python/*/v*"
   workflow_dispatch:
     inputs:
+      tag:
+        description: Release tag to validate and build when dispatching from a branch (dry run), e.g. python/mcp/v0.1.0. Leave empty when dispatching on a tag ref.
+        type: string
+        default: ""
+      skip-publish:
+        description: Dry run - validate, test and build, but upload nothing and draft no release
+        type: boolean
+        default: false
       publish-prerelease-to-pypi:
         description: For a pre-release tag ref, also publish to PyPI (still gated by the pypi environment; ignored while plugin.toml [release] allow-final is false)
         type: boolean
@@ -46,6 +59,8 @@ jobs:
       coordinate: ${{ steps.tag.outputs.coordinate }}
       root_api: ${{ steps.tag.outputs.root_api }}
       smoke_imports: ${{ steps.tag.outputs.smoke_imports }}
+      allow_final: ${{ steps.tag.outputs.allow_final }}
+      publish: ${{ steps.gate.outputs.publish }}
       publish_pypi: ${{ steps.gate.outputs.publish_pypi }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -58,7 +73,7 @@ jobs:
       - name: Parse tag
         id: tag
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: uv run --project scripts --locked python scripts/release/release_tool.py parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
       - name: Tag version matches the manifest
         env:
@@ -76,11 +91,15 @@ jobs:
           PY
       - name: Tag is reachable from main
         # fetch-depth 0 above already brought origin/main; no extra fetch (credentials are not persisted).
+        env:
+          REF_TYPE: ${{ github.ref_type }}
         run: |
           git rev-parse --verify --quiet origin/main > /dev/null || { echo "::error::origin/main not present in checkout"; exit 1; }
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then exit 0; fi
+          if [ "$REF_TYPE" = "tag" ]; then
             echo "::error::release tags must point at a commit on main"; exit 1
           fi
+          echo "::warning::dry run from a commit that is not on main; a release tag here would be rejected"
       - name: Version policy
         env:
           PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
@@ -92,7 +111,16 @@ jobs:
           PRERELEASE: ${{ steps.tag.outputs.prerelease }}
           ALLOW_FINAL: ${{ steps.tag.outputs.allow_final }}
           OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish-prerelease-to-pypi }}
+          REF_TYPE: ${{ github.ref_type }}
+          SKIP_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.skip-publish }}
         run: |
+          # Uploads and the draft release happen only for a real tag ref, and never on a dry run.
+          if [ "$REF_TYPE" = "tag" ] && [ "$SKIP_PUBLISH" != "true" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::dry run: validation, tests and the build run; nothing is uploaded and no release is drafted"
+          fi
           # Finals reach PyPI; pre-releases only via the dispatch override, and never while the plugin
           # is still in the SDK-cutover transition (allow-final = false).
           if [ "$PRERELEASE" = "false" ] || { [ "$OVERRIDE" = "true" ] && [ "$ALLOW_FINAL" = "true" ]; }; then
@@ -111,31 +139,12 @@ jobs:
       plugin: ${{ needs.prepare.outputs.plugin }}
       deps: locked
 
-  build:
-    name: Build distributions
-    needs: prepare
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: ${{ needs.prepare.outputs.plugin_dir }}/pyproject.toml
-      - uses: ./.github/actions/python-build-check
-        with:
-          plugin-dir: ${{ needs.prepare.outputs.plugin_dir }}
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: dist
-          path: ${{ needs.prepare.outputs.plugin_dir }}/dist
-          if-no-files-found: error
-
   publish-testpypi:
     name: Publish to TestPyPI
-    needs: [prepare, test, build]
+    # dist-<plugin> is built, verified and smoke-tested by the test job's ubuntu dist cell
+    # (_python-plugin.yml): the published bytes are the tested bytes.
+    needs: [prepare, test]
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     environment: testpypi
     permissions:
@@ -143,7 +152,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist
+          name: dist-${{ needs.prepare.outputs.plugin }}
           path: dist/
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
@@ -155,6 +164,7 @@ jobs:
   smoke-testpypi:
     name: Smoke-test from TestPyPI
     needs: [prepare, publish-testpypi]
+    if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -172,13 +182,14 @@ jobs:
           ROOT_API: ${{ needs.prepare.outputs.root_api }}
           SMOKE_IMPORTS: ${{ needs.prepare.outputs.smoke_imports }}
           INDEX_URL: https://test.pypi.org/simple/
-          ALLOW_OVERLAP_WITH_CORE: "1"
+          # A plugin the SDK still bundles (allow-final = false) may overlap it; any other must not.
+          ALLOW_OVERLAP_WITH_CORE: ${{ needs.prepare.outputs.allow_final == 'true' && '0' || '1' }}
         run: bash scripts/release/smoke_from_index.sh
 
   publish-pypi:
     name: Publish to PyPI
     needs: [prepare, smoke-testpypi]
-    if: needs.prepare.outputs.publish_pypi == 'true'
+    if: needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -186,7 +197,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist
+          name: dist-${{ needs.prepare.outputs.plugin }}
           path: dist/
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
@@ -197,7 +208,7 @@ jobs:
   smoke-pypi:
     name: Smoke-test from PyPI
     needs: [prepare, publish-pypi]
-    if: needs.prepare.outputs.publish_pypi == 'true'
+    if: needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -214,15 +225,16 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           ROOT_API: ${{ needs.prepare.outputs.root_api }}
           SMOKE_IMPORTS: ${{ needs.prepare.outputs.smoke_imports }}
-          # Finals must never overlap the SDK; a dispatched pre-release still may.
-          ALLOW_OVERLAP_WITH_CORE: ${{ needs.prepare.outputs.prerelease == 'true' && '1' || '0' }}
+          # Same rule as TestPyPI: only a plugin the SDK still bundles may overlap it.
+          ALLOW_OVERLAP_WITH_CORE: ${{ needs.prepare.outputs.allow_final == 'true' && '0' || '1' }}
         run: bash scripts/release/smoke_from_index.sh
 
   github-release:
     name: Draft GitHub release
     needs: [prepare, smoke-testpypi, smoke-pypi]
     if: >-
-      always() && needs.prepare.result == 'success' && needs.smoke-testpypi.result == 'success'
+      always() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
+      && needs.smoke-testpypi.result == 'success'
       && (needs.smoke-pypi.result == 'success' || needs.smoke-pypi.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
@@ -231,12 +243,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false # gh uses GH_TOKEN below; do not leave the write token in .git/config
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version-file: scripts/pyproject.toml
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist
+          name: dist-${{ needs.prepare.outputs.plugin }}
           path: dist/
       - name: Generate release notes from history
         env:

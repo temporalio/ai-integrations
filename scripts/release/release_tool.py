@@ -3,7 +3,8 @@
 
 Subcommands:
   parse-tag TAG                 validate `<language>/<plugin>/v<version>` and emit its parts
-  check-version-policy          enforce the version policy against the production registry
+  check-version-policy          enforce the version policy against the production registry, and
+                                refuse a version that already exists on TestPyPI (uploads are immutable)
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
 
@@ -32,7 +33,10 @@ from pathlib import Path
 from packaging.version import InvalidVersion, Version
 
 TAG_RE = re.compile(r"^(?P<language>python|typescript|java|go)/(?P<plugin>[a-z0-9_.-]+)/v(?P<version>.+)$")
-REGISTRY_JSON = {"pypi": "https://pypi.org/pypi/{coordinate}/json"}
+REGISTRY_JSON = {
+    "pypi": "https://pypi.org/pypi/{coordinate}/json",
+    "testpypi": "https://test.pypi.org/pypi/{coordinate}/json",
+}
 FIRST_VERSION = {"ga": Version("1.0.0"), "preview": Version("0.1.0"), "experimental": Version("0.1.0")}
 TRANSITION_MARKER = "TRANSITION(sdk-cutover)"
 DEFAULT_REPO = "temporalio/ai-integrations"
@@ -147,13 +151,15 @@ def check_policy(version: Version, maturity: str, published: list[Version]) -> N
 
 
 def transition_markers(repo_root: Path, plugin_dir: str) -> list[str]:
-    try:
-        out = subprocess.run(
-            ["git", "grep", "-l", TRANSITION_MARKER, "--", plugin_dir],
-            capture_output=True, text=True, cwd=repo_root,
-        )
-    except FileNotFoundError:
-        return []
+    """List plugin files containing the transition marker. Fails closed on any git error."""
+    out = subprocess.run(
+        ["git", "grep", "-l", TRANSITION_MARKER, "--", plugin_dir],
+        capture_output=True, text=True, cwd=repo_root,
+    )
+    # git grep exits 1 for "no match"; anything else (not a repo, bad pathspec, ...) is an error
+    # and must not be mistaken for "no markers".
+    if out.returncode not in (0, 1):
+        raise PolicyError(f"git grep for {TRANSITION_MARKER} failed in {repo_root} ({out.returncode}): {out.stderr.strip()}")
     return [line for line in out.stdout.splitlines() if line.strip()]
 
 
@@ -167,6 +173,14 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     published = fetch_published_versions(coordinate, registry, Path(args.registry_json) if args.registry_json else None)
     check_policy(version, maturity, published)
     print(f"OK: {coordinate} {version} satisfies the version policy (published: {[str(v) for v in sorted(published)] or 'none'})")
+    if registry == "pypi":
+        # Every release is uploaded to TestPyPI first, and uploads are immutable: a version that is
+        # already there would be skipped (skip-existing) and the smoke test would validate stale
+        # bytes while reporting success. Fix forward with the next rcN instead.
+        staged = fetch_published_versions(coordinate, "testpypi", Path(args.testpypi_json) if args.testpypi_json else None)
+        if version in staged:
+            raise PolicyError(f"{coordinate} {version} already exists on TestPyPI; uploads are immutable, use the next pre-release number")
+        print(f"OK: {coordinate} {version} is not yet on TestPyPI")
     if not version.is_prerelease:
         if not meta.get("release", {}).get("allow-final"):
             raise PolicyError(
@@ -227,7 +241,8 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
                 f"from https://github.com/{up_repo}/commits/main/{up_path}.",
                 "",
             ]
-        lines += [f"**Source**: https://github.com/{repo}/tree/{tag}/{plugin_dir}", ""]
+        # refs/tags/ keeps GitHub from reading the slash-separated tag as a ref plus a path.
+        lines += [f"**Source**: https://github.com/{repo}/tree/refs/tags/{tag}/{plugin_dir}", ""]
     else:
         prev_tag, _ = prev
         log = _git("log", "--no-decorate", "--format=%h%x1f%s", f"{prev_tag}..{tag}", "--", plugin_dir, cwd=repo_root)
@@ -245,11 +260,15 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
             "## Pre-release notes",
             "",
             "- This pre-release is published to **TestPyPI only** to validate the release pipeline.",
-            f"- Do **not** install it alongside a `temporalio` release that still embeds `{root_api or coordinate}`; both distributions "
-            "write the same files and whichever installs last wins. Wait for the SDK cutover release.",
-            "- docs.temporal.io still describes the SDK-embedded install until the cutover.",
-            "",
         ]
+        if not meta.get("release", {}).get("allow-final", False):
+            # Only a plugin the SDK still bundles shares files with it.
+            lines += [
+                f"- Do **not** install it alongside a `temporalio` release that still embeds `{root_api or coordinate}`; both distributions "
+                "write the same files and whichever installs last wins. Wait for the SDK cutover release.",
+                "- docs.temporal.io still describes the SDK-embedded install until the cutover.",
+            ]
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -305,18 +324,13 @@ def cmd_draft_release(args: argparse.Namespace) -> int:
         _gh("api", "-X", "PATCH", f"repos/{repo}/releases/{release_id}", "-f", f"name={args.title}",
             "-F", "draft=true", "-F", f"prerelease={'true' if args.prerelease else 'false'}", "-f", f"body={body}")
         print(f"updated existing release {release_id} for {args.tag}")
-    existing: list[dict] = []
-    for page in _json_documents(_gh("api", f"repos/{repo}/releases/{release_id}/assets?per_page=100", "--paginate")):
-        existing.extend(page if isinstance(page, list) else [page])
-    by_name = {a["name"]: a["id"] for a in existing}
-    for path in sorted(Path(args.dist).iterdir()):
-        if not path.is_file():
-            continue
-        if path.name in by_name:
-            _gh("api", "-X", "DELETE", f"repos/{repo}/releases/assets/{by_name[path.name]}")
-        upload_url = f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={path.name}"
-        _gh("api", "-X", "POST", "-H", "Content-Type: application/octet-stream", "--input", str(path), upload_url)
-        print(f"uploaded {path.name}")
+    assets = [str(path) for path in sorted(Path(args.dist).iterdir()) if path.is_file()]
+    if assets:
+        # gh streams the binaries itself and --clobber replaces same-name assets atomically,
+        # instead of a delete-then-POST through `gh api --input`.
+        _gh("release", "upload", args.tag, *assets, "--repo", repo, "--clobber")
+        for asset in assets:
+            print(f"uploaded {Path(asset).name}")
     print(f"OK: draft release ready: https://github.com/{repo}/releases/tag/{args.tag}")
     return 0
 
@@ -338,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--plugin-dir", required=True)
     p.add_argument("--version", required=True)
     p.add_argument("--registry-json", default=None, help="read published versions from this file instead of the registry (tests)")
+    p.add_argument("--testpypi-json", default=None, help="read TestPyPI versions from this file instead of the registry (tests)")
     p.set_defaults(func=cmd_check_version_policy)
 
     p = sub.add_parser("release-notes", help="generate release notes from history")
