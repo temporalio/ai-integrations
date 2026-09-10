@@ -41,7 +41,7 @@ defaults:
     shell: bash
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }} # dry runs of different tags on main do not queue behind each other
   cancel-in-progress: false
 
 jobs:
@@ -59,6 +59,7 @@ jobs:
       coordinate: ${{ steps.tag.outputs.coordinate }}
       root_api: ${{ steps.tag.outputs.root_api }}
       smoke_imports: ${{ steps.tag.outputs.smoke_imports }}
+      tag: ${{ steps.tag.outputs.tag }}
       allow_final: ${{ steps.tag.outputs.allow_final }}
       publish: ${{ steps.gate.outputs.publish }}
       publish_pypi: ${{ steps.gate.outputs.publish_pypi }}
@@ -70,6 +71,19 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version-file: scripts/pyproject.toml
+      - name: Dispatch inputs are consistent with the ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ] && [ -n "$INPUT_TAG" ] && [ "$INPUT_TAG" != "$REF_NAME" ]; then
+            echo "::error::tag input '$INPUT_TAG' does not match the dispatched tag ref '$REF_NAME'; dispatch on the tag without a tag input, or on a branch for a dry run"; exit 1
+          fi
+          if [ "$REF_TYPE" != "tag" ] && [ -z "$INPUT_TAG" ]; then
+            echo "::error::dispatching from a branch is a dry run and needs the tag input, e.g. python/mcp/v0.1.0"; exit 1
+          fi
       - name: Parse tag
         id: tag
         env:
@@ -104,7 +118,7 @@ jobs:
         env:
           PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
           VERSION: ${{ steps.tag.outputs.version }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py --repo-root "$PWD" check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
+        run: uv run --project scripts --locked python scripts/release/release_tool.py --repo-root "$PWD" check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION" --check-testpypi
       - name: Decide whether PyPI publication is allowed
         id: gate
         env:
@@ -115,7 +129,8 @@ jobs:
           SKIP_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.skip-publish }}
         run: |
           # Uploads and the draft release happen only for a real tag ref, and never on a dry run.
-          if [ "$REF_TYPE" = "tag" ] && [ "$SKIP_PUBLISH" != "true" ]; then
+          # Compare against the literal "false": anything else (a typo such as `True` or `1`) is a dry run.
+          if [ "$REF_TYPE" = "tag" ] && [ "$SKIP_PUBLISH" = "false" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
@@ -141,8 +156,8 @@ jobs:
 
   publish-testpypi:
     name: Publish to TestPyPI
-    # dist-<plugin> is built, verified and smoke-tested by the test job's ubuntu dist cell
-    # (_python-plugin.yml): the published bytes are the tested bytes.
+    # dist-<plugin>-locked is built, verified and smoke-tested by the test job's ubuntu dist cell
+    # (_python-plugin.yml, deps=locked): the published bytes are the tested bytes.
     needs: [prepare, test]
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
@@ -152,7 +167,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist-${{ needs.prepare.outputs.plugin }}
+          name: dist-${{ needs.prepare.outputs.plugin }}-locked
           path: dist/
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
@@ -175,6 +190,17 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version-file: scripts/pyproject.toml
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-${{ needs.prepare.outputs.plugin }}-locked
+          path: dist/
+      - name: Index files are the tested artifacts
+        # skip-existing keeps a re-run from failing, so prove the files the index serves are the
+        # bytes this run built (uv_build is reproducible) rather than an earlier upload's.
+        env:
+          COORDINATE: ${{ needs.prepare.outputs.coordinate }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py verify-index-files --coordinate "$COORDINATE" --version "$VERSION" --dist dist --index testpypi
       - name: Install from TestPyPI into a clean project and smoke-test
         env:
           COORDINATE: ${{ needs.prepare.outputs.coordinate }}
@@ -197,7 +223,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist-${{ needs.prepare.outputs.plugin }}
+          name: dist-${{ needs.prepare.outputs.plugin }}-locked
           path: dist/
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
@@ -219,6 +245,15 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version-file: scripts/pyproject.toml
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-${{ needs.prepare.outputs.plugin }}-locked
+          path: dist/
+      - name: Index files are the tested artifacts
+        env:
+          COORDINATE: ${{ needs.prepare.outputs.coordinate }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py verify-index-files --coordinate "$COORDINATE" --version "$VERSION" --dist dist --index pypi
       - name: Install from PyPI into a clean project and smoke-test
         env:
           COORDINATE: ${{ needs.prepare.outputs.coordinate }}
@@ -233,7 +268,7 @@ jobs:
     name: Draft GitHub release
     needs: [prepare, smoke-testpypi, smoke-pypi]
     if: >-
-      always() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
+      !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
       && needs.smoke-testpypi.result == 'success'
       && (needs.smoke-pypi.result == 'success' || needs.smoke-pypi.result == 'skipped')
     runs-on: ubuntu-latest
@@ -249,18 +284,18 @@ jobs:
           version-file: scripts/pyproject.toml
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: dist-${{ needs.prepare.outputs.plugin }}
+          name: dist-${{ needs.prepare.outputs.plugin }}-locked
           path: dist/
       - name: Generate release notes from history
         env:
           PLUGIN_DIR: ${{ needs.prepare.outputs.plugin_dir }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: uv run --project scripts --locked python scripts/release/release_tool.py --repo-root "$PWD" release-notes --plugin-dir "$PLUGIN_DIR" --tag "$TAG" --output notes.md
       - name: Create or update the draft release
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
           TITLE: ${{ needs.prepare.outputs.plugin }} ${{ needs.prepare.outputs.version }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |

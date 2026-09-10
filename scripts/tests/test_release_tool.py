@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -12,7 +14,8 @@ from conftest import commit_all, git, make_python_plugin
 
 def test_parse_tag_valid() -> None:
     assert release_tool.parse_tag("python/openai_agents/v1.0.0rc1") == {
-        "language": "python", "plugin": "openai_agents", "version": "1.0.0rc1", "prerelease": "true", "plugin_dir": "python/openai_agents",
+        "tag": "python/openai_agents/v1.0.0rc1", "language": "python", "plugin": "openai_agents", "version": "1.0.0rc1",
+        "prerelease": "true", "plugin_dir": "python/openai_agents",
     }
     assert release_tool.parse_tag("go/googleadk/v0.3.0")["prerelease"] == "false"
     assert release_tool.parse_tag("typescript/vercel-ai-sdk/v1.0.0.dev1")["prerelease"] == "true"
@@ -58,7 +61,7 @@ def _registry(tmp_path: Path, versions: list[str] | None) -> Path:
 def test_cli_policy_prerelease_with_no_published_versions(plugin_repo: Path, tmp_path: Path) -> None:
     reg = _registry(tmp_path, None)
     rc = release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
-                            "--version", "0.1.0rc1", "--registry-json", str(reg)])
+                            "--version", "0.1.0rc1", "--registry-json", str(reg), "--testpypi-json", str(tmp_path / "absent.json")])
     assert rc == 0
 
 
@@ -74,33 +77,100 @@ def test_cli_policy_final_blocked_by_transition_markers(repo: Path, tmp_path: Pa
     (d / "src/temporalio/contrib/fakeplug/_impl.py").write_text("# TRANSITION(sdk-cutover): remove\nVALUE = 1\n")
     commit_all(repo, "plugin")
     reg = _registry(tmp_path, None)
-    rc = release_tool.main(["--repo-root", str(repo), "check-version-policy", "--plugin-dir", str(d), "--version", "0.1.0", "--registry-json", str(reg)])
+    policy = ["--repo-root", str(repo), "check-version-policy", "--plugin-dir", str(d), "--version", "0.1.0", "--registry-json", str(reg),
+              "--testpypi-json", str(tmp_path / "absent.json")]
+    rc = release_tool.main(policy)
     out = capsys.readouterr().out
     assert rc == 1 and "TRANSITION(sdk-cutover)" in out
     (d / "src/temporalio/contrib/fakeplug/_impl.py").write_text("VALUE = 1\n")
     commit_all(repo, "clean")
-    assert release_tool.main(["--repo-root", str(repo), "check-version-policy", "--plugin-dir", str(d), "--version", "0.1.0", "--registry-json", str(reg)]) == 0
+    assert release_tool.main(policy) == 0
 
 
-def test_cli_policy_rejects_a_version_already_on_testpypi(plugin_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_policy_warns_when_the_version_is_already_on_testpypi(plugin_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     reg = _registry(tmp_path, None)
     staged = tmp_path / "testpypi.json"
     staged.write_text(json.dumps({"releases": {"0.1.0rc1": []}}))
     args = ["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
             "--registry-json", str(reg), "--testpypi-json", str(staged)]
-    assert release_tool.main([*args, "--version", "0.1.0rc1"]) == 1
-    assert "already exists on TestPyPI" in capsys.readouterr().out
+    # A re-run after a staged upload is the normal recovery path, so this is a warning, not a failure.
+    assert release_tool.main([*args, "--version", "0.1.0rc1"]) == 0
+    assert "::warning::" in capsys.readouterr().out
     assert release_tool.main([*args, "--version", "0.1.0rc2"]) == 0
+    assert "not yet on TestPyPI" in capsys.readouterr().out
 
 
-def test_transition_markers_fail_closed_outside_a_repository(tmp_path: Path) -> None:
+def test_cli_policy_does_not_touch_testpypi_unless_asked(plugin_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_args, **_kwargs):
+        raise AssertionError("network access")
+
+    monkeypatch.setattr(release_tool.urllib.request, "urlopen", boom)
+    reg = _registry(tmp_path, None)
+    assert release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
+                              "--version", "0.1.0rc1", "--registry-json", str(reg)]) == 0
+
+
+def test_transition_markers_fail_closed_on_git_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def broken(*_args, **_kwargs):
+        return subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="fatal: not a git repository")
+
+    monkeypatch.setattr(release_tool.subprocess, "run", broken)
     with pytest.raises(release_tool.PolicyError, match="git grep"):
         release_tool.transition_markers(tmp_path, "python/fakeplug")
+
+    def missing(*_args, **_kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(release_tool.subprocess, "run", missing)
+    with pytest.raises(release_tool.PolicyError, match="git is required"):
+        release_tool.transition_markers(tmp_path, "python/fakeplug")
+
+
+def _dist(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    digests = {}
+    for name, payload in (("fakeplug-0.1.0-py3-none-any.whl", b"wheel"), ("fakeplug-0.1.0.tar.gz", b"sdist")):
+        (dist / name).write_bytes(payload)
+        digests[name] = hashlib.sha256(payload).hexdigest()
+    return dist, digests
+
+
+def _index_json(tmp_path: Path, digests: dict[str, str]) -> Path:
+    f = tmp_path / "release.json"
+    f.write_text(json.dumps({"urls": [{"filename": n, "digests": {"sha256": d}} for n, d in digests.items()]}))
+    return f
+
+
+def test_verify_index_files_accepts_identical_digests(tmp_path: Path) -> None:
+    dist, digests = _dist(tmp_path)
+    assert release_tool.main(["verify-index-files", "--coordinate", "temporalio-fakeplug", "--version", "0.1.0", "--dist", str(dist),
+                              "--index", "testpypi", "--attempts", "1", "--delay", "0", "--index-json", str(_index_json(tmp_path, digests))]) == 0
+
+
+def test_verify_index_files_rejects_different_bytes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    dist, digests = _dist(tmp_path)
+    digests["fakeplug-0.1.0.tar.gz"] = hashlib.sha256(b"someone else's sdist").hexdigest()
+    assert release_tool.main(["verify-index-files", "--coordinate", "temporalio-fakeplug", "--version", "0.1.0", "--dist", str(dist),
+                              "--attempts", "1", "--delay", "0", "--index-json", str(_index_json(tmp_path, digests))]) == 1
+    assert "different bytes" in capsys.readouterr().out
+
+
+def test_verify_index_files_rejects_missing_files(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    dist, digests = _dist(tmp_path)
+    digests.pop("fakeplug-0.1.0.tar.gz")
+    assert release_tool.main(["verify-index-files", "--coordinate", "temporalio-fakeplug", "--version", "0.1.0", "--dist", str(dist),
+                              "--attempts", "2", "--delay", "0", "--index-json", str(_index_json(tmp_path, digests))]) == 1
+    assert "does not serve" in capsys.readouterr().out
+    # An absent release (404) is reported the same way rather than as a crash.
+    assert release_tool.main(["verify-index-files", "--coordinate", "temporalio-fakeplug", "--version", "0.1.0", "--dist", str(dist),
+                              "--attempts", "1", "--delay", "0", "--index-json", str(tmp_path / "missing.json")]) == 1
 
 
 def test_cli_policy_existing_versions(plugin_repo: Path, tmp_path: Path) -> None:
     reg = _registry(tmp_path, ["0.1.0", "0.2.0"])
-    args = ["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"), "--registry-json", str(reg)]
+    args = ["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"), "--registry-json", str(reg),
+            "--testpypi-json", str(tmp_path / "absent.json")]
     assert release_tool.main([*args, "--version", "0.3.0rc1"]) == 0
     assert release_tool.main([*args, "--version", "0.2.0"]) == 1
     assert release_tool.main([*args, "--version", "0.1.5"]) == 1
