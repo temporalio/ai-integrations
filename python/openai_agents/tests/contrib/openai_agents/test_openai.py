@@ -1,9 +1,8 @@
 import asyncio
 import json
-import os
 import sys
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, cast
@@ -53,7 +52,7 @@ from agents.items import (
     ToolCallOutputItem,
     TResponseStreamEvent,
 )
-from agents.mcp import MCPServer, MCPServerStdio
+from agents.mcp import MCPServer
 from agents.sandbox.capabilities.tools import SandboxApplyPatchTool
 from agents.tool import CustomTool
 from agents.tool_context import ToolContext
@@ -2816,28 +2815,8 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
 async def test_stateful_mcp_server_no_worker(client: Client):
     server = StatefulMCPServerProvider(
         "Filesystem-Server",
-        lambda _: MCPServerStdio(
-            name="Filesystem-Server",
-            params={
-                "command": "npx",
-                "args": [
-                    "-y",
-                    "@modelcontextprotocol/server-filesystem",
-                    os.path.dirname(os.path.abspath(__file__)),
-                ],
-            },
-        ),
+        lambda _: get_tracking_server("Filesystem-Server"),
     )
-
-    # Override the connect activity to not actually start a worker
-    @activity.defn(name="Filesystem-Server-stateful-connect")
-    async def connect() -> None:
-        await asyncio.sleep(30)
-
-    def override_get_activities() -> Sequence[Callable]:
-        return (connect,)
-
-    server.get_activities = override_get_activities  # type:ignore
 
     async with AgentEnvironment(
         model_params=ModelActivityParameters(

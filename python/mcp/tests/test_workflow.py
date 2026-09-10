@@ -3,11 +3,18 @@ import socket
 import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
+# Imported outside imports_passed_through() on purpose: MCPPlugin must pass
+# mcp_types through the sandbox, or this becomes a sandbox-local copy of the
+# class and the isinstance check in NativeMCPWorkflow fails.
+import mcp_types
+
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 from temporalio.contrib.mcp import TemporalMCPClient
 
 with workflow.unsafe.imports_passed_through():
@@ -15,7 +22,6 @@ with workflow.unsafe.imports_passed_through():
     from mcp import Client, StdioServerParameters, stdio_client
     from mcp.server.mcpserver import MCPServer
     from mcp.types import TextContent, TextResourceContents
-    from mcp_types import TextContent as DirectTextContent
 
     from temporalio.client import Client as TemporalClient
     from temporalio.contrib.mcp import MCPPlugin
@@ -54,7 +60,7 @@ class NativeMCPWorkflow:
         # The second call is served from replay-safe workflow state.
         assert await client.list_tools() is tools
         tool_result = await client.call_tool("echo", {"value": "hello"})
-        assert isinstance(tool_result.content[0], DirectTextContent)
+        assert isinstance(tool_result.content[0], mcp_types.TextContent)
         prompts = await client.list_prompts()
         prompt = await client.get_prompt("greeting", {"name": "Temporal"})
         resources = await client.list_resources()
@@ -69,6 +75,27 @@ class NativeMCPWorkflow:
             templates.resource_templates[0].name,
             cast(TextResourceContents, resource.contents[0]).text,
         )
+
+
+@workflow.defn
+class ConfiguredMCPWorkflow:
+    @workflow.run
+    async def run(self, mode: str) -> str:
+        if mode == "retry-policy-only":
+            config: workflow.ActivityConfig = {
+                "retry_policy": RetryPolicy(maximum_attempts=1)
+            }
+        elif mode == "explicit-none":
+            config = {
+                "start_to_close_timeout": None,
+                "schedule_to_close_timeout": None,
+                "retry_policy": RetryPolicy(maximum_attempts=1),
+            }
+        else:
+            config = {"schedule_to_close_timeout": timedelta(hours=1)}
+        client = TemporalMCPClient("rich", activity_config=config)
+        result = await client.call_tool("echo", {"value": mode})
+        return cast(TextContent, result.content[0]).text
 
 
 @workflow.defn
@@ -125,6 +152,57 @@ async def test_native_workflow_operations_and_replay(client: TemporalClient) -> 
     await Replayer(workflows=[NativeMCPWorkflow], plugins=[plugin]).replay_workflow(
         history
     )
+
+
+async def test_activity_config_keeps_default_timeout_only_when_needed(
+    client: TemporalClient,
+) -> None:
+    server = rich_server()
+    plugin = MCPPlugin({"rich": lambda: Client(server)})
+    async with new_worker(client, ConfiguredMCPWorkflow, plugins=[plugin]) as worker:
+        for mode in (
+            "retry-policy-only",
+            "explicit-none",
+            "schedule-to-close-only",
+        ):
+            handle = await client.start_workflow(
+                ConfiguredMCPWorkflow.run,
+                mode,
+                id=f"configured-mcp-{mode}-{uuid4()}",
+                task_queue=worker.task_queue,
+            )
+            assert await handle.result() == mode
+            [(start_to_close, schedule_to_close)] = await activity_timeouts(handle)
+            if mode in {"retry-policy-only", "explicit-none"}:
+                # The default start-to-close timeout was merged in.
+                assert (start_to_close, schedule_to_close) == (
+                    timedelta(minutes=1),
+                    None,
+                )
+            else:
+                # A caller-supplied schedule-to-close timeout is left alone: the
+                # one-minute default is not added (the server fills start-to-close
+                # from schedule-to-close when the command leaves it unset).
+                assert schedule_to_close == timedelta(hours=1)
+                assert start_to_close != timedelta(minutes=1)
+
+
+async def activity_timeouts(
+    handle: Any,
+) -> list[tuple[timedelta | None, timedelta | None]]:
+    timeouts: list[tuple[timedelta | None, timedelta | None]] = []
+    async for event in handle.fetch_history_events():
+        if event.HasField("activity_task_scheduled_event_attributes"):
+            attrs = event.activity_task_scheduled_event_attributes
+            start_to_close = attrs.start_to_close_timeout.ToTimedelta()
+            schedule_to_close = attrs.schedule_to_close_timeout.ToTimedelta()
+            timeouts.append(
+                (
+                    start_to_close or None,
+                    schedule_to_close or None,
+                )
+            )
+    return timeouts
 
 
 async def run_transport_workflow(

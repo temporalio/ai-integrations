@@ -20,9 +20,10 @@ uv add temporalio-openai-agents       # OpenAI Agents SDK
 ```
 
 Until the Temporal Python SDK release that stops bundling `temporalio.contrib.openai_agents`,
-do not install this package next to `temporalio<=1.32`: both ship the same files, and
-uninstalling the plugin then deletes files the SDK still needs (repair with a reinstall of
-`temporalio`). Pre-releases are published to TestPyPI only for that reason.
+do not install `temporalio-openai-agents` next to `temporalio<=1.32`: both ship the same files,
+and uninstalling the plugin then deletes files the SDK still needs (repair with a reinstall of
+`temporalio`). Its pre-releases are published to TestPyPI only for that reason. `temporalio-mcp`
+shares no files with the SDK and is released to PyPI.
 
 ## Develop
 

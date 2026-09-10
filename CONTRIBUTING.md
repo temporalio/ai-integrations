@@ -6,7 +6,7 @@ workflow.
 ## Set up
 
 - Python plugins: install [uv](https://docs.astral.sh/uv/) and GNU make (`brew install make` on
-  macOS if needed; `choco install make` on Windows, or use WSL). Node is needed for the MCP tests.
+  macOS if needed; `choco install make` on Windows, or use WSL).
 - `cd python/<plugin> && make sync && make lint && make test`.
 
 ## Pull requests
@@ -17,8 +17,9 @@ workflow.
   merged with **"Create a merge commit"**, never squash or rebase. Adaptation changes go in
   separate commits after the merge commit and never touch imported files (the one recorded
   exception, the `openai_agents` MCP v2 adapter, is described in AGENTS.md, "Transition rules").
-- CI runs only the plugins whose files changed (`.github/workflows/ci.yml`); `ci-status` is the
-  required check. No secrets are needed: provider behavior uses deterministic local test doubles.
+- CI runs only the plugins whose files changed (`.github/workflows/ci.yml`); `ci-status`,
+  `Check for CODEOWNERS` and `opengrep/scan` are the required checks, plus one code-owner
+  approval. No secrets are needed: provider behavior uses deterministic local test doubles.
 - During the SDK cutover transition, bug fixes for a migrated plugin land in the SDK repository
   first and reach this repository through a re-sync (AGENTS.md, "Transition rules").
 

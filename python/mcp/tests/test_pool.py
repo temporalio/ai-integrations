@@ -3,8 +3,14 @@ from datetime import timedelta
 from typing import Any, cast
 
 import pytest
-from mcp import Client
+from mcp import Client, MCPError
 from mcp.server.mcpserver import MCPServer
+from mcp.types import (
+    CONNECTION_CLOSED,
+    INVALID_PARAMS,
+    REQUEST_TIMEOUT,
+    UNSUPPORTED_PROTOCOL_VERSION,
+)
 
 from temporalio.contrib.mcp._client import _MCPClientBackend
 from temporalio.contrib.mcp._pool import _MCPConnectionPool
@@ -154,6 +160,58 @@ async def test_operation_failure_evicts_connection() -> None:
             "echo",
             factory_argument=None,
         ):
+            pass
+        assert created == 2
+    finally:
+        await pool.close()
+
+
+async def test_protocol_error_response_keeps_connection() -> None:
+    server = echo_server()
+    created = 0
+
+    def factory() -> _MCPClientBackend:
+        nonlocal created
+        created += 1
+        return _MCPClientBackend(Client(server))
+
+    pool = _MCPConnectionPool({"echo": factory}, timedelta(minutes=5))
+    try:
+        # An unknown resource is answered with a JSON-RPC error over a healthy
+        # connection; a real server round-trip proves the transport survived.
+        async with pool.backend("echo", factory_argument=None) as client:
+            with pytest.raises(MCPError) as err:
+                await client.read_resource("test://missing")
+            assert err.value.code == INVALID_PARAMS
+        with pytest.raises(MCPError):
+            async with pool.backend("echo", factory_argument=None):
+                raise MCPError(INVALID_PARAMS, "bad arguments")
+        async with pool.backend("echo", factory_argument=None) as client:
+            result = await client.call_tool("echo", {"value": "hi"}, None)
+            assert result.is_error is False
+        assert created == 1
+    finally:
+        await pool.close()
+
+
+@pytest.mark.parametrize(
+    "code", [CONNECTION_CLOSED, REQUEST_TIMEOUT, UNSUPPORTED_PROTOCOL_VERSION]
+)
+async def test_unusable_connection_error_retires_connection(code: int) -> None:
+    server = echo_server()
+    created = 0
+
+    def factory() -> _MCPClientBackend:
+        nonlocal created
+        created += 1
+        return _MCPClientBackend(Client(server))
+
+    pool = _MCPConnectionPool({"echo": factory}, timedelta(minutes=5))
+    try:
+        with pytest.raises(MCPError):
+            async with pool.backend("echo", factory_argument=None):
+                raise MCPError(code, "transport gone")
+        async with pool.backend("echo", factory_argument=None):
             pass
         assert created == 2
     finally:

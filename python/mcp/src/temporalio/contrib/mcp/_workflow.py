@@ -33,8 +33,10 @@ class TemporalMCPClient:
 
     This class is experimental and may change in future versions.
 
-    Each operation executes as an Activity. Tool discovery is cached for the
-    lifetime of this object by default. A non-None ``factory_argument`` selects
+    Each operation executes as an Activity with ``activity_config``; a one-minute
+    ``start_to_close_timeout`` is added when the config sets neither
+    ``start_to_close_timeout`` nor ``schedule_to_close_timeout``. Tool discovery
+    is cached for the lifetime of this object by default. A non-None ``factory_argument`` selects
     a fresh worker-side client for every Activity. The argument is recorded in
     workflow history and must not contain secrets.
 
@@ -54,9 +56,15 @@ class TemporalMCPClient:
     ) -> None:
         """Configure the registered name and MCP operation Activities."""
         self._name = name
-        self._activity_config: ActivityConfig = activity_config or {
-            "start_to_close_timeout": timedelta(minutes=1)
-        }
+        config = (
+            ActivityConfig(**activity_config) if activity_config else ActivityConfig()
+        )
+        if (
+            config.get("start_to_close_timeout") is None
+            and config.get("schedule_to_close_timeout") is None
+        ):
+            config["start_to_close_timeout"] = timedelta(minutes=1)
+        self._activity_config: ActivityConfig = config
         self._cache_tools_list = cache_tools_list
         self._tools: ListToolsResult | None = None
         self._factory_argument = factory_argument
@@ -154,8 +162,3 @@ class TemporalMCPClient:
         )
         value = await self._execute("read-resource", request, dict[str, Any])
         return ReadResourceResult.model_validate(value)
-
-
-# Kept as an internal alias while contrib integrations migrate to the public
-# name. It is not exported from ``temporalio.contrib.mcp``.
-_MCPClient = TemporalMCPClient

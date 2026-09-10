@@ -8,6 +8,10 @@ from typing import Any, Protocol
 from mcp.types import (
     CallToolResult,
     GetPromptResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
+    ListToolsResult,
     Prompt,
     ReadResourceResult,
     RequestParamsMeta,
@@ -20,7 +24,13 @@ from temporalio.exceptions import ApplicationError
 
 
 class _MCPBackend(Protocol):
-    """Normalized worker-side MCP operations used by the Activity layer."""
+    """Normalized worker-side MCP operations used by the Activity layer.
+
+    Implemented here by ``_client._MCPClientBackend`` and, in
+    ``temporalio-openai-agents``, by an adapter over the OpenAI Agents
+    ``MCPServer``. A change to this protocol, ``_FactoryInvoker`` or
+    ``_activities._MCPActivities`` is a coordinated release across both packages.
+    """
 
     async def __aenter__(self) -> "_MCPBackend": ...
 
@@ -34,7 +44,7 @@ class _MCPBackend(Protocol):
     @property
     def cacheable(self) -> bool: ...
 
-    async def list_tools(self) -> list[Tool]: ...
+    async def list_tools(self) -> ListToolsResult | list[Tool]: ...
 
     async def call_tool(
         self,
@@ -43,15 +53,17 @@ class _MCPBackend(Protocol):
         meta: RequestParamsMeta | None,
     ) -> CallToolResult: ...
 
-    async def list_prompts(self) -> list[Prompt]: ...
+    async def list_prompts(self) -> ListPromptsResult | list[Prompt]: ...
 
     async def get_prompt(
         self, name: str, arguments: dict[str, str] | None
     ) -> GetPromptResult: ...
 
-    async def list_resources(self) -> list[Resource]: ...
+    async def list_resources(self) -> ListResourcesResult | list[Resource]: ...
 
-    async def list_resource_templates(self) -> list[ResourceTemplate]: ...
+    async def list_resource_templates(
+        self,
+    ) -> ListResourceTemplatesResult | list[ResourceTemplate]: ...
 
     async def read_resource(self, uri: str) -> ReadResourceResult: ...
 

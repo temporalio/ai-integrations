@@ -9,16 +9,20 @@ from typing import Any, TypeVar
 
 from mcp import MCPError
 from mcp.types import (
+    HEADER_MISMATCH,
     INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
     PARSE_ERROR,
+    UNSUPPORTED_PROTOCOL_VERSION,
+    URL_ELICITATION_REQUIRED,
     ListPromptsResult,
     ListResourcesResult,
     ListResourceTemplatesResult,
     ListToolsResult,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from temporalio import activity
 from temporalio.contrib.mcp._activity import (
@@ -33,16 +37,23 @@ from temporalio.contrib.mcp._pool import _MCPConnectionPool
 from temporalio.exceptions import ApplicationError
 
 _Result = TypeVar("_Result")
+_ListResult = TypeVar("_ListResult", bound=BaseModel)
 
 logger = logging.getLogger(__name__)
 
 # Upper bound on how long worker shutdown waits for MCP transports to close.
 _CLOSE_TIMEOUT_SECONDS = 10.0
+# JSON-RPC errors that a retry of the same request cannot fix. INTERNAL_ERROR,
+# CONNECTION_CLOSED, REQUEST_TIMEOUT and unknown codes stay retryable.
 _NON_RETRYABLE_PROTOCOL_ERRORS = {
     PARSE_ERROR,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
     INVALID_PARAMS,
+    HEADER_MISMATCH,
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
+    UNSUPPORTED_PROTOCOL_VERSION,
+    URL_ELICITATION_REQUIRED,
 }
 
 
@@ -50,8 +61,21 @@ def _dump(model: BaseModel) -> dict[str, Any]:
     return model.model_dump(mode="json")
 
 
+def _normalize_list_result(
+    value: BaseModel | list[Any], result_type: type[_ListResult], field: str
+) -> _ListResult:
+    """Wrap list-only compatibility backends in an MCP result envelope."""
+    if isinstance(value, result_type):
+        return value
+    return result_type.model_validate({field: value})
+
+
 class _MCPActivities:
-    """Build framework-neutral MCP operation Activities for named backends."""
+    """Build framework-neutral MCP operation Activities for named backends.
+
+    ``temporalio-openai-agents`` builds on this class and on ``_backend``; a
+    change to either is a coordinated release across both packages.
+    """
 
     def __init__(
         self,
@@ -77,11 +101,19 @@ class _MCPActivities:
             ) as backend:
                 return await operation(backend)
         except MCPError as err:
+            details = (err.code,) if err.data is None else (err.code, err.data)
             raise ApplicationError(
                 err.message,
-                err.code,
+                *details,
                 type="MCPProtocolError",
                 non_retryable=err.code in _NON_RETRYABLE_PROTOCOL_ERRORS,
+            ) from err
+        except ValidationError as err:
+            raise ApplicationError(
+                "MCP server returned an invalid response",
+                err.errors(include_url=False, include_input=False),
+                type="MCPProtocolError",
+                non_retryable=True,
             ) from err
 
     def _build_activities(self) -> Sequence[Callable[..., Any]]:
@@ -93,15 +125,12 @@ class _MCPActivities:
                 request: dict[str, Any], server: str = server
             ) -> dict[str, Any]:
                 parsed = _MCPRequest(**request)
-                return _dump(
-                    ListToolsResult(
-                        tools=await self._run(
-                            server,
-                            parsed,
-                            lambda backend: backend.list_tools(),
-                        )
-                    )
+                result = await self._run(
+                    server,
+                    parsed,
+                    lambda backend: backend.list_tools(),
                 )
+                return _dump(_normalize_list_result(result, ListToolsResult, "tools"))
 
             @activity.defn(name=_activity_name(server, "call-tool"))
             async def call_tool(
@@ -124,14 +153,13 @@ class _MCPActivities:
                 request: dict[str, Any], server: str = server
             ) -> dict[str, Any]:
                 parsed = _MCPRequest(**request)
+                result = await self._run(
+                    server,
+                    parsed,
+                    lambda backend: backend.list_prompts(),
+                )
                 return _dump(
-                    ListPromptsResult(
-                        prompts=await self._run(
-                            server,
-                            parsed,
-                            lambda backend: backend.list_prompts(),
-                        )
-                    )
+                    _normalize_list_result(result, ListPromptsResult, "prompts")
                 )
 
             @activity.defn(name=_activity_name(server, "get-prompt"))
@@ -154,14 +182,13 @@ class _MCPActivities:
                 request: dict[str, Any], server: str = server
             ) -> dict[str, Any]:
                 parsed = _MCPRequest(**request)
+                result = await self._run(
+                    server,
+                    parsed,
+                    lambda backend: backend.list_resources(),
+                )
                 return _dump(
-                    ListResourcesResult(
-                        resources=await self._run(
-                            server,
-                            parsed,
-                            lambda backend: backend.list_resources(),
-                        )
-                    )
+                    _normalize_list_result(result, ListResourcesResult, "resources")
                 )
 
             @activity.defn(name=_activity_name(server, "list-resource-templates"))
@@ -169,13 +196,16 @@ class _MCPActivities:
                 request: dict[str, Any], server: str = server
             ) -> dict[str, Any]:
                 parsed = _MCPRequest(**request)
+                result = await self._run(
+                    server,
+                    parsed,
+                    lambda backend: backend.list_resource_templates(),
+                )
                 return _dump(
-                    ListResourceTemplatesResult(
-                        resource_templates=await self._run(
-                            server,
-                            parsed,
-                            lambda backend: backend.list_resource_templates(),
-                        )
+                    _normalize_list_result(
+                        result,
+                        ListResourceTemplatesResult,
+                        "resource_templates",
                     )
                 )
 
@@ -218,7 +248,7 @@ class _MCPActivities:
                 self._run_contexts[loop] = remaining
             else:
                 self._run_contexts.pop(loop)
-                close_task = asyncio.create_task(self._pool.close())
+                close_task = asyncio.create_task(self._close_if_unused(loop))
                 try:
                     await self._finish_close(close_task)
                 except asyncio.CancelledError:
@@ -228,6 +258,13 @@ class _MCPActivities:
                     if not body_completed:
                         raise
                     await self._finish_close(close_task)
+
+    async def _close_if_unused(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Close this loop's connections unless another Worker has entered."""
+        if self._run_contexts.get(loop, 0) == 0:
+            # close() detaches the loop's pool generation before its first
+            # suspension, so a later entrant cannot inherit closing records.
+            await self._pool.close()
 
     async def _finish_close(self, close_task: asyncio.Task[None]) -> None:
         """Wait a bounded time for the connection pool to close."""
