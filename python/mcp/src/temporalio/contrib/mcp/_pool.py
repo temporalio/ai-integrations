@@ -6,7 +6,15 @@ from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any, cast
 
+from mcp import MCPError
+from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT
+
 from temporalio.contrib.mcp._backend import _MCPBackend, _MCPBackendFactory
+
+# JSON-RPC error codes that indicate the connection itself is unusable. Every
+# other MCPError is an error *response*, proof that the transport still works.
+# REQUEST_TIMEOUT is retired conservatively: the peer may be alive but stuck.
+_TRANSPORT_ERROR_CODES = frozenset({CONNECTION_CLOSED, REQUEST_TIMEOUT})
 
 
 class _ConnectionRecord:
@@ -175,6 +183,12 @@ class _MCPConnectionPool:
             # client cancels the in-flight request on the wire. Retiring the
             # connection here would make one cancelled Activity force every
             # other workflow sharing it to reconnect.
+            raise
+        except MCPError as err:
+            # A tool or resource typo answers with a JSON-RPC error over a
+            # healthy connection. Retiring it would respawn a stdio server or
+            # reconnect an HTTP client for every workflow sharing it.
+            failed = err.code in _TRANSPORT_ERROR_CODES
             raise
         except BaseException:
             failed = True
