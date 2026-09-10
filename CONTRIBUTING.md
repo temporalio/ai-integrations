@@ -15,7 +15,8 @@ workflow.
   `temporalio/.github`.
 - PRs that import or re-sync history from an SDK repository are labelled `history-import` and are
   merged with **"Create a merge commit"**, never squash or rebase. Adaptation changes go in
-  separate commits after the merge commit and never touch imported files.
+  separate commits after the merge commit and never touch imported files (the one recorded
+  exception, the `openai_agents` MCP v2 adapter, is described in AGENTS.md, "Transition rules").
 - CI runs only the plugins whose files changed (`.github/workflows/ci.yml`); `ci-status` is the
   required check. No secrets are needed: provider behavior uses deterministic local test doubles.
 - During the SDK cutover transition, bug fixes for a migrated plugin land in the SDK repository

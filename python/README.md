@@ -34,8 +34,10 @@ models, mock transports, or in-process servers so the same assertions run in eve
 ## Dependency cooldown
 
 `exclude-newer = "2 weeks"` applies to third-party packages; `exclude-newer-package =
-{ temporalio = false }` exempts the SDK so a new release is adoptable immediately. Nightly CI
-lanes re-lock to the newest and lowest allowed versions without committing the lock.
+{ temporalio = false }` exempts the SDK so a new release is adoptable immediately, and a plugin
+that depends on another plugin exempts that coordinate as well (`temporalio-mcp = false` in
+`openai_agents`). Nightly CI lanes re-lock to the newest and lowest allowed versions without
+committing the lock.
 
 ## LICENSE
 

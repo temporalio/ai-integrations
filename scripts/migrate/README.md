@@ -70,7 +70,8 @@ Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merg
 1. Run the script unchanged, fetch, and `git merge sdk-python-filtered/main` on a new branch.
    Only commits newer than the previous import arrive because the rewrite is byte-identical.
 2. Resolve conflicts only where adaptation commits touched imported files (there should be
-   none while the transition rules are followed).
+   none while the transition rules are followed, except in the `openai_agents` MCP v2 adapter
+   files listed in AGENTS.md, "Transition rules": keep both sides there).
 3. Diff the vendored test scaffolding against upstream and port relevant changes by hand:
    `tests/conftest.py`, `tests/__init__.py`, `tests/helpers/__init__.py`, `tests/helpers/nexus.py`.
 4. If upstream added provider-network tests, add deterministic local coverage without credentials.
@@ -83,7 +84,9 @@ arguments, `replace-message.txt`, the commit callback, `--prune-empty`/`--preser
 the pinned git-filter-repo version, and upstream history itself (a force-push or a `SRC_REF`
 that is not a descendant of the previous import). If a rule must change, the plugin needs a
 one-time full re-import PR (delete `python/<plugin>`, import again, re-apply adaptation
-commits) and a note in `IMPORTS.md`.
+commits) and a note in `IMPORTS.md`. A `SRC_REF` from a closed upstream PR is the exception
+that needs only the `IMPORTS.md` note: its filtered commits share byte-identical history with
+`main` up to the merge base, and they can never arrive from upstream a second time.
 
 ## Adding another plugin
 
