@@ -81,7 +81,6 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = ["../_shared"]
 # Do not use log_cli since this shows logging for all tests, not just the ones
 # that failed. Instead, show all logs for failed tests at the end.
 log_level = "DEBUG"
