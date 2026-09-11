@@ -62,6 +62,7 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["../_shared"]
 # Do not use log_cli since this shows logging for all tests, not just the ones
 # that failed. Instead, show all logs for failed tests at the end.
 log_level = "DEBUG"
@@ -75,7 +76,7 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-files = ["src", "tests"]
+files = ["src", "tests", "../_shared/temporalio_ai_integrations_pytest.py"]
 mypy_path = "src"
 namespace_packages = true
 explicit_package_bases = true
@@ -103,7 +104,7 @@ reportUnnecessaryIsInstance = "none"
 reportUnnecessaryTypeIgnoreComment = "none"
 reportUnusedCallResult = "none"
 reportUnknownLambdaType = "none"
-include = ["src", "tests"]
+include = ["src", "tests", "../_shared/temporalio_ai_integrations_pytest.py"]
 
 # Resolve the plugin's own modules from source rather than from site-packages.
 [[tool.pyright.executionEnvironments]]
