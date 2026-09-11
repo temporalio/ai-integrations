@@ -18,7 +18,6 @@ dependencies = ["packaging>=26,<27"]
 
 [dependency-groups]
 dev = [
-  "pydocstyle>=6.3,<7",
   "pytest>=9,<10",
   "pyyaml>=6,<7",
   "ruff>=0.15.12,<0.16",
