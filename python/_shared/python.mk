@@ -53,9 +53,9 @@ lint: ## Import order, formatting, pyright, mypy, basedpyright, docstrings
 	uv run ruff check --select I
 	uv run ruff format --check
 	uv run pyright
-	uv run mypy
+	uv run mypy --config-file ../_shared/mypy.ini src tests
 	uv run basedpyright
-	uv run pydocstyle --ignore-decorators=overload src
+	uv run pydocstyle --config=../_shared/pydocstyle.ini --ignore-decorators=overload src
 
 test: ## Run the suite against a local dev server
 	$(PYTEST) $(PYTEST_ARGS)

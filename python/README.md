@@ -20,6 +20,10 @@ Every plugin's `Makefile` is two lines that include `python/_shared/python.mk`; 
 lists the targets. The important ones: `sync` (non-editable install; run it after pulling),
 `lint`, `test`, and `build`.
 
+`python/_shared/` also contains composable, non-Python configuration for Pyright, Mypy, Ruff,
+and pydocstyle. Python source and stubs are intentionally not shared: test support is copied into
+each plugin so editors and type checkers resolve it using that plugin's environment.
+
 Why non-editable: `temporalio` is a regular package, so an editable install of a plugin cannot be
 imported as `temporalio.contrib.<name>`. The make targets export `UV_NO_EDITABLE=1`, and the
 `[tool.uv] cache-keys` in each `pyproject.toml` make `uv` rebuild the plugin when `src/` changes.

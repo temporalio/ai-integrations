@@ -7,6 +7,7 @@ with a list of violations. Passes on a repository with zero plugins.
 Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
   * plugin folder names never end in `-plugin` / `_plugin`
   * no language-level lockfiles (python/uv.lock, typescript/pnpm-lock.yaml, ...)
+  * python/_shared contains configuration and make logic, never Python source or stubs
   * every Python plugin has pyproject.toml, uv.lock, plugin.toml, Makefile, README.md,
     src/temporalio/contrib/<name>/{__init__.py,py.typed}
   * NO src/temporalio/__init__.py and NO src/temporalio/contrib/__init__.py (namespace invariant)
@@ -89,6 +90,13 @@ class Checker:
                         self.fail(f"{language}/{child.name}: plugin folders must not end in -plugin/_plugin")
                     if child not in [p.path for p in discovered[language]]:
                         self.fail(f"{language}/{child.name}: directory has no {language} manifest; non-plugin folders must start with `_`")
+        shared_python = self.root / "python" / "_shared"
+        if shared_python.is_dir():
+            for path in shared_python.rglob("*"):
+                if path.is_file() and path.suffix in {".py", ".pyi", ".pyw", ".pyx"}:
+                    self.fail(
+                        f"{path.relative_to(self.root)}: Python code must be duplicated into each plugin, not shared"
+                    )
 
     def check_python_plugin(self, plugin: Plugin) -> None:
         d = plugin.path

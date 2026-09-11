@@ -63,6 +63,15 @@ def test_plugin_folder_suffix_and_language_lockfile(plugin_repo: Path) -> None:
     assert any("language-level lockfiles" in x for x in v) and any("must not end in -plugin/_plugin" in x for x in v)
 
 
+def test_python_code_is_forbidden_in_shared(plugin_repo: Path) -> None:
+    shared = plugin_repo / "python/_shared"
+    shared.mkdir()
+    (shared / "ruff.toml").write_text('target-version = "py310"\n')
+    assert run(plugin_repo) == []
+    (shared / "fixtures.py").write_text("VALUE = 1\n")
+    assert any("Python code must be duplicated" in x for x in run(plugin_repo))
+
+
 def test_plugin_toml_agreement(plugin_repo: Path) -> None:
     meta = plugin_repo / "python/fakeplug/plugin.toml"
     meta.write_text(meta.read_text().replace('coordinate = "temporalio-fakeplug"', 'coordinate = "temporalio-other"'))
