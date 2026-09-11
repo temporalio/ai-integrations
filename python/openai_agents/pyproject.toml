@@ -126,10 +126,10 @@ reportUnusedCallResult = "none"
 reportUnknownLambdaType = "none"
 include = ["src", "tests"]
 
-# TRANSITION(sdk-cutover): upstream code reaches sibling contrib packages with relative imports
+# TRANSITION(sdk-cutover): this code reaches sibling contrib packages with relative imports
 # (e.g. `from ..opentelemetry._id_generator import ...`), which pyright cannot resolve from a
 # split source tree although they work at runtime through site-packages. Silence only under src/
-# (basedpyright fails on warnings) until upstream switches to absolute imports of public names.
+# (basedpyright fails on warnings) until the imports use absolute public names.
 [[tool.pyright.executionEnvironments]]
 root = "src"
 reportMissingImports = "none"
@@ -154,7 +154,6 @@ target-version = "py310"
 src = [".", "src"]
 
 [tool.ruff.lint.isort]
-# Upstream (sdk-python) has the whole `temporalio` package in-tree, so every temporalio.* import is
-# first-party there. Only our own subpackage exists under src/, so force the same classification
-# to keep imported files byte-identical to upstream.
+# The SDK owns the top-level `temporalio` package while this project owns only its contrib
+# subpackage, so classify every temporalio.* import consistently as first-party.
 known-first-party = ["temporalio", "tests"]

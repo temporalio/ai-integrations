@@ -1,12 +1,7 @@
 """Shared pytest configuration for this plugin.
 
-Vendored from temporalio/sdk-python ``tests/conftest.py`` (origin/main) and pruned to what this
-plugin's tests use. Re-sync it by hand when upstream changes (scripts/migrate/README.md).
-
-Added on top of upstream:
-
-* Provenance guard. The session aborts unless the installed plugin is the non-editable build of
-  this checkout (tests/helpers/provenance.py).
+The provenance guard aborts the session unless the installed plugin is the non-editable build of
+this checkout (tests/helpers/provenance.py).
 """
 
 from __future__ import annotations
@@ -23,7 +18,6 @@ from agents.tracing import set_trace_processors
 from opentelemetry.util._once import Once
 
 from temporalio.client import Client
-from temporalio.envconfig import ClientConfigProfile
 from temporalio.testing import WorkflowEnvironment
 from tests.helpers.plugin_meta import load_plugin_meta
 from tests.helpers.provenance import ProvenanceError, check_provenance
@@ -39,7 +33,7 @@ PLUGIN = load_plugin_meta(PLUGIN_ROOT)
 set_trace_processors([])
 
 # ---------------------------------------------------------------------------
-# pytest hooks (upstream hooks plus the provenance guard)
+# pytest hooks and provenance guard
 # ---------------------------------------------------------------------------
 
 
@@ -47,26 +41,6 @@ def pytest_runtest_setup(item):  # type: ignore[reportMissingParameterType]
     """Print a newline so that custom printed output starts on new line."""
     if item.config.getoption("-s"):
         print()
-
-
-def pytest_addoption(parser):  # type: ignore[reportMissingParameterType]
-    parser.addoption(
-        "-E",
-        "--workflow-environment",
-        default="local",
-        help="Which workflow environment to use ('local', 'time-skipping', 'envconfig', or ip:port for existing server)",
-    )
-
-
-def _uses_envconfig_server(env_type: str) -> bool:
-    return env_type == "envconfig"
-
-
-def pytest_configure(config: pytest.Config) -> None:
-    config.addinivalue_line(
-        "markers",
-        "requires_local_server: test requires local-server-only behavior and cannot run against an envconfig server",
-    )
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:  # type: ignore[reportUnusedParameter]
@@ -85,27 +59,6 @@ def pytest_sessionstart(session: pytest.Session) -> None:  # type: ignore[report
         pytest.exit(f"provenance guard failed: {exc}", returncode=1)
 
 
-def pytest_collection_modifyitems(
-    config: pytest.Config, items: list[pytest.Item]
-) -> None:
-    skip_local_only = pytest.mark.skip(
-        reason="requires a local Temporal server, not the configured envconfig server"
-    )
-    envconfig = _uses_envconfig_server(config.getoption("--workflow-environment"))
-    for item in items:
-        if envconfig and item.get_closest_marker("requires_local_server"):
-            item.add_marker(skip_local_only)
-
-
-async def _create_env_from_envconfig() -> WorkflowEnvironment:
-    config = ClientConfigProfile.load().to_client_connect_config()
-    if not config.get("target_host"):
-        raise ValueError(
-            "An envconfig workflow environment requires TEMPORAL_ADDRESS or an envconfig profile with an address"
-        )
-    return WorkflowEnvironment.from_client(await Client.connect(**config))
-
-
 @pytest.fixture(scope="session")
 def event_loop():
     loop = asyncio.get_event_loop_policy().new_event_loop()  # type: ignore[reportDeprecated]
@@ -116,26 +69,14 @@ def event_loop():
         raise
 
 
-@pytest.fixture(scope="session")
-def env_type(request: pytest.FixtureRequest) -> str:
-    return request.config.getoption("--workflow-environment")  # type: ignore[reportReturnType]
-
-
 @pytest_asyncio.fixture(scope="session")  # type: ignore[reportUntypedFunctionDecorator]
-async def env(env_type: str) -> AsyncGenerator[WorkflowEnvironment, None]:
-    if _uses_envconfig_server(env_type):
-        env = await _create_env_from_envconfig()
-    elif env_type == "local":
-        # No --dynamic-config-value flags: the dev server's defaults cover everything the plugin
-        # suites exercise (verified by running the full suite without any). Add a flag here only when a
-        # test needs a server feature that is off by default, and say which test needs it.
-        env = await WorkflowEnvironment.start_local(
-            dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
-        )
-    elif env_type == "time-skipping":
-        env = await WorkflowEnvironment.start_time_skipping()
-    else:
-        env = WorkflowEnvironment.from_client(await Client.connect(env_type))
+async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
+    # No --dynamic-config-value flags: the dev server's defaults cover everything the plugin
+    # suites exercise (verified by running the full suite without any). Add a flag here only when a
+    # test needs a server feature that is off by default, and say which test needs it.
+    env = await WorkflowEnvironment.start_local(
+        dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
+    )
 
     yield env
     await env.shutdown()
