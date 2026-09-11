@@ -79,7 +79,7 @@ filterwarnings = [
 ]
 
 [tool.mypy]
-files = ["src", "tests", "../_shared/temporalio_ai_integrations_pytest.py"]
+files = ["src", "tests"]
 mypy_path = "src"
 namespace_packages = true
 explicit_package_bases = true
@@ -107,7 +107,7 @@ reportUnnecessaryIsInstance = "none"
 reportUnnecessaryTypeIgnoreComment = "none"
 reportUnusedCallResult = "none"
 reportUnknownLambdaType = "none"
-include = ["src", "tests", "../_shared/temporalio_ai_integrations_pytest.py"]
+include = ["src", "tests"]
 
 # TRANSITION(sdk-cutover): upstream code reaches sibling contrib packages with relative imports
 # (e.g. `from ..opentelemetry._id_generator import ...`), which pyright cannot resolve from a

@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-
 import tests as plugin_tests
 from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment

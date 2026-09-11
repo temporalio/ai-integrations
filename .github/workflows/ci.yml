@@ -85,6 +85,11 @@ jobs:
           PR_COMMITS: ${{ github.event.pull_request.commits }}
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: uv run --project scripts --locked python scripts/ci/check_conventions.py
+      - name: Lint shared Python
+        run: |
+          uv run --project scripts --locked ruff check --select I python/_shared/temporalio_ai_integrations_pytest.py
+          uv run --project scripts --locked ruff format --check python/_shared/temporalio_ai_integrations_pytest.py
+          uv run --project scripts --locked pydocstyle python/_shared/temporalio_ai_integrations_pytest.py
       - name: Tooling unit tests
         run: uv run --project scripts --locked pytest scripts/tests -q
 

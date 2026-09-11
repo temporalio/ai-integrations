@@ -19,7 +19,6 @@ export UV_NO_EDITABLE := 1
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 PYTEST_ARGS ?=
 PYTEST := uv run pytest -n auto --dist=worksteal
-SHARED_PYTEST := ../_shared/temporalio_ai_integrations_pytest.py
 
 .PHONY: help sync sync-latest sync-lowest format lint test build clean
 
@@ -47,16 +46,16 @@ sync-lowest: ## Re-lock to the lowest allowed direct versions and install (night
 	uv sync --locked --resolution lowest-direct --reinstall-package $(DIST)
 
 format: ## Fix import order and formatting
-	uv run ruff check --select I --fix . $(SHARED_PYTEST)
-	uv run ruff format . $(SHARED_PYTEST)
+	uv run ruff check --select I --fix
+	uv run ruff format
 
 lint: ## Import order, formatting, pyright, mypy, basedpyright, docstrings
-	uv run ruff check --select I . $(SHARED_PYTEST)
-	uv run ruff format --check . $(SHARED_PYTEST)
+	uv run ruff check --select I
+	uv run ruff format --check
 	uv run pyright
 	uv run mypy
 	uv run basedpyright
-	uv run pydocstyle --ignore-decorators=overload src $(SHARED_PYTEST)
+	uv run pydocstyle --ignore-decorators=overload src
 
 test: ## Run the suite against a local dev server
 	$(PYTEST) $(PYTEST_ARGS)
