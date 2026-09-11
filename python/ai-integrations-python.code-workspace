@@ -1,0 +1,20 @@
+{
+  "folders": [
+    {
+      "name": "_shared",
+      "path": "_shared"
+    },
+    {
+      "name": "mcp",
+      "path": "mcp"
+    },
+    {
+      "name": "openai_agents",
+      "path": "openai_agents"
+    },
+    {
+      "name": "scripts",
+      "path": "../scripts"
+    }
+  ]
+}

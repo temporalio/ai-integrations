@@ -30,6 +30,11 @@ Shared pytest support is a separate tooling project. Run `cd python/_shared && m
 create its `.venv` with pytest, pytest-asyncio and Temporal installed; editors can use that
 interpreter for files under `_shared`. Its `make lint` runs once in the conventions job.
 
+For VS Code and other Pyright-based editors, open `python/ai-integrations-python.code-workspace`.
+Each Python project is then a separate workspace folder, so the language server uses that
+project's `.venv`; a single-folder repository workspace cannot represent these independent
+environments.
+
 ## Provider-independent tests
 
 Tests must not require provider credentials. Exercise provider behavior with deterministic local
