@@ -78,7 +78,9 @@ jobs:
         with:
           version-file: scripts/pyproject.toml
           enable-cache: true
-          cache-dependency-glob: scripts/uv.lock
+          cache-dependency-glob: |
+            scripts/uv.lock
+            python/_shared/uv.lock
       - name: Check repository conventions
         env:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
@@ -86,9 +88,8 @@ jobs:
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: uv run --project scripts --locked python scripts/ci/check_conventions.py
       - name: Lint shared Python
-        run: |
-          uv run --project scripts --locked ruff check --select I python/_shared/temporalio_ai_integrations_pytest.py
-          uv run --project scripts --locked ruff format --check python/_shared/temporalio_ai_integrations_pytest.py
+        working-directory: python/_shared
+        run: make sync && make lint
       - name: Tooling unit tests
         run: uv run --project scripts --locked pytest scripts/tests -q
 

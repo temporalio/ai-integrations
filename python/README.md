@@ -26,6 +26,10 @@ imported as `temporalio.contrib.<name>`. The make targets export `UV_NO_EDITABLE
 A test session that finds an editable or stale install fails immediately with the fix in the
 message (`make sync`).
 
+Shared pytest support is a separate tooling project. Run `cd python/_shared && make sync` to
+create its `.venv` with pytest, pytest-asyncio and Temporal installed; editors can use that
+interpreter for files under `_shared`. Its `make lint` runs once in the conventions job.
+
 ## Provider-independent tests
 
 Tests must not require provider credentials. Exercise provider behavior with deterministic local
@@ -46,4 +50,4 @@ conventions check enforces it; refresh with `cp LICENSE python/<name>/LICENSE`).
 ## Platform notes
 
 - Windows: install GNU make (`choco install make`) or use WSL; CI installs it on Windows runners.
-- The dev server is downloaded on first run by the test suite (`tests/__init__.py` pins the version).
+- The dev server is downloaded on first run by the test suite (`_shared/temporalio_ai_integrations_pytest.py` pins the version).

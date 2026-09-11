@@ -9,14 +9,16 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-import tests as plugin_tests
 from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
-from tests import DEV_SERVER_DOWNLOAD_VERSION
-from tests.helpers.plugin_meta import load_plugin_meta
-from tests.helpers.provenance import ProvenanceError, check_provenance
 
-PLUGIN_ROOT = Path(plugin_tests.__file__).resolve().parents[1]
+from temporalio_ai_integrations_support import (
+    ProvenanceError,
+    check_provenance,
+    load_plugin_meta,
+)
+
+DEV_SERVER_DOWNLOAD_VERSION = "v1.8.3-server-1.32.0-162.0"
 
 
 def pytest_runtest_setup(item):  # type: ignore[reportMissingParameterType]
@@ -27,7 +29,7 @@ def pytest_runtest_setup(item):  # type: ignore[reportMissingParameterType]
 
 def pytest_sessionstart(session: pytest.Session) -> None:  # type: ignore[reportUnusedParameter]
     """Abort unless the installed plugin is the non-editable build of this checkout."""
-    plugin = load_plugin_meta(PLUGIN_ROOT)
+    plugin = load_plugin_meta(Path(session.config.rootpath))
     allow_overlap = (not plugin.allow_final) or os.environ.get(
         "ALLOW_OVERLAP_WITH_CORE"
     ) == "1"
