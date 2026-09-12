@@ -121,6 +121,29 @@ def env_type(request: pytest.FixtureRequest) -> str:
     return request.config.getoption("--workflow-environment")  # type: ignore[reportReturnType]
 
 
+async def _start_local_dev_server(attempts: int = 3) -> WorkflowEnvironment:
+    """Start the dev server, retrying the fixed five-second connect window the SDK bridge allows.
+
+    Every xdist worker starts its own server; on a cold Windows runner the binary can take longer
+    than five seconds to accept connections, which surfaces as "Failed starting Temporal dev server
+    ... ConnectionRefused" in two or three workers while the rest pass.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return await WorkflowEnvironment.start_local(
+                dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
+            )
+        except RuntimeError as err:
+            if attempt == attempts or "Failed starting Temporal dev server" not in str(
+                err
+            ):
+                raise
+            print(
+                f"dev server did not accept connections in time (attempt {attempt}/{attempts}); retrying"
+            )
+    raise AssertionError("unreachable")
+
+
 @pytest_asyncio.fixture(scope="session")  # type: ignore[reportUntypedFunctionDecorator]
 async def env(env_type: str) -> AsyncGenerator[WorkflowEnvironment, None]:
     if _uses_envconfig_server(env_type):
@@ -129,9 +152,7 @@ async def env(env_type: str) -> AsyncGenerator[WorkflowEnvironment, None]:
         # No --dynamic-config-value flags: the dev server's defaults cover everything the plugin
         # suites exercise (verified by running the full suite without any). Add a flag here only when a
         # test needs a server feature that is off by default, and say which test needs it.
-        env = await WorkflowEnvironment.start_local(
-            dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
-        )
+        env = await _start_local_dev_server()
     elif env_type == "time-skipping":
         env = await WorkflowEnvironment.start_time_skipping()
     else:
