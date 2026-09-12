@@ -35,7 +35,8 @@ from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
 
-TAG_RE = re.compile(r"^(?P<language>python|typescript|java|go)/(?P<plugin>[a-z0-9_.-]+)/v(?P<version>.+)$")
+# \Z (not $) so a trailing newline cannot ride along into GITHUB_OUTPUT.
+TAG_RE = re.compile(r"^(?P<language>python|typescript|java|go)/(?P<plugin>[a-z0-9][a-z0-9_.-]*)/v(?P<version>.+)\Z")
 REGISTRY_JSON = {
     "pypi": "https://pypi.org/pypi/{coordinate}/json",
     "testpypi": "https://test.pypi.org/pypi/{coordinate}/json",
@@ -55,6 +56,8 @@ class PolicyError(Exception):
 
 def _write_outputs(path: str | None, values: dict[str, str]) -> None:
     for k, v in values.items():
+        if "\n" in v or "\r" in v:
+            raise PolicyError(f"output {k!r} contains a line break; refusing to write it to GITHUB_OUTPUT")
         print(f"{k}={v}")
     if path:
         with open(path, "a", encoding="utf-8") as fh:
@@ -81,6 +84,8 @@ def parse_tag(tag: str) -> dict[str, str]:
     m = TAG_RE.match(tag)
     if not m:
         raise PolicyError(f"tag {tag!r} does not match <language>/<plugin>/v<version>")
+    if ".." in m.group("plugin"):
+        raise PolicyError(f"tag {tag!r} has an invalid plugin name")
     raw = m.group("version")
     try:
         version = Version(raw)
@@ -145,7 +150,8 @@ def fetch_published_versions(coordinate: str, registry: str, registry_json: Path
     return versions
 
 
-def check_policy(version: Version, maturity: str, published: list[Version]) -> None:
+def check_policy(version: Version, maturity: str, published: list[Version]) -> str | None:
+    """Raise on a policy violation; return a warning when this looks like a re-run of the newest release."""
     if maturity not in FIRST_VERSION:
         raise PolicyError(f"unknown maturity {maturity!r}")
     if not published:
@@ -154,10 +160,16 @@ def check_policy(version: Version, maturity: str, published: list[Version]) -> N
             raise PolicyError(
                 f"first release of a {maturity} coordinate must be {first} (or a pre-release of it); got {version}"
             )
-        return
+        return None
     newest = max(published)
-    if version <= newest:
-        raise PolicyError(f"{version} is not strictly greater than the newest published version {newest}; versions never reset")
+    if version == newest:
+        # A fresh run of the tag that already produced the newest release (a failure after the PyPI
+        # upload, for instance). Tags never move, uploads are skipped when present, and the smoke
+        # jobs verify the served files, so this is safe to continue.
+        return f"{version} is already the newest published version of this coordinate; treating this run as a re-run of that release"
+    if version < newest:
+        raise PolicyError(f"{version} is not greater than the newest published version {newest}; versions never reset")
+    return None
 
 
 def transition_markers(repo_root: Path, plugin_dir: str) -> list[str]:
@@ -184,7 +196,9 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     registry = meta["plugin"].get("registry", "pypi")
     version = Version(args.version)
     published = fetch_published_versions(coordinate, registry, Path(args.registry_json) if args.registry_json else None)
-    check_policy(version, maturity, published)
+    rerun = check_policy(version, maturity, published)
+    if rerun:
+        print(f"::warning::{rerun}")
     print(f"OK: {coordinate} {version} satisfies the version policy (published: {[str(v) for v in sorted(published)] or 'none'})")
     if registry == "pypi" and (args.check_testpypi or args.testpypi_json):
         # Every release is staged on TestPyPI first and uploads are immutable, so a re-run finds the
@@ -222,38 +236,61 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def index_release_files(coordinate: str, version: str, registry: str, index_json: Path | None = None) -> dict[str, str]:
-    """Return {filename: sha256} for one version on the index (empty when the version is absent)."""
+def index_release_files(coordinate: str, version: str, registry: str, index_json: Path | None = None) -> dict[str, dict]:
+    """Return {filename: {"sha256", "yanked"}} for one version on the index (empty when the version is absent)."""
     data = _fetch_json(RELEASE_JSON[registry].format(coordinate=coordinate, version=version), index_json)
     if not data:
         return {}
-    return {entry["filename"]: entry["digests"]["sha256"] for entry in data.get("urls", [])}
+    return {
+        entry["filename"]: {"sha256": entry["digests"]["sha256"], "yanked": bool(entry.get("yanked"))}
+        for entry in data.get("urls", [])
+    }
 
 
 def verify_index_files(coordinate: str, version: str, registry: str, dist: Path, *, attempts: int, delay: float, index_json: Path | None = None) -> None:
-    """Fail unless every local distribution file is served by the index with an identical sha256.
+    """Fail unless the index serves exactly the local distribution files, byte for byte, none yanked.
 
     Uploads are immutable and the publish step skips files that already exist, so this is what
     makes "the published bytes are the tested bytes" true on a re-run as well as on the first run.
+    Index propagation and transient registry errors are retried; a real mismatch is not.
     """
+    if attempts < 1:
+        raise PolicyError("attempts must be at least 1")
     local = {path.name: _sha256(path) for path in sorted(dist.iterdir()) if path.is_file()}
     if not local:
         raise PolicyError(f"no distribution files in {dist}")
-    remote: dict[str, str] = {}
+    remote: dict[str, dict] = {}
     for attempt in range(1, attempts + 1):
-        remote = index_release_files(coordinate, version, registry, index_json)
-        missing = sorted(set(local) - set(remote))
-        if not missing:
-            break
-        if attempt == attempts:
-            raise PolicyError(f"{registry} does not serve {missing} for {coordinate} {version} after {attempts} attempts")
-        print(f"{missing} not yet on {registry}; waiting for index propagation (attempt {attempt}/{attempts})")
+        try:
+            remote = index_release_files(coordinate, version, registry, index_json)
+        except PolicyError as exc:
+            if attempt == attempts:
+                raise
+            print(f"{exc}; retrying (attempt {attempt}/{attempts})")
+        else:
+            missing = sorted(set(local) - set(remote))
+            if not missing:
+                break
+            if attempt == attempts:
+                raise PolicyError(f"{registry} does not serve {missing} for {coordinate} {version} after {attempts} attempts")
+            print(f"{missing} not yet on {registry}; waiting for index propagation (attempt {attempt}/{attempts})")
         time.sleep(delay)
-    mismatched = sorted(name for name, digest in local.items() if remote[name] != digest)
+    extra = sorted(set(remote) - set(local))
+    if extra:
+        raise PolicyError(
+            f"{registry} serves files for {coordinate} {version} that this run did not build: {extra}. "
+            "Only the tested artifacts may be published; fix forward with the next version"
+        )
+    yanked = sorted(name for name, entry in remote.items() if entry["yanked"])
+    if yanked:
+        raise PolicyError(f"{registry} has yanked {yanked} for {coordinate} {version}; a yanked release is not what users get")
+    mismatched = sorted(name for name, digest in local.items() if remote[name]["sha256"] != digest)
     if mismatched:
         raise PolicyError(
-            f"{registry} serves different bytes than this run built for {mismatched}: an earlier upload of "
-            f"{coordinate} {version} is what users get. Uploads are immutable; fix forward with the next version"
+            f"{registry} serves different bytes than this run built for {mismatched}. Either an earlier upload of "
+            f"{coordinate} {version} is what users get, or this is a fresh run of a tag whose upload already happened "
+            "and the rebuild used a different uv version (uv_build stamps its version into the wheel). Use "
+            "'Re-run failed jobs' on the run that uploaded, or fix forward with the next version; uploads are immutable"
         )
     for name in sorted(local):
         print(f"OK: {name} on {registry} matches the tested artifact (sha256 {local[name][:12]}...)")
@@ -358,54 +395,46 @@ def _gh(*args: str, input_text: str | None = None) -> str:
     return subprocess.run(["gh", *args], check=True, capture_output=True, text=True, input=input_text).stdout
 
 
-def _json_documents(text: str) -> list:
-    """Parse the concatenated JSON documents that `gh api --paginate` emits (one per page)."""
-    decoder = json.JSONDecoder()
-    docs: list = []
-    idx = 0
-    text = text.strip()
-    while idx < len(text):
-        doc, end = decoder.raw_decode(text, idx)
-        docs.append(doc)
-        idx = end
-        while idx < len(text) and text[idx].isspace():
-            idx += 1
-    return docs
-
-
-def find_release_id(repo: str, tag: str) -> str | None:
-    out = _gh("api", f"repos/{repo}/releases?per_page=100", "--paginate", "--jq", f'.[] | select(.tag_name == "{tag}") | .id')
-    ids = [line.strip() for line in out.splitlines() if line.strip()]
-    return ids[0] if ids else None
+def find_releases(repo: str, tag: str) -> list[dict]:
+    """Every release, draft or published, whose tag_name is `tag` (newest first)."""
+    out = _gh("api", f"repos/{repo}/releases?per_page=100", "--paginate", "--jq",
+              f'.[] | select(.tag_name == "{tag}") | "\\(.id)\\t\\(.draft)"')
+    releases = []
+    for line in out.splitlines():
+        if line.strip():
+            release_id, _, draft = line.partition("\t")
+            releases.append({"id": release_id.strip(), "draft": draft.strip() == "true"})
+    return releases
 
 
 def cmd_draft_release(args: argparse.Namespace) -> int:
     repo = args.repo or _repo()
-    release_id = find_release_id(repo, args.tag)
-    if release_id is None:
+    releases = find_releases(repo, args.tag)
+    if any(not release["draft"] for release in releases):
+        # Runbook step 5 publishes the draft by hand. A published release owns the tag, and a later
+        # re-run must neither un-publish it nor swap its assets; refusing here also keeps
+        # `gh release upload <tag>` below from ever resolving to a published release.
+        raise PolicyError(f"a published release already exists for {args.tag}; refusing to modify it")
+    if not releases:
         cmd = ["release", "create", args.tag, "--repo", repo, "--draft", "--verify-tag", "--title", args.title, "--notes-file", args.notes]
         if args.prerelease:
             cmd.append("--prerelease")
         _gh(*cmd)
-        release_id = find_release_id(repo, args.tag)
-        if release_id is None:
+        releases = find_releases(repo, args.tag)
+        if not releases:
             raise PolicyError("release was created but could not be found afterwards")
-        print(f"created draft release {release_id} for {args.tag}")
+        print(f"created draft release {releases[0]['id']} for {args.tag}")
     else:
-        existing = json.loads(_gh("api", f"repos/{repo}/releases/{release_id}"))
-        if not existing.get("draft"):
-            # Runbook step 4 publishes the draft by hand; a later re-run must not un-publish it or
-            # swap its assets.
-            raise PolicyError(f"the release for {args.tag} is already published; refusing to modify it")
+        release_id = releases[0]["id"]
         body = Path(args.notes).read_text(encoding="utf-8")
         _gh("api", "-X", "PATCH", f"repos/{repo}/releases/{release_id}", "-f", f"name={args.title}",
             "-F", "draft=true", "-F", f"prerelease={'true' if args.prerelease else 'false'}", "-f", f"body={body}")
-        print(f"updated existing release {release_id} for {args.tag}")
+        print(f"updated existing draft release {release_id} for {args.tag}")
     assets = [str(path) for path in sorted(Path(args.dist).iterdir()) if path.is_file()]
     if assets:
-        # gh resolves a draft by its pending tag and streams the binaries itself. --clobber deletes a
-        # same-name asset before re-uploading it (not atomic), which is fine for a draft nobody has
-        # downloaded yet; the published-release guard above keeps it away from anything final.
+        # No published release owns this tag (checked above), so gh falls through to its draft lookup
+        # by pending tag and streams the binaries itself. --clobber deletes a same-name asset before
+        # re-uploading it (not atomic), which is fine for a draft nobody has downloaded yet.
         _gh("release", "upload", args.tag, *assets, "--repo", repo, "--clobber")
         for asset in assets:
             print(f"uploaded {Path(asset).name}")
