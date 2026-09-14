@@ -1,7 +1,4 @@
-"""Test helpers vendored from temporalio/sdk-python ``tests/helpers/__init__.py`` (origin/main).
-
-Trimmed to what this plugin's tests import. Re-sync by hand (scripts/migrate/README.md).
-"""
+"""Test helpers for this integration."""
 
 import asyncio
 import time

@@ -1,0 +1,5 @@
+target-version = "py310"
+
+[lint.isort]
+# The SDK owns the top-level temporalio package; plugins own only their contrib subpackage.
+known-first-party = ["temporalio", "tests"]

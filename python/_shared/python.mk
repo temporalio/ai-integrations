@@ -16,7 +16,6 @@ endif
 # plugin cannot be imported as temporalio.contrib.<name>. Every uv command below runs non-editable.
 export UV_NO_EDITABLE := 1
 
-REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 PYTEST_ARGS ?=
 PYTEST := uv run pytest -n auto --dist=worksteal
 
