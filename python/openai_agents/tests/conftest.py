@@ -60,12 +60,33 @@ def event_loop():
         raise
 
 
+async def _start_local_dev_server(attempts: int = 3) -> WorkflowEnvironment:
+    """Start the dev server, retrying the fixed five-second connect window the SDK bridge allows.
+
+    Every xdist worker starts its own server; on a cold Windows runner the binary can take longer
+    than five seconds to accept connections, which surfaces as "Failed starting Temporal dev server
+    ... ConnectionRefused" in two or three workers while the rest pass.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return await WorkflowEnvironment.start_local(
+                dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
+            )
+        except RuntimeError as err:
+            if attempt == attempts or "Failed starting Temporal dev server" not in str(
+                err
+            ):
+                raise
+            print(
+                f"dev server did not accept connections in time (attempt {attempt}/{attempts}); retrying"
+            )
+    raise AssertionError("unreachable")
+
+
 @pytest_asyncio.fixture(scope="session")  # type: ignore[reportUntypedFunctionDecorator]
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     """Start the pinned local Temporal development server."""
-    environment = await WorkflowEnvironment.start_local(
-        dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
-    )
+    environment = await _start_local_dev_server()
     yield environment
     await environment.shutdown()
 
