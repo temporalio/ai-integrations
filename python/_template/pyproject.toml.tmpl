@@ -17,7 +17,6 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  # TRANSITION(sdk-cutover): raise the floor to the SDK release that no longer ships this module before 1.0.0.
   "temporalio>=1.32.0,<2",
   # Add the integration's own dependencies here, declaring exactly what the package imports at module level.
 ]
@@ -58,7 +57,7 @@ default-groups = ["dev"]
 required-version = ">=0.12.5,<0.13"              # same value in scripts/pyproject.toml; CI reads it via setup-uv version-file
 exclude-newer = "2 weeks"                        # org supply-chain cooldown for third-party packages
 exclude-newer-package = { temporalio = false }   # the SDK is exempt: cutover releases must be adoptable on day one
-link-mode = "copy"                               # TRANSITION(sdk-cutover): deterministic overwrites while temporalio<=1.32 ships the same files
+link-mode = "copy"
 cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
 
 [tool.pytest.ini_options]
@@ -77,23 +76,31 @@ filterwarnings = [
   "ignore::DeprecationWarning",
 ]
 
+[tool.mypy]
+files = ["src", "tests"]
+mypy_path = "src"
+namespace_packages = true
+explicit_package_bases = true
+check_untyped_defs = true
+ignore_missing_imports = true
+
 [tool.pyright]
 extends = "../_shared/pyrightconfig.json"
 include = ["src", "tests"]
 
-# TRANSITION(sdk-cutover): upstream code reaches sibling contrib packages with relative imports
-# (e.g. `from ..opentelemetry._id_generator import ...`), which pyright cannot resolve from a
-# split source tree although they work at runtime through site-packages. Silence only under src/
-# (basedpyright fails on warnings) until upstream switches to absolute imports of public names.
-[[tool.pyright.executionEnvironments]]
-root = "src"
-reportMissingImports = "none"
-
-# Everything else (tests, tooling) resolves from the project root, with src/ as an extra root so
-# the plugin's own modules are checked from source rather than from site-packages.
+# Resolve the plugin's own modules from source rather than from site-packages.
 [[tool.pyright.executionEnvironments]]
 root = "."
 extraPaths = ["src"]
+
+[tool.pydocstyle]
+convention = "google"
+add_ignore = [
+  # We like to wrap at a certain number of chars, even long summary sentences.
+  # https://github.com/PyCQA/pydocstyle/issues/184
+  "D205",
+  "D415",
+]
 
 [tool.ruff]
 extend = "../_shared/ruff.toml"

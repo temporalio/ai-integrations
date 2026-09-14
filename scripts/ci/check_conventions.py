@@ -48,6 +48,11 @@ LANGUAGE_LOCKFILES = ("uv.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lo
 RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
 MAX_PR_COMMITS_WITHOUT_LABEL = 20
 HISTORY_IMPORT_LABEL = "history-import"
+STANDARD_TEST_SUPPORT = {
+    "tests/helpers/plugin_meta.py": "tests/helpers/plugin_meta.py.tmpl",
+    "tests/helpers/provenance.py": "tests/helpers/provenance.py.tmpl",
+    "tests/test_installed_matches_source.py": "tests/test_installed_matches_source.py.tmpl",
+}
 
 
 class Checker:
@@ -92,8 +97,9 @@ class Checker:
                         self.fail(f"{language}/{child.name}: directory has no {language} manifest; non-plugin folders must start with `_`")
         shared_python = self.root / "python" / "_shared"
         if shared_python.is_dir():
-            for path in shared_python.rglob("*"):
-                if path.is_file() and path.suffix in {".py", ".pyi", ".pyw", ".pyx"}:
+            for tracked in sorted(self.tracked_files("python/_shared")):
+                path = self.root / tracked
+                if path.suffix in {".py", ".pyi", ".pyw", ".pyx"}:
                     self.fail(
                         f"{path.relative_to(self.root)}: Python code must be duplicated into each plugin, not shared"
                     )
@@ -142,6 +148,23 @@ class Checker:
         self.check_plugin_toml(plugin, meta, pyproject)
         self.check_pyproject(plugin, pyproject)
         self.check_readme(plugin)
+        self.check_standard_test_support(plugin)
+
+    def check_standard_test_support(self, plugin: Plugin) -> None:
+        template_root = self.root / "python" / "_template"
+        if not template_root.is_dir():
+            return
+        for plugin_rel, template_rel in STANDARD_TEST_SUPPORT.items():
+            plugin_path = plugin.path / plugin_rel
+            template_path = template_root / template_rel
+            if not plugin_path.is_file():
+                self.fail(f"{plugin.rel}: missing standard test support file {plugin_rel}")
+            elif not template_path.is_file():
+                self.fail(f"python/_template/{template_rel}: missing canonical test support template")
+            elif plugin_path.read_bytes() != template_path.read_bytes():
+                self.fail(
+                    f"{plugin.rel}/{plugin_rel}: differs from canonical python/_template/{template_rel}"
+                )
 
     def check_plugin_toml(self, plugin: Plugin, meta: dict[str, Any], pyproject: dict[str, Any]) -> None:
         rel = plugin.rel

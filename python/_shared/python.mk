@@ -16,7 +16,6 @@ endif
 # plugin cannot be imported as temporalio.contrib.<name>. Every uv command below runs non-editable.
 export UV_NO_EDITABLE := 1
 
-REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 PYTEST_ARGS ?=
 PYTEST := uv run pytest -n auto --dist=worksteal
 
@@ -53,9 +52,9 @@ lint: ## Import order, formatting, pyright, mypy, basedpyright, docstrings
 	uv run ruff check --select I
 	uv run ruff format --check
 	uv run pyright
-	uv run mypy --config-file ../_shared/mypy.ini src tests
+	uv run mypy
 	uv run basedpyright
-	uv run pydocstyle --config=../_shared/pydocstyle.ini --ignore-decorators=overload src
+	uv run pydocstyle --ignore-decorators=overload src
 
 test: ## Run the suite against a local dev server
 	$(PYTEST) $(PYTEST_ARGS)

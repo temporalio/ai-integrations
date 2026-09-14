@@ -465,7 +465,11 @@ async def test_tool_failure_workflow(client: Client):
             assert "Workflow failure exception in Agents Framework" in cause.message
 
 
+@pytest.mark.requires_local_server
 async def test_nexus_tool_workflow(client: Client, env: WorkflowEnvironment):
+    if env.supports_time_skipping:
+        pytest.skip("Nexus tests don't work with time-skipping server")
+
     async with AgentEnvironment(
         model=nexus_weather_mock_model(),
         model_params=ModelActivityParameters(
@@ -1699,7 +1703,10 @@ async def test_alternative_model(client: Client):
             await workflow_handle.result()
 
 
-async def test_heartbeat(client: Client):
+async def test_heartbeat(client: Client, env: WorkflowEnvironment):
+    if env.supports_time_skipping:
+        pytest.skip("Relies on real timing, skip.")
+
     async with AgentEnvironment(
         model=WaitModel(),
         model_params=ModelActivityParameters(

@@ -3,6 +3,7 @@
 import asyncio
 import os
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -13,6 +14,8 @@ from tests import DEV_SERVER_DOWNLOAD_VERSION
 from tests.helpers.plugin_meta import load_plugin_meta
 from tests.helpers.provenance import ProvenanceError, check_provenance
 
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+
 
 def pytest_runtest_setup(item):  # type: ignore[reportMissingParameterType]
     """Print a newline so that custom printed output starts on a new line."""
@@ -20,9 +23,11 @@ def pytest_runtest_setup(item):  # type: ignore[reportMissingParameterType]
         print()
 
 
-def pytest_sessionstart(session: pytest.Session) -> None:  # type: ignore[reportUnusedParameter]
+def pytest_sessionstart(session: pytest.Session) -> None:
     """Abort unless the installed plugin is the non-editable build of this checkout."""
-    plugin = load_plugin_meta(session.config.rootpath)
+    if hasattr(session.config, "workerinput"):
+        return
+    plugin = load_plugin_meta(PLUGIN_ROOT)
     allow_overlap = (not plugin.allow_final) or os.environ.get(
         "ALLOW_OVERLAP_WITH_CORE"
     ) == "1"

@@ -8,6 +8,7 @@ registry = "pypi"
 root-api = "temporalio.contrib.openai_agents"
 maturity = "ga"
 docs = "https://docs.temporal.io/develop/python/integrations/openai-agents"
+upstream = "temporalio/sdk-python:temporalio/contrib/openai_agents"
 
 [release]
 allow-final = false

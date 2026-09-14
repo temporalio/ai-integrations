@@ -1,6 +1,6 @@
 """Read the plugin's ``plugin.toml`` (the machine-readable metadata every plugin carries)."""
 
-# template-override: MCP owns its test metadata loader.
+from __future__ import annotations
 
 import sys
 from dataclasses import dataclass

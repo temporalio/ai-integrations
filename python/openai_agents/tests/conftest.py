@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import opentelemetry.trace
 import pytest
@@ -18,12 +19,12 @@ from tests import DEV_SERVER_DOWNLOAD_VERSION
 from tests.helpers.plugin_meta import load_plugin_meta
 from tests.helpers.provenance import ProvenanceError, check_provenance
 
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+
 # The Agents SDK installs a process-global exporter by default. Tests that
 # exercise tracing install their own processors, so begin with an empty set to
 # prevent unrelated test spans from being exported from background threads.
 set_trace_processors([])
-
-CONTINUE_AS_NEW_SUGGEST_HISTORY_COUNT = 50
 
 
 def pytest_runtest_setup(item):  # type: ignore[reportMissingParameterType]
@@ -32,9 +33,19 @@ def pytest_runtest_setup(item):  # type: ignore[reportMissingParameterType]
         print()
 
 
-def pytest_sessionstart(session: pytest.Session) -> None:  # type: ignore[reportUnusedParameter]
+def pytest_configure(config: pytest.Config) -> None:
+    """Register markers retained by the upstream-owned test suite."""
+    config.addinivalue_line(
+        "markers",
+        "requires_local_server: test requires behavior specific to the local dev server",
+    )
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
     """Abort unless the installed plugin is the non-editable build of this checkout."""
-    plugin = load_plugin_meta(session.config.rootpath)
+    if hasattr(session.config, "workerinput"):
+        return
+    plugin = load_plugin_meta(PLUGIN_ROOT)
     allow_overlap = (not plugin.allow_final) or os.environ.get(
         "ALLOW_OVERLAP_WITH_CORE"
     ) == "1"
