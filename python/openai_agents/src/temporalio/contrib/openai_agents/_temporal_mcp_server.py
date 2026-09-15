@@ -55,13 +55,7 @@ class _TemporalMCPServer(MCPServer):
         if self._tool_filter is None:
             return tools
         if isinstance(self._tool_filter, dict):
-            if "allowed_tool_names" in self._tool_filter:
-                allowed = self._tool_filter["allowed_tool_names"]
-                tools = [tool for tool in tools if tool.name in allowed]
-            if "blocked_tool_names" in self._tool_filter:
-                blocked = self._tool_filter["blocked_tool_names"]
-                tools = [tool for tool in tools if tool.name not in blocked]
-            return tools
+            return self._apply_static_tool_filter(tools)
         if run_context is None or agent is None:
             raise ValueError(
                 "run_context and agent are required for dynamic MCP tool filtering"
@@ -78,10 +72,28 @@ class _TemporalMCPServer(MCPServer):
                 filtered.append(tool)
         return filtered
 
+    def _apply_static_tool_filter(self, tools: list[Tool]) -> list[Tool]:
+        assert isinstance(self._tool_filter, dict)
+        if "allowed_tool_names" in self._tool_filter:
+            allowed = self._tool_filter["allowed_tool_names"]
+            tools = [tool for tool in tools if tool.name in allowed]
+        if "blocked_tool_names" in self._tool_filter:
+            blocked = self._tool_filter["blocked_tool_names"]
+            tools = [tool for tool in tools if tool.name not in blocked]
+        return tools
+
     @property
     def cached_tools(self) -> list[Tool] | None:
         result = self._client.cached_tools
-        return result.tools if result is not None else None
+        if result is None:
+            return None
+        if isinstance(self._tool_filter, dict):
+            return self._apply_static_tool_filter(result.tools)
+        # A callable filter depends on the current run context and agent, neither
+        # of which is available to this context-free property.
+        if self._tool_filter is not None:
+            return None
+        return result.tools
 
     async def call_tool(
         self,
@@ -99,6 +111,12 @@ class _TemporalMCPServer(MCPServer):
     async def get_prompt(
         self, name: str, arguments: dict[str, Any] | None = None
     ) -> GetPromptResult:
+        """Get a prompt after converting every argument value with ``str()``.
+
+        OpenAI Agents accepts arbitrary argument values, while the MCP client
+        protocol requires ``dict[str, str]``. For example, ``True`` becomes
+        ``"True"`` and a mapping uses its Python string representation.
+        """
         string_arguments = (
             None
             if arguments is None

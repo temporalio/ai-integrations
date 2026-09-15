@@ -419,7 +419,10 @@ worker-side OpenAI `MCPServer`. Configure workflow-facing behavior such as
 resolvers on `temporal_mcp_server(...)`, where the OpenAI agent can use it.
 Custom `MCPServer` method implementations still execute worker-side. A callable
 `tool_filter` on the worker-side server is rejected, because the run context and
-agent it receives exist only in the workflow.
+agent it receives exist only in the workflow. A callable `tool_filter` passed to
+`temporal_mcp_server(...)` therefore executes during workflow replay and must be
+deterministic: it must not perform I/O or depend on the system clock, randomness,
+mutable global state, or other external state.
 
 Every MCP operation is a Temporal Activity. The workflow-side tool list is
 cached by default; pass `cache_tools_list=False` to refresh it on every Agents
