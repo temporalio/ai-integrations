@@ -3,8 +3,8 @@
 
 Subcommands:
   parse-tag TAG                 validate `<language>/<plugin>/v<version>` and emit its parts
-  check-version-policy          enforce the version policy against the production registry (and,
-                                with --check-testpypi, warn when the version is already staged there)
+  check-version-policy          enforce production and staging registry version ordering (with
+                                exact-version re-runs allowed for recovery)
   verify-index-files            prove the files an index serves for a version are the local artifacts
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
@@ -13,6 +13,7 @@ Policy (AGENTS.md, "Release runbook"):
   * a coordinate with no published release starts at exactly 1.0.0 (maturity ga)
     or 0.1.0 (preview/experimental); pre-releases of that version are allowed
   * an existing coordinate only ever moves strictly forward (max published incl. yanked)
+  * TestPyPI versions move forward too, except that its newest version may be re-run
   * final (non pre-release) versions additionally require plugin.toml
     [release] allow-final = true and no TRANSITION(sdk-cutover) markers in the plugin
   * versions are canonical PEP 440 and never local (+...)
@@ -172,6 +173,21 @@ def check_policy(version: Version, maturity: str, published: list[Version]) -> s
     return None
 
 
+def check_staging_policy(version: Version, staged: list[Version]) -> str | None:
+    """Require TestPyPI versions to move forward; allow an exact newest-version re-run."""
+    if not staged:
+        return None
+    newest = max(staged)
+    if version == newest:
+        return f"{version} is already the newest version staged on TestPyPI; treating this run as a re-run"
+    if version < newest:
+        raise PolicyError(
+            f"{version} is not greater than the newest version staged on TestPyPI {newest}; "
+            "staged versions never move backwards"
+        )
+    return None
+
+
 def transition_markers(repo_root: Path, plugin_dir: str) -> list[str]:
     """List plugin files containing the transition marker. Fails closed on any git error."""
     try:
@@ -203,12 +219,13 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     if registry == "pypi" and (args.check_testpypi or args.testpypi_json):
         # Every release is staged on TestPyPI first and uploads are immutable, so a re-run finds the
         # version already there and skip-existing keeps the upload from failing. That is the normal
-        # recovery path (a rejected environment approval, a flaky smoke), so only warn here; the
-        # smoke job proves the served files are this run's artifacts (verify-index-files).
+        # recovery path (a rejected environment approval, a flaky smoke), so allow an exact newest
+        # version re-run; the smoke job proves the served files are this run's artifacts.
         staged = fetch_published_versions(coordinate, "testpypi", Path(args.testpypi_json) if args.testpypi_json else None)
-        if version in staged:
-            print(f"::warning::{coordinate} {version} already exists on TestPyPI: the TestPyPI upload will be skipped "
-                  "and smoke-testpypi verifies that the served files are this run's artifacts")
+        staged_rerun = check_staging_policy(version, staged)
+        if staged_rerun:
+            print(f"::warning::{coordinate} {staged_rerun}: the TestPyPI upload will be skipped and "
+                  "smoke-testpypi verifies that the served files are this run's artifacts")
         else:
             print(f"OK: {coordinate} {version} is not yet on TestPyPI")
     if not version.is_prerelease:
@@ -459,7 +476,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--plugin-dir", required=True)
     p.add_argument("--version", required=True)
     p.add_argument("--registry-json", default=None, help="read published versions from this file instead of the registry (tests)")
-    p.add_argument("--check-testpypi", action="store_true", help="also warn when the version is already staged on TestPyPI")
+    p.add_argument(
+        "--check-testpypi",
+        action="store_true",
+        help="also enforce TestPyPI ordering and allow its newest exact version as a re-run",
+    )
     p.add_argument("--testpypi-json", default=None, help="read TestPyPI versions from this file instead of the registry (tests)")
     p.set_defaults(func=cmd_check_version_policy)
 

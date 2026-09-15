@@ -1,6 +1,6 @@
 [project]
 name = "temporalio-mcp"
-version = "0.1.0"
+version = "0.0.0"
 description = "Temporal integration for the Model Context Protocol"
 authors = [{ name = "Temporal Technologies Inc", email = "sdk@temporal.io" }]
 requires-python = ">=3.10"

@@ -116,8 +116,15 @@ def test_release_publishes_the_tested_artifacts() -> None:
         assert downloads == [tested], f"{job} must use the artifact the test job produced"
     assert "test" in doc["jobs"]["publish-testpypi"]["needs"]
     assert doc["jobs"]["test"]["with"]["deps"] == "locked"
+    assert doc["jobs"]["test"]["with"]["version"] == "${{ needs.prepare.outputs.version }}"
     plugin_wf = yaml.safe_load((REPO / ".github/workflows/_python-plugin.yml").read_text())
+    assert plugin_wf[True]["workflow_call"]["inputs"]["version"]["default"] == ""
     steps = plugin_wf["jobs"]["test"]["steps"]
+    inject = next(s for s in steps if s.get("name") == "Apply release version from tag")
+    sync = next(s for s in steps if s.get("name") == "Sync environment")
+    assert inject["if"] == "inputs.version != ''"
+    assert 'uv version "$RELEASE_VERSION"' in inject["run"]
+    assert steps.index(inject) < steps.index(sync), "release version must be injected before sync, test, and build"
     upload = next(s for s in steps if "upload-artifact" in s.get("uses", "") and s["with"]["name"].startswith("dist-"))
     assert upload["with"]["name"] == "dist-${{ inputs.plugin }}-${{ inputs.deps }}"
     assert upload["if"] == "matrix.dist" and upload["with"]["if-no-files-found"] == "error"

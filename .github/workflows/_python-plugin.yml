@@ -15,6 +15,10 @@ on:
         description: "locked: uv.lock as committed; latest: uv lock --upgrade; lowest: --resolution lowest-direct"
         type: string
         default: locked
+      version:
+        description: Release version to inject from a validated tag; empty during ordinary CI
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -67,6 +71,15 @@ jobs:
           version-file: python/${{ inputs.plugin }}/pyproject.toml
           enable-cache: true
           cache-dependency-glob: python/${{ inputs.plugin }}/uv.lock
+      - name: Apply release version from tag
+        if: inputs.version != ''
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          cd "$PLUGIN_DIR"
+          uv version "$RELEASE_VERSION"
+          actual="$(uv version --short)"
+          [ "$actual" = "$RELEASE_VERSION" ] || { echo "::error::injected version $actual != tag version $RELEASE_VERSION"; exit 1; }
       - name: Install GNU make (Windows)
         if: runner.os == 'Windows'
         run: choco install make -y --no-progress

@@ -39,6 +39,7 @@ before changes can be merged. A link to the CLA will be posted in the pull reque
 
 ## Releasing
 
-Bump the version in a release PR, merge, tag `python/<name>/v<version>`, and follow the runbook
-in AGENTS.md ("Releases"). Release notes are generated from commit messages, so write commit
-subjects you would want users to read.
+Release tags are authoritative: keep the committed Python version at `0.0.0`, dry-run the intended
+`python/<name>/v<version>` tag from `main`, then create the protected tag without a version-only PR.
+Follow the runbook in AGENTS.md ("Releases"). Release notes are generated from commit messages, so
+write commit subjects you would want users to read.

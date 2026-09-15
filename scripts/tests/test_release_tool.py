@@ -53,6 +53,14 @@ def test_policy_existing_coordinate_moves_forward() -> None:
             release_tool.check_policy(Version(v), "ga", published)
 
 
+def test_testpypi_policy_moves_forward_and_allows_newest_rerun() -> None:
+    staged = [Version("0.1.0rc1"), Version("0.1.0rc2")]
+    assert release_tool.check_staging_policy(Version("0.1.0rc3"), staged) is None
+    assert "re-run" in (release_tool.check_staging_policy(Version("0.1.0rc2"), staged) or "")
+    with pytest.raises(release_tool.PolicyError, match="never move backwards"):
+        release_tool.check_staging_policy(Version("0.1.0rc1"), staged)
+
+
 def test_outputs_refuse_line_breaks(tmp_path: Path) -> None:
     with pytest.raises(release_tool.PolicyError, match="line break"):
         release_tool._write_outputs(str(tmp_path / "out"), {"coordinate": "evil\nother=value"})
@@ -107,6 +115,8 @@ def test_cli_policy_warns_when_the_version_is_already_on_testpypi(plugin_repo: P
     assert "::warning::" in capsys.readouterr().out
     assert release_tool.main([*args, "--version", "0.1.0rc2"]) == 0
     assert "not yet on TestPyPI" in capsys.readouterr().out
+    assert release_tool.main([*args, "--version", "0.1.0a1"]) == 1
+    assert "never move backwards" in capsys.readouterr().out
 
 
 def test_cli_policy_does_not_touch_testpypi_unless_asked(plugin_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -270,4 +280,3 @@ def test_release_notes_ignores_other_plugins_tags(plugin_repo: Path) -> None:
     assert release_tool.previous_tag(repo, "fakeplug" and "python", "fakeplug", Version("0.1.0")) is None
     notes = release_tool.release_notes(repo, "python/fakeplug", "python/fakeplug/v0.1.0", "temporalio/ai-integrations")
     assert "First standalone release" in notes
-

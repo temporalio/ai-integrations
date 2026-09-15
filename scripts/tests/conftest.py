@@ -44,7 +44,7 @@ def make_python_plugin(
     root: Path,
     name: str = "fakeplug",
     *,
-    version: str = "0.1.0rc1",
+    version: str = "0.0.0",
     maturity: str = "experimental",
     dependencies: list[str] | None = None,
     allow_final: bool = False,
