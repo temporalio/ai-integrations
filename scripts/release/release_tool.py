@@ -33,6 +33,7 @@ import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import quote
 
 from packaging.version import InvalidVersion, Version
 
@@ -424,6 +425,29 @@ def find_releases(repo: str, tag: str) -> list[dict]:
     return releases
 
 
+def wait_for_release(repo: str, tag: str, attempts: int = 5, delay: float = 1.0) -> list[dict]:
+    """Wait briefly for a newly created draft to become visible through the releases API."""
+    for attempt in range(attempts):
+        releases = find_releases(repo, tag)
+        if releases:
+            return releases
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    return []
+
+
+def upload_release_asset(repo: str, release_id: str, asset: str) -> None:
+    """Replace an asset on a draft by stable release ID, avoiding tag lookup in gh."""
+    filename = Path(asset).name
+    existing = json.loads(_gh("api", f"repos/{repo}/releases/{release_id}/assets?per_page=100") or "[]")
+    for item in existing:
+        if item.get("name") == filename:
+            _gh("api", "-X", "DELETE", f"repos/{repo}/releases/assets/{item['id']}")
+    name = quote(filename, safe="")
+    url = f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={name}"
+    _gh("api", "--method", "POST", "-H", "Content-Type: application/octet-stream", "--input", asset, url)
+
+
 def cmd_draft_release(args: argparse.Namespace) -> int:
     repo = args.repo or _repo()
     releases = find_releases(repo, args.tag)
@@ -437,23 +461,23 @@ def cmd_draft_release(args: argparse.Namespace) -> int:
         if args.prerelease:
             cmd.append("--prerelease")
         _gh(*cmd)
-        releases = find_releases(repo, args.tag)
+        releases = wait_for_release(repo, args.tag)
         if not releases:
             raise PolicyError("release was created but could not be found afterwards")
         print(f"created draft release {releases[0]['id']} for {args.tag}")
     else:
         release_id = releases[0]["id"]
         body = Path(args.notes).read_text(encoding="utf-8")
-        _gh("api", "-X", "PATCH", f"repos/{repo}/releases/{release_id}", "-f", f"name={args.title}",
+        _gh("api", "-X", "PATCH", f"repos/{repo}/releases/{release_id}", "-f", f"tag_name={args.tag}",
+            "-f", f"name={args.title}",
             "-F", "draft=true", "-F", f"prerelease={'true' if args.prerelease else 'false'}", "-f", f"body={body}")
         print(f"updated existing draft release {release_id} for {args.tag}")
     assets = [str(path) for path in sorted(Path(args.dist).iterdir()) if path.is_file()]
     if assets:
-        # No published release owns this tag (checked above), so gh falls through to its draft lookup
-        # by pending tag and streams the binaries itself. --clobber deletes a same-name asset before
-        # re-uploading it (not atomic), which is fine for a draft nobody has downloaded yet.
-        _gh("release", "upload", args.tag, *assets, "--repo", repo, "--clobber")
+        # Address the draft by its stable API ID. `gh release upload <tag>` cannot reliably resolve
+        # slash-containing tags for drafts. Replacing a same-name draft asset preserves idempotency.
         for asset in assets:
+            upload_release_asset(repo, releases[0]["id"], asset)
             print(f"uploaded {Path(asset).name}")
     print(f"OK: draft release ready: https://github.com/{repo}/releases/tag/{args.tag}")
     return 0
