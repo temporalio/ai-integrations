@@ -107,7 +107,12 @@ from temporalio.contrib.openai_agents.testing import (
     TestModelProvider,
 )
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.exceptions import ApplicationError, CancelledError, TemporalError
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+    CancelledError,
+    TemporalError,
+)
 from temporalio.testing import WorkflowEnvironment
 from temporalio.workflow import ActivityConfig
 from tests.contrib.openai_agents.research_agents.research_manager import (
@@ -1306,7 +1311,6 @@ async def test_output_guardrail(client: Client):
                 OutputGuardrailWorkflow.run,
                 id=f"output-guardrail-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=10),
             )
             result = await workflow_handle.result()
 
@@ -1360,7 +1364,6 @@ async def test_workflow_method_tools(client: Client):
             WorkflowToolWorkflow.run,
             id=f"workflow-tool-{uuid.uuid4()}",
             task_queue=worker.task_queue,
-            execution_timeout=timedelta(seconds=10),
         )
         await workflow_handle.result()
 
@@ -1422,10 +1425,12 @@ async def assert_status_retry_behavior(
                 "Input",
                 id=f"workflow-tool-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=10),
             )
-            with pytest.raises(WorkflowFailureError):
+            with pytest.raises(WorkflowFailureError) as err:
                 await workflow_handle.result()
+            assert isinstance(err.value.cause, ActivityError)
+            assert isinstance(err.value.cause.cause, ApplicationError)
+            assert err.value.cause.cause.type == "APIStatusError"
 
             found = False
             async for event in workflow_handle.fetch_history_events():
@@ -1620,7 +1625,6 @@ async def test_chat_completions_model(client: Client):
                     WorkflowToolWorkflow.run,
                     id=f"workflow-tool-{uuid.uuid4()}",
                     task_queue=worker.task_queue,
-                    execution_timeout=timedelta(seconds=10),
                 )
                 await workflow_handle.result()
 
@@ -1698,7 +1702,6 @@ async def test_alternative_model(client: Client):
                 "Hello",
                 id=f"alternative-model-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=10),
             )
             await workflow_handle.result()
 
@@ -1724,7 +1727,6 @@ async def test_heartbeat(client: Client, env: WorkflowEnvironment):
                 "Tell me about recursion in programming.",
                 id=f"workflow-tool-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=5.0),
             )
             await workflow_handle.result()
 
@@ -1756,7 +1758,6 @@ async def test_session(client: Client):
                 SessionWorkflow.run,
                 id=f"session-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=10.0),
                 retry_policy=RetryPolicy(maximum_attempts=1),
             )
 
@@ -1869,7 +1870,6 @@ async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
                 "Tell me about recursion in programming",
                 id=f"lite-llm-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=10),
             )
 
     assert result == "hello from litellm"
@@ -2307,7 +2307,6 @@ async def test_multiple_models(client: Client):
                 False,
                 id=f"multiple-model-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=10),
             )
             await workflow_handle.result()
             assert provider.model_names == {None, "gpt-4o-mini"}
@@ -2332,7 +2331,6 @@ async def test_run_config_models(client: Client):
                 True,
                 id=f"run-config-model-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=10),
             )
             await workflow_handle.result()
 
@@ -2389,7 +2387,6 @@ async def test_dict_run_config_models(client: Client):
                 DictRunConfigWorkflow.run,
                 id=f"dict-run-config-model-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=10),
             )
             result = await workflow_handle.result()
 
@@ -2446,7 +2443,6 @@ async def test_summary_provider(client: Client):
                 "Prompt",
                 id=f"summary-provider-model-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=10),
             )
             await workflow_handle.result()
             async for e in workflow_handle.fetch_history_events():
@@ -2502,7 +2498,6 @@ async def test_output_type(client: Client):
                 OutputTypeWorkflow.run,
                 id=f"output-type-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=10),
             )
             result = await workflow_handle.result()
             assert isinstance(result, OutputType)
@@ -2922,7 +2917,6 @@ async def test_local_hello_world_agent(client: Client):
                 "Tell me about recursion in programming.",
                 id=f"hello-workflow-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=5),
             )
             result = await handle.result()
             assert result == "test"
