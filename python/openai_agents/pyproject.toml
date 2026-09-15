@@ -20,7 +20,8 @@ dependencies = [
   # TRANSITION(sdk-cutover): raise the floor to the SDK release that no longer ships this module before 1.0.0.
   # opentelemetry and pydantic extras: the plugin imports temporalio.contrib.opentelemetry and
   # temporalio.contrib.pydantic at module level.
-  "temporalio[opentelemetry,pydantic]>=1.32.0,<2",
+  # 1.33 passes pydantic_core through the workflow sandbox, which the replay tests require.
+  "temporalio[opentelemetry,pydantic]>=1.33.0,<2",
   "openai-agents>=0.19.2,<0.20",
   "openai>=2.45,<3",          # imports openai._models.construct_type and openai.types.responses
   "mcp>=1.19,<2",
