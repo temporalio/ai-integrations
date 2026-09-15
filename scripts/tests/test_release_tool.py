@@ -4,6 +4,7 @@ import hashlib
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from packaging.version import Version
@@ -51,6 +52,14 @@ def test_policy_existing_coordinate_moves_forward() -> None:
     for v in ("1.0.5", "0.9.1", "1.1.0rc1"):
         with pytest.raises(release_tool.PolicyError):
             release_tool.check_policy(Version(v), "ga", published)
+
+
+def test_testpypi_policy_moves_forward_and_allows_newest_rerun() -> None:
+    staged = [Version("0.1.0rc1"), Version("0.1.0rc2")]
+    assert release_tool.check_staging_policy(Version("0.1.0rc3"), staged) is None
+    assert "re-run" in (release_tool.check_staging_policy(Version("0.1.0rc2"), staged) or "")
+    with pytest.raises(release_tool.PolicyError, match="never move backwards"):
+        release_tool.check_staging_policy(Version("0.1.0rc1"), staged)
 
 
 def test_outputs_refuse_line_breaks(tmp_path: Path) -> None:
@@ -107,6 +116,8 @@ def test_cli_policy_warns_when_the_version_is_already_on_testpypi(plugin_repo: P
     assert "::warning::" in capsys.readouterr().out
     assert release_tool.main([*args, "--version", "0.1.0rc2"]) == 0
     assert "not yet on TestPyPI" in capsys.readouterr().out
+    assert release_tool.main([*args, "--version", "0.1.0a1"]) == 1
+    assert "never move backwards" in capsys.readouterr().out
 
 
 def test_cli_policy_does_not_touch_testpypi_unless_asked(plugin_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -263,6 +274,59 @@ def test_prerelease_notes_warn_about_sdk_overlap_only_while_the_sdk_bundles_the_
     assert "still embeds" not in notes and "SDK cutover" not in notes
 
 
+def test_draft_release_waits_for_new_release_visibility(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    notes = tmp_path / "notes.md"
+    notes.write_text("notes")
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    lookups = iter([[], [], [{"id": "42", "draft": True}]])
+    calls: list[tuple[str, ...]] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(release_tool, "find_releases", lambda repo, tag: next(lookups))
+    monkeypatch.setattr(release_tool, "_gh", lambda *args, **kwargs: calls.append(args) or "")
+    monkeypatch.setattr(release_tool.time, "sleep", sleeps.append)
+    args = SimpleNamespace(repo="temporalio/ai-integrations", tag="python/mcp/v0.1.0rc1", title="mcp 0.1.0rc1",
+                           notes=str(notes), dist=str(dist), prerelease=True)
+    assert release_tool.cmd_draft_release(args) == 0
+    assert any(call[:2] == ("release", "create") for call in calls)
+    assert sleeps == [1.0]
+
+
+def test_draft_release_update_preserves_tag_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    notes = tmp_path / "notes.md"
+    notes.write_text("notes")
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(release_tool, "find_releases", lambda repo, tag: [{"id": "42", "draft": True}])
+    monkeypatch.setattr(release_tool, "_gh", lambda *args, **kwargs: calls.append(args) or "")
+    args = SimpleNamespace(repo="temporalio/ai-integrations", tag="python/mcp/v0.1.0rc1", title="mcp 0.1.0rc1",
+                           notes=str(notes), dist=str(dist), prerelease=True)
+    assert release_tool.cmd_draft_release(args) == 0
+    patch = next(call for call in calls if "PATCH" in call)
+    assert "tag_name=python/mcp/v0.1.0rc1" in patch
+
+
+def test_upload_release_asset_replaces_by_release_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    asset = tmp_path / "fake plug-0.1.0.whl"
+    asset.write_bytes(b"wheel")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(*args: str, **kwargs: str) -> str:
+        calls.append(args)
+        if args == ("api", "repos/temporalio/ai-integrations/releases/42/assets?per_page=100"):
+            return json.dumps([{"id": 7, "name": asset.name}])
+        return ""
+
+    monkeypatch.setattr(release_tool, "_gh", fake_gh)
+    release_tool.upload_release_asset("temporalio/ai-integrations", "42", str(asset))
+    assert ("api", "-X", "DELETE", "repos/temporalio/ai-integrations/releases/assets/7") in calls
+    upload = calls[-1]
+    assert upload[:4] == ("api", "--method", "POST", "-H")
+    assert "/releases/42/assets?name=fake%20plug-0.1.0.whl" in upload[-1]
+    assert "release" not in upload
+
+
 def test_release_notes_ignores_other_plugins_tags(plugin_repo: Path) -> None:
     repo = plugin_repo
     git(repo, "tag", "python/other/v9.0.0")
@@ -270,4 +334,3 @@ def test_release_notes_ignores_other_plugins_tags(plugin_repo: Path) -> None:
     assert release_tool.previous_tag(repo, "fakeplug" and "python", "fakeplug", Version("0.1.0")) is None
     notes = release_tool.release_notes(repo, "python/fakeplug", "python/fakeplug/v0.1.0", "temporalio/ai-integrations")
     assert "First standalone release" in notes
-

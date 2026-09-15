@@ -1,6 +1,6 @@
 [project]
 name = "temporalio-openai-agents"
-version = "1.0.0rc1"
+version = "0.0.0"
 description = "Temporal integration for the OpenAI Agents SDK (temporalio.contrib.openai_agents)"
 authors = [{ name = "Temporal Technologies Inc", email = "sdk@temporal.io" }]
 requires-python = ">=3.10"
@@ -20,7 +20,8 @@ dependencies = [
   # TRANSITION(sdk-cutover): raise the floor to the SDK release that no longer ships this module before 1.0.0.
   # opentelemetry and pydantic extras: the plugin imports temporalio.contrib.opentelemetry and
   # temporalio.contrib.pydantic at module level.
-  "temporalio[opentelemetry,pydantic]>=1.32.0,<2",
+  # 1.33 passes pydantic_core through the workflow sandbox, which the replay tests require.
+  "temporalio[opentelemetry,pydantic]>=1.33.0,<2",
   "openai-agents>=0.20,<0.21",
   "openai>=2.45,<3",          # imports openai._models.construct_type and openai.types.responses
   "mcp>=1.24,<3",

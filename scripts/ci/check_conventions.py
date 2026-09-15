@@ -42,6 +42,7 @@ MATURITY_CLASSIFIER = {
 REGISTRIES = {"python": "pypi", "typescript": "npm", "java": "maven", "go": "goproxy"}
 LANGUAGE_LOCKFILES = ("uv.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "go.sum", "gradle.lockfile")
 RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
+PYTHON_DEVELOPMENT_VERSION = "0.0.0"
 
 
 class Checker:
@@ -186,6 +187,11 @@ class Checker:
     def check_pyproject(self, plugin: Plugin, pyproject: dict[str, Any]) -> None:
         rel = plugin.rel
         project = pyproject.get("project", {})
+        if project.get("version") != PYTHON_DEVELOPMENT_VERSION:
+            self.fail(
+                f"{rel}: pyproject [project] version must be the tag-authoritative development placeholder "
+                f"{PYTHON_DEVELOPMENT_VERSION!r} (got {project.get('version')!r})"
+            )
         if project.get("license") != "MIT":
             self.fail(f"{rel}: pyproject [project] license must be the SPDX expression \"MIT\"")
         if project.get("license-files") != ["LICENSE"]:

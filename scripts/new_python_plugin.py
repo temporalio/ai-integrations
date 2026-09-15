@@ -3,7 +3,7 @@
 
 Usage:
     python3 scripts/new_python_plugin.py NAME --description "..." [--coordinate NAME] \
-        [--maturity ga|preview|experimental] [--version X.Y.Z] [--existing]
+        [--maturity ga|preview|experimental] [--existing]
 
 ``--existing`` lets the scaffolder fill in packaging files a history import did not
 bring without touching anything that already exists, in particular ``src/``.
@@ -35,7 +35,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--description", required=True, help="one-line package description")
     parser.add_argument("--coordinate", help="PyPI name; default temporalio-<name with _ -> ->")
     parser.add_argument("--maturity", choices=sorted(MATURITY_CLASSIFIER), default="experimental")
-    parser.add_argument("--version", help="initial version; default 1.0.0 for ga, else 0.1.0")
     parser.add_argument("--existing", action="store_true", help="add missing files to an existing plugin dir")
     return parser.parse_args(argv)
 
@@ -54,13 +53,11 @@ def main(argv: list[str]) -> int:
     name = args.name
     validate_name(name)
     coordinate = args.coordinate or "temporalio-" + name.replace("_", "-")
-    version = args.version or ("1.0.0" if args.maturity == "ga" else "0.1.0")
     substitutions = {
         "__NAME__": name,
         "__COORDINATE__": coordinate,
         "__MODULE__": f"temporalio.contrib.{name}",
         "__DESCRIPTION__": args.description,
-        "__VERSION__": version,
         "__MATURITY__": args.maturity,
         "__MATURITY_CLASSIFIER__": MATURITY_CLASSIFIER[args.maturity],
         "__DOCS_SLUG__": name.replace("_", "-"),
@@ -111,7 +108,7 @@ def main(argv: list[str]) -> int:
 
     print(
         f"""
-Next steps for python/{name} ({coordinate} {version}, maturity={args.maturity}):
+Next steps for python/{name} ({coordinate}, maturity={args.maturity}):
   1. Fill in [project].dependencies in pyproject.toml (declare exactly what is imported).
   2. cd python/{name} && make sync   # creates uv.lock; commit it
   3. make lint && make test
