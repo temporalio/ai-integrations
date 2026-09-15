@@ -314,6 +314,7 @@ async def test_list_results_preserve_mcp_envelopes() -> None:
         async def list_resource_templates(
             self, cursor: str | None = None
         ) -> ListResourceTemplatesResult:
+            del cursor
             return ListResourceTemplatesResult.model_validate(
                 {
                     "resourceTemplates": [
