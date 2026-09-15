@@ -4,8 +4,9 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pytest
-from agents import Agent, AgentBase, RunContextWrapper, Runner, UserError
+from agents import Agent, AgentBase, RunContextWrapper, Runner
 from agents.mcp import MCPServer as AgentsMCPServer
+from agents.mcp import MCPServerStdio
 from mcp import Client as MCPClient
 from mcp.server.mcpserver import MCPServer as SDKMCPServer
 from mcp.types import (
@@ -14,6 +15,7 @@ from mcp.types import (
     ListPromptsResult,
     ListResourcesResult,
     ListResourceTemplatesResult,
+    ListToolsResult,
     Prompt,
     Resource,
     ResourceTemplate,
@@ -23,10 +25,14 @@ from mcp.types import (
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib import openai_agents
+from temporalio.contrib.mcp import TemporalMCPClient
 from temporalio.contrib.openai_agents import ModelActivityParameters
 from temporalio.contrib.openai_agents._mcp_backend import (
     _mcp_server_backend_factory,
     _OpenAIMCPServerBackend,
+)
+from temporalio.contrib.openai_agents._temporal_mcp_server import (
+    _TemporalMCPServer,
 )
 from temporalio.contrib.openai_agents.testing import (
     AgentEnvironment,
@@ -236,6 +242,37 @@ def test_static_worker_side_tool_filter_is_allowed() -> None:
     }
 
 
+def test_cached_tools_applies_static_filter() -> None:
+    class CachedClient:
+        name = "hello"
+        cached_tools = ListToolsResult(
+            tools=[
+                Tool(name="allowed", input_schema={}),
+                Tool(name="blocked", input_schema={}),
+            ]
+        )
+
+    client = cast(TemporalMCPClient, cast(object, CachedClient()))
+    value = _TemporalMCPServer(client, tool_filter={"blocked_tool_names": ["blocked"]})
+
+    cached_tools = value.cached_tools
+    assert cached_tools is not None
+    assert [tool.name for tool in cached_tools] == ["allowed"]
+
+
+def test_cached_tools_is_unavailable_for_dynamic_filter() -> None:
+    class CachedClient:
+        name = "hello"
+        cached_tools = ListToolsResult(
+            tools=[Tool(name="context-dependent", input_schema={})]
+        )
+
+    client = cast(TemporalMCPClient, cast(object, CachedClient()))
+    value = _TemporalMCPServer(client, tool_filter=lambda context, tool: True)
+
+    assert value.cached_tools is None
+
+
 async def test_repeated_pagination_cursor_is_non_retryable() -> None:
     class RepeatingCursorServer:
         async def list_resources(
@@ -255,22 +292,24 @@ async def test_repeated_pagination_cursor_is_non_retryable() -> None:
 
 @pytest.mark.parametrize("method", ["list_tools", "list_prompts"])
 async def test_agents_repeated_pagination_cursor_is_non_retryable(
-    method: str,
+    method: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class RepeatingCursorServer:
-        async def list_tools(self) -> list[Tool]:
-            raise UserError(
-                "MCP server 'repeating' returned a repeated cursor while listing tools."
-            )
+    server = MCPServerStdio(params={"command": "unused"}, name="repeating")
+    server.session = cast(Any, object())
 
-        async def list_prompts(self) -> ListPromptsResult:
-            raise UserError(
-                "MCP server 'repeating' returned a repeated cursor while listing prompts."
-            )
+    async def list_tools_page(
+        _session: object, _cursor: str | None = None
+    ) -> ListToolsResult:
+        return ListToolsResult(tools=[], next_cursor="repeated")
 
-    backend = _OpenAIMCPServerBackend(
-        cast(AgentsMCPServer, cast(object, RepeatingCursorServer()))
-    )
+    async def list_prompts_page(
+        _session: object, _cursor: str | None = None
+    ) -> ListPromptsResult:
+        return ListPromptsResult(prompts=[], next_cursor="repeated")
+
+    monkeypatch.setattr(server, "_list_tools_page", list_tools_page)
+    monkeypatch.setattr(server, "_list_prompts_page", list_prompts_page)
+    backend = _OpenAIMCPServerBackend(server)
     with pytest.raises(ApplicationError) as err:
         await getattr(backend, method)()
 

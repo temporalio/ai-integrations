@@ -400,6 +400,11 @@ def temporal_mcp_server(
         visible in the web UI. Resolve credentials worker-side inside the server factory
         instead.
 
+    .. warning::
+        A callable ``tool_filter`` executes in the workflow and must be deterministic. Do not
+        read external state, perform I/O, use the system clock, or use nondeterministic randomness
+        from the filter.
+
     Args:
         name: Name matching a server factory registered on the plugin.
         activity_config: Activity options for MCP operations. Defaults to a
