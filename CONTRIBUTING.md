@@ -16,13 +16,10 @@ workflow.
 - PRs that import or re-sync commits reachable from an SDK repository's default branch are labelled
   `history-import` and merged with **"Create a merge commit"**, never squash or rebase. Work from
   an unmerged or closed upstream PR is ordinary PR work and must not carry that label, regardless
-  of its commit count or trailers. Adaptation changes go in separate commits after a real import;
-  documented local-only divergences are preserved across later re-syncs as described in AGENTS.md.
+  of its commit count or trailers. Adaptation changes go in separate commits after a real import.
 - CI runs only the plugins whose files changed (`.github/workflows/ci.yml`); `ci-status`,
   `Check for CODEOWNERS` and `opengrep/scan` are the required checks, plus one code-owner
   approval. No secrets are needed: provider behavior uses deterministic local test doubles.
-- During the SDK cutover transition, bug fixes for a migrated plugin land in the SDK repository
-  first and reach this repository through a re-sync (AGENTS.md, "Transition rules").
 
 ## Adding a Python plugin
 

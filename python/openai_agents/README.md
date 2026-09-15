@@ -8,12 +8,6 @@ We welcome questions and feedback in the [#python-sdk](https://temporalio.slack.
 uv add temporalio-openai-agents
 ```
 
-> **Transition note.** Until the Temporal Python SDK release that stops bundling
-> `temporalio.contrib.openai_agents`, do not install this package next to `temporalio<=1.32`: both
-> ship the same files, and uninstalling this package then removes files the SDK still needs (repair
-> with a reinstall of `temporalio`). Pre-releases are published to TestPyPI only for that reason.
-> Source and issues: https://github.com/temporalio/ai-integrations/tree/main/python/openai_agents
-
 ## Introduction
 
 This integration combines [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) with [Temporal's durable execution](https://docs.temporal.io/evaluate/understanding-temporal#durable-execution).

@@ -113,11 +113,11 @@ from temporalio.exceptions import (
 )
 from temporalio.testing import WorkflowEnvironment
 from temporalio.workflow import ActivityConfig
-from tests.contrib.openai_agents.research_agents.research_manager import (
-    ResearchManager,
-)
 from tests.helpers import assert_eventually, new_worker
 from tests.helpers.nexus import make_nexus_endpoint_name
+from tests.research_agents.research_manager import (
+    ResearchManager,
+)
 
 
 def hello_mock_model():

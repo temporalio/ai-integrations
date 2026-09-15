@@ -20,11 +20,11 @@ from temporalio.worker.workflow_sandbox import (
     SandboxedWorkflowRunner,
     SandboxRestrictions,
 )
-from tests.contrib.openai_agents.test_openai import (
+from tests.helpers import assert_eq_eventually, new_worker
+from tests.test_openai import (
     ResearchWorkflow,
     research_mock_model,
 )
-from tests.helpers import assert_eq_eventually, new_worker
 
 
 class MemoryTracingProcessor(TracingProcessor):

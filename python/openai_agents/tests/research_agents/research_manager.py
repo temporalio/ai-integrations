@@ -5,13 +5,13 @@ import asyncio
 from agents import Runner, custom_span
 
 import temporalio.workflow
-from tests.contrib.openai_agents.research_agents.planner_agent import (
+from tests.research_agents.planner_agent import (
     WebSearchItem,
     WebSearchPlan,
     new_planner_agent,
 )
-from tests.contrib.openai_agents.research_agents.search_agent import new_search_agent
-from tests.contrib.openai_agents.research_agents.writer_agent import (
+from tests.research_agents.search_agent import new_search_agent
+from tests.research_agents.writer_agent import (
     ReportData,
     new_writer_agent,
 )

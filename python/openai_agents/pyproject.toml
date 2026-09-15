@@ -17,11 +17,10 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  # TRANSITION(sdk-cutover): raise the floor to the SDK release that no longer ships this module before 1.0.0.
   # opentelemetry and pydantic extras: the plugin imports temporalio.contrib.opentelemetry and
   # temporalio.contrib.pydantic at module level.
-  # 1.33 passes pydantic_core through the workflow sandbox, which the replay tests require.
-  "temporalio[opentelemetry,pydantic]>=1.33.0,<2",
+  # 1.34 is the first SDK release that does not also ship this integration.
+  "temporalio[opentelemetry,pydantic]>=1.34.0,<2",
   "openai-agents>=0.20,<0.21",
   "openai>=2.45,<3",          # imports openai._models.construct_type and openai.types.responses
   "mcp>=1.24,<3",
@@ -82,7 +81,6 @@ default-groups = ["dev"]
 required-version = ">=0.12.5,<0.13"              # same value in scripts/pyproject.toml; CI reads it via setup-uv version-file
 exclude-newer = "2 weeks"                        # org supply-chain cooldown for third-party packages
 exclude-newer-package = { temporalio = false, temporalio-mcp = false }   # first-party packages are exempt: SDK cutover releases and temporalio-mcp releases must be adoptable on day one
-link-mode = "copy"                               # TRANSITION(sdk-cutover): deterministic overwrites while temporalio<=1.32 ships the same files
 cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
 
 [tool.pytest.ini_options]
@@ -132,10 +130,9 @@ reportUnusedCallResult = "none"
 reportUnknownLambdaType = "none"
 include = ["src", "tests"]
 
-# TRANSITION(sdk-cutover): upstream code reaches sibling contrib packages with relative imports
-# (e.g. `from ..opentelemetry._id_generator import ...`), which pyright cannot resolve from a
-# split source tree although they work at runtime through site-packages. Silence only under src/
-# (basedpyright fails on warnings) until upstream switches to absolute imports of public names.
+# The source tree does not contain sibling SDK-owned contrib packages, so pyright cannot resolve
+# imports such as `from ..opentelemetry._id_generator import ...` even though they work at runtime
+# through site-packages. Silence missing imports only under src/; basedpyright fails on warnings.
 [[tool.pyright.executionEnvironments]]
 root = "src"
 reportMissingImports = "none"
