@@ -2722,7 +2722,7 @@ pydantic = [
 
 [[package]]
 name = "temporalio-openai-agents"
-version = "1.0.0rc1"
+version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },

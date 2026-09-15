@@ -1,6 +1,6 @@
 [project]
 name = "temporalio-openai-agents"
-version = "1.0.0rc1"
+version = "0.0.0"
 description = "Temporal integration for the OpenAI Agents SDK (temporalio.contrib.openai_agents)"
 authors = [{ name = "Temporal Technologies Inc", email = "sdk@temporal.io" }]
 requires-python = ">=3.10"

@@ -21,6 +21,12 @@ def test_valid_plugin_passes(plugin_repo: Path) -> None:
     assert run(plugin_repo) == []
 
 
+def test_python_version_is_the_development_placeholder(plugin_repo: Path) -> None:
+    pyproject = plugin_repo / "python/fakeplug/pyproject.toml"
+    pyproject.write_text(pyproject.read_text().replace('version = "0.0.0"', 'version = "0.1.0"'))
+    assert any("tag-authoritative development placeholder" in x for x in run(plugin_repo))
+
+
 def test_namespace_init_files_are_forbidden(plugin_repo: Path) -> None:
     (plugin_repo / "python/fakeplug/src/temporalio/__init__.py").write_text("")
     (plugin_repo / "python/fakeplug/src/temporalio/contrib/__init__.py").write_text("")
