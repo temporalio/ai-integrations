@@ -109,6 +109,8 @@ class _OpenAIMCPServerBackend:
                 if meta is None:
                     meta = {}
                 meta.update(result.meta)
+            # CacheableResult normalizes an omitted ttlMs to 0 (immediately
+            # stale), so it must participate in the minimum across pages.
             ttl_ms = result.ttl_ms if ttl_ms is None else min(ttl_ms, result.ttl_ms)
             if result.cache_scope == "private":
                 cache_scope = "private"

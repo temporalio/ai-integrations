@@ -278,6 +278,36 @@ async def test_agents_repeated_pagination_cursor_is_non_retryable(
     assert err.value.non_retryable
 
 
+async def test_paginated_results_allow_missing_later_ttl() -> None:
+    class MissingLaterTTLServer:
+        async def list_resources(
+            self, cursor: str | None = None
+        ) -> ListResourcesResult:
+            if cursor is None:
+                return ListResourcesResult.model_validate(
+                    {
+                        "resources": [Resource(name="one", uri="file:///one")],
+                        "nextCursor": "next",
+                        "ttlMs": 300,
+                    }
+                )
+            return ListResourcesResult.model_validate(
+                {"resources": [Resource(name="two", uri="file:///two")]}
+            )
+
+    backend = _OpenAIMCPServerBackend(
+        cast(AgentsMCPServer, cast(object, MissingLaterTTLServer()))
+    )
+
+    resources = await backend.list_resources()
+
+    assert [str(resource.uri) for resource in resources.resources] == [
+        "file:///one",
+        "file:///two",
+    ]
+    assert resources.ttl_ms == 0
+
+
 async def test_list_results_preserve_mcp_envelopes() -> None:
     class MetadataServer:
         async def list_prompts(self) -> ListPromptsResult:
