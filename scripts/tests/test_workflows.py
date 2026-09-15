@@ -79,6 +79,8 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
     # The release job must act on the parsed tag, never on the ref name (they differ on a dry run).
     tag_envs = [s["env"]["TAG"] for s in doc["jobs"]["github-release"]["steps"] if "TAG" in s.get("env", {})]
     assert tag_envs and all(v == "${{ needs.prepare.outputs.tag }}" for v in tag_envs)
+    draft = next(s for s in doc["jobs"]["github-release"]["steps"] if s.get("name") == "Create or update the draft release")
+    assert draft["env"]["TITLE"] == "${{ needs.prepare.outputs.coordinate }} ${{ needs.prepare.outputs.version }}"
     # Only prepare may look at the ref name (to check the dispatch inputs against it); every later job
     # works from prepare's parsed outputs.
     for name, job in doc["jobs"].items():
