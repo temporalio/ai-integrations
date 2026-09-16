@@ -2689,11 +2689,13 @@ def test_legacy_mcp_apis_are_deprecated():
         openai_agents.OpenAIAgentsPlugin(mcp_server_providers=[stateless_provider])
 
 
-@pytest.mark.parametrize("stateful", [True, False])
-@pytest.mark.parametrize("caching", [True, False])
-async def test_mcp_server(client: Client, stateful: bool, caching: bool):
-    if stateful and caching:
-        pytest.skip("Caching is only supported for stateless MCP servers")
+@pytest.mark.parametrize(
+    "mode",
+    ["stateful", "stateless", "stateless-cached"],
+)
+async def test_mcp_server(client: Client, mode: str):
+    stateful = mode == "stateful"
+    caching = mode == "stateless-cached"
 
     from agents.mcp import MCPServer  # type: ignore
 
