@@ -108,11 +108,11 @@ Runbook for `python/<name>`:
 
 ## Cutover sequencing
 
-- Publish `temporalio-openai-agents` 1.0.0 first. Its `temporalio.openai_agents` root does not overlap the SDK's former `temporalio.contrib.openai_agents` files, so it can safely support `temporalio>=1.33.0`. Then make the SDK's `openai-agents` extra forward to the published package, merge the SDK removal and publish `temporalio` 1.34.0.
+- Publish `temporalio-openai-agents` 1.0.0 first. Its `temporalio.openai_agents` root does not overlap the SDK's former `temporalio.contrib.openai_agents` files, so it supports Temporal 1.33 when both distributions share the same physical `site-packages/temporalio` directory. Temporal 1.33 does not extend the regular `temporalio` package path, so split-directory installations require Temporal 1.34 or later. Then make the SDK's `openai-agents` extra forward to the published package, merge the SDK removal and publish `temporalio` 1.34.0.
 
 ## Cutover checklist
 
-SDK side: make the `openai-agents` extra depend on `temporalio-openai-agents`, retain explicit compatibility modules under `temporalio.contrib.openai_agents`, add `pkgutil.extend_path` to `temporalio/__init__.py` for editable installs, merge the removal PR and publish 1.34.0; consider a public export of `TemporalIdGenerator`. Docs: repoint `openai-agents.mdx` and the install text; decide where the plugin API reference is hosted (the SDK's pydoctor site loses these pages). Downstream: `samples-python` dependency groups, `auto-aie` path assumptions, `cicd-terraform` onboarding (merge commits allowed, required check `ci-status`, CLA app installed first).
+SDK side: make the `openai-agents` extra depend on `temporalio-openai-agents`, retain explicit compatibility modules under `temporalio.contrib.openai_agents`, add `pkgutil.extend_path` to `temporalio/__init__.py` for split-directory installations (including editable installs), merge the removal PR and publish 1.34.0; consider a public export of `TemporalIdGenerator`. Docs: repoint `openai-agents.mdx` and the install text; decide where the plugin API reference is hosted (the SDK's pydoctor site loses these pages). Downstream: `samples-python` dependency groups, `auto-aie` path assumptions, `cicd-terraform` onboarding (merge commits allowed, required check `ci-status`, CLA app installed first).
 
 ## Verification commands
 
