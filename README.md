@@ -14,7 +14,6 @@ More plugins are migrating here from the SDK repositories; see the target table 
 
 ## Install
 
-```console
 $ uv add temporalio-mcp
 $ uv add temporalio-openai-agents
 ```
