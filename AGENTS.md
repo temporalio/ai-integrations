@@ -8,7 +8,7 @@ link here. Design source: the
 ## Do not
 
 1. Do not create `__init__.py` in `python/<plugin>/src/temporalio/` or `src/temporalio/contrib/`. The SDK wheel owns those packages; `scripts/ci/check_wheel.py` fails the build if they appear.
-2. Do not edit imported files (`src/...`, `tests/contrib/<plugin>/...`) while the plugin's `plugin.toml` still names an `upstream`. Fix upstream, then re-sync.
+2. Do not edit imported files (`src/...`, `tests/contrib/<plugin>/...`) while the plugin's `plugin.toml` still names an `upstream`. Fix upstream, then re-sync. Preserve documented local-only divergences, such as the `openai_agents` MCP v2 adapter, when resolving a re-sync.
 3. Do not apply `history-import` to work that is not reachable from the upstream repository's default branch, including work from an unmerged or closed upstream PR. A valid `history-import` PR must be merged with "Create a merge commit", never squash or rebase.
 4. Do not install with plain `uv sync` or run tests with a bare `uv run`. Use `make sync`, `make test`, and the other targets; they export `UV_NO_EDITABLE=1`.
 5. Do not add a workflow file, job, or secret for one plugin. Plugin variation lives in `plugin.toml`, `pyproject.toml`, and the shared make targets.

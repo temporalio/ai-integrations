@@ -338,6 +338,10 @@ def previous_tag(repo_root: Path, language: str, plugin: str, current: Version) 
             v = Version(tag[len(prefix):])
         except InvalidVersion:
             continue
+        # A final release summarizes everything since the previous final. Its
+        # release candidates are staging points, not stable changelog boundaries.
+        if not current.is_prerelease and v.is_prerelease:
+            continue
         if v < current:
             candidates.append((v, tag))
     if not candidates:
@@ -354,6 +358,8 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
     coordinate = meta["plugin"].get("coordinate", parts["plugin"])
     root_api = meta["plugin"].get("root-api", "")
     prev = previous_tag(repo_root, parts["language"], parts["plugin"], version)
+    revision = f"{prev[0]}..{tag}" if prev else tag
+    log = _git("log", "--no-decorate", "--format=%h%x1f%s", revision, "--", plugin_dir, cwd=repo_root)
     lines = [f"# {coordinate} {version}", ""]
     if prev is None:
         lines += [
@@ -368,19 +374,26 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
                 f"from https://github.com/{up_repo}/commits/main/{up_path}.",
                 "",
             ]
+    lines += ["## What's changed", ""]
+    entries = [line for line in log.splitlines() if line.strip()]
+    if not entries:
+        scope = "through this release" if prev is None else "since the previous release"
+        lines.append(f"_No commits touched this plugin {scope}._")
+    for entry in entries:
+        sha, _, subject = entry.partition("\x1f")
+        subject = PR_REF.sub(lambda m: f"[#{m.group(1)}](https://github.com/{repo}/pull/{m.group(1)})", subject)
+        lines.append(f"- {subject} ({sha})")
+    if prev is None:
         # refs/tags/ keeps GitHub from reading the slash-separated tag as a ref plus a path.
-        lines += [f"**Source**: https://github.com/{repo}/tree/refs/tags/{tag}/{plugin_dir}", ""]
+        lines += [
+            "",
+            f"**Full changelog**: https://github.com/{repo}/commits/refs/tags/{tag}/{plugin_dir}",
+            "",
+            f"**Source**: https://github.com/{repo}/tree/refs/tags/{tag}/{plugin_dir}",
+            "",
+        ]
     else:
         prev_tag, _ = prev
-        log = _git("log", "--no-decorate", "--format=%h%x1f%s", f"{prev_tag}..{tag}", "--", plugin_dir, cwd=repo_root)
-        lines += ["## What's changed", ""]
-        entries = [line for line in log.splitlines() if line.strip()]
-        if not entries:
-            lines.append("_No commits touched this plugin since the previous release._")
-        for entry in entries:
-            sha, _, subject = entry.partition("\x1f")
-            subject = PR_REF.sub(lambda m: f"[#{m.group(1)}](https://github.com/{repo}/pull/{m.group(1)})", subject)
-            lines.append(f"- {subject} ({sha})")
         lines += ["", f"**Full changelog**: https://github.com/{repo}/compare/{prev_tag}...{tag}", ""]
     if version.is_prerelease:
         lines += [

@@ -245,8 +245,10 @@ def test_release_notes_initial_and_incremental(plugin_repo: Path, tmp_path: Path
     git(repo, "tag", "python/fakeplug/v0.1.0rc1")
     notes = release_tool.release_notes(repo, "python/fakeplug", "python/fakeplug/v0.1.0rc1", "temporalio/ai-integrations")
     assert "First standalone release of `temporalio-fakeplug`" in notes
+    assert "add fake plugin" in notes
     assert "TestPyPI only" in notes and "temporalio.contrib.fakeplug" in notes
     assert "commits/main/temporalio/contrib/fakeplug" in notes
+    assert "commits/refs/tags/python/fakeplug/v0.1.0rc1/python/fakeplug" in notes
     assert "tree/refs/tags/python/fakeplug/v0.1.0rc1/python/fakeplug" in notes
 
     (repo / "python/fakeplug/src/temporalio/contrib/fakeplug/_impl.py").write_text("VALUE = 2\n")
@@ -257,11 +259,14 @@ def test_release_notes_initial_and_incremental(plugin_repo: Path, tmp_path: Path
     commit_all(repo, "Docs: mention temporalio/sdk-python#77 (#14)")
     git(repo, "tag", "python/fakeplug/v0.1.0")
     notes = release_tool.release_notes(repo, "python/fakeplug", "python/fakeplug/v0.1.0", "temporalio/ai-integrations")
+    assert "First standalone release of `temporalio-fakeplug`" in notes
+    assert "add fake plugin" in notes
     assert "[#12](https://github.com/temporalio/ai-integrations/pull/12)" in notes
     assert "[#14](https://github.com/temporalio/ai-integrations/pull/14)" in notes
     assert "#13" not in notes
     assert "temporalio/sdk-python#77" in notes and "pull/77" not in notes
-    assert "compare/python/fakeplug/v0.1.0rc1...python/fakeplug/v0.1.0" in notes
+    assert "commits/refs/tags/python/fakeplug/v0.1.0/python/fakeplug" in notes
+    assert "compare/python/fakeplug/v0.1.0rc1" not in notes
     assert "Pre-release notes" not in notes
 
 
