@@ -2,9 +2,13 @@
 
 > This package is experimental and may change in future versions.
 
-`temporalio.contrib.mcp` lets native Temporal workflow code use MCP Python SDK
+`temporalio.mcp` lets native Temporal workflow code use MCP Python SDK
 v2 clients. The workflow sees a durable proxy, while MCP transports, processes,
 network connections, and credentials remain in worker-side Activities.
+
+Version 0.2.0 changes both the import root and registered Activity-name prefix
+from `temporalio.contrib.mcp` to `temporalio.mcp`. Workflows started with 0.1.x
+must finish on 0.1.x workers before those workers are upgraded.
 
 Install the integration with:
 
@@ -20,7 +24,7 @@ request/response operations:
 ```python
 from mcp.types import TextContent
 from temporalio import workflow
-from temporalio.contrib.mcp import TemporalMCPClient
+from temporalio.mcp import TemporalMCPClient
 
 
 @workflow.defn
@@ -42,7 +46,7 @@ simplest network transport:
 
 ```python
 from mcp import Client
-from temporalio.contrib.mcp import MCPPlugin
+from temporalio.mcp import MCPPlugin
 from temporalio.worker import Worker
 
 plugin = MCPPlugin(
@@ -63,7 +67,7 @@ For a stdio server, return a fresh `Client` and transport from the factory:
 
 ```python
 from mcp import Client, StdioServerParameters, stdio_client
-from temporalio.contrib.mcp import MCPPlugin
+from temporalio.mcp import MCPPlugin
 
 parameters = StdioServerParameters(
     command="python",
@@ -110,7 +114,7 @@ both `start_to_close_timeout` and `schedule_to_close_timeout` are omitted or
 
 ```python
 from datetime import timedelta
-from temporalio.contrib.mcp import TemporalMCPClient
+from temporalio.mcp import TemporalMCPClient
 
 mcp = TemporalMCPClient(
     "weather",
@@ -152,7 +156,7 @@ retries, and/or set a `retry_policy` to bound the number of attempts:
 ```python
 from datetime import timedelta
 from temporalio.common import RetryPolicy
-from temporalio.contrib.mcp import TemporalMCPClient
+from temporalio.mcp import TemporalMCPClient
 
 mcp = TemporalMCPClient(
     "weather",

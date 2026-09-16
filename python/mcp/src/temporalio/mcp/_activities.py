@@ -25,16 +25,16 @@ from mcp.types import (
 from pydantic import BaseModel, ValidationError
 
 from temporalio import activity
-from temporalio.contrib.mcp._activity import (
+from temporalio.exceptions import ApplicationError
+from temporalio.mcp._activity import (
     _activity_name,
     _CallToolRequest,
     _GetPromptRequest,
     _MCPRequest,
     _ReadResourceRequest,
 )
-from temporalio.contrib.mcp._backend import _MCPBackend, _MCPBackendFactory
-from temporalio.contrib.mcp._pool import _MCPConnectionPool
-from temporalio.exceptions import ApplicationError
+from temporalio.mcp._backend import _MCPBackend, _MCPBackendFactory
+from temporalio.mcp._pool import _MCPConnectionPool
 
 _Result = TypeVar("_Result")
 _ListResult = TypeVar("_ListResult", bound=BaseModel)

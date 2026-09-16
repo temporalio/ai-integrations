@@ -8,7 +8,7 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
   * plugin folder names never end in `-plugin` / `_plugin`
   * no language-level lockfiles (python/uv.lock, typescript/pnpm-lock.yaml, ...)
   * every Python plugin has pyproject.toml, uv.lock, plugin.toml, Makefile, README.md,
-    src/temporalio/contrib/<name>/{__init__.py,py.typed}
+    and {root-api}/{__init__.py,py.typed} under src/
   * NO src/temporalio/__init__.py and NO src/temporalio/contrib/__init__.py (namespace invariant)
   * LICENSE is a committed regular file byte-identical to the root LICENSE; pyproject declares license = "MIT"
     and license-files = ["LICENSE"]; no CHANGELOG*, no smoke_test.py in the plugin dir
@@ -90,14 +90,36 @@ class Checker:
         d = plugin.path
         rel = plugin.rel
         name = plugin.name
-        pkg = d / "src" / "temporalio" / "contrib" / name
         for required in ("pyproject.toml", "uv.lock", "plugin.toml", "Makefile", "README.md"):
             if not (d / required).is_file():
                 self.fail(f"{rel}: missing {required}")
+
+        pyproject: dict[str, Any] | None = None
+        meta: dict[str, Any] | None = None
+        if (d / "pyproject.toml").is_file() and (d / "plugin.toml").is_file():
+            try:
+                pyproject = load_toml(d / "pyproject.toml")
+                meta = load_toml(d / "plugin.toml")
+            except Exception as exc:  # noqa: BLE001
+                self.fail(f"{rel}: cannot parse TOML: {exc}")
+
+        root_api = (
+            meta.get("plugin", {}).get("root-api")
+            if isinstance(meta, dict) and isinstance(meta.get("plugin"), dict)
+            else None
+        )
+        package_parts = (
+            root_api.split(".")
+            if isinstance(root_api, str)
+            and root_api in {f"temporalio.contrib.{name}", f"temporalio.{name}"}
+            else ["temporalio", "contrib", name]
+        )
+        package_rel = Path("src", *package_parts)
+        pkg = d / package_rel
         if not (pkg / "__init__.py").is_file():
-            self.fail(f"{rel}: missing src/temporalio/contrib/{name}/__init__.py")
+            self.fail(f"{rel}: missing {package_rel}/__init__.py")
         if not (pkg / "py.typed").is_file():
-            self.fail(f"{rel}: missing src/temporalio/contrib/{name}/py.typed")
+            self.fail(f"{rel}: missing {package_rel}/py.typed")
         for forbidden in ("src/temporalio/__init__.py", "src/temporalio/contrib/__init__.py"):
             if (d / forbidden).exists():
                 self.fail(f"{rel}: {forbidden} must not exist (namespace invariant; the SDK owns these packages)")
@@ -119,13 +141,7 @@ class Checker:
             if base == "smoke_test.py":
                 self.fail(f"{rel}: {f} is committed; the generic scripts/ci/smoke.py replaces per-plugin smoke scripts")
 
-        if not (d / "pyproject.toml").is_file() or not (d / "plugin.toml").is_file():
-            return
-        try:
-            pyproject = load_toml(d / "pyproject.toml")
-            meta = load_toml(d / "plugin.toml")
-        except Exception as exc:  # noqa: BLE001
-            self.fail(f"{rel}: cannot parse TOML: {exc}")
+        if pyproject is None or meta is None:
             return
         self.check_plugin_toml(plugin, meta, pyproject)
         self.check_pyproject(plugin, pyproject)
@@ -138,7 +154,9 @@ class Checker:
             self.fail(f"{rel}: plugin.toml missing [plugin] table")
             return
         expected_coordinate = "temporalio-" + plugin.name.replace("_", "-")
-        expected_root_api = "temporalio.contrib." + plugin.name
+        root_api = p.get("root-api")
+        expected_root_api = "temporalio." + plugin.name
+        transitional_root_api = "temporalio.contrib." + plugin.name
         if p.get("name") != plugin.name:
             self.fail(f"{rel}: plugin.toml name {p.get('name')!r} must equal the folder name {plugin.name!r}")
         if p.get("language") != plugin.language:
@@ -147,15 +165,24 @@ class Checker:
             self.fail(f"{rel}: plugin.toml coordinate must be {expected_coordinate!r} (got {p.get('coordinate')!r})")
         if p.get("registry") != REGISTRIES[plugin.language]:
             self.fail(f"{rel}: plugin.toml registry must be {REGISTRIES[plugin.language]!r}")
-        if p.get("root-api") != expected_root_api:
-            self.fail(f"{rel}: plugin.toml root-api must be {expected_root_api!r}")
+        release = meta.get("release", {})
+        is_transitional_root = (
+            root_api == transitional_root_api
+            and isinstance(p.get("upstream"), str)
+            and release.get("allow-final") is False
+        )
+        if root_api != expected_root_api and not is_transitional_root:
+            self.fail(
+                f"{rel}: plugin.toml root-api must be {expected_root_api!r}; "
+                f"{transitional_root_api!r} is allowed only for an upstream-backed migration "
+                f"with [release] allow-final = false (got {root_api!r})"
+            )
         maturity = p.get("maturity")
         if maturity not in MATURITY_CLASSIFIER:
             self.fail(f"{rel}: plugin.toml maturity must be one of {sorted(MATURITY_CLASSIFIER)}")
         for banned in ("owners", "live-secrets", "secrets"):
             if banned in p or banned in meta.get("ci", {}):
                 self.fail(f"{rel}: plugin.toml must not contain {banned!r} (ownership is CODEOWNERS; CI has no secrets)")
-        release = meta.get("release", {})
         if not isinstance(release.get("allow-final"), bool):
             self.fail(f"{rel}: plugin.toml [release] allow-final must be a boolean")
         versions = meta.get("ci", {}).get("runtime-versions")
@@ -163,8 +190,11 @@ class Checker:
             self.fail(f"{rel}: plugin.toml [ci] runtime-versions must be a non-empty list")
             versions = []
         smoke_imports = meta.get("smoke", {}).get("imports", [])
-        if smoke_imports and not all(isinstance(i, str) and i.startswith(expected_root_api) for i in smoke_imports):
-            self.fail(f"{rel}: plugin.toml [smoke] imports must be modules under {expected_root_api}")
+        if smoke_imports and not all(
+            isinstance(i, str) and isinstance(root_api, str) and i.startswith(root_api)
+            for i in smoke_imports
+        ):
+            self.fail(f"{rel}: plugin.toml [smoke] imports must be modules under {root_api}")
 
         project = pyproject.get("project", {})
         if project.get("name") != p.get("coordinate"):
@@ -181,8 +211,8 @@ class Checker:
         elif versions and str(versions[0]) != m.group(1):
             self.fail(f"{rel}: first [ci] runtime-versions entry {versions[0]!r} must equal the requires-python floor {m.group(1)!r}")
         module_name = pyproject.get("tool", {}).get("uv", {}).get("build-backend", {}).get("module-name")
-        if module_name != expected_root_api:
-            self.fail(f"{rel}: [tool.uv.build-backend] module-name must be {expected_root_api!r} (got {module_name!r})")
+        if module_name != root_api:
+            self.fail(f"{rel}: [tool.uv.build-backend] module-name must be {root_api!r} (got {module_name!r})")
 
     def check_pyproject(self, plugin: Plugin, pyproject: dict[str, Any]) -> None:
         rel = plugin.rel

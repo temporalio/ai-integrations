@@ -18,7 +18,7 @@ from mcp.types import (
 )
 
 from temporalio import workflow
-from temporalio.contrib.mcp._activity import (
+from temporalio.mcp._activity import (
     _activity_name,
     _CallToolRequest,
     _GetPromptRequest,
