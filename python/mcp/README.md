@@ -6,10 +6,6 @@
 v2 clients. The workflow sees a durable proxy, while MCP transports, processes,
 network connections, and credentials remain in worker-side Activities.
 
-Version 0.2.0 changes both the import root and registered Activity-name prefix
-from `temporalio.contrib.mcp` to `temporalio.mcp`. Workflows started with 0.1.x
-must finish on 0.1.x workers before those workers are upgraded.
-
 Install the integration with:
 
 ```bash
