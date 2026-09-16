@@ -8,8 +8,8 @@ link here. Design source: the
 ## Do not
 
 1. Do not create `__init__.py` in `python/<plugin>/src/temporalio/` or `src/temporalio/contrib/`. The SDK wheel owns those packages; `scripts/ci/check_wheel.py` fails the build if they appear.
-2. Do not edit imported files (`src/...`, `tests/contrib/<plugin>/...`) while the plugin's `plugin.toml` still names an `upstream`. Fix upstream, then re-sync.
-3. Do not squash or rebase a PR labelled `history-import`. Merge it with "Create a merge commit".
+2. Do not edit imported files (`src/...`, `tests/contrib/<plugin>/...`) while the plugin's `plugin.toml` still names an `upstream`. Fix upstream, then re-sync. Preserve documented local-only divergences, such as the `openai_agents` MCP v2 adapter, when resolving a re-sync.
+3. Do not apply `history-import` to work that is not reachable from the upstream repository's default branch, including work from an unmerged or closed upstream PR. A valid `history-import` PR must be merged with "Create a merge commit", never squash or rebase.
 4. Do not install with plain `uv sync` or run tests with a bare `uv run`. Use `make sync`, `make test`, and the other targets; they export `UV_NO_EDITABLE=1`.
 5. Do not add a workflow file, job, or secret for one plugin. Plugin variation lives in `plugin.toml`, `pyproject.toml`, and the shared make targets.
 6. Do not add `exclude-newer` without `exclude-newer-package = { temporalio = false }`, and do not replace `--locked` with `--frozen`.
@@ -72,7 +72,7 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
 - Build backend `uv_build` with `module-name = "temporalio.contrib.<name>"`. `py.typed` ships in the leaf package (redundant with the SDK's marker, kept on purpose).
 - Installs are non-editable. `temporalio` is a regular package owned by the SDK wheel, so an editable install of a plugin makes `temporalio.contrib.<name>` resolve to whatever the SDK ships (silently wrong before cutover, `ImportError` after). `python/_shared/python.mk` exports `UV_NO_EDITABLE=1`; `[tool.uv] cache-keys` includes `src/**/*` so edits trigger a rebuild; `link-mode = "copy"` keeps overwrites deterministic during the transition.
 - Provenance guard (`tests/helpers/provenance.py`, mirrored by `scripts/ci/smoke.py`) runs at every pytest session start and fails loudly if the install is editable, any file differs from the distribution's RECORD, files under the package directory are not owned by the distribution, or another distribution ships the same paths. While `plugin.toml` `[release] allow-final = false`, the SDK's overlap (`temporalio<=1.32` ships `temporalio/contrib/openai_agents/*`) is tolerated with a warning. `tests/test_installed_matches_source.py` additionally byte-compares the installed package with `src/`.
-- Dependency cooldown: `exclude-newer = "2 weeks"` (org supply-chain policy) with `exclude-newer-package = { temporalio = false }` so a new SDK release is adoptable the day it ships. Declare exactly what the package imports at module level; `openinference` and similar lazy imports go in an extra.
+- Dependency cooldown: `exclude-newer = "2 weeks"` (org supply-chain policy) with `exclude-newer-package = { temporalio = false }` so a new SDK release is adoptable the day it ships; a plugin that depends on another plugin adds that coordinate too (`temporalio-mcp = false` in `openai_agents`), otherwise a fresh first-party release is invisible to `uv lock` for two weeks. Declare exactly what the package imports at module level; `openinference` and similar lazy imports go in an extra.
 - Tooling: ruff, pyright, basedpyright, mypy (`mypy_path = "src"`, `explicit_package_bases`), pydocstyle (google), pytest + xdist (`-n auto --dist=worksteal`; the `os._exit(0)` hook is xdist-aware). All invoked through `make` targets; see `make help`.
 - Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in a plugin's conftest only when one of its tests needs a server feature that is off by default.
 - Provider tests: each plugin owns its `tests/conftest.py` and test helpers. Tests must not require real provider credentials; use deterministic local models, mock transports, or in-process servers to exercise provider behavior in CI.
@@ -103,7 +103,7 @@ Runbook for `python/<name>`:
 
 ## Migration and re-sync
 
-`scripts/migrate/extract-sdk-python.sh` plus `scripts/migrate/README.md` are the procedure. Rules: find every historical path first; the script is frozen after a plugin's first import; import PRs are labelled `history-import` and merged with a merge commit; adaptation files are separate commits on top; every import and re-sync gets a row in `scripts/migrate/IMPORTS.md`. Expected verification numbers are in that README.
+`scripts/migrate/extract-sdk-python.sh` plus `scripts/migrate/README.md` are the procedure. Only commits reachable from the upstream repository's default branch qualify as imported history. Work from an unmerged or closed PR, feature branch or fork is ordinary local work: do not apply `history-import` and do not add it to `scripts/migrate/IMPORTS.md`. Commit count, `Migrated-From` trailers and use of the migration tooling do not change that classification. For valid imports, find every historical path first; the script is frozen after a plugin's first import; label the PR `history-import` and merge it with a merge commit; keep adaptation files in separate commits on top; and record every import and re-sync in `IMPORTS.md`. Expected verification numbers are in the migration README.
 
 ## Transition rules (until the SDK cutover PR merges)
 

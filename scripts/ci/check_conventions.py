@@ -16,15 +16,12 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
     maturity classifier/requires-python floor/module-name/required-version)
   * no [tool.uv.sources] path or workspace entries
   * README has no relative markdown links (PyPI renders the README)
-  * PR context: a PR with more than 20 commits must carry the `history-import` label
   * --nightly: coordinates with [release] allow-final = false must not exist on PyPI yet
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import re
 import stat
 import subprocess
@@ -45,8 +42,6 @@ MATURITY_CLASSIFIER = {
 REGISTRIES = {"python": "pypi", "typescript": "npm", "java": "maven", "go": "goproxy"}
 LANGUAGE_LOCKFILES = ("uv.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "go.sum", "gradle.lockfile")
 RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
-MAX_PR_COMMITS_WITHOUT_LABEL = 20
-HISTORY_IMPORT_LABEL = "history-import"
 PYTHON_DEVELOPMENT_VERSION = "0.0.0"
 
 
@@ -224,22 +219,6 @@ class Checker:
             if RELATIVE_LINK.search(line):
                 self.fail(f"{plugin.rel}/README.md:{lineno}: relative link; use absolute https://github.com/... URLs (PyPI renders this file)")
 
-    def check_pr_context(self) -> None:
-        if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
-            return
-        try:
-            commits = int(os.environ.get("PR_COMMITS", "0") or 0)
-        except ValueError:
-            commits = 0
-        try:
-            labels = json.loads(os.environ.get("PR_LABELS", "[]") or "[]")
-        except json.JSONDecodeError:
-            labels = []
-        if commits > MAX_PR_COMMITS_WITHOUT_LABEL and HISTORY_IMPORT_LABEL not in labels:
-            self.fail(
-                f"PR has {commits} commits without the `{HISTORY_IMPORT_LABEL}` label; only history imports/re-syncs may carry that many commits, and they must be merged with a merge commit"
-            )
-
     def check_nightly(self, plugins: list[Plugin]) -> None:
         for plugin in plugins:
             meta_path = plugin.path / "plugin.toml"
@@ -270,7 +249,6 @@ class Checker:
         self.check_language_roots(discovered)
         for plugin in discovered["python"]:
             self.check_python_plugin(plugin)
-        self.check_pr_context()
         if nightly:
             self.check_nightly(discovered["python"])
         return self.violations

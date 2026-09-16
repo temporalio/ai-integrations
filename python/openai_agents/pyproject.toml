@@ -22,14 +22,16 @@ dependencies = [
   # temporalio.contrib.pydantic at module level.
   # 1.33 passes pydantic_core through the workflow sandbox, which the replay tests require.
   "temporalio[opentelemetry,pydantic]>=1.33.0,<2",
-  "openai-agents>=0.19.2,<0.20",
+  "openai-agents>=0.20,<0.21",
   "openai>=2.45,<3",          # imports openai._models.construct_type and openai.types.responses
-  "mcp>=1.19,<2",
+  "mcp>=1.24,<3",
   "pydantic>=2,<3",
   "typing-extensions>=4.2,<5",
 ]
 
 [project.optional-dependencies]
+# Lazily imported when OpenAIAgentsPlugin(mcp_servers=...) or workflow.temporal_mcp_server() is used.
+mcp = ["mcp>=2,<3", "mcp-types>=2,<3", "temporalio-mcp>=0.1.0,<0.2"]
 # Lazily imported when OpenAIAgentsPlugin(use_otel_instrumentation=True); see README "OpenTelemetry Integration".
 openinference = ["openinference-instrumentation-openai-agents>=0.1.0", "opentelemetry-sdk>=1.26,<2"]
 
@@ -63,9 +65,12 @@ dev = [
   # Used by the migrated test suite.
   "httpx>=0.28",
   "rich>=13",
+  "mcp>=2,<3",
+  "mcp-types>=2,<3",
+  "temporalio-mcp>=0.1.0,<0.2",
   "openinference-instrumentation-openai-agents>=0.1.0",
   "opentelemetry-sdk>=1.26,<2",
-  "openai-agents[litellm]>=0.19.2,<0.20; python_version < '3.14'",
+  "openai-agents[litellm]>=0.20,<0.21; python_version < '3.14'",
   # litellm 1.98.0 through 1.100.0 import typing.NotRequired (3.11+) and fail to import on 3.10;
   # the fix is on litellm main but unreleased. Raise the 3.10 cap once a fixed release is out.
   "litellm>=1.83.0,<1.98; python_version < '3.11'",
@@ -76,7 +81,7 @@ dev = [
 default-groups = ["dev"]
 required-version = ">=0.12.5,<0.13"              # same value in scripts/pyproject.toml; CI reads it via setup-uv version-file
 exclude-newer = "2 weeks"                        # org supply-chain cooldown for third-party packages
-exclude-newer-package = { temporalio = false }   # the SDK is exempt: cutover releases must be adoptable on day one
+exclude-newer-package = { temporalio = false, temporalio-mcp = false }   # first-party packages are exempt: SDK cutover releases and temporalio-mcp releases must be adoptable on day one
 link-mode = "copy"                               # TRANSITION(sdk-cutover): deterministic overwrites while temporalio<=1.32 ships the same files
 cache-keys = [{ file = "pyproject.toml" }, { file = "README.md" }, { file = "src/**/*" }]
 

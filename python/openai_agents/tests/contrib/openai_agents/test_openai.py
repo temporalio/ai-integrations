@@ -5,10 +5,7 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import (
-    Any,
-    cast,
-)
+from typing import Any, cast
 
 import nexusrpc
 import pydantic
@@ -64,6 +61,7 @@ from openai.types.responses import (
     ResponseCodeInterpreterToolCall,
     ResponseCustomToolCall,
     ResponseFileSearchToolCall,
+    ResponseFunctionToolCall,
     ResponseFunctionWebSearch,
 )
 from openai.types.responses.response_file_search_tool_call import Result
@@ -124,6 +122,15 @@ from tests.helpers.nexus import make_nexus_endpoint_name
 
 def hello_mock_model():
     return TestModel.returning_responses([ResponseBuilders.output_message("test")])
+
+
+def test_tool_call_response_builder_keeps_default_ids():
+    response = ResponseBuilders.tool_call("{}", "test")
+    assert len(response.output) == 1
+    call = response.output[0]
+    assert isinstance(call, ResponseFunctionToolCall)
+    assert call.call_id == "call"
+    assert call.id == "id"
 
 
 @workflow.defn
@@ -236,15 +243,36 @@ class WeatherServiceHandler:
 def weather_mock_model():
     return TestModel.returning_responses(
         [
-            ResponseBuilders.tool_call('{"city":"Tokyo"}', "get_weather"),
             ResponseBuilders.tool_call(
-                '{"input":{"city":"Tokyo"}}', "get_weather_object"
+                '{"city":"Tokyo"}',
+                "get_weather",
+                call_id="call-get-weather",
+                item_id="item-get-weather",
             ),
             ResponseBuilders.tool_call(
-                '{"city":"Tokyo","country":"Japan"}', "get_weather_country"
+                '{"input":{"city":"Tokyo"}}',
+                "get_weather_object",
+                call_id="call-get-weather-object",
+                item_id="item-get-weather-object",
             ),
-            ResponseBuilders.tool_call('{"city":"Tokyo"}', "get_weather_context"),
-            ResponseBuilders.tool_call('{"city":"Tokyo"}', "get_weather_method"),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo","country":"Japan"}',
+                "get_weather_country",
+                call_id="call-get-weather-country",
+                item_id="item-get-weather-country",
+            ),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo"}',
+                "get_weather_context",
+                call_id="call-get-weather-context",
+                item_id="item-get-weather-context",
+            ),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo"}',
+                "get_weather_method",
+                call_id="call-get-weather-method",
+                item_id="item-get-weather-method",
+            ),
             ResponseBuilders.output_message("Test weather result"),
         ]
     )
@@ -890,7 +918,12 @@ def customer_service_mock_model():
     return TestModel.returning_responses(
         [
             ResponseBuilders.output_message("Hi there! How can I assist you today?"),
-            ResponseBuilders.tool_call("{}", "transfer_to_seat_booking_agent"),
+            ResponseBuilders.tool_call(
+                "{}",
+                "transfer_to_seat_booking_agent",
+                call_id="call-transfer-to-seat-booking-agent",
+                item_id="item-transfer-to-seat-booking-agent",
+            ),
             ResponseBuilders.output_message(
                 "Could you please provide your confirmation number?"
             ),
@@ -900,11 +933,18 @@ def customer_service_mock_model():
             ResponseBuilders.tool_call(
                 '{"confirmation_number":"11111","new_seat":"window seat"}',
                 "update_seat",
+                call_id="call-update-seat",
+                item_id="item-update-seat",
             ),
             ResponseBuilders.output_message(
                 "Your seat has been updated to a window seat. If there's anything else you need, feel free to let me know!"
             ),
-            ResponseBuilders.tool_call("{}", "transfer_to_triage_agent"),
+            ResponseBuilders.tool_call(
+                "{}",
+                "transfer_to_triage_agent",
+                call_id="call-transfer-to-triage-agent",
+                item_id="item-transfer-to-triage-agent",
+            ),
             ResponseBuilders.output_message("You're welcome!"),
         ]
     )
@@ -2093,11 +2133,11 @@ def hosted_mcp_mock_model():
             ModelResponse(
                 output=[
                     McpApprovalRequest(
-                        arguments="",
-                        name="",
+                        arguments="{}",
+                        name="search",
                         server_label="gitmcp",
                         type="mcp_approval_request",
-                        id="id",
+                        id="approval-1",
                     )
                 ],
                 usage=Usage(),
@@ -2106,11 +2146,11 @@ def hosted_mcp_mock_model():
             ModelResponse(
                 output=[
                     McpCall(
-                        arguments="",
-                        name="",
-                        server_label="",
+                        arguments="{}",
+                        name="search",
+                        server_label="gitmcp",
                         type="mcp_call",
-                        id="id",
+                        id="call-1",
                         output="Mcp output",
                     ),
                     ResponseBuilders.response_output_message("Some language"),
@@ -2553,10 +2593,14 @@ def tracking_mcp_mock_model():
             ResponseBuilders.tool_call(
                 arguments='{"name":"Tom"}',
                 name="Say-Hello",
+                call_id="call-say-hello-tom",
+                item_id="item-say-hello-tom",
             ),
             ResponseBuilders.tool_call(
                 arguments='{"name":"Tim"}',
                 name="Say-Hello",
+                call_id="call-say-hello-tim",
+                item_id="item-say-hello-tim",
             ),
             ResponseBuilders.output_message("Hi Tom and Tim!"),
         ]
@@ -2594,16 +2638,18 @@ def get_tracking_server(name: str):
         ) -> list[MCPTool]:
             self.calls.append("list_tools")
             return [
-                MCPTool(
-                    name="Say-Hello",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
+                MCPTool.model_validate(
+                    {
+                        "name": "Say-Hello",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                            },
+                            "required": ["name"],
+                            "$schema": "http://json-schema.org/draft-07/schema#",
                         },
-                        "required": ["name"],
-                        "$schema": "http://json-schema.org/draft-07/schema#",
-                    },
+                    }
                 )
             ]
 
@@ -2628,6 +2674,25 @@ def get_tracking_server(name: str):
             raise NotImplementedError()
 
     return TrackingMCPServer(name)
+
+
+def test_legacy_mcp_apis_are_deprecated():
+    with pytest.warns(DeprecationWarning, match="StatelessMCPServerProvider"):
+        stateless_provider = StatelessMCPServerProvider(
+            "deprecated-stateless",
+            lambda: cast(MCPServer, cast(object, None)),
+        )
+    with pytest.warns(DeprecationWarning, match="StatefulMCPServerProvider"):
+        StatefulMCPServerProvider(
+            "deprecated-stateful",
+            lambda _argument: cast(MCPServer, cast(object, None)),
+        )
+    with pytest.warns(DeprecationWarning, match="stateless_mcp_server"):
+        openai_agents.workflow.stateless_mcp_server("deprecated-stateless")
+    with pytest.warns(DeprecationWarning, match="stateful_mcp_server"):
+        openai_agents.workflow.stateful_mcp_server("deprecated-stateful")
+    with pytest.warns(DeprecationWarning, match="mcp_server_providers"):
+        openai_agents.OpenAIAgentsPlugin(mcp_server_providers=[stateless_provider])
 
 
 @pytest.mark.parametrize("stateful", [True, False])

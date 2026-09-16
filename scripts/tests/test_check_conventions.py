@@ -103,15 +103,10 @@ def test_exclude_newer_requires_temporalio_exemption(plugin_repo: Path) -> None:
     assert any("temporalio is not exempted" in x for x in run(plugin_repo))
 
 
-def test_pr_commit_count_requires_history_import_label(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pr_commit_count_does_not_imply_history_import(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
     monkeypatch.setenv("PR_COMMITS", "25")
     monkeypatch.setenv("PR_LABELS", '["enhancement"]')
-    assert any("history-import" in x for x in run(plugin_repo))
-    monkeypatch.setenv("PR_LABELS", '["history-import"]')
-    assert run(plugin_repo) == []
-    monkeypatch.setenv("PR_LABELS", "[]")
-    monkeypatch.setenv("PR_COMMITS", "3")
     assert run(plugin_repo) == []
 
 

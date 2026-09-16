@@ -13,9 +13,11 @@ workflow.
 
 - Ordinary PRs are squash-merged. Issue and PR templates are the organization defaults from
   `temporalio/.github`.
-- PRs that import or re-sync history from an SDK repository are labelled `history-import` and are
-  merged with **"Create a merge commit"**, never squash or rebase. Adaptation changes go in
-  separate commits after the merge commit and never touch imported files.
+- PRs that import or re-sync commits reachable from an SDK repository's default branch are labelled
+  `history-import` and merged with **"Create a merge commit"**, never squash or rebase. Work from
+  an unmerged or closed upstream PR is ordinary PR work and must not carry that label, regardless
+  of its commit count or trailers. Adaptation changes go in separate commits after a real import;
+  documented local-only divergences are preserved across later re-syncs as described in AGENTS.md.
 - CI runs only the plugins whose files changed (`.github/workflows/ci.yml`); `ci-status`,
   `Check for CODEOWNERS` and `opengrep/scan` are the required checks, plus one code-owner
   approval. No secrets are needed: provider behavior uses deterministic local test doubles.

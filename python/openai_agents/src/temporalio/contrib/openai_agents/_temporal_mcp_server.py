@@ -1,0 +1,144 @@
+"""Adapter exposing durable MCP v2 clients as OpenAI Agents MCP servers."""
+
+# pyright: reportUnusedClass=false
+
+from __future__ import annotations
+
+import inspect
+from typing import Any, cast
+
+from agents import AgentBase, RunContextWrapper
+from agents.mcp import MCPServer
+from agents.mcp.util import ToolFilter, ToolFilterContext
+from mcp.types import (
+    CallToolResult,
+    GetPromptResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
+    ReadResourceResult,
+    RequestParamsMeta,
+    Tool,
+)
+
+from temporalio.contrib.mcp import TemporalMCPClient
+
+
+class _TemporalMCPServer(MCPServer):
+    def __init__(
+        self,
+        client: TemporalMCPClient,
+        *,
+        tool_filter: ToolFilter = None,
+        **kwargs: Any,
+    ) -> None:
+        self._client = client
+        self._tool_filter = tool_filter
+        super().__init__(**kwargs)
+
+    @property
+    def name(self) -> str:
+        return self._client.name
+
+    async def connect(self) -> None:
+        pass
+
+    async def cleanup(self) -> None:
+        pass
+
+    async def list_tools(
+        self,
+        run_context: RunContextWrapper[Any] | None = None,
+        agent: AgentBase | None = None,
+    ) -> list[Tool]:
+        tools = (await self._client.list_tools()).tools
+        if self._tool_filter is None:
+            return tools
+        if isinstance(self._tool_filter, dict):
+            return self._apply_static_tool_filter(tools)
+        if run_context is None or agent is None:
+            raise ValueError(
+                "run_context and agent are required for dynamic MCP tool filtering"
+            )
+        context = ToolFilterContext(
+            run_context=run_context, agent=agent, server_name=self.name
+        )
+        filtered: list[Tool] = []
+        for tool in tools:
+            included = self._tool_filter(context, tool)
+            if inspect.isawaitable(included):
+                included = await included
+            if included:
+                filtered.append(tool)
+        return filtered
+
+    def _apply_static_tool_filter(self, tools: list[Tool]) -> list[Tool]:
+        assert isinstance(self._tool_filter, dict)
+        if "allowed_tool_names" in self._tool_filter:
+            allowed = self._tool_filter["allowed_tool_names"]
+            tools = [tool for tool in tools if tool.name in allowed]
+        if "blocked_tool_names" in self._tool_filter:
+            blocked = self._tool_filter["blocked_tool_names"]
+            tools = [tool for tool in tools if tool.name not in blocked]
+        return tools
+
+    @property
+    def cached_tools(self) -> list[Tool] | None:
+        result = self._client.cached_tools
+        if result is None:
+            return None
+        if isinstance(self._tool_filter, dict):
+            return self._apply_static_tool_filter(result.tools)
+        # A callable filter depends on the current run context and agent, neither
+        # of which is available to this context-free property.
+        if self._tool_filter is not None:
+            return None
+        return result.tools
+
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        meta: dict[str, Any] | None = None,
+    ) -> CallToolResult:
+        return await self._client.call_tool(
+            tool_name, arguments, meta=cast(RequestParamsMeta | None, meta)
+        )
+
+    async def list_prompts(self) -> ListPromptsResult:
+        return await self._client.list_prompts()
+
+    async def get_prompt(
+        self, name: str, arguments: dict[str, Any] | None = None
+    ) -> GetPromptResult:
+        """Get a prompt after converting every argument value with ``str()``.
+
+        OpenAI Agents accepts arbitrary argument values, while the MCP client
+        protocol requires ``dict[str, str]``. For example, ``True`` becomes
+        ``"True"`` and a mapping uses its Python string representation.
+        """
+        string_arguments = (
+            None
+            if arguments is None
+            else {key: str(value) for key, value in arguments.items()}
+        )
+        return await self._client.get_prompt(name, string_arguments)
+
+    async def list_resources(self, cursor: str | None = None) -> ListResourcesResult:
+        if cursor is not None:
+            raise ValueError(
+                "Temporal MCP servers return fully paginated resource lists"
+            )
+        return await self._client.list_resources()
+
+    async def list_resource_templates(
+        self, cursor: str | None = None
+    ) -> ListResourceTemplatesResult:
+        if cursor is not None:
+            raise ValueError(
+                "Temporal MCP servers return fully paginated resource template lists"
+            )
+        return await self._client.list_resource_templates()
+
+    async def read_resource(self, uri: str) -> ReadResourceResult:
+        return await self._client.read_resource(uri)

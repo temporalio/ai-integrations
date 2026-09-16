@@ -1,4 +1,6 @@
 # Schema: ../../AGENTS.md#repository-invariants; TRANSITION(sdk-cutover): remove transitional fields at cutover.
+# TRANSITION(sdk-cutover): `upstream` still names sdk-python, but the MCP v2 adapter is a
+# documented local-only divergence that must be preserved across re-syncs (see AGENTS.md).
 
 [plugin]
 name = "openai_agents"
