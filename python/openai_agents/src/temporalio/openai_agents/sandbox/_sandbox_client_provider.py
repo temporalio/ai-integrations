@@ -13,11 +13,12 @@ from agents.sandbox.session.sandbox_client import BaseSandboxClient
 from agents.sandbox.session.sandbox_session import SandboxSession
 
 from temporalio import activity
-from temporalio.contrib.openai_agents._temporal_worker_env_ref import (
+from temporalio.exceptions import ApplicationError
+from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     _snapshot_resolvable_env_vars,
 )
-from temporalio.contrib.openai_agents.sandbox._temporal_activity_models import (
+from temporalio.openai_agents.sandbox._temporal_activity_models import (
     CreateSessionArgs,
     ExecArgs,
     HydrateWorkspaceArgs,
@@ -37,13 +38,12 @@ from temporalio.contrib.openai_agents.sandbox._temporal_activity_models import (
     WriteArgs,
     _HasState,
 )
-from temporalio.contrib.openai_agents.sandbox._temporal_activity_models import (
+from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ExecResult as ExecResultModel,
 )
-from temporalio.contrib.openai_agents.sandbox._temporal_worker_env_value import (
+from temporalio.openai_agents.sandbox._temporal_worker_env_value import (
     _resolvable_worker_env_vars_scope,
 )
-from temporalio.exceptions import ApplicationError
 
 
 @contextmanager
@@ -92,7 +92,7 @@ class SandboxClientProvider:
         )
 
     On the **workflow side**, reference a provider by name via
-    :func:`temporalio.contrib.openai_agents.workflow.temporal_sandbox_client`::
+    :func:`temporalio.openai_agents.workflow.temporal_sandbox_client`::
 
         run_config = RunConfig(
             sandbox=SandboxRunConfig(

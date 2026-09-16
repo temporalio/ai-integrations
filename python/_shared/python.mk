@@ -25,8 +25,8 @@ PYTEST := uv run pytest -n auto --dist=worksteal
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
 
-# TRANSITION(sdk-cutover): the second sync reinstalls this plugin last so its files win the
-# overlap with temporalio<=1.32, which still ships the same module. Delete it at cutover.
+# Reinstall the plugin last so its files win while a plugin is being migrated from a distribution
+# that ships the same namespace paths. Keeping this shared behavior makes future migrations safe.
 sync: ## Install locked dependencies and this plugin (non-editable); creates uv.lock on first run
 	@test -f uv.lock || uv lock
 	uv sync --locked

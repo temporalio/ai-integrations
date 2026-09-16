@@ -1,12 +1,7 @@
 """Shared pytest configuration for this plugin.
 
-Vendored from temporalio/sdk-python ``tests/conftest.py`` (origin/main) and pruned to what this
-plugin's tests use. Re-sync it by hand when upstream changes (scripts/migrate/README.md).
-
-Added on top of upstream:
-
-* Provenance guard. The session aborts unless the installed plugin is the non-editable build of
-  this checkout (tests/helpers/provenance.py).
+The provenance guard aborts the session unless the installed plugin is the non-editable build of
+this checkout (tests/helpers/provenance.py).
 """
 
 from __future__ import annotations
@@ -71,15 +66,10 @@ def pytest_configure(config: pytest.Config) -> None:
 
 def pytest_sessionstart(session: pytest.Session) -> None:  # type: ignore[reportUnusedParameter]
     """Abort unless the installed plugin is the non-editable build of this checkout."""
-    allow_overlap = (not PLUGIN.allow_final) or os.environ.get(
-        "ALLOW_OVERLAP_WITH_CORE"
-    ) == "1"
     try:
         check_provenance(
             PLUGIN.coordinate,
             PLUGIN.package_relpath,
-            allow_overlap=allow_overlap,
-            warn=lambda message: print(f"provenance: {message}"),
         )
     except ProvenanceError as exc:
         pytest.exit(f"provenance guard failed: {exc}", returncode=1)

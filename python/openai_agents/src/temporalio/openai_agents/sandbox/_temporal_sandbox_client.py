@@ -16,14 +16,14 @@ from agents.sandbox.snapshot import SnapshotBase, SnapshotSpec, SnapshotSpecUnio
 from pydantic.type_adapter import TypeAdapter
 
 from temporalio import workflow
-from temporalio.contrib.openai_agents._errors import AgentsWorkflowError
-from temporalio.contrib.openai_agents.sandbox._temporal_activity_models import (
+from temporalio.openai_agents._errors import AgentsWorkflowError
+from temporalio.openai_agents.sandbox._temporal_activity_models import (
     CreateSessionArgs,
     ResumeSessionArgs,
     SessionResult,
     StopArgs,
 )
-from temporalio.contrib.openai_agents.sandbox._temporal_sandbox_session import (
+from temporalio.openai_agents.sandbox._temporal_sandbox_session import (
     TemporalSandboxSession,
 )
 from temporalio.workflow import ActivityConfig
@@ -38,7 +38,7 @@ class TemporalSandboxClient(BaseSandboxClient[BaseSandboxClientOptions]):
     ``BaseSandboxClient`` lives inside :class:`SandboxClientProvider` on the worker.
 
     Users should never need to instantiate this directly -- use
-    :func:`temporalio.contrib.openai_agents.workflow.temporal_sandbox_client`
+    :func:`temporalio.openai_agents.workflow.temporal_sandbox_client`
     instead.
 
     Args:

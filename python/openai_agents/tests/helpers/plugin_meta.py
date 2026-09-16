@@ -18,21 +18,18 @@ class PluginMeta:
     name: str
     coordinate: str
     root_api: str
-    allow_final: bool
 
     @property
     def package_relpath(self) -> str:
-        """Root API as a path relative to site-packages, e.g. ``temporalio/contrib/openai_agents``."""
+        """Root API as a path relative to site-packages, e.g. ``temporalio/openai_agents``."""
         return self.root_api.replace(".", "/")
 
 
 def load_plugin_meta(plugin_root: Path) -> PluginMeta:
     data = tomllib.loads((plugin_root / "plugin.toml").read_text(encoding="utf-8"))
     plugin = data["plugin"]
-    release = data.get("release", {})
     return PluginMeta(
         name=plugin["name"],
         coordinate=plugin["coordinate"],
         root_api=plugin["root-api"],
-        allow_final=bool(release.get("allow-final", False)),
     )

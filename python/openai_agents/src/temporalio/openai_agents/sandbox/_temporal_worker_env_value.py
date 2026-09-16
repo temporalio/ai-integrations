@@ -11,12 +11,12 @@ from typing import Literal
 from agents.sandbox.manifest import EnvValue
 
 from temporalio import workflow
-from temporalio.contrib.openai_agents._temporal_worker_env_ref import (
+from temporalio.exceptions import ApplicationError
+from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     _is_resolvable,
     _snapshot_resolvable_env_vars,
 )
-from temporalio.exceptions import ApplicationError
 
 _resolvable_worker_env_vars: ContextVar[frozenset[str] | AllowAllWorkerEnvVars] = (
     ContextVar("temporal_resolvable_worker_env_vars")

@@ -32,7 +32,7 @@ from agents.tool import (
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 
 from temporalio import workflow
-from temporalio.contrib.openai_agents._invoke_model_activity import (
+from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
     AgentOutputSchemaInput,
     ApplyPatchToolInput,
@@ -46,7 +46,7 @@ from temporalio.contrib.openai_agents._invoke_model_activity import (
     StreamingActivityModelInput,
     ToolInput,
 )
-from temporalio.contrib.openai_agents._model_parameters import ModelActivityParameters
+from temporalio.openai_agents._model_parameters import ModelActivityParameters
 
 
 class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]

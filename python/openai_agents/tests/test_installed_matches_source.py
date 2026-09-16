@@ -38,9 +38,6 @@ def test_installed_matches_source() -> None:
     )
     expected = _digests(src_dir)
     actual = _digests(installed_dir)
-    if not META.allow_final or os.environ.get("ALLOW_OVERLAP_WITH_CORE") == "1":
-        # temporalio<=1.32 ships a README.md inside the package directory.
-        actual.pop("README.md", None)
     assert set(actual) == set(expected), (
         f"installed file set differs from src/: missing={sorted(set(expected) - set(actual))} "
         f"extra={sorted(set(actual) - set(expected))}; run `make sync`"

@@ -74,36 +74,10 @@ from openai.types.responses.response_output_item import (
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 from pydantic import ConfigDict, Field, TypeAdapter
 
+import temporalio.openai_agents as openai_agents
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.common import RetryPolicy
-from temporalio.contrib import openai_agents
-from temporalio.contrib.openai_agents import (
-    ModelActivityParameters,
-    StatefulMCPServerProvider,
-    StatelessMCPServerProvider,
-)
-from temporalio.contrib.openai_agents._invoke_model_activity import (
-    _build_tool,
-    _raise_for_openai_status,
-)
-from temporalio.contrib.openai_agents._model_parameters import ModelSummaryProvider
-from temporalio.contrib.openai_agents._openai_runner import (
-    _coerce_run_config,
-    _convert_agent,
-)
-from temporalio.contrib.openai_agents._temporal_model_stub import (
-    _TemporalModelStub,
-)
-from temporalio.contrib.openai_agents._temporal_worker_env_ref import (
-    _WorkerEnvRefResolver,
-)
-from temporalio.contrib.openai_agents.testing import (
-    AgentEnvironment,
-    ResponseBuilders,
-    TestModel,
-    TestModelProvider,
-)
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import (
     ActivityError,
@@ -111,13 +85,39 @@ from temporalio.exceptions import (
     CancelledError,
     TemporalError,
 )
+from temporalio.openai_agents import (
+    ModelActivityParameters,
+    StatefulMCPServerProvider,
+    StatelessMCPServerProvider,
+)
+from temporalio.openai_agents._invoke_model_activity import (
+    _build_tool,
+    _raise_for_openai_status,
+)
+from temporalio.openai_agents._model_parameters import ModelSummaryProvider
+from temporalio.openai_agents._openai_runner import (
+    _coerce_run_config,
+    _convert_agent,
+)
+from temporalio.openai_agents._temporal_model_stub import (
+    _TemporalModelStub,
+)
+from temporalio.openai_agents._temporal_worker_env_ref import (
+    _WorkerEnvRefResolver,
+)
+from temporalio.openai_agents.testing import (
+    AgentEnvironment,
+    ResponseBuilders,
+    TestModel,
+    TestModelProvider,
+)
 from temporalio.testing import WorkflowEnvironment
 from temporalio.workflow import ActivityConfig
-from tests.contrib.openai_agents.research_agents.research_manager import (
-    ResearchManager,
-)
 from tests.helpers import assert_eventually, new_worker
 from tests.helpers.nexus import make_nexus_endpoint_name
+from tests.research_agents.research_manager import (
+    ResearchManager,
+)
 
 
 def hello_mock_model():
@@ -2703,7 +2703,7 @@ async def test_mcp_server(client: Client, stateful: bool, caching: bool):
 
     from agents.mcp import MCPServer  # type: ignore
 
-    from temporalio.contrib.openai_agents import (
+    from temporalio.openai_agents import (
         StatefulMCPServerProvider,
         StatelessMCPServerProvider,
     )
