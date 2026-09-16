@@ -52,20 +52,6 @@ Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merg
   - `--force`, needed only because the optional `SRC_REF` pin fails filter-repo's fresh-clone
     check; the clone is a throwaway directory.
 
-## Expected verification output (openai_agents)
-
-- `git rev-list --count sdk-python-filtered/main` equals
-  `git log --oneline -- python/openai_agents | wc -l` and is at least 100 (grows with upstream).
-- `git shortlog -sne -- python/openai_agents` lists 18 author identities (grows as upstream
-  lands commits by new people; the plan's earlier count of 17 predates two later contributors).
-- `git log --follow --format=%h python/openai_agents/src/temporalio/contrib/openai_agents/__init__.py | tail -1`
-  and the same for `python/openai_agents/tests/research_agents/planner_agent.py`
-  print `53d9ace6` (2025-06-18, the first upstream commit).
-- `git log --format=%B -- python/openai_agents | grep -c Migrated-From` equals the commit count.
-- `git tag | wc -l` is 0 and `git log --merges -- python/openai_agents` shows only the import merge.
-- Running the script again against the same upstream state and merging prints
-  `Already up to date.`
-
 ## Re-sync (bringing new upstream commits)
 
 Use this procedure only while the plugin's `plugin.toml` names `sdk-python` as its `upstream`.
