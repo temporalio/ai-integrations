@@ -35,12 +35,12 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohappyeyeballs" },
     { name = "aiosignal" },
-    { name = "async-timeout", marker = "python_full_version < '3.11' or python_full_version >= '3.14'" },
+    { name = "async-timeout", marker = "python_full_version < '3.11'" },
     { name = "attrs" },
     { name = "frozenlist" },
     { name = "multidict" },
     { name = "propcache" },
-    { name = "typing-extensions", marker = "python_full_version != '3.13.*'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
     { name = "yarl" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/58/d9/22ce5786ac0c1653ae8b6c23bded02c1686d11f0dbb45b31ce128e0df985/aiohttp-3.14.3.tar.gz", hash = "sha256:9491196535a88924a60afd5b5f434b5b203b6cc616250878dbdb223a8f7844bc", size = 7971213, upload-time = "2026-07-23T01:57:27.037Z" }
@@ -171,7 +171,7 @@ version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "frozenlist" },
-    { name = "typing-extensions", marker = "python_full_version != '3.13.*'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/61/62/06741b579156360248d1ec624842ad0edf697050bbaf7c3e46394e106ad1/aiosignal-1.4.0.tar.gz", hash = "sha256:f47eecd9468083c2029cc99945502cb7708b082c232f9aca65da147157b251c7", size = 25007, upload-time = "2025-07-03T22:54:43.528Z" }
 wheels = [
@@ -1300,7 +1300,7 @@ name = "multidict"
 version = "6.7.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.11' or python_full_version >= '3.14'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1a/c2/c2d94cbe6ac1753f3fc980da97b3d930efe1da3af3c9f5125354436c073d/multidict-6.7.1.tar.gz", hash = "sha256:ec6652a1bee61c53a3e5776b6049172c53b6aaba34f18c9ad04f82712bac623d", size = 102010, upload-time = "2026-01-26T02:46:45.979Z" }
 wheels = [
@@ -2809,11 +2809,11 @@ openinference = [
 dev = [
     { name = "basedpyright" },
     { name = "httpx" },
-    { name = "litellm", marker = "python_full_version < '3.14'" },
+    { name = "litellm" },
     { name = "mcp" },
     { name = "mcp-types" },
     { name = "mypy" },
-    { name = "openai-agents", extra = ["litellm"], marker = "python_full_version < '3.14'" },
+    { name = "openai-agents", extra = ["litellm"] },
     { name = "openinference-instrumentation-openai-agents" },
     { name = "opentelemetry-sdk" },
     { name = "pydocstyle" },
@@ -2851,11 +2851,11 @@ dev = [
     { name = "basedpyright", specifier = "==1.34.0" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "litellm", marker = "python_full_version < '3.11'", specifier = ">=1.83.0,<1.98" },
-    { name = "litellm", marker = "python_full_version >= '3.11' and python_full_version < '3.14'", specifier = ">=1.83.0" },
+    { name = "litellm", marker = "python_full_version >= '3.11'", specifier = ">=1.83.0" },
     { name = "mcp", specifier = ">=2,<3" },
     { name = "mcp-types", specifier = ">=2,<3" },
     { name = "mypy", specifier = "==1.18.2" },
-    { name = "openai-agents", extras = ["litellm"], marker = "python_full_version < '3.14'", specifier = ">=0.20,<0.21" },
+    { name = "openai-agents", extras = ["litellm"], specifier = ">=0.20,<0.21" },
     { name = "openinference-instrumentation-openai-agents", specifier = ">=0.1.0" },
     { name = "opentelemetry-sdk", specifier = ">=1.26,<2" },
     { name = "pydocstyle", specifier = ">=6.3,<7" },
