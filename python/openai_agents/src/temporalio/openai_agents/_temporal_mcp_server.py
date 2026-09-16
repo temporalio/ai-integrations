@@ -21,7 +21,7 @@ from mcp.types import (
     Tool,
 )
 
-from temporalio.contrib.mcp import TemporalMCPClient
+from temporalio.mcp import TemporalMCPClient
 
 
 class _TemporalMCPServer(MCPServer):

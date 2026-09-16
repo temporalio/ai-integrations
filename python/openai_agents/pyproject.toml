@@ -31,7 +31,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Lazily imported when OpenAIAgentsPlugin(mcp_servers=...) or workflow.temporal_mcp_server() is used.
-mcp = ["mcp>=2,<3", "mcp-types>=2,<3", "temporalio-mcp>=0.1.0,<0.2"]
+mcp = ["mcp>=2,<3", "mcp-types>=2,<3", "temporalio-mcp>=0.2.0,<0.3"]
 # Lazily imported when OpenAIAgentsPlugin(use_otel_instrumentation=True); see README "OpenTelemetry Integration".
 openinference = ["openinference-instrumentation-openai-agents>=0.1.0", "opentelemetry-sdk>=1.26,<2"]
 
@@ -67,7 +67,7 @@ dev = [
   "rich>=13",
   "mcp>=2,<3",
   "mcp-types>=2,<3",
-  "temporalio-mcp>=0.1.0,<0.2",
+  "temporalio-mcp>=0.2.0,<0.3",
   "openinference-instrumentation-openai-agents>=0.1.0",
   "opentelemetry-sdk>=1.26,<2",
   "openai-agents[litellm]>=0.20,<0.21; python_version < '3.14'",

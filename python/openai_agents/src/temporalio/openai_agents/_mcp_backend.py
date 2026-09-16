@@ -20,12 +20,12 @@ from mcp.types import (
 )
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
-from temporalio.contrib.mcp._backend import (
+from temporalio.exceptions import ApplicationError
+from temporalio.mcp._backend import (
     _NOT_SUPPLIED,
     _FactoryInvoker,
     _MCPBackendFactory,
 )
-from temporalio.exceptions import ApplicationError
 
 _MCPServerFactory = Callable[[], MCPServer] | Callable[[Any], MCPServer]
 

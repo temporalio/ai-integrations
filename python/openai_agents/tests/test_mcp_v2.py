@@ -25,8 +25,8 @@ from mcp.types import (
 import temporalio.openai_agents as openai_agents
 from temporalio import workflow
 from temporalio.client import Client
-from temporalio.contrib.mcp import TemporalMCPClient
 from temporalio.exceptions import ApplicationError
+from temporalio.mcp import TemporalMCPClient
 from temporalio.openai_agents import ModelActivityParameters
 from temporalio.openai_agents._mcp_backend import (
     _mcp_server_backend_factory,
@@ -177,7 +177,7 @@ async def test_openai_agents_uses_mcp_v2_and_caches_connection(
     assert (
         sum(
             event.activity_task_scheduled_event_attributes.activity_type.name
-            == "temporalio.contrib.mcp.hello.list-tools"
+            == "temporalio.mcp.hello.list-tools"
             for event in history.events
             if event.HasField("activity_task_scheduled_event_attributes")
         )

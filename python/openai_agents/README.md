@@ -435,7 +435,7 @@ Activity and are never shared across workflows.
 
 `OpenAIAgentsPlugin(mcp_servers={"x": ...})` and
 `MCPPlugin(clients={"x": ...})` both register Activities under
-`temporalio.contrib.mcp.x.*`. Do not register the same MCP server name through
+`temporalio.mcp.x.*`. Do not register the same MCP server name through
 both plugins on one worker; Temporal rejects the duplicate Activity types.
 
 An optional `factory_argument` can select worker-side configuration such as a

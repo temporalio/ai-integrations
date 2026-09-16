@@ -382,7 +382,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
             # The shared Activity layer requires MCP v2, but the legacy OpenAI
             # provider path remains importable with MCP v1.
             try:
-                from temporalio.contrib.mcp._activities import _MCPActivities
+                from temporalio.mcp._activities import _MCPActivities
                 from temporalio.openai_agents._mcp_backend import (
                     _mcp_server_backend_factory,
                 )
