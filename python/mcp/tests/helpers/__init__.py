@@ -1,7 +1,5 @@
 """Test helpers for temporalio-mcp."""
 
-# template-override: MCP owns its test helpers.
-
 import uuid
 from collections.abc import Callable, Sequence
 

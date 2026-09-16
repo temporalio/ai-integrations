@@ -69,6 +69,32 @@ def test_plugin_folder_suffix_and_language_lockfile(plugin_repo: Path) -> None:
     assert any("language-level lockfiles" in x for x in v) and any("must not end in -plugin/_plugin" in x for x in v)
 
 
+def test_python_code_is_forbidden_in_shared(plugin_repo: Path) -> None:
+    shared = plugin_repo / "python/_shared"
+    shared.mkdir()
+    (shared / "ruff.toml").write_text('target-version = "py310"\n')
+    assert run(plugin_repo) == []
+    (shared / "fixtures.py").write_text("VALUE = 1\n")
+    assert run(plugin_repo) == []
+    commit_all(plugin_repo, "add forbidden shared source")
+    assert any("Python code must be duplicated" in x for x in run(plugin_repo))
+
+
+def test_standard_test_support_matches_templates(plugin_repo: Path) -> None:
+    template = plugin_repo / "python/_template"
+    plugin = plugin_repo / "python/fakeplug"
+    for plugin_rel, template_rel in check_conventions.STANDARD_TEST_SUPPORT.items():
+        canonical = template / template_rel
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text(f"# canonical {plugin_rel}\n")
+        rendered = plugin / plugin_rel
+        rendered.parent.mkdir(parents=True, exist_ok=True)
+        rendered.write_bytes(canonical.read_bytes())
+    assert run(plugin_repo) == []
+    (plugin / "tests/helpers/provenance.py").write_text("# drifted\n")
+    assert any("differs from canonical" in x for x in run(plugin_repo))
+
+
 def test_plugin_toml_agreement(plugin_repo: Path) -> None:
     meta = plugin_repo / "python/fakeplug/plugin.toml"
     meta.write_text(meta.read_text().replace('coordinate = "temporalio-fakeplug"', 'coordinate = "temporalio-other"'))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import tomllib
 from pathlib import Path
@@ -41,6 +42,14 @@ def test_new_plugin_is_top_level_and_release_ready(tmp_path: Path) -> None:
     assert metadata["release"]["allow-final"] is True
     assert (plugin / "src/temporalio/fakeplug/__init__.py").is_file()
     assert not (plugin / "src/temporalio/contrib").exists()
+    assert "TRANSITION(sdk-cutover)" not in (plugin / "plugin.toml").read_text()
+    assert "TRANSITION(sdk-cutover)" not in (plugin / "pyproject.toml").read_text()
+    assert (plugin / "tests/test_installed_matches_source.py").is_file()
+    for source in (plugin / "tests").rglob("*.py"):
+        ast.parse(source.read_text(), filename=str(source))
+
+    conftest = (plugin / "tests/conftest.py").read_text()
+    assert "import pytest_asyncio\n\nfrom temporalio.client" in conftest
 
     (plugin / "uv.lock").write_text("version = 1\n")
     commit_all(repo, "add generated plugin")

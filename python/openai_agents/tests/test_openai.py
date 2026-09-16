@@ -1,6 +1,5 @@
 import asyncio
 import json
-import sys
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -1829,34 +1828,31 @@ class LiteLlmAgent:
 
 
 async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
-    if sys.version_info >= (3, 14):
-        pytest.skip("Lite LLM does not yet support Python 3.14")  # type:ignore[reportUnreachable]
-
     # LiteLLM fetches its model cost map at import time unless explicitly told to
     # use the copy bundled in the package.
     monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
-    import litellm as litellm_module  # type:ignore[reportMissingImports, reportUnreachable]
+    import litellm as litellm_module  # type:ignore[reportMissingImports]
     from agents.extensions.models.litellm_provider import (
-        LitellmProvider,  # type:ignore[reportUnreachable]
+        LitellmProvider,
     )
     from litellm import (  # pyright: ignore[reportMissingImports]
-        ModelResponse as LiteLlmResponse,  # type:ignore[reportUnreachable]
+        ModelResponse as LiteLlmResponse,
     )
     from litellm.llms.custom_llm import (  # pyright: ignore[reportMissingImports]
-        CustomLLM,  # type:ignore[reportUnreachable]
+        CustomLLM,
     )
     from litellm.types.llms.openai import (  # pyright: ignore[reportMissingImports, reportMissingTypeStubs]
-        ChatCompletionReasoningSummaryTextBlock,  # type:ignore[reportUnreachable]
+        ChatCompletionReasoningSummaryTextBlock,
     )
     from litellm.types.utils import (  # pyright: ignore[reportMissingImports, reportMissingTypeStubs]
-        Message as LiteLlmMessage,  # type:ignore[reportUnreachable]
+        Message as LiteLlmMessage,
     )
 
     # LiteLLM 1.97 leaves this Pydantic model's nested forward reference
     # unresolved on Python 3.10, before a custom provider can handle the call.
     if not LiteLlmMessage.__pydantic_complete__:
-        LiteLlmMessage.model_rebuild(  # type:ignore[reportUnreachable]
+        LiteLlmMessage.model_rebuild(
             _types_namespace={
                 "ChatCompletionReasoningSummaryTextBlock": ChatCompletionReasoningSummaryTextBlock
             }
@@ -1865,9 +1861,7 @@ async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
     requested_models: list[str] = []
 
     class FakeLiteLlmProvider(CustomLLM):
-        def completion(  # type:ignore[reportUnreachable]
-            self, *args: Any, **kwargs: Any
-        ) -> LiteLlmResponse:
+        def completion(self, *args: Any, **kwargs: Any) -> LiteLlmResponse:
             model = args[0] if args else kwargs.get("model", "unknown")
             requested_models.append(model)
             return LiteLlmResponse(
@@ -1899,13 +1893,13 @@ async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
             start_to_close_timeout=timedelta(seconds=30),
         ),
     ) as agent_env:
-        client = agent_env.applied_on_client(client)  # type:ignore[reportUnreachable]
+        client = agent_env.applied_on_client(client)
 
         async with new_worker(
             client,
             LiteLlmAgent,
         ) as worker:
-            result = await client.execute_workflow(  # type:ignore[reportUnreachable]
+            result = await client.execute_workflow(
                 LiteLlmAgent.run,
                 "Tell me about recursion in programming",
                 id=f"lite-llm-{uuid.uuid4()}",
@@ -2695,11 +2689,13 @@ def test_legacy_mcp_apis_are_deprecated():
         openai_agents.OpenAIAgentsPlugin(mcp_server_providers=[stateless_provider])
 
 
-@pytest.mark.parametrize("stateful", [True, False])
-@pytest.mark.parametrize("caching", [True, False])
-async def test_mcp_server(client: Client, stateful: bool, caching: bool):
-    if stateful and caching:
-        pytest.skip("Caching is only supported for stateless MCP servers")
+@pytest.mark.parametrize(
+    "mode",
+    ["stateful", "stateless", "stateless-cached"],
+)
+async def test_mcp_server(client: Client, mode: str):
+    stateful = mode == "stateful"
+    caching = mode == "stateless-cached"
 
     from agents.mcp import MCPServer  # type: ignore
 

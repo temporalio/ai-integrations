@@ -4,9 +4,9 @@ Keep in sync with ``scripts/ci/smoke.py``, which runs the same checks against th
 an isolated environment.
 
 Why this exists: ``temporalio`` is a regular package owned by the SDK wheel, so this plugin is
-installed *into* it. Two failure modes are silent without this guard: an editable install can make
-``temporalio.<name>`` resolve incorrectly, and another distribution can write the same
-file paths as this distribution.
+installed *into* it. Two failure modes are silent without this guard: an editable install makes
+``temporalio.contrib.<name>`` resolve to whatever the SDK wheel ships, and, until the SDK cutover
+release drops the module, ``temporalio<=1.32`` writes the same file paths as this distribution.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import importlib.metadata as importlib_metadata
 import json
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -31,17 +32,25 @@ def _normalize(name: str) -> str:
 def check_provenance(
     dist_name: str,
     pkg_rel: str,
+    *,
+    allow_overlap: bool = False,
+    warn: Callable[[str], None] | None = None,
 ) -> Path:
     """Verify the installed distribution and return the installed package directory.
 
     Args:
         dist_name: Distribution name, e.g. ``temporalio-openai-agents``.
-        pkg_rel: Root API as a relative path, e.g. ``temporalio/openai_agents``.
+        pkg_rel: Root API as a relative path, e.g. ``temporalio/contrib/openai_agents``.
+        allow_overlap: Tolerate the SDK wheel also shipping files under ``pkg_rel``
+            (true while the plugin's ``allow-final`` is false, i.e. before the SDK cutover).
+        warn: Sink for tolerated problems; defaults to printing a WARNING line.
+
     Raises:
         ProvenanceError: on an editable install, a RECORD mismatch, files under the package
-            directory that this distribution does not own, or a second distribution shipping
-            the same paths.
+            directory that this distribution does not own, or (unless tolerated) a second
+            distribution shipping the same paths.
     """
+    emit = warn or (lambda message: print(f"WARNING: {message}"))
     try:
         dist = importlib_metadata.distribution(dist_name)
     except importlib_metadata.PackageNotFoundError as exc:
@@ -50,7 +59,7 @@ def check_provenance(
     direct_url = dist.read_text("direct_url.json")
     if direct_url and json.loads(direct_url).get("dir_info", {}).get("editable"):
         raise ProvenanceError(
-            f"{dist_name} is installed editable, so the SDK-owned temporalio package cannot resolve to src/; "
+            f"{dist_name} is installed editable, so temporalio.contrib.* cannot resolve to src/; "
             "run `make sync` (it exports UV_NO_EDITABLE=1)"
         )
 
@@ -88,6 +97,10 @@ def check_provenance(
         and "__pycache__" not in path.parts
         and not path.name.endswith(".pyc")
     } - owned
+    if allow_overlap:
+        # temporalio<=1.32 ships a README.md inside the package directory; this plugin keeps its
+        # README at the plugin root, so the SDK's copy is the one expected leftover.
+        extras.discard(os.path.normpath(str(pkg_dir / "README.md")))
     if extras:
         raise ProvenanceError(
             f"files under {pkg_dir} are not owned by {dist_name}: {sorted(extras)}; run `make sync`"
@@ -106,5 +119,11 @@ def check_provenance(
         }
     )
     if others:
-        raise ProvenanceError(f"{prefix} is also shipped by {others}")
+        message = f"{prefix} is also shipped by {others}"
+        if allow_overlap:
+            emit(
+                f"{message}; tolerated until the SDK cutover (plugin.toml [release] allow-final = false)"
+            )
+        else:
+            raise ProvenanceError(message)
     return pkg_dir
