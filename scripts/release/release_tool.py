@@ -360,7 +360,9 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
     prev = previous_tag(repo_root, parts["language"], parts["plugin"], version)
     revision = f"{prev[0]}..{tag}" if prev else tag
     log = _git("log", "--no-decorate", "--format=%h%x1f%s", revision, "--", plugin_dir, cwd=repo_root)
-    lines = [f"# {coordinate} {version}", ""]
+    # The GitHub release already displays its name above the body. Keep the
+    # generated notes focused on release content instead of repeating it.
+    lines: list[str] = []
     if prev is None:
         lines += [
             f"First standalone release of `{coordinate}`.",
