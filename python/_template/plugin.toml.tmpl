@@ -1,4 +1,4 @@
-# Schema: ../../AGENTS.md#repository-invariants; TRANSITION(sdk-cutover): remove transitional fields at cutover.
+# Schema: ../../AGENTS.md#repository-invariants
 
 [plugin]
 name = "__NAME__"
@@ -8,10 +8,10 @@ registry = "pypi"
 root-api = "__MODULE__"
 maturity = "__MATURITY__"
 docs = "https://docs.temporal.io/develop/python/integrations/__DOCS_SLUG__"
-upstream = "temporalio/sdk-python:temporalio/contrib/__NAME__"
+__UPSTREAM__
 
 [release]
-allow-final = false
+allow-final = __ALLOW_FINAL__
 
 [ci]
 runtime-versions = ["3.10", "3.14"]

@@ -94,17 +94,35 @@ def test_top_level_temporalio_root_api_is_allowed(plugin_repo: Path) -> None:
     assert run(plugin_repo) == []
 
 
-def test_release_ready_contrib_root_api_is_rejected(plugin_repo: Path) -> None:
+def test_contrib_root_api_requires_upstream(plugin_repo: Path) -> None:
     meta = plugin_repo / "python/fakeplug/plugin.toml"
     meta.write_text(
-        meta.read_text()
-        .replace(
-            '        upstream = "temporalio/sdk-python:temporalio/contrib/fakeplug"\n',
+        meta.read_text().replace(
+            'upstream = "temporalio/sdk-python:temporalio/contrib/fakeplug"\n',
             "",
         )
-        .replace("allow-final = false", "allow-final = true")
     )
     assert any("allowed only for an upstream-backed migration" in x for x in run(plugin_repo))
+
+
+def test_contrib_root_api_requires_final_releases_disabled(plugin_repo: Path) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(meta.read_text().replace("allow-final = false", "allow-final = true"))
+    assert any("allowed only for an upstream-backed migration" in x for x in run(plugin_repo))
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ['["temporalio.contrib.fakeplug"]', '{ value = "temporalio.contrib.fakeplug" }'],
+)
+def test_malformed_root_api_is_reported(plugin_repo: Path, malformed: str) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(
+        meta.read_text().replace(
+            'root-api = "temporalio.contrib.fakeplug"', f"root-api = {malformed}"
+        )
+    )
+    assert any("root-api must be 'temporalio.fakeplug'" in x for x in run(plugin_repo))
 
 
 def test_unrelated_root_api_is_rejected(plugin_repo: Path) -> None:

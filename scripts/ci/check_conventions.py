@@ -110,7 +110,8 @@ class Checker:
         )
         package_parts = (
             root_api.split(".")
-            if root_api in {f"temporalio.contrib.{name}", f"temporalio.{name}"}
+            if isinstance(root_api, str)
+            and root_api in {f"temporalio.contrib.{name}", f"temporalio.{name}"}
             else ["temporalio", "contrib", name]
         )
         package_rel = Path("src", *package_parts)
