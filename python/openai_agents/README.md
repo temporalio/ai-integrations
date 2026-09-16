@@ -8,11 +8,12 @@ We welcome questions and feedback in the [#python-sdk](https://temporalio.slack.
 uv add temporalio-openai-agents
 ```
 
-> **Transition note.** Until the Temporal Python SDK release that stops bundling
-> `temporalio.contrib.openai_agents`, do not install this package next to `temporalio<=1.32`: both
-> ship the same files, and uninstalling this package then removes files the SDK still needs (repair
-> with a reinstall of `temporalio`). Pre-releases are published to TestPyPI only for that reason.
-> Source and issues: https://github.com/temporalio/ai-integrations/tree/main/python/openai_agents
+With Temporal 1.33, both distributions must be installed into the same
+physical `site-packages/temporalio` directory, as they are in a standard
+non-editable virtual environment. Split-directory installations—including
+editable installs, separate user and system sites, layered deployments, and
+`--target` installs—require Temporal 1.34 or later so that `temporalio` extends
+its package search path.
 
 ## Introduction
 
@@ -198,7 +199,7 @@ import asyncio
 from datetime import timedelta
 
 from temporalio.client import Client
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
+from temporalio.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
 from temporalio.worker import Worker
 
 from hello_world_workflow import HelloWorldAgent
@@ -246,7 +247,7 @@ import asyncio
 
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin
+from temporalio.openai_agents import OpenAIAgentsPlugin
 
 from hello_world_workflow import HelloWorldAgent
 
@@ -386,114 +387,117 @@ Tools that run in the workflow can also update OpenAI Agents context, which is r
 
 ## MCP Support
 
-This integration provides support for Model Context Protocol (MCP) servers through two wrapper approaches designed to handle different implications of failures.
+The durable MCP integration uses MCP Python SDK v2 and the optional `mcp`
+dependencies:
 
-While Temporal provides durable execution for your workflows, this durability does not extend to MCP servers, which operate independently of the workflow and must provide their own durability. The integration handles this by offering stateless and stateful wrappers that you can choose based on your MCP server's design.
+```bash
+uv add "temporalio-openai-agents[mcp]"
+```
 
-### Stateless vs Stateful MCP Servers
-
-You need to understand your MCP server's behavior to choose the correct wrapper:
-
-**Stateless MCP servers** treat each operation independently. For example, a weather server with a `get_weather(location)` tool is stateless because each call is self-contained and includes all necessary information. These servers can be safely restarted or reconnected to without changing their behavior.
-
-**Stateful MCP servers** maintain session state between calls. For example, a weather server that requires calling `set_location(location)` followed by `get_weather()` is stateful because it remembers the configured location and uses it for subsequent calls. If the session or the server is restarted, state crucial for operation is lost. Temporal identifies such failures and raises an `ApplicationError` to signal the need for application-level failure handling.
-
-### Usage Example (Stateless MCP)
-
-The code below gives an example of using a stateless MCP server.
-
-#### Worker Configuration
+Register named OpenAI MCP server factories on the worker, then reference the
+same name from workflow code:
 
 ```python
-import asyncio
-from datetime import timedelta
-from agents.mcp import MCPServerStdio
-from temporalio.client import Client
-from temporalio.contrib.openai_agents import (
-    ModelActivityParameters,
-    OpenAIAgentsPlugin,
-    StatelessMCPServerProvider,
+from agents.mcp import MCPServerStreamableHttp
+
+from temporalio.openai_agents import OpenAIAgentsPlugin
+
+plugin = OpenAIAgentsPlugin(
+    mcp_servers={
+        "weather": lambda: MCPServerStreamableHttp(
+            name="weather",
+            params={"url": "https://example.com/mcp"},
+        ),
+    },
 )
-from temporalio.worker import Worker
-
-
-async def main():
-    # Create the MCP server provider
-    filesystem_server = StatelessMCPServerProvider(
-        lambda: MCPServerStdio(
-            name="FileSystemServer",
-            params={
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/files"],
-            },
-        )
-    )
-
-    # Register the MCP server with the OpenAI Agents plugin
-    client = await Client.connect(
-        "localhost:7233",
-        plugins=[
-            OpenAIAgentsPlugin(
-                model_params=ModelActivityParameters(
-                    start_to_close_timeout=timedelta(seconds=60)
-                ),
-                mcp_server_providers=[filesystem_server],
-            ),
-        ],
-    )
-
-    worker = Worker(
-        client,
-        task_queue="my-task-queue",
-        workflows=[FileSystemWorkflow],
-    )
-    await worker.run()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 ```
-
-#### Workflow Implementation
 
 ```python
-from temporalio import workflow
-from temporalio.contrib import openai_agents
-from agents import Agent, Runner
+from agents import Agent
+from temporalio.openai_agents.workflow import temporal_mcp_server
 
-@workflow.defn
-class FileSystemWorkflow:
-    @workflow.run
-    async def run(self, query: str) -> str:
-        # Reference the MCP server by name (matches name in worker configuration)
-        server = openai_agents.workflow.stateless_mcp_server("FileSystemServer")
-
-        agent = Agent(
-            name="File Assistant",
-            instructions="Use the filesystem tools to read files and answer questions.",
-            mcp_servers=[server],
-        )
-
-        result = await Runner.run(agent, input=query)
-        return result.final_output
+server = temporal_mcp_server("weather")
+agent = Agent(name="weather", mcp_servers=[server])
 ```
 
-The `StatelessMCPServerProvider` takes a factory function that creates new MCP server instances. The server name used in `stateless_mcp_server()` must match the name configured in the MCP server instance. In this example, the name is `FileSystemServer`.
+Configure transport, connection, retry, and message-handling behavior on the
+worker-side OpenAI `MCPServer`. Configure workflow-facing behavior such as
+`tool_filter`, `require_approval`, `failure_error_function`, and metadata
+resolvers on `temporal_mcp_server(...)`, where the OpenAI agent can use it.
+Custom `MCPServer` method implementations still execute worker-side. A callable
+`tool_filter` on the worker-side server is rejected, because the run context and
+agent it receives exist only in the workflow. A callable `tool_filter` passed to
+`temporal_mcp_server(...)` therefore executes during workflow replay and must be
+deterministic: it must not perform I/O or depend on the system clock, randomness,
+mutable global state, or other external state.
 
-### Stateful MCP Servers
+Every MCP operation is a Temporal Activity. The workflow-side tool list is
+cached by default; pass `cache_tools_list=False` to refresh it on every Agents
+SDK listing. A parameterless factory's connection is also reused for up to five
+idle minutes when it negotiates the modern, sessionless protocol. Set
+`mcp_connection_idle_timeout=None` to keep cached modern connections until
+plugin shutdown, or `timedelta(0)` to close them as soon as they become idle.
+Connections that negotiate a legacy handshake are closed after the current
+Activity and are never shared across workflows.
 
-For implementation details and examples, see the [samples repository](https://github.com/temporalio/samples-python/tree/main/openai_agents/mcp).
+`OpenAIAgentsPlugin(mcp_servers={"x": ...})` and
+`MCPPlugin(clients={"x": ...})` both register Activities under
+`temporalio.mcp.x.*`. Do not register the same MCP server name through
+both plugins on one worker; Temporal rejects the duplicate Activity types.
 
-When using stateful servers, the dedicated worker maintaining the connection may fail due to network issues or server problems. When this happens, Temporal raises an `ApplicationError` and cannot automatically recover because it cannot restore the lost server state.
-To recover from such failures, you need to implement your own application-level retry logic.
+An optional `factory_argument` can select worker-side configuration such as a
+tenant endpoint:
 
-### Factory Arguments
+```python
+server = temporal_mcp_server(
+    "weather",
+    factory_argument={"tenant": "acme"},
+)
+```
 
-Both `stateless_mcp_server()` and `stateful_mcp_server()` accept an optional `factory_argument`, which is passed to the registered server factory when the MCP server is created.
+A non-`None` argument creates a fresh client for each Activity. Omitting the
+argument or passing `None` uses the zero-argument factory and permits connection
+caching. Caching by only the registered name could otherwise
+reuse one tenant's endpoint or authorization for another tenant; caching by the
+argument itself is unsafe because arguments may be unhashable, high-cardinality,
+or refer to configuration that changes worker-side. The argument is recorded in
+workflow history, so it must be a non-secret stable identifier. Resolve secrets
+inside the factory.
 
-A stateless factory that declares no parameters — like the `lambda: MCPServerStdio(...)` example above — ignores the value, but it is still recorded in history.
+MCP v2 uses `httpx2`, not legacy `httpx`. OpenAI Agents owns the custom HTTP
+client lifecycle supplied through its MCP server parameters:
 
-**Do not pass secrets, credentials, or API keys through `factory_argument`.** It is an activity argument, so it is recorded in workflow history and, without a payload codec, visible in the web UI. Resolve credentials worker-side inside the server factory instead.
+```python
+import httpx2
+from agents.mcp import MCPServerStreamableHttp
+
+
+def http_client_factory(headers=None, timeout=None, auth=None):
+    return httpx2.AsyncClient(
+        headers={**(headers or {}), "X-Client": "temporal"},
+        timeout=timeout,
+        auth=auth,
+    )
+
+
+def weather_server() -> MCPServerStreamableHttp:
+    return MCPServerStreamableHttp(
+        name="weather",
+        params={
+            "url": "https://example.com/mcp",
+            "httpx_client_factory": http_client_factory,
+        },
+    )
+```
+
+`StatelessMCPServerProvider`, `StatefulMCPServerProvider`, the plugin's
+`mcp_server_providers` option, `stateless_mcp_server()`, and
+`stateful_mcp_server()` are deprecated. They remain supported for source and
+workflow-history compatibility and can still run with MCP Python SDK v1 when
+the `mcp` extra is not installed. New integrations should use `mcp_servers` and
+`temporal_mcp_server()`, which require the `mcp` extra and MCP Python SDK v2.
+The legacy stateful path retains its dedicated per-workflow worker and
+persistent-session behavior.
 
 ### Hosted MCP Tool
 
@@ -519,7 +523,7 @@ plugin = OpenAIAgentsPlugin(resolvable_worker_env_vars=["MY_MCP_TOKEN"])
 Names are matched exactly, with no globbing. Passing `AllowAllWorkerEnvVars()` in place of the list makes every environment variable on the worker resolvable, so a workflow-authored sandbox manifest can name any variable on the worker and have its value land inside the container.
 
 ```python
-from temporalio.contrib.openai_agents import AllowAllWorkerEnvVars
+from temporalio.openai_agents import AllowAllWorkerEnvVars
 
 plugin = OpenAIAgentsPlugin(resolvable_worker_env_vars=AllowAllWorkerEnvVars())
 ```
@@ -532,7 +536,7 @@ Pass `temporal_worker_env_ref()` the *name of an environment variable*, in place
 
 ```python
 from agents import HostedMCPTool
-from temporalio.contrib.openai_agents import temporal_worker_env_ref
+from temporalio.openai_agents import temporal_worker_env_ref
 
 tool = HostedMCPTool(
     tool_config={
@@ -560,7 +564,7 @@ Put a `TemporalWorkerEnvValue` in the environment of a [sandbox](#sandbox-suppor
 from agents.sandbox import Manifest
 from agents.sandbox.manifest import Environment
 
-from temporalio.contrib.openai_agents import TemporalWorkerEnvValue
+from temporalio.openai_agents import TemporalWorkerEnvValue
 
 manifest = Manifest(
     environment=Environment(
@@ -610,7 +614,7 @@ import asyncio
 from datetime import timedelta
 from temporalio.client import Client
 from temporalio.worker import Worker
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin, SandboxClientProvider, ModelActivityParameters
+from temporalio.openai_agents import OpenAIAgentsPlugin, SandboxClientProvider, ModelActivityParameters
 from agents.extensions.sandbox.daytona import DaytonaSandboxClient
 from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
 
@@ -646,7 +650,7 @@ In the workflow, use `temporal_sandbox_client()` to create a reference to a regi
 
 ```python
 from temporalio import workflow
-from temporalio.contrib.openai_agents.workflow import temporal_sandbox_client
+from temporalio.openai_agents.workflow import temporal_sandbox_client
 from agents import Runner
 from agents.sandbox import SandboxAgent, SandboxRunConfig
 from agents.run import RunConfig
@@ -823,17 +827,19 @@ As described in [Tool Calling](#tool-calling), context propagation is read-only 
 
 ### MCP
 
-The MCP protocol is stateful, but many MCP servers are stateless.
-We let you choose between two MCP wrappers, one designed for stateless MCP servers and one for stateful MCP servers.
-These wrappers work with all transport varieties.
+The integration supports MCP Python SDK v2 clients. Modern MCP protocol
+connections are sessionless; transport connections may still be reused as an
+optimization. The OpenAI MCP server factory can use stdio, streamable HTTP, an
+in-process server, or a custom v2 transport.
 
 Note that when using network-accessible MCP servers, you also can also use the tool `HostedMCPTool`, which is part of the OpenAI Responses API and uses an MCP client hosted by OpenAI.
 
-| MCP Class               | Supported |
+| MCP v2 client transport | Supported |
 | :---------------------- | :-------: |
-| MCPServerStdio          |    Yes    |
-| MCPServerSse            |    Yes    |
-| MCPServerStreamableHttp |    Yes    |
+| Stdio                   |    Yes    |
+| Streamable HTTP         |    Yes    |
+| In-process server       |    Yes    |
+| Custom transport        |    Yes    |
 
 ### Guardrails
 
@@ -869,7 +875,7 @@ To enable OTEL telemetry export, you need to set up a global `ReplaySafeTracerPr
 ```python
 from datetime import timedelta
 from temporalio.client import Client
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
+from temporalio.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
 from temporalio.contrib.opentelemetry import create_tracer_provider
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry import trace
@@ -917,19 +923,18 @@ Choose the appropriate OTEL exporter for your monitoring system:
 # For OTLP (works with most OTEL collectors and monitoring systems)
 pip install opentelemetry-exporter-otlp
 
-# For Console output (development/debugging)
-pip install opentelemetry-exporter-console
-
 # Other exporters available for specific systems
 pip install opentelemetry-exporter-<your-system>
 ```
+
+`ConsoleSpanExporter` (development/debugging) ships with `opentelemetry-sdk`, so it needs no extra package.
 
 ### Example: Multiple Exporters
 
 ```python
 from temporalio.contrib.opentelemetry import create_tracer_provider
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.exporter.console import ConsoleSpanExporter
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 from opentelemetry import trace
 
 exporters = [
@@ -946,8 +951,10 @@ exporters = [
     ConsoleSpanExporter(),
 ]
 
-# Set up global tracer provider with multiple exporters
-tracer_provider = create_tracer_provider(exporters=exporters)
+# Set up the global tracer provider with one span processor per exporter
+tracer_provider = create_tracer_provider()
+for exporter in exporters:
+    tracer_provider.add_span_processor(BatchSpanProcessor(exporter))
 trace.set_tracer_provider(tracer_provider)
 
 plugin = OpenAIAgentsPlugin(use_otel_instrumentation=True)
@@ -1064,7 +1071,7 @@ You can also start an Agents SDK trace on the client side before executing a wor
 
 ```python
 from agents import trace, custom_span
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin
+from temporalio.openai_agents import OpenAIAgentsPlugin
 
 # Set up the plugin with OTEL integration
 plugin = OpenAIAgentsPlugin(use_otel_instrumentation=True)

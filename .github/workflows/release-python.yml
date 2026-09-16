@@ -9,6 +9,10 @@
 # tested build runs, nothing is uploaded and no tag is consumed. A dispatch from a branch can
 # never publish; `skip-publish` additionally turns a dispatch on a tag ref into a dry run.
 #
+# The protected tag is the release-version source. Each test-matrix checkout injects that
+# version into pyproject.toml and uv.lock before sync, test, and build; committed manifests use
+# the 0.0.0 development placeholder and never need a version-only release PR.
+#
 # Publishing uses PyPI trusted publishing (OIDC): no stored credentials. The
 # publish jobs live INLINE here on purpose: PyPI rejects reusable workflows as
 # trusted publishers (warehouse#11096). Pre-releases go to TestPyPI only unless
@@ -89,20 +93,6 @@ jobs:
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: uv run --project scripts --locked python scripts/release/release_tool.py parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
-      - name: Tag version matches the manifest
-        env:
-          PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
-          VERSION: ${{ steps.tag.outputs.version }}
-        run: |
-          manifest="$(uv version --short --directory "$PLUGIN_DIR")"
-          echo "tag=$VERSION manifest=$manifest"
-          uv run --project scripts --locked python - "$VERSION" "$manifest" <<'PY'
-          import sys
-          from packaging.version import Version
-          tag, manifest = sys.argv[1:3]
-          if Version(tag) != Version(manifest):
-              sys.exit(f"::error::tag version {tag} does not match pyproject version {manifest}")
-          PY
       - name: Tag is reachable from main
         # fetch-depth 0 above already brought origin/main; no extra fetch (credentials are not persisted).
         env:
@@ -153,6 +143,7 @@ jobs:
     with:
       plugin: ${{ needs.prepare.outputs.plugin }}
       deps: locked
+      version: ${{ needs.prepare.outputs.version }}
 
   publish-testpypi:
     name: Publish to TestPyPI
@@ -298,7 +289,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
-          TITLE: ${{ needs.prepare.outputs.plugin }} ${{ needs.prepare.outputs.version }}
+          TITLE: ${{ needs.prepare.outputs.coordinate }} ${{ needs.prepare.outputs.version }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           extra=()

@@ -62,7 +62,7 @@ def test_smoke_in_env_detects_editable_and_version_mismatch(built: tuple[Path, P
     env = {**os.environ, "UV_LINK_MODE": "copy"}
     subprocess.run(["uv", "pip", "install", "--quiet", "--python", str(py), "--editable", str(plugin)], check=True, env=env)
     r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"],
-                       env={**env, "EXPECTED_VERSION": "0.1.0rc1"}, capture_output=True, text=True)
+                       env={**env, "EXPECTED_VERSION": "0.0.0"}, capture_output=True, text=True)
     assert r.returncode == 1 and "editable mode" in r.stdout
 
     wheel = next(dist.glob("*.whl"))
@@ -71,7 +71,7 @@ def test_smoke_in_env_detects_editable_and_version_mismatch(built: tuple[Path, P
                        env={**env, "EXPECTED_VERSION": "9.9.9"}, capture_output=True, text=True)
     assert r.returncode == 1 and "installed version" in r.stdout
     r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"],
-                       env={**env, "EXPECTED_VERSION": "0.1.0-rc1"}, capture_output=True, text=True)  # non-canonical spelling is normalised
+                       env={**env, "EXPECTED_VERSION": "0.0.0"}, capture_output=True, text=True)
     assert r.returncode == 0, r.stdout
 
 
@@ -87,12 +87,12 @@ def test_smoke_in_env_detects_overwritten_and_stray_files(built: tuple[Path, Pat
     pkg_dir = Path(site)
     (pkg_dir / "_impl.py").write_text("VALUE = 'tampered'\n")
     r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"],
-                       env={**os.environ, "EXPECTED_VERSION": "0.1.0rc1"}, capture_output=True, text=True)
+                       env={**os.environ, "EXPECTED_VERSION": "0.0.0"}, capture_output=True, text=True)
     assert r.returncode == 1 and "differs from the hash" in r.stdout
     subprocess.run(["uv", "pip", "install", "--quiet", "--python", str(py), "--reinstall", str(wheel)], check=True, env={**os.environ, "UV_LINK_MODE": "copy"})
     (pkg_dir / "stray.py").write_text("x = 1\n")
     r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"],
-                       env={**os.environ, "EXPECTED_VERSION": "0.1.0rc1"}, capture_output=True, text=True)
+                       env={**os.environ, "EXPECTED_VERSION": "0.0.0"}, capture_output=True, text=True)
     assert r.returncode == 1 and "not owned by" in r.stdout
 
 

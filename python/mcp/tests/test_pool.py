@@ -12,8 +12,8 @@ from mcp.types import (
     UNSUPPORTED_PROTOCOL_VERSION,
 )
 
-from temporalio.contrib.mcp._client import _MCPClientBackend
-from temporalio.contrib.mcp._pool import _MCPConnectionPool
+from temporalio.mcp._client import _MCPClientBackend
+from temporalio.mcp._pool import _MCPConnectionPool
 
 
 def echo_server() -> MCPServer[Any]:

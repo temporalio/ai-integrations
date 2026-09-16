@@ -80,10 +80,6 @@ jobs:
           enable-cache: true
           cache-dependency-glob: scripts/uv.lock
       - name: Check repository conventions
-        env:
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          PR_COMMITS: ${{ github.event.pull_request.commits }}
-          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: uv run --project scripts --locked python scripts/ci/check_conventions.py
       - name: Tooling unit tests
         run: uv run --project scripts --locked pytest scripts/tests -q

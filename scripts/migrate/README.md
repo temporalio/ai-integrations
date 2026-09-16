@@ -6,6 +6,10 @@ author, date and message intact. The result is merged into this repository with 
 unrelated-histories merge commit. `git log --follow`, `git blame` and `git shortlog` then work on
 the imported files exactly as they did upstream.
 
+Imported history means commits reachable from the upstream repository's default branch. Never use
+this procedure, the `history-import` label or `IMPORTS.md` for work that exists only on an unmerged
+or closed upstream PR, feature branch or fork; port that work as ordinary local commits instead.
+
 ## Procedure
 
 ```bash
@@ -21,7 +25,8 @@ Then add the files the import does not bring, as **separate commits on top of th
 (never amend the merge and never edit an imported file in the same PR):
 
 ```bash
-python3 scripts/new_python_plugin.py openai_agents --existing --maturity ga --version 1.0.0rc1 \
+python3 scripts/new_python_plugin.py openai_agents --existing --maturity ga \
+  --upstream temporalio/sdk-python:temporalio/contrib/openai_agents \
   --description "Temporal integration for the OpenAI Agents SDK"
 ```
 
@@ -48,29 +53,17 @@ Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merg
   - `--force`, needed only because the optional `SRC_REF` pin fails filter-repo's fresh-clone
     check; the clone is a throwaway directory.
 
-## Expected verification output (openai_agents)
-
-- `git rev-list --count sdk-python-filtered/main` equals
-  `git log --oneline -- python/openai_agents | wc -l` and is at least 100 (grows with upstream).
-- `git shortlog -sne -- python/openai_agents` lists 18 author identities (grows as upstream
-  lands commits by new people; the plan's earlier count of 17 predates two later contributors).
-- `git log --follow --format=%h python/openai_agents/src/temporalio/contrib/openai_agents/__init__.py | tail -1`
-  and the same for `python/openai_agents/tests/contrib/openai_agents/research_agents/planner_agent.py`
-  print `53d9ace6` (2025-06-18, the first upstream commit).
-- `git log --format=%B -- python/openai_agents | grep -c Migrated-From` equals the commit count.
-- `git tag | wc -l` is 0 and `git log --merges -- python/openai_agents` shows only the import merge.
-- Running the script again against the same upstream state and merging prints
-  `Already up to date.`
-
 ## Re-sync (bringing new upstream commits)
 
-`sdk-python` remains the source of truth for the plugin until the SDK cutover PR merges
-(AGENTS.md, "Transition rules"). To pick up upstream changes:
+Use this procedure only while the plugin's `plugin.toml` names `sdk-python` as its `upstream`.
+Removing that field makes this repository the source of truth; do not re-sync the plugin after
+that point. While the field is present, pick up upstream changes as follows:
 
 1. Run the script unchanged, fetch, and `git merge sdk-python-filtered/main` on a new branch.
    Only commits newer than the previous import arrive because the rewrite is byte-identical.
-2. Resolve conflicts only where adaptation commits touched imported files (there should be
-   none while the transition rules are followed).
+2. Resolve conflicts only where adaptation commits or documented local-only divergences touched
+   imported files. For the `openai_agents` MCP v2 adapter files listed in AGENTS.md, "Transition
+   rules", preserve both the new upstream changes and the local adapter.
 3. Diff the vendored test scaffolding against upstream and port relevant changes by hand:
    `tests/conftest.py`, `tests/__init__.py`, `tests/helpers/__init__.py`, `tests/helpers/nexus.py`.
 4. If upstream added provider-network tests, add deterministic local coverage without credentials.
@@ -80,10 +73,12 @@ Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merg
 
 The rewrite stays byte-identical only if none of these change: the `--path`/`--path-rename`
 arguments, `replace-message.txt`, the commit callback, `--prune-empty`/`--preserve-commit-hashes`,
-the pinned git-filter-repo version, and upstream history itself (a force-push or a `SRC_REF`
-that is not a descendant of the previous import). If a rule must change, the plugin needs a
-one-time full re-import PR (delete `python/<plugin>`, import again, re-apply adaptation
-commits) and a note in `IMPORTS.md`.
+the pinned git-filter-repo version, and upstream default-branch history itself. `SRC_REF` must be
+both reachable from the upstream default branch and a descendant of the previous import. Stop if
+either condition is false; a PR or feature-branch ref is not a history-import input and its changes
+must be ported as ordinary local commits. If a rewrite rule changes or upstream rewrites its default
+branch, the plugin needs a one-time full re-import PR (delete `python/<plugin>`, import again,
+re-apply adaptation and documented local-only commits) and a note in `IMPORTS.md`.
 
 ## Adding another plugin
 
