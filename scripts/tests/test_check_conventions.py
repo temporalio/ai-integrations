@@ -94,10 +94,23 @@ def test_top_level_temporalio_root_api_is_allowed(plugin_repo: Path) -> None:
     assert run(plugin_repo) == []
 
 
+def test_release_ready_contrib_root_api_is_rejected(plugin_repo: Path) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(
+        meta.read_text()
+        .replace(
+            '        upstream = "temporalio/sdk-python:temporalio/contrib/fakeplug"\n',
+            "",
+        )
+        .replace("allow-final = false", "allow-final = true")
+    )
+    assert any("allowed only for an upstream-backed migration" in x for x in run(plugin_repo))
+
+
 def test_unrelated_root_api_is_rejected(plugin_repo: Path) -> None:
     meta = plugin_repo / "python/fakeplug/plugin.toml"
     meta.write_text(meta.read_text().replace("temporalio.contrib.fakeplug", "other.fakeplug"))
-    assert any("root-api must be one of" in x for x in run(plugin_repo))
+    assert any("root-api must be 'temporalio.fakeplug'" in x for x in run(plugin_repo))
 
 
 def test_maturity_classifier_must_agree(plugin_repo: Path) -> None:
