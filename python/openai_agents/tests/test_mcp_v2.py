@@ -22,24 +22,24 @@ from mcp.types import (
     Tool,
 )
 
+import temporalio.openai_agents as openai_agents
 from temporalio import workflow
 from temporalio.client import Client
-from temporalio.contrib import openai_agents
 from temporalio.contrib.mcp import TemporalMCPClient
-from temporalio.contrib.openai_agents import ModelActivityParameters
-from temporalio.contrib.openai_agents._mcp_backend import (
+from temporalio.exceptions import ApplicationError
+from temporalio.openai_agents import ModelActivityParameters
+from temporalio.openai_agents._mcp_backend import (
     _mcp_server_backend_factory,
     _OpenAIMCPServerBackend,
 )
-from temporalio.contrib.openai_agents._temporal_mcp_server import (
+from temporalio.openai_agents._temporal_mcp_server import (
     _TemporalMCPServer,
 )
-from temporalio.contrib.openai_agents.testing import (
+from temporalio.openai_agents.testing import (
     AgentEnvironment,
     ResponseBuilders,
     TestModel,
 )
-from temporalio.exceptions import ApplicationError
 from tests.helpers import new_worker
 
 

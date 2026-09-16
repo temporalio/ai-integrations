@@ -8,12 +8,6 @@ We welcome questions and feedback in the [#python-sdk](https://temporalio.slack.
 uv add temporalio-openai-agents
 ```
 
-> **Transition note.** Until the Temporal Python SDK release that stops bundling
-> `temporalio.contrib.openai_agents`, do not install this package next to `temporalio<=1.32`: both
-> ship the same files, and uninstalling this package then removes files the SDK still needs (repair
-> with a reinstall of `temporalio`). Pre-releases are published to TestPyPI only for that reason.
-> Source and issues: https://github.com/temporalio/ai-integrations/tree/main/python/openai_agents
-
 ## Introduction
 
 This integration combines [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) with [Temporal's durable execution](https://docs.temporal.io/evaluate/understanding-temporal#durable-execution).
@@ -198,7 +192,7 @@ import asyncio
 from datetime import timedelta
 
 from temporalio.client import Client
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
+from temporalio.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
 from temporalio.worker import Worker
 
 from hello_world_workflow import HelloWorldAgent
@@ -246,7 +240,7 @@ import asyncio
 
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin
+from temporalio.openai_agents import OpenAIAgentsPlugin
 
 from hello_world_workflow import HelloWorldAgent
 
@@ -399,7 +393,7 @@ same name from workflow code:
 ```python
 from agents.mcp import MCPServerStreamableHttp
 
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin
+from temporalio.openai_agents import OpenAIAgentsPlugin
 
 plugin = OpenAIAgentsPlugin(
     mcp_servers={
@@ -413,7 +407,7 @@ plugin = OpenAIAgentsPlugin(
 
 ```python
 from agents import Agent
-from temporalio.contrib.openai_agents.workflow import temporal_mcp_server
+from temporalio.openai_agents.workflow import temporal_mcp_server
 
 server = temporal_mcp_server("weather")
 agent = Agent(name="weather", mcp_servers=[server])
@@ -522,7 +516,7 @@ plugin = OpenAIAgentsPlugin(resolvable_worker_env_vars=["MY_MCP_TOKEN"])
 Names are matched exactly, with no globbing. Passing `AllowAllWorkerEnvVars()` in place of the list makes every environment variable on the worker resolvable, so a workflow-authored sandbox manifest can name any variable on the worker and have its value land inside the container.
 
 ```python
-from temporalio.contrib.openai_agents import AllowAllWorkerEnvVars
+from temporalio.openai_agents import AllowAllWorkerEnvVars
 
 plugin = OpenAIAgentsPlugin(resolvable_worker_env_vars=AllowAllWorkerEnvVars())
 ```
@@ -535,7 +529,7 @@ Pass `temporal_worker_env_ref()` the *name of an environment variable*, in place
 
 ```python
 from agents import HostedMCPTool
-from temporalio.contrib.openai_agents import temporal_worker_env_ref
+from temporalio.openai_agents import temporal_worker_env_ref
 
 tool = HostedMCPTool(
     tool_config={
@@ -563,7 +557,7 @@ Put a `TemporalWorkerEnvValue` in the environment of a [sandbox](#sandbox-suppor
 from agents.sandbox import Manifest
 from agents.sandbox.manifest import Environment
 
-from temporalio.contrib.openai_agents import TemporalWorkerEnvValue
+from temporalio.openai_agents import TemporalWorkerEnvValue
 
 manifest = Manifest(
     environment=Environment(
@@ -613,7 +607,7 @@ import asyncio
 from datetime import timedelta
 from temporalio.client import Client
 from temporalio.worker import Worker
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin, SandboxClientProvider, ModelActivityParameters
+from temporalio.openai_agents import OpenAIAgentsPlugin, SandboxClientProvider, ModelActivityParameters
 from agents.extensions.sandbox.daytona import DaytonaSandboxClient
 from agents.sandbox.sandboxes.unix_local import UnixLocalSandboxClient
 
@@ -649,7 +643,7 @@ In the workflow, use `temporal_sandbox_client()` to create a reference to a regi
 
 ```python
 from temporalio import workflow
-from temporalio.contrib.openai_agents.workflow import temporal_sandbox_client
+from temporalio.openai_agents.workflow import temporal_sandbox_client
 from agents import Runner
 from agents.sandbox import SandboxAgent, SandboxRunConfig
 from agents.run import RunConfig
@@ -874,7 +868,7 @@ To enable OTEL telemetry export, you need to set up a global `ReplaySafeTracerPr
 ```python
 from datetime import timedelta
 from temporalio.client import Client
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
+from temporalio.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
 from temporalio.contrib.opentelemetry import create_tracer_provider
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry import trace
@@ -1070,7 +1064,7 @@ You can also start an Agents SDK trace on the client side before executing a wor
 
 ```python
 from agents import trace, custom_span
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin
+from temporalio.openai_agents import OpenAIAgentsPlugin
 
 # Set up the plugin with OTEL integration
 plugin = OpenAIAgentsPlugin(use_otel_instrumentation=True)

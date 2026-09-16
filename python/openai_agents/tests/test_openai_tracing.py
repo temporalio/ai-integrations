@@ -11,20 +11,20 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from temporalio import activity, workflow
 from temporalio.client import Client
-from temporalio.contrib.openai_agents import _temporal_openai_agents
-from temporalio.contrib.openai_agents.testing import (
+from temporalio.contrib.opentelemetry import create_tracer_provider
+from temporalio.openai_agents import _temporal_openai_agents
+from temporalio.openai_agents.testing import (
     AgentEnvironment,
 )
-from temporalio.contrib.opentelemetry import create_tracer_provider
 from temporalio.worker.workflow_sandbox import (
     SandboxedWorkflowRunner,
     SandboxRestrictions,
 )
-from tests.contrib.openai_agents.test_openai import (
+from tests.helpers import assert_eq_eventually, new_worker
+from tests.test_openai import (
     ResearchWorkflow,
     research_mock_model,
 )
-from tests.helpers import assert_eq_eventually, new_worker
 
 
 class MemoryTracingProcessor(TracingProcessor):

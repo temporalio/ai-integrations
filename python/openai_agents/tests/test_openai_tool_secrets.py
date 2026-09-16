@@ -26,24 +26,24 @@ from agents.tool import ShellTool, ShellToolEnvironment
 
 from temporalio import workflow
 from temporalio.client import Client
-from temporalio.contrib.openai_agents import (
+from temporalio.openai_agents import (
     ModelActivityParameters,
     OpenAIAgentsPlugin,
     OpenAIPayloadConverter,
     temporal_worker_env_ref,
 )
-from temporalio.contrib.openai_agents._invoke_model_activity import (
+from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
     ModelActivity,
     StreamingActivityModelInput,
     _build_tool,
 )
-from temporalio.contrib.openai_agents._temporal_model_stub import _TemporalModelStub
-from temporalio.contrib.openai_agents._temporal_worker_env_ref import (
+from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
+from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     _WorkerEnvRefResolver,
 )
-from temporalio.contrib.openai_agents.testing import (
+from temporalio.openai_agents.testing import (
     AgentEnvironment,
     TestModelProvider,
 )

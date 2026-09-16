@@ -59,7 +59,7 @@ Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merg
 - `git shortlog -sne -- python/openai_agents` lists 18 author identities (grows as upstream
   lands commits by new people; the plan's earlier count of 17 predates two later contributors).
 - `git log --follow --format=%h python/openai_agents/src/temporalio/contrib/openai_agents/__init__.py | tail -1`
-  and the same for `python/openai_agents/tests/contrib/openai_agents/research_agents/planner_agent.py`
+  and the same for `python/openai_agents/tests/research_agents/planner_agent.py`
   print `53d9ace6` (2025-06-18, the first upstream commit).
 - `git log --format=%B -- python/openai_agents | grep -c Migrated-From` equals the commit count.
 - `git tag | wc -l` is 0 and `git log --merges -- python/openai_agents` shows only the import merge.
@@ -68,8 +68,9 @@ Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merg
 
 ## Re-sync (bringing new upstream commits)
 
-`sdk-python` remains the source of truth for the plugin until the SDK cutover PR merges
-(AGENTS.md, "Transition rules"). To pick up upstream changes:
+Use this procedure only while the plugin's `plugin.toml` names `sdk-python` as its `upstream`.
+Removing that field makes this repository the source of truth; do not re-sync the plugin after
+that point. While the field is present, pick up upstream changes as follows:
 
 1. Run the script unchanged, fetch, and `git merge sdk-python-filtered/main` on a new branch.
    Only commits newer than the previous import arrive because the rewrite is byte-identical.

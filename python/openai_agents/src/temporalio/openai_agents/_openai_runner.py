@@ -20,10 +20,10 @@ from agents.sandbox import SandboxAgent
 from typing_extensions import Unpack
 
 from temporalio import workflow
-from temporalio.contrib.openai_agents._errors import AgentsWorkflowError
-from temporalio.contrib.openai_agents._model_parameters import ModelActivityParameters
-from temporalio.contrib.openai_agents._temporal_model_stub import _TemporalModelStub
-from temporalio.contrib.openai_agents.sandbox._temporal_sandbox_client import (
+from temporalio.openai_agents._errors import AgentsWorkflowError
+from temporalio.openai_agents._model_parameters import ModelActivityParameters
+from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
+from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
 
@@ -149,7 +149,7 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         if starting_agent.mcp_servers:
-            from temporalio.contrib.openai_agents._mcp import (
+            from temporalio.openai_agents._mcp import (
                 _StatefulMCPServerReference,
                 _StatelessMCPServerReference,
             )
@@ -167,7 +167,7 @@ class TemporalOpenAIRunner(AgentRunner):
                 # workflow that uses the legacy MCP v1 provider path.
                 if (
                     type(s).__module__
-                    == "temporalio.contrib.openai_agents._temporal_mcp_server"
+                    == "temporalio.openai_agents._temporal_mcp_server"
                     and type(s).__name__ == "_TemporalMCPServer"
                 ):
                     continue
@@ -202,7 +202,7 @@ class TemporalOpenAIRunner(AgentRunner):
                     "A SandboxAgent was provided but run_config.sandbox is not configured. "
                     "You must set run_config.sandbox to a SandboxRunConfig. "
                     "For example:\n"
-                    "  from temporalio.contrib.openai_agents.workflow import temporal_sandbox_client\n"
+                    "  from temporalio.openai_agents.workflow import temporal_sandbox_client\n"
                     "  run_config = RunConfig(sandbox=SandboxRunConfig(client=temporal_sandbox_client('my-backend')))"
                 )
             elif run_config.sandbox.session is not None:
@@ -214,13 +214,13 @@ class TemporalOpenAIRunner(AgentRunner):
             elif run_config.sandbox.client is None:
                 raise ValueError(
                     "run_config.sandbox.client must be set to a temporal sandbox client. "
-                    "Use temporalio.contrib.openai_agents.workflow.temporal_sandbox_client(name) "
+                    "Use temporalio.openai_agents.workflow.temporal_sandbox_client(name) "
                     "to create one, where name matches a SandboxClientProvider registered on the plugin."
                 )
             elif not isinstance(run_config.sandbox.client, TemporalSandboxClient):
                 raise ValueError(
                     "run_config.sandbox.client must be created via "
-                    "temporalio.contrib.openai_agents.workflow.temporal_sandbox_client(name). "
+                    "temporalio.openai_agents.workflow.temporal_sandbox_client(name). "
                     "Do not pass a raw sandbox client directly."
                 )
 

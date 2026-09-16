@@ -46,13 +46,13 @@ from openai.types.responses.tool_param import Mcp
 from typing_extensions import Required, TypedDict
 
 from temporalio import activity
-from temporalio.contrib.openai_agents._heartbeat_decorator import auto_heartbeater
-from temporalio.contrib.openai_agents._temporal_worker_env_ref import (
+from temporalio.contrib.workflow_streams import WorkflowStreamClient
+from temporalio.exceptions import ApplicationError
+from temporalio.openai_agents._heartbeat_decorator import auto_heartbeater
+from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     _WorkerEnvRefResolver,
 )
-from temporalio.contrib.workflow_streams import WorkflowStreamClient
-from temporalio.exceptions import ApplicationError
 
 
 @dataclass

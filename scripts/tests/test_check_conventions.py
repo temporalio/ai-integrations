@@ -77,6 +77,29 @@ def test_plugin_toml_agreement(plugin_repo: Path) -> None:
     assert any("project.name" in x for x in v)
 
 
+def test_top_level_temporalio_root_api_is_allowed(plugin_repo: Path) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(
+        meta.read_text().replace("temporalio.contrib.fakeplug", "temporalio.fakeplug")
+    )
+    pyproject = plugin_repo / "python/fakeplug/pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text().replace(
+            "temporalio.contrib.fakeplug", "temporalio.fakeplug"
+        )
+    )
+    old_package = plugin_repo / "python/fakeplug/src/temporalio/contrib/fakeplug"
+    new_package = plugin_repo / "python/fakeplug/src/temporalio/fakeplug"
+    old_package.rename(new_package)
+    assert run(plugin_repo) == []
+
+
+def test_unrelated_root_api_is_rejected(plugin_repo: Path) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(meta.read_text().replace("temporalio.contrib.fakeplug", "other.fakeplug"))
+    assert any("root-api must be one of" in x for x in run(plugin_repo))
+
+
 def test_maturity_classifier_must_agree(plugin_repo: Path) -> None:
     meta = plugin_repo / "python/fakeplug/plugin.toml"
     meta.write_text(meta.read_text().replace('maturity = "experimental"', 'maturity = "ga"'))

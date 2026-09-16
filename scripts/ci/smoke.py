@@ -18,9 +18,9 @@ In-env (stdlib only; runs inside the target environment, Python 3.10+):
   in our RECORD matches its hash,
   no files under our package directory that we do not own, and no other
   distribution ships our module path. $ALLOW_OVERLAP_WITH_CORE=1 downgrades the
-  last two checks to warnings while the SDK still ships the same module
-  (TRANSITION(sdk-cutover)); the orchestrator sets it automatically while
-  plugin.toml has [release] allow-final = false.
+  overlap check to a warning for plugins being migrated from another distribution;
+  the orchestrator sets it automatically while plugin.toml has
+  [release] allow-final = false.
 """
 
 from __future__ import annotations
@@ -93,8 +93,6 @@ def check_provenance(dist_name: str, pkg_rel: str, allow_overlap: bool = False, 
         for p in pkg_dir.rglob("*")
         if p.is_file() and "__pycache__" not in p.parts and not p.name.endswith(".pyc")
     } - owned
-    if allow_overlap:
-        extras.discard(os.path.normpath(str(pkg_dir / "README.md")))  # temporalio<=1.32 ships it inside the package
     if extras:
         raise ProvenanceError(
             f"files under {pkg_rel} not owned by {dist_name}: {sorted(extras)}. "
@@ -115,9 +113,9 @@ def check_provenance(dist_name: str, pkg_rel: str, allow_overlap: bool = False, 
     if others:
         msg = f"{pkg_rel} is also shipped by {sorted(others)}"
         if allow_overlap:
-            warn(f"WARN: {msg} (expected until the SDK cutover release drops the embedded module)")
+            warn(f"WARN: {msg} (allowed while this plugin is being migrated)")
         else:
-            raise ProvenanceError(msg + "; the temporalio floor must be a release that no longer embeds this module")
+            raise ProvenanceError(msg + "; raise the dependency floor past the overlapping distribution")
 
 
 # ---------------------------------------------------------------------------

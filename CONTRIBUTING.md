@@ -21,8 +21,6 @@ workflow.
 - CI runs only the plugins whose files changed (`.github/workflows/ci.yml`); `ci-status`,
   `Check for CODEOWNERS` and `opengrep/scan` are the required checks, plus one code-owner
   approval. No secrets are needed: provider behavior uses deterministic local test doubles.
-- During the SDK cutover transition, bug fixes for a migrated plugin land in the SDK repository
-  first and reach this repository through a re-sync (AGENTS.md, "Transition rules").
 
 ## Adding a Python plugin
 
