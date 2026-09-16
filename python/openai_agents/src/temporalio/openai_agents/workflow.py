@@ -22,13 +22,13 @@ from agents.tool import (
 from temporalio import activity
 from temporalio import workflow as temporal_workflow
 from temporalio.common import Priority, RetryPolicy
-from temporalio.contrib.openai_agents._errors import (
+from temporalio.exceptions import ApplicationError, TemporalError
+from temporalio.openai_agents._errors import (
     AgentsWorkflowError as AgentsWorkflowError,
 )
-from temporalio.contrib.openai_agents.sandbox._temporal_sandbox_client import (
+from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
-from temporalio.exceptions import ApplicationError, TemporalError
 from temporalio.workflow import (
     ActivityCancellationType,
     ActivityConfig,
@@ -318,7 +318,7 @@ def stateless_mcp_server(
         DeprecationWarning,
         stacklevel=2,
     )
-    from temporalio.contrib.openai_agents._mcp import (
+    from temporalio.openai_agents._mcp import (
         _StatelessMCPServerReference,
     )
 
@@ -371,7 +371,7 @@ def stateful_mcp_server(
         DeprecationWarning,
         stacklevel=2,
     )
-    from temporalio.contrib.openai_agents._mcp import (
+    from temporalio.openai_agents._mcp import (
         _StatefulMCPServerReference,
     )
 
@@ -418,7 +418,7 @@ def temporal_mcp_server(
     """
     try:
         from temporalio.contrib.mcp import TemporalMCPClient
-        from temporalio.contrib.openai_agents._temporal_mcp_server import (
+        from temporalio.openai_agents._temporal_mcp_server import (
             _TemporalMCPServer,
         )
     except ImportError as err:

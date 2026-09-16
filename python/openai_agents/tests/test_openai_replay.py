@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from temporalio.client import WorkflowHistory
-from temporalio.contrib.openai_agents import OpenAIAgentsPlugin
+from temporalio.openai_agents import OpenAIAgentsPlugin
 from temporalio.worker import Replayer
 from tests.test_openai import (
     AgentsAsToolsWorkflow,

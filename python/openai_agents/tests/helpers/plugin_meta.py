@@ -21,7 +21,7 @@ class PluginMeta:
 
     @property
     def package_relpath(self) -> str:
-        """Root API as a path relative to site-packages, e.g. ``temporalio/contrib/openai_agents``."""
+        """Root API as a path relative to site-packages, e.g. ``temporalio/openai_agents``."""
         return self.root_api.replace(".", "/")
 
 

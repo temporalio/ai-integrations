@@ -5,7 +5,7 @@ name = "openai_agents"
 language = "python"
 coordinate = "temporalio-openai-agents"
 registry = "pypi"
-root-api = "temporalio.contrib.openai_agents"
+root-api = "temporalio.openai_agents"
 maturity = "ga"
 docs = "https://docs.temporal.io/develop/python/integrations/openai-agents"
 
@@ -16,4 +16,4 @@ allow-final = true
 runtime-versions = ["3.10", "3.14"]
 
 [smoke]
-imports = ["temporalio.contrib.openai_agents.workflow", "temporalio.contrib.openai_agents.testing", "temporalio.contrib.openai_agents.sandbox"]
+imports = ["temporalio.openai_agents.workflow", "temporalio.openai_agents.testing", "temporalio.openai_agents.sandbox"]

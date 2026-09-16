@@ -13,7 +13,7 @@ $(error DIST must be set to the plugin's distribution name (e.g. temporalio-open
 endif
 
 # `temporalio` is a regular package owned by the SDK wheel, so an editable install of this
-# plugin cannot be imported as temporalio.contrib.<name>. Every uv command below runs non-editable.
+# plugin cannot reliably extend it with another package root. Every uv command below runs non-editable.
 export UV_NO_EDITABLE := 1
 
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)

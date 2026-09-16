@@ -33,7 +33,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `python/google_genai` | `temporalio-google-genai` | 0.1.0 | experimental | `temporalio.contrib.google_genai` |
 | `python/langgraph` | `temporalio-langgraph` | 0.1.0 | experimental | `temporalio.contrib.langgraph` |
 | `python/langsmith` | `temporalio-langsmith` | 0.1.0 | experimental | `temporalio.contrib.langsmith` |
-| `python/openai_agents` | `temporalio-openai-agents` | 1.0.0 | ga | `temporalio.contrib.openai_agents` |
+| `python/openai_agents` | `temporalio-openai-agents` | 1.0.0 | ga | `temporalio.openai_agents` |
 | `python/strands_agents` | `temporalio-strands-agents` | 0.1.0 | experimental | `temporalio.contrib.strands_agents` |
 | `typescript/vercel-ai-sdk` | `@temporalio/vercel-ai-sdk` | 1.0.0 | ga | `@temporalio/vercel-ai-sdk` |
 | `typescript/google-adk` | `@temporalio/google-adk` | 0.1.0 | preview | `@temporalio/google-adk` |
@@ -49,9 +49,9 @@ site cannot live in a monorepo subdirectory under an unchanged import path; deci
 repo, new import path, or staying in sdk-go) before that migration.
 
 Naming derivation, enforced by `scripts/ci/check_conventions.py`: folder name = `plugin.toml`
-`name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API =
-`temporalio.contrib.<name>`; release tag = `<language>/<name>/v<version>`. Folders never end in
-`-plugin` or `_plugin`.
+`name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API is
+either `temporalio.contrib.<name>` or `temporalio.<name>` as declared in `plugin.toml`; release tag
+= `<language>/<name>/v<version>`. Folders never end in `-plugin` or `_plugin`.
 
 Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree): `ga` =
 `Development Status :: 5 - Production/Stable`; `preview` = `4 - Beta`; `experimental` = `3 - Alpha`.
@@ -68,9 +68,9 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
 
 ## Python conventions
 
-- Layout: `python/<name>/{pyproject.toml, uv.lock, plugin.toml, Makefile, README.md, LICENSE, src/temporalio/contrib/<name>/, tests/}`. Migrated plugins keep the upstream test tree (`tests/contrib/<name>/...`, `tests/helpers/`, `tests/conftest.py`) so re-syncs never conflict; flatten only after cutover.
-- Build backend `uv_build` with `module-name = "temporalio.contrib.<name>"`. `py.typed` ships in the leaf package (redundant with the SDK's marker, kept on purpose).
-- Installs are non-editable. `temporalio` is a regular package owned by the SDK wheel, so an editable install of a plugin can make `temporalio.contrib.<name>` resolve incorrectly. `python/_shared/python.mk` exports `UV_NO_EDITABLE=1`, reinstalls the plugin last to support future overlapping migrations, and `[tool.uv] cache-keys` includes `src/**/*` so edits trigger a rebuild.
+- Layout: `python/<name>/{pyproject.toml, uv.lock, plugin.toml, Makefile, README.md, LICENSE, src/<root-api>/, tests/}`. Migrated plugins keep the upstream test tree (`tests/contrib/<name>/...`, `tests/helpers/`, `tests/conftest.py`) so re-syncs never conflict; flatten only after cutover.
+- Build backend `uv_build` with `module-name` equal to `plugin.toml`'s `root-api`. `py.typed` ships in the leaf package (redundant with the SDK's marker, kept on purpose).
+- Installs are non-editable. `temporalio` is a regular package owned by the SDK wheel, so an editable install of a plugin can resolve incorrectly unless the SDK extends its package path. `python/_shared/python.mk` exports `UV_NO_EDITABLE=1`, reinstalls the plugin last to support future overlapping migrations, and `[tool.uv] cache-keys` includes `src/**/*` so edits trigger a rebuild.
 - Provenance guard (`tests/helpers/provenance.py`, mirrored by `scripts/ci/smoke.py`) runs at every pytest session start and fails loudly if the install is editable, any file differs from the distribution's RECORD, files under the package directory are not owned by the distribution, or another distribution ships the same paths. The shared smoke check can temporarily tolerate a second distribution while a plugin's `[release] allow-final = false`; release-ready plugins use strict provenance. `tests/test_installed_matches_source.py` additionally byte-compares the installed package with `src/`.
 - Dependency cooldown: `exclude-newer = "2 weeks"` (org supply-chain policy) with `exclude-newer-package = { temporalio = false }` so a new SDK release is adoptable the day it ships; a plugin that depends on another plugin adds that coordinate too (`temporalio-mcp = false` in `openai_agents`), otherwise a fresh first-party release is invisible to `uv lock` for two weeks. Declare exactly what the package imports at module level; `openinference` and similar lazy imports go in an extra.
 - Tooling: ruff, pyright, basedpyright, mypy (`mypy_path = "src"`, `explicit_package_bases`), pydocstyle (google), pytest + xdist (`-n auto --dist=worksteal`; the `os._exit(0)` hook is xdist-aware). All invoked through `make` targets; see `make help`.
@@ -107,11 +107,11 @@ Runbook for `python/<name>`:
 
 ## Cutover sequencing
 
-- Merge the SDK removal and publish `temporalio` 1.34.0 before publishing the plugin's final 1.0.0 release. The plugin requires `temporalio>=1.34.0`, so ordinary dependency resolution prevents installation beside an SDK release that still bundles the same module. Regenerate and commit `python/openai_agents/uv.lock` as soon as 1.34.0 is available from PyPI.
+- Publish `temporalio-openai-agents` 1.0.0 first. Its `temporalio.openai_agents` root does not overlap the SDK's former `temporalio.contrib.openai_agents` files, so it can safely support `temporalio>=1.33.0`. Then make the SDK's `openai-agents` extra forward to the published package, merge the SDK removal and publish `temporalio` 1.34.0.
 
 ## Cutover checklist
 
-SDK side: merge the removal PR and publish 1.34.0; optionally add a helpful `ImportError` via `temporalio.contrib.__getattr__`, `pkgutil.extend_path` in `temporalio/__init__.py` and `temporalio/contrib/__init__.py` (enables editable installs), and a public export of `TemporalIdGenerator`. Docs: repoint `openai-agents.mdx` and the install text; decide where the plugin API reference is hosted (the SDK's pydoctor site loses these pages). Downstream: `samples-python` dependency groups, `auto-aie` path assumptions, `cicd-terraform` onboarding (merge commits allowed, required check `ci-status`, CLA app installed first).
+SDK side: make the `openai-agents` extra depend on `temporalio-openai-agents`, retain explicit compatibility modules under `temporalio.contrib.openai_agents`, add `pkgutil.extend_path` to `temporalio/__init__.py` for editable installs, merge the removal PR and publish 1.34.0; consider a public export of `TemporalIdGenerator`. Docs: repoint `openai-agents.mdx` and the install text; decide where the plugin API reference is hosted (the SDK's pydoctor site loses these pages). Downstream: `samples-python` dependency groups, `auto-aie` path assumptions, `cicd-terraform` onboarding (merge commits allowed, required check `ci-status`, CLA app installed first).
 
 ## Verification commands
 

@@ -7,8 +7,8 @@ from typing import Any
 import opentelemetry.trace
 
 import temporalio.converter
+from temporalio.contrib.opentelemetry._id_generator import TemporalIdGenerator
 
-from ..opentelemetry._id_generator import TemporalIdGenerator
 from ._trace_interceptor import (
     OpenAIAgentsContextPropagationInterceptor,
     _InputWithHeaders,

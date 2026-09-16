@@ -32,7 +32,8 @@ from pydantic_core import to_json
 
 from temporalio import workflow
 from temporalio.client import Client, WorkflowFailureError
-from temporalio.contrib.openai_agents import (
+from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.openai_agents import (
     AgentsWorkflowError,
     ModelActivityParameters,
     OpenAIAgentsPlugin,
@@ -40,11 +41,11 @@ from temporalio.contrib.openai_agents import (
     SandboxClientProvider,
     TemporalWorkerEnvValue,
 )
-from temporalio.contrib.openai_agents._openai_runner import _has_sandbox_agent
-from temporalio.contrib.openai_agents._temporal_worker_env_ref import (
+from temporalio.openai_agents._openai_runner import _has_sandbox_agent
+from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
 )
-from temporalio.contrib.openai_agents.sandbox._temporal_activity_models import (
+from temporalio.openai_agents.sandbox._temporal_activity_models import (
     CreateSessionArgs,
     ExecArgs,
     HydrateWorkspaceArgs,
@@ -61,23 +62,22 @@ from temporalio.contrib.openai_agents.sandbox._temporal_activity_models import (
     StopArgs,
     WriteArgs,
 )
-from temporalio.contrib.openai_agents.sandbox._temporal_activity_models import (
+from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ExecResult as ExecResultModel,
 )
-from temporalio.contrib.openai_agents.sandbox._temporal_sandbox_client import (
+from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
-from temporalio.contrib.openai_agents.sandbox._temporal_worker_env_value import (
+from temporalio.openai_agents.sandbox._temporal_worker_env_value import (
     _resolvable_worker_env_vars,
 )
-from temporalio.contrib.openai_agents.testing import (
+from temporalio.openai_agents.testing import (
     AgentEnvironment,
     ResponseBuilders,
     TestModel,
     TestModelProvider,
 )
-from temporalio.contrib.openai_agents.workflow import temporal_sandbox_client
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.openai_agents.workflow import temporal_sandbox_client
 from temporalio.workflow import ActivityConfig
 from tests.helpers import new_worker
 

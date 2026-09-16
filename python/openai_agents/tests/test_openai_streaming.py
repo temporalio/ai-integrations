@@ -45,9 +45,9 @@ from openai.types.shared.response_format_text import ResponseFormatText
 
 from temporalio import workflow
 from temporalio.client import Client, WorkflowFailureError
-from temporalio.contrib.openai_agents import ModelActivityParameters
-from temporalio.contrib.openai_agents.testing import AgentEnvironment
 from temporalio.contrib.workflow_streams import WorkflowStream, WorkflowStreamClient
+from temporalio.openai_agents import ModelActivityParameters
+from temporalio.openai_agents.testing import AgentEnvironment
 from tests.helpers import new_worker
 
 logger = logging.getLogger(__name__)

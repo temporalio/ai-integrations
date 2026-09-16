@@ -25,13 +25,13 @@ from openai.types.responses import (
 )
 
 from temporalio.client import Client
-from temporalio.contrib.openai_agents._mcp import (
+from temporalio.openai_agents._mcp import (
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
 )
-from temporalio.contrib.openai_agents._model_parameters import ModelActivityParameters
-from temporalio.contrib.openai_agents._temporal_openai_agents import OpenAIAgentsPlugin
-from temporalio.contrib.openai_agents._temporal_worker_env_ref import (
+from temporalio.openai_agents._model_parameters import ModelActivityParameters
+from temporalio.openai_agents._temporal_openai_agents import OpenAIAgentsPlugin
+from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     _snapshot_resolvable_env_vars,
 )
@@ -166,7 +166,7 @@ class AgentEnvironment:
     for OpenAI agents with mocked model calls and Temporal integration.
 
     Example:
-        >>> from temporalio.contrib.openai_agents.testing import AgentEnvironment, TestModelProvider, ResponseBuilders
+        >>> from temporalio.openai_agents.testing import AgentEnvironment, TestModelProvider, ResponseBuilders
         >>> from temporalio.client import Client
         >>>
         >>> # Create a mock model that returns predefined responses

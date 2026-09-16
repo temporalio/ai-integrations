@@ -13,16 +13,16 @@ from pydantic import BaseModel, TypeAdapter
 from pydantic_core import SchemaSerializer
 from pydantic_core.core_schema import any_schema
 
-from temporalio.contrib.openai_agents import (
+from temporalio.exceptions import ApplicationError
+from temporalio.openai_agents import (
     AllowAllWorkerEnvVars,
     OpenAIPayloadConverter,
     TemporalWorkerEnvValue,
 )
-from temporalio.contrib.openai_agents.sandbox._temporal_activity_models import ExecArgs
-from temporalio.contrib.openai_agents.sandbox._temporal_worker_env_value import (
+from temporalio.openai_agents.sandbox._temporal_activity_models import ExecArgs
+from temporalio.openai_agents.sandbox._temporal_worker_env_value import (
     _resolvable_worker_env_vars_scope,
 )
-from temporalio.exceptions import ApplicationError
 
 SECRET = "sk-not-in-history-1234567890"
 NAME = "TEST_WORKER_ENV_VALUE_NAME"

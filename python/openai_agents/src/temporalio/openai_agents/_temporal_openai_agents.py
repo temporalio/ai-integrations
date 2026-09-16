@@ -29,22 +29,6 @@ from agents.tracing.provider import DefaultTraceProvider
 from openai._models import construct_type
 
 import temporalio.api.common.v1
-from temporalio.contrib.openai_agents._errors import AgentsWorkflowError
-from temporalio.contrib.openai_agents._invoke_model_activity import ModelActivity
-from temporalio.contrib.openai_agents._model_parameters import ModelActivityParameters
-from temporalio.contrib.openai_agents._openai_runner import (
-    TemporalOpenAIRunner,
-)
-from temporalio.contrib.openai_agents._temporal_trace_provider import (
-    TemporalTraceProvider,
-)
-from temporalio.contrib.openai_agents._temporal_worker_env_ref import (
-    AllowAllWorkerEnvVars,
-    _snapshot_resolvable_env_vars,
-)
-from temporalio.contrib.openai_agents._trace_interceptor import (
-    OpenAIAgentsContextPropagationInterceptor,
-)
 from temporalio.contrib.opentelemetry._tracer_provider import ReplaySafeTracerProvider
 from temporalio.contrib.pydantic import (
     PydanticJSONPlainPayloadConverter,
@@ -56,12 +40,28 @@ from temporalio.converter import (
     DefaultPayloadConverter,
     JSONPlainPayloadConverter,
 )
+from temporalio.openai_agents._errors import AgentsWorkflowError
+from temporalio.openai_agents._invoke_model_activity import ModelActivity
+from temporalio.openai_agents._model_parameters import ModelActivityParameters
+from temporalio.openai_agents._openai_runner import (
+    TemporalOpenAIRunner,
+)
+from temporalio.openai_agents._temporal_trace_provider import (
+    TemporalTraceProvider,
+)
+from temporalio.openai_agents._temporal_worker_env_ref import (
+    AllowAllWorkerEnvVars,
+    _snapshot_resolvable_env_vars,
+)
+from temporalio.openai_agents._trace_interceptor import (
+    OpenAIAgentsContextPropagationInterceptor,
+)
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 if typing.TYPE_CHECKING:
-    from temporalio.contrib.openai_agents import (
+    from temporalio.openai_agents import (
         SandboxClientProvider,
         StatefulMCPServerProvider,
         StatelessMCPServerProvider,
@@ -264,7 +264,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
         >>> from temporalio.client import Client
         >>> from temporalio.worker import Worker
         >>> from agents.mcp import MCPServerStreamableHttp
-        >>> from temporalio.contrib.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
+        >>> from temporalio.openai_agents import OpenAIAgentsPlugin, ModelActivityParameters
         >>> from datetime import timedelta
         >>>
         >>> # Configure model parameters
@@ -383,7 +383,7 @@ class OpenAIAgentsPlugin(SimplePlugin):
             # provider path remains importable with MCP v1.
             try:
                 from temporalio.contrib.mcp._activities import _MCPActivities
-                from temporalio.contrib.openai_agents._mcp_backend import (
+                from temporalio.openai_agents._mcp_backend import (
                     _mcp_server_backend_factory,
                 )
             except ImportError as err:

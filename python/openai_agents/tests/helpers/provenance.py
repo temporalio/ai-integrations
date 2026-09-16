@@ -5,7 +5,7 @@ an isolated environment.
 
 Why this exists: ``temporalio`` is a regular package owned by the SDK wheel, so this plugin is
 installed *into* it. Two failure modes are silent without this guard: an editable install can make
-``temporalio.contrib.<name>`` resolve incorrectly, and another distribution can write the same
+``temporalio.<name>`` resolve incorrectly, and another distribution can write the same
 file paths as this distribution.
 """
 
@@ -36,7 +36,7 @@ def check_provenance(
 
     Args:
         dist_name: Distribution name, e.g. ``temporalio-openai-agents``.
-        pkg_rel: Root API as a relative path, e.g. ``temporalio/contrib/openai_agents``.
+        pkg_rel: Root API as a relative path, e.g. ``temporalio/openai_agents``.
     Raises:
         ProvenanceError: on an editable install, a RECORD mismatch, files under the package
             directory that this distribution does not own, or a second distribution shipping
@@ -50,7 +50,7 @@ def check_provenance(
     direct_url = dist.read_text("direct_url.json")
     if direct_url and json.loads(direct_url).get("dir_info", {}).get("editable"):
         raise ProvenanceError(
-            f"{dist_name} is installed editable, so temporalio.contrib.* cannot resolve to src/; "
+            f"{dist_name} is installed editable, so the SDK-owned temporalio package cannot resolve to src/; "
             "run `make sync` (it exports UV_NO_EDITABLE=1)"
         )
 

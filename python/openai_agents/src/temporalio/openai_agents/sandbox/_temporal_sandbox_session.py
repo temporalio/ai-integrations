@@ -11,7 +11,7 @@ from agents.sandbox.session.sandbox_session_state import SandboxSessionState
 from agents.sandbox.types import ExecResult, User
 
 from temporalio import workflow
-from temporalio.contrib.openai_agents.sandbox._temporal_activity_models import (
+from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ExecArgs,
     HydrateWorkspaceArgs,
     PersistWorkspaceArgs,
@@ -27,7 +27,7 @@ from temporalio.contrib.openai_agents.sandbox._temporal_activity_models import (
     StopArgs,
     WriteArgs,
 )
-from temporalio.contrib.openai_agents.sandbox._temporal_activity_models import (
+from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ExecResult as ExecResultModel,
 )
 from temporalio.workflow import ActivityConfig
