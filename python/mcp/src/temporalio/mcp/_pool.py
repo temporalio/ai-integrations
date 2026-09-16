@@ -9,7 +9,7 @@ from typing import Any, cast
 from mcp import MCPError
 from mcp.types import CONNECTION_CLOSED, REQUEST_TIMEOUT, UNSUPPORTED_PROTOCOL_VERSION
 
-from temporalio.contrib.mcp._backend import _MCPBackend, _MCPBackendFactory
+from temporalio.mcp._backend import _MCPBackend, _MCPBackendFactory
 
 # JSON-RPC error codes that make a cached connection unsafe to reuse. Every
 # other MCPError is an error *response*, proof that the transport still works.

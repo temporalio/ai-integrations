@@ -26,10 +26,10 @@ from mcp.types import (
 )
 
 from temporalio import activity
-from temporalio.contrib.mcp import _activities
-from temporalio.contrib.mcp._activities import _MCPActivities
-from temporalio.contrib.mcp._client import _MCPClientBackend
 from temporalio.exceptions import ApplicationError
+from temporalio.mcp import _activities
+from temporalio.mcp._activities import _MCPActivities
+from temporalio.mcp._client import _MCPClientBackend
 
 
 class FakeClient:
@@ -156,9 +156,7 @@ async def test_operations_are_plain_json_and_lists_are_fully_paginated() -> None
             ("list-resources", "resources"),
             ("list-resource-templates", "resource_templates"),
         ):
-            result = await functions[f"temporalio.contrib.mcp.test.{operation}"](
-                request
-            )
+            result = await functions[f"temporalio.mcp.test.{operation}"](request)
             assert [item["name"] for item in result[result_key]] == ["one", "two"]
             assert result["next_cursor"] is None
             assert result["meta"] == {"page-one": True, "page-two": True}
@@ -166,17 +164,17 @@ async def test_operations_are_plain_json_and_lists_are_fully_paginated() -> None
             assert result["cache_scope"] == "private"
             assert result["result_type"] == "test/list"
 
-        tool_result = await functions["temporalio.contrib.mcp.test.call-tool"](
+        tool_result = await functions["temporalio.mcp.test.call-tool"](
             {**request, "name": "echo", "arguments": {}, "meta": {"trace": "value"}}
         )
         assert tool_result["content"][0]["text"] == "echo"
 
-        prompt_result = await functions["temporalio.contrib.mcp.test.get-prompt"](
+        prompt_result = await functions["temporalio.mcp.test.get-prompt"](
             {**request, "name": "prompt", "arguments": {}}
         )
         assert prompt_result["messages"][0]["content"]["text"] == "prompt"
 
-        resource_result = await functions["temporalio.contrib.mcp.test.read-resource"](
+        resource_result = await functions["temporalio.mcp.test.read-resource"](
             {**request, "uri": "test://resource"}
         )
         assert resource_result["contents"][0]["text"] == "contents"
@@ -213,7 +211,7 @@ async def test_unknown_resource_protocol_error_fails_without_retry() -> None:
     )
     read_resource = _activity_by_name(
         support,
-        "temporalio.contrib.mcp.test.read-resource",
+        "temporalio.mcp.test.read-resource",
     )
     try:
         with pytest.raises(ApplicationError, match="Unknown resource") as err:
@@ -239,7 +237,7 @@ async def test_internal_protocol_error_remains_retryable() -> None:
     )
     get_prompt = _activity_by_name(
         support,
-        "temporalio.contrib.mcp.test.get-prompt",
+        "temporalio.mcp.test.get-prompt",
     )
     try:
         with pytest.raises(ApplicationError, match="Failed to get prompt") as err:
@@ -277,7 +275,7 @@ async def test_permanent_protocol_error_fails_without_retry() -> None:
         {"test": lambda: _MCPClientBackend(cast(Any, ElicitingClient()))},
         idle_timeout=timedelta(minutes=5),
     )
-    call_tool = _activity_by_name(support, "temporalio.contrib.mcp.test.call-tool")
+    call_tool = _activity_by_name(support, "temporalio.mcp.test.call-tool")
     try:
         with pytest.raises(ApplicationError, match="needs a browser") as err:
             await call_tool(
@@ -309,7 +307,7 @@ async def test_invalid_server_response_fails_without_retry() -> None:
     )
     get_prompt = _activity_by_name(
         support,
-        "temporalio.contrib.mcp.test.get-prompt",
+        "temporalio.mcp.test.get-prompt",
     )
     try:
         with pytest.raises(ApplicationError, match="invalid response") as err:

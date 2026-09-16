@@ -32,4 +32,4 @@ class _ReadResourceRequest(_MCPRequest):
 
 
 def _activity_name(server: str, operation: str) -> str:
-    return f"temporalio.contrib.mcp.{server}.{operation}"
+    return f"temporalio.mcp.{server}.{operation}"

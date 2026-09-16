@@ -34,7 +34,7 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 # src/temporalio and src/temporalio/contrib must NOT contain __init__.py: the SDK wheel owns them.
-module-name = "temporalio.contrib.mcp"
+module-name = "temporalio.mcp"
 
 [dependency-groups]
 dev = [

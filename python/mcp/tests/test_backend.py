@@ -2,8 +2,8 @@ from typing import Any
 
 import pytest
 
-from temporalio.contrib.mcp._backend import _factory_accepts_argument, _FactoryInvoker
 from temporalio.exceptions import ApplicationError
+from temporalio.mcp._backend import _factory_accepts_argument, _FactoryInvoker
 
 
 def test_parameterless_factory_is_called_with_no_arguments() -> None:
