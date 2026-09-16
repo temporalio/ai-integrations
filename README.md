@@ -4,10 +4,10 @@ Plugins that connect AI agent frameworks and SDKs to [Temporal](https://temporal
 execution. Each plugin is its own package with its own dependencies, tests, version and release
 cadence, laid out as `<language>/<integration>/`.
 
-| Plugin | Package | Root API | Maturity |
-|---|---|---|---|
-| [`python/mcp`](python/mcp) | [`temporalio-mcp`](https://pypi.org/project/temporalio-mcp/) | `temporalio.contrib.mcp` | Experimental |
-| [`python/openai_agents`](python/openai_agents) | [`temporalio-openai-agents`](https://pypi.org/project/temporalio-openai-agents/) | `temporalio.openai_agents` | GA |
+| Language | Plugin | Package | Root API | Maturity | Docs |
+|---|---|---|---|---|---|
+| Python | [`python/mcp`](python/mcp) | [`temporalio-mcp`](https://pypi.org/project/temporalio-mcp/) | `temporalio.mcp` | Experimental | [MCP](python/mcp#readme) |
+| Python | [`python/openai_agents`](python/openai_agents) | [`temporalio-openai-agents`](https://pypi.org/project/temporalio-openai-agents/) | `temporalio.openai_agents` | GA | [OpenAI Agents SDK](https://docs.temporal.io/develop/python/integrations/openai-agents) |
 
 More plugins are migrating here from the SDK repositories; see the target table in
 [`AGENTS.md`](AGENTS.md).

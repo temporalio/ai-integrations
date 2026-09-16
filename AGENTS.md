@@ -27,7 +27,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 
 | Folder | Coordinate | First version here | Maturity | Root API |
 |---|---|---|---|---|
-| `python/mcp` | `temporalio-mcp` | 0.1.0 | experimental | `temporalio.contrib.mcp` |
+| `python/mcp` | `temporalio-mcp` | 0.1.0 | experimental | `temporalio.mcp` |
 | `python/deepagents` | `temporalio-deepagents` | 0.1.0 | experimental | `temporalio.contrib.deepagents` |
 | `python/google_adk` | `temporalio-google-adk` | 0.1.0 | preview | `temporalio.contrib.google_adk` |
 | `python/google_genai` | `temporalio-google-genai` | 0.1.0 | experimental | `temporalio.contrib.google_genai` |
@@ -49,9 +49,10 @@ site cannot live in a monorepo subdirectory under an unchanged import path; deci
 repo, new import path, or staying in sdk-go) before that migration.
 
 Naming derivation, enforced by `scripts/ci/check_conventions.py`: folder name = `plugin.toml`
-`name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API is
-either `temporalio.contrib.<name>` or `temporalio.<name>` as declared in `plugin.toml`; release tag
-= `<language>/<name>/v<version>`. Folders never end in `-plugin` or `_plugin`.
+`name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API =
+`temporalio.<name>`; release tag = `<language>/<name>/v<version>`. Folders never end in `-plugin`
+or `_plugin`. An upstream-backed migration may temporarily retain `temporalio.contrib.<name>` only
+while `[release] allow-final = false`.
 
 Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree): `ga` =
 `Development Status :: 5 - Production/Stable`; `preview` = `4 - Beta`; `experimental` = `3 - Alpha`.
@@ -68,10 +69,10 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
 
 ## Python conventions
 
-- Layout: `python/<name>/{pyproject.toml, uv.lock, plugin.toml, Makefile, README.md, LICENSE, src/<root-api>/, tests/}`. Migrated plugins keep the upstream test tree (`tests/contrib/<name>/...`, `tests/helpers/`, `tests/conftest.py`) so re-syncs never conflict; flatten only after cutover.
-- Build backend `uv_build` with `module-name` equal to `plugin.toml`'s `root-api`. `py.typed` ships in the leaf package (redundant with the SDK's marker, kept on purpose).
-- Installs are non-editable. `temporalio` is a regular package owned by the SDK wheel, so an editable install of a plugin can resolve incorrectly unless the SDK extends its package path. `python/_shared/python.mk` exports `UV_NO_EDITABLE=1`, reinstalls the plugin last to support future overlapping migrations, and `[tool.uv] cache-keys` includes `src/**/*` so edits trigger a rebuild.
-- Provenance guard (`tests/helpers/provenance.py`, mirrored by `scripts/ci/smoke.py`) runs at every pytest session start and fails loudly if the install is editable, any file differs from the distribution's RECORD, files under the package directory are not owned by the distribution, or another distribution ships the same paths. The shared smoke check can temporarily tolerate a second distribution while a plugin's `[release] allow-final = false`; release-ready plugins use strict provenance. `tests/test_installed_matches_source.py` additionally byte-compares the installed package with `src/`.
+- Layout: `python/<name>/{pyproject.toml, uv.lock, plugin.toml, Makefile, README.md, LICENSE, src/temporalio/<name>/, tests/}`. Migrated plugins may temporarily keep the upstream source and test trees while final releases are disabled; flatten and move to the final root at cutover.
+- Build backend `uv_build` with `module-name = "temporalio.<name>"`. `py.typed` ships in the leaf package (redundant with the SDK's marker, kept on purpose).
+- Installs are non-editable. `temporalio` is a regular package owned by the SDK wheel, so an editable install of a plugin can resolve incorrectly unless the SDK extends its package path. `python/_shared/python.mk` exports `UV_NO_EDITABLE=1` and reinstalls the plugin last to support overlapping migrations; `[tool.uv] cache-keys` includes `src/**/*` so edits trigger a rebuild; `link-mode = "copy"` keeps overwrites deterministic during the transition.
+- Provenance guard (`tests/helpers/provenance.py`, mirrored by `scripts/ci/smoke.py`) runs at every pytest session start and fails loudly if the install is editable, any file differs from the distribution's RECORD, files under the package directory are not owned by the distribution, or another distribution ships the same paths. While `plugin.toml` `[release] allow-final = false`, the SDK's overlap (`temporalio<=1.32` ships `temporalio/contrib/openai_agents/*`) is tolerated with a warning. `tests/test_installed_matches_source.py` additionally byte-compares the installed package with `src/`.
 - Dependency cooldown: `exclude-newer = "2 weeks"` (org supply-chain policy) with `exclude-newer-package = { temporalio = false }` so a new SDK release is adoptable the day it ships; a plugin that depends on another plugin adds that coordinate too (`temporalio-mcp = false` in `openai_agents`), otherwise a fresh first-party release is invisible to `uv lock` for two weeks. Declare exactly what the package imports at module level; `openinference` and similar lazy imports go in an extra.
 - Tooling: ruff, pyright, basedpyright, mypy (`mypy_path = "src"`, `explicit_package_bases`), pydocstyle (google), pytest + xdist (`-n auto --dist=worksteal`; the `os._exit(0)` hook is xdist-aware). All invoked through `make` targets; see `make help`.
 - Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in a plugin's conftest only when one of its tests needs a server feature that is off by default.

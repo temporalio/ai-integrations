@@ -15,7 +15,7 @@ import mcp_types
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.contrib.mcp import TemporalMCPClient
+from temporalio.mcp import TemporalMCPClient
 
 with workflow.unsafe.imports_passed_through():
     import uvicorn
@@ -24,7 +24,7 @@ with workflow.unsafe.imports_passed_through():
     from mcp.types import TextContent, TextResourceContents
 
     from temporalio.client import Client as TemporalClient
-    from temporalio.contrib.mcp import MCPPlugin
+    from temporalio.mcp import MCPPlugin
     from temporalio.worker import Replayer
     from tests.helpers import new_worker
 
@@ -141,13 +141,13 @@ async def test_native_workflow_operations_and_replay(client: TemporalClient) -> 
         history = await handle.fetch_history()
 
     assert names == [
-        "temporalio.contrib.mcp.rich.list-tools",
-        "temporalio.contrib.mcp.rich.call-tool",
-        "temporalio.contrib.mcp.rich.list-prompts",
-        "temporalio.contrib.mcp.rich.get-prompt",
-        "temporalio.contrib.mcp.rich.list-resources",
-        "temporalio.contrib.mcp.rich.list-resource-templates",
-        "temporalio.contrib.mcp.rich.read-resource",
+        "temporalio.mcp.rich.list-tools",
+        "temporalio.mcp.rich.call-tool",
+        "temporalio.mcp.rich.list-prompts",
+        "temporalio.mcp.rich.get-prompt",
+        "temporalio.mcp.rich.list-resources",
+        "temporalio.mcp.rich.list-resource-templates",
+        "temporalio.mcp.rich.read-resource",
     ]
     await Replayer(workflows=[NativeMCPWorkflow], plugins=[plugin]).replay_workflow(
         history

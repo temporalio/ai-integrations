@@ -110,7 +110,8 @@ class Checker:
         )
         package_parts = (
             root_api.split(".")
-            if root_api in {f"temporalio.contrib.{name}", f"temporalio.{name}"}
+            if isinstance(root_api, str)
+            and root_api in {f"temporalio.contrib.{name}", f"temporalio.{name}"}
             else ["temporalio", "contrib", name]
         )
         package_rel = Path("src", *package_parts)
@@ -154,10 +155,8 @@ class Checker:
             return
         expected_coordinate = "temporalio-" + plugin.name.replace("_", "-")
         root_api = p.get("root-api")
-        allowed_root_apis = {
-            "temporalio.contrib." + plugin.name,
-            "temporalio." + plugin.name,
-        }
+        expected_root_api = "temporalio." + plugin.name
+        transitional_root_api = "temporalio.contrib." + plugin.name
         if p.get("name") != plugin.name:
             self.fail(f"{rel}: plugin.toml name {p.get('name')!r} must equal the folder name {plugin.name!r}")
         if p.get("language") != plugin.language:
@@ -166,10 +165,17 @@ class Checker:
             self.fail(f"{rel}: plugin.toml coordinate must be {expected_coordinate!r} (got {p.get('coordinate')!r})")
         if p.get("registry") != REGISTRIES[plugin.language]:
             self.fail(f"{rel}: plugin.toml registry must be {REGISTRIES[plugin.language]!r}")
-        if root_api not in allowed_root_apis:
+        release = meta.get("release", {})
+        is_transitional_root = (
+            root_api == transitional_root_api
+            and isinstance(p.get("upstream"), str)
+            and release.get("allow-final") is False
+        )
+        if root_api != expected_root_api and not is_transitional_root:
             self.fail(
-                f"{rel}: plugin.toml root-api must be one of "
-                f"{sorted(allowed_root_apis)!r} (got {root_api!r})"
+                f"{rel}: plugin.toml root-api must be {expected_root_api!r}; "
+                f"{transitional_root_api!r} is allowed only for an upstream-backed migration "
+                f"with [release] allow-final = false (got {root_api!r})"
             )
         maturity = p.get("maturity")
         if maturity not in MATURITY_CLASSIFIER:
@@ -177,7 +183,6 @@ class Checker:
         for banned in ("owners", "live-secrets", "secrets"):
             if banned in p or banned in meta.get("ci", {}):
                 self.fail(f"{rel}: plugin.toml must not contain {banned!r} (ownership is CODEOWNERS; CI has no secrets)")
-        release = meta.get("release", {})
         if not isinstance(release.get("allow-final"), bool):
             self.fail(f"{rel}: plugin.toml [release] allow-final must be a boolean")
         versions = meta.get("ci", {}).get("runtime-versions")

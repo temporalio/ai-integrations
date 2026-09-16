@@ -4,8 +4,8 @@ import dataclasses
 from collections.abc import Mapping
 from datetime import timedelta
 
-from temporalio.contrib.mcp._activities import _MCPActivities
-from temporalio.contrib.mcp._client import (
+from temporalio.mcp._activities import _MCPActivities
+from temporalio.mcp._client import (
     _mcp_client_backend_factory,
     _MCPClientFactory,
 )
@@ -20,7 +20,7 @@ class MCPPlugin(SimplePlugin):
     This class is experimental and may change in future versions.
 
     The mapping keys are durable server names used by
-    :class:`temporalio.contrib.mcp.TemporalMCPClient`. Factories and transports
+    :class:`temporalio.mcp.TemporalMCPClient`. Factories and transports
     remain on the worker, so credentials are not captured in workflow history.
 
     A factory may declare one positional parameter. It receives the workflow

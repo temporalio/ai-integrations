@@ -3,10 +3,12 @@
 
 Usage:
     python3 scripts/new_python_plugin.py NAME --description "..." [--coordinate NAME] \
-        [--maturity ga|preview|experimental] [--existing]
+        [--maturity ga|preview|experimental] [--existing] [--upstream SOURCE]
 
 ``--existing`` lets the scaffolder fill in packaging files a history import did not
 bring without touching anything that already exists, in particular ``src/``.
+``--upstream`` selects the temporary ``temporalio.contrib`` layout for such a
+migration and disables final releases until cutover.
 
 Standard library only; Python 3.11+.
 """
@@ -36,6 +38,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--coordinate", help="PyPI name; default temporalio-<name with _ -> ->")
     parser.add_argument("--maturity", choices=sorted(MATURITY_CLASSIFIER), default="experimental")
     parser.add_argument("--existing", action="store_true", help="add missing files to an existing plugin dir")
+    parser.add_argument(
+        "--upstream",
+        help="upstream source for a migration (for example temporalio/sdk-python:temporalio/contrib/NAME)",
+    )
     return parser.parse_args(argv)
 
 
@@ -53,14 +59,18 @@ def main(argv: list[str]) -> int:
     name = args.name
     validate_name(name)
     coordinate = args.coordinate or "temporalio-" + name.replace("_", "-")
+    module = f"temporalio.contrib.{name}" if args.upstream else f"temporalio.{name}"
     substitutions = {
         "__NAME__": name,
         "__COORDINATE__": coordinate,
-        "__MODULE__": f"temporalio.contrib.{name}",
+        "__MODULE__": module,
+        "__MODULE_PATH__": module.replace(".", os.sep),
         "__DESCRIPTION__": args.description,
         "__MATURITY__": args.maturity,
         "__MATURITY_CLASSIFIER__": MATURITY_CLASSIFIER[args.maturity],
         "__DOCS_SLUG__": name.replace("_", "-"),
+        "__UPSTREAM__": f'upstream = "{args.upstream}"' if args.upstream else "",
+        "__ALLOW_FINAL__": "false" if args.upstream else "true",
     }
 
     target = REPO_ROOT / "python" / name
@@ -73,7 +83,9 @@ def main(argv: list[str]) -> int:
     for src in sorted(TEMPLATE.rglob("*")):
         if src.is_dir() or "__pycache__" in src.parts or src.suffix == ".pyc":
             continue
-        rel = str(src.relative_to(TEMPLATE)).replace("__NAME__", name)
+        rel = str(src.relative_to(TEMPLATE))
+        for placeholder in ("__NAME__", "__MODULE_PATH__"):
+            rel = rel.replace(placeholder, substitutions[placeholder])
         if rel.endswith(".tmpl"):
             rel = rel[: -len(".tmpl")]
         dest = target / rel
