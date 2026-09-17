@@ -24,7 +24,7 @@ from agents import (
     UserError,
 )
 from agents.items import TResponseStreamEvent
-from agents.tool import ShellTool, ShellToolEnvironment
+from agents.tool import ApplyPatchTool, ShellTool, ShellToolEnvironment
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -36,10 +36,12 @@ from temporalio.openai_agents import (
 )
 from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
+    ApplyPatchToolInput,
     FunctionToolInput,
     HandoffInput,
     ModelActivity,
     ModelTracingInput,
+    ShellToolInput,
     StreamingActivityModelInput,
     _build_tool,
     _build_tools_and_handoffs,
@@ -74,7 +76,9 @@ def test_lenient_activity_input_reconstructs_tools_and_handoffs():
                 name="get_weather",
                 description="Get the weather",
                 params_json_schema={"type": "object"},
-            )
+            ),
+            ApplyPatchToolInput(name="apply_patch"),
+            ShellToolInput(name="apply_patch", environment={"type": "local"}),
         ],
         "handoffs": [
             HandoffInput(
@@ -97,9 +101,13 @@ def test_lenient_activity_input_reconstructs_tools_and_handoffs():
     received_tools = received.get("tools")
     received_handoffs = received.get("handoffs")
     assert received_tools and isinstance(received_tools[0], FunctionToolInput)
+    assert isinstance(received_tools[1], ApplyPatchToolInput)
+    assert isinstance(received_tools[2], ShellToolInput)
     assert received_handoffs and isinstance(received_handoffs[0], HandoffInput)
     tools, handoffs = _build_tools_and_handoffs(received, _WorkerEnvRefResolver(()))
     assert tools[0].name == "get_weather"
+    assert isinstance(tools[1], ApplyPatchTool)
+    assert isinstance(tools[2], ShellTool)
     assert handoffs[0].agent_name == "helper"
 
 

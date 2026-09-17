@@ -95,8 +95,8 @@ class ShellToolInput:
     execution to determine what tool to call, not the actual tool invocation, which remains in the workflow context.
     """
 
+    environment: ShellToolEnvironment | None
     name: str = "shell"
-    environment: ShellToolEnvironment | None = None
 
 
 class _NoopApplyPatchEditor:
