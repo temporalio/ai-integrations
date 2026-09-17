@@ -228,6 +228,15 @@ async def _noop_shell_executor(*_a: Any, **_kw: Any) -> str:
     return ""
 
 
+def _raise_unknown_tool(tool: Any) -> NoReturn:
+    if isinstance(tool, dict):
+        raise UserError(
+            "Tool input was not reconstructed into a supported tool type; "
+            f"got a dict with keys: {sorted(tool)}"
+        )
+    raise UserError(f"Unknown tool type: {getattr(tool, 'name', type(tool).__name__)}")
+
+
 def _build_tool(tool: ToolInput, env_refs: _WorkerEnvRefResolver) -> Tool:
     """Reconstruct a Tool from its data-conversion-friendly input form."""
     if isinstance(
@@ -276,7 +285,7 @@ def _build_tool(tool: ToolInput, env_refs: _WorkerEnvRefResolver) -> Tool:
             strict_json_schema=tool.strict_json_schema,
         )
     else:
-        raise UserError(f"Unknown tool type: {tool.name}")  # type:ignore[reportUnreachable]
+        _raise_unknown_tool(tool)  # type:ignore[reportUnreachable]
 
 
 def _build_tools_and_handoffs(

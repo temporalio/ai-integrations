@@ -1,5 +1,6 @@
 """Tests for worker environment references in hosted tool secrets."""
 
+import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Collection
@@ -20,6 +21,7 @@ from agents import (
     Tool,
     TResponseInputItem,
     Usage,
+    UserError,
 )
 from agents.items import TResponseStreamEvent
 from agents.tool import ShellTool, ShellToolEnvironment
@@ -34,9 +36,13 @@ from temporalio.openai_agents import (
 )
 from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
+    FunctionToolInput,
+    HandoffInput,
     ModelActivity,
+    ModelTracingInput,
     StreamingActivityModelInput,
     _build_tool,
+    _build_tools_and_handoffs,
 )
 from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
 from temporalio.openai_agents._temporal_worker_env_ref import (
@@ -56,6 +62,50 @@ OTHER_SENTINEL = "sk-test-other-8c3d5e0a1f"
 OTHER_ENV_NAME = "TEMPORAL_TEST_OTHER_TOOL_SECRET"
 
 _RESOLVER_ALLOWING_TEST_NAMES = _WorkerEnvRefResolver([ENV_NAME, OTHER_ENV_NAME])
+
+
+def test_lenient_activity_input_reconstructs_tools_and_handoffs():
+    activity_input: ActivityModelInput = {
+        "model_name": "gpt-5",
+        "input": "hi",
+        "model_settings": ModelSettings(),
+        "tools": [
+            FunctionToolInput(
+                name="get_weather",
+                description="Get the weather",
+                params_json_schema={"type": "object"},
+            )
+        ],
+        "handoffs": [
+            HandoffInput(
+                tool_name="transfer_to_agent",
+                tool_description="Transfer to the agent",
+                input_json_schema={"type": "object"},
+                agent_name="helper",
+            )
+        ],
+        "tracing": ModelTracingInput.DISABLED,
+    }
+    converter = OpenAIPayloadConverter()
+    payload = converter.to_payload(activity_input)
+    raw = json.loads(payload.data)
+    raw["tracing"] = "invalid-enum-value"
+    payload.data = json.dumps(raw).encode()
+
+    received = converter.from_payload(payload, ActivityModelInput)
+
+    received_tools = received.get("tools")
+    received_handoffs = received.get("handoffs")
+    assert received_tools and isinstance(received_tools[0], FunctionToolInput)
+    assert received_handoffs and isinstance(received_handoffs[0], HandoffInput)
+    tools, handoffs = _build_tools_and_handoffs(received, _WorkerEnvRefResolver(()))
+    assert tools[0].name == "get_weather"
+    assert handoffs[0].agent_name == "helper"
+
+
+def test_build_tool_reports_unreconstructed_dict():
+    with pytest.raises(UserError, match="not reconstructed.*dict.*name"):
+        _build_tool(cast(Any, {"name": "get_weather"}), _WorkerEnvRefResolver(()))
 
 
 def _round_trip_activity_input(tool: Tool) -> tuple[bytes, ActivityModelInput]:
