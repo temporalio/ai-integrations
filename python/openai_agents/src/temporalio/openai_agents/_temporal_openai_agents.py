@@ -27,6 +27,7 @@ from agents.tracing.provider import DefaultTraceProvider
 # one the SDK uses to parse live API responses. It is in a private module but
 # has no public alias.
 from openai._models import construct_type
+from typing_extensions import NotRequired, Required, is_typeddict
 
 import temporalio.api.common.v1
 from temporalio.contrib.opentelemetry._tracer_provider import ReplaySafeTracerProvider
@@ -166,12 +167,24 @@ def _set_open_ai_agent_temporal_overrides(
 def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
     """Build ``value`` into ``type_`` without enforcing required fields.
 
-    OpenAI's ``construct_type`` handles its own response models (and the
-    unions/lists thereof), but not the ``agents`` dataclasses that wrap them
-    (e.g. ``ModelResponse``), so the dataclass layer is reconstructed here and
-    each field delegated to ``construct_type``. ``include_extras`` preserves the
-    ``Annotated`` discriminators the unions rely on.
+    OpenAI's ``construct_type`` handles its own response models, but not the
+    ``TypedDict`` and ``agents`` dataclass layers that wrap them (e.g.
+    ``ActivityModelInput`` and ``ModelResponse``). Walk those containers here,
+    then delegate their leaves to ``construct_type``. ``include_extras``
+    preserves the ``Annotated`` discriminators the unions rely on.
     """
+    origin = typing.get_origin(type_)
+    if origin in (Required, NotRequired):
+        return _lenient_construct(typing.get_args(type_)[0], value)
+    if is_typeddict(type_) and isinstance(value, dict):
+        hints = typing.get_type_hints(type_, include_extras=True)
+        return {
+            key: _lenient_construct(hints.get(key, object), item)
+            for key, item in value.items()
+        }
+    if origin is list and isinstance(value, list):
+        (item_type,) = typing.get_args(type_)
+        return [_lenient_construct(item_type, item) for item in value]
     if (
         isinstance(type_, type)
         and dataclasses.is_dataclass(type_)
