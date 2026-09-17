@@ -14,7 +14,9 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager, contextmanager
+from contextvars import Token
 from datetime import timedelta
+from weakref import WeakKeyDictionary
 
 import pydantic
 from agents import ModelProvider, Trace, set_trace_provider
@@ -62,6 +64,10 @@ from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 if typing.TYPE_CHECKING:
+    from openinference.instrumentation.openai_agents._processor import (
+        OpenInferenceTracingProcessor,
+    )
+
     from temporalio.openai_agents import (
         SandboxClientProvider,
         StatefulMCPServerProvider,
@@ -72,6 +78,9 @@ if typing.TYPE_CHECKING:
 _otel_trace_start_patch_lock = threading.RLock()
 _otel_trace_start_patch_ref_count = 0
 _otel_trace_start_original: Callable[..., typing.Any] | None = None
+_otel_trace_end_original: (
+    Callable[["OpenInferenceTracingProcessor", Trace], None] | None
+) = None
 _otel_trace_start_instrumentor: typing.Any | None = None
 
 
@@ -79,25 +88,41 @@ def _install_otel_instrumentation(tracer_provider: typing.Any) -> None:
     """Configure OpenInference while at least one tracing context is active."""
     global _otel_trace_start_instrumentor
     global _otel_trace_start_original
+    global _otel_trace_end_original
     global _otel_trace_start_patch_ref_count
 
     from openinference.instrumentation.openai_agents import OpenAIAgentsInstrumentor
     from openinference.instrumentation.openai_agents._processor import (
         OpenInferenceTracingProcessor,
     )
-    from opentelemetry.context import attach
+    from opentelemetry.context import Context, attach, detach
     from opentelemetry.trace import set_span_in_context
 
     with _otel_trace_start_patch_lock:
         if _otel_trace_start_patch_ref_count == 0:
             original_on_trace_start = OpenInferenceTracingProcessor.on_trace_start
+            original_on_trace_end = OpenInferenceTracingProcessor.on_trace_end
             _otel_trace_start_original = original_on_trace_start
+            _otel_trace_end_original = original_on_trace_end
+            trace_tokens: WeakKeyDictionary[Trace, Token[Context]] = WeakKeyDictionary()
 
-            def on_trace_start(self: typing.Any, trace: Trace) -> None:  # type: ignore[reportUnusedFunction]
-                original_on_trace_start(self, trace)
-                attach(set_span_in_context(self._root_spans[trace.trace_id]))
+            def on_trace_start(
+                self: OpenInferenceTracingProcessor, trace: Trace
+            ) -> None:
+                original_on_trace_start(self=self, trace=trace)
+                trace_tokens[trace] = attach(
+                    set_span_in_context(self._root_spans[trace.trace_id])
+                )
+
+            def on_trace_end(self: OpenInferenceTracingProcessor, trace: Trace) -> None:
+                try:
+                    original_on_trace_end(self=self, trace=trace)
+                finally:
+                    if token := trace_tokens.pop(trace, None):
+                        detach(token)
 
             setattr(OpenInferenceTracingProcessor, "on_trace_start", on_trace_start)
+            setattr(OpenInferenceTracingProcessor, "on_trace_end", on_trace_end)
             try:
                 _otel_trace_start_instrumentor = OpenAIAgentsInstrumentor()
                 _otel_trace_start_instrumentor.instrument(
@@ -109,7 +134,13 @@ def _install_otel_instrumentation(tracer_provider: typing.Any) -> None:
                     "on_trace_start",
                     _otel_trace_start_original,
                 )
+                setattr(
+                    OpenInferenceTracingProcessor,
+                    "on_trace_end",
+                    _otel_trace_end_original,
+                )
                 _otel_trace_start_original = None
+                _otel_trace_end_original = None
                 _otel_trace_start_instrumentor = None
                 raise
         _otel_trace_start_patch_ref_count += 1
@@ -119,6 +150,7 @@ def _uninstall_otel_instrumentation() -> None:
     """Tear down OpenInference after the final tracing context exits."""
     global _otel_trace_start_instrumentor
     global _otel_trace_start_original
+    global _otel_trace_end_original
     global _otel_trace_start_patch_ref_count
 
     from openinference.instrumentation.openai_agents._processor import (
@@ -140,7 +172,14 @@ def _uninstall_otel_instrumentation() -> None:
                         "on_trace_start",
                         _otel_trace_start_original,
                     )
+                if _otel_trace_end_original is not None:
+                    setattr(
+                        OpenInferenceTracingProcessor,
+                        "on_trace_end",
+                        _otel_trace_end_original,
+                    )
                 _otel_trace_start_original = None
+                _otel_trace_end_original = None
                 _otel_trace_start_instrumentor = None
 
 
@@ -487,7 +526,6 @@ class OpenAIAgentsPlugin(SimplePlugin):
 
             interceptor = OTelOpenAIAgentsContextPropagationInterceptor(
                 add_temporal_spans=add_temporal_spans,
-                otel_id_generator=provider.id_generator(),
             )
 
         @asynccontextmanager
