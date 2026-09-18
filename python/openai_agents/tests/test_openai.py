@@ -4,7 +4,7 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import nexusrpc
 import pydantic
@@ -117,6 +117,9 @@ from tests.helpers.nexus import make_nexus_endpoint_name
 from tests.research_agents.research_manager import (
     ResearchManager,
 )
+
+if TYPE_CHECKING:
+    import httpx2
 
 
 def hello_mock_model():
@@ -1435,14 +1438,14 @@ async def assert_status_retry_behavior(
     def status_error(status: int) -> ModelResponse:
         with workflow.unsafe.imports_passed_through():
             with workflow.unsafe.sandbox_unrestricted():
-                import httpx
+                import httpx2
             error_type: type[APIStatusError] = (
                 RateLimitError if status == 429 else APIStatusError
             )
             raise error_type(
                 message="Something went wrong.",
-                response=httpx.Response(
-                    status_code=status, request=httpx.Request("GET", url="")
+                response=httpx2.Response(
+                    status_code=status, request=httpx2.Request("GET", url="")
                 ),
                 body=None,
             )
@@ -1503,13 +1506,13 @@ async def test_exception_handling(client: Client):
 
 
 def _openai_status_error(status: int, headers: dict[str, str]) -> APIStatusError:
-    import httpx
+    import httpx2
 
     return APIStatusError(
         message="Something went wrong.",
-        response=httpx.Response(
+        response=httpx2.Response(
             status_code=status,
-            request=httpx.Request("GET", url=""),
+            request=httpx2.Request("GET", url=""),
             headers=headers,
         ),
         body=None,
@@ -1572,7 +1575,7 @@ class CustomModelProvider(ModelProvider):
 
 
 async def test_chat_completions_model(client: Client):
-    import httpx
+    import httpx2
 
     requests: list[dict[str, Any]] = []
     responses = iter(
@@ -1632,15 +1635,15 @@ async def test_chat_completions_model(client: Client):
         ]
     )
 
-    def handle_request(request: httpx.Request) -> httpx.Response:
+    def handle_request(request: "httpx2.Request") -> "httpx2.Response":
         assert request.method == "POST"
         assert request.url.host == "openai.invalid"
         assert request.url.path == "/v1/chat/completions"
         requests.append(json.loads(request.content))
-        return httpx.Response(200, json=next(responses))
+        return httpx2.Response(200, json=next(responses))
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handle_request)
+    async with httpx2.AsyncClient(
+        transport=httpx2.MockTransport(handle_request)
     ) as http_client:
         openai_client = AsyncOpenAI(
             api_key="not-a-real-key",
