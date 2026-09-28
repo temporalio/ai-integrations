@@ -14,6 +14,7 @@ cadence.
 | [`python/deepagents`](python/deepagents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-deepagents.svg)](https://pypi.org/project/temporalio-deepagents/) (Pre-release, no Python 3.10 support) |
 | [`python/google_adk`](python/google_adk) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-adk.svg)](https://pypi.org/project/temporalio-google-adk/) (Pre-release) |
 | [`python/google_genai`](python/google_genai) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-genai.svg)](https://pypi.org/project/temporalio-google-genai/) (Public Preview) |
+| [`python/harbor`](python/harbor) | [![PyPI](https://img.shields.io/pypi/v/temporalio-harbor.svg)](https://pypi.org/project/temporalio-harbor/) (Pre-release, no Python 3.10 or 3.11 support) |
 | [`python/langgraph`](python/langgraph) | [![PyPI](https://img.shields.io/pypi/v/temporalio-langgraph.svg)](https://pypi.org/project/temporalio-langgraph/) (Public Preview) |
 | [`python/langsmith`](python/langsmith) | [![PyPI](https://img.shields.io/pypi/v/temporalio-langsmith.svg)](https://pypi.org/project/temporalio-langsmith/) (Public Preview) |
 | [`python/mcp`](python/mcp) | [![PyPI](https://img.shields.io/pypi/v/temporalio-mcp.svg)](https://pypi.org/project/temporalio-mcp/) (Public Preview) |

@@ -1,0 +1,19 @@
+# Schema: ../../AGENTS.md#repository-invariants
+
+[plugin]
+name = "harbor"
+language = "python"
+coordinate = "temporalio-harbor"
+registry = "pypi"
+root-api = "temporalio.harbor"
+maturity = "experimental"
+docs = "https://github.com/temporalio/ai-integrations/tree/main/python/harbor#readme"
+
+[release]
+allow-final = true
+
+[ci]
+runtime-versions = ["3.12", "3.14"]
+
+[smoke]
+imports = ["temporalio.harbor._plugin", "temporalio.harbor._workflow"]
