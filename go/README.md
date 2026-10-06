@@ -4,10 +4,6 @@ Plugins that connect Go AI frameworks and SDKs to Temporal. Each plugin lives
 in `go/<name>/` as an independent Go module with its own source, tests,
 `go.mod`, `go.sum`, `plugin.toml`, `Makefile`, `README.md` and `LICENSE`.
 
-Current plugins:
-
-- [`googleadk`](googleadk/README.md): Google ADK integration.
-
 Each plugin's README describes its API and installation. Its `go.mod` sets
 the minimum Go version, and `plugin.toml` records its maturity, upstream
 and release status.
