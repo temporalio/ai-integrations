@@ -63,6 +63,8 @@ def native_id(meta: Any) -> str:
 
 
 class Burst:
+    supervised = False
+
     def __init__(
         self,
         root: Path,

@@ -7,6 +7,96 @@ at commit [`3ac4b25`](https://github.com/brianstrauch/claude-agent-sdk-python/co
 See [Main-agent recovery](#main-agent-recovery-with-the-sdk-fork-2026-09-30)
 for setup and the recovery/suspension experiments.
 
+## High-priority prototype fixes (2026-10-06)
+
+The live native-tool prototype in [`tests/hybrid/native.py`](tests/hybrid/native.py)
+now runs **Read, Edit, Write, Bash and configured MCP tools** through the same
+long-lived CLI. Each original call still has its own Temporal Activity and stored
+result. Workspace tools execute in order, and their permission is withheld until
+the Workflow has accepted the original ID and scheduled its Activity. Ten native
+Bash rounds used **one CLI process** and measured **181.9 ms median** between model
+requests on a small local workspace (Python 3.14.4, Temporal 1.33.0, pinned SDK fork,
+CLI 2.1.273, deterministic local Messages API). This measurement includes Activity
+dispatch, result storage and workspace snapshots; provider latency and larger
+workspaces will change it.
+
+The execution ledger refuses a second permission for an ID that may already have
+executed. Tool Activity retries rejoin the original executor or return its committed
+native result. Worker replacement returns committed results under their original
+IDs without running the effect again. A Worker lost after an external effect but
+before outcome publication **fails closed and requires reconciliation**. This is
+an explicit ambiguous outcome, not a successful result: arbitrary Bash commands
+and non-idempotent MCP services cannot safely be retried without a service receipt
+or equivalent idempotency support. The tests use an external append-only file and
+a deliberately non-idempotent MCP charge service, and verify one effect after both
+Activity retry and Worker loss.
+
+Native Edit and Write retain Claude's own execution, schemas and results. After a
+committed overwrite, the SDK fork completes the original pending transcript before
+starting the replacement CLI. The engine therefore sees the original successful
+result and does not revalidate the already-modified file. Both Edit and an
+overwriting Write after a Read are covered across Worker loss, including Workflow
+history replay. This is the prototype's workaround for
+[claude-code#99041](https://github.com/anthropics/claude-code/issues/99041).
+
+Workspace snapshots now preserve a complete managed tree of regular files and
+directories, including binary contents, empty directories, file deletions,
+permissions and modification times. The original result and tree are committed
+together. Replacement Workers restore the tree before starting their CLI. A local
+OS lock prevents checkout while the previous executor is alive, and database
+ownership checks fence stale result/snapshot writers. Links, special files and
+snapshots over 64 MiB fail publication. All Workers still need the shared
+transactional store and the same logical working-directory path. This is not a
+filesystem sandbox or a rollback mechanism for external effects.
+
+The packaged segment runner and live native prototype now require a supervisor.
+On Linux the supervisor becomes a subreaper before startup, so orphaned tool
+processes are adopted by it. On macOS it retains process lifetime IDs and original
+parent IDs throughout execution, including after a child detaches or its parent
+exits. The engine waits at an exec gate until its own identity has been recorded.
+POSIX cleanup freezes and stops owned processes before releasing the workspace
+lock; it requires `/bin/ps`, plus Linux `prctl` or macOS `proc_pidinfo` support.
+The macOS identity interface is private and fails startup if unavailable. It can
+recover direct detached children after immediate engine exit; a fast double fork
+whose intermediate parent disappears before discovery still requires a stronger
+execution boundary on macOS. On Windows it assigns a suspended engine to a
+kill-on-close job before letting it run. The supervisor retains its
+lock until cleanup finishes. A missing launcher, unavailable lock, or failed job
+setup prevents engine startup; there is no warning-and-continue fallback. Crash
+probes cover Worker loss, normal engine exit, engine SIGKILL, and immediate exit
+after spawning a detached child. They verify that writes stop before a replacement
+can obtain the lock, while unrelated processes continue running. A real in-flight
+Bash command also stops before reaching its delayed external write. Actual
+Windows job behavior is implemented but was not exercised on this macOS host.
+
+These changes extend the test prototype; the exported durable-agent API still
+uses segments. Subagent recovery and the older checkpoint/replay experiments
+retain their documented limits below.
+
+```bash
+cd python/claude_agent_sdk
+make sync
+make lint
+make test PYTEST_ARGS='tests/test_process.py tests/hybrid/test_workspace_snapshot.py tests/hybrid/test_native_effects.py -n 3 -q'
+# Print the native Bash round measurement:
+make test PYTEST_ARGS='tests/hybrid/test_native_effects.py -k native_rounds -n 0 -s -q'
+```
+
+Initial validation on this host: the full regression run passed **251 tests**, with
+the opt-in benchmark skipped. The recovery/cleanup suite passed **42 tests**,
+and two additional real-engine permission-callback regressions passed for the
+live client and segment query. Lint, wheel/sdist checks and isolated artifact
+smoke installs passed. Repository conventions passed in a disposable clean
+worktree; the working checkout retains ignored virtualenv directories from other
+branches, which the conventions discovery otherwise treats as missing plugins.
+
+The P1 supervision follow-up passed **263 tests** in the full regression run,
+with the opt-in benchmark and Linux-only double-fork case skipped on macOS.
+A final process-only check passed **13 tests**. Linux container probes covered Worker loss,
+normal engine exit, engine SIGKILL, immediate exit and double-fork cleanup. The
+process tests also verify startup fencing, PID reuse protection, lock reuse and
+continued execution of unrelated processes.
+
 Temporal integration for Anthropic's [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview), published as [`temporalio-claude-agent-sdk`](https://pypi.org/project/temporalio-claude-agent-sdk/) and imported as `temporalio.claude_agent_sdk`.
 
 - **Every durable tool call Claude makes is its own Temporal Activity.** Finished calls never run again after a crash, retries follow your retry policy, and the Activity ID (`tool-<tool_use_id>`) doubles as an idempotency key for the systems a tool touches.

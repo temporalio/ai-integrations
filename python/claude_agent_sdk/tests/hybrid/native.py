@@ -11,6 +11,7 @@ from typing import Any
 from claude_agent_sdk import HookMatcher, ResultMessage, ToolResultBlock
 
 from temporalio import activity
+from temporalio.claude_agent_sdk._managed import SupervisedClient
 from temporalio.exceptions import ApplicationError
 from tests.hybrid.activities import HybridActivities
 from tests.hybrid.engine import Burst, PrototypeBlocked
@@ -20,12 +21,16 @@ from tests.hybrid.workflows import HybridWorkflow
 
 
 class NativeBurst(Burst):
+    supervised = True
+
     def __init__(self, *args: Any, native_store: NativeStore, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.native_store = native_store
-        self.sdk.options.tools = ["Read", "Edit"]
-        self.sdk.options.allowed_tools = ["Read", "Edit"]
-        self.sdk.options.mcp_servers = {}
+        self.sdk.options.tools = sorted(
+            t for t in native_store.tools if not t.startswith("mcp__")
+        )
+        self.sdk.options.allowed_tools = sorted(native_store.tools)
+        self.sdk.options.mcp_servers = native_store.mcp_servers
         self.sdk.options.permission_mode = "acceptEdits"
         if hasattr(self.sdk.options, "parallel_tool_recovery"):
             # Read/Edit share mutable workspace state; restore them in order.
@@ -36,15 +41,18 @@ class NativeBurst(Burst):
             setattr(self.sdk.options, "recover_pending_tool", None)
         self.sdk.options.hooks = {
             "PreToolUse": [
-                HookMatcher(matcher="Read|Edit", hooks=[self.pre_tool], timeout=120)
+                HookMatcher(matcher=".*", hooks=[self.pre_tool], timeout=120)
             ],
             "PostToolUse": [
-                HookMatcher(matcher="Read|Edit", hooks=[self.post_tool], timeout=120)
+                HookMatcher(matcher=".*", hooks=[self.post_tool], timeout=120)
             ],
             "PostToolUseFailure": [
-                HookMatcher(matcher="Read|Edit", hooks=[self.post_tool], timeout=120)
+                HookMatcher(matcher=".*", hooks=[self.post_tool], timeout=120)
             ],
         }
+        self.sdk = SupervisedClient(self.sdk.options, native_store.lock_path)
+        self.native_gate = asyncio.Lock()
+        self.gated: set[str] = set()
 
     async def open(self) -> NativeBurst:
         await asyncio.to_thread(self.native_store.checkout, self.attempt)
@@ -60,7 +68,7 @@ class NativeBurst(Burst):
         return self
 
     async def recover_tool(self, pending: Any) -> ToolResultBlock:
-        if pending.key != self.key or pending.name not in {"Read", "Edit"}:
+        if pending.key != self.key or pending.name not in self.native_store.tools:
             raise PrototypeBlocked("unexpected native recovery call")
         uid, subpath = await self.store.wait_call(
             self.key, pending.id, pending.name, pending.input, self.storage_timeout
@@ -72,7 +80,7 @@ class NativeBurst(Burst):
             raise PrototypeBlocked(
                 "native recovery blocked: no committed execution result for "
                 + pending.name
-                + "; the CLI has no verified pending built-in executor protocol"
+                + "; its effect may have executed and requires reconciliation"
             )
         call = Call(pending.id, pending.name, dict(pending.input), self.attempt, uid)
         self.calls[call.id] = call
@@ -104,6 +112,8 @@ class NativeBurst(Burst):
             # completion ahead of the next tool's execution permission.
             if self.callbacks:
                 await asyncio.gather(*self.callbacks)
+            await self.native_gate.acquire()
+            self.gated.add(tid)
             deadline = time.monotonic() + self.storage_timeout
             while tid not in self.observed:
                 if time.monotonic() > deadline:
@@ -129,6 +139,7 @@ class NativeBurst(Burst):
 
             def completed(done: asyncio.Task[Reply]) -> None:
                 self.callbacks.discard(done)
+                self.release_gate(tid)
                 if not done.cancelled() and (error := done.exception()) is not None:
                     self.failure = error
 
@@ -151,7 +162,13 @@ class NativeBurst(Burst):
                     "permissionDecision": "allow",
                 }
             }
+        except asyncio.CancelledError:
+            if tid:
+                self.release_gate(tid)
+            raise
         except Exception as exc:
+            if tid:
+                self.release_gate(tid)
             self.failure = exc
             return {
                 "hookSpecificOutput": {
@@ -160,6 +177,11 @@ class NativeBurst(Burst):
                     "permissionDecisionReason": str(exc),
                 }
             }
+
+    def release_gate(self, tid: str) -> None:
+        if tid in self.gated:
+            self.gated.remove(tid)
+            self.native_gate.release()
 
     async def post_tool(self, data: Any, tid: str | None, context: Any) -> Any:
         del context
@@ -235,6 +257,8 @@ class NativeBurst(Burst):
 
 
 class NativeActivities(HybridActivities):
+    native_tools = True
+
     async def run_burst(self, inp: BurstInput) -> BurstResult:
         assert isinstance(self.store, NativeStore)
         info = activity.info()

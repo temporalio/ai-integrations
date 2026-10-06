@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
 import uuid
 from contextlib import suppress
 from pathlib import Path
@@ -79,9 +80,9 @@ def native_requests(api: FakeMessagesAPI) -> list[dict[str, Any]]:
 
 def stop_worker(proc: subprocess.Popen[bytes], root: Path) -> None:
     log = root / "cli-pids.jsonl"
-    pids = (
+    processes = (
         [
-            r["pid"]
+            r
             for r in map(json.loads, log.read_text().splitlines())
             if r["worker"] == proc.pid
         ]
@@ -92,11 +93,22 @@ def stop_worker(proc: subprocess.Popen[bytes], root: Path) -> None:
         proc.kill()
     # A supervising host owns this cleanup; Python teardown cannot run after
     # SIGKILL. Never kill a process that was not recorded by this test Worker.
-    for pid in pids:
+    for recorded in processes:
+        pid = recorded["pid"]
         if alive(pid):
             with suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
+                # A supervised PID is the launcher, not its child engine. Let
+                # it finish process-tree cleanup instead of SIGKILLing it.
+                os.kill(
+                    pid,
+                    signal.SIGTERM if recorded.get("supervised") else signal.SIGKILL,
+                )
     proc.wait()
+    supervised = [r["pid"] for r in processes if r.get("supervised")]
+    deadline = time.monotonic() + 5
+    while any(alive(pid) for pid in supervised) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not any(alive(pid) for pid in supervised), "engine supervisor did not stop"
 
 
 async def assert_native_history(

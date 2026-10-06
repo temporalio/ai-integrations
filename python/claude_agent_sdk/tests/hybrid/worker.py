@@ -9,6 +9,7 @@ from pathlib import Path
 from temporalio.client import Client
 from temporalio.worker import Worker
 from tests.hybrid.activities import HybridActivities
+from tests.hybrid.effects import configure_effects
 from tests.hybrid.executor_store import ExecutionStore
 from tests.hybrid.executor_workflow import NativeExecutionWorkflow
 from tests.hybrid.native import NativeActivities
@@ -44,7 +45,10 @@ async def main() -> None:
         return
     acts = HybridActivities(client, root, env, TranscriptStore(root / "store.db"))
     if phase := os.environ.get("HYBRID_NATIVE_PHASE"):
-        acts = NativeActivities(client, root, env, NativeStore(root, phase))
+        store = NativeStore(root, phase)
+        if os.environ.get("HYBRID_NATIVE_EFFECTS"):
+            configure_effects(store)
+        acts = NativeActivities(client, root, env, store)
     acts.recovery = os.environ.get("HYBRID_MAIN_RECOVERY") == "1"
     if os.environ.get("HYBRID_HOLD_DELIVERY"):
         acts.before_delivery = asyncio.Event()

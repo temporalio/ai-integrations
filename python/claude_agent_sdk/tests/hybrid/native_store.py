@@ -1,19 +1,18 @@
-"""Recoverable single-file workspace and original native tool results for probes."""
+"""Recoverable workspace and original native tool results for probes."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
-import os
-import shutil
-import stat
 import time
 from pathlib import Path
 from typing import Any, cast
 
 from claude_agent_sdk import SessionKey, SessionStoreEntry
 
+from temporalio.claude_agent_sdk._process import workspace_lock
+from temporalio.claude_agent_sdk._workspace import restore, snapshot
 from tests.hybrid.models import Attempt, Call
 from tests.hybrid.store import TranscriptStore
 
@@ -21,13 +20,16 @@ from tests.hybrid.store import TranscriptStore
 class NativeStore(TranscriptStore):
     """SQLite is a shared test service; each Worker materializes a disposable copy.
 
-    Only note.txt belongs to this experiment. This is not a general filesystem
-    snapshotter, a lease service, or a rollback mechanism for external effects.
+    The managed tree contains regular files and directories. Links and special
+    files fail publication. External effects cannot be rolled back with the tree.
     """
 
     def __init__(self, root: Path, phase: str = "live") -> None:
         super().__init__(root / "store.db")
         self.workspace = root / "workspace"
+        self.lock_path = root / "workspace.lock"
+        self.tools = {"Read", "Edit", "Write", "Bash"}
+        self.mcp_servers: dict[str, Any] = {}
         self.phase = phase
         self.owner = ""
         self.held = asyncio.Event()
@@ -60,6 +62,10 @@ class NativeStore(TranscriptStore):
             )
 
     def checkout(self, attempt: Attempt) -> None:
+        with workspace_lock(self.lock_path):
+            self._checkout(attempt)
+
+    def _checkout(self, attempt: Attempt) -> None:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -78,35 +84,35 @@ class NativeStore(TranscriptStore):
             )
             files = json.loads(row[3])
         self.owner = attempt.token
-        if self.workspace.exists():
-            shutil.rmtree(self.workspace)
-        self.workspace.mkdir()
-        for name, entry in files.items():
-            assert name == "note.txt"
-            path = self.workspace / name
-            path.write_bytes(base64.b64decode(entry["data"]))
-            path.chmod(entry["mode"])
-            if "mtime_ns" in entry:
-                os.utime(path, ns=(entry["mtime_ns"], entry["mtime_ns"]))
+        restore(self.workspace, files)
 
     def prepare(self, call: Call) -> None:
-        if call.name not in {"Read", "Edit"} or call.subpath:
+        if call.name not in self.tools or call.subpath:
             raise RuntimeError("unsupported native workspace call")
-        if Path(call.arguments["file_path"]).resolve() != self.workspace / "note.txt":
-            raise RuntimeError("native probe must stay in its managed workspace")
+        if call.name in {"Read", "Edit", "Write"}:
+            path = Path(call.arguments["file_path"]).resolve()
+            if self.workspace not in path.parents:
+                raise RuntimeError("native probe must stay in its managed workspace")
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             owner = db.execute("SELECT owner FROM workspace WHERE id=1").fetchone()[0]
             if owner != call.attempt.token:
                 raise RuntimeError("stale native executor")
             previous = db.execute(
-                "SELECT name,arguments,result FROM native_calls WHERE id=?", (call.id,)
+                "SELECT name,arguments,result,phase,owner FROM native_calls WHERE id=?",
+                (call.id,),
             ).fetchone()
             arguments = json.dumps(call.arguments, sort_keys=True)
             if previous and (previous[0], previous[1]) != (call.name, arguments):
                 raise RuntimeError("conflicting native execution ID")
             if previous and previous[2] is not None:
                 raise RuntimeError("native engine tried to repeat a completed call")
+            if previous and (
+                previous[3] != "requested" or previous[4] != call.attempt.token
+            ):
+                raise RuntimeError(
+                    "native effect may have executed; reconcile its original ID before retrying"
+                )
             db.execute(
                 "INSERT OR IGNORE INTO native_calls "
                 "VALUES (?,?,?,?,'requested',NULL,NULL,NULL)",
@@ -120,6 +126,28 @@ class NativeStore(TranscriptStore):
             if owner != call.attempt.token:
                 raise RuntimeError(
                     "native executor was lost without a committed result"
+                )
+            row = db.execute(
+                "SELECT name,arguments,owner,phase,result FROM native_calls WHERE id=?",
+                (call.id,),
+            ).fetchone()
+            if row is None or (row[0], row[1], row[2]) != (
+                call.name,
+                json.dumps(call.arguments, sort_keys=True),
+                call.attempt.token,
+            ):
+                raise RuntimeError("missing or conflicting native execution request")
+            if row[4] is not None or row[3] in {
+                "permitted",
+                "executed",
+                "held-before-execution",
+                "effect-without-result",
+            }:
+                # Rejoin the original live executor without issuing another permission.
+                return
+            if row[3] != "requested":
+                raise RuntimeError(
+                    "native effect may have executed; reconcile its original ID before retrying"
                 )
             db.execute(
                 "UPDATE native_calls SET phase='permitted' WHERE id=?", (call.id,)
@@ -140,16 +168,7 @@ class NativeStore(TranscriptStore):
             )
 
     def stage(self, tid: str) -> None:
-        path = self.workspace / "note.txt"
-        if path.is_symlink() or not path.is_file():
-            raise RuntimeError("native workspace artifact is not a regular file")
-        files = {
-            "note.txt": {
-                "data": base64.b64encode(path.read_bytes()).decode(),
-                "mode": stat.S_IMODE(path.stat().st_mode),
-                "mtime_ns": path.stat().st_mtime_ns,
-            }
-        }
+        files = snapshot(self.workspace)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if (
@@ -212,7 +231,7 @@ class NativeStore(TranscriptStore):
                         continue
                     tid = block["tool_use_id"]
                     row = db.execute(
-                        "SELECT owner,staged,result,name FROM native_calls WHERE id=?",
+                        "SELECT owner,staged,result,name,phase FROM native_calls WHERE id=?",
                         (tid,),
                     ).fetchone()
                     if row is None:
@@ -229,6 +248,10 @@ class NativeStore(TranscriptStore):
                         raise RuntimeError("stale native result writer")
                     if row[1] is None:
                         raise RuntimeError("native result has no workspace snapshot")
+                    if row[4] != "executed":
+                        raise RuntimeError(
+                            "native result has no execution acknowledgment"
+                        )
                     version += 1
                     db.execute(
                         "UPDATE workspace SET files=?,version=? WHERE id=1",

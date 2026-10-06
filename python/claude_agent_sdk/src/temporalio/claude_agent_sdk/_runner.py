@@ -63,13 +63,13 @@ from claude_agent_sdk import (
     create_sdk_mcp_server,
     fork_session_via_store,
     project_key_for_directory,
-    query,
     tool,
 )
 from temporalio import activity
 
 from ._defer_hook import STOPPED
 from ._events import emit
+from ._managed import supervised_query as query
 from ._models import DeferredCall, SegmentInput, SegmentOutput, ToolOutcome, ToolSpec
 
 ENV_AUTH = (

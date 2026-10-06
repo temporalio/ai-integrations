@@ -28,6 +28,8 @@ from tests.hybrid.workflows import HybridWorkflow
 
 
 class HybridActivities:
+    native_tools = False
+
     def __init__(
         self, client: Client, root: Path, env: dict[str, str], store: TranscriptStore
     ) -> None:
@@ -136,7 +138,7 @@ class HybridActivities:
             return await handle.execute_update(
                 HybridWorkflow.request,
                 call,
-                id="native-" + call.id if call.name in {"Read", "Edit"} else None,
+                id="native-" + call.id if self.native_tools else None,
             )
 
         resume = inp.checkpoint is not None or inp.recovering
@@ -165,7 +167,16 @@ class HybridActivities:
         async def run() -> BurstResult:
             await burst.open()
             with (self.root / "cli-pids.jsonl").open("a") as log:
-                log.write(json.dumps({"pid": burst.pid, "worker": os.getpid()}) + "\n")
+                log.write(
+                    json.dumps(
+                        {
+                            "pid": burst.pid,
+                            "worker": os.getpid(),
+                            "supervised": burst.supervised,
+                        }
+                    )
+                    + "\n"
+                )
             answers = []
             for offset, prompt in enumerate(inp.prompts):
                 index = inp.burst + offset

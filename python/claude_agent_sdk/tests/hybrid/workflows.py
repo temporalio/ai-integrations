@@ -167,7 +167,7 @@ class HybridWorkflow:
                 activity_id="tool-" + call.id,
                 start_to_close_timeout=timedelta(seconds=30),
                 heartbeat_timeout=(
-                    timedelta(seconds=3) if call.name in {"Read", "Edit"} else None
+                    timedelta(seconds=3) if call.name != "echo" else None
                 ),
                 retry_policy=RetryPolicy(maximum_attempts=2),
             )
