@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import inspect
 import random
 import time
@@ -208,6 +209,11 @@ class GoogleAdkPlugin(SimplePlugin):
 
             # If in sandbox, add additional passthrough
             if isinstance(runner, SandboxedWorkflowRunner):
+                # Runner.run_async lazily loads authentication for graph/HITL
+                # support, even for agents without MCP. Initialize its native
+                # cryptography dependencies outside the sandbox before either
+                # worker execution or replay. google.adk is passed through below.
+                importlib.import_module("google.adk.auth.auth_handler")
                 return dataclasses.replace(
                     runner,
                     restrictions=runner.restrictions.with_passthrough_modules(
