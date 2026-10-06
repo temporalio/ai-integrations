@@ -1,0 +1,18 @@
+# Schema: ../../AGENTS.md#repository-invariants.
+# History snapshot: sdk-go remains the published upstream until Go cutover.
+
+[plugin]
+name = "googleadk"
+language = "go"
+coordinate = "go.temporal.io/sdk/contrib/googleadk"
+registry = "goproxy"
+root-api = "googleadk"
+maturity = "public-preview"
+docs = "https://pkg.go.dev/go.temporal.io/sdk/contrib/googleadk"
+upstream = "temporalio/sdk-go:contrib/googleadk"
+
+[release]
+allow-final = false
+
+[ci]
+runtime-versions = ["1.26.5", "1.27"]

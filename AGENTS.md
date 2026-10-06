@@ -47,7 +47,11 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 "First version here" values are informational; the registry is the source of truth for the
 version policy (below). The Go row has an unresolved problem: a module served by the static vanity
 site cannot live in a monorepo subdirectory under an unchanged import path; decide (split mirror
-repo, new import path, or staying in sdk-go) before that migration.
+repo, new import path, or staying in sdk-go) before publishing cutover. `go/googleadk` is currently
+an upstream-backed history snapshot: sdk-go remains the published source, the existing module
+path is retained, and final releases here are disabled. Its source, tests and README remain
+unchanged; its inherited changelog is kept only in Git history. Go CI and release workflows
+remain cutover work.
 
 Naming derivation, enforced by `scripts/ci/check_conventions.py`: folder name = `plugin.toml`
 `name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API =
@@ -112,6 +116,9 @@ Runbook for `python/<name>`:
 6. If a job fails after an upload, use "Re-run failed jobs" on that run: `prepare`'s outputs and the tested artifact survive, the upload is skipped, and the smoke jobs verify the served files. A fresh dispatch on the tag also passes the version policy (the newest published version is treated as a re-run, with a warning) but rebuilds the artifacts, and `verify-index-files` fails if the rebuild is not byte-identical (a different uv version stamps its `Generator` into the wheel). If the artifacts themselves must change, fix forward with the next `rcN`; uploaded files are immutable and tags are never moved.
 
 ## Migration and re-sync
+
+Go history snapshots use `scripts/migrate/extract-sdk-go.sh` and the Go section of
+`scripts/migrate/README.md`, with the same default-branch and merge-commit requirements below.
 
 `scripts/migrate/extract-sdk-python.sh` plus `scripts/migrate/README.md` are the procedure. Only commits reachable from the upstream repository's default branch qualify as imported history. Work from an unmerged or closed PR, feature branch or fork is ordinary local work: do not apply `history-import` and do not add it to `scripts/migrate/IMPORTS.md`. Commit count, `Migrated-From` trailers and use of the migration tooling do not change that classification. For valid imports, find every historical path first; the script is frozen after a plugin's first import; label the PR `history-import` and merge it with a merge commit; keep adaptation files in separate commits on top; and record every import and re-sync in `IMPORTS.md`. Expected verification numbers are in the migration README.
 

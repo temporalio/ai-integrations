@@ -1,8 +1,9 @@
 # Import log
 
 Append-only record of every history import and re-sync performed with
-`scripts/migrate/extract-sdk-python.sh`. The merge SHA is the `--allow-unrelated-histories`
-merge commit on `main`.
+`scripts/migrate/extract-sdk-python.sh` or `scripts/migrate/extract-sdk-go.sh`.
+The merge SHA is the `--allow-unrelated-histories` merge commit retained when the
+import branch is merged to `main`.
 
 | Date (UTC) | Plugin | Source repo @ SHA | git-filter-repo | Merge SHA | Notes |
 |---|---|---|---|---|---|
@@ -15,3 +16,4 @@ merge commit on `main`.
 | 2026-10-05 | langgraph | temporalio/sdk-python @ 6adc0d84290a79952dee3ef02c36f6ed9334874a | 2.47.0 | 1c44efea656151f90d88caab0b7807d06ca00218 | initial import: 7 commits, 2 identities; upstream source and tests unchanged in the import merge; local API cutover is a separate commit; SDK module langgraph |
 | 2026-10-05 | langsmith | temporalio/sdk-python @ 6adc0d84290a79952dee3ef02c36f6ed9334874a | 2.47.0 | c67a20453d104ede255affecc22503e11980cb3d | initial import: 12 commits, 5 identities; upstream source and tests unchanged in the import merge; local API cutover is a separate commit; SDK module langsmith |
 | 2026-10-05 | strands_agents | temporalio/sdk-python @ 6adc0d84290a79952dee3ef02c36f6ed9334874a | 2.47.0 | a819a447f092a40601cfc988c9cedd1b9aed1d1c | initial import: 6 commits, 2 identities; upstream source and tests unchanged in the import merge; local API cutover is a separate commit; SDK module strands |
+| 2026-10-06 | go/googleadk | temporalio/sdk-go @ b7c1605ccd85e18d5bb2bb153c7b4077f2f4aa4b | 2.47.0 | 7bb092f662b1d0f433faad052da6c6d0e2985704 | initial history snapshot: 15 commits, 6 identities, 47 files, no tags; every commit's file blobs and author/committer metadata verified; source, tests, README and dependencies unchanged; separate local setup commit removes the inherited changelog and adds metadata, make targets and LICENSE; sdk-go remains the published upstream pending the Go vanity-path cutover |

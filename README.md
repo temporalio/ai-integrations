@@ -6,6 +6,7 @@ cadence, laid out as `<language>/<integration>/`.
 
 | Plugin | Package | Root API | Release stage |
 |---|---|---|---|
+| [`go/googleadk`](go/googleadk) | [`go.temporal.io/sdk/contrib/googleadk`](https://pkg.go.dev/go.temporal.io/sdk/contrib/googleadk) | `googleadk` | Public Preview |
 | [`python/deepagents`](python/deepagents) | `temporalio-deepagents` | `temporalio.deepagents` | [Pre-release](https://docs.temporal.io/develop/python/integrations/deepagents) |
 | [`python/google_adk`](python/google_adk) | `temporalio-google-adk` | `temporalio.google_adk` | [Pre-release](https://docs.temporal.io/develop/python/integrations/google-adk) |
 | [`python/google_genai`](python/google_genai) | `temporalio-google-genai` | `temporalio.google_genai` | [Public Preview](https://docs.temporal.io/develop/python/integrations/google-genai) |
@@ -17,6 +18,9 @@ cadence, laid out as `<language>/<integration>/`.
 
 More plugins are migrating here from the SDK repositories; see the target table in
 [`AGENTS.md`](AGENTS.md).
+
+Go is an upstream-backed history snapshot, still published from sdk-go. Development
+and the publishing-cutover status are documented in [`go/README.md`](go/README.md).
 
 ## Install
 
