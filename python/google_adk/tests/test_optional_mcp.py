@@ -51,6 +51,7 @@ async def test_cold_agent_execution_and_replay(
             """
 import asyncio
 import importlib.abc
+import os
 import sys
 from pathlib import Path
 
@@ -73,6 +74,12 @@ else:
 
 assert not any(name == "mcp" or name.startswith("mcp.") for name in sys.modules)
 assert "temporalio.google_adk._mcp" not in sys.modules
+
+# The SDK bridge can abort during interpreter shutdown on Python 3.10.
+# Match conftest's exit workaround only after execution/replay and all assertions.
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
 """,
             str(without_mcp),
             mode,
