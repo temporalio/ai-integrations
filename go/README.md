@@ -1,28 +1,36 @@
 # Go integrations
 
-[`googleadk`](googleadk) contains the Google ADK integration imported with its
-history from `temporalio/sdk-go`. See [`scripts/migrate/IMPORTS.md`](../scripts/migrate/IMPORTS.md)
-for the pinned upstream commit and import merge.
+Plugins that connect Go AI frameworks and SDKs to Temporal. Each plugin lives
+in `go/<name>/` as an independent Go module with its own source, tests,
+`go.mod`, `go.sum`, `plugin.toml`, `Makefile`, `README.md` and `LICENSE`.
+
+Current plugins:
+
+- [`googleadk`](googleadk/README.md): Google ADK integration.
+
+Each plugin's README describes its API and installation. Its `go.mod` sets
+the minimum Go version, and `plugin.toml` records its maturity, upstream
+and release status.
+
+Run the shared make targets from the plugin directory, replacing `<name>`
+with the plugin's folder name:
 
 ```bash
-cd go/googleadk
+cd go/<name>
 make sync
 make lint
 make test
 make build
 ```
 
-Go 1.26.5 or later is required. Tests use local models, mock transports and
-in-process MCP servers; integration tests start a local Temporal dev server
-and download the Temporal CLI on first use. Provider credentials are not required.
+Plugin Makefiles include [`_shared/go.mk`](_shared/go.mk). `make help` lists
+the targets; dependency checks use the committed module versions.
 
-This is a history snapshot, with `sdk-go` still the published upstream. The
-imported module path remains `go.temporal.io/sdk/contrib/googleadk`, and final
-releases here are disabled. Before publishing from this repository, resolve
-the Go vanity-path hosting decision in [`AGENTS.md`](../AGENTS.md).
+Tests must not require provider credentials. Use deterministic local models,
+mock transports or in-process servers. Tests that need Temporal start a local
+dev server and may download the Temporal CLI on first use.
 
-The imported source, tests, dependency files and README remain unchanged.
-The upstream changelog is preserved in Git history; this repository derives
-release notes from commits and does not maintain a changelog. The repository
-adds metadata, make targets and a copy of the root license in a separate commit.
-Go CI and release workflows must be added before the publishing cutover.
+Repository conventions and Go publishing requirements are in
+[`AGENTS.md`](../AGENTS.md). History imports and re-syncs follow
+[`scripts/migrate/README.md`](../scripts/migrate/README.md), with provenance
+recorded in [`IMPORTS.md`](../scripts/migrate/IMPORTS.md).
