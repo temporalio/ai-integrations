@@ -48,9 +48,12 @@ def test_ci_status_is_the_fan_in() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     status = doc["jobs"]["ci-status"]
     assert status["if"] == "always()"
-    assert set(status["needs"]) == {"changes", "conventions", "python"}
-    assert doc["jobs"]["python"]["uses"] == "./.github/workflows/_python-plugin.yml"
-    assert "needs.changes.result == 'success'" in doc["jobs"]["python"]["if"]
+    assert set(status["needs"]) == {"changes", "conventions", "python", "go"}
+    for language in ("python", "go"):
+        job = doc["jobs"][language]
+        assert job["uses"] == f"./.github/workflows/_{language}-plugin.yml"
+        assert "needs.changes.result == 'success'" in job["if"]
+        assert f"needs.changes.outputs.{language} != '[]'" in job["if"]
 
 
 def test_release_publish_jobs_are_inline_and_oidc_only() -> None:

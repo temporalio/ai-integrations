@@ -139,7 +139,8 @@ and updates self-imports, the worker plugin name, metadata and examples. Its
 active `upstream` field is removed because this repository now owns the code.
 The original UUID and span random-stream identifiers remain stable for replay
 compatibility. The extraction script and imported commit graph stay unchanged.
-Final releases remain disabled until vanity routing and Go CI/release workflows
+Go CI now runs the shared make targets across the declared runtimes and platforms.
+Final releases remain disabled until vanity routing and Go release automation
 are ready; the required subdirectory mapping is documented in AGENTS.md.
 
 For a plugin that still names an active upstream, run the frozen script unchanged

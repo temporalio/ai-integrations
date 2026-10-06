@@ -32,14 +32,31 @@ def test_classify_aggregates_results_by_plugin() -> None:
 
 def test_report_matches_ci_workflow_job_names() -> None:
     workflow = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
-    python_jobs = {
-        job["name"]
-        for job in workflow["jobs"].values()
-        if isinstance(job, dict) and str(job.get("uses", "")).endswith("_python-plugin.yml")
-    }
-    assert python_jobs == {"Python"}, (
-        "ci.yml renamed a Python job; update JOB_RE in scripts/ci/nightly_report.py"
-    )
-    for job in python_jobs:
-        match = nightly_report.JOB_RE.match(f"{job} (fakeplug) / fakeplug (ubuntu-latest, py3.14)")
+    for language, expected_name in (("python", "Python"), ("go", "Go")):
+        names = {
+            job["name"]
+            for job in workflow["jobs"].values()
+            if isinstance(job, dict) and str(job.get("uses", "")).endswith(f"_{language}-plugin.yml")
+        }
+        assert names == {expected_name}, (
+            f"ci.yml renamed a {language} job; update JOB_RE in scripts/ci/nightly_report.py"
+        )
+        match = nightly_report.JOB_RE.match(f"{expected_name} (fakeplug) / matrix")
         assert match is not None and match.group("plugin") == "fakeplug"
+        assert match.group("language") == expected_name
+    assert {"python", "go"}.issubset(workflow["jobs"]["nightly-report"]["needs"])
+
+
+def test_classify_go_failures_and_keep_language_identities_separate() -> None:
+    failing, passing = nightly_report.classify(
+        [
+            _job("Python (shared) / shared (ubuntu-latest, py3.14)", "success"),
+            _job("Go (shared) / matrix", "success"),
+            _job("Go (shared) / shared (ubuntu-latest, go1.26.5)", "failure"),
+            _job("Go (shared) / shared (windows-latest, go1.27)", "success"),
+            _job("Go (recovered) / recovered (macos-latest, go1.27)", "success"),
+            _job("Go (pending) / pending (ubuntu-latest, go1.27)", None),
+        ]
+    )
+    assert failing == {"go/shared"}
+    assert passing == {"shared", "go/recovered"}

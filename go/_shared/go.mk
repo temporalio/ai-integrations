@@ -6,16 +6,23 @@ GOFLAGS += -mod=readonly
 export GOFLAGS
 .DEFAULT_GOAL := help
 
-.PHONY: help sync lint test build
+.PHONY: help sync sync-latest lint test build
 
 help:
 	@echo "sync   Download and verify the committed module dependencies"
+	@echo "sync-latest   Upgrade compatible dependencies for nightly checks"
 	@echo "lint   Check formatting and run go vet"
 	@echo "test   Run all tests, including local Temporal dev-server coverage"
 	@echo "build  Build all packages"
 
 sync:
 	$(GO) mod download
+	$(GO) mod verify
+
+# These updates stay in the CI checkout; do not commit nightly dependency drift.
+sync-latest:
+	$(GO) get -u -t ./...
+	$(GO) mod tidy
 	$(GO) mod verify
 
 lint:
