@@ -106,7 +106,8 @@ func WorkflowContext(ctx context.Context) (workflow.Context, bool) {
 }
 
 // uuidRandomStream names the workflow random stream that feeds
-// newDeterministicUUIDProvider.
+// newDeterministicUUIDProvider. Keep the original identifier across module
+// renames so existing workflow histories replay with the same UUIDs.
 const uuidRandomStream = "go.temporal.io/sdk/contrib/googleadk/uuid"
 
 // newDeterministicUUIDProvider returns a platform.UUIDProvider whose output is

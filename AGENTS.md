@@ -42,16 +42,24 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
 | `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
 | `java/temporal-spring-ai` | `io.temporal:temporal-spring-ai` | continues (1.39.0 next) | Public Preview | `io.temporal.springai` |
-| `go/googleadk` | `go.temporal.io/sdk/contrib/googleadk` | continues (v0.3.0 next) | Public Preview | `googleadk` |
+| `go/googleadk` | `go.temporal.io/googleadk` | 0.1.0 (new coordinate) | Public Preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
-version policy (below). The Go row has an unresolved problem: a module served by the static vanity
-site cannot live in a monorepo subdirectory under an unchanged import path; decide (split mirror
-repo, new import path, or staying in sdk-go) before publishing cutover. `go/googleadk` is currently
-an upstream-backed history snapshot: sdk-go remains the published source, the existing module
-path is retained, and final releases here are disabled. Its source, tests and README remain
-unchanged; its inherited changelog is kept only in Git history. Go CI and release workflows
-remain cutover work.
+version policy (below). Go plugins use `go.temporal.io/<name>` module paths and live under
+`go/<name>/`. Before publishing, the vanity site must route each module to this repository's
+subdirectory. The [Go module reference](https://go.dev/ref/mod#vcs-find) documents the fourth
+`go-import` field for subdirectories, supported since Go 1.25. Google ADK requires Go 1.26.5,
+so its mapping can be:
+
+```html
+<meta name="go-import" content="go.temporal.io/googleadk git https://github.com/temporalio/ai-integrations go/googleadk">
+```
+
+Its tags are `go/googleadk/v<version>`. `go/googleadk` is now owned here under the new module
+path; its active `upstream` metadata is removed, so do not re-sync it. Imported history remains
+intact, and the inherited changelog is kept only in Git history. UUID and span random-stream
+identifiers retain their original strings for replay compatibility. Final releases here remain
+disabled until vanity routing and Go CI/release workflows are ready.
 
 Naming derivation, enforced by `scripts/ci/check_conventions.py`: folder name = `plugin.toml`
 `name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API =
@@ -117,7 +125,7 @@ Runbook for `python/<name>`:
 
 ## Migration and re-sync
 
-Go history snapshots use `scripts/migrate/extract-sdk-go.sh` and the Go section of
+Go history imports use `scripts/migrate/extract-sdk-go.sh` and the Go section of
 `scripts/migrate/README.md`, with the same default-branch and merge-commit requirements below.
 
 `scripts/migrate/extract-sdk-python.sh` plus `scripts/migrate/README.md` are the procedure. Only commits reachable from the upstream repository's default branch qualify as imported history. Work from an unmerged or closed PR, feature branch or fork is ordinary local work: do not apply `history-import` and do not add it to `scripts/migrate/IMPORTS.md`. Commit count, `Migrated-From` trailers and use of the migration tooling do not change that classification. For valid imports, find every historical path first; the script is frozen after a plugin's first import; label the PR `history-import` and merge it with a merge commit; keep adaptation files in separate commits on top; and record every import and re-sync in `IMPORTS.md`. Expected verification numbers are in the migration README.

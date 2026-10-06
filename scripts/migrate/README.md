@@ -55,7 +55,7 @@ Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merg
 
 ## Re-sync (bringing new upstream commits)
 
-For Go history snapshots, use the corresponding frozen script and rules in
+For Go history imports, use the corresponding frozen script and rules in
 the Go section below. The Python procedure follows.
 
 Use this procedure only while the plugin's `plugin.toml` names `sdk-python` as its `upstream`.
@@ -98,7 +98,7 @@ Add a `case` entry to `extract-sdk-python.sh` with every path found (filters fir
 second, README rename before directory rename). Missing a historical path cannot be fixed later
 without rewriting every imported SHA.
 
-## Go history snapshots
+## Go history imports
 
 `extract-sdk-go.sh` applies the same pinned `git-filter-repo` 2.47.0 procedure
 to Go plugins. The first `googleadk` import is pinned to upstream `main` at
@@ -122,25 +122,31 @@ git remote remove sdk-go-filtered
 `SRC_REF` must be reachable from upstream `main`; the script checks this before
 rewriting. It keeps original authors, committers and dates, qualifies bare
 issue references as `temporalio/sdk-go#<number>`, preserves referenced SHAs,
-and adds `Migrated-From: temporalio/sdk-go@<original SHA>` trailers. Imported
-source, tests, README, `go.mod` and `go.sum` remain byte-identical to upstream.
+and adds `Migrated-From: temporalio/sdk-go@<original SHA>` trailers. In the import
+merge, source, tests, README, `go.mod` and `go.sum` are byte-identical to upstream.
 Verify every filtered commit's tree and author/committer metadata against its
 original entry in the generated `.git/filter-repo/commit-map`, not just the tip.
 
 Add local metadata, make targets and the root LICENSE copy as a separate
 adaptation commit. Remove the upstream `CHANGELOG.md` from the current tree
 in that commit, retaining its history to follow this repository's generated
-release-notes policy. This removal is the sole local divergence to preserve
-during re-sync; do not edit the imported source, tests or README.
+release-notes policy. While `plugin.toml` names an active upstream, preserve
+this deletion during re-sync and do not edit the imported source, tests or README.
 
-This import is a history snapshot. `sdk-go` remains the published upstream,
-the existing Go module path is retained, and `[release] allow-final = false`
-until the vanity-path hosting decision in AGENTS.md is resolved. Go CI and
-release workflows remain publishing-cutover work.
+Google ADK's initial setup retained the upstream module path. A separate local
+API cutover, requested after the import, renames it to `go.temporal.io/googleadk`
+and updates self-imports, the worker plugin name, metadata and examples. Its
+active `upstream` field is removed because this repository now owns the code.
+The original UUID and span random-stream identifiers remain stable for replay
+compatibility. The extraction script and imported commit graph stay unchanged.
+Final releases remain disabled until vanity routing and Go CI/release workflows
+are ready; the required subdirectory mapping is documented in AGENTS.md.
 
-For re-sync, run the frozen script unchanged with a default-branch commit
-that descends from the previous source SHA. Fetch and merge the result; do
-not re-import an unrelated history or remove the preserved local metadata.
+For a plugin that still names an active upstream, run the frozen script unchanged
+with a default-branch commit that descends from the previous source SHA. Do not
+re-sync after removing that field, including Google ADK after its API cutover.
+Fetch and merge the result; do not re-import an unrelated history or remove
+the preserved local metadata.
 Keep the changelog removed if upstream changes conflict with its deletion.
 Append an import-log row, use the `history-import` label on the PR, and merge
 with **Create a merge commit**, never squash or rebase.

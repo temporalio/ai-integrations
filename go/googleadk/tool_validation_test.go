@@ -8,7 +8,7 @@ import (
 
 	"go.temporal.io/sdk/workflow"
 
-	"go.temporal.io/sdk/contrib/googleadk"
+	"go.temporal.io/googleadk"
 )
 
 // validationArgs is the well-formed TArgs struct used by the signature

@@ -1,4 +1,4 @@
-module go.temporal.io/sdk/contrib/googleadk
+module go.temporal.io/googleadk
 
 go 1.26.5
 

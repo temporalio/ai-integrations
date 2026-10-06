@@ -12,7 +12,7 @@ import (
 
 	"google.golang.org/adk/v2/model"
 
-	"go.temporal.io/sdk/contrib/googleadk"
+	"go.temporal.io/googleadk"
 )
 
 // TestSingleAgentRoutesModelToActivity is the cardinal end-to-end test: a real

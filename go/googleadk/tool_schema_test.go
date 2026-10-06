@@ -9,7 +9,7 @@ import (
 
 	"google.golang.org/genai"
 
-	"go.temporal.io/sdk/contrib/googleadk"
+	"go.temporal.io/googleadk"
 )
 
 // schemaInner is a nested struct used to prove the json:"-" exclusion applies

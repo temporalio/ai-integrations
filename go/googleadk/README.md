@@ -25,14 +25,18 @@ wired onto the worker by `googleadk.NewPlugin(...)`.
 
 ## Add to your project
 
+The module path is `go.temporal.io/googleadk`. Publishing from this repository
+is pending vanity-path routing and Go release automation; the install command
+below applies after the first release.
+
 From your application's Go module, run:
 
 ```sh
-go get go.temporal.io/sdk/contrib/googleadk@latest
+go get go.temporal.io/googleadk@latest
 ```
 
 ```go
-import "go.temporal.io/sdk/contrib/googleadk"
+import "go.temporal.io/googleadk"
 ```
 
 This package depends on the deterministic ADK `platform` seams
@@ -48,12 +52,17 @@ replay-safe telemetry gate composes `workflow.IsReadOnly`.
 ## Module versioning
 
 The Google ADK integration is released as a separate Go module from the core
-Temporal Go SDK. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+Temporal Go SDK. This repository owns `go.temporal.io/googleadk`, replacing
+the former `go.temporal.io/sdk/contrib/googleadk` module. Release notes are
+generated from commit messages. See [AGENTS.md](../../AGENTS.md) for publishing
+requirements.
 
 ## Samples
 
 Runnable end-to-end samples live in
 [temporalio/samples-go](https://github.com/temporalio/samples-go/tree/main/googleadk).
+Those upstream samples use the former module path; update their Google ADK
+import to `go.temporal.io/googleadk` when using this module.
 
 ## Hello world
 
@@ -79,7 +88,7 @@ import (
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/genai"
 
-	"go.temporal.io/sdk/contrib/googleadk"
+	"go.temporal.io/googleadk"
 )
 
 const taskQueue = "adk"
@@ -364,7 +373,7 @@ import (
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
-	"go.temporal.io/sdk/contrib/googleadk"
+	"go.temporal.io/googleadk"
 )
 
 func main() {

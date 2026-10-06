@@ -13,7 +13,7 @@ import (
 
 	"google.golang.org/adk/v2/tool"
 
-	"go.temporal.io/sdk/contrib/googleadk"
+	"go.temporal.io/googleadk"
 )
 
 // countingFactory wraps an MCPFactory and counts its invocations, so a test can

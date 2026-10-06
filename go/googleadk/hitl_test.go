@@ -22,7 +22,7 @@ import (
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
 
-	"go.temporal.io/sdk/contrib/googleadk"
+	"go.temporal.io/googleadk"
 )
 
 // hitlToolRan is flipped by the HITL-guarded tool's handler the (single) time it

@@ -19,7 +19,7 @@ import (
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
 
-	"go.temporal.io/sdk/contrib/googleadk"
+	"go.temporal.io/googleadk"
 )
 
 // mcpGuardedRuns counts executions of the guarded MCP tool's handler. It stays

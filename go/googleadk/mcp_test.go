@@ -15,7 +15,7 @@ import (
 
 	"google.golang.org/adk/v2/model"
 
-	"go.temporal.io/sdk/contrib/googleadk"
+	"go.temporal.io/googleadk"
 )
 
 // recordingModel wraps a FakeModel and records the tool declarations carried in

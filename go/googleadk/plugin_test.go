@@ -18,7 +18,7 @@ import (
 
 	"google.golang.org/adk/v2/tool"
 
-	"go.temporal.io/sdk/contrib/googleadk"
+	"go.temporal.io/googleadk"
 )
 
 // pluginRecordingRegistry implements the plugin run-context registry (the full

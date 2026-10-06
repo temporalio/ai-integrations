@@ -54,7 +54,8 @@ func replaySuppressed(ctx context.Context) bool {
 
 // spanRandomStreamPrefix names the per-tracer workflow random streams feeding
 // the span-ID generator, so a workflow span re-created on replay draws the same
-// trace and span IDs it drew on first execution.
+// trace and span IDs it drew on first execution. Keep the original prefix across
+// module renames so existing workflow histories retain their span identities.
 const spanRandomStreamPrefix = "go.temporal.io/sdk/contrib/googleadk/spans/"
 
 // otelRandomKey carries the io.Reader the span-ID generator draws from.
@@ -499,7 +500,7 @@ func warnOnNonReplaySafeTelemetryProviders(logger log.Logger, tracerProvider, lo
 			"The global OpenTelemetry %s is not replay-safe: ADK emits telemetry through it "+
 				"from workflow code, and every history replay will re-emit one full copy. Install a "+
 				"replay-safe provider from googleadk.%s as the first global provider set in the "+
-				"process; see \"Telemetry and replay\" in the contrib/googleadk README.",
+				"process; see \"Telemetry and replay\" in the go/googleadk README.",
 			global, wrapper),
 			"provider", fmt.Sprintf("%T", p))
 	}

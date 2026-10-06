@@ -64,7 +64,7 @@ func NewPlugin(cfg Config) (worker.Plugin, error) {
 			otel.GetTracerProvider(), otelloglobal.GetLoggerProvider(), otel.GetMeterProvider())
 	}
 	return temporal.NewSimplePlugin(temporal.SimplePluginOptions{
-		Name: "go.temporal.io/sdk/contrib/googleadk",
+		Name: "go.temporal.io/googleadk",
 		// Once per replayer construction — the replayer-side counterpart of
 		// the worker-start warning; RunContextBefore would repeat it per
 		// replayed workflow.

@@ -32,7 +32,7 @@ import (
 
 	"google.golang.org/adk/v2/model"
 
-	"go.temporal.io/sdk/contrib/googleadk"
+	"go.temporal.io/googleadk"
 )
 
 // slowModel is a model.LLM that stays silent for a configured delay before
