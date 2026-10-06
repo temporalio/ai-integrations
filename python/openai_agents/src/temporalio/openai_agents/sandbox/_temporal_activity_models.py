@@ -5,8 +5,6 @@ serialized/deserialized automatically. Each activity receives a single typed
 model instance rather than a positional arg list.
 """
 
-from __future__ import annotations
-
 from base64 import b64decode, b64encode
 from typing import Annotated, Any, cast
 

@@ -1,7 +1,5 @@
 """Worker-environment secrets: the reference form, and the allowlist both forms share."""
 
-from __future__ import annotations
-
 import dataclasses
 import os
 import re

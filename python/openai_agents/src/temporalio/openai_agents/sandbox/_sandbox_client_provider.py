@@ -1,7 +1,5 @@
 """Public-facing provider that pairs a name with a real sandbox client."""
 
-from __future__ import annotations
-
 import io
 from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager

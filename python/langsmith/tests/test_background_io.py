@@ -4,8 +4,6 @@ Covers create_child propagation, executor-backed post/patch,
 replay suppression, and post-shutdown fallback.
 """
 
-from __future__ import annotations
-
 import logging
 import threading
 import uuid

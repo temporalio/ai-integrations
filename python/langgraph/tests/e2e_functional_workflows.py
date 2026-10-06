@@ -1,7 +1,5 @@
 """Workflow definitions for Functional API E2E tests."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 

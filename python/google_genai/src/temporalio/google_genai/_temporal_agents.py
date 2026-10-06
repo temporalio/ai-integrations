@@ -12,8 +12,6 @@ The shim depends only on the public ``google.genai.interactions`` surface, not
 on google-genai internals.
 """
 
-from __future__ import annotations
-
 from datetime import timedelta
 from typing import Any, cast
 

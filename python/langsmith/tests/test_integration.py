@@ -1,7 +1,5 @@
 """Integration tests for LangSmith plugin with real Temporal worker."""
 
-from __future__ import annotations
-
 import uuid
 from datetime import timedelta
 from typing import Any

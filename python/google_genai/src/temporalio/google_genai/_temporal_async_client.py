@@ -40,8 +40,6 @@ replay-safe.  Pass explicit ``display_name`` and ``dest`` when creating Vertex
 batch jobs from a workflow.
 """
 
-from __future__ import annotations
-
 import functools
 import inspect
 from collections.abc import AsyncIterator, Callable

@@ -6,8 +6,6 @@ it is off when the env is unset or set to ``false``. Tests verify that
 produces runs.
 """
 
-from __future__ import annotations
-
 import uuid
 from datetime import timedelta
 

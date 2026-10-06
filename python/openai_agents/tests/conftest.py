@@ -1,7 +1,5 @@
 """Common pytest fixtures and OpenAI Agents test isolation."""
 
-from __future__ import annotations
-
 import asyncio
 import os
 from collections.abc import AsyncGenerator

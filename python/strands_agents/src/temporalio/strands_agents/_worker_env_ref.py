@@ -1,7 +1,5 @@
 """References to environment variables resolved by sandbox activity workers."""
 
-from __future__ import annotations
-
 import os
 import re
 from collections.abc import Collection

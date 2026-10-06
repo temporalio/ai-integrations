@@ -1,7 +1,5 @@
 """Tests for LangSmith interceptor points and helper functions."""
 
-from __future__ import annotations
-
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone

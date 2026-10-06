@@ -6,8 +6,6 @@ consumers, and the fail-fast when ``streaming_topic`` is set without a hosted
 ``WorkflowStream``.
 """
 
-from __future__ import annotations
-
 import uuid
 from datetime import timedelta
 

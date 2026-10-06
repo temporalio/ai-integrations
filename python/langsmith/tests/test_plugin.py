@@ -1,7 +1,5 @@
 """Tests for LangSmithPlugin construction, configuration, and end-to-end usage."""
 
-from __future__ import annotations
-
 import uuid
 from typing import Any
 from unittest.mock import MagicMock

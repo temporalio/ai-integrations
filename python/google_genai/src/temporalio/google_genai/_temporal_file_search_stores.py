@@ -6,8 +6,6 @@ activity so the entire upload (including filesystem access and resumable
 upload negotiation) runs on the activity worker.
 """
 
-from __future__ import annotations
-
 import io
 import os
 from datetime import timedelta

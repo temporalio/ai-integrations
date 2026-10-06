@@ -1,7 +1,5 @@
 """Temporal-aware sandbox client that dispatches lifecycle operations as activities."""
 
-from __future__ import annotations
-
 from datetime import timedelta
 from typing import Any
 

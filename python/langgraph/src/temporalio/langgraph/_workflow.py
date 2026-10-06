@@ -2,8 +2,6 @@
 
 # pyright: reportMissingTypeStubs=false
 
-from __future__ import annotations
-
 import dataclasses
 from collections.abc import Awaitable
 from inspect import iscoroutinefunction

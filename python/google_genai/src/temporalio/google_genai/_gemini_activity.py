@@ -6,8 +6,6 @@ requests. Credentials are fetched/refreshed only within the activity —
 they never appear in workflow event history.
 """
 
-from __future__ import annotations
-
 from collections.abc import Sequence
 from contextlib import AsyncExitStack
 from datetime import timedelta

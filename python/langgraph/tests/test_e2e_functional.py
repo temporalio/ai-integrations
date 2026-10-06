@@ -5,8 +5,6 @@ LangGraph's Functional API requires Python >= 3.11 for async context
 variable propagation (see langgraph.config.get_config).
 """
 
-from __future__ import annotations
-
 import sys
 from datetime import timedelta
 from typing import Any

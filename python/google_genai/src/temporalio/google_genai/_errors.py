@@ -1,7 +1,5 @@
 """Error types for the Google Gemini SDK Temporal integration."""
 
-from __future__ import annotations
-
 from temporalio.exceptions import ApplicationError
 
 

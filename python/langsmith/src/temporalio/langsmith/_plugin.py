@@ -1,7 +1,5 @@
 """LangSmith plugin for Temporal SDK."""
 
-from __future__ import annotations
-
 import dataclasses
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager

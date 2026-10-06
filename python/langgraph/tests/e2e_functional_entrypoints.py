@@ -3,8 +3,6 @@
 These define @task and @entrypoint functions used in functional API E2E tests.
 """
 
-from __future__ import annotations
-
 import asyncio
 
 import langgraph.types

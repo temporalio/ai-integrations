@@ -1,7 +1,5 @@
 """Sandbox environment value resolved from the Temporal Worker's environment."""
 
-from __future__ import annotations
-
 import os
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager

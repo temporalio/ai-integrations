@@ -1,7 +1,5 @@
 """Temporal-aware sandbox session that routes all I/O through Temporal activities."""
 
-from __future__ import annotations
-
 import io
 from pathlib import Path
 

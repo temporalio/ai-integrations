@@ -78,8 +78,6 @@ Quickstart::
             return response.text
 """
 
-from __future__ import annotations
-
 from typing import TYPE_CHECKING, Any
 
 from temporalio.google_genai._errors import GoogleGenAIError

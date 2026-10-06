@@ -15,8 +15,6 @@ name (which selects the worker-side factory) plus activity options; the
 connection factory is never passed to the workflow or the root client.
 """
 
-from __future__ import annotations
-
 from datetime import timedelta
 from typing import Any
 

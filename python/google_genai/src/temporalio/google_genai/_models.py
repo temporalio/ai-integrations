@@ -4,8 +4,6 @@ These models cross the activity boundary — they're constructed on the
 workflow side and deserialized on the activity side (or vice versa).
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 from google.genai import types

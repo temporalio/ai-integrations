@@ -9,8 +9,6 @@ installed *into* it. Two failure modes are silent without this guard: an editabl
 release drops the module, ``temporalio<=1.32`` writes the same file paths as this distribution.
 """
 
-from __future__ import annotations
-
 import base64
 import hashlib
 import importlib.metadata as importlib_metadata

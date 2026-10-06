@@ -1,7 +1,5 @@
 """Tests for node/task summaries (static summary and summary_fn)."""
 
-from __future__ import annotations
-
 import uuid
 from datetime import timedelta
 from typing import Any, Callable

@@ -1,7 +1,5 @@
 """Shared test helpers for LangSmith plugin tests."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock

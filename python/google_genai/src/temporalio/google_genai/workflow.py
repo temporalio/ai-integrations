@@ -7,8 +7,6 @@ workflows.  The key entry points are:
   callable for use with automatic function calling (AFC).
 """
 
-from __future__ import annotations
-
 import functools
 import inspect
 from collections.abc import Callable

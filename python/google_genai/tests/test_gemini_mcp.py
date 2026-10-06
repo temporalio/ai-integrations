@@ -17,8 +17,6 @@ Plus the server-side pass-through paths that need no shim code:
 - Interactions API ``MCPServerToolCallStep`` / ``MCPServerToolResultStep`` rehydration
 """
 
-from __future__ import annotations
-
 import json
 import sys
 from collections.abc import AsyncIterator

@@ -1,7 +1,5 @@
 """Read the plugin's ``plugin.toml`` (the machine-readable metadata every plugin carries)."""
 
-from __future__ import annotations
-
 import sys
 from dataclasses import dataclass
 from pathlib import Path

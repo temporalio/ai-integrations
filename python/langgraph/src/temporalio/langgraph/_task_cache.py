@@ -5,8 +5,6 @@ completed tasks are not re-executed after a continue-as-new. The cache state
 is a plain dict that can travel through workflow.continue_as_new().
 """
 
-from __future__ import annotations
-
 from contextvars import ContextVar
 from hashlib import sha256
 from json import dumps
