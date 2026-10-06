@@ -37,8 +37,8 @@ the SDK's AFC loop drives it, with ``list_tools`` / ``call_tool`` running as
 activities against a pooled worker-side connection.  Server-side MCP on Vertex
 AI (``Tool(mcp_servers=[McpServer(...)])``) and the Interactions API's MCP step
 types are executed by Google's backend and flow through unchanged as request /
-response data — no extra wiring needed.  Client-side MCP requires the ``mcp``
-package.
+response data — no extra wiring needed.  Client-side MCP requires the
+``temporalio-google-genai[mcp]`` extra (MCP Python SDK v1).
 
 Streaming: set ``TemporalAsyncClient(streaming_topic=...)`` and host a
 :class:`temporalio.contrib.workflow_streams.WorkflowStream` in the workflow's

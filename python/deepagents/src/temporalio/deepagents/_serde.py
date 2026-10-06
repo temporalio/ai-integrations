@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
 
 from temporalio.contrib.pydantic import PydanticPayloadConverter, ToJsonOptions
-from temporalio.converter import DataConverter
+from temporalio.converter import DataConverter, DefaultPayloadConverter
 
 # ---------------------------------------------------------------------------
 # Worker-wide dispatch settings
@@ -110,22 +110,24 @@ def build_data_converter(
     """Compose the plugin's converter with whatever the caller already set.
 
     * ``None`` — install the plugin default.
-    * the SDK default converter — swap in the LangChain-aware Pydantic
-      converter via :func:`dataclasses.replace`.
-    * a custom converter — refuse rather than silently clobber it; the caller
-      must fold :class:`DeepAgentsPayloadConverter` into their own converter.
+    * the SDK default payload converter — swap in the LangChain-aware Pydantic
+      converter while preserving the codec and other data converter settings.
+    * a compatible payload converter — preserve the supplied data converter.
+    * any other payload converter — refuse rather than silently clobber it.
     """
     if user_converter is None:
         return data_converter
-    if user_converter is DataConverter.default:
+    if user_converter.payload_converter_class is DefaultPayloadConverter:
         return dataclasses.replace(
             user_converter, payload_converter_class=DeepAgentsPayloadConverter
         )
+    if issubclass(user_converter.payload_converter_class, DeepAgentsPayloadConverter):
+        return user_converter
     raise ValueError(
         "DeepAgentsPlugin cannot compose with a custom data_converter "
         "automatically. Set payload_converter_class=DeepAgentsPayloadConverter "
         "on your own DataConverter (so LangChain messages serialize with "
-        "exclude_unset=True), or omit data_converter to use the plugin default."
+        "exclude_unset=True)."
     )
 
 

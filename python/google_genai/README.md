@@ -134,6 +134,16 @@ A timeout is required — `activity_config` must set `start_to_close_timeout` or
 
 ## MCP support
 
+Install the optional dependency for client-side MCP:
+
+```bash
+uv add "temporalio-google-genai[mcp]"
+```
+
+This adapter requires MCP Python SDK v1. The base package does not require MCP
+and can be installed alongside MCP v2 integrations. Server-side MCP on Vertex AI
+and the Interactions API do not require this extra.
+
 Client-side MCP (Gemini Developer API) is wired through the plugin: register the
 server on the worker and reference it by name in the workflow.
 
