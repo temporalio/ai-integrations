@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from conftest import commit_all, git
+
 REPO = Path(__file__).resolve().parents[2]
 WORKFLOWS = sorted((REPO / ".github" / "workflows").glob("*.yml"))
 ACTIONS = sorted((REPO / ".github" / "actions").glob("*/action.yml"))
@@ -59,17 +61,16 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
     for job in ("publish-testpypi", "publish-pypi"):
         j = doc["jobs"][job]
-        assert j["permissions"] == {"id-token": "write", "actions": "read"}
+        assert j["permissions"] == {"id-token": "write"}
         assert "uses" not in j, "publish jobs must be inline (PyPI rejects reusable workflows as trusted publishers)"
         steps = [s.get("uses", "") for s in j["steps"]]
         assert not any("checkout" in s for s in steps), "publish jobs download artifacts only"
         assert any(s.startswith("pypa/gh-action-pypi-publish@") for s in steps)
     assert doc["jobs"]["publish-testpypi"]["environment"] == "testpypi"
     assert doc["jobs"]["publish-pypi"]["environment"] == "pypi"
-    # Uploads require a tagged run's tests or validated artifact recovery; PyPI needs its policy gate.
-    assert "needs.prepare.outputs.publish == 'true'" in doc["jobs"]["publish-testpypi"]["if"]
-    assert "needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true'" in doc["jobs"]["publish-testpypi"]["if"]
-    assert "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'" in doc["jobs"]["publish-pypi"]["if"]
+    # Nothing is uploaded on a dry run or from a non-tag ref; PyPI additionally needs the policy gate.
+    assert doc["jobs"]["publish-testpypi"]["if"] == "needs.prepare.outputs.publish == 'true'"
+    assert doc["jobs"]["publish-pypi"]["if"] == "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'"
     assert "needs.prepare.outputs.publish == 'true'" in doc["jobs"]["github-release"]["if"]
     assert doc[True]["push"]["tags"] == ["python/*/v*"]  # PyYAML parses the `on` key as boolean True
     inputs = doc[True]["workflow_dispatch"]["inputs"]
@@ -79,6 +80,7 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
     assert prepare_steps.index("Dispatch inputs are consistent with the ref") < prepare_steps.index("Parse tag")
     gate = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "gate")
     assert '[ "$SKIP_PUBLISH" = "false" ]' in gate["run"], "publish only on the literal false"
+    assert gate["env"]["EXISTING_TAG"] == "${{ steps.existing.outputs.existing_tag }}"
     # The release job must act on the parsed tag, never on the ref name (they differ on a dry run).
     tag_envs = [s["env"]["TAG"] for s in doc["jobs"]["github-release"]["steps"] if "TAG" in s.get("env", {})]
     assert tag_envs and all(v == "${{ needs.prepare.outputs.tag }}" for v in tag_envs)
@@ -120,17 +122,14 @@ def test_release_publishes_the_tested_artifacts() -> None:
     for job in ("publish-testpypi", "publish-pypi", "smoke-testpypi", "smoke-pypi", "github-release"):
         downloads = [s["with"]["name"] for s in doc["jobs"][job]["steps"] if "download-artifact" in s.get("uses", "")]
         assert downloads == [tested], f"{job} must use the artifact the test job produced"
-        download = next(s for s in doc["jobs"][job]["steps"] if "download-artifact" in s.get("uses", ""))
-        assert download["with"]["run-id"] == "${{ needs.prepare.outputs.artifact_run_id }}"
     assert "test" in doc["jobs"]["publish-testpypi"]["needs"]
     assert doc["jobs"]["test"]["with"]["deps"] == "locked"
     assert doc["jobs"]["test"]["with"]["version"] == "${{ needs.prepare.outputs.version }}"
-    # Recovery skips rebuilding. Every dependent job must handle that skip explicitly and still
-    # require its own immediate predecessor to succeed.
-    for job, predecessor in (("smoke-testpypi", "publish-testpypi"), ("publish-pypi", "smoke-testpypi"), ("smoke-pypi", "publish-pypi")):
-        condition = doc["jobs"][job]["if"]
-        assert "!cancelled()" in condition and f"needs.{predecessor}.result == 'success'" in condition
+    assert doc["jobs"]["test"]["with"]["ref"] == "${{ needs.prepare.outputs.source_ref }}"
     plugin_wf = yaml.safe_load((REPO / ".github/workflows/_python-plugin.yml").read_text())
+    for job in plugin_wf["jobs"].values():
+        checkout = next(s for s in job["steps"] if "actions/checkout@" in s.get("uses", ""))
+        assert checkout["with"]["ref"] == "${{ inputs.ref }}"
     assert plugin_wf[True]["workflow_call"]["inputs"]["version"]["default"] == ""
     steps = plugin_wf["jobs"]["test"]["steps"]
     inject = next(s for s in steps if s.get("name") == "Apply release version from tag")
@@ -149,29 +148,48 @@ def test_release_publishes_the_tested_artifacts() -> None:
     assert steps.index(build_check) < steps.index(upload), "the artifact must be built and checked before it is uploaded"
 
 
-@pytest.mark.parametrize("ref_type,recovery,skip,publish", [
+@pytest.mark.parametrize("ref_type,existing,skip,publish", [
     ("tag", "", "false", True), ("branch", "", "false", False),
     ("branch", "true", "false", True), ("branch", "false", "false", False),
     ("tag", "", "true", False), ("branch", "true", "true", False),
-    ("tag", "", "1", False), ("branch", "true", "True", False),
+    ("tag", "", "1", False),
 ])
-def test_release_publication_gate(ref_type: str, recovery: str, skip: str, publish: bool, tmp_path: Path) -> None:
+def test_release_publication_gate(ref_type: str, existing: str, skip: str, publish: bool, tmp_path: Path) -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
     gate = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "gate")
     output = tmp_path / "outputs"
-    env = dict(os.environ, REF_TYPE=ref_type, RECOVERY=recovery, SKIP_PUBLISH=skip,
+    env = dict(os.environ, REF_TYPE=ref_type, EXISTING_TAG=existing, SKIP_PUBLISH=skip,
                PRERELEASE="false", ALLOW_FINAL="true", OVERRIDE="false", GITHUB_OUTPUT=str(output))
     subprocess.run(["bash", "-c", gate["run"]], env=env, check=True, capture_output=True, text=True)
     assert f"publish={'true' if publish else 'false'}\n" in output.read_text()
 
 
-@pytest.mark.parametrize("ref_type,ref_name", [("tag", "main"), ("branch", "feature"), ("tag", "python/fake/v0.0.1")])
-def test_release_recovery_rejects_dispatch_outside_main(ref_type: str, ref_name: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize("case", ["valid", "tag_ref", "other_branch", "missing_tag", "outside_main", "plugin.toml", "pyproject.toml"])
+def test_existing_tag_rebuild_validation(case: str, plugin_repo: Path, tmp_path: Path) -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
-    recovery = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "recovery")
-    env = dict(os.environ, REF_TYPE=ref_type, REF_NAME=ref_name, TAG="python/fake/v0.0.1", RUN_ID="123", GITHUB_OUTPUT=str(tmp_path / "outputs"))
-    result = subprocess.run(["bash", "-c", recovery["run"]], env=env, capture_output=True, text=True)
-    assert result.returncode == 1 and "recovery must be dispatched on main" in result.stdout
+    existing = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "existing")
+    assert existing["if"] == "github.event_name == 'workflow_dispatch' && inputs.publish-existing-tag"
+    tag = "python/fakeplug/v0.0.1rc1"
+    sha = git(plugin_repo, "rev-parse", "HEAD")
+    git(plugin_repo, "update-ref", "refs/remotes/origin/main", sha)
+    if case == "outside_main":
+        (plugin_repo / "README.md").write_text("feature\n")
+        commit_all(plugin_repo, "feature")
+    if case != "missing_tag":
+        git(plugin_repo, "tag", tag)
+    if case in ("plugin.toml", "pyproject.toml"):
+        manifest = plugin_repo / "python/fakeplug" / case
+        manifest.write_text(manifest.read_text() + "\n# changed\n")
+    output = tmp_path / "outputs"
+    env = dict(os.environ, REF_TYPE="tag" if case == "tag_ref" else "branch",
+               REF_NAME="feature" if case == "other_branch" else "main", TAG=tag,
+               PLUGIN_DIR="python/fakeplug", RUNNER_TEMP=str(tmp_path), GITHUB_OUTPUT=str(output))
+    result = subprocess.run(["bash", "-c", existing["run"]], env=env, cwd=plugin_repo, capture_output=True, text=True)
+    if case == "valid":
+        assert result.returncode == 0
+        assert output.read_text() == f"source_ref={sha}\nexisting_tag=true\n"
+    else:
+        assert result.returncode != 0 and not output.exists()
 
 
 def test_release_checkouts_do_not_persist_credentials() -> None:
