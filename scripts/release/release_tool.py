@@ -10,8 +10,8 @@ Subcommands:
   draft-release                 create/update an idempotent draft GitHub Release with assets
 
 Policy (AGENTS.md, "Release runbook"):
-  * a coordinate with no published release starts at exactly 1.0.0 (generally-available)
-    or 0.1.0 (public-preview/pre-release); pre-releases of that version are allowed
+  * a coordinate with no published release starts at exactly 1.0.0 (generally-available),
+    0.1.0 (public-preview), or 0.0.1 (pre-release); pre-releases of that version are allowed
   * an existing coordinate only ever moves strictly forward (max published incl. yanked)
   * TestPyPI versions move forward too, except that its newest version may be re-run
   * final (non pre-release) versions additionally require plugin.toml
@@ -50,7 +50,7 @@ RELEASE_JSON = {
 FIRST_VERSION = {
     "generally-available": Version("1.0.0"),
     "public-preview": Version("0.1.0"),
-    "pre-release": Version("0.1.0"),
+    "pre-release": Version("0.0.1"),
 }
 TRANSITION_MARKER = "TRANSITION(sdk-cutover)"
 DEFAULT_REPO = "temporalio/ai-integrations"

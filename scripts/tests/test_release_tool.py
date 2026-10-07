@@ -35,13 +35,13 @@ def test_parse_tag_invalid(tag: str) -> None:
 @pytest.mark.parametrize("maturity,first", [
     ("generally-available", "1.0.0"),
     ("public-preview", "0.1.0"),
-    ("pre-release", "0.1.0"),
+    ("pre-release", "0.0.1"),
 ])
 def test_policy_first_release(maturity: str, first: str) -> None:
     release_tool.check_policy(Version(first), maturity, [])
     release_tool.check_policy(Version(first + "rc1"), maturity, [])
     release_tool.check_policy(Version(first + "a1"), maturity, [])
-    for version in ("0.1.0", "1.0.0", "1.1.0", first + ".post1", "2.0.0"):
+    for version in ("0.0.0", "0.0.1", "0.1.0", "1.0.0", "1.1.0", first + ".post1", "2.0.0"):
         if version == first:
             continue
         with pytest.raises(release_tool.PolicyError):
@@ -91,14 +91,14 @@ def _registry(tmp_path: Path, versions: list[str] | None) -> Path:
 def test_cli_policy_prerelease_with_no_published_versions(plugin_repo: Path, tmp_path: Path) -> None:
     reg = _registry(tmp_path, None)
     rc = release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
-                            "--version", "0.1.0rc1", "--registry-json", str(reg), "--testpypi-json", str(tmp_path / "absent.json")])
+                            "--version", "0.0.1rc1", "--registry-json", str(reg), "--testpypi-json", str(tmp_path / "absent.json")])
     assert rc == 0
 
 
 def test_cli_policy_final_blocked_by_allow_final(plugin_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     reg = _registry(tmp_path, None)
     rc = release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
-                            "--version", "0.1.0", "--registry-json", str(reg)])
+                            "--version", "0.0.1", "--registry-json", str(reg)])
     assert rc == 1 and "allow-final is false" in capsys.readouterr().out
 
 
@@ -107,7 +107,7 @@ def test_cli_policy_final_blocked_by_transition_markers(repo: Path, tmp_path: Pa
     (d / "src/temporalio/contrib/fakeplug/_impl.py").write_text("# TRANSITION(sdk-cutover): remove\nVALUE = 1\n")
     commit_all(repo, "plugin")
     reg = _registry(tmp_path, None)
-    policy = ["--repo-root", str(repo), "check-version-policy", "--plugin-dir", str(d), "--version", "0.1.0", "--registry-json", str(reg),
+    policy = ["--repo-root", str(repo), "check-version-policy", "--plugin-dir", str(d), "--version", "0.0.1", "--registry-json", str(reg),
               "--testpypi-json", str(tmp_path / "absent.json")]
     rc = release_tool.main(policy)
     out = capsys.readouterr().out
@@ -120,15 +120,15 @@ def test_cli_policy_final_blocked_by_transition_markers(repo: Path, tmp_path: Pa
 def test_cli_policy_warns_when_the_version_is_already_on_testpypi(plugin_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     reg = _registry(tmp_path, None)
     staged = tmp_path / "testpypi.json"
-    staged.write_text(json.dumps({"releases": {"0.1.0rc1": []}}))
+    staged.write_text(json.dumps({"releases": {"0.0.1rc1": []}}))
     args = ["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
             "--registry-json", str(reg), "--testpypi-json", str(staged), "--check-testpypi"]
     # A re-run after a staged upload is the normal recovery path, so this is a warning, not a failure.
-    assert release_tool.main([*args, "--version", "0.1.0rc1"]) == 0
+    assert release_tool.main([*args, "--version", "0.0.1rc1"]) == 0
     assert "::warning::" in capsys.readouterr().out
-    assert release_tool.main([*args, "--version", "0.1.0rc2"]) == 0
+    assert release_tool.main([*args, "--version", "0.0.1rc2"]) == 0
     assert "not yet on TestPyPI" in capsys.readouterr().out
-    assert release_tool.main([*args, "--version", "0.1.0a1"]) == 1
+    assert release_tool.main([*args, "--version", "0.0.1a1"]) == 1
     assert "never move backwards" in capsys.readouterr().out
 
 
@@ -139,7 +139,7 @@ def test_cli_policy_does_not_touch_testpypi_unless_asked(plugin_repo: Path, tmp_
     monkeypatch.setattr(release_tool.urllib.request, "urlopen", boom)
     reg = _registry(tmp_path, None)
     assert release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
-                              "--version", "0.1.0rc1", "--registry-json", str(reg)]) == 0
+                              "--version", "0.0.1rc1", "--registry-json", str(reg)]) == 0
 
 
 def test_transition_markers_fail_closed_on_git_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -29,8 +29,8 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | Folder | Coordinate | First version here | Maturity | Root API |
 |---|---|---|---|---|
 | `python/mcp` | `temporalio-mcp` | 0.1.0 | Pre-release | `temporalio.mcp` |
-| `python/deepagents` | `temporalio-deepagents` | 0.1.0 | Pre-release | `temporalio.deepagents` |
-| `python/google_adk` | `temporalio-google-adk` | 0.1.0 | Pre-release | `temporalio.google_adk` |
+| `python/deepagents` | `temporalio-deepagents` | 0.0.1 | Pre-release | `temporalio.deepagents` |
+| `python/google_adk` | `temporalio-google-adk` | 0.0.1 | Pre-release | `temporalio.google_adk` |
 | `python/google_genai` | `temporalio-google-genai` | 0.1.0 | Public Preview | `temporalio.google_genai` |
 | `python/langgraph` | `temporalio-langgraph` | 0.1.0 | Public Preview | `temporalio.langgraph` |
 | `python/langsmith` | `temporalio-langsmith` | 0.1.0 | Public Preview | `temporalio.langsmith` |
@@ -101,7 +101,7 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 
 Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
 
-Version policy (`release_tool.py check-version-policy`; version ordering is evaluated against pypi.org and test.pypi.org): a coordinate with no published release must start at exactly `1.0.0` (`generally-available`) or `0.1.0` (otherwise), pre-releases of that version allowed; an existing coordinate must be strictly greater than its highest published version, yanked releases included. TestPyPI versions also move forward. A version already staged on TestPyPI, or already the newest release on pypi.org, only produces a warning (a re-run after an upload is the normal recovery path); an older staged version is rejected. Each smoke job proves the index serves exactly the artifacts this run built, none yanked (`verify-index-files`). Final versions additionally require `plugin.toml` `[release] allow-final = true` and no `TRANSITION(sdk-cutover)` marker in the plugin.
+Version policy (`release_tool.py check-version-policy`; version ordering is evaluated against pypi.org and test.pypi.org): a coordinate with no published release must start at exactly `1.0.0` (`generally-available`), `0.1.0` (`public-preview`), or `0.0.1` (`pre-release`), pre-releases of that version allowed; an existing coordinate must be strictly greater than its highest published version, yanked releases included. Maturity is independent of PEP 440 version status: a Pre-release plugin can publish a final version such as `0.0.1` to PyPI. TestPyPI versions also move forward. A version already staged on TestPyPI, or already the newest release on pypi.org, only produces a warning (a re-run after an upload is the normal recovery path); an older staged version is rejected. Each smoke job proves the index serves exactly the artifacts this run built, none yanked (`verify-index-files`). Final versions additionally require `plugin.toml` `[release] allow-final = true` and no `TRANSITION(sdk-cutover)` marker in the plugin.
 
 Runbook for `python/<name>`:
 1. Merge every code, dependency and migration change intended for the release. Re-sync from upstream first while the transition rules apply. Do not change the committed `0.0.0` development version.
