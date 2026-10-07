@@ -32,6 +32,107 @@ def test_parse_tag_invalid(tag: str) -> None:
         release_tool.parse_tag(tag)
 
 
+def test_cli_parse_tag_emits_plugin_python_requirement(plugin_repo: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    manifest = plugin_repo / "python/fakeplug/pyproject.toml"
+    manifest.write_text(manifest.read_text().replace('requires-python = ">=3.10"', 'requires-python = ">=3.11"'))
+    assert release_tool.main(["--repo-root", str(plugin_repo), "parse-tag", "python/fakeplug/v0.0.1"]) == 0
+    assert "requires_python=>=3.11" in capsys.readouterr().out
+
+
+@pytest.fixture
+def recovery_source(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict, dict, dict]:
+    tag = "python/fakeplug/v0.0.1rc1"
+    sha = git(plugin_repo, "rev-parse", "HEAD")
+    git(plugin_repo, "tag", tag)
+    git(plugin_repo, "update-ref", "refs/remotes/origin/main", sha)
+    run = {"repository": {"full_name": "temporalio/ai-integrations"}, "event": "push", "head_branch": tag,
+           "head_sha": sha, "path": ".github/workflows/release-python.yml", "status": "completed"}
+    names = ["Validate tag and version policy", "Test / matrix"]
+    names.extend(f"Test / fakeplug ({runner}, py{version})" for runner, version in (
+        ("ubuntu-latest", "3.10"), ("ubuntu-latest", "3.14"), ("macos-latest", "3.14"), ("windows-latest", "3.14"),
+    ))
+    jobs = {"jobs": [{"name": name, "status": "completed", "conclusion": "success"} for name in names]}
+    artifacts = {"artifacts": [{"name": "dist-fakeplug-locked", "expired": False}]}
+
+    def gh(*args: str, **_kwargs: object) -> str:
+        endpoint = args[1]
+        if "/jobs?" in endpoint:
+            return json.dumps([jobs])
+        if "/artifacts?" in endpoint:
+            return json.dumps(artifacts)
+        return json.dumps(run)
+
+    monkeypatch.setattr(release_tool, "_gh", gh)
+    return plugin_repo, run, jobs, artifacts
+
+
+def test_recovery_accepts_tested_tagged_artifacts(recovery_source: tuple, tmp_path: Path) -> None:
+    repo, *_ = recovery_source
+    output = tmp_path / "outputs"
+    assert release_tool.main(["--repo-root", str(repo), "check-recovery-run", "--tag", "python/fakeplug/v0.0.1rc1",
+                              "--run-id", "123", "--github-output", str(output)]) == 0
+    assert output.read_text() == "recovery=true\nartifact_run_id=123\n"
+
+
+@pytest.mark.parametrize("key,value", [
+    ("event", "workflow_dispatch"), ("head_branch", "python/other/v0.0.1rc1"), ("head_sha", "wrong"),
+    ("path", ".github/workflows/ci.yml"), ("status", "in_progress"), ("repository", {"full_name": "other/repo"}),
+])
+def test_recovery_rejects_unrelated_or_unfinished_runs(recovery_source: tuple, key: str, value: object) -> None:
+    repo, run, *_ = recovery_source
+    run[key] = value
+    with pytest.raises(release_tool.PolicyError, match="completed release-python.yml push run"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "python/fakeplug/v0.0.1rc1", 123)
+
+
+@pytest.mark.parametrize("name", ["Validate tag and version policy", "Test / fakeplug (macos-latest, py3.14)"])
+@pytest.mark.parametrize("state", ["missing", "failure", "in_progress"])
+def test_recovery_requires_the_complete_successful_matrix(recovery_source: tuple, name: str, state: str) -> None:
+    repo, _, jobs, _ = recovery_source
+    job = next(job for job in jobs["jobs"] if job["name"] == name)
+    if state == "missing":
+        jobs["jobs"].remove(job)
+    elif state == "failure":
+        job["conclusion"] = "failure"
+    else:
+        job["status"] = "in_progress"
+    with pytest.raises(release_tool.PolicyError, match="no successful completed job"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "python/fakeplug/v0.0.1rc1", 123)
+
+
+@pytest.mark.parametrize("state", ["missing", "expired", "wrong_name", "duplicate"])
+def test_recovery_requires_one_available_distribution_artifact(recovery_source: tuple, state: str) -> None:
+    repo, _, _, artifacts = recovery_source
+    if state == "missing":
+        artifacts["artifacts"] = []
+    elif state == "expired":
+        artifacts["artifacts"][0]["expired"] = True
+    elif state == "wrong_name":
+        artifacts["artifacts"][0]["name"] = "dist-other-locked"
+    else:
+        artifacts["artifacts"].append(dict(artifacts["artifacts"][0]))
+    with pytest.raises(release_tool.PolicyError, match="exactly one unexpired"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "python/fakeplug/v0.0.1rc1", 123)
+
+
+@pytest.mark.parametrize("filename", ["plugin.toml", "pyproject.toml"])
+def test_recovery_rejects_changed_package_metadata(recovery_source: tuple, filename: str) -> None:
+    repo, *_ = recovery_source
+    path = repo / "python/fakeplug" / filename
+    path.write_text(path.read_text() + "\n# changed\n")
+    with pytest.raises(release_tool.PolicyError, match="match the release tag"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "python/fakeplug/v0.0.1rc1", 123)
+
+
+def test_recovery_rejects_tags_outside_main(recovery_source: tuple) -> None:
+    repo, *_ = recovery_source
+    (repo / "README.md").write_text("changed\n")
+    commit_all(repo, "feature branch")
+    git(repo, "tag", "python/fakeplug/v0.0.1rc2")
+    with pytest.raises(release_tool.PolicyError, match="reachable from origin/main"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "python/fakeplug/v0.0.1rc2", 123)
+
+
 @pytest.mark.parametrize("maturity,first", [
     ("generally-available", "1.0.0"),
     ("public-preview", "0.1.0"),

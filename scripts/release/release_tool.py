@@ -6,6 +6,7 @@ Subcommands:
   check-version-policy          enforce production and staging registry version ordering (with
                                 exact-version re-runs allowed for recovery)
   verify-index-files            prove the files an index serves for a version are the local artifacts
+  check-recovery-run            validate a tagged run's tested artifacts for publication recovery
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
 
@@ -120,6 +121,7 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
         out["root_api"] = meta["plugin"]["root-api"]
         out["smoke_imports"] = ",".join(meta.get("smoke", {}).get("imports", []))
         out["allow_final"] = "true" if meta.get("release", {}).get("allow-final") else "false"
+        out["requires_python"] = _load(plugin_toml.parent / "pyproject.toml")["project"]["requires-python"]
     _write_outputs(args.github_output, out)
     return 0
 
@@ -425,11 +427,68 @@ def cmd_release_notes(args: argparse.Namespace) -> int:
     return 0
 
 
-# --------------------------------------------------------------------------- draft release
+# --------------------------------------------------------------------------- GitHub API and recovery
 
 
 def _gh(*args: str, input_text: str | None = None) -> str:
     return subprocess.run(["gh", *args], check=True, capture_output=True, text=True, input=input_text).stdout
+
+
+def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> None:
+    """Require an existing main-reachable tag and a completed run with its full matrix tested."""
+    parsed = parse_tag(tag)
+    if parsed["language"] != "python" or run_id <= 0:
+        raise PolicyError("recovery requires a Python release tag and a positive run ID")
+    ref = f"refs/tags/{tag}"
+    sha = _git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=repo_root).strip()
+    if subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], cwd=repo_root).returncode != 0:
+        raise PolicyError("recovery tag must be reachable from origin/main")
+    plugin_dir = parsed["plugin_dir"]
+    # The caller's metadata controls publication gates and smoke imports. It must describe the
+    # original package, even though repaired workflow/tooling code comes from main.
+    for filename in ("plugin.toml", "pyproject.toml"):
+        relative = f"{plugin_dir}/{filename}"
+        tagged = _git("show", f"{ref}:{relative}", cwd=repo_root)
+        if (repo_root / relative).read_text(encoding="utf-8") != tagged:
+            raise PolicyError(f"recovery requires {relative} to match the release tag")
+    meta = _load(repo_root / plugin_dir / "plugin.toml")
+    run = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}"))
+    if (
+        run.get("repository", {}).get("full_name") != repo
+        or run.get("path") != ".github/workflows/release-python.yml"
+        or run.get("event") != "push"
+        or run.get("head_branch") != tag
+        or run.get("head_sha") != sha
+        or run.get("status") != "completed"
+    ):
+        raise PolicyError("recovery source must be a completed release-python.yml push run for this exact tag and commit")
+    pages = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100", "--paginate", "--slurp"))
+    jobs = {job["name"]: job for page in pages for job in page["jobs"]}
+    versions = meta["ci"]["runtime-versions"]
+    cells = {
+        ("ubuntu-latest", versions[0]), ("ubuntu-latest", versions[-1]),
+        ("macos-latest", versions[-1]), ("windows-latest", versions[-1]),
+    }
+    required = {"Validate tag and version policy", "Test / matrix"}
+    required.update(f"Test / {parsed['plugin']} ({runner}, py{version})" for runner, version in cells)
+    for name in sorted(required):
+        job = jobs.get(name, {})
+        if job.get("status") != "completed" or job.get("conclusion") != "success":
+            raise PolicyError(f"recovery source has no successful completed job: {name}")
+    artifact_name = f"dist-{parsed['plugin']}-locked"
+    artifacts = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/artifacts?name={artifact_name}&per_page=100"))
+    matching = [item for item in artifacts["artifacts"] if item["name"] == artifact_name and not item["expired"]]
+    if len(matching) != 1:
+        raise PolicyError(f"recovery source must have exactly one unexpired {artifact_name} artifact")
+
+
+def cmd_check_recovery_run(args: argparse.Namespace) -> int:
+    check_recovery_run(Path(args.repo_root).resolve(), args.repo or _repo(), args.tag, args.run_id)
+    _write_outputs(args.github_output, {"recovery": "true", "artifact_run_id": str(args.run_id)})
+    return 0
+
+
+# --------------------------------------------------------------------------- draft release
 
 
 def find_releases(repo: str, tag: str) -> list[dict]:
@@ -536,6 +595,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--delay", type=float, default=30.0, help="seconds between retries (default 30)")
     p.add_argument("--index-json", default=None, help="read the release JSON from this file instead of the index (tests)")
     p.set_defaults(func=cmd_verify_index_files)
+
+    p = sub.add_parser("check-recovery-run", help="validate a tagged run's tested artifacts for recovery")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--run-id", type=int, required=True)
+    p.add_argument("--repo", default=None)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    p.set_defaults(func=cmd_check_recovery_run)
 
     p = sub.add_parser("release-notes", help="generate release notes from history")
     p.add_argument("--plugin-dir", required=True)
