@@ -16,7 +16,6 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
   * plugin.toml schema and agreement with pyproject.toml (name/coordinate/root-api/
     maturity classifier/requires-python floor/module-name/required-version)
   * no [tool.uv.sources] path or workspace entries
-  * Python SDK requirements and committed lockfiles match python/_shared/sdk.toml
   * the project's published README has no relative markdown links (PyPI renders it)
   * --nightly: coordinates with [release] allow-final = false must not exist on PyPI yet
 """
@@ -32,10 +31,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
-
-from packaging.requirements import Requirement
-from packaging.specifiers import SpecifierSet
-from packaging.version import Version
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import LANGUAGES, Plugin, discover_plugins, load_toml, repo_root  # noqa: E402
@@ -187,60 +182,6 @@ class Checker:
                     f"{plugin.rel}/{plugin_rel}: differs from canonical python/_template/{template_rel}"
                 )
 
-    def check_python_sdk(self, plugins: list[Plugin]) -> None:
-        if not plugins:
-            return
-        policy_path = self.root / "python/_shared/sdk.toml"
-        try:
-            version = load_toml(policy_path).get("version")
-            if not isinstance(version, str) or str(Version(version)) != version:
-                raise ValueError("version must be a canonical version string")
-        except (OSError, ValueError) as exc:
-            self.fail(f"python/_shared/sdk.toml: cannot read SDK baseline: {exc}")
-            return
-        expected = SpecifierSet(f">={version},<2")
-        paths = [plugin.path for plugin in plugins]
-        template = self.root / "python/_template"
-        if (template / "pyproject.toml.tmpl").is_file():
-            paths.append(template)
-        for path in paths:
-            rel = str(path.relative_to(self.root))
-            manifest = path / ("pyproject.toml.tmpl" if path == template else "pyproject.toml")
-            if not manifest.is_file():
-                continue  # Reported by check_python_plugin.
-            try:
-                project = load_toml(manifest).get("project", {})
-                sdk_requirements = [
-                    requirement for dependency in project.get("dependencies", [])
-                    if (requirement := Requirement(dependency)).name.lower() == "temporalio"
-                ]
-            except (OSError, ValueError, TypeError) as exc:
-                self.fail(f"{rel}: cannot read SDK requirement: {exc}")
-                continue
-            if len(sdk_requirements) != 1 or any(
-                requirement.specifier != expected or requirement.url or requirement.marker
-                for requirement in sdk_requirements
-            ):
-                self.fail(
-                    f"{rel}: SDK requirement must be temporalio>={version},<2 "
-                    "(SDK extras allowed), matching python/_shared/sdk.toml"
-                )
-            lock = path / "uv.lock"
-            if path == template or not lock.is_file():
-                continue
-            try:
-                sdk_packages = [
-                    package for package in load_toml(lock).get("package", [])
-                    if isinstance(package, dict) and package.get("name") == "temporalio"
-                ]
-            except (OSError, ValueError) as exc:
-                self.fail(f"{rel}/uv.lock: cannot read SDK version: {exc}")
-                continue
-            if len(sdk_packages) != 1 or sdk_packages[0].get("version") != version:
-                self.fail(
-                    f"{rel}/uv.lock: locked SDK version must be {version}, matching python/_shared/sdk.toml"
-                )
-
     def check_plugin_toml(self, plugin: Plugin, meta: dict[str, Any], pyproject: dict[str, Any]) -> None:
         rel = plugin.rel
         p = meta.get("plugin")
@@ -379,7 +320,6 @@ class Checker:
         self.check_language_roots(discovered)
         for plugin in discovered["python"]:
             self.check_python_plugin(plugin)
-        self.check_python_sdk(discovered["python"])
         if nightly:
             self.check_nightly(discovered["python"])
         return self.violations

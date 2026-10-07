@@ -68,7 +68,6 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 ## Repository invariants
 
 - Each plugin owns its manifest and lockfile (`pyproject.toml` + `uv.lock`); no lockfile at a language root, no root Python project. `scripts/` is a separate tooling project, not a root project.
-- Python plugins share the SDK baseline declared in `python/_shared/sdk.toml`. Every plugin and the source template require `temporalio>=<baseline>,<2` (SDK extras are allowed), and every committed plugin lockfile contains exactly that SDK version. The conventions check enforces both. To bump the SDK, update the baseline, all minimum requirements and the template, then run `make lock-sdk` in every plugin. Nightly `sync-latest` may use a newer SDK without committing its lockfile.
 - Each plugin carries `plugin.toml` (metadata only: name, language, coordinate, registry, root API, maturity, docs, optional upstream, `[release] allow-final`, `[ci] runtime-versions`, `[smoke] imports`). It holds no secrets and no owners; `.github/CODEOWNERS` is `* @temporalio/ai-sdk`.
 - The root `LICENSE` is the source of truth and every plugin directory carries a committed regular-file copy of it, because each wheel and sdist must ship the license text. The conventions check fails unless the plugin copy is committed and byte-identical to the root file (`cp LICENSE python/<name>/LICENSE` to refresh); `pyproject.toml` declares `license = "MIT"` and `license-files = ["LICENSE"]`; `check_wheel.py` verifies the packaged text equals the root file.
 - Python manifests and lockfiles carry the static `0.0.0` development placeholder. A protected release tag is the published version source; the release matrix runs `uv version <tag-version>` before sync, test and build, and only those tested artifacts are published. Ordinary CI and local development keep `0.0.0`.
@@ -118,7 +117,7 @@ Runbook for `python/<name>`:
 
 ## Cutover sequencing
 
-- Publish `temporalio-openai-agents` 1.0.0 first. Its `temporalio.openai_agents` root does not overlap the SDK's former `temporalio.contrib.openai_agents` files. Python plugins now require the common SDK baseline (at least Temporal 1.34), which extends the regular `temporalio` package path for split-directory installations. Then make the SDK's `openai-agents` extra forward to the published package, merge the SDK removal and publish `temporalio` 1.34.0.
+- Publish `temporalio-openai-agents` 1.0.0 first. Its `temporalio.openai_agents` root does not overlap the SDK's former `temporalio.contrib.openai_agents` files. Python plugins now require Temporal 1.34 or later, which extends the regular `temporalio` package path for split-directory installations. Then make the SDK's `openai-agents` extra forward to the published package, merge the SDK removal and publish `temporalio` 1.34.0.
 
 ## Cutover checklist
 

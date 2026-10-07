@@ -16,14 +16,12 @@ endif
 # plugin cannot reliably extend it with another package root. Every uv command below runs non-editable.
 export UV_NO_EDITABLE := 1
 
-SDK_VERSION := $(shell awk -F '"' '/^version = / {print $$2}' ../_shared/sdk.toml)
-
 PYTEST_ARGS ?=
 # Keep the dependency versions selected by sync or sync-latest through all tool runs.
 UV_RUN := uv run --locked
 PYTEST := $(UV_RUN) pytest -n auto --dist=worksteal
 
-.PHONY: help sync sync-latest lock-sdk format lint test build clean
+.PHONY: help sync sync-latest format lint test build clean
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
@@ -31,7 +29,7 @@ help: ## Show available targets
 # Reinstall the plugin last so its files win while a plugin is being migrated from a distribution
 # that ships the same namespace paths. Keeping this shared behavior makes future migrations safe.
 sync: ## Install locked dependencies and this plugin (non-editable); creates uv.lock on first run
-	@test -f uv.lock || uv lock --upgrade-package "temporalio==$(SDK_VERSION)"
+	@test -f uv.lock || uv lock
 	uv sync --locked
 	uv sync --locked --reinstall-package $(DIST)
 
@@ -39,9 +37,6 @@ sync-latest: ## Re-lock to the newest allowed versions and install (nightly lane
 	uv lock --upgrade
 	uv sync --locked
 	uv sync --locked --reinstall-package $(DIST)
-
-lock-sdk: ## Align the locked SDK version with python/_shared/sdk.toml
-	uv lock --upgrade-package "temporalio==$(SDK_VERSION)"
 
 format: ## Fix import order and formatting
 	$(UV_RUN) ruff check --select I --fix

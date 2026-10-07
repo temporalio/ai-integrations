@@ -7,7 +7,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
-from conftest import SDK_VERSION, commit_all, init_repo
+from conftest import commit_all, init_repo
 
 import check_conventions
 
@@ -56,9 +56,7 @@ def test_new_plugin_is_top_level_and_release_ready(tmp_path: Path, maturity: str
     conftest = (plugin / "tests/conftest.py").read_text()
     assert "import pytest_asyncio\n\nfrom temporalio.client" in conftest
 
-    (plugin / "uv.lock").write_text(
-        f'version = 1\n\n[[package]]\nname = "temporalio"\nversion = "{SDK_VERSION}"\n'
-    )
+    (plugin / "uv.lock").write_text("version = 1\n")
     commit_all(repo, "add generated plugin")
     assert check_conventions.Checker(repo).run(nightly=False) == []
 

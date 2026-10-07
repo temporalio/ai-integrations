@@ -11,7 +11,7 @@ from conftest import commit_all, git, make_python_plugin
 def _setup(repo: Path) -> str:
     make_python_plugin(repo, "alpha")
     make_python_plugin(repo, "beta")
-    (repo / "python" / "_shared").mkdir(parents=True, exist_ok=True)
+    (repo / "python" / "_shared").mkdir(parents=True)
     (repo / "python" / "_shared" / "python.mk").write_text("all:\n")
     (repo / "python" / "README.md").write_text("python\n")
     ts = repo / "typescript" / "gamma"
@@ -42,11 +42,11 @@ def test_plugin_file_selects_only_that_plugin(repo: Path, path: str) -> None:
     assert r["python"] == ["alpha"] and r["typescript"] == [] and r["any"] is True and r["mode"] == "diff"
 
 
-@pytest.mark.parametrize("path", ["python/README.md", "python/_shared/python.mk", "python/_shared/sdk.toml"])
-def test_shared_language_file_selects_all_plugins_of_that_language(repo: Path, path: str) -> None:
+def test_shared_language_file_selects_all_plugins_of_that_language(repo: Path) -> None:
     base = _setup(repo)
-    r = _run(repo, base, path)
-    assert r["python"] == ["alpha", "beta"] and r["typescript"] == []
+    assert _run(repo, base, "python/README.md")["python"] == ["alpha", "beta"]
+    assert _run(repo, base, "python/_shared/python.mk")["python"] == ["alpha", "beta"]
+    assert _run(repo, base, "python/_shared/python.mk")["typescript"] == []
 
 
 def test_github_or_scripts_ci_selects_everything(repo: Path) -> None:
