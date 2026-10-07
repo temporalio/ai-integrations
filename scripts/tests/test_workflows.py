@@ -110,8 +110,25 @@ def test_release_notes_are_available_before_pypi_approval() -> None:
     assert '--github-output "$GITHUB_OUTPUT"' in create["run"]
     summary = next(step for step in draft["steps"] if "GITHUB_STEP_SUMMARY" in step.get("run", ""))
     assert summary["env"]["RELEASE_URL"] == "${{ steps.release.outputs.url }}"
-    # Drafting never auto-publishes the release, even after the PyPI upload succeeds.
-    assert "--draft=false" not in yaml.dump(jobs)
+    assert "publish-release" not in yaml.dump(draft), "drafting must not publish before approval"
+    assert draft["outputs"]["release_id"] == "${{ steps.release.outputs.release_id }}"
+    assert create["env"]["PRERELEASE"] == "${{ needs.prepare.outputs.github_prerelease }}"
+
+
+def test_github_release_is_published_only_after_pypi_verification() -> None:
+    jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
+    publish = jobs["publish-github-release"]
+    assert set(publish["needs"]) == {"prepare", "github-release", "smoke-pypi"}
+    assert "!cancelled()" in publish["if"]
+    assert "needs.smoke-pypi.result == 'success'" in publish["if"]
+    assert "needs.github-release.result == 'success'" in publish["if"]
+    assert "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'" in publish["if"]
+    assert publish["permissions"] == {"contents": "write"}
+    step = next(step for step in publish["steps"] if "publish-release" in step.get("run", ""))
+    assert step["env"]["RELEASE_ID"] == "${{ needs.github-release.outputs.release_id }}"
+    assert step["env"]["TAG"] == "${{ needs.prepare.outputs.tag }}"
+    assert '--release-id "$RELEASE_ID"' in step["run"]
+    assert not any("download-artifact" in step.get("uses", "") for step in publish["steps"])
 
 
 def test_release_smoke_is_strict_unless_the_sdk_still_bundles_the_plugin() -> None:

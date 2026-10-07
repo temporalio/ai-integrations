@@ -39,6 +39,22 @@ def test_cli_parse_tag_emits_plugin_python_requirement(plugin_repo: Path, capsys
     assert "requires_python=>=3.11" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("maturity,version,github_flag", [
+    ("pre-release", "0.0.1", "true"), ("pre-release", "0.0.1rc1", "true"),
+    ("public-preview", "0.1.0", "false"), ("public-preview", "0.1.0rc1", "true"),
+    ("generally-available", "1.0.0", "false"), ("generally-available", "1.0.0rc1", "true"),
+])
+def test_github_classification_does_not_change_registry_routing(
+    plugin_repo: Path, capsys: pytest.CaptureFixture[str], maturity: str, version: str, github_flag: str,
+) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(meta.read_text().replace('maturity = "pre-release"', f'maturity = "{maturity}"'))
+    assert release_tool.main(["--repo-root", str(plugin_repo), "parse-tag", f"python/fakeplug/v{version}"]) == 0
+    outputs = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines())
+    assert outputs["github_prerelease"] == github_flag
+    assert outputs["prerelease"] == ("true" if Version(version).is_prerelease else "false")
+
+
 @pytest.fixture
 def recovery_source(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict, dict, dict]:
     tag = "python/fakeplug/v0.0.1rc1"
@@ -419,7 +435,7 @@ def test_draft_release_waits_for_new_release_visibility(tmp_path: Path, monkeypa
     assert release_tool.cmd_draft_release(args) == 0
     assert any(call[:2] == ("release", "create") for call in calls)
     assert sleeps == [1.0]
-    assert output.read_text() == f"url={release_url}\n"
+    assert output.read_text() == f"release_id=42\nurl={release_url}\n"
 
 
 def test_draft_release_update_preserves_tag_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -446,7 +462,7 @@ def test_draft_release_update_preserves_tag_name(tmp_path: Path, monkeypatch: py
     ]) == 0
     patch = next(call for call in calls if "PATCH" in call)
     assert "tag_name=python/mcp/v0.1.0rc1" in patch
-    assert output.read_text() == f"url={release_url}\n"
+    assert output.read_text() == f"release_id=42\nurl={release_url}\n"
 
 
 def test_upload_release_asset_replaces_by_release_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -480,6 +496,56 @@ def test_draft_release_refuses_to_modify_a_published_release(tmp_path: Path, mon
     with pytest.raises(release_tool.PolicyError, match="published release already exists"):
         release_tool.cmd_draft_release(args)
     assert calls == [] and not output.exists()
+
+
+@pytest.mark.parametrize("maturity,version,prerelease", [
+    ("pre-release", "0.0.1", True), ("public-preview", "0.1.0", False),
+    ("generally-available", "1.0.0", False), ("generally-available", "1.0.0rc1", True),
+])
+def test_publish_release_preserves_reviewed_content_and_never_marks_latest(
+    plugin_repo: Path, monkeypatch: pytest.MonkeyPatch, maturity: str, version: str, prerelease: bool,
+) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(meta.read_text().replace('maturity = "pre-release"', f'maturity = "{maturity}"'))
+    tag = f"python/fakeplug/v{version}"
+    endpoint = "repos/temporalio/ai-integrations/releases/42"
+    release = {"tag_name": tag, "draft": True, "body": "Reviewer-edited notes", "assets": [{"id": 7}],
+               "html_url": f"https://github.com/temporalio/ai-integrations/releases/tag/{tag}"}
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(*args: str, input_text: str | None = None) -> str:
+        calls.append(args)
+        if args == ("api", endpoint):
+            return json.dumps(release)
+        assert args == ("api", "-X", "PATCH", endpoint, "--input", "-")
+        payload = json.loads(input_text or "{}")
+        assert payload == {"draft": False, "prerelease": prerelease, "make_latest": "false"}
+        return json.dumps({**release, **payload})
+
+    monkeypatch.setattr(release_tool, "_gh", fake_gh)
+    output = plugin_repo / "outputs"
+    assert release_tool.main([
+        "--repo-root", str(plugin_repo), "publish-release", "--repo", "temporalio/ai-integrations",
+        "--tag", tag, "--release-id", "42", "--github-output", str(output),
+    ]) == 0
+    assert len(calls) == 2
+    assert output.read_text() == f"url={release['html_url']}\n"
+
+
+@pytest.mark.parametrize("tag,draft,status", [
+    ("python/fakeplug/v0.0.1", False, 0), ("python/other/v0.0.1", True, 1),
+])
+def test_publish_release_rerun_and_tag_mismatch_do_not_modify_releases(
+    plugin_repo: Path, monkeypatch: pytest.MonkeyPatch, tag: str, draft: bool, status: int,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    release = {"tag_name": tag, "draft": draft, "html_url": "https://github.com/temporalio/ai-integrations/releases/42"}
+    monkeypatch.setattr(release_tool, "_gh", lambda *args, **kwargs: calls.append(args) or json.dumps(release))
+    assert release_tool.main([
+        "--repo-root", str(plugin_repo), "publish-release", "--repo", "temporalio/ai-integrations",
+        "--tag", "python/fakeplug/v0.0.1", "--release-id", "42", "--github-output", str(plugin_repo / "outputs"),
+    ]) == status
+    assert calls == [("api", "repos/temporalio/ai-integrations/releases/42")]
 
 
 def test_release_notes_ignores_other_plugins_tags(plugin_repo: Path) -> None:

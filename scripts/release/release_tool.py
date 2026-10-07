@@ -9,6 +9,7 @@ Subcommands:
   check-recovery-run            validate a tagged run's tested artifacts for publication recovery
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
+  publish-release               publish the reviewed draft after registry verification, never as latest
 
 Policy (AGENTS.md, "Release runbook"):
   * a coordinate with no published release starts at exactly 1.0.0 (generally-available),
@@ -121,9 +122,17 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
         out["root_api"] = meta["plugin"]["root-api"]
         out["smoke_imports"] = ",".join(meta.get("smoke", {}).get("imports", []))
         out["allow_final"] = "true" if meta.get("release", {}).get("allow-final") else "false"
+        out["github_prerelease"] = "true" if github_prerelease(Version(out["version"]), meta["plugin"]["maturity"]) else "false"
         out["requires_python"] = _load(plugin_toml.parent / "pyproject.toml")["project"]["requires-python"]
     _write_outputs(args.github_output, out)
     return 0
+
+
+def github_prerelease(version: Version, maturity: str) -> bool:
+    """Classify GitHub releases independently of which package index receives the version."""
+    if maturity not in FIRST_VERSION:
+        raise PolicyError(f"unknown maturity {maturity!r}")
+    return version.is_prerelease or maturity == "pre-release"
 
 
 # --------------------------------------------------------------------------- policy
@@ -530,9 +539,7 @@ def cmd_draft_release(args: argparse.Namespace) -> int:
     repo = args.repo or _repo()
     releases = find_releases(repo, args.tag)
     if any(not release["draft"] for release in releases):
-        # Runbook step 5 publishes the draft by hand. A published release owns the tag, and a later
-        # re-run must neither un-publish it nor swap its assets; refusing here also keeps
-        # `gh release upload <tag>` below from ever resolving to a published release.
+        # A published release owns the tag; a later re-run must not un-publish it or swap its assets.
         raise PolicyError(f"a published release already exists for {args.tag}; refusing to modify it")
     if not releases:
         cmd = ["release", "create", args.tag, "--repo", repo, "--draft", "--verify-tag", "--title", args.title, "--notes-file", args.notes]
@@ -561,8 +568,30 @@ def cmd_draft_release(args: argparse.Namespace) -> int:
     release_url = _gh("api", f"repos/{repo}/releases/{releases[0]['id']}", "--jq", ".html_url").strip()
     if not release_url:
         raise PolicyError("draft release has no URL for approval")
-    _write_outputs(args.github_output, {"url": release_url})
+    _write_outputs(args.github_output, {"release_id": releases[0]["id"], "url": release_url})
     print(f"OK: draft release ready: {release_url}")
+    return 0
+
+
+def cmd_publish_release(args: argparse.Namespace) -> int:
+    repo = args.repo or _repo()
+    parsed = parse_tag(args.tag)
+    meta = _load(Path(args.repo_root) / parsed["plugin_dir"] / "plugin.toml")
+    prerelease = github_prerelease(Version(parsed["version"]), meta["plugin"]["maturity"])
+    endpoint = f"repos/{repo}/releases/{args.release_id}"
+    release = json.loads(_gh("api", endpoint))
+    if release["tag_name"] != args.tag:
+        raise PolicyError(f"release {args.release_id} does not belong to {args.tag}")
+    if release["draft"]:
+        # Update only publication flags, preserving the reviewed notes and tested assets.
+        release = json.loads(_gh("api", "-X", "PATCH", endpoint, "--input", "-", input_text=json.dumps({
+            "draft": False, "prerelease": prerelease, "make_latest": "false",
+        })))
+    else:
+        # A retry after a successful PATCH must leave the published release untouched.
+        print(f"release {args.release_id} is already published")
+    _write_outputs(args.github_output, {"url": release["html_url"]})
+    print(f"OK: published release: {release['html_url']}")
     return 0
 
 
@@ -624,6 +653,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--repo", default=None)
     p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     p.set_defaults(func=cmd_draft_release)
+
+    p = sub.add_parser("publish-release", help="publish the reviewed draft, never as latest")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--release-id", required=True, type=int)
+    p.add_argument("--repo", default=None)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    p.set_defaults(func=cmd_publish_release)
 
     args = parser.parse_args(argv)
     try:

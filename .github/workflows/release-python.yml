@@ -3,7 +3,7 @@
 #
 #   prepare -> test (reusable CI, full matrix; its ubuntu dist cell builds and checks the artifacts)
 #   -> publish-testpypi -> smoke-testpypi -> github-release (draft)
-#   -> [finals only] publish-pypi (approval links to the draft) -> smoke-pypi
+#   -> [finals only] publish-pypi (approval links to the draft) -> smoke-pypi -> publish-github-release
 #
 # The artifacts that were tested are the artifacts that get published. Dry run: dispatch on
 # main with the `tag` input set to the tag you intend to push; everything up to and including the
@@ -67,6 +67,7 @@ jobs:
       plugin_dir: ${{ steps.tag.outputs.plugin_dir }}
       version: ${{ steps.tag.outputs.version }}
       prerelease: ${{ steps.tag.outputs.prerelease }}
+      github_prerelease: ${{ steps.tag.outputs.github_prerelease }}
       coordinate: ${{ steps.tag.outputs.coordinate }}
       root_api: ${{ steps.tag.outputs.root_api }}
       smoke_imports: ${{ steps.tag.outputs.smoke_imports }}
@@ -250,6 +251,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_url: ${{ steps.release.outputs.url }}
+      release_id: ${{ steps.release.outputs.release_id }}
     permissions:
       contents: write
       actions: read
@@ -279,7 +281,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.tag }}
           TITLE: ${{ needs.prepare.outputs.coordinate }} ${{ needs.prepare.outputs.version }}
-          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          PRERELEASE: ${{ needs.prepare.outputs.github_prerelease }}
         run: |
           extra=()
           [ "$PRERELEASE" = "true" ] && extra+=(--prerelease)
@@ -353,3 +355,32 @@ jobs:
           # Same rule as TestPyPI: only a plugin the SDK still bundles may overlap it.
           ALLOW_OVERLAP_WITH_CORE: ${{ needs.prepare.outputs.allow_final == 'true' && '0' || '1' }}
         run: bash scripts/release/smoke_from_index.sh
+
+  publish-github-release:
+    name: Publish GitHub release
+    needs: [prepare, github-release, smoke-pypi]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' && needs.github-release.result == 'success'
+      && needs.smoke-pypi.result == 'success'
+      && needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - name: Publish the reviewed draft
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_ID: ${{ needs.github-release.outputs.release_id }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py publish-release --tag "$TAG" --release-id "$RELEASE_ID" --github-output "$GITHUB_OUTPUT"
+      - name: Link published release
+        env:
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+        run: printf '[Published GitHub release](%s)\n' "$RELEASE_URL" >> "$GITHUB_STEP_SUMMARY"
