@@ -403,13 +403,23 @@ def test_draft_release_waits_for_new_release_visibility(tmp_path: Path, monkeypa
     calls: list[tuple[str, ...]] = []
     sleeps: list[float] = []
     monkeypatch.setattr(release_tool, "find_releases", lambda repo, tag: next(lookups))
-    monkeypatch.setattr(release_tool, "_gh", lambda *args, **kwargs: calls.append(args) or "")
+    release_url = "https://github.com/temporalio/ai-integrations/releases/tag/untagged-123"
+
+    def fake_gh(*args: str, **kwargs: str) -> str:
+        calls.append(args)
+        if args == ("api", "repos/temporalio/ai-integrations/releases/42", "--jq", ".html_url"):
+            return release_url
+        return ""
+
+    monkeypatch.setattr(release_tool, "_gh", fake_gh)
     monkeypatch.setattr(release_tool.time, "sleep", sleeps.append)
+    output = tmp_path / "outputs"
     args = SimpleNamespace(repo="temporalio/ai-integrations", tag="python/mcp/v0.1.0rc1", title="mcp 0.1.0rc1",
-                           notes=str(notes), dist=str(dist), prerelease=True)
+                           notes=str(notes), dist=str(dist), prerelease=True, github_output=str(output))
     assert release_tool.cmd_draft_release(args) == 0
     assert any(call[:2] == ("release", "create") for call in calls)
     assert sleeps == [1.0]
+    assert output.read_text() == f"url={release_url}\n"
 
 
 def test_draft_release_update_preserves_tag_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -419,12 +429,24 @@ def test_draft_release_update_preserves_tag_name(tmp_path: Path, monkeypatch: py
     dist.mkdir()
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(release_tool, "find_releases", lambda repo, tag: [{"id": "42", "draft": True}])
-    monkeypatch.setattr(release_tool, "_gh", lambda *args, **kwargs: calls.append(args) or "")
-    args = SimpleNamespace(repo="temporalio/ai-integrations", tag="python/mcp/v0.1.0rc1", title="mcp 0.1.0rc1",
-                           notes=str(notes), dist=str(dist), prerelease=True)
-    assert release_tool.cmd_draft_release(args) == 0
+    release_url = "https://github.com/temporalio/ai-integrations/releases/tag/untagged-456"
+
+    def fake_gh(*args: str, **kwargs: str) -> str:
+        calls.append(args)
+        if args == ("api", "repos/temporalio/ai-integrations/releases/42", "--jq", ".html_url"):
+            return release_url
+        return ""
+
+    monkeypatch.setattr(release_tool, "_gh", fake_gh)
+    output = tmp_path / "outputs"
+    assert release_tool.main([
+        "draft-release", "--repo", "temporalio/ai-integrations", "--tag", "python/mcp/v0.1.0rc1",
+        "--title", "mcp 0.1.0rc1", "--notes", str(notes), "--dist", str(dist), "--prerelease",
+        "--github-output", str(output),
+    ]) == 0
     patch = next(call for call in calls if "PATCH" in call)
     assert "tag_name=python/mcp/v0.1.0rc1" in patch
+    assert output.read_text() == f"url={release_url}\n"
 
 
 def test_upload_release_asset_replaces_by_release_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -445,6 +467,19 @@ def test_upload_release_asset_replaces_by_release_id(tmp_path: Path, monkeypatch
     assert upload[:4] == ("api", "--method", "POST", "-H")
     assert "/releases/42/assets?name=fake%20plug-0.1.0.whl" in upload[-1]
     assert "release" not in upload
+
+
+def test_draft_release_refuses_to_modify_a_published_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(release_tool, "find_releases", lambda repo, tag: [{"id": "42", "draft": False}])
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(release_tool, "_gh", lambda *args, **kwargs: calls.append(args) or "")
+    output = tmp_path / "outputs"
+    args = SimpleNamespace(repo="temporalio/ai-integrations", tag="python/mcp/v0.1.0rc1", title="mcp 0.1.0rc1",
+                           notes=str(tmp_path / "notes.md"), dist=str(tmp_path / "dist"), prerelease=True,
+                           github_output=str(output))
+    with pytest.raises(release_tool.PolicyError, match="published release already exists"):
+        release_tool.cmd_draft_release(args)
+    assert calls == [] and not output.exists()
 
 
 def test_release_notes_ignores_other_plugins_tags(plugin_repo: Path) -> None:

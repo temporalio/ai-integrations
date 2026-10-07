@@ -557,7 +557,12 @@ def cmd_draft_release(args: argparse.Namespace) -> int:
         for asset in assets:
             upload_release_asset(repo, releases[0]["id"], asset)
             print(f"uploaded {Path(asset).name}")
-    print(f"OK: draft release ready: https://github.com/{repo}/releases/tag/{args.tag}")
+    # Drafts use an untagged URL until publication; the eventual tag URL returns 404 meanwhile.
+    release_url = _gh("api", f"repos/{repo}/releases/{releases[0]['id']}", "--jq", ".html_url").strip()
+    if not release_url:
+        raise PolicyError("draft release has no URL for approval")
+    _write_outputs(args.github_output, {"url": release_url})
+    print(f"OK: draft release ready: {release_url}")
     return 0
 
 
@@ -617,6 +622,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dist", required=True)
     p.add_argument("--prerelease", action="store_true")
     p.add_argument("--repo", default=None)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     p.set_defaults(func=cmd_draft_release)
 
     args = parser.parse_args(argv)

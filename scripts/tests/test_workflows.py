@@ -65,7 +65,7 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
         assert not any("checkout" in s for s in steps), "publish jobs download artifacts only"
         assert any(s.startswith("pypa/gh-action-pypi-publish@") for s in steps)
     assert doc["jobs"]["publish-testpypi"]["environment"] == "testpypi"
-    assert doc["jobs"]["publish-pypi"]["environment"] == "pypi"
+    assert doc["jobs"]["publish-pypi"]["environment"]["name"] == "pypi"
     # Uploads require a tagged run's tests or validated artifact recovery; PyPI needs its policy gate.
     assert "needs.prepare.outputs.publish == 'true'" in doc["jobs"]["publish-testpypi"]["if"]
     assert "needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true'" in doc["jobs"]["publish-testpypi"]["if"]
@@ -94,8 +94,24 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
     assert doc["concurrency"]["group"] == "release-${{ inputs.tag || github.ref }}"
     release_if = doc["jobs"]["github-release"]["if"]
     assert release_if.lstrip().startswith("!cancelled()")
-    # A skipped smoke-pypi also means "publish-pypi failed or was rejected"; a final must not draft then.
-    assert "(needs.prepare.outputs.publish_pypi != 'true' || needs.smoke-pypi.result == 'success')" in release_if
+    assert "needs.smoke-testpypi.result == 'success'" in release_if
+
+
+def test_release_notes_are_available_before_pypi_approval() -> None:
+    jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
+    draft = jobs["github-release"]
+    publish = jobs["publish-pypi"]
+    assert set(draft["needs"]) == {"prepare", "smoke-testpypi"}
+    assert "github-release" in publish["needs"]
+    assert "needs.github-release.result == 'success'" in publish["if"]
+    assert publish["environment"]["url"] == "${{ needs.github-release.outputs.release_url }}"
+    assert draft["outputs"]["release_url"] == "${{ steps.release.outputs.url }}"
+    create = next(step for step in draft["steps"] if step.get("id") == "release")
+    assert '--github-output "$GITHUB_OUTPUT"' in create["run"]
+    summary = next(step for step in draft["steps"] if "GITHUB_STEP_SUMMARY" in step.get("run", ""))
+    assert summary["env"]["RELEASE_URL"] == "${{ steps.release.outputs.url }}"
+    # Drafting never auto-publishes the release, even after the PyPI upload succeeds.
+    assert "--draft=false" not in yaml.dump(jobs)
 
 
 def test_release_smoke_is_strict_unless_the_sdk_still_bundles_the_plugin() -> None:
