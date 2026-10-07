@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import check_conventions
-from conftest import commit_all, make_python_plugin
+from conftest import SDK_VERSION, commit_all, make_python_plugin
 
 
 def run(repo: Path, nightly: bool = False) -> list[str]:
@@ -19,6 +19,64 @@ def test_empty_repo_passes(repo: Path) -> None:
 
 def test_valid_plugin_passes(plugin_repo: Path) -> None:
     assert run(plugin_repo) == []
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        "temporalio>=1.32.0,<2",
+        f"temporalio=={SDK_VERSION}",
+        f"temporalio>={SDK_VERSION},<2; python_version >= '3.11'",
+        "temporalio @ https://example.com/temporalio.whl",
+        "pydantic>=2,<3",
+    ],
+)
+def test_sdk_requirement_matches_shared_baseline(plugin_repo: Path, requirement: str) -> None:
+    manifest = plugin_repo / "python/fakeplug/pyproject.toml"
+    manifest.write_text(manifest.read_text().replace(f"temporalio>={SDK_VERSION},<2", requirement))
+    assert any("SDK requirement must be" in violation for violation in run(plugin_repo))
+
+
+def test_sdk_extras_preserve_the_shared_baseline(plugin_repo: Path) -> None:
+    manifest = plugin_repo / "python/fakeplug/pyproject.toml"
+    manifest.write_text(manifest.read_text().replace("temporalio>=", "temporalio[opentelemetry,pydantic]>="))
+    assert run(plugin_repo) == []
+
+
+@pytest.mark.parametrize("version", ["1.32.0", "1.33.0", "1.35.0"])
+def test_locked_sdk_version_matches_shared_baseline(plugin_repo: Path, version: str) -> None:
+    lock = plugin_repo / "python/fakeplug/uv.lock"
+    lock.write_text(lock.read_text().replace(SDK_VERSION, version))
+    assert any("locked SDK version must be" in violation for violation in run(plugin_repo))
+
+
+@pytest.mark.parametrize("packages", ["", '[[package]]\nname = "temporalio"\nversion = "1.33.0"\n'])
+def test_sdk_lock_requires_exactly_one_sdk_package(plugin_repo: Path, packages: str) -> None:
+    lock = plugin_repo / "python/fakeplug/uv.lock"
+    lock.write_text("version = 1\n" if not packages else lock.read_text() + "\n" + packages)
+    assert any("locked SDK version must be" in violation for violation in run(plugin_repo))
+
+
+@pytest.mark.parametrize("policy", [None, 'version = "invalid"\n', "version = 123\n"])
+def test_sdk_baseline_must_be_present_and_valid(plugin_repo: Path, policy: str | None) -> None:
+    path = plugin_repo / "python/_shared/sdk.toml"
+    if policy is None:
+        path.unlink()
+    else:
+        path.write_text(policy)
+    assert any("cannot read SDK baseline" in violation for violation in run(plugin_repo))
+
+
+def test_sdk_baseline_applies_to_new_plugin_template(plugin_repo: Path) -> None:
+    template = plugin_repo / "python/_template"
+    template.mkdir()
+    (template / "pyproject.toml.tmpl").write_text(
+        '[project]\ndependencies = ["temporalio>=1.32.0,<2"]\n'
+    )
+    # Avoid unrelated standard-support checks when testing only the SDK policy.
+    checker = check_conventions.Checker(plugin_repo)
+    checker.check_python_sdk(check_conventions.discover_plugins(plugin_repo)["python"])
+    assert any("python/_template: SDK requirement must be" in violation for violation in checker.violations)
 
 
 def test_python_version_is_the_development_placeholder(plugin_repo: Path) -> None:
@@ -85,7 +143,7 @@ def test_plugin_folder_suffix_and_language_lockfile(plugin_repo: Path) -> None:
 
 def test_python_code_is_forbidden_in_shared(plugin_repo: Path) -> None:
     shared = plugin_repo / "python/_shared"
-    shared.mkdir()
+    shared.mkdir(exist_ok=True)
     (shared / "ruff.toml").write_text('target-version = "py310"\n')
     assert run(plugin_repo) == []
     (shared / "fixtures.py").write_text("VALUE = 1\n")
@@ -94,7 +152,8 @@ def test_python_code_is_forbidden_in_shared(plugin_repo: Path) -> None:
     assert any("Python code must be duplicated" in x for x in run(plugin_repo))
 
 
-def test_standard_test_support_matches_templates(plugin_repo: Path) -> None:
+@pytest.mark.parametrize("support_file", sorted(check_conventions.STANDARD_TEST_SUPPORT))
+def test_standard_test_support_matches_templates(plugin_repo: Path, support_file: str) -> None:
     template = plugin_repo / "python/_template"
     plugin = plugin_repo / "python/fakeplug"
     for plugin_rel, template_rel in check_conventions.STANDARD_TEST_SUPPORT.items():
@@ -105,8 +164,8 @@ def test_standard_test_support_matches_templates(plugin_repo: Path) -> None:
         rendered.parent.mkdir(parents=True, exist_ok=True)
         rendered.write_bytes(canonical.read_bytes())
     assert run(plugin_repo) == []
-    (plugin / "tests/helpers/provenance.py").write_text("# drifted\n")
-    assert any("differs from canonical" in x for x in run(plugin_repo))
+    (plugin / support_file).write_text("# drifted\n")
+    assert any(support_file in x and "differs from canonical" in x for x in run(plugin_repo))
 
 
 def test_plugin_toml_agreement(plugin_repo: Path) -> None:

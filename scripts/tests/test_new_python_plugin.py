@@ -7,7 +7,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
-from conftest import commit_all, init_repo
+from conftest import SDK_VERSION, commit_all, init_repo
 
 import check_conventions
 
@@ -48,13 +48,17 @@ def test_new_plugin_is_top_level_and_release_ready(tmp_path: Path, maturity: str
     assert "TRANSITION(sdk-cutover)" not in (plugin / "plugin.toml").read_text()
     assert "TRANSITION(sdk-cutover)" not in (plugin / "pyproject.toml").read_text()
     assert (plugin / "tests/test_installed_matches_source.py").is_file()
+    assert (plugin / "tests/helpers/environment.py").is_file()
+    assert (plugin / "tests/test_env.py").is_file()
     for source in (plugin / "tests").rglob("*.py"):
         ast.parse(source.read_text(), filename=str(source))
 
     conftest = (plugin / "tests/conftest.py").read_text()
     assert "import pytest_asyncio\n\nfrom temporalio.client" in conftest
 
-    (plugin / "uv.lock").write_text("version = 1\n")
+    (plugin / "uv.lock").write_text(
+        f'version = 1\n\n[[package]]\nname = "temporalio"\nversion = "{SDK_VERSION}"\n'
+    )
     commit_all(repo, "add generated plugin")
     assert check_conventions.Checker(repo).run(nightly=False) == []
 

@@ -6,11 +6,14 @@ import os
 import shutil
 import subprocess
 import textwrap
+import tomllib
 from pathlib import Path
 
 import pytest
 
 REQUIRED_VERSION = ">=0.12.5,<0.13"
+SDK_POLICY = (Path(__file__).resolve().parents[2] / "python/_shared/sdk.toml").read_text()
+SDK_VERSION = tomllib.loads(SDK_POLICY)["version"]
 LICENSE_TEXT = "MIT License\n\nCopyright (c) 2026 Temporal Technologies Inc.\n\nPermission is hereby granted...\n"
 
 
@@ -27,6 +30,9 @@ def init_repo(root: Path) -> Path:
     (root / "LICENSE").write_text(LICENSE_TEXT)
     (root / ".gitignore").write_text(".venv/\ndist/\n")
     (root / "README.md").write_text("# repo\n")
+    shared = root / "python/_shared"
+    shared.mkdir(parents=True, exist_ok=True)
+    (shared / "sdk.toml").write_text(SDK_POLICY)
     (root / "scripts").mkdir(exist_ok=True)
     (root / "scripts" / "pyproject.toml").write_text(
         f'[project]\nname = "scripts"\nversion = "0"\n\n[tool.uv]\npackage = false\nrequired-version = "{REQUIRED_VERSION}"\n'
@@ -61,7 +67,7 @@ def make_python_plugin(
     (pkg / "__init__.py").write_text('"""Fake plugin."""\n\n__all__ = ["hello"]\n\n\ndef hello() -> str:\n    return "hi"\n')
     (pkg / "_impl.py").write_text("VALUE = 1\n")
     (pkg / "py.typed").write_text("")
-    deps = dependencies if dependencies is not None else ["temporalio>=1.32.0,<2"]
+    deps = dependencies if dependencies is not None else [f"temporalio>={SDK_VERSION},<2"]
     deps_toml = ", ".join(f'"{x}"' for x in deps)
     (d / "pyproject.toml").write_text(textwrap.dedent(f'''
         [project]
@@ -109,7 +115,9 @@ def make_python_plugin(
     ''').lstrip())
     (d / "Makefile").write_text("DIST := " + coordinate + "\ninclude ../_shared/python.mk\n")
     (d / "README.md").write_text("# fake\n\nSee https://github.com/temporalio/ai-integrations for details.\n")
-    (d / "uv.lock").write_text("version = 1\n")
+    (d / "uv.lock").write_text(
+        f'version = 1\n\n[[package]]\nname = "temporalio"\nversion = "{SDK_VERSION}"\n'
+    )
     lic = d / "LICENSE"  # committed copy, byte-identical to the root LICENSE
     if lic.exists() or lic.is_symlink():
         lic.unlink()
