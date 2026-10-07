@@ -290,6 +290,8 @@ Where a tool executes depends on how it is defined:
 | Tool | Execution | Use for |
 | --- | --- | --- |
 | `activity_as_tool()` | Temporal activity | External I/O and non-deterministic operations |
+| `child_workflow_as_tool()` | Child Workflow | Isolated subagents with their own durable history and lifecycle |
+| `nexus_operation_as_tool()` | Nexus operation | Subagents or tools behind an independent service boundary |
 | `FunctionTool` / `@function_tool` | Workflow | Deterministic, workflow-safe computation |
 | OpenAI-hosted tool | Model provider | Provider-hosted features executed as part of the model invocation |
 
@@ -351,6 +353,120 @@ worker = Worker(
     activities=[get_weather],
 )
 ```
+
+### Child Workflow Agents as Tools
+
+OpenAI Agents' `Agent.as_tool()` runs the subagent loop inside the calling
+Workflow. Use `child_workflow_as_tool()` when each subagent should instead have
+its own Workflow history, retries, lifecycle, or task queue. The child Workflow
+constructs its agent locally; live `Agent` and context objects are not serialized
+into Workflow history.
+
+```python
+from agents import Agent, Runner
+from temporalio import workflow
+from temporalio.openai_agents import workflow as openai_workflow
+
+
+@workflow.defn
+class ResearchAgentWorkflow:
+    @workflow.run
+    async def run(self, question: str) -> str:
+        """Research a question with a specialist agent."""
+        agent = Agent(
+            name="Researcher",
+            instructions="Research the question and return a concise answer.",
+        )
+        result = await Runner.run(agent, question)
+        return str(result.final_output)
+
+
+@workflow.defn
+class OrchestratorWorkflow:
+    @workflow.run
+    async def run(self, question: str) -> str:
+        agent = Agent(
+            name="Orchestrator",
+            instructions="Use the research tool before answering.",
+            tools=[
+                openai_workflow.child_workflow_as_tool(
+                    ResearchAgentWorkflow.run,
+                    tool_name="research",
+                    tool_description="Research a question with a specialist agent.",
+                )
+            ],
+        )
+        result = await Runner.run(agent, question)
+        return str(result.final_output)
+```
+
+Register both Workflow types on the Worker. By default, the child runs on the
+parent's task queue; pass `task_queue=` to deploy subagents separately. Leave
+`id=` unset if the model may invoke the tool more than once, allowing Temporal
+to assign a deterministic unique Child Workflow ID for every invocation.
+
+```python
+worker = Worker(
+    client,
+    task_queue="agents",
+    workflows=[OrchestratorWorkflow, ResearchAgentWorkflow],
+)
+```
+
+### Messaging Between Agent Workflows
+
+`send_message_tool()` gives an agent a durable `send_message` tool backed by a
+Temporal Signal. The recipient installs `AgentMessageInbox` inside its Workflow.
+Recipient names come from an explicit allowlist, so the model cannot signal an
+arbitrary Workflow ID.
+
+```python
+from temporalio import workflow
+from temporalio.openai_agents import workflow as openai_workflow
+
+
+@workflow.defn
+class ResearchAgentWorkflow:
+    @workflow.run
+    async def run(self, question: str) -> str:
+        tools = [
+            openai_workflow.send_message_tool(
+                {},
+                include_parent=True,
+                tool_description="Send progress or results to the coordinator.",
+            )
+        ]
+        # Construct and run the research agent with tools=tools.
+        ...
+
+
+@workflow.defn
+class CoordinatorWorkflow:
+    def __init__(self) -> None:
+        self.messages = openai_workflow.AgentMessageInbox()
+
+    @workflow.run
+    async def run(self, question: str) -> str:
+        # Start or invoke child agents, then consume durable messages.
+        message = await self.messages.receive()
+        return message.body
+```
+
+For sibling agents, pass aliases and Workflow IDs explicitly:
+
+```python
+openai_workflow.send_message_tool(
+    {
+        "researcher": researcher_workflow_id,
+        "reviewer": reviewer_workflow_id,
+    }
+)
+```
+
+Workflow-to-workflow delivery uses Signals because Temporal Workflow code can
+Signal another Workflow but cannot directly invoke its Update handler. Updates
+remain useful when an external client needs synchronous request/response access
+to an agent Workflow.
 
 ### Calling OpenAI Agents Tools inside Temporal Workflows
 
