@@ -9,7 +9,7 @@ Subcommands:
   check-recovery-run            validate a tagged run's tested artifacts for publication recovery
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
-  publish-release               publish the reviewed draft after registry verification, never as latest
+  publish-release               publish the reviewed draft after registry verification
 
 Policy (AGENTS.md, "Release runbook"):
   * a coordinate with no published release starts at exactly 1.0.0 (generally-available),
@@ -585,7 +585,7 @@ def cmd_publish_release(args: argparse.Namespace) -> int:
     if release["draft"]:
         # Update only publication flags, preserving the reviewed notes and tested assets.
         release = json.loads(_gh("api", "-X", "PATCH", endpoint, "--input", "-", input_text=json.dumps({
-            "draft": False, "prerelease": prerelease, "make_latest": "false",
+            "draft": False, "prerelease": prerelease,
         })))
     else:
         # A retry after a successful PATCH must leave the published release untouched.
@@ -654,7 +654,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     p.set_defaults(func=cmd_draft_release)
 
-    p = sub.add_parser("publish-release", help="publish the reviewed draft, never as latest")
+    p = sub.add_parser("publish-release", help="publish the reviewed draft")
     p.add_argument("--tag", required=True)
     p.add_argument("--release-id", required=True, type=int)
     p.add_argument("--repo", default=None)

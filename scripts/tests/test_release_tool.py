@@ -502,7 +502,7 @@ def test_draft_release_refuses_to_modify_a_published_release(tmp_path: Path, mon
     ("pre-release", "0.0.1", True), ("public-preview", "0.1.0", False),
     ("generally-available", "1.0.0", False), ("generally-available", "1.0.0rc1", True),
 ])
-def test_publish_release_preserves_reviewed_content_and_never_marks_latest(
+def test_publish_release_preserves_reviewed_content_and_classification(
     plugin_repo: Path, monkeypatch: pytest.MonkeyPatch, maturity: str, version: str, prerelease: bool,
 ) -> None:
     meta = plugin_repo / "python/fakeplug/plugin.toml"
@@ -519,7 +519,7 @@ def test_publish_release_preserves_reviewed_content_and_never_marks_latest(
             return json.dumps(release)
         assert args == ("api", "-X", "PATCH", endpoint, "--input", "-")
         payload = json.loads(input_text or "{}")
-        assert payload == {"draft": False, "prerelease": prerelease, "make_latest": "false"}
+        assert payload == {"draft": False, "prerelease": prerelease}
         return json.dumps({**release, **payload})
 
     monkeypatch.setattr(release_tool, "_gh", fake_gh)
