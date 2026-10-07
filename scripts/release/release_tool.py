@@ -580,12 +580,15 @@ def cmd_publish_release(args: argparse.Namespace) -> int:
     prerelease = github_prerelease(Version(parsed["version"]), meta["plugin"]["maturity"])
     endpoint = f"repos/{repo}/releases/{args.release_id}"
     release = json.loads(_gh("api", endpoint))
-    if release["tag_name"] != args.tag:
+    # Saving reviewed notes in GitHub can replace a draft's tag with an untagged-* placeholder.
+    # The workflow passes the original draft's stable ID, so restore that placeholder on publication.
+    untagged_draft = release["draft"] and release["tag_name"].startswith("untagged-")
+    if release["tag_name"] != args.tag and not untagged_draft:
         raise PolicyError(f"release {args.release_id} does not belong to {args.tag}")
     if release["draft"]:
-        # Update only publication flags, preserving the reviewed notes and tested assets.
+        # Set the tag and publication flags, preserving the reviewed title, notes and tested assets.
         release = json.loads(_gh("api", "-X", "PATCH", endpoint, "--input", "-", input_text=json.dumps({
-            "draft": False, "prerelease": prerelease,
+            "tag_name": args.tag, "draft": False, "prerelease": prerelease,
         })))
     else:
         # A retry after a successful PATCH must leave the published release untouched.
@@ -656,7 +659,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("publish-release", help="publish the reviewed draft")
     p.add_argument("--tag", required=True)
-    p.add_argument("--release-id", required=True, type=int)
+    p.add_argument("--release-id", required=True, type=int, help="stable release ID captured by draft-release")
     p.add_argument("--repo", default=None)
     p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     p.set_defaults(func=cmd_publish_release)

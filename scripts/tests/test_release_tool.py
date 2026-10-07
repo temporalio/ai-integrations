@@ -502,15 +502,19 @@ def test_draft_release_refuses_to_modify_a_published_release(tmp_path: Path, mon
     ("pre-release", "0.0.1", True), ("public-preview", "0.1.0", False),
     ("generally-available", "1.0.0", False), ("generally-available", "1.0.0rc1", True),
 ])
+@pytest.mark.parametrize("untagged", [False, True])
 def test_publish_release_preserves_reviewed_content_and_classification(
-    plugin_repo: Path, monkeypatch: pytest.MonkeyPatch, maturity: str, version: str, prerelease: bool,
+    plugin_repo: Path, monkeypatch: pytest.MonkeyPatch, maturity: str, version: str, prerelease: bool, untagged: bool,
 ) -> None:
     meta = plugin_repo / "python/fakeplug/plugin.toml"
     meta.write_text(meta.read_text().replace('maturity = "pre-release"', f'maturity = "{maturity}"'))
     tag = f"python/fakeplug/v{version}"
     endpoint = "repos/temporalio/ai-integrations/releases/42"
-    release = {"tag_name": tag, "draft": True, "body": "Reviewer-edited notes", "assets": [{"id": 7}],
-               "html_url": f"https://github.com/temporalio/ai-integrations/releases/tag/{tag}"}
+    draft_tag = "untagged-5568a832d017c5de0ec3" if untagged else tag
+    release = {"tag_name": draft_tag, "draft": True, "name": "Reviewer-edited title",
+               "body": "Reviewer-edited notes", "assets": [{"id": 7}],
+               "html_url": f"https://github.com/temporalio/ai-integrations/releases/tag/{draft_tag}"}
+    published_url = f"https://github.com/temporalio/ai-integrations/releases/tag/{tag}"
     calls: list[tuple[str, ...]] = []
 
     def fake_gh(*args: str, input_text: str | None = None) -> str:
@@ -519,8 +523,9 @@ def test_publish_release_preserves_reviewed_content_and_classification(
             return json.dumps(release)
         assert args == ("api", "-X", "PATCH", endpoint, "--input", "-")
         payload = json.loads(input_text or "{}")
-        assert payload == {"draft": False, "prerelease": prerelease}
-        return json.dumps({**release, **payload})
+        assert payload == {"tag_name": tag, "draft": False, "prerelease": prerelease}
+        release.update(payload, html_url=published_url)
+        return json.dumps(release)
 
     monkeypatch.setattr(release_tool, "_gh", fake_gh)
     output = plugin_repo / "outputs"
@@ -529,11 +534,16 @@ def test_publish_release_preserves_reviewed_content_and_classification(
         "--tag", tag, "--release-id", "42", "--github-output", str(output),
     ]) == 0
     assert len(calls) == 2
-    assert output.read_text() == f"url={release['html_url']}\n"
+    assert release["tag_name"] == tag and not release["draft"]
+    assert release["name"] == "Reviewer-edited title"
+    assert release["body"] == "Reviewer-edited notes" and release["assets"] == [{"id": 7}]
+    assert output.read_text() == f"url={published_url}\n"
 
 
 @pytest.mark.parametrize("tag,draft,status", [
     ("python/fakeplug/v0.0.1", False, 0), ("python/other/v0.0.1", True, 1),
+    ("python/other/v0.0.1", False, 1), ("untagged-5568a832d017c5de0ec3", False, 1),
+    ("", True, 1),
 ])
 def test_publish_release_rerun_and_tag_mismatch_do_not_modify_releases(
     plugin_repo: Path, monkeypatch: pytest.MonkeyPatch, tag: str, draft: bool, status: int,
