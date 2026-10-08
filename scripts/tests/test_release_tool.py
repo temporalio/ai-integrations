@@ -45,6 +45,32 @@ def test_cli_parse_tag_emits_plugin_python_requirement(plugin_repo: Path, capsys
     assert "requires_python=>=3.11" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("version,prerelease", [("0.1.0-RC1", "true"), ("0.1.0", "false")])
+def test_cli_parse_java_tag_without_python_manifest(tmp_path: Path, version: str, prerelease: str) -> None:
+    plugin = tmp_path / "java/spring-ai"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.toml").write_text('''[plugin]
+name = "spring-ai"
+language = "java"
+coordinate = "io.temporal:spring-ai"
+root-api = "io.temporal.springai"
+maturity = "public-preview"
+
+[release]
+allow-final = false
+''')
+    output = tmp_path / "outputs"
+    assert release_tool.main(["--repo-root", str(tmp_path), "parse-tag", f"java/spring-ai/v{version}",
+                              "--github-output", str(output)]) == 0
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert outputs["coordinate"] == "io.temporal:spring-ai"
+    assert outputs["plugin_dir"] == "java/spring-ai"
+    assert outputs["version"] == version
+    assert outputs["prerelease"] == prerelease
+    assert outputs["github_prerelease"] == prerelease
+    assert "requires_python" not in outputs
+
+
 @pytest.mark.parametrize("maturity,version,github_flag", [
     ("pre-release", "0.0.1", "true"), ("pre-release", "0.0.1rc1", "true"),
     ("public-preview", "0.1.0", "false"), ("public-preview", "0.1.0rc1", "true"),
