@@ -214,6 +214,13 @@ class GoogleAdkPlugin(SimplePlugin):
                 # cryptography dependencies outside the sandbox before either
                 # worker execution or replay. google.adk is passed through below.
                 importlib.import_module("google.adk.auth.auth_handler")
+                # ADK also probes optional model providers on the first LLM turn.
+                # Warm its cached discovery here so their large import trees
+                # cannot trip the workflow deadlock detector during execution
+                # or replay. ADK tolerates providers that are not installed.
+                from google.adk.flows.llm_flows.contents import _id_pairing_model_types
+
+                _id_pairing_model_types()
                 return dataclasses.replace(
                     runner,
                     restrictions=runner.restrictions.with_passthrough_modules(
