@@ -1,0 +1,19 @@
+# Schema: ../../AGENTS.md#repository-invariants
+
+[plugin]
+name = "strands_agents"
+language = "python"
+coordinate = "temporalio-strands-agents"
+registry = "pypi"
+root-api = "temporalio.strands_agents"
+maturity = "public-preview"
+docs = "https://docs.temporal.io/develop/python/integrations/strands-agents"
+
+[release]
+allow-final = true
+
+[ci]
+runtime-versions = ["3.10", "3.14"]
+
+[smoke]
+imports = ["temporalio.strands_agents.workflow"]

@@ -48,10 +48,29 @@ def test_check_wheel_requires_exactly_one_artifact_each(built: tuple[Path, Path,
     assert len(problems) == 2 and all("expected exactly one" in p for p in problems)
 
 
+@pytest.mark.parametrize("readme", ['"README.pypi.md"', '{file = "README.pypi.md", content-type = "text/markdown"}'])
+def test_check_wheel_uses_the_published_readme(tmp_path: Path, readme: str) -> None:
+    root = init_repo(tmp_path / "repo")
+    plugin = make_python_plugin(root, "fakeplug", dependencies=[])
+    manifest = plugin / "pyproject.toml"
+    manifest.write_text(manifest.read_text().replace('readme = "README.md"', f"readme = {readme}"))
+    (plugin / "README.pypi.md").write_text("Published package documentation\n")
+    assert check_wheel.check(plugin, build_plugin(plugin), root) == ["METADATA Requires-Dist must include temporalio"]
+
+
 def test_smoke_orchestrator_passes(built: tuple[Path, Path, Path]) -> None:
     _, plugin, dist = built
     rc = smoke.main(["--plugin", str(plugin), "--dist", str(dist)])
     assert rc == 0
+
+
+def test_smoke_uses_the_running_interpreter(tmp_path: Path) -> None:
+    root = init_repo(tmp_path / "repo")
+    plugin = make_python_plugin(root, "fakeplug", dependencies=[])
+    manifest = plugin / "pyproject.toml"
+    floor = f">={sys.version_info.major}.{sys.version_info.minor}"
+    manifest.write_text(manifest.read_text().replace(">=3.10", floor))
+    assert smoke.main(["--plugin", str(plugin), "--dist", str(build_plugin(plugin))]) == 0
 
 
 def test_smoke_in_env_detects_editable_and_version_mismatch(built: tuple[Path, Path, Path], tmp_path: Path) -> None:
@@ -85,6 +104,14 @@ def test_smoke_in_env_detects_overwritten_and_stray_files(built: tuple[Path, Pat
     site = subprocess.run([str(py), "-c", "import temporalio.contrib.fakeplug as m, pathlib; print(pathlib.Path(m.__file__).parent)"],
                           check=True, capture_output=True, text=True).stdout.strip()
     pkg_dir = Path(site)
+    (pkg_dir / "README.md").write_text("SDK package README left behind during migration\n")
+    args = [str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"]
+    env = {**os.environ, "EXPECTED_VERSION": "0.0.0", "ALLOW_OVERLAP_WITH_CORE": "0"}
+    r = subprocess.run(args, env=env, capture_output=True, text=True)
+    assert r.returncode == 1 and "README.md" in r.stdout
+    r = subprocess.run(args, env={**env, "ALLOW_OVERLAP_WITH_CORE": "1"}, capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout
+    (pkg_dir / "README.md").unlink()
     (pkg_dir / "_impl.py").write_text("VALUE = 'tampered'\n")
     r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"],
                        env={**os.environ, "EXPECTED_VERSION": "0.0.0"}, capture_output=True, text=True)
@@ -92,7 +119,7 @@ def test_smoke_in_env_detects_overwritten_and_stray_files(built: tuple[Path, Pat
     subprocess.run(["uv", "pip", "install", "--quiet", "--python", str(py), "--reinstall", str(wheel)], check=True, env={**os.environ, "UV_LINK_MODE": "copy"})
     (pkg_dir / "stray.py").write_text("x = 1\n")
     r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"],
-                       env={**os.environ, "EXPECTED_VERSION": "0.0.0"}, capture_output=True, text=True)
+                       env={**os.environ, "EXPECTED_VERSION": "0.0.0", "ALLOW_OVERLAP_WITH_CORE": "1"}, capture_output=True, text=True)
     assert r.returncode == 1 and "not owned by" in r.stdout
 
 

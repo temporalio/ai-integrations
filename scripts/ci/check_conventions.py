@@ -16,7 +16,7 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
   * plugin.toml schema and agreement with pyproject.toml (name/coordinate/root-api/
     maturity classifier/requires-python floor/module-name/required-version)
   * no [tool.uv.sources] path or workspace entries
-  * README has no relative markdown links (PyPI renders the README)
+  * the project's published README has no relative markdown links (PyPI renders it)
   * --nightly: coordinates with [release] allow-final = false must not exist on PyPI yet
 """
 
@@ -36,9 +36,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import LANGUAGES, Plugin, discover_plugins, load_toml, repo_root  # noqa: E402
 
 MATURITY_CLASSIFIER = {
-    "ga": "Development Status :: 5 - Production/Stable",
-    "preview": "Development Status :: 4 - Beta",
-    "experimental": "Development Status :: 3 - Alpha",
+    "generally-available": "Development Status :: 5 - Production/Stable",
+    "public-preview": "Development Status :: 4 - Beta",
+    "pre-release": "Development Status :: 3 - Alpha",
 }
 REGISTRIES = {"python": "pypi", "typescript": "npm", "java": "maven", "go": "goproxy"}
 LANGUAGE_LOCKFILES = ("uv.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "go.sum", "gradle.lockfile")
@@ -161,7 +161,7 @@ class Checker:
             return
         self.check_plugin_toml(plugin, meta, pyproject)
         self.check_pyproject(plugin, pyproject)
-        self.check_readme(plugin)
+        self.check_readme(plugin, pyproject)
         self.check_standard_test_support(plugin)
 
     def check_standard_test_support(self, plugin: Plugin) -> None:
@@ -325,13 +325,19 @@ class Checker:
         if "exclude-newer" in uv_cfg and exclude_newer_pkg.get("temporalio") is not False:
             self.fail(f"{rel}: exclude-newer is set but temporalio is not exempted (`exclude-newer-package = {{ temporalio = false }}`)")
 
-    def check_readme(self, plugin: Plugin) -> None:
-        readme = plugin.path / "README.md"
+    def check_readme(self, plugin: Plugin, pyproject: dict[str, Any]) -> None:
+        configured = pyproject.get("project", {}).get("readme", "README.md")
+        filename = configured.get("file") if isinstance(configured, dict) else configured
+        if not isinstance(filename, str) or Path(filename).is_absolute() or ".." in Path(filename).parts:
+            self.fail(f"{plugin.rel}: project.readme must name a file inside the plugin directory")
+            return
+        readme = plugin.path / filename
         if not readme.is_file():
+            self.fail(f"{plugin.rel}: published README {filename} is missing")
             return
         for lineno, line in enumerate(readme.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if RELATIVE_LINK.search(line):
-                self.fail(f"{plugin.rel}/README.md:{lineno}: relative link; use absolute https://github.com/... URLs (PyPI renders this file)")
+                self.fail(f"{plugin.rel}/{filename}:{lineno}: relative link; use absolute https://github.com/... URLs (PyPI renders this file)")
 
     def check_nightly(self, plugins: list[Plugin]) -> None:
         for plugin in plugins:

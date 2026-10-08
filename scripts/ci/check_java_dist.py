@@ -27,6 +27,10 @@ def check(plugin_dir: Path, version: str, dist: Path | None = None) -> None:
             raise ValueError(f'POM {field} differs from {value}')
     if pom.findtext('m:licenses/m:license/m:name', namespaces=ns) != 'MIT':
         raise ValueError('POM license must be MIT')
+    for dependency_version in pom.findall('.//m:dependency/m:version', namespaces=ns):
+        value = dependency_version.text or ''
+        if value.endswith('+') or value in {'latest.release', 'latest.integration'}:
+            raise ValueError(f'POM contains a Gradle-only dependency version: {value}')
     module = json.loads((dist / f'{base}.module').read_text())
     component = module['component']
     if (component['group'], component['module'], component['version']) != (group, artifact, version):

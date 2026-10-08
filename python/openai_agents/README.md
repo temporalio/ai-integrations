@@ -1,5 +1,7 @@
 # OpenAI Agents SDK Integration for Temporal
 
+> Release stage: [Generally Available](https://temporal.io/blog/announcing-openai-agents-sdk-integration).
+
 We welcome questions and feedback in the [#python-sdk](https://temporalio.slack.com/archives/CTT84RS0P) Slack channel at [temporalio.slack.com](https://temporalio.slack.com/).
 
 ## Install

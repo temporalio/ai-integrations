@@ -6,6 +6,7 @@ import tomllib
 from pathlib import Path
 from types import ModuleType
 
+import pytest
 from conftest import commit_all, init_repo
 
 import check_conventions
@@ -22,7 +23,8 @@ def load_scaffolder() -> ModuleType:
     return module
 
 
-def test_new_plugin_is_top_level_and_release_ready(tmp_path: Path) -> None:
+@pytest.mark.parametrize("maturity", ["pre-release", "public-preview", "generally-available"])
+def test_new_plugin_is_top_level_and_release_ready(tmp_path: Path, maturity: str) -> None:
     repo = init_repo(tmp_path / "repo")
     scaffolder = load_scaffolder()
     scaffolder.REPO_ROOT = repo
@@ -30,13 +32,14 @@ def test_new_plugin_is_top_level_and_release_ready(tmp_path: Path) -> None:
 
     assert (
         scaffolder.main(
-            ["fakeplug", "--description", "A fake integration", "--maturity", "preview"]
+            ["fakeplug", "--description", "A fake integration", "--maturity", maturity]
         )
         == 0
     )
 
     plugin = repo / "python/fakeplug"
     metadata = tomllib.loads((plugin / "plugin.toml").read_text())
+    assert metadata["plugin"]["maturity"] == maturity
     assert metadata["plugin"]["root-api"] == "temporalio.fakeplug"
     assert "upstream" not in metadata["plugin"]
     assert metadata["release"]["allow-final"] is True
@@ -82,6 +85,7 @@ def test_upstream_mode_uses_transitional_layout(tmp_path: Path) -> None:
 
     plugin = repo / "python/fakeplug"
     metadata = tomllib.loads((plugin / "plugin.toml").read_text())
+    assert metadata["plugin"]["maturity"] == "pre-release"
     assert metadata["plugin"]["root-api"] == "temporalio.contrib.fakeplug"
     assert metadata["plugin"]["upstream"] == upstream
     assert metadata["release"]["allow-final"] is False

@@ -112,7 +112,9 @@ def check(plugin_dir: Path, dist: Path, root: Path | None = None) -> list[str]:
             problems.append(f"sdist must have a single top-level directory, found {sorted(tops)}")
             return problems
         top = tops.pop()
-        for required in ("pyproject.toml", "README.md", "LICENSE"):
+        readme = project.get("readme", "README.md")
+        readme_file = readme.get("file", "README.md") if isinstance(readme, dict) else readme
+        for required in ("pyproject.toml", readme_file, "LICENSE"):
             if f"{top}/{required}" not in members:
                 problems.append(f"sdist missing {required}")
         for rel in src_py:

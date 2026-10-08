@@ -34,6 +34,19 @@ def test_valid_publication(tmp_path: Path) -> None:
     check(publication(tmp_path), '1.41.0-RC1')
 
 
+@pytest.mark.parametrize('version', ['1.1.+', 'latest.release', 'latest.integration'])
+def test_publication_rejects_gradle_only_dependency_versions(tmp_path: Path, version: str) -> None:
+    plugin = publication(tmp_path)
+    pom = plugin / 'dist/example-1.41.0-RC1.pom'
+    pom.write_text(pom.read_text().replace('</project>', f'''
+<dependencyManagement><dependencies><dependency>
+<groupId>org.example</groupId><artifactId>example-bom</artifactId>
+<version>{version}</version><type>pom</type><scope>import</scope>
+</dependency></dependencies></dependencyManagement></project>'''))
+    with pytest.raises(ValueError, match='Gradle-only dependency version'):
+        check(plugin, '1.41.0-RC1')
+
+
 @pytest.mark.parametrize('fault', ['missing', 'extra', 'version', 'license', 'bytecode'])
 def test_publication_rejects_invalid_artifacts(tmp_path: Path, fault: str) -> None:
     plugin = publication(tmp_path)

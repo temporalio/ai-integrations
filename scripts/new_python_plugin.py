@@ -3,7 +3,7 @@
 
 Usage:
     python3 scripts/new_python_plugin.py NAME --description "..." [--coordinate NAME] \
-        [--maturity ga|preview|experimental] [--existing] [--upstream SOURCE]
+        [--maturity pre-release|public-preview|generally-available] [--existing] [--upstream SOURCE]
 
 ``--existing`` lets the scaffolder fill in packaging files a history import did not
 bring without touching anything that already exists, in particular ``src/``.
@@ -24,9 +24,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = REPO_ROOT / "python" / "_template"
 MATURITY_CLASSIFIER = {
-    "ga": "Development Status :: 5 - Production/Stable",
-    "preview": "Development Status :: 4 - Beta",
-    "experimental": "Development Status :: 3 - Alpha",
+    "generally-available": "Development Status :: 5 - Production/Stable",
+    "public-preview": "Development Status :: 4 - Beta",
+    "pre-release": "Development Status :: 3 - Alpha",
 }
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -36,7 +36,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("name", help="folder name under python/, snake_case (e.g. openai_agents)")
     parser.add_argument("--description", required=True, help="one-line package description")
     parser.add_argument("--coordinate", help="PyPI name; default temporalio-<name with _ -> ->")
-    parser.add_argument("--maturity", choices=sorted(MATURITY_CLASSIFIER), default="experimental")
+    parser.add_argument("--maturity", choices=sorted(MATURITY_CLASSIFIER), default="pre-release")
     parser.add_argument("--existing", action="store_true", help="add missing files to an existing plugin dir")
     parser.add_argument(
         "--upstream",

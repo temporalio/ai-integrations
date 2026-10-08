@@ -93,6 +93,10 @@ def check_provenance(dist_name: str, pkg_rel: str, allow_overlap: bool = False, 
         for p in pkg_dir.rglob("*")
         if p.is_file() and "__pycache__" not in p.parts and not p.name.endswith(".pyc")
     } - owned
+    if allow_overlap:
+        # During migration the SDK still ships a package README, while plugins
+        # move that file to their distribution root (same exception as pytest).
+        extras.discard(os.path.normpath(str(pkg_dir / "README.md")))
     if extras:
         raise ProvenanceError(
             f"files under {pkg_rel} not owned by {dist_name}: {sorted(extras)}. "
@@ -230,7 +234,7 @@ def run_isolated(plugin_dir: Path, dist: Path, keep: bool = False) -> int:
         venv = tmp / "venv"
         try:
             print(f"=== {artifact.name} ===")
-            subprocess.run([uv, "venv", "--quiet", str(venv)], check=True)
+            subprocess.run([uv, "venv", "--quiet", "--python", sys.executable, str(venv)], check=True)
             py = _venv_python(venv)
             env = {**os.environ, "VIRTUAL_ENV": str(venv), "UV_LINK_MODE": "copy"}
             subprocess.run([uv, "pip", "install", "--quiet", "--python", str(py), str(artifact)], check=True, env=env)

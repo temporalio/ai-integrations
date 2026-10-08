@@ -46,6 +46,25 @@ case "$PLUGIN" in
       --path-rename "tests/contrib/research_agents/:$P/tests/contrib/openai_agents/research_agents/"
     )
     ;;
+  deepagents|google_adk|google_genai|langgraph|langsmith|strands_agents)
+    # All six packages began at these paths and have no historical renames outside
+    # their package/test trees (verified against sdk-python@6adc0d84290a79952dee3ef02c36f6ed9334874a).
+    # Keep upstream module names until cutover; distribution/folder names are independent.
+    case "$PLUGIN" in
+      google_adk) UPSTREAM_NAME=google_adk_agents ;;
+      strands_agents) UPSTREAM_NAME=strands ;;
+      *) UPSTREAM_NAME="$PLUGIN" ;;
+    esac
+    PATH_ARGS=(
+      --path "temporalio/contrib/$UPSTREAM_NAME/"
+      --path "tests/contrib/$UPSTREAM_NAME/"
+    )
+    RENAME_ARGS=(
+      --path-rename "temporalio/contrib/$UPSTREAM_NAME/README.md:$P/README.md"
+      --path-rename "temporalio/contrib/$UPSTREAM_NAME/:$P/src/temporalio/contrib/$UPSTREAM_NAME/"
+      --path-rename "tests/contrib/$UPSTREAM_NAME/:$P/tests/contrib/$UPSTREAM_NAME/"
+    )
+    ;;
   *)
     echo "error: no path archaeology recorded for PLUGIN=$PLUGIN; add a case to $0 (see README.md)" >&2
     exit 2

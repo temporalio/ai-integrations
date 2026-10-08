@@ -110,8 +110,10 @@ def _install_otel_instrumentation(tracer_provider: typing.Any) -> None:
                 self: OpenInferenceTracingProcessor, trace: Trace
             ) -> None:
                 original_on_trace_start(self=self, trace=trace)
-                trace_tokens[trace] = attach(
-                    set_span_in_context(self._root_spans[trace.trace_id])
+                # Older OpenTelemetry versions annotate context tokens as object.
+                trace_tokens[trace] = typing.cast(
+                    Token[Context],  # pyright: ignore[reportUnnecessaryCast]
+                    attach(set_span_in_context(self._root_spans[trace.trace_id])),
                 )
 
             def on_trace_end(self: OpenInferenceTracingProcessor, trace: Trace) -> None:

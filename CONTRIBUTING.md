@@ -25,7 +25,7 @@ workflow.
 ## Adding a Python plugin
 
 ```bash
-uv run --project scripts --locked python scripts/new_python_plugin.py <name> --description "..." --maturity experimental
+uv run --project scripts --locked python scripts/new_python_plugin.py <name> --description "..." --maturity pre-release
 ```
 
 The scaffolder copies `python/_template`, prints the remaining manual steps, and no workflow

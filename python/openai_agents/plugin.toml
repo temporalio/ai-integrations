@@ -6,7 +6,7 @@ language = "python"
 coordinate = "temporalio-openai-agents"
 registry = "pypi"
 root-api = "temporalio.openai_agents"
-maturity = "ga"
+maturity = "generally-available"
 docs = "https://docs.temporal.io/develop/python/integrations/openai-agents"
 
 [release]

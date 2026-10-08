@@ -1,0 +1,20 @@
+# Snapshot precedes sdk-python#1854 until a published SDK supports named workflow.new_random().
+# Schema: ../../AGENTS.md#repository-invariants
+
+[plugin]
+name = "google_adk"
+language = "python"
+coordinate = "temporalio-google-adk"
+registry = "pypi"
+root-api = "temporalio.google_adk"
+maturity = "pre-release"
+docs = "https://docs.temporal.io/develop/python/integrations/google-adk"
+
+[release]
+allow-final = true
+
+[ci]
+runtime-versions = ["3.10", "3.14"]
+
+[smoke]
+imports = ["temporalio.google_adk.workflow"]

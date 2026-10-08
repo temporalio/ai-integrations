@@ -1,0 +1,19 @@
+# Schema: ../../AGENTS.md#repository-invariants
+
+[plugin]
+name = "langsmith"
+language = "python"
+coordinate = "temporalio-langsmith"
+registry = "pypi"
+root-api = "temporalio.langsmith"
+maturity = "public-preview"
+docs = "https://docs.temporal.io/develop/python/integrations/langsmith"
+
+[release]
+allow-final = true
+
+[ci]
+runtime-versions = ["3.10", "3.14"]
+
+[smoke]
+imports = ["temporalio.langsmith._plugin", "temporalio.langsmith._interceptor"]
