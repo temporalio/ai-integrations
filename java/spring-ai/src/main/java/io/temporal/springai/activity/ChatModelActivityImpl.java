@@ -3,6 +3,7 @@ package io.temporal.springai.activity;
 import io.temporal.springai.model.ChatModelTypes;
 import io.temporal.springai.model.ChatModelTypes.Message;
 import io.temporal.springai.util.ChatOptionsCodec;
+import io.temporal.springai.util.OpenAiFailureSupport;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.HashMap;
@@ -77,7 +78,12 @@ public class ChatModelActivityImpl implements ChatModelActivity {
       ChatModelTypes.ChatModelActivityInput input) {
     ChatModel chatModel = resolveChatModel(input.modelName());
     Prompt prompt = createPrompt(input, chatModel.getOptions());
-    ChatResponse response = chatModel.call(prompt);
+    ChatResponse response;
+    try {
+      response = chatModel.call(prompt);
+    } catch (RuntimeException error) {
+      throw OpenAiFailureSupport.convert(error);
+    }
     return toOutput(response);
   }
 
