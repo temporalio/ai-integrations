@@ -10,12 +10,10 @@ We welcome questions and feedback in the [#python-sdk](https://temporalio.slack.
 uv add temporalio-openai-agents
 ```
 
-With Temporal 1.33, both distributions must be installed into the same
-physical `site-packages/temporalio` directory, as they are in a standard
-non-editable virtual environment. Split-directory installations—including
-editable installs, separate user and system sites, layered deployments, and
-`--target` installs—require Temporal 1.34 or later so that `temporalio` extends
-its package search path.
+This integration requires Temporal 1.34 or later. The SDK extends its package
+search path to support split-directory installations, including editable
+installs, separate user and system sites, layered deployments, and `--target`
+installs.
 
 ## Introduction
 

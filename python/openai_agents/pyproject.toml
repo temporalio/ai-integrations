@@ -19,9 +19,7 @@ classifiers = [
 dependencies = [
   # opentelemetry and pydantic extras: the plugin imports temporalio.contrib.opentelemetry and
   # temporalio.contrib.pydantic at module level.
-  # Temporal 1.33 is supported when both distributions share one physical
-  # site-packages/temporalio directory; split-directory installs require 1.34+.
-  "temporalio[opentelemetry,pydantic]>=1.33.0,<2",
+  "temporalio[opentelemetry,pydantic]>=1.34.0,<2",
   "openai-agents>=0.22,<0.23",
   "openai>=3,<4",             # imports openai._models.construct_type and openai.types.responses
   "mcp>=1.24,<3",

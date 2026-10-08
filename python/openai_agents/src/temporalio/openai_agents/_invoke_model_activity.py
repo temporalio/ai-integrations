@@ -24,15 +24,16 @@ from agents import (
     OpenAIProvider,
     RunContextWrapper,
     Tool,
+    ToolCaller,
     TResponseInputItem,
     UserError,
     WebSearchTool,
+    tool_namespace,
 )
 from agents.items import TResponseStreamEvent
 from agents.tool import (
     ApplyPatchTool,
     CustomTool,
-    LocalShellTool,
     ShellTool,
     ShellToolEnvironment,
     ToolSearchTool,
@@ -78,6 +79,13 @@ class FunctionToolInput:
     description: str
     params_json_schema: dict[str, Any]
     strict_json_schema: bool = True
+    # The fields below were added after the first release. They are optional so that
+    # activity inputs recorded in older workflow histories still decode.
+    defer_loading: bool = False
+    namespace: str | None = None
+    namespace_description: str | None = None
+    allowed_callers: list[ToolCaller] | None = None
+    output_json_schema: dict[str, Any] | None = None
 
 
 @dataclass
@@ -136,7 +144,6 @@ ToolInput = (
     | CodeInterpreterTool
     | HostedMCPToolInput
     | ShellToolInput
-    | LocalShellTool
     | ApplyPatchToolInput
     | CustomToolInput
     | ToolSearchTool
@@ -245,7 +252,6 @@ def _build_tool(tool: ToolInput, env_refs: _WorkerEnvRefResolver) -> Tool:
             FileSearchTool,
             WebSearchTool,
             ImageGenerationTool,
-            LocalShellTool,
             ToolSearchTool,
         ),
     ):
@@ -277,13 +283,26 @@ def _build_tool(tool: ToolInput, env_refs: _WorkerEnvRefResolver) -> Tool:
             defer_loading=tool.tool_config.get("defer_loading", False),
         )
     elif isinstance(tool, FunctionToolInput):
-        return FunctionTool(
+        function_tool = FunctionTool(
             name=tool.name,
             description=tool.description,
             params_json_schema=tool.params_json_schema,
             on_invoke_tool=_empty_on_invoke_tool,
             strict_json_schema=tool.strict_json_schema,
+            defer_loading=tool.defer_loading,
+            allowed_callers=tool.allowed_callers,
+            output_json_schema=tool.output_json_schema,
         )
+        if tool.namespace:
+            # tool_namespace() is the only public way to attach namespace metadata.
+            # The tool was already validated in the workflow, so the fallback
+            # description only covers inputs built by hand without one.
+            function_tool = tool_namespace(
+                name=tool.namespace,
+                description=tool.namespace_description or tool.namespace,
+                tools=[function_tool],
+            )[0]
+        return function_tool
     else:
         _raise_unknown_tool(tool)  # type:ignore[reportUnreachable]
 

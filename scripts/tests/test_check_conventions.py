@@ -94,7 +94,8 @@ def test_python_code_is_forbidden_in_shared(plugin_repo: Path) -> None:
     assert any("Python code must be duplicated" in x for x in run(plugin_repo))
 
 
-def test_standard_test_support_matches_templates(plugin_repo: Path) -> None:
+@pytest.mark.parametrize("support_file", sorted(check_conventions.STANDARD_TEST_SUPPORT))
+def test_standard_test_support_matches_templates(plugin_repo: Path, support_file: str) -> None:
     template = plugin_repo / "python/_template"
     plugin = plugin_repo / "python/fakeplug"
     for plugin_rel, template_rel in check_conventions.STANDARD_TEST_SUPPORT.items():
@@ -105,8 +106,8 @@ def test_standard_test_support_matches_templates(plugin_repo: Path) -> None:
         rendered.parent.mkdir(parents=True, exist_ok=True)
         rendered.write_bytes(canonical.read_bytes())
     assert run(plugin_repo) == []
-    (plugin / "tests/helpers/provenance.py").write_text("# drifted\n")
-    assert any("differs from canonical" in x for x in run(plugin_repo))
+    (plugin / support_file).write_text("# drifted\n")
+    assert any(support_file in x and "differs from canonical" in x for x in run(plugin_repo))
 
 
 def test_plugin_toml_agreement(plugin_repo: Path) -> None:
