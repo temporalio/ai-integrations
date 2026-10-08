@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import compact_json, load_toml, write_github_output  # noqa: E402
 
-def build_matrix(runtime_versions: list[str]) -> dict[str, list[dict[str, object]]]:
+def build_matrix(runtime_versions: list[str], spring_boot_versions: list[str] | None = None) -> dict[str, list[dict[str, object]]]:
     if not runtime_versions:
         raise ValueError("[ci] runtime-versions must list at least one version")
     versions = [str(v) for v in runtime_versions]
@@ -32,6 +32,9 @@ def build_matrix(runtime_versions: list[str]) -> dict[str, list[dict[str, object
     include.append({"os": "ubuntu-latest", "runtime": hi, "dist": True})
     for runner in ("macos-latest", "windows-latest"):
         include.append({"os": runner, "runtime": hi, "dist": False})
+    if spring_boot_versions:
+        include = [dict(cell, spring_boot=boot, dist=bool(cell["dist"] and i == 0))
+                   for i, boot in enumerate(spring_boot_versions) for cell in include]
     return {"include": include}
 
 
@@ -43,7 +46,7 @@ def main(argv: list[str] | None = None) -> dict[str, list[dict[str, object]]]:
 
     meta = load_toml(args.plugin_dir / "plugin.toml")
     versions = meta.get("ci", {}).get("runtime-versions", [])
-    matrix = build_matrix(versions)
+    matrix = build_matrix(versions, meta.get("ci", {}).get("spring-boot-versions"))
     text = compact_json(matrix)
     print(f"matrix={text}")
     write_github_output(args.github_output or os.environ.get("GITHUB_OUTPUT"), {"matrix": text})

@@ -32,7 +32,7 @@ def test_classify_aggregates_results_by_plugin() -> None:
 
 def test_report_matches_ci_workflow_job_names() -> None:
     workflow = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
-    for language, expected_name in (("python", "Python"), ("go", "Go")):
+    for language, expected_name in (("python", "Python"), ("java", "Java"), ("go", "Go")):
         names = {
             job["name"]
             for job in workflow["jobs"].values()
@@ -44,7 +44,7 @@ def test_report_matches_ci_workflow_job_names() -> None:
         match = nightly_report.JOB_RE.match(f"{expected_name} (fakeplug) / matrix")
         assert match is not None and match.group("plugin") == "fakeplug"
         assert match.group("language") == expected_name
-    assert {"python", "go"}.issubset(workflow["jobs"]["nightly-report"]["needs"])
+    assert {"python", "java", "go"}.issubset(workflow["jobs"]["nightly-report"]["needs"])
 
 
 def test_classify_go_failures_and_keep_language_identities_separate() -> None:
@@ -60,3 +60,12 @@ def test_classify_go_failures_and_keep_language_identities_separate() -> None:
     )
     assert failing == {"go/shared"}
     assert passing == {"shared", "go/recovered"}
+
+
+def test_java_failures_are_aggregated_by_plugin() -> None:
+    failing, passing = nightly_report.classify([
+        _job("Java (spring-ai) / spring-ai (windows-latest, java25)", "failure"),
+        _job("Java (spring-ai) / matrix", "success"),
+    ])
+    assert failing == {"spring-ai"}
+    assert not passing

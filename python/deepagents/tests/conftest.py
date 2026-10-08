@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncGenerator
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ import pytest_asyncio
 from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 from tests import DEV_SERVER_DOWNLOAD_VERSION
+from tests.helpers.environment import start_local_with_retry
 from tests.helpers.plugin_meta import load_plugin_meta
 from tests.helpers.provenance import ProvenanceError, check_provenance
 
@@ -58,13 +60,11 @@ def event_loop():
 @pytest_asyncio.fixture(scope="session")  # type: ignore[reportUntypedFunctionDecorator]
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     """Start the pinned local Temporal development server."""
-    environment = await WorkflowEnvironment.start_local(
-        dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
-        # Exercise the imported server-suggested continue-as-new test.
-        dev_server_extra_args=[
-            "--dynamic-config-value",
-            "limit.historyCount.suggestContinueAsNew=50",
-        ],
+    environment = await start_local_with_retry(
+        partial(
+            WorkflowEnvironment.start_local,
+            dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
+        )
     )
     yield environment
     await environment.shutdown()
@@ -94,9 +94,3 @@ def pytest_cmdline_main(config):  # type: ignore[reportMissingParameterType, rep
     if exit_code == 0 and not running_with_xdist:
         os._exit(0)
     return exit_code
-
-
-@pytest.fixture(scope="session")
-def env_type() -> str:
-    """The imported continue-as-new test requires a local development server."""
-    return "local"

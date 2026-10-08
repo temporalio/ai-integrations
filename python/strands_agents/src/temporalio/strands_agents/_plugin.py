@@ -152,12 +152,12 @@ def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
 
 
 def _data_converter(converter: DataConverter | None) -> DataConverter:
-    if (
-        converter is None
-        or converter.payload_converter_class is DefaultPayloadConverter
-    ):
-        return replace(
-            pydantic_data_converter,
-            failure_converter_class=StrandsFailureConverter,
-        )
-    return converter
+    if converter is None:
+        converter = pydantic_data_converter
+    elif converter.payload_converter_class is not DefaultPayloadConverter:
+        return converter
+    return replace(
+        converter,
+        payload_converter_class=pydantic_data_converter.payload_converter_class,
+        failure_converter_class=StrandsFailureConverter,
+    )

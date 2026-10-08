@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       latest-deps:
-        description: Re-resolve the newest allowed dependencies before testing
+        description: Re-resolve the newest supported dependencies before testing
         type: boolean
         default: false
 
@@ -97,6 +97,21 @@ jobs:
       plugin: ${{ matrix.plugin }}
       deps: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.latest-deps)) && 'latest' || 'locked' }}
 
+  java:
+    name: Java
+    needs: changes
+    if: needs.changes.result == 'success' && needs.changes.outputs.java != '[]'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJson(needs.changes.outputs.java) }}
+    uses: ./.github/workflows/_java-plugin.yml
+    with:
+      plugin: ${{ matrix.plugin }}
+      deps: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.latest-deps)) && 'latest' || 'locked' }}
+
   go:
     name: Go
     needs: changes
@@ -114,7 +129,7 @@ jobs:
 
   nightly-report:
     name: Nightly report
-    needs: [changes, python, go]
+    needs: [changes, python, java, go]
     if: always() && github.event_name == 'schedule' && needs.changes.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -139,7 +154,7 @@ jobs:
 
   ci-status:
     name: ci-status
-    needs: [changes, conventions, python, go]
+    needs: [changes, conventions, python, java, go]
     if: always()
     runs-on: ubuntu-latest
     steps:

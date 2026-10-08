@@ -1,0 +1,44 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'com.diffplug.spotless' version '7.0.2'
+}
+
+description = 'Temporal Spring AI integration (Public Preview)'
+def latestDependencies = providers.gradleProperty('dependencyMode').getOrElse('locked') == 'latest'
+ext {
+    javaRelease = 17
+    temporalVersion = latestDependencies ? '1.+' : '1.40.0'
+    springAiVersion = latestDependencies ? '1.+' : '1.1.0'
+    springBootVersion = providers.gradleProperty('springBootVersion').getOrElse('3.5.12')
+    if (latestDependencies) {
+        springBootVersion = springBootVersion.tokenize('.')[0] + '.+'
+    }
+    latestDependencyGroups = ['io.temporal', 'org.springframework.ai', 'org.springframework.boot']
+}
+
+apply from: '../_shared/java.gradle'
+
+dependencies {
+    api platform("org.springframework.boot:spring-boot-dependencies:$springBootVersion")
+    api platform("org.springframework.ai:spring-ai-bom:$springAiVersion")
+    // Consumers supply the SDK, including when using its shaded artifact.
+    compileOnly "io.temporal:temporal-sdk:$temporalVersion"
+    compileOnly "io.temporal:temporal-spring-boot-autoconfigure:$temporalVersion"
+    compileOnly 'com.google.code.findbugs:jsr305:3.0.2'
+    api 'org.springframework.boot:spring-boot-autoconfigure'
+    api 'org.springframework.ai:spring-ai-client-chat'
+    implementation 'org.springframework.boot:spring-boot-starter'
+    compileOnly 'org.springframework.ai:spring-ai-rag'
+    compileOnly 'org.springframework.ai:spring-ai-mcp'
+
+    testImplementation "io.temporal:temporal-sdk:$temporalVersion"
+    testImplementation "io.temporal:temporal-testing:$temporalVersion"
+    testImplementation 'org.mockito:mockito-core:5.14.2'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testImplementation 'org.springframework.ai:spring-ai-rag'
+    testImplementation 'org.springframework.ai:spring-ai-mcp'
+    testImplementation 'org.springframework.ai:spring-ai-retry'
+    testRuntimeOnly 'ch.qos.logback:logback-classic'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import inspect
 import random
 import time
@@ -9,7 +10,7 @@ import warnings
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from types import FrameType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import opentelemetry.metrics
 import opentelemetry.trace
@@ -20,10 +21,6 @@ from temporalio.contrib.pydantic import (
     ToJsonOptions,
 )
 from temporalio.converter import DataConverter, DefaultPayloadConverter
-from temporalio.google_adk._mcp import (
-    TemporalMcpToolSetProvider,
-    TemporalStatefulMcpToolSetProvider,
-)
 from temporalio.google_adk._model import (
     invoke_model,
     invoke_model_streaming,
@@ -35,6 +32,12 @@ from temporalio.worker import (
     WorkflowRunner,
 )
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
+
+if TYPE_CHECKING:
+    from temporalio.google_adk._mcp import (
+        TemporalMcpToolSetProvider,
+        TemporalStatefulMcpToolSetProvider,
+    )
 
 
 def _install_provider(module: Any, var_name: str, provider: Callable[[], Any]) -> None:
@@ -191,7 +194,8 @@ class GoogleAdkPlugin(SimplePlugin):
             toolset_providers: Optional list of stateless
                 (:class:`TemporalMcpToolSetProvider`) or stateful
                 (:class:`TemporalStatefulMcpToolSetProvider`) toolset providers
-                for MCP integration.
+                for MCP integration. Requires the ``temporalio-google-adk[mcp]``
+                extra (MCP Python SDK v1).
         """
 
         @asynccontextmanager
@@ -205,6 +209,11 @@ class GoogleAdkPlugin(SimplePlugin):
 
             # If in sandbox, add additional passthrough
             if isinstance(runner, SandboxedWorkflowRunner):
+                # Runner.run_async lazily loads authentication for graph/HITL
+                # support, even for agents without MCP. Initialize its native
+                # cryptography dependencies outside the sandbox before either
+                # worker execution or replay. google.adk is passed through below.
+                importlib.import_module("google.adk.auth.auth_handler")
                 return dataclasses.replace(
                     runner,
                     restrictions=runner.restrictions.with_passthrough_modules(

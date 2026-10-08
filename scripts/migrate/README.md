@@ -211,3 +211,20 @@ implementations and forwards to the planned final APIs. It depends on publishing
 packages after cutover and is not an import input. The newer SDK main commit
 `3f29fd7935f9a03fbe86f24624dfe6458872098e` does not change the five plugins pinned to
 `6adc0d84290a79952dee3ef02c36f6ed9334874a`.
+
+## Java Spring AI extraction
+
+Run `scripts/migrate/extract-sdk-java.sh` with a default-branch-reachable `SRC_REF`.
+The frozen mapping covers `temporal-spring-ai/` and `contrib/temporal-spring-ai/`.
+It retains the historical destination `java/temporal-spring-ai/`; a separate
+adaptation commit renames that directory to `java/spring-ai/` and the published
+coordinate to `io.temporal:spring-ai`. Do not change the frozen extractor.
+The frozen `replace-message-java.txt` rule qualifies issue and PR references as
+`temporalio/sdk-java#NNN` so imported messages retain their upstream links.
+At be01e60acc1e2ccfb20e783a9770bad745ed85c1 there are 12 rewritten commits
+(13 upstream path commits; the directory-only rename becomes empty), one author
+identity, 33 main Java files, one resource, and 14 test files. Source and tests
+are unchanged; the upstream README and build are archived under `_upstream/`.
+Merge the extracted branch with unrelated histories allowed, record the merge in
+IMPORTS.md, and label only the import PR `history-import`. The GitHub PR must use
+Create a merge commit. Gradle and MIT licensing adaptations are separate commits.

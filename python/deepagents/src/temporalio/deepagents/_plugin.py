@@ -33,6 +33,7 @@ from datetime import timedelta
 from typing import Any, Callable
 
 from temporalio import activity as activity_mod
+from temporalio.converter import DataConverter
 from temporalio.deepagents import _serde, _tools
 from temporalio.deepagents._activity import DeepAgentActivities
 from temporalio.deepagents.workflow import DeepAgentsWorkflowError
@@ -64,9 +65,11 @@ class DeepAgentsPlugin(SimplePlugin):
             chunks before publishing a batch.
         passthrough_modules: Extra sandbox-passthrough modules, merged with the
             plugin's LangChain/deepagents defaults.
-        data_converter: Override the default LangChain-aware converter. ``None``
-            installs the default; the SDK default is upgraded in place; any other
-            converter raises (fold ``DeepAgentsPayloadConverter`` into your own).
+        data_converter: Explicit converter override. ``None`` adapts the client
+            or replayer's existing converter, preserving its codec and other
+            settings. The SDK default payload converter is upgraded; converters
+            using ``DeepAgentsPayloadConverter`` or a subclass are accepted;
+            other payload converters raise.
     """
 
     def __init__(
@@ -78,7 +81,7 @@ class DeepAgentsPlugin(SimplePlugin):
         streaming_topic: str | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
         passthrough_modules: Sequence[str] | None = None,
-        data_converter: Any = None,
+        data_converter: DataConverter | None = None,
     ) -> None:
         """Configure the plugin; see the class docstring for parameters."""
         if sys.version_info < _MIN_PYTHON:
@@ -94,7 +97,11 @@ class DeepAgentsPlugin(SimplePlugin):
         # passed straight into the call that consumes it (below), not stashed as
         # dead config.
         self._tool_activity_options = tool_activity_options
-        self._data_converter = data_converter
+        self._data_converter = (
+            _serde.build_data_converter(data_converter)
+            if data_converter is not None
+            else None
+        )
 
         # Push dispatch defaults down to the model and tool seams that read them.
         # These live in ``_serde`` / ``_tools`` (langchain-free modules) so
@@ -127,13 +134,17 @@ class DeepAgentsPlugin(SimplePlugin):
         super().__init__(
             "langchain.DeepAgentsPlugin",
             activities=activities,
-            # wired-via-composition: ``data_converter`` flows into SimplePlugin's
-            # own ``data_converter`` kwarg (renamed to ``user_converter`` inside
-            # build_data_converter), which installs it on the client/worker.
-            data_converter=_serde.build_data_converter(self._data_converter),
+            data_converter=self._configure_data_converter,
             workflow_runner=self._make_workflow_runner(),
             workflow_failure_exception_types=[DeepAgentsWorkflowError],
             run_context=self._run_context,
+        )
+
+    def _configure_data_converter(
+        self, converter: DataConverter | None
+    ) -> DataConverter:
+        return _serde.build_data_converter(
+            self._data_converter if self._data_converter is not None else converter
         )
 
     # -- sandbox passthrough -------------------------------------------------

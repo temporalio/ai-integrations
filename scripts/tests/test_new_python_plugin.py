@@ -48,6 +48,8 @@ def test_new_plugin_is_top_level_and_release_ready(tmp_path: Path, maturity: str
     assert "TRANSITION(sdk-cutover)" not in (plugin / "plugin.toml").read_text()
     assert "TRANSITION(sdk-cutover)" not in (plugin / "pyproject.toml").read_text()
     assert (plugin / "tests/test_installed_matches_source.py").is_file()
+    assert (plugin / "tests/helpers/environment.py").is_file()
+    assert (plugin / "tests/test_env.py").is_file()
     for source in (plugin / "tests").rglob("*.py"):
         ast.parse(source.read_text(), filename=str(source))
 

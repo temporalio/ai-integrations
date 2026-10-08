@@ -1,0 +1,96 @@
+# Shared Java CI and release testing. Variants come from plugin metadata.
+name: Java plugin
+on:
+  workflow_call:
+    inputs:
+      plugin:
+        type: string
+        required: true
+      deps:
+        description: "locked: committed locks; latest: newest stable versions in supported dependency families"
+        type: string
+        default: locked
+      version:
+        description: Validated release version; empty for development builds
+        type: string
+        default: ""
+permissions: {}
+defaults:
+  run:
+    shell: bash
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - id: matrix
+        env:
+          PLUGIN: ${{ inputs.plugin }}
+        run: uv run --project scripts --locked python scripts/ci/matrix.py --plugin-dir "java/$PLUGIN" --github-output "$GITHUB_OUTPUT"
+  test:
+    name: ${{ inputs.plugin }} (${{ matrix.os }}, java${{ matrix.runtime }}, boot${{ matrix.spring_boot }})
+    needs: matrix
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    env:
+      PLUGIN_DIR: java/${{ inputs.plugin }}
+      RELEASE_VERSION: ${{ inputs.version || '0.0.0' }}
+      SPRING_BOOT_VERSION: ${{ matrix.spring_boot }}
+      DEPS: ${{ inputs.deps }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.runtime }}
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - name: Resolve latest dependencies
+        if: inputs.deps == 'latest'
+        run: |
+          cd "$PLUGIN_DIR"
+          ./gradlew --no-daemon "-PdependencyMode=$DEPS" "-PspringBootVersion=$SPRING_BOOT_VERSION" resolveAndLockAll --write-locks --refresh-dependencies
+      - name: Lint and test
+        run: |
+          cd "$PLUGIN_DIR"
+          ./gradlew --no-daemon "-PreleaseVersion=$RELEASE_VERSION" "-PspringBootVersion=$SPRING_BOOT_VERSION" "-PdependencyMode=$DEPS" spotlessCheck test
+      - name: Build and verify tested distributions
+        if: matrix.dist
+        run: |
+          cd "$PLUGIN_DIR"
+          ./gradlew --no-daemon "-PreleaseVersion=$RELEASE_VERSION" "-PspringBootVersion=$SPRING_BOOT_VERSION" "-PdependencyMode=$DEPS" stageDist
+          cd ../..
+          uv run --project scripts --locked python scripts/ci/check_java_dist.py --plugin-dir "$PLUGIN_DIR" --version "$RELEASE_VERSION"
+          uv run --project scripts --locked python scripts/ci/smoke_java.py --plugin-dir "$PLUGIN_DIR" --version "$RELEASE_VERSION"
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: junit-java-${{ inputs.plugin }}-${{ matrix.os }}-${{ matrix.runtime }}-${{ matrix.spring_boot }}
+          path: java/${{ inputs.plugin }}/build/test-results
+          if-no-files-found: ignore
+      - name: Upload tested distributions
+        if: matrix.dist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-java-${{ inputs.plugin }}
+          path: java/${{ inputs.plugin }}/dist
+          if-no-files-found: error
+          overwrite: true

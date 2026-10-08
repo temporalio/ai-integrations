@@ -1,0 +1,20 @@
+[plugin]
+name = "spring-ai"
+language = "java"
+coordinate = "io.temporal:spring-ai"
+registry = "maven"
+root-api = "io.temporal.springai"
+maturity = "public-preview"
+docs = "https://github.com/temporalio/ai-integrations/tree/main/java/spring-ai"
+upstream = "temporalio/sdk-java:contrib/temporal-spring-ai"
+
+[release]
+allow-final = false
+
+[ci]
+runtime-versions = ["17", "25"]
+spring-boot-versions = ["3.5.12"]
+
+[smoke]
+dependencies = ["io.temporal:temporal-sdk:1.40.0", "io.temporal:temporal-spring-boot-starter:1.40.0"]
+imports = ["io.temporal.springai.chat.TemporalChatClient", "io.temporal.springai.model.ActivityChatModel", "io.temporal.springai.plugin.SpringAiPlugin"]

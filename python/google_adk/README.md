@@ -114,6 +114,15 @@ worker = Worker(
 
 **With MCP Tools:**
 
+Install the optional client-side MCP dependency:
+
+```bash
+uv add "temporalio-google-adk[mcp]"
+```
+
+The MCP toolsets require MCP Python SDK v1. The base package does not require MCP
+and can be installed alongside MCP v2 integrations.
+
 ```python
 import os
 from google.adk import Agent

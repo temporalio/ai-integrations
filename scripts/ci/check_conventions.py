@@ -46,8 +46,10 @@ RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
 MAX_PR_COMMITS_WITHOUT_LABEL = 20
 HISTORY_IMPORT_LABEL = "history-import"
 STANDARD_TEST_SUPPORT = {
+    "tests/helpers/environment.py": "tests/helpers/environment.py.tmpl",
     "tests/helpers/plugin_meta.py": "tests/helpers/plugin_meta.py.tmpl",
     "tests/helpers/provenance.py": "tests/helpers/provenance.py.tmpl",
+    "tests/test_env.py": "tests/test_env.py.tmpl",
     "tests/test_installed_matches_source.py": "tests/test_installed_matches_source.py.tmpl",
 }
 PYTHON_DEVELOPMENT_VERSION = "0.0.0"
@@ -179,6 +181,57 @@ class Checker:
                 self.fail(
                     f"{plugin.rel}/{plugin_rel}: differs from canonical python/_template/{template_rel}"
                 )
+
+    def check_java_plugin(self, plugin: Plugin) -> None:
+        d, rel = plugin.path, plugin.rel
+        for required in ("build.gradle", "settings.gradle", "plugin.toml", "README.md", "LICENSE",
+                         "gradlew", "gradlew.bat", "gradle/wrapper/gradle-wrapper.jar",
+                         "gradle/wrapper/gradle-wrapper.properties"):
+            if not (d / required).is_file():
+                self.fail(f"{rel}: missing {required}")
+        if not (d / "plugin.toml").is_file():
+            return
+        meta = load_toml(d / "plugin.toml")
+        p = meta.get("plugin", {})
+        for key, expected in {"name": plugin.name, "language": "java", "registry": "maven",
+                              "coordinate": f"io.temporal:{plugin.name}"}.items():
+            if p.get(key) != expected:
+                self.fail(f"{rel}: plugin.toml {key} must be {expected!r}")
+        root_api = p.get("root-api", "")
+        if not isinstance(root_api, str) or not root_api.startswith("io.temporal."):
+            self.fail(f"{rel}: root-api must be under io.temporal")
+        if p.get("maturity") not in MATURITY_CLASSIFIER:
+            self.fail(f"{rel}: invalid maturity")
+        if not isinstance(meta.get("release", {}).get("allow-final"), bool):
+            self.fail(f"{rel}: allow-final must be boolean")
+        ci = meta.get("ci", {})
+        runtimes = ci.get("runtime-versions", [])
+        if not runtimes or not all(isinstance(v, str) and v.isdigit() for v in runtimes):
+            self.fail(f"{rel}: runtime-versions must contain Java major versions")
+        for table in (p, ci):
+            for banned in ("owners", "secrets", "live-secrets"):
+                if banned in table:
+                    self.fail(f"{rel}: plugin.toml must not contain {banned!r}")
+        for boot in ci.get("spring-boot-versions", []):
+            if not re.fullmatch(r"\d+\.\d+\.\d+", str(boot)):
+                self.fail(f"{rel}: invalid Spring Boot version {boot!r}")
+            elif not (d / f"gradle/dependency-locks/spring-boot-{boot}.lockfile").is_file():
+                self.fail(f"{rel}: missing dependency lock for Spring Boot {boot}")
+        imports = meta.get("smoke", {}).get("imports", [])
+        if not imports or not all(isinstance(i, str) and i.startswith(root_api + ".") for i in imports):
+            self.fail(f"{rel}: smoke imports must name classes under root-api")
+        license_path = d / "LICENSE"
+        if not license_path.is_file() or license_path.is_symlink():
+            self.fail(f"{rel}: LICENSE must be a regular file")
+        elif f"{rel}/LICENSE" not in self.tracked_files(rel):
+            self.fail(f"{rel}: LICENSE must be committed")
+        elif license_path.read_bytes() != (self.root / "LICENSE").read_bytes():
+            self.fail(f"{rel}: LICENSE differs from root")
+        wrapper = d / "gradle/wrapper/gradle-wrapper.properties"
+        if wrapper.is_file() and not re.search(r"^distributionSha256Sum=[a-f0-9]{64}$", wrapper.read_text(), re.M):
+            self.fail(f"{rel}: Gradle distribution checksum must be pinned")
+        if any(path.name.upper().startswith("CHANGELOG") for path in d.iterdir()):
+            self.fail(f"{rel}: release notes are generated; no changelog files")
 
     def check_plugin_toml(self, plugin: Plugin, meta: dict[str, Any], pyproject: dict[str, Any]) -> None:
         rel = plugin.rel
@@ -318,6 +371,8 @@ class Checker:
         self.check_language_roots(discovered)
         for plugin in discovered["python"]:
             self.check_python_plugin(plugin)
+        for plugin in discovered["java"]:
+            self.check_java_plugin(plugin)
         if nightly:
             self.check_nightly(discovered["python"])
         return self.violations

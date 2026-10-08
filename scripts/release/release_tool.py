@@ -6,12 +6,15 @@ Subcommands:
   check-version-policy          enforce production and staging registry version ordering (with
                                 exact-version re-runs allowed for recovery)
   verify-index-files            prove the files an index serves for a version are the local artifacts
+  check-recovery-run            validate a tagged run's tested artifacts for publication recovery
+  check-published-release       verify the published GitHub release and emit its deployment URL
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
+  publish-release               publish the reviewed draft after registry verification
 
 Policy (AGENTS.md, "Release runbook"):
-  * a coordinate with no published release starts at exactly 1.0.0 (generally-available)
-    or 0.1.0 (public-preview/pre-release); pre-releases of that version are allowed
+  * a coordinate with no published release starts at exactly 1.0.0 (generally-available),
+    0.1.0 (public-preview), or 0.0.1 (pre-release); pre-releases of that version are allowed
   * an existing coordinate only ever moves strictly forward (max published incl. yanked)
   * TestPyPI versions move forward too, except that its newest version may be re-run
   * final (non pre-release) versions additionally require plugin.toml
@@ -50,7 +53,7 @@ RELEASE_JSON = {
 FIRST_VERSION = {
     "generally-available": Version("1.0.0"),
     "public-preview": Version("0.1.0"),
-    "pre-release": Version("0.1.0"),
+    "pre-release": Version("0.0.1"),
 }
 TRANSITION_MARKER = "TRANSITION(sdk-cutover)"
 DEFAULT_REPO = "temporalio/ai-integrations"
@@ -120,8 +123,17 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
         out["root_api"] = meta["plugin"]["root-api"]
         out["smoke_imports"] = ",".join(meta.get("smoke", {}).get("imports", []))
         out["allow_final"] = "true" if meta.get("release", {}).get("allow-final") else "false"
+        out["github_prerelease"] = "true" if github_prerelease(Version(out["version"]), meta["plugin"]["maturity"]) else "false"
+        out["requires_python"] = _load(plugin_toml.parent / "pyproject.toml")["project"]["requires-python"]
     _write_outputs(args.github_output, out)
     return 0
+
+
+def github_prerelease(version: Version, maturity: str) -> bool:
+    """Classify GitHub releases independently of which package index receives the version."""
+    if maturity not in FIRST_VERSION:
+        raise PolicyError(f"unknown maturity {maturity!r}")
+    return version.is_prerelease or maturity == "pre-release"
 
 
 # --------------------------------------------------------------------------- policy
@@ -224,7 +236,7 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     if registry == "pypi" and (args.check_testpypi or args.testpypi_json):
         # Every release is staged on TestPyPI first and uploads are immutable, so a re-run finds the
         # version already there and skip-existing keeps the upload from failing. That is the normal
-        # recovery path (a rejected environment approval, a flaky smoke), so allow an exact newest
+        # recovery path (a failed publish job, a flaky smoke), so allow an exact newest
         # version re-run; the smoke job proves the served files are this run's artifacts.
         staged = fetch_published_versions(coordinate, "testpypi", Path(args.testpypi_json) if args.testpypi_json else None)
         staged_rerun = check_staging_policy(version, staged)
@@ -425,11 +437,84 @@ def cmd_release_notes(args: argparse.Namespace) -> int:
     return 0
 
 
-# --------------------------------------------------------------------------- draft release
+# --------------------------------------------------------------------------- GitHub API and recovery
 
 
 def _gh(*args: str, input_text: str | None = None) -> str:
     return subprocess.run(["gh", *args], check=True, capture_output=True, text=True, input=input_text).stdout
+
+
+def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> None:
+    """Require an existing main-reachable tag and a completed run with its full matrix tested."""
+    parsed = parse_tag(tag)
+    if parsed["language"] != "python" or run_id <= 0:
+        raise PolicyError("recovery requires a Python release tag and a positive run ID")
+    ref = f"refs/tags/{tag}"
+    sha = _git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=repo_root).strip()
+    if subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], cwd=repo_root).returncode != 0:
+        raise PolicyError("recovery tag must be reachable from origin/main")
+    plugin_dir = parsed["plugin_dir"]
+    # The caller's metadata controls publication gates and smoke imports. It must describe the
+    # original package, even though repaired workflow/tooling code comes from main.
+    for filename in ("plugin.toml", "pyproject.toml"):
+        relative = f"{plugin_dir}/{filename}"
+        tagged = _git("show", f"{ref}:{relative}", cwd=repo_root)
+        if (repo_root / relative).read_text(encoding="utf-8") != tagged:
+            raise PolicyError(f"recovery requires {relative} to match the release tag")
+    meta = _load(repo_root / plugin_dir / "plugin.toml")
+    run = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}"))
+    if (
+        run.get("repository", {}).get("full_name") != repo
+        or run.get("path") != ".github/workflows/release-python.yml"
+        or run.get("event") not in {"release", "push"}  # retain recovery of legacy tag-push runs
+        or run.get("head_branch") != tag
+        or run.get("head_sha") != sha
+        or run.get("status") != "completed"
+    ):
+        raise PolicyError("recovery source must be a completed release-python.yml release or legacy push run for this exact tag and commit")
+    pages = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100", "--paginate", "--slurp"))
+    jobs = {job["name"]: job for page in pages for job in page["jobs"]}
+    versions = meta["ci"]["runtime-versions"]
+    cells = {
+        ("ubuntu-latest", versions[0]), ("ubuntu-latest", versions[-1]),
+        ("macos-latest", versions[-1]), ("windows-latest", versions[-1]),
+    }
+    required = {"Validate tag and version policy", "Test / matrix"}
+    required.update(f"Test / {parsed['plugin']} ({runner}, py{version})" for runner, version in cells)
+    for name in sorted(required):
+        job = jobs.get(name, {})
+        if job.get("status") != "completed" or job.get("conclusion") != "success":
+            raise PolicyError(f"recovery source has no successful completed job: {name}")
+    artifact_name = f"dist-{parsed['plugin']}-locked"
+    artifacts = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/artifacts?name={artifact_name}&per_page=100"))
+    matching = [item for item in artifacts["artifacts"] if item["name"] == artifact_name and not item["expired"]]
+    if len(matching) != 1:
+        raise PolicyError(f"recovery source must have exactly one unexpired {artifact_name} artifact")
+
+
+def cmd_check_recovery_run(args: argparse.Namespace) -> int:
+    check_recovery_run(Path(args.repo_root).resolve(), args.repo or _repo(), args.tag, args.run_id)
+    _write_outputs(args.github_output, {"recovery": "true", "artifact_run_id": str(args.run_id)})
+    return 0
+
+
+def cmd_check_published_release(args: argparse.Namespace) -> int:
+    repo = args.repo or _repo()
+    parsed = parse_tag(args.tag)
+    meta = _load(Path(args.repo_root) / parsed["plugin_dir"] / "plugin.toml")
+    prerelease = github_prerelease(Version(parsed["version"]), meta["plugin"]["maturity"])
+    release = json.loads(_gh("api", f"repos/{repo}/releases/tags/{quote(args.tag, safe='')}"))
+    if release.get("tag_name") != args.tag or release.get("draft") is not False:
+        raise PolicyError(f"a published GitHub release is required for {args.tag}")
+    if release.get("prerelease") is not prerelease:
+        raise PolicyError(f"GitHub release prerelease must be {prerelease} for {args.tag} and its plugin maturity")
+    if not release.get("html_url"):
+        raise PolicyError("published GitHub release has no URL for the deployment")
+    _write_outputs(args.github_output, {"url": release["html_url"]})
+    return 0
+
+
+# --------------------------------------------------------------------------- draft release
 
 
 def find_releases(repo: str, tag: str) -> list[dict]:
@@ -471,9 +556,7 @@ def cmd_draft_release(args: argparse.Namespace) -> int:
     repo = args.repo or _repo()
     releases = find_releases(repo, args.tag)
     if any(not release["draft"] for release in releases):
-        # Runbook step 5 publishes the draft by hand. A published release owns the tag, and a later
-        # re-run must neither un-publish it nor swap its assets; refusing here also keeps
-        # `gh release upload <tag>` below from ever resolving to a published release.
+        # A published release owns the tag; a later re-run must not un-publish it or swap its assets.
         raise PolicyError(f"a published release already exists for {args.tag}; refusing to modify it")
     if not releases:
         cmd = ["release", "create", args.tag, "--repo", repo, "--draft", "--verify-tag", "--title", args.title, "--notes-file", args.notes]
@@ -498,7 +581,37 @@ def cmd_draft_release(args: argparse.Namespace) -> int:
         for asset in assets:
             upload_release_asset(repo, releases[0]["id"], asset)
             print(f"uploaded {Path(asset).name}")
-    print(f"OK: draft release ready: https://github.com/{repo}/releases/tag/{args.tag}")
+    # Drafts use an untagged URL until publication; the eventual tag URL returns 404 meanwhile.
+    release_url = _gh("api", f"repos/{repo}/releases/{releases[0]['id']}", "--jq", ".html_url").strip()
+    if not release_url:
+        raise PolicyError("draft release has no URL for approval")
+    _write_outputs(args.github_output, {"release_id": releases[0]["id"], "url": release_url})
+    print(f"OK: draft release ready: {release_url}")
+    return 0
+
+
+def cmd_publish_release(args: argparse.Namespace) -> int:
+    repo = args.repo or _repo()
+    parsed = parse_tag(args.tag)
+    meta = _load(Path(args.repo_root) / parsed["plugin_dir"] / "plugin.toml")
+    prerelease = github_prerelease(Version(parsed["version"]), meta["plugin"]["maturity"])
+    endpoint = f"repos/{repo}/releases/{args.release_id}"
+    release = json.loads(_gh("api", endpoint))
+    # Saving reviewed notes in GitHub can replace a draft's tag with an untagged-* placeholder.
+    # The workflow passes the original draft's stable ID, so restore that placeholder on publication.
+    untagged_draft = release["draft"] and release["tag_name"].startswith("untagged-")
+    if release["tag_name"] != args.tag and not untagged_draft:
+        raise PolicyError(f"release {args.release_id} does not belong to {args.tag}")
+    if release["draft"]:
+        # Set the tag and publication flags, preserving the reviewed title, notes and tested assets.
+        release = json.loads(_gh("api", "-X", "PATCH", endpoint, "--input", "-", input_text=json.dumps({
+            "tag_name": args.tag, "draft": False, "prerelease": prerelease,
+        })))
+    else:
+        # A retry after a successful PATCH must leave the published release untouched.
+        print(f"release {args.release_id} is already published")
+    _write_outputs(args.github_output, {"url": release["html_url"]})
+    print(f"OK: published release: {release['html_url']}")
     return 0
 
 
@@ -537,6 +650,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--index-json", default=None, help="read the release JSON from this file instead of the index (tests)")
     p.set_defaults(func=cmd_verify_index_files)
 
+    p = sub.add_parser("check-recovery-run", help="validate a tagged run's tested artifacts for recovery")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--run-id", type=int, required=True)
+    p.add_argument("--repo", default=None)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    p.set_defaults(func=cmd_check_recovery_run)
+
+    p = sub.add_parser("check-published-release", help="verify a published GitHub release and emit its URL")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--repo", default=None)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    p.set_defaults(func=cmd_check_published_release)
+
     p = sub.add_parser("release-notes", help="generate release notes from history")
     p.add_argument("--plugin-dir", required=True)
     p.add_argument("--tag", required=True)
@@ -551,7 +677,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dist", required=True)
     p.add_argument("--prerelease", action="store_true")
     p.add_argument("--repo", default=None)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     p.set_defaults(func=cmd_draft_release)
+
+    p = sub.add_parser("publish-release", help="publish the reviewed draft")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--release-id", required=True, type=int, help="stable release ID captured by draft-release")
+    p.add_argument("--repo", default=None)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    p.set_defaults(func=cmd_publish_release)
 
     args = parser.parse_args(argv)
     try:

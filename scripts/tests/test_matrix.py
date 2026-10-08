@@ -21,6 +21,14 @@ def test_single_version_still_covers_three_operating_systems() -> None:
     assert [e["os"] for e in matrix.build_matrix(["3.12"])["include"]] == ["ubuntu-latest", "macos-latest", "windows-latest"]
 
 
+def test_java_boot_variants_have_one_artifact_producer() -> None:
+    cells = matrix.build_matrix(["17", "21"], ["4.0.8", "4.1.1"])["include"]
+    assert len(cells) == 8
+    assert {(c["runtime"], c["os"]) for c in cells} == {
+        ("17", "ubuntu-latest"), ("21", "ubuntu-latest"), ("21", "macos-latest"), ("21", "windows-latest")}
+    assert [c["spring_boot"] for c in cells if c["dist"]] == ["4.0.8"]
+
+
 def test_errors() -> None:
     with pytest.raises(ValueError):
         matrix.build_matrix([])

@@ -1,0 +1,110 @@
+// Shared build conventions. Plugin dependencies and supported versions live in
+// each plugin's build.gradle and plugin.toml, never in the CI workflow.
+def dependencyMode = providers.gradleProperty('dependencyMode').getOrElse('locked')
+if (!(dependencyMode in ['locked', 'latest'])) {
+    throw new GradleException("Unknown dependency mode: $dependencyMode")
+}
+if (dependencyMode == 'latest') {
+    configurations.configureEach {
+        resolutionStrategy.componentSelection.all { selection ->
+            if (selection.candidate.group in latestDependencyGroups &&
+                !(selection.candidate.version ==~ /\d+\.\d+\.\d+/)) {
+                selection.reject('Latest dependency checks use stable releases only')
+            }
+        }
+    }
+}
+group = 'io.temporal'
+version = providers.gradleProperty('releaseVersion').getOrElse('0.0.0')
+if (!(version ==~ /(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-RC[1-9][0-9]*)?/)) {
+    throw new GradleException("Invalid release version: $version")
+}
+
+repositories { mavenCentral() }
+java {
+    sourceCompatibility = JavaVersion.toVersion(javaRelease)
+    targetCompatibility = JavaVersion.toVersion(javaRelease)
+    withSourcesJar()
+    withJavadocJar()
+}
+tasks.withType(JavaCompile).configureEach {
+    options.release = javaRelease
+    options.encoding = 'UTF-8'
+    options.compilerArgs += ['-parameters']
+}
+tasks.withType(Jar).configureEach {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+    from('LICENSE') { into 'META-INF' }
+}
+tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
+    options.addBooleanOption('notimestamp', true)
+    options.addStringOption('Xdoclint:none', '-quiet')
+}
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    maxHeapSize = '1g'
+    testLogging { events 'failed', 'skipped'; exceptionFormat 'full' }
+}
+spotless {
+    java {
+        target 'src/**/*.java'
+        googleJavaFormat('1.28.0')
+    }
+}
+dependencyLocking {
+    lockAllConfigurations()
+    lockMode = LockMode.STRICT
+    def suffix = dependencyMode == 'latest' ? '.latest.lockfile' : '.lockfile'
+    lockFile = file("gradle/dependency-locks/spring-boot-${springBootVersion}$suffix")
+}
+tasks.register('resolveAndLockAll') {
+    dependsOn 'spotlessJava'
+    doFirst {
+        if (!gradle.startParameter.writeDependencyLocks) {
+            throw new GradleException('Run with --write-locks')
+        }
+    }
+    doLast { configurations.findAll { it.canBeResolved }.each { it.resolve() } }
+}
+
+publishing {
+    publications {
+        mavenJava(MavenPublication) {
+            from components.java
+            if (dependencyMode == 'latest') {
+                versionMapping {
+                    usage('java-api') { fromResolutionOf('runtimeClasspath') }
+                    usage('java-runtime') { fromResolutionResult() }
+                }
+            }
+            pom {
+                name = project.name
+                description = project.description
+                url = "https://github.com/temporalio/ai-integrations/tree/main/java/${project.name}"
+                licenses {
+                    license { name = 'MIT'; url = 'https://opensource.org/license/mit/'; distribution = 'repo' }
+                }
+                developers {
+                    developer { id = 'temporal'; name = 'Temporal Technologies Inc.'; url = 'https://temporal.io' }
+                }
+                scm {
+                    url = 'https://github.com/temporalio/ai-integrations'
+                    connection = 'scm:git:https://github.com/temporalio/ai-integrations.git'
+                    developerConnection = 'scm:git:ssh://git@github.com/temporalio/ai-integrations.git'
+                }
+            }
+        }
+    }
+    repositories {
+        maven { name = 'staging'; url = layout.buildDirectory.dir('staging') }
+    }
+}
+tasks.register('stageDist', Sync) {
+    dependsOn 'publishMavenJavaPublicationToStagingRepository'
+    from(layout.buildDirectory.dir("staging/${project.group.toString().replace('.', '/')}/${project.name}/${project.version}")) {
+        include '*.jar', '*.pom', '*.module'
+    }
+    into 'dist'
+}
