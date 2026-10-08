@@ -7,6 +7,7 @@ Subcommands:
                                 exact-version re-runs allowed for recovery)
   verify-index-files            prove the files an index serves for a version are the local artifacts
   check-recovery-run            validate a tagged run's tested artifacts for publication recovery
+  check-published-release       verify the published GitHub release and emit its deployment URL
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
   publish-release               publish the reviewed draft after registry verification
@@ -235,7 +236,7 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     if registry == "pypi" and (args.check_testpypi or args.testpypi_json):
         # Every release is staged on TestPyPI first and uploads are immutable, so a re-run finds the
         # version already there and skip-existing keeps the upload from failing. That is the normal
-        # recovery path (a rejected environment approval, a flaky smoke), so allow an exact newest
+        # recovery path (a failed publish job, a flaky smoke), so allow an exact newest
         # version re-run; the smoke job proves the served files are this run's artifacts.
         staged = fetch_published_versions(coordinate, "testpypi", Path(args.testpypi_json) if args.testpypi_json else None)
         staged_rerun = check_staging_policy(version, staged)
@@ -465,12 +466,12 @@ def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> Non
     if (
         run.get("repository", {}).get("full_name") != repo
         or run.get("path") != ".github/workflows/release-python.yml"
-        or run.get("event") != "push"
+        or run.get("event") not in {"release", "push"}  # retain recovery of legacy tag-push runs
         or run.get("head_branch") != tag
         or run.get("head_sha") != sha
         or run.get("status") != "completed"
     ):
-        raise PolicyError("recovery source must be a completed release-python.yml push run for this exact tag and commit")
+        raise PolicyError("recovery source must be a completed release-python.yml release or legacy push run for this exact tag and commit")
     pages = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100", "--paginate", "--slurp"))
     jobs = {job["name"]: job for page in pages for job in page["jobs"]}
     versions = meta["ci"]["runtime-versions"]
@@ -494,6 +495,22 @@ def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> Non
 def cmd_check_recovery_run(args: argparse.Namespace) -> int:
     check_recovery_run(Path(args.repo_root).resolve(), args.repo or _repo(), args.tag, args.run_id)
     _write_outputs(args.github_output, {"recovery": "true", "artifact_run_id": str(args.run_id)})
+    return 0
+
+
+def cmd_check_published_release(args: argparse.Namespace) -> int:
+    repo = args.repo or _repo()
+    parsed = parse_tag(args.tag)
+    meta = _load(Path(args.repo_root) / parsed["plugin_dir"] / "plugin.toml")
+    prerelease = github_prerelease(Version(parsed["version"]), meta["plugin"]["maturity"])
+    release = json.loads(_gh("api", f"repos/{repo}/releases/tags/{quote(args.tag, safe='')}"))
+    if release.get("tag_name") != args.tag or release.get("draft") is not False:
+        raise PolicyError(f"a published GitHub release is required for {args.tag}")
+    if release.get("prerelease") is not prerelease:
+        raise PolicyError(f"GitHub release prerelease must be {prerelease} for {args.tag} and its plugin maturity")
+    if not release.get("html_url"):
+        raise PolicyError("published GitHub release has no URL for the deployment")
+    _write_outputs(args.github_output, {"url": release["html_url"]})
     return 0
 
 
@@ -639,6 +656,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--repo", default=None)
     p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     p.set_defaults(func=cmd_check_recovery_run)
+
+    p = sub.add_parser("check-published-release", help="verify a published GitHub release and emit its URL")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--repo", default=None)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    p.set_defaults(func=cmd_check_published_release)
 
     p = sub.add_parser("release-notes", help="generate release notes from history")
     p.add_argument("--plugin-dir", required=True)

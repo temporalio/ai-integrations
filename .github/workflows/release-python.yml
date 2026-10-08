@@ -1,9 +1,9 @@
-# Release pipeline for ONE Python plugin, triggered by a scoped tag such as
-# python/openai_agents/v1.0.0rc1. The plugin is a parameter parsed from the tag.
+# Release pipeline for ONE Python plugin, triggered by publishing a GitHub release
+# for a scoped tag such as python/openai_agents/v1.0.0rc1. The plugin is parsed from the tag.
 #
 #   prepare -> test (reusable CI, full matrix; its ubuntu dist cell builds and checks the artifacts)
-#   -> publish-testpypi -> smoke-testpypi -> github-release (draft)
-#   -> [finals only] publish-pypi (approval links to the draft) -> smoke-pypi -> publish-github-release
+#   -> publish-testpypi -> smoke-testpypi
+#   -> [finals only] publish-pypi (links to the published release) -> smoke-pypi
 #
 # The artifacts that were tested are the artifacts that get published. Dry run: dispatch on
 # main with the `tag` input set to the tag you intend to push; everything up to and including the
@@ -18,13 +18,12 @@
 # Publishing uses PyPI trusted publishing (OIDC): no stored credentials. The
 # publish jobs live INLINE here on purpose: PyPI rejects reusable workflows as
 # trusted publishers (warehouse#11096). Pre-releases go to TestPyPI only unless
-# dispatched with publish-prerelease-to-pypi; environments gate every upload.
+# dispatched with publish-prerelease-to-pypi; environments restrict publication refs without a review gate.
 name: Release (Python)
 
 on:
-  push:
-    tags:
-      - "python/*/v*"
+  release:
+    types: [published] # stable releases and prereleases, including publication from a draft
   workflow_dispatch:
     inputs:
       tag:
@@ -32,7 +31,7 @@ on:
         type: string
         default: ""
       skip-publish:
-        description: Dry run - validate, test and build, but upload nothing and draft no release
+        description: Dry run - validate, test and build, but upload nothing
         type: boolean
         default: false
       recover-run:
@@ -40,7 +39,7 @@ on:
         type: string
         default: ""
       publish-prerelease-to-pypi:
-        description: For a pre-release tag ref, also publish to PyPI (still gated by the pypi environment; ignored while plugin.toml [release] allow-final is false)
+        description: For a pre-release tag ref, also publish to PyPI (ignored while plugin.toml [release] allow-final is false)
         type: boolean
         default: false
 
@@ -51,12 +50,14 @@ defaults:
     shell: bash
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref }} # dry runs of different tags on main do not queue behind each other
+  group: release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }} # release events and manual retries of the same tag share a queue
   cancel-in-progress: false
 
 jobs:
   prepare:
     name: Validate tag and version policy
+    # release events have no tag filter; other languages use their own release workflows.
+    if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'python/')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -78,6 +79,7 @@ jobs:
       artifact_run_id: ${{ steps.recovery.outputs.artifact_run_id || github.run_id }}
       publish: ${{ steps.gate.outputs.publish }}
       publish_pypi: ${{ steps.gate.outputs.publish_pypi }}
+      release_url: ${{ steps.release.outputs.url }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -102,7 +104,7 @@ jobs:
       - name: Parse tag
         id: tag
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
         run: uv run --project scripts --locked python scripts/release/release_tool.py parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
       - name: Tag is reachable from main
         # fetch-depth 0 above already brought origin/main; no extra fetch (credentials are not persisted).
@@ -150,7 +152,7 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::dry run: validation, tests and the build run; nothing is uploaded and no release is drafted"
+            echo "::notice::dry run: validation, tests and the build run; nothing is uploaded"
           fi
           # Finals reach PyPI; pre-releases only via the dispatch override, and never while the plugin
           # is still in the SDK-cutover transition (allow-final = false).
@@ -159,6 +161,18 @@ jobs:
           else
             echo "publish_pypi=false" >> "$GITHUB_OUTPUT"
           fi
+      - name: Verify the published GitHub release
+        id: release
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py check-published-release --tag "$TAG" --github-output "$GITHUB_OUTPUT"
+      - name: Link published release notes
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+        run: printf '[Published GitHub release](%s)\n' "$RELEASE_URL" >> "$GITHUB_STEP_SUMMARY"
 
   test:
     name: Test
@@ -241,66 +255,16 @@ jobs:
           ALLOW_OVERLAP_WITH_CORE: ${{ needs.prepare.outputs.allow_final == 'true' && '0' || '1' }}
         run: bash scripts/release/smoke_from_index.sh
 
-  github-release:
-    name: Draft GitHub release
-    needs: [prepare, smoke-testpypi]
-    # Create the reviewable notes and tested assets before the PyPI environment requests approval.
-    if: >-
-      !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
-      && needs.smoke-testpypi.result == 'success'
-    runs-on: ubuntu-latest
-    outputs:
-      release_url: ${{ steps.release.outputs.url }}
-      release_id: ${{ steps.release.outputs.release_id }}
-    permissions:
-      contents: write
-      actions: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false # gh uses GH_TOKEN below; do not leave the write token in .git/config
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: dist-${{ needs.prepare.outputs.plugin }}-locked
-          path: dist/
-          github-token: ${{ github.token }}
-          run-id: ${{ needs.prepare.outputs.artifact_run_id }}
-      - name: Generate release notes from history
-        env:
-          PLUGIN_DIR: ${{ needs.prepare.outputs.plugin_dir }}
-          TAG: ${{ needs.prepare.outputs.tag }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py --repo-root "$PWD" release-notes --plugin-dir "$PLUGIN_DIR" --tag "$TAG" --output notes.md
-      - name: Create or update the draft release
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          TAG: ${{ needs.prepare.outputs.tag }}
-          TITLE: ${{ needs.prepare.outputs.coordinate }} ${{ needs.prepare.outputs.version }}
-          PRERELEASE: ${{ needs.prepare.outputs.github_prerelease }}
-        run: |
-          extra=()
-          [ "$PRERELEASE" = "true" ] && extra+=(--prerelease)
-          uv run --project scripts --locked python scripts/release/release_tool.py draft-release --tag "$TAG" --title "$TITLE" --notes notes.md --dist dist --github-output "$GITHUB_OUTPUT" "${extra[@]}"
-      - name: Link release notes for approval
-        env:
-          RELEASE_URL: ${{ steps.release.outputs.url }}
-        run: printf '[Review release notes and tested artifacts](%s)\n' "$RELEASE_URL" >> "$GITHUB_STEP_SUMMARY"
-
   publish-pypi:
     name: Publish to PyPI
-    needs: [prepare, smoke-testpypi, github-release]
+    needs: [prepare, smoke-testpypi]
     if: >-
-      !cancelled() && needs.smoke-testpypi.result == 'success' && needs.github-release.result == 'success'
+      !cancelled() && needs.smoke-testpypi.result == 'success'
       && needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: ${{ needs.github-release.outputs.release_url }}
+      url: ${{ needs.prepare.outputs.release_url }}
     permissions:
       id-token: write
       actions: read
@@ -355,32 +319,3 @@ jobs:
           # Same rule as TestPyPI: only a plugin the SDK still bundles may overlap it.
           ALLOW_OVERLAP_WITH_CORE: ${{ needs.prepare.outputs.allow_final == 'true' && '0' || '1' }}
         run: bash scripts/release/smoke_from_index.sh
-
-  publish-github-release:
-    name: Publish GitHub release
-    needs: [prepare, github-release, smoke-pypi]
-    if: >-
-      !cancelled() && needs.prepare.result == 'success' && needs.github-release.result == 'success'
-      && needs.smoke-pypi.result == 'success'
-      && needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
-      - name: Publish the reviewed draft
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.prepare.outputs.tag }}
-          RELEASE_ID: ${{ needs.github-release.outputs.release_id }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py publish-release --tag "$TAG" --release-id "$RELEASE_ID" --github-output "$GITHUB_OUTPUT"
-      - name: Link published release
-        env:
-          RELEASE_URL: ${{ steps.release.outputs.url }}
-        run: printf '[Published GitHub release](%s)\n' "$RELEASE_URL" >> "$GITHUB_STEP_SUMMARY"

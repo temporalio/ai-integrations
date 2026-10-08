@@ -61,7 +61,7 @@ def recovery_source(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> tuple
     sha = git(plugin_repo, "rev-parse", "HEAD")
     git(plugin_repo, "tag", tag)
     git(plugin_repo, "update-ref", "refs/remotes/origin/main", sha)
-    run = {"repository": {"full_name": "temporalio/ai-integrations"}, "event": "push", "head_branch": tag,
+    run = {"repository": {"full_name": "temporalio/ai-integrations"}, "event": "release", "head_branch": tag,
            "head_sha": sha, "path": ".github/workflows/release-python.yml", "status": "completed"}
     names = ["Validate tag and version policy", "Test / matrix"]
     names.extend(f"Test / fakeplug ({runner}, py{version})" for runner, version in (
@@ -82,8 +82,10 @@ def recovery_source(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> tuple
     return plugin_repo, run, jobs, artifacts
 
 
-def test_recovery_accepts_tested_tagged_artifacts(recovery_source: tuple, tmp_path: Path) -> None:
-    repo, *_ = recovery_source
+@pytest.mark.parametrize("event", ["release", "push"])
+def test_recovery_accepts_tested_tagged_artifacts(recovery_source: tuple, tmp_path: Path, event: str) -> None:
+    repo, run, *_ = recovery_source
+    run["event"] = event
     output = tmp_path / "outputs"
     assert release_tool.main(["--repo-root", str(repo), "check-recovery-run", "--tag", "python/fakeplug/v0.0.1rc1",
                               "--run-id", "123", "--github-output", str(output)]) == 0
@@ -97,8 +99,51 @@ def test_recovery_accepts_tested_tagged_artifacts(recovery_source: tuple, tmp_pa
 def test_recovery_rejects_unrelated_or_unfinished_runs(recovery_source: tuple, key: str, value: object) -> None:
     repo, run, *_ = recovery_source
     run[key] = value
-    with pytest.raises(release_tool.PolicyError, match="completed release-python.yml push run"):
+    with pytest.raises(release_tool.PolicyError, match="completed release-python.yml release or legacy push run"):
         release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "python/fakeplug/v0.0.1rc1", 123)
+
+
+@pytest.mark.parametrize("maturity,version,prerelease", [
+    ("pre-release", "0.0.1", True), ("pre-release", "0.0.1rc1", True),
+    ("public-preview", "0.1.0", False), ("public-preview", "0.1.0rc1", True),
+    ("generally-available", "1.0.0", False), ("generally-available", "1.0.0rc1", True),
+])
+def test_published_release_check_is_read_only_and_emits_review_url(
+    plugin_repo: Path, monkeypatch: pytest.MonkeyPatch, maturity: str, version: str, prerelease: bool,
+) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(meta.read_text().replace('maturity = "pre-release"', f'maturity = "{maturity}"'))
+    tag = f"python/fakeplug/v{version}"
+    url = f"https://github.com/temporalio/ai-integrations/releases/tag/{tag}"
+    release = {"tag_name": tag, "draft": False, "prerelease": prerelease, "html_url": url}
+    calls = []
+    monkeypatch.setattr(release_tool, "_gh", lambda *args: calls.append(args) or json.dumps(release))
+    output = plugin_repo / "outputs"
+    assert release_tool.main(["--repo-root", str(plugin_repo), "check-published-release", "--repo", "temporalio/ai-integrations",
+                              "--tag", tag, "--github-output", str(output)]) == 0
+    assert output.read_text() == f"url={url}\n"
+    assert calls == [("api", f"repos/temporalio/ai-integrations/releases/tags/python%2Ffakeplug%2Fv{version}")]
+
+
+@pytest.mark.parametrize("key,value,message", [
+    ("tag_name", "python/other/v0.0.1", "published GitHub release is required"),
+    ("draft", True, "published GitHub release is required"),
+    ("draft", None, "published GitHub release is required"),
+    ("prerelease", False, "GitHub release prerelease must be True"),
+    ("html_url", "", "has no URL for the deployment"),
+])
+def test_published_release_check_rejects_unreviewed_or_misclassified_release(
+    plugin_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], key: str, value: object, message: str,
+) -> None:
+    release = {"tag_name": "python/fakeplug/v0.0.1", "draft": False, "prerelease": True,
+               "html_url": "https://github.com/temporalio/ai-integrations/releases/tag/python/fakeplug/v0.0.1"}
+    release[key] = value
+    monkeypatch.setattr(release_tool, "_gh", lambda *args: json.dumps(release))
+    output = plugin_repo / "outputs"
+    assert release_tool.main(["--repo-root", str(plugin_repo), "check-published-release", "--repo", "temporalio/ai-integrations",
+                              "--tag", "python/fakeplug/v0.0.1", "--github-output", str(output)]) == 1
+    assert message in capsys.readouterr().out
+    assert not output.exists()
 
 
 @pytest.mark.parametrize("name", ["Validate tag and version policy", "Test / fakeplug (macos-latest, py3.14)"])

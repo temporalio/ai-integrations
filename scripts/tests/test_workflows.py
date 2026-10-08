@@ -72,8 +72,9 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
     assert "needs.prepare.outputs.publish == 'true'" in doc["jobs"]["publish-testpypi"]["if"]
     assert "needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true'" in doc["jobs"]["publish-testpypi"]["if"]
     assert "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'" in doc["jobs"]["publish-pypi"]["if"]
-    assert "needs.prepare.outputs.publish == 'true'" in doc["jobs"]["github-release"]["if"]
-    assert doc[True]["push"]["tags"] == ["python/*/v*"]  # PyYAML parses the `on` key as boolean True
+    assert doc[True]["release"]["types"] == ["published"]  # PyYAML parses the `on` key as boolean True
+    assert "push" not in doc[True], "tag creation must not publish before release notes are reviewed"
+    assert doc["jobs"]["prepare"]["if"] == "github.event_name != 'release' || startsWith(github.event.release.tag_name, 'python/')"
     inputs = doc[True]["workflow_dispatch"]["inputs"]
     assert inputs["skip-publish"]["type"] == "boolean" and inputs["tag"]["type"] == "string"
     # A dispatch on a tag ref with a different tag input must be rejected before anything runs.
@@ -81,11 +82,8 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
     assert prepare_steps.index("Dispatch inputs are consistent with the ref") < prepare_steps.index("Parse tag")
     gate = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "gate")
     assert '[ "$SKIP_PUBLISH" = "false" ]' in gate["run"], "publish only on the literal false"
-    # The release job must act on the parsed tag, never on the ref name (they differ on a dry run).
-    tag_envs = [s["env"]["TAG"] for s in doc["jobs"]["github-release"]["steps"] if "TAG" in s.get("env", {})]
-    assert tag_envs and all(v == "${{ needs.prepare.outputs.tag }}" for v in tag_envs)
-    draft = next(s for s in doc["jobs"]["github-release"]["steps"] if s.get("name") == "Create or update the draft release")
-    assert draft["env"]["TITLE"] == "${{ needs.prepare.outputs.coordinate }} ${{ needs.prepare.outputs.version }}"
+    tag = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "tag")
+    assert tag["env"]["TAG"] == "${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
     # Only prepare may look at the ref name (to check the dispatch inputs against it); every later job
     # works from prepare's parsed outputs.
     for name, job in doc["jobs"].items():
@@ -93,44 +91,33 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
             continue
         for step in job.get("steps", []):
             assert "github.ref_name" not in yaml.dump(step.get("env", {})), f"{name}: read the parsed tag, not the ref name"
-    assert doc["concurrency"]["group"] == "release-${{ inputs.tag || github.ref }}"
-    release_if = doc["jobs"]["github-release"]["if"]
-    assert release_if.lstrip().startswith("!cancelled()")
-    assert "needs.smoke-testpypi.result == 'success'" in release_if
+    assert doc["concurrency"]["group"] == "release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
 
 
-def test_release_notes_are_available_before_pypi_approval() -> None:
+def test_published_release_is_verified_before_uploads_and_linked_from_deployment() -> None:
     jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
-    draft = jobs["github-release"]
+    prepare = jobs["prepare"]
     publish = jobs["publish-pypi"]
-    assert set(draft["needs"]) == {"prepare", "smoke-testpypi"}
-    assert "github-release" in publish["needs"]
-    assert "needs.github-release.result == 'success'" in publish["if"]
-    assert publish["environment"]["url"] == "${{ needs.github-release.outputs.release_url }}"
-    assert draft["outputs"]["release_url"] == "${{ steps.release.outputs.url }}"
-    create = next(step for step in draft["steps"] if step.get("id") == "release")
-    assert '--github-output "$GITHUB_OUTPUT"' in create["run"]
-    summary = next(step for step in draft["steps"] if "GITHUB_STEP_SUMMARY" in step.get("run", ""))
+    assert set(publish["needs"]) == {"prepare", "smoke-testpypi"}
+    assert publish["environment"]["url"] == "${{ needs.prepare.outputs.release_url }}"
+    assert prepare["outputs"]["release_url"] == "${{ steps.release.outputs.url }}"
+    verify = next(step for step in prepare["steps"] if step.get("id") == "release")
+    assert "check-published-release" in verify["run"] and '--github-output "$GITHUB_OUTPUT"' in verify["run"]
+    assert verify["if"] == "steps.gate.outputs.publish == 'true'", "dry runs need no existing release"
+    assert verify["env"]["TAG"] == "${{ steps.tag.outputs.tag }}"
+    assert prepare["steps"].index(next(s for s in prepare["steps"] if s.get("id") == "gate")) < prepare["steps"].index(verify)
+    summary = next(step for step in prepare["steps"] if "GITHUB_STEP_SUMMARY" in step.get("run", ""))
     assert summary["env"]["RELEASE_URL"] == "${{ steps.release.outputs.url }}"
-    assert "publish-release" not in yaml.dump(draft), "drafting must not publish before approval"
-    assert draft["outputs"]["release_id"] == "${{ steps.release.outputs.release_id }}"
-    assert create["env"]["PRERELEASE"] == "${{ needs.prepare.outputs.github_prerelease }}"
+    assert summary["if"] == verify["if"]
 
 
-def test_github_release_is_published_only_after_pypi_verification() -> None:
+def test_publication_does_not_modify_the_reviewed_github_release() -> None:
     jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
-    publish = jobs["publish-github-release"]
-    assert set(publish["needs"]) == {"prepare", "github-release", "smoke-pypi"}
-    assert "!cancelled()" in publish["if"]
-    assert "needs.smoke-pypi.result == 'success'" in publish["if"]
-    assert "needs.github-release.result == 'success'" in publish["if"]
-    assert "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.publish_pypi == 'true'" in publish["if"]
-    assert publish["permissions"] == {"contents": "write"}
-    step = next(step for step in publish["steps"] if "publish-release" in step.get("run", ""))
-    assert step["env"]["RELEASE_ID"] == "${{ needs.github-release.outputs.release_id }}"
-    assert step["env"]["TAG"] == "${{ needs.prepare.outputs.tag }}"
-    assert '--release-id "$RELEASE_ID"' in step["run"]
-    assert not any("download-artifact" in step.get("uses", "") for step in publish["steps"])
+    for job in jobs.values():
+        assert job.get("permissions", {}).get("contents") != "write"
+        for step in job.get("steps", []):
+            assert "draft-release" not in step.get("run", "")
+            assert "publish-release" not in step.get("run", "")
 
 
 def test_release_smoke_is_strict_unless_the_sdk_still_bundles_the_plugin() -> None:
@@ -152,7 +139,7 @@ def test_release_publishes_the_tested_artifacts() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
     assert "build" not in doc["jobs"], "the test job's dist cell builds the artifacts; do not rebuild for publishing"
     tested = "dist-${{ needs.prepare.outputs.plugin }}-locked"
-    for job in ("publish-testpypi", "publish-pypi", "smoke-testpypi", "smoke-pypi", "github-release"):
+    for job in ("publish-testpypi", "publish-pypi", "smoke-testpypi", "smoke-pypi"):
         downloads = [s["with"]["name"] for s in doc["jobs"][job]["steps"] if "download-artifact" in s.get("uses", "")]
         assert downloads == [tested], f"{job} must use the artifact the test job produced"
         download = next(s for s in doc["jobs"][job]["steps"] if "download-artifact" in s.get("uses", ""))
@@ -198,6 +185,23 @@ def test_release_publication_gate(ref_type: str, recovery: str, skip: str, publi
                PRERELEASE="false", ALLOW_FINAL="true", OVERRIDE="false", GITHUB_OUTPUT=str(output))
     subprocess.run(["bash", "-c", gate["run"]], env=env, check=True, capture_output=True, text=True)
     assert f"publish={'true' if publish else 'false'}\n" in output.read_text()
+
+
+@pytest.mark.parametrize("prerelease,allow_final,override,publish_pypi", [
+    ("false", "true", "false", True), ("false", "true", "true", True),
+    ("true", "true", "false", False), ("true", "true", "true", True),
+    ("true", "false", "false", False), ("true", "false", "true", False),
+])
+def test_registry_routing_uses_version_and_cutover_policy(
+    prerelease: str, allow_final: str, override: str, publish_pypi: bool, tmp_path: Path,
+) -> None:
+    jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
+    gate = next(s for s in jobs["prepare"]["steps"] if s.get("id") == "gate")
+    output = tmp_path / "outputs"
+    env = dict(os.environ, REF_TYPE="tag", RECOVERY="", SKIP_PUBLISH="false", PRERELEASE=prerelease,
+               ALLOW_FINAL=allow_final, OVERRIDE=override, GITHUB_OUTPUT=str(output))
+    subprocess.run(["bash", "-c", gate["run"]], env=env, check=True, capture_output=True, text=True)
+    assert f"publish_pypi={'true' if publish_pypi else 'false'}\n" in output.read_text()
 
 
 @pytest.mark.parametrize("ref_type,ref_name", [("tag", "main"), ("branch", "feature"), ("tag", "python/fake/v0.0.1")])
