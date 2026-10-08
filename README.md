@@ -10,7 +10,7 @@ cadence.
 
 | Plugin | Package |
 |---|---|
-| [`java/temporal-spring-ai`](java/temporal-spring-ai) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/temporal-spring-ai.svg)](https://central.sonatype.com/artifact/io.temporal/temporal-spring-ai) (Public Preview) |
+| [`java/spring-ai`](java/spring-ai) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/spring-ai.svg)](https://central.sonatype.com/artifact/io.temporal/spring-ai) (Public Preview) |
 | [`python/deepagents`](python/deepagents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-deepagents.svg)](https://pypi.org/project/temporalio-deepagents/) (Pre-release, no Python 3.10 support) |
 | [`python/google_adk`](python/google_adk) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-adk.svg)](https://pypi.org/project/temporalio-google-adk/) (Pre-release) |
 | [`python/google_genai`](python/google_genai) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-genai.svg)](https://pypi.org/project/temporalio-google-genai/) (Public Preview) |
