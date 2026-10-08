@@ -17,6 +17,7 @@ import uuid
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -104,25 +105,6 @@ def test_state_snapshot_roundtrip() -> None:
     assert hit and value == {"dumped": "message"}
 
 
-class SlowFakeAgent:
-    """Like ``FakeAgent`` but each turn burns timers so a single run's history
-    grows past the dev server's continue-as-new suggestion threshold (the test
-    env pins ``limit.historyCount.suggestContinueAsNew`` low)."""
-
-    async def ainvoke(self, input: Any) -> dict:
-        for _ in range(20):
-            await workflow.sleep(0.001)
-        messages = list(input.get("messages", [])) if isinstance(input, dict) else []
-        messages = [*messages, "step"]
-        done = messages.count("step") >= 2
-        return {
-            "messages": messages,
-            "todos": [
-                {"content": "work", "status": "completed" if done else "pending"}
-            ],
-        }
-
-
 @workflow.defn
 class SuggestedCanWorkflow:
     @workflow.run
@@ -130,46 +112,52 @@ class SuggestedCanWorkflow:
         # No continue_as_new_after: the default follows the server's own
         # is_continue_as_new_suggested() signal.
         return await run_deep_agent(
-            SlowFakeAgent(),
+            FakeAgent(),
             input,
             state_snapshot=state_snapshot,
         )
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("suggested", [False, True])
 async def test_can_defaults_to_server_suggestion(
-    env: WorkflowEnvironment, env_type: str
+    env: WorkflowEnvironment, suggested: bool
 ) -> None:
-    """With ``continue_as_new_after`` unset, the driver continues-as-new when
-    the SERVER suggests it (history count/size), not on a fixed threshold."""
-    if env_type != "local":
-        pytest.skip("needs the local dev server's low suggestContinueAsNew threshold")
-    plugin = DeepAgentsPlugin()
-    async with Worker(
-        env.client,
-        task_queue="da-can-suggested",
-        workflows=[SuggestedCanWorkflow],
-        plugins=[plugin],
-    ):
-        handle = await env.client.start_workflow(
-            SuggestedCanWorkflow.run,
-            {"messages": ["start"]},
-            id=f"da-can-suggested-{uuid.uuid4()}",
-            task_queue="da-can-suggested",
-        )
-        result = await handle.result()
+    """The default follows the SDK suggestion and carries state through real runs.
 
-    # Carry across the suggested continue-as-new: the conversation only reaches
-    # 3 messages if snapshots crossed run boundaries.
-    assert result["messages"] == ["start", "step", "step"], result
-    assert result["todos"][0]["status"] == "completed"
-    # The first run really did continue-as-new (not complete).
+    Supply the SDK's suggestion directly instead of changing server configuration
+    or generating thousands of events to reach its default threshold.
+    """
+    plugin = DeepAgentsPlugin()
+    with patch.object(
+        workflow.Info, "is_continue_as_new_suggested", return_value=suggested
+    ) as suggestion:
+        async with Worker(
+            env.client,
+            task_queue="da-can-suggested",
+            workflows=[SuggestedCanWorkflow],
+            plugins=[plugin],
+        ):
+            handle = await env.client.start_workflow(
+                SuggestedCanWorkflow.run,
+                {"messages": ["start"]},
+                id=f"da-can-suggested-{uuid.uuid4()}",
+                task_queue="da-can-suggested",
+            )
+            result = await handle.result()
+        suggestion.assert_called()
+
+    steps = 3 if suggested else 1
+    assert result["messages"] == ["start", *(["step"] * steps)], result
+    assert result["todos"][0]["status"] == ("completed" if suggested else "pending")
     first = env.client.get_workflow_handle(
         handle.id, run_id=handle.first_execution_run_id
     )
     desc = await first.describe()
-    assert desc.status is not None and desc.status.name == "CONTINUED_AS_NEW", (
-        desc.status
+    assert desc.status == (
+        WorkflowExecutionStatus.CONTINUED_AS_NEW
+        if suggested
+        else WorkflowExecutionStatus.COMPLETED
     )
 
 

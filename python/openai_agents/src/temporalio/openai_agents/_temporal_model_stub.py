@@ -25,13 +25,13 @@ from agents.items import TResponseStreamEvent
 from agents.tool import (
     ApplyPatchTool,
     CustomTool,
-    LocalShellTool,
     ShellTool,
     ToolSearchTool,
 )
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 
 from temporalio import workflow
+from temporalio.openai_agents._errors import AgentsWorkflowError
 from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
     AgentOutputSchemaInput,
@@ -85,7 +85,6 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
                     WebSearchTool,
                     ImageGenerationTool,
                     CodeInterpreterTool,
-                    LocalShellTool,
                     ToolSearchTool,
                 ),
             ):
@@ -107,9 +106,26 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
                     description=tool.description,
                     params_json_schema=tool.params_json_schema,
                     strict_json_schema=tool.strict_json_schema,
+                    defer_loading=tool.defer_loading,
+                    namespace=getattr(tool, "_tool_namespace", None),
+                    namespace_description=getattr(
+                        tool, "_tool_namespace_description", None
+                    ),
+                    allowed_callers=tool.allowed_callers,
+                    output_json_schema=tool.output_json_schema,
                 )
             else:
-                raise ValueError(f"Unsupported tool type: {tool.name}")
+                # Raise a workflow failure rather than a plain exception, which would
+                # fail the workflow task and leave the workflow retrying it forever.
+                raise AgentsWorkflowError(
+                    f"Tool {getattr(tool, 'name', type(tool).__name__)!r} "
+                    f"({type(tool).__name__}) is not supported by the Temporal OpenAI "
+                    "Agents plugin because it cannot be carried to the model activity: "
+                    "LocalShellTool and ComputerTool wrap local executors or devices, "
+                    "and ProgrammaticToolCallingTool is not supported yet. Remove it "
+                    "from the agent's tools, or run the work in a Temporal activity "
+                    "exposed with activity_as_tool()."
+                )
 
         tool_infos = [make_tool_info(x) for x in tools]
         handoff_infos = [

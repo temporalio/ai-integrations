@@ -254,6 +254,28 @@ def test_java_matrix_runs_before_artifact_upload() -> None:
     assert steps.index(test) < steps.index(build) < steps.index(upload)
 
 
+def test_java_latest_dependencies_are_selected_and_locked_before_testing() -> None:
+    ci = yaml.safe_load((REPO / '.github/workflows/ci.yml').read_text())
+    mode = ci['jobs']['java']['with']['deps']
+    assert mode == ci['jobs']['python']['with']['deps']
+    assert "github.event_name == 'schedule'" in mode
+    assert "github.event_name == 'workflow_dispatch' && inputs.latest-deps" in mode
+    doc = yaml.safe_load((REPO / '.github/workflows/_java-plugin.yml').read_text())
+    assert doc[True]['workflow_call']['inputs']['deps']['default'] == 'locked'
+    assert doc['jobs']['test']['env']['DEPS'] == '${{ inputs.deps }}'
+    steps = doc['jobs']['test']['steps']
+    resolve = next(s for s in steps if s.get('name') == 'Resolve latest dependencies')
+    test = next(s for s in steps if s.get('name') == 'Lint and test')
+    build = next(s for s in steps if s.get('name') == 'Build and verify tested distributions')
+    assert resolve['if'] == "inputs.deps == 'latest'"
+    assert 'resolveAndLockAll --write-locks --refresh-dependencies' in resolve['run']
+    for step in (resolve, test, build):
+        assert '-PdependencyMode=$DEPS' in step['run']
+        assert '-PspringBootVersion=$SPRING_BOOT_VERSION' in step['run']
+    assert '--write-locks' not in test['run'] + build['run']
+    assert steps.index(resolve) < steps.index(test) < steps.index(build)
+
+
 def test_java_release_reuses_tested_bytes_and_recovers_deployments() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-java.yml").read_text())
     jobs = doc["jobs"]
@@ -281,25 +303,3 @@ def test_java_release_reuses_tested_bytes_and_recovers_deployments() -> None:
         assert f"maven_release.py {name}" in command["run"] and "--smoke" in command["run"]
     gate = next(s for s in jobs["prepare"]["steps"] if s.get("id") == "gate")
     assert '[ "$REF_TYPE" = "tag" ] && [ "$SKIP_PUBLISH" = "false" ]' in gate["run"]
-
-
-def test_java_latest_dependencies_are_selected_and_locked_before_testing() -> None:
-    ci = yaml.safe_load((REPO / '.github/workflows/ci.yml').read_text())
-    mode = ci['jobs']['java']['with']['deps']
-    assert mode == ci['jobs']['python']['with']['deps']
-    assert "github.event_name == 'schedule'" in mode
-    assert "github.event_name == 'workflow_dispatch' && inputs.latest-deps" in mode
-    doc = yaml.safe_load((REPO / '.github/workflows/_java-plugin.yml').read_text())
-    assert doc[True]['workflow_call']['inputs']['deps']['default'] == 'locked'
-    assert doc['jobs']['test']['env']['DEPS'] == '${{ inputs.deps }}'
-    steps = doc['jobs']['test']['steps']
-    resolve = next(s for s in steps if s.get('name') == 'Resolve latest dependencies')
-    test = next(s for s in steps if s.get('name') == 'Lint and test')
-    build = next(s for s in steps if s.get('name') == 'Build and verify tested distributions')
-    assert resolve['if'] == "inputs.deps == 'latest'"
-    assert 'resolveAndLockAll --write-locks --refresh-dependencies' in resolve['run']
-    for step in (resolve, test, build):
-        assert '-PdependencyMode=$DEPS' in step['run']
-        assert '-PspringBootVersion=$SPRING_BOOT_VERSION' in step['run']
-    assert '--write-locks' not in test['run'] + build['run']
-    assert steps.index(resolve) < steps.index(test) < steps.index(build)

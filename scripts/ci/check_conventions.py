@@ -46,8 +46,10 @@ RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
 MAX_PR_COMMITS_WITHOUT_LABEL = 20
 HISTORY_IMPORT_LABEL = "history-import"
 STANDARD_TEST_SUPPORT = {
+    "tests/helpers/environment.py": "tests/helpers/environment.py.tmpl",
     "tests/helpers/plugin_meta.py": "tests/helpers/plugin_meta.py.tmpl",
     "tests/helpers/provenance.py": "tests/helpers/provenance.py.tmpl",
+    "tests/test_env.py": "tests/test_env.py.tmpl",
     "tests/test_installed_matches_source.py": "tests/test_installed_matches_source.py.tmpl",
 }
 PYTHON_DEVELOPMENT_VERSION = "0.0.0"
