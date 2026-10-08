@@ -4,9 +4,8 @@ import functools
 import inspect
 import json
 import typing
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
@@ -22,7 +21,7 @@ from agents.tool import (
 
 from temporalio import activity
 from temporalio import workflow as temporal_workflow
-from temporalio.common import Priority, RetryPolicy, WorkflowIDReusePolicy
+from temporalio.common import Priority, RetryPolicy
 from temporalio.exceptions import ApplicationError, TemporalError
 from temporalio.openai_agents._errors import (
     AgentsWorkflowError as AgentsWorkflowError,
@@ -33,170 +32,11 @@ from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
 from temporalio.workflow import (
     ActivityCancellationType,
     ActivityConfig,
-    ChildWorkflowCancellationType,
-    ParentClosePolicy,
     VersioningIntent,
 )
 
 if typing.TYPE_CHECKING:
     from agents.mcp import MCPServer
-
-
-_AGENT_MESSAGE_SIGNAL = "temporalio.openai_agents.receive_message"
-
-
-@dataclass(frozen=True)
-class AgentMessage:
-    """A durable message sent between agent Workflows."""
-
-    id: str
-    sender_workflow_id: str
-    sender_run_id: str
-    body: str
-
-
-class AgentMessageInbox:
-    """A deterministic inbox receiving messages through a Temporal Signal.
-
-    Construct this object inside a Workflow to register its Signal handler.
-    Messages can then be drained synchronously or awaited without polling an
-    external system.
-    """
-
-    def __init__(self, *, signal_name: str = _AGENT_MESSAGE_SIGNAL) -> None:
-        """Register an inbox for the current Workflow.
-
-        Args:
-            signal_name: Signal name used for message delivery. Most callers
-                should use the shared default.
-        """
-        self._messages: list[AgentMessage] = []
-        temporal_workflow.set_signal_handler(signal_name, self._receive)
-
-    def _receive(self, message: AgentMessage) -> None:
-        self._messages.append(message)
-
-    @property
-    def messages(self) -> tuple[AgentMessage, ...]:
-        """Return a read-only snapshot of pending messages."""
-        return tuple(self._messages)
-
-    def drain(self) -> list[AgentMessage]:
-        """Remove and return all pending messages in delivery order."""
-        messages = self._messages
-        self._messages = []
-        return messages
-
-    async def receive(
-        self, *, timeout: timedelta | float | None = None
-    ) -> AgentMessage:
-        """Wait for and remove the next pending message.
-
-        Args:
-            timeout: Optional durable wait timeout.
-
-        Returns:
-            The next message in delivery order.
-        """
-        await temporal_workflow.wait_condition(
-            lambda: bool(self._messages),
-            timeout=timeout,
-            timeout_summary="Waiting for an agent message",
-        )
-        return self._messages.pop(0)
-
-
-def send_message_tool(
-    recipients: Mapping[str, str],
-    *,
-    include_parent: bool = False,
-    tool_name: str = "send_message",
-    tool_description: str | None = None,
-    signal_name: str = _AGENT_MESSAGE_SIGNAL,
-    strict_json_schema: bool = True,
-) -> Tool:
-    """Create an OpenAI tool that Signals a message to another agent Workflow.
-
-    Recipient names are resolved through the supplied allowlist. Set
-    ``include_parent=True`` inside a Child Workflow to additionally expose its
-    parent as ``"parent"``. Workflow IDs are never accepted directly from the
-    model.
-
-    Args:
-        recipients: Mapping of model-facing recipient names to Workflow IDs.
-        include_parent: Add the current Child Workflow's parent as ``"parent"``.
-        tool_name: Model-facing tool name.
-        tool_description: Model-facing tool description.
-        signal_name: Signal name registered by the recipient's
-            :class:`AgentMessageInbox`.
-        strict_json_schema: Whether the tool should use a strict JSON schema.
-
-    Returns:
-        An OpenAI agent tool that durably sends messages through Signals.
-
-    Raises:
-        ApplicationError: If ``include_parent`` is used outside a Child Workflow,
-            or if the model selects an unknown recipient.
-    """
-    resolved_recipients = dict(recipients)
-    if include_parent:
-        parent = temporal_workflow.info().parent
-        if parent is None:
-            raise ApplicationError(
-                "send_message_tool(include_parent=True) requires a Child Workflow",
-                "invalid_tool",
-                non_retryable=True,
-            )
-        resolved_recipients["parent"] = parent.workflow_id
-
-    def send_message(
-        recipient: str,  # type: ignore[reportUnusedParameter]
-        message: str,  # type: ignore[reportUnusedParameter]
-    ) -> str:
-        """Send a message to another agent."""
-        raise NotImplementedError("This function definition is used as a type only")
-
-    send_message.__name__ = tool_name
-    schema = function_schema(send_message)
-
-    async def run_send_message(_ctx: RunContextWrapper[Any], input: str) -> str:
-        try:
-            json_data = json.loads(input)
-        except Exception as e:
-            raise ApplicationError(
-                f"Invalid JSON input for tool {schema.name}: {input}"
-            ) from e
-        args, _ = schema.to_call_args(schema.params_pydantic_model(**json_data))
-        recipient, body = typing.cast(tuple[str, str], tuple(args))
-        workflow_id = resolved_recipients.get(recipient)
-        if workflow_id is None:
-            allowed = ", ".join(sorted(resolved_recipients)) or "none"
-            raise ApplicationError(
-                f"Unknown message recipient {recipient!r}; allowed recipients: {allowed}",
-                "invalid_message_recipient",
-                non_retryable=True,
-            )
-
-        info = temporal_workflow.info()
-        message = AgentMessage(
-            id=str(temporal_workflow.uuid4()),
-            sender_workflow_id=info.workflow_id,
-            sender_run_id=info.run_id,
-            body=body,
-        )
-        handle = temporal_workflow.get_external_workflow_handle(workflow_id)
-        await handle.signal(signal_name, message)
-        return f"Message sent to {recipient}."
-
-    allowed_recipients = ", ".join(sorted(resolved_recipients)) or "none"
-    return FunctionTool(
-        name=schema.name,
-        description=tool_description
-        or f"Send a message to another agent. Allowed recipients: {allowed_recipients}.",
-        params_json_schema=schema.params_json_schema,
-        on_invoke_tool=run_send_message,
-        strict_json_schema=strict_json_schema,
-    )
 
 
 def activity_as_tool(
@@ -403,138 +243,6 @@ def nexus_operation_as_tool(
         description=schema.description or "",
         params_json_schema=schema.params_json_schema,
         on_invoke_tool=run_operation,
-        strict_json_schema=strict_json_schema,
-    )
-
-
-def child_workflow_as_tool(
-    fn: Callable,
-    *,
-    tool_name: str | None = None,
-    tool_description: str | None = None,
-    id: str | None = None,
-    task_queue: str | None = None,
-    cancellation_type: ChildWorkflowCancellationType = ChildWorkflowCancellationType.WAIT_CANCELLATION_COMPLETED,
-    parent_close_policy: ParentClosePolicy = ParentClosePolicy.TERMINATE,
-    execution_timeout: timedelta | None = None,
-    run_timeout: timedelta | None = None,
-    task_timeout: timedelta | None = None,
-    retry_policy: RetryPolicy | None = None,
-    id_reuse_policy: WorkflowIDReusePolicy = WorkflowIDReusePolicy.ALLOW_DUPLICATE,
-    versioning_intent: VersioningIntent | None = None,
-    static_summary: str | None = None,
-    static_details: str | None = None,
-    priority: Priority = Priority.default,
-    strict_json_schema: bool = True,
-) -> Tool:
-    """Convert a Temporal Child Workflow into an OpenAI agent tool.
-
-    The child Workflow is a durable execution boundary for the tool call. This is
-    useful for an agent that should run as a tool while retaining its own Workflow
-    history, retries, task queue, and lifecycle. Define and run the subagent inside
-    the child Workflow; live ``Agent`` and ``RunContextWrapper`` objects are not
-    serialized across the boundary.
-
-    The decorated Workflow ``run`` method's parameters define the tool's JSON
-    schema. Its return value is converted to a string for the calling agent.
-
-    Args:
-        fn: A decorated Temporal Workflow ``run`` method.
-        tool_name: Model-facing tool name. Defaults to the Workflow type name.
-        tool_description: Model-facing description. Defaults to the run method's
-            docstring.
-        id: Optional Child Workflow ID. Leave unset when the tool may be invoked
-            more than once so Temporal assigns a deterministic unique ID.
-        strict_json_schema: Whether the tool should use a strict JSON schema.
-        task_queue: Task queue on which to run the Child Workflow.
-        cancellation_type: Behavior when cancellation is requested.
-        parent_close_policy: Behavior when the parent Workflow closes.
-        execution_timeout: Total Child Workflow execution timeout.
-        run_timeout: Timeout for a single Child Workflow run.
-        task_timeout: Timeout for each Child Workflow task.
-        retry_policy: Retry policy for the Child Workflow.
-        id_reuse_policy: Policy for reusing an explicitly supplied Workflow ID.
-        versioning_intent: Worker versioning intent.
-        static_summary: Summary shown in Temporal UI and APIs.
-        static_details: Details shown in Temporal UI and APIs.
-        priority: Child Workflow priority.
-
-    Returns:
-        An OpenAI agent tool that executes the decorated Child Workflow.
-
-    Raises:
-        ApplicationError: If ``fn`` is not a decorated Workflow run method.
-
-    Example:
-        >>> @temporal_workflow.defn
-        ... class ResearchAgentWorkflow:
-        ...     @temporal_workflow.run
-        ...     async def run(self, question: str) -> str:
-        ...         result = await Runner.run(research_agent, question)
-        ...         return str(result.final_output)
-        ...
-        >>> tool = child_workflow_as_tool(
-        ...     ResearchAgentWorkflow.run,
-        ...     tool_name="research",
-        ...     tool_description="Research a question with a specialist agent.",
-        ... )
-    """
-    definition = temporal_workflow._Definition.from_run_fn(fn)
-    if definition is None or definition.name is None:
-        raise ApplicationError(
-            "Input must be a decorated Workflow run method",
-            "invalid_tool",
-        )
-    workflow_name = definition.name
-
-    params = list(inspect.signature(fn).parameters.keys())
-    schema_callable = fn
-    if params and params[0] == "self":
-        schema_callable = functools.partial(fn, None)
-        schema_callable.__annotations__ = getattr(fn, "__annotations__", {})
-        schema_callable.__doc__ = fn.__doc__
-    setattr(schema_callable, "__name__", tool_name or workflow_name)
-    schema = function_schema(schema_callable)
-
-    async def run_child_workflow(_ctx: RunContextWrapper[Any], input: str) -> Any:
-        try:
-            json_data = json.loads(input)
-        except Exception as e:
-            raise ApplicationError(
-                f"Invalid JSON input for tool {schema.name}: {input}"
-            ) from e
-
-        args, _ = schema.to_call_args(schema.params_pydantic_model(**json_data))
-        result = await temporal_workflow.execute_child_workflow(
-            workflow_name,
-            args=args,
-            id=id,
-            task_queue=task_queue,
-            result_type=definition.ret_type,
-            cancellation_type=cancellation_type,
-            parent_close_policy=parent_close_policy,
-            execution_timeout=execution_timeout,
-            run_timeout=run_timeout,
-            task_timeout=task_timeout,
-            retry_policy=retry_policy,
-            id_reuse_policy=id_reuse_policy,
-            versioning_intent=versioning_intent,
-            static_summary=static_summary or schema.description,
-            static_details=static_details,
-            priority=priority,
-        )
-        try:
-            return str(result)
-        except Exception as e:
-            raise ToolSerializationError(
-                "You must return a string representation of the tool output, or something we can call str() on"
-            ) from e
-
-    return FunctionTool(
-        name=schema.name,
-        description=tool_description or schema.description or "",
-        params_json_schema=schema.params_json_schema,
-        on_invoke_tool=run_child_workflow,
         strict_json_schema=strict_json_schema,
     )
 

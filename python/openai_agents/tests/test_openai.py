@@ -4,7 +4,6 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timedelta
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import nexusrpc
@@ -54,7 +53,7 @@ from agents.items import (
 )
 from agents.mcp import MCPServer
 from agents.sandbox.capabilities.tools import SandboxApplyPatchTool
-from agents.tool import CustomTool, FunctionTool
+from agents.tool import CustomTool
 from agents.tool_context import ToolContext
 from openai import APIStatusError, AsyncOpenAI, BaseModel, RateLimitError
 from openai.types.responses import (
@@ -747,176 +746,6 @@ def agent_as_tools_mock_model():
     )
 
 
-def child_workflow_agent_tool_mock_model():
-    return TestModel.returning_responses(
-        [
-            ResponseBuilders.tool_call(
-                '{"question":"Why is the sky blue?"}', "research"
-            ),
-            ResponseBuilders.output_message(
-                "Rayleigh scattering makes shorter blue wavelengths scatter more."
-            ),
-            ResponseBuilders.output_message(
-                "Research says the sky is blue because of Rayleigh scattering."
-            ),
-        ]
-    )
-
-
-@workflow.defn
-class ResearchAgentWorkflow:
-    @workflow.run
-    async def run(self, question: str) -> str:
-        """Research a question with a specialist agent."""
-        result = await Runner.run(
-            starting_agent=Agent(
-                name="Research agent",
-                instructions="Research the question and return a concise answer.",
-            ),
-            input=question,
-        )
-        return str(result.final_output)
-
-
-@workflow.defn
-class ChildWorkflowAgentToolWorkflow:
-    @workflow.run
-    async def run(self, question: str) -> str:
-        agent = Agent(
-            name="Orchestrator agent",
-            instructions="Use the research tool before answering.",
-            tools=[
-                openai_agents.workflow.child_workflow_as_tool(
-                    ResearchAgentWorkflow.run,
-                    tool_name="research",
-                    tool_description="Research a question with a specialist agent.",
-                )
-            ],
-        )
-        result = await Runner.run(starting_agent=agent, input=question)
-        return str(result.final_output)
-
-
-async def test_child_workflow_as_tool_dispatches_typed_arguments(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    captured: dict[str, Any] = {}
-
-    async def execute_child(workflow_name: str, **kwargs: Any) -> str:
-        captured["workflow_name"] = workflow_name
-        captured.update(kwargs)
-        return "specialist result"
-
-    monkeypatch.setattr(workflow, "execute_child_workflow", execute_child)
-    tool = cast(
-        FunctionTool,
-        openai_agents.workflow.child_workflow_as_tool(
-            ResearchAgentWorkflow.run,
-            tool_name="research",
-            tool_description="Delegate research to a specialist.",
-            task_queue="specialists",
-        ),
-    )
-
-    result = await tool.on_invoke_tool(
-        ToolContext(
-            None,
-            tool_name="research",
-            tool_call_id="call-research",
-            tool_arguments='{"question":"Why is the sky blue?"}',
-        ),
-        '{"question":"Why is the sky blue?"}',
-    )
-
-    assert result == "specialist result"
-    assert tool.name == "research"
-    assert tool.description == "Delegate research to a specialist."
-    assert tool.params_json_schema["properties"] == {
-        "question": {"title": "Question", "type": "string"}
-    }
-    assert captured["workflow_name"] == "ResearchAgentWorkflow"
-    assert captured["args"] == ["Why is the sky blue?"]
-    assert captured["task_queue"] == "specialists"
-    assert captured["static_summary"] == "Research a question with a specialist agent."
-
-
-async def test_send_message_tool_signals_allowed_workflow(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    delivered: list[tuple[str, Any]] = []
-
-    class Handle:
-        async def signal(self, name: str, message: Any) -> None:
-            delivered.append((name, message))
-
-    monkeypatch.setattr(
-        workflow,
-        "info",
-        lambda: SimpleNamespace(
-            workflow_id="research-child",
-            run_id="child-run",
-            parent=None,
-        ),
-    )
-    monkeypatch.setattr(workflow, "uuid4", lambda: "message-id")
-    monkeypatch.setattr(
-        workflow,
-        "get_external_workflow_handle",
-        lambda workflow_id: Handle(),
-    )
-    tool = cast(
-        FunctionTool,
-        openai_agents.workflow.send_message_tool({"coordinator": "parent-id"}),
-    )
-
-    result = await tool.on_invoke_tool(
-        ToolContext(
-            None,
-            tool_name="send_message",
-            tool_call_id="call-send-message",
-            tool_arguments=(
-                '{"recipient":"coordinator","message":"Research is complete."}'
-            ),
-        ),
-        '{"recipient":"coordinator","message":"Research is complete."}',
-    )
-
-    assert result == "Message sent to coordinator."
-    assert len(delivered) == 1
-    signal_name, message = delivered[0]
-    assert signal_name == "temporalio.openai_agents.receive_message"
-    assert message == openai_agents.workflow.AgentMessage(
-        id="message-id",
-        sender_workflow_id="research-child",
-        sender_run_id="child-run",
-        body="Research is complete.",
-    )
-
-
-def test_agent_message_inbox_receives_and_drains(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    registered: dict[str, Any] = {}
-    monkeypatch.setattr(
-        workflow,
-        "set_signal_handler",
-        lambda name, handler: registered.update({name: handler}),
-    )
-    inbox = openai_agents.workflow.AgentMessageInbox()
-    message = openai_agents.workflow.AgentMessage(
-        id="message-id",
-        sender_workflow_id="child-id",
-        sender_run_id="child-run",
-        body="Done.",
-    )
-
-    registered["temporalio.openai_agents.receive_message"](message)
-
-    assert inbox.messages == (message,)
-    assert inbox.drain() == [message]
-    assert inbox.messages == ()
-
-
 async def test_agents_as_tools_workflow(client: Client):
     async with AgentEnvironment(
         model=agent_as_tools_mock_model(),
@@ -970,71 +799,6 @@ async def test_agents_as_tools_workflow(client: Client):
                 in events[3]
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
-            )
-
-
-async def test_child_workflow_as_agent_tool(client: Client):
-    async with AgentEnvironment(
-        model=child_workflow_agent_tool_mock_model(),
-        model_params=ModelActivityParameters(
-            start_to_close_timeout=timedelta(seconds=30),
-        ),
-    ) as env:
-        client = env.applied_on_client(client)
-
-        async with new_worker(
-            client,
-            ChildWorkflowAgentToolWorkflow,
-            ResearchAgentWorkflow,
-        ) as worker:
-            workflow_handle = await client.start_workflow(
-                ChildWorkflowAgentToolWorkflow.run,
-                "Why is the sky blue?",
-                id=f"child-workflow-agent-tool-{uuid.uuid4()}",
-                task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=30),
-            )
-            result = await workflow_handle.result()
-
-            assert (
-                result
-                == "Research says the sky is blue because of Rayleigh scattering."
-            )
-
-            history = await workflow_handle.fetch_history()
-            child_started = next(
-                event
-                for event in history.events
-                if event.HasField(
-                    "start_child_workflow_execution_initiated_event_attributes"
-                )
-            )
-            assert (
-                child_started.start_child_workflow_execution_initiated_event_attributes.workflow_type.name
-                == "ResearchAgentWorkflow"
-            )
-            child_workflow_id = child_started.start_child_workflow_execution_initiated_event_attributes.workflow_id
-            assert any(
-                event.HasField("child_workflow_execution_completed_event_attributes")
-                for event in history.events
-            )
-            assert (
-                sum(
-                    event.HasField("activity_task_completed_event_attributes")
-                    for event in history.events
-                )
-                == 2
-            )
-
-            child_history = await client.get_workflow_handle(
-                child_workflow_id
-            ).fetch_history()
-            assert (
-                sum(
-                    event.HasField("activity_task_completed_event_attributes")
-                    for event in child_history.events
-                )
-                == 1
             )
 
 
