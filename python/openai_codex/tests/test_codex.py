@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from pydantic import BaseModel, ValidationError
 
 from temporalio import activity
 from temporalio.api.enums.v1 import EventType
@@ -22,7 +23,7 @@ from temporalio.client import Client, WorkflowFailureError
 from temporalio.openai_codex import CodexObserver, CodexPlugin, CodexTokenUsage
 from temporalio.openai_codex._app_server import AppServer
 from temporalio.openai_codex.testing import FakeResponsesServer
-from temporalio.openai_codex.workflow import codex_tool
+from temporalio.openai_codex.workflow import codex_tool, function_schema
 from tests._workflows import (
     CodexWorkflow,
     ObservedCodexWorkflow,
@@ -121,6 +122,29 @@ def test_codex_tool_derives_the_spec_from_the_function() -> None:
     assert tool.spec.input_schema["type"] == "object"
     assert tool.spec.input_schema["properties"]["q"]["type"] == "string"
     assert tool.spec.input_schema["required"] == ["q"]
+
+
+class Address(BaseModel):
+    """A postal address."""
+
+    city: str
+
+
+def ship(order_id: str, to: Address, express: bool = False) -> str:
+    """Ship an order."""
+    return f"{order_id}:{to.city}:{express}"
+
+
+def test_function_schema_parses_arguments_into_the_functions_own_types() -> None:
+    schema = function_schema(ship)
+    assert schema.spec.name == "ship"
+    assert schema.spec.input_schema["required"] == ["order_id", "to"]
+    kwargs = schema.parse({"order_id": "o1", "to": {"city": "Paris"}})
+    assert list(kwargs) == ["order_id", "to", "express"]
+    assert isinstance(kwargs["to"], Address)
+    assert ship(**kwargs) == "o1:Paris:False"
+    with pytest.raises(ValidationError):
+        schema.parse({"order_id": "o1"})
 
 
 @requires_codex_binary

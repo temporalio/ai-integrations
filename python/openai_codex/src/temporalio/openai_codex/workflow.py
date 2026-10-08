@@ -41,8 +41,10 @@ __all__ = [
     "CodexTool",
     "CodexToolSpec",
     "CodexTurnResult",
+    "FunctionSchema",
     "activity_as_tool",
     "codex_tool",
+    "function_schema",
 ]
 
 
@@ -66,10 +68,43 @@ def _stringify(result: Any) -> str:
     return json.dumps(to_jsonable_python(result))
 
 
-def _derive(
-    fn: Callable[..., Any], name: str | None, description: str | None
-) -> tuple[CodexToolSpec, type[BaseModel], list[str]]:
-    """Derive the tool spec, an argument model, and the ordered parameter names from ``fn``."""
+@dataclass(frozen=True)
+class FunctionSchema:
+    """A function's tool spec plus a parser for the arguments the model sends for it."""
+
+    spec: CodexToolSpec
+    _args_model: type[BaseModel]
+    _order: tuple[str, ...]
+
+    def parse(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Validate the model's call arguments and return them as keyword arguments.
+
+        Values are the function's own annotated types (for example Pydantic models for nested
+        objects), in the function's parameter order.
+
+        Raises:
+            pydantic.ValidationError: If the arguments do not match the function's signature.
+        """
+        parsed = self._args_model.model_validate(arguments)
+        return {name: getattr(parsed, name) for name in self._order}
+
+
+def function_schema(
+    fn: Callable[..., Any],
+    *,
+    name: str | None = None,
+    description: str | None = None,
+) -> FunctionSchema:
+    """Derive a tool spec (JSON schema from the signature, description from the docstring) from ``fn``.
+
+    This is what :func:`codex_tool` and :func:`activity_as_tool` use; call it directly to build a
+    :class:`CodexTool` that executes the function some other way.
+
+    Args:
+        fn: The function (sync or async) whose signature describes the tool.
+        name: Tool name shown to the model. Defaults to the function's name.
+        description: Tool description. Defaults to the function's docstring.
+    """
     tool_name = name or getattr(fn, "__name__", None) or "tool"
     try:
         signature = inspect.signature(fn, eval_str=True)
@@ -94,7 +129,7 @@ def _derive(
         description=(description or inspect.getdoc(fn) or "").strip(),
         input_schema=schema,
     )
-    return spec, args_model, order
+    return FunctionSchema(spec, args_model, tuple(order))
 
 
 def codex_tool(
@@ -114,13 +149,12 @@ def codex_tool(
         name: Tool name shown to the model. Defaults to the function's name.
         description: Tool description. Defaults to the function's docstring.
     """
-    spec, args_model, order = _derive(fn, name, description)
+    schema = function_schema(fn, name=name, description=description)
 
     async def handler(call: CodexPendingCall) -> str:
-        parsed = args_model.model_validate(call.arguments)
-        return _stringify(await fn(**{k: getattr(parsed, k) for k in order}))
+        return _stringify(await fn(**schema.parse(call.arguments)))
 
-    return CodexTool(spec=spec, handler=handler)
+    return CodexTool(spec=schema.spec, handler=handler)
 
 
 def activity_as_tool(
@@ -145,13 +179,12 @@ def activity_as_tool(
         retry_policy: Activity retry policy.
         task_queue: Task queue to run the Activity on; defaults to the Workflow's.
     """
-    spec, args_model, order = _derive(activity_fn, name, description)
+    schema = function_schema(activity_fn, name=name, description=description)
 
     async def handler(call: CodexPendingCall) -> str:
-        parsed = args_model.model_validate(call.arguments)
         result = await workflow.execute_activity(
             activity_fn,
-            args=[getattr(parsed, k) for k in order],
+            args=list(schema.parse(call.arguments).values()),
             activity_id=f"tool-{call.call_id}",
             start_to_close_timeout=start_to_close_timeout,
             retry_policy=retry_policy,
@@ -159,7 +192,7 @@ def activity_as_tool(
         )
         return _stringify(result)
 
-    return CodexTool(spec=spec, handler=handler)
+    return CodexTool(spec=schema.spec, handler=handler)
 
 
 class CodexSession:
