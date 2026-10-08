@@ -48,7 +48,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 version policy (below). Go plugins use `go.temporal.io/<name>` module paths and live under
 `go/<name>/`. Before publishing, the vanity site must route each module to this repository's
 subdirectory. The [Go module reference](https://go.dev/ref/mod#vcs-find) documents the fourth
-`go-import` field for subdirectories, supported since Go 1.25. Google ADK requires Go 1.26.5,
+`go-import` field for subdirectories, supported since Go 1.25. Google ADK requires Go 1.26.6,
 so its mapping can be:
 
 ```html

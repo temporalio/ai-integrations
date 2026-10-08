@@ -52,7 +52,7 @@ def test_classify_go_failures_and_keep_language_identities_separate() -> None:
         [
             _job("Python (shared) / shared (ubuntu-latest, py3.14)", "success"),
             _job("Go (shared) / matrix", "success"),
-            _job("Go (shared) / shared (ubuntu-latest, go1.26.5)", "failure"),
+            _job("Go (shared) / shared (ubuntu-latest, go1.26.6)", "failure"),
             _job("Go (shared) / shared (windows-latest, go1.27)", "success"),
             _job("Go (recovered) / recovered (macos-latest, go1.27)", "success"),
             _job("Go (pending) / pending (ubuntu-latest, go1.27)", None),

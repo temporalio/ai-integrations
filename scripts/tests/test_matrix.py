@@ -45,10 +45,10 @@ def test_cli_reads_plugin_toml(tmp_path: Path) -> None:
 def test_cli_preserves_go_patch_floor_and_selects_all_platforms(tmp_path: Path) -> None:
     plugin = tmp_path / "go" / "fakeplug"
     plugin.mkdir(parents=True)
-    (plugin / "plugin.toml").write_text('[ci]\nruntime-versions = ["1.26.5", "1.27"]\n')
+    (plugin / "plugin.toml").write_text('[ci]\nruntime-versions = ["1.26.6", "1.27"]\n')
     result = matrix.main(["--plugin-dir", str(plugin)])
     assert [(cell["os"], cell["runtime"]) for cell in result["include"]] == [
-        ("ubuntu-latest", "1.26.5"),
+        ("ubuntu-latest", "1.26.6"),
         ("ubuntu-latest", "1.27"),
         ("macos-latest", "1.27"),
         ("windows-latest", "1.27"),

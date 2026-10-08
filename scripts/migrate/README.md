@@ -143,6 +143,15 @@ Go CI now runs the shared make targets across the declared runtimes and platform
 Final releases remain disabled until vanity routing and Go release automation
 are ready; the required subdirectory mapping is documented in AGENTS.md.
 
+An explicitly requested final re-sync before the import PR merged brought in
+upstream `main` at `6ae07bca8301bd25ba1358d1ea92ae837932d76b` on 2026-10-08.
+The frozen extraction reproduced the original 15 commits and added two dependency
+updates, for **17 commits, 6 identities, no tags**. All imported file blobs and
+author/committer metadata were verified. The merge preserves the new module path,
+self-imports, worker plugin name, replay random-stream identifiers, and changelog
+deletion. ADK v2.3.0 and the patched OpenTelemetry log API raise the Go floor to
+1.26.6; plugin CI metadata uses that same minimum.
+
 For a plugin that still names an active upstream, run the frozen script unchanged
 with a default-branch commit that descends from the previous source SHA. Do not
 re-sync after removing that field, including Google ADK after its API cutover.
