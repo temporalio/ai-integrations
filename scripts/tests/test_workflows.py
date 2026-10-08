@@ -92,7 +92,7 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
     assert doc["concurrency"]["group"] == "release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
 
 
-def test_published_release_is_verified_before_uploads_and_linked_for_approval() -> None:
+def test_published_release_is_verified_before_uploads_and_linked_from_deployment() -> None:
     jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
     prepare = jobs["prepare"]
     publish = jobs["publish-pypi"]

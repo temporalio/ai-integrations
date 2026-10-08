@@ -7,7 +7,7 @@ Subcommands:
                                 exact-version re-runs allowed for recovery)
   verify-index-files            prove the files an index serves for a version are the local artifacts
   check-recovery-run            validate a tagged run's tested artifacts for publication recovery
-  check-published-release       verify the reviewed GitHub release and emit its URL for approval
+  check-published-release       verify the published GitHub release and emit its deployment URL
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
   publish-release               publish the reviewed draft after registry verification
@@ -236,7 +236,7 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     if registry == "pypi" and (args.check_testpypi or args.testpypi_json):
         # Every release is staged on TestPyPI first and uploads are immutable, so a re-run finds the
         # version already there and skip-existing keeps the upload from failing. That is the normal
-        # recovery path (a rejected environment approval, a flaky smoke), so allow an exact newest
+        # recovery path (a failed publish job, a flaky smoke), so allow an exact newest
         # version re-run; the smoke job proves the served files are this run's artifacts.
         staged = fetch_published_versions(coordinate, "testpypi", Path(args.testpypi_json) if args.testpypi_json else None)
         staged_rerun = check_staging_policy(version, staged)
@@ -509,7 +509,7 @@ def cmd_check_published_release(args: argparse.Namespace) -> int:
     if release.get("prerelease") is not prerelease:
         raise PolicyError(f"GitHub release prerelease must be {prerelease} for {args.tag} and its plugin maturity")
     if not release.get("html_url"):
-        raise PolicyError("published GitHub release has no URL for approval")
+        raise PolicyError("published GitHub release has no URL for the deployment")
     _write_outputs(args.github_output, {"url": release["html_url"]})
     return 0
 

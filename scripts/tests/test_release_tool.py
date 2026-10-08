@@ -130,7 +130,7 @@ def test_published_release_check_is_read_only_and_emits_review_url(
     ("draft", True, "published GitHub release is required"),
     ("draft", None, "published GitHub release is required"),
     ("prerelease", False, "GitHub release prerelease must be True"),
-    ("html_url", "", "has no URL for approval"),
+    ("html_url", "", "has no URL for the deployment"),
 ])
 def test_published_release_check_rejects_unreviewed_or_misclassified_release(
     plugin_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], key: str, value: object, message: str,

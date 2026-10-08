@@ -3,7 +3,7 @@
 #
 #   prepare -> test (reusable CI, full matrix; its ubuntu dist cell builds and checks the artifacts)
 #   -> publish-testpypi -> smoke-testpypi
-#   -> [finals only] publish-pypi (approval links to the reviewed release) -> smoke-pypi
+#   -> [finals only] publish-pypi (links to the published release) -> smoke-pypi
 #
 # The artifacts that were tested are the artifacts that get published. Dry run: dispatch on
 # main with the `tag` input set to the tag you intend to push; everything up to and including the
@@ -18,7 +18,7 @@
 # Publishing uses PyPI trusted publishing (OIDC): no stored credentials. The
 # publish jobs live INLINE here on purpose: PyPI rejects reusable workflows as
 # trusted publishers (warehouse#11096). Pre-releases go to TestPyPI only unless
-# dispatched with publish-prerelease-to-pypi; environments gate every upload.
+# dispatched with publish-prerelease-to-pypi; environments restrict publication refs without a review gate.
 name: Release (Python)
 
 on:
@@ -39,7 +39,7 @@ on:
         type: string
         default: ""
       publish-prerelease-to-pypi:
-        description: For a pre-release tag ref, also publish to PyPI (still gated by the pypi environment; ignored while plugin.toml [release] allow-final is false)
+        description: For a pre-release tag ref, also publish to PyPI (ignored while plugin.toml [release] allow-final is false)
         type: boolean
         default: false
 
@@ -168,11 +168,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: uv run --project scripts --locked python scripts/release/release_tool.py check-published-release --tag "$TAG" --github-output "$GITHUB_OUTPUT"
-      - name: Link reviewed release notes
+      - name: Link published release notes
         if: steps.gate.outputs.publish == 'true'
         env:
           RELEASE_URL: ${{ steps.release.outputs.url }}
-        run: printf '[Reviewed GitHub release](%s)\n' "$RELEASE_URL" >> "$GITHUB_STEP_SUMMARY"
+        run: printf '[Published GitHub release](%s)\n' "$RELEASE_URL" >> "$GITHUB_STEP_SUMMARY"
 
   test:
     name: Test
