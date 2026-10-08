@@ -107,7 +107,10 @@ def history_of(
                 name, args = uses.get(block.get("tool_use_id"), ("?", {}))
                 raw = _text_of(block.get("content"))
                 try:  # the engine may append a <system-reminder>; read only the JSON
-                    value: Any = json.JSONDecoder().raw_decode(raw.strip())[0]
+                    value, end = json.JSONDecoder().raw_decode(raw.strip())
+                    suffix = raw.strip()[end:].strip()
+                    if suffix and not suffix.startswith("<system-reminder>"):
+                        value = raw
                 except ValueError:
                     value = raw
                 history.append(
@@ -125,15 +128,23 @@ def history_of(
 class FakeMessagesAPI:
     """A local Messages API server that answers with scripted content blocks."""
 
-    def __init__(self, decide: Decide, *, strict: bool = True) -> None:
+    def __init__(
+        self,
+        decide: Decide,
+        *,
+        strict: bool = True,
+        helper_decide: Decide | None = None,
+    ) -> None:
         """Create the server (call :meth:`start`).
 
         Args:
             decide: Returns the assistant content blocks for a request that offers
                 durable tools. Other requests (the engine's side calls) get "ok".
             strict: Reject requests that break the tool pairing rules with a 400.
+            helper_decide: Optional deterministic response for helper model requests.
         """
         self.decide = decide
+        self.helper_decide = helper_decide
         self.strict = strict
         self.fail_status: int | None = None
         """When set, requests that offer durable tools get this HTTP error."""
@@ -141,6 +152,7 @@ class FakeMessagesAPI:
         """The error message sent with ``fail_status``."""
         self.errors: list[str] = []
         self.requests: list[dict[str, Any]] = []
+        self.request_headers: list[dict[str, str]] = []
         self._ids = itertools.count(1)
         self._server: ThreadingHTTPServer | None = None
 
@@ -183,6 +195,7 @@ class FakeMessagesAPI:
                 if not self.path.startswith("/v1/messages"):
                     return self.send_json({})
                 api.requests.append(body)
+                api.request_headers.append(dict(self.headers.items()))
                 problem = validate(body) if api.strict else None
                 if problem is not None:
                     api.errors.append(problem)
@@ -199,7 +212,11 @@ class FakeMessagesAPI:
                         {"type": "error", "error": error}, status=api.fail_status
                     )
                 blocks = (
-                    api.decide(body) if durable else [{"type": "text", "text": "ok"}]
+                    api.decide(body)
+                    if durable
+                    else api.helper_decide(body)
+                    if api.helper_decide is not None
+                    else [{"type": "text", "text": "ok"}]
                 )
                 api.write(self, body, blocks)
 
@@ -259,13 +276,13 @@ class FakeMessagesAPI:
         ]
         for i, block in enumerate(blocks):
             start: dict[str, Any]
-            delta: dict[str, Any]
+            delta: dict[str, Any] = {}
             if block["type"] == "text":
                 start = {"type": "text", "text": ""}
                 delta = {"type": "text_delta", "text": block["text"]}
-            else:
+            elif block["type"] in ("tool_use", "server_tool_use"):
                 start = {
-                    "type": "tool_use",
+                    "type": block["type"],
                     "id": block["id"],
                     "name": block["name"],
                     "input": {},
@@ -274,10 +291,15 @@ class FakeMessagesAPI:
                     "type": "input_json_delta",
                     "partial_json": json.dumps(block["input"]),
                 }
+            else:
+                start = block
             events.append(
                 {"type": "content_block_start", "index": i, "content_block": start}
             )
-            events.append({"type": "content_block_delta", "index": i, "delta": delta})
+            if block["type"] in ("text", "tool_use", "server_tool_use"):
+                events.append(
+                    {"type": "content_block_delta", "index": i, "delta": delta}
+                )
             events.append({"type": "content_block_stop", "index": i})
         events.append(
             {

@@ -907,9 +907,26 @@ async def _engine_messages(
     See ``_turn_messages`` for when its input ends.
     """
     feed = _Feed(messages)
-    client = ClaudeSDKClient(ClaudeAgentOptions(**options))
+    lease = options.get("env", {}).get("TCA_BATCH_LEASE")
+    client: ClaudeSDKClient
+    if lease:
+        from ._managed import SupervisedClient
+
+        client = SupervisedClient(ClaudeAgentOptions(**options), Path(lease))
+    else:
+        client = ClaudeSDKClient(ClaudeAgentOptions(**options))
     try:
         await client.connect(feed.stream())
+        if options.get("env", {}).get("TCA_EXECUTE_BATCH"):
+            # Native effects wait for Workflow acceptance. Flush child assistant
+            # records while their PreToolUse callback is parked, rather than at
+            # the parent's final ResultMessage (the SDK's batching default).
+            sdk_query: Any = client._query
+            batcher = getattr(sdk_query, "_transcript_mirror_batcher", None)
+            if batcher is not None:
+                batcher.max_pending_entries = 0
+                batcher.max_pending_bytes = 0
+                await batcher.flush()
         async for message in _turn_messages(client, feed, resumed):
             yield message
     finally:
@@ -1330,7 +1347,9 @@ def _decision_of(output: Any) -> str | None:
     return None
 
 
-def _guard_hooks(hooks: Any, decides_alone: Any, violations: list[str]) -> Any:
+def _guard_hooks(
+    hooks: Any, decides_alone: Any, violations: list[str], fail_closed: bool = False
+) -> Any:
     """Wrap ``extra_options["hooks"]`` so they cannot decide on calls the plugin decides.
 
     A ``PreToolUse`` callback that returns a decision for a tool that runs as an
@@ -1346,8 +1365,19 @@ def _guard_hooks(hooks: Any, decides_alone: Any, violations: list[str]) -> Any:
             output = await callback(input_data, tool_use_id, context)
             name = str((input_data or {}).get("tool_name") or "")
             decision = _decision_of(output)
-            if decision is not None and decides_alone(name):
-                violations.append(f"{decision} on {name}")
+            updated = isinstance(output, dict) and "updatedInput" in (
+                output.get("hookSpecificOutput") or {}
+            )
+            if (decision is not None or updated) and decides_alone(name):
+                violations.append(f"{decision or 'updatedInput'} on {name}")
+                if fail_closed:
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": "A user hook attempted to change an accepted native call",
+                        }
+                    }
                 return {}
             return output
 
@@ -1498,6 +1528,7 @@ class ClaudeAgentSdkRunner:
         self.stub_calls = 0
         """Durable tools the engine ran itself. Stays 0 while the engine honors defer."""
         self._stand_in = StandInModel()
+        self._native_batches: dict[tuple[str, str], Any] = {}
         self._versions: dict[str, str | None] = {}
         self._launch: str | None = (
             None  # the checked launcher script (``_launch_path``)
@@ -1715,6 +1746,10 @@ class ClaudeAgentSdkRunner:
         if reported is not None and _too_old(reported):
             return _too_old_output(inp.session_id, reported)  # before the engine starts
         await self._prepare_engine()
+        if inp.execution_protocol == 2:
+            from ._batch import prepare
+
+            return await prepare(self, inp, attempt)
         injected = {k: _as_outcome(v) for k, v in inp.injected.items()}
         if self._store is None:
             return await self._run_held(inp, injected, attempt)
@@ -1859,8 +1894,23 @@ class ClaudeAgentSdkRunner:
             RuntimeError: If the Workflow did not serve its conversation, or the
                 conversation is kept where this runner does not keep it (retried).
         """
-        del attempt
         await self._prepare_engine()
+        if step.execution_protocol == 2:
+            from ._batch import execute
+
+            outcome = await execute(self, step, attempt)
+            from ._conversation import PAYLOAD_LIMIT_BYTES, json_bytes
+
+            if (
+                not external_storage_on()
+                and json_bytes(dataclasses.asdict(outcome)) > PAYLOAD_LIMIT_BYTES
+            ):
+                raise ApplicationError(
+                    "Native tool results and metadata exceed one Temporal payload. Configure External Storage on the Client.",
+                    non_retryable=True,
+                )
+            return outcome
+        del attempt
         call = step.call
         key = {
             "project_key": project_key_for_directory(self._cwd),
@@ -2032,7 +2082,11 @@ class ClaudeAgentSdkRunner:
         """
 
         def make_stub(spec: ToolSpec) -> Any:
-            @tool(spec.name, spec.description, spec.input_schema)
+            schema = dict(spec.input_schema)
+            if schema.get("type") == "object":
+                schema.setdefault("properties", {})
+
+            @tool(spec.name, spec.description, schema)
             async def stub(args: dict[str, Any]) -> dict[str, Any]:
                 del args
                 self.stub_calls += 1  # never happens while the hook defers
@@ -2333,7 +2387,9 @@ class ClaudeAgentSdkRunner:
             return name.startswith(PREFIX) or _runs_as_activity(name, activities)
 
         if "hooks" in extra:
-            extra["hooks"] = _guard_hooks(extra["hooks"], decides_alone, violations)
+            extra["hooks"] = _guard_hooks(
+                extra["hooks"], decides_alone, violations, inp.execution_protocol == 2
+            )
         system_prompt: Any
         if inp.system_prompt is None and isinstance(default_prompt, dict):
             preset = cast("dict[str, Any]", default_prompt)  # e.g. Claude Code's own

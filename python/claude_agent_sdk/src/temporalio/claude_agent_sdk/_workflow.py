@@ -8,7 +8,7 @@ import inspect
 import json
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from typing import Any, NoReturn, cast
 
@@ -23,6 +23,8 @@ from ._models import (
     AgentState,
     ConversationRef,
     DeferredCall,
+    NativeCallState,
+    NativeRequest,
     SegmentInput,
     SegmentOutput,
     ToolOutcome,
@@ -49,6 +51,9 @@ _CHECKS_PATCH = "temporalio-claude-agent-sdk-continue-as-new-checks"
 (766c647): Workflows that version started keep their decisions on replay."""
 _CARRY_PATCH = "temporalio-claude-agent-sdk-measured-stream-carry"
 """Patch ID of the check of the new run's input with the live output stream in it."""
+_BATCH_PATCH = "temporalio-claude-agent-sdk-native-batches-v2"
+_NATIVE_UPDATE = "__claude_agent_native_tool"
+_NATIVE_QUERY = "__claude_agent_native_state"
 _HISTORY_EVENTS = 51_200
 _HISTORY_BYTES = 50 * 1024 * 1024
 """Temporal's default limits for one run's history: the server ends a run past them."""
@@ -70,25 +75,48 @@ def _event_bytes(item: Any) -> int:
     return len(item.data) + len(item.topic) + _STREAM_ITEM_BYTES
 
 
-_ENGINE_ACTIVITY_TOOLS = ("Bash", "PowerShell")
+_ENGINE_ACTIVITY_TOOLS = (
+    "Agent",
+    "AskUserQuestion",
+    "Bash",
+    "Edit",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "Glob",
+    "Grep",
+    "ListMcpResources",
+    "Monitor",
+    "NotebookEdit",
+    "PowerShell",
+    "Read",
+    "ReadMcpResource",
+    "Skill",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "TodoWrite",
+    "ToolSearch",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+)
 """Claude Code built-in tools that can run as their own Activities (and MCP tools)."""
 
 
 def _check_tool_activities(patterns: Sequence[str], approvals: Sequence[str]) -> None:
-    """Refuse Claude Code tools that cannot run as their own Activities.
-
-    A tool step answers the engine's model calls with a stand-in, and Claude Code
-    checks a file tool call again when the next segment delivers its result: an Edit
-    run in a tool step happens, but Claude is told it failed, because the file changed
-    since Claude read it (tested). So file tools, tools that call the model themselves
-    (such as WebFetch) and subagents stay in the segment.
-    """
+    """Validate native built-ins and external MCP patterns managed by Activities."""
     for pattern in patterns:
-        if pattern not in _ENGINE_ACTIVITY_TOOLS and not pattern.startswith("mcp__"):
+        if (
+            pattern != "*"
+            and pattern not in _ENGINE_ACTIVITY_TOOLS
+            and not pattern.startswith("mcp__")
+        ):
             raise ValueError(
                 f"tool_activities: {pattern!r} cannot run as its own Activity. Use "
-                "'Bash', 'PowerShell', or MCP tool names ('mcp__<server>__<tool>', "
-                "patterns allowed); other Claude Code tools stay in the segment."
+                "'*', a native tool name, or MCP tool name patterns."
             )
     for pattern in approvals:
         if not any(fnmatch.fnmatchcase(pattern, p) for p in patterns):
@@ -125,6 +153,49 @@ class _Conversations:
             raise ValueError(f"This Workflow has no agent {agent!r}")
         return held._page(start, total, limit)  # pyright: ignore[reportPrivateUsage]
 
+    async def native(self, request: NativeRequest) -> ToolOutcome:
+        """Accept a native child call on the owning agent."""
+        held = self.agents.get(request.agent)
+        if held is None:
+            raise ApplicationError("Unknown native agent", non_retryable=True)
+        held._native_handlers += 1
+        try:
+            return await held._native(request)
+        finally:
+            held._native_handlers -= 1
+
+    def native_state(
+        self,
+        agent: str,
+        child: str | None = None,
+        start: int = 0,
+        limit: int = PAGE_BYTES,
+    ) -> dict[str, Any]:
+        """Serve bounded pages of accepted native calls and child transcripts."""
+        held = self.agents[agent]
+        limit = min(max(limit, 1), PAGE_BYTES)
+        if child is not None:
+            entries = held._state.child_conversations[child]
+            return {
+                "entries": page(
+                    entries, [len(entry_text(e)) for e in entries], start, limit
+                )
+            }
+        calls = [asdict(c) for c in held._state.native_calls.values()]
+        selected = page(calls, [len(entry_text(c)) for c in calls], start, limit)
+        return {
+            "calls": {c["request"]["call"]["id"]: c for c in selected},
+            "total": len(calls),
+            "children": {
+                key: len(value)
+                for key, value in held._state.child_conversations.items()
+            },
+        }
+
+    def native_outcome(self, agent: str, tool_use_id: str) -> ToolOutcome | None:
+        """Serve a committed rejection or completed durable result to the engine."""
+        return self.agents[agent]._outcomes.get(tool_use_id)
+
 
 def _register(agent: DurableClaudeAgent) -> str:
     """Serve ``agent``'s conversation through the Workflow's Query; return its key.
@@ -136,6 +207,11 @@ def _register(agent: DurableClaudeAgent) -> str:
     if not isinstance(registry, _Conversations):
         registry = _Conversations()
         workflow.set_query_handler(QUERY, registry.serve)
+        workflow.set_query_handler(_NATIVE_QUERY, registry.native_state)
+        workflow.set_query_handler(
+            "__claude_agent_native_outcome", registry.native_outcome
+        )
+        workflow.set_update_handler(_NATIVE_UPDATE, registry.native)
     key = str(len(registry.agents))
     registry.agents[key] = agent
     return key
@@ -284,7 +360,7 @@ class DurableClaudeAgent:
         model: str | None = None,
         max_turns: int | None = None,
         builtin_tools: Sequence[str] = (),
-        tool_activities: Sequence[str] = ("Bash", "mcp__*"),
+        tool_activities: Sequence[str] | None = None,
         tool_approvals: Sequence[str] = (),
         tool_activity_timeout: timedelta = timedelta(minutes=10),
         tool_activity_retry_policy: RetryPolicy | None = None,
@@ -313,14 +389,12 @@ class DurableClaudeAgent:
             model: Optional model name.
             max_turns: Optional cap on engine turns within one segment.
             builtin_tools: Claude Code built-in tools to enable inside the engine.
-                Those in ``tool_activities`` run as their own Activities; the others
-                run inside the segment Activity.
-            tool_activities: Claude Code tools that run as their own Activities, like
-                durable tools: ``Bash``, ``PowerShell``, and MCP tools (name patterns
-                such as ``mcp__github__*``). Each call is an Activity
-                ``run_claude_tool_step`` with ID ``tool-<tool_use_id>``. A subagent
-                cannot call them: its call is denied with a hint to leave it to the
-                main agent.
+            tool_activities: Native built-ins and MCP patterns managed by Activities.
+                The default (``None``) manages all enabled tools in new histories.
+                A native file, helper, or Agent pattern selects whole-batch execution
+                using Claude Code's scheduler; every call, including child calls,
+                gets Activity ID ``tool-<tool_use_id>``. Explicit Bash/PowerShell/MCP
+                patterns retain the legacy protocol. ``[]`` keeps native tools inline.
             tool_approvals: Patterns of ``tool_activities`` whose calls wait for a
                 human decision first, like ``needs_approval`` tools. Each must fall
                 within a ``tool_activities`` pattern.
@@ -390,8 +464,11 @@ class DurableClaudeAgent:
         self._model = model
         self._max_turns = max_turns
         self._builtin_tools = list(builtin_tools)
-        _check_tool_activities(tool_activities, tool_approvals)
-        self._tool_activities = list(tool_activities)
+        self._default_tool_activities = tool_activities is None
+        self._tool_activities = list(
+            tool_activities if tool_activities is not None else ("*",)
+        )
+        _check_tool_activities(self._tool_activities, tool_approvals)
         self._tool_approvals = list(tool_approvals)
         self._tool_activity_timeout = tool_activity_timeout
         self._tool_activity_retry_policy = tool_activity_retry_policy
@@ -409,6 +486,14 @@ class DurableClaudeAgent:
         self._calls: dict[str, dict[str, Any]] = {}
         self._outcomes: dict[str, ToolOutcome] = {}  # of unanswered calls that finished
         self._unanswered: list[DeferredCall] = []
+        self._execution_protocol = 1
+        self._batch: list[DeferredCall] = []
+        self._batch_outcomes: dict[str, ToolOutcome] = {}
+        self._native_tasks: dict[str, asyncio.Task[ToolOutcome]] = {}
+        self._native_handlers = 0
+        self._interactions: dict[str, DeferredCall] = {}
+        self._responses: dict[str, Any] = {}
+        self._root_ready: set[str] = set()
         self._running = False
         self._state = state if state is not None else AgentState()
         self._key: str | None = None  # names this agent in the conversation Query
@@ -537,6 +622,7 @@ class DurableClaudeAgent:
         s = self._state
         return AgentState(
             session_id=s.session_id,
+            workspace_id=s.workspace_id,
             checkpoint=s.checkpoint,
             segment_index=s.segment_index,
             task_prompt=s.task_prompt,
@@ -550,7 +636,138 @@ class DurableClaudeAgent:
             fork_next=s.fork_next,
             conversation=list(s.conversation),
             external_storage=s.external_storage,
+            native_calls=dict(s.native_calls),
+            child_conversations={k: list(v) for k, v in s.child_conversations.items()},
         )
+
+    def pending_interactions(self) -> list[dict[str, Any]]:
+        """Return native questions and plan decisions awaiting a Workflow Update."""
+        return [
+            {"id": c.id, "name": c.name, "input": c.input}
+            for c in self._interactions.values()
+        ]
+
+    def validate_response(
+        self, tool_use_id: str, response: Any, approver: str | None = None
+    ) -> None:
+        """Validate an interaction response before its Update enters history."""
+        call = self._interactions.get(tool_use_id)
+        if call is None or tool_use_id in self._responses:
+            raise ValueError(f"No unanswered interaction {tool_use_id}")
+        if self._approvers is not None and approver not in self._approvers:
+            raise ValueError(f"{approver!r} is not allowed to answer interactions")
+        if call.name == "AskUserQuestion":
+            expected = {q["question"] for q in call.input.get("questions", [])}
+            if (
+                not isinstance(response, dict)
+                or set(response) != expected
+                or any(
+                    not isinstance(v, str) or not v.strip() for v in response.values()
+                )
+            ):
+                raise ValueError("Answers must map every question to a nonempty string")
+        elif not isinstance(response, bool):
+            raise ValueError("A plan decision must be a boolean")
+
+    def respond(
+        self, tool_use_id: str, response: Any, approver: str | None = None
+    ) -> bool:
+        """Record the first validated native question answer or plan decision."""
+        self.validate_response(tool_use_id, response, approver)
+        self._responses[tool_use_id] = response
+        if approver is not None:
+            self._calls[tool_use_id]["decided_by"] = approver
+        return True
+
+    async def _native(self, request: NativeRequest) -> ToolOutcome:
+        """Accept a nested native call before permitting its Activity to execute."""
+        if not self._running or not self._batch:
+            raise ApplicationError("No native batch is running", non_retryable=True)
+        if not request.child:
+            call = next((c for c in self._batch if c.id == request.call.id), None)
+            if call is None or call != request.call:
+                raise ApplicationError("Unaccepted native call", non_retryable=True)
+            self._root_ready.add(call.id)
+            if call.kind == "engine":
+                return ToolOutcome()
+            await workflow.wait_condition(lambda: call.id in self._outcomes)
+            return self._outcomes[call.id]
+        if not 1 <= request.depth <= 8:
+            raise ApplicationError(
+                "Native subagent depth exceeds eight", non_retryable=True
+            )
+        parent = next((c for c in self._batch if c.id == request.parent), None)
+        parent_state = self._state.native_calls.get(request.parent)
+        if parent is None and parent_state is not None:
+            parent = parent_state.request.call
+        if (
+            parent is None
+            or parent.name != "Agent"
+            or parent.kind != "engine"
+            or request.depth != (parent_state.request.depth + 1 if parent_state else 1)
+            or (
+                parent_state is not None
+                and request.controller != parent_state.request.controller
+            )
+        ):
+            raise ApplicationError("Invalid native Agent parent", non_retryable=True)
+        known = self._state.native_calls.get(request.call.id)
+        if known is not None:
+            if (
+                known.request.call != request.call
+                or known.request.child != request.child
+                or known.request.controller != request.controller
+                or known.request.parent != request.parent
+                or known.request.depth != request.depth
+            ):
+                raise ApplicationError(
+                    "Conflicting original native call identity", non_retryable=True
+                )
+            if known.outcome is not None:
+                return known.outcome
+        else:
+            accepted = next(
+                (
+                    b
+                    for e in request.entries
+                    for b in e.get("message", {}).get("content", [])
+                    if isinstance(b, dict)
+                    and b.get("type") == "tool_use"
+                    and b.get("id") == request.call.id
+                ),
+                None,
+            )
+            native_name = (
+                "mcp__durable__" + request.call.name
+                if request.call.kind == "durable"
+                else request.call.name
+            )
+            if (
+                accepted is None
+                or accepted.get("name") != native_name
+                or accepted.get("input") != request.call.input
+            ):
+                raise ApplicationError(
+                    "A native child call must match its original transcript",
+                    non_retryable=True,
+                )
+            known = NativeCallState(replace(request, entries=[]))
+            self._state.native_calls[request.call.id] = known
+            self._state.child_conversations[request.child] = list(request.entries)
+        if request.call.id not in self._native_tasks:
+
+            async def execute() -> ToolOutcome:
+                outcome = await self._run_tool(request.call)
+                known.outcome = outcome
+                if outcome.entries:
+                    self._state.child_conversations[request.child].extend(
+                        outcome.entries
+                    )
+                self._state.tool_calls += 1
+                return outcome
+
+            self._native_tasks[request.call.id] = asyncio.create_task(execute())
+        return await asyncio.shield(self._native_tasks[request.call.id])
 
     def _page(self, start: int, total: int, limit: int) -> list[dict[str, Any]]:
         """A page of the conversation the Workflow holds (read-only: Query handler).
@@ -773,15 +990,24 @@ class DurableClaudeAgent:
         if state.session_id is None:
             state.session_id = str(workflow.uuid4())
         self._running = True
+        closing = False
         try:
             return await self._loop()
         except BaseException as err:
+            closing = isinstance(err, GeneratorExit)
             if _is_cancellation(err):
                 self._end_task("the Workflow was cancelled")
                 self._publish({"type": "cancelled"})
                 await self._linger_if_live()
             raise
         finally:
+            for task in self._native_tasks.values():
+                if not task.done():
+                    task.cancel()
+            if self._native_tasks and not closing:
+                await asyncio.gather(
+                    *self._native_tasks.values(), return_exceptions=True
+                )
             self._running = False
 
     async def _loop(self) -> str:
@@ -798,6 +1024,19 @@ class DurableClaudeAgent:
             index = state.segment_index
 
             def segment_input(index: int = index) -> SegmentInput:
+                native = workflow.patched(_BATCH_PATCH)
+                if self._default_tool_activities:
+                    self._tool_activities = ["*"] if native else ["Bash", "mcp__*"]
+                if native and (
+                    "*" in self._tool_activities
+                    or any(
+                        p not in ("Bash", "PowerShell") and not p.startswith("mcp__")
+                        for p in self._tool_activities
+                    )
+                ):
+                    self._execution_protocol = 2
+                    if state.workspace_id is None:
+                        state.workspace_id = state.session_id
                 return SegmentInput(
                     session_id=state.session_id or "",
                     prompt=state.task_prompt if send_prompt else None,
@@ -807,6 +1046,8 @@ class DurableClaudeAgent:
                     max_turns=self._max_turns,
                     builtin_tools=self._builtin_tools,
                     tool_activities=self._tool_activities,
+                    execution_protocol=self._execution_protocol,
+                    workspace_id=state.workspace_id,
                     checkpoint=state.checkpoint,
                     injected=dict(state.pending),
                     segment_index=index,
@@ -874,6 +1115,9 @@ class DurableClaudeAgent:
                 return result
             # The paused call, and the other durable calls of the same message.
             calls = [seg.deferred, *seg.siblings]
+            self._execution_protocol = seg.execution_protocol
+            self._batch = list(calls)
+            self._batch_outcomes = {}
             self._unanswered = calls
             seen: set[str] = set()
             for call in calls:
@@ -900,8 +1144,24 @@ class DurableClaudeAgent:
                     f"tool call{plural} {which}."
                 )
             outcomes = await self._run_tools(calls)
+            if self._execution_protocol == 2 and self._native_tasks:
+                await asyncio.gather(*self._native_tasks.values())
+            if self._execution_protocol == 2:
+                # The SDK's custom-tool callbacks must receive their committed
+                # results before this batch's result map can be cleared.
+                await workflow.wait_condition(lambda: self._native_handlers == 0)
+                state.recent_call_ids = [*state.recent_call_ids, *state.native_calls][
+                    -_RECENT_CALLS:
+                ]
+                state.native_calls.clear()
+                self._native_tasks.clear()
+                self._root_ready.clear()
+            for outcome in outcomes:
+                self._state.child_conversations.update(outcome.children)
             state.pending = {c.id: o for c, o in zip(calls, outcomes)}
             self._unanswered = []
+            self._batch = []
+            self._batch_outcomes = {}
             self._outcomes.clear()  # they are pending now
             state.recent_call_ids = [
                 *state.recent_call_ids,
@@ -1116,6 +1376,18 @@ class DurableClaudeAgent:
             call=call,
             tools=[t.spec() for t in self._tools.values()],
             builtin_tools=self._builtin_tools,
+            execution_protocol=self._execution_protocol,
+            workspace_id=self._state.workspace_id,
+            model=self._model,
+            system_prompt=self._system_prompt,
+            batch=list(self._batch),
+            batch_outcomes=dict(self._batch_outcomes),
+            controller=(
+                self._state.native_calls[call.id].request.controller
+                if call.id in self._state.native_calls
+                else None
+            ),
+            response=self._responses.get(call.id),
             conversation=ConversationRef(
                 query=QUERY, agent=self._key or "", entries=len(state.conversation)
             ),
@@ -1127,15 +1399,38 @@ class DurableClaudeAgent:
         If one is cancelled (the Workflow is), the others still finish or stop
         before the cancellation goes on.
         """
-        if len(calls) == 1:
-            return [await self._run_tool(calls[0])]
-        done = await asyncio.gather(
-            *(self._run_tool(c) for c in calls), return_exceptions=True
-        )
-        for item in done:
-            if isinstance(item, BaseException):
-                raise item
-        return cast("list[ToolOutcome]", done)
+        tasks: list[Any] = [asyncio.create_task(self._run_tool(c)) for c in calls]
+        if self._execution_protocol == 2 and any(c.kind == "engine" for c in calls):
+            tasks.append(
+                workflow.start_activity(
+                    TOOL_STEP_ACTIVITY_NAME,
+                    replace(
+                        self._tool_step(next(c for c in calls if c.kind == "engine")),
+                        control=True,
+                    ),
+                    result_type=ToolOutcome,
+                    activity_id=f"native-batch-{self._key}-{self._state.segment_index}",
+                    task_queue=f"{workflow.info().task_queue}.__claude_native_controller",
+                    start_to_close_timeout=self._tool_activity_timeout,
+                    heartbeat_timeout=self._segment_heartbeat_timeout,
+                    retry_policy=self._tool_activity_retry_policy,
+                    cancellation_type=self._segment_cancellation_type,
+                    summary="Claude native batch controller",
+                )
+            )
+        try:
+            done = await asyncio.gather(*tasks)
+            return cast("list[ToolOutcome]", done[: len(calls)])
+        except GeneratorExit:
+            # The SDK closes cached Workflow coroutines without driving their
+            # event loop. It owns their tasks; cleanup must not yield here.
+            raise
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
     async def _run_tool(self, call: DeferredCall) -> ToolOutcome:
         record: dict[str, Any] = {
@@ -1174,6 +1469,22 @@ class DurableClaudeAgent:
             )
         else:
             needs_approval = tool is not None and tool.needs_approval
+        if (
+            self._execution_protocol == 2
+            and call.id not in self._state.native_calls
+            and any(c.kind == "engine" for c in self._batch)
+        ):
+            await workflow.wait_condition(lambda: call.id in self._root_ready)
+        if engine and call.name in ("AskUserQuestion", "ExitPlanMode"):
+            self._interactions[call.id] = call
+            record["status"] = "waiting for response"
+            try:
+                await workflow.wait_condition(lambda: call.id in self._responses)
+            finally:
+                self._interactions.pop(call.id, None)
+            if self._responses[call.id] is False:
+                record["status"] = "rejected"
+                return ToolOutcome(content="The user rejected the plan.", is_error=True)
         if needs_approval:
             self._waiting[call.id] = call
             record["status"] = "waiting for approval"
@@ -1203,6 +1514,13 @@ class DurableClaudeAgent:
                     self._tool_step(call),
                     result_type=ToolOutcome,
                     activity_id=f"tool-{call.id}",
+                    task_queue=(
+                        f"{workflow.info().task_queue}.__claude_native_{self._state.native_calls[call.id].request.depth}"
+                        if call.id in self._state.native_calls
+                        else f"{workflow.info().task_queue}.__claude_native_0"
+                        if self._execution_protocol == 2
+                        else None
+                    ),
                     start_to_close_timeout=self._tool_activity_timeout,
                     heartbeat_timeout=self._segment_heartbeat_timeout,
                     retry_policy=self._tool_activity_retry_policy,
@@ -1215,7 +1533,12 @@ class DurableClaudeAgent:
                 tool.activity,
                 call.input,
                 activity_id=f"tool-{call.id}",
-                task_queue=tool.task_queue,
+                task_queue=tool.task_queue
+                or (
+                    f"{workflow.info().task_queue}.__claude_native_{self._state.native_calls[call.id].request.depth}"
+                    if call.id in self._state.native_calls
+                    else None
+                ),
                 start_to_close_timeout=tool.start_to_close_timeout,
                 schedule_to_close_timeout=tool.schedule_to_close_timeout,
                 heartbeat_timeout=tool.heartbeat_timeout,

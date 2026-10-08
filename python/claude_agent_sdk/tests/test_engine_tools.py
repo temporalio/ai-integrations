@@ -740,9 +740,7 @@ def test_hook_in_a_tool_step_allows_exactly_its_call(
 @pytest.mark.parametrize(
     ("activities", "approvals", "problem"),
     [
-        (["Edit"], [], "cannot run as its own Activity"),
-        (["WebFetch"], [], "cannot run as its own Activity"),
-        (["*"], [], "cannot run as its own Activity"),
+        (["UnknownNativeTool"], [], "cannot run as its own Activity"),
         ([], ["Bash"], "does not run as its own Activity"),
         (["mcp__github__*"], ["Bash"], "does not run as its own Activity"),
     ],
@@ -760,6 +758,8 @@ def test_tools_that_can_run_as_activities_are_accepted() -> None:
     from temporalio.claude_agent_sdk import DurableClaudeAgent
 
     DurableClaudeAgent(tool_activities=["Bash", "PowerShell", "mcp__github__*"])
+    DurableClaudeAgent(tool_activities=["Read", "Edit", "Write", "WebFetch", "Agent"])
+    DurableClaudeAgent(tool_activities=["*"], tool_approvals=["Bash"])
     DurableClaudeAgent(
         tool_activities=["mcp__*"], tool_approvals=["mcp__github__create_issue"]
     )

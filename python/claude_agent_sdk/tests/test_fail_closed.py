@@ -14,6 +14,7 @@ import re
 import sys
 import uuid
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -74,12 +75,20 @@ def broken_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_runner, "_hook_entry", lambda: entry)
 
 
+class LegacySdkRunner(ClaudeAgentSdkRunner):
+    """Exercise the deferred-call protocol, whose hooks these tests break."""
+
+    async def run(self, inp: SegmentInput, attempt: int) -> SegmentOutput:
+        """Retain the original protocol even in a newly started Workflow."""
+        return await super().run(replace(inp, execution_protocol=1), attempt)
+
+
 def real_runner(
     api: FakeMessagesAPI, tmp_path: Path, mode: str
 ) -> ClaudeAgentSdkRunner:
     """A runner on the real engine whose hook misbehaves as ``mode`` says."""
     env = {**engine_env(api, str(tmp_path / "cfg")), "BROKEN_ENGINE": mode}
-    return ClaudeAgentSdkRunner(
+    return LegacySdkRunner(
         session_store=FileSessionStore(tmp_path / "store"), cwd=str(tmp_path), env=env
     )
 

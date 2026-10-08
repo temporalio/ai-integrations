@@ -37,6 +37,10 @@ class ToolOutcome:
     content: Any = None
     is_error: bool = False
     blocks: list[dict[str, Any]] | None = None
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    """Original native result carriers, including file-tool state for resume."""
+    children: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    """Completed native child transcripts returned with an Agent outcome."""
 
 
 @dataclass
@@ -123,6 +127,10 @@ class SegmentInput:
     conversation: ConversationRef | None = None
     transcript: list[dict[str, Any]] | None = None
     tool_activities: list[str] = field(default_factory=list)
+    execution_protocol: int = 1
+    """One is the legacy deferred-call protocol; two records whole native batches."""
+    workspace_id: str | None = None
+    """Stable native task and plan state namespace across transcript branches."""
 
 
 @dataclass
@@ -149,6 +157,42 @@ class ToolStepInput:
     builtin_tools: list[str] = field(default_factory=list)
     conversation: ConversationRef | None = None
     transcript: list[dict[str, Any]] | None = None
+    execution_protocol: int = 1
+    batch: list[DeferredCall] = field(default_factory=list)
+    """Accepted native calls of this message, in their original order."""
+    batch_outcomes: dict[str, ToolOutcome] = field(default_factory=dict)
+    """Results already supplied by durable tools or human decisions."""
+    controller: str | None = None
+    """Private shared-workspace mailbox of a running native batch."""
+    response: Any = None
+    """A recorded answer to an interactive native tool."""
+    workspace_id: str | None = None
+    model: str | None = None
+    system_prompt: str | None = None
+    control: bool = False
+    """Supervise a whole native batch on its independent controller queue."""
+
+
+@dataclass
+class NativeRequest:
+    """A nested call, accepted by the Workflow before the engine executes it."""
+
+    agent: str
+    controller: str
+    call: DeferredCall
+    child: str = ""
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    depth: int = 1
+    parent: str = ""
+    """Original Agent tool-use ID that owns this child."""
+
+
+@dataclass
+class NativeCallState:
+    """The accepted identity and committed outcome of a nested tool call."""
+
+    request: NativeRequest
+    outcome: ToolOutcome | None = None
 
 
 @dataclass
@@ -188,6 +232,7 @@ class SegmentOutput:
     transcript_add: list[dict[str, Any]] = field(default_factory=list)
     external_storage: bool = False
     siblings: list[DeferredCall] = field(default_factory=list)
+    execution_protocol: int = 1
 
 
 @dataclass
@@ -238,3 +283,9 @@ class AgentState:
     stream: WorkflowStreamState | None = None
     conversation: list[str] = field(default_factory=list)
     external_storage: bool = False
+    native_calls: dict[str, NativeCallState] = field(default_factory=dict)
+    """Nested calls accepted before their native effects."""
+    child_conversations: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    """Native child transcripts used to reconstruct interrupted subagents."""
+    workspace_id: str | None = None
+    """Stable native task and plan namespace across transcript branches."""

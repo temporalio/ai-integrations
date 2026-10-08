@@ -31,7 +31,13 @@ pytestmark = [
 
 
 async def start_worker(
-    address: str, queue: str, env: dict[str, str], log: Path, *, real: bool = False
+    address: str,
+    queue: str,
+    env: dict[str, str],
+    log: Path,
+    *,
+    real: bool = False,
+    module: str = "tests.refund.worker",
 ) -> subprocess.Popen[bytes]:
     """Start ``tests.refund.worker`` in its own process and wait until it is ready."""
     python_path = os.pathsep.join(
@@ -40,7 +46,7 @@ async def start_worker(
     argv = [
         sys.executable,
         "-m",
-        "tests.refund.worker",
+        module,
         "--address",
         address,
         "--task-queue",

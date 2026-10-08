@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -1301,6 +1301,7 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
+    { name = "cryptography" },
     { name = "temporalio" },
 ]
 
@@ -1324,6 +1325,7 @@ dev = [
 requires-dist = [
     { name = "claude-agent-sdk", marker = "sys_platform != 'win32'", specifier = ">=0.2.153,<0.3" },
     { name = "claude-agent-sdk", marker = "sys_platform == 'win32'", specifier = ">=0.2.153,!=0.2.157,!=0.2.160,!=0.2.161,!=0.2.162,!=0.2.163,<0.3" },
+    { name = "cryptography", specifier = ">=50.0.1,<51" },
     { name = "temporalio", specifier = ">=1.33.0,<2" },
 ]
 

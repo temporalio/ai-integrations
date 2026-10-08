@@ -195,6 +195,13 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
     output: dict[str, Any]
     if run_dir is not None and not os.path.isdir(run_dir):
         output = _deny(STOPPED)  # the run ended, or this hook cannot see its folder
+    elif os.environ.get("TCA_PREPARE_BATCH"):
+        # A bounded preparation turn records the entire assistant message. Its
+        # private denial records never become part of the committed conversation.
+        output = _deny("This tool call is awaiting its Temporal Activity.")
+    elif os.environ.get("TCA_EXECUTE_BATCH"):
+        # The in-process batch hook gates each original call on its Activity.
+        output = _deny(STOPPED) if stopped else {"hookEventName": "PreToolUse"}
     elif allow_id is not None:  # a tool step: exactly this call, nothing else
         if stopped:
             output = _deny(STOPPED)
