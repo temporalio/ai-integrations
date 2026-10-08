@@ -11,6 +11,9 @@ from typing import Any
 CODEX_RUN_SEGMENT_ACTIVITY = "openai_codex.run_segment"
 """Name of the Activity that runs one segment of a Codex turn."""
 
+CODEX_APPROVAL_UPDATE = "openai_codex.approval"
+"""Name of the Workflow Update a segment calls to ask for an approval decision."""
+
 
 @dataclass
 class CodexToolSpec:
@@ -28,6 +31,40 @@ class CodexPendingCall:
     call_id: str
     tool: str
     arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class CodexApprovalRequest:
+    """Codex asks to run a command or apply a file change; the Workflow decides.
+
+    ``kind`` is ``"command"`` or ``"file_change"``. For a command, ``command`` and ``cwd`` are set; for
+    a file change, ``changes`` lists what would change (``path``, ``kind`` and ``diff`` per file).
+    ``item_id`` is Codex's id for the call and stays stable for the life of that call.
+    """
+
+    kind: str
+    item_id: str
+    command: str | None = None
+    cwd: str | None = None
+    reason: str | None = None
+    changes: list[dict[str, Any]] = field(default_factory=list)
+    # Which segment Activity (and which attempt of it) is asking. A retried segment asks again with a
+    # higher attempt, which tells the Workflow that the earlier attempt's questions are dead.
+    segment: str | None = None
+    attempt: int = 1
+
+
+@dataclass
+class CodexApprovalDecision:
+    """The Workflow's answer to a :class:`CodexApprovalRequest`.
+
+    ``approved=False`` makes Codex skip the action; the model is told it was rejected, and ``reason``
+    is for your own records. ``interrupt=True`` also ends the turn.
+    """
+
+    approved: bool
+    reason: str | None = None
+    interrupt: bool = False
 
 
 @dataclass
@@ -56,6 +93,10 @@ class CodexSegmentInput:
     model: str | None = None
     cwd: str | None = None
     sandbox: str = "read-only"
+    # Native mode: Codex's own tools (shell, apply_patch, ...) stay on and every action that needs
+    # approval is sent to the Workflow as an Update. Host-only mode turns them off.
+    native_tools: bool = False
+    approval_policy: str = "untrusted"
     # Opaque JSON handed to the Worker's observer factory (see CodexPlugin), if one is configured.
     observer_context: dict[str, Any] | None = None
 

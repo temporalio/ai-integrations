@@ -26,7 +26,10 @@ with workflow.unsafe.imports_passed_through():
     from pydantic_core import to_jsonable_python
 
 from ._models import (
+    CODEX_APPROVAL_UPDATE,
     CODEX_RUN_SEGMENT_ACTIVITY,
+    CodexApprovalDecision,
+    CodexApprovalRequest,
     CodexPendingCall,
     CodexSegmentInput,
     CodexSegmentResult,
@@ -36,6 +39,9 @@ from ._models import (
 )
 
 __all__ = [
+    "ApprovalHandler",
+    "CodexApprovalDecision",
+    "CodexApprovalRequest",
     "CodexPendingCall",
     "CodexSession",
     "CodexTool",
@@ -195,11 +201,43 @@ def activity_as_tool(
     return CodexTool(spec=schema.spec, handler=handler)
 
 
+ApprovalHandler = Callable[[CodexApprovalRequest], Awaitable[CodexApprovalDecision]]
+"""Decides whether Codex may run a command or apply a file change. Runs in the Workflow."""
+
+
+def _fingerprint(request: CodexApprovalRequest) -> str:
+    return json.dumps(
+        [request.kind, request.command, request.cwd, request.changes],
+        sort_keys=True,
+        default=str,
+    )
+
+
+_SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
+
+
+def _check_sandbox(sandbox: str, allow_full_access: bool) -> None:
+    if sandbox not in _SANDBOXES:
+        raise ValueError(
+            f"sandbox must be one of {sorted(_SANDBOXES)}, not {sandbox!r}"
+        )
+    if sandbox == "danger-full-access" and not allow_full_access:
+        raise ValueError(
+            'sandbox="danger-full-access" removes all confinement; '
+            "pass allow_full_access=True to use it deliberately"
+        )
+
+
 class CodexSession:
     """One Codex thread, owned by a Workflow. Keep it on the Workflow instance.
 
     Holds the conversation (thread id plus the committed rollout) so it survives Worker loss, and
-    drives each turn: segment Activity, then host tool, then the next segment, until Codex answers.
+    drives each turn. In **native mode** (the default) Codex runs its own tools, shell and
+    ``apply_patch`` among them, inside its sandbox in ``cwd``. Every action that needs approval is
+    put to your ``approval_handler``, which runs in the Workflow, so it can wait on a Signal, a
+    human, or a policy for as long as it takes. With **host-tool mode** (``native_tools=False``)
+    Codex's own tools are off and only the ``tools`` you pass are available.
+
     Its attributes are plain data (:attr:`thread_id`, :attr:`rollout_name`, :attr:`rollout`,
     :attr:`tool_results`), so you can carry them across Continue-As-New yourself.
     """
@@ -208,32 +246,53 @@ class CodexSession:
         self,
         *,
         tools: Sequence[CodexTool] = (),
+        native_tools: bool = True,
+        approval_handler: ApprovalHandler | None = None,
+        approval_policy: str = "untrusted",
         instructions: str | None = None,
         model: str | None = None,
         cwd: str | None = None,
-        sandbox: str = "read-only",
+        sandbox: str = "workspace-write",
         continue_prompt: str = "Continue.",
         max_segments: int = 50,
-        segment_timeout: timedelta = timedelta(minutes=5),
+        segment_timeout: timedelta = timedelta(hours=1),
         heartbeat_timeout: timedelta = timedelta(seconds=30),
         retry_policy: RetryPolicy | None = None,
+        allow_full_access: bool = False,
     ) -> None:
         """Create a session.
 
         Args:
-            tools: Host tools the model may call.
+            tools: Extra host tools the model may call, alongside Codex's own in native mode.
+            native_tools: Keep Codex's own tools (shell, ``apply_patch``, ...) on, as Codex runs
+                them, inside ``sandbox``. If ``False``, they are turned off and only ``tools`` run.
+            approval_handler: Called for every command or file change Codex asks permission for.
+                Without one, everything that needs approval is declined. It runs in the Workflow
+                (as an Update handler), so it may await anything, for as long as needed.
+            approval_policy: Codex's approval policy: ``"untrusted"`` asks before running anything
+                not known to be safe, ``"on-request"`` lets the model decide when to ask.
             instructions: Developer instructions for the thread (applied when it starts).
             model: Model id to request for the thread; defaults to Codex's own default.
-            cwd: Working directory for the app-server; defaults to a scratch directory.
-            sandbox: Codex sandbox preset for the thread. Built-in tools are off, so this only
-                matters if you re-enable some.
-            continue_prompt: The user message that resumes the turn after each tool call.
-            max_segments: Safety bound on tool round trips in one turn.
-            segment_timeout: Start-to-close timeout of each segment Activity.
+            cwd: The workspace Codex works in. Required in native mode. It must exist on the Worker
+                that runs the segment, and again on whichever Worker retries it.
+            sandbox: Codex's sandbox: ``"read-only"``, ``"workspace-write"`` or
+                ``"danger-full-access"``.
+            continue_prompt: The user message that resumes the turn after a host-tool call.
+            max_segments: Safety bound on host-tool round trips in one turn.
+            segment_timeout: Start-to-close timeout of each segment Activity. In native mode it must
+                outlast your longest approval wait. Defaults to an hour.
             heartbeat_timeout: Heartbeat timeout of each segment Activity.
             retry_policy: Retry policy of each segment Activity. Defaults to 3 attempts.
+            allow_full_access: Must be ``True`` to use ``sandbox="danger-full-access"``, which
+                removes Codex's filesystem and network confinement.
         """
+        _check_sandbox(sandbox, allow_full_access)
+        if native_tools and not cwd:
+            raise ValueError("native mode needs `cwd`, the workspace Codex works in")
         self._tools: dict[str, CodexTool] = {t.spec.name: t for t in tools}
+        self._native_tools = native_tools
+        self._approval_handler = approval_handler
+        self._approval_policy = approval_policy
         self._instructions = instructions
         self._model = model
         self._cwd = cwd
@@ -253,6 +312,62 @@ class CodexSession:
         """The committed rollout (Codex's append-only JSONL conversation log)."""
         self.tool_results: dict[str, str] = {}
         """Output of every host tool call so far, by call id."""
+        self.pending_approvals: dict[str, CodexApprovalRequest] = {}
+        """Approvals the handler has been asked for and has not yet answered, by Codex item id."""
+        self._approved_this_turn: set[str] = set()
+        # The handler task for every approval still waiting, so a dead one can be cancelled.
+        self._approval_tasks: dict[
+            str, tuple[asyncio.Future[CodexApprovalDecision], CodexApprovalRequest]
+        ] = {}
+        self._superseded: set[str] = set()
+        if native_tools:
+            workflow.set_update_handler(CODEX_APPROVAL_UPDATE, self._on_approval)
+
+    def _supersede(self, stale: Callable[[CodexApprovalRequest], bool]) -> None:
+        """Stop waiting for approvals whose asker is gone."""
+        for item_id, (task, request) in list(self._approval_tasks.items()):
+            if stale(request):
+                self._superseded.add(item_id)
+                self.pending_approvals.pop(item_id, None)
+                task.cancel()
+
+    async def _on_approval(
+        self, request: CodexApprovalRequest
+    ) -> CodexApprovalDecision:
+        """Update handler a segment calls when Codex asks for permission."""
+        key = _fingerprint(request)
+        if key in self._approved_this_turn:
+            # The identical action was approved earlier this turn (for example: the segment crashed
+            # after approval and Codex, resuming, asked again). Do not ask twice.
+            return CodexApprovalDecision(True, "approved earlier in this turn")
+        if self._approval_handler is None:
+            return CodexApprovalDecision(False, "no approval_handler is configured")
+        # A retried segment asks again with a higher attempt number. Whatever the earlier attempt
+        # was still waiting on can never be answered (its process is gone): stop waiting for it, so
+        # nobody is left looking at an approval that does nothing.
+        self._supersede(
+            lambda r: r.segment == request.segment and r.attempt < request.attempt
+        )
+        self.pending_approvals[request.item_id] = request
+        task = asyncio.ensure_future(self._approval_handler(request))
+        self._approval_tasks[request.item_id] = (task, request)
+        try:
+            decision = await task
+        except (asyncio.CancelledError, CancelledError):
+            if request.item_id in self._superseded:
+                return CodexApprovalDecision(
+                    False, "superseded: the segment that asked was retried"
+                )
+            raise
+        except Exception as exc:  # noqa: BLE001 - a failing handler must not approve anything
+            decision = CodexApprovalDecision(False, f"approval handler failed: {exc}")
+        finally:
+            self._approval_tasks.pop(request.item_id, None)
+            self._superseded.discard(request.item_id)
+            self.pending_approvals.pop(request.item_id, None)
+        if decision.approved:
+            self._approved_this_turn.add(key)
+        return decision
 
     async def run(
         self, prompt: str, *, observer_context: dict[str, Any] | None = None
@@ -264,31 +379,42 @@ class CodexSession:
             observer_context: Opaque JSON handed to the Worker's observer factory (see
                 :class:`~temporalio.openai_codex.CodexPlugin`) so live events can be routed.
         """
+        self._approved_this_turn.clear()
         text = prompt
         inject: dict[str, str] = {}
         usage: CodexTokenUsage | None = None
         for segments in range(1, self._max_segments + 1):
-            seg: CodexSegmentResult = await workflow.execute_activity(
-                CODEX_RUN_SEGMENT_ACTIVITY,
-                CodexSegmentInput(
-                    prompt=text,
-                    thread_id=self.thread_id,
-                    rollout_name=self.rollout_name,
-                    rollout=self.rollout,
-                    committed_lines=len(self.rollout.splitlines()),
-                    inject=inject,
-                    tools=[t.spec for t in self._tools.values()],
-                    instructions=self._instructions,
-                    model=self._model,
-                    cwd=self._cwd,
-                    sandbox=self._sandbox,
-                    observer_context=observer_context,
-                ),
-                result_type=CodexSegmentResult,
-                start_to_close_timeout=self._segment_timeout,
-                heartbeat_timeout=self._heartbeat_timeout,
-                retry_policy=self._retry_policy,
-            )
+            try:
+                seg: CodexSegmentResult = await workflow.execute_activity(
+                    CODEX_RUN_SEGMENT_ACTIVITY,
+                    CodexSegmentInput(
+                        prompt=text,
+                        thread_id=self.thread_id,
+                        rollout_name=self.rollout_name,
+                        rollout=self.rollout,
+                        committed_lines=len(self.rollout.splitlines()),
+                        inject=inject,
+                        tools=[t.spec for t in self._tools.values()],
+                        instructions=self._instructions,
+                        model=self._model,
+                        cwd=self._cwd,
+                        sandbox=self._sandbox,
+                        native_tools=self._native_tools,
+                        approval_policy=self._approval_policy,
+                        observer_context=observer_context,
+                    ),
+                    result_type=CodexSegmentResult,
+                    start_to_close_timeout=self._segment_timeout,
+                    heartbeat_timeout=self._heartbeat_timeout,
+                    retry_policy=self._retry_policy,
+                    # On cancellation, wait for the segment to stop Codex before the Workflow
+                    # finishes, so no command is left running on the Worker.
+                    cancellation_type=workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+                )
+            finally:
+                # The segment is over (or the turn was cancelled): any approval still waiting
+                # belongs to an attempt that is gone.
+                self._supersede(lambda _request: True)
             self.thread_id, self.rollout_name = seg.thread_id, seg.rollout_name
             self.rollout += seg.tail
             usage = seg.usage or usage

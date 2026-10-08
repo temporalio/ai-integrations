@@ -5,6 +5,9 @@ No credentials needed: Codex talks to a local scripted server through a custom m
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,12 +23,27 @@ from pydantic import BaseModel, ValidationError
 from temporalio import activity
 from temporalio.api.enums.v1 import EventType
 from temporalio.client import Client, WorkflowFailureError
-from temporalio.openai_codex import CodexObserver, CodexPlugin, CodexTokenUsage
+from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.openai_codex import (
+    CodexActivities,
+    CodexObserver,
+    CodexPlugin,
+    CodexTokenUsage,
+)
 from temporalio.openai_codex._app_server import AppServer
 from temporalio.openai_codex.testing import FakeResponsesServer
-from temporalio.openai_codex.workflow import codex_tool, function_schema
+from temporalio.openai_codex.workflow import (
+    CodexSession,
+    _check_sandbox,
+    codex_tool,
+    function_schema,
+)
+from temporalio.worker import Worker
 from tests._workflows import (
+    ChatWorkflow,
     CodexWorkflow,
+    NativeCodexWorkflow,
+    NativeInput,
     ObservedCodexWorkflow,
     lookup,
     record,
@@ -52,6 +70,12 @@ class RecordingObserver:
 
     def reply_delta(self, text: str) -> None:
         self.events.append(("delta", text))
+
+    def item_started(self, item: dict[str, Any]) -> None:
+        self.events.append(("item_started", item["type"]))
+
+    def item_completed(self, item: dict[str, Any]) -> None:
+        self.events.append(("item_completed", (item["type"], item.get("status"))))
 
     def model_interaction_ended(
         self,
@@ -100,6 +124,8 @@ async def codex_worker(
         client,
         CodexWorkflow,
         ObservedCodexWorkflow,
+        NativeCodexWorkflow,
+        ChatWorkflow,
         activities=[record],
         plugins=[plugin],
     )
@@ -317,3 +343,595 @@ async def test_a_failed_model_call_fails_the_turn_instead_of_replying_empty(
         )
         with pytest.raises(WorkflowFailureError):
             await handle.result()
+
+
+# ---------------------------------------------------------------------------
+# Native mode: Codex runs its own tools; the Workflow decides every approval.
+# ---------------------------------------------------------------------------
+
+ECHO = 'Write it.\nCALL:exec_command|{"cmd":"echo hello > out.txt && cat out.txt"}'
+PATCH = "*** Begin Patch\n*** Add File: hello.txt\n+hi from patch\n*** End Patch\n"
+PATCH_PROMPT = "Patch it.\nCALL:apply_patch|" + json.dumps(PATCH)
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> Path:
+    path = tmp_path / "workspace"
+    path.mkdir()
+    return path
+
+
+async def run_native(
+    client: Client,
+    fake: FakeResponsesServer,
+    tmp_path: Path,
+    workspace: Path,
+    prompt: str,
+    mode: str = "approve",
+    model: str | None = None,
+    events: list[tuple[str, Any]] | None = None,
+    approval_policy: str = "untrusted",
+) -> tuple[str, list[Any]]:
+    async with codex_worker(client, fake, tmp_path, events) as task_queue:
+        handle = await client.start_workflow(
+            NativeCodexWorkflow.run,
+            NativeInput(prompt, str(workspace), mode, model, approval_policy),
+            id=f"codex-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        result = await handle.result()
+        return result, await handle.query(NativeCodexWorkflow.asked_requests)
+
+
+def test_native_mode_needs_a_workspace() -> None:
+    with pytest.raises(ValueError, match="cwd"):
+        CodexSession()
+
+
+@requires_codex_binary
+async def test_an_approved_command_runs_natively(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    result, asked = await run_native(client, fake, tmp_path, workspace, ECHO)
+
+    assert (workspace / "out.txt").read_text() == "hello\n"
+    assert "hello" in result
+    (request,) = asked
+    assert request.kind == "command"
+    assert request.command == "echo hello > out.txt && cat out.txt"
+    assert Path(request.cwd or "").resolve() == workspace.resolve()
+    # Native mode keeps Codex's own tools.
+    assert "exec_command" in offered_tools(fake)
+
+
+@requires_codex_binary
+async def test_a_relative_workspace_is_resolved_on_the_worker(
+    client: Client,
+    fake: FakeResponsesServer,
+    tmp_path: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    async with codex_worker(client, fake, tmp_path) as task_queue:
+        handle = await client.start_workflow(
+            NativeCodexWorkflow.run,
+            NativeInput(ECHO, workspace.name),  # relative to the Worker's directory
+            id=f"codex-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        assert "hello" in await handle.result()
+    assert (workspace / "out.txt").read_text() == "hello\n"
+
+
+@requires_codex_binary
+async def test_a_missing_workspace_fails_the_workflow_clearly(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path
+) -> None:
+    async with codex_worker(client, fake, tmp_path) as task_queue:
+        handle = await client.start_workflow(
+            NativeCodexWorkflow.run,
+            NativeInput(ECHO, str(tmp_path / "no-such-folder")),
+            id=f"codex-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+    activity_error = excinfo.value.cause
+    assert isinstance(activity_error, ActivityError)
+    assert isinstance(activity_error.cause, ApplicationError)
+    assert "does not exist" in activity_error.cause.message
+
+
+@requires_codex_binary
+async def test_a_declined_command_does_not_run(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    result, asked = await run_native(
+        client, fake, tmp_path, workspace, ECHO, mode="decline"
+    )
+
+    assert not (workspace / "out.txt").exists()
+    assert "rejected" in result
+    assert len(asked) == 1
+
+
+@requires_codex_binary
+async def test_without_an_approval_handler_everything_is_declined(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    result, _ = await run_native(client, fake, tmp_path, workspace, ECHO, mode="none")
+
+    assert not (workspace / "out.txt").exists()
+    assert "rejected" in result
+
+
+@requires_codex_binary
+async def test_untrusted_policy_asks_even_for_a_listing(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    _, asked = await run_native(
+        client, fake, tmp_path, workspace, 'List.\nCALL:exec_command|{"cmd":"ls"}'
+    )
+
+    assert [r.command for r in asked] == ["ls"]
+
+
+@requires_codex_binary
+async def test_on_request_policy_lets_sandboxed_commands_run_without_asking(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    result, asked = await run_native(
+        client,
+        fake,
+        tmp_path,
+        workspace,
+        ECHO,
+        approval_policy="on-request",
+    )
+
+    # Inside the workspace sandbox, Codex does not need permission: the handler is never asked.
+    assert asked == []
+    assert (workspace / "out.txt").read_text() == "hello\n"
+    assert "hello" in result
+
+
+@requires_codex_binary
+async def test_the_workflow_can_wait_on_a_human_for_as_long_as_it_takes(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    async with codex_worker(client, fake, tmp_path) as task_queue:
+        handle = await client.start_workflow(
+            NativeCodexWorkflow.run,
+            NativeInput(ECHO, str(workspace), "signal"),
+            id=f"codex-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        # The approval is pending in the Workflow; the command has not run.
+        pending = []
+        for _ in range(100):
+            pending = await handle.query(NativeCodexWorkflow.pending)
+            if pending:
+                break
+            await asyncio.sleep(0.2)
+        assert pending, "the approval request never reached the Workflow"
+        await asyncio.sleep(1.5)  # longer than a heartbeat: the segment keeps waiting
+        assert not (workspace / "out.txt").exists()
+        status = (await handle.describe()).status
+        assert status is not None and status.name == "RUNNING"
+
+        await handle.signal(NativeCodexWorkflow.decide, args=[pending[0].item_id, True])
+        assert "hello" in await handle.result()
+    assert (workspace / "out.txt").read_text() == "hello\n"
+
+
+@requires_codex_binary
+async def test_an_approved_patch_is_applied(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    result, asked = await run_native(
+        client, fake, tmp_path, workspace, PATCH_PROMPT, model="gpt-5.5"
+    )
+
+    assert (workspace / "hello.txt").read_text() == "hi from patch\n"
+    (request,) = asked
+    assert request.kind == "file_change"
+    assert [c["path"].endswith("hello.txt") for c in request.changes] == [True]
+    assert request.changes[0]["diff"] == "hi from patch\n"
+    assert "Success" in result
+
+
+@requires_codex_binary
+async def test_a_declined_patch_is_not_applied(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    result, _ = await run_native(
+        client, fake, tmp_path, workspace, PATCH_PROMPT, mode="decline", model="gpt-5.5"
+    )
+
+    assert not (workspace / "hello.txt").exists()
+    assert "rejected" in result
+
+
+@requires_codex_binary
+async def test_the_observer_sees_codexs_own_tool_activity(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    events: list[tuple[str, Any]] = []
+    await run_native(client, fake, tmp_path, workspace, ECHO, events=events)
+
+    assert ("item_started", "commandExecution") in events
+    assert ("item_completed", ("commandExecution", "completed")) in events
+
+
+@requires_codex_binary
+async def test_a_crash_after_approval_does_not_ask_again(
+    client: Client,
+    fake: FakeResponsesServer,
+    tmp_path: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_init = AppServer.__init__
+
+    def init(self: AppServer, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        inner = self._on_notification
+
+        def on_notification(note: dict[str, Any]) -> None:
+            if inner is not None:
+                inner(note)
+            item = (note.get("params") or {}).get("item") or {}
+            if (
+                note["method"] == "item/completed"
+                and item.get("type") == "commandExecution"
+                and activity.info().attempt == 1
+            ):
+                self.kill()  # the command ran, then the Worker "dies" before the turn ends
+
+        self._on_notification = on_notification
+
+    monkeypatch.setattr(AppServer, "__init__", init)
+
+    result, asked = await run_native(
+        client,
+        fake,
+        tmp_path,
+        workspace,
+        'Log it.\nCALL:exec_command|{"cmd":"echo run >> log.txt"}',
+    )
+
+    assert "Process exited with code 0" in result
+    # Codex, resuming from the last committed rollout, asked to run the same command again. The
+    # Workflow had already approved it this turn, so the handler was asked only once...
+    assert len(asked) == 1
+    # ...but the command itself ran twice: native tool effects are not exactly-once.
+    assert (workspace / "log.txt").read_text() == "run\nrun\n"
+
+
+@requires_codex_binary
+async def test_a_dead_attempts_approval_is_dropped_when_the_retry_asks_again(
+    client: Client,
+    fake: FakeResponsesServer,
+    tmp_path: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    servers: list[AppServer] = []
+    original_init = AppServer.__init__
+
+    def init(self: AppServer, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        servers.append(self)
+
+    original_ask = CodexActivities._ask_workflow  # pyright: ignore[reportPrivateUsage]
+
+    async def ask(self: CodexActivities, request: Any) -> Any:
+        if activity.info().attempt == 1:
+            # The question reaches the Workflow and waits there...
+            asking = asyncio.create_task(original_ask(self, request))
+            await asyncio.sleep(1)
+            # ...then the Worker dies: nobody will ever hear the answer.
+            asking.cancel()
+            servers[-1].kill()
+            await asyncio.sleep(60)
+        return await original_ask(self, request)
+
+    monkeypatch.setattr(AppServer, "__init__", init)
+    monkeypatch.setattr(CodexActivities, "_ask_workflow", ask)
+
+    async with codex_worker(client, fake, tmp_path) as task_queue:
+        handle = await client.start_workflow(
+            NativeCodexWorkflow.run,
+            NativeInput(ECHO, str(workspace), "signal"),
+            id=f"codex-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        # The retry asks again. Only that question may be left waiting: the dead attempt's is gone.
+        pending: list[Any] = []
+        for _ in range(150):
+            pending = await handle.query(NativeCodexWorkflow.pending)
+            if any(r.attempt == 2 for r in pending):
+                break
+            await asyncio.sleep(0.2)
+        assert [r.attempt for r in pending] == [2], pending
+        assert (await handle.query(NativeCodexWorkflow.asked_requests))[0].attempt == 1
+
+        await handle.signal(NativeCodexWorkflow.decide, args=[pending[0].item_id, True])
+        assert "hello" in await handle.result()
+    assert (workspace / "out.txt").read_text() == "hello\n"
+
+
+# ---------------------------------------------------------------------------
+# Safe defaults.
+# ---------------------------------------------------------------------------
+
+
+@requires_codex_binary
+async def test_commands_do_not_see_the_workers_secrets(
+    client: Client,
+    fake: FakeResponsesServer,
+    tmp_path: Path,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s3cr3t-aws")
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:s3cr3t-db@host/db")
+    monkeypatch.setenv("MY_API_TOKEN", "s3cr3t-token")
+    result, _ = await run_native(
+        client, fake, tmp_path, workspace, 'Show env.\nCALL:exec_command|{"cmd":"env"}'
+    )
+
+    assert "PATH=" in result  # the command did run and print its environment
+    assert "s3cr3t" not in result
+
+
+def test_full_access_sandbox_must_be_asked_for_explicitly() -> None:
+    with pytest.raises(ValueError, match="allow_full_access"):
+        _check_sandbox("danger-full-access", False)
+    _check_sandbox("danger-full-access", True)
+    _check_sandbox("workspace-write", False)
+    with pytest.raises(ValueError, match="sandbox"):
+        _check_sandbox("everything", False)
+
+
+# ---------------------------------------------------------------------------
+# Cancellation and shutdown.
+# ---------------------------------------------------------------------------
+
+
+async def wait_for_pending(handle: Any) -> Any:
+    for _ in range(100):
+        pending = await handle.query(NativeCodexWorkflow.pending)
+        if pending:
+            return pending
+        await asyncio.sleep(0.2)
+    raise AssertionError("the approval request never reached the Workflow")
+
+
+@requires_codex_binary
+async def test_cancelling_while_a_command_runs_stops_the_command(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    marker = f"sleep-{uuid.uuid4().hex}"
+    command = {"cmd": f"sleep 60; echo {marker} > after.txt", "yield_time_ms": 40000}
+    prompt = f"Wait.\nCALL:exec_command|{json.dumps(command)}"
+    async with codex_worker(client, fake, tmp_path) as task_queue:
+        handle = await client.start_workflow(
+            NativeCodexWorkflow.run,
+            NativeInput(prompt, str(workspace), "approve", heartbeat_seconds=3),
+            id=f"codex-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        for _ in range(100):  # until the command is really running
+            if await _process_running(f"sleep 60; echo {marker}"):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            raise AssertionError("the command never started")
+
+        await handle.cancel()
+        try:
+            r = await asyncio.wait_for(handle.result(), 30)
+        except WorkflowFailureError:
+            pass
+        else:
+            events = [e.event_type for e in (await handle.fetch_history()).events]
+            raise AssertionError(
+                f"workflow returned {r!r}; {[EventType.Name(e) for e in events]}"
+            )
+        status = (await handle.describe()).status
+        assert status is not None and status.name == "CANCELED"
+        # The Workflow waited for the segment to stop Codex: nothing is left running.
+        assert not await _process_running(f"sleep 60; echo {marker}")
+    assert not (workspace / "after.txt").exists()
+
+
+async def _process_running(needle: str) -> bool:
+    proc = await asyncio.create_subprocess_exec(
+        "pgrep", "-f", needle, stdout=asyncio.subprocess.PIPE
+    )
+    out, _ = await proc.communicate()
+    return any(pid != str(os.getpid()) for pid in out.decode().split()) and bool(
+        out.strip()
+    )
+
+
+@requires_codex_binary
+async def test_cancelling_while_an_approval_is_pending_ends_cleanly(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    async with codex_worker(client, fake, tmp_path) as task_queue:
+        handle = await client.start_workflow(
+            NativeCodexWorkflow.run,
+            NativeInput(ECHO, str(workspace), "signal"),
+            id=f"codex-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        await wait_for_pending(handle)
+        await handle.cancel()
+        with pytest.raises(WorkflowFailureError):
+            await asyncio.wait_for(handle.result(), 30)
+        assert await handle.query(NativeCodexWorkflow.pending) == []
+    assert not (workspace / "out.txt").exists()
+
+
+@requires_codex_binary
+async def test_another_worker_continues_after_a_worker_shuts_down_mid_approval(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    task_queue = str(uuid.uuid4())
+
+    def worker() -> Worker:
+        return Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[NativeCodexWorkflow],
+            plugins=[
+                CodexPlugin(
+                    config_overrides=fake.config_overrides, home_root=str(tmp_path)
+                )
+            ],
+            graceful_shutdown_timeout=timedelta(0),
+        )
+
+    first = worker()
+    async with first:
+        handle = await client.start_workflow(
+            NativeCodexWorkflow.run,
+            NativeInput(ECHO, str(workspace), "signal"),
+            id=f"codex-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        await wait_for_pending(handle)
+    # The first Worker is gone, mid-approval. A second one takes the retried segment.
+    async with worker():
+        pending = await wait_for_pending(handle)
+        await handle.signal(NativeCodexWorkflow.decide, args=[pending[0].item_id, True])
+        assert "hello" in await asyncio.wait_for(handle.result(), 60)
+    assert (workspace / "out.txt").read_text() == "hello\n"
+
+
+@requires_codex_binary
+async def test_a_command_still_running_when_the_segment_ends_is_stopped(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    marker = f"sleep-{uuid.uuid4().hex}"
+    command = {"cmd": f"sleep 60; echo {marker} > after.txt", "yield_time_ms": 1000}
+    result, _ = await run_native(
+        client,
+        fake,
+        tmp_path,
+        workspace,
+        f"Start it.\nCALL:exec_command|{json.dumps(command)}",
+    )
+
+    assert (
+        "Process running" in result
+    )  # the turn ended while the command was still going
+    await asyncio.sleep(0.5)
+    assert not await _process_running(f"sleep 60; echo {marker}")
+
+
+# ---------------------------------------------------------------------------
+# Configuration drift on resume.
+# ---------------------------------------------------------------------------
+
+
+def plugin_for(fake: FakeResponsesServer | None, tmp_path: Path) -> CodexPlugin:
+    return CodexPlugin(
+        config_overrides=fake.config_overrides if fake else [], home_root=str(tmp_path)
+    )
+
+
+async def answered(handle: Any, count: int) -> list[str]:
+    for _ in range(100):
+        replies = await handle.query(ChatWorkflow.answered)
+        if len(replies) >= count:
+            return replies
+        await asyncio.sleep(0.2)
+    raise AssertionError("the turn never finished")
+
+
+@requires_codex_binary
+async def test_a_resumed_thread_uses_the_workers_current_model_provider(
+    client: Client, tmp_path: Path, workspace: Path
+) -> None:
+    before, after = FakeResponsesServer("before"), FakeResponsesServer("after")
+    await before.start()
+    await after.start()
+    try:
+        task_queue = str(uuid.uuid4())
+        async with Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[ChatWorkflow],
+            plugins=[plugin_for(before, tmp_path)],
+        ):
+            handle = await client.start_workflow(
+                ChatWorkflow.run,
+                str(workspace),
+                id=f"codex-{uuid.uuid4()}",
+                task_queue=task_queue,
+            )
+            await handle.signal(ChatWorkflow.say, "first")
+            await answered(handle, 1)
+        sent_before = len(before.requests)
+
+        # The Worker is reconfigured to another provider; the thread was recorded under the first.
+        async with Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[ChatWorkflow],
+            plugins=[plugin_for(after, tmp_path)],
+        ):
+            await handle.signal(ChatWorkflow.say, "second")
+            await answered(handle, 2)
+            await handle.signal(ChatWorkflow.say, "")
+            await handle.result()
+        assert len(before.requests) == sent_before
+        assert after.requests and after.requests[-1]["model"] == "after-model"
+    finally:
+        await before.stop()
+        await after.stop()
+
+
+@requires_codex_binary
+async def test_resuming_under_a_worker_that_lacks_the_provider_fails_clearly(
+    client: Client, tmp_path: Path, workspace: Path
+) -> None:
+    before = FakeResponsesServer("before")
+    await before.start()
+    try:
+        task_queue = str(uuid.uuid4())
+        async with Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[ChatWorkflow],
+            plugins=[plugin_for(before, tmp_path)],
+        ):
+            handle = await client.start_workflow(
+                ChatWorkflow.run,
+                str(workspace),
+                id=f"codex-{uuid.uuid4()}",
+                task_queue=task_queue,
+            )
+            await handle.signal(ChatWorkflow.say, "first")
+            await answered(handle, 1)
+        async with Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[ChatWorkflow],
+            plugins=[plugin_for(None, tmp_path)],
+        ):
+            await handle.signal(ChatWorkflow.say, "second")
+            with pytest.raises(WorkflowFailureError) as raised:
+                await asyncio.wait_for(handle.result(), 30)
+        cause = raised.value.cause
+        assert isinstance(cause, ActivityError)
+        assert isinstance(cause.cause, ApplicationError)
+        assert cause.cause.type == "CodexConfigDrift"
+        assert "config_overrides" in str(cause.cause)
+    finally:
+        await before.stop()

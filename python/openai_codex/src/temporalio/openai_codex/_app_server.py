@@ -47,8 +47,13 @@ class AppServer:
         env: Mapping[str, str],
         cwd: str,
         on_request: Callable[[str, Any], Awaitable[Any]],
+        on_notification: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
-        """Prepare (but do not start) the process; ``on_request`` serves server->client requests."""
+        """Prepare (but do not start) the process.
+
+        ``on_request`` serves server->client requests. ``on_notification``, if given, sees every
+        notification synchronously as it is read, before any request that follows it is served.
+        """
         self._argv = [codex_bin]
         for kv in config_overrides:
             self._argv += ["--config", kv]
@@ -56,6 +61,7 @@ class AppServer:
         self._env = {**os.environ, **env, "CODEX_HOME": home}
         self._cwd = cwd
         self._on_request = on_request
+        self._on_notification = on_notification
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         self._readers: list[asyncio.Task[None]] = []
@@ -127,6 +133,8 @@ class AppServer:
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
             elif "method" in message:
+                if self._on_notification is not None:
+                    self._on_notification(message)
                 self.notifications.put_nowait(message)
             else:
                 future = self._pending.pop(message["id"], None)

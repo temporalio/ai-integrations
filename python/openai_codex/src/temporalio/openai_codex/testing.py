@@ -45,8 +45,13 @@ def _user_text(items: list[dict[str, Any]]) -> str:
 class FakeResponsesServer:
     """A local ``POST /v1/responses`` endpoint speaking just enough SSE for Codex."""
 
-    def __init__(self) -> None:
-        """Create a stopped server; call :meth:`start` to listen."""
+    def __init__(self, provider: str = "fake") -> None:
+        """Create a stopped server; call :meth:`start` to listen.
+
+        ``provider`` names the Codex model provider that points at this server (and the model is
+        ``<provider>-model``): use two names to simulate a Worker reconfigured between turns.
+        """
+        self.provider = provider
         self.requests: list[dict[str, Any]] = []
         # Set to an HTTP status (e.g. 400) to make every model request fail with it.
         self.failure_status: int | None = None
@@ -70,10 +75,11 @@ class FakeResponsesServer:
     def config_overrides(self) -> list[str]:
         """``--config`` overrides that point Codex at this server (pass to ``CodexPlugin``)."""
         return [
-            'model_providers.fake={name="fake", base_url="http://127.0.0.1:%d/v1", '
-            'wire_api="responses", requires_openai_auth=false}' % self.port,
-            'model_provider="fake"',
-            'model="fake-model"',
+            f'model_providers.{self.provider}={{name="{self.provider}", '
+            f'base_url="http://127.0.0.1:{self.port}/v1", '
+            'wire_api="responses", requires_openai_auth=false}',
+            f'model_provider="{self.provider}"',
+            f'model="{self.provider}-model"',
         ]
 
     @staticmethod
@@ -154,7 +160,11 @@ class FakeResponsesServer:
                 },
             )
         )
-        outputs = [i for i in items if i.get("type") == "function_call_output"]
+        outputs = [
+            i
+            for i in items
+            if i.get("type") in ("function_call_output", "custom_tool_call_output")
+        ]
         output_texts = [self._output_text(i) for i in outputs]
         script = [
             line[len("CALL:") :].split("|", 1)
@@ -169,13 +179,26 @@ class FakeResponsesServer:
             calls = [[name, args]]
         if calls:
             for k, (name, args) in enumerate(calls):
-                item = {
-                    "type": "function_call",
-                    "id": f"fc_{n}_{k}",
-                    "call_id": f"call_{n}_{k}",
-                    "name": name,
-                    "arguments": args.strip(),
-                }
+                if name == "apply_patch":
+                    # Codex's freeform patch tool: the argument is a JSON string holding the patch.
+                    item = {
+                        "type": "custom_tool_call",
+                        "id": f"fc_{n}_{k}",
+                        "call_id": f"call_{n}_{k}",
+                        "name": name,
+                        "input": json.loads(args),
+                    }
+                else:
+                    item = {
+                        "type": "function_call",
+                        "id": f"fc_{n}_{k}",
+                        "call_id": f"call_{n}_{k}",
+                        "name": name,
+                        "arguments": args.strip(),
+                    }
+                    if "::" in name:
+                        # An MCP-style tool: `namespace::tool`.
+                        item["namespace"], item["name"] = name.split("::", 1)
                 writer.write(
                     _sse(
                         "response.output_item.added",
