@@ -5,7 +5,7 @@ Plain dataclasses, so they cross the Activity boundary with Temporal's default p
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 CODEX_RUN_SEGMENT_ACTIVITY = "openai_codex.run_segment"
@@ -76,6 +76,16 @@ class CodexTokenUsage:
     reasoning_tokens: int | None = None
     total_tokens: int | None = None
 
+    def plus(self, other: CodexTokenUsage | None) -> CodexTokenUsage:
+        """The counts of this and ``other`` added together."""
+        values: dict[str, int | None] = {}
+        for f in fields(self):
+            mine, theirs = getattr(self, f.name), getattr(other, f.name, None)
+            values[f.name] = (
+                None if mine is None and theirs is None else (mine or 0) + (theirs or 0)
+            )
+        return CodexTokenUsage(**values)
+
 
 @dataclass
 class CodexSegmentInput:
@@ -111,7 +121,10 @@ class CodexSegmentResult:
     status: str  # "done" | "tool_call"
     final_response: str = ""
     call: CodexPendingCall | None = None
-    usage: CodexTokenUsage | None = None
+    usage: CodexTokenUsage | None = None  # used by this segment alone
+    thread_total: CodexTokenUsage | None = (
+        None  # the thread's cumulative counts afterwards
+    )
 
 
 @dataclass

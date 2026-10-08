@@ -10,7 +10,11 @@ from typing import Any
 from temporalio import activity, workflow
 
 with workflow.unsafe.imports_passed_through():
-    from temporalio.openai_codex import CodexApprovalDecision, CodexApprovalRequest
+    from temporalio.openai_codex import (
+        CodexApprovalDecision,
+        CodexApprovalRequest,
+        CodexTokenUsage,
+    )
     from temporalio.openai_codex.workflow import (
         CodexSession,
         activity_as_tool,
@@ -55,16 +59,20 @@ class CodexWorkflow:
 
     def __init__(self) -> None:
         self.session = new_session()
+        self.usage: CodexTokenUsage | None = None
 
     @workflow.run
     async def run(self, prompt: str) -> str:
         """Run the turn and return Codex's answer."""
-        return (await self.session.run(prompt)).text
+        result = await self.session.run(prompt)
+        self.usage = result.usage
+        return result.text
 
     @workflow.query
     def state(self) -> dict[str, Any]:
         """The conversation state the Workflow holds."""
         return {
+            "usage": self.usage,
             "thread_id": self.session.thread_id,
             "rollout_lines": len(self.session.rollout.splitlines()),
             "tool_results": self.session.tool_results,
@@ -155,6 +163,7 @@ class ChatWorkflow:
         self.session = CodexSession(cwd=cwd, approval_policy="on-request")
         self.prompts: list[str] = []
         self.replies: list[str] = []
+        self.usages: list[CodexTokenUsage | None] = []
 
     @workflow.run
     async def run(self, cwd: str) -> list[str]:  # pyright: ignore[reportUnusedParameter]
@@ -164,7 +173,9 @@ class ChatWorkflow:
             prompt = self.prompts[len(self.replies)]
             if not prompt:
                 return self.replies
-            self.replies.append((await self.session.run(prompt)).text)
+            result = await self.session.run(prompt)
+            self.usages.append(result.usage)
+            self.replies.append(result.text)
 
     @workflow.signal
     def say(self, prompt: str) -> None:
@@ -175,3 +186,8 @@ class ChatWorkflow:
     def answered(self) -> list[str]:
         """The replies so far."""
         return self.replies
+
+    @workflow.query
+    def turn_usages(self) -> list[CodexTokenUsage | None]:
+        """Token usage of each finished turn."""
+        return self.usages

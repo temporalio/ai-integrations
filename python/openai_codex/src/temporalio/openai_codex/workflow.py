@@ -417,7 +417,8 @@ class CodexSession:
                 self._supersede(lambda _request: True)
             self.thread_id, self.rollout_name = seg.thread_id, seg.rollout_name
             self.rollout += seg.tail
-            usage = seg.usage or usage
+            if seg.usage is not None:
+                usage = seg.usage.plus(usage)
             if seg.status == "done" or seg.call is None:
                 return CodexTurnResult(
                     text=seg.final_response, usage=usage, segments=segments

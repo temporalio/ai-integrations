@@ -111,7 +111,7 @@ The defaults are the restrictive ones; loosening any of them is a deliberate act
 | Approval policy | `untrusted`: Codex asks before running anything not known to be safe, even `ls` | `approval_policy="on-request"` |
 | Sandbox | `workspace-write`: writes only inside `cwd` (and temp dirs), **network off** | `sandbox="read-only"` (tighter) or `"danger-full-access"` |
 | Full access | refused unless `allow_full_access=True` is also passed | `CodexSession(allow_full_access=True)` |
-| Environment of commands | Codex's `core` set only (`PATH`, `HOME`, `USER`, `SHELL`, `TMPDIR`, ...); the Worker's secrets (`*_KEY`, `*_TOKEN`, `DATABASE_URL`, ...) are **not** visible to commands the model runs | a `shell_environment_policy` entry in `config_overrides` (later overrides win) |
+| Environment of commands | Codex's `core` set only (`PATH`, `HOME`, `USER`, `SHELL`, `TMPDIR`, ...); the Worker's secrets (`*_KEY`, `*_TOKEN`, `DATABASE_URL`, ...) are **not** visible to commands the model runs | a `shell_environment_policy` entry in `config_overrides` (later overrides win). Codex's shell snapshot is also turned off (`features.shell_snapshot=false`): when ready, it re-exports the full environment into commands, and without this the secrets showed up in about 3 of 10 runs |
 | Auth | the Codex process itself keeps the Worker's environment (it needs the provider key); a login file is copied into a private `0600` `CODEX_HOME` per segment and deleted after | |
 | Tools | no web search, no `view_image` in host-tool mode; every approval goes through your handler, and without a handler everything is declined | |
 
@@ -175,6 +175,14 @@ the Workflow-side code:
 2. Run `make test`; a determinism failure on a recorded history means the change needs a patch.
 3. Record new histories only after deciding the change is safe:
    `CODEX_RECORD_HISTORIES=1 make test PYTEST_ARGS="-k record_histories"`.
+
+## Token usage
+
+`CodexTurnResult.usage` (and the observer's `model_interaction_ended`) counts exactly the model calls of that
+turn or segment. It is summed from the per-call `token_usage_record` entries Codex writes to the rollout, so it
+is correct across segments, resumed threads and host-tool pauses. (Codex's live `thread/tokenUsage/updated`
+notifications are not used: they are missing for a paused segment, and the first one after a resume replays
+the previous call.)
 
 ## Limits
 

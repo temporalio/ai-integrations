@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import glob
+import json
 import os
 import shutil
 import tempfile
@@ -57,7 +58,11 @@ THREAD_CONFIG: dict[str, Any] = {
 # Commands the model runs get only Codex's "core" environment (PATH, HOME, ...), not the Worker's
 # secrets: the Codex process itself keeps the full environment because it needs the provider key,
 # but nothing the model runs should be able to read it.
-SAFE_CONFIG_OVERRIDES: tuple[str, ...] = ('shell_environment_policy.inherit="core"',)
+SAFE_CONFIG_OVERRIDES: tuple[str, ...] = (
+    'shell_environment_policy.inherit="core"',
+    # A shell snapshot re-exports the full environment into commands, around the policy above.
+    "features.shell_snapshot=false",
+)
 
 # How long a cancelled segment waits for Codex to stop its turn before the process is closed.
 _INTERRUPT_TIMEOUT = 3.0
@@ -90,7 +95,7 @@ class CodexObserver(Protocol):
     def model_interaction_ended(
         self, model: str | None, usage: CodexTokenUsage | None
     ) -> None:
-        """The model interaction ended; ``usage`` is set when Codex reported it."""
+        """The model interaction ended; ``usage`` counts its model calls (``None`` if none ran)."""
 
 
 ObserverFactory = Callable[[dict[str, Any]], AbstractAsyncContextManager[CodexObserver]]
@@ -107,18 +112,31 @@ def _override_value(overrides: Sequence[str], key: str) -> str | None:
     return value
 
 
-def _token_usage(params: Mapping[str, Any]) -> CodexTokenUsage | None:
-    last: Mapping[str, Any] | None = (params.get("tokenUsage") or {}).get(
-        "last"
-    ) or None
-    if not last:
-        return None
-    return CodexTokenUsage(
-        input_tokens=last.get("inputTokens"),
-        output_tokens=last.get("outputTokens"),
-        reasoning_tokens=last.get("reasoningOutputTokens"),
-        total_tokens=last.get("totalTokens"),
-    )
+def _rollout_usage(rollout: str, skip_lines: int) -> CodexTokenUsage | None:
+    """Sum the model calls Codex recorded in the rollout lines after the first ``skip_lines``.
+
+    Codex writes a ``token_usage_record`` (that call's own counts) for every model call, including
+    one in a segment that is paused by killing the process, which never sends a usage notification.
+    Counting these is exact however many segments, processes and resumes a turn takes.
+    """
+    total: CodexTokenUsage | None = None
+    seen: set[str] = set()
+    for line in rollout.splitlines()[skip_lines:]:
+        if '"token_usage_record"' not in line:
+            continue
+        payload = json.loads(line).get("payload") or {}
+        call = payload.get("usage") or {}
+        response_id = str(payload.get("response_id"))
+        if response_id in seen or not call:
+            continue
+        seen.add(response_id)
+        total = CodexTokenUsage(
+            input_tokens=call.get("input_tokens"),
+            output_tokens=call.get("output_tokens"),
+            reasoning_tokens=call.get("reasoning_output_tokens"),
+            total_tokens=call.get("total_tokens"),
+        ).plus(total)
+    return total
 
 
 def _copy_auth_in(source: str, home: str) -> None:
@@ -431,10 +449,9 @@ class CodexActivities:
                 )
                 turn_id = (started_turn.get("turn") or {}).get("id")
                 final = ""
-                usage: CodexTokenUsage | None = None
 
                 async def pump() -> None:
-                    nonlocal final, usage
+                    nonlocal final
                     while True:
                         note = await server.notifications.get()
                         method = note["method"]
@@ -447,8 +464,6 @@ class CodexActivities:
                         params = note.get("params") or {}
                         if method == "item/agentMessage/delta" and observer is not None:
                             observer.reply_delta(params.get("delta", ""))
-                        elif method == "thread/tokenUsage/updated":
-                            usage = _token_usage(params) or usage
                         elif method in ("item/started", "item/completed"):
                             item = params.get("item") or {}
                             if method == "item/completed":
@@ -505,7 +520,11 @@ class CodexActivities:
                     call_task.cancel()
                     pump_task.result()  # re-raises if the app-server exited or the turn failed
                 if observer is not None:
-                    observer.model_interaction_ended(inp.model, usage)
+                    files = _rollout_files(home, thread_id)
+                    text = open(files[0]).read() if len(files) == 1 else ""
+                    observer.model_interaction_ended(
+                        inp.model, _rollout_usage(text, inp.committed_lines)
+                    )
         finally:
             await server.close()
 
@@ -532,5 +551,5 @@ class CodexActivities:
                 if call
                 else None
             ),
-            usage=usage,
+            usage=_rollout_usage("\n".join(lines), inp.committed_lines),
         )

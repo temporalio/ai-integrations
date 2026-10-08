@@ -935,3 +935,56 @@ async def test_resuming_under_a_worker_that_lacks_the_provider_fails_clearly(
         assert "config_overrides" in str(cause.cause)
     finally:
         await before.stop()
+
+
+# ---------------------------------------------------------------------------
+# Token usage: counted per turn from the thread's running total.
+# ---------------------------------------------------------------------------
+
+PER_CALL = 18  # what the fake Responses server reports for every model call
+
+
+@requires_codex_binary
+async def test_a_host_tool_turn_counts_every_segments_model_call(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path
+) -> None:
+    async with codex_worker(client, fake, tmp_path) as task_queue:
+        handle = await client.start_workflow(
+            CodexWorkflow.run, PROMPT, id=f"codex-{uuid.uuid4()}", task_queue=task_queue
+        )
+        await handle.result()
+        usage = (await handle.query(CodexWorkflow.state))["usage"]
+
+    # Two segments (before and after the tool call), one model call each.
+    assert len(fake.requests) == 2
+    assert usage["total_tokens"] == 2 * PER_CALL
+
+
+@requires_codex_binary
+async def test_usage_is_per_turn_across_a_resumed_thread(
+    client: Client, fake: FakeResponsesServer, tmp_path: Path, workspace: Path
+) -> None:
+    script = "\n".join('CALL:exec_command|{"cmd":"echo %d"}' % i for i in range(2))
+    async with codex_worker(client, fake, tmp_path) as task_queue:
+        handle = await client.start_workflow(
+            ChatWorkflow.run,
+            str(workspace),
+            id=f"codex-{uuid.uuid4()}",
+            task_queue=task_queue,
+        )
+        await handle.signal(ChatWorkflow.say, f"go\n{script}")
+        await answered(handle, 1)
+        calls_first = len(fake.requests)
+        await handle.signal(ChatWorkflow.say, "plain follow-up")
+        await answered(handle, 2)
+        calls_second = len(fake.requests) - calls_first
+        await handle.signal(ChatWorkflow.say, "")
+        await handle.result()
+        first, second = await handle.query(ChatWorkflow.turn_usages)
+    assert first is not None and second is not None
+
+    # Every turn is billed for exactly its own model calls, even though each segment runs in a
+    # new process that starts from the thread's restored running total.
+    assert calls_first == 3 and first.total_tokens == calls_first * PER_CALL
+    assert second.total_tokens == calls_second * PER_CALL
+    assert first.input_tokens and second.input_tokens
