@@ -2,7 +2,7 @@
 """Open, update, or close one GitHub issue per failing plugin after a nightly run.
 
 Reads the jobs of the current workflow run through `gh api`, maps reusable
-workflow job names such as `Python (openai_agents) / openai_agents (ubuntu-latest, py3.14)`
+workflow job names such as `Python (openai_agents) / ...` and `Go (googleadk) / ...`
 to a plugin, and keeps exactly one open issue per failing plugin labelled `nightly`.
 Passing plugins with an open issue get a comment and are closed.
 """
@@ -16,9 +16,9 @@ import re
 import subprocess
 import sys
 
-# Job names come from ci.yml (`name: Python` and `name: Java`) joined with the reusable workflow's
+# Job names come from ci.yml (`name: Python`, `name: Java`, `name: Go`) joined with the reusable workflow's
 # job name; test_nightly_report.py asserts the two stay in step.
-JOB_RE = re.compile(r"^(?:Python|Java) \((?P<plugin>[^)]+)\) / ")
+JOB_RE = re.compile(r"^(?P<language>Python|Java|Go) \((?P<plugin>[^)]+)\) / ")
 LABEL = "nightly"
 FAILED = {"failure", "timed_out"}
 
@@ -50,6 +50,9 @@ def classify(jobs: list[dict]) -> tuple[set[str], set[str]]:
         if not m or not job.get("conclusion"):
             continue
         plugin = m.group("plugin")
+        # Preserve existing Python and Java issue titles; qualify Go to avoid collisions.
+        if m.group("language") == "Go":
+            plugin = f"go/{plugin}"
         seen.add(plugin)
         if job["conclusion"] in FAILED:
             failing.add(plugin)

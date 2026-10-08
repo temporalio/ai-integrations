@@ -42,12 +42,24 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
 | `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
 | `java/spring-ai` | `io.temporal:spring-ai` | 0.1.0 (0.1.0-RC1 planned) | Public Preview | `io.temporal.springai` |
-| `go/googleadk` | `go.temporal.io/sdk/contrib/googleadk` | continues (v0.3.0 next) | Public Preview | `googleadk` |
+| `go/googleadk` | `go.temporal.io/googleadk` | 0.1.0 (new coordinate) | Public Preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
-version policy (below). The Go row has an unresolved problem: a module served by the static vanity
-site cannot live in a monorepo subdirectory under an unchanged import path; decide (split mirror
-repo, new import path, or staying in sdk-go) before that migration.
+version policy (below). Go plugins use `go.temporal.io/<name>` module paths and live under
+`go/<name>/`. Before publishing, the vanity site must route each module to this repository's
+subdirectory. The [Go module reference](https://go.dev/ref/mod#vcs-find) documents the fourth
+`go-import` field for subdirectories, supported since Go 1.25. Google ADK requires Go 1.26.6,
+so its mapping can be:
+
+```html
+<meta name="go-import" content="go.temporal.io/googleadk git https://github.com/temporalio/ai-integrations go/googleadk">
+```
+
+Its tags are `go/googleadk/v<version>`. `go/googleadk` is now owned here under the new module
+path; its active `upstream` metadata is removed, so do not re-sync it. Imported history remains
+intact, and the inherited changelog is kept only in Git history. UUID and span random-stream
+identifiers retain their original strings for replay compatibility. Final releases here remain
+disabled until vanity routing and Go release automation are ready.
 
 Naming derivation, enforced by `scripts/ci/check_conventions.py`: folder name = `plugin.toml`
 `name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API =
@@ -111,11 +123,12 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 
 One entry workflow, one reusable workflow per language, plugin as a parameter, no secrets.
 
-- `.github/workflows/ci.yml` (`pull_request`, `merge_group`, push to `main`, nightly, dispatch). Job `changes` runs `scripts/ci/detect_changes.py`: plugins are discovered from `<language>/*/<manifest>` (ignoring `_*`); a changed file under a plugin selects that plugin; a non-plugin file under a language root selects every plugin of that language; `.github/**` and `scripts/ci/**` select everything; `scripts/release/**` and `scripts/migrate/**` select only the script tests; push to `main`, nightly and dispatch select everything. Job `conventions` checks repository invariants and runs the script tests. Job `python` calls `_python-plugin.yml` once per selected plugin. Job `java` calls `_java-plugin.yml` for selected Java plugins. Job `ci-status` fans in and is the only required check (skipped upstream jobs count as success).
+- `.github/workflows/ci.yml` (`pull_request`, `merge_group`, push to `main`, nightly, dispatch). Job `changes` runs `scripts/ci/detect_changes.py`: plugins are discovered from `<language>/*/<manifest>` (ignoring `_*`); a changed file under a plugin selects that plugin; a non-plugin file under a language root selects every plugin of that language; `.github/**` and `scripts/ci/**` select everything; `scripts/release/**` and `scripts/migrate/**` select only the script tests; push to `main`, nightly and dispatch select everything. Job `conventions` checks repository invariants and runs the script tests. Jobs `python`, `java`, and `go` call their per-language reusable workflows once per selected plugin. Job `ci-status` fans in and is the only required check (skipped upstream jobs count as success).
 - `.github/workflows/_python-plugin.yml`: job `matrix` reads `plugin.toml` `runtime-versions` and emits the same matrix for every run, pull requests included (ubuntu at the min and max versions, macOS and Windows at max); job `test` runs `make sync` (or `sync-latest` on nightly runs), `make lint`, `make test`, then, on the ubuntu/max cell only, the `python-build-check` composite action (`make build`, `check_wheel.py`, isolated `smoke.py` on wheel and sdist). Windows runners install GNU make with choco.
-- Dependencies: ordinary CI uses the committed lockfile; local `make sync` uses the existing lockfile. Nightly runs every plugin with the newest allowed dependencies (`sync-latest`) without committing the updated lock; manual dispatch can select that mode too. Shared lint, test and format targets use `uv run --locked` to preserve the dependency versions selected during sync.
+- `.github/workflows/_go-plugin.yml`: uses the same matrix generator and platform layout with each plugin's Go `runtime-versions`. Every cell runs `make sync` (or `sync-latest`), `make lint`, `make test`, and `make build`; the ubuntu/max cell enables `-race`. `GOTOOLCHAIN=local` prevents dependencies from silently replacing the runtime under test. Windows runners install GNU make with choco. Go action caching keys include the plugin's `go.mod` and `go.sum`.
+- Dependencies: ordinary CI uses the committed lockfile (`go.mod`/`go.sum` for Go); local `make sync` uses the existing versions. Nightly runs every plugin with the newest allowed dependencies (`sync-latest`) without committing the updated lock; manual dispatch can select that mode too. Python make targets use `uv run --locked`; Go lint, test and build use `-mod=readonly` to preserve the versions selected during sync. Go `sync-latest` runs `go get -u -t ./...`, tidies the module and verifies its checksums.
 - Required checks on `main`: `ci-status`, `Check for CODEOWNERS` and `opengrep/scan` (the last two are org-enforced workflows that run automatically on every PR), plus one approving review from a code owner; `license/cla` joins once the CLA app is installed. Do not add a local opengrep caller; the org one already runs. TRANSITION(sdk-cutover): branch protection, the `testpypi`/`pypi` environments (tag policy `python/*/v*`) and the release-tag ruleset were configured by hand on 2026-09-09. The `pypi` required-reviewer gate was removed on 2026-10-07.
-- Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing plugin from the job names `Python (<plugin>) / ...` and `Java (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs.
+- Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing plugin from the job names `Python (<plugin>) / ...`, `Java (<plugin>) / ...`, and `Go (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs. Existing Python and Java issue titles stay unchanged; Go keys use `go/<plugin>` so plugins in different languages cannot share an issue.
 
 ## Releases
 
@@ -134,6 +147,9 @@ Runbook for `python/<name>`:
 6. If a job fails after an upload, use "Re-run failed jobs" on that run: `prepare`'s outputs and the tested artifact survive, the upload is skipped, and the smoke jobs verify the served files. If the tagged workflow or tooling itself needs a repair, merge the repair first, then dispatch on `main` with `-f tag=python/<name>/v<version> -f recover-run=<original-release-run-id>`. Recovery validates that the completed source run is a release-event run (or a legacy tag-push run) for the exact main-reachable tag, passed version validation and every test-matrix job, and retains an unexpired distribution artifact. A published GitHub Release for the tag must exist, and package manifests must still match the tag. It downloads those tested bytes without rebuilding; the normal ref restrictions, registry ordering and file-hash checks still apply. Recovery requires a `main` branch deployment policy in the `testpypi` and `pypi` environments. A fresh dispatch on the tag also passes the version policy (the newest published version is treated as a re-run, with a warning) but rebuilds the artifacts, and `verify-index-files` fails if the rebuild is not byte-identical (a different uv version stamps its `Generator` into the wheel). If the artifacts themselves must change, fix forward with the next `rcN`; uploaded files are immutable and tags are never moved.
 
 ## Migration and re-sync
+
+Go history imports use `scripts/migrate/extract-sdk-go.sh` and the Go section of
+`scripts/migrate/README.md`, with the same default-branch and merge-commit requirements below.
 
 `scripts/migrate/extract-sdk-python.sh` plus `scripts/migrate/README.md` are the procedure. Only commits reachable from the upstream repository's default branch qualify as imported history. Work from an unmerged or closed PR, feature branch or fork is ordinary local work: do not apply `history-import` and do not add it to `scripts/migrate/IMPORTS.md`. Commit count, `Migrated-From` trailers and use of the migration tooling do not change that classification. For valid imports, find every historical path first; the script is frozen after a plugin's first import; label the PR `history-import` and merge it with a merge commit; keep adaptation files in separate commits on top; and record every import and re-sync in `IMPORTS.md`. Expected verification numbers are in the migration README.
 

@@ -1,8 +1,9 @@
 # Import log
 
 Append-only record of every history import and re-sync performed with
-`scripts/migrate/extract-sdk-python.sh`. The merge SHA is the `--allow-unrelated-histories`
-merge commit on `main`.
+`scripts/migrate/extract-sdk-python.sh` or `scripts/migrate/extract-sdk-go.sh`.
+The merge SHA is the `--allow-unrelated-histories` merge commit retained when the
+import branch is merged to `main`.
 
 | Date (UTC) | Plugin | Source repo @ SHA | git-filter-repo | Merge SHA | Notes |
 |---|---|---|---|---|---|
@@ -16,4 +17,6 @@ merge commit on `main`.
 | 2026-10-05 | langgraph | temporalio/sdk-python @ 6adc0d84290a79952dee3ef02c36f6ed9334874a | 2.47.0 | 1c44efea656151f90d88caab0b7807d06ca00218 | initial import: 7 commits, 2 identities; upstream source and tests unchanged in the import merge; local API cutover is a separate commit; SDK module langgraph |
 | 2026-10-05 | langsmith | temporalio/sdk-python @ 6adc0d84290a79952dee3ef02c36f6ed9334874a | 2.47.0 | c67a20453d104ede255affecc22503e11980cb3d | initial import: 12 commits, 5 identities; upstream source and tests unchanged in the import merge; local API cutover is a separate commit; SDK module langsmith |
 | 2026-10-05 | strands_agents | temporalio/sdk-python @ 6adc0d84290a79952dee3ef02c36f6ed9334874a | 2.47.0 | a819a447f092a40601cfc988c9cedd1b9aed1d1c | initial import: 6 commits, 2 identities; upstream source and tests unchanged in the import merge; local API cutover is a separate commit; SDK module strands |
+| 2026-10-06 | go/googleadk | temporalio/sdk-go @ b7c1605ccd85e18d5bb2bb153c7b4077f2f4aa4b | 2.47.0 | 7bb092f662b1d0f433faad052da6c6d0e2985704 | initial history snapshot: 15 commits, 6 identities, 47 files, no tags; every commit's file blobs and author/committer metadata verified; source, tests, README and dependencies unchanged; separate local setup commit removes the inherited changelog and adds metadata, make targets and LICENSE; sdk-go remains the published upstream pending the Go vanity-path cutover |
 | 2026-10-06 | google_genai | temporalio/sdk-python @ d1fdae5f3d72847542ae0ca99bad3124dc7298bb | 2.47.0 | 50170c970349c20c8374fe7376f985d70bfbd1e2 | re-sync requested after cutover: 9 commits, 4 identities; imported #1939 streaming fixture fix and deserialization example while preserving the temporalio.google_genai package and flattened test paths |
+| 2026-10-08 | go/googleadk | temporalio/sdk-go @ 6ae07bca8301bd25ba1358d1ea92ae837932d76b | 2.47.0 | 338b12f92cc40c0d5ead01d880f45e34422dc00b | final pre-merge re-sync explicitly requested after API cutover: 17 commits, 6 identities, two new dependency updates; all imported file blobs and author/committer metadata verified; adopted ADK 2.3.0 and patched OpenTelemetry dependencies while preserving the new module path, self-imports, plugin name, replay random-stream identifiers, local metadata and changelog deletion; Go minimum is now 1.26.6 |

@@ -10,6 +10,7 @@ cadence.
 
 | Plugin | Package |
 |---|---|
+| [`go/googleadk`](go/googleadk) | [`go.temporal.io/googleadk`](go/googleadk/README.md) (Public Preview) |
 | [`java/spring-ai`](java/spring-ai) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/spring-ai.svg)](https://central.sonatype.com/artifact/io.temporal/spring-ai) (Public Preview) |
 | [`python/deepagents`](python/deepagents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-deepagents.svg)](https://pypi.org/project/temporalio-deepagents/) (Pre-release, no Python 3.10 support) |
 | [`python/google_adk`](python/google_adk) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-adk.svg)](https://pypi.org/project/temporalio-google-adk/) (Pre-release) |
@@ -19,3 +20,6 @@ cadence.
 | [`python/mcp`](python/mcp) | [![PyPI](https://img.shields.io/pypi/v/temporalio-mcp.svg)](https://pypi.org/project/temporalio-mcp/) (Public Preview) |
 | [`python/openai_agents`](python/openai_agents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-openai-agents.svg)](https://pypi.org/project/temporalio-openai-agents/) |
 | [`python/strands_agents`](python/strands_agents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-strands-agents.svg)](https://pypi.org/project/temporalio-strands-agents/) (Public Preview) |
+
+Go development is documented in [`go/README.md`](go/README.md); publishing
+requirements are in [`AGENTS.md`](AGENTS.md).

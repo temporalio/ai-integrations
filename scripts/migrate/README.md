@@ -55,6 +55,9 @@ Record the import in `IMPORTS.md`, open a PR labelled `history-import`, and merg
 
 ## Re-sync (bringing new upstream commits)
 
+For Go history imports, use the corresponding frozen script and rules in
+the Go section below. The Python procedure follows.
+
 Use this procedure only while the plugin's `plugin.toml` names `sdk-python` as its `upstream`.
 Removing that field makes this repository the source of truth; do not re-sync the plugin after
 that point. While the field is present, pick up upstream changes as follows:
@@ -94,6 +97,69 @@ git log --all --oneline --follow -- temporalio/contrib/<name>/__init__.py
 Add a `case` entry to `extract-sdk-python.sh` with every path found (filters first, renames
 second, README rename before directory rename). Missing a historical path cannot be fixed later
 without rewriting every imported SHA.
+
+## Go history imports
+
+`extract-sdk-go.sh` applies the same pinned `git-filter-repo` 2.47.0 procedure
+to Go plugins. The first `googleadk` import is pinned to upstream `main` at
+`b7c1605ccd85e18d5bb2bb153c7b4077f2f4aa4b`. Full default-branch path archaeology
+found that all files originated at `contrib/googleadk/` in
+`6adaffdaef7cc18dc922cc53bfe1f55852e49d1c` (sdk-go#2439), with no earlier
+locations or moves outside that directory. The sole rewrite moves that tree
+to `go/googleadk/`. Expected history: **15 commits, 6 identities, no tags**.
+
+```bash
+git switch -c import/go-googleadk origin/main
+PLUGIN=googleadk scripts/migrate/extract-sdk-go.sh
+git remote add sdk-go-filtered "$WORK" # set WORK to the filtered clone path printed by the script
+git fetch --no-tags sdk-go-filtered main
+git merge --allow-unrelated-histories --no-ff \
+  -m "Import googleadk from temporalio/sdk-go@<SRC_SHA> (history preserved; git-filter-repo 2.47.0)" \
+  sdk-go-filtered/main
+git remote remove sdk-go-filtered
+```
+
+`SRC_REF` must be reachable from upstream `main`; the script checks this before
+rewriting. It keeps original authors, committers and dates, qualifies bare
+issue references as `temporalio/sdk-go#<number>`, preserves referenced SHAs,
+and adds `Migrated-From: temporalio/sdk-go@<original SHA>` trailers. In the import
+merge, source, tests, README, `go.mod` and `go.sum` are byte-identical to upstream.
+Verify every filtered commit's tree and author/committer metadata against its
+original entry in the generated `.git/filter-repo/commit-map`, not just the tip.
+
+Add local metadata, make targets and the root LICENSE copy as a separate
+adaptation commit. Remove the upstream `CHANGELOG.md` from the current tree
+in that commit, retaining its history to follow this repository's generated
+release-notes policy. While `plugin.toml` names an active upstream, preserve
+this deletion during re-sync and do not edit the imported source, tests or README.
+
+Google ADK's initial setup retained the upstream module path. A separate local
+API cutover, requested after the import, renames it to `go.temporal.io/googleadk`
+and updates self-imports, the worker plugin name, metadata and examples. Its
+active `upstream` field is removed because this repository now owns the code.
+The original UUID and span random-stream identifiers remain stable for replay
+compatibility. The extraction script and imported commit graph stay unchanged.
+Go CI now runs the shared make targets across the declared runtimes and platforms.
+Final releases remain disabled until vanity routing and Go release automation
+are ready; the required subdirectory mapping is documented in AGENTS.md.
+
+An explicitly requested final re-sync before the import PR merged brought in
+upstream `main` at `6ae07bca8301bd25ba1358d1ea92ae837932d76b` on 2026-10-08.
+The frozen extraction reproduced the original 15 commits and added two dependency
+updates, for **17 commits, 6 identities, no tags**. All imported file blobs and
+author/committer metadata were verified. The merge preserves the new module path,
+self-imports, worker plugin name, replay random-stream identifiers, and changelog
+deletion. ADK v2.3.0 and the patched OpenTelemetry log API raise the Go floor to
+1.26.6; plugin CI metadata uses that same minimum.
+
+For a plugin that still names an active upstream, run the frozen script unchanged
+with a default-branch commit that descends from the previous source SHA. Do not
+re-sync after removing that field, including Google ADK after its API cutover.
+Fetch and merge the result; do not re-import an unrelated history or remove
+the preserved local metadata.
+Keep the changelog removed if upstream changes conflict with its deletion.
+Append an import-log row, use the `history-import` label on the PR, and merge
+with **Create a merge commit**, never squash or rebase.
 
 ## Remaining Python plugin imports (2026-10-05)
 

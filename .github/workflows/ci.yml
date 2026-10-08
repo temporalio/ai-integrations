@@ -4,6 +4,7 @@
 #   changes      -> which plugins the event touches (scripts/ci/detect_changes.py)
 #   conventions  -> repository invariants + tooling tests (always)
 #   python       -> _python-plugin.yml once per changed Python plugin (locked deps; newest on nightly)
+#   go           -> _go-plugin.yml once per changed Go plugin (same dependency modes)
 #   ci-status    -> the ONLY required status check; skipped jobs count as success
 #
 # No provider secrets are used in CI: tests use deterministic local models,
@@ -111,9 +112,24 @@ jobs:
       plugin: ${{ matrix.plugin }}
       deps: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.latest-deps)) && 'latest' || 'locked' }}
 
+  go:
+    name: Go
+    needs: changes
+    if: needs.changes.result == 'success' && needs.changes.outputs.go != '[]'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJson(needs.changes.outputs.go) }}
+    uses: ./.github/workflows/_go-plugin.yml
+    with:
+      plugin: ${{ matrix.plugin }}
+      deps: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.latest-deps)) && 'latest' || 'locked' }}
+
   nightly-report:
     name: Nightly report
-    needs: [changes, python, java]
+    needs: [changes, python, java, go]
     if: always() && github.event_name == 'schedule' && needs.changes.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -138,7 +154,7 @@ jobs:
 
   ci-status:
     name: ci-status
-    needs: [changes, conventions, python, java]
+    needs: [changes, conventions, python, java, go]
     if: always()
     runs-on: ubuntu-latest
     steps:

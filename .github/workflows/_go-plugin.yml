@@ -1,0 +1,87 @@
+# Reusable per-language workflow for one Go plugin. Plugin-specific settings
+# belong in go/<plugin>/plugin.toml, go.mod and the shared make targets.
+name: Go plugin
+
+on:
+  workflow_call:
+    inputs:
+      plugin:
+        description: Plugin folder name under go/
+        type: string
+        required: true
+      deps:
+        description: "locked: committed go.mod/go.sum; latest: compatible dependency upgrades"
+        type: string
+        default: locked
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  matrix:
+    name: matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - id: matrix
+        env:
+          PLUGIN: ${{ inputs.plugin }}
+        run: uv run --project scripts --locked python scripts/ci/matrix.py --plugin-dir "go/$PLUGIN" --github-output "$GITHUB_OUTPUT"
+
+  test:
+    name: ${{ inputs.plugin }} (${{ matrix.os }}, go${{ matrix.runtime }})
+    needs: matrix
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    env:
+      PLUGIN_DIR: go/${{ inputs.plugin }}
+      GOTOOLCHAIN: local # Test the declared runtime; do not silently download a newer one.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.runtime }}
+          check-latest: true
+          cache-dependency-path: |
+            go/${{ inputs.plugin }}/go.mod
+            go/${{ inputs.plugin }}/go.sum
+      - name: Install GNU make (Windows)
+        if: runner.os == 'Windows'
+        run: choco install make -y --no-progress
+      - name: Sync dependencies
+        env:
+          DEPS: ${{ inputs.deps }}
+        run: |
+          cd "$PLUGIN_DIR"
+          case "$DEPS" in
+            locked) make sync ;;
+            latest) make sync-latest ;;
+            *) echo "::error::unknown deps mode '$DEPS'"; exit 1 ;;
+          esac
+      - name: Lint
+        run: cd "$PLUGIN_DIR" && make lint
+      - name: Test
+        env:
+          TEST_ARGS: ${{ matrix.dist && '-race' || '' }} # Race detection on ubuntu/max.
+        run: cd "$PLUGIN_DIR" && make test
+      - name: Build
+        run: cd "$PLUGIN_DIR" && make build
