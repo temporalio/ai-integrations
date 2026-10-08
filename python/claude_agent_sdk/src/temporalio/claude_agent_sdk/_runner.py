@@ -78,8 +78,12 @@ import unicodedata
 import uuid
 import warnings
 from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any, cast
+
+from mcp.types import PaginatedRequestParams
+from mcp.types import Tool as McpTool
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -94,6 +98,7 @@ from claude_agent_sdk import (
     SystemMessage,
     TextBlock,
     ToolResultBlock,
+    ToolUseBlock,
     UserMessage,
     create_sdk_mcp_server,
     fork_session_via_store,
@@ -118,6 +123,7 @@ from ._models import (
     ToolSpec,
     ToolStepInput,
 )
+from ._native import ChildStore, NativeBridge, mcp_connection
 from ._stand_in import StandInModel
 
 ENV_AUTH = (
@@ -142,7 +148,7 @@ ONE_TOOL_HINT = "Call at most one tool per message, then wait for its result bef
 PAUSE_CONTRACT = (
     "Durable tools never run inside the engine (the in-engine tool only returns an "
     "error), so nothing ran outside Temporal. This segment stops instead of "
-    "continuing. Durable tools cannot be called from subagents; otherwise, use a "
+    "continuing. Native child tools must use the Workflow bridge; use a "
     "Claude Code version that passes this plugin's test suite."
 )
 
@@ -402,12 +408,12 @@ _OPTIONAL_STORE_METHODS = (
 )
 
 
-def _is_transcript(entry: Any) -> bool:
+def _is_transcript(entry: Any, *, child: bool = False) -> bool:
     return (
         isinstance(entry, dict)
         and isinstance(entry.get("uuid"), str)
         and entry.get("type") in _TRANSCRIPT_TYPES
-        and not entry.get("isSidechain")
+        and (child or not entry.get("isSidechain"))
     )
 
 
@@ -431,10 +437,10 @@ def _without_cost_state(entries: list[Any]) -> list[Any]:
     return [e for e in entries if not _is_cost_state(e)]
 
 
-def _last_entry(entries: list[Any]) -> str | None:
+def _last_entry(entries: list[Any], *, child: bool = False) -> str | None:
     """The uuid of the session's last transcript entry: where the engine resumes."""
     for entry in reversed(entries):
-        if _is_transcript(entry):
+        if _is_transcript(entry, child=child):
             return entry["uuid"]
     return None
 
@@ -599,7 +605,9 @@ def _deliver(
     return [*entries[:first], *moved, *entries[first : marker + 1]], delivered
 
 
-def _seed(committed: list[Any], checkpoint: str) -> list[Any] | None:
+def _seed(
+    committed: list[Any], checkpoint: str, *, child: bool = False
+) -> list[Any] | None:
     """The committed conversation up to the checkpoint, where the next run resumes.
 
     That is all of it, unless the checkpoint is the paused call's deferral marker
@@ -608,11 +616,11 @@ def _seed(committed: list[Any], checkpoint: str) -> list[Any] | None:
     Returns:
         The entries, or None if the checkpoint is not in the conversation.
     """
-    if _last_entry(committed) == checkpoint:
+    if _last_entry(committed, child=child) == checkpoint:
         return committed
     for index in range(len(committed) - 1, -1, -1):
         entry = committed[index]
-        if _is_transcript(entry) and entry["uuid"] == checkpoint:
+        if _is_transcript(entry, child=child) and entry["uuid"] == checkpoint:
             return committed[: index + 1]
     return None
 
@@ -907,12 +915,15 @@ async def _engine_messages(
     See ``_turn_messages`` for when its input ends.
     """
     feed = _Feed(messages)
+    native_bridge = options.pop("_native_bridge", None)
     client = ClaudeSDKClient(ClaudeAgentOptions(**options))
     try:
         await client.connect(feed.stream())
         async for message in _turn_messages(client, feed, resumed):
             yield message
     finally:
+        if native_bridge is not None:
+            await native_bridge.close()
         await _disconnect(client)
 
 
@@ -1079,7 +1090,7 @@ def _warn_once(message: str, key: str) -> None:
         warnings.warn(message, stacklevel=3)
 
 
-def _engines_end_with_worker() -> None:
+def _engines_end_with_worker(*, strict: bool = False) -> None:
     """Windows: put the Claude Code processes the SDK has started in the Worker's job.
 
     The SDK keeps the processes it started (in this Worker process, the plugin's
@@ -1096,6 +1107,11 @@ def _engines_end_with_worker() -> None:
             if isinstance(pid, int):
                 _end_with_worker(pid)
     except Exception as err:
+        if strict:
+            raise ApplicationError(
+                "Cannot protect the native child engine with a Windows job",
+                non_retryable=True,
+            ) from err
         _warn_once(
             "temporalio.claude_agent_sdk: cannot put Claude Code in a job object "
             f"({err!r}), so if this Worker process dies, Claude Code finishes its "
@@ -1620,7 +1636,23 @@ class ClaudeAgentSdkRunner:
         if inp.checkpoint is None:  # nothing committed yet: a new session
             return _attempt_session_id(inp.session_id, attempt), False, set()
         if attempt == 1 and not inp.fork:
-            return inp.session_id, True, set()
+            moved_child = False
+            for path, checkpoint in inp.child_checkpoints.items():
+                entries = (
+                    await self._store.load(
+                        {
+                            "project_key": project_key_for_directory(self._cwd),
+                            "session_id": inp.session_id,
+                            "subpath": path,
+                        }
+                    )
+                    or []
+                )
+                moved_child = (
+                    moved_child or _last_entry(entries, child=True) != checkpoint
+                )
+            if not moved_child:
+                return inp.session_id, True, set()
         session_id, delivered = await self._copy(inp, injected)
         return session_id, True, delivered
 
@@ -1649,6 +1681,7 @@ class ClaudeAgentSdkRunner:
                 directory=self._cwd,
                 up_to_message_id=inp.checkpoint,
             )
+            await self._copy_children(inp, forked.session_id)
             return forked.session_id, set()
         seed, delivered = moved
         copy_id = str(uuid.uuid4())
@@ -1656,7 +1689,36 @@ class ClaudeAgentSdkRunner:
             {**key, "session_id": copy_id},
             [{**e, "sessionId": copy_id} if "sessionId" in e else e for e in seed],
         )
+        await self._copy_children(inp, copy_id)
         return copy_id, delivered
+
+    async def _copy_children(self, inp: SegmentInput, session_id: str) -> None:
+        """Copy only each child's committed prefix into a new parent session."""
+        for path in inp.child_subpaths:
+            key = {
+                "project_key": project_key_for_directory(self._cwd),
+                "session_id": inp.session_id,
+                "subpath": path,
+            }
+            entries = await self._store.load(key) or []
+            checkpoint = inp.child_checkpoints.get(path)
+            seed = (
+                _seed(entries, checkpoint, child=True)
+                if checkpoint is not None
+                else entries
+            )
+            if seed is None:
+                raise ApplicationError(
+                    f"Child checkpoint {checkpoint} is missing for {path}",
+                    non_retryable=True,
+                )
+            await self._store.append(
+                {**key, "session_id": session_id},
+                [
+                    {**e, "sessionId": session_id} if "sessionId" in e else e
+                    for e in seed
+                ],
+            )
 
     async def _checkpoint(
         self,
@@ -1809,6 +1871,18 @@ class ClaudeAgentSdkRunner:
                 error="Nothing to send: no tool result and no prompt",
             )
         store = InMemorySessionStore()
+        for path, ref in inp.child_conversations.items():
+            child = await read_conversation(
+                dataclasses.replace(inp, conversation=ref, transcript=None)
+            )
+            await store.append(
+                {
+                    "project_key": project_key_for_directory(self._cwd),
+                    "session_id": session_id,
+                    "subpath": path,
+                },
+                cast(Any, child),
+            )  # type: ignore[arg-type]
         if seed:
             key = {
                 "project_key": project_key_for_directory(self._cwd),
@@ -1859,6 +1933,8 @@ class ClaudeAgentSdkRunner:
             RuntimeError: If the Workflow did not serve its conversation, or the
                 conversation is kept where this runner does not keep it (retried).
         """
+        if step.native:
+            return await self._run_native_tool(step)
         del attempt
         await self._prepare_engine()
         call = step.call
@@ -1995,8 +2071,181 @@ class ClaudeAgentSdkRunner:
             )
         return ToolOutcome(content=text, is_error=is_error)
 
+    async def _run_native_tool(self, step: ToolStepInput) -> ToolOutcome:
+        """Run one recorded child call, with no model rediscovery or child resume."""
+        await self._prepare_engine()
+        if sys.platform != "win32" and self._launch is None:
+            raise ApplicationError(
+                "Native tool execution requires a working launcher", non_retryable=True
+            )
+        call = step.call
+        folder = _hook_folder()
+        lock = _hold_worker_lock(folder)
+        if lock is None:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise ApplicationError(
+                "Native tool execution requires a Worker lock", non_retryable=True
+            )
+        try:
+            model = StandInModel(
+                {
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.input,
+                }
+            )
+        except BaseException:
+            _release_worker_lock(lock)
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
+        store = InMemorySessionStore()
+        session_id = str(uuid.uuid4())
+        violations: list[str] = []
+        inp = SegmentInput(
+            session_id,
+            "Run the recorded tool call.",
+            step.tools,
+            builtin_tools=step.builtin_tools,
+            max_turns=1,
+        )
+        options = self._engine_options(
+            inp,
+            {},
+            session_id,
+            False,
+            store,
+            None,
+            folder,
+            self._durable_server(step.tools, []),
+            violations,
+        )
+        options["env"]["TCA_REQUIRE_LOCK"] = "1"
+        options["env"]["TCA_REQUIRE_NATIVE_PROTECTION"] = "1"
+        for name, config in list(options["mcp_servers"].items()):
+            if config.get("type", "stdio") == "stdio":
+                before = {
+                    **os.environ,
+                    **self._env,
+                    **(self._extra.get("env") or {}),
+                    **(config.get("env") or {}),
+                }
+                options["mcp_servers"][name] = {
+                    **config,
+                    "env": {
+                        k: v for k, v in before.items() if not k.startswith("TCA_")
+                    },
+                }
+        options["env"] = self._step_env(options["env"], folder, call.id, model)
+        if sys.platform != "win32":
+            Path(folder, "native_protected").touch()
+        result: ToolResultBlock | None = None
+        raw: dict[str, Any] | None = None
+        observed = False
+        joining = _join_job_while_starting()
+        stopper = (
+            asyncio.ensure_future(_stop_hooks_when_cancelled(folder))
+            if activity.in_activity()
+            else None
+        )
+        try:
+            async for message in query(
+                prompt=inp.prompt or "", options=ClaudeAgentOptions(**options)
+            ):
+                if sys.platform == "win32":
+                    _engines_end_with_worker(strict=True)
+                    Path(folder, "native_protected").touch()
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, ToolUseBlock):
+                            if (block.id, block.name, block.input) != (
+                                call.id,
+                                call.name,
+                                call.input,
+                            ):
+                                raise ApplicationError(
+                                    "Native replay changed the accepted call",
+                                    non_retryable=True,
+                                )
+                            observed = True
+                if isinstance(message, UserMessage) and isinstance(
+                    message.content, list
+                ):
+                    for block in message.content:
+                        if (
+                            isinstance(block, ToolResultBlock)
+                            and block.tool_use_id == call.id
+                        ):
+                            result, raw = block, message.tool_use_result
+        except Exception:
+            if result is None:
+                raise
+        finally:
+            if joining is not None:
+                joining.cancel()
+            if stopper is not None:
+                stopper.cancel()
+            denials = _hook_denials(folder)
+            _release_worker_lock(lock)
+            shutil.rmtree(folder, ignore_errors=True)
+            await asyncio.to_thread(model.close)
+            self._forget_local_copy(session_id)
+        if (
+            not observed
+            or result is None
+            or denial_name(call.id) in denials
+            or violations
+        ):
+            raise ApplicationError(
+                "Native replay did not execute the accepted call", non_retryable=True
+            )
+        content = result.content
+        if (
+            call.name.startswith("mcp__")
+            and result.is_error
+            and isinstance(content, str)
+        ):
+            # Native MCP errors carry an engine-added prefix. The live MCP bridge
+            # adds it again, so store the original error body rather than double it.
+            content = content.removeprefix("Error: ")
+        if call.name in ("Bash", "PowerShell"):
+            if result.is_error:
+                match = re.match(r"Exit code (\d+)\r?\n", _text(content))
+                if match is None:
+                    raise ApplicationError(
+                        "Native shell failure has no recorded exit status",
+                        non_retryable=True,
+                    )
+                # Claude Code exposes a failed shell call as a rendered string,
+                # including its exit status, rather than the success output schema.
+                # Preserve that native visible output without guessing which stream
+                # produced a byte; the renderer reproduces the same error content.
+                raw = {
+                    "stdout": _text(content)[match.end() :],
+                    "stderr": "",
+                    "exitCode": int(match[1]),
+                }
+            elif (
+                not isinstance(raw, dict)
+                or not isinstance(raw.get("stdout"), str)
+                or not isinstance(raw.get("stderr"), str)
+            ):
+                raise ApplicationError(
+                    "Native shell output has an unsupported shape", non_retryable=True
+                )
+        return ToolOutcome(
+            content=content if isinstance(content, str) else None,
+            blocks=list(content) if isinstance(content, list) else None,
+            is_error=bool(result.is_error),
+            native_output=raw if call.name in ("Bash", "PowerShell") else None,
+        )
+
     def _step_env(
-        self, env: dict[str, str], hook_dir: str, call_id: str
+        self,
+        env: dict[str, str],
+        hook_dir: str,
+        call_id: str,
+        model: StandInModel | None = None,
     ) -> dict[str, str]:
         """The engine's environment in a tool step, and the command's.
 
@@ -2005,6 +2254,7 @@ class ClaudeAgentSdkRunner:
         Worker's own environment back (see ``_command_env``), so a command that calls
         the Anthropic API reaches the Worker's provider as it would in a segment.
         """
+        model = model or self._stand_in
         before = {**os.environ, **env}
         hosts: list[str] = []
         for name in ("NO_PROXY", "no_proxy"):
@@ -2015,8 +2265,8 @@ class ClaudeAgentSdkRunner:
             hosts.append("127.0.0.1")
         overrides = {
             **STEP_PROVIDER_ENV,
-            "ANTHROPIC_API_KEY": self._stand_in.key,
-            "ANTHROPIC_BASE_URL": self._stand_in.base_url,
+            "ANTHROPIC_API_KEY": model.key,
+            "ANTHROPIC_BASE_URL": model.base_url,
             "NO_PROXY": ",".join(hosts),
             "no_proxy": ",".join(hosts),
         }
@@ -2119,17 +2369,127 @@ class ClaudeAgentSdkRunner:
         ran_inside: list[str] = []
         violations: list[str] = []  # decisions hooks in extra_options tried to make
         hook_dir = _hook_folder()
+        native = (
+            activity.in_activity()
+            and inp.conversation is not None
+            and bool({"Agent", "Task", "*", "all"} & set(inp.builtin_tools))
+        )
+        children = ChildStore(store, inp.child_subpaths)
+        committed_children = (
+            {
+                path: await children.load(
+                    {
+                        "project_key": project_key_for_directory(self._cwd),
+                        "session_id": session_id,
+                        "subpath": path,
+                    }
+                )
+                or []
+                for path in inp.child_subpaths
+            }
+            if committed is not None
+            else {}
+        )
+        bridge = (
+            NativeBridge(
+                inp, activity.info().attempt, children, self._cwd, session_id, hook_dir
+            )
+            if native
+            else None
+        )
+        connections = AsyncExitStack()
+        await connections.__aenter__()
+        if bridge is not None:
+            try:
+                await bridge.update()
+            except BaseException:
+                shutil.rmtree(hook_dir, ignore_errors=True)
+                await connections.aclose()
+                raise
         options = self._engine_options(
             inp,
             injected,
             session_id,
             resume,
-            store,
+            children,
             guard,
             hook_dir,
             self._durable_server(inp.tools, ran_inside),
             violations,
         )
+        if bridge is not None:
+            ran_inside = bridge.ran_inside
+            options["_native_bridge"] = bridge
+            options["forward_subagent_text"] = True
+            options["session_store_flush"] = "eager"
+            options["env"]["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "0"
+            options["env"].update(bridge.start())
+            settings_file = Path(hook_dir, "settings.json")
+            settings = json.loads(settings_file.read_text())
+            for event in (
+                "SubagentStart",
+                "SubagentStop",
+                "PostToolUse",
+                "PostToolUseFailure",
+            ):
+                settings["hooks"][event] = [
+                    {"matcher": ".*", "hooks": [{**_hook_entry(), "timeout": 86400}]}
+                ]
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = 86400
+            settings_file.write_text(json.dumps(settings), encoding="utf-8")
+            servers = options["mcp_servers"]
+            servers[SERVER] = bridge.proxy(
+                SERVER,
+                [
+                    McpTool(
+                        name=t.name,
+                        description=t.description,
+                        input_schema=t.input_schema,
+                    )
+                    for t in inp.tools
+                ],
+            )
+            try:
+                for name, config in list(servers.items()):
+                    if name == SERVER or not any(
+                        p.startswith("mcp__") for p in inp.tool_activities
+                    ):
+                        continue
+                    if config.get("type", "stdio") == "stdio":
+                        before = {
+                            **os.environ,
+                            **self._env,
+                            **(self._extra.get("env") or {}),
+                            **(config.get("env") or {}),
+                        }
+                        config = {
+                            **config,
+                            "env": {
+                                k: v
+                                for k, v in before.items()
+                                if not k.startswith("TCA_")
+                            },
+                        }
+                    session = await connections.enter_async_context(
+                        mcp_connection(config, self._cwd)
+                    )
+                    tools: list[McpTool] = []
+                    cursor = None
+                    while True:
+                        listing = await session.list_tools(
+                            params=PaginatedRequestParams(cursor=cursor)
+                        )
+                        tools.extend(listing.tools)
+                        cursor = listing.next_cursor
+                        if not cursor:
+                            break
+                    if any(bridge.managed(f"mcp__{name}__{t.name}") for t in tools):
+                        servers[name] = bridge.proxy(name, tools, session)
+            except BaseException:
+                await bridge.close()
+                await connections.aclose()
+                shutil.rmtree(hook_dir, ignore_errors=True)
+                raise
         # A command that runs inside the segment sees none of the plugin's variables.
         options["env"] = _command_env(options["env"], hook_dir, self._cwd, {}, {})
         prompt: Any
@@ -2159,12 +2519,24 @@ class ClaudeAgentSdkRunner:
         joining = _join_job_while_starting()
         try:
             lock = _hold_worker_lock(hook_dir)
+            if bridge is not None:
+                bridge.protected = (
+                    lock is not None
+                    and sys.platform != "win32"
+                    and self._launch is not None
+                )
             engine = _engine_messages(options, await _as_messages(prompt), resume)
             async with contextlib.aclosing(engine) as messages:
                 async for message in messages:
                     if joining is not None and not joining.done():
                         joining.cancel()
                         _engines_end_with_worker()
+                    if bridge is not None:
+                        if sys.platform == "win32":
+                            _engines_end_with_worker(strict=True)
+                            bridge.protected = lock is not None
+                        if isinstance(message, AssistantMessage):
+                            bridge.observe(message)
                     if isinstance(message, MirrorErrorMessage):
                         store_error = message.error or "unknown error"
                     elif (
@@ -2183,7 +2555,16 @@ class ClaudeAgentSdkRunner:
                     elif isinstance(message, UserMessage):
                         stopped_by_hook = stopped_by_hook or _hook_said_stopped(message)
                     elif isinstance(message, ResultMessage):
-                        result = message
+                        # A background child's completion may wake the parent
+                        # after it already paused. Keep that original boundary:
+                        # later model text cannot erase an unanswered parent call.
+                        if (
+                            bridge is None
+                            or result is None
+                            or result.deferred_tool_use is None
+                            or result.deferred_tool_use.id in injected
+                        ):
+                            result = message
             marker = Path(hook_dir) / "paused_call"  # written when the hook defers
             if marker.exists():
                 paused_by_hook = marker.read_text(encoding="utf-8").strip() or None
@@ -2205,6 +2586,9 @@ class ClaudeAgentSdkRunner:
                 joining.cancel()
             _release_worker_lock(lock)
             shutil.rmtree(hook_dir, ignore_errors=True)  # the hook denies from now on
+            if bridge is not None:
+                await bridge.close()
+            await connections.aclose()
 
         violation = _hook_violation(violations)
         if violation is not None:
@@ -2293,6 +2677,29 @@ class ClaudeAgentSdkRunner:
                 cost_usd=cost,
             )
         out.external_storage = external_storage_on()
+        out.child_subpaths = list(inp.child_subpaths)
+        out.child_checkpoints = dict(inp.child_checkpoints)
+        if bridge is not None:
+            try:
+                transcripts = await bridge.verify()
+            except RuntimeError as err:
+                return SegmentOutput(session_id=sid, is_error=True, error=str(err))
+            out.native_calls = list(bridge.outcomes)
+            out.child_subpaths = sorted(children.subpaths)
+            out.child_checkpoints = {
+                path: child_checkpoint
+                for path, entries in transcripts.items()
+                if (child_checkpoint := _last_entry(entries, child=True)) is not None
+            }
+            if committed is not None:
+                for path, child_entries in transcripts.items():
+                    keep, covered = _kept(
+                        committed_children.get(path, []), child_entries
+                    )
+                    out.child_keep[path] = keep
+                    out.child_transcripts[path] = _without_cost_state(
+                        child_entries[covered:]
+                    )
         if committed is not None:
             # The engine only appends to what it resumed from, which is the committed
             # conversation, cut after the checkpoint when that is the deferral marker.

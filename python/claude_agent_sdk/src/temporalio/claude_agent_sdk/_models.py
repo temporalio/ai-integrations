@@ -37,6 +37,8 @@ class ToolOutcome:
     content: Any = None
     is_error: bool = False
     blocks: list[dict[str, Any]] | None = None
+    native_output: dict[str, Any] | None = None
+    """Native shell output, used to render a child call's recorded result."""
 
 
 @dataclass
@@ -123,6 +125,9 @@ class SegmentInput:
     conversation: ConversationRef | None = None
     transcript: list[dict[str, Any]] | None = None
     tool_activities: list[str] = field(default_factory=list)
+    child_conversations: dict[str, ConversationRef] = field(default_factory=dict)
+    child_subpaths: list[str] = field(default_factory=list)
+    child_checkpoints: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -149,6 +154,8 @@ class ToolStepInput:
     builtin_tools: list[str] = field(default_factory=list)
     conversation: ConversationRef | None = None
     transcript: list[dict[str, Any]] | None = None
+    native: bool = False
+    """Replay exactly this accepted child call against a local model."""
 
 
 @dataclass
@@ -188,6 +195,34 @@ class SegmentOutput:
     transcript_add: list[dict[str, Any]] = field(default_factory=list)
     external_storage: bool = False
     siblings: list[DeferredCall] = field(default_factory=list)
+    child_transcripts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    child_keep: dict[str, int] = field(default_factory=dict)
+    child_subpaths: list[str] = field(default_factory=list)
+    child_checkpoints: dict[str, str] = field(default_factory=dict)
+    native_calls: list[str] = field(default_factory=list)
+
+
+@dataclass
+class NativeRequest:
+    """Internal segment-to-Workflow request, fenced by segment and Activity attempt."""
+
+    agent: str
+    segment: int
+    attempt: int
+    token: str
+    call: DeferredCall | None = None
+    child: str = ""
+
+
+@dataclass
+class NativeCallState:
+    """A child call accepted by the Workflow, including an undelivered outcome."""
+
+    segment: int
+    child: str
+    call: DeferredCall
+    outcome: ToolOutcome | None = None
+    delivered: bool = False
 
 
 @dataclass
@@ -238,3 +273,7 @@ class AgentState:
     stream: WorkflowStreamState | None = None
     conversation: list[str] = field(default_factory=list)
     external_storage: bool = False
+    child_conversations: dict[str, list[str]] = field(default_factory=dict)
+    child_subpaths: list[str] = field(default_factory=list)
+    child_checkpoints: dict[str, str] = field(default_factory=dict)
+    native_calls: dict[str, NativeCallState] = field(default_factory=dict)

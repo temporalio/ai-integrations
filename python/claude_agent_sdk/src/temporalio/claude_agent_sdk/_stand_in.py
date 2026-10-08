@@ -25,6 +25,7 @@ MAX_BODY_BYTES = 1024**3
 
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    replay: dict[str, Any] | None = None
 
     def log_message(self, format: str, *args: Any) -> None:
         del format, args
@@ -67,6 +68,20 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send({"input_tokens": 1})
         if not self.path.startswith("/v1/messages"):
             return self._send({})
+        replay = getattr(self, "replay", None)
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": ANSWER}]
+        stop = "end_turn"
+        if replay is not None:
+            used = [
+                b
+                for m in body.get("messages", [])
+                for b in (
+                    m.get("content") if isinstance(m.get("content"), list) else []
+                )
+                if b.get("type") == "tool_use" and b.get("id") == replay["id"]
+            ]
+            if not used:
+                blocks, stop = [replay], "tool_use"
         message = {
             "id": "msg_tool_step",
             "type": "message",
@@ -78,24 +93,34 @@ class _Handler(BaseHTTPRequestHandler):
             "usage": {"input_tokens": 1, "output_tokens": 1},
         }
         if not body.get("stream"):
-            text = [{"type": "text", "text": ANSWER}]
-            return self._send({**message, "content": text, "stop_reason": "end_turn"})
+            return self._send({**message, "content": blocks, "stop_reason": stop})
         events: list[dict[str, Any]] = [
             {"type": "message_start", "message": message},
             {
                 "type": "content_block_start",
                 "index": 0,
-                "content_block": {"type": "text", "text": ""},
+                "content_block": (
+                    {**blocks[0], "input": {}}
+                    if stop == "tool_use"
+                    else {"type": "text", "text": ""}
+                ),
             },
             {
                 "type": "content_block_delta",
                 "index": 0,
-                "delta": {"type": "text_delta", "text": ANSWER},
+                "delta": (
+                    {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(blocks[0]["input"]),
+                    }
+                    if stop == "tool_use"
+                    else {"type": "text_delta", "text": ANSWER}
+                ),
             },
             {"type": "content_block_stop", "index": 0},
             {
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "delta": {"stop_reason": stop, "stop_sequence": None},
                 "usage": {"output_tokens": 1},
             },
             {"type": "message_stop"},
@@ -121,9 +146,10 @@ class StandInModel:
     401 before the body of its request is read.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, replay: dict[str, Any] | None = None) -> None:
         """Create it; it starts on first use."""
         self._server: ThreadingHTTPServer | None = None
+        self.replay = replay
         self._lock = threading.Lock()
         self._count_lock = threading.Lock()
         self.key = secrets.token_hex(16)
@@ -140,6 +166,7 @@ class StandInModel:
 
                 class Counting(_Handler):
                     def do_POST(self) -> None:
+                        self.replay = stand_in.replay
                         given = self.headers.get("x-api-key", "")
                         if not hmac.compare_digest(
                             given.encode("latin-1", "replace"), stand_in.key.encode()
@@ -159,3 +186,9 @@ class StandInModel:
                     daemon=True,
                 ).start()
             return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def close(self) -> None:
+        """Stop a bounded native replay's local provider after its tool Activity."""
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()

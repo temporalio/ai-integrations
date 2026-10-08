@@ -23,6 +23,8 @@ from ._models import (
     AgentState,
     ConversationRef,
     DeferredCall,
+    NativeCallState,
+    NativeRequest,
     SegmentInput,
     SegmentOutput,
     ToolOutcome,
@@ -35,6 +37,9 @@ SEGMENT_ACTIVITY_NAME = "run_claude_segment"
 
 TOOL_STEP_ACTIVITY_NAME = "run_claude_tool_step"
 """Name of the Activity that runs one Claude Code tool call (a tool step)."""
+
+NATIVE_UPDATE = "__claude_agent_native_tool"
+"""Internal Update for registering attempts and running native child calls."""
 
 _OPEN_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": True}
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,50}")
@@ -120,10 +125,18 @@ class _Conversations:
         self, agent: str, start: int, total: int, limit: int
     ) -> list[dict[str, Any]]:
         """Return a page of an agent's conversation (the segment Activity asks)."""
-        held = self.agents.get(agent)
+        key, _, subpath = agent.partition("/")
+        held = self.agents.get(key)
         if held is None:
             raise ValueError(f"This Workflow has no agent {agent!r}")
-        return held._page(start, total, limit)  # pyright: ignore[reportPrivateUsage]
+        return held._page(start, total, limit, subpath)  # pyright: ignore[reportPrivateUsage]
+
+    async def native(self, request: NativeRequest) -> ToolOutcome | None:
+        """Route an internal child request to its owning agent."""
+        held = self.agents.get(request.agent)
+        if held is None:
+            raise ApplicationError("Unknown Claude agent", non_retryable=True)
+        return await held._native(request)  # pyright: ignore[reportPrivateUsage]
 
 
 def _register(agent: DurableClaudeAgent) -> str:
@@ -136,6 +149,7 @@ def _register(agent: DurableClaudeAgent) -> str:
     if not isinstance(registry, _Conversations):
         registry = _Conversations()
         workflow.set_query_handler(QUERY, registry.serve)
+        workflow.set_update_handler(NATIVE_UPDATE, registry.native)
     key = str(len(registry.agents))
     registry.agents[key] = agent
     return key
@@ -288,6 +302,7 @@ class DurableClaudeAgent:
         tool_approvals: Sequence[str] = (),
         tool_activity_timeout: timedelta = timedelta(minutes=10),
         tool_activity_retry_policy: RetryPolicy | None = None,
+        tool_activity_task_queue: str | None = None,
         segment_timeout: timedelta = timedelta(minutes=10),
         segment_heartbeat_timeout: timedelta | None = timedelta(seconds=30),
         segment_retry_policy: RetryPolicy | None = None,
@@ -318,9 +333,8 @@ class DurableClaudeAgent:
             tool_activities: Claude Code tools that run as their own Activities, like
                 durable tools: ``Bash``, ``PowerShell``, and MCP tools (name patterns
                 such as ``mcp__github__*``). Each call is an Activity
-                ``run_claude_tool_step`` with ID ``tool-<tool_use_id>``. A subagent
-                cannot call them: its call is denied with a hint to leave it to the
-                main agent.
+                ``run_claude_tool_step`` with ID ``tool-<tool_use_id>``. Native
+                subagents also run these calls as Activities, with the same approvals.
             tool_approvals: Patterns of ``tool_activities`` whose calls wait for a
                 human decision first, like ``needs_approval`` tools. Each must fall
                 within a ``tool_activities`` pattern.
@@ -330,6 +344,9 @@ class DurableClaudeAgent:
                 when the step breaks before it has the call's result. By default
                 Temporal retries it without limit, so the command can run again then;
                 ``maximum_attempts=1`` runs it at most once.
+            tool_activity_task_queue: Task queue for engine tool Activities. Use a
+                separate queue when model segments occupy all the segment Worker's
+                Activity slots while waiting for native child results.
             segment_timeout: Timeout of each model segment attempt.
             segment_heartbeat_timeout: Heartbeat timeout of each segment attempt, and
                 of each tool step. It also bounds how late a cancel reaches a running
@@ -395,6 +412,7 @@ class DurableClaudeAgent:
         self._tool_approvals = list(tool_approvals)
         self._tool_activity_timeout = tool_activity_timeout
         self._tool_activity_retry_policy = tool_activity_retry_policy
+        self._tool_activity_task_queue = tool_activity_task_queue
         self._segment_timeout = segment_timeout
         self._segment_heartbeat_timeout = segment_heartbeat_timeout
         self._segment_retry_policy = segment_retry_policy
@@ -410,6 +428,9 @@ class DurableClaudeAgent:
         self._outcomes: dict[str, ToolOutcome] = {}  # of unanswered calls that finished
         self._unanswered: list[DeferredCall] = []
         self._running = False
+        self._native_segment: int | None = None
+        self._native_attempt: tuple[int, str] | None = None
+        self._native_tasks: dict[str, asyncio.Task[ToolOutcome]] = {}
         self._state = state if state is not None else AgentState()
         self._key: str | None = None  # names this agent in the conversation Query
         self._sizes = [len(t) for t in self._state.conversation]
@@ -525,6 +546,11 @@ class DurableClaudeAgent:
         """Return the tool calls waiting for a decision."""
         return [
             {"id": c.id, "name": c.name, "input": c.input}
+            | (
+                {"child": self._state.native_calls[c.id].child}
+                if c.id in self._state.native_calls
+                else {}
+            )
             for c in self._waiting.values()
         ]
 
@@ -550,22 +576,108 @@ class DurableClaudeAgent:
             fork_next=s.fork_next,
             conversation=list(s.conversation),
             external_storage=s.external_storage,
+            child_conversations={k: list(v) for k, v in s.child_conversations.items()},
+            child_subpaths=list(s.child_subpaths),
+            child_checkpoints=dict(s.child_checkpoints),
+            native_calls=dict(s.native_calls),
         )
 
-    def _page(self, start: int, total: int, limit: int) -> list[dict[str, Any]]:
+    def _page(
+        self, start: int, total: int, limit: int, subpath: str = ""
+    ) -> list[dict[str, Any]]:
         """A page of the conversation the Workflow holds (read-only: Query handler).
 
         A step scheduled with another number of entries is out of date (for example
         an attempt that timed out and still runs): it gets no page.
         """
-        texts = self._state.conversation
+        texts = (
+            self._state.child_conversations.get(subpath, [])
+            if subpath
+            else self._state.conversation
+        )
         if total != len(texts):
             raise ValueError(
                 f"The conversation has {len(texts)} entries, but the step that asks "
                 f"was scheduled with {total}."
             )
         limit = min(max(limit, 1), PAGE_BYTES)
-        return [json.loads(t) for t in page(texts, self._sizes, start, limit)]
+        sizes = [len(t) for t in texts] if subpath else self._sizes
+        return [json.loads(t) for t in page(texts, sizes, start, limit)]
+
+    async def _native(self, request: NativeRequest) -> ToolOutcome | None:
+        """Accept a child request once; never regenerate it after segment loss."""
+        if not self._running or request.segment != self._native_segment:
+            raise ApplicationError(
+                "Stopped or stale Claude segment", non_retryable=True
+            )
+        identity = (request.attempt, request.token)
+        calls = self._state.native_calls
+        if request.call is None:
+            if self._native_attempt == identity:
+                return None
+            if any(c.segment == request.segment for c in calls.values()):
+                raise ApplicationError(
+                    "The native child segment was lost after accepting a tool call. "
+                    "Its outcomes remain in AgentState.native_calls; native result "
+                    "delivery cannot be restored safely. Do not rediscover the call.",
+                    type="ClaudeNativeDeliveryLost",
+                    non_retryable=True,
+                )
+            if self._native_attempt and request.attempt <= self._native_attempt[0]:
+                raise ApplicationError("Stale Claude attempt", non_retryable=True)
+            self._native_attempt = identity
+            return None
+        if identity != self._native_attempt or not request.child:
+            raise ApplicationError(
+                "Stale or unidentified child call", non_retryable=True
+            )
+        call = request.call
+        valid = (
+            call.name in self._tools
+            if call.kind == "durable"
+            else call.kind == "engine"
+            and any(fnmatch.fnmatchcase(call.name, p) for p in self._tool_activities)
+        )
+        if not valid:
+            raise ApplicationError("Unmanaged child tool", non_retryable=True)
+        previous = calls.get(call.id)
+        if previous is not None:
+            if (
+                previous.segment != request.segment
+                or previous.child != request.child
+                or previous.call != call
+            ):
+                raise ApplicationError(
+                    "Conflicting native call identity", non_retryable=True
+                )
+            if previous.outcome is not None:
+                return previous.outcome
+        else:
+            if call.id in self._calls or call.id in self._state.recent_call_ids:
+                raise ApplicationError("Reused native tool-use ID", non_retryable=True)
+            calls[call.id] = NativeCallState(request.segment, request.child, call)
+            self._state.tool_calls += 1
+
+            async def execute() -> ToolOutcome:
+                outcome = await self._run_tool(call)
+                calls[call.id].outcome = outcome
+                return outcome
+
+            self._native_tasks[call.id] = asyncio.create_task(execute())
+        # Duplicate Update callers share the same execution. Cancelling one caller
+        # must not cancel the accepted Activity or another caller's delivery.
+        return await asyncio.shield(self._native_tasks[call.id])
+
+    async def _drain_native(self) -> None:
+        """Fence new calls, stop outstanding calls, and settle their handlers."""
+        self._native_segment = None
+        for task in self._native_tasks.values():
+            if not task.done():
+                task.cancel()
+        if self._native_tasks:
+            await asyncio.gather(*self._native_tasks.values(), return_exceptions=True)
+        self._native_tasks.clear()
+        self._native_attempt = None
 
     # ---- Continue-As-New ----
     def should_continue_as_new(self) -> bool:
@@ -783,6 +895,7 @@ class DurableClaudeAgent:
             raise
         finally:
             self._running = False
+            await self._drain_native()
 
     async def _loop(self) -> str:
         state = self._state
@@ -796,6 +909,8 @@ class DurableClaudeAgent:
                 await self._continue_as_new_or_stop(first_of_task=first)
             first = False
             index = state.segment_index
+            self._native_segment = index
+            self._native_attempt = None
 
             def segment_input(index: int = index) -> SegmentInput:
                 return SegmentInput(
@@ -817,6 +932,14 @@ class DurableClaudeAgent:
                         agent=self._key or "",
                         entries=len(state.conversation),
                     ),
+                    child_conversations={
+                        path: ConversationRef(
+                            QUERY, f"{self._key}/{path}", len(entries)
+                        )
+                        for path, entries in state.child_conversations.items()
+                    },
+                    child_subpaths=list(state.child_subpaths),
+                    child_checkpoints=dict(state.child_checkpoints),
                 )
 
             seg_input = await self._fit_results(segment_input)
@@ -843,6 +966,28 @@ class DurableClaudeAgent:
             state.total_cost_usd += seg.cost_usd
             if seg.is_error:
                 await self._fail(f"Claude run failed: {seg.error}")
+            accepted = {
+                key for key, call in state.native_calls.items() if call.segment == index
+            }
+            if accepted != set(seg.native_calls) or any(
+                state.native_calls[key].outcome is None for key in accepted
+            ):
+                await self._fail(
+                    "Native child outcomes were not delivered and verified"
+                )
+            for key in accepted:
+                state.native_calls[key].delivered = True
+            state.recent_call_ids = [*state.recent_call_ids, *sorted(accepted)][
+                -_RECENT_CALLS:
+            ]
+            completed = [
+                key for key, call in state.native_calls.items() if call.delivered
+            ]
+            for key in completed[:-_RECENT_CALLS]:
+                del state.native_calls[key]
+            self._native_segment = None
+            self._native_tasks.clear()
+            self._native_attempt = None
             if seg.checkpoint is None:
                 await self._fail(
                     "The segment runner returned no checkpoint, so a retry could not "
@@ -858,6 +1003,15 @@ class DurableClaudeAgent:
             state.session_id = seg.session_id or state.session_id
             state.checkpoint = seg.checkpoint
             state.external_storage = seg.external_storage
+            state.child_subpaths = list(seg.child_subpaths)
+            state.child_checkpoints = dict(seg.child_checkpoints)
+            for path, entries in seg.child_transcripts.items():
+                held = state.child_conversations.setdefault(path, [])
+                keep = seg.child_keep.get(path, 0)
+                if not 0 <= keep <= len(held):
+                    await self._fail("Invalid child transcript checkpoint")
+                del held[keep:]
+                held.extend(entry_text(e) for e in entries)
             if seg.transcript_keep is not None:
                 keep = seg.transcript_keep
                 added = [entry_text(e) for e in seg.transcript_add]
@@ -1119,6 +1273,7 @@ class DurableClaudeAgent:
             conversation=ConversationRef(
                 query=QUERY, agent=self._key or "", entries=len(state.conversation)
             ),
+            native=call.id in state.native_calls,
         )
 
     async def _run_tools(self, calls: list[DeferredCall]) -> list[ToolOutcome]:
@@ -1144,9 +1299,18 @@ class DurableClaudeAgent:
             "input": call.input,
             "status": "started",
         }
+        native = self._state.native_calls.get(call.id)
+        if native is not None:
+            record["child"] = native.child
         self._calls[call.id] = record
         self._publish(
-            {"type": "tool_call", "id": call.id, "name": call.name, "input": call.input}
+            {
+                "type": "tool_call",
+                "id": call.id,
+                "name": call.name,
+                "input": call.input,
+                **({"child": native.child} if native is not None else {}),
+            }
         )
         outcome = await self._execute_tool(call, record)
         self._outcomes[call.id] = outcome
@@ -1156,6 +1320,7 @@ class DurableClaudeAgent:
                 "id": call.id,
                 "name": call.name,
                 "status": record["status"],
+                **({"child": native.child} if native is not None else {}),
             }
         )
         return outcome
@@ -1183,6 +1348,7 @@ class DurableClaudeAgent:
                     "id": call.id,
                     "name": call.name,
                     "input": call.input,
+                    **({"child": record["child"]} if "child" in record else {}),
                 }
             )
             try:
@@ -1203,6 +1369,7 @@ class DurableClaudeAgent:
                     self._tool_step(call),
                     result_type=ToolOutcome,
                     activity_id=f"tool-{call.id}",
+                    task_queue=self._tool_activity_task_queue,
                     start_to_close_timeout=self._tool_activity_timeout,
                     heartbeat_timeout=self._segment_heartbeat_timeout,
                     retry_policy=self._tool_activity_retry_policy,
@@ -1236,4 +1403,6 @@ class DurableClaudeAgent:
             record["status"] = "failed"
             return ToolOutcome(content=f"Tool failed: {message}", is_error=True)
         record["status"] = "done"
-        return ToolOutcome(content=result)
+        return (
+            result if isinstance(result, ToolOutcome) else ToolOutcome(content=result)
+        )

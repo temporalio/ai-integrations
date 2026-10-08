@@ -11,10 +11,9 @@ Tool steps: with ``$TCA_ALLOW_ID`` set, the engine resumed a session that paused
 Claude Code tool call, to run exactly that call; the hook allows it and denies
 anything else.
 
-Subagents (``agent_id`` in the event) cannot pause the run. A subagent's call to a
-tool that runs as an Activity (a durable tool, or a Claude Code tool in
-``$TCA_TOOL_ACTIVITIES``) is denied with a hint to leave it to the main agent, so such
-calls always run as Activities, with their approvals. Other tools run in the subagent
+Subagents (``agent_id`` in the event) cannot pause the run. The authenticated native
+bridge waits for their Activity outcomes and delivers them to the original calls.
+Without a bridge, managed child calls are denied. Other tools run in the subagent
 as usual.
 
 Parallel calls: the engine keeps only one paused call per run. So the first new call
@@ -48,6 +47,7 @@ import json
 import os
 import re
 import sys
+import urllib.request
 from typing import Any
 
 NOT_RUN = (
@@ -136,7 +136,7 @@ def _worker_gone(run_dir: str) -> bool:
     try:
         fd = os.open(os.path.join(run_dir, WORKER_LOCK), os.O_RDWR)
     except OSError:
-        return False
+        return os.environ.get("TCA_REQUIRE_LOCK") == "1"
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -196,7 +196,13 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
     if run_dir is not None and not os.path.isdir(run_dir):
         output = _deny(STOPPED)  # the run ended, or this hook cannot see its folder
     elif allow_id is not None:  # a tool step: exactly this call, nothing else
-        if stopped:
+        if stopped or (
+            os.environ.get("TCA_REQUIRE_NATIVE_PROTECTION") == "1"
+            and (
+                run_dir is None
+                or not os.path.isfile(os.path.join(run_dir, "native_protected"))
+            )
+        ):
             output = _deny(STOPPED)
         elif tool_use_id == allow_id:
             output = {"hookEventName": "PreToolUse", "permissionDecision": "allow"}
@@ -206,8 +212,25 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
         # On resume the engine re-announces the call whose result was just delivered.
         # It must never run, whatever the tool (the settings may have changed since).
         output = {"hookEventName": "PreToolUse", "permissionDecision": "defer"}
+    elif (
+        not event.get("agent_id")
+        and _runs_as_activity(name)
+        and os.environ.get("TCA_CHILD_URL")
+    ):
+        # Let native children in the same assistant batch finish their durable
+        # deliveries before the parent takes the segment's pause boundary.
+        output = _child_hook(event)
+        if output.get("permissionDecision") != "deny":
+            event = {**event, "_children_drained": True}
+            url = os.environ.pop("TCA_CHILD_URL")
+            try:
+                return decide(event)
+            finally:
+                os.environ["TCA_CHILD_URL"] = url
     elif event.get("agent_id") and _runs_as_activity(name):
-        output = _deny(MAIN_AGENT_ONLY)  # a subagent cannot pause the run
+        output = (
+            _deny(STOPPED) if stopped else _child_hook(event)
+        )  # child calls wait on their Workflow-owned Activity outcome
     elif event.get("agent_id") or not _runs_as_activity(name):
         # A tool that runs in the engine runs normally, unless the step was stopped
         # or a call already paused this run.
@@ -241,6 +264,27 @@ def decide(event: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
+def _child_hook(event: dict[str, Any]) -> dict[str, Any]:
+    """Ask the live Worker bridge; missing bridges always deny managed child calls."""
+    url = os.environ.get("TCA_CHILD_URL")
+    key = os.environ.get("TCA_CHILD_KEY")
+    if not url or not key:
+        return _deny(MAIN_AGENT_ONLY)
+    try:
+        request = urllib.request.Request(
+            url, json.dumps(event).encode(), {"Authorization": key}, method="POST"
+        )
+        # Never inherit a provider proxy for this authenticated loopback request.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request) as response:
+            output = json.load(response)
+        if not isinstance(output, dict):
+            raise ValueError("Invalid native hook answer")
+        return output
+    except Exception:
+        return _deny(STOPPED)
+
+
 def main() -> None:
     """Read one event from stdin and print the decision.
 
@@ -248,7 +292,9 @@ def main() -> None:
     reject the tool input. The answer is ASCII (``json.dumps`` escapes the rest).
     """
     event = json.loads(sys.stdin.buffer.read().decode("utf-8"))
-    print(json.dumps({"hookSpecificOutput": decide(event)}))
+    kind = event.get("hook_event_name", "PreToolUse")
+    output = decide(event) if kind == "PreToolUse" else _child_hook(event)
+    print(json.dumps({"hookSpecificOutput": output} if output else {}))
 
 
 if __name__ == "__main__":
