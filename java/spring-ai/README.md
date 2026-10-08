@@ -54,6 +54,31 @@ The [archived Spring AI 1 usage guide](https://github.com/temporalio/ai-integrat
 records the imported implementation. Maintenance is now owned by ai-integrations;
 there is no active upstream sync relationship.
 
+## Provider retries
+
+OpenAI HTTP errors retain their status, headers, and error body in the Activity's
+`ApplicationFailure` details. Rate limits (429), request timeouts (408), conflicts
+(409), and server errors are retryable. Other HTTP client errors and
+`insufficient_quota` responses are non-retryable. `Retry-After` (seconds or an HTTP
+date) and `retry-after-ms` set Temporal's next retry delay; missing or invalid
+headers leave the Activity's configured backoff in effect. Custom Activity retry
+policies still control maximum attempts and can exclude additional error types.
+
+Disable provider SDK retries on models registered with Temporal so each Activity
+attempt makes one provider request. For a manually constructed OpenAI model, use
+`OpenAiChatOptions.builder().maxRetries(0)` when building the worker's model.
+For Spring Boot's OpenAI chat model:
+
+```properties
+spring.ai.openai.chat.max-retries=0
+```
+
+These options configure the provider client at construction time; setting them
+on a workflow prompt does not disable retries on an existing client. Keep a
+separate model/client if calls outside Temporal need SDK retries. Without this
+configuration, Spring AI 2.0.1's three internal OpenAI retries can produce twelve
+requests across the default three Activity attempts.
+
 ## Development
 
 ```bash

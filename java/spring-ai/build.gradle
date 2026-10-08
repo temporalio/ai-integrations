@@ -31,6 +31,8 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter'
     compileOnly 'org.springframework.ai:spring-ai-rag'
     compileOnly 'org.springframework.ai:spring-ai-mcp'
+    // Classify native provider failures without requiring a provider at runtime.
+    compileOnly 'org.springframework.ai:spring-ai-openai'
 
     testImplementation "io.temporal:temporal-sdk:$temporalVersion"
     testImplementation "io.temporal:temporal-testing:$temporalVersion"
