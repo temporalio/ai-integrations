@@ -1,6 +1,6 @@
 # Temporal MCP integration
 
-> This package is experimental and may change in future versions.
+> Release stage: **Pre-release**.
 
 `temporalio.mcp` lets native Temporal workflow code use MCP Python SDK
 v2 clients. The workflow sees a durable proxy, while MCP transports, processes,

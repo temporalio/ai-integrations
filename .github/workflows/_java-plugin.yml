@@ -6,6 +6,10 @@ on:
       plugin:
         type: string
         required: true
+      deps:
+        description: "locked: committed locks; latest: newest stable versions in supported dependency families"
+        type: string
+        default: locked
       version:
         description: Validated release version; empty for development builds
         type: string
@@ -46,6 +50,7 @@ jobs:
       PLUGIN_DIR: java/${{ inputs.plugin }}
       RELEASE_VERSION: ${{ inputs.version || '0.0.0' }}
       SPRING_BOOT_VERSION: ${{ matrix.spring_boot }}
+      DEPS: ${{ inputs.deps }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -57,15 +62,20 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version-file: scripts/pyproject.toml
+      - name: Resolve latest dependencies
+        if: inputs.deps == 'latest'
+        run: |
+          cd "$PLUGIN_DIR"
+          ./gradlew --no-daemon "-PdependencyMode=$DEPS" "-PspringBootVersion=$SPRING_BOOT_VERSION" resolveAndLockAll --write-locks --refresh-dependencies
       - name: Lint and test
         run: |
           cd "$PLUGIN_DIR"
-          ./gradlew --no-daemon "-PreleaseVersion=$RELEASE_VERSION" "-PspringBootVersion=$SPRING_BOOT_VERSION" spotlessCheck test
+          ./gradlew --no-daemon "-PreleaseVersion=$RELEASE_VERSION" "-PspringBootVersion=$SPRING_BOOT_VERSION" "-PdependencyMode=$DEPS" spotlessCheck test
       - name: Build and verify tested distributions
         if: matrix.dist
         run: |
           cd "$PLUGIN_DIR"
-          ./gradlew --no-daemon "-PreleaseVersion=$RELEASE_VERSION" "-PspringBootVersion=$SPRING_BOOT_VERSION" stageDist
+          ./gradlew --no-daemon "-PreleaseVersion=$RELEASE_VERSION" "-PspringBootVersion=$SPRING_BOOT_VERSION" "-PdependencyMode=$DEPS" stageDist
           cd ../..
           uv run --project scripts --locked python scripts/ci/check_java_dist.py --plugin-dir "$PLUGIN_DIR" --version "$RELEASE_VERSION"
           uv run --project scripts --locked python scripts/ci/smoke_java.py --plugin-dir "$PLUGIN_DIR" --version "$RELEASE_VERSION"

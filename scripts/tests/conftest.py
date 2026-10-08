@@ -45,14 +45,14 @@ def make_python_plugin(
     name: str = "fakeplug",
     *,
     version: str = "0.0.0",
-    maturity: str = "experimental",
+    maturity: str = "pre-release",
     dependencies: list[str] | None = None,
     allow_final: bool = False,
 ) -> Path:
     classifier = {
-        "ga": "Development Status :: 5 - Production/Stable",
-        "preview": "Development Status :: 4 - Beta",
-        "experimental": "Development Status :: 3 - Alpha",
+        "generally-available": "Development Status :: 5 - Production/Stable",
+        "public-preview": "Development Status :: 4 - Beta",
+        "pre-release": "Development Status :: 3 - Alpha",
     }[maturity]
     coordinate = "temporalio-" + name.replace("_", "-")
     d = root / "python" / name

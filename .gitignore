@@ -13,6 +13,7 @@ junit/
 .gradle/
 build/
 java/_cache/
+java/*/gradle/dependency-locks/*.latest.lockfile
 
 # Editors / OS
 .DS_Store

@@ -2,18 +2,18 @@
 # Install a just-published distribution from a package index into a brand-new uv
 # project (no repository paths on sys.path) and run the stdlib-only smoke test.
 #
-# Env: COORDINATE, VERSION, ROOT_API (required); SMOKE_IMPORTS (comma list);
+# Env: COORDINATE, VERSION, ROOT_API, REQUIRES_PYTHON (required); SMOKE_IMPORTS (comma list);
 #      INDEX_URL (optional; when set, ONLY $COORDINATE is resolved from that index,
 #      every dependency still comes from PyPI); ALLOW_OVERLAP_WITH_CORE.
 set -euo pipefail
-: "${COORDINATE:?}" "${VERSION:?}" "${ROOT_API:?}"
+: "${COORDINATE:?}" "${VERSION:?}" "${ROOT_API:?}" "${REQUIRES_PYTHON:?}"
 workspace=${GITHUB_WORKSPACE:-$(git rev-parse --show-toplevel)}
 proj=$(mktemp -d)
 cat > "$proj/pyproject.toml" <<TOML
 [project]
 name = "smoke"
 version = "0"
-requires-python = ">=3.10"
+requires-python = "${REQUIRES_PYTHON}"
 dependencies = ["${COORDINATE}==${VERSION}"]
 TOML
 if [ -n "${INDEX_URL:-}" ]; then

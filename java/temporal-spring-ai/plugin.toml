@@ -4,14 +4,14 @@ language = "java"
 coordinate = "io.temporal:temporal-spring-ai"
 registry = "maven"
 root-api = "io.temporal.springai"
-maturity = "preview"
+maturity = "public-preview"
 docs = "https://github.com/temporalio/ai-integrations/tree/main/java/temporal-spring-ai"
 
 [release]
 allow-final = false
 
 [ci]
-runtime-versions = ["17", "21"]
+runtime-versions = ["17", "25"]
 spring-boot-versions = ["4.0.8", "4.1.1"]
 
 [smoke]

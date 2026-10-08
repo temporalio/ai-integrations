@@ -98,7 +98,7 @@ def check_provenance(
         and not path.name.endswith(".pyc")
     } - owned
     if allow_overlap:
-        # temporalio<=1.32 ships a README.md inside the package directory; this plugin keeps its
+        # Before cutover, the SDK ships a README.md inside the package directory; this plugin keeps its
         # README at the plugin root, so the SDK's copy is the one expected leftover.
         extras.discard(os.path.normpath(str(pkg_dir / "README.md")))
     if extras:

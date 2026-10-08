@@ -32,26 +32,155 @@ def test_parse_tag_invalid(tag: str) -> None:
         release_tool.parse_tag(tag)
 
 
-def test_policy_first_release() -> None:
-    release_tool.check_policy(Version("1.0.0"), "ga", [])
-    release_tool.check_policy(Version("1.0.0rc1"), "ga", [])
-    release_tool.check_policy(Version("0.1.0"), "experimental", [])
-    release_tool.check_policy(Version("0.1.0a1"), "preview", [])
-    for v, m in [("0.1.0", "ga"), ("1.0.0", "experimental"), ("1.1.0", "ga"), ("1.0.0.post1", "ga"), ("2.0.0", "ga")]:
+def test_cli_parse_tag_emits_plugin_python_requirement(plugin_repo: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    manifest = plugin_repo / "python/fakeplug/pyproject.toml"
+    manifest.write_text(manifest.read_text().replace('requires-python = ">=3.10"', 'requires-python = ">=3.11"'))
+    assert release_tool.main(["--repo-root", str(plugin_repo), "parse-tag", "python/fakeplug/v0.0.1"]) == 0
+    assert "requires_python=>=3.11" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("maturity,version,github_flag", [
+    ("pre-release", "0.0.1", "true"), ("pre-release", "0.0.1rc1", "true"),
+    ("public-preview", "0.1.0", "false"), ("public-preview", "0.1.0rc1", "true"),
+    ("generally-available", "1.0.0", "false"), ("generally-available", "1.0.0rc1", "true"),
+])
+def test_github_classification_does_not_change_registry_routing(
+    plugin_repo: Path, capsys: pytest.CaptureFixture[str], maturity: str, version: str, github_flag: str,
+) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(meta.read_text().replace('maturity = "pre-release"', f'maturity = "{maturity}"'))
+    assert release_tool.main(["--repo-root", str(plugin_repo), "parse-tag", f"python/fakeplug/v{version}"]) == 0
+    outputs = dict(line.split("=", 1) for line in capsys.readouterr().out.splitlines())
+    assert outputs["github_prerelease"] == github_flag
+    assert outputs["prerelease"] == ("true" if Version(version).is_prerelease else "false")
+
+
+@pytest.fixture
+def recovery_source(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict, dict, dict]:
+    tag = "python/fakeplug/v0.0.1rc1"
+    sha = git(plugin_repo, "rev-parse", "HEAD")
+    git(plugin_repo, "tag", tag)
+    git(plugin_repo, "update-ref", "refs/remotes/origin/main", sha)
+    run = {"repository": {"full_name": "temporalio/ai-integrations"}, "event": "push", "head_branch": tag,
+           "head_sha": sha, "path": ".github/workflows/release-python.yml", "status": "completed"}
+    names = ["Validate tag and version policy", "Test / matrix"]
+    names.extend(f"Test / fakeplug ({runner}, py{version})" for runner, version in (
+        ("ubuntu-latest", "3.10"), ("ubuntu-latest", "3.14"), ("macos-latest", "3.14"), ("windows-latest", "3.14"),
+    ))
+    jobs = {"jobs": [{"name": name, "status": "completed", "conclusion": "success"} for name in names]}
+    artifacts = {"artifacts": [{"name": "dist-fakeplug-locked", "expired": False}]}
+
+    def gh(*args: str, **_kwargs: object) -> str:
+        endpoint = args[1]
+        if "/jobs?" in endpoint:
+            return json.dumps([jobs])
+        if "/artifacts?" in endpoint:
+            return json.dumps(artifacts)
+        return json.dumps(run)
+
+    monkeypatch.setattr(release_tool, "_gh", gh)
+    return plugin_repo, run, jobs, artifacts
+
+
+def test_recovery_accepts_tested_tagged_artifacts(recovery_source: tuple, tmp_path: Path) -> None:
+    repo, *_ = recovery_source
+    output = tmp_path / "outputs"
+    assert release_tool.main(["--repo-root", str(repo), "check-recovery-run", "--tag", "python/fakeplug/v0.0.1rc1",
+                              "--run-id", "123", "--github-output", str(output)]) == 0
+    assert output.read_text() == "recovery=true\nartifact_run_id=123\n"
+
+
+@pytest.mark.parametrize("key,value", [
+    ("event", "workflow_dispatch"), ("head_branch", "python/other/v0.0.1rc1"), ("head_sha", "wrong"),
+    ("path", ".github/workflows/ci.yml"), ("status", "in_progress"), ("repository", {"full_name": "other/repo"}),
+])
+def test_recovery_rejects_unrelated_or_unfinished_runs(recovery_source: tuple, key: str, value: object) -> None:
+    repo, run, *_ = recovery_source
+    run[key] = value
+    with pytest.raises(release_tool.PolicyError, match="completed release-python.yml push run"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "python/fakeplug/v0.0.1rc1", 123)
+
+
+@pytest.mark.parametrize("name", ["Validate tag and version policy", "Test / fakeplug (macos-latest, py3.14)"])
+@pytest.mark.parametrize("state", ["missing", "failure", "in_progress"])
+def test_recovery_requires_the_complete_successful_matrix(recovery_source: tuple, name: str, state: str) -> None:
+    repo, _, jobs, _ = recovery_source
+    job = next(job for job in jobs["jobs"] if job["name"] == name)
+    if state == "missing":
+        jobs["jobs"].remove(job)
+    elif state == "failure":
+        job["conclusion"] = "failure"
+    else:
+        job["status"] = "in_progress"
+    with pytest.raises(release_tool.PolicyError, match="no successful completed job"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "python/fakeplug/v0.0.1rc1", 123)
+
+
+@pytest.mark.parametrize("state", ["missing", "expired", "wrong_name", "duplicate"])
+def test_recovery_requires_one_available_distribution_artifact(recovery_source: tuple, state: str) -> None:
+    repo, _, _, artifacts = recovery_source
+    if state == "missing":
+        artifacts["artifacts"] = []
+    elif state == "expired":
+        artifacts["artifacts"][0]["expired"] = True
+    elif state == "wrong_name":
+        artifacts["artifacts"][0]["name"] = "dist-other-locked"
+    else:
+        artifacts["artifacts"].append(dict(artifacts["artifacts"][0]))
+    with pytest.raises(release_tool.PolicyError, match="exactly one unexpired"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "python/fakeplug/v0.0.1rc1", 123)
+
+
+@pytest.mark.parametrize("filename", ["plugin.toml", "pyproject.toml"])
+def test_recovery_rejects_changed_package_metadata(recovery_source: tuple, filename: str) -> None:
+    repo, *_ = recovery_source
+    path = repo / "python/fakeplug" / filename
+    path.write_text(path.read_text() + "\n# changed\n")
+    with pytest.raises(release_tool.PolicyError, match="match the release tag"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "python/fakeplug/v0.0.1rc1", 123)
+
+
+def test_recovery_rejects_tags_outside_main(recovery_source: tuple) -> None:
+    repo, *_ = recovery_source
+    (repo / "README.md").write_text("changed\n")
+    commit_all(repo, "feature branch")
+    git(repo, "tag", "python/fakeplug/v0.0.1rc2")
+    with pytest.raises(release_tool.PolicyError, match="reachable from origin/main"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "python/fakeplug/v0.0.1rc2", 123)
+
+
+@pytest.mark.parametrize("maturity,first", [
+    ("generally-available", "1.0.0"),
+    ("public-preview", "0.1.0"),
+    ("pre-release", "0.0.1"),
+])
+def test_policy_first_release(maturity: str, first: str) -> None:
+    release_tool.check_policy(Version(first), maturity, [])
+    release_tool.check_policy(Version(first + "rc1"), maturity, [])
+    release_tool.check_policy(Version(first + "a1"), maturity, [])
+    for version in ("0.0.0", "0.0.1", "0.1.0", "1.0.0", "1.1.0", first + ".post1", "2.0.0"):
+        if version == first:
+            continue
         with pytest.raises(release_tool.PolicyError):
-            release_tool.check_policy(Version(v), m, [])
+            release_tool.check_policy(Version(version), maturity, [])
+
+
+@pytest.mark.parametrize("maturity", ["experimental", "preview", "ga"])
+def test_policy_rejects_legacy_maturity(maturity: str) -> None:
+    with pytest.raises(release_tool.PolicyError, match="unknown maturity"):
+        release_tool.check_policy(Version("0.1.0"), maturity, [])
 
 
 def test_policy_existing_coordinate_moves_forward() -> None:
     published = [Version("1.0.0"), Version("1.1.0"), Version("0.9.0")]
-    assert release_tool.check_policy(Version("1.1.1"), "ga", published) is None
-    assert release_tool.check_policy(Version("1.2.0rc1"), "ga", published) is None
-    assert release_tool.check_policy(Version("2.0.0"), "experimental", published) is None  # existing coordinates: no major rule
+    assert release_tool.check_policy(Version("1.1.1"), "generally-available", published) is None
+    assert release_tool.check_policy(Version("1.2.0rc1"), "generally-available", published) is None
+    assert release_tool.check_policy(Version("2.0.0"), "pre-release", published) is None  # existing coordinates: no major rule
     # The newest published version is a re-run of its own release (a failure after the PyPI upload), not a violation.
-    assert "re-run" in (release_tool.check_policy(Version("1.1.0"), "ga", published) or "")
+    assert "re-run" in (release_tool.check_policy(Version("1.1.0"), "generally-available", published) or "")
     for v in ("1.0.5", "0.9.1", "1.1.0rc1"):
         with pytest.raises(release_tool.PolicyError):
-            release_tool.check_policy(Version(v), "ga", published)
+            release_tool.check_policy(Version(v), "generally-available", published)
 
 
 def test_testpypi_policy_moves_forward_and_allows_newest_rerun() -> None:
@@ -79,14 +208,14 @@ def _registry(tmp_path: Path, versions: list[str] | None) -> Path:
 def test_cli_policy_prerelease_with_no_published_versions(plugin_repo: Path, tmp_path: Path) -> None:
     reg = _registry(tmp_path, None)
     rc = release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
-                            "--version", "0.1.0rc1", "--registry-json", str(reg), "--testpypi-json", str(tmp_path / "absent.json")])
+                            "--version", "0.0.1rc1", "--registry-json", str(reg), "--testpypi-json", str(tmp_path / "absent.json")])
     assert rc == 0
 
 
 def test_cli_policy_final_blocked_by_allow_final(plugin_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     reg = _registry(tmp_path, None)
     rc = release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
-                            "--version", "0.1.0", "--registry-json", str(reg)])
+                            "--version", "0.0.1", "--registry-json", str(reg)])
     assert rc == 1 and "allow-final is false" in capsys.readouterr().out
 
 
@@ -95,7 +224,7 @@ def test_cli_policy_final_blocked_by_transition_markers(repo: Path, tmp_path: Pa
     (d / "src/temporalio/contrib/fakeplug/_impl.py").write_text("# TRANSITION(sdk-cutover): remove\nVALUE = 1\n")
     commit_all(repo, "plugin")
     reg = _registry(tmp_path, None)
-    policy = ["--repo-root", str(repo), "check-version-policy", "--plugin-dir", str(d), "--version", "0.1.0", "--registry-json", str(reg),
+    policy = ["--repo-root", str(repo), "check-version-policy", "--plugin-dir", str(d), "--version", "0.0.1", "--registry-json", str(reg),
               "--testpypi-json", str(tmp_path / "absent.json")]
     rc = release_tool.main(policy)
     out = capsys.readouterr().out
@@ -108,15 +237,15 @@ def test_cli_policy_final_blocked_by_transition_markers(repo: Path, tmp_path: Pa
 def test_cli_policy_warns_when_the_version_is_already_on_testpypi(plugin_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     reg = _registry(tmp_path, None)
     staged = tmp_path / "testpypi.json"
-    staged.write_text(json.dumps({"releases": {"0.1.0rc1": []}}))
+    staged.write_text(json.dumps({"releases": {"0.0.1rc1": []}}))
     args = ["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
             "--registry-json", str(reg), "--testpypi-json", str(staged), "--check-testpypi"]
     # A re-run after a staged upload is the normal recovery path, so this is a warning, not a failure.
-    assert release_tool.main([*args, "--version", "0.1.0rc1"]) == 0
+    assert release_tool.main([*args, "--version", "0.0.1rc1"]) == 0
     assert "::warning::" in capsys.readouterr().out
-    assert release_tool.main([*args, "--version", "0.1.0rc2"]) == 0
+    assert release_tool.main([*args, "--version", "0.0.1rc2"]) == 0
     assert "not yet on TestPyPI" in capsys.readouterr().out
-    assert release_tool.main([*args, "--version", "0.1.0a1"]) == 1
+    assert release_tool.main([*args, "--version", "0.0.1a1"]) == 1
     assert "never move backwards" in capsys.readouterr().out
 
 
@@ -127,7 +256,7 @@ def test_cli_policy_does_not_touch_testpypi_unless_asked(plugin_repo: Path, tmp_
     monkeypatch.setattr(release_tool.urllib.request, "urlopen", boom)
     reg = _registry(tmp_path, None)
     assert release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
-                              "--version", "0.1.0rc1", "--registry-json", str(reg)]) == 0
+                              "--version", "0.0.1rc1", "--registry-json", str(reg)]) == 0
 
 
 def test_transition_markers_fail_closed_on_git_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -290,13 +419,23 @@ def test_draft_release_waits_for_new_release_visibility(tmp_path: Path, monkeypa
     calls: list[tuple[str, ...]] = []
     sleeps: list[float] = []
     monkeypatch.setattr(release_tool, "find_releases", lambda repo, tag: next(lookups))
-    monkeypatch.setattr(release_tool, "_gh", lambda *args, **kwargs: calls.append(args) or "")
+    release_url = "https://github.com/temporalio/ai-integrations/releases/tag/untagged-123"
+
+    def fake_gh(*args: str, **kwargs: str) -> str:
+        calls.append(args)
+        if args == ("api", "repos/temporalio/ai-integrations/releases/42", "--jq", ".html_url"):
+            return release_url
+        return ""
+
+    monkeypatch.setattr(release_tool, "_gh", fake_gh)
     monkeypatch.setattr(release_tool.time, "sleep", sleeps.append)
+    output = tmp_path / "outputs"
     args = SimpleNamespace(repo="temporalio/ai-integrations", tag="python/mcp/v0.1.0rc1", title="mcp 0.1.0rc1",
-                           notes=str(notes), dist=str(dist), prerelease=True)
+                           notes=str(notes), dist=str(dist), prerelease=True, github_output=str(output))
     assert release_tool.cmd_draft_release(args) == 0
     assert any(call[:2] == ("release", "create") for call in calls)
     assert sleeps == [1.0]
+    assert output.read_text() == f"release_id=42\nurl={release_url}\n"
 
 
 def test_draft_release_update_preserves_tag_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -306,12 +445,24 @@ def test_draft_release_update_preserves_tag_name(tmp_path: Path, monkeypatch: py
     dist.mkdir()
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(release_tool, "find_releases", lambda repo, tag: [{"id": "42", "draft": True}])
-    monkeypatch.setattr(release_tool, "_gh", lambda *args, **kwargs: calls.append(args) or "")
-    args = SimpleNamespace(repo="temporalio/ai-integrations", tag="python/mcp/v0.1.0rc1", title="mcp 0.1.0rc1",
-                           notes=str(notes), dist=str(dist), prerelease=True)
-    assert release_tool.cmd_draft_release(args) == 0
+    release_url = "https://github.com/temporalio/ai-integrations/releases/tag/untagged-456"
+
+    def fake_gh(*args: str, **kwargs: str) -> str:
+        calls.append(args)
+        if args == ("api", "repos/temporalio/ai-integrations/releases/42", "--jq", ".html_url"):
+            return release_url
+        return ""
+
+    monkeypatch.setattr(release_tool, "_gh", fake_gh)
+    output = tmp_path / "outputs"
+    assert release_tool.main([
+        "draft-release", "--repo", "temporalio/ai-integrations", "--tag", "python/mcp/v0.1.0rc1",
+        "--title", "mcp 0.1.0rc1", "--notes", str(notes), "--dist", str(dist), "--prerelease",
+        "--github-output", str(output),
+    ]) == 0
     patch = next(call for call in calls if "PATCH" in call)
     assert "tag_name=python/mcp/v0.1.0rc1" in patch
+    assert output.read_text() == f"release_id=42\nurl={release_url}\n"
 
 
 def test_upload_release_asset_replaces_by_release_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -332,6 +483,79 @@ def test_upload_release_asset_replaces_by_release_id(tmp_path: Path, monkeypatch
     assert upload[:4] == ("api", "--method", "POST", "-H")
     assert "/releases/42/assets?name=fake%20plug-0.1.0.whl" in upload[-1]
     assert "release" not in upload
+
+
+def test_draft_release_refuses_to_modify_a_published_release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(release_tool, "find_releases", lambda repo, tag: [{"id": "42", "draft": False}])
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(release_tool, "_gh", lambda *args, **kwargs: calls.append(args) or "")
+    output = tmp_path / "outputs"
+    args = SimpleNamespace(repo="temporalio/ai-integrations", tag="python/mcp/v0.1.0rc1", title="mcp 0.1.0rc1",
+                           notes=str(tmp_path / "notes.md"), dist=str(tmp_path / "dist"), prerelease=True,
+                           github_output=str(output))
+    with pytest.raises(release_tool.PolicyError, match="published release already exists"):
+        release_tool.cmd_draft_release(args)
+    assert calls == [] and not output.exists()
+
+
+@pytest.mark.parametrize("maturity,version,prerelease", [
+    ("pre-release", "0.0.1", True), ("public-preview", "0.1.0", False),
+    ("generally-available", "1.0.0", False), ("generally-available", "1.0.0rc1", True),
+])
+@pytest.mark.parametrize("untagged", [False, True])
+def test_publish_release_preserves_reviewed_content_and_classification(
+    plugin_repo: Path, monkeypatch: pytest.MonkeyPatch, maturity: str, version: str, prerelease: bool, untagged: bool,
+) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(meta.read_text().replace('maturity = "pre-release"', f'maturity = "{maturity}"'))
+    tag = f"python/fakeplug/v{version}"
+    endpoint = "repos/temporalio/ai-integrations/releases/42"
+    draft_tag = "untagged-5568a832d017c5de0ec3" if untagged else tag
+    release = {"tag_name": draft_tag, "draft": True, "name": "Reviewer-edited title",
+               "body": "Reviewer-edited notes", "assets": [{"id": 7}],
+               "html_url": f"https://github.com/temporalio/ai-integrations/releases/tag/{draft_tag}"}
+    published_url = f"https://github.com/temporalio/ai-integrations/releases/tag/{tag}"
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(*args: str, input_text: str | None = None) -> str:
+        calls.append(args)
+        if args == ("api", endpoint):
+            return json.dumps(release)
+        assert args == ("api", "-X", "PATCH", endpoint, "--input", "-")
+        payload = json.loads(input_text or "{}")
+        assert payload == {"tag_name": tag, "draft": False, "prerelease": prerelease}
+        release.update(payload, html_url=published_url)
+        return json.dumps(release)
+
+    monkeypatch.setattr(release_tool, "_gh", fake_gh)
+    output = plugin_repo / "outputs"
+    assert release_tool.main([
+        "--repo-root", str(plugin_repo), "publish-release", "--repo", "temporalio/ai-integrations",
+        "--tag", tag, "--release-id", "42", "--github-output", str(output),
+    ]) == 0
+    assert len(calls) == 2
+    assert release["tag_name"] == tag and not release["draft"]
+    assert release["name"] == "Reviewer-edited title"
+    assert release["body"] == "Reviewer-edited notes" and release["assets"] == [{"id": 7}]
+    assert output.read_text() == f"url={published_url}\n"
+
+
+@pytest.mark.parametrize("tag,draft,status", [
+    ("python/fakeplug/v0.0.1", False, 0), ("python/other/v0.0.1", True, 1),
+    ("python/other/v0.0.1", False, 1), ("untagged-5568a832d017c5de0ec3", False, 1),
+    ("", True, 1),
+])
+def test_publish_release_rerun_and_tag_mismatch_do_not_modify_releases(
+    plugin_repo: Path, monkeypatch: pytest.MonkeyPatch, tag: str, draft: bool, status: int,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    release = {"tag_name": tag, "draft": draft, "html_url": "https://github.com/temporalio/ai-integrations/releases/42"}
+    monkeypatch.setattr(release_tool, "_gh", lambda *args, **kwargs: calls.append(args) or json.dumps(release))
+    assert release_tool.main([
+        "--repo-root", str(plugin_repo), "publish-release", "--repo", "temporalio/ai-integrations",
+        "--tag", "python/fakeplug/v0.0.1", "--release-id", "42", "--github-output", str(plugin_repo / "outputs"),
+    ]) == status
+    assert calls == [("api", "repos/temporalio/ai-integrations/releases/42")]
 
 
 def test_release_notes_ignores_other_plugins_tags(plugin_repo: Path) -> None:

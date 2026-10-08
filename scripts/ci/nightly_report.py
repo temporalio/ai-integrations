@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Open, update, or close one GitHub issue per failing (plugin, lane) after a nightly run.
+"""Open, update, or close one GitHub issue per failing plugin after a nightly run.
 
 Reads the jobs of the current workflow run through `gh api`, maps reusable
 workflow job names such as `Python (openai_agents) / openai_agents (ubuntu-latest, py3.14)`
-or `Python (lowest-direct) (openai_agents) / ...` to a (lane, plugin)
-pair, and keeps exactly one open issue per failing pair labelled `nightly`.
-Passing pairs with an open issue get a comment and are closed.
+to a plugin, and keeps exactly one open issue per failing plugin labelled `nightly`.
+Passing plugins with an open issue get a comment and are closed.
 """
 
 from __future__ import annotations
@@ -17,10 +16,9 @@ import re
 import subprocess
 import sys
 
-# Job names come from ci.yml (`name: Python` and `name: Python (lowest-direct)`) joined with the
-# reusable workflow's job name; test_nightly_report.py asserts the two stay in step.
-JOB_RE = re.compile(r"^(?P<lane>Python(?: \(lowest-direct\))?|Java) \((?P<plugin>[^)]+)\) / ")
-LANE_KEY = {"Python": "latest", "Python (lowest-direct)": "lowest-direct", "Java": "java-locked"}
+# Job names come from ci.yml (`name: Python` and `name: Java`) joined with the reusable workflow's
+# job name; test_nightly_report.py asserts the two stay in step.
+JOB_RE = re.compile(r"^(?:Python|Java) \((?P<plugin>[^)]+)\) / ")
 LABEL = "nightly"
 FAILED = {"failure", "timed_out"}
 
@@ -44,22 +42,22 @@ def _json_documents(text: str) -> list:
     return docs
 
 
-def classify(jobs: list[dict]) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
-    failing: set[tuple[str, str]] = set()
-    seen: set[tuple[str, str]] = set()
+def classify(jobs: list[dict]) -> tuple[set[str], set[str]]:
+    failing: set[str] = set()
+    seen: set[str] = set()
     for job in jobs:
         m = JOB_RE.match(job.get("name", ""))
         if not m or not job.get("conclusion"):
             continue
-        key = (LANE_KEY.get(m.group("lane"), m.group("lane")), m.group("plugin"))
-        seen.add(key)
+        plugin = m.group("plugin")
+        seen.add(plugin)
         if job["conclusion"] in FAILED:
-            failing.add(key)
+            failing.add(plugin)
     return failing, seen - failing
 
 
-def title_for(lane: str, plugin: str) -> str:
-    return f"nightly: {plugin} failing ({lane})"
+def title_for(plugin: str) -> str:
+    return f"nightly: {plugin} failing (latest)"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -81,23 +79,23 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     subprocess.run(["gh", "label", "create", LABEL, "--repo", args.repo, "--force", "--color", "B60205",
-                    "--description", "Nightly dependency lanes (latest / lowest-direct) failing"], check=False, capture_output=True)
+                    "--description", "Nightly checks with latest allowed dependencies failing"], check=False, capture_output=True)
     open_issues = json.loads(_gh("issue", "list", "--repo", args.repo, "--label", LABEL, "--state", "open", "--limit", "200", "--json", "number,title") or "[]")
     by_title = {i["title"]: i["number"] for i in open_issues}
 
-    for lane, plugin in sorted(failing):
-        title = title_for(lane, plugin)
-        body = (f"The nightly `{lane}` dependency lane is failing for `{plugin}`.\n\n"
+    for plugin in sorted(failing):
+        title = title_for(plugin)
+        body = (f"The nightly check with latest allowed dependencies is failing for `{plugin}`.\n\n"
                 f"Latest run: {run_url}\n\nThis issue is updated automatically by `scripts/ci/nightly_report.py`; "
-                "it closes itself when the lane is green again.")
+                "it closes itself when the plugin is green again.")
         if title in by_title:
             _gh("issue", "comment", str(by_title[title]), "--repo", args.repo, "--body", f"Still failing: {run_url}")
             print(f"updated #{by_title[title]}: {title}")
         else:
             out = _gh("issue", "create", "--repo", args.repo, "--title", title, "--label", LABEL, "--body", body)
             print(f"opened {out.strip()}: {title}")
-    for lane, plugin in sorted(passing):
-        title = title_for(lane, plugin)
+    for plugin in sorted(passing):
+        title = title_for(plugin)
         if title in by_title:
             _gh("issue", "close", str(by_title[title]), "--repo", args.repo, "--comment", f"Green again: {run_url}")
             print(f"closed #{by_title[title]}: {title}")

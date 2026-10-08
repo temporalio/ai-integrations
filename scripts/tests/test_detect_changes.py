@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 import detect_changes
 from conftest import commit_all, git, make_python_plugin
 
@@ -33,17 +35,10 @@ def _run(repo: Path, base: str, *touch: str, event: str = "pull_request") -> dic
     return detect_changes.main(["--repo-root", str(repo), "--event", event, "--base", base, "--dry-run"])
 
 
-def test_dependency_change_marks_plugin_for_the_lowest_lane(repo: Path) -> None:
+@pytest.mark.parametrize("path", ["src/temporalio/contrib/alpha/_impl.py", "pyproject.toml", "uv.lock"])
+def test_plugin_file_selects_only_that_plugin(repo: Path, path: str) -> None:
     base = _setup(repo)
-    r = _run(repo, base, "python/alpha/pyproject.toml")
-    assert r["python"] == ["alpha"] and r["python_deps"] == ["alpha"]
-    r = _run(repo, base, "python/beta/src/temporalio/contrib/beta/_impl.py")
-    assert r["python"] == ["alpha", "beta"] and r["python_deps"] == ["alpha"]  # cumulative diff vs base
-
-
-def test_plugin_file_selects_only_that_plugin(repo: Path) -> None:
-    base = _setup(repo)
-    r = _run(repo, base, "python/alpha/src/temporalio/contrib/alpha/_impl.py")
+    r = _run(repo, base, f"python/alpha/{path}")
     assert r["python"] == ["alpha"] and r["typescript"] == [] and r["any"] is True and r["mode"] == "diff"
 
 

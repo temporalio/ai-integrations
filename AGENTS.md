@@ -28,21 +28,21 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 
 | Folder | Coordinate | First version here | Maturity | Root API |
 |---|---|---|---|---|
-| `python/mcp` | `temporalio-mcp` | 0.1.0 | experimental | `temporalio.mcp` |
-| `python/deepagents` | `temporalio-deepagents` | 0.1.0 | experimental | `temporalio.contrib.deepagents` |
-| `python/google_adk` | `temporalio-google-adk` | 0.1.0 | preview | `temporalio.contrib.google_adk` |
-| `python/google_genai` | `temporalio-google-genai` | 0.1.0 | experimental | `temporalio.contrib.google_genai` |
-| `python/langgraph` | `temporalio-langgraph` | 0.1.0 | experimental | `temporalio.contrib.langgraph` |
-| `python/langsmith` | `temporalio-langsmith` | 0.1.0 | experimental | `temporalio.contrib.langsmith` |
-| `python/openai_agents` | `temporalio-openai-agents` | 1.0.0 | ga | `temporalio.openai_agents` |
-| `python/strands_agents` | `temporalio-strands-agents` | 0.1.0 | experimental | `temporalio.contrib.strands_agents` |
-| `typescript/vercel-ai-sdk` | `@temporalio/vercel-ai-sdk` | 1.0.0 | ga | `@temporalio/vercel-ai-sdk` |
-| `typescript/google-adk` | `@temporalio/google-adk` | 0.1.0 | preview | `@temporalio/google-adk` |
-| `typescript/langsmith` | `@temporalio/langsmith` | continues (1.24.0 next) | experimental | `@temporalio/langsmith` |
-| `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | ga | `@temporalio/openai-agents` |
-| `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | experimental | `@temporalio/strands-agents` |
-| `java/temporal-spring-ai` | `io.temporal:temporal-spring-ai` | continues (1.41.0-RC1 planned) | preview | `io.temporal.springai` |
-| `go/googleadk` | `go.temporal.io/sdk/contrib/googleadk` | continues (v0.3.0 next) | preview | `googleadk` |
+| `python/mcp` | `temporalio-mcp` | 0.1.0 | Pre-release | `temporalio.mcp` |
+| `python/deepagents` | `temporalio-deepagents` | 0.0.1 | Pre-release | `temporalio.deepagents` |
+| `python/google_adk` | `temporalio-google-adk` | 0.0.1 | Pre-release | `temporalio.google_adk` |
+| `python/google_genai` | `temporalio-google-genai` | 0.1.0 | Public Preview | `temporalio.google_genai` |
+| `python/langgraph` | `temporalio-langgraph` | 0.1.0 | Public Preview | `temporalio.langgraph` |
+| `python/langsmith` | `temporalio-langsmith` | 0.1.0 | Public Preview | `temporalio.langsmith` |
+| `python/openai_agents` | `temporalio-openai-agents` | 1.0.0 | Generally Available | `temporalio.openai_agents` |
+| `python/strands_agents` | `temporalio-strands-agents` | 0.1.0 | Public Preview | `temporalio.strands_agents` |
+| `typescript/vercel-ai-sdk` | `@temporalio/vercel-ai-sdk` | 1.0.0 | Generally Available | `@temporalio/vercel-ai-sdk` |
+| `typescript/google-adk` | `@temporalio/google-adk` | 0.1.0 | Public Preview | `@temporalio/google-adk` |
+| `typescript/langsmith` | `@temporalio/langsmith` | continues (1.24.0 next) | Public Preview | `@temporalio/langsmith` |
+| `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
+| `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
+| `java/temporal-spring-ai` | `io.temporal:temporal-spring-ai` | continues (1.41.0-RC1 planned) | Public Preview | `io.temporal.springai` |
+| `go/googleadk` | `go.temporal.io/sdk/contrib/googleadk` | continues (v0.3.0 next) | Public Preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
 version policy (below). The Go row has an unresolved problem: a module served by the static vanity
@@ -55,8 +55,15 @@ Naming derivation, enforced by `scripts/ci/check_conventions.py`: folder name = 
 or `_plugin`. An upstream-backed migration may temporarily retain `temporalio.contrib.<name>` only
 while `[release] allow-final = false`.
 
-Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree): `ga` =
-`Development Status :: 5 - Production/Stable`; `preview` = `4 - Beta`; `experimental` = `3 - Alpha`.
+Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree):
+`pre-release` = `Development Status :: 3 - Alpha`; `public-preview` =
+`Development Status :: 4 - Beta`; `generally-available` =
+`Development Status :: 5 - Production/Stable`.
+Use each plugin's public Temporal documentation for its release stage. In READMEs and
+this table's Maturity column, use the three release-stage labels: Pre-release maps to
+`pre-release`, Public Preview to `public-preview`, and Generally Available to
+`generally-available`. Feature-specific stages do not change a plugin's
+overall maturity (for example, OpenAI Agents is Generally Available with preview or experimental features).
 
 ## Repository invariants
 
@@ -66,11 +73,12 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
 - Python manifests and lockfiles carry the static `0.0.0` development placeholder. A protected release tag is the published version source; the release matrix runs `uv version <tag-version>` before sync, test and build, and only those tested artifacts are published. Ordinary CI and local development keep `0.0.0`.
 - No changelog files. `scripts/release/release_tool.py release-notes` derives notes from commit subjects touching the plugin directory since its previous tag.
 - Every GitHub Action is pinned to a full commit SHA with a `# vN` comment (org opengrep rule).
-- Dependabot mirrors sdk-python: security advisories only (`open-pull-requests-limit: 0`) because its uv support is not yet mature enough for routine bumps; the nightly newest/lowest lanes are the dependency-drift signal.
+- Dependabot mirrors sdk-python: security advisories only (`open-pull-requests-limit: 0`) because its uv support is not yet mature enough for routine bumps; nightly checks with the newest allowed dependencies are the dependency-drift signal.
 
 ## Python conventions
 
 - Layout: `python/<name>/{pyproject.toml, uv.lock, plugin.toml, Makefile, README.md, LICENSE, src/temporalio/<name>/, tests/}`. Migrated plugins may temporarily keep the upstream source and test trees while final releases are disabled; flatten and move to the final root at cutover.
+- While a plugin still names an `upstream`, preserve imported READMEs unchanged. If upstream-relative links need adaptation for PyPI, add a separate `README.pypi.md` and select it with `[project] readme`; conventions check the published README's links.
 - Build backend `uv_build` with `module-name = "temporalio.<name>"`. `py.typed` ships in the leaf package (redundant with the SDK's marker, kept on purpose).
 - Installs are non-editable. `temporalio` is a regular package owned by the SDK wheel, so an editable install of a plugin can resolve incorrectly unless the SDK extends its package path. `python/_shared/python.mk` exports `UV_NO_EDITABLE=1` and reinstalls the plugin last to support overlapping migrations; `[tool.uv] cache-keys` includes `src/**/*` so edits trigger a rebuild; `link-mode = "copy"` keeps overwrites deterministic during the transition.
 - Provenance guard (`tests/helpers/provenance.py`, mirrored by `scripts/ci/smoke.py`) runs at every pytest session start and fails loudly if the install is editable, any file differs from the distribution's RECORD, files under the package directory are not owned by the distribution, or another distribution ships the same paths. While `plugin.toml` `[release] allow-final = false`, the SDK's overlap (`temporalio<=1.32` ships `temporalio/contrib/openai_agents/*`) is tolerated with a warning. `tests/test_installed_matches_source.py` additionally byte-compares the installed package with `src/`.
@@ -88,11 +96,16 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
   before tests and builds. Do not publish the placeholder or add snapshot automation.
 - Java packages and publication metadata use the root MIT license. Imported source
   and tests stay unchanged until active upstream metadata is removed at ownership handoff.
-- CI uses metadata to test Ubuntu on Java 17/21 and macOS/Windows on Java 21.
+- CI uses metadata to test Ubuntu on Java 17/25 and macOS/Windows on Java 25.
   All compatibility variants run on PRs. The primary Ubuntu/max variant alone
   produces the tested Maven distributions and runs a clean consumer smoke test.
 - `./gradlew spotlessCheck test stageDist` checks without rewriting source. Updating
   dependency locks is intentional: `./gradlew resolveAndLockAll --write-locks`.
+- Nightly and `latest-deps=true` runs use `-PdependencyMode=latest`, selecting stable
+  releases within the plugin's declared dependency families and each configured
+  Spring Boot major series. Run `resolveAndLockAll --write-locks --refresh-dependencies`
+  first; subsequent test and build commands reuse a separate ignored latest lock.
+  Ordinary CI and releases default to `-PdependencyMode=locked` and committed locks.
 
 The Spring AI history import is followed by an explicit ownership handoff: remove
 active upstream metadata before implementing Spring AI 2 here. Spring AI 1-to-2
@@ -104,24 +117,24 @@ version is `1.41.0-RC1`; workflow streams and OpenTelemetry never migrate here.
 One entry workflow, one reusable workflow per language, plugin as a parameter, no secrets.
 
 - `.github/workflows/ci.yml` (`pull_request`, `merge_group`, push to `main`, nightly, dispatch). Job `changes` runs `scripts/ci/detect_changes.py`: plugins are discovered from `<language>/*/<manifest>` (ignoring `_*`); a changed file under a plugin selects that plugin; a non-plugin file under a language root selects every plugin of that language; `.github/**` and `scripts/ci/**` select everything; `scripts/release/**` and `scripts/migrate/**` select only the script tests; push to `main`, nightly and dispatch select everything. Job `conventions` checks repository invariants and runs the script tests. Job `python` calls `_python-plugin.yml` once per selected plugin. Job `java` calls `_java-plugin.yml` for selected Java plugins. Job `ci-status` fans in and is the only required check (skipped upstream jobs count as success).
-- `.github/workflows/_python-plugin.yml`: job `matrix` reads `plugin.toml` `runtime-versions` and emits the same matrix for every run, pull requests included (ubuntu at the min and max versions, macOS and Windows at max); job `test` runs `make sync` (or `sync-latest` / `sync-lowest`), `make lint`, `make test`, then, on the ubuntu/max cell only, the `python-build-check` composite action (`make build`, `check_wheel.py`, isolated `smoke.py` on wheel and sdist). Windows runners install GNU make with choco.
-- Dependency lanes: nightly runs every plugin with the newest allowed dependencies (`sync-latest`) and with the lowest allowed direct dependencies (`sync-lowest`; the sync repeats `--resolution lowest-direct`, otherwise uv discards the lowest lock and re-resolves to the newest versions), opening or updating one issue per failing plugin. The lowest-direct lane also runs, and blocks, on pull requests that change a plugin's `pyproject.toml` or `uv.lock`, because that is when floors change.
+- `.github/workflows/_python-plugin.yml`: job `matrix` reads `plugin.toml` `runtime-versions` and emits the same matrix for every run, pull requests included (ubuntu at the min and max versions, macOS and Windows at max); job `test` runs `make sync` (or `sync-latest` on nightly runs), `make lint`, `make test`, then, on the ubuntu/max cell only, the `python-build-check` composite action (`make build`, `check_wheel.py`, isolated `smoke.py` on wheel and sdist). Windows runners install GNU make with choco.
+- Dependencies: ordinary CI uses the committed lockfile; local `make sync` uses the existing lockfile. Nightly runs every plugin with the newest allowed dependencies (`sync-latest`) without committing the updated lock; manual dispatch can select that mode too. Shared lint, test and format targets use `uv run --locked` to preserve the dependency versions selected during sync.
 - Required checks on `main`: `ci-status`, `Check for CODEOWNERS` and `opengrep/scan` (the last two are org-enforced workflows that run automatically on every PR), plus one approving review from a code owner; `license/cla` joins once the CLA app is installed. Do not add a local opengrep caller; the org one already runs. TRANSITION(sdk-cutover): branch protection, the `testpypi`/`pypi` environments (tag policy `python/*/v*`, `@temporalio/ai-sdk` reviewers on `pypi`) and the release-tag ruleset were configured by hand on 2026-09-09.
-- Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing (lane, plugin) pair from the job names `Python (<plugin>) / ...` and `Python (lowest-direct) (<plugin>) / ...` and `Java (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs.
+- Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing plugin from the job names `Python (<plugin>) / ...` and `Java (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs.
 
 ## Releases
 
 Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
 
-Version policy (`release_tool.py check-version-policy`; version ordering is evaluated against pypi.org and test.pypi.org): a coordinate with no published release must start at exactly `1.0.0` (`ga`) or `0.1.0` (otherwise), pre-releases of that version allowed; an existing coordinate must be strictly greater than its highest published version, yanked releases included. TestPyPI versions also move forward. A version already staged on TestPyPI, or already the newest release on pypi.org, only produces a warning (a re-run after an upload is the normal recovery path); an older staged version is rejected. Each smoke job proves the index serves exactly the artifacts this run built, none yanked (`verify-index-files`). Final versions additionally require `plugin.toml` `[release] allow-final = true` and no `TRANSITION(sdk-cutover)` marker in the plugin.
+Version policy (`release_tool.py check-version-policy`; version ordering is evaluated against pypi.org and test.pypi.org): a coordinate with no published release must start at exactly `1.0.0` (`generally-available`), `0.1.0` (`public-preview`), or `0.0.1` (`pre-release`), pre-releases of that version allowed; an existing coordinate must be strictly greater than its highest published version, yanked releases included. Maturity is independent of PEP 440 version status: a Pre-release plugin can publish a final version such as `0.0.1` to PyPI. TestPyPI versions also move forward. A version already staged on TestPyPI, or already the newest release on pypi.org, only produces a warning (a re-run after an upload is the normal recovery path); an older staged version is rejected. Each smoke job proves the index serves exactly the artifacts this run built, none yanked (`verify-index-files`). Final versions additionally require `plugin.toml` `[release] allow-final = true` and no `TRANSITION(sdk-cutover)` marker in the plugin.
 
 Runbook for `python/<name>`:
 1. Merge every code, dependency and migration change intended for the release. Re-sync from upstream first while the transition rules apply. Do not change the committed `0.0.0` development version.
 2. Choose a canonical PEP 440 version and dry-run it on `main`: `gh workflow run release-python.yml --ref main -f tag=python/<name>/v<version>`. The workflow injects the tag version into each checkout, runs policy validation, the full test matrix and the artifact build, but uploads nothing and consumes no tag. `-f skip-publish=true` does the same for a dispatch on an existing tag ref.
 3. `git tag -a python/<name>/v<version> -m "python/<name> v<version>"` on the tested `main` commit and push the tag. Tags must match `<language>/<name>/v<version>` and are protected by a tag ruleset.
-4. `release-python.yml` validates the tag, injects its version, and runs the full test matrix (its ubuntu dist cell builds, checks and smoke-tests the wheel and sdist). It publishes those tested artifacts to TestPyPI (environment `testpypi`), proves TestPyPI serves exactly those files, smoke-installs from TestPyPI in a clean project, and for final versions publishes to PyPI (environment `pypi`, required reviewers confirm the tag SHA is on `main`) and repeats the proof and the smoke there. The clean-project smoke tolerates overlap during migrations only while `allow-final = false`.
-5. A draft GitHub Release is created idempotently with generated notes and the artifacts. Edit the notes and publish it by hand; a later re-run refuses to touch a release that is already published.
-6. If a job fails after an upload, use "Re-run failed jobs" on that run: `prepare`'s outputs and the tested artifact survive, the upload is skipped, and the smoke jobs verify the served files. A fresh dispatch on the tag also passes the version policy (the newest published version is treated as a re-run, with a warning) but rebuilds the artifacts, and `verify-index-files` fails if the rebuild is not byte-identical (a different uv version stamps its `Generator` into the wheel). If the artifacts themselves must change, fix forward with the next `rcN`; uploaded files are immutable and tags are never moved.
+4. `release-python.yml` validates the tag, injects its version, and runs the full test matrix (its ubuntu dist cell builds, checks and smoke-tests the wheel and sdist). It publishes those tested artifacts to TestPyPI (environment `testpypi`), proves TestPyPI serves exactly those files, and smoke-installs from TestPyPI in a clean project. It then creates an idempotent draft GitHub Release with generated notes and the tested artifacts, linked from the run summary and the `pypi` deployment URL. For final versions, required reviewers review the draft and confirm the tag SHA is on `main` before approving the `pypi` environment; the workflow publishes to PyPI and repeats the artifact proof and smoke there. The clean-project smoke tolerates overlap during migrations only while `allow-final = false`.
+5. Edit the draft release notes before approving publication. After PyPI artifact verification and smoke tests succeed, the workflow publishes the reviewed GitHub Release, preserving its notes and assets. Mark it as a GitHub pre-release when the plugin's maturity is `pre-release` or the version is a PEP 440 pre-release. TestPyPI-only runs leave the release as a draft. A retry of GitHub publication leaves an already-published release untouched; a full re-run refuses to replace its notes or assets. The draft remains available if PyPI approval is rejected or publication fails.
+6. If a job fails after an upload, use "Re-run failed jobs" on that run: `prepare`'s outputs and the tested artifact survive, the upload is skipped, and the smoke jobs verify the served files. If the tagged workflow or tooling itself needs a repair, merge the repair first, then dispatch on `main` with `-f tag=python/<name>/v<version> -f recover-run=<original-tag-run-id>`. Recovery validates that the completed source run belongs to the exact main-reachable tag, passed version validation and every test-matrix job, and retains an unexpired distribution artifact. Package manifests must still match the tag. It downloads those tested bytes without rebuilding; the normal environment reviews, registry ordering and file-hash checks still apply. Recovery requires a `main` branch deployment policy in the `testpypi` and `pypi` environments. A fresh dispatch on the tag also passes the version policy (the newest published version is treated as a re-run, with a warning) but rebuilds the artifacts, and `verify-index-files` fails if the rebuild is not byte-identical (a different uv version stamps its `Generator` into the wheel). If the artifacts themselves must change, fix forward with the next `rcN`; uploaded files are immutable and tags are never moved.
 
 ## Migration and re-sync
 
