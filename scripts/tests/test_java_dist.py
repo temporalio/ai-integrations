@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from check_java_dist import check
+from smoke_java import relocation_source
 
 
 def publication(tmp_path: Path) -> Path:
@@ -32,6 +33,23 @@ def publication(tmp_path: Path) -> Path:
 
 def test_valid_publication(tmp_path: Path) -> None:
     check(publication(tmp_path), '1.41.0-RC1')
+
+
+def test_spring_ai_relocation_preserves_old_version_and_resets_target_version() -> None:
+    pom = Path(__file__).parents[2] / 'java/spring-ai/relocation.pom'
+    assert relocation_source(pom, 'io.temporal:spring-ai', '0.1.0') == (
+        'io.temporal', 'temporal-spring-ai', '1.41.0')
+
+
+@pytest.mark.parametrize('coordinate,version', [
+    ('io.temporal:spring-ai', '0.1.0-RC1'),
+    ('io.temporal:temporal-spring-ai', '0.1.0'),
+    ('org.example:spring-ai', '0.1.0'),
+])
+def test_relocation_rejects_a_different_target(coordinate: str, version: str) -> None:
+    pom = Path(__file__).parents[2] / 'java/spring-ai/relocation.pom'
+    with pytest.raises(ValueError, match='relocation target'):
+        relocation_source(pom, coordinate, version)
 
 
 @pytest.mark.parametrize('version', ['1.1.+', 'latest.release', 'latest.integration'])

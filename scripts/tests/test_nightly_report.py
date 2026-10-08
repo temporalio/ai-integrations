@@ -47,8 +47,8 @@ def test_report_matches_ci_workflow_job_names() -> None:
 
 def test_java_failures_are_aggregated_by_plugin() -> None:
     failing, passing = nightly_report.classify([
-        _job("Java (temporal-spring-ai) / temporal-spring-ai (windows-latest, java21)", "failure"),
-        _job("Java (temporal-spring-ai) / matrix", "success"),
+        _job("Java (spring-ai) / spring-ai (windows-latest, java25)", "failure"),
+        _job("Java (spring-ai) / matrix", "success"),
     ])
-    assert failing == {"temporal-spring-ai"}
+    assert failing == {"spring-ai"}
     assert not passing

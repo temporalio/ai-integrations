@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>io.temporal</groupId>
+  <artifactId>temporal-spring-ai</artifactId>
+  <version>1.41.0</version>
+  <packaging>pom</packaging>
+  <name>Temporal Spring AI relocation</name>
+  <description>Relocates the SDK's Spring AI integration to its independently versioned package.</description>
+  <url>https://github.com/temporalio/ai-integrations/tree/main/java/spring-ai</url>
+  <licenses>
+    <license>
+      <name>MIT</name>
+      <url>https://opensource.org/license/mit/</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+  <developers>
+    <developer>
+      <id>temporal</id>
+      <name>Temporal Technologies Inc.</name>
+      <url>https://temporal.io</url>
+    </developer>
+  </developers>
+  <scm>
+    <url>https://github.com/temporalio/ai-integrations</url>
+    <connection>scm:git:https://github.com/temporalio/ai-integrations.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/temporalio/ai-integrations.git</developerConnection>
+  </scm>
+  <distributionManagement>
+    <relocation>
+      <groupId>io.temporal</groupId>
+      <artifactId>spring-ai</artifactId>
+      <version>0.1.0</version>
+      <message>Use io.temporal:spring-ai. Version 0.1.0 targets Spring AI 2 and Spring Boot 4; Spring AI 1 users should keep temporal-spring-ai 1.40.x.</message>
+    </relocation>
+  </distributionManagement>
+</project>

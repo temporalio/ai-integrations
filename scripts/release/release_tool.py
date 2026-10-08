@@ -107,7 +107,7 @@ def parse_tag(tag: str) -> dict[str, str]:
         raise PolicyError(f"tag version {raw!r} must not have a local segment")
     if m.group("language") == "java":
         if not JAVA_VERSION_RE.fullmatch(raw):
-            raise PolicyError(f"Java version {raw!r} must be X.Y.Z or X.Y.Z-RCN (for example 1.41.0-RC1)")
+            raise PolicyError(f"Java version {raw!r} must be X.Y.Z or X.Y.Z-RCN (for example 0.1.0-RC1)")
     elif str(version) != raw:
         raise PolicyError(f"tag version {raw!r} is not canonical PEP 440 (expected {version})")
     return {

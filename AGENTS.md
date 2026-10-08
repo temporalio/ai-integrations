@@ -41,7 +41,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `typescript/langsmith` | `@temporalio/langsmith` | continues (1.24.0 next) | Public Preview | `@temporalio/langsmith` |
 | `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
 | `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
-| `java/temporal-spring-ai` | `io.temporal:temporal-spring-ai` | continues (1.41.0-RC1 planned) | Public Preview | `io.temporal.springai` |
+| `java/spring-ai` | `io.temporal:spring-ai` | 0.1.0 (0.1.0-RC1 planned) | Public Preview | `io.temporal.springai` |
 | `go/googleadk` | `go.temporal.io/sdk/contrib/googleadk` | continues (v0.3.0 next) | Public Preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
@@ -110,7 +110,7 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 The Spring AI history import is followed by an explicit ownership handoff: remove
 active upstream metadata before implementing Spring AI 2 here. Spring AI 1-to-2
 workflow-history replay compatibility is outside the upgrade's scope. The candidate
-version is `1.41.0-RC1`; workflow streams and OpenTelemetry never migrate here.
+version is `0.1.0-RC1`; workflow streams and OpenTelemetry never migrate here.
 
 ## CI
 
@@ -140,8 +140,9 @@ Runbook for `python/<name>`:
 
 Runbook for `java/<name>`:
 1. Merge the import (with a merge commit), the Spring AI 2 upgrade, and the release
-   pipeline, in that order. Keep the existing Maven coordinate and the committed
-   `0.0.0` development version. Workflow streams and OpenTelemetry stay in sdk-java.
+   pipeline, in that order. Publish `io.temporal:spring-ai` starting at Public
+   Preview version `0.1.0` (candidate `0.1.0-RC1`); keep the committed `0.0.0`
+   development version. Workflow streams and OpenTelemetry stay in sdk-java.
 2. Configure shared environments `maven-central-staging` and `maven-central`, both
    accepting tags `java/*/v*` only. Production requires an `@temporalio/ai-sdk`
    reviewer and prevents self-review. Extend the immutable release-tag ruleset to
@@ -161,20 +162,25 @@ Runbook for `java/<name>`:
    the public key to a supported keyserver before Central validation; see
    [Sonatype's GPG requirements](https://central.sonatype.org/publish/requirements/gpg/).
 4. Dry-run the candidate on main:
-   `gh workflow run release-java.yml --ref main -f tag=java/temporal-spring-ai/v1.41.0-RC1`.
+   `gh workflow run release-java.yml --ref main -f tag=java/spring-ai/v0.1.0-RC1`.
    The full compatibility matrix tests the injected version; its primary
    Ubuntu/max cell builds and verifies the five Maven artifacts and installs a
    clean consumer. A branch dispatch never signs, uploads, or creates a release.
 5. Tag the tested main commit with an annotated, immutable tag
-   `java/temporal-spring-ai/v1.41.0-RC1` and push it. The shared workflow signs the
+   `java/spring-ai/v0.1.0-RC1` and push it. The shared workflow signs the
    tested bytes, adds checksums, uploads a `USER_MANAGED` bundle to Central Portal,
    waits for `VALIDATED`, compares all staged files byte for byte, and installs
    a clean consumer from the authenticated staging endpoint. Candidates remain
    privately staged; they are not public Maven Central releases. A draft GitHub
    release contains generated notes, the tested files, signed bundle, and deployment
    metadata. Review and publish the GitHub draft separately.
-6. Final publication additionally requires stopping sdk-java publication of this
-   artifact, removing all plugin cutover markers, and setting `allow-final = true`.
+6. Final publication additionally requires an agreed SDK cutover plan, removing
+   all plugin cutover markers, and setting `allow-final = true`. Publish
+   `io.temporal:spring-ai:0.1.0` before sdk-java publishes the one-time relocation
+   POM at `io.temporal:temporal-spring-ai:1.41.0`; the template is
+   `java/spring-ai/relocation.pom`. Recheck Maven Central for the next available
+   old-coordinate version at cutover if sdk-java has released again. Old releases
+   remain unchanged. The new pipeline publishes only the new coordinate.
    The production environment approval publishes the already verified deployment;
    the workflow waits for `PUBLISHED`, proves Maven Central serves the same files,
    and installs a clean consumer before drafting a final GitHub release. Do not
@@ -196,8 +202,8 @@ Runbook for `java/<name>`:
 
 The Java pipeline uses the
 [Central Portal Publisher API](https://central.sonatype.org/publish/publish-portal-api/)
-directly. Maven Central remains the public host, preserving existing consumer
-coordinates. The retired OSSRH service and its compatibility API are unnecessary
+directly. Maven Central remains the public host. sdk-java publishes the old
+coordinate's relocation POM separately after the new package is public. The retired OSSRH service and its compatibility API are unnecessary
 for this new pipeline. Snapshot publishing is not configured.
 
 ## Migration and re-sync

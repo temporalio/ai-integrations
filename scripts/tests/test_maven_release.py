@@ -18,8 +18,8 @@ import yaml
 import maven_release as maven
 from release_tool import PolicyError
 
-COORDINATE = "io.temporal:temporal-spring-ai"
-VERSION = "1.41.0-RC1"
+COORDINATE = "io.temporal:spring-ai"
+VERSION = "0.1.0-RC1"
 DEPLOYMENT = "12345678-1234-1234-1234-123456789abc"
 
 
@@ -27,7 +27,7 @@ def raw_files(tmp_path: Path, version: str = VERSION) -> dict[str, bytes]:
     dist = tmp_path / "dist"
     dist.mkdir()
     for suffix in maven.SUFFIXES:
-        (dist / f"temporal-spring-ai-{version}{suffix}").write_bytes(f"tested artifact {suffix}".encode())
+        (dist / f"spring-ai-{version}{suffix}").write_bytes(f"tested artifact {suffix}".encode())
     return maven.artifacts(dist, COORDINATE, version)
 
 
@@ -58,7 +58,7 @@ def test_bundle_and_state_preserve_tested_bytes_and_detect_tampering(tmp_path: P
     state = maven.save_state(state_dir, DEPLOYMENT, COORDINATE, VERSION, raw)
     assert maven.load_state(state_dir, COORDINATE, VERSION, raw) == state
     with pytest.raises(PolicyError, match="tested artifacts"):
-        maven.load_state(state_dir, COORDINATE, "1.41.0-RC2", raw)
+        maven.load_state(state_dir, COORDINATE, "0.1.0-RC2", raw)
     changed = dict(raw)
     changed[next(iter(raw))] = b"rebuilt different bytes"
     with pytest.raises(PolicyError, match="tested artifacts"):
@@ -118,7 +118,7 @@ class FakePortal:
 
     def status(self, deployment):
         return {"deploymentId": deployment, "deploymentState": self.state,
-                "purls": [f"pkg:maven/io.temporal/temporal-spring-ai@{self.version}"]}
+                "purls": [f"pkg:maven/io.temporal/spring-ai@{self.version}"]}
 
     def wait(self, deployment, **kwargs):
         assert deployment == DEPLOYMENT
@@ -194,7 +194,7 @@ def test_ambiguous_upload_failure_cannot_trigger_a_second_post(tmp_path: Path, m
 
 def test_deployment_recovery_rejects_additional_coordinates() -> None:
     portal = FakePortal()
-    portal.status = lambda _: {"purls": [f"pkg:maven/io.temporal/temporal-spring-ai@{VERSION}", "pkg:maven/io.temporal/other@1.0.0"]}
+    portal.status = lambda _: {"purls": [f"pkg:maven/io.temporal/spring-ai@{VERSION}", "pkg:maven/io.temporal/other@1.0.0"]}
     with pytest.raises(PolicyError, match="unrelated artifacts"):
         maven.verify_deployment(portal, DEPLOYMENT, COORDINATE, VERSION)
 
@@ -231,7 +231,7 @@ def test_release_dispatch_recovery_gate(ref_type: str, skip_publish: str, deploy
     workflow = yaml.safe_load(workflow_path.read_text())
     gate = next(step for step in workflow["jobs"]["prepare"]["steps"]
                 if step.get("name") == "Dispatch inputs are consistent with the ref")
-    tag = "java/temporal-spring-ai/v1.41.0-RC1"
+    tag = "java/spring-ai/v0.1.0-RC1"
     result = subprocess.run(["bash", "-c", gate["run"]], capture_output=True, text=True,
                             env={**os.environ, "REF_TYPE": ref_type, "REF_NAME": tag,
                                  "INPUT_TAG": tag, "DEPLOYMENT_ID": deployment, "SKIP_PUBLISH": skip_publish})
@@ -263,7 +263,7 @@ def test_candidates_never_publish_and_recovery_rejects_a_public_candidate(tmp_pa
 
 
 def test_final_publishes_only_verified_deployment_and_rechecks_policy(tmp_path: Path, monkeypatch) -> None:
-    version = "1.41.0"
+    version = "0.1.0"
     raw = raw_files(tmp_path, version)
     invocation = args(tmp_path, version, smoke=True)
     contents = fake_bundle(invocation.state_dir / "bundle.zip", raw)

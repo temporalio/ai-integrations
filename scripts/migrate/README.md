@@ -159,6 +159,9 @@ packages after cutover and is not an import input. The newer SDK main commit
 
 Run `scripts/migrate/extract-sdk-java.sh` with a default-branch-reachable `SRC_REF`.
 The frozen mapping covers `temporal-spring-ai/` and `contrib/temporal-spring-ai/`.
+It retains the historical destination `java/temporal-spring-ai/`; a separate
+adaptation commit renames that directory to `java/spring-ai/` and the published
+coordinate to `io.temporal:spring-ai`. Do not change the frozen extractor.
 The frozen `replace-message-java.txt` rule qualifies issue and PR references as
 `temporalio/sdk-java#NNN` so imported messages retain their upstream links.
 At be01e60acc1e2ccfb20e783a9770bad745ed85c1 there are 12 rewritten commits

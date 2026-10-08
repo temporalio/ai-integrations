@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Intended tag for a branch dry run, e.g. java/temporal-spring-ai/v1.41.0-RC1. Leave empty when dispatching on that tag.
+        description: Intended tag for a branch dry run, e.g. java/spring-ai/v0.1.0-RC1. Leave empty when dispatching on that tag.
         type: string
         default: ""
       skip-publish:
