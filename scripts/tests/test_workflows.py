@@ -1,4 +1,4 @@
-"""Static checks on the workflow files: SHA-pinned actions, no secrets, least-privilege permissions."""
+"""Static workflow checks: pinned actions, isolated publishing secrets, least privilege."""
 
 from __future__ import annotations
 
@@ -41,7 +41,17 @@ def test_workflows_parse_and_have_no_secrets(path: Path) -> None:
     doc = yaml.safe_load(path.read_text())
     assert isinstance(doc, dict) and "jobs" in doc
     text = path.read_text()
-    assert "secrets." not in text.replace("secrets: inherit", "secrets.INHERIT"), f"{path.name} must not use repository secrets"
+    if path.name == "release-java.yml":
+        allowed = {"stage": {"CENTRAL_USERNAME", "CENTRAL_PASSWORD", "GPG_PRIVATE_KEY", "GPG_PASSPHRASE"},
+                   "publish": {"CENTRAL_USERNAME", "CENTRAL_PASSWORD"}}
+        for name, job in doc["jobs"].items():
+            found = set(re.findall(r"secrets\.([A-Z_]+)", yaml.dump(job)))
+            assert found == allowed.get(name, set()), f"{name}: unexpected Maven credentials"
+            if found:
+                assert job["environment"] == {"stage": "maven-central-staging", "publish": "maven-central"}[name]
+                assert "needs.prepare.outputs.publish == 'true'" in job["if"]
+    else:
+        assert "secrets." not in text, f"{path.name} must not use stored publishing credentials"
     assert "secrets: inherit" not in text, f"{path.name} must not inherit secrets"
     assert "cancel-in-progress: true" not in text, f"{path.name} must not cancel in-progress runs (required checks)"
 
@@ -213,8 +223,9 @@ def test_release_recovery_rejects_dispatch_outside_main(ref_type: str, ref_name:
     assert result.returncode == 1 and "recovery must be dispatched on main" in result.stdout
 
 
-def test_release_checkouts_do_not_persist_credentials() -> None:
-    doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
+@pytest.mark.parametrize("language", ["python", "java"])
+def test_release_checkouts_do_not_persist_credentials(language: str) -> None:
+    doc = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())
     for name, job in doc["jobs"].items():
         for step in job.get("steps", []):
             if "actions/checkout@" in step.get("uses", ""):
@@ -263,3 +274,32 @@ def test_java_latest_dependencies_are_selected_and_locked_before_testing() -> No
         assert '-PspringBootVersion=$SPRING_BOOT_VERSION' in step['run']
     assert '--write-locks' not in test['run'] + build['run']
     assert steps.index(resolve) < steps.index(test) < steps.index(build)
+
+
+def test_java_release_reuses_tested_bytes_and_recovers_deployments() -> None:
+    doc = yaml.safe_load((REPO / ".github/workflows/release-java.yml").read_text())
+    jobs = doc["jobs"]
+    assert doc[True]["push"]["tags"] == ["java/*/v*"]
+    # Tag pushes and dispatches with a matching tag input must use the same full ref.
+    assert doc["concurrency"]["group"] == "release-${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}"
+    assert jobs["test"]["uses"] == "./.github/workflows/_java-plugin.yml"
+    assert jobs["test"]["with"]["version"] == "${{ needs.prepare.outputs.version }}"
+    assert set(jobs["stage"]["needs"]) == {"prepare", "test"}
+    assert jobs["stage"]["if"] == "needs.prepare.outputs.publish == 'true'"
+    assert jobs["publish"]["if"] == "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.prerelease == 'false'"
+    assert "needs.stage.result == 'success'" in jobs["github-release"]["if"]
+    assert "needs.prepare.outputs.prerelease == 'true' || needs.publish.result == 'success'" in jobs["github-release"]["if"]
+    for name in ("stage", "publish", "github-release"):
+        steps = jobs[name]["steps"]
+        downloads = [s["with"]["name"] for s in steps if "download-artifact@" in s.get("uses", "")]
+        assert downloads == ["dist-java-${{ needs.prepare.outputs.plugin }}", "central-deployment-${{ needs.prepare.outputs.plugin }}"]
+        assert not any("gradlew" in s.get("run", "") for s in steps), "publish jobs must not rebuild"
+    recover = next(s for s in jobs["stage"]["steps"] if s.get("name") == "Recover saved deployment on a failed-job rerun")
+    assert recover["continue-on-error"] is True
+    preserve = next(s for s in jobs["stage"]["steps"] if s.get("name") == "Preserve signed bundle and deployment ID for recovery")
+    assert preserve["if"] == "always()" and preserve["with"]["overwrite"] is True
+    for name in ("stage", "publish"):
+        command = next(s for s in jobs[name]["steps"] if "maven_release.py" in s.get("run", ""))
+        assert f"maven_release.py {name}" in command["run"] and "--smoke" in command["run"]
+    gate = next(s for s in jobs["prepare"]["steps"] if s.get("id") == "gate")
+    assert '[ "$REF_TYPE" = "tag" ] && [ "$SKIP_PUBLISH" = "false" ]' in gate["run"]

@@ -105,6 +105,26 @@ Committed development builds use `0.0.0`. CI supplies `-PreleaseVersion=<version
 from an immutable release tag before testing and building. No placeholder versions
 or snapshots are published.
 
+The shared [Java release runbook](../../AGENTS.md#releases) describes dry runs,
+protected tags, Central Portal staging, final publication gates, and recovery.
+The release workflow signs and publishes the distributions built by the test matrix.
+
+The one-time [relocation POM](relocation.pom) is for sdk-java to publish as
+`io.temporal:temporal-spring-ai:1.41.0` after `io.temporal:spring-ai:0.1.0` is public.
+Its old-coordinate version continues the SDK lineage; its target version starts
+the new Public Preview lineage. The new package's release workflow publishes only
+`io.temporal:spring-ai`. Existing published versions are unchanged. Recheck the
+next available old-coordinate version at cutover if sdk-java has released again.
+
+To verify the relocation locally without publishing:
+
+```bash
+./gradlew -PreleaseVersion=0.1.0 stageDist
+cd ../..
+uv run --project scripts --locked python scripts/ci/check_java_dist.py --plugin-dir java/spring-ai --version 0.1.0
+uv run --project scripts --locked python scripts/ci/smoke_java.py --plugin-dir java/spring-ai --version 0.1.0 --relocation-pom java/spring-ai/relocation.pom
+```
+
 TRANSITION(sdk-cutover): final standalone publication awaits the agreed SDK
 cutover plan. Publish the new package before sdk-java publishes the old
 coordinate's relocation POM. The imported implementation and tests,

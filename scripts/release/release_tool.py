@@ -19,7 +19,7 @@ Policy (AGENTS.md, "Release runbook"):
   * TestPyPI versions move forward too, except that its newest version may be re-run
   * final (non pre-release) versions additionally require plugin.toml
     [release] allow-final = true and no TRANSITION(sdk-cutover) markers in the plugin
-  * versions are canonical PEP 440 and never local (+...)
+  * Python versions are canonical PEP 440, Java versions are X.Y.Z[-RCN]; neither is local (+...)
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ import time
 import tomllib
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote
 
@@ -42,6 +43,8 @@ from packaging.version import InvalidVersion, Version
 
 # \Z (not $) so a trailing newline cannot ride along into GITHUB_OUTPUT.
 TAG_RE = re.compile(r"^(?P<language>python|typescript|java|go)/(?P<plugin>[a-z0-9][a-z0-9_.-]*)/v(?P<version>.+)\Z")
+JAVA_VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-RC[1-9][0-9]*)?\Z")
+MAVEN_CENTRAL = "https://repo.maven.apache.org/maven2"
 REGISTRY_JSON = {
     "pypi": "https://pypi.org/pypi/{coordinate}/json",
     "testpypi": "https://test.pypi.org/pypi/{coordinate}/json",
@@ -102,7 +105,10 @@ def parse_tag(tag: str) -> dict[str, str]:
         raise PolicyError(f"tag version {raw!r} is not PEP 440: {exc}") from exc
     if version.local is not None:
         raise PolicyError(f"tag version {raw!r} must not have a local segment")
-    if str(version) != raw:
+    if m.group("language") == "java":
+        if not JAVA_VERSION_RE.fullmatch(raw):
+            raise PolicyError(f"Java version {raw!r} must be X.Y.Z or X.Y.Z-RCN (for example 0.1.0-RC1)")
+    elif str(version) != raw:
         raise PolicyError(f"tag version {raw!r} is not canonical PEP 440 (expected {version})")
     return {
         "tag": tag,
@@ -124,7 +130,8 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
         out["smoke_imports"] = ",".join(meta.get("smoke", {}).get("imports", []))
         out["allow_final"] = "true" if meta.get("release", {}).get("allow-final") else "false"
         out["github_prerelease"] = "true" if github_prerelease(Version(out["version"]), meta["plugin"]["maturity"]) else "false"
-        out["requires_python"] = _load(plugin_toml.parent / "pyproject.toml")["project"]["requires-python"]
+        if out["language"] == "python":
+            out["requires_python"] = _load(plugin_toml.parent / "pyproject.toml")["project"]["requires-python"]
     _write_outputs(args.github_output, out)
     return 0
 
@@ -156,6 +163,10 @@ def _fetch_json(url: str, local: Path | None = None) -> dict | None:
 
 def fetch_published_versions(coordinate: str, registry: str, registry_json: Path | None = None) -> list[Version]:
     """Return every published version (yanked included). 404 -> []. Anything else fails closed."""
+    if registry == "maven":
+        return fetch_maven_versions(coordinate, registry_json)
+    if registry not in REGISTRY_JSON:
+        raise PolicyError(f"unsupported release registry {registry!r}")
     data = _fetch_json(REGISTRY_JSON[registry].format(coordinate=coordinate), registry_json)
     if not data:
         return []
@@ -166,6 +177,33 @@ def fetch_published_versions(coordinate: str, registry: str, registry_json: Path
         except InvalidVersion:
             continue
     return versions
+
+
+def fetch_maven_versions(coordinate: str, local: Path | None = None) -> list[Version]:
+    """Read the public Maven Central version list, including published candidates."""
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]+:[a-zA-Z0-9_.-]+", coordinate):
+        raise PolicyError(f"invalid Maven coordinate {coordinate!r}")
+    group, artifact = coordinate.split(":")
+    url = f"{MAVEN_CENTRAL}/{group.replace('.', '/')}/{artifact}/maven-metadata.xml"
+    try:
+        if local is not None:
+            if not local.is_file():
+                return []
+            payload = local.read_bytes()
+        else:
+            with urllib.request.urlopen(url, timeout=30) as response:  # noqa: S310
+                payload = response.read()
+        root = ET.fromstring(payload)
+        raw_versions = root.findall("./versioning/versions/version")
+        if not raw_versions:
+            raise PolicyError("Maven metadata has no version list; refusing to guess")
+        return [Version(entry.text or "") for entry in raw_versions]
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return []
+        raise PolicyError(f"Maven Central returned HTTP {exc.code}; refusing to guess") from exc
+    except (urllib.error.URLError, TimeoutError, ET.ParseError, InvalidVersion) as exc:
+        raise PolicyError(f"cannot read Maven Central versions ({exc}); refusing to guess") from exc
 
 
 def check_policy(version: Version, maturity: str, published: list[Version]) -> str | None:
@@ -227,12 +265,14 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     coordinate = meta["plugin"]["coordinate"]
     maturity = meta["plugin"]["maturity"]
     registry = meta["plugin"].get("registry", "pypi")
+    if registry == "maven" and not JAVA_VERSION_RE.fullmatch(args.version):
+        raise PolicyError("Maven release versions must be X.Y.Z or X.Y.Z-RCN")
     version = Version(args.version)
     published = fetch_published_versions(coordinate, registry, Path(args.registry_json) if args.registry_json else None)
     rerun = check_policy(version, maturity, published)
     if rerun:
         print(f"::warning::{rerun}")
-    print(f"OK: {coordinate} {version} satisfies the version policy (published: {[str(v) for v in sorted(published)] or 'none'})")
+    print(f"OK: {coordinate} {args.version} satisfies the version policy (published: {[str(v) for v in sorted(published)] or 'none'})")
     if registry == "pypi" and (args.check_testpypi or args.testpypi_json):
         # Every release is staged on TestPyPI first and uploads are immutable, so a re-run finds the
         # version already there and skip-existing keeps the upload from failing. That is the normal
@@ -417,9 +457,13 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
         lines += [
             "## Pre-release notes",
             "",
-            "- This pre-release is published to **TestPyPI only** to validate the release pipeline.",
+            ("- This candidate is privately staged and validated in **Maven Central Portal**; it is not published to Maven Central."
+             if parts["language"] == "java" else
+             "- This pre-release is published to **TestPyPI only** to validate the release pipeline."),
         ]
-        if not meta.get("release", {}).get("allow-final", False):
+        if parts["language"] == "java" and not meta.get("release", {}).get("allow-final", False):
+            lines += ["- Final publication remains blocked until the SDK publishing cutover is complete."]
+        elif not meta.get("release", {}).get("allow-final", False):
             # Only a plugin the SDK still bundles shares files with it.
             lines += [
                 f"- Do **not** install it alongside a `temporalio` release that still embeds `{root_api or coordinate}`; both distributions "
@@ -631,7 +675,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("check-version-policy", help="enforce the version policy")
     p.add_argument("--plugin-dir", required=True)
     p.add_argument("--version", required=True)
-    p.add_argument("--registry-json", default=None, help="read published versions from this file instead of the registry (tests)")
+    p.add_argument("--registry-json", default=None, help="read registry JSON (or Maven metadata XML) from this file instead of the network (tests)")
     p.add_argument(
         "--check-testpypi",
         action="store_true",

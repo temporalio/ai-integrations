@@ -129,7 +129,7 @@ Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-act
 
 Every Python plugin uses the `testpypi` and `pypi` GitHub environments without required reviewers, regardless of maturity. Both environments allow the `python/*/v*` tag pattern and `main` for validated publication recovery. Publishing the GitHub Release starts the release pipeline; eligible versions upload to PyPI automatically after the full test matrix and TestPyPI verification succeed. Trusted publishers remain bound to their existing environment names.
 
-Version policy (`release_tool.py check-version-policy`; version ordering is evaluated against pypi.org and test.pypi.org): a coordinate with no published release must start at exactly `1.0.0` (`generally-available`), `0.1.0` (`public-preview`), or `0.0.1` (`pre-release`), pre-releases of that version allowed; an existing coordinate must be strictly greater than its highest published version, yanked releases included. Maturity is independent of PEP 440 version status: a Pre-release plugin can publish a final version such as `0.0.1` to PyPI. TestPyPI versions also move forward. A version already staged on TestPyPI, or already the newest release on pypi.org, only produces a warning (a re-run after an upload is the normal recovery path); an older staged version is rejected. Each smoke job proves the index serves exactly the artifacts this run built, none yanked (`verify-index-files`). Final versions additionally require `plugin.toml` `[release] allow-final = true` and no `TRANSITION(sdk-cutover)` marker in the plugin.
+Version policy (`release_tool.py check-version-policy`; version ordering is evaluated against pypi.org, test.pypi.org, or Maven Central's metadata): a coordinate with no published release must start at exactly `1.0.0` (`generally-available`), `0.1.0` (`public-preview`), or `0.0.1` (`pre-release`), pre-releases of that version allowed; an existing coordinate must be strictly greater than its highest published version, yanked releases included. Maturity is independent of PEP 440 version status: a Pre-release plugin can publish a final version such as `0.0.1` to PyPI. TestPyPI versions also move forward. A version already staged on TestPyPI, or already the newest release on pypi.org, only produces a warning (a re-run after an upload is the normal recovery path); an older staged version is rejected. Each Python smoke job proves the index serves exactly the artifacts this run built, none yanked (`verify-index-files`). Java smoke jobs compare staged and public Maven artifacts byte for byte with the tested files. Final versions additionally require `plugin.toml` `[release] allow-final = true` and no `TRANSITION(sdk-cutover)` marker in the plugin.
 
 Runbook for `python/<name>`:
 1. Merge every code, dependency and migration change intended for the release. Re-sync from upstream first while the transition rules apply. Do not change the committed `0.0.0` development version.
@@ -138,6 +138,74 @@ Runbook for `python/<name>`:
 4. Publish the reviewed GitHub Release using the GitHub UI or `gh release edit python/<name>/v<version> --draft=false`. Mark it as a GitHub pre-release when the plugin's maturity is `pre-release` or the version is a PEP 440 pre-release. Its `release: published` event starts `release-python.yml` for Python tags; pushing a tag alone does not start publication. Publication with a workflow's `GITHUB_TOKEN` does not trigger this event workflow; use a human's session or the manual dispatch fallback on the tag. The GitHub Release is now visible even if package publication later fails.
 5. `release-python.yml` validates the main-reachable tag, version policy, published release and GitHub pre-release classification, injects the tag's version, and runs the full test matrix (its ubuntu dist cell builds, checks and smoke-tests the wheel and sdist). It publishes those tested artifacts to TestPyPI (environment `testpypi`), proves TestPyPI serves exactly those files, and smoke-installs from TestPyPI in a clean project. Eligible versions then publish automatically to PyPI (environment `pypi`), with the published release linked from the deployment; the workflow repeats the artifact proof and smoke there. PEP 440 pre-releases go to TestPyPI only unless a tag dispatch uses `publish-prerelease-to-pypi` with `allow-final = true`; GitHub's pre-release flag does not control index routing. The clean-project smoke tolerates overlap during migrations only while `allow-final = false`. The workflow reads the GitHub Release without changing its notes or assets.
 6. If a job fails after an upload, use "Re-run failed jobs" on that run: `prepare`'s outputs and the tested artifact survive, the upload is skipped, and the smoke jobs verify the served files. If the tagged workflow or tooling itself needs a repair, merge the repair first, then dispatch on `main` with `-f tag=python/<name>/v<version> -f recover-run=<original-release-run-id>`. Recovery validates that the completed source run is a release-event run (or a legacy tag-push run) for the exact main-reachable tag, passed version validation and every test-matrix job, and retains an unexpired distribution artifact. A published GitHub Release for the tag must exist, and package manifests must still match the tag. It downloads those tested bytes without rebuilding; the normal ref restrictions, registry ordering and file-hash checks still apply. Recovery requires a `main` branch deployment policy in the `testpypi` and `pypi` environments. A fresh dispatch on the tag also passes the version policy (the newest published version is treated as a re-run, with a warning) but rebuilds the artifacts, and `verify-index-files` fails if the rebuild is not byte-identical (a different uv version stamps its `Generator` into the wheel). If the artifacts themselves must change, fix forward with the next `rcN`; uploaded files are immutable and tags are never moved.
+
+Runbook for `java/<name>`:
+1. Merge the import (with a merge commit), the Spring AI 2 upgrade, and the release
+   pipeline, in that order. Publish `io.temporal:spring-ai` starting at Public
+   Preview version `0.1.0` (candidate `0.1.0-RC1`); keep the committed `0.0.0`
+   development version. Workflow streams and OpenTelemetry stay in sdk-java.
+2. Configure shared environments `maven-central-staging` and `maven-central`, both
+   accepting tags `java/*/v*` only. Production requires an `@temporalio/ai-sdk`
+   reviewer and prevents self-review. Extend the immutable release-tag ruleset to
+   Java without relaxing its Python rules.
+   These environments and tag policies were configured on 2026-10-02; credential
+   installation remains a maintainer setup step.
+3. In staging, install environment secrets `CENTRAL_USERNAME`, `CENTRAL_PASSWORD`
+   (a Central Portal user-token pair), `GPG_PRIVATE_KEY` (armored private key or
+   sdk-java's base64-encoded secret keyring), and
+   `GPG_PASSPHRASE`; set environment variable `GPG_FINGERPRINT` to the full public
+   fingerprint. Production needs only the Central token pair, with access to the
+   staging deployment. Use credentials from the same publishing account in both.
+   The sdk-java equivalents are `RH_USER`, `RH_PASSWORD`, `JAR_SIGNING_KEY`,
+   `JAR_SIGNING_KEY_PASSWORD`, and `JAR_SIGNING_KEY_ID` (derive the full fingerprint
+   if it contains only a short ID). GitHub cannot export existing secret values;
+   an authorized maintainer must install them from the credential source. Publish
+   the public key to a supported keyserver before Central validation; see
+   [Sonatype's GPG requirements](https://central.sonatype.org/publish/requirements/gpg/).
+4. Dry-run the candidate on main:
+   `gh workflow run release-java.yml --ref main -f tag=java/spring-ai/v0.1.0-RC1`.
+   The full compatibility matrix tests the injected version; its primary
+   Ubuntu/max cell builds and verifies the five Maven artifacts and installs a
+   clean consumer. A branch dispatch never signs, uploads, or creates a release.
+5. Tag the tested main commit with an annotated, immutable tag
+   `java/spring-ai/v0.1.0-RC1` and push it. The shared workflow signs the
+   tested bytes, adds checksums, uploads a `USER_MANAGED` bundle to Central Portal,
+   waits for `VALIDATED`, compares all staged files byte for byte, and installs
+   a clean consumer from the authenticated staging endpoint. Candidates remain
+   privately staged; they are not public Maven Central releases. A draft GitHub
+   release contains generated notes, the tested files, signed bundle, and deployment
+   metadata. Review and publish the GitHub draft separately.
+6. Final publication additionally requires an agreed SDK cutover plan, removing
+   all plugin cutover markers, and setting `allow-final = true`. Publish
+   `io.temporal:spring-ai:0.1.0` before sdk-java publishes the one-time relocation
+   POM at `io.temporal:temporal-spring-ai:1.41.0`; the template is
+   `java/spring-ai/relocation.pom`. Recheck Maven Central for the next available
+   old-coordinate version at cutover if sdk-java has released again. Old releases
+   remain unchanged. The new pipeline publishes only the new coordinate.
+   The production environment approval publishes the already verified deployment;
+   the workflow waits for `PUBLISHED`, proves Maven Central serves the same files,
+   and installs a clean consumer before drafting a final GitHub release. Do not
+   remove these gates merely to run the candidate.
+7. After an upload failure, use **Re-run failed jobs**. The workflow preserves the
+   signed bundle, upload intent, and deployment ID even if validation or the consumer
+   fails. It reuses those signatures and never retries an ambiguous upload POST.
+   A fresh publishing dispatch on the same tag requires `-f deployment-id=<Portal UUID>`;
+   recovery downloads the existing signed files and rejects any rebuilt-byte
+   mismatch or deployment containing additional coordinates. If an upload response
+   was lost, inspect Portal for its ID before retrying. Publishing dispatches cannot
+   start a new upload, even when Portal is still validating the original upload;
+   the initial upload runs on the tag push. A dispatch with `skip-publish=true`
+   remains a credential-free dry run and does not require a deployment ID.
+   Never move a tag or replace uploaded files: a changed candidate gets the next `RCN`.
+   Portal does not expose
+   TestPyPI-style staging version enumeration; public ordering is checked against
+   Maven Central and an existing validated staged version requires explicit recovery.
+
+The Java pipeline uses the
+[Central Portal Publisher API](https://central.sonatype.org/publish/publish-portal-api/)
+directly. Maven Central remains the public host. sdk-java publishes the old
+coordinate's relocation POM separately after the new package is public. The retired OSSRH service and its compatibility API are unnecessary
+for this new pipeline. Snapshot publishing is not configured.
 
 ## Migration and re-sync
 
