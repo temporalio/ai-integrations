@@ -8,6 +8,7 @@ from datetime import timedelta
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.converter import DataConverter
 from temporalio.harbor._activity import HarborActivities
+from temporalio.harbor._hooks import TrialHooks
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
@@ -29,7 +30,10 @@ class HarborPlugin(SimplePlugin):
     """
 
     def __init__(
-        self, *, heartbeat_interval: timedelta = timedelta(seconds=30)
+        self,
+        *,
+        heartbeat_interval: timedelta = timedelta(seconds=30),
+        trial_hooks: TrialHooks | None = None,
     ) -> None:
         """Create the plugin.
 
@@ -37,8 +41,14 @@ class HarborPlugin(SimplePlugin):
             heartbeat_interval: How often a running trial heartbeats. Must be
                 well under the ``heartbeat_timeout`` given to
                 :func:`temporalio.harbor.execute_trial`.
+            trial_hooks: How this worker takes part in running each trial.
+                Defaults to :class:`temporalio.harbor.TrialHooks`, which runs
+                trials as ``harbor run`` does, retries included.
         """
-        activities = HarborActivities(heartbeat_interval=heartbeat_interval)
+        activities = HarborActivities(
+            heartbeat_interval=heartbeat_interval,
+            hooks=trial_hooks if trial_hooks is not None else TrialHooks(),
+        )
 
         def data_converter(converter: DataConverter | None) -> DataConverter:
             if converter is None or converter == DataConverter.default:

@@ -16,15 +16,20 @@ from harbor.models.trial.config import (
     TaskConfig,
     TrialConfig,
 )
-from harbor.models.trial.result import TrialResult
+from harbor.models.trial.result import ExceptionInfo, TrialResult
 from harbor.trial.queue import TrialQueue
 
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import ActivityError, ApplicationError
-from temporalio.harbor import retry_policy_from_harbor
-from temporalio.harbor._activity import should_retry
+from temporalio.harbor import (
+    TrialContext,
+    TrialHooks,
+    TrialRetry,
+    _compat,
+    retry_policy_from_harbor,
+)
 from tests.harbor_fixtures import history, tasks
-from tests.harbor_fixtures.workflows import RunOneTrial, TrialArgs, new_worker
+from tests.harbor_fixtures.workflows import RunOneTrial, TrialArgs, new_worker, run_one
 
 on_posix = pytest.mark.skipif(
     sys.platform == "win32",
@@ -55,15 +60,8 @@ def _trial(task: Path, trials_dir: Path, name: str) -> TrialConfig:
 
 
 async def _run(client: Client, args: TrialArgs) -> tuple[TrialResult, list[int]]:
-    async with new_worker(client, RunOneTrial) as worker:
-        handle = await client.start_workflow(
-            RunOneTrial.run,
-            args,
-            id=f"trial-{uuid.uuid4()}",
-            task_queue=worker.task_queue,
-        )
-        result = await handle.result()
-    return result, await history.final_attempts(handle)
+    outcome, attempts = await run_one(client, args)
+    return outcome.result, attempts
 
 
 @on_posix
@@ -161,17 +159,102 @@ def test_retry_policy_mapping() -> None:
         retry_policy_from_harbor(RetryConfig(), infrastructure_retries=-1)
 
 
+def _errored(exception_type: str) -> TrialResult:
+    # Only the recorded exception matters to the retry decision.
+    return TrialResult.model_construct(
+        exception_info=ExceptionInfo.model_construct(exception_type=exception_type)
+    )
+
+
+def _context(config: RetryConfig, attempt: int) -> TrialContext:
+    trial = TrialConfig(task=TaskConfig(path=Path("task")), trial_name="t")
+    return TrialContext(config=trial, retry=config, attempt=attempt, data=None)
+
+
 @pytest.mark.parametrize(
     ("include", "exclude"),
     list(itertools.product([None, set(), {"A"}, {"A", "B"}], [None, set(), {"B"}])),
 )
-def test_retry_decision_matches_harbor(
+def test_default_retry_decision_is_harbors(
     include: set[str] | None, exclude: set[str] | None
 ) -> None:
     config = RetryConfig(
-        max_retries=1, include_exceptions=include, exclude_exceptions=exclude
+        max_retries=2,
+        include_exceptions=include,
+        exclude_exceptions=exclude,
+        min_wait_sec=1,
+        wait_multiplier=3,
+        max_wait_sec=5,
     )
     queue = TrialQueue(n_concurrent=1, retry_config=config)
     for exception_type in ("A", "B", "C"):
-        expected = queue._should_retry_exception(exception_type)
-        assert should_retry(config, exception_type) == expected, exception_type
+        for attempt in (1, 2, 3):
+            decision = TrialHooks().retry(
+                _errored(exception_type), _context(config, attempt)
+            )
+            # Harbor's loop runs attempt 0 through max_retries; ours counts from 1.
+            if attempt > config.max_retries or not queue._should_retry_exception(
+                exception_type
+            ):
+                assert decision is None, (exception_type, attempt)
+            else:
+                delay = queue._calculate_backoff_delay_sec(attempt - 1)
+                assert decision == TrialRetry(timedelta(seconds=delay))
+
+
+def test_default_retry_delays_follow_harbor_backoff() -> None:
+    config = RetryConfig(
+        max_retries=3, min_wait_sec=1, wait_multiplier=3, max_wait_sec=5
+    )
+    delays = [
+        TrialHooks().retry(_errored("A"), _context(config, attempt))
+        for attempt in (1, 2, 3)
+    ]
+    assert delays == [TrialRetry(timedelta(seconds=s)) for s in (1, 3, 5)]
+
+
+def test_default_retry_keeps_harbors_exclusions() -> None:
+    config = RetryConfig(max_retries=3)
+    assert (
+        TrialHooks().retry(_errored("RewardFileNotFoundError"), _context(config, 1))
+        is None
+    )
+    assert TrialHooks().retry(
+        _errored("NonZeroAgentExitCodeError"), _context(config, 1)
+    )
+
+
+def test_trial_retry_rejects_negative_delay() -> None:
+    with pytest.raises(ValueError):
+        TrialRetry(timedelta(seconds=-1))
+
+
+class _Moved:
+    def instance(self, config: object) -> None: ...  # type: ignore[reportUnusedParameter]
+
+    @staticmethod
+    def static(config: object) -> None: ...  # type: ignore[reportUnusedParameter]
+
+    @staticmethod
+    def renamed(cfg: object) -> None: ...  # type: ignore[reportUnusedParameter]
+
+
+@pytest.mark.parametrize(
+    ("name", "params", "ok"),
+    [
+        ("static", ("config",), True),
+        ("instance", ("self", "config"), True),
+        # A static method became an instance method, or changed its parameters.
+        ("instance", ("config",), False),
+        ("renamed", ("config",), False),
+        ("gone", ("config",), False),
+    ],
+)
+def test_compat_rejects_harbor_internals_that_moved(
+    name: str, params: tuple[str, ...], ok: bool
+) -> None:
+    if ok:
+        _compat._require(_Moved, name, params)
+    else:
+        with pytest.raises(ImportError, match=f"_Moved.{name}"):
+            _compat._require(_Moved, name, params)

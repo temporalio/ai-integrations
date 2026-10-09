@@ -11,7 +11,7 @@ from typing import Any
 
 from harbor.environments.factory import EnvironmentFactory
 from harbor.models.agent.context import AgentContext
-from harbor.models.job.config import JobConfig, RetryConfig
+from harbor.models.job.config import JobConfig
 from harbor.models.trial.config import TaskConfig
 from harbor.models.trial.result import TrialResult
 from harbor.trial.hooks import TrialEvent, TrialHookEvent
@@ -20,6 +20,7 @@ from harbor.trial.trial import Trial
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 from temporalio.harbor import _compat
+from temporalio.harbor._hooks import TrialContext, TrialHooks
 from temporalio.harbor._types import (
     COMPUTE_METRICS,
     RESOLVE_JOB,
@@ -27,25 +28,13 @@ from temporalio.harbor._types import (
     ComputeMetricsInput,
     Rewards,
     RunTrialInput,
+    TrialOutcome,
 )
 
 # A recorded traceback is kept for debugging but never read by harbor's
 # aggregation. The tail holds the frames that matter; the head of a deep
 # harbor traceback is the same event-loop plumbing every time.
 _TRACEBACK_MAX = 8_000
-
-
-def should_retry(config: RetryConfig, exception_type: str) -> bool:
-    """Whether harbor would retry a trial that recorded ``exception_type``.
-
-    ``exclude_exceptions`` takes precedence over ``include_exceptions``, and an
-    unset ``include_exceptions`` admits everything, as in harbor's own queue.
-    """
-    if config.exclude_exceptions and exception_type in config.exclude_exceptions:
-        return False
-    if config.include_exceptions and exception_type not in config.include_exceptions:
-        return False
-    return True
 
 
 def slim(result: TrialResult) -> TrialResult:
@@ -91,14 +80,24 @@ def _set_aside(trial_dir: Path, attempt: int) -> None:
     trial_dir.rename(aside)
 
 
+def _last_attempt(info: activity.Info) -> bool:
+    policy = info.retry_policy
+    return (
+        policy is not None
+        and policy.maximum_attempts > 0
+        and info.attempt >= policy.maximum_attempts
+    )
+
+
 class HarborActivities:
     """The Activities registered by :class:`temporalio.harbor.HarborPlugin`."""
 
-    def __init__(self, *, heartbeat_interval: timedelta) -> None:
-        """Configure how often a running trial heartbeats."""
+    def __init__(self, *, heartbeat_interval: timedelta, hooks: TrialHooks) -> None:
+        """Configure how often a running trial heartbeats, and how it runs."""
         if heartbeat_interval <= timedelta(0):
             raise ValueError("heartbeat_interval must be positive")
         self._heartbeat_interval = heartbeat_interval.total_seconds()
+        self._hooks = hooks
 
     @activity.defn(name=RESOLVE_JOB)
     async def resolve_job(self, config: JobConfig) -> list[TaskConfig]:
@@ -107,19 +106,24 @@ class HarborActivities:
         return await _compat.resolve_task_configs(config)
 
     @activity.defn(name=RUN_TRIAL)
-    async def run_trial(self, input: RunTrialInput) -> TrialResult:
+    async def run_trial(self, input: RunTrialInput) -> TrialOutcome:
         """Run one harbor trial.
 
         A trial that runs and fails is a result, as it is in ``harbor run``:
-        it is returned, unless harbor's retry configuration says to try it
-        again, in which case it raises so that Temporal re-runs the slot.
+        it is returned, unless the hooks' retry decision says to try it again,
+        in which case it raises so that Temporal re-runs the slot.
         """
         info = activity.info()
-        config = input.config
-        _set_aside(Path(config.trials_dir) / config.trial_name, info.attempt)
+        context = TrialContext(
+            config=input.config,
+            retry=input.retry,
+            attempt=info.attempt,
+            data=input.data,
+        )
+        _set_aside(context.trial_dir, info.attempt)
 
-        # Harbor's lifecycle events name the phase; "load" covers fetching the
-        # task, which happens before the trial exists to emit anything.
+        # Harbor's lifecycle events name the phase; "load" covers the hooks'
+        # setup and fetching the task, before the trial can emit anything.
         phase = "load"
         started = time.monotonic()
 
@@ -141,30 +145,41 @@ class HarborActivities:
 
             return hook
 
+        outcome: TrialOutcome | None = None
         beat = asyncio.create_task(heartbeat())
         try:
-            trial = await Trial.create(config)
-            for event in TrialEvent:
-                trial.add_hook(event, track(event))
-            result = await trial.run()
+            async with self._hooks.scope(context):
+                trial = await Trial.create(context.config)
+                for event in TrialEvent:
+                    trial.add_hook(event, track(event))
+                await self._hooks.trial_created(trial, context)
+                result = await trial.run()
+                exc = result.exception_info
+                if exc is not None and not _last_attempt(info):
+                    retry = self._hooks.retry(result, context)
+                    if retry is not None:
+                        activity.logger.warning(
+                            f"trial {context.config.trial_name} attempt "
+                            f"{info.attempt} raised {exc.exception_type}; "
+                            f"retrying in {retry.delay}"
+                        )
+                        raise ApplicationError(
+                            f"{exc.exception_type}: {exc.exception_message}",
+                            type=exc.exception_type,
+                            next_retry_delay=retry.delay,
+                        )
+                output = await self._hooks.output(result, context)
+                outcome = TrialOutcome(result=slim(result), output=output)
         finally:
             beat.cancel()
-
-        exc = result.exception_info
-        if (
-            exc is not None
-            and should_retry(input.retry, exc.exception_type)
-            and info.attempt <= input.retry.max_retries
-        ):
-            activity.logger.warning(
-                f"trial {config.trial_name} attempt {info.attempt} raised "
-                f"{exc.exception_type}; retrying"
+        # Type checkers take the scope at its word that it never suppresses
+        # an exception; one that does leaves no result to return.
+        if outcome is None:  # type: ignore[reportUnnecessaryComparison]
+            raise RuntimeError(  # type: ignore[reportUnreachable]
+                f"{type(self._hooks).__name__}.scope suppressed an exception, "
+                f"so trial {context.config.trial_name} produced no result"
             )
-            raise ApplicationError(
-                f"{exc.exception_type}: {exc.exception_message}",
-                type=exc.exception_type,
-            )
-        return slim(result)
+        return outcome
 
     @activity.defn(name=COMPUTE_METRICS)
     async def compute_metrics(

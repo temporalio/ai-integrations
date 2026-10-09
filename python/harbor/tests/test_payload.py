@@ -149,6 +149,8 @@ async def test_trial_activity_returns_slim_result(
             task_queue=worker.task_queue,
         )
 
+    assert returned.output is None
+    returned = returned.result
     assert returned.verifier_result is not None
     assert returned.verifier_result.rewards == {"reward": 1.0}
     assert returned.agent_result is not None

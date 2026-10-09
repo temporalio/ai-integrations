@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import timedelta
 
 from temporalio import workflow
@@ -13,9 +13,9 @@ from temporalio.exceptions import ApplicationError
 with workflow.unsafe.imports_passed_through():
     from harbor.models.job.config import JobConfig, RetryConfig
     from harbor.models.job.result import JobStats
-    from harbor.models.trial.config import TaskConfig, TrialConfig
-    from harbor.models.trial.result import TrialResult
+    from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig
     from harbor.utils.pass_at_k import compute_pass_at_k_by_evals
+    from pydantic import JsonValue
 
     from temporalio.harbor._retry import retry_policy_from_harbor
     from temporalio.harbor._types import (
@@ -26,6 +26,7 @@ with workflow.unsafe.imports_passed_through():
         JobPlan,
         Rewards,
         RunTrialInput,
+        TrialOutcome,
     )
 
 # Resolving a job and scoring it reach dataset registries and may run a
@@ -43,14 +44,17 @@ def _task_name(task: TaskConfig) -> str:
     return task.get_task_id().get_name().split("/")[-1]
 
 
-def _trial_name(task: TaskConfig) -> str:
+def _trial_name(task: TaskConfig, agent: AgentConfig, attempt: int) -> str:  # type: ignore[reportUnusedParameter]
     # Harbor's own format, with the random suffix drawn from the workflow so
     # that replay produces the same name and a retry re-runs the same slot.
     return f"{_task_name(task)[:32].rstrip('_-')}__{workflow.uuid4().hex[:7]}"
 
 
 async def plan_job(
-    config: JobConfig, *, start_to_close_timeout: timedelta = timedelta(minutes=10)
+    config: JobConfig,
+    *,
+    start_to_close_timeout: timedelta = timedelta(minutes=10),
+    trial_name: Callable[[TaskConfig, AgentConfig, int], str] | None = None,
 ) -> JobPlan:
     """Resolve a harbor job into the trials ``harbor run`` would run.
 
@@ -65,9 +69,16 @@ async def plan_job(
     Args:
         config: The job, as it would be given to ``harbor run``.
         start_to_close_timeout: Bound on resolving the job's datasets.
+        trial_name: Names each trial from its task, its agent and which of the
+            job's ``n_attempts`` it is, counting from 0. A trial's name is its
+            directory, so a name derived from what the trial is lets a later
+            run find it. Must be deterministic and unique within the job.
+            Defaults to harbor's format with a suffix drawn from
+            ``workflow.uuid4()``.
 
     Raises:
-        ApplicationError: If ``config`` is a regrade job, which is not supported.
+        ApplicationError: If ``config`` is a regrade job, which is not
+            supported, or if two trials are given the same name.
     """
     if config.is_regrade:
         raise ApplicationError(
@@ -83,12 +94,13 @@ async def plan_job(
         start_to_close_timeout=start_to_close_timeout,
         retry_policy=_LIFECYCLE_RETRY,
     )
+    name = trial_name if trial_name is not None else _trial_name
     job_id = workflow.uuid4()
     job_dir = config.jobs_dir / config.job_name
     trials = [
         TrialConfig(
             task=task_config,
-            trial_name=_trial_name(task_config),
+            trial_name=name(task_config, agent_config, attempt),
             trials_dir=job_dir,
             install_only=config.install_only,
             agent=agent_config,
@@ -105,12 +117,22 @@ async def plan_job(
             extra_instructions=config.extra_instructions,
             job_id=job_id,
         )
-        for _ in range(config.n_attempts)
+        for attempt in range(config.n_attempts)
         for task_config in task_configs
         # Agents innermost, as harbor orders them, so consecutive trials spread
         # across model providers.
         for agent_config in config.agents
     ]
+    seen: set[str] = set()
+    for trial in trials:
+        if trial.trial_name in seen:
+            raise ApplicationError(
+                f"two trials are named {trial.trial_name!r}; each trial needs "
+                "its own directory",
+                type="HarborDuplicateTrialName",
+                non_retryable=True,
+            )
+        seen.add(trial.trial_name)
     return JobPlan(config=config, task_configs=task_configs, trials=trials)
 
 
@@ -128,14 +150,18 @@ async def execute_trial(
     retry: RetryConfig | None = None,
     heartbeat_timeout: timedelta = timedelta(minutes=2),
     infrastructure_retries: int = 3,
+    retry_policy: RetryPolicy | None = None,
+    schedule_to_close_timeout: timedelta | None = None,
+    data: JsonValue = None,
     summary: str | None = None,
-) -> TrialResult:
+) -> TrialOutcome:
     """Run one harbor trial as one Activity.
 
     A trial that runs and fails comes back as a result with ``exception_info``
-    set, exactly as ``harbor run`` records it, after any retries ``retry``
-    allows. Only a trial that could not run at all, after its infrastructure
-    retries, raises.
+    set, exactly as ``harbor run`` records it, after any retries the worker's
+    :meth:`TrialHooks.retry` asks for; by default those are the retries
+    ``retry`` allows. Only a trial that could not run at all, after its
+    infrastructure retries, raises.
 
     The result omits rollout details and agent metadata, which harbor's
     aggregation does not read; the full result stays in the trial directory.
@@ -150,26 +176,38 @@ async def execute_trial(
             its worker is presumed lost.
         infrastructure_retries: Extra attempts for failures harbor never
             records, such as a lost worker.
+        retry_policy: Replaces the policy built from ``retry`` and
+            ``infrastructure_retries``. Its ``maximum_attempts`` bounds every
+            retry, including those :meth:`TrialHooks.retry` asks for; the
+            last attempt returns its result rather than retrying.
+        schedule_to_close_timeout: Bound on the trial across all its attempts.
+        data: Handed to the worker's :class:`TrialHooks` as
+            :attr:`TrialContext.data`.
         summary: Shown for the Activity in the Temporal UI. Defaults to the
             task and agent.
     """
     retry = retry if retry is not None else RetryConfig()
     return await workflow.execute_activity(
         RUN_TRIAL,
-        RunTrialInput(config=config, retry=retry),
-        result_type=TrialResult,
+        RunTrialInput(config=config, retry=retry, data=data),
+        result_type=TrialOutcome,
         summary=summary if summary is not None else _summary(config),
         start_to_close_timeout=start_to_close_timeout,
+        schedule_to_close_timeout=schedule_to_close_timeout,
         heartbeat_timeout=heartbeat_timeout,
-        retry_policy=retry_policy_from_harbor(
-            retry, infrastructure_retries=infrastructure_retries
+        retry_policy=(
+            retry_policy
+            if retry_policy is not None
+            else retry_policy_from_harbor(
+                retry, infrastructure_retries=infrastructure_retries
+            )
         ),
     )
 
 
 async def aggregate_job(
     plan: JobPlan,
-    results: Sequence[TrialResult],
+    outcomes: Sequence[TrialOutcome],
     *,
     start_to_close_timeout: timedelta = timedelta(minutes=10),
 ) -> JobStats:
@@ -185,10 +223,10 @@ async def aggregate_job(
 
     Args:
         plan: The job's plan, from :func:`plan_job`.
-        results: The job's trial results, from :func:`execute_trial`.
+        outcomes: The job's trial outcomes, from :func:`execute_trial`.
         start_to_close_timeout: Bound on computing the metrics.
     """
-    results = list(results)
+    results = [outcome.result for outcome in outcomes]
     stats = JobStats.from_trial_results(results, n_total_trials=len(plan.trials))
 
     rewards: defaultdict[str, list[Rewards | None]] = defaultdict(list)

@@ -18,11 +18,13 @@ def retry_policy_from_harbor(
     failed attempt (counting from zero), capped at ``max_wait_sec``. Temporal's
     schedule has the same shape, so the backoff carries over exactly.
 
-    Which failures are retried is decided inside the trial Activity against the
-    same ``config``, because a Temporal RetryPolicy cannot see the exception a
-    trial recorded. Temporal also spends an attempt when a worker is lost or a
-    trial fails before harbor can record anything, which harbor never sees;
-    ``infrastructure_retries`` is the extra budget for those.
+    Which recorded failures are retried is decided inside the trial Activity,
+    by :meth:`temporalio.harbor.TrialHooks.retry`, because a Temporal
+    RetryPolicy cannot see the exception a trial recorded; that decision also
+    sets its own delay. Temporal also spends an attempt when a worker is lost
+    or a trial fails before harbor can record anything, which harbor never
+    sees. Those attempts follow this policy's backoff, and
+    ``infrastructure_retries`` is the extra budget for them.
 
     Args:
         config: Harbor's retry configuration, usually ``JobConfig.retry``.

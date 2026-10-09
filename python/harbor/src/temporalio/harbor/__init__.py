@@ -3,7 +3,8 @@
 Register :class:`HarborPlugin` on the Client. In a workflow, resolve a harbor
 ``JobConfig`` with :func:`plan_job`, run each trial with :func:`execute_trial`,
 and compute the job's statistics with :func:`aggregate_job`; the numbers match
-what ``harbor run`` reports for the same job.
+what ``harbor run`` reports for the same job. Subclass :class:`TrialHooks` to
+take part in how the worker runs each trial.
 
 This package is experimental and may change in future versions.
 """
@@ -11,14 +12,19 @@ This package is experimental and may change in future versions.
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from temporalio.harbor._hooks import TrialContext, TrialHooks, TrialRetry
     from temporalio.harbor._plugin import HarborPlugin
     from temporalio.harbor._retry import retry_policy_from_harbor
-    from temporalio.harbor._types import JobPlan
+    from temporalio.harbor._types import JobPlan, TrialOutcome
     from temporalio.harbor._workflow import aggregate_job, execute_trial, plan_job
 
 __all__ = [
     "HarborPlugin",
     "JobPlan",
+    "TrialContext",
+    "TrialHooks",
+    "TrialOutcome",
+    "TrialRetry",
     "aggregate_job",
     "execute_trial",
     "plan_job",
@@ -28,6 +34,10 @@ __all__ = [
 _MODULES = {
     "HarborPlugin": "_plugin",
     "JobPlan": "_types",
+    "TrialContext": "_hooks",
+    "TrialHooks": "_hooks",
+    "TrialOutcome": "_types",
+    "TrialRetry": "_hooks",
     "aggregate_job": "_workflow",
     "execute_trial": "_workflow",
     "plan_job": "_workflow",

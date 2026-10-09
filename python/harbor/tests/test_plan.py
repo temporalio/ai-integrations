@@ -15,7 +15,12 @@ from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfi
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from tests.harbor_fixtures import tasks
-from tests.harbor_fixtures.workflows import PlanJob, new_worker
+from tests.harbor_fixtures.workflows import (
+    PlanCollidingJob,
+    PlanJob,
+    PlanNamedJob,
+    new_worker,
+)
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
@@ -86,3 +91,37 @@ async def test_regrade_rejected(harbor_client: Client, tmp_path: Path) -> None:
     cause = failure.value.cause
     assert isinstance(cause, ApplicationError)
     assert cause.type == "HarborRegradeUnsupported"
+
+
+async def test_trial_names_can_be_derived(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    async with new_worker(harbor_client, PlanNamedJob) as worker:
+        plan = await harbor_client.execute_workflow(
+            PlanNamedJob.run,
+            _config(tmp_path),
+            id=f"plan-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+    assert [t.trial_name for t in plan.trials] == [
+        f"{task}__{agent}__{attempt}"
+        for attempt in (0, 1)
+        for task in ("answers", "stays-silent")
+        for agent in ("oracle", "nop")
+    ]
+
+
+async def test_colliding_trial_names_rejected(
+    harbor_client: Client, tmp_path: Path
+) -> None:
+    async with new_worker(harbor_client, PlanCollidingJob) as worker:
+        with pytest.raises(WorkflowFailureError) as failure:
+            await harbor_client.execute_workflow(
+                PlanCollidingJob.run,
+                _config(tmp_path),
+                id=f"plan-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+    cause = failure.value.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "HarborDuplicateTrialName"

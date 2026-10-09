@@ -68,7 +68,7 @@ class EvalJob:
     @workflow.run
     async def run(self, config: JobConfig) -> JobStats:
         plan = await plan_job(config)
-        results = await asyncio.gather(
+        outcomes = await asyncio.gather(
             *(
                 execute_trial(
                     trial,
@@ -78,7 +78,7 @@ class EvalJob:
                 for trial in plan.trials
             )
         )
-        return await aggregate_job(plan, results)
+        return await aggregate_job(plan, outcomes)
 ```
 
 Start it with the same `JobConfig` you would give `harbor run`:
@@ -108,19 +108,22 @@ Build the `JobConfig` outside the workflow, as above, and pass it in. `JobConfig
 `plan_job(config)` resolves the job's datasets in an Activity, since that can reach a dataset
 registry. It then expands every attempt of every task for every agent into a `TrialConfig`, exactly
 as harbor's `Job` does. Each trial gets a name that is stable across replay, so a retried trial
-re-runs in the same slot.
+re-runs in the same slot. Pass `trial_name=` to derive names from each trial's task, agent and
+attempt instead; they must be deterministic and unique within the job.
 
 `execute_trial(trial, ...)` runs one trial as one Activity.
 
 - It heartbeats every `heartbeat_interval` (30 seconds by default, set on `HarborPlugin`) for the
   whole trial, even while an agent runs silently for hours. Each heartbeat carries the trial's
   current harbor phase and elapsed time.
-- It returns harbor's `TrialResult`. Rollout details (token IDs and log-probabilities) and agent
-  metadata are omitted, because harbor's aggregation never reads them and they are most of a
-  result's size. The complete result stays in the trial directory, where harbor writes it.
+- It returns a `TrialOutcome`. `outcome.result` is harbor's `TrialResult`, with rollout details
+  (token IDs and log-probabilities) and agent metadata omitted, because harbor's aggregation never
+  reads them and they are most of a result's size. The complete result stays in the trial
+  directory, where harbor writes it. `outcome.output` is whatever the worker's `TrialHooks.output`
+  returned (see [Customizing trials](#customizing-trials)).
 - `start_to_close_timeout` is required: trials range from seconds to hours.
 
-`aggregate_job(plan, results)` computes harbor's `JobStats` from the results. Statistics and pass@k
+`aggregate_job(plan, outcomes)` computes harbor's `JobStats` from the outcomes. Statistics and pass@k
 are computed in the workflow. Each dataset's metrics are computed in an Activity, from rewards
 alone, because a dataset's metric can be a script that harbor runs with `uv`.
 
@@ -129,20 +132,82 @@ alone, because a dataset's metric can be a script that harbor runs with `uv`.
 A trial that runs and fails is a result, just as `harbor run` records it. It comes back with
 `exception_info` set and counts toward `JobStats.n_errored_trials`; it is not a failed workflow.
 
-Whether a failed trial is tried again follows harbor's `RetryConfig` (pass `JobConfig.retry`):
+By default, whether a failed trial is tried again follows harbor's `RetryConfig` (pass
+`JobConfig.retry`). The plugin asks harbor's own `TrialQueue` rather than restating its rules, so
+the decision matches the installed harbor release:
 
 - An exception in `exclude_exceptions`, or not in `include_exceptions`, is recorded immediately.
 - Otherwise the trial is re-run up to `max_retries` times, backing off `min_wait_sec * wait_multiplier ** n`
-  (capped at `max_wait_sec`), exactly as harbor does.
+  (capped at `max_wait_sec`).
 - Harbor's defaults allow no retries.
+
+Override `TrialHooks.retry` to decide differently for some failures (see
+[Customizing trials](#customizing-trials)). However the decision is made, the Activity's last
+attempt under its retry policy returns its result instead of retrying, so a recorded failure is
+never lost to an exhausted policy.
 
 Some failures happen outside anything harbor records: a worker lost mid-trial, a heartbeat timeout,
 or a task that cannot be loaded. Temporal retries those up to `infrastructure_retries` extra times
 (3 by default). If they are exhausted, `execute_trial` raises `ActivityError`, whose cause is an
 `ApplicationError` with `type` set to the exception's class name.
 
-`retry_policy_from_harbor(retry_config)` returns the `RetryPolicy` this uses, if you schedule the
-trial Activity yourself.
+`retry_policy_from_harbor(retry_config)` returns the `RetryPolicy` this uses. Pass
+`retry_policy=` to `execute_trial` to replace it; its `maximum_attempts` then bounds every retry.
+
+## Customizing trials
+
+A worker takes part in running each trial through `TrialHooks`. Subclass it, override what you
+need, and pass it to the plugin as `HarborPlugin(trial_hooks=...)`. Hooks run on the worker, so
+they can do I/O. For each attempt, the trial Activity:
+
+1. enters `scope(context)`, an async context manager around the whole attempt;
+2. creates harbor's `Trial` and passes it to `trial_created(trial, context)`, before it runs;
+3. runs the trial;
+4. if the trial recorded an exception, asks `retry(result, context)` whether to run it again;
+5. otherwise returns `output(result, context)` to the workflow as `outcome.output`.
+
+`context` is a `TrialContext`: the trial's config, its retry configuration, the attempt number,
+its directory, and the `data` the workflow passed to `execute_trial`.
+
+```python
+import contextlib
+from collections.abc import AsyncIterator
+from datetime import timedelta
+
+from harbor.models.trial.result import TrialResult
+from pydantic import JsonValue
+
+from temporalio.harbor import TrialContext, TrialHooks, TrialRetry
+
+
+class EvalHooks(TrialHooks):
+    @contextlib.asynccontextmanager
+    async def _scope(self, context: TrialContext) -> AsyncIterator[None]:
+        try:
+            yield
+        except BaseException:
+            # A retry, a cancellation, or a trial harbor could not run:
+            # keep the evidence before the next attempt reuses the slot.
+            upload(context.trial_dir)
+            raise
+
+    def scope(self, context: TrialContext) -> contextlib.AbstractAsyncContextManager[None]:
+        return self._scope(context)
+
+    def retry(self, result: TrialResult, context: TrialContext) -> TrialRetry | None:
+        exc = result.exception_info
+        if exc is not None and exc.exception_type == "ApiRateLimitError":
+            return TrialRetry(delay=timedelta(minutes=2)) if context.attempt < 3 else None
+        return super().retry(result, context)  # harbor's decision for everything else
+
+    async def output(self, result: TrialResult, context: TrialContext) -> JsonValue:
+        return {"run": context.data, "reward": reward_of(result)}
+```
+
+An exception leaves `scope` whenever an attempt ends early: the `ApplicationError` that asks for a
+retry, `asyncio.CancelledError` when the trial is cancelled, or whatever stopped harbor from
+recording a result. Re-raise it. `output` sees the complete result, before it is slimmed; what it
+returns is stored in workflow history, so keep it small.
 
 ## Scaling a job
 
@@ -151,10 +216,10 @@ survive a lost worker, and it also bounds how many trials one workflow should ru
 is typically a few kilobytes. For jobs of more than a few hundred trials, run slices of `plan.trials`
 in child workflows, and use continue-as-new as your workflow's history grows.
 
-Aggregate once, over all of the job's results. Pass@k averages over tasks, so it cannot be combined
-from shards aggregated separately. Have children return their results, and call `aggregate_job` in
+Aggregate once, over all of the job's outcomes. Pass@k averages over tasks, so it cannot be combined
+from shards aggregated separately. Have children return their outcomes, and call `aggregate_job` in
 the parent. A child's return value is a single payload, so keep slices small enough that their
-results fit within Temporal's payload size limit.
+outcomes fit within Temporal's payload size limit.
 
 `JobConfig.n_concurrent_trials` is not used. The worker's activity slots
 (`max_concurrent_activities`) bound how many trials run at once, across every job on the task queue.
@@ -163,7 +228,7 @@ results fit within Temporal's payload size limit.
 
 - Regrade jobs (`JobConfig.source_jobs`). `plan_job` rejects them.
 - Uploading trial directories off the worker. They stay on the disk of the worker that ran the
-  trial.
+  trial unless a `TrialHooks.scope` or `output` uploads them.
 
 ## Composing with other plugins
 

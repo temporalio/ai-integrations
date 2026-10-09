@@ -17,6 +17,7 @@ from harbor.models.trial.config import (
     TrialConfig,
 )
 
+from temporalio.harbor import TrialHooks
 from temporalio.harbor._activity import HarborActivities
 from temporalio.harbor._types import RunTrialInput
 from temporalio.testing import ActivityEnvironment
@@ -52,10 +53,11 @@ async def _beats(
         agent=AgentConfig(name="oracle"),
         environment=EnvironmentConfig(import_path=tasks.LOCAL_ENV),
     )
-    activities = HarborActivities(heartbeat_interval=_INTERVAL)
-    result = await env.run(
+    activities = HarborActivities(heartbeat_interval=_INTERVAL, hooks=TrialHooks())
+    outcome = await env.run(
         activities.run_trial, RunTrialInput(config=config, retry=RetryConfig())
     )
+    result = outcome.result
     assert result.verifier_result is not None
     assert result.verifier_result.rewards == {"reward": 1.0}
     return beats

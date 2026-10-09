@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from harbor.models.job.config import JobConfig, RetryConfig
 from harbor.models.trial.config import TaskConfig, TrialConfig
-from pydantic import BaseModel
+from harbor.models.trial.result import TrialResult
+from pydantic import BaseModel, JsonValue
 
 RESOLVE_JOB = "harbor.resolve_job"
 RUN_TRIAL = "harbor.run_trial"
@@ -35,6 +36,20 @@ class RunTrialInput(BaseModel):
 
     config: TrialConfig
     retry: RetryConfig
+    data: JsonValue = None
+
+
+class TrialOutcome(BaseModel):
+    """What one trial produced, as :func:`temporalio.harbor.execute_trial` returns it.
+
+    ``result`` is harbor's result for the trial, less rollout details and agent
+    metadata, which harbor's aggregation does not read; the complete result
+    stays in the trial directory. ``output`` is what the worker's
+    :meth:`temporalio.harbor.TrialHooks.output` returned, ``None`` by default.
+    """
+
+    result: TrialResult
+    output: JsonValue = None
 
 
 class ComputeMetricsInput(BaseModel):
