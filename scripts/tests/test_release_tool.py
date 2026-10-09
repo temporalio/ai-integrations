@@ -83,12 +83,29 @@ def recovery_source(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> tuple
 
 
 @pytest.mark.parametrize("event", ["release", "push"])
-def test_recovery_accepts_tested_tagged_artifacts(recovery_source: tuple, tmp_path: Path, event: str) -> None:
+@pytest.mark.parametrize("github_repo,cli_repo,run_repo", [
+    pytest.param(None, None, "temporalio/ai-integrations", id="default-repo"),
+    pytest.param("temporalio/ai-integrations", None, "temporalio/ai-integrations", id="upstream-repo"),
+    pytest.param("contributor/ai-integrations", None, "contributor/ai-integrations", id="fork-repo"),
+    pytest.param("contributor/ai-integrations", "temporalio/ai-integrations", "temporalio/ai-integrations", id="explicit-repo"),
+])
+def test_recovery_accepts_tested_tagged_artifacts(
+    recovery_source: tuple, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event: str,
+    github_repo: str | None, cli_repo: str | None, run_repo: str,
+) -> None:
+    if github_repo is None:
+        monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    else:
+        monkeypatch.setenv("GITHUB_REPOSITORY", github_repo)
     repo, run, *_ = recovery_source
     run["event"] = event
+    run["repository"]["full_name"] = run_repo
     output = tmp_path / "outputs"
-    assert release_tool.main(["--repo-root", str(repo), "check-recovery-run", "--tag", "python/fakeplug/v0.0.1rc1",
-                              "--run-id", "123", "--github-output", str(output)]) == 0
+    args = ["--repo-root", str(repo), "check-recovery-run", "--tag", "python/fakeplug/v0.0.1rc1",
+            "--run-id", "123", "--github-output", str(output)]
+    if cli_repo is not None:
+        args.extend(["--repo", cli_repo])
+    assert release_tool.main(args) == 0
     assert output.read_text() == "recovery=true\nartifact_run_id=123\n"
 
 
