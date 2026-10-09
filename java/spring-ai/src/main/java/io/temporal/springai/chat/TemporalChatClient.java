@@ -117,7 +117,7 @@ public class TemporalChatClient extends DefaultChatClient {
      * @param chatModel the chat model to use
      */
     public Builder(ChatModel chatModel) {
-      super(chatModel, ObservationRegistry.NOOP, null, null);
+      super(chatModel, ObservationRegistry.NOOP, null, null, null);
     }
 
     /**
@@ -131,7 +131,7 @@ public class TemporalChatClient extends DefaultChatClient {
         ChatModel chatModel,
         ObservationRegistry observationRegistry,
         @Nullable ChatClientObservationConvention customObservationConvention) {
-      super(chatModel, observationRegistry, customObservationConvention, null);
+      super(chatModel, observationRegistry, customObservationConvention, null, null);
     }
 
     /**

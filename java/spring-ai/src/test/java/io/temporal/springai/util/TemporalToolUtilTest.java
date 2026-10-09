@@ -80,9 +80,9 @@ class TemporalToolUtilTest {
   }
 
   @Test
-  void convertTools_plainString_throwsIllegalState() {
+  void convertTools_plainString_throwsIllegalArgument() {
     // String has no @Tool methods — Spring AI's ToolCallbacks.from() throws
-    assertThrows(IllegalStateException.class, () -> TemporalToolUtil.convertTools("not a tool"));
+    assertThrows(IllegalArgumentException.class, () -> TemporalToolUtil.convertTools("not a tool"));
   }
 
   // --- Tests for @SideEffectTool ---

@@ -4,10 +4,10 @@ import io.modelcontextprotocol.spec.McpSchema;
 import java.util.List;
 import java.util.Map;
 import org.springframework.ai.mcp.McpToolUtils;
-import org.springframework.ai.model.ModelOptionsUtils;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.DefaultToolDefinition;
 import org.springframework.ai.tool.definition.ToolDefinition;
+import org.springframework.ai.util.JsonHelper;
 
 /**
  * A {@link ToolCallback} implementation that executes MCP tools via Temporal activities.
@@ -37,6 +37,7 @@ import org.springframework.ai.tool.definition.ToolDefinition;
  * @see McpClientActivity
  */
 public class McpToolCallback implements ToolCallback {
+  private static final JsonHelper JSON = new JsonHelper();
 
   private final ActivityMcpClient client;
   private final String clientName;
@@ -63,7 +64,7 @@ public class McpToolCallback implements ToolCallback {
         DefaultToolDefinition.builder()
             .name(prefixedName)
             .description(tool.description())
-            .inputSchema(ModelOptionsUtils.toJsonString(tool.inputSchema()))
+            .inputSchema(JSON.toJson(tool.inputSchema()))
             .build();
   }
 
@@ -102,7 +103,7 @@ public class McpToolCallback implements ToolCallback {
 
   @Override
   public String call(String toolInput) {
-    Map<String, Object> arguments = ModelOptionsUtils.jsonToMap(toolInput);
+    Map<String, Object> arguments = JSON.fromJsonToMap(toolInput);
 
     // Use the original tool name (not prefixed) when calling the MCP server
     McpSchema.CallToolRequest request = new McpSchema.CallToolRequest(tool.name(), arguments);
@@ -111,7 +112,7 @@ public class McpToolCallback implements ToolCallback {
 
     // Return the result as-is (including errors) so the AI can handle them.
     // For example, an "access denied" error lets the AI suggest a valid path.
-    return ModelOptionsUtils.toJsonString(result.content());
+    return JSON.toJson(result.content());
   }
 
   /**

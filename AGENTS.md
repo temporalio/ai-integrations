@@ -108,6 +108,11 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   first; subsequent test and build commands reuse a separate ignored latest lock.
   Ordinary CI and releases default to `-PdependencyMode=locked` and committed locks.
 
+The Spring AI history import is followed by an explicit ownership handoff: remove
+active upstream metadata before implementing Spring AI 2 here. Spring AI 1-to-2
+workflow-history replay compatibility is outside the upgrade's scope. The candidate
+version is `0.1.0-RC1`; workflow streams and OpenTelemetry never migrate here.
+
 ## CI
 
 One entry workflow, one reusable workflow per language, plugin as a parameter, no secrets.

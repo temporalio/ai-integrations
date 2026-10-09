@@ -7,6 +7,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import io.temporal.failure.ApplicationFailure;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import javax.annotation.Nullable;
 
 /**
@@ -144,6 +145,7 @@ public final class ChatModelTypes {
    * @param toolCallId tool call ID this message responds to (for TOOL role)
    * @param toolCalls tool calls requested by the model (for ASSISTANT role)
    * @param mediaContents optional media attachments
+   * @param metadata optional assistant metadata, including provider continuation state
    */
   @JsonInclude(JsonInclude.Include.NON_NULL)
   @JsonIgnoreProperties(ignoreUnknown = true)
@@ -156,7 +158,18 @@ public final class ChatModelTypes {
           @JsonFormat(with = JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY)
           List<ToolCall> toolCalls,
       @JsonProperty("media") @JsonFormat(with = JsonFormat.Feature.ACCEPT_SINGLE_VALUE_AS_ARRAY)
-          List<MediaContent> mediaContents) {
+          List<MediaContent> mediaContents,
+      @JsonProperty("metadata") Map<String, Object> metadata) {
+    public Message(
+        String content,
+        Role role,
+        String name,
+        String toolCallId,
+        List<ToolCall> toolCalls,
+        List<MediaContent> mediaContents) {
+      this(content, role, name, toolCallId, toolCalls, mediaContents, null);
+    }
+
     public Message(String content, Role role) {
       this(content, role, null, null, null, null);
     }
