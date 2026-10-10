@@ -735,8 +735,10 @@ result = await Runner.run(
 
 The cloud backend requires an image and authenticates on the worker using
 `SMOL_CLOUD_TOKEN` or `smol auth login`; neither the token nor local VM access
-needs to enter workflow history. Guest networking is disabled by default. To
-permit it, configure the worker's `SmolSandboxClient(allow_network=True)` and
+needs to enter workflow history. Cloud VMs default to a one-hour TTL; set
+`ttl_seconds` in `SmolSandboxClientOptions` to cover the expected workflow
+lifetime. Guest networking is disabled by default. To permit it, configure the
+worker's `SmolSandboxClient(allow_network=True)` and
 set `network=True` or an `allow_hosts` list in the workflow's machine options.
 The one-attempt activity policy avoids duplicate VMs and repeated guest commands
 when a failed activity is retried; handle failures at the workflow level.
