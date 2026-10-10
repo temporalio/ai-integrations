@@ -11,8 +11,8 @@ already finished, and the Temporal UI shows one opaque Activity for hours. With 
 
 - A lost worker costs only the trials that were in flight. Every finished trial's result is
   already in workflow history.
-- Each trial is visible in the UI, with its task, agent, and the harbor phase it is in (`agent-start`,
-  `verification-start`, …) in its heartbeat.
+- Each trial is visible in the UI, labeled with its task and agent. Its heartbeat carries the
+  harbor phase it is in (`agent-start`, `verification-start`, …).
 - The job's statistics come from harbor's own code: reward and error statistics, token and cost
   totals, each dataset's metrics, and pass@k. They match what `harbor run` reports for the same job.
 
@@ -22,8 +22,9 @@ already finished, and the Temporal UI shows one opaque Activity for hours. With 
 uv add temporalio-harbor
 ```
 
-Requires Python 3.12 or later, like harbor itself. Harbor brings its own sandbox-provider
-dependencies with it.
+Requires Python 3.12 or later, like harbor itself. Docker and other local container runtimes need
+nothing more. Cloud sandbox providers such as Daytona, Modal and E2B are harbor extras; install the
+ones your jobs use on every Worker, for example `uv add 'harbor[daytona]'`.
 
 ## Usage
 
@@ -136,7 +137,8 @@ By default, whether a failed trial is tried again follows harbor's `RetryConfig`
 `JobConfig.retry`). The plugin asks harbor's own `TrialQueue` rather than restating its rules, so
 the decision matches the installed harbor release:
 
-- An exception in `exclude_exceptions`, or not in `include_exceptions`, is recorded immediately.
+- An exception in `exclude_exceptions`, or missing from a non-empty `include_exceptions`, is
+  recorded immediately.
 - Otherwise the trial is re-run up to `max_retries` times, backing off `min_wait_sec * wait_multiplier ** n`
   (capped at `max_wait_sec`).
 - Harbor's defaults allow no retries.
@@ -148,8 +150,8 @@ never lost to an exhausted policy.
 
 Some failures happen outside anything harbor records: a worker lost mid-trial, a heartbeat timeout,
 or a task that cannot be loaded. Temporal retries those up to `infrastructure_retries` extra times
-(3 by default). If they are exhausted, `execute_trial` raises `ActivityError`, whose cause is an
-`ApplicationError` with `type` set to the exception's class name.
+(3 by default). If they are exhausted, `execute_trial` raises `ActivityError`, whose cause is the
+last attempt's failure, such as a `temporalio.exceptions.TimeoutError` when heartbeats stop.
 
 `retry_policy_from_harbor(retry_config)` returns the `RetryPolicy` this uses. Pass
 `retry_policy=` to `execute_trial` to replace it; its `maximum_attempts` then bounds every retry.
