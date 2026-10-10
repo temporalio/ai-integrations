@@ -255,18 +255,22 @@ class SandboxClientProvider:
                 )
 
         @activity.defn(name=f"{prefix}-sandbox_session_start")
-        async def start(args: StartArgs) -> None:
+        async def start(args: StartArgs) -> SessionResult:
             with _sandbox_activity_scope(resolvable):
                 session = await self._session(args)
                 await session.start()
-                return None
+                return SessionResult(
+                    state=session.state, supports_pty=session.supports_pty()
+                )
 
         @activity.defn(name=f"{prefix}-sandbox_session_stop")
-        async def session_stop(args: StopArgs) -> None:
+        async def session_stop(args: StopArgs) -> SessionResult:
             with _sandbox_activity_scope(resolvable):
                 session = await self._session(args)
                 await session.stop()
-                return None
+                return SessionResult(
+                    state=session.state, supports_pty=session.supports_pty()
+                )
 
         @activity.defn(name=f"{prefix}-sandbox_session_shutdown")
         async def session_shutdown(args: StopArgs) -> None:
