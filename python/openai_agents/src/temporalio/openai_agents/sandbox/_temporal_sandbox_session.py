@@ -23,6 +23,7 @@ from temporalio.openai_agents.sandbox._temporal_activity_models import (
     ReadResult,
     RunningArgs,
     RunningResult,
+    SessionResult,
     StartArgs,
     StopArgs,
     WriteArgs,
@@ -224,16 +225,20 @@ class TemporalSandboxSession(BaseSandboxSession):
 
     async def start(self) -> None:
         """Start the sandbox session via activity."""
-        await workflow.execute_activity(
+        result: SessionResult = await workflow.execute_activity(
             f"{self._name}-sandbox_session_start",
             arg=StartArgs(state=self.state),
+            result_type=SessionResult,
             **self._config,
         )
+        self._state = result.state
 
     async def stop(self) -> None:
         """Stop the sandbox session via activity."""
-        await workflow.execute_activity(
+        result: SessionResult = await workflow.execute_activity(
             f"{self._name}-sandbox_session_stop",
             arg=StopArgs(state=self.state),
+            result_type=SessionResult,
             **self._config,
         )
+        self._state = result.state
