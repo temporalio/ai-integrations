@@ -680,6 +680,69 @@ class MyWorkflow:
 
 The name passed to `temporal_sandbox_client()` must exactly match the name used in `SandboxClientProvider` on the worker.
 
+### Smol Machines: local and cloud microVMs
+
+Install `smolmachines[openai-agents]` alongside this plugin. Smol runs the
+agent's commands and workspace inside a microVM; register the backend on the
+**worker**, where VM access and cloud credentials belong:
+
+```python
+from smol.openai_sandbox import SmolSandboxClient
+from temporalio.openai_agents import OpenAIAgentsPlugin, SandboxClientProvider
+
+plugin = OpenAIAgentsPlugin(
+    sandbox_clients=[
+        SandboxClientProvider("smol-local", SmolSandboxClient()),
+        SandboxClientProvider("smol-cloud", SmolSandboxClient(target="cloud")),
+    ],
+)
+# Pass plugin to Client.connect(..., plugins=[plugin]) on the worker.
+```
+
+In a workflow, choose the registered backend and provide machine options. The
+same `SandboxAgent` works with either target:
+
+```python
+from datetime import timedelta
+
+from agents import RunConfig, Runner
+from agents.sandbox import SandboxAgent, SandboxRunConfig
+from agents.sandbox.capabilities import Shell
+from smol.openai_sandbox import SmolSandboxClientOptions
+from temporalio.common import RetryPolicy
+from temporalio.openai_agents.workflow import temporal_sandbox_client
+from temporalio.workflow import ActivityConfig
+
+agent = SandboxAgent(name="Builder", capabilities=[Shell()])
+backend = "smol-local"  # Use "smol-cloud" to run in Smol Cloud.
+result = await Runner.run(
+    agent,
+    "Print 42 inside the VM",
+    run_config=RunConfig(
+        sandbox=SandboxRunConfig(
+            client=temporal_sandbox_client(
+                backend,
+                ActivityConfig(
+                    start_to_close_timeout=timedelta(minutes=5),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                ),
+            ),
+            options=SmolSandboxClientOptions(image="alpine:3.20", memory_mb=768),
+        ),
+    ),
+)
+```
+
+The cloud backend requires an image and authenticates on the worker using
+`SMOL_CLOUD_TOKEN` or `smol auth login`; neither the token nor local VM access
+needs to enter workflow history. Cloud VMs default to a one-hour TTL; set
+`ttl_seconds` in `SmolSandboxClientOptions` to cover the expected workflow
+lifetime. Guest networking is disabled by default. To permit it, configure the
+worker's `SmolSandboxClient(allow_network=True)` and
+set `network=True` or an `allow_hosts` list in the workflow's machine options.
+The one-attempt activity policy avoids duplicate VMs and repeated guest commands
+when a failed activity is retried; handle failures at the workflow level.
+
 ### Multiple Backends
 
 A single workflow can target different backends by name. Register all backends on the worker and reference each by name in the workflow:
