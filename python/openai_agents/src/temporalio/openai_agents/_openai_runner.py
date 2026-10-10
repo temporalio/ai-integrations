@@ -22,6 +22,7 @@ from typing_extensions import Unpack
 from temporalio import workflow
 from temporalio.openai_agents._errors import AgentsWorkflowError
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
+from temporalio.openai_agents._temporal_model_provider import install_model_provider
 from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
@@ -194,6 +195,8 @@ class TemporalOpenAIRunner(AgentRunner):
                     run_config.model, model_params=self.model_params, agent=None
                 ),
             )
+
+        run_config = install_model_provider(self.model_params, run_config)
 
         # run_config.sandbox is global for the entire run — configure it if any agent needs it.
         if _has_sandbox_agent(starting_agent) or run_config.sandbox:

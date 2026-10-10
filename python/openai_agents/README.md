@@ -385,6 +385,23 @@ Code running in the workflow can also invoke a Temporal activity directly when n
 
 Tools that run in the workflow can also update OpenAI Agents context, which is read-only for tools run as Temporal activities.
 
+### Resuming a `RunState` after tool approvals
+
+A workflow can pause a run for tool approval (`@function_tool(needs_approval=True)`) and resume it later,
+including across `continue_as_new`, by serializing the state with `RunState.to_string()` and restoring it
+with the regular Agents SDK API. Model calls from the resumed run still execute as Temporal activities.
+
+```python
+result = await Runner.run(agent, "Transfer $5")
+state_string = result.to_state().to_string()  # carry this over continue_as_new
+
+# later, possibly in a new run
+state = await RunState.from_string(agent, state_string)
+for interruption in state.get_interruptions():
+    state.approve(interruption)
+result = await Runner.run(agent, state)  # or Runner.run_streamed(agent, state)
+```
+
 ## MCP Support
 
 The durable MCP integration uses MCP Python SDK v2 and the optional `mcp`

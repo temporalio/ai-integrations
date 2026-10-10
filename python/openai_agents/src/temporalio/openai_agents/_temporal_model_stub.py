@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from agents import (
@@ -58,10 +58,12 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         *,
         model_params: ModelActivityParameters,
         agent: Agent[Any] | None,
+        current_agent: Callable[[], Agent[Any] | None] | None = None,
     ) -> None:
         self.model_name = model_name
         self.model_params = model_params
         self.agent = agent
+        self._current_agent = current_agent
 
     def _build_activity_input(
         self,
@@ -172,18 +174,22 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             prompt=prompt,
         )
 
+        agent = self.agent
+        if agent is None and self._current_agent is not None:
+            agent = self._current_agent()
+
         if self.model_params.summary_override:
             summary = (
                 self.model_params.summary_override
                 if isinstance(self.model_params.summary_override, str)
                 else (
                     self.model_params.summary_override.provide(
-                        self.agent, system_instructions, input
+                        agent, system_instructions, input
                     )
                 )
             )
-        elif self.agent:
-            summary = self.agent.name
+        elif agent:
+            summary = agent.name
         else:
             summary = None
 
