@@ -59,6 +59,15 @@ class PlanJob:
 
 
 @workflow.defn
+class PlanAndAggregate:
+    """Plan the job and aggregate it without running any trial."""
+
+    @workflow.run
+    async def run(self, config: JobConfig) -> JobStats:
+        return await aggregate_job(await plan_job(config), [])
+
+
+@workflow.defn
 class TrialNames:
     """Run a job's trials and report the names it planned them under."""
 

@@ -9,13 +9,17 @@ from pathlib import Path
 
 import pytest
 from harbor.job import Job
-from harbor.models.job.config import JobConfig, SourceJobConfig
+from harbor.models.job.config import DatasetConfig, JobConfig, SourceJobConfig
+from harbor.models.registry import DatasetMetadata
+from harbor.models.task.id import PackageTaskId
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig
+from harbor.registry.client import package
 
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from tests.harbor_fixtures import tasks
 from tests.harbor_fixtures.workflows import (
+    PlanAndAggregate,
     PlanCollidingJob,
     PlanJob,
     PlanNamedJob,
@@ -71,6 +75,79 @@ async def test_expansion_matches_harbor(harbor_client: Client, tmp_path: Path) -
     assert {t.job_id for t in plan.trials} != {None}
     assert len({t.job_id for t in plan.trials}) == 1
     assert {t.trials_dir for t in plan.trials} == {tmp_path / "jobs" / "expansion"}
+
+
+class _PackageRegistry:
+    def __init__(self) -> None:
+        self.lookups: list[str] = []
+
+    async def get_dataset_metadata(self, name: str) -> DatasetMetadata:
+        self.lookups.append(name)
+        return DatasetMetadata(
+            name="org/ds",
+            version="sha256:v1",
+            task_ids=[PackageTaskId(org="org", name="task", ref="sha256:t1")],
+        )
+
+    async def download_dataset_files(self, _: DatasetMetadata) -> dict[str, Path]:
+        return {}
+
+
+@pytest.mark.parametrize(
+    "dataset",
+    [DatasetConfig(name="org/ds"), DatasetConfig(name="org/ds", version="1.0")],
+    ids=["unversioned", "versioned"],
+)
+async def test_metrics_come_from_the_package_version_resolved(
+    harbor_client: Client,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dataset: DatasetConfig,
+) -> None:
+    registry = _PackageRegistry()
+    monkeypatch.setattr(package, "PackageDatasetClient", lambda: registry)
+    config = JobConfig(
+        job_name="pinned",
+        jobs_dir=tmp_path / "jobs",
+        datasets=[dataset],
+        environment=EnvironmentConfig(import_path=tasks.LOCAL_ENV),
+    )
+    async with new_worker(harbor_client, PlanAndAggregate) as worker:
+        await harbor_client.execute_workflow(
+            PlanAndAggregate.run,
+            config,
+            id=f"pinned-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+    assert registry.lookups == ["org/ds@latest", "org/ds@sha256:v1"]
+
+
+async def test_plan_pins_only_package_datasets(
+    harbor_client: Client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(package, "PackageDatasetClient", _PackageRegistry)
+    local = tmp_path / "local"
+    tasks.passing(local)
+    config = JobConfig(
+        job_name="mixed",
+        jobs_dir=tmp_path / "jobs",
+        datasets=[
+            DatasetConfig(path=local, version="1.0"),
+            DatasetConfig(name="org/ds", version="1.0"),
+        ],
+        environment=EnvironmentConfig(import_path=tasks.LOCAL_ENV),
+    )
+    async with new_worker(harbor_client, PlanJob) as worker:
+        plan = await harbor_client.execute_workflow(
+            PlanJob.run,
+            config,
+            id=f"mixed-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+    assert plan.config.datasets == [
+        DatasetConfig(path=local, version="1.0"),
+        DatasetConfig(name="org/ds", ref="sha256:v1"),
+    ]
 
 
 async def test_regrade_rejected(harbor_client: Client, tmp_path: Path) -> None:

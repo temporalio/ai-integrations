@@ -12,7 +12,6 @@ from typing import Any
 from harbor.environments.factory import EnvironmentFactory
 from harbor.models.agent.context import AgentContext
 from harbor.models.job.config import JobConfig
-from harbor.models.trial.config import TaskConfig
 from harbor.models.trial.result import TrialResult
 from harbor.trial.hooks import TrialEvent, TrialHookEvent
 from harbor.trial.trial import Trial
@@ -26,6 +25,7 @@ from temporalio.harbor._types import (
     RESOLVE_JOB,
     RUN_TRIAL,
     ComputeMetricsInput,
+    ResolveJobResult,
     Rewards,
     RunTrialInput,
     TrialOutcome,
@@ -100,10 +100,14 @@ class HarborActivities:
         self._hooks = hooks
 
     @activity.defn(name=RESOLVE_JOB)
-    async def resolve_job(self, config: JobConfig) -> list[TaskConfig]:
-        """Resolve a job's tasks, reaching dataset registries as harbor does."""
+    async def resolve_job(self, config: JobConfig) -> ResolveJobResult:
+        """Resolve tasks and dataset refs, reaching registries as harbor does."""
         EnvironmentFactory.validate_resource_policies(config.environment)
-        return await _compat.resolve_task_configs(config)
+        task_configs = await _compat.resolve_task_configs(config)
+        return ResolveJobResult(
+            task_configs=task_configs,
+            dataset_refs=[dataset.ref for dataset in config.datasets],
+        )
 
     @activity.defn(name=RUN_TRIAL)
     async def run_trial(self, input: RunTrialInput) -> TrialOutcome:

@@ -24,6 +24,7 @@ with workflow.unsafe.imports_passed_through():
         RUN_TRIAL,
         ComputeMetricsInput,
         JobPlan,
+        ResolveJobResult,
         Rewards,
         RunTrialInput,
         TrialOutcome,
@@ -86,14 +87,15 @@ async def plan_job(
             type="HarborRegradeUnsupported",
             non_retryable=True,
         )
-    task_configs = await workflow.execute_activity(
+    resolved = await workflow.execute_activity(
         RESOLVE_JOB,
         config,
-        result_type=list[TaskConfig],
+        result_type=ResolveJobResult,
         summary=f"resolve {config.job_name}",
         start_to_close_timeout=start_to_close_timeout,
         retry_policy=_LIFECYCLE_RETRY,
     )
+    task_configs = resolved.task_configs
     name = trial_name if trial_name is not None else _trial_name
     job_id = workflow.uuid4()
     job_dir = config.jobs_dir / config.job_name
@@ -133,7 +135,23 @@ async def plan_job(
                 non_retryable=True,
             )
         seen.add(trial.trial_name)
-    return JobPlan(config=config, task_configs=task_configs, trials=trials)
+    # Harbor resolves a package dataset by its ref alone and rejects a dataset
+    # that sets both ref and version, so pinning the ref clears the version.
+    pinned = config.model_copy(
+        update={
+            "datasets": [
+                (
+                    dataset.model_copy(update={"ref": ref, "version": None})
+                    if dataset.is_package()
+                    else dataset
+                )
+                for dataset, ref in zip(
+                    config.datasets, resolved.dataset_refs, strict=True
+                )
+            ]
+        }
+    )
+    return JobPlan(config=pinned, task_configs=task_configs, trials=trials)
 
 
 def _summary(config: TrialConfig) -> str:

@@ -18,12 +18,24 @@ COMPUTE_METRICS = "harbor.compute_metrics"
 Rewards = dict[str, float | int]
 
 
+class ResolveJobResult(BaseModel):
+    """Output of the resolve Activity: the tasks, and each dataset's ref.
+
+    Only a package dataset's ref is pinned, to the content hash it resolved to.
+    """
+
+    task_configs: list[TaskConfig]
+    dataset_refs: list[str | None]
+
+
 class JobPlan(BaseModel):
     """A harbor job resolved into the trials it will run.
 
     Produced by :func:`temporalio.harbor.plan_job`. ``trials`` is what the
     workflow fans out; ``config`` and ``task_configs`` are what
     :func:`temporalio.harbor.aggregate_job` needs to reproduce harbor's metrics.
+    In ``config``, each package dataset's ``ref`` is pinned to the content
+    hash its tasks were resolved from, and its ``version`` is cleared.
     """
 
     config: JobConfig
