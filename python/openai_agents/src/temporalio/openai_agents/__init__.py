@@ -24,6 +24,7 @@ from temporalio.openai_agents.sandbox._sandbox_client_provider import (
 from temporalio.openai_agents.sandbox._temporal_worker_env_value import (
     TemporalWorkerEnvValue,
 )
+from temporalio.openai_agents.session import WorkflowSession
 
 from . import testing, workflow
 
@@ -37,6 +38,7 @@ __all__ = [
     "StatelessMCPServerProvider",
     "StatefulMCPServerProvider",
     "TemporalWorkerEnvValue",
+    "WorkflowSession",
     "temporal_worker_env_ref",
     "testing",
     "workflow",

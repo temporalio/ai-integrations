@@ -850,11 +850,34 @@ Note that when using network-accessible MCP servers, you also can also use the t
 
 ### Sessions
 
-SQLite storage is not suited to a distributed environment.
+Use `WorkflowSession` for conversation history across multiple agent runs in a
+single workflow execution:
 
-| Feature       | Supported |
-| :------------ | :-------: |
-| SQLiteSession |    No     |
+```python
+from agents import Agent, Runner
+from temporalio import workflow
+from temporalio.openai_agents import WorkflowSession
+
+@workflow.defn
+class Conversation:
+    @workflow.run
+    async def run(self) -> str:
+        agent = Agent(name="Assistant")
+        session = WorkflowSession("conversation")
+        await Runner.run(agent, "My name is Ada.", session=session)
+        result = await Runner.run(agent, "What is my name?", session=session)
+        return result.final_output
+```
+
+Keep the same session instance for each turn. The items live in workflow state
+and are reconstructed on replay after a worker restart. A second workflow
+execution, even one that uses the same `session_id`, starts with an empty session.
+SQLite storage is not suited to a distributed workflow environment.
+
+| Feature         | Supported |
+| :-------------- | :-------: |
+| WorkflowSession |    Yes    |
+| SQLiteSession   |    No     |
 
 ### Tracing
 
