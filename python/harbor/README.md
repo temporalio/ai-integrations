@@ -1,10 +1,10 @@
 # Temporal Harbor integration
 
+> Release stage: **Pre-release**.
+
 Run [harbor](https://github.com/harbor-framework/harbor) evaluation jobs durably, with each trial as
 its own Temporal Activity. Published as [`temporalio-harbor`](https://pypi.org/project/temporalio-harbor/)
 and imported as `temporalio.harbor`.
-
-This package is experimental and may change in future versions.
 
 Wrapping a whole `harbor run` in one Activity means a lost worker throws away every trial that
 already finished, and the Temporal UI shows one opaque Activity for hours. With this plugin:

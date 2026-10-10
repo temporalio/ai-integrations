@@ -6,7 +6,7 @@ language = "python"
 coordinate = "temporalio-harbor"
 registry = "pypi"
 root-api = "temporalio.harbor"
-maturity = "experimental"
+maturity = "pre-release"
 docs = "https://github.com/temporalio/ai-integrations/tree/main/python/harbor#readme"
 
 [release]

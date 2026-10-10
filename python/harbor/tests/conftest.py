@@ -6,6 +6,7 @@ import asyncio
 import os
 from collections.abc import AsyncGenerator
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from temporalio.client import Client
 from temporalio.harbor import HarborPlugin
 from temporalio.testing import WorkflowEnvironment
 from tests import DEV_SERVER_DOWNLOAD_VERSION
+from tests.helpers.environment import start_local_with_retry
 from tests.helpers.plugin_meta import load_plugin_meta
 from tests.helpers.provenance import ProvenanceError, check_provenance
 
@@ -60,8 +62,11 @@ def event_loop():
 @pytest_asyncio.fixture(scope="session")  # type: ignore[reportUntypedFunctionDecorator]
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     """Start the pinned local Temporal development server."""
-    environment = await WorkflowEnvironment.start_local(
-        dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
+    environment = await start_local_with_retry(
+        partial(
+            WorkflowEnvironment.start_local,
+            dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
+        )
     )
     yield environment
     await environment.shutdown()
