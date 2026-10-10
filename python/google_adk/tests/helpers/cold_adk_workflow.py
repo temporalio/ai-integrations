@@ -6,9 +6,6 @@ from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
-# Match conftest's preload of ADK's optional model SDK to avoid an unrelated
-# cold-import deadlock on Python 3.10. Do not import any MCP or auth modules.
-import openai  # noqa: F401  # pyright: ignore[reportUnusedImport]
 from google.adk.agents import Agent
 from google.adk.models import BaseLlm, LLMRegistry
 from google.adk.models.llm_request import LlmRequest

@@ -8,10 +8,6 @@ from collections.abc import AsyncGenerator
 from functools import partial
 from pathlib import Path
 
-# ADK lazily imports this provider even for local models. Load its large OpenAI
-# type tree before workflow tasks start so cold imports cannot trip the SDK's
-# two-second deadlock detector (particularly under Python 3.10).
-import openai  # noqa: E402,F401  # pyright: ignore[reportUnusedImport]
 import opentelemetry._logs._internal
 import opentelemetry.metrics
 import opentelemetry.metrics._internal
