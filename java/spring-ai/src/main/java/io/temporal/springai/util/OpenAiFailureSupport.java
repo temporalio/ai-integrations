@@ -12,6 +12,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import org.springframework.util.ClassUtils;
@@ -60,12 +61,19 @@ public final class OpenAiFailureSupport {
               && body instanceof Map<?, ?> errorBody
               && ("insufficient_quota".equals(errorBody.get("code"))
                   || "insufficient_quota".equals(errorBody.get("type")));
+      String retryDirective =
+          provider.headers().values("x-should-retry").stream().findFirst().orElse(null);
       boolean retryable =
-          !quotaExhausted && (status == 408 || status == 409 || status == 429 || status >= 500);
+          !quotaExhausted
+              && !"false".equals(retryDirective)
+              && ("true".equals(retryDirective)
+                  || status == 408
+                  || status == 409
+                  || status == 429
+                  || status >= 500);
       Map<String, List<String>> headers = new HashMap<>();
-      provider
-          .headers()
-          .names()
+      provider.headers().names().stream()
+          .filter(NativeFailures::isDiagnosticHeader)
           .forEach(name -> headers.put(name, provider.headers().values(name)));
 
       Map<String, Object> details = new HashMap<>();
@@ -87,6 +95,15 @@ public final class OpenAiFailureSupport {
                   : null)
           .setDetails(details)
           .build();
+    }
+
+    private static boolean isDiagnosticHeader(String name) {
+      String normalized = name.toLowerCase(Locale.ROOT);
+      return normalized.equals("retry-after")
+          || normalized.equals("retry-after-ms")
+          || normalized.equals("x-request-id")
+          || normalized.equals("x-should-retry")
+          || normalized.startsWith("x-ratelimit-");
     }
   }
 

@@ -4,8 +4,10 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import com.sun.net.httpserver.HttpServer;
 import io.temporal.activity.Activity;
+import io.temporal.activity.ActivityOptions;
 import io.temporal.client.WorkflowException;
 import io.temporal.client.WorkflowOptions;
+import io.temporal.common.RetryOptions;
 import io.temporal.failure.ActivityFailure;
 import io.temporal.failure.ApplicationFailure;
 import io.temporal.springai.activity.ChatModelActivityImpl;
@@ -43,6 +45,7 @@ class ProviderRateLimitRetryTest {
   private volatile int status = 429;
   private volatile String code = "rate_limit_exceeded";
   private volatile String retryAfter = "7";
+  private volatile String shouldRetry;
 
   @BeforeEach
   void setUp() throws Exception {
@@ -62,6 +65,9 @@ class ProviderRateLimitRetryTest {
                   .getBytes(StandardCharsets.UTF_8);
           exchange.getResponseHeaders().add("Content-Type", "application/json");
           exchange.getResponseHeaders().add("Retry-After", retryAfter);
+          if (shouldRetry != null) {
+            exchange.getResponseHeaders().add("X-Should-Retry", shouldRetry);
+          }
           exchange.sendResponseHeaders(status, body.length);
           try (var response = exchange.getResponseBody()) {
             response.write(body);
@@ -77,7 +83,7 @@ class ProviderRateLimitRetryTest {
   }
 
   @Test
-  void rateLimitUsesTemporalAttemptsAndProviderDelay() {
+  void rateLimitUsesTemporalAttemptsAndProviderDelayBeyondMaximumInterval() {
     ApplicationFailure failure = run(0);
     assertEquals(List.of(1, 2, 3), attempts);
     assertEquals("com.openai.errors.RateLimitException", failure.getType());
@@ -100,6 +106,7 @@ class ProviderRateLimitRetryTest {
   @Test
   void quotaExhaustionDoesNotRetry() {
     code = "insufficient_quota";
+    shouldRetry = "true";
     ApplicationFailure failure = run(0);
     assertEquals(List.of(1), attempts);
     assertTrue(failure.isNonRetryable());
@@ -121,6 +128,28 @@ class ProviderRateLimitRetryTest {
     ApplicationFailure failure = run(0);
     assertEquals(List.of(1, 2, 3), attempts);
     assertFalse(failure.isNonRetryable());
+  }
+
+  @Test
+  void serverRetryVetoOverridesTransientStatus() {
+    status = 503;
+    shouldRetry = "false";
+    ApplicationFailure failure = run(0);
+    assertEquals(List.of(1), attempts);
+    assertEquals("com.openai.errors.InternalServerException", failure.getType());
+    assertTrue(failure.isNonRetryable());
+    assertNull(failure.getNextRetryDelay());
+  }
+
+  @Test
+  void serverRetryDirectiveOverridesClientErrorStatus() {
+    status = 400;
+    shouldRetry = "true";
+    ApplicationFailure failure = run(0);
+    assertEquals(List.of(1, 2, 3), attempts);
+    assertEquals("com.openai.errors.BadRequestException", failure.getType());
+    assertFalse(failure.isNonRetryable());
+    assertEquals(Duration.ofSeconds(7), failure.getNextRetryDelay());
   }
 
   private ApplicationFailure run(int maxRetries) {
@@ -172,7 +201,15 @@ class ProviderRateLimitRetryTest {
   public static class ChatWorkflowImpl implements ChatWorkflow {
     @Override
     public String chat() {
-      return TemporalChatClient.builder(ActivityChatModel.forDefault())
+      ActivityOptions defaults = ActivityChatModel.defaultActivityOptions();
+      ActivityOptions options =
+          ActivityOptions.newBuilder(defaults)
+              .setRetryOptions(
+                  RetryOptions.newBuilder(defaults.getRetryOptions())
+                      .setMaximumInterval(Duration.ofSeconds(2))
+                      .build())
+              .build();
+      return TemporalChatClient.builder(ActivityChatModel.forDefault(options))
           .build()
           .prompt()
           .user("ping")

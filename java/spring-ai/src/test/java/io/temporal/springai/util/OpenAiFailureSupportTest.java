@@ -38,13 +38,69 @@ class OpenAiFailureSupportTest {
     assertTrue(failure(status, Map.of("code", "invalid_request")).isNonRetryable());
   }
 
-  @Test
-  void quotaTypeIsPermanentAndKeepsStructuredBody() {
-    ApplicationFailure failure = failure(429, Map.of("type", "insufficient_quota"));
+  @ParameterizedTest
+  @MethodSource("retryDirectives")
+  void retryDirectiveOverridesStatusBeforeFallingBack(
+      int status, List<String> directives, boolean retryable) {
+    ApplicationFailure failure =
+        failure(
+            status,
+            Map.of("code", "provider_error"),
+            Headers.builder().put("X-sHoUlD-rEtRy", directives).put("Retry-After", "7").build());
+    assertEquals(!retryable, failure.isNonRetryable());
+    assertEquals(retryable ? Duration.ofSeconds(7) : null, failure.getNextRetryDelay());
+  }
+
+  private static Stream<Arguments> retryDirectives() {
+    return Stream.of(
+        Arguments.of(503, List.of("false"), false),
+        Arguments.of(400, List.of("true"), true),
+        Arguments.of(503, List.of(), true),
+        Arguments.of(400, List.of(), false),
+        Arguments.of(503, List.of("invalid"), true),
+        Arguments.of(400, List.of("invalid"), false),
+        Arguments.of(503, List.of("FALSE"), true),
+        Arguments.of(400, List.of("TRUE"), false),
+        Arguments.of(503, List.of("false", "true"), false),
+        Arguments.of(400, List.of("true", "false"), true));
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"code", "type"})
+  void quotaIsPermanentEvenWhenProviderRequestsRetriesAndKeepsStructuredBody(String field) {
+    ApplicationFailure failure =
+        failure(
+            429,
+            Map.of(field, "insufficient_quota"),
+            Headers.builder().put("X-Should-Retry", "true").put("Retry-After", "7").build());
     assertTrue(failure.isNonRetryable());
     assertNull(failure.getNextRetryDelay());
     assertEquals(
-        Map.of("type", "insufficient_quota"), failure.getDetails().get(0, Map.class).get("body"));
+        Map.of(field, "insufficient_quota"), failure.getDetails().get(0, Map.class).get("body"));
+  }
+
+  @Test
+  void detailsKeepOnlyDiagnosticResponseHeaders() {
+    Headers diagnostic =
+        Headers.builder()
+            .put("Retry-After", "7")
+            .put("Retry-After-Ms", "1500")
+            .put("X-Request-Id", "request-123")
+            .put("X-sHoUlD-rEtRy", "true")
+            .put("X-RateLimit-Limit-Requests", "100")
+            .put("x-ratelimit-remaining-tokens", List.of("20", "10"))
+            .build();
+    Headers headers =
+        diagnostic.toBuilder()
+            .put("Set-Cookie", "__cf_bm=abc")
+            .put("OpenAI-Organization", "org-123")
+            .put("Content-Type", "application/json")
+            .put("X-RateLimits-Other", "unrelated")
+            .build();
+    ApplicationFailure failure = failure(429, Map.of("code", "rate_limit_exceeded"), headers);
+    var saved = (Map<?, ?>) failure.getDetails().get(0, Map.class).get("headers");
+    assertEquals(diagnostic.names(), saved.keySet());
+    diagnostic.names().forEach(name -> assertEquals(diagnostic.values(name), saved.get(name)));
   }
 
   @Test
@@ -92,10 +148,14 @@ class OpenAiFailureSupportTest {
   }
 
   private static ApplicationFailure failure(int status, Map<String, Object> body) {
+    return failure(status, body, Headers.builder().put("Retry-After", "7").build());
+  }
+
+  private static ApplicationFailure failure(int status, Map<String, Object> body, Headers headers) {
     OpenAIServiceException error = mock(OpenAIServiceException.class);
     when(error.statusCode()).thenReturn(status);
     when(error.body()).thenReturn(JsonValue.from(body));
-    when(error.headers()).thenReturn(Headers.builder().put("Retry-After", "7").build());
+    when(error.headers()).thenReturn(headers);
     return assertInstanceOf(
         ApplicationFailure.class, OpenAiFailureSupport.convert(new RuntimeException(error)));
   }
