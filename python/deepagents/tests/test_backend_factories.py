@@ -105,9 +105,8 @@ async def test_backend_factory_on_another_process(
     )
     try:
         assert process.stdout is not None
-        assert (
-            await asyncio.wait_for(process.stdout.readline(), timeout=30) == b"READY\n"
-        )
+        ready = await asyncio.wait_for(process.stdout.readline(), timeout=30)
+        assert ready.rstrip(b"\r\n") == b"READY"
         workflow_class = (
             FactoryShellWorkflow
             if factory_name == "shell"
