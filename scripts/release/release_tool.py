@@ -8,6 +8,8 @@ Subcommands:
   verify-index-files            prove the files an index serves for a version are the local artifacts
   check-recovery-run            validate a tagged run's tested artifacts for publication recovery
   check-published-release       verify the published GitHub release and emit its deployment URL
+  check-go-vanity               verify the Go vanity path routes to this plugin's subdirectory
+  verify-go-module              compare public Go module bytes and build a clean consumer
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
   publish-release               publish the reviewed draft after registry verification
@@ -19,7 +21,8 @@ Policy (AGENTS.md, "Release runbook"):
   * TestPyPI versions move forward too, except that its newest version may be re-run
   * final (non pre-release) versions additionally require plugin.toml
     [release] allow-final = true and no TRANSITION(sdk-cutover) markers in the plugin
-  * versions are canonical PEP 440 and never local (+...)
+  * Python versions are canonical PEP 440; Go versions are canonical SemVer
+    without build metadata (+...)
 """
 
 from __future__ import annotations
@@ -39,6 +42,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 from packaging.version import InvalidVersion, Version
+
+from go_release import GoReleaseError, GoVersion, check_vanity, fetch_versions, verify_module
 
 # \Z (not $) so a trailing newline cannot ride along into GITHUB_OUTPUT.
 TAG_RE = re.compile(r"^(?P<language>python|typescript|java|go)/(?P<plugin>[a-z0-9][a-z0-9_.-]*)/v(?P<version>.+)\Z")
@@ -89,13 +94,12 @@ def _repo() -> str:
 # --------------------------------------------------------------------------- parse-tag
 
 
-def parse_tag(tag: str) -> dict[str, str]:
-    m = TAG_RE.match(tag)
-    if not m:
-        raise PolicyError(f"tag {tag!r} does not match <language>/<plugin>/v<version>")
-    if ".." in m.group("plugin"):
-        raise PolicyError(f"tag {tag!r} has an invalid plugin name")
-    raw = m.group("version")
+def release_version(language: str, raw: str) -> Version | GoVersion:
+    if language == "go":
+        try:
+            return GoVersion(raw)
+        except GoReleaseError as exc:
+            raise PolicyError(str(exc)) from exc
     try:
         version = Version(raw)
     except InvalidVersion as exc:
@@ -104,6 +108,17 @@ def parse_tag(tag: str) -> dict[str, str]:
         raise PolicyError(f"tag version {raw!r} must not have a local segment")
     if str(version) != raw:
         raise PolicyError(f"tag version {raw!r} is not canonical PEP 440 (expected {version})")
+    return version
+
+
+def parse_tag(tag: str) -> dict[str, str]:
+    m = TAG_RE.match(tag)
+    if not m:
+        raise PolicyError(f"tag {tag!r} does not match <language>/<plugin>/v<version>")
+    if ".." in m.group("plugin"):
+        raise PolicyError(f"tag {tag!r} has an invalid plugin name")
+    raw = m.group("version")
+    version = release_version(m.group("language"), raw)
     return {
         "tag": tag,
         "language": m.group("language"),
@@ -117,19 +132,34 @@ def parse_tag(tag: str) -> dict[str, str]:
 def cmd_parse_tag(args: argparse.Namespace) -> int:
     out = parse_tag(args.tag)
     plugin_toml = Path(args.repo_root) / out["plugin_dir"] / "plugin.toml"
+    if out["language"] == "go" and not plugin_toml.is_file():
+        raise PolicyError(f"unknown Go plugin: {out['plugin_dir']}")
     if plugin_toml.is_file():
         meta = _load(plugin_toml)
         out["coordinate"] = meta["plugin"]["coordinate"]
         out["root_api"] = meta["plugin"]["root-api"]
         out["smoke_imports"] = ",".join(meta.get("smoke", {}).get("imports", []))
         out["allow_final"] = "true" if meta.get("release", {}).get("allow-final") else "false"
-        out["github_prerelease"] = "true" if github_prerelease(Version(out["version"]), meta["plugin"]["maturity"]) else "false"
-        out["requires_python"] = _load(plugin_toml.parent / "pyproject.toml")["project"]["requires-python"]
+        out["github_prerelease"] = "true" if github_prerelease(release_version(out["language"], out["version"]), meta["plugin"]["maturity"]) else "false"
+        if out["language"] == "python":
+            out["requires_python"] = _load(plugin_toml.parent / "pyproject.toml")["project"]["requires-python"]
+        elif out["language"] == "go":
+            plugin = meta["plugin"]
+            if plugin.get("language") != "go" or plugin.get("name") != out["plugin"] or plugin.get("registry") != "goproxy":
+                raise PolicyError("Go tag does not match plugin.toml name, language and registry")
+            if out["coordinate"] != f"go.temporal.io/{out['plugin']}":
+                raise PolicyError("Go module coordinate does not match the plugin folder")
+            module = re.search(r'^module\s+"?([^\s"]+)"?', (plugin_toml.parent / "go.mod").read_text(), re.M)
+            if not module or module[1] != out["coordinate"]:
+                raise PolicyError("go.mod module path must match plugin.toml coordinate")
+            if GoVersion(out["version"]).release[0] >= 2:
+                raise PolicyError("Go v2+ releases require a /vN module-path cutover before release")
+            out["go_runtime"] = str(meta["ci"]["runtime-versions"][-1])
     _write_outputs(args.github_output, out)
     return 0
 
 
-def github_prerelease(version: Version, maturity: str) -> bool:
+def github_prerelease(version: Version | GoVersion, maturity: str) -> bool:
     """Classify GitHub releases independently of which package index receives the version."""
     if maturity not in FIRST_VERSION:
         raise PolicyError(f"unknown maturity {maturity!r}")
@@ -154,8 +184,10 @@ def _fetch_json(url: str, local: Path | None = None) -> dict | None:
         raise PolicyError(f"registry unreachable ({exc}); refusing to guess (fail closed)") from exc
 
 
-def fetch_published_versions(coordinate: str, registry: str, registry_json: Path | None = None) -> list[Version]:
+def fetch_published_versions(coordinate: str, registry: str, registry_json: Path | None = None) -> list[Version] | list[GoVersion]:
     """Return every published version (yanked included). 404 -> []. Anything else fails closed."""
+    if registry == "goproxy":
+        return fetch_versions(coordinate, registry_json)
     data = _fetch_json(REGISTRY_JSON[registry].format(coordinate=coordinate), registry_json)
     if not data:
         return []
@@ -168,13 +200,13 @@ def fetch_published_versions(coordinate: str, registry: str, registry_json: Path
     return versions
 
 
-def check_policy(version: Version, maturity: str, published: list[Version]) -> str | None:
+def check_policy(version: Version | GoVersion, maturity: str, published: list[Version] | list[GoVersion]) -> str | None:
     """Raise on a policy violation; return a warning when this looks like a re-run of the newest release."""
     if maturity not in FIRST_VERSION:
         raise PolicyError(f"unknown maturity {maturity!r}")
     if not published:
         first = FIRST_VERSION[maturity]
-        if version.release != first.release or version.post is not None:
+        if version.release != first.release or getattr(version, "post", None) is not None:
             raise PolicyError(
                 f"first release of a {maturity} coordinate must be {first} (or a pre-release of it); got {version}"
             )
@@ -227,8 +259,12 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     coordinate = meta["plugin"]["coordinate"]
     maturity = meta["plugin"]["maturity"]
     registry = meta["plugin"].get("registry", "pypi")
-    version = Version(args.version)
+    version = release_version("go" if registry == "goproxy" else "python", args.version)
     published = fetch_published_versions(coordinate, registry, Path(args.registry_json) if args.registry_json else None)
+    # A Go tag is already public when this job starts. A proxy listing containing
+    # only this tag must still satisfy the first-release policy.
+    if registry == "goproxy" and not any(v != version for v in published):
+        check_policy(version, maturity, [])
     rerun = check_policy(version, maturity, published)
     if rerun:
         print(f"::warning::{rerun}")
@@ -249,7 +285,7 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
         if not meta.get("release", {}).get("allow-final"):
             raise PolicyError(
                 f"{coordinate} {version} is a final release but plugin.toml [release] allow-final is false "
-                "(the SDK cutover has not happened; publish a pre-release instead)"
+                "(final releases are not enabled; publish a pre-release instead)"
             )
         repo_root = Path(args.repo_root).resolve()
         markers = transition_markers(repo_root, os.path.relpath(plugin_dir.resolve(), repo_root))
@@ -343,16 +379,16 @@ def cmd_verify_index_files(args: argparse.Namespace) -> int:
 PR_REF = re.compile(r"(?<![\w/])#(\d+)\b")
 
 
-def previous_tag(repo_root: Path, language: str, plugin: str, current: Version) -> tuple[str, Version] | None:
+def previous_tag(repo_root: Path, language: str, plugin: str, current: Version | GoVersion) -> tuple[str, Version | GoVersion] | None:
     prefix = f"{language}/{plugin}/v"
-    candidates: list[tuple[Version, str]] = []
+    candidates: list[tuple[Version | GoVersion, str]] = []
     for tag in _git("tag", "--list", f"{prefix}*", cwd=repo_root).splitlines():
         tag = tag.strip()
         if not tag:
             continue
         try:
-            v = Version(tag[len(prefix):])
-        except InvalidVersion:
+            v = release_version(language, tag[len(prefix):])
+        except PolicyError:
             continue
         # A final release summarizes everything since the previous final. Its
         # release candidates are staging points, not stable changelog boundaries.
@@ -368,7 +404,7 @@ def previous_tag(repo_root: Path, language: str, plugin: str, current: Version) 
 
 def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
     parts = parse_tag(tag)
-    version = Version(parts["version"])
+    version = release_version(parts["language"], parts["version"])
     meta_path = repo_root / plugin_dir / "plugin.toml"
     meta = _load(meta_path) if meta_path.is_file() else {"plugin": {}}
     coordinate = meta["plugin"].get("coordinate", parts["plugin"])
@@ -413,7 +449,9 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
     else:
         prev_tag, _ = prev
         lines += ["", f"**Full changelog**: https://github.com/{repo}/compare/{prev_tag}...{tag}", ""]
-    if version.is_prerelease:
+    if version.is_prerelease and parts["language"] == "go":
+        lines += ["## Pre-release notes", "", f"Install this Go pre-release with `go get {coordinate}@v{version}`.", ""]
+    elif version.is_prerelease:
         lines += [
             "## Pre-release notes",
             "",
@@ -502,7 +540,7 @@ def cmd_check_published_release(args: argparse.Namespace) -> int:
     repo = args.repo or _repo()
     parsed = parse_tag(args.tag)
     meta = _load(Path(args.repo_root) / parsed["plugin_dir"] / "plugin.toml")
-    prerelease = github_prerelease(Version(parsed["version"]), meta["plugin"]["maturity"])
+    prerelease = github_prerelease(release_version(parsed["language"], parsed["version"]), meta["plugin"]["maturity"])
     release = json.loads(_gh("api", f"repos/{repo}/releases/tags/{quote(args.tag, safe='')}"))
     if release.get("tag_name") != args.tag or release.get("draft") is not False:
         raise PolicyError(f"a published GitHub release is required for {args.tag}")
@@ -594,7 +632,7 @@ def cmd_publish_release(args: argparse.Namespace) -> int:
     repo = args.repo or _repo()
     parsed = parse_tag(args.tag)
     meta = _load(Path(args.repo_root) / parsed["plugin_dir"] / "plugin.toml")
-    prerelease = github_prerelease(Version(parsed["version"]), meta["plugin"]["maturity"])
+    prerelease = github_prerelease(release_version(parsed["language"], parsed["version"]), meta["plugin"]["maturity"])
     endpoint = f"repos/{repo}/releases/{args.release_id}"
     release = json.loads(_gh("api", endpoint))
     # Saving reviewed notes in GitHub can replace a draft's tag with an untagged-* placeholder.
@@ -618,6 +656,21 @@ def cmd_publish_release(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- CLI
 
 
+def cmd_check_go_vanity(args: argparse.Namespace) -> int:
+    meta = _load(Path(args.repo_root) / args.plugin_dir / "plugin.toml")
+    check_vanity(meta["plugin"]["coordinate"], args.repo or _repo(), args.plugin_dir)
+    print("OK: Go vanity path routes to this repository's plugin subdirectory")
+    return 0
+
+
+def cmd_verify_go_module(args: argparse.Namespace) -> int:
+    root = Path(args.repo_root).resolve()
+    meta = _load(root / args.plugin_dir / "plugin.toml")
+    version = release_version("go", args.version)
+    verify_module(root, args.plugin_dir, meta["plugin"]["coordinate"], str(version), args.attempts, args.delay)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo-root", default=os.environ.get("GITHUB_WORKSPACE", "."))
@@ -639,6 +692,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--testpypi-json", default=None, help="read TestPyPI versions from this file instead of the registry (tests)")
     p.set_defaults(func=cmd_check_version_policy)
+
+    p = sub.add_parser("check-go-vanity", help="verify Go vanity routing to the plugin subdirectory")
+    p.add_argument("--plugin-dir", required=True)
+    p.add_argument("--repo", default=None)
+    p.set_defaults(func=cmd_check_go_vanity)
+
+    p = sub.add_parser("verify-go-module", help="verify the public Go module bytes and build a clean consumer")
+    p.add_argument("--plugin-dir", required=True)
+    p.add_argument("--version", required=True)
+    p.add_argument("--attempts", type=int, default=10)
+    p.add_argument("--delay", type=float, default=30)
+    p.set_defaults(func=cmd_verify_go_module)
 
     p = sub.add_parser("verify-index-files", help="fail unless the index serves exactly the local distribution files")
     p.add_argument("--coordinate", required=True)
@@ -690,7 +755,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except PolicyError as exc:
+    except (PolicyError, GoReleaseError) as exc:
         print(f"FAIL: {exc}")
         return 1
     except subprocess.CalledProcessError as exc:

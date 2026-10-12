@@ -58,6 +58,73 @@ def test_ci_status_is_the_fan_in() -> None:
         assert f"needs.changes.outputs.{language} != '[]'" in job["if"]
 
 
+def test_go_release_reuses_the_full_matrix_and_verifies_the_same_commit() -> None:
+    doc = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())
+    assert doc[True]["push"]["tags"] == ["go/*/v*"]
+    assert doc[True]["release"]["types"] == ["published"]
+    assert doc["permissions"] == {}
+    assert all(job["permissions"] == {"contents": "read"} for job in doc["jobs"].values())
+    test = doc["jobs"]["test"]
+    assert test["uses"] == "./.github/workflows/_go-plugin.yml"
+    assert test["with"] == {"plugin": "${{ needs.prepare.outputs.plugin }}", "deps": "locked", "ref": "${{ needs.prepare.outputs.sha }}"}
+    verify = doc["jobs"]["verify"]
+    assert verify["needs"] == ["prepare", "test"]
+    assert verify["if"] == "needs.prepare.outputs.verify == 'true'"
+    checkout = next(step for step in verify["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+    assert checkout["with"]["ref"] == "${{ needs.prepare.outputs.sha }}"
+    reusable = yaml.safe_load((REPO / ".github/workflows/_go-plugin.yml").read_text())
+    for job in reusable["jobs"].values():
+        checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+        assert checkout["with"]["ref"] == "${{ inputs.ref || github.sha }}"
+
+
+@pytest.mark.parametrize("ref_type,dry_run,verify", [
+    ("tag", "false", "true"), ("tag", "true", "false"), ("branch", "false", "false"),
+    ("branch", "true", "false"), ("tag", "", "false"), ("tag", "False", "false"),
+])
+def test_go_release_dry_runs_do_not_verify_a_public_module(tmp_path: Path, ref_type: str, dry_run: str, verify: str) -> None:
+    doc = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())
+    gate = next(step for step in doc["jobs"]["prepare"]["steps"] if step.get("id") == "gate")
+    output = tmp_path / "output"
+    env = dict(os.environ, REF_TYPE=ref_type, DRY_RUN=dry_run, GITHUB_OUTPUT=str(output))
+    result = subprocess.run(["bash", "-c", gate["run"]], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert output.read_text() == f"verify={verify}\n"
+
+
+@pytest.mark.parametrize("ref_type,ref_name,tag,allowed", [
+    ("tag", "go/fake/v0.1.0", "", True), ("tag", "go/fake/v0.1.0", "go/fake/v0.1.0", True),
+    ("tag", "go/fake/v0.1.0", "go/other/v0.1.0", False), ("branch", "main", "", False),
+    ("branch", "main", "go/fake/v0.1.0", True),
+])
+def test_go_release_dispatch_ref_must_match_the_tag(ref_type: str, ref_name: str, tag: str, allowed: bool) -> None:
+    doc = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())
+    step = next(step for step in doc["jobs"]["prepare"]["steps"] if step.get("name") == "Dispatch inputs are consistent with the ref")
+    env = dict(os.environ, REF_TYPE=ref_type, REF_NAME=ref_name, INPUT_TAG=tag)
+    result = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+    assert (result.returncode == 0) == allowed, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("on_main,ref_type,allowed", [(True, "tag", True), (False, "tag", False), (False, "branch", True)])
+def test_go_release_source_must_be_main_reachable_for_tag_runs(plugin_repo: Path, tmp_path: Path, on_main: bool, ref_type: str, allowed: bool) -> None:
+    from conftest import commit_all, git
+
+    git(plugin_repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    if not on_main:
+        (plugin_repo / "README.md").write_text("feature branch\n")
+        commit_all(plugin_repo, "Feature")
+    tag = "go/fake/v0.1.0"
+    git(plugin_repo, "tag", "-a", tag, "-m", "Go release")
+    doc = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())
+    source = next(step for step in doc["jobs"]["prepare"]["steps"] if step.get("id") == "source")
+    output = tmp_path / "output"
+    env = dict(os.environ, REF_TYPE=ref_type, TAG=tag, GITHUB_OUTPUT=str(output))
+    result = subprocess.run(["bash", "-c", source["run"]], env=env, cwd=plugin_repo, capture_output=True, text=True)
+    assert (result.returncode == 0) == allowed, result.stdout + result.stderr
+    if allowed:
+        assert output.read_text() == f"sha={git(plugin_repo, 'rev-parse', 'HEAD')}\n"
+
+
 def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
     for job in ("publish-testpypi", "publish-pypi"):

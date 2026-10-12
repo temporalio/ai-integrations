@@ -140,8 +140,9 @@ active `upstream` field is removed because this repository now owns the code.
 The original UUID and span random-stream identifiers remain stable for replay
 compatibility. The extraction script and imported commit graph stay unchanged.
 Go CI now runs the shared make targets across the declared runtimes and platforms.
-Final releases remain disabled until vanity routing and Go release automation
-are ready; the required subdirectory mapping is documented in AGENTS.md.
+The shared Go release workflow is available. Final releases remain disabled until
+vanity routing is verified; the subdirectory mapping and release runbook are
+documented in AGENTS.md.
 
 An explicitly requested final re-sync before the import PR merged brought in
 upstream `main` at `6ae07bca8301bd25ba1358d1ea92ae837932d76b` on 2026-10-08.

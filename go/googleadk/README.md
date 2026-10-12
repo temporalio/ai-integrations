@@ -25,9 +25,10 @@ wired onto the worker by `googleadk.NewPlugin(...)`.
 
 ## Add to your project
 
-The module path is `go.temporal.io/googleadk`. Publishing from this repository
-is pending vanity-path routing and Go release automation; the install command
-below applies after the first release.
+The module path is `go.temporal.io/googleadk`. The shared Go release workflow is
+available; publishing is pending vanity-path routing and the first release. The
+install command below applies after that release. See the
+[Go release runbook](../../AGENTS.md#go-releases).
 
 From your application's Go module, run:
 

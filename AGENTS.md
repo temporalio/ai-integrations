@@ -59,8 +59,8 @@ so its mapping can be:
 Its tags are `go/googleadk/v<version>`. `go/googleadk` is now owned here under the new module
 path; its active `upstream` metadata is removed, so do not re-sync it. Imported history remains
 intact, and the inherited changelog is kept only in Git history. UUID and span random-stream
-identifiers retain their original strings for replay compatibility. Final releases here remain
-disabled until vanity routing and Go release automation are ready.
+identifiers retain their original strings for replay compatibility. The shared Go release
+workflow is available; final releases here remain disabled until vanity routing is verified.
 
 Naming derivation, enforced by `scripts/ci/check_conventions.py`: folder name = `plugin.toml`
 `name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API =
@@ -134,6 +134,52 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 ## Releases
 
 Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
+
+### Go releases
+
+`.github/workflows/release-go.yml` handles every Go plugin. It runs on pushes of
+`go/*/v*` tags, published Go GitHub Releases, and manual dispatch. Go versions use
+canonical SemVer (`0.1.0`, `0.1.0-rc.1`), with no build metadata. The shared release
+tool checks the module path, maturity's first version, and forward ordering against
+`proxy.golang.org`, including retracted releases. A re-run of the newest version is
+allowed. Final versions require `allow-final = true` and no transition markers.
+The currently supported vanity coordinates have no `/vN` suffix; v2+ requires a
+module-path cutover before the release tooling can support it.
+
+The full `_go-plugin.yml` matrix tests locked dependencies at one pinned commit,
+including race detection on Ubuntu/max. Tagged runs additionally verify the
+four-field vanity mapping, download the exact public version with a clean module
+cache and `sum.golang.org` verification, compare the complete module zip and
+`go.mod` bytes with that tested checkout, and build a clean consumer importing the
+root package. Temporary proxy propagation failures are retried. The workflow uses
+read-only repository permissions and creates no tags or GitHub Releases.
+
+**Pushing a Go tag makes the version discoverable before CI finishes.** A GitHub
+draft does not hide the tag from Go consumers. Run the dry run before tagging:
+
+1. Merge the release changes to `main`. Configure the vanity mapping above and
+   include Go tags in the protected release-tag ruleset. Enable `allow-final` only
+   after routing is ready. Do not alter `go.mod` dependency versions for a release.
+2. Dispatch `gh workflow run release-go.yml --ref main -f tag=go/<name>/v<version>`.
+   Branch dispatches always validate, test and build without consuming a tag or
+   fetching the proposed module. An explicit `-f dry-run=true` does the same for
+   an existing tag ref. While final releases are disabled, use `0.1.0-rc.1` for
+   the Google ADK dry run.
+3. After the full matrix succeeds, create an annotated `go/<name>/v<version>` tag
+   on that exact tested main commit and push it. The tag run repeats the matrix
+   and verifies the public module. Tags are immutable; a failed release requiring
+   changed source gets the next version, such as `0.1.0-rc.2`.
+4. Generate reviewed notes with `uv run --project scripts --locked python
+   scripts/release/release_tool.py release-notes --plugin-dir go/<name>
+   --tag go/<name>/v<version> --output /tmp/release-notes.md`, then create a draft
+   GitHub Release for the existing tag. Publish it after verification succeeds;
+   mark it as a GitHub pre-release for prerelease versions or Pre-release maturity.
+   The publication run checks that classification without modifying the release.
+5. For a proxy or consumer verification failure, re-run failed jobs or dispatch
+   `release-go.yml` on the same tag ref with no tag input. Never move or delete
+   the tag. A missing vanity mapping must be repaired before retrying.
+
+### Python releases
 
 Every Python plugin uses the `testpypi` and `pypi` GitHub environments without required reviewers, regardless of maturity. Both environments allow the `python/*/v*` tag pattern and `main` for validated publication recovery. Publishing the GitHub Release starts the release pipeline; eligible versions upload to PyPI automatically after the full test matrix and TestPyPI verification succeed. Trusted publishers remain bound to their existing environment names.
 

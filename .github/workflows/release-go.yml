@@ -1,0 +1,156 @@
+# Go releases are immutable tags, with no package upload. Run a branch dry run
+# before pushing a tag: the Go proxy can discover a tag before this workflow passes.
+name: Release (Go)
+
+on:
+  push:
+    tags: ["go/*/v*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Proposed scoped tag for a branch dry run, e.g. go/googleadk/v0.1.0-rc.1. Leave empty when dispatching on a tag ref.
+        type: string
+        default: ""
+      dry-run:
+        description: Validate, test and build without public module verification (an existing tag remains public)
+        type: boolean
+        default: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate Go tag and version policy
+    if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'go/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      plugin: ${{ steps.tag.outputs.plugin }}
+      plugin_dir: ${{ steps.tag.outputs.plugin_dir }}
+      version: ${{ steps.tag.outputs.version }}
+      go_runtime: ${{ steps.tag.outputs.go_runtime }}
+      sha: ${{ steps.source.outputs.sha }}
+      verify: ${{ steps.gate.outputs.verify }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - name: Dispatch inputs are consistent with the ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ] && [ -n "$INPUT_TAG" ] && [ "$INPUT_TAG" != "$REF_NAME" ]; then
+            echo "::error::tag input must match the dispatched tag ref"; exit 1
+          fi
+          if [ "$REF_TYPE" != "tag" ] && [ -z "$INPUT_TAG" ]; then
+            echo "::error::a branch dry run needs a proposed tag input"; exit 1
+          fi
+      - name: Parse Go tag
+        id: tag
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+        run: |
+          case "$TAG" in go/*/v*) ;; *) echo "::error::expected a go/<plugin>/v<version> tag"; exit 1 ;; esac
+          uv run --project scripts --locked python scripts/release/release_tool.py parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
+      - name: Pin source and require main-reachable release tags
+        id: source
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          git rev-parse --verify --quiet origin/main > /dev/null || { echo "::error::origin/main is missing"; exit 1; }
+          if [ "$REF_TYPE" = "tag" ]; then
+            [ "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$SHA" ] || { echo "::error::checkout does not match the release tag"; exit 1; }
+            git merge-base --is-ancestor "$SHA" origin/main || { echo "::error::release tags must point at a commit on main"; exit 1; }
+          elif ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::warning::dry run is off main; merge before tagging a release"
+          fi
+      - name: Version policy
+        env:
+          PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
+      - name: Decide whether to verify the public module
+        id: gate
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ] && [ "$DRY_RUN" = "false" ]; then
+            echo "verify=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "verify=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::dry run: validate, test and build; no tags or GitHub releases are created"
+          fi
+      - name: Verify vanity routing
+        if: steps.gate.outputs.verify == 'true'
+        env:
+          PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py check-go-vanity --plugin-dir "$PLUGIN_DIR"
+      - name: Verify the published GitHub release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py check-published-release --tag "$TAG"
+
+  test:
+    name: Test
+    needs: prepare
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_go-plugin.yml
+    with:
+      plugin: ${{ needs.prepare.outputs.plugin }}
+      deps: locked
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  verify:
+    name: Verify public Go module and consumer
+    needs: [prepare, test]
+    if: needs.prepare.outputs.verify == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ needs.prepare.outputs.go_runtime }}
+          check-latest: true
+          cache-dependency-path: |
+            go/${{ needs.prepare.outputs.plugin }}/go.mod
+            go/${{ needs.prepare.outputs.plugin }}/go.sum
+      - name: Verify public source bytes and build a clean consumer
+        env:
+          PLUGIN_DIR: ${{ needs.prepare.outputs.plugin_dir }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py verify-go-module --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
