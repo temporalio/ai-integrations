@@ -159,19 +159,42 @@ search_tool])`. An unwrapped, non-builtin tool runs in-workflow and the plugin
 warns at construction, so the choice is never silent. Deep Agents' pure
 built-ins (`write_todos`, state-backed file tools) stay in-workflow by design.
 
+Call `tool_as_activity(...)` at module import or worker startup on **every
+activity worker** that can receive `deepagents.invoke_tool`. Registration is
+process-local; calling it only inside a workflow does not register the tool in
+another process. With `activity_as_tool(...)`, register the underlying Temporal
+activity on every worker polling its task queue.
+
 ## Durable file and shell backends
 
-Wrap a real-I/O backend (`FilesystemBackend` / `LocalShellBackend` /
-`StoreBackend`) in `TemporalBackend` and the agent's *built-in* file and shell
-tools execute as durable `deepagents.backend_op` Activities instead of touching
-disk from workflow code:
+Use `TemporalBackend("name", ...)` for a real-I/O backend
+(`FilesystemBackend` / `LocalShellBackend` / a remote sandbox). The agent's
+*built-in* file and shell tools execute as durable `deepagents.backend_op`
+Activities. Each activity worker constructs the backend from the configuration
+sent with the operation, so multiple worker processes and serverless workers
+can execute it independently:
 
 ```python
 from datetime import timedelta
 
 from deepagents.backends import FilesystemBackend
 from temporalio import workflow
-from temporalio.deepagents import TemporalBackend, create_temporal_deep_agent
+from temporalio.deepagents import (
+    DeepAgentsPlugin,
+    TemporalBackend,
+    create_temporal_deep_agent,
+)
+from temporalio.workflow import ActivityConfig
+
+
+# Configure this plugin on every worker polling backend activities.
+plugin = DeepAgentsPlugin(
+    backends={
+        "filesystem": lambda root_dir: FilesystemBackend(
+            root_dir=root_dir, virtual_mode=True
+        ),
+    }
+)
 
 
 @workflow.defn
@@ -179,8 +202,12 @@ class FilesystemAgent:
     @workflow.run
     async def run(self, root_dir: str) -> str:
         backend = TemporalBackend(
-            FilesystemBackend(root_dir=root_dir, virtual_mode=True),
-            activity_options={"start_to_close_timeout": timedelta(seconds=30)},
+            "filesystem",
+            factory_argument=root_dir,
+            backend_type=FilesystemBackend,
+            activity_options=ActivityConfig(
+                start_to_close_timeout=timedelta(seconds=30)
+            ),
         )
         agent = create_temporal_deep_agent(
             model="anthropic:claude-sonnet-4-5",
@@ -191,6 +218,34 @@ class FilesystemAgent:
         )
         return result["messages"][-1].content
 ```
+
+Add `plugin` to the Client or Worker as in the Hello world example.
+`activity_options` accepts the SDK's `ActivityConfig`, a typed dictionary for
+timeouts, retry policy and task queue routing. Existing dictionary literals also
+work.
+`backend_type` advertises the backend's delete and shell capabilities and method
+signatures without constructing it in the workflow. For a sandbox, pass
+`metadata={"id": sandbox_id}` if workflow code needs its `id`.
+
+For a remote sandbox, register a factory that reconnects using a serializable
+sandbox ID, and pass that ID as `factory_argument`. This follows the MCP plugins'
+named factory pattern: the lambda stays on the activity worker; only its name
+and argument cross the activity boundary. A factory can accept one positional
+argument (`None` by default), or no arguments when everything is configured on
+the worker, for example
+`{"filesystem": lambda: FilesystemBackend(root_dir="/shared")}`. Factories may be
+synchronous or asynchronous and run once per activity attempt. Operations and
+retries must reconnect to the same external state; changes held only in a
+backend instance's memory do not survive between calls. A local filesystem
+path must be accessible to every activity worker that can receive the operation,
+or the backend activities must be routed to a task queue whose workers share
+that filesystem. The factory argument is recorded in workflow history;
+credentials and live connections belong in the worker-side factory.
+
+`TemporalBackend(existing_backend, ...)` also works when the workflow and its
+backend activities execute in the same process. It holds the backend in a
+process-local registry, so use a named backend factory when activities can run
+in another process.
 
 State-only backends (the default) need no wrapping — they are pure workflow
 state, replayed deterministically.

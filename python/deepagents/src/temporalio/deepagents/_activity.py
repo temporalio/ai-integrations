@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import importlib
+import inspect
+from collections.abc import Mapping
 from datetime import timedelta
 from functools import wraps
 from typing import Any, Callable
@@ -99,11 +101,15 @@ class BackendOpInput:
     """A single filesystem / shell / store operation for a wrapped backend."""
 
     backend_ref: str
-    """Key identifying which registered backend to act on."""
+    """Backend reference; instance wrappers resolve it in the local registry."""
     op: str
     """Backend method name, e.g. ``ls`` / ``read_file`` / ``write_file`` / ``execute``."""
     args: list[Any] = dataclasses.field(default_factory=list)
     kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
+    backend_factory: str | None = None
+    """Worker-configured factory name; when set, bypasses the local registry."""
+    factory_argument: Any = None
+    """Serializable argument passed to the factory on each activity attempt."""
 
 
 @dataclasses.dataclass
@@ -208,6 +214,48 @@ def _translate_api_error(exc: Exception) -> ApplicationError | None:
 # ---------------------------------------------------------------------------
 
 
+class _BackendFactory:
+    """Invoke a worker-side backend factory with zero or one argument."""
+
+    def __init__(self, name: str, factory: Callable[..., Any]) -> None:
+        self._name = name
+        self._factory = factory
+        self._accepts_argument = False
+        try:
+            signature = inspect.signature(factory)
+        except (TypeError, ValueError):
+            return
+        self._accepts_argument = any(
+            parameter.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.VAR_POSITIONAL,
+            )
+            for parameter in signature.parameters.values()
+        )
+        try:
+            signature.bind(None) if self._accepts_argument else signature.bind()
+        except TypeError as exc:
+            raise TypeError(
+                f"Backend factory {name!r} must accept zero arguments or one "
+                "positional factory_argument."
+            ) from exc
+
+    def __call__(self, argument: Any) -> Any:
+        if self._accepts_argument:
+            return self._factory(argument)
+        if argument is not None:
+            raise ApplicationError(
+                f"Backend factory {self._name!r} declares no parameters, so it "
+                "cannot receive a factory_argument; declare one positional "
+                "parameter to accept it.",
+                type="DeepAgentsInvalidBackendFactoryArgument",
+                non_retryable=True,
+            )
+        return self._factory()
+
+
 def _default_model_provider(model_name: str) -> Any:
     """Build a chat model from a name string with LLM-SDK retries disabled.
 
@@ -234,10 +282,15 @@ class DeepAgentActivities:
         self,
         *,
         model_provider: Callable[[str], Any] | None = None,
+        backends: Mapping[str, Callable[..., Any]] | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
     ) -> None:
-        """Store the worker-side model provider + streaming configuration."""
+        """Store worker-side model and backend factories and streaming settings."""
         self._model_provider = model_provider or _default_model_provider
+        self._backends = {
+            name: _BackendFactory(name, factory)
+            for name, factory in (backends or {}).items()
+        }
         self._streaming_batch_interval = streaming_batch_interval
 
     def _build_bound_model(self, input: ModelActivityInput) -> Any:
@@ -320,7 +373,8 @@ class DeepAgentActivities:
         if tool is None:
             raise ApplicationError(
                 f"Tool {input.tool_name!r} is not registered on this worker. "
-                f"Wrap it with tool_as_activity(...) or activity_as_tool(...).",
+                "Call tool_as_activity(...) at startup on every activity worker, "
+                "or expose a registered activity with activity_as_tool(...).",
                 type="DeepAgentsUnknownTool",
                 non_retryable=True,
             )
@@ -337,13 +391,29 @@ class DeepAgentActivities:
     @activity.defn(name=BACKEND_OP)
     @_auto_heartbeater
     async def backend_op(self, input: BackendOpInput) -> BackendOpOutput:
-        """Run one operation against a registered (real-I/O) backend."""
+        """Run one operation against a factory-built or registered backend."""
         from temporalio.deepagents._tools import lookup_backend
 
-        backend = lookup_backend(input.backend_ref)
+        if input.backend_factory is not None:
+            factory = self._backends.get(input.backend_factory)
+            if factory is None:
+                raise ApplicationError(
+                    f"Backend factory {input.backend_factory!r} is not configured "
+                    "on this worker. Configure DeepAgentsPlugin(backends=...) "
+                    "on every activity worker.",
+                    type="DeepAgentsUnknownBackendFactory",
+                    non_retryable=True,
+                )
+            backend = factory(input.factory_argument)
+            if inspect.isawaitable(backend):
+                backend = await backend
+        else:
+            backend = lookup_backend(input.backend_ref)
         if backend is None:
             raise ApplicationError(
-                f"Backend {input.backend_ref!r} is not registered on this worker.",
+                f"Backend {input.backend_ref!r} is not registered on this worker. "
+                "Use TemporalBackend with a named worker-side factory for "
+                "operations that may run in another process.",
                 type="DeepAgentsUnknownBackend",
                 non_retryable=True,
             )

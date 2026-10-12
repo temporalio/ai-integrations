@@ -18,10 +18,11 @@ The choice is always explicit: an unwrapped non-builtin tool runs in-workflow,
 and the plugin warns at construction so that is a conscious decision, never a
 silent one.
 
-Registries here live in a ``temporalio``-namespaced (sandbox-passthrough) module,
-so the object the worker's activity sees is the same one the module-level
-``tool_as_activity(...)`` / ``TemporalBackend(...)`` call populated. They hold
-worker-wide wiring, not per-workflow state.
+Registries here live in a ``temporalio``-namespaced (sandbox-passthrough) module
+and are process-local. Tools must be registered at startup in every activity
+worker. Instance-backed ``TemporalBackend`` wrappers require activities to run
+in the same process; named ``TemporalBackend`` handles send a factory argument
+so any activity worker can construct the backend independently.
 """
 
 from __future__ import annotations
@@ -35,11 +36,13 @@ import weakref
 from collections.abc import Mapping
 from datetime import timedelta
 from functools import wraps
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable
 
 from temporalio import activity as activity_mod
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
+from temporalio.workflow import ActivityConfig
 
 # LangChain is a runtime dependency of the *tool seam*, but importing this module
 # must not require it (the plugin imports it just to read tool defaults). So the
@@ -303,6 +306,10 @@ def tool_as_activity(
     same name and argument schema (so the model's calls are unchanged) but, when
     invoked in-workflow, dispatches ``deepagents.invoke_tool`` instead of running
     the tool body inline.
+
+    Call this at module import or worker startup on every process that can
+    execute tool activities. Registration inside a workflow alone does not
+    make the tool available in another worker process.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import BaseTool, StructuredTool
@@ -504,13 +511,39 @@ class TemporalBackend:
 
     Unknown attribute access is forwarded to the inner backend so backend
     metadata / configuration the agent reads (but that does no I/O) still works.
+
+    Wrapping an instance requires the operation's activity to run in the same
+    process as the workflow. For multiple worker processes or serverless workers,
+    pass the name of a factory registered with
+    ``DeepAgentsPlugin(backends=...)`` instead. No backend is constructed
+    in the workflow; each activity attempt invokes the worker-side factory.
+
+    Args:
+        inner: Backend instance, or the name of a worker-side backend factory.
+        activity_options: SDK ``ActivityConfig`` for backend activity timeouts,
+            retries and routing.
+        factory_argument: Serializable argument passed to a named factory, such
+            as a sandbox ID. It is recorded in workflow history; keep credentials
+            on the worker. Factories declaring one positional parameter receive
+            this value (``None`` by default); parameterless factories are called
+            without arguments. Operations and retries must reconnect to the same
+            external state; instance memory is not carried between operations.
+        backend_type: Required for a named factory. Class used to advertise
+            delete and shell capabilities and method signatures, without
+            instantiating it. For a composite backend, supply a class exposing
+            the default backend's capabilities.
+        metadata: For a named factory, attributes read by workflow code, such
+            as ``id`` for a sandbox. Values must be deterministic and require no I/O.
     """
 
     def __new__(
         cls,
         inner: Any,
         *,
-        activity_options: Mapping[str, Any] | None = None,
+        activity_options: ActivityConfig | None = None,
+        factory_argument: Any = None,
+        backend_type: type | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> "TemporalBackend":
         """Pick the wrapper class that mirrors ``inner``'s optional capabilities.
 
@@ -518,10 +551,28 @@ class TemporalBackend:
         gets a mirrored subclass of ``MyBackend``, so ``isinstance`` and any
         methods it defines are preserved.
         """
+        if isinstance(inner, str):
+            if not inner:
+                raise ValueError("A backend factory name is required.")
+            if backend_type is None:
+                raise ValueError(
+                    "backend_type is required for a named backend factory."
+                )
+            mirror = backend_type
+        else:
+            if (
+                factory_argument is not None
+                or backend_type is not None
+                or metadata is not None
+            ):
+                raise ValueError(
+                    "factory_argument, backend_type and metadata require a named backend factory."
+                )
+            mirror = inner
         target: type[TemporalBackend] = (
             cls
             if getattr(cls, "_temporal_mirror_of", None) is not None
-            else _wrapper_class_for(inner, cls)
+            else _wrapper_class_for(mirror, cls)
         )
         return object.__new__(target)
 
@@ -529,10 +580,30 @@ class TemporalBackend:
         self,
         inner: Any,
         *,
-        activity_options: Mapping[str, Any] | None = None,
+        activity_options: ActivityConfig | None = None,
+        factory_argument: Any = None,
+        backend_type: type | None = None,
+        metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        """Wrap ``inner`` so its I/O ops dispatch as durable activities."""
+        """Wrap an instance or reference a named worker-side backend factory."""
+        self._backend_factory: str | None = None
+        self._factory_argument: Any = None
+        self._configure_dispatch(activity_options)
+        if isinstance(inner, str):
+            self._inner = SimpleNamespace(**dict(metadata or {}))
+            self._backend_factory = inner
+            self._factory_argument = factory_argument
+            return
         self._inner = inner
+        register_backend(self._ref, inner)
+        # Balance the registration when this wrapper is garbage-collected
+        # (workflow completion / cache eviction) so per-run backends do not
+        # accumulate in the worker-global registry. The finalizer captures
+        # (ref, inner) — not ``self`` — so it cannot keep the wrapper alive,
+        # and it only removes its own registration (see _unregister_backend).
+        self._finalizer = weakref.finalize(self, _unregister_backend, self._ref, inner)
+
+    def _configure_dispatch(self, activity_options: ActivityConfig | None) -> None:
         # A deterministic id: workflow.uuid4() is seeded per-run, so the ref is
         # identical across replays (unlike id(inner)). Falls back to a plain uuid
         # when a backend is wrapped outside a workflow (e.g. in a plain test).
@@ -542,13 +613,6 @@ class TemporalBackend:
             self._ref = f"backend:{_uuid.uuid4().hex}"
         self._opts: dict[str, Any] = dict(activity_options or {})
         self._opts.setdefault("start_to_close_timeout", timedelta(minutes=1))
-        register_backend(self._ref, inner)
-        # Balance the registration when this wrapper is garbage-collected
-        # (workflow completion / cache eviction) so per-run backends do not
-        # accumulate in the worker-global registry. The finalizer captures
-        # (ref, inner) — not ``self`` — so it cannot keep the wrapper alive,
-        # and it only removes its own registration (see _unregister_backend).
-        self._finalizer = weakref.finalize(self, _unregister_backend, self._ref, inner)
 
     async def _dispatch(self, op: str, *args: Any, **kwargs: Any) -> Any:
         from temporalio.deepagents.workflow import call_backend_op
@@ -558,6 +622,8 @@ class TemporalBackend:
             op=op,
             args=list(args),
             kwargs=dict(kwargs),
+            backend_factory=self._backend_factory,
+            factory_argument=self._factory_argument,
         )
         output = await call_backend_op(
             activity_input,
@@ -635,10 +701,14 @@ def _wrapper_class_for(
         filesystem = importlib.import_module("deepagents.middleware.filesystem")
     except ImportError:
         return base
-    inner_cls = type(inner)
+    inner_cls = inner if isinstance(inner, type) else type(inner)
     default_delete = protocol.BackendProtocol.delete
     has_delete = getattr(inner_cls, "delete", default_delete) is not default_delete
-    has_execute = bool(filesystem.supports_execution(inner))
+    has_execute = (
+        issubclass(inner_cls, protocol.SandboxBackendProtocol)
+        if isinstance(inner, type)
+        else bool(filesystem.supports_execution(inner))
+    )
     # Keyed by the inner CLASS too, since the dispatchers carry its method
     # signatures. ``has_execute`` stays in the key: for a ``CompositeBackend``
     # deepagents answers it per instance, from the default backend.

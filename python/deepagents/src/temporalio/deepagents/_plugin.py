@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import sys
 import warnings
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
@@ -59,6 +59,13 @@ class DeepAgentsPlugin(SimplePlugin):
             ActivityConfig]``) for the model activities — timeouts, retry policy.
         tool_activity_options: ``ActivityConfig`` (or ``Mapping[tool_name,
             ActivityConfig]``) default for tools wrapped with ``tool_as_activity``.
+        backends: Map of names to worker-side backend factories used by
+            ``TemporalBackend("name", ...)``. Factories accept zero arguments or
+            one positional ``factory_argument`` and return a backend, synchronously
+            or asynchronously. A one-parameter factory receives ``None`` when the
+            workflow supplies no argument.
+            Configure the same names on every worker polling backend activities;
+            credentials and connections belong in these factories.
         streaming_topic: When set, model calls stream through the streaming
             activity and publish chunk batches to this workflow-streams topic.
         streaming_batch_interval: How long the streaming activity coalesces
@@ -78,6 +85,7 @@ class DeepAgentsPlugin(SimplePlugin):
         model_provider: Callable[[str], Any] | None = None,
         model_activity_options: Any = None,
         tool_activity_options: Any = None,
+        backends: Mapping[str, Callable[..., Any]] | None = None,
         streaming_topic: str | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
         passthrough_modules: Sequence[str] | None = None,
@@ -122,6 +130,7 @@ class DeepAgentsPlugin(SimplePlugin):
         # the batch interval are captured here so API keys never enter an input.
         self._activities = DeepAgentActivities(
             model_provider=model_provider,
+            backends=backends,
             streaming_batch_interval=streaming_batch_interval,
         )
         activities = [
