@@ -1,5 +1,6 @@
 package io.temporal.springai.util;
 
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
 import java.util.Collection;
 import java.util.function.Function;
 import org.springframework.ai.chat.prompt.ChatOptions;
@@ -34,6 +35,7 @@ public final class ChatOptionsCodec {
         .annotationIntrospector(new OptionsIntrospector())
         .addMixIn(ToolCallingChatOptions.class, ToolOptionsMixin.class)
         .addMixIn(ToolCallingChatOptions.Builder.class, ToolOptionsMixin.class)
+        .addMixIn(ChatOptions.Builder.class, OptionsBuilderMixin.class)
         .addMixIn(Function.class, FunctionMixin.class)
         .build();
   }
@@ -45,6 +47,15 @@ public final class ChatOptionsCodec {
 
   @com.fasterxml.jackson.annotation.JsonIgnoreType
   private abstract static class FunctionMixin {}
+
+  // Builders have no getters. Serialize their raw fields so provider defaults are not applied
+  // before the activity has merged the caller's explicit choices with the selected model.
+  @JsonAutoDetect(
+      fieldVisibility = JsonAutoDetect.Visibility.ANY,
+      getterVisibility = JsonAutoDetect.Visibility.NONE,
+      isGetterVisibility = JsonAutoDetect.Visibility.NONE,
+      setterVisibility = JsonAutoDetect.Visibility.NONE)
+  private abstract static class OptionsBuilderMixin {}
 
   // Native provider SDKs still use Jackson 2 annotations and codecs. Keep their wire values
   // intact while Spring AI's immutable option wrappers use the Jackson 3 mapper above.

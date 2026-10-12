@@ -306,8 +306,12 @@ public class ActivityChatModel implements ChatModel {
       String chatOptionsClass = null;
       String chatOptionsJson = null;
       try {
-        chatOptionsJson = OPTIONS_MAPPER.writeValueAsString(opts);
-        chatOptionsClass = opts.getClass().getName();
+        Object serializedOptions =
+            opts instanceof WorkflowChatOptions workflowOptions
+                ? workflowOptions.activityOptions()
+                : opts;
+        chatOptionsJson = OPTIONS_MAPPER.writeValueAsString(serializedOptions);
+        chatOptionsClass = serializedOptions.getClass().getName();
       } catch (JacksonException e) {
         log.debug(
             "Could not JSON-serialize ChatOptions of type {}; activity will fall back to"

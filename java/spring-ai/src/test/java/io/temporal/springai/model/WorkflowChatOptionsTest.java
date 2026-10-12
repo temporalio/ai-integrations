@@ -13,6 +13,7 @@ import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.model.tool.StructuredOutputChatOptions;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.ai.model.tool.ToolCallingManager;
 import org.springframework.ai.openai.OpenAiChatOptions;
@@ -28,6 +29,7 @@ class WorkflowChatOptionsTest {
         OpenAiChatOptions.builder()
             .model("test")
             .reasoningEffort("medium")
+            .stopSequences(List.of("A", "B", "C"))
             .toolCallbacks(providerTool)
             .toolContext("default", "value")
             .build();
@@ -40,7 +42,13 @@ class WorkflowChatOptionsTest {
             .build();
     assertEquals(List.of(providerTool, additionalTool), merged.getToolCallbacks());
     assertEquals(Map.of("default", "value", "additional", "value"), merged.getToolContext());
-    assertEquals("medium", assertInstanceOf(OpenAiChatOptions.class, merged).getReasoningEffort());
+    OpenAiChatOptions provider =
+        assertInstanceOf(
+            OpenAiChatOptions.class,
+            assertInstanceOf(WorkflowChatOptions.class, merged).activityOptions().build());
+    assertEquals("medium", provider.getReasoningEffort());
+    assertEquals(List.of("A", "B", "C"), provider.getStopSequences());
+    assertEquals(List.of("A", "B", "C"), merged.mutate().build().getStopSequences());
     assertEquals(List.of(providerTool), defaults.getToolCallbacks());
   }
 
@@ -75,6 +83,44 @@ class WorkflowChatOptionsTest {
     assertEquals(List.of(tool), options.getToolCallbacks());
     assertEquals(1, ToolCallingManager.builder().build().resolveToolDefinitions(options).size());
   }
+
+  @Test
+  void nativeStructuredOutputKeepsTheProviderSchemaAndUnspecifiedModel() {
+    AtomicReference<Prompt> captured = new AtomicReference<>();
+    ChatModel model =
+        new ChatModel() {
+          @Override
+          public ChatOptions getOptions() {
+            return new WorkflowChatOptions();
+          }
+
+          @Override
+          public ChatResponse call(Prompt prompt) {
+            captured.set(prompt);
+            return new ChatResponse(
+                List.of(new Generation(new AssistantMessage("{\"answer\":\"ok\"}"))));
+          }
+        };
+    assertEquals(
+        new Answer("ok"),
+        ChatClient.builder(model)
+            .defaultOptions(OpenAiChatOptions.builder().temperature(0.5))
+            .build()
+            .prompt()
+            .user("ping")
+            .call()
+            .entity(Answer.class, spec -> spec.useProviderStructuredOutput()));
+    WorkflowChatOptions options =
+        assertInstanceOf(WorkflowChatOptions.class, captured.get().getOptions());
+    assertNull(options.getModel());
+    assertInstanceOf(StructuredOutputChatOptions.class, options);
+    OpenAiChatOptions provider =
+        assertInstanceOf(OpenAiChatOptions.class, options.activityOptions().build());
+    assertTrue(provider.getOutputSchema().contains("answer"));
+    assertEquals("ping", captured.get().getUserMessage().getText());
+  }
+
+  public record Answer(String answer) {}
 
   private ToolCallback tool(String name) {
     return new ToolCallback() {

@@ -95,9 +95,9 @@ public class ChatModelActivityImpl implements ChatModelActivity {
     List<org.springframework.ai.chat.messages.Message> messages =
         input.messages().stream().map(this::toSpringMessage).collect(Collectors.toList());
 
-    ChatOptions callerOptions = tryRehydrateChatOptions(input.modelOptions());
+    ChatOptions.Builder<?> callerOptions = tryRehydrateChatOptions(input.modelOptions());
     if (callerOptions == null) {
-      callerOptions = commonOptions(input.modelOptions());
+      callerOptions = commonOptions(input.modelOptions()).mutate();
     }
 
     // Spring AI 2 providers expect their own options type and do not merge prompt options
@@ -107,12 +107,14 @@ public class ChatModelActivityImpl implements ChatModelActivity {
     if (defaults == null
         || defaults.getClass() == DefaultChatOptions.class
         || defaults.getClass() == DefaultToolCallingChatOptions.class) {
-      optionsBuilder = callerOptions.mutate();
+      optionsBuilder = callerOptions.clone();
       if (defaults != null) {
-        optionsBuilder.combineWith(defaults.mutate().combineWith(callerOptions.mutate()));
+        // Keep caller provider fields, then merge generic defaults and caller fields once.
+        optionsBuilder.stopSequences(null);
+        optionsBuilder.combineWith(defaults.mutate().combineWith(callerOptions));
       }
     } else {
-      optionsBuilder = defaults.mutate().combineWith(callerOptions.mutate());
+      optionsBuilder = defaults.mutate().combineWith(callerOptions);
     }
 
     if (optionsBuilder instanceof ToolCallingChatOptions.Builder<?> toolOptions) {
@@ -157,11 +159,11 @@ public class ChatModelActivityImpl implements ChatModelActivity {
   }
 
   /**
-   * Attempts to rehydrate the caller's exact {@link ChatOptions} subclass from the serialized blob
-   * in {@code modelOptions}. Returns {@code null} if the blob is absent or rehydration fails, in
-   * which case the caller should use the common-field fallback.
+   * Attempts to rehydrate the caller's options builder from the serialized blob in {@code
+   * modelOptions}. Returns {@code null} if the blob is absent or rehydration fails, in which case
+   * the caller should use the common-field fallback.
    */
-  private ChatOptions tryRehydrateChatOptions(ChatModelTypes.ModelOptions modelOptions) {
+  private ChatOptions.Builder<?> tryRehydrateChatOptions(ChatModelTypes.ModelOptions modelOptions) {
     if (modelOptions == null
         || modelOptions.chatOptionsClass() == null
         || modelOptions.chatOptionsJson() == null) {
@@ -170,13 +172,17 @@ public class ChatModelActivityImpl implements ChatModelActivity {
     String className = modelOptions.chatOptionsClass();
     try {
       Class<?> cls = Class.forName(className, true, Thread.currentThread().getContextClassLoader());
+      if (ChatOptions.Builder.class.isAssignableFrom(cls)) {
+        return (ChatOptions.Builder<?>)
+            OPTIONS_MAPPER.readValue(modelOptions.chatOptionsJson(), cls);
+      }
       if (!ChatOptions.class.isAssignableFrom(cls)) {
         log.warn(
             "Serialized ChatOptions class {} is not a ChatOptions; falling back to common fields.",
             className);
         return null;
       }
-      return (ChatOptions) OPTIONS_MAPPER.readValue(modelOptions.chatOptionsJson(), cls);
+      return ((ChatOptions) OPTIONS_MAPPER.readValue(modelOptions.chatOptionsJson(), cls)).mutate();
     } catch (ClassNotFoundException e) {
       log.warn(
           "Could not load ChatOptions class {} on the activity side; falling back to common"
@@ -243,6 +249,16 @@ public class ChatModelActivityImpl implements ChatModelActivity {
       return Map.of();
     }
     Map<String, Object> metadata = new HashMap<>(message.metadata());
+    Object signatures = metadata.get("thoughtSignatures");
+    if (signatures instanceof List<?>) {
+      // Gemini expects byte arrays, including null entries for unsigned parts. Temporal's
+      // untyped metadata map decodes the binary values as base64 strings instead.
+      metadata.put(
+          "thoughtSignatures",
+          OPTIONS_MAPPER.convertValue(
+              signatures,
+              OPTIONS_MAPPER.getTypeFactory().constructCollectionType(List.class, byte[].class)));
+    }
     Object thinking = metadata.get("anthropicThinkingContents");
     if (thinking instanceof List<?> blocks && !blocks.isEmpty()) {
       // Temporal decodes metadata as JSON maps. Anthropic expects its typed records in

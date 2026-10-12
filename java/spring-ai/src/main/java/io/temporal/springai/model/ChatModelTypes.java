@@ -250,13 +250,14 @@ public final class ChatModelTypes {
    * Model options for the chat request.
    *
    * <p>When {@code chatOptionsClass} and {@code chatOptionsJson} are both non-null, the activity
-   * side attempts to rehydrate the caller's exact {@link
-   * org.springframework.ai.chat.prompt.ChatOptions} subclass by loading the class and
-   * JSON-deserializing the blob. That path carries every field the caller set, including
-   * provider-specific ones like OpenAI {@code reasoning_effort} or Anthropic thinking-budget
-   * settings. If class loading or deserialization fails, or if the workflow side couldn't serialize
-   * the caller's options in the first place, the common scalar fields on this record are used as a
-   * fallback.
+   * side attempts to rehydrate the caller's {@link
+   * org.springframework.ai.chat.prompt.ChatOptions.Builder} by loading the class and
+   * JSON-deserializing the blob. ChatClient customizers remain unbuilt until they are merged with
+   * the selected worker model's defaults; directly supplied ChatOptions are also supported. That
+   * path carries every field the caller set, including provider-specific ones like OpenAI {@code
+   * reasoning_effort} or Anthropic thinking-budget settings. If class loading or deserialization
+   * fails, or if the workflow side couldn't serialize the caller's options in the first place, the
+   * common scalar fields on this record are used as a fallback.
    */
   @JsonInclude(JsonInclude.Include.NON_NULL)
   @JsonIgnoreProperties(ignoreUnknown = true)

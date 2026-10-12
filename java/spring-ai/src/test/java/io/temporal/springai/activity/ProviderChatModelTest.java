@@ -10,13 +10,21 @@ import com.openai.core.RequestOptions;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.openai.models.chat.completions.ChatCompletionMessage;
+import io.temporal.client.WorkflowOptions;
+import io.temporal.springai.chat.TemporalChatClient;
+import io.temporal.springai.model.ActivityChatModel;
 import io.temporal.springai.model.ChatModelTypes.*;
 import io.temporal.springai.util.ChatOptionsCodec;
+import io.temporal.testing.TestWorkflowEnvironment;
+import io.temporal.workflow.WorkflowInterface;
+import io.temporal.workflow.WorkflowMethod;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
@@ -141,6 +149,76 @@ class ProviderChatModelTest {
     assertEquals(0.4, request.temperature().orElseThrow());
     assertEquals("high", request.reasoningEffort().orElseThrow().asString());
     assertEquals("worker-model", model.getOptions().getModel());
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void callerCustomizer_preservesSelectedWorkerModel(boolean requestOptions) {
+    runOptionsWorkflow(requestOptions, null);
+    ChatCompletionCreateParams request = request();
+    assertEquals("worker-model", request.model().asString());
+    assertEquals(0.5, request.temperature().orElseThrow());
+    assertEquals("high", request.reasoningEffort().orElseThrow().asString());
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void callerCustomizer_preservesExplicitModelAndStopSequences(boolean requestOptions) {
+    runOptionsWorkflow(requestOptions, "caller-model");
+    ChatCompletionCreateParams request = request();
+    assertEquals("caller-model", request.model().asString());
+    assertEquals(List.of("A", "B", "C"), request.stop().orElseThrow().asStrings());
+    assertTrue(request.responseFormat().orElseThrow().isJsonSchema());
+  }
+
+  private void runOptionsWorkflow(boolean requestOptions, String callerModel) {
+    OpenAiChatModel provider =
+        model(OpenAiChatOptions.builder().model("worker-model").temperature(0.4).build());
+    try (TestWorkflowEnvironment env = TestWorkflowEnvironment.newInstance()) {
+      var worker = env.newWorker("openai-options");
+      worker.registerWorkflowImplementationTypes(OptionsWorkflowImpl.class);
+      worker.registerActivitiesImplementations(
+          new ChatModelActivityImpl(Map.of("selected", provider), "selected"));
+      env.start();
+      var workflow =
+          env.getWorkflowClient()
+              .newWorkflowStub(
+                  OptionsWorkflow.class,
+                  WorkflowOptions.newBuilder().setTaskQueue("openai-options").build());
+      assertEquals("pong", workflow.chat(requestOptions, callerModel));
+    }
+    assertEquals("worker-model", provider.getOptions().getModel());
+    assertEquals(0.4, provider.getOptions().getTemperature());
+  }
+
+  @WorkflowInterface
+  public interface OptionsWorkflow {
+    @WorkflowMethod
+    String chat(boolean requestOptions, String callerModel);
+  }
+
+  public static class OptionsWorkflowImpl implements OptionsWorkflow {
+    @Override
+    public String chat(boolean requestOptions, String callerModel) {
+      var options =
+          OpenAiChatOptions.builder()
+              .temperature(0.5)
+              .reasoningEffort("high")
+              .outputSchema("{\"type\":\"object\",\"properties\":{}}")
+              .stopSequences(List.of("A", "B", "C"));
+      if (callerModel != null) {
+        options.model(callerModel);
+      }
+      var builder = TemporalChatClient.builder(ActivityChatModel.forModel("selected"));
+      if (!requestOptions) {
+        builder.defaultOptions(options);
+      }
+      var prompt = builder.build().prompt().user("ping");
+      if (requestOptions) {
+        prompt.options(options);
+      }
+      return prompt.call().content();
+    }
   }
 
   private OpenAiChatModel model(OpenAiChatOptions options) {
