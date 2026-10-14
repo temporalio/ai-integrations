@@ -404,7 +404,8 @@ class DeepAgentActivities:
                     type="DeepAgentsUnknownBackendFactory",
                     non_retryable=True,
                 )
-            backend = factory(input.factory_argument)
+            # Preserve the activity context without blocking heartbeat tasks.
+            backend = await asyncio.to_thread(factory, input.factory_argument)
             if inspect.isawaitable(backend):
                 backend = await backend
         else:

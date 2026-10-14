@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import sys
+import time
 from typing import Any
 
 from temporalio import activity
@@ -26,6 +27,12 @@ def filesystem_factory(config: dict[str, Any]) -> Any:
 async def async_filesystem_factory(config: dict[str, Any]) -> Any:
     """Also exercise asynchronous sandbox connection factories."""
     await asyncio.sleep(0)
+    return filesystem_factory(config)
+
+
+def blocking_filesystem_factory(config: dict[str, Any]) -> Any:
+    """Simulate a synchronous reconnect slower than the heartbeat timeout."""
+    time.sleep(2)
     return filesystem_factory(config)
 
 
@@ -60,6 +67,7 @@ async def main() -> None:
                         {"root_dir": sys.argv[3], "virtual_mode": True}
                     ),
                     "async-filesystem": async_filesystem_factory,
+                    "blocking-filesystem": blocking_filesystem_factory,
                     "retry-filesystem": retry_filesystem_factory,
                     "shell": shell_factory,
                 }

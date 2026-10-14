@@ -43,8 +43,12 @@ class FactoryFilesystemWorkflow:
             backend_type=FilesystemBackend,
             activity_options=ActivityConfig(
                 start_to_close_timeout=timedelta(seconds=10),
+                heartbeat_timeout=timedelta(seconds=1),
                 retry_policy=RetryPolicy(
-                    initial_interval=timedelta(milliseconds=1), maximum_attempts=2
+                    initial_interval=timedelta(milliseconds=1),
+                    maximum_attempts=(
+                        1 if config["factory"] == "blocking-filesystem" else 2
+                    ),
                 ),
             ),
         )
@@ -81,6 +85,7 @@ class FactoryShellWorkflow:
         "filesystem",
         "worker-filesystem",
         "async-filesystem",
+        "blocking-filesystem",
         "retry-filesystem",
         "shell",
     ],
@@ -189,11 +194,12 @@ def test_factory_wrapper_capabilities_without_construction() -> None:
     )
 
 
-@pytest.mark.parametrize("async_factory", [False, True])
+@pytest.mark.parametrize("factory_kind", ["sync", "async", "sync-awaitable"])
 async def test_factory_is_called_for_each_operation_and_is_worker_local(
-    async_factory: bool,
+    factory_kind: str,
 ) -> None:
     seen: list[dict[str, Any]] = []
+    event_loop = asyncio.get_running_loop()
 
     class Backend:
         def read(self, path: str) -> str:
@@ -204,11 +210,15 @@ async def test_factory_is_called_for_each_operation_and_is_worker_local(
         return Backend()
 
     async def async_build(config: dict[str, Any]) -> Backend:
+        assert asyncio.get_running_loop() is event_loop
         return build(config)
 
-    activities = DeepAgentActivities(
-        backends={"remote": async_build if async_factory else build}
-    )
+    factories: dict[str, Callable[..., Any]] = {
+        "sync": build,
+        "async": async_build,
+        "sync-awaitable": lambda config: async_build(config),
+    }
+    activities = DeepAgentActivities(backends={"remote": factories[factory_kind]})
     input = BackendOpInput(
         backend_ref="unused-ref",
         op="read",

@@ -235,7 +235,9 @@ argument (`None` by default), or no arguments when everything is configured on
 the worker, for example
 `{"filesystem": lambda: FilesystemBackend(root_dir="/shared")}`. Factories may be
 synchronous or asynchronous and run once per activity attempt. Operations and
-retries must reconnect to the same external state; changes held only in a
+retries must reconnect to the same external state. Synchronous factory
+construction runs in a thread with the activity context preserved; returned
+awaitables run on the activity event loop. Changes held only in a
 backend instance's memory do not survive between calls. A local filesystem
 path must be accessible to every activity worker that can receive the operation,
 or the backend activities must be routed to a task queue whose workers share
