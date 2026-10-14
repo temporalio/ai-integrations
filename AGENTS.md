@@ -42,7 +42,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `typescript/langsmith` | `@temporalio/langsmith` | continues (1.24.0 next) | Public Preview | `@temporalio/langsmith` |
 | `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
 | `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
-| `java/spring-ai` | `io.temporal:spring-ai` | 0.1.0 (0.1.0-RC1 planned) | Public Preview | `io.temporal.springai` |
+| `java/spring-ai` | `io.temporal:spring-ai` | 0.1.0 | Public Preview | `io.temporal.springai` |
 | `go/googleadk` | `go.temporal.io/googleadk` | 0.1.0 (new coordinate) | Public Preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
@@ -122,8 +122,9 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 
 The Spring AI history import is followed by an explicit ownership handoff: remove
 active upstream metadata before implementing Spring AI 2 here. Spring AI 1-to-2
-workflow-history replay compatibility is outside the upgrade's scope. The candidate
-version is `0.1.0-RC1`; workflow streams and OpenTelemetry never migrate here.
+workflow-history replay compatibility is outside the upgrade's scope. The
+`0.1.0-RC3` candidate is privately validated; the first final version is `0.1.0`.
+Workflow streams and OpenTelemetry never migrate here.
 
 ## CI
 

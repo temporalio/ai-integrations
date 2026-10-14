@@ -8,7 +8,7 @@ maturity = "public-preview"
 docs = "https://github.com/temporalio/ai-integrations/tree/main/java/spring-ai"
 
 [release]
-allow-final = false
+allow-final = true
 
 [ci]
 runtime-versions = ["17", "25"]

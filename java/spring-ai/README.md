@@ -6,9 +6,10 @@ tools execute through the ChatClient tool-calling advisor on the workflow thread
 
 The new coordinate is `io.temporal:spring-ai` on
 [Maven Central](https://central.sonatype.com/artifact/io.temporal/spring-ai).
-The first Public Preview release is **0.1.0**, with **0.1.0-RC1** staged privately
-in Central Portal first. After `0.1.0` is published, sdk-java publishes a relocation
-POM from the next `io.temporal:temporal-spring-ai` version to the new coordinate.
+The first Public Preview release is **0.1.0**, following the privately validated
+**0.1.0-RC3** candidate in Central Portal. After `0.1.0` is published, sdk-java
+publishes a relocation POM from the next `io.temporal:temporal-spring-ai` version
+to the new coordinate.
 CI tests Java 17 and 25; published bytecode targets Java 17.
 
 ## Requirements and installation
@@ -18,7 +19,7 @@ CI tests Java 17 and 25; published bytecode targets Java 17.
 - Temporal Java SDK and `temporal-spring-boot-starter` 1.40.0 or later.
 - A Spring AI provider starter for your chosen model. This integration supplies no provider.
 
-After the standalone final release is available:
+Install the standalone integration:
 
 ```groovy
 implementation 'io.temporal:spring-ai:0.1.0'
@@ -132,8 +133,10 @@ uv run --project scripts --locked python scripts/ci/check_java_dist.py --plugin-
 uv run --project scripts --locked python scripts/ci/smoke_java.py --plugin-dir java/spring-ai --version 0.1.0 --relocation-pom java/spring-ai/relocation.pom
 ```
 
-TRANSITION(sdk-cutover): final standalone publication awaits the agreed SDK
-cutover plan. Publish the new package before sdk-java publishes the old
-coordinate's relocation POM. The imported implementation and tests,
-as well as the migration adaptations, are relicensed under the repository's MIT
+The release sequence publishes `io.temporal:spring-ai:0.1.0` before sdk-java
+publishes the old coordinate's relocation POM. Production publication requires
+the shared Maven Central environment's reviewer approval.
+
+The imported implementation and tests, as well as the migration adaptations,
+are relicensed under the repository's MIT
 license. Historical upstream commits retain their original licensing records.
