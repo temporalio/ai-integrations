@@ -133,9 +133,11 @@ def verify_module(repo_root: Path, plugin_dir: str, coordinate: str, version: st
     if attempts < 1 or delay < 0:
         raise GoReleaseError("module verification needs attempts >= 1 and delay >= 0")
     with tempfile.TemporaryDirectory(prefix="go-release-") as directory:
-        consumer = Path(directory)
+        root = Path(directory)
+        consumer = root / "consumer"
+        consumer.mkdir()
         env = dict(os.environ, GOPROXY=PROXY, GOSUMDB="sum.golang.org", GOPRIVATE="", GONOPROXY="", GONOSUMDB="",
-                   GOWORK="off", GOTOOLCHAIN="local", GOFLAGS="", GOMODCACHE=str(consumer / "modcache"))
+                   GOWORK="off", GOTOOLCHAIN="local", GOFLAGS="", GOMODCACHE=str(root / "modcache"))
         query = f"{coordinate}@v{version}"
         for attempt in range(attempts):
             result = subprocess.run(["go", "mod", "download", "-json", query], cwd=consumer, env=env, capture_output=True, text=True, timeout=180)

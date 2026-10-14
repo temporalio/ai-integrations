@@ -197,7 +197,8 @@ def test_verification_uses_public_checksums_and_builds_a_clean_consumer(go_repo:
         assert env["GOPROXY"] == "https://proxy.golang.org" and env["GOSUMDB"] == "sum.golang.org"
         assert all(env[key] == "" for key in ("GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOFLAGS"))
         assert env["GOWORK"] == "off" and env["GOTOOLCHAIN"] == "local"
-        assert Path(env["GOMODCACHE"]).parent == kwargs["cwd"]
+        # Cached dependencies without go.mod must not become consumer packages.
+        assert not Path(env["GOMODCACHE"]).is_relative_to(kwargs["cwd"])
         data = {"Path": "go.temporal.io/fakeplug", "Version": "v0.1.0-rc.1", "Sum": "h1:zip", "GoModSum": "h1:mod",
                 "Zip": str(archive), "GoMod": str(go_repo / "go/fakeplug/go.mod")}
         if command[1:3] == ["get", "go.temporal.io/fakeplug@v0.1.0-rc.1"]:
