@@ -1,5 +1,6 @@
 # Temporal AI Integrations
 
+[![Go: 1.26.6 and 1.27](https://img.shields.io/badge/go-1.26.6%20%7C%201.27-blue.svg)](https://go.dev/dl/)
 [![Java: 17, 21, and 25](https://img.shields.io/badge/java-17%20%7C%2021%20%7C%2025-blue.svg)](https://dev.java/)
 [![Python: 3.10 through 3.14](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -10,7 +11,7 @@ cadence.
 
 | Plugin | Package |
 |---|---|
-| [`go/googleadk`](go/googleadk) | [`go.temporal.io/googleadk`](go/googleadk/README.md) (Public Preview) |
+| [`go/googleadk`](go/googleadk) | [![Go Reference](https://pkg.go.dev/badge/go.temporal.io/googleadk.svg)](https://pkg.go.dev/go.temporal.io/googleadk) (Public Preview) |
 | [`java/spring-ai`](java/spring-ai) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/spring-ai.svg)](https://central.sonatype.com/artifact/io.temporal/spring-ai) (Public Preview) |
 | [`python/deepagents`](python/deepagents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-deepagents.svg)](https://pypi.org/project/temporalio-deepagents/) (Pre-release, no Python 3.10 support) |
 | [`python/google_adk`](python/google_adk) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-adk.svg)](https://pypi.org/project/temporalio-google-adk/) (Pre-release) |
