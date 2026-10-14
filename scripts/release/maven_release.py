@@ -95,6 +95,26 @@ def signing_home():
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def run_gpg(base: list[str], arguments: list[str], operation: str, **kwargs) -> subprocess.CompletedProcess:
+    """Report the failed signing operation without exposing GPG's raw diagnostics."""
+    try:
+        return subprocess.run([*base, "--status-fd", "2", *arguments],
+                              check=True, capture_output=True, **kwargs)
+    except subprocess.CalledProcessError as exc:
+        diagnostics = exc.stderr or b""
+        if isinstance(diagnostics, bytes):
+            diagnostics = diagnostics.decode(errors="replace")
+        # Status arguments and ordinary stderr can contain key material, identities
+        # or passphrases. Only these fixed machine-readable names may reach logs.
+        allowed = {"BAD_PASSPHRASE", "MISSING_PASSPHRASE", "NODATA", "BADARMOR",
+                   "KEYEXPIRED", "KEYREVOKED", "INV_SGNR", "NO_SECKEY", "NO_PUBKEY",
+                   "FAILURE", "ERROR"}
+        statuses = sorted(set(re.findall(r"^\[GNUPG:\] ([A-Z_]+)(?: |$)", diagnostics, re.MULTILINE)) & allowed)
+        detail = ", ".join(statuses) or "no recognized status"
+        raise PolicyError(f"GPG {operation} failed (exit {exc.returncode}; {detail}); "
+                          "verify the private key, passphrase and signing-key configuration") from None
+
+
 def sign_bundle(bundle: Path, raw: dict[str, bytes]) -> None:
     key = os.environ.get("GPG_PRIVATE_KEY")
     passphrase = os.environ.get("GPG_PASSPHRASE")
@@ -105,8 +125,8 @@ def sign_bundle(bundle: Path, raw: dict[str, bytes]) -> None:
     with signing_home() as home:
         base = ["gpg", "--homedir", str(home), "--batch", "--no-tty"]
         # Neither key nor passphrase enters CLI arguments, logs, artifacts, or the checkout.
-        subprocess.run([*base, "--import"], input=key_payload, check=True, capture_output=True)
-        listing = subprocess.run([*base, "--with-colons", "--list-secret-keys"], check=True, capture_output=True, text=True).stdout
+        run_gpg(base, ["--import"], "private-key import", input=key_payload)
+        listing = run_gpg(base, ["--with-colons", "--list-secret-keys"], "secret-key listing", text=True).stdout
         fingerprints = {line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")}
         if fingerprint not in fingerprints:
             raise PolicyError("GPG_FINGERPRINT does not match the imported signing key")
@@ -115,12 +135,12 @@ def sign_bundle(bundle: Path, raw: dict[str, bytes]) -> None:
             source = home / Path(name).name
             source.write_bytes(payload)
             signature = source.with_name(source.name + ".asc")
-            subprocess.run(
-                [*base, "--pinentry-mode", "loopback", "--passphrase-fd", "0", "--local-user", fingerprint,
+            run_gpg(
+                base, ["--pinentry-mode", "loopback", "--passphrase-fd", "0", "--local-user", fingerprint,
                  "--armor", "--detach-sign", "--output", str(signature), str(source)],
-                input=passphrase.encode() + b"\n", check=True, capture_output=True,
+                "artifact signing", input=passphrase.encode() + b"\n",
             )
-            subprocess.run([*base, "--verify", str(signature), str(source)], check=True, capture_output=True)
+            run_gpg(base, ["--verify", str(signature), str(source)], "signature verification")
             contents[name] = payload
             contents[name + ".asc"] = signature.read_bytes()
             for signed_name in (name, name + ".asc"):

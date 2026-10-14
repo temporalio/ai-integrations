@@ -109,6 +109,38 @@ def test_signing_accepts_the_existing_sdk_java_key_encoding() -> None:
         maven.private_key_payload("invalid!encoding")
 
 
+@pytest.mark.parametrize("operation", ["private-key import", "secret-key listing", "artifact signing", "signature verification"])
+@pytest.mark.parametrize("text_mode", [False, True])
+def test_gpg_failure_identifies_operation_without_exposing_diagnostics(monkeypatch, operation, text_mode) -> None:
+    secret = "private-key-or-passphrase-must-never-appear"
+    diagnostics = (f"gpg: {secret}\n[GNUPG:] BAD_PASSPHRASE {secret}\n"
+                   f"[GNUPG:] FAILURE sign 123\n[GNUPG:] {secret}\n")
+
+    def failed(command, **kwargs):
+        assert "--status-fd" in command
+        assert kwargs["capture_output"] and kwargs["check"]
+        raise subprocess.CalledProcessError(2, command, output=secret,
+                                            stderr=diagnostics if text_mode else diagnostics.encode())
+
+    monkeypatch.setattr(maven.subprocess, "run", failed)
+    with pytest.raises(PolicyError) as error:
+        maven.run_gpg(["gpg"], ["--import"], operation, text=text_mode)
+    message = str(error.value)
+    assert operation in message and "exit 2" in message
+    assert "BAD_PASSPHRASE, FAILURE" in message
+    assert secret not in message and "123" not in message
+
+
+def test_gpg_failure_with_no_machine_status_remains_safe(monkeypatch) -> None:
+    def failed(command, **kwargs):
+        raise subprocess.CalledProcessError(1, command, stderr=b"sensitive raw error")
+
+    monkeypatch.setattr(maven.subprocess, "run", failed)
+    with pytest.raises(PolicyError, match="private-key import failed .*no recognized status") as error:
+        maven.run_gpg(["gpg"], ["--import"], "private-key import")
+    assert "sensitive raw error" not in str(error.value)
+
+
 class FakePortal:
     def __init__(self, contents=None, state="VALIDATED", version=VERSION):
         self.contents = contents or {}
