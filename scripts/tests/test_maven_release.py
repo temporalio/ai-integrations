@@ -16,6 +16,7 @@ import pytest
 import yaml
 
 import maven_release as maven
+import release_tool
 from release_tool import PolicyError
 
 COORDINATE = "io.temporal:spring-ai"
@@ -200,23 +201,36 @@ def test_deployment_recovery_rejects_additional_coordinates() -> None:
 
 
 @pytest.mark.parametrize("state", ["PENDING", "VALIDATING"])
-def test_fresh_dispatch_after_ambiguous_upload_never_posts_again(tmp_path: Path, monkeypatch, state: str) -> None:
+@pytest.mark.parametrize("event,attempt", [("workflow_dispatch", 1), ("push", 2), ("push", 3)])
+def test_missing_state_after_ambiguous_upload_never_signs_or_posts_again(
+    tmp_path: Path, monkeypatch, state: str, event: str, attempt: int,
+) -> None:
     raw = raw_files(tmp_path)
     portal = FakePortal(state=state)
     monkeypatch.setattr(maven, "Portal", lambda: portal)
     monkeypatch.setattr(maven, "public_file", lambda name: None)
-    monkeypatch.setattr(maven, "sign_bundle", fake_bundle)
+    signings = []
+    def sign(bundle, contents):
+        signings.append(bundle)
+        return fake_bundle(bundle, contents)
+    monkeypatch.setattr(maven, "sign_bundle", sign)
     def uncertain(*a):
         portal.uploads += 1
         raise PolicyError("response lost after Portal accepted the upload")
     portal.upload = uncertain
     with pytest.raises(PolicyError, match="response lost"):
         maven.stage(args(tmp_path), COORDINATE, raw)
-    # A new workflow run cannot retrieve the previous run's state artifact, and
-    # the shared download endpoint does not expose a deployment still validating.
+    monkeypatch.setattr(release_tool, "_gh", lambda *a: json.dumps([{"jobs": [{
+        "name": release_tool.JAVA_STAGE_JOB, "status": "completed", "conclusion": "failure", "steps": [
+            {"name": release_tool.JAVA_STAGE_STEP, "status": "completed", "conclusion": "failure"},
+        ],
+    }]}]))
+    recover_only = release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, attempt, event)
+    # A fresh runner has lost its state, and the shared download endpoint does
+    # not expose a deployment still validating. Neither permits another upload.
     with pytest.raises(PolicyError, match="recovery requires saved deployment state or --deployment-id"):
-        maven.stage(args(tmp_path, state_dir=tmp_path / "fresh-run", recover_only=True), COORDINATE, raw)
-    assert portal.uploads == 1
+        maven.stage(args(tmp_path, state_dir=tmp_path / "fresh-run", recover_only=recover_only), COORDINATE, raw)
+    assert len(signings) == portal.uploads == 1
 
 
 @pytest.mark.parametrize("ref_type,skip_publish,deployment,expected", [

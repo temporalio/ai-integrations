@@ -7,6 +7,7 @@ Subcommands:
                                 exact-version re-runs allowed for recovery)
   verify-index-files            prove the files an index serves for a version are the local artifacts
   check-recovery-run            validate a tagged run's tested artifacts for publication recovery
+  check-java-stage-recovery      prevent another upload when a prior staging attempt may have uploaded
   check-published-release       verify the published GitHub release and emit its deployment URL
   check-go-vanity               verify the Go vanity path routes to this plugin's subdirectory
   verify-go-module              compare public Go module bytes and build a clean consumer
@@ -526,6 +527,45 @@ def _gh(*args: str, input_text: str | None = None) -> str:
     return subprocess.run(["gh", *args], check=True, capture_output=True, text=True, input=input_text).stdout
 
 
+JAVA_STAGE_JOB = "Sign, privately stage and verify"
+JAVA_STAGE_STEP = "Stage tested bytes, prove staged files and install a clean consumer"
+
+
+def java_stage_recovery_only(repo: str, run_id: int, run_attempt: int, event: str) -> bool:
+    """Allow an initial upload only when no earlier attempt could have staged it."""
+    if run_id <= 0 or run_attempt <= 0 or event not in {"push", "workflow_dispatch"}:
+        raise PolicyError("expected a Java release push or dispatch with a positive run ID and attempt")
+    if event == "workflow_dispatch":
+        return True
+    # A later attempt may have failed to restore state and skipped staging. Check
+    # every earlier attempt so that this cannot hide the original upload.
+    for attempt in range(1, run_attempt):
+        pages = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+                               "--paginate", "--slurp"))
+        jobs = [job for page in pages for job in page["jobs"]]
+        if not jobs:
+            raise PolicyError("cannot verify prior staging jobs; inspect Portal before retrying")
+        for job in jobs:
+            if job["name"] != JAVA_STAGE_JOB:
+                continue
+            if job.get("status") == "completed" and job.get("conclusion") == "skipped":
+                continue
+            staging = [step for step in job.get("steps", []) if step["name"] == JAVA_STAGE_STEP]
+            if (job.get("status") != "completed" or len(staging) != 1
+                or staging[0].get("status") != "completed" or staging[0].get("conclusion") != "skipped"):
+                return True
+    return False
+
+
+def cmd_check_java_stage_recovery(args: argparse.Namespace) -> int:
+    recover_only = java_stage_recovery_only(args.repo or _repo(), args.run_id, args.run_attempt, args.event)
+    _write_outputs(args.github_output, {
+        "recover_only": str(recover_only).lower(),
+        "restore_state": str(recover_only and args.event == "push").lower(),
+    })
+    return 0
+
+
 def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> None:
     """Require an existing main-reachable tag and a completed run with its full matrix tested."""
     parsed = parse_tag(tag)
@@ -765,6 +805,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--repo", default=None)
     p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     p.set_defaults(func=cmd_check_recovery_run)
+
+    p = sub.add_parser("check-java-stage-recovery", help="require recovery if an earlier Java staging attempt may have uploaded")
+    p.add_argument("--run-id", type=int, required=True)
+    p.add_argument("--run-attempt", type=int, required=True)
+    p.add_argument("--event", choices=("push", "workflow_dispatch"), required=True)
+    p.add_argument("--repo", default=None)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    p.set_defaults(func=cmd_check_java_stage_recovery)
 
     p = sub.add_parser("check-published-release", help="verify a published GitHub release and emit its URL")
     p.add_argument("--tag", required=True)

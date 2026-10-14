@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+import release_tool
+
 REPO = Path(__file__).resolve().parents[2]
 WORKFLOWS = sorted((REPO / ".github" / "workflows").glob("*.yml"))
 ACTIONS = sorted((REPO / ".github" / "actions").glob("*/action.yml"))
@@ -363,9 +365,23 @@ def test_java_release_reuses_tested_bytes_and_recovers_deployments() -> None:
         assert downloads == ["dist-java-${{ needs.prepare.outputs.plugin }}", "central-deployment-${{ needs.prepare.outputs.plugin }}"]
         assert not any("gradlew" in s.get("run", "") for s in steps), "publish jobs must not rebuild"
     recover = next(s for s in jobs["stage"]["steps"] if s.get("name") == "Recover saved deployment on a failed-job rerun")
-    assert recover["continue-on-error"] is True
+    assert "continue-on-error" not in recover
+    assert recover["if"] == "steps.recovery.outputs.restore_state == 'true'"
+    check = next(s for s in jobs["stage"]["steps"] if s.get("id") == "recovery")
+    assert "check-java-stage-recovery" in check["run"]
+    assert check["env"]["RUN_ATTEMPT"] == "${{ github.run_attempt }}"
+    assert check["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert jobs["stage"]["permissions"]["actions"] == "read"
+    command = next(s for s in jobs["stage"]["steps"] if s.get("id") == "staging")
+    assert jobs["stage"]["name"] == release_tool.JAVA_STAGE_JOB
+    assert command["name"] == release_tool.JAVA_STAGE_STEP
+    assert command["env"]["RECOVER_ONLY"] == "${{ steps.recovery.outputs.recover_only }}"
+    assert "--recover-only" in command["run"]
+    steps = jobs["stage"]["steps"]
+    assert steps.index(check) < steps.index(recover) < steps.index(command)
     preserve = next(s for s in jobs["stage"]["steps"] if s.get("name") == "Preserve signed bundle and deployment ID for recovery")
-    assert preserve["if"] == "always()" and preserve["with"]["overwrite"] is True
+    assert preserve["if"] == "always() && (steps.staging.outcome == 'success' || steps.staging.outcome == 'failure' || steps.staging.outcome == 'cancelled')"
+    assert preserve["with"]["overwrite"] is True
     for name in ("stage", "publish"):
         command = next(s for s in jobs[name]["steps"] if "maven_release.py" in s.get("run", ""))
         assert f"maven_release.py {name}" in command["run"] and "--smoke" in command["run"]

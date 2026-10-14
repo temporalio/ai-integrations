@@ -114,6 +114,105 @@ def recovery_source(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> tuple
     return plugin_repo, run, jobs, artifacts
 
 
+@pytest.mark.parametrize("event,attempt,recover,restore", [
+    ("push", 1, "false", "false"),
+    ("workflow_dispatch", 1, "true", "false"),
+    ("workflow_dispatch", 3, "true", "false"),
+])
+def test_java_first_attempt_and_dispatch_recovery_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event: str, attempt: int, recover: str, restore: str,
+) -> None:
+    monkeypatch.setattr(release_tool, "_gh", lambda *a: pytest.fail("no prior jobs lookup needed"))
+    output = tmp_path / "outputs"
+    assert release_tool.main(["check-java-stage-recovery", "--repo", "temporalio/ai-integrations",
+                              "--run-id", "123", "--run-attempt", str(attempt), "--event", event,
+                              "--github-output", str(output)]) == 0
+    assert output.read_text() == f"recover_only={recover}\nrestore_state={restore}\n"
+
+
+@pytest.mark.parametrize("job_status,job_conclusion,step_status,step_conclusion,recover", [
+    ("completed", "skipped", None, None, False),
+    ("completed", "failure", "completed", "skipped", False),  # setup failed before staging
+    ("completed", "success", "completed", "success", True),
+    ("completed", "failure", "completed", "failure", True),
+    ("completed", "cancelled", "completed", "cancelled", True),
+    ("completed", "timed_out", "completed", "timed_out", True),
+    ("completed", "failure", None, None, True),  # missing step history is ambiguous
+    ("completed", "failure", "in_progress", None, True),
+    ("in_progress", None, "completed", "skipped", True),
+])
+def test_java_rerun_requires_recovery_unless_prior_staging_was_skipped(
+    monkeypatch: pytest.MonkeyPatch, job_status: str, job_conclusion: str | None,
+    step_status: str | None, step_conclusion: str | None, recover: bool,
+) -> None:
+    job = {"name": release_tool.JAVA_STAGE_JOB, "status": job_status, "conclusion": job_conclusion, "steps": []}
+    if step_status:
+        job["steps"] = [{"name": release_tool.JAVA_STAGE_STEP, "status": step_status, "conclusion": step_conclusion}]
+    monkeypatch.setattr(release_tool, "_gh", lambda *a: json.dumps([{"jobs": [job]}]))
+    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 2, "push") is recover
+
+
+def test_java_rerun_checks_every_earlier_attempt_and_job_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    def gh(*args: str) -> str:
+        calls.append(args)
+        job = {"name": release_tool.JAVA_STAGE_JOB, "status": "completed", "conclusion": "failure", "steps": [
+            {"name": release_tool.JAVA_STAGE_STEP, "status": "completed",
+             "conclusion": "skipped" if "/attempts/1/" in args[1] else "failure"},
+        ]}
+        return json.dumps([{"jobs": [{"name": "Test / matrix"}]}, {"jobs": [job]}])
+    monkeypatch.setattr(release_tool, "_gh", gh)
+    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 3, "push") is True
+    assert calls == [("api", f"repos/temporalio/ai-integrations/actions/runs/123/attempts/{attempt}/jobs?per_page=100",
+                      "--paginate", "--slurp") for attempt in (1, 2)]
+
+
+def test_java_restore_failure_on_a_later_attempt_cannot_hide_an_earlier_upload(monkeypatch: pytest.MonkeyPatch) -> None:
+    job = {"name": release_tool.JAVA_STAGE_JOB, "status": "completed", "conclusion": "failure", "steps": [
+        {"name": release_tool.JAVA_STAGE_STEP, "status": "completed", "conclusion": "failure"},
+    ]}
+    def gh(*args: str) -> str:
+        if "/attempts/1/" not in args[1]:
+            job["steps"][0]["conclusion"] = "skipped"
+        return json.dumps([{"jobs": [job]}])
+    monkeypatch.setattr(release_tool, "_gh", gh)
+    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 3, "push") is True
+
+
+def test_java_rerun_before_staging_can_perform_its_first_upload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(release_tool, "_gh", lambda *a: json.dumps([{"jobs": [
+        {"name": "Test / matrix", "status": "completed", "conclusion": "failure"},
+    ]}]))
+    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 3, "push") is False
+
+
+def test_java_tag_rerun_emits_mandatory_restore_and_recovery_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(release_tool, "_gh", lambda *a: json.dumps([{"jobs": [
+        {"name": release_tool.JAVA_STAGE_JOB, "status": "completed", "conclusion": "failure"},
+    ]}]))
+    output = tmp_path / "outputs"
+    assert release_tool.main(["check-java-stage-recovery", "--repo", "temporalio/ai-integrations",
+                              "--run-id", "123", "--run-attempt", "2", "--event", "push",
+                              "--github-output", str(output)]) == 0
+    assert output.read_text() == "recover_only=true\nrestore_state=true\n"
+
+
+@pytest.mark.parametrize("failure", ["api", "empty"])
+def test_java_rerun_cannot_allow_upload_when_prior_job_lookup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    def gh(*args: str) -> str:
+        if failure == "api":
+            raise subprocess.CalledProcessError(1, ["gh", *args], stderr="job history unavailable")
+        return json.dumps([{"jobs": []}])
+    monkeypatch.setattr(release_tool, "_gh", gh)
+    output = tmp_path / "outputs"
+    assert release_tool.main(["check-java-stage-recovery", "--repo", "temporalio/ai-integrations",
+                              "--run-id", "123", "--run-attempt", "2", "--event", "push",
+                              "--github-output", str(output)]) == 1
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("event", ["release", "push"])
 @pytest.mark.parametrize("github_repo,cli_repo,run_repo", [
     pytest.param(None, None, "temporalio/ai-integrations", id="default-repo"),

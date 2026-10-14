@@ -248,6 +248,10 @@ Runbook for `java/<name>`:
 7. After an upload failure, use **Re-run failed jobs**. The workflow preserves the
    signed bundle, upload intent, and deployment ID even if validation or the consumer
    fails. It reuses those signatures and never retries an ambiguous upload POST.
+   Tag-push reruns inspect every earlier attempt. Once the staging command may
+   have run, recovery requires the saved state; a missing or failed state download
+   stops the job without signing, uploading, or replacing the saved artifact.
+   If all earlier attempts skipped staging, a rerun may perform the first upload.
    A fresh publishing dispatch on the same tag requires `-f deployment-id=<Portal UUID>`;
    recovery downloads the existing signed files and rejects any rebuilt-byte
    mismatch or deployment containing additional coordinates. If an upload response
