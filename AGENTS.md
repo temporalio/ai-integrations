@@ -139,6 +139,12 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 
 ## Releases
 
+Pre-release and Public Preview plugins publish without a required-reviewer approval
+gate in every language. Use the plugin's `maturity`, independently of whether its
+version is a prerelease. Keep automated validation, immutable tags, tested-artifact
+verification, and final-release eligibility checks. GA plugins retain any existing
+approval policy.
+
 Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
 
 ### Go releases
@@ -205,9 +211,11 @@ Runbook for `java/<name>`:
    Preview version `0.1.0` (candidate `0.1.0-RC1`); keep the committed `0.0.0`
    development version. Workflow streams and OpenTelemetry stay in sdk-java.
 2. Configure shared environments `maven-central-staging` and `maven-central`, both
-   accepting tags `java/*/v*` only. Production requires an `@temporalio/ai-sdk`
-   reviewer and prevents self-review. Extend the immutable release-tag ruleset to
-   Java without relaxing its Python rules.
+   accepting tags `java/*/v*` only. `maven-central-staging` has no required reviewers;
+   it handles staging for all plugins and publication for Pre-release and Public
+   Preview plugins. GA publication uses `maven-central`, which requires an
+   `@temporalio/ai-sdk` reviewer and prevents self-review. Extend the immutable
+   release-tag ruleset to Java without relaxing its Python rules.
    These environments and tag policies were configured on 2026-10-02; credential
    installation remains a maintainer setup step.
 3. In staging, install environment secrets `CENTRAL_USERNAME`, `CENTRAL_PASSWORD`
@@ -242,10 +250,11 @@ Runbook for `java/<name>`:
    `java/spring-ai/relocation.pom`. Recheck Maven Central for the next available
    old-coordinate version at cutover if sdk-java has released again. Old releases
    remain unchanged. The new pipeline publishes only the new coordinate.
-   The production environment approval publishes the already verified deployment;
-   the workflow waits for `PUBLISHED`, proves Maven Central serves the same files,
-   and installs a clean consumer before drafting a final GitHub release. Do not
-   remove these gates merely to run the candidate.
+   The workflow publishes the already verified deployment automatically for non-GA
+   plugins; GA plugins require production environment approval first. It waits for
+   `PUBLISHED`, proves Maven Central serves the same files, and installs a clean
+   consumer before drafting a final GitHub release. Candidates retain the private
+   staging behavior above.
 7. After an upload failure, use **Re-run failed jobs**. The workflow preserves the
    signed bundle, upload intent, and deployment ID even if validation or the consumer
    fails. It reuses those signatures and never retries an ambiguous upload POST.

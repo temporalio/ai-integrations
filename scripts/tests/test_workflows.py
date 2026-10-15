@@ -18,6 +18,10 @@ ACTIONS = sorted((REPO / ".github" / "actions").glob("*/action.yml"))
 USES_LINE = re.compile(r"^\s*-?\s*uses:\s*(?P<ref>\S+)(?:\s+#\s*(?P<comment>.*))?\s*$")
 SHA_REF = re.compile(r"^[\w.-]+/[\w.-]+(?:/[\w./-]+)?@[0-9a-f]{40}$")
 ALLOWED_UNPINNED = ("./.github/", "temporalio/public-actions/")
+JAVA_PUBLISH_ENVIRONMENT = (
+    "${{ (needs.prepare.outputs.maturity == 'pre-release' || needs.prepare.outputs.maturity == 'public-preview') "
+    "&& 'maven-central-staging' || 'maven-central' }}"
+)
 
 
 def _uses_lines(path: Path) -> list[tuple[str, str | None]]:
@@ -50,12 +54,26 @@ def test_workflows_parse_and_have_no_secrets(path: Path) -> None:
             found = set(re.findall(r"secrets\.([A-Z_]+)", yaml.dump(job)))
             assert found == allowed.get(name, set()), f"{name}: unexpected Maven credentials"
             if found:
-                assert job["environment"] == {"stage": "maven-central-staging", "publish": "maven-central"}[name]
+                assert job["environment"] == {"stage": "maven-central-staging", "publish": JAVA_PUBLISH_ENVIRONMENT}[name]
                 assert "needs.prepare.outputs.publish == 'true'" in job["if"]
     else:
         assert "secrets." not in text, f"{path.name} must not use stored publishing credentials"
     assert "secrets: inherit" not in text, f"{path.name} must not inherit secrets"
     assert "cancel-in-progress: true" not in text, f"{path.name} must not cancel in-progress runs (required checks)"
+
+
+def test_non_ga_releases_use_environments_without_required_reviewers() -> None:
+    java = yaml.safe_load((REPO / ".github/workflows/release-java.yml").read_text())["jobs"]
+    assert java["prepare"]["outputs"]["maturity"] == "${{ steps.tag.outputs.maturity }}"
+    # Only the two recognized non-GA stages bypass the protected environment.
+    # Missing/unknown maturity falls back to maven-central, independently of version prerelease status.
+    assert java["publish"]["environment"] == JAVA_PUBLISH_ENVIRONMENT
+    assert java["stage"]["environment"] == "maven-central-staging"
+    python = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
+    assert python["publish-testpypi"]["environment"] == "testpypi"
+    assert python["publish-pypi"]["environment"]["name"] == "pypi"
+    go = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())["jobs"]
+    assert all("environment" not in job for job in go.values())
 
 
 def test_ci_status_is_the_fan_in() -> None:

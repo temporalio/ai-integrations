@@ -28,7 +28,7 @@ import org.springframework.ai.util.JsonHelper;
  *
  *     // Use with TemporalChatClient
  *     this.chatClient = TemporalChatClient.builder(chatModel)
- *             .defaultToolCallbacks(mcpTools)
+ *             .defaultTools(mcpTools.toArray())
  *             .build();
  * }
  * }</pre>
@@ -106,7 +106,8 @@ public class McpToolCallback implements ToolCallback {
     Map<String, Object> arguments = JSON.fromJsonToMap(toolInput);
 
     // Use the original tool name (not prefixed) when calling the MCP server
-    McpSchema.CallToolRequest request = new McpSchema.CallToolRequest(tool.name(), arguments);
+    McpSchema.CallToolRequest request =
+        McpSchema.CallToolRequest.builder(tool.name()).arguments(arguments).build();
     String summary = "mcp: " + clientName + "." + tool.name();
     McpSchema.CallToolResult result = client.callTool(clientName, request, summary);
 

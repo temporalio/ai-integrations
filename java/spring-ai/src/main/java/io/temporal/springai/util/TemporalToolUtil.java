@@ -17,6 +17,7 @@ import org.springframework.ai.tool.ToolCallback;
  * <p>Each tool object is detected and handled as follows:
  *
  * <ul>
+ *   <li><b>Tool callbacks</b> - Preserved as supplied, including their execution behavior
  *   <li><b>Activity stubs</b> - Executed as durable Temporal activities
  *   <li><b>Local activity stubs</b> - Executed as local activities
  *   <li><b>Nexus service stubs</b> - Executed as Nexus operations
@@ -48,7 +49,10 @@ public final class TemporalToolUtil {
         throw new IllegalArgumentException("Tool object cannot be null");
       }
 
-      if (TemporalStubUtil.isActivityStub(toolObject)) {
+      if (toolObject instanceof ToolCallback toolCallback) {
+        toolCallbacks.add(toolCallback);
+
+      } else if (TemporalStubUtil.isActivityStub(toolObject)) {
         toolCallbacks.addAll(List.of(ActivityToolUtil.fromActivityStub(toolObject)));
 
       } else if (TemporalStubUtil.isLocalActivityStub(toolObject)) {

@@ -60,6 +60,7 @@ def test_go_tag_metadata_does_not_need_a_python_manifest(go_repo: Path, capsys: 
     assert outputs["coordinate"] == "go.temporal.io/fakeplug"
     assert outputs["go_runtime"] == "1.27"
     assert outputs["github_prerelease"] == "true"
+    assert outputs["maturity"] == "public-preview"
     assert "requires_python" not in outputs
 
 

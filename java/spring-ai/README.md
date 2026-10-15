@@ -112,6 +112,8 @@ or snapshots are published.
 The shared [Java release runbook](../../AGENTS.md#releases) describes dry runs,
 protected tags, Central Portal staging, final publication gates, and recovery.
 The release workflow signs and publishes the distributions built by the test matrix.
+Pre-release and Public Preview plugins publish without reviewer approval; GA
+plugins use the protected production environment.
 
 The one-time [relocation POM](relocation.pom) is for sdk-java to publish as
 `io.temporal:temporal-spring-ai:1.41.0` after `io.temporal:spring-ai:0.1.0` is public.

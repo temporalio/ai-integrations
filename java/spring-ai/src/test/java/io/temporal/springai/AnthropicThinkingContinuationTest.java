@@ -169,7 +169,7 @@ class AnthropicThinkingContinuationTest {
             }
           };
       return TemporalChatClient.builder(ActivityChatModel.forDefault())
-          .defaultToolCallbacks(tool)
+          .defaultTools(tool)
           .build()
           .prompt()
           .user("ping")

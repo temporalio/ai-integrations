@@ -147,7 +147,8 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
         out["root_api"] = meta["plugin"]["root-api"]
         out["smoke_imports"] = ",".join(meta.get("smoke", {}).get("imports", []))
         out["allow_final"] = "true" if meta.get("release", {}).get("allow-final") else "false"
-        out["github_prerelease"] = "true" if github_prerelease(release_version(out["language"], out["version"]), meta["plugin"]["maturity"]) else "false"
+        out["maturity"] = meta["plugin"]["maturity"]
+        out["github_prerelease"] = "true" if github_prerelease(release_version(out["language"], out["version"]), out["maturity"]) else "false"
         if out["language"] == "python":
             out["requires_python"] = _load(plugin_toml.parent / "pyproject.toml")["project"]["requires-python"]
         elif out["language"] == "go":

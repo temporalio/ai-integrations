@@ -43,6 +43,7 @@ jobs:
       plugin_dir: ${{ steps.tag.outputs.plugin_dir }}
       version: ${{ steps.tag.outputs.version }}
       prerelease: ${{ steps.tag.outputs.prerelease }}
+      maturity: ${{ steps.tag.outputs.maturity }}
       coordinate: ${{ steps.tag.outputs.coordinate }}
       tag: ${{ steps.tag.outputs.tag }}
       publish: ${{ steps.gate.outputs.publish }}
@@ -204,7 +205,9 @@ jobs:
     if: needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    environment: maven-central
+    # Non-GA plugins publish automatically using the same account as staging.
+    # Unknown or missing maturity retains the protected GA environment.
+    environment: ${{ (needs.prepare.outputs.maturity == 'pre-release' || needs.prepare.outputs.maturity == 'public-preview') && 'maven-central-staging' || 'maven-central' }}
     permissions:
       contents: read
     steps:
