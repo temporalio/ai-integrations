@@ -255,6 +255,8 @@ Runbook for `java/<name>`:
    `PUBLISHED`, proves Maven Central serves the same files, and installs a clean
    consumer before drafting a final GitHub release. Candidates retain the private
    staging behavior above.
+   Publication and recovery share a 30-minute polling budget within the 45-minute
+   job; a polling timeout preserves the deployment for a failed-job rerun.
 7. After an upload failure, use **Re-run failed jobs**. The workflow preserves the
    signed bundle, upload intent, and deployment ID even if validation or the consumer
    fails. It reuses those signatures and never retries an ambiguous upload POST.

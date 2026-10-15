@@ -147,6 +147,7 @@ class FakePortal:
         self.state = state
         self.uploads = 0
         self.requests = []
+        self.waits = []
         self.version = version
 
     def status(self, deployment):
@@ -155,7 +156,8 @@ class FakePortal:
 
     def wait(self, deployment, **kwargs):
         assert deployment == DEPLOYMENT
-        return "PUBLISHED" if kwargs.get("published") else self.state
+        self.waits.append(kwargs)
+        return "PUBLISHED" if kwargs.get("published") or self.state == "PUBLISHING" else self.state
 
     def download(self, deployment, name):
         assert deployment == DEPLOYMENT
@@ -308,13 +310,15 @@ def test_candidates_never_publish_and_recovery_rejects_a_public_candidate(tmp_pa
         maven.publish(invocation, COORDINATE, raw)
 
 
-def test_final_publishes_only_verified_deployment_and_rechecks_policy(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("initial_state", ["VALIDATED", "PUBLISHING", "PUBLISHED"])
+def test_final_publishes_only_verified_deployment_and_rechecks_policy(tmp_path: Path, monkeypatch, initial_state: str) -> None:
     version = "0.1.0"
     raw = raw_files(tmp_path, version)
     invocation = args(tmp_path, version, smoke=True)
     contents = fake_bundle(invocation.state_dir / "bundle.zip", raw)
     maven.save_state(invocation.state_dir, DEPLOYMENT, COORDINATE, version, raw)
-    portal = FakePortal(contents, version=version)
+    portal = FakePortal(contents, state=initial_state, version=version)
+    monkeypatch.setattr(maven.time, "monotonic", lambda: 100)
     monkeypatch.setattr(maven, "Portal", lambda: portal)
     monkeypatch.setattr(maven, "public_file", contents.__getitem__)
     policy_calls = []
@@ -323,7 +327,9 @@ def test_final_publishes_only_verified_deployment_and_rechecks_policy(tmp_path: 
     monkeypatch.setattr(maven, "smoke", lambda *a: consumers.append(a))
     maven.publish(invocation, COORDINATE, raw)
     assert "check-version-policy" in policy_calls[0]
-    assert portal.requests == [(f"/deployment/{DEPLOYMENT}", {"method": "POST"})]
+    assert portal.requests == ([(f"/deployment/{DEPLOYMENT}", {"method": "POST"})] if initial_state == "VALIDATED" else [])
+    assert portal.waits == [{"deadline": 1900}, {"published": True, "deadline": 1900}]
+    assert portal.uploads == 0
     assert consumers == [(invocation.plugin_dir, version, maven.MAVEN_CENTRAL)]
     portal.state = "PUBLISHED"
     portal.requests.clear()
@@ -373,10 +379,38 @@ def test_portal_waits_through_publishing_and_fails_validation(monkeypatch) -> No
     monkeypatch.setattr(maven.time, "sleep", lambda *_: None)
     states = iter(["PUBLISHING", "PUBLISHED"])
     portal.status = lambda _: {"deploymentState": next(states)}
-    assert portal.wait(DEPLOYMENT, attempts=2) == "PUBLISHED"
+    assert portal.wait(DEPLOYMENT) == "PUBLISHED"
     portal.status = lambda _: {"deploymentState": "FAILED"}
     with pytest.raises(PolicyError, match="validation failed"):
-        portal.wait(DEPLOYMENT, attempts=1)
+        portal.wait(DEPLOYMENT)
+
+
+def test_publication_can_finish_after_the_old_ten_minute_limit(monkeypatch) -> None:
+    portal = object.__new__(maven.Portal)
+    elapsed = [0.0]
+    monkeypatch.setattr(maven.time, "monotonic", lambda: elapsed[0])
+    def sleep(delay):
+        elapsed[0] += delay
+    monkeypatch.setattr(maven.time, "sleep", sleep)
+    portal.status = lambda _: {"deploymentState": "PUBLISHED" if elapsed[0] >= 1200 else "PUBLISHING"}
+    assert portal.wait(DEPLOYMENT, published=True, deadline=1800) == "PUBLISHED"
+    assert elapsed[0] == 1200
+
+
+def test_portal_polling_stops_at_its_deadline(monkeypatch) -> None:
+    portal = object.__new__(maven.Portal)
+    elapsed = [0.0]
+    sleeps = []
+    monkeypatch.setattr(maven.time, "monotonic", lambda: elapsed[0])
+    def sleep(delay):
+        sleeps.append(delay)
+        elapsed[0] += delay
+    monkeypatch.setattr(maven.time, "sleep", sleep)
+    portal.status = lambda _: {"deploymentState": "PUBLISHING"}
+    with pytest.raises(PolicyError, match="timed out.*saved deployment ID"):
+        portal.wait(DEPLOYMENT, published=True, deadline=25)
+    assert sleeps == [10, 10, 5]
+    assert elapsed[0] == 25
 
 
 def test_redirects_strip_portal_credentials_to_storage_hosts() -> None:
