@@ -73,9 +73,9 @@ def _convert_agent(
                 handoff_agent = await invoke_func(context, args)
                 return _convert_agent(model_params, handoff_agent, seen)
 
-            new_handoffs.append(
-                dataclasses.replace(handoff, on_invoke_handoff=on_invoke)
-            )
+            new_handoff = dataclasses.replace(handoff, on_invoke_handoff=on_invoke)
+            new_handoff._agent_ref = handoff._agent_ref
+            new_handoffs.append(new_handoff)
         else:
             raise TypeError(f"Unknown handoff type: {type(handoff)}")
 

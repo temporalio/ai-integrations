@@ -56,6 +56,7 @@ from temporalio.client import Client
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.openai_agents import ModelActivityParameters
 from temporalio.openai_agents._model_parameters import ModelSummaryProvider
+from temporalio.openai_agents._openai_runner import _convert_agent
 from temporalio.openai_agents._temporal_model_provider import (
     _CaptureAgentFilter,  # pyright: ignore[reportPrivateUsage]
     _TemporalModelProvider,  # pyright: ignore[reportPrivateUsage]
@@ -89,6 +90,7 @@ class ScriptedModel(Model):
     ) -> None:
         self.reply = reply
         self.seen_instructions: list[str | None] = []
+        self.seen_model_settings: list[ModelSettings] = []
 
     def _next(
         self, system_instructions: str | None, input: str | list[TResponseInputItem]
@@ -107,6 +109,7 @@ class ScriptedModel(Model):
         tracing: ModelTracing,
         **kwargs: Any,
     ) -> ModelResponse:
+        self.seen_model_settings.append(model_settings)
         return self._next(system_instructions, input)
 
     async def stream_response(
@@ -120,6 +123,7 @@ class ScriptedModel(Model):
         tracing: ModelTracing,
         **kwargs: Any,
     ) -> AsyncIterator[TResponseStreamEvent]:
+        self.seen_model_settings.append(model_settings)
         response = self._next(system_instructions, input)
         yield ResponseCompletedEvent(
             response=Response(
@@ -242,6 +246,38 @@ async def _approve_and_resume(
         str(resumed.final_output),
         *[str(item.output) for item in resumed.new_items if hasattr(item, "output")],
     ]
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("use_handoff_object", [False, True])
+async def test_converted_handoff_restores_tool_use_after_resume(
+    streamed: bool, use_handoff_object: bool
+) -> None:
+    banker = _make_banker()
+    banker.model_settings.tool_choice = "required"
+    triage = Agent[None](
+        name="Triage",
+        handoffs=[handoff(banker) if use_handoff_object else banker],
+    )
+    state = RunState(
+        context=RunContextWrapper(context=None),
+        original_input="Move 5 dollars.",
+        starting_agent=banker,
+        max_turns=10,
+    )
+    state.set_tool_use_tracker_snapshot({"Banker": ["transfer_funds"]})
+    converted = _convert_agent(ModelActivityParameters(), triage, None)
+    restored = await RunState.from_string(converted, state.to_string())
+    model = ScriptedModel(
+        lambda _instructions, _input: ResponseBuilders.output_message(
+            "Transfer complete."
+        )
+    )
+    result = await _run(
+        converted, restored, streamed=streamed, run_config=RunConfig(model=model)
+    )
+    assert result.final_output == "Transfer complete."
+    assert model.seen_model_settings[0].tool_choice is None
 
 
 @workflow.defn
