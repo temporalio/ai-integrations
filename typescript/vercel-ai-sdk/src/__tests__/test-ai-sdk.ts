@@ -52,6 +52,7 @@ import type { InjectedSinks } from '@temporalio/worker';
 import type { BaseContext } from '@temporalio/test-helpers';
 import {
   test as anyTest,
+  assertEventually,
   createBaseBundlerOptions,
   helpers,
   Worker,
@@ -767,9 +768,10 @@ test('idle MCP client connection is closed and evicted after the idle timeout el
   t.is(factoryCalls, 1);
   t.deepEqual(closeCalls, [], 'connection should still be open immediately after the call');
 
-  // Wait past the idle timeout for the eviction timer to fire.
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  t.deepEqual(closeCalls, ['client-1'], 'connection should be closed once the idle timeout elapses');
+  // Timer callbacks can be delayed on busy runners; wait for eviction instead of a fixed sleep.
+  await assertEventually(t, (t) => {
+    t.deepEqual(closeCalls, ['client-1'], 'connection should be closed once the idle timeout elapses');
+  });
 
   // A subsequent call should reconnect via a fresh factory call.
   await callToolActivity({ name: 'testTool', input: {}, options: {} });
