@@ -171,13 +171,14 @@ export function buildListToolsActivity(
         inputSchema: t.toolSpec.inputSchema,
       }));
     } catch (err) {
-      // The session may be broken (e.g. the server was redeployed); drop it so
-      // the next call reconnects to the current deployment.
-      await _evictConnection(server);
+      // The session may be broken (e.g. the server was redeployed); stop handing
+      // it out so the next call reconnects to the current deployment. It is
+      // closed once the calls still using it have finished.
+      markBroken(server, record);
       throw err;
     } finally {
-      // No more in-flight call on this connection; let idle eviction resume
-      // (no-op if the connection was just evicted above).
+      // Closes the connection if it was marked broken and this was the last
+      // in-flight call; otherwise lets idle eviction resume.
       releaseConnection(server, record, idleMs);
     }
   };
@@ -200,6 +201,12 @@ interface ConnectionRecord {
   client: Promise<McpClient>;
   /** Number of activities currently using this connection. */
   inflight: number;
+  /**
+   * Set after a failed call. A broken record is no longer handed out to new
+   * calls, and is only disconnected once `inflight` drops back to 0, so an
+   * error in one concurrent call can't close the session under its siblings.
+   */
+  broken: boolean;
   /** Armed only while `inflight` is 0. */
   idleTimer?: NodeJS.Timeout;
 }
@@ -218,12 +225,7 @@ export async function _evictConnection(server: string): Promise<void> {
     clearTimeout(record.idleTimer);
     record.idleTimer = undefined;
   }
-  try {
-    const client = await record.client;
-    await client.disconnect();
-  } catch {
-    // Best-effort; the session may already be broken.
-  }
+  await closeRecord(record);
 }
 
 /**
@@ -238,6 +240,7 @@ function acquireConnection(server: string, factory: () => McpClient): Connection
   if (record === undefined) {
     const entry: ConnectionRecord = {
       inflight: 0,
+      broken: false,
       client: (async () => {
         const client = factory();
         await client.connect();
@@ -260,9 +263,42 @@ function acquireConnection(server: string, factory: () => McpClient): Connection
   return record;
 }
 
-/** Mark a call done; arm idle eviction once no calls remain in flight. */
+/**
+ * Flag `record` as suspect after a failed call. It is unpublished at once so
+ * new calls open a fresh connection, but not disconnected until the calls
+ * still using it have released it (see {@link releaseConnection}).
+ */
+function markBroken(server: string, record: ConnectionRecord): void {
+  // Already evicted or replaced; whoever did that is closing it.
+  if (CONNECTIONS.get(server) !== record) return;
+  record.broken = true;
+  CONNECTIONS.delete(server);
+  if (record.idleTimer !== undefined) {
+    clearTimeout(record.idleTimer);
+    record.idleTimer = undefined;
+  }
+}
+
+/** Disconnect a record that is no longer in {@link CONNECTIONS}. Best-effort. */
+async function closeRecord(record: ConnectionRecord): Promise<void> {
+  try {
+    const client = await record.client;
+    await client.disconnect();
+  } catch {
+    // Best-effort; the session may already be broken.
+  }
+}
+
+/**
+ * Mark a call done. Once no calls remain in flight, disconnect a broken
+ * connection or arm idle eviction for a healthy one.
+ */
 function releaseConnection(server: string, record: ConnectionRecord, idleMs: number): void {
   record.inflight -= 1;
+  if (record.broken) {
+    if (record.inflight === 0) void closeRecord(record);
+    return;
+  }
   // Only the record still cached under this server arms a timer; a record
   // already evicted must not schedule one, or it could later evict a
   // different, healthy connection for the same server.
@@ -305,12 +341,13 @@ export function buildCallToolActivity(
       const client = await record.client;
       return await client.callTool(tool, input.args);
     } catch (err) {
-      // The session may be broken; drop it so the next call reconnects.
-      await _evictConnection(server);
+      // The session may be broken; stop handing it out so the next call
+      // reconnects. It is closed once the calls still using it have finished.
+      markBroken(server, record);
       throw err;
     } finally {
-      // No more in-flight call on this connection; let idle eviction resume
-      // (no-op if the connection was just evicted above).
+      // Closes the connection if it was marked broken and this was the last
+      // in-flight call; otherwise lets idle eviction resume.
       releaseConnection(server, record, idleMs);
     }
   };
