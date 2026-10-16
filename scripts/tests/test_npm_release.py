@@ -17,11 +17,17 @@ import yaml
 
 import npm_release
 import release_tool
+from conftest import commit_all, git
 
 
-@pytest.mark.parametrize("version", ["0.1.0rc1", "0.1.0.dev1", "01.0.0", "0.1.0-rc.01", "0.1.0+build", "v0.1.0"])
+@pytest.mark.parametrize("version", [
+    "0.1.0rc1", "0.1.0.dev1", "01.0.0", "0.1.0-rc.01", "0.1.0+build", "v0.1.0", "0.1",
+    "0.1.0-", "0.1.0-rc.1+build", "0.1.0\n", " 0.1.0", "0.1.0 ",
+])
 def test_npm_rejects_noncanonical_versions(version: str) -> None:
-    with pytest.raises(release_tool.PolicyError, match="npm version"):
+    with pytest.raises(npm_release.NpmReleaseError, match="npm version"):
+        npm_release.NpmVersion(version)
+    with pytest.raises(release_tool.PolicyError):
         release_tool.parse_tag(f"typescript/google-adk/v{version}")
 
 
@@ -159,11 +165,22 @@ def test_npm_publishes_only_the_full_matrix_artifact_with_oidc() -> None:
     assert test["with"]["ref"] == "${{ needs.prepare.outputs.sha }}"
     publish = workflow["jobs"]["publish"]
     assert publish["needs"] == ["prepare", "test"]
-    assert publish["if"] == "needs.prepare.outputs.publish == 'true'"
+    assert "!cancelled() && needs.prepare.result == 'success'" in publish["if"]
+    assert "needs.prepare.outputs.publish == 'true'" in publish["if"]
+    assert "needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true'" in publish["if"]
+    assert test["if"] == "needs.prepare.outputs.recovery != 'true'"
     assert publish["permissions"] == {"contents": "read", "actions": "read", "id-token": "write"}
     assert publish["environment"]["name"] == "npm"
     download = next(step for step in publish["steps"] if "download-artifact@" in step.get("uses", ""))
     assert download["with"]["name"] == test["with"]["artifact-name"]
+    assert download["with"]["run-id"] == "${{ needs.prepare.outputs.artifact_run_id }}"
+    assert download["with"]["github-token"] == "${{ github.token }}"
+    prepare = workflow["jobs"]["prepare"]
+    assert prepare["permissions"]["actions"] == "read"
+    assert prepare["outputs"]["artifact_run_id"] == "${{ steps.recovery.outputs.artifact_run_id || github.run_id }}"
+    recovery = next(step for step in prepare["steps"] if step.get("id") == "recovery")
+    assert recovery["if"] == "github.event_name == 'workflow_dispatch' && inputs.recover-run != ''"
+    assert 'check-recovery-run --tag "$TAG" --run-id "$RUN_ID"' in recovery["run"]
     upload = next(step for step in publish["steps"] if "npm publish" in step.get("run", ""))
     assert upload["if"] == "steps.existing.outputs.exists == 'false'"
     assert '"$PLUGIN_DIR"/dist/*.tgz' in upload["run"]
@@ -178,6 +195,129 @@ def test_npm_publishes_only_the_full_matrix_artifact_with_oidc() -> None:
     inject = next(i for i, step in enumerate(steps) if step.get("name") == "Inject release version")
     lint = next(i for i, step in enumerate(steps) if step.get("name") == "Lint and test")
     assert inject < lint
+    save = next(step for step in steps if "upload-artifact@" in step.get("uses", ""))
+    assert save["with"]["overwrite"] is True
+
+
+@pytest.mark.parametrize("language", ["python", "go", "typescript"])
+def test_release_events_do_not_share_concurrency_between_workflows(language: str) -> None:
+    workflow = yaml.safe_load(WORKFLOW.with_name(f"release-{language}.yml").read_text())
+    assert workflow["concurrency"]["group"].startswith("${{ github.workflow }}-")
+    assert workflow["concurrency"]["cancel-in-progress"] is False
+
+
+def test_npm_recovery_requires_a_tag_ref(tmp_path: Path) -> None:
+    recovery = next(step for step in yaml.safe_load(WORKFLOW.read_text())["jobs"]["prepare"]["steps"]
+                    if step.get("id") == "recovery")
+    env = dict(os.environ, REF_TYPE="branch")
+    result = subprocess.run(["bash", "-c", recovery["run"]], env=env, cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode != 0 and "must be dispatched on the release tag" in result.stdout
+
+
+@pytest.fixture
+def npm_recovery_source(repo: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, dict, dict, dict]:
+    plugin = repo / "typescript/fake"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.toml").write_text('[ci]\nruntime-versions = ["22", "24"]\n')
+    (plugin / "package.json").write_text('{"name": "@temporalio/fake", "version": "0.0.0", "private": false}')
+    (plugin / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    (plugin / "pnpm-workspace.yaml").write_text("minimumReleaseAge: 20160\n")
+    sha = commit_all(repo, "Add npm package")
+    git(repo, "tag", "typescript/fake/v0.1.0")
+    git(repo, "update-ref", "refs/remotes/origin/main", sha)
+    run = {"repository": {"full_name": "temporalio/ai-integrations"}, "event": "workflow_dispatch", "head_branch": "main",
+           "head_sha": sha, "path": ".github/workflows/release-typescript.yml", "status": "completed"}
+    names = ["Validate TypeScript tag and version policy", "Test / matrix"]
+    names.extend(f"Test / fake ({runner}, node{version})" for runner, version in (
+        ("ubuntu-latest", "22"), ("ubuntu-latest", "24"), ("macos-latest", "24"), ("windows-latest", "24"),
+    ))
+    jobs = {"jobs": [{"name": name, "status": "completed", "conclusion": "success"} for name in names]}
+    artifacts = {"artifacts": [{"name": "npm-dist-fake", "expired": False}]}
+
+    def gh(*args: str) -> str:
+        endpoint = args[1]
+        if "/jobs?" in endpoint:
+            return json.dumps([jobs])
+        if "/artifacts?" in endpoint:
+            return json.dumps(artifacts)
+        return json.dumps(run)
+
+    monkeypatch.setattr(release_tool, "_gh", gh)
+    return repo, run, jobs, artifacts
+
+
+@pytest.mark.parametrize("event,branch", [
+    ("workflow_dispatch", "main"), ("workflow_dispatch", "typescript/fake/v0.1.0"), ("release", "typescript/fake/v0.1.0"),
+])
+def test_npm_recovery_reuses_tested_dry_run_or_release_artifacts(npm_recovery_source: tuple, event: str, branch: str) -> None:
+    repo, run, *_ = npm_recovery_source
+    run.update(event=event, head_branch=branch)
+    output = repo / "outputs"
+    assert release_tool.main(["--repo-root", str(repo), "check-recovery-run", "--repo", "temporalio/ai-integrations",
+                              "--tag", "typescript/fake/v0.1.0", "--run-id", "123", "--github-output", str(output)]) == 0
+    assert output.read_text() == "recovery=true\nartifact_run_id=123\n"
+
+
+@pytest.mark.parametrize("key,value", [
+    ("event", "pull_request"), ("event", "push"), ("head_branch", "feature"), ("head_sha", "different-commit"),
+    ("path", ".github/workflows/ci.yml"), ("status", "in_progress"), ("repository", {"full_name": "other/repo"}),
+])
+def test_npm_recovery_rejects_untrusted_or_unfinished_sources(npm_recovery_source: tuple, key: str, value: object) -> None:
+    repo, run, *_ = npm_recovery_source
+    run[key] = value
+    with pytest.raises(release_tool.PolicyError, match="completed release-typescript.yml"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "typescript/fake/v0.1.0", 123)
+
+
+@pytest.mark.parametrize("name", [
+    "Validate TypeScript tag and version policy", "Test / matrix", "Test / fake (ubuntu-latest, node22)",
+    "Test / fake (ubuntu-latest, node24)", "Test / fake (macos-latest, node24)", "Test / fake (windows-latest, node24)",
+])
+@pytest.mark.parametrize("state", ["missing", "failure", "in_progress", "skipped"])
+def test_npm_recovery_requires_the_complete_successful_matrix(npm_recovery_source: tuple, name: str, state: str) -> None:
+    repo, _, jobs, _ = npm_recovery_source
+    job = next(job for job in jobs["jobs"] if job["name"] == name)
+    if state == "missing":
+        jobs["jobs"].remove(job)
+    elif state == "in_progress":
+        job["status"] = state
+    else:
+        job["conclusion"] = state
+    with pytest.raises(release_tool.PolicyError, match="no successful completed job"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "typescript/fake/v0.1.0", 123)
+
+
+@pytest.mark.parametrize("state", ["missing", "expired", "wrong_name", "duplicate"])
+def test_npm_recovery_requires_one_available_tarball(npm_recovery_source: tuple, state: str) -> None:
+    repo, _, _, artifacts = npm_recovery_source
+    if state == "missing":
+        artifacts["artifacts"] = []
+    elif state == "expired":
+        artifacts["artifacts"][0]["expired"] = True
+    elif state == "wrong_name":
+        artifacts["artifacts"][0]["name"] = "npm-dist-other"
+    else:
+        artifacts["artifacts"].append(dict(artifacts["artifacts"][0]))
+    with pytest.raises(release_tool.PolicyError, match="exactly one unexpired npm-dist-fake"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "typescript/fake/v0.1.0", 123)
+
+
+@pytest.mark.parametrize("filename", ["plugin.toml", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"])
+def test_npm_recovery_rejects_changed_package_metadata(npm_recovery_source: tuple, filename: str) -> None:
+    repo, *_ = npm_recovery_source
+    path = repo / "typescript/fake" / filename
+    path.write_text(path.read_text() + "\n")
+    with pytest.raises(release_tool.PolicyError, match="match the release tag"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "typescript/fake/v0.1.0", 123)
+
+
+def test_npm_recovery_rejects_tags_outside_main(npm_recovery_source: tuple) -> None:
+    repo, *_ = npm_recovery_source
+    (repo / "README.md").write_text("unmerged change")
+    commit_all(repo, "Unmerged feature")
+    git(repo, "tag", "typescript/fake/v0.1.1")
+    with pytest.raises(release_tool.PolicyError, match="reachable from origin/main"):
+        release_tool.check_recovery_run(repo, "temporalio/ai-integrations", "typescript/fake/v0.1.1", 123)
 
 
 def test_private_package_cannot_pass_publication_gate(tmp_path: Path) -> None:
@@ -190,8 +330,6 @@ def test_private_package_cannot_pass_publication_gate(tmp_path: Path) -> None:
 
 
 def test_npm_tagged_source_must_be_on_main(plugin_repo: Path, tmp_path: Path) -> None:
-    from conftest import commit_all, git
-
     git(plugin_repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     (plugin_repo / "README.md").write_text("unmerged change")
     commit_all(plugin_repo, "Unmerged feature")

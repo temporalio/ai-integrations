@@ -6,7 +6,7 @@ Subcommands:
   check-version-policy          enforce production and staging registry version ordering (with
                                 exact-version re-runs allowed for recovery)
   verify-index-files            prove the files an index serves for a version are the local artifacts
-  check-recovery-run            validate a tagged run's tested artifacts for publication recovery
+  check-recovery-run            validate tested artifacts for publication recovery of an existing tag
   check-java-stage-recovery      prevent another upload when a prior staging attempt may have uploaded
   check-published-release       verify the published GitHub release and emit its deployment URL
   check-go-vanity               verify the Go vanity path routes to this plugin's subdirectory
@@ -590,8 +590,9 @@ def cmd_check_java_stage_recovery(args: argparse.Namespace) -> int:
 def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> None:
     """Require an existing main-reachable tag and a completed run with its full matrix tested."""
     parsed = parse_tag(tag)
-    if parsed["language"] != "python" or run_id <= 0:
-        raise PolicyError("recovery requires a Python release tag and a positive run ID")
+    language = parsed["language"]
+    if language not in {"python", "typescript"} or run_id <= 0:
+        raise PolicyError("recovery requires a Python or TypeScript release tag and a positive run ID")
     ref = f"refs/tags/{tag}"
     sha = _git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=repo_root).strip()
     if subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], cwd=repo_root).returncode != 0:
@@ -599,22 +600,33 @@ def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> Non
     plugin_dir = parsed["plugin_dir"]
     # The caller's metadata controls publication gates and smoke imports. It must describe the
     # original package, even though repaired workflow/tooling code comes from main.
-    for filename in ("plugin.toml", "pyproject.toml"):
+    filenames = (("plugin.toml", "pyproject.toml") if language == "python" else
+                 ("plugin.toml", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"))
+    for filename in filenames:
         relative = f"{plugin_dir}/{filename}"
         tagged = _git("show", f"{ref}:{relative}", cwd=repo_root)
         if (repo_root / relative).read_text(encoding="utf-8") != tagged:
             raise PolicyError(f"recovery requires {relative} to match the release tag")
     meta = _load(repo_root / plugin_dir / "plugin.toml")
     run = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}"))
+    if language == "python":
+        # Retain recovery of legacy Python tag-push runs.
+        source_matches = run.get("event") in {"release", "push"} and run.get("head_branch") == tag
+        source_description = "release-python.yml release or legacy push run"
+    else:
+        source_matches = (
+            (run.get("event") == "release" and run.get("head_branch") == tag)
+            or (run.get("event") == "workflow_dispatch" and run.get("head_branch") in {"main", tag})
+        )
+        source_description = "release-typescript.yml release or main/tag dispatch run"
     if (
         run.get("repository", {}).get("full_name") != repo
-        or run.get("path") != ".github/workflows/release-python.yml"
-        or run.get("event") not in {"release", "push"}  # retain recovery of legacy tag-push runs
-        or run.get("head_branch") != tag
+        or run.get("path") != f".github/workflows/release-{language}.yml"
+        or not source_matches
         or run.get("head_sha") != sha
         or run.get("status") != "completed"
     ):
-        raise PolicyError("recovery source must be a completed release-python.yml release or legacy push run for this exact tag and commit")
+        raise PolicyError(f"recovery source must be a completed {source_description} for this exact tag and commit")
     pages = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100", "--paginate", "--slurp"))
     jobs = {job["name"]: job for page in pages for job in page["jobs"]}
     versions = meta["ci"]["runtime-versions"]
@@ -622,13 +634,15 @@ def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> Non
         ("ubuntu-latest", versions[0]), ("ubuntu-latest", versions[-1]),
         ("macos-latest", versions[-1]), ("windows-latest", versions[-1]),
     }
-    required = {"Validate tag and version policy", "Test / matrix"}
-    required.update(f"Test / {parsed['plugin']} ({runner}, py{version})" for runner, version in cells)
+    validation_job = "Validate tag and version policy" if language == "python" else "Validate TypeScript tag and version policy"
+    runtime = "py" if language == "python" else "node"
+    required = {validation_job, "Test / matrix"}
+    required.update(f"Test / {parsed['plugin']} ({runner}, {runtime}{version})" for runner, version in cells)
     for name in sorted(required):
         job = jobs.get(name, {})
         if job.get("status") != "completed" or job.get("conclusion") != "success":
             raise PolicyError(f"recovery source has no successful completed job: {name}")
-    artifact_name = f"dist-{parsed['plugin']}-locked"
+    artifact_name = f"dist-{parsed['plugin']}-locked" if language == "python" else f"npm-dist-{parsed['plugin']}"
     artifacts = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/artifacts?name={artifact_name}&per_page=100"))
     matching = [item for item in artifacts["artifacts"] if item["name"] == artifact_name and not item["expired"]]
     if len(matching) != 1:
@@ -850,7 +864,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--index-json", default=None, help="read the release JSON from this file instead of the index (tests)")
     p.set_defaults(func=cmd_verify_index_files)
 
-    p = sub.add_parser("check-recovery-run", help="validate a tagged run's tested artifacts for recovery")
+    p = sub.add_parser("check-recovery-run", help="validate tested artifacts for recovery of an existing tag")
     p.add_argument("--tag", required=True)
     p.add_argument("--run-id", type=int, required=True)
     p.add_argument("--repo", default=None)

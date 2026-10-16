@@ -102,4 +102,5 @@ jobs:
           name: ${{ inputs.artifact-name }}
           path: typescript/${{ inputs.plugin }}/dist/*.tgz
           if-no-files-found: error
+          overwrite: true
           retention-days: 30

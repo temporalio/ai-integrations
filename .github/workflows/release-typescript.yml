@@ -14,6 +14,10 @@ on:
         description: Validate, test and build without uploading
         type: boolean
         default: false
+      recover-run:
+        description: On a tag ref, reuse a completed dry run or release run's tested tarball by run ID
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -22,7 +26,7 @@ defaults:
     shell: bash
 
 concurrency:
-  group: release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  group: ${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -33,6 +37,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
     outputs:
       plugin: ${{ steps.tag.outputs.plugin }}
       plugin_dir: ${{ steps.tag.outputs.plugin_dir }}
@@ -42,6 +47,8 @@ jobs:
       sha: ${{ steps.source.outputs.sha }}
       publish: ${{ steps.gate.outputs.publish }}
       release_url: ${{ steps.release.outputs.url }}
+      recovery: ${{ steps.recovery.outputs.recovery || 'false' }}
+      artifact_run_id: ${{ steps.recovery.outputs.artifact_run_id || github.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -88,6 +95,19 @@ jobs:
           PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
           VERSION: ${{ steps.tag.outputs.version }}
         run: uv run --project scripts --locked python scripts/release/release_tool.py check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
+      - name: Validate publication recovery
+        id: recovery
+        if: github.event_name == 'workflow_dispatch' && inputs.recover-run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          RUN_ID: ${{ inputs.recover-run }}
+        run: |
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::npm artifact recovery must be dispatched on the release tag"; exit 1
+          fi
+          uv run --project scripts --locked python scripts/release/release_tool.py check-recovery-run --tag "$TAG" --run-id "$RUN_ID" --github-output "$GITHUB_OUTPUT"
       - name: Decide whether to publish
         id: gate
         env:
@@ -113,6 +133,7 @@ jobs:
   test:
     name: Test
     needs: prepare
+    if: needs.prepare.outputs.recovery != 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/_typescript-plugin.yml
@@ -126,7 +147,9 @@ jobs:
   publish:
     name: Publish tested tarball to npm
     needs: [prepare, test]
-    if: needs.prepare.outputs.publish == 'true'
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
+      && (needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment:
@@ -159,6 +182,8 @@ jobs:
         with:
           name: npm-dist-${{ needs.prepare.outputs.plugin }}
           path: typescript/${{ needs.prepare.outputs.plugin }}/dist
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.prepare.outputs.artifact_run_id }}
       - name: Check whether these exact bytes are already published
         id: existing
         run: uv run --project scripts --locked python scripts/release/release_tool.py npm-registry-state --coordinate "$COORDINATE" --version "$VERSION" --dist "$PLUGIN_DIR/dist" --github-output "$GITHUB_OUTPUT"

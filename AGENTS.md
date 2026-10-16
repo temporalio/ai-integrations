@@ -245,7 +245,8 @@ committed development version `0.0.0`.
    flag for prerelease versions or Pre-release maturity.
 4. For a new npm coordinate only, npm requires the package to exist before a
    trusted publisher can be registered. Download the successful dry run's tested
-   tarball, authenticate interactively with an authorized npm account and publish
+   `npm-dist-<name>` tarball and record its run ID. Authenticate interactively with
+   an authorized npm account and publish
    those exact bytes using `npm publish <tarball> --access public --tag latest
    --ignore-scripts` (use `next` for prerelease versions). Then register the trusted
    publisher with `npm trust github @temporalio/<name> --repo temporalio/ai-integrations
@@ -256,10 +257,23 @@ committed development version `0.0.0`.
    tarball to `latest` for final versions or `next` for prereleases, verifies npm's
    SHA-512/SHA-1 metadata and downloaded bytes, and installs that public version
    in a clean consumer. It leaves the reviewed GitHub Release unchanged.
+   After the bootstrap upload in step 4, dispatch
+   `gh workflow run release-typescript.yml --ref typescript/<name>/v<version> -f recover-run=<dry-run-id>`.
+   This verifies the exact tarball already uploaded, even if the automatic release
+   run rebuilt different bytes. Recovery requires that the source dry run or
+   release run completed at the tag's exact main-reachable commit, passed version
+   validation and every matrix job, and retains one unexpired `npm-dist-<name>`
+   artifact. It downloads that artifact without rebuilding. The downloaded
+   package must have the release's name and version and be public before any upload.
 6. Re-run failed jobs after an upload. An existing version is skipped only when
-   its registry hashes and served bytes equal the tested tarball. A new run
-   rebuilds and must pass the same byte check. A mismatch requires fixing forward
-   with a new version; never move a tag or replace an uploaded artifact.
+   its registry hashes and served bytes equal the tested tarball. For a fresh run,
+   dispatch on the same tag with `-f recover-run=<original-run-id>` to reuse those
+   tested bytes. The published GitHub Release and normal registry policy are still
+   required. Recovery is accepted only on a tag ref; branch dispatches remain dry
+   runs. A full rerun can replace its saved artifact, so preserve a downloaded copy
+   after manually publishing it and prefer re-running failed jobs. If the original
+   artifact is unavailable or its bytes differ from npm, fix forward with a new
+   version; never move a tag or replace an uploaded artifact.
 
 ### Python releases
 

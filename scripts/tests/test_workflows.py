@@ -186,7 +186,7 @@ def test_release_publish_jobs_are_inline_and_oidc_only() -> None:
             continue
         for step in job.get("steps", []):
             assert "github.ref_name" not in yaml.dump(step.get("env", {})), f"{name}: read the parsed tag, not the ref name"
-    assert doc["concurrency"]["group"] == "release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
+    assert doc["concurrency"]["group"] == "${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
 
 
 def test_published_release_is_verified_before_uploads_and_linked_from_deployment() -> None:

@@ -21,7 +21,7 @@ class NpmReleaseError(ValueError):
 
 
 class NpmVersion(GoVersion):
-    """npm and Go use the same canonical SemVer precedence rules."""
+    """Apply npm release policy using the shared semver-backed implementation."""
 
     def __post_init__(self) -> None:
         try:
