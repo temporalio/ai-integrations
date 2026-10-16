@@ -49,7 +49,3 @@ Its telemetry test explicitly registers a tracing provider and an in-memory
 exporter. The test environments omit the unused OpenTelemetry Node SDK and its
 Jaeger/Prometheus dependencies.
 
-The development version is `0.0.0`. Packages remain private and final releases
-disabled until the shared npm publication workflow and trusted publishers are
-configured. The history import and ownership cutover do not publish anything.
-See [AGENTS.md](../AGENTS.md) and the [import log](../scripts/migrate/IMPORTS.md).

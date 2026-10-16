@@ -4,21 +4,21 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import tempfile
 import time
 import urllib.error
 import urllib.request
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import total_ordering
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import quote
 
+from semver import Version
+
 PROXY = "https://proxy.golang.org"
-SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?\Z")
 
 
 class GoReleaseError(ValueError):
@@ -31,19 +31,24 @@ class GoVersion:
     """Canonical Go release SemVer, without the tag's leading v or build metadata."""
 
     raw: str
+    _version: Version = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        match = SEMVER.fullmatch(self.raw)
-        if not match or any(len(p) > 1 and p.startswith("0") and p.isdigit() for p in (match[4] or "").split(".")):
+        try:
+            version = Version.parse(self.raw)
+        except ValueError as exc:
+            raise GoReleaseError(f"Go version {self.raw!r} must be canonical SemVer, e.g. 0.1.0 or 0.1.0-rc.1") from exc
+        if version.build is not None or str(version) != self.raw:
             raise GoReleaseError(f"Go version {self.raw!r} must be canonical SemVer, e.g. 0.1.0 or 0.1.0-rc.1")
+        object.__setattr__(self, "_version", version)
 
     @property
     def release(self) -> tuple[int, ...]:
-        return tuple(int(p) for p in self.raw.split("-", 1)[0].split("."))
+        return self._version.major, self._version.minor, self._version.patch
 
     @property
     def is_prerelease(self) -> bool:
-        return "-" in self.raw
+        return self._version.prerelease is not None
 
     def __str__(self) -> str:
         return self.raw
@@ -52,11 +57,7 @@ class GoVersion:
         if not isinstance(other, GoVersion):
             return NotImplemented
 
-        def key(v: GoVersion) -> tuple:
-            identifiers = v.raw.split("-", 1)[1].split(".") if v.is_prerelease else []
-            return v.release, not v.is_prerelease, tuple((0, int(p)) if p.isdigit() else (1, p) for p in identifiers)
-
-        return key(self) < key(other)
+        return self._version < other._version
 
 
 def _fetch(url: str) -> str | None:

@@ -20,7 +20,7 @@ def test_parse_tag_valid() -> None:
         "prerelease": "true", "plugin_dir": "python/openai_agents",
     }
     assert release_tool.parse_tag("go/googleadk/v0.3.0")["prerelease"] == "false"
-    assert release_tool.parse_tag("typescript/vercel-ai-sdk/v1.0.0.dev1")["prerelease"] == "true"
+    assert release_tool.parse_tag("typescript/vercel-ai-sdk/v1.0.0-dev.1")["prerelease"] == "true"
     java = release_tool.parse_tag("java/spring-ai/v0.1.0-RC1")
     assert java["version"] == "0.1.0-RC1" and java["prerelease"] == "true"
     assert release_tool.parse_tag("java/spring-ai/v0.1.0")["prerelease"] == "false"
@@ -118,6 +118,7 @@ def recovery_source(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> tuple
 
 
 @pytest.mark.parametrize("event,attempt,recover,restore", [
+    ("release", 1, "false", "false"),
     ("push", 1, "false", "false"),
     ("workflow_dispatch", 1, "true", "false"),
     ("workflow_dispatch", 3, "true", "false"),
@@ -133,6 +134,7 @@ def test_java_first_attempt_and_dispatch_recovery_outputs(
     assert output.read_text() == f"recover_only={recover}\nrestore_state={restore}\n"
 
 
+@pytest.mark.parametrize("event", ["release", "push"])
 @pytest.mark.parametrize("job_status,job_conclusion,step_status,step_conclusion,recover", [
     ("completed", "skipped", None, None, False),
     ("completed", "failure", "completed", "skipped", False),  # setup failed before staging
@@ -145,17 +147,18 @@ def test_java_first_attempt_and_dispatch_recovery_outputs(
     ("in_progress", None, "completed", "skipped", True),
 ])
 def test_java_rerun_requires_recovery_unless_prior_staging_was_skipped(
-    monkeypatch: pytest.MonkeyPatch, job_status: str, job_conclusion: str | None,
+    monkeypatch: pytest.MonkeyPatch, event: str, job_status: str, job_conclusion: str | None,
     step_status: str | None, step_conclusion: str | None, recover: bool,
 ) -> None:
     job = {"name": release_tool.JAVA_STAGE_JOB, "status": job_status, "conclusion": job_conclusion, "steps": []}
     if step_status:
         job["steps"] = [{"name": release_tool.JAVA_STAGE_STEP, "status": step_status, "conclusion": step_conclusion}]
     monkeypatch.setattr(release_tool, "_gh", lambda *a: json.dumps([{"jobs": [job]}]))
-    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 2, "push") is recover
+    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 2, event) is recover
 
 
-def test_java_rerun_checks_every_earlier_attempt_and_job_page(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("event", ["release", "push"])
+def test_java_rerun_checks_every_earlier_attempt_and_job_page(monkeypatch: pytest.MonkeyPatch, event: str) -> None:
     calls = []
     def gh(*args: str) -> str:
         calls.append(args)
@@ -165,12 +168,13 @@ def test_java_rerun_checks_every_earlier_attempt_and_job_page(monkeypatch: pytes
         ]}
         return json.dumps([{"jobs": [{"name": "Test / matrix"}]}, {"jobs": [job]}])
     monkeypatch.setattr(release_tool, "_gh", gh)
-    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 3, "push") is True
+    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 3, event) is True
     assert calls == [("api", f"repos/temporalio/ai-integrations/actions/runs/123/attempts/{attempt}/jobs?per_page=100",
                       "--paginate", "--slurp") for attempt in (1, 2)]
 
 
-def test_java_restore_failure_on_a_later_attempt_cannot_hide_an_earlier_upload(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("event", ["release", "push"])
+def test_java_restore_failure_on_a_later_attempt_cannot_hide_an_earlier_upload(monkeypatch: pytest.MonkeyPatch, event: str) -> None:
     job = {"name": release_tool.JAVA_STAGE_JOB, "status": "completed", "conclusion": "failure", "steps": [
         {"name": release_tool.JAVA_STAGE_STEP, "status": "completed", "conclusion": "failure"},
     ]}
@@ -179,30 +183,35 @@ def test_java_restore_failure_on_a_later_attempt_cannot_hide_an_earlier_upload(m
             job["steps"][0]["conclusion"] = "skipped"
         return json.dumps([{"jobs": [job]}])
     monkeypatch.setattr(release_tool, "_gh", gh)
-    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 3, "push") is True
+    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 3, event) is True
 
 
-def test_java_rerun_before_staging_can_perform_its_first_upload(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("event", ["release", "push"])
+def test_java_rerun_before_staging_can_perform_its_first_upload(monkeypatch: pytest.MonkeyPatch, event: str) -> None:
     monkeypatch.setattr(release_tool, "_gh", lambda *a: json.dumps([{"jobs": [
         {"name": "Test / matrix", "status": "completed", "conclusion": "failure"},
     ]}]))
-    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 3, "push") is False
+    assert release_tool.java_stage_recovery_only("temporalio/ai-integrations", 123, 3, event) is False
 
 
-def test_java_tag_rerun_emits_mandatory_restore_and_recovery_outputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("event", ["release", "push"])
+def test_java_release_rerun_emits_mandatory_restore_and_recovery_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event: str,
+) -> None:
     monkeypatch.setattr(release_tool, "_gh", lambda *a: json.dumps([{"jobs": [
         {"name": release_tool.JAVA_STAGE_JOB, "status": "completed", "conclusion": "failure"},
     ]}]))
     output = tmp_path / "outputs"
     assert release_tool.main(["check-java-stage-recovery", "--repo", "temporalio/ai-integrations",
-                              "--run-id", "123", "--run-attempt", "2", "--event", "push",
+                              "--run-id", "123", "--run-attempt", "2", "--event", event,
                               "--github-output", str(output)]) == 0
     assert output.read_text() == "recover_only=true\nrestore_state=true\n"
 
 
+@pytest.mark.parametrize("event", ["release", "push"])
 @pytest.mark.parametrize("failure", ["api", "empty"])
 def test_java_rerun_cannot_allow_upload_when_prior_job_lookup_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, event: str,
 ) -> None:
     def gh(*args: str) -> str:
         if failure == "api":
@@ -211,7 +220,7 @@ def test_java_rerun_cannot_allow_upload_when_prior_job_lookup_fails(
     monkeypatch.setattr(release_tool, "_gh", gh)
     output = tmp_path / "outputs"
     assert release_tool.main(["check-java-stage-recovery", "--repo", "temporalio/ai-integrations",
-                              "--run-id", "123", "--run-attempt", "2", "--event", "push",
+                              "--run-id", "123", "--run-attempt", "2", "--event", event,
                               "--github-output", str(output)]) == 1
     assert not output.exists()
 
@@ -595,6 +604,48 @@ def test_release_notes_initial_and_incremental(plugin_repo: Path, tmp_path: Path
     assert "commits/refs/tags/python/fakeplug/v0.1.0/python/fakeplug" in notes
     assert "compare/python/fakeplug/v0.1.0rc1" not in notes
     assert "Pre-release notes" not in notes
+
+
+@pytest.mark.parametrize("language,coordinate,version", [
+    ("python", "temporalio-fake", "0.2.0"), ("typescript", "@temporalio/fake", "0.2.0"),
+    ("java", "io.temporal:fake", "0.2.0"), ("go", "go.temporal.io/fake", "0.2.0"),
+    ("typescript", "@temporalio/fake", "0.2.0-rc.1"),
+])
+@pytest.mark.parametrize("incremental", [False, True])
+def test_release_notes_before_tag_creation_use_the_tested_commit(
+    repo: Path, tmp_path: Path, language: str, coordinate: str, version: str, incremental: bool,
+) -> None:
+    plugin_dir = f"{language}/fake"
+    plugin = repo / plugin_dir
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.toml").write_text(f'[plugin]\ncoordinate = "{coordinate}"\n')
+    commit_all(repo, "Initial plugin")
+    previous = f"{language}/fake/v0.1.0"
+    if incremental:
+        git(repo, "tag", previous)
+    (plugin / "README.md").write_text("Tested content\n")
+    tested_sha = commit_all(repo, "Tested change (#98)")
+    (plugin / "README.md").write_text("Untested content\n")
+    (plugin / "plugin.toml").write_text('[plugin]\ncoordinate = "untested-coordinate"\n')
+    commit_all(repo, "Untested change")
+    tag = f"{language}/fake/v{version}"
+    output = tmp_path / "notes.md"
+    assert release_tool.main([
+        "--repo-root", str(repo), "release-notes", "--plugin-dir", plugin_dir,
+        "--tag", tag, "--ref", tested_sha, "--repo", "temporalio/ai-integrations", "--output", str(output),
+    ]) == 0
+    notes = output.read_text()
+    assert "Tested change" in notes and "Untested change" not in notes
+    assert "untested-coordinate" not in notes
+    if not incremental:
+        assert f"First standalone release of `{coordinate}`" in notes
+    assert ("Initial plugin" in notes) == (not incremental)
+    assert ("First standalone release" in notes) == (not incremental)
+    assert (f"compare/{previous}...{tag}" in notes) is incremental
+    if language == "typescript" and "-" in version:
+        assert f"npm install {coordinate}@{version}" in notes
+        assert "TestPyPI" not in notes and "SDK cutover" not in notes
+    assert tag not in git(repo, "tag", "--list").splitlines()
 
 
 def test_prerelease_notes_warn_about_sdk_overlap_only_while_the_sdk_bundles_the_plugin(repo: Path) -> None:

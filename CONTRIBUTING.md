@@ -36,10 +36,3 @@ history, follow [`scripts/migrate/README.md`](scripts/migrate/README.md).
 
 All contributors must complete the Temporal Contributor License Agreement (CLA)
 before changes can be merged. A link to the CLA will be posted in the pull request.
-
-## Releasing
-
-Release tags are authoritative: keep the committed Python version at `0.0.0`, dry-run the intended
-`python/<name>/v<version>` tag from `main`, then create the protected tag without a version-only PR.
-Follow the runbook in AGENTS.md ("Releases"). Release notes are generated from commit messages, so
-write commit subjects you would want users to read.

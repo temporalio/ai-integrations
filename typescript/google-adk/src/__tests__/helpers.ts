@@ -30,6 +30,7 @@ import {
 
 import { GoogleAdkPlugin } from '../index';
 import { FakeLlm, type MockMCPToolDefinition } from '../testing';
+import { startLocalWithRetry } from './helpers/environment';
 
 const here = __dirname;
 
@@ -59,7 +60,7 @@ export function uid(prefix: string): string {
 export function setupTestEnv(test: TestFn): () => TestWorkflowEnvironment {
   let env: TestWorkflowEnvironment;
   test.before(async () => {
-    env = await TestWorkflowEnvironment.createLocal();
+    env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
   });
   test.after.always(async () => {
     await env?.teardown();

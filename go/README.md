@@ -5,8 +5,7 @@ in `go/<name>/` as an independent Go module with its own source, tests,
 `go.mod`, `go.sum`, `plugin.toml`, `Makefile`, `README.md` and `LICENSE`.
 
 Each plugin's README describes its API and installation. Its `go.mod` sets
-the minimum Go version, and `plugin.toml` records its maturity, upstream
-and release status.
+the minimum Go version, and `plugin.toml` records its integration metadata.
 
 Run the shared make targets from the plugin directory, replacing `<name>`
 with the plugin's folder name:
@@ -32,15 +31,7 @@ Tests must not require provider credentials. Use deterministic local models,
 mock transports or in-process servers. Tests that need Temporal start a local
 dev server and may download the Temporal CLI on first use.
 
-Repository conventions and Go publishing requirements are in
+Repository conventions are in
 [`AGENTS.md`](../AGENTS.md). History imports and re-syncs follow
 [`scripts/migrate/README.md`](../scripts/migrate/README.md), with provenance
 recorded in [`IMPORTS.md`](../scripts/migrate/IMPORTS.md).
-
-The shared [`release-go.yml`](../.github/workflows/release-go.yml) validates
-scoped SemVer tags, runs the full test matrix and verifies public module bytes,
-checksums and a clean consumer build. Dispatch it on `main` with a proposed tag
-for a dry run before tagging. Pushing a Go tag makes it discoverable immediately;
-a draft GitHub Release does not delay Go publication. Follow the
-[`Go release runbook`](../AGENTS.md#go-releases) for vanity routing, protected tags
-and retries.

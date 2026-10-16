@@ -14,7 +14,7 @@ name = "ai-integrations-scripts"
 version = "0"
 description = "Repository tooling for temporalio/ai-integrations (not published)"
 requires-python = ">=3.11"
-dependencies = ["packaging>=26,<27"]
+dependencies = ["packaging>=26,<27", "semver>=3.1,<4"]
 
 [dependency-groups]
 dev = ["pytest>=9,<10", "pyyaml>=6,<7"]

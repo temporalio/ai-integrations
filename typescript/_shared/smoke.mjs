@@ -9,7 +9,8 @@ const tarballs = readdirSync('dist').filter((name) => name.endsWith('.tgz'));
 if (tarballs.length !== 1) throw new Error('Expected exactly one npm tarball in dist');
 const tarball = resolve('dist', tarballs[0]);
 const workflowSmoke = resolve('tests/smoke');
-const dependencies = [tarball];
+const registryVersion = process.env.NPM_REGISTRY_VERSION;
+const dependencies = [registryVersion ? `${pkg.name}@${registryVersion}` : tarball];
 if (existsSync(workflowSmoke)) {
   for (const dependency of ['@temporalio/worker', '@temporalio/testing']) {
     dependencies.push(`${dependency}@${pkg.devDependencies[dependency]}`);
@@ -27,6 +28,8 @@ try {
     cwd: consumer,
     stdio: 'inherit',
   });
+  const installed = JSON.parse(readFileSync(join(consumer, 'node_modules', pkg.name, 'package.json'), 'utf8'));
+  if (installed.version !== (registryVersion || pkg.version)) throw new Error('Installed version differs from release');
   console.log(`OK: clean consumer imports ${pkg.name}`);
   if (existsSync(workflowSmoke)) {
     cpSync(workflowSmoke, join(consumer, 'smoke'), { recursive: true });
