@@ -240,13 +240,16 @@ Runbook for `java/<name>`:
    Preview version `0.1.0` (candidate `0.1.0-RC1`); keep the committed `0.0.0`
    development version. Workflow streams and OpenTelemetry stay in sdk-java.
 2. Configure shared environments `maven-central-staging` and `maven-central`, both
-   accepting tags `java/*/v*` only. `maven-central-staging` has no required reviewers;
-   it handles staging for all plugins and publication for Pre-release and Public
-   Preview plugins. GA publication uses `maven-central`, which requires an
-   `@temporalio/ai-sdk` reviewer and prevents self-review. Extend the immutable
-   release-tag ruleset to Java without relaxing its Python rules.
-   These environments and tag policies were configured on 2026-10-02; credential
-   installation remains a maintainer setup step.
+   accepting tags `java/*/v*` only, with no required reviewers. Every plugin uses
+   `maven-central-staging` for private staging and `maven-central` for public
+   publication, so their deployment histories track the two phases separately.
+   The shared `maven-central-approval` environment accepts the same tag pattern,
+   requires an `@temporalio/ai-sdk` reviewer and prevents self-review; it holds no
+   secrets. GA publication must pass this approval job first. Only recognized
+   Pre-release and Public Preview maturities skip it; missing or unknown maturity
+   requires approval. Extend the immutable release-tag ruleset to Java without
+   relaxing its Python rules.
+   Credential installation remains a maintainer setup step.
 3. In staging, install environment secrets `CENTRAL_USERNAME`, `CENTRAL_PASSWORD`
    (a Central Portal user-token pair), `GPG_PRIVATE_KEY` (armored private key or
    sdk-java's base64-encoded secret keyring), and
@@ -280,7 +283,7 @@ Runbook for `java/<name>`:
    old-coordinate version at cutover if sdk-java has released again. Old releases
    remain unchanged. The new pipeline publishes only the new coordinate.
    The workflow publishes the already verified deployment automatically for non-GA
-   plugins; GA plugins require production environment approval first. It waits for
+   plugins; GA plugins require `maven-central-approval` approval first. It waits for
    `PUBLISHED`, proves Maven Central serves the same files, and installs a clean
    consumer before drafting a final GitHub release. Candidates retain the private
    staging behavior above.

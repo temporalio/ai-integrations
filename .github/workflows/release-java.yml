@@ -199,15 +199,31 @@ jobs:
           overwrite: true
           retention-days: 90
 
+  approve:
+    name: Approve GA publication
+    needs: [prepare, stage]
+    if: >-
+      needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.prerelease == 'false'
+      && needs.prepare.outputs.maturity != 'pre-release' && needs.prepare.outputs.maturity != 'public-preview'
+    runs-on: ubuntu-latest
+    environment: maven-central-approval
+    permissions: {}
+    steps:
+      - name: Record publication approval
+        run: echo "Maven Central publication approved"
+
   publish:
     name: Publish and verify Maven Central
-    needs: [prepare, stage]
-    if: needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.prerelease == 'false'
+    needs: [prepare, stage, approve]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' && needs.stage.result == 'success'
+      && needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.prerelease == 'false'
+      && (needs.approve.result == 'success'
+          || (needs.approve.result == 'skipped'
+              && (needs.prepare.outputs.maturity == 'pre-release' || needs.prepare.outputs.maturity == 'public-preview')))
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # Non-GA plugins publish automatically using the same account as staging.
-    # Unknown or missing maturity retains the protected GA environment.
-    environment: ${{ (needs.prepare.outputs.maturity == 'pre-release' || needs.prepare.outputs.maturity == 'public-preview') && 'maven-central-staging' || 'maven-central' }}
+    environment: maven-central
     permissions:
       contents: read
     steps:
