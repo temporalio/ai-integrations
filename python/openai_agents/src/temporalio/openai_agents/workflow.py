@@ -11,13 +11,18 @@ from typing import Any
 
 import nexusrpc
 from agents import (
+    ModelBehaviorError,
     RunContextWrapper,
     Tool,
+    _debug,
+    default_tool_error_function,
 )
-from agents.function_schema import function_schema
+from agents.function_schema import FuncSchema, function_schema
 from agents.tool import (
     FunctionTool,
+    ToolErrorFunction,
 )
+from pydantic import BaseModel, ValidationError
 
 from temporalio import activity
 from temporalio import workflow as temporal_workflow
@@ -39,6 +44,62 @@ if typing.TYPE_CHECKING:
     from agents.mcp import MCPServer
 
 
+def _parse_tool_arguments(schema: FuncSchema, input: str | None) -> BaseModel:
+    """Parse and validate model-supplied tool arguments.
+
+    Mirrors the Agents SDK's ``function_tool``, including leaving the input and
+    validation details out of the error unless ``DONT_LOG_TOOL_DATA`` is disabled.
+
+    Raises:
+        ModelBehaviorError: If the input is not a JSON object matching the tool's parameters.
+    """
+    message = f"Invalid JSON input for tool {schema.name}"
+    json_data: Any = {}
+    json_error: json.JSONDecodeError | None = None
+    try:
+        if input:
+            json_data = json.loads(input)
+    except json.JSONDecodeError as e:
+        json_error = e
+    # Raised outside the except blocks so redacted errors do not chain the input
+    if json_error is not None:
+        if _debug.DONT_LOG_TOOL_DATA:
+            raise ModelBehaviorError(message)
+        raise ModelBehaviorError(f"{message}: {input}") from json_error
+    if not isinstance(json_data, dict):
+        raise ModelBehaviorError(f"{message}: expected a JSON object")
+    validation_error: ValidationError | None = None
+    try:
+        return schema.params_pydantic_model(**json_data)
+    except ValidationError as e:
+        validation_error = e
+    if _debug.DONT_LOG_TOOL_DATA:
+        raise ModelBehaviorError(message)
+    raise ModelBehaviorError(f"{message}: {validation_error}") from validation_error
+
+
+async def _tool_argument_error(
+    failure_error_function: ToolErrorFunction | None,
+    ctx: RunContextWrapper[Any],
+    error: ModelBehaviorError,
+) -> str:
+    """Format an argument error as the tool output returned to the model.
+
+    Raises:
+        ApplicationError: Non-retryable, if ``failure_error_function`` is None.
+            Unlike ``ModelBehaviorError``, it fails the workflow instead of
+            retrying the workflow task.
+    """
+    if failure_error_function is None:
+        raise ApplicationError(
+            str(error), type="ModelBehaviorError", non_retryable=True
+        ) from error
+    result = failure_error_function(ctx, error)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
 def activity_as_tool(
     fn: Callable,
     *,
@@ -54,6 +115,7 @@ def activity_as_tool(
     summary: str | None = None,
     priority: Priority = Priority.default,
     strict_json_schema: bool = True,
+    failure_error_function: ToolErrorFunction | None = default_tool_error_function,
 ) -> Tool:
     """Convert a single Temporal activity function to an OpenAI agent tool.
 
@@ -69,7 +131,13 @@ def activity_as_tool(
         fn: A Temporal activity function to convert to a tool.
         strict_json_schema: Whether the tool should follow a strict schema.
             See https://openai.github.io/openai-agents-python/ref/tool/#agents.tool.FunctionTool.strict_json_schema
-
+        failure_error_function: Formats the error text returned to the model
+            when its arguments are not valid JSON or do not match the tool's
+            parameters, so that it can retry. Defaults to the Agents SDK's
+            ``default_tool_error_function``. If None, the workflow fails with a
+            non-retryable ``ApplicationError`` of type ``ModelBehaviorError``.
+            Errors raised by the activity itself are not handled by this
+            function.
 
     Returns:
         An OpenAI agent tool that wraps the provided activity.
@@ -120,14 +188,12 @@ def activity_as_tool(
 
     async def run_activity(ctx: RunContextWrapper[Any], input: str) -> Any:
         try:
-            json_data = json.loads(input)
-        except Exception as e:
-            raise ApplicationError(
-                f"Invalid JSON input for tool {schema.name}: {input}"
-            ) from e
+            params = _parse_tool_arguments(schema, input)
+        except ModelBehaviorError as e:
+            return await _tool_argument_error(failure_error_function, ctx, e)
 
         # Activities don't support keyword only arguments, so we can ignore the kwargs_dict return
-        args, _ = schema.to_call_args(schema.params_pydantic_model(**json_data))
+        args, _ = schema.to_call_args(params)
 
         # Add the context to the arguments if it takes that
         if schema.takes_context:
@@ -170,6 +236,7 @@ def nexus_operation_as_tool(
     endpoint: str,
     schedule_to_close_timeout: timedelta | None = None,
     strict_json_schema: bool = True,
+    failure_error_function: ToolErrorFunction | None = default_tool_error_function,
 ) -> Tool:
     """Convert a Nexus operation into an OpenAI agent tool.
 
@@ -183,6 +250,13 @@ def nexus_operation_as_tool(
         service: The Nexus service class that contains the operation.
         endpoint: The Nexus endpoint to use for the operation.
         strict_json_schema: Whether the tool should follow a strict schema
+        failure_error_function: Formats the error text returned to the model
+            when its arguments are not valid JSON or do not match the
+            operation's input, so that it can retry. Defaults to the Agents
+            SDK's ``default_tool_error_function``. If None, the workflow fails
+            with a non-retryable ``ApplicationError`` of type
+            ``ModelBehaviorError``. Errors raised by the operation itself are
+            not handled by this function.
 
     Returns:
         An OpenAI agent tool that wraps the provided operation.
@@ -212,18 +286,16 @@ def nexus_operation_as_tool(
 
     schema = function_schema(operation_callable)
 
-    async def run_operation(_ctx: RunContextWrapper[Any], input: str) -> Any:
+    async def run_operation(ctx: RunContextWrapper[Any], input: str) -> Any:
         try:
-            json_data = json.loads(input)
-        except Exception as e:
-            raise ApplicationError(
-                f"Invalid JSON input for tool {schema.name}: {input}"
-            ) from e
+            params = _parse_tool_arguments(schema, input)
+        except ModelBehaviorError as e:
+            return await _tool_argument_error(failure_error_function, ctx, e)
 
         nexus_client = temporal_workflow.create_nexus_client(
             service=service, endpoint=endpoint
         )
-        args, _ = schema.to_call_args(schema.params_pydantic_model(**json_data))
+        args, _ = schema.to_call_args(params)
         assert len(args) == 1, "Nexus operations must have exactly one argument"
         [arg] = args
         result = await nexus_client.execute_operation(
