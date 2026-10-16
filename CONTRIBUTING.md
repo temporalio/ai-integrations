@@ -36,11 +36,3 @@ history, follow [`scripts/migrate/README.md`](scripts/migrate/README.md).
 
 All contributors must complete the Temporal Contributor License Agreement (CLA)
 before changes can be merged. A link to the CLA will be posted in the pull request.
-
-## Releasing
-
-Release tags are authoritative: keep committed development versions at `0.0.0` and dry-run the intended
-`<language>/<name>/v<version>` from `main`. Create the draft with `gh release create <tag>
---target <tested-sha> --draft`; publishing it creates the protected tag on that tested commit.
-Follow the runbook in AGENTS.md ("Releases"). Release notes are generated from commit messages, so
-write commit subjects you would want users to read.

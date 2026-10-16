@@ -175,6 +175,9 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 
 ## Releases
 
+Release procedures and publication policy belong only in this file. READMEs and
+contributing guides cover installation, usage, and local development.
+
 Pre-release and Public Preview plugins publish without a required-reviewer approval
 gate in every language. Use the plugin's `maturity`, independently of whether its
 version is a prerelease. Keep automated validation, immutable tags, tested-artifact
@@ -384,6 +387,17 @@ as Actions artifacts.
    staging behavior above.
    Publication and recovery share a 30-minute polling budget within the 45-minute
    job; a polling timeout preserves the deployment for a failed-job rerun.
+
+   Verify the relocation locally from the repository root before SDK publication:
+
+   ```bash
+   cd java/spring-ai
+   ./gradlew -PreleaseVersion=0.1.0 stageDist
+   cd ../..
+   uv run --project scripts --locked python scripts/ci/check_java_dist.py --plugin-dir java/spring-ai --version 0.1.0
+   uv run --project scripts --locked python scripts/ci/smoke_java.py --plugin-dir java/spring-ai --version 0.1.0 --relocation-pom java/spring-ai/relocation.pom
+   ```
+
 7. After an upload failure, use **Re-run failed jobs**. The workflow preserves the
    signed bundle, upload intent, and deployment ID even if validation or the consumer
    fails. It reuses those signatures and never retries an ambiguous upload POST.
