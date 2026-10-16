@@ -200,6 +200,8 @@ interface ConnectionRecord {
   client: Promise<McpClient>;
   /** Number of activities currently using this connection. */
   inflight: number;
+  /** A failed call makes this record unavailable to new callers. */
+  broken?: boolean;
   /** Armed only while `inflight` is 0. */
   idleTimer?: NodeJS.Timeout;
 }
@@ -208,12 +210,7 @@ interface ConnectionRecord {
 // Node process, so this module state is shared across every activity invocation on the worker.
 const CONNECTIONS: Map<string, ConnectionRecord> = new Map();
 
-export async function _evictConnection(server: string): Promise<void> {
-  const record = CONNECTIONS.get(server);
-  if (record === undefined) return;
-  // Delete before awaiting: a call arriving during `disconnect` must open a
-  // fresh connection rather than join the one being torn down.
-  CONNECTIONS.delete(server);
+async function disconnectRecord(record: ConnectionRecord): Promise<void> {
   if (record.idleTimer !== undefined) {
     clearTimeout(record.idleTimer);
     record.idleTimer = undefined;
@@ -226,6 +223,15 @@ export async function _evictConnection(server: string): Promise<void> {
   }
 }
 
+export async function _evictConnection(server: string): Promise<void> {
+  const record = CONNECTIONS.get(server);
+  if (record === undefined) return;
+  // Delete before awaiting: a call arriving during `disconnect` must open a
+  // fresh connection rather than join the one being torn down.
+  CONNECTIONS.delete(server);
+  await disconnectRecord(record);
+}
+
 /**
  * Return the cached connection for `server`, opening one lazily if needed, and
  * mark a call in flight so idle eviction can't disconnect underneath it.
@@ -235,6 +241,9 @@ export async function _evictConnection(server: string): Promise<void> {
  */
 function acquireConnection(server: string, factory: () => McpClient): ConnectionRecord {
   let record = CONNECTIONS.get(server);
+  if (record?.broken) {
+    record = undefined;
+  }
   if (record === undefined) {
     const entry: ConnectionRecord = {
       inflight: 0,
@@ -263,6 +272,11 @@ function acquireConnection(server: string, factory: () => McpClient): Connection
 /** Mark a call done; arm idle eviction once no calls remain in flight. */
 function releaseConnection(server: string, record: ConnectionRecord, idleMs: number): void {
   record.inflight -= 1;
+  if (record.broken && record.inflight === 0) {
+    if (CONNECTIONS.get(server) === record) CONNECTIONS.delete(server);
+    void disconnectRecord(record);
+    return;
+  }
   // Only the record still cached under this server arms a timer; a record
   // already evicted must not schedule one, or it could later evict a
   // different, healthy connection for the same server.
@@ -305,8 +319,13 @@ export function buildCallToolActivity(
       const client = await record.client;
       return await client.callTool(tool, input.args);
     } catch (err) {
-      // The session may be broken; drop it so the next call reconnects.
-      await _evictConnection(server);
+      // Keep the broken record until current callers release it, so a concurrent
+      // call is not disconnected underneath. New callers open a fresh record.
+      record.broken = true;
+      if (record.inflight === 1) {
+        if (CONNECTIONS.get(server) === record) CONNECTIONS.delete(server);
+        await disconnectRecord(record);
+      }
       throw err;
     } finally {
       // No more in-flight call on this connection; let idle eviction resume
