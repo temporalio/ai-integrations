@@ -4,8 +4,10 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.*;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.openai.client.OpenAIClient;
 import com.openai.client.OpenAIClientAsync;
+import com.openai.core.ObjectMappers;
 import com.openai.core.RequestOptions;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
@@ -113,7 +115,10 @@ class ProviderChatModelTest {
     ChatCompletionCreateParams request = request();
     assertEquals("worker-model", request.model().asString());
     assertEquals(0.7, request.temperature().orElseThrow());
-    assertEquals(256, request.maxTokens().orElseThrow());
+    // The common maxTokens option still maps to the legacy wire field. Assert the
+    // payload directly instead of using the native SDK's deprecated accessor.
+    JsonNode body = ObjectMappers.jsonMapper().valueToTree(request._body());
+    assertEquals(256, body.path("max_tokens").asInt());
     assertEquals("medium", request.reasoningEffort().orElseThrow().asString());
     assertEquals(1, request.tools().orElseThrow().size());
     assertEquals(

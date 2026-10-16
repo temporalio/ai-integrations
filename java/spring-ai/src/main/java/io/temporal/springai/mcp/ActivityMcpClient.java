@@ -28,7 +28,7 @@ import javax.annotation.Nullable;
  *
  *     // Use with TemporalChatClient
  *     this.chatClient = TemporalChatClient.builder(chatModel)
- *             .defaultToolCallbacks(mcpTools)
+ *             .defaultTools(mcpTools.toArray())
  *             .build();
  * }
  * }</pre>

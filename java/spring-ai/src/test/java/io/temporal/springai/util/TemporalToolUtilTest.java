@@ -136,6 +136,19 @@ class TemporalToolUtilTest {
   // --- Tests for mixed tool types ---
 
   @Test
+  void convertTools_existingCallback_preservesExecutionAndMetadata() {
+    ToolCallback callback = TemporalToolUtil.convertTools(new UnannotatedTools()).get(0);
+
+    List<ToolCallback> callbacks =
+        TemporalToolUtil.convertTools(new MathTools(), callback, new TimestampTools());
+
+    assertEquals(4, callbacks.size());
+    assertSame(callback, callbacks.get(2));
+    assertEquals("\"result\"", callbacks.get(2).call("{}"));
+    assertInstanceOf(SideEffectToolCallback.class, callbacks.get(3));
+  }
+
+  @Test
   void convertTools_mixedPlainAndSideEffect_allConvertCorrectly() {
     List<ToolCallback> callbacks =
         TemporalToolUtil.convertTools(new MathTools(), new TimestampTools(), new RandomTools());

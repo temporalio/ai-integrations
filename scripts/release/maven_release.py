@@ -204,19 +204,23 @@ class Portal:
             raise PolicyError("Portal returned an invalid deployment status")
         return result
 
-    def wait(self, deployment: str, *, published: bool = False, attempts: int = 60, delay: float = 10) -> str:
-        for attempt in range(attempts):
+    def wait(self, deployment: str, *, published: bool = False, deadline: float | None = None, delay: float = 10) -> str:
+        if deadline is None:
+            deadline = time.monotonic() + 10 * 60
+        while True:
             status = self.status(deployment)
             state = status["deploymentState"]
-            print(f"Central deployment {deployment}: {state}")
+            print(f"Central deployment {deployment}: {state}", flush=True)
             if state == "FAILED":
                 raise PolicyError(f"Central validation failed for {deployment}; inspect its validation report in Portal")
             if state == "PUBLISHED" or (state == "VALIDATED" and not published):
                 return state
             if state not in {"PENDING", "VALIDATING", "VALIDATED", "PUBLISHING"}:
                 raise PolicyError(f"unexpected Portal state {state!r}")
-            if attempt + 1 < attempts:
-                time.sleep(delay)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(delay, remaining))
         raise PolicyError(f"timed out waiting for {deployment}; rerun the failed job using the saved deployment ID")
 
     def upload(self, bundle: Path, coordinate: str, version: str) -> str:
@@ -386,11 +390,15 @@ def publish(args: argparse.Namespace, coordinate: str, raw: dict[str, bytes]) ->
         raise PolicyError("publication requires the saved, verified staging deployment")
     portal = Portal()
     deployment = state["deployment_id"]
-    state_name = portal.wait(deployment)
+    # Central publication can take longer than private validation. Share one
+    # budget across initial/recovery polling and publication, leaving time in the
+    # 45-minute job for public artifact verification and the clean consumer.
+    deadline = time.monotonic() + 30 * 60
+    state_name = portal.wait(deployment, deadline=deadline)
     verify_deployment(portal, deployment, coordinate, args.version)
     if state_name == "VALIDATED":
         portal.request(f"/deployment/{deployment}", method="POST")
-    portal.wait(deployment, published=True)
+    portal.wait(deployment, published=True, deadline=deadline)
     verify_remote(validate_bundle(args.state_dir / "bundle.zip", raw), public_file, attempts=30)
     if args.smoke:
         smoke(args.plugin_dir, args.version, MAVEN_CENTRAL)

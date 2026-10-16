@@ -118,7 +118,7 @@ class McpPluginTest {
 
   private static McpSyncClient mockClientNamed(String name) {
     McpSyncClient client = mock(McpSyncClient.class);
-    McpSchema.Implementation info = new McpSchema.Implementation(name, "1.0.0");
+    McpSchema.Implementation info = McpSchema.Implementation.builder(name, "1.0.0").build();
     when(client.getClientInfo()).thenReturn(info);
     return client;
   }

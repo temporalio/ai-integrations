@@ -86,7 +86,6 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - Python manifests and lockfiles carry the static `0.0.0` development placeholder. A protected release tag is the published version source; the release matrix runs `uv version <tag-version>` before sync, test and build, and only those tested artifacts are published. Ordinary CI and local development keep `0.0.0`.
 - No changelog files. `scripts/release/release_tool.py release-notes` derives notes from commit subjects touching the plugin directory since its previous tag.
 - Every GitHub Action is pinned to a full commit SHA with a `# vN` comment (org opengrep rule).
-- Dependabot mirrors sdk-python: security advisories only (`open-pull-requests-limit: 0`) because its uv support is not yet mature enough for routine bumps; nightly checks with the newest allowed dependencies are the dependency-drift signal.
 
 ## Python conventions
 
@@ -142,6 +141,11 @@ Workflow streams and OpenTelemetry never migrate here.
   unpublished SDK test helpers are copied into each consuming plugin's
   `tests/helpers/`, with a private development-only link. Never use a local
   SDK checkout or another plugin's checkout as a dependency.
+- Local server startup uses `startLocalWithRetry`, with three attempts and a
+  one-second delay only for the SDK's explicit startup-deadline error. Bind each
+  plugin's server configuration in the startup callback. Copy the helper and its
+  regression tests from `typescript/_template/src/__tests__/`; the conventions
+  check keeps each plugin's copies byte-identical to the templates.
 - `make sync` preserves the committed lock. `make sync-latest` updates compatible
   ranges under the two-week pnpm release-age policy. Preserve first-party and
   exact AI SDK dependency-family cooldown exceptions inherited from the SDK.
@@ -170,6 +174,12 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 - Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing plugin from the job names `Python (<plugin>) / ...`, `Java (<plugin>) / ...`, and `Go (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs. Existing Python and Java issue titles stay unchanged; Go keys use `go/<plugin>` so plugins in different languages cannot share an issue.
 
 ## Releases
+
+Pre-release and Public Preview plugins publish without a required-reviewer approval
+gate in every language. Use the plugin's `maturity`, independently of whether its
+version is a prerelease. Keep automated validation, immutable tags, tested-artifact
+verification, and final-release eligibility checks. GA plugins retain any existing
+approval policy.
 
 Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
 
@@ -317,11 +327,16 @@ as Actions artifacts.
    Preview version `0.1.0` (candidate `0.1.0-RC1`); keep the committed `0.0.0`
    development version. Workflow streams and OpenTelemetry stay in sdk-java.
 2. Configure shared environments `maven-central-staging` and `maven-central`, both
-   accepting tags `java/*/v*` only. Production requires an `@temporalio/ai-sdk`
-   reviewer and prevents self-review. Extend the immutable release-tag ruleset to
-   Java without relaxing its Python rules.
-   These environments and tag policies were configured on 2026-10-02; credential
-   installation remains a maintainer setup step.
+   accepting tags `java/*/v*` only, with no required reviewers. Every plugin uses
+   `maven-central-staging` for private staging and `maven-central` for public
+   publication, so their deployment histories track the two phases separately.
+   The shared `maven-central-approval` environment accepts the same tag pattern,
+   requires an `@temporalio/ai-sdk` reviewer and prevents self-review; it holds no
+   secrets. GA publication must pass this approval job first. Only recognized
+   Pre-release and Public Preview maturities skip it; missing or unknown maturity
+   requires approval. Extend the immutable release-tag ruleset to Java without
+   relaxing its Python rules.
+   Credential installation remains a maintainer setup step.
 3. In staging, install environment secrets `CENTRAL_USERNAME`, `CENTRAL_PASSWORD`
    (a Central Portal user-token pair), `GPG_PRIVATE_KEY` (armored private key or
    sdk-java's base64-encoded secret keyring), and
@@ -362,10 +377,13 @@ as Actions artifacts.
    `java/spring-ai/relocation.pom`. Recheck Maven Central for the next available
    old-coordinate version at cutover if sdk-java has released again. Old releases
    remain unchanged. The new pipeline publishes only the new coordinate.
-   The production environment approval publishes the already verified deployment;
-   the workflow waits for `PUBLISHED`, proves Maven Central serves the same files,
-   and installs a clean consumer after the GitHub Release is published. Do not
-   remove these gates merely to run the candidate.
+   The workflow publishes the already verified deployment automatically for non-GA
+   plugins; GA plugins require `maven-central-approval` approval first. It waits for
+   `PUBLISHED`, proves Maven Central serves the same files, and installs a clean
+   consumer after the GitHub Release is published. Candidates retain the private
+   staging behavior above.
+   Publication and recovery share a 30-minute polling budget within the 45-minute
+   job; a polling timeout preserves the deployment for a failed-job rerun.
 7. After an upload failure, use **Re-run failed jobs**. The workflow preserves the
    signed bundle, upload intent, and deployment ID even if validation or the consumer
    fails. It reuses those signatures and never retries an ambiguous upload POST.
