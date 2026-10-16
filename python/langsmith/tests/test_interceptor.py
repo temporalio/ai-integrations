@@ -158,6 +158,9 @@ class TestContextPropagation:
 
         # Mock from_headers for extraction (real one needs valid LangSmith header format)
         mock_extracted = MagicMock()
+        mock_extracted.dotted_order = (
+            "20250101T000000000000Z00000000-0000-0000-0000-000000000001"
+        )
         MockRunTree.from_headers.return_value = mock_extracted
 
         extracted = _extract_context(result, _make_executor(), MagicMock())
@@ -1217,7 +1220,6 @@ class TestAddTemporalRunsToggle:
         # (unconditionally, before _maybe_run)
         mock_tracing_ctx.assert_called_once_with(
             client=config._client,
-            project_name=None,
             parent=mock_extracted_parent,
         )
         mock_act_next.execute_activity.assert_called_once()
@@ -1249,7 +1251,5 @@ class TestAddTemporalRunsToggle:
 
         MockRunTree.assert_not_called()
         # tracing_context called with client (no parent)
-        mock_tracing_ctx.assert_called_once_with(
-            client=config._client, project_name=None, parent=None
-        )
+        mock_tracing_ctx.assert_called_once_with(client=config._client, parent=None)
         mock_act_next.execute_activity.assert_called_once()
