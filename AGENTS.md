@@ -104,6 +104,9 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - Each Java plugin owns a Gradle wrapper with distribution checksum, `build.gradle`,
   `settings.gradle`, `plugin.toml`, and per-Spring-Boot dependency locks. Shared build
   conventions live in `java/_shared/java.gradle`.
+- Every Java plugin starts `settings.gradle` with a `pluginManagement` block applying
+  `../_shared/settings.gradle`. The shared script checks Maven Central before the
+  Gradle Plugin Portal; the conventions check enforces this entry point for every plugin.
 - Java development versions are `0.0.0`; a release tag supplies `-PreleaseVersion`
   before tests and builds. Do not publish the placeholder or add snapshot automation.
 - Java packages and publication metadata use the root MIT license. Imported source

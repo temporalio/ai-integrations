@@ -10,6 +10,7 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
   * python/_shared contains configuration and make logic, never Python source or stubs
   * every Python plugin has pyproject.toml, uv.lock, plugin.toml, Makefile, README.md,
     and {root-api}/{__init__.py,py.typed} under src/
+  * every Java plugin loads the shared plugin repositories from its initial pluginManagement block
   * NO src/temporalio/__init__.py and NO src/temporalio/contrib/__init__.py (namespace invariant)
   * LICENSE is a committed regular file byte-identical to the root LICENSE; pyproject declares license = "MIT"
     and license-files = ["LICENSE"]; no CHANGELOG*, no smoke_test.py in the plugin dir
@@ -58,6 +59,10 @@ STANDARD_TYPESCRIPT_TEST_SUPPORT = {
     "src/__tests__/test-environment-startup.test.ts": "src/__tests__/test-environment-startup.test.ts.tmpl",
 }
 PYTHON_DEVELOPMENT_VERSION = "0.0.0"
+JAVA_PLUGIN_MANAGEMENT = """pluginManagement {
+    apply from: '../_shared/settings.gradle'
+}
+"""
 
 
 class Checker:
@@ -199,6 +204,14 @@ class Checker:
                          "gradle/wrapper/gradle-wrapper.properties"):
             if not (d / required).is_file():
                 self.fail(f"{rel}: missing {required}")
+        settings = d / "settings.gradle"
+        if settings.is_file() and not settings.read_text().lstrip().startswith(JAVA_PLUGIN_MANAGEMENT):
+            self.fail(
+                f"{rel}/settings.gradle: must start with the shared pluginManagement block:\n"
+                f"{JAVA_PLUGIN_MANAGEMENT.rstrip()}"
+            )
+        if not (self.root / "java/_shared/settings.gradle").is_file():
+            self.fail("java/_shared/settings.gradle: missing shared plugin repository configuration")
         if not (d / "plugin.toml").is_file():
             return
         meta = load_toml(d / "plugin.toml")

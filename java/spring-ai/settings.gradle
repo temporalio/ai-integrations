@@ -1,8 +1,5 @@
 pluginManagement {
-    repositories {
-        mavenCentral()
-        gradlePluginPortal()
-    }
+    apply from: '../_shared/settings.gradle'
 }
 
 rootProject.name = 'spring-ai'
