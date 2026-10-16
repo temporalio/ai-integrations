@@ -10,7 +10,7 @@
  * @internal
  */
 
-import type { RunTree } from 'langsmith/run_trees';
+import type { RunTree, RunTreeConfig } from 'langsmith/run_trees';
 import { AsyncLocalStorageProviderSingleton } from 'langsmith/singletons/traceable';
 import type {
   ContinueAsNewInput,
@@ -61,6 +61,7 @@ import {
   startNexusOperationRunName,
   validateUpdateRunName,
 } from './run-tree';
+import { destination, type ReplicaRouting } from './routing';
 
 /**
  * Configuration the worker injects into the workflow bundle via the bundler's
@@ -72,6 +73,8 @@ import {
 export interface WorkflowLangSmithConfig {
   addTemporalRuns: boolean;
   projectName?: string;
+  address?: RunTreeConfig['address'];
+  replicas?: ReplicaRouting[];
   tags?: string[];
   metadata?: Record<string, unknown>;
 }
@@ -137,8 +140,11 @@ function asReplaySafeParent(
       id: parent.id,
       trace_id: parent.trace_id,
       dotted_order: parent.dotted_order,
+      start_time: parent.start_time,
       parent_run_id: parent.parent_run_id,
-      project_name: parent.project_name,
+      ...destination(parent),
+      replicas: parent.replicas,
+      distributedParentId: parent.distributedParentId,
     },
     generateNewUuid4
   );
@@ -149,9 +155,15 @@ function asReplaySafeParent(
  * so a workflow-body `traceable` always nests via `createChild`; never emitted,
  * and its children are independent roots (see {@link _RootReplaySafeRunTreeFactory}).
  */
-function placeholderRoot(generateNewUuid4?: () => string): _RootReplaySafeRunTreeFactory {
+function placeholderRoot(config: WorkflowLangSmithConfig, generateNewUuid4?: () => string): _RootReplaySafeRunTreeFactory {
   return new _RootReplaySafeRunTreeFactory(
-    { name: workflowInfo().workflowType, run_type: RUN_TYPE.CHAIN },
+    {
+      name: workflowInfo().workflowType,
+      run_type: RUN_TYPE.CHAIN,
+      project_name: config.projectName,
+      address: config.address,
+      replicas: config.replicas,
+    },
     generateNewUuid4
   );
 }
@@ -182,7 +194,8 @@ function buildReplaySafeRunTree(
       name: params.name,
       run_type: params.runType,
       parent_run: params.parent,
-      project_name: config.projectName,
+      ...destination(params.parent, { project_name: config.projectName, address: config.address }),
+      replicas: params.parent?.replicas ?? config.replicas,
       tags: config.tags,
       extra: { metadata: scrubSensitive(config.metadata) ?? {} },
       inputs: params.inputs,
@@ -249,7 +262,7 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
       // no-parent `crypto` path) so the validator body nests under the update's
       // trace.
       const ambient =
-        asReplaySafeParent(reconstructParent(input.headers), generateNewUuid4) ?? placeholderRoot(generateNewUuid4);
+        asReplaySafeParent(reconstructParent(input.headers), generateNewUuid4) ?? placeholderRoot(this.config, generateNewUuid4);
       sharedStore.run(ambient, () => next(input));
       return;
     }
@@ -296,7 +309,7 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
       // `undefined` so a workflow-body `traceable` takes LangSmith's
       // `createChild` branch (deterministic id) rather than the no-parent branch
       // that mints a uuid via `crypto`, which the isolate lacks.
-      const ambient = asReplaySafeParent(parent, generateNewUuid4) ?? placeholderRoot(generateNewUuid4);
+      const ambient = asReplaySafeParent(parent, generateNewUuid4) ?? placeholderRoot(this.config, generateNewUuid4);
       return sharedStore.run(ambient, next);
     }
     const run = buildReplaySafeRunTree(this.config, {

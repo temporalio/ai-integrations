@@ -24,6 +24,7 @@ import { getRandomStream, proxySinks, workflowInfo } from '@temporalio/workflow'
 
 import { scrubSensitive, type LangSmithTraceContext } from './propagation';
 import { LANGSMITH_SINK_NAME, type EmitterConfig, type LangSmithSinks, type SerializedRun } from './sinks';
+import { destination, normalizeReplicaHeaders, replicaHeaders, replicaRouting } from './routing';
 
 /** Named random stream for recorded-path run ids; isolated from the workflow's main RNG. */
 const LANGSMITH_RUN_TREE_STREAM = 'package-langsmith-tracing';
@@ -130,6 +131,9 @@ function serializeRun(run: RunTree): SerializedRun {
     extra,
     tags: run.tags,
     project_name: run.project_name,
+    address: run.address,
+    replicas: replicaRouting(run.replicas),
+    distributedParentId: run.distributedParentId,
     events: run.events as Record<string, unknown>[] | undefined,
   };
 }
@@ -165,7 +169,19 @@ export function asOutputs(result: unknown): Record<string, unknown> {
 
 /** The trace context to propagate for `run`, or `undefined` when absent. */
 export function runHeaders(run: RunTree | undefined): LangSmithTraceContext | undefined {
-  return run ? (run.toHeaders() as LangSmithTraceContext) : undefined;
+  if (!run) return undefined;
+  const headers = run.toHeaders() as LangSmithTraceContext;
+  const baggage = headers.baggage.split(',').filter(
+    (item) => !item.startsWith('langsmith-replicas=') && !item.startsWith('langsmith-metadata=')
+  );
+  const metadata = scrubSensitive(run.extra?.metadata as Record<string, unknown> | undefined);
+  if (metadata && Object.keys(metadata).length > 0) {
+    baggage.push(`langsmith-metadata=${encodeURIComponent(JSON.stringify(metadata))}`);
+  }
+  const replicas = replicaRouting(run.replicas);
+  if (replicas !== undefined) baggage.push(`langsmith-replicas=${encodeURIComponent(JSON.stringify(replicaHeaders(replicas)))}`);
+  headers.baggage = baggage.filter(Boolean).join(',');
+  return headers;
 }
 
 /** Emit a short-lived marker run. */
@@ -181,7 +197,17 @@ export function runTreeFromContext(ctx: LangSmithTraceContext | undefined): RunT
     return undefined;
   }
   try {
-    return RunTree.fromHeaders(ctx) ?? undefined;
+    const run = RunTree.fromHeaders({ ...ctx, baggage: normalizeReplicaHeaders(ctx.baggage ?? '') });
+    if (!run) return undefined;
+    run.replicas = replicaRouting(run.replicas);
+    // fromHeaders defaults to Date.now(); the recorded order already has the parent's timestamp.
+    const stamp = run.dotted_order.split('.').at(-1)!;
+    const time = Date.parse(
+      `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}T` +
+      `${stamp.slice(9, 11)}:${stamp.slice(11, 13)}:${stamp.slice(13, 15)}.${stamp.slice(15, 18)}Z`
+    );
+    if (Number.isFinite(time)) run.start_time = time;
+    return run;
   } catch {
     return undefined;
   }
@@ -205,11 +231,25 @@ export function buildRunTree(config: EmitterConfig, params: RunTreeParams): RunT
     inputs: params.inputs ?? {},
     parent_run: params.parent,
     client: config.client,
-    project_name: config.projectName ?? params.parent?.project_name,
+    ...destination(params.parent, { project_name: config.projectName, address: config.address }),
+    replicas: params.parent?.replicas ?? config.replicas,
     tags: config.tags,
     extra: { metadata: scrubSensitive(config.metadata) ?? {} },
     tracingEnabled: true,
   });
+}
+
+/** An invisible worker-side factory gives unparented traceables the plugin's destination and client. */
+export function rootRunTree(config: EmitterConfig): RunTree {
+  const factory = buildRunTree(config, { name: 'temporal-routing-parent', runType: RUN_TYPE.CHAIN, parent: undefined });
+  factory.createChild = (child) => new RunTree({
+    ...child,
+    ...destination(child, factory),
+    replicas: child.replicas ?? factory.replicas,
+    client: config.client,
+    tracingEnabled: true,
+  });
+  return factory;
 }
 
 /**
@@ -267,7 +307,8 @@ export class ReplaySafeRunTree extends RunTree {
         parent_run: this,
         parent_run_id: this.id,
         trace_id: this.trace_id,
-        project_name: config.project_name ?? this.project_name,
+        ...destination(this, config),
+        replicas: config.replicas ?? this.replicas?.map(({ reroot: _reroot, ...replica }) => replica),
       },
       this.generateNewUuid4
     );
@@ -318,7 +359,8 @@ export class _RootReplaySafeRunTreeFactory extends ReplaySafeRunTree {
       {
         ...config,
         run_type: config.run_type ?? RUN_TYPE.CHAIN,
-        project_name: config.project_name ?? this.project_name,
+        ...destination(config, this),
+        replicas: config.replicas ?? this.replicas,
       },
       this.generateNewUuid4
     );
