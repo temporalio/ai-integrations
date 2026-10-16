@@ -40,7 +40,8 @@ recorded in [`IMPORTS.md`](../scripts/migrate/IMPORTS.md).
 The shared [`release-go.yml`](../.github/workflows/release-go.yml) validates
 scoped SemVer tags, runs the full test matrix and verifies public module bytes,
 checksums and a clean consumer build. Dispatch it on `main` with a proposed tag
-for a dry run before tagging. Pushing a Go tag makes it discoverable immediately;
-a draft GitHub Release does not delay Go publication. Follow the
+for a dry run, then create the draft GitHub Release with `--target <tested-sha>`.
+Publishing the draft creates the tag and makes the Go version discoverable before
+public module verification finishes. Follow the
 [`Go release runbook`](../AGENTS.md#go-releases) for vanity routing, protected tags
 and retries.

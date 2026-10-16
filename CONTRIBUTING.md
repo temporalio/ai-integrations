@@ -39,7 +39,8 @@ before changes can be merged. A link to the CLA will be posted in the pull reque
 
 ## Releasing
 
-Release tags are authoritative: keep the committed Python version at `0.0.0`, dry-run the intended
-`python/<name>/v<version>` tag from `main`, then create the protected tag without a version-only PR.
+Release tags are authoritative: keep committed development versions at `0.0.0` and dry-run the intended
+`<language>/<name>/v<version>` from `main`. Create the draft with `gh release create <tag>
+--target <tested-sha> --draft`; publishing it creates the protected tag on that tested commit.
 Follow the runbook in AGENTS.md ("Releases"). Release notes are generated from commit messages, so
 write commit subjects you would want users to read.

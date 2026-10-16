@@ -206,8 +206,9 @@ def test_published_release_is_verified_before_uploads_and_linked_from_deployment
     assert summary["if"] == verify["if"]
 
 
-def test_publication_does_not_modify_the_reviewed_github_release() -> None:
-    jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
+@pytest.mark.parametrize("language", ["python", "typescript", "java", "go"])
+def test_publication_does_not_modify_the_reviewed_github_release(language: str) -> None:
+    jobs = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())["jobs"]
     for job in jobs.values():
         assert job.get("permissions", {}).get("contents") != "write"
         for step in job.get("steps", []):
@@ -364,17 +365,23 @@ def test_java_latest_dependencies_are_selected_and_locked_before_testing() -> No
 def test_java_release_reuses_tested_bytes_and_recovers_deployments() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-java.yml").read_text())
     jobs = doc["jobs"]
-    assert doc[True]["push"]["tags"] == ["java/*/v*"]
-    # Tag pushes and dispatches with a matching tag input must use the same full ref.
-    assert doc["concurrency"]["group"] == "release-${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}"
+    assert doc[True]["release"]["types"] == ["published"]
+    assert "push" not in doc[True], "publishing the reviewed release creates the tag and starts staging"
+    assert doc["concurrency"]["group"] == "${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
+    prepare = jobs["prepare"]
+    assert prepare["if"] == "github.event_name != 'release' || startsWith(github.event.release.tag_name, 'java/')"
+    tag = next(s for s in prepare["steps"] if s.get("id") == "tag")
+    assert tag["env"]["TAG"] == "${{ inputs.tag || github.event.release.tag_name || github.ref_name }}"
+    verify = next(s for s in prepare["steps"] if "check-published-release" in s.get("run", ""))
+    assert verify["if"] == "steps.gate.outputs.publish == 'true'"
+    assert verify["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert verify["env"]["TAG"] == "${{ steps.tag.outputs.tag }}"
     assert jobs["test"]["uses"] == "./.github/workflows/_java-plugin.yml"
     assert jobs["test"]["with"]["version"] == "${{ needs.prepare.outputs.version }}"
     assert set(jobs["stage"]["needs"]) == {"prepare", "test"}
     assert jobs["stage"]["if"] == "needs.prepare.outputs.publish == 'true'"
     assert jobs["publish"]["if"] == "needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.prerelease == 'false'"
-    assert "needs.stage.result == 'success'" in jobs["github-release"]["if"]
-    assert "needs.prepare.outputs.prerelease == 'true' || needs.publish.result == 'success'" in jobs["github-release"]["if"]
-    for name in ("stage", "publish", "github-release"):
+    for name in ("stage", "publish"):
         steps = jobs[name]["steps"]
         downloads = [s["with"]["name"] for s in steps if "download-artifact@" in s.get("uses", "")]
         assert downloads == ["dist-java-${{ needs.prepare.outputs.plugin }}", "central-deployment-${{ needs.prepare.outputs.plugin }}"]

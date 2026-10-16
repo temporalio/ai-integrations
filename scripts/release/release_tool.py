@@ -464,15 +464,20 @@ def previous_tag(repo_root: Path, language: str, plugin: str, current: Version |
     return tag, v
 
 
-def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
+def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str, *, ref: str | None = None) -> str:
     parts = parse_tag(tag)
     version = release_version(parts["language"], parts["version"])
     meta_path = repo_root / plugin_dir / "plugin.toml"
-    meta = _load(meta_path) if meta_path.is_file() else {"plugin": {}}
+    if ref is not None:
+        ref = _git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=repo_root).strip()
+        meta = tomllib.loads(_git("show", f"{ref}:{plugin_dir}/plugin.toml", cwd=repo_root))
+    else:
+        meta = _load(meta_path) if meta_path.is_file() else {"plugin": {}}
     coordinate = meta["plugin"].get("coordinate", parts["plugin"])
     root_api = meta["plugin"].get("root-api", "")
     prev = previous_tag(repo_root, parts["language"], parts["plugin"], version)
-    revision = f"{prev[0]}..{tag}" if prev else tag
+    source = ref or tag
+    revision = f"{prev[0]}..{source}" if prev else source
     log = _git("log", "--no-decorate", "--format=%h%x1f%s", revision, "--", plugin_dir, cwd=repo_root)
     # The GitHub release already displays its name above the body. Keep the
     # generated notes focused on release content instead of repeating it.
@@ -513,6 +518,8 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
         lines += ["", f"**Full changelog**: https://github.com/{repo}/compare/{prev_tag}...{tag}", ""]
     if version.is_prerelease and parts["language"] == "go":
         lines += ["## Pre-release notes", "", f"Install this Go pre-release with `go get {coordinate}@v{version}`.", ""]
+    elif version.is_prerelease and parts["language"] == "typescript":
+        lines += ["## Pre-release notes", "", f"Install this npm pre-release with `npm install {coordinate}@{version}`.", ""]
     elif version.is_prerelease:
         lines += [
             "## Pre-release notes",
@@ -535,7 +542,7 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
 
 
 def cmd_release_notes(args: argparse.Namespace) -> int:
-    notes = release_notes(Path(args.repo_root).resolve(), args.plugin_dir.rstrip("/"), args.tag, args.repo or _repo())
+    notes = release_notes(Path(args.repo_root).resolve(), args.plugin_dir.rstrip("/"), args.tag, args.repo or _repo(), ref=args.ref)
     Path(args.output).write_text(notes, encoding="utf-8")
     print(notes)
     return 0
@@ -554,8 +561,8 @@ JAVA_STAGE_STEP = "Stage tested bytes, prove staged files and install a clean co
 
 def java_stage_recovery_only(repo: str, run_id: int, run_attempt: int, event: str) -> bool:
     """Allow an initial upload only when no earlier attempt could have staged it."""
-    if run_id <= 0 or run_attempt <= 0 or event not in {"push", "workflow_dispatch"}:
-        raise PolicyError("expected a Java release push or dispatch with a positive run ID and attempt")
+    if run_id <= 0 or run_attempt <= 0 or event not in {"release", "push", "workflow_dispatch"}:
+        raise PolicyError("expected a Java release, legacy push or dispatch with a positive run ID and attempt")
     if event == "workflow_dispatch":
         return True
     # A later attempt may have failed to restore state and skipped staging. Check
@@ -582,7 +589,7 @@ def cmd_check_java_stage_recovery(args: argparse.Namespace) -> int:
     recover_only = java_stage_recovery_only(args.repo or _repo(), args.run_id, args.run_attempt, args.event)
     _write_outputs(args.github_output, {
         "recover_only": str(recover_only).lower(),
-        "restore_state": str(recover_only and args.event == "push").lower(),
+        "restore_state": str(recover_only and args.event in {"release", "push"}).lower(),
     })
     return 0
 
@@ -874,7 +881,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("check-java-stage-recovery", help="require recovery if an earlier Java staging attempt may have uploaded")
     p.add_argument("--run-id", type=int, required=True)
     p.add_argument("--run-attempt", type=int, required=True)
-    p.add_argument("--event", choices=("push", "workflow_dispatch"), required=True)
+    p.add_argument("--event", choices=("release", "push", "workflow_dispatch"), required=True)
     p.add_argument("--repo", default=None)
     p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     p.set_defaults(func=cmd_check_java_stage_recovery)
@@ -888,6 +895,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("release-notes", help="generate release notes from history")
     p.add_argument("--plugin-dir", required=True)
     p.add_argument("--tag", required=True)
+    p.add_argument("--ref", help="tested commit to generate notes from before the release tag exists (default: --tag)")
     p.add_argument("--output", required=True)
     p.add_argument("--repo", default=None)
     p.set_defaults(func=cmd_release_notes)

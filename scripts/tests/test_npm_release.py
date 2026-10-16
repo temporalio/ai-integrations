@@ -76,8 +76,6 @@ def metadata(path: Path) -> dict:
     payload = path.read_bytes()
     return {"name": "@temporalio/fake", "version": "0.1.0", "dist": {
         "integrity": "sha512-" + base64.b64encode(hashlib.sha512(payload).digest()).decode(),
-        "shasum": hashlib.sha1(payload).hexdigest(),
-        "tarball": "https://registry.npmjs.org/@temporalio/fake/-/fake-0.1.0.tgz",
     }}
 
 
@@ -88,17 +86,14 @@ def test_wrong_or_private_tarball_cannot_be_published(tmp_path: Path, overrides:
         npm_release.artifact(tmp_path, "@temporalio/fake", "0.1.0")
 
 
-def test_rerun_requires_matching_registry_hashes_and_served_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rerun_requires_matching_registry_integrity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tarball(tmp_path)
     info = metadata(path)
     monkeypatch.setattr(npm_release, "fetch_package", lambda *args: {"name": "@temporalio/fake", "versions": {"0.1.0": info}})
-    monkeypatch.setattr(npm_release.urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(path.read_bytes()))
+    monkeypatch.setattr(npm_release.urllib.request, "urlopen", lambda *args, **kwargs: pytest.fail("npm install verifies the download"))
     assert npm_release.registry_state("@temporalio/fake", "0.1.0", tmp_path)
-    monkeypatch.setattr(npm_release.urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(b"different bytes"))
-    with pytest.raises(npm_release.NpmReleaseError, match="different bytes"):
-        npm_release.registry_state("@temporalio/fake", "0.1.0", tmp_path)
     info["dist"]["integrity"] = "sha512-wrong"
-    with pytest.raises(npm_release.NpmReleaseError, match="hashes differ"):
+    with pytest.raises(npm_release.NpmReleaseError, match="integrity differs"):
         npm_release.registry_state("@temporalio/fake", "0.1.0", tmp_path)
 
 
@@ -109,11 +104,12 @@ def test_registry_identity_and_deprecation_are_verified(tmp_path: Path, override
         npm_release.verify_artifact({**metadata(path), **override}, path, "@temporalio/fake", "0.1.0")
 
 
-def test_tarball_host_must_be_the_public_npm_registry(tmp_path: Path) -> None:
+@pytest.mark.parametrize("dist", [{}, {"integrity": "sha1-legacy"}])
+def test_registry_integrity_is_required(tmp_path: Path, dist: dict) -> None:
     path = tarball(tmp_path)
     info = metadata(path)
-    info["dist"]["tarball"] = "https://other.example/fake.tgz"
-    with pytest.raises(npm_release.NpmReleaseError, match="must be served"):
+    info["dist"] = dist
+    with pytest.raises(npm_release.NpmReleaseError, match="integrity differs"):
         npm_release.verify_artifact(info, path, "@temporalio/fake", "0.1.0")
 
 
@@ -199,7 +195,7 @@ def test_npm_publishes_only_the_full_matrix_artifact_with_oidc() -> None:
     assert save["with"]["overwrite"] is True
 
 
-@pytest.mark.parametrize("language", ["python", "go", "typescript"])
+@pytest.mark.parametrize("language", ["python", "java", "go", "typescript"])
 def test_release_events_do_not_share_concurrency_between_workflows(language: str) -> None:
     workflow = yaml.safe_load(WORKFLOW.with_name(f"release-{language}.yml").read_text())
     assert workflow["concurrency"]["group"].startswith("${{ github.workflow }}-")

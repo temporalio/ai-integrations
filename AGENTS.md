@@ -173,6 +173,13 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 
 Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
 
+After a successful dry run, use its full commit SHA as `<tested-sha>` when generating
+notes with `release-notes --ref` and creating the draft with `gh release create
+--target`. This pins both to the tested source even if `main` advances. GitHub creates
+the new tag when the draft is published.
+Use `--prerelease` when the version is a prerelease or the plugin's maturity is
+Pre-release. Release tags are immutable once created.
+
 ### Go releases
 
 `.github/workflows/release-go.yml` handles every Go plugin. It runs on pushes of
@@ -192,8 +199,9 @@ cache and `sum.golang.org` verification, compare the complete module zip and
 root package. Temporary proxy propagation failures are retried. The workflow uses
 read-only repository permissions and creates no tags or GitHub Releases.
 
-**Pushing a Go tag makes the version discoverable before CI finishes.** A GitHub
-draft does not hide the tag from Go consumers. Run the dry run before tagging:
+**Creating a Go tag makes the version discoverable before CI finishes.** A GitHub
+draft does not hide an existing tag from Go consumers. Complete the dry run before
+publishing the release:
 
 1. Merge the release changes to `main`. Configure the vanity mapping above and
    include Go tags in the protected release-tag ruleset. Enable `allow-final` only
@@ -203,16 +211,18 @@ draft does not hide the tag from Go consumers. Run the dry run before tagging:
    fetching the proposed module. An explicit `-f dry-run=true` does the same for
    an existing tag ref. While final releases are disabled, use `0.1.0-rc.1` for
    the Google ADK dry run.
-3. After the full matrix succeeds, create an annotated `go/<name>/v<version>` tag
-   on that exact tested main commit and push it. The tag run repeats the matrix
-   and verifies the public module. Tags are immutable; a failed release requiring
-   changed source gets the next version, such as `0.1.0-rc.2`.
-4. Generate reviewed notes with `uv run --project scripts --locked python
+3. After the full matrix succeeds, generate notes with `uv run --project scripts --locked python
    scripts/release/release_tool.py release-notes --plugin-dir go/<name>
-   --tag go/<name>/v<version> --output /tmp/release-notes.md`, then create a draft
-   GitHub Release for the existing tag. Publish it after verification succeeds;
-   mark it as a GitHub pre-release for prerelease versions or Pre-release maturity.
-   The publication run checks that classification without modifying the release.
+   --tag go/<name>/v<version> --ref <tested-sha> --output /tmp/release-notes.md`.
+   Create the draft with `gh release create go/<name>/v<version>
+   --target <tested-sha> --draft --notes-file /tmp/release-notes.md`, adding
+   `--prerelease` when required.
+4. Review the draft and publish it with
+   `gh release edit go/<name>/v<version> --draft=false`. GitHub creates the tag on
+   the tested commit. The release workflow repeats the matrix and verifies the
+   public module, including the release's prerelease classification. The GitHub
+   Release and Go version are visible before this verification finishes. A failed
+   release requiring changed source gets the next version, such as `0.1.0-rc.2`.
 5. For a proxy or consumer verification failure, re-run failed jobs or dispatch
    `release-go.yml` on the same tag ref with no tag input. Never move or delete
    the tag. A missing vanity mapping must be repaired before retrying.
@@ -239,10 +249,12 @@ committed development version `0.0.0`.
    The full Node/platform matrix tests the injected version at one pinned commit;
    Ubuntu/max packs, checks and smoke-installs the tarball and saves
    `npm-dist-<name>` as an Actions artifact.
-3. Create and push an annotated `typescript/<name>/v<version>` tag on that exact
-   tested main commit. Generate notes with the shared `release-notes` command and
-   create a draft GitHub Release for the existing tag. Use the GitHub pre-release
-   flag for prerelease versions or Pre-release maturity.
+3. Generate notes with `uv run --project scripts --locked python
+   scripts/release/release_tool.py release-notes --plugin-dir typescript/<name>
+   --tag typescript/<name>/v<version> --ref <tested-sha> --output /tmp/release-notes.md`.
+   Create the draft with `gh release create typescript/<name>/v<version>
+   --target <tested-sha> --draft --notes-file /tmp/release-notes.md`, adding
+   `--prerelease` when required.
 4. For a new npm coordinate only, npm requires the package to exist before a
    trusted publisher can be registered. Download the successful dry run's tested
    `npm-dist-<name>` tarball and record its run ID. Authenticate interactively with
@@ -252,11 +264,15 @@ committed development version `0.0.0`.
    publisher with `npm trust github @temporalio/<name> --repo temporalio/ai-integrations
    --file release-typescript.yml --env npm --allow-publish`. Complete any npm 2FA
    challenge interactively. Do not upload a placeholder package or add a token.
-5. Publish the reviewed GitHub Release, or dispatch the workflow on its tag ref.
+5. Publish the reviewed draft with
+   `gh release edit typescript/<name>/v<version> --draft=false`. GitHub creates the
+   tag on the tested commit and starts the workflow. A later dispatch on that tag
+   ref can retry publication.
    After the full matrix succeeds, the inline OIDC job publishes the tested
    tarball to `latest` for final versions or `next` for prereleases, verifies npm's
-   SHA-512/SHA-1 metadata and downloaded bytes, and installs that public version
-   in a clean consumer. It leaves the reviewed GitHub Release unchanged.
+   SHA-512 integrity against the tested tarball, and installs that public version
+   in a clean consumer. npm verifies the downloaded bytes against that integrity.
+   It leaves the reviewed GitHub Release unchanged.
    After the bootstrap upload in step 4, dispatch
    `gh workflow run release-typescript.yml --ref typescript/<name>/v<version> -f recover-run=<dry-run-id>`.
    This verifies the exact tarball already uploaded, even if the automatic release
@@ -266,7 +282,7 @@ committed development version `0.0.0`.
    artifact. It downloads that artifact without rebuilding. The downloaded
    package must have the release's name and version and be public before any upload.
 6. Re-run failed jobs after an upload. An existing version is skipped only when
-   its registry hashes and served bytes equal the tested tarball. For a fresh run,
+   its registry integrity matches the tested tarball. For a fresh run,
    dispatch on the same tag with `-f recover-run=<original-run-id>` to reuse those
    tested bytes. The published GitHub Release and normal registry policy are still
    required. Recovery is accepted only on a tag ref; branch dispatches remain dry
@@ -284,12 +300,18 @@ Version policy (`release_tool.py check-version-policy`; version ordering is eval
 Runbook for `python/<name>`:
 1. Merge every code, dependency and migration change intended for the release. Re-sync from upstream first while the transition rules apply. Do not change the committed `0.0.0` development version.
 2. Choose a canonical PEP 440 version and dry-run it on `main`: `gh workflow run release-python.yml --ref main -f tag=python/<name>/v<version>`. The workflow injects the tag version into each checkout, runs policy validation, the full test matrix and the artifact build, but uploads nothing and consumes no tag. `-f skip-publish=true` does the same for a dispatch on an existing tag ref.
-3. `git tag -a python/<name>/v<version> -m "python/<name> v<version>"` on the tested `main` commit and push the tag. Tags must match `<language>/<name>/v<version>` and are protected by a tag ruleset. Generate notes with `uv run --project scripts --locked python scripts/release/release_tool.py release-notes --plugin-dir python/<name> --tag python/<name>/v<version> --output /tmp/release-notes.md`, then create a draft GitHub Release for that existing tag and review its notes. If GitHub release assets are wanted, attach the tested distributions downloaded from the successful dry run before publication; the workflow retains its distributions as Actions artifacts.
-4. Publish the reviewed GitHub Release using the GitHub UI or `gh release edit python/<name>/v<version> --draft=false`. Mark it as a GitHub pre-release when the plugin's maturity is `pre-release` or the version is a PEP 440 pre-release. Its `release: published` event starts `release-python.yml` for Python tags; pushing a tag alone does not start publication. Publication with a workflow's `GITHUB_TOKEN` does not trigger this event workflow; use a human's session or the manual dispatch fallback on the tag. The GitHub Release is now visible even if package publication later fails.
+3. Generate notes with `uv run --project scripts --locked python scripts/release/release_tool.py release-notes --plugin-dir python/<name> --tag python/<name>/v<version> --ref <tested-sha> --output /tmp/release-notes.md`. Create the draft with `gh release create python/<name>/v<version> --target <tested-sha> --draft --notes-file /tmp/release-notes.md`, adding `--prerelease` when required. If GitHub release assets are wanted, attach the tested distributions downloaded from the successful dry run before publication; the workflow retains its distributions as Actions artifacts.
+4. Publish the reviewed GitHub Release using the GitHub UI or `gh release edit python/<name>/v<version> --draft=false`. GitHub creates the protected tag on the tested commit. Its `release: published` event starts `release-python.yml` for Python tags; pushing a tag alone does not start publication. Publication with a workflow's `GITHUB_TOKEN` does not trigger this event workflow; use a human's session or the manual dispatch fallback on the tag. The GitHub Release is now visible even if package publication later fails.
 5. `release-python.yml` validates the main-reachable tag, version policy, published release and GitHub pre-release classification, injects the tag's version, and runs the full test matrix (its ubuntu dist cell builds, checks and smoke-tests the wheel and sdist). It publishes those tested artifacts to TestPyPI (environment `testpypi`), proves TestPyPI serves exactly those files, and smoke-installs from TestPyPI in a clean project. Eligible versions then publish automatically to PyPI (environment `pypi`), with the published release linked from the deployment; the workflow repeats the artifact proof and smoke there. PEP 440 pre-releases go to TestPyPI only unless a tag dispatch uses `publish-prerelease-to-pypi` with `allow-final = true`; GitHub's pre-release flag does not control index routing. The clean-project smoke tolerates overlap during migrations only while `allow-final = false`. The workflow reads the GitHub Release without changing its notes or assets.
 6. If a job fails after an upload, use "Re-run failed jobs" on that run: `prepare`'s outputs and the tested artifact survive, the upload is skipped, and the smoke jobs verify the served files. If the tagged workflow or tooling itself needs a repair, merge the repair first, then dispatch on `main` with `-f tag=python/<name>/v<version> -f recover-run=<original-release-run-id>`. Recovery validates that the completed source run is a release-event run (or a legacy tag-push run) for the exact main-reachable tag, passed version validation and every test-matrix job, and retains an unexpired distribution artifact. A published GitHub Release for the tag must exist, and package manifests must still match the tag. It downloads those tested bytes without rebuilding; the normal ref restrictions, registry ordering and file-hash checks still apply. Recovery requires a `main` branch deployment policy in the `testpypi` and `pypi` environments. A fresh dispatch on the tag also passes the version policy (the newest published version is treated as a re-run, with a warning) but rebuilds the artifacts, and `verify-index-files` fails if the rebuild is not byte-identical (a different uv version stamps its `Generator` into the wheel). If the artifacts themselves must change, fix forward with the next `rcN`; uploaded files are immutable and tags are never moved.
 
 Runbook for `java/<name>`:
+
+The shared workflow starts when the reviewed GitHub Release is published. Tag
+pushes alone do not start staging. The workflow verifies the published release
+before signing or uploading and retains tested distributions and deployment state
+as Actions artifacts.
+
 1. Merge the import (with a merge commit), the Spring AI 2 upgrade, and the release
    pipeline, in that order. Publish `io.temporal:spring-ai` starting at Public
    Preview version `0.1.0` (candidate `0.1.0-RC1`); keep the committed `0.0.0`
@@ -317,14 +339,22 @@ Runbook for `java/<name>`:
    The full compatibility matrix tests the injected version; its primary
    Ubuntu/max cell builds and verifies the five Maven artifacts and installs a
    clean consumer. A branch dispatch never signs, uploads, or creates a release.
-5. Tag the tested main commit with an annotated, immutable tag
-   `java/spring-ai/v0.1.0-RC1` and push it. The shared workflow signs the
-   tested bytes, adds checksums, uploads a `USER_MANAGED` bundle to Central Portal,
+5. Generate notes with `uv run --project scripts --locked python
+   scripts/release/release_tool.py release-notes --plugin-dir java/spring-ai
+   --tag java/spring-ai/v0.1.0-RC1 --ref <tested-sha> --output /tmp/release-notes.md`.
+   Create the draft with `gh release create java/spring-ai/v0.1.0-RC1
+   --target <tested-sha> --draft --prerelease --notes-file /tmp/release-notes.md`.
+   Review the notes and attach any wanted tested distributions from the dry run
+   before publication. Publish with
+   `gh release edit java/spring-ai/v0.1.0-RC1 --draft=false`; GitHub creates the tag
+   on the tested commit and starts the workflow. The full matrix runs again, then
+   the shared workflow signs the tested bytes, adds checksums, uploads a
+   `USER_MANAGED` bundle to Central Portal,
    waits for `VALIDATED`, compares all staged files byte for byte, and installs
    a clean consumer from the authenticated staging endpoint. Candidates remain
-   privately staged; they are not public Maven Central releases. A draft GitHub
-   release contains generated notes, the tested files, signed bundle, and deployment
-   metadata. Review and publish the GitHub draft separately.
+   privately staged in Central Portal. The GitHub Release is visible before this
+   validation finishes. The signed bundle and deployment metadata are retained as
+   Actions artifacts; the workflow leaves the reviewed release unchanged.
 6. Final publication additionally requires an agreed SDK cutover plan, removing
    all plugin cutover markers, and setting `allow-final = true`. Publish
    `io.temporal:spring-ai:0.1.0` before sdk-java publishes the one-time relocation
@@ -334,13 +364,13 @@ Runbook for `java/<name>`:
    remain unchanged. The new pipeline publishes only the new coordinate.
    The production environment approval publishes the already verified deployment;
    the workflow waits for `PUBLISHED`, proves Maven Central serves the same files,
-   and installs a clean consumer before drafting a final GitHub release. Do not
+   and installs a clean consumer after the GitHub Release is published. Do not
    remove these gates merely to run the candidate.
 7. After an upload failure, use **Re-run failed jobs**. The workflow preserves the
    signed bundle, upload intent, and deployment ID even if validation or the consumer
    fails. It reuses those signatures and never retries an ambiguous upload POST.
-   Tag-push reruns inspect every earlier attempt. Once the staging command may
-   have run, recovery requires the saved state; a missing or failed state download
+   Release-event reruns and legacy tag-push reruns inspect every earlier attempt.
+   Once the staging command may have run, recovery requires the saved state; a missing or failed state download
    stops the job without signing, uploading, or replacing the saved artifact.
    If all earlier attempts skipped staging, a rerun may perform the first upload.
    A fresh publishing dispatch on the same tag requires `-f deployment-id=<Portal UUID>`;
@@ -348,8 +378,8 @@ Runbook for `java/<name>`:
    mismatch or deployment containing additional coordinates. If an upload response
    was lost, inspect Portal for its ID before retrying. Publishing dispatches cannot
    start a new upload, even when Portal is still validating the original upload;
-   the initial upload runs on the tag push. A dispatch with `skip-publish=true`
-   remains a credential-free dry run and does not require a deployment ID.
+   the initial upload runs on GitHub Release publication. A dispatch with
+   `skip-publish=true` remains a credential-free dry run and does not require a deployment ID.
    Never move a tag or replace uploaded files: a changed candidate gets the next `RCN`.
    Portal does not expose
    TestPyPI-style staging version enumeration; public ordering is checked against
