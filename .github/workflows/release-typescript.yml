@@ -1,0 +1,198 @@
+# Shared npm publishing; register this filename in each package's trusted publisher.
+name: Release (TypeScript)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Proposed typescript/<plugin>/v<version> for a branch dry run; leave empty on a tag ref
+        type: string
+        default: ""
+      skip-publish:
+        description: Validate, test and build without uploading
+        type: boolean
+        default: false
+      recover-run:
+        description: On a tag ref, reuse a completed dry run or release run's tested tarball by run ID
+        type: string
+        default: ""
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate TypeScript tag and version policy
+    if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'typescript/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      plugin: ${{ steps.tag.outputs.plugin }}
+      plugin_dir: ${{ steps.tag.outputs.plugin_dir }}
+      coordinate: ${{ steps.tag.outputs.coordinate }}
+      version: ${{ steps.tag.outputs.version }}
+      dist_tag: ${{ steps.tag.outputs.dist_tag }}
+      sha: ${{ steps.source.outputs.sha }}
+      publish: ${{ steps.gate.outputs.publish }}
+      release_url: ${{ steps.release.outputs.url }}
+      recovery: ${{ steps.recovery.outputs.recovery || 'false' }}
+      artifact_run_id: ${{ steps.recovery.outputs.artifact_run_id || github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - name: Dispatch inputs are consistent with the ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ] && [ -n "$INPUT_TAG" ] && [ "$INPUT_TAG" != "$REF_NAME" ]; then
+            echo "::error::tag input must match the dispatched tag ref"; exit 1
+          fi
+          if [ "$REF_TYPE" != "tag" ] && [ -z "$INPUT_TAG" ]; then
+            echo "::error::a branch dry run needs a proposed tag input"; exit 1
+          fi
+      - name: Parse TypeScript tag
+        id: tag
+        env:
+          TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+        run: |
+          case "$TAG" in typescript/*/v*) ;; *) echo "::error::expected typescript/<plugin>/v<version>"; exit 1 ;; esac
+          uv run --project scripts --locked python scripts/release/release_tool.py parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
+      - name: Pin source and require main-reachable release tags
+        id: source
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          git rev-parse --verify --quiet origin/main > /dev/null || { echo "::error::origin/main is missing"; exit 1; }
+          if [ "$REF_TYPE" = "tag" ]; then
+            [ "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$SHA" ] || { echo "::error::checkout differs from tag"; exit 1; }
+            git merge-base --is-ancestor "$SHA" origin/main || { echo "::error::release tags must be on main"; exit 1; }
+          fi
+      - name: Version policy
+        env:
+          PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
+      - name: Validate publication recovery
+        id: recovery
+        if: github.event_name == 'workflow_dispatch' && inputs.recover-run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          RUN_ID: ${{ inputs.recover-run }}
+        run: |
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::npm artifact recovery must be dispatched on the release tag"; exit 1
+          fi
+          uv run --project scripts --locked python scripts/release/release_tool.py check-recovery-run --tag "$TAG" --run-id "$RUN_ID" --github-output "$GITHUB_OUTPUT"
+      - name: Decide whether to publish
+        id: gate
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          SKIP_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.skip-publish }}
+          PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ] && [ "$SKIP_PUBLISH" = "false" ]; then
+            node -e 'if (require("./" + process.env.PLUGIN_DIR + "/package.json").private) throw Error("Package is still private")' || exit 1
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::dry run: no uploads, tags or GitHub releases"
+          fi
+      - name: Verify the published GitHub release
+        id: release
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py check-published-release --tag "$TAG" --github-output "$GITHUB_OUTPUT"
+
+  test:
+    name: Test
+    needs: prepare
+    if: needs.prepare.outputs.recovery != 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_typescript-plugin.yml
+    with:
+      plugin: ${{ needs.prepare.outputs.plugin }}
+      deps: locked
+      ref: ${{ needs.prepare.outputs.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+      artifact-name: npm-dist-${{ needs.prepare.outputs.plugin }}
+
+  publish:
+    name: Publish tested tarball to npm
+    needs: [prepare, test]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
+      && (needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: npm
+      url: ${{ needs.prepare.outputs.release_url }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      PLUGIN_DIR: ${{ needs.prepare.outputs.plugin_dir }}
+      COORDINATE: ${{ needs.prepare.outputs.coordinate }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          check-latest: true
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-dist-${{ needs.prepare.outputs.plugin }}
+          path: typescript/${{ needs.prepare.outputs.plugin }}/dist
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.prepare.outputs.artifact_run_id }}
+      - name: Check whether these exact bytes are already published
+        id: existing
+        run: uv run --project scripts --locked python scripts/release/release_tool.py npm-registry-state --coordinate "$COORDINATE" --version "$VERSION" --dist "$PLUGIN_DIR/dist" --github-output "$GITHUB_OUTPUT"
+      - name: Publish with npm trusted publishing
+        if: steps.existing.outputs.exists == 'false'
+        run: npm publish "$PLUGIN_DIR"/dist/*.tgz --access public --tag "$DIST_TAG" --ignore-scripts
+      - name: Verify public npm bytes
+        run: uv run --project scripts --locked python scripts/release/release_tool.py npm-registry-state --coordinate "$COORDINATE" --version "$VERSION" --dist "$PLUGIN_DIR/dist" --require-present --attempts 12 --delay 10
+      - name: Install the public version in a clean consumer
+        env:
+          NPM_REGISTRY_VERSION: ${{ needs.prepare.outputs.version }}
+        run: cd "$PLUGIN_DIR" && node ../_shared/smoke.mjs

@@ -59,6 +59,7 @@ import {
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
 import { AiSdkPlugin, createActivities } from '..';
+import { startLocalWithRetry } from './helpers/environment';
 import {
   embeddingWorkflow,
   generateObjectWorkflow,
@@ -283,7 +284,7 @@ function* embeddingGenerator(): Generator<EmbeddingResponse> {
 const test = anyTest as TestFn<BaseContext>;
 
 test.before(async (t) => {
-  const env = await TestWorkflowEnvironment.createLocal();
+  const env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
   const workflowBundle = await bundleWorkflowCode({
     ...createBaseBundlerOptions(),
     workflowsPath: require.resolve('./workflows/ai-sdk'),

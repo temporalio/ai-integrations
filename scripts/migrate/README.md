@@ -129,9 +129,9 @@ original entry in the generated `.git/filter-repo/commit-map`, not just the tip.
 
 Add local metadata, make targets and the root LICENSE copy as a separate
 adaptation commit. Remove the upstream `CHANGELOG.md` from the current tree
-in that commit, retaining its history to follow this repository's generated
-release-notes policy. While `plugin.toml` names an active upstream, preserve
-this deletion during re-sync and do not edit the imported source, tests or README.
+in that commit, retaining it in Git history. While `plugin.toml` names an active
+upstream, preserve this deletion during re-sync and do not edit the imported source,
+tests or README.
 
 Google ADK's initial setup retained the upstream module path. A separate local
 API cutover, requested after the import, renames it to `go.temporal.io/googleadk`
@@ -140,9 +140,6 @@ active `upstream` field is removed because this repository now owns the code.
 The original UUID and span random-stream identifiers remain stable for replay
 compatibility. The extraction script and imported commit graph stay unchanged.
 Go CI now runs the shared make targets across the declared runtimes and platforms.
-The shared Go release workflow is available. Final releases remain disabled until
-vanity routing is verified; the subdirectory mapping and release runbook are
-documented in AGENTS.md.
 
 An explicitly requested final re-sync before the import PR merged brought in
 upstream `main` at `6ae07bca8301bd25ba1358d1ea92ae837932d76b` on 2026-10-08.
@@ -201,11 +198,10 @@ helpers are copied only where used: `new_worker` for Google GenAI and LangSmith,
 helpers for LangSmith, and the span formatter and provider-reset fixtures for Google ADK.
 DeepAgents sets the low history-count threshold required by its server-suggested continue-as-new
 test. Its README tests point at the standalone distribution README. Provider tests use
-local models, mock transports or in-process MCP servers. Final releases are enabled
-after the API cutover; the committed development version remains `0.0.0`.
+local models, mock transports or in-process MCP servers.
 
 Google GenAI and Strands README links resolve SDK-owned dependencies to the pinned SDK
-tree. The conventions check validates the README actually published.
+tree. The conventions check validates these README links.
 
 The shared make targets use the committed lockfile for regular checks and re-lock to
 the newest allowed dependencies on nightly runs. Lint and tests use `uv run --locked`
@@ -217,8 +213,7 @@ types before workflow tasks to avoid cold-import deadlock detection on Python 3.
 
 At the final audit, 63 issues and 16 PRs were open. A new draft,
 [sdk-python#1923](https://github.com/temporalio/sdk-python/pull/1923), removes the bundled
-implementations and forwards to the planned final APIs. It depends on publishing these
-packages after cutover and is not an import input. The newer SDK main commit
+implementations and forwards to the planned final APIs. It is not an import input. The newer SDK main commit
 `3f29fd7935f9a03fbe86f24624dfe6458872098e` does not change the five plugins pinned to
 `6adc0d84290a79952dee3ef02c36f6ed9334874a`.
 

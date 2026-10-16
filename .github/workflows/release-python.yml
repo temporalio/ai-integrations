@@ -50,7 +50,7 @@ defaults:
     shell: bash
 
 concurrency:
-  group: release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }} # release events and manual retries of the same tag share a queue
+  group: ${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }} # release events and manual retries of the same tag share a queue
   cancel-in-progress: false
 
 jobs:

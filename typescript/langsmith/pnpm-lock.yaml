@@ -60,8 +60,8 @@ importers:
         specifier: ^2.31.0
         version: 2.32.0(@typescript-eslint/parser@8.71.0(eslint@9.39.5)(typescript@5.9.3))(eslint-import-resolver-typescript@3.10.1)(eslint@9.39.5)
       langsmith:
-        specifier: ^0.7.9
-        version: 0.7.17
+        specifier: ^0.10.8
+        version: 0.10.8
       long:
         specifier: ^5.3.2
         version: 5.3.2
@@ -1781,8 +1781,8 @@ packages:
   keyv@4.5.4:
     resolution: {integrity: sha512-oxVHkHR/EJf2CNXnWxRLW6mg7JyCCUcG0DtEGmL2ctUo1PNTin1PUil+r/+4r5MpVgC/fn1kjsx7mjSujKqIpw==}
 
-  langsmith@0.7.17:
-    resolution: {integrity: sha512-FfmxKOVp+qBkdbOWTwXxU7qeX2H40RMsLW9Us+53/4rZYl/QzfUeeBe/rE98mfuSSnEz1tOOMjoPJIYoMt1wnw==}
+  langsmith@0.10.8:
+    resolution: {integrity: sha512-svLrSnytr4cwZvx5XAel93fXRB1/OmC/u7tfXhnmyMpxIazPLDKKaMQYxGIjCvCRGhprmp9P4RiKM8ecZU46Mg==}
     peerDependencies:
       '@opentelemetry/api': '*'
       '@opentelemetry/exporter-trace-otlp-proto': '*'
@@ -4365,7 +4365,7 @@ snapshots:
     dependencies:
       json-buffer: 3.0.1
 
-  langsmith@0.7.17:
+  langsmith@0.10.8:
     dependencies:
       p-queue: 6.6.2
 

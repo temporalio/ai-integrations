@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from _common import Plugin
-from check_conventions import Checker
+from check_conventions import Checker, STANDARD_TYPESCRIPT_TEST_SUPPORT
 from conftest import commit_all
 
 
@@ -36,6 +36,13 @@ imports = ["@temporalio/fake"]
     for name in ("pnpm-lock.yaml", "pnpm-workspace.yaml", "tsconfig.json", "Makefile", "README.md"):
         (directory / name).touch()
     (directory / "LICENSE").write_bytes((repo / "LICENSE").read_bytes())
+    for plugin_rel, template_rel in STANDARD_TYPESCRIPT_TEST_SUPPORT.items():
+        canonical = repo / "typescript/_template" / template_rel
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text(f"// canonical {plugin_rel}\n")
+        rendered = directory / plugin_rel
+        rendered.parent.mkdir(parents=True, exist_ok=True)
+        rendered.write_bytes(canonical.read_bytes())
     commit_all(repo, "add TypeScript plugin")
     return Plugin("typescript", "fake", directory)
 
@@ -45,6 +52,26 @@ def test_independent_typescript_plugin_and_private_test_helpers(repo: Path) -> N
     checker = Checker(repo)
     checker.check_typescript_plugin(plugin)
     assert checker.violations == []
+
+
+@pytest.mark.parametrize("support_file", sorted(STANDARD_TYPESCRIPT_TEST_SUPPORT))
+@pytest.mark.parametrize("failure", ["drift", "missing", "missing-template"])
+def test_typescript_standard_test_support(repo: Path, support_file: str, failure: str) -> None:
+    plugin = _plugin(repo)
+    support = plugin.path / support_file
+    if failure == "drift":
+        support.write_text("// drifted\n")
+        expected = "differs from canonical"
+    elif failure == "missing":
+        support.unlink()
+        expected = "missing standard test support file"
+    else:
+        (repo / "typescript/_template" / STANDARD_TYPESCRIPT_TEST_SUPPORT[support_file]).unlink()
+        expected = "missing canonical test support template"
+    checker = Checker(repo)
+    checker.check_typescript_plugin(plugin)
+    assert len(checker.violations) == 1
+    assert support_file in checker.violations[0] and expected in checker.violations[0]
 
 
 @pytest.mark.parametrize("section", ["dependencies", "devDependencies", "peerDependencies"])

@@ -10,6 +10,15 @@ on:
       deps:
         type: string
         default: locked
+      ref:
+        type: string
+        default: ""
+      version:
+        type: string
+        default: ""
+      artifact-name:
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -27,6 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - id: matrix
         env:
@@ -48,6 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
@@ -71,6 +82,11 @@ jobs:
             latest) make sync-latest ;;
             *) echo "::error::unknown deps mode '$DEPS'"; exit 1 ;;
           esac
+      - name: Inject release version
+        if: inputs.version != ''
+        env:
+          VERSION: ${{ inputs.version }}
+        run: cd "$PLUGIN_DIR" && npm version "$VERSION" --no-git-tag-version --ignore-scripts
       - name: Lint and test
         run: cd "$PLUGIN_DIR" && make lint && make test
       - name: Build and verify npm package
@@ -80,3 +96,11 @@ jobs:
           make build
           python3 ../../scripts/ci/check_npm_package.py --plugin-dir .
           node ../_shared/smoke.mjs
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.dist && inputs.artifact-name != ''
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: typescript/${{ inputs.plugin }}/dist/*.tgz
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30

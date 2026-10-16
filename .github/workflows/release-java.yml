@@ -4,9 +4,8 @@
 name: Release (Java)
 
 on:
-  push:
-    tags:
-      - "java/*/v*"
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -14,7 +13,7 @@ on:
         type: string
         default: ""
       skip-publish:
-        description: Validate, test and build without uploading or drafting a release
+        description: Validate, test and build without uploading
         type: boolean
         default: false
       deployment-id:
@@ -29,12 +28,13 @@ defaults:
     shell: bash
 
 concurrency:
-  group: release-${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
+  group: ${{ github.workflow }}-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   prepare:
     name: Validate tag and version policy
+    if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'java/')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -74,12 +74,12 @@ jobs:
             echo "::error::deployment recovery requires a protected tag ref"; exit 1
           fi
           if [ "$REF_TYPE" = "tag" ] && [ "$SKIP_PUBLISH" = "false" ] && [ -z "$DEPLOYMENT_ID" ]; then
-            echo "::error::publishing dispatches require deployment-id; inspect Portal or re-run the original tag workflow"; exit 1
+            echo "::error::publishing dispatches require deployment-id; inspect Portal or re-run the original release workflow"; exit 1
           fi
       - name: Parse tag
         id: tag
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
         run: uv run --project scripts --locked python scripts/release/release_tool.py parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
       - name: Java plugin exists
         env:
@@ -113,8 +113,14 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::dry run: tests and the build run; nothing is signed, uploaded or drafted"
+            echo "::notice::dry run: tests and the build run; nothing is signed or uploaded"
           fi
+      - name: Verify the published GitHub release
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py check-published-release --tag "$TAG"
 
   test:
     name: Test
@@ -199,15 +205,31 @@ jobs:
           overwrite: true
           retention-days: 90
 
+  approve:
+    name: Approve GA publication
+    needs: [prepare, stage]
+    if: >-
+      needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.prerelease == 'false'
+      && needs.prepare.outputs.maturity != 'pre-release' && needs.prepare.outputs.maturity != 'public-preview'
+    runs-on: ubuntu-latest
+    environment: maven-central-approval
+    permissions: {}
+    steps:
+      - name: Record publication approval
+        run: echo "Maven Central publication approved"
+
   publish:
     name: Publish and verify Maven Central
-    needs: [prepare, stage]
-    if: needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.prerelease == 'false'
+    needs: [prepare, stage, approve]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' && needs.stage.result == 'success'
+      && needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.prerelease == 'false'
+      && (needs.approve.result == 'success'
+          || (needs.approve.result == 'skipped'
+              && (needs.prepare.outputs.maturity == 'pre-release' || needs.prepare.outputs.maturity == 'public-preview')))
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # Non-GA plugins publish automatically using the same account as staging.
-    # Unknown or missing maturity retains the protected GA environment.
-    environment: ${{ (needs.prepare.outputs.maturity == 'pre-release' || needs.prepare.outputs.maturity == 'public-preview') && 'maven-central-staging' || 'maven-central' }}
+    environment: maven-central
     permissions:
       contents: read
     steps:
@@ -239,49 +261,3 @@ jobs:
         run: |
           uv run --project scripts --locked python scripts/release/maven_release.py publish \
             --plugin-dir "$PLUGIN_DIR" --version "$VERSION" --dist dist --state-dir release-state --smoke
-
-  github-release:
-    name: Draft GitHub release
-    needs: [prepare, stage, publish]
-    if: >-
-      !cancelled() && needs.prepare.result == 'success' && needs.prepare.outputs.publish == 'true'
-      && needs.stage.result == 'success'
-      && (needs.prepare.outputs.prerelease == 'true' || needs.publish.result == 'success')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: dist-java-${{ needs.prepare.outputs.plugin }}
-          path: dist/
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: central-deployment-${{ needs.prepare.outputs.plugin }}
-          path: release-state/
-      - name: Generate release notes from history
-        env:
-          PLUGIN_DIR: ${{ needs.prepare.outputs.plugin_dir }}
-          TAG: ${{ needs.prepare.outputs.tag }}
-        run: |
-          uv run --project scripts --locked python scripts/release/release_tool.py release-notes --plugin-dir "$PLUGIN_DIR" --tag "$TAG" --output notes.md
-          cp release-state/bundle.zip dist/central-bundle.zip
-          cp release-state/deployment.json dist/central-deployment.json
-      - name: Create or update the draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          TAG: ${{ needs.prepare.outputs.tag }}
-          TITLE: ${{ needs.prepare.outputs.coordinate }} ${{ needs.prepare.outputs.version }}
-          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
-        run: |
-          extra=()
-          [ "$PRERELEASE" = "true" ] && extra+=(--prerelease)
-          uv run --project scripts --locked python scripts/release/release_tool.py draft-release --tag "$TAG" --title "$TITLE" --notes notes.md --dist dist "${extra[@]}"

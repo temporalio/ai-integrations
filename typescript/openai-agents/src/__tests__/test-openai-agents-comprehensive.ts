@@ -24,6 +24,7 @@ import {
 import { FakeModelProvider, textResponse, toolCallResponse, handoffResponse } from './stubs/openai-agents-fakes';
 import { FakeSandboxClient } from './stubs/sandbox-fakes';
 import { installOtelCollector, installAgentSdkCollector } from './helpers/openai-agents-spans';
+import { startLocalWithRetry } from './helpers/environment';
 import * as activities from './activities/openai-agents-comprehensive';
 import {
   simpleAgentWorkflow,
@@ -743,7 +744,7 @@ const EXPECTED_OTEL_TEST_2: string[][] = [
  * tests share no state and can run concurrently.
  */
 async function withTestEnv(fn: (env: TestWorkflowEnvironment) => Promise<void>): Promise<void> {
-  const env = await createTestWorkflowEnvironment();
+  const env = await startLocalWithRetry(() => createTestWorkflowEnvironment());
   try {
     await fn(env);
   } finally {

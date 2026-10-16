@@ -25,9 +25,8 @@ wired onto the worker by `googleadk.NewPlugin(...)`.
 
 ## Add to your project
 
-The module path is `go.temporal.io/googleadk`. Releases use the shared Go release
-workflow and the `go/googleadk/v<version>` tag format. See the
-[Go release runbook](../../AGENTS.md#go-releases).
+The module path is `go.temporal.io/googleadk`, replacing
+`go.temporal.io/sdk/contrib/googleadk`.
 
 From your application's Go module, run:
 
@@ -48,14 +47,6 @@ v2.3.0 for compatibility with OpenTelemetry log SDK v0.21.0. Request-order
 confirmation resume (google/adk-go#1169), available since v2.2.0, makes
 multi-decision confirmation resumes replay-stable. ADK sets the Go floor:
 1.26.6+. The replay-safe telemetry gate composes `workflow.IsReadOnly`.
-
-## Module versioning
-
-The Google ADK integration is released as a separate Go module from the core
-Temporal Go SDK. This repository owns `go.temporal.io/googleadk`, replacing
-the former `go.temporal.io/sdk/contrib/googleadk` module. Release notes are
-generated from commit messages. See [AGENTS.md](../../AGENTS.md) for publishing
-requirements.
 
 ## Samples
 

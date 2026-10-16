@@ -6,11 +6,12 @@ Subcommands:
   check-version-policy          enforce production and staging registry version ordering (with
                                 exact-version re-runs allowed for recovery)
   verify-index-files            prove the files an index serves for a version are the local artifacts
-  check-recovery-run            validate a tagged run's tested artifacts for publication recovery
+  check-recovery-run            validate tested artifacts for publication recovery of an existing tag
   check-java-stage-recovery      prevent another upload when a prior staging attempt may have uploaded
   check-published-release       verify the published GitHub release and emit its deployment URL
   check-go-vanity               verify the Go vanity path routes to this plugin's subdirectory
   verify-go-module              compare public Go module bytes and build a clean consumer
+  npm-registry-state           verify existing npm bytes before skipping an upload
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
   publish-release               publish the reviewed draft after registry verification
@@ -23,7 +24,7 @@ Policy (AGENTS.md, "Release runbook"):
   * final (non pre-release) versions additionally require plugin.toml
     [release] allow-final = true and no TRANSITION(sdk-cutover) markers in the plugin
   * Python versions are canonical PEP 440; Java versions are X.Y.Z[-RCN];
-    Go versions are canonical SemVer; local versions and build metadata (+...) are forbidden
+    Go and TypeScript versions are canonical SemVer; local versions and build metadata (+...) are forbidden
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ from urllib.parse import quote
 from packaging.version import InvalidVersion, Version
 
 from go_release import GoReleaseError, GoVersion, check_vanity, fetch_versions, verify_module
+from npm_release import NpmReleaseError, NpmVersion, fetch_versions as fetch_npm_versions, registry_state
 
 # \Z (not $) so a trailing newline cannot ride along into GITHUB_OUTPUT.
 TAG_RE = re.compile(r"^(?P<language>python|typescript|java|go)/(?P<plugin>[a-z0-9][a-z0-9_.-]*)/v(?P<version>.+)\Z")
@@ -99,6 +101,11 @@ def _repo() -> str:
 
 
 def release_version(language: str, raw: str) -> Version | GoVersion:
+    if language == "typescript":
+        try:
+            return NpmVersion(raw)
+        except NpmReleaseError as exc:
+            raise PolicyError(str(exc)) from exc
     if language == "go":
         try:
             return GoVersion(raw)
@@ -139,8 +146,9 @@ def parse_tag(tag: str) -> dict[str, str]:
 def cmd_parse_tag(args: argparse.Namespace) -> int:
     out = parse_tag(args.tag)
     plugin_toml = Path(args.repo_root) / out["plugin_dir"] / "plugin.toml"
-    if out["language"] == "go" and not plugin_toml.is_file():
-        raise PolicyError(f"unknown Go plugin: {out['plugin_dir']}")
+    if out["language"] in ("go", "typescript") and not plugin_toml.is_file():
+        label = "Go" if out["language"] == "go" else "TypeScript"
+        raise PolicyError(f"unknown {label} plugin: {out['plugin_dir']}")
     if plugin_toml.is_file():
         meta = _load(plugin_toml)
         out["coordinate"] = meta["plugin"]["coordinate"]
@@ -151,6 +159,14 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
         out["github_prerelease"] = "true" if github_prerelease(release_version(out["language"], out["version"]), out["maturity"]) else "false"
         if out["language"] == "python":
             out["requires_python"] = _load(plugin_toml.parent / "pyproject.toml")["project"]["requires-python"]
+        elif out["language"] == "typescript":
+            package = json.loads((plugin_toml.parent / "package.json").read_text())
+            expected = f"@temporalio/{out['plugin']}"
+            if (meta["plugin"].get("name") != out["plugin"] or meta["plugin"].get("language") != "typescript"
+                    or meta["plugin"].get("registry") != "npm" or out["coordinate"] != expected
+                    or package.get("name") != expected):
+                raise PolicyError("TypeScript tag, plugin metadata and package name must match")
+            out["dist_tag"] = "next" if out["prerelease"] == "true" else "latest"
         elif out["language"] == "go":
             plugin = meta["plugin"]
             if plugin.get("language") != "go" or plugin.get("name") != out["plugin"] or plugin.get("registry") != "goproxy":
@@ -196,6 +212,11 @@ def fetch_published_versions(coordinate: str, registry: str, registry_json: Path
     """Return every published version (yanked included). 404 -> []. Anything else fails closed."""
     if registry == "goproxy":
         return fetch_versions(coordinate, registry_json)
+    if registry == "npm":
+        try:
+            return fetch_npm_versions(coordinate, registry_json)
+        except NpmReleaseError as exc:
+            raise PolicyError(str(exc)) from exc
     if registry == "maven":
         return fetch_maven_versions(coordinate, registry_json)
     if registry not in REGISTRY_JSON:
@@ -300,7 +321,7 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     registry = meta["plugin"].get("registry", "pypi")
     if registry == "maven" and not JAVA_VERSION_RE.fullmatch(args.version):
         raise PolicyError("Maven release versions must be X.Y.Z or X.Y.Z-RCN")
-    language = {"goproxy": "go", "maven": "java"}.get(registry, "python")
+    language = {"goproxy": "go", "maven": "java", "npm": "typescript"}.get(registry, "python")
     version = release_version(language, args.version)
     published = fetch_published_versions(coordinate, registry, Path(args.registry_json) if args.registry_json else None)
     # A Go tag is already public when this job starts. A proxy listing containing
@@ -444,15 +465,20 @@ def previous_tag(repo_root: Path, language: str, plugin: str, current: Version |
     return tag, v
 
 
-def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
+def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str, *, ref: str | None = None) -> str:
     parts = parse_tag(tag)
     version = release_version(parts["language"], parts["version"])
     meta_path = repo_root / plugin_dir / "plugin.toml"
-    meta = _load(meta_path) if meta_path.is_file() else {"plugin": {}}
+    if ref is not None:
+        ref = _git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=repo_root).strip()
+        meta = tomllib.loads(_git("show", f"{ref}:{plugin_dir}/plugin.toml", cwd=repo_root))
+    else:
+        meta = _load(meta_path) if meta_path.is_file() else {"plugin": {}}
     coordinate = meta["plugin"].get("coordinate", parts["plugin"])
     root_api = meta["plugin"].get("root-api", "")
     prev = previous_tag(repo_root, parts["language"], parts["plugin"], version)
-    revision = f"{prev[0]}..{tag}" if prev else tag
+    source = ref or tag
+    revision = f"{prev[0]}..{source}" if prev else source
     log = _git("log", "--no-decorate", "--format=%h%x1f%s", revision, "--", plugin_dir, cwd=repo_root)
     # The GitHub release already displays its name above the body. Keep the
     # generated notes focused on release content instead of repeating it.
@@ -493,6 +519,8 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
         lines += ["", f"**Full changelog**: https://github.com/{repo}/compare/{prev_tag}...{tag}", ""]
     if version.is_prerelease and parts["language"] == "go":
         lines += ["## Pre-release notes", "", f"Install this Go pre-release with `go get {coordinate}@v{version}`.", ""]
+    elif version.is_prerelease and parts["language"] == "typescript":
+        lines += ["## Pre-release notes", "", f"Install this npm pre-release with `npm install {coordinate}@{version}`.", ""]
     elif version.is_prerelease:
         lines += [
             "## Pre-release notes",
@@ -515,7 +543,7 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str) -> str:
 
 
 def cmd_release_notes(args: argparse.Namespace) -> int:
-    notes = release_notes(Path(args.repo_root).resolve(), args.plugin_dir.rstrip("/"), args.tag, args.repo or _repo())
+    notes = release_notes(Path(args.repo_root).resolve(), args.plugin_dir.rstrip("/"), args.tag, args.repo or _repo(), ref=args.ref)
     Path(args.output).write_text(notes, encoding="utf-8")
     print(notes)
     return 0
@@ -534,8 +562,8 @@ JAVA_STAGE_STEP = "Stage tested bytes, prove staged files and install a clean co
 
 def java_stage_recovery_only(repo: str, run_id: int, run_attempt: int, event: str) -> bool:
     """Allow an initial upload only when no earlier attempt could have staged it."""
-    if run_id <= 0 or run_attempt <= 0 or event not in {"push", "workflow_dispatch"}:
-        raise PolicyError("expected a Java release push or dispatch with a positive run ID and attempt")
+    if run_id <= 0 or run_attempt <= 0 or event not in {"release", "push", "workflow_dispatch"}:
+        raise PolicyError("expected a Java release, legacy push or dispatch with a positive run ID and attempt")
     if event == "workflow_dispatch":
         return True
     # A later attempt may have failed to restore state and skipped staging. Check
@@ -562,7 +590,7 @@ def cmd_check_java_stage_recovery(args: argparse.Namespace) -> int:
     recover_only = java_stage_recovery_only(args.repo or _repo(), args.run_id, args.run_attempt, args.event)
     _write_outputs(args.github_output, {
         "recover_only": str(recover_only).lower(),
-        "restore_state": str(recover_only and args.event == "push").lower(),
+        "restore_state": str(recover_only and args.event in {"release", "push"}).lower(),
     })
     return 0
 
@@ -570,8 +598,9 @@ def cmd_check_java_stage_recovery(args: argparse.Namespace) -> int:
 def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> None:
     """Require an existing main-reachable tag and a completed run with its full matrix tested."""
     parsed = parse_tag(tag)
-    if parsed["language"] != "python" or run_id <= 0:
-        raise PolicyError("recovery requires a Python release tag and a positive run ID")
+    language = parsed["language"]
+    if language not in {"python", "typescript"} or run_id <= 0:
+        raise PolicyError("recovery requires a Python or TypeScript release tag and a positive run ID")
     ref = f"refs/tags/{tag}"
     sha = _git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=repo_root).strip()
     if subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], cwd=repo_root).returncode != 0:
@@ -579,22 +608,33 @@ def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> Non
     plugin_dir = parsed["plugin_dir"]
     # The caller's metadata controls publication gates and smoke imports. It must describe the
     # original package, even though repaired workflow/tooling code comes from main.
-    for filename in ("plugin.toml", "pyproject.toml"):
+    filenames = (("plugin.toml", "pyproject.toml") if language == "python" else
+                 ("plugin.toml", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"))
+    for filename in filenames:
         relative = f"{plugin_dir}/{filename}"
         tagged = _git("show", f"{ref}:{relative}", cwd=repo_root)
         if (repo_root / relative).read_text(encoding="utf-8") != tagged:
             raise PolicyError(f"recovery requires {relative} to match the release tag")
     meta = _load(repo_root / plugin_dir / "plugin.toml")
     run = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}"))
+    if language == "python":
+        # Retain recovery of legacy Python tag-push runs.
+        source_matches = run.get("event") in {"release", "push"} and run.get("head_branch") == tag
+        source_description = "release-python.yml release or legacy push run"
+    else:
+        source_matches = (
+            (run.get("event") == "release" and run.get("head_branch") == tag)
+            or (run.get("event") == "workflow_dispatch" and run.get("head_branch") in {"main", tag})
+        )
+        source_description = "release-typescript.yml release or main/tag dispatch run"
     if (
         run.get("repository", {}).get("full_name") != repo
-        or run.get("path") != ".github/workflows/release-python.yml"
-        or run.get("event") not in {"release", "push"}  # retain recovery of legacy tag-push runs
-        or run.get("head_branch") != tag
+        or run.get("path") != f".github/workflows/release-{language}.yml"
+        or not source_matches
         or run.get("head_sha") != sha
         or run.get("status") != "completed"
     ):
-        raise PolicyError("recovery source must be a completed release-python.yml release or legacy push run for this exact tag and commit")
+        raise PolicyError(f"recovery source must be a completed {source_description} for this exact tag and commit")
     pages = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100", "--paginate", "--slurp"))
     jobs = {job["name"]: job for page in pages for job in page["jobs"]}
     versions = meta["ci"]["runtime-versions"]
@@ -602,13 +642,15 @@ def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> Non
         ("ubuntu-latest", versions[0]), ("ubuntu-latest", versions[-1]),
         ("macos-latest", versions[-1]), ("windows-latest", versions[-1]),
     }
-    required = {"Validate tag and version policy", "Test / matrix"}
-    required.update(f"Test / {parsed['plugin']} ({runner}, py{version})" for runner, version in cells)
+    validation_job = "Validate tag and version policy" if language == "python" else "Validate TypeScript tag and version policy"
+    runtime = "py" if language == "python" else "node"
+    required = {validation_job, "Test / matrix"}
+    required.update(f"Test / {parsed['plugin']} ({runner}, {runtime}{version})" for runner, version in cells)
     for name in sorted(required):
         job = jobs.get(name, {})
         if job.get("status") != "completed" or job.get("conclusion") != "success":
             raise PolicyError(f"recovery source has no successful completed job: {name}")
-    artifact_name = f"dist-{parsed['plugin']}-locked"
+    artifact_name = f"dist-{parsed['plugin']}-locked" if language == "python" else f"npm-dist-{parsed['plugin']}"
     artifacts = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/artifacts?name={artifact_name}&per_page=100"))
     matching = [item for item in artifacts["artifacts"] if item["name"] == artifact_name and not item["expired"]]
     if len(matching) != 1:
@@ -756,6 +798,26 @@ def cmd_verify_go_module(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_npm_registry_state(args: argparse.Namespace) -> int:
+    """Skip an existing upload only after proving its bytes match; retry propagation."""
+    release_version("typescript", args.version)
+    if args.attempts < 1 or args.delay < 0:
+        raise PolicyError("npm verification needs positive attempts and nonnegative delay")
+    for attempt in range(args.attempts):
+        try:
+            exists = registry_state(args.coordinate, args.version, Path(args.dist))
+            if exists or not args.require_present:
+                _write_outputs(args.github_output, {"exists": "true" if exists else "false"})
+                return 0
+            error = f"npm does not yet serve {args.coordinate}@{args.version}"
+        except (NpmReleaseError, urllib.error.URLError, TimeoutError) as exc:
+            error = str(exc)
+        if attempt + 1 < args.attempts:
+            print(f"npm verification attempt {attempt + 1}: {error}")
+            time.sleep(args.delay)
+    raise PolicyError(error)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo-root", default=os.environ.get("GITHUB_WORKSPACE", "."))
@@ -790,6 +852,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--delay", type=float, default=30)
     p.set_defaults(func=cmd_verify_go_module)
 
+    p = sub.add_parser("npm-registry-state", help="verify existing npm bytes before skipping an upload")
+    p.add_argument("--coordinate", required=True)
+    p.add_argument("--version", required=True)
+    p.add_argument("--dist", required=True)
+    p.add_argument("--require-present", action="store_true")
+    p.add_argument("--attempts", type=int, default=1)
+    p.add_argument("--delay", type=float, default=10)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    p.set_defaults(func=cmd_npm_registry_state)
+
     p = sub.add_parser("verify-index-files", help="fail unless the index serves exactly the local distribution files")
     p.add_argument("--coordinate", required=True)
     p.add_argument("--version", required=True)
@@ -800,7 +872,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--index-json", default=None, help="read the release JSON from this file instead of the index (tests)")
     p.set_defaults(func=cmd_verify_index_files)
 
-    p = sub.add_parser("check-recovery-run", help="validate a tagged run's tested artifacts for recovery")
+    p = sub.add_parser("check-recovery-run", help="validate tested artifacts for recovery of an existing tag")
     p.add_argument("--tag", required=True)
     p.add_argument("--run-id", type=int, required=True)
     p.add_argument("--repo", default=None)
@@ -810,7 +882,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("check-java-stage-recovery", help="require recovery if an earlier Java staging attempt may have uploaded")
     p.add_argument("--run-id", type=int, required=True)
     p.add_argument("--run-attempt", type=int, required=True)
-    p.add_argument("--event", choices=("push", "workflow_dispatch"), required=True)
+    p.add_argument("--event", choices=("release", "push", "workflow_dispatch"), required=True)
     p.add_argument("--repo", default=None)
     p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     p.set_defaults(func=cmd_check_java_stage_recovery)
@@ -824,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("release-notes", help="generate release notes from history")
     p.add_argument("--plugin-dir", required=True)
     p.add_argument("--tag", required=True)
+    p.add_argument("--ref", help="tested commit to generate notes from before the release tag exists (default: --tag)")
     p.add_argument("--output", required=True)
     p.add_argument("--repo", default=None)
     p.set_defaults(func=cmd_release_notes)
