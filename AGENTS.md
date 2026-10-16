@@ -142,6 +142,11 @@ Workflow streams and OpenTelemetry never migrate here.
   unpublished SDK test helpers are copied into each consuming plugin's
   `tests/helpers/`, with a private development-only link. Never use a local
   SDK checkout or another plugin's checkout as a dependency.
+- Local server startup uses `startLocalWithRetry`, with three attempts and a
+  one-second delay only for the SDK's explicit startup-deadline error. Bind each
+  plugin's server configuration in the startup callback. Copy the helper and its
+  regression tests from `typescript/_template/src/__tests__/`; the conventions
+  check keeps each plugin's copies byte-identical to the templates.
 - `make sync` preserves the committed lock. `make sync-latest` updates compatible
   ranges under the two-week pnpm release-age policy. Preserve first-party and
   exact AI SDK dependency-family cooldown exceptions inherited from the SDK.

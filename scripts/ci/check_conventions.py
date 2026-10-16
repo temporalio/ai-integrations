@@ -53,6 +53,10 @@ STANDARD_TEST_SUPPORT = {
     "tests/test_env.py": "tests/test_env.py.tmpl",
     "tests/test_installed_matches_source.py": "tests/test_installed_matches_source.py.tmpl",
 }
+STANDARD_TYPESCRIPT_TEST_SUPPORT = {
+    "src/__tests__/helpers/environment.ts": "src/__tests__/helpers/environment.ts.tmpl",
+    "src/__tests__/test-environment-startup.test.ts": "src/__tests__/test-environment-startup.test.ts.tmpl",
+}
 PYTHON_DEVELOPMENT_VERSION = "0.0.0"
 
 
@@ -168,19 +172,24 @@ class Checker:
         self.check_standard_test_support(plugin)
 
     def check_standard_test_support(self, plugin: Plugin) -> None:
-        template_root = self.root / "python" / "_template"
+        template_rel_root = f"{plugin.language}/_template"
+        template_root = self.root / template_rel_root
         if not template_root.is_dir():
             return
-        for plugin_rel, template_rel in STANDARD_TEST_SUPPORT.items():
+        support_files = {
+            "python": STANDARD_TEST_SUPPORT,
+            "typescript": STANDARD_TYPESCRIPT_TEST_SUPPORT,
+        }[plugin.language]
+        for plugin_rel, template_rel in support_files.items():
             plugin_path = plugin.path / plugin_rel
             template_path = template_root / template_rel
             if not plugin_path.is_file():
                 self.fail(f"{plugin.rel}: missing standard test support file {plugin_rel}")
             elif not template_path.is_file():
-                self.fail(f"python/_template/{template_rel}: missing canonical test support template")
+                self.fail(f"{template_rel_root}/{template_rel}: missing canonical test support template")
             elif plugin_path.read_bytes() != template_path.read_bytes():
                 self.fail(
-                    f"{plugin.rel}/{plugin_rel}: differs from canonical python/_template/{template_rel}"
+                    f"{plugin.rel}/{plugin_rel}: differs from canonical {template_rel_root}/{template_rel}"
                 )
 
     def check_java_plugin(self, plugin: Plugin) -> None:
@@ -278,6 +287,7 @@ class Checker:
             self.fail(f"{rel}: LICENSE differs from root")
         if any(path.name.upper().startswith("CHANGELOG") for path in d.iterdir()):
             self.fail(f"{rel}: release notes are generated; no changelog files")
+        self.check_standard_test_support(plugin)
 
     def check_plugin_toml(self, plugin: Plugin, meta: dict[str, Any], pyproject: dict[str, Any]) -> None:
         rel = plugin.rel

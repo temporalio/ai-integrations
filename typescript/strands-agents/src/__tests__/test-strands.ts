@@ -8,6 +8,7 @@ import { test as anyTest, createBaseBundlerOptions, helpers, TestWorkflowEnviron
 import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { StrandsPlugin } from '..';
+import { startLocalWithRetry } from './helpers/environment';
 import { auditLog, auditTool, deleteState, deleteThing, getWeather, getWeatherCalls } from './activities/strands';
 import {
   activityToolAgent,
@@ -134,7 +135,7 @@ class StubMcpClient extends McpClient {
 const test = anyTest as TestFn<BaseContext>;
 
 test.before(async (t) => {
-  const env = await TestWorkflowEnvironment.createLocal();
+  const env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
   // Pass a `StrandsPlugin` to `bundleWorkflowCode` so the plugin can stub out
   // `@strands-agents/sdk/mcp-config.js`'s dynamic `node:*`/MCP-transport
   // imports and inline async chunks.
