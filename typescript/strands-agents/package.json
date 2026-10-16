@@ -94,6 +94,5 @@
     "!lib/__tests__",
     "LICENSE"
   ],
-  "private": true,
   "packageManager": "pnpm@10.27.0"
 }

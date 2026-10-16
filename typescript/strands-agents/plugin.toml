@@ -8,7 +8,7 @@ maturity = "pre-release"
 docs = "https://docs.temporal.io/develop/typescript/integrations/strands-agents"
 
 [release]
-allow-final = false
+allow-final = true
 
 [ci]
 runtime-versions = ["22", "24"]

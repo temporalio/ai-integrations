@@ -158,9 +158,9 @@ Workflow streams and OpenTelemetry never migrate here.
   Activity names remain unchanged. The Google ADK random-stream identifier uses
   the new package name as explicitly requested for this cutover.
 - Packages remain private and `[release] allow-final = false` until their release
-  setup is ready. The shared npm workflow is `release-typescript.yml`; Google ADK
-  and Vercel AI SDK are enabled for release. New coordinates require one interactive
-  publication of the tested tarball before npm permits configuring their trusted
+  setup is ready. All five initial TypeScript integrations are enabled for release
+  through the shared `release-typescript.yml` workflow. New coordinates require one
+  interactive publication of the tested tarball before npm permits configuring their trusted
   publisher, as described below. No per-plugin workflows or secrets. CI checks
   tarball contents and a clean consumer import.
 
