@@ -86,7 +86,6 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - Python manifests and lockfiles carry the static `0.0.0` development placeholder. A protected release tag is the published version source; the release matrix runs `uv version <tag-version>` before sync, test and build, and only those tested artifacts are published. Ordinary CI and local development keep `0.0.0`.
 - No changelog files. `scripts/release/release_tool.py release-notes` derives notes from commit subjects touching the plugin directory since its previous tag.
 - Every GitHub Action is pinned to a full commit SHA with a `# vN` comment (org opengrep rule).
-- Dependabot mirrors sdk-python: security advisories only (`open-pull-requests-limit: 0`) because its uv support is not yet mature enough for routine bumps; nightly checks with the newest allowed dependencies are the dependency-drift signal.
 
 ## Python conventions
 
