@@ -2,11 +2,14 @@ package io.temporal.springai;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import io.modelcontextprotocol.client.McpSyncClient;
+import io.modelcontextprotocol.spec.McpSchema;
 import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowOptions;
 import io.temporal.serviceclient.WorkflowServiceStubsOptions;
 import io.temporal.spring.boot.TemporalOptionsCustomizer;
 import io.temporal.springai.chat.TemporalChatClient;
+import io.temporal.springai.mcp.ActivityMcpClient;
 import io.temporal.springai.model.ActivityChatModel;
 import io.temporal.springai.plugin.SpringAiPlugin;
 import io.temporal.testserver.TestServer;
@@ -14,8 +17,10 @@ import io.temporal.worker.Worker;
 import io.temporal.worker.WorkerFactory;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.springframework.ai.chat.messages.AssistantMessage;
@@ -29,6 +34,42 @@ import org.springframework.context.annotation.Configuration;
 
 /** Loads the real Boot 4 and Temporal starter auto-configurations with an offline model. */
 class SpringBootAutoConfigurationTest {
+  @Test
+  @Timeout(30)
+  void discoversAutoConfiguredMcpClientListAndExecutesToolsThroughActivities() {
+    new ApplicationContextRunner()
+        .withUserConfiguration(Application.class)
+        .withPropertyValues(
+            "spring.temporal.connection.target=127.0.0.1:7233",
+            "spring.temporal.start-workers=false",
+            "spring.temporal.workers[0].task-queue=boot-mcp-test",
+            "spring.temporal.workers[0].workflow-classes[0]=" + McpWorkflowImpl.class.getName(),
+            "spring.ai.mcp.client.stdio.connections.filesystem.command="
+                + Path.of(System.getProperty("java.home"), "bin", "java"),
+            "spring.ai.mcp.client.stdio.connections.filesystem.args[0]=-cp",
+            "spring.ai.mcp.client.stdio.connections.filesystem.args[1]="
+                + System.getProperty("mcp.test.classpath"),
+            "spring.ai.mcp.client.stdio.connections.filesystem.args[2]="
+                + StdioMcpTestServer.class.getName())
+        .run(
+            context -> {
+              assertNull(context.getStartupFailure());
+              // Spring AI owns a typed list, with no individual client beans or sample bridge.
+              assertTrue(context.getBeansOfType(McpSyncClient.class).isEmpty());
+              context.getBean(WorkerFactory.class).start();
+              McpWorkflow workflow =
+                  context
+                      .getBean(WorkflowClient.class)
+                      .newWorkflowStub(
+                          McpWorkflow.class,
+                          WorkflowOptions.newBuilder()
+                              .setTaskQueue("boot-mcp-test")
+                              .setWorkflowExecutionTimeout(Duration.ofSeconds(10))
+                              .build());
+              assertEquals("hello from /tmp/notes.txt", workflow.readFile("/tmp/notes.txt"));
+            });
+  }
+
   @Test
   @Timeout(30)
   void discoversPluginAndRegistersModelActivityWithStarterWorker() {
@@ -99,6 +140,26 @@ class SpringBootAutoConfigurationTest {
           .user("ping")
           .call()
           .content();
+    }
+  }
+
+  @WorkflowInterface
+  public interface McpWorkflow {
+    @WorkflowMethod
+    String readFile(String path);
+  }
+
+  public static class McpWorkflowImpl implements McpWorkflow {
+    @Override
+    public String readFile(String path) {
+      ActivityMcpClient mcp = ActivityMcpClient.create();
+      String clientName = mcp.getClientInfo().keySet().iterator().next();
+      String toolName = mcp.listTools().get(clientName).tools().get(0).name();
+      McpSchema.CallToolResult result =
+          mcp.callTool(
+              clientName,
+              McpSchema.CallToolRequest.builder(toolName).arguments(Map.of("path", path)).build());
+      return ((McpSchema.TextContent) result.content().get(0)).text();
     }
   }
 }

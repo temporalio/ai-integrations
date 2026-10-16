@@ -41,9 +41,20 @@ dependencies {
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation 'org.springframework.ai:spring-ai-rag'
     testImplementation 'org.springframework.ai:spring-ai-mcp'
+    testImplementation('org.springframework.ai:spring-ai-starter-mcp-client') {
+        // The integration's compatibility matrix supplies its own Boot starter version.
+        exclude group: 'org.springframework.boot', module: 'spring-boot-starter'
+    }
     testImplementation 'org.springframework.ai:spring-ai-retry'
     testImplementation 'org.springframework.ai:spring-ai-openai'
     testImplementation 'org.springframework.ai:spring-ai-anthropic'
     testRuntimeOnly 'ch.qos.logback:logback-classic'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    // Launch the local stdio MCP server with the same dependencies as the test.
+    doFirst {
+        systemProperty 'mcp.test.classpath', sourceSets.test.runtimeClasspath.asPath
+    }
 }

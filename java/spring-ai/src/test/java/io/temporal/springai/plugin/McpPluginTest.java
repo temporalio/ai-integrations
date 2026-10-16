@@ -15,12 +15,93 @@ import io.modelcontextprotocol.spec.McpSchema;
 import io.temporal.springai.mcp.McpClientActivityImpl;
 import io.temporal.worker.Worker;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.context.ApplicationContext;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.ResolvableType;
 
 class McpPluginTest {
+
+  @Test
+  void discoversTypedClientListsAndDeduplicatesIndividualBeanAliases() {
+    try (var context = new AnnotationConfigApplicationContext(ClientLists.class)) {
+      Object alpha = context.getBean("mcpSyncClients", List.class).get(0);
+      context.getBeanFactory().registerSingleton("alphaAlias", alpha);
+      McpPlugin plugin = new McpPlugin();
+      plugin.setApplicationContext(context);
+      Worker worker = mock(Worker.class);
+
+      plugin.initializeWorker("mcp-tq", worker);
+
+      ArgumentCaptor<Object> captor = ArgumentCaptor.forClass(Object.class);
+      verify(worker).registerActivitiesImplementations(captor.capture());
+      McpClientActivityImpl activity = (McpClientActivityImpl) captor.getValue();
+      assertEquals(Set.of("alpha", "beta", "gamma"), activity.getClientInfo().keySet());
+    }
+  }
+
+  @Test
+  void distinctClientsWithTheSameNameAcrossListsAndIndividualBeansAreRejected() {
+    try (var context = new AnnotationConfigApplicationContext(ClientLists.class)) {
+      context.getBeanFactory().registerSingleton("duplicateBeta", mockClientNamed("beta"));
+      McpPlugin plugin = new McpPlugin();
+      plugin.setApplicationContext(context);
+
+      IllegalArgumentException thrown =
+          assertThrows(
+              IllegalArgumentException.class,
+              () -> plugin.initializeWorker("mcp-tq", mock(Worker.class)));
+      assertTrue(thrown.getMessage().contains("beta"));
+    }
+  }
+
+  @Test
+  void clientListsAppearLate_registeredViaAfterSingletonsInstantiated() {
+    ApplicationContext context = mock(ApplicationContext.class);
+    McpSyncClient client = mockClientNamed("late");
+    when(context.getBeansOfType(McpSyncClient.class)).thenReturn(Map.of());
+    when(context.getBeanNamesForType(
+            ResolvableType.forClassWithGenerics(List.class, McpSyncClient.class)))
+        .thenReturn(new String[0])
+        .thenReturn(new String[] {"mcpSyncClients"});
+    when(context.getBean("mcpSyncClients", List.class)).thenReturn(List.of(client));
+    McpPlugin plugin = new McpPlugin();
+    plugin.setApplicationContext(context);
+    Worker worker = mock(Worker.class);
+
+    plugin.initializeWorker("mcp-tq", worker);
+    verifyNoInteractions(worker);
+    plugin.afterSingletonsInstantiated();
+
+    ArgumentCaptor<Object> captor = ArgumentCaptor.forClass(Object.class);
+    verify(worker).registerActivitiesImplementations(captor.capture());
+    McpClientActivityImpl activity = (McpClientActivityImpl) captor.getValue();
+    assertEquals(Set.of("late"), activity.getClientInfo().keySet());
+  }
+
+  @Configuration(proxyBeanMethods = false)
+  static class ClientLists {
+    @Bean
+    List<McpSyncClient> mcpSyncClients() {
+      return List.of(mockClientNamed("alpha"), mockClientNamed("beta"));
+    }
+
+    @Bean
+    List<McpSyncClient> otherMcpClients() {
+      return List.of(mockClientNamed("gamma"));
+    }
+
+    @Bean
+    List<String> unrelatedList() {
+      return List.of("not an MCP client");
+    }
+  }
 
   @Test
   void discoversMcpClientBeansByType() {
@@ -32,7 +113,7 @@ class McpPluginTest {
     beans.put("mcpClientAlpha", clientA);
     beans.put("mcpClientBeta", clientB);
 
-    ApplicationContext ctx = mock(ApplicationContext.class);
+    ApplicationContext ctx = contextWithoutClientLists();
     when(ctx.getBeansOfType(McpSyncClient.class)).thenReturn(beans);
 
     McpPlugin plugin = new McpPlugin();
@@ -58,7 +139,7 @@ class McpPluginTest {
     beans.put("mcpClientA", clientA);
     beans.put("mcpClientB", clientB);
 
-    ApplicationContext ctx = mock(ApplicationContext.class);
+    ApplicationContext ctx = contextWithoutClientLists();
     when(ctx.getBeansOfType(McpSyncClient.class)).thenReturn(beans);
 
     McpPlugin plugin = new McpPlugin();
@@ -75,7 +156,7 @@ class McpPluginTest {
 
   @Test
   void noMcpBeans_defersWorker_thenClearsAfterSingletonsInstantiated() {
-    ApplicationContext ctx = mock(ApplicationContext.class);
+    ApplicationContext ctx = contextWithoutClientLists();
     when(ctx.getBeansOfType(McpSyncClient.class)).thenReturn(Map.of());
 
     McpPlugin plugin = new McpPlugin();
@@ -95,7 +176,7 @@ class McpPluginTest {
 
   @Test
   void beansAppearLate_registeredViaAfterSingletonsInstantiated() {
-    ApplicationContext ctx = mock(ApplicationContext.class);
+    ApplicationContext ctx = contextWithoutClientLists();
     // First lookup returns empty (Spring AI MCP bean hasn't been created yet when
     // initializeWorker runs).
     when(ctx.getBeansOfType(McpSyncClient.class))
@@ -114,6 +195,12 @@ class McpPluginTest {
     ArgumentCaptor<Object> captor = ArgumentCaptor.forClass(Object.class);
     verify(worker, atLeastOnce()).registerActivitiesImplementations(captor.capture());
     assertEquals(McpClientActivityImpl.class, captor.getValue().getClass());
+  }
+
+  private static ApplicationContext contextWithoutClientLists() {
+    ApplicationContext context = mock(ApplicationContext.class);
+    when(context.getBeanNamesForType(any(ResolvableType.class))).thenReturn(new String[0]);
+    return context;
   }
 
   private static McpSyncClient mockClientNamed(String name) {
