@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import random
@@ -10,14 +11,16 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
+from datetime import timezone
 from typing import Any, ClassVar, NoReturn, Protocol
+from urllib.parse import quote
 
 import langsmith
 import langsmith.utils
 import nexusrpc.handler
-from langsmith import tracing_context
+from langsmith import get_tracing_context, tracing_context
 from langsmith.run_helpers import get_current_run_tree
-from langsmith.run_trees import RunTree, WriteReplica
+from langsmith.run_trees import RunTree, WriteReplica, _parse_dotted_order
 
 import temporalio.activity
 import temporalio.client
@@ -57,6 +60,28 @@ class _InputWithHeaders(Protocol):
     headers: Mapping[str, Payload]
 
 
+def _trace_headers(run_tree: RunTree) -> dict[str, str]:
+    """Include credential-free replica destinations omitted by LangSmith 0.14.4."""
+    headers = run_tree.to_headers()
+    baggage = headers.get("baggage", "")
+    if any(item.startswith("langsmith-replicas=") for item in baggage.split(",")):
+        return headers
+    replicas = getattr(run_tree, "replicas", None)
+    if replicas:
+        from langsmith import run_trees
+
+        # Use LangSmith's own allow-list/sanitizer: credentials, client objects,
+        # and ingestion URLs must never enter persisted Temporal headers.
+        filter_replica = getattr(run_trees, "_filter_replica_for_headers", None)
+        if filter_replica is not None:
+            safe = [filter_replica(replica) for replica in replicas]
+            encoded = quote(json.dumps(safe, separators=(",", ":"), default=str))
+            headers["baggage"] = ",".join(
+                part for part in (baggage, f"langsmith-replicas={encoded}") if part
+            )
+    return headers
+
+
 def _inject_context(
     headers: Mapping[str, Payload],
     run_tree: RunTree,
@@ -67,7 +92,7 @@ def _inject_context(
     into a Temporal header under ``_temporal-langsmith-context``, enabling parent-child
     trace nesting across process boundaries (client → worker, workflow → activity).
     """
-    ls_headers = run_tree.to_headers()
+    ls_headers = _trace_headers(run_tree)
     return {
         **headers,
         HEADER_KEY: _payload_converter.to_payloads([ls_headers])[0],
@@ -108,6 +133,13 @@ def _extract_context(
     run = RunTree.from_headers(ls_headers)
     if run is None:
         return None
+    # from_headers defaults to wall-clock time. LangSmith clamps child start
+    # times to the parent's, so that default would change dotted_order on each
+    # workflow replay. The persisted dotted order already contains the time.
+    assert run.dotted_order
+    run.start_time = _parse_dotted_order(run.dotted_order)[-1][0].replace(
+        tzinfo=timezone.utc
+    )
     run.ls_client = ls_client
     return _ReplaySafeRunTree(run, executor=executor)
 
@@ -117,7 +149,7 @@ def _inject_nexus_context(
     run_tree: RunTree,
 ) -> dict[str, str]:
     """Inject LangSmith context into Nexus string headers."""
-    ls_headers = run_tree.to_headers()
+    ls_headers = _trace_headers(run_tree)
     return {
         **headers,
         HEADER_KEY: json.dumps(ls_headers),
@@ -137,6 +169,10 @@ def _extract_nexus_context(
     run = RunTree.from_headers(ls_headers)
     if run is None:
         return None
+    assert run.dotted_order
+    run.start_time = _parse_dotted_order(run.dotted_order)[-1][0].replace(
+        tzinfo=timezone.utc
+    )
     run.ls_client = ls_client
     return _ReplaySafeRunTree(run, executor=executor)
 
@@ -159,6 +195,7 @@ def _get_current_run_for_propagation() -> RunTree | None:
 # ---------------------------------------------------------------------------
 
 _aio_to_thread_override_installed = False
+_root_factory_override_installed = False
 
 
 async def _temporal_aio_to_thread(
@@ -195,6 +232,88 @@ def _install_aio_to_thread_override() -> None:
         return
     langsmith.set_runtime_overrides(aio_to_thread=_temporal_aio_to_thread)
     _aio_to_thread_override_installed = True
+
+
+def _install_root_factory_override() -> None:
+    """Resolve native root destinations before the invisible factory is used.
+
+    LangSmith treats our factory as a real parent, bypassing root destination
+    selection on decorators and tracing contexts. Its setup seam is shared by
+    sync and async traceables. Resolve the destination without the factory,
+    then give setup an equivalent replay-safe factory with that destination.
+    Calls with real parents and calls outside this plugin are unchanged.
+    """
+    global _root_factory_override_installed  # noqa: PLW0603
+    if _root_factory_override_installed:
+        return
+    from langsmith import run_helpers
+
+    # Earlier supported LangSmith versions have no agent addressing API.
+    resolve = getattr(run_helpers, "_resolve_traceable_addressing", None)
+    if resolve is None:
+        return
+    original = run_helpers._setup_run
+
+    @functools.wraps(original)
+    def setup_run(
+        func: Callable[..., Any],
+        container_input: Any,
+        langsmith_extra: Any = None,
+        args: Any = None,
+        kwargs: Any = None,
+    ) -> Any:
+        extra: Any = langsmith_extra or {}
+        if not isinstance(get_current_run_tree(), _RootReplaySafeRunTreeFactory):
+            return original(func, container_input, langsmith_extra, args, kwargs)
+        parent = run_helpers._get_parent_run(extra, (kwargs or {}).get("config"))
+        if not isinstance(parent, _RootReplaySafeRunTreeFactory):
+            return original(func, container_input, langsmith_extra, args, kwargs)
+        context = get_tracing_context()
+        try:
+            project, address = resolve(None, extra, container_input)
+        except langsmith.address.EnvAddressError:
+            # Let LangSmith apply its own warning/untraced-call behavior for
+            # invalid environment configuration, without a synthetic parent.
+            untraced_context: dict[str, Any] = {**context, "parent": False}
+            with tracing_context(**untraced_context):
+                return original(func, container_input, langsmith_extra, args, kwargs)
+        replicas = extra.get("replicas")
+        if replicas is None:
+            replicas = context.get("replicas")
+        if replicas is None:
+            replicas = parent.replicas
+        factory = _RootReplaySafeRunTreeFactory(
+            ls_client=parent.client,
+            executor=parent._executor,
+            session_name=project,
+            address=address,
+            replicas=replicas,
+        )
+        factory_context: dict[str, Any] = {**context, "parent": factory}
+        with tracing_context(**factory_context):
+            return original(func, container_input, langsmith_extra, args, kwargs)
+
+    run_helpers._setup_run = setup_run
+    _root_factory_override_installed = True
+
+
+def _destination(
+    project_name: str | None,
+    address: str | None,
+    parent: RunTree | None = None,
+) -> dict[str, Any]:
+    """Inherit the upstream destination before applying local defaults."""
+    if parent is not None:
+        parent_address = getattr(parent, "address", None)
+        if isinstance(parent_address, str):
+            return {"address": parent_address}
+        if isinstance(parent.session_name, str):
+            return {"project_name": parent.session_name}
+    if address is not None:
+        return {"address": address}
+    if project_name is not None:
+        return {"project_name": project_name}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +499,7 @@ class _RootReplaySafeRunTreeFactory(_ReplaySafeRunTree):
         ls_client: langsmith.Client,
         executor: ThreadPoolExecutor,
         session_name: str | None = None,
+        address: str | None = None,
         replicas: Sequence[WriteReplica] | None = None,
     ) -> None:
         """Create a root factory with the given LangSmith client."""
@@ -388,9 +508,8 @@ class _RootReplaySafeRunTreeFactory(_ReplaySafeRunTree):
             name="__root_factory__",
             run_type="chain",
             ls_client=ls_client,
+            **_destination(session_name, address),
         )
-        if session_name is not None:
-            factory_run.session_name = session_name
         if replicas is not None:
             factory_run.replicas = replicas
         object.__setattr__(self, "_run", factory_run)
@@ -419,17 +538,32 @@ class _RootReplaySafeRunTreeFactory(_ReplaySafeRunTree):
 
         # RunTree expects "id", but callers pass "run_id". RunTree.create_child
         # also does the same mapping internally.
-        if "run_id" in kwargs:
-            kwargs["id"] = kwargs.pop("run_id")
+        run_id = kwargs.pop("run_id", None)
+        if run_id is not None:
+            kwargs["id"] = run_id
 
-        # Inherit ls_client and session_name from factory.
-        # session_name must be passed at construction time.
+        # A root may explicitly select a different destination. Never combine
+        # an address with an inherited project name.
         kwargs.setdefault("ls_client", self._run.ls_client)
-        kwargs.setdefault("session_name", self._run.session_name)
+        if not any(
+            kwargs.get(key) is not None
+            for key in (
+                "address",
+                "project_name",
+                "session_name",
+                "project_id",
+                "session_id",
+            )
+        ):
+            kwargs.update(
+                _destination(
+                    self._run.session_name, getattr(self._run, "address", None)
+                )
+            )
 
         child_run = RunTree(*args, **kwargs)
         # Replicas must be set post-construction
-        if self._run.replicas is not None:
+        if "replicas" not in kwargs and self._run.replicas is not None:
             child_run.replicas = self._run.replicas
         return _ReplaySafeRunTree(child_run, executor=self._executor)
 
@@ -478,6 +612,7 @@ def _maybe_run(
     tags: list[str] | None = None,
     parent: RunTree | None = None,
     project_name: str | None = None,
+    address: str | None = None,
     executor: ThreadPoolExecutor,
 ) -> Iterator[None]:
     """Create a LangSmith run, handling errors.
@@ -511,6 +646,7 @@ def _maybe_run(
         tags: Tags to attach to the run.
         parent: Parent run for nesting.
         project_name: LangSmith project name override.
+        address: LangSmith agent/environment address used instead of a project.
         executor: ThreadPoolExecutor for background I/O.
     """
     if not add_temporal_runs or not langsmith.utils.tracing_is_enabled():
@@ -536,10 +672,14 @@ def _maybe_run(
     if rng is not None:
         run_tree_args["id"] = _uuid_from_random(rng)
         run_tree_args["start_time"] = temporalio.workflow.now()
-    if project_name is not None:
-        run_tree_args["project_name"] = project_name
+    destination = _destination(project_name, address, parent)
+    if not destination:
+        context = get_tracing_context()
+        destination = _destination(context.get("project_name"), context.get("address"))
+    run_tree_args.update(destination)
     if parent is not None:
         run_tree_args["parent_run"] = parent
+        run_tree_args["replicas"] = parent.replicas
     if metadata:
         run_tree_args["extra"] = {"metadata": metadata}
     if tags:
@@ -590,16 +730,26 @@ class LangSmithInterceptor(
         *,
         client: langsmith.Client | None = None,
         project_name: str | None = None,
+        address: str | None = None,
         add_temporal_runs: bool = False,
         default_metadata: dict[str, Any] | None = None,
         default_tags: list[str] | None = None,
     ) -> None:
         """Initialize the LangSmith interceptor with tracing configuration."""
         super().__init__()
+        if project_name is not None and address is not None:
+            raise ValueError("project_name and address are mutually exclusive")
+        if address is not None:
+            address_api = getattr(langsmith, "address", None)
+            parse_address = getattr(address_api, "parse", None)
+            if not callable(parse_address):
+                raise ValueError("Agent addressing requires langsmith>=0.14.4")
+            address = str(parse_address(address))
         if client is None:
             client = langsmith.Client()
         self._client = client
         self._project_name = project_name
+        self._address = address
         self._add_temporal_runs = add_temporal_runs
         self._default_metadata = default_metadata or {}
         self._default_tags = default_tags or []
@@ -626,6 +776,7 @@ class LangSmithInterceptor(
             parent=parent,
             executor=self._executor,
             project_name=self._project_name,
+            address=self._address,
         ) as run:
             yield run
 
@@ -646,6 +797,7 @@ class LangSmithInterceptor(
     ) -> type[_LangSmithWorkflowInboundInterceptor]:
         """Return the workflow interceptor class with config bound."""
         _install_aio_to_thread_override()
+        _install_root_factory_override()
         config = self
 
         class InterceptorWithConfig(_LangSmithWorkflowInboundInterceptor):
@@ -765,8 +917,8 @@ class _LangSmithActivityInboundInterceptor(
         }
         tracing_args: dict[str, Any] = {
             "client": self._config._client,
-            "project_name": self._config._project_name,
             "parent": parent,
+            **_destination(self._config._project_name, self._config._address, parent),
         }
         with tracing_context(**tracing_args):
             with self._config.maybe_run(
@@ -824,12 +976,13 @@ class _LangSmithWorkflowInboundInterceptor(
                 ls_client=self._config._client,
                 executor=self._config._executor,
                 session_name=self._config._project_name,
+                address=self._config._address,
             )
         )
         tracing_args: dict[str, Any] = {
             "client": self._config._client,
-            "project_name": self._config._project_name,
             "parent": tracing_parent,
+            **_destination(self._config._project_name, self._config._address, parent),
         }
         info = temporalio.workflow.info()
         extra_metadata = {
@@ -988,8 +1141,8 @@ class _LangSmithNexusOperationInboundInterceptor(
         )
         tracing_args: dict[str, Any] = {
             "client": self._config._client,
-            "project_name": self._config._project_name,
             "parent": parent,
+            **_destination(self._config._project_name, self._config._address, parent),
         }
         with tracing_context(**tracing_args):
             with self._config.maybe_run(
@@ -1007,8 +1160,8 @@ class _LangSmithNexusOperationInboundInterceptor(
         )
         tracing_args: dict[str, Any] = {
             "client": self._config._client,
-            "project_name": self._config._project_name,
             "parent": parent,
+            **_destination(self._config._project_name, self._config._address, parent),
         }
         with tracing_context(**tracing_args):
             with self._config.maybe_run(
