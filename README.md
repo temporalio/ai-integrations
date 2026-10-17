@@ -3,7 +3,7 @@
 [![Go: 1.26.6 and 1.27](https://img.shields.io/badge/go-1.26.6%20%7C%201.27-blue.svg)](https://go.dev/dl/)
 [![Java: 17, 21, and 25](https://img.shields.io/badge/java-17%20%7C%2021%20%7C%2025-blue.svg)](https://dev.java/)
 [![Python: 3.10 through 3.14](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](https://www.python.org/downloads/)
-[![TypeScript: 5.9.3](https://img.shields.io/badge/typescript-5.9.3-blue.svg)](https://www.typescriptlang.org/)
+[![TypeScript: Node.js 22 and 24](https://img.shields.io/badge/typescript-Node.js%2022%20%7C%2024-blue.svg)](typescript/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Plugins that connect AI agent frameworks and SDKs to [Temporal](https://temporal.io) durable
