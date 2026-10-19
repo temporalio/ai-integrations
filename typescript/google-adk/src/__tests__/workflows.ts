@@ -750,7 +750,13 @@ interface ProbeActivities {
  * and sends them through an Activity, so a replay that regenerated them
  * differently would fail with a non-determinism error.
  */
-export async function cryptoShimProbe(): Promise<{ before: string; callId: string; after: string }> {
+export async function cryptoShimProbe(): Promise<{
+  before: string;
+  callId: string;
+  after: string;
+  direct: string;
+  bytes: string;
+}> {
   const { echoId } = proxyActivities<ProbeActivities>({ startToCloseTimeout: '10 seconds' });
   const before = new RequestInput({}).interruptId;
   const callId = generateClientFunctionCallId();
@@ -758,7 +764,14 @@ export async function cryptoShimProbe(): Promise<{ before: string; callId: strin
   await sleep('1 ms');
   const after = new RequestInput({}).interruptId;
   await echoId(after);
-  return { before, callId, after };
+  // The sandbox `crypto` global itself — what ADK >= 2.1's bundled web build
+  // (and the `uuid` package it inlines) reads directly.
+  const direct = globalThis.crypto.randomUUID();
+  const bytes = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(8)), (b) =>
+    b.toString(16).padStart(2, '0')
+  ).join('');
+  await echoId(direct);
+  return { before, callId, after, direct, bytes };
 }
 
 // ADK 2.0 workflow-runtime fixtures; bundled through this module.

@@ -1057,9 +1057,9 @@ export async function hitlConfirmMcpTool(): Promise<RunOutcome & { turns: number
 /**
  * A `BaseTool` that gates itself at run time without declaring it through
  * `checkRequireConfirmation` — what a tool body calling
- * `toolContext.requestConfirmation()` looks like. ADK 2.0.0 refuses to bind the
- * approval to it (`confirmation_not_required`), which is why the plugin's tools
- * declare their gate instead.
+ * `toolContext.requestConfirmation()` looks like. ADK 2.0.0 refused to bind the
+ * approval to it (`confirmation_not_required`); ADK 2.1 resumes it like a
+ * declared gate. The plugin's tools declare their gate either way.
  */
 class DynamicGateTool extends BaseTool {
   constructor() {
@@ -1102,8 +1102,9 @@ class ConfirmDangerPolicy implements BasePolicyEngine {
 
 /**
  * ADK's `SecurityPlugin` gating an ungated activity tool: its CONFIRM outcome
- * raises the pause, but the approval hits the same ADK 2.0.0 limit as
- * {@link DynamicGateTool} because the tool itself never declared a gate.
+ * raises the pause, and the approval resumes the call — ADK 2.0.0 refused it
+ * with the same `confirmation_not_required` limit as {@link DynamicGateTool},
+ * because the tool itself never declared a gate.
  */
 export async function hitlSecurityPlugin(): Promise<RunOutcome & { turns: number }> {
   const agent = new LlmAgent({
@@ -1335,7 +1336,7 @@ export async function routedLlmAgent(pick: 'a' | 'b'): Promise<string> {
  * `apigeeIsBuiltIn` additionally pins identity, proving the class the registry
  * holds is the same `ApigeeLlm` object this module imports (the sandbox has one
  * copy of ADK's shimmed `apigee_llm.js`, reached both directly and through
- * `dist/web/common.js`) — which is what makes the in-place override possible.
+ * `dist/esm/common.js`) — which is what makes the in-place override possible.
  */
 export async function registryResolveProbe(): Promise<{
   gemini: string;
