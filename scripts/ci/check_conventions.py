@@ -240,6 +240,10 @@ class Checker:
                 self.fail(f"{rel}: invalid Spring Boot version {boot!r}")
             elif not (d / f"gradle/dependency-locks/spring-boot-{boot}.lockfile").is_file():
                 self.fail(f"{rel}: missing dependency lock for Spring Boot {boot}")
+        if not ci.get("spring-boot-versions") and not (
+            d / "gradle/dependency-locks/dependencies.lockfile"
+        ).is_file():
+            self.fail(f"{rel}: missing gradle/dependency-locks/dependencies.lockfile")
         imports = meta.get("smoke", {}).get("imports", [])
         if not imports or not all(isinstance(i, str) and i.startswith(root_api + ".") for i in imports):
             self.fail(f"{rel}: smoke imports must name classes under root-api")
