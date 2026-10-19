@@ -158,12 +158,20 @@ test('configureBundler pins the bare @google/adk specifier to the per-file commo
 test('redirects crypto requests issued from inside @google/adk to the deterministic shim', (t) => {
   const resolve = sandboxCompatResolveHook();
   const shim = require.resolve('../crypto-shim');
-  const adkIssuer = '/app/node_modules/@google/adk/dist/web/utils/env_aware_utils.js';
+  const adkIssuer = '/app/node_modules/@google/adk/dist/esm/utils/env_aware_utils.js';
   // Both request forms, from an ADK file, land on the shim.
   t.is(resolve({ request: 'node:crypto', contextInfo: { issuer: adkIssuer } }), shim);
   t.is(resolve({ request: 'crypto', contextInfo: { issuer: adkIssuer } }), shim);
   // The issuer may only be known as a directory.
-  t.is(resolve({ request: 'node:crypto', context: '/app/node_modules/@google/adk/dist/web/utils' }), shim);
+  t.is(resolve({ request: 'node:crypto', context: '/app/node_modules/@google/adk/dist/esm/utils' }), shim);
+  // The installed `uuid` package (ADK >= 2.1 imports it) is answered too, in
+  // pnpm's and npm's layouts; a user's own `uuid/` directory is not.
+  t.is(
+    resolve({ request: 'crypto', contextInfo: { issuer: '/app/node_modules/.pnpm/uuid@11.1.1/node_modules/uuid/dist/esm/rng.js' } }),
+    shim
+  );
+  t.is(resolve({ request: 'crypto', contextInfo: { issuer: '/app/node_modules/uuid/dist/esm/native.js' } }), shim);
+  t.is(resolve({ request: 'crypto', contextInfo: { issuer: '/app/src/uuid/ids.ts' } }), 'crypto');
   // Any other issuer keeps the bundler's policy: the scheme is stripped so the
   // bare-name `alias → false` applies, and nothing is redirected.
   t.is(
@@ -174,9 +182,20 @@ test('redirects crypto requests issued from inside @google/adk to the determinis
   t.is(resolve({ request: 'node:crypto' }), 'crypto');
 });
 
+test("answers ADK's undeclared uuid import with the plugin's own copy", (t) => {
+  const resolve = sandboxCompatResolveHook();
+  const expected = require.resolve('uuid');
+  t.true(expected.endsWith(path.join('dist', 'cjs', 'index.js')));
+  const adkIssuer = '/app/node_modules/@google/adk/dist/esm/plugins/reflect_retry_model_plugin.js';
+  t.is(resolve({ request: 'uuid', contextInfo: { issuer: adkIssuer } }), expected);
+  // Only the bare request from ADK; a user's own import resolves as usual.
+  t.is(resolve({ request: 'uuid', contextInfo: { issuer: '/app/src/workflows.ts' } }), 'uuid');
+  t.is(resolve({ request: 'uuid/package.json', contextInfo: { issuer: adkIssuer } }), 'uuid/package.json');
+});
+
 test("replaces ADK's own request for the broken apigee_llm.js web module", (t) => {
   const resolve = sandboxCompatResolveHook();
-  const adkIssuer = '/app/node_modules/@google/adk/dist/web/models/registry.js';
+  const adkIssuer = '/app/node_modules/@google/adk/dist/esm/models/registry.js';
   // ADK 2.0.0's `dist/web/models/apigee_llm.js` does not parse, so the request
   // is answered with the inert stand-in rather than the published file.
   t.true(resolve({ request: './apigee_llm.js', contextInfo: { issuer: adkIssuer } }).startsWith('data:'));

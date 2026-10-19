@@ -47,6 +47,7 @@ import {
   type TemporalMCPToolsetOptions,
   type TemporalModelOptions,
 } from '../workflow';
+import { randomFillSync } from '../crypto-shim';
 
 // Mirrors `@google/adk` >= 1.5.0 `tools/load_web_page.js` (on the barrel
 // path), which parses its blocked-CIDR tables at module load, calling
@@ -756,6 +757,7 @@ export async function cryptoShimProbe(): Promise<{
   after: string;
   direct: string;
   bytes: string;
+  filled: string;
 }> {
   const { echoId } = proxyActivities<ProbeActivities>({ startToCloseTimeout: '10 seconds' });
   const before = new RequestInput({}).interruptId;
@@ -764,14 +766,19 @@ export async function cryptoShimProbe(): Promise<{
   await sleep('1 ms');
   const after = new RequestInput({}).interruptId;
   await echoId(after);
-  // The sandbox `crypto` global itself — what ADK >= 2.1's bundled web build
-  // (and the `uuid` package it inlines) reads directly.
+  // The sandbox `crypto` global itself — what ADK's id generator and `uuid`'s
+  // browser build read — and the `randomFillSync` that `uuid`'s node build
+  // imports from the shim as `node:crypto`.
   const direct = globalThis.crypto.randomUUID();
-  const bytes = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(8)), (b) =>
-    b.toString(16).padStart(2, '0')
-  ).join('');
+  const bytes = hex(globalThis.crypto.getRandomValues(new Uint8Array(8)));
+  const filled = hex(randomFillSync(new Uint8Array(6), 2, 3));
   await echoId(direct);
-  return { before, callId, after, direct, bytes };
+  await echoId(`${bytes}:${filled}`);
+  return { before, callId, after, direct, bytes, filled };
+}
+
+function hex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 // ADK 2.0 workflow-runtime fixtures; bundled through this module.
