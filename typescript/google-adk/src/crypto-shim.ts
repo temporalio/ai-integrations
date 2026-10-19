@@ -12,7 +12,9 @@
  *  - **As the `node:crypto` module.** The Workflow bundle pins ADK's per-file
  *    `dist/esm/common.js` surface, where that import is a real module request;
  *    the plugin's bundler plugin redirects it, when issued from inside
- *    `@google/adk`, to this module (`nodeRandomUUID` is {@link randomUUID}).
+ *    `@google/adk` or the `uuid` package (ADK's request for it is pinned to
+ *    the plugin's own copy), to this module (`nodeRandomUUID` is
+ *    {@link randomUUID}; `uuid`'s node builds take {@link randomFillSync}).
  *    ADK's OAuth2 PKCE helpers import `createHash` and `randomBytes` from the
  *    same module; those are throwing stand-ins here (see below).
  *  - **As the sandbox's `crypto` global.** The polyfill loader
@@ -77,6 +79,21 @@ export function getRandomValues<T extends ArrayBufferView>(view: T): T {
 }
 
 /**
+ * `node:crypto`'s `randomFillSync`, which the `uuid` package's node build
+ * imports for its v4 byte pool: fills `size` elements of `buffer` from
+ * `offset` (both in elements, as in Node) with bytes from the plugin's
+ * workflow random stream and returns `buffer` — the same draw its browser
+ * build makes through {@link getRandomValues}.
+ */
+export function randomFillSync<T extends ArrayBufferView>(buffer: T, offset = 0, size?: number): T {
+  const elementSize = (buffer as { BYTES_PER_ELEMENT?: number }).BYTES_PER_ELEMENT ?? 1;
+  const byteOffset = offset * elementSize;
+  const byteLength = size === undefined ? buffer.byteLength - byteOffset : size * elementSize;
+  stream().fill(new Uint8Array(buffer.buffer, buffer.byteOffset + byteOffset, byteLength));
+  return buffer;
+}
+
+/**
  * The Web Crypto surface the plugin provides: `node:crypto`'s `webcrypto`
  * namespace for consumers that reach it, and the object the polyfill loader
  * installs as the sandbox's `crypto` global.
@@ -109,4 +126,4 @@ export function randomBytes(_size: number): never {
   throw new Error(PKCE_UNSUPPORTED);
 }
 
-export default { randomUUID, getRandomValues, webcrypto, createHash, randomBytes };
+export default { randomUUID, getRandomValues, randomFillSync, webcrypto, createHash, randomBytes };

@@ -65,9 +65,9 @@ export const interceptors: WorkflowInterceptorsFactory = () => ({});
  * stringified to their full source — so the five re-registrations below would
  * each put a multi-kilobyte line on the Worker's console per Workflow run (ADK
  * >= 2.1's default logger writes through `console`; ADK 2.0's went through the
- * inert winston shim). The replacement is this module's purpose, not an event worth
- * reporting, so ADK's logger is swapped out only for the duration of the call
- * and the user's own logger (or the default) is restored afterwards.
+ * inert winston shim). The replacement is this module's purpose, not an event
+ * worth reporting, so ADK's logger is swapped out only for the duration of the
+ * call and the user's own logger (or the default) is restored afterwards.
  */
 const SILENT_LOGGER: Logger = {
   setLogLevel() {},

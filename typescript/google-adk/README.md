@@ -24,15 +24,17 @@ npm install @temporalio/google-adk
 ```
 
 The supported peer range is `@google/adk` `>=2.0.0 <2.4.0` and `@google/genai`
-`^2.9.0`. The ceiling is exact by design: the plugin's Workflow-sandbox shims are
-keyed to what ADK reaches at module load, so an ADK minor outside this range can
-break the Workflow bundle. `@modelcontextprotocol/sdk` is an optional peer: install
-it if you use `TemporalMCPToolset` (ADK 2.0 made it optional too).
+`^2.9.0` (ADK 2.3 itself requires `@google/genai` 2.29.1 or newer; keep your own
+copy inside ADK's range so the Workflow bundle holds one). The ceiling is exact by
+design: the plugin's Workflow-sandbox shims are keyed to what ADK reaches at
+module load, so an ADK minor outside this range can break the Workflow bundle.
+`@modelcontextprotocol/sdk` is an optional peer: install it if you use
+`TemporalMCPToolset` (ADK 2.0 made it optional too).
 
 Provide Gemini credentials to the Worker as usual, for example with
 `GOOGLE_GENAI_API_KEY`, `GOOGLE_API_KEY` or `GEMINI_API_KEY`.
 
-### Upgrading from ADK 1.5
+### Upgrading ADK
 
 Versions of this plugin for `@google/adk` 1.5 are not compatible with 2.0, and a
 Workflow started under 1.5 cannot be replayed by a Worker on 2.0: ADK's internals
@@ -40,6 +42,12 @@ and its id generation changed. Drain in-flight Workflows before switching, or ru
 the two versions on separate task queues. Nothing in your Workflow code has to
 change; raw model strings (`model: 'gemini-2.5-flash'`) now work inside a Workflow
 without `TemporalModel` (see [Model routing](#model-routing)).
+
+ADK minors within the range also change the agent loop in ways a history records
+(2.1 resumes run-time tool gates that 2.0 refused; 2.3 returns a node's input-schema
+rejection to the model as a tool error), so treat an ADK minor upgrade like a
+Workflow code change: drain in-flight Workflows, or move between the versions
+with Worker Versioning or separate task queues.
 
 ## Hello world
 
@@ -484,12 +492,12 @@ export async function reviewWorkflow(prompt: string): Promise<unknown> {
   enforced on an `LlmAgent` turn; ADK's workflow `ToolNode` does not route through
   confirmation. Declare the gate this
   way rather than calling `toolContext.requestConfirmation()` from a tool body:
-  a declared gate resumes on every supported ADK version, whereas ADK 2.0.0
-  bound an approval only to a tool whose `checkRequireConfirmation` said the
-  call needs one and refused a gate requested only at run time — the same limit
-  applied to `SecurityPlugin`'s `CONFIRM` outcome — ending the Workflow with
-  `GoogleAdkIntentMismatchError` (`confirmation_not_required`). ADK 2.1 resumes
-  those gates too.
+  a declared gate resumes on every supported ADK version, whereas a gate
+  requested only at run time — `SecurityPlugin`'s `CONFIRM` outcome included —
+  resumes only from ADK 2.1 on; ADK 2.0.0 bound an approval to a tool whose
+  `checkRequireConfirmation` said the call needs one and refused the rest,
+  ending the Workflow with `GoogleAdkIntentMismatchError`
+  (`confirmation_not_required`).
 
   ```typescript
   activityAsTool({ name: 'deploy', description: 'Deploy.', parameters, requireConfirmation: true });
@@ -655,9 +663,10 @@ Cautions:
   global first. The sandbox has none, so the plugin installs one — `randomUUID`
   and `getRandomValues` only, no `subtle` — whose values come from a **named
   workflow random stream**: replay-stable, and independent of the Workflow's own
-  `Math.random()` sequence. (ADK's own `node:crypto` import is redirected to the
-  same stream; the ids are identical either way.) Workflow code and other
-  bundled packages see that `crypto` too. Its
+  `Math.random()` sequence. (ADK's own `node:crypto` import, and the `uuid`
+  package's, are redirected to the same stream; the ids are identical either
+  way.) The global is bundle-wide: your Workflow code and other bundled packages
+  see that `crypto` too. Its
   values are **not cryptographically random**; nor is ADK's OAuth2 `state`,
   which is one reason credential flows are unsupported there.
 - ADK's node retry backoff and timeouts are durable timers; the retry jitter is

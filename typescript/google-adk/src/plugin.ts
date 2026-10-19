@@ -19,6 +19,19 @@ const OTEL_API_PACKAGE = '@opentelemetry/api';
 const ADK_PACKAGE = '@google/adk';
 
 /**
+ * ADK >= 2.1's `plugins/reflect_retry_model_plugin.js` (on the `common`
+ * surface) imports `uuid` without declaring it: its single-file web bundle
+ * inlined the package, and the node builds resolve it only through whatever
+ * the host layout hoists. Under a strict layout (pnpm `hoist=false`, Yarn PnP)
+ * nothing is reachable from ADK's own directory and the Workflow bundle fails
+ * with `Can't resolve 'uuid'`. The plugin therefore depends on `uuid` itself
+ * and answers ADK's request with its own copy's CJS entry, whose `crypto`
+ * import the deterministic shim serves ({@link CRYPTO_SHIM_ISSUER_PATTERN}), so
+ * the ids are the same whatever the consumer's layout or webpack target.
+ */
+const UUID_PACKAGE = 'uuid';
+
+/**
  * Resolves the `@google/adk` entry the Workflow bundle uses: ADK's `common.ts`
  * surface, taken from its **per-file ESM build** (`dist/esm/common.js`). ADK
  * publishes the same sources three ways, and which one webpack picks for the
@@ -66,17 +79,33 @@ function adkWorkflowEntry(): string {
 }
 
 /**
- * Whether a module request was issued from inside `@google/adk`'s own files,
- * so a shim can be scoped to ADK without changing what any other package in
- * the bundle sees. Matches both path separators.
+ * Matches the resource path of a module inside `@google/adk`'s own files, so a
+ * shim can be scoped to ADK without changing what any other package in the
+ * bundle sees. Matches both path separators.
  */
 const ADK_ISSUER_PATTERN = /[\\/]@google[\\/]adk[\\/]/;
 
 /**
+ * Issuers whose `crypto` / `node:crypto` requests the deterministic shim
+ * answers: ADK's own files, and the installed `uuid` package, which ADK >= 2.1
+ * imports for its retry plugins. `uuid`'s browser build reads the `crypto`
+ * global (which the polyfill loader supplies), but its node build — the one a
+ * consumer's webpack target or browserslist can select — imports `randomUUID`
+ * / `randomFillSync` from the `crypto` builtin, and `uuid` is strict ESM, so
+ * the bundler's empty-module alias would fail the build on the missing
+ * exports. Any installed `uuid` copy matches — the one ADK's request is pinned
+ * to ({@link UUID_PACKAGE}) and one a user's own Workflow code imports, which
+ * then draws from the same stream; the `node_modules` segment keeps a user's
+ * own `uuid/` source directory out.
+ */
+const CRYPTO_SHIM_ISSUER_PATTERN = /[\\/](?:@google[\\/]adk|node_modules[\\/]uuid)[\\/]/;
+
+/**
  * Resolves the `@opentelemetry/api` copy that `@google/adk` itself resolves.
- * ADK pins an exact api version while other packages in the Workflow bundle
- * (notably `@temporalio/interceptors-opentelemetry`) may resolve a different
- * one, so without intervention the bundle can contain two api copies. ADK's
+ * ADK's own `@opentelemetry/api` dependency can resolve to a different copy
+ * than other packages in the Workflow bundle (notably
+ * `@temporalio/interceptors-opentelemetry`) resolve, so without intervention
+ * the bundle can contain two api copies. ADK's
  * `telemetry/tracing.js` caches `trace.getTracer(...)` at module load; if that
  * binds a different api copy than the one the OTel interceptor registers its
  * tracer provider on, every ADK span is silently lost (the workflow still
@@ -439,45 +468,48 @@ function isCryptoRequest(request: string): boolean {
   return request === 'crypto' || request === `${NODE_SCHEME}crypto`;
 }
 
-/** Whether the module issuing a request lives inside `@google/adk`. */
-function issuedByAdk(data: ResolveDataLike): boolean {
-  const issuer = data.contextInfo?.issuer ?? data.context ?? '';
-  return ADK_ISSUER_PATTERN.test(issuer);
+/** The resource path (or, failing that, the directory) of the module issuing a request. */
+function issuerOf(data: ResolveDataLike): string {
+  return data.contextInfo?.issuer ?? data.context ?? '';
 }
 
 /**
  * The webpack plugin that makes the `@google/adk` barrel load inside the
- * Workflow sandbox. It does five things:
+ * Workflow sandbox. It does six things:
  *
- *  1. **Deterministic `crypto` for ADK 2.0**: in `beforeResolve`, a `crypto` /
- *     `node:crypto` request issued from inside `@google/adk` is redirected to
- *     the plugin's {@link ./crypto-shim | crypto shim}, whose `randomUUID` /
- *     `getRandomValues` draw from a named workflow random stream. ADK's id
- *     generator (`utils/env_aware_utils.js`) falls through to that import when
- *     no `crypto` global exists, and the sandbox has none; without the shim the
- *     first `createEvent()` in a Workflow throws. The redirect is scoped to ADK
- *     issuers so no other package in the bundle sees a `crypto` it did not have
- *     before. The shim is a real module (not a `data:` URI) because it imports
+ *  1. **Deterministic `crypto`**: in `beforeResolve`, a `crypto` /
+ *     `node:crypto` request issued from inside `@google/adk` (or the `uuid`
+ *     package it imports, see {@link CRYPTO_SHIM_ISSUER_PATTERN}) is redirected
+ *     to the plugin's {@link ./crypto-shim | crypto shim}, whose `randomUUID`
+ *     / `getRandomValues` / `randomFillSync` draw from a named workflow random
+ *     stream. ADK's id generator (`utils/env_aware_utils.js`) falls through to
+ *     that import when no `crypto` global exists; without the shim the first
+ *     `createEvent()` in a Workflow throws. The module redirect is scoped to
+ *     those issuers; no other package's `crypto` *import* changes. The shim is
+ *     a real module (not a `data:` URI) because it imports
  *     `@temporalio/workflow`. The same shim is also the sandbox's `crypto`
- *     *global*, installed by the `load-polyfills` interceptor module (recipe
- *     step 3 in {@link GoogleAdkPlugin.configureBundler}): ADK's id generator
- *     reads `globalThis.crypto` before falling back to its `node:crypto`
- *     import, the `uuid` package ADK's retry plugins import has only the
- *     global, and ADK 2.1+'s single-file web bundle (which a consumer's own
+ *     *global*, installed bundle-wide by the `load-polyfills` interceptor
+ *     module (recipe step 3 in {@link GoogleAdkPlugin.configureBundler}; the
+ *     README's determinism notes document it): ADK's id generator reads
+ *     `globalThis.crypto` first — its `node:crypto` import is only the Node 18
+ *     fallback — and ADK 2.1+'s single-file web bundle (which a consumer's own
  *     alias could still select) has `node:crypto` pre-resolved to a stand-in
  *     that throws, leaving no request to redirect.
- *  2. **`apigee_llm.js` replacement**: ADK's own request for that module, also
+ *  2. **`uuid` for ADK**: a `uuid` request issued from inside `@google/adk` is
+ *     redirected to this plugin's own `uuid` dependency ({@link UUID_PACKAGE}),
+ *     which ADK does not declare.
+ *  3. **`apigee_llm.js` replacement**: ADK's own request for that module, also
  *     scoped to ADK issuers, is redirected to {@link APIGEE_LLM_SHIM_SOURCE};
  *     the published web file is a syntax error webpack cannot parse.
- *  3. **Shim redirects** ({@link REQUEST_SHIM_SOURCES}): redirect the
+ *  4. **Shim redirects** ({@link REQUEST_SHIM_SOURCES}): redirect the
  *     load-dereferenced requests to their inline `data:` URI shims.
- *  4. **`node:` scheme strip**: every other `node:<name>` → bare `<name>`. The
+ *  5. **`node:` scheme strip**: every other `node:<name>` → bare `<name>`. The
  *     Worker bundler aliases each disallowed builtin to `false` by its **bare**
  *     name; a `node:`-prefixed request never reaches `resolve.alias` — webpack's
  *     scheme handler intercepts it first and throws `UnhandledSchemeError` (a
  *     hard *build* failure). Stripping the scheme lets the bundler's bare-name
  *     policy take over.
- *  5. **`process` provide**: a `ProvidePlugin` injects the deterministic
+ *  6. **`process` provide**: a `ProvidePlugin` injects the deterministic
  *     `process` shim ({@link PROCESS_SHIM_SOURCE}) wherever `process` is a free
  *     variable.
  */
@@ -489,6 +521,9 @@ function googleAdkSandboxCompatPlugin(): unknown {
   const processShimUri = toDataUri(PROCESS_SHIM_SOURCE);
   const apigeeShimUri = toDataUri(APIGEE_LLM_SHIM_SOURCE);
   const cryptoShimPath = require.resolve('./crypto-shim');
+  // The CJS entry: its `require('crypto')` is answered by the shim above, with
+  // no strict-ESM export check to satisfy, whatever the consumer's webpack target.
+  const uuidEntry = require.resolve(UUID_PACKAGE);
   return {
     name: 'google-adk-sandbox-compat',
     apply(compiler: WebpackCompilerLike): void {
@@ -500,9 +535,14 @@ function googleAdkSandboxCompatPlugin(): unknown {
         nmf.hooks.beforeResolve.tap('GoogleAdkSandboxCompat', (data) => {
           const request = data.request;
           if (!request) return;
-          if (issuedByAdk(data)) {
-            if (isCryptoRequest(request)) {
-              data.request = cryptoShimPath;
+          const issuer = issuerOf(data);
+          if (isCryptoRequest(request) && CRYPTO_SHIM_ISSUER_PATTERN.test(issuer)) {
+            data.request = cryptoShimPath;
+            return;
+          }
+          if (ADK_ISSUER_PATTERN.test(issuer)) {
+            if (request === UUID_PACKAGE) {
+              data.request = uuidEntry;
               return;
             }
             if (APIGEE_LLM_REQUEST.test(request)) {
