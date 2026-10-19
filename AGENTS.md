@@ -40,6 +40,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
 | `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
 | `java/spring-ai` | `io.temporal:spring-ai` | 0.1.0 | Public Preview | `io.temporal.springai` |
+| `java/google-adk` | `io.temporal:google-adk` | 0.0.1 | Pre-release | `io.temporal.googleadk` |
 | `go/googleadk` | `go.temporal.io/googleadk` | 0.1.0 (new coordinate) | Public Preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
@@ -96,8 +97,11 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 ## Java conventions
 
 - Each Java plugin owns a Gradle wrapper with distribution checksum, `build.gradle`,
-  `settings.gradle`, `plugin.toml`, and per-Spring-Boot dependency locks. Shared build
-  conventions live in `java/_shared/java.gradle`.
+  `settings.gradle`, `plugin.toml`, and committed dependency locks. Plugins with a
+  `spring-boot-versions` matrix lock once per Boot version
+  (`gradle/dependency-locks/spring-boot-<version>.lockfile`); the others keep one
+  `gradle/dependency-locks/dependencies.lockfile`. Shared build conventions live in
+  `java/_shared/java.gradle`.
 - Every Java plugin starts `settings.gradle` with a `pluginManagement` block applying
   `../_shared/settings.gradle`. The shared script checks Maven Central before the
   Gradle Plugin Portal; the conventions check enforces this entry point for every plugin.
