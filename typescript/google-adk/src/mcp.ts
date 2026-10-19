@@ -18,7 +18,7 @@
  * which nothing in that graph imports.
  *
  * ADK's own MCP classes are not on the `@google/adk` surface the Workflow
- * bundle pins (ADK 2.0's web build; MCP lives on the full barrel and the
+ * bundle pins (ADK's `common` surface; MCP lives on the full barrel and the
  * `@google/adk/tools/mcp` subpath), while the barrel's single typings file
  * still declares them. Everything this module needs from them runs OUTSIDE a
  * Workflow — the direct (non-Temporal) fallback — so the class is looked up
@@ -199,14 +199,14 @@ function readExport(namespace: object, exportName: string): unknown {
  * ADK's real `MCPToolset` constructor, for the direct (non-Workflow) path. On
  * the worker `@google/adk` is the full barrel and the class is present; inside
  * a Workflow this is never reached (MCP traffic goes through Activities) and
- * the class is absent from the pinned web surface — hence the lazy lookup.
+ * the class is absent from the pinned `common` surface — hence the lazy lookup.
  */
 function mcpToolsetCtor(name: string): MCPToolsetCtor {
   const ctor = readExport(adk, 'MCPToolset') as MCPToolsetCtor | undefined;
   if (ctor === undefined) {
     throw ApplicationFailure.nonRetryable(
       `TemporalMCPToolset('${name}'): @google/adk's MCPToolset is not available in this runtime. ` +
-        "ADK 2.0 ships MCP only on its full (node) barrel; the Workflow bundle pins ADK's web build, " +
+        "ADK ships MCP only on its full (node) barrel; the Workflow bundle pins ADK's common surface, " +
         'which omits it. MCP traffic inside a Workflow is routed through the <name>-listTools / ' +
         '<name>-callTool / <name>-listResources / <name>-readResource Activities and never needs it.',
       MCP_TOOLSET_OUTSIDE_WORKFLOW_FAILURE_TYPE
@@ -580,7 +580,7 @@ function warn(message: string): void {
   }
 }
 
-/** Mirrors ADK's `appendInstructions` (`models/llm_request.ts`), which the web surface does not export. */
+/** Mirrors ADK's `appendInstructions` (`models/llm_request.ts`), which the `common` surface does not export. */
 function appendSystemInstruction(llmRequest: LlmRequest, instruction: string): void {
   if (!llmRequest.config) {
     llmRequest.config = {};

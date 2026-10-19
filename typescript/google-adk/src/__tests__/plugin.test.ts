@@ -3,6 +3,7 @@
  * `configureWorker` output without bundling or executing a Workflow.
  */
 
+import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 
@@ -33,7 +34,7 @@ test('configureBundler stubs ADK node-only packages and disallowed builtins', (t
     '@modelcontextprotocol/sdk',
     '@google-cloud/storage',
     'express',
-    // ADK 2.0's `skills/loader.js` (on the web surface) imports the zip reader.
+    // ADK 2.0's `skills/loader.js` (on its `common` surface) imports the zip reader.
     'adm-zip',
   ]) {
     t.true(ignored.has(pkg), `expected ADK node-only package ${pkg} to be stubbed`);
@@ -129,7 +130,12 @@ test('configureBundler aliases @opentelemetry/api to the copy @google/adk resolv
   t.is(alias['user-alias'], '/user/alias');
 });
 
-test('configureBundler pins the bare @google/adk specifier to the web build', (t) => {
+/** The per-file ESM `common` surface the Workflow bundle pins `@google/adk` to. */
+function adkCommonEntry(): string {
+  return path.join(path.dirname(require.resolve('@google/adk/package.json')), 'dist', 'esm', 'common.js');
+}
+
+test('configureBundler pins the bare @google/adk specifier to the per-file common surface', (t) => {
   const plugin = new GoogleAdkPlugin();
   const { webpackConfigHook } = plugin.configureBundler({ workflowsPath: 'wf' } as BundleOptions);
   const cfg = webpackConfigHook!({ plugins: [], resolve: { alias: {} } } as never) as {
@@ -138,12 +144,15 @@ test('configureBundler pins the bare @google/adk specifier to the web build', (t
   const alias = cfg.resolve?.alias ?? {};
 
   // Which `@google/adk` build the bundle gets must not depend on the consumer's
-  // webpack target / browserslist: the sandbox always gets ADK's web surface,
-  // and subpath imports (`@google/adk/tools/mcp`) are left alone by the `$` form.
-  const expected = require.resolve('@google/adk/dist/web/index_web.js');
+  // webpack target / browserslist: the sandbox always gets ADK's `common`
+  // surface from the per-file ESM build — not the single-file web bundle ADK
+  // >= 2.1 publishes, which inlines its own `@opentelemetry/api` — and subpath
+  // imports (`@google/adk/tools/mcp`) are left alone by the `$` form.
+  const expected = adkCommonEntry();
+  t.true(existsSync(expected));
   t.is(alias['@google/adk$'], expected);
   t.false('@google/adk' in alias);
-  t.true(expected.endsWith(path.join('dist', 'web', 'index_web.js')));
+  t.true(expected.endsWith(path.join('dist', 'esm', 'common.js')));
 });
 
 test('redirects crypto requests issued from inside @google/adk to the deterministic shim', (t) => {
@@ -215,11 +224,7 @@ test('configureBundler prepends the api pin to an array-form user alias list', (
   // the object form.
   const expected = createRequire(require.resolve('@google/adk')).resolve('@opentelemetry/api');
   t.deepEqual(alias[0], { name: '@opentelemetry/api', onlyModule: true, alias: expected });
-  t.deepEqual(alias[1], {
-    name: '@google/adk',
-    onlyModule: true,
-    alias: require.resolve('@google/adk/dist/web/index_web.js'),
-  });
+  t.deepEqual(alias[1], { name: '@google/adk', onlyModule: true, alias: adkCommonEntry() });
   t.is(alias[2], userEntry);
 });
 

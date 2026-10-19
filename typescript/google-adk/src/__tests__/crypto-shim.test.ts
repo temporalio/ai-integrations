@@ -1,7 +1,9 @@
 /**
  * The deterministic `crypto` shim: ADK's `randomUUID()` (interrupt ids,
  * client function-call ids, session ids) is served from a named workflow random
- * stream, so ids are well-formed and regenerate identically on replay.
+ * stream — through the sandbox `crypto` global for ADK's bundled web build
+ * (>= 2.1) and the issuer-scoped `node:crypto` redirect for ADK 2.0 — so ids
+ * are well-formed and regenerate identically on replay.
  */
 
 import test from 'ava';
@@ -33,9 +35,18 @@ test.serial('ADK ids are v4 UUIDs that survive a full replay', async (t) => {
   t.regex(ids.after, UUID_V4);
   t.not(ids.before, ids.after);
   t.regex(ids.callId, ADK_CALL_ID);
+  // The sandbox `crypto` global is the same shim: a v4 UUID and 8 bytes of hex,
+  // distinct from the ids ADK drew before it.
+  t.regex(ids.direct, UUID_V4);
+  t.regex(ids.bytes, /^[0-9a-f]{16}$/);
+  t.false([ids.before, ids.after].includes(ids.direct));
   // The ids the Worker really saw, once each: every task after the first is a
   // replay, and a replayed Activity resolves from history instead of running.
-  t.deepEqual(activities.executionsFor(workflowId), [`echoId:${ids.before}`, `echoId:${ids.after}`]);
+  t.deepEqual(activities.executionsFor(workflowId), [
+    `echoId:${ids.before}`,
+    `echoId:${ids.after}`,
+    `echoId:${ids.direct}`,
+  ]);
   await Worker.runReplayHistory(
     { workflowsPath, reuseV8Context: REUSE_V8_CONTEXT, plugins: [new GoogleAdkPlugin()] },
     await env.client.workflow.getHandle(workflowId).fetchHistory()
