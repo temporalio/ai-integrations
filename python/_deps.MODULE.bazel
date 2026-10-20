@@ -1,0 +1,161 @@
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.10")
+python.toolchain(python_version = "3.11")
+python.toolchain(
+    is_default = True,
+    python_version = "3.14",
+)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_tools",
+    pyproject_toml = "//python/_tools:pyproject.toml",
+    python_version = "3.14",
+    uv_lock = "//python/_tools:uv.lock",
+)
+use_repo(pip, "python_tools")
+
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_deepagents",
+    pyproject_toml = "//python/deepagents:pyproject.toml",
+    python_version = "3.11",
+    uv_lock = "//python/deepagents:uv.lock",
+)
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_deepagents",
+    pyproject_toml = "//python/deepagents:pyproject.toml",
+    python_version = "3.14",
+    uv_lock = "//python/deepagents:uv.lock",
+)
+use_repo(pip, "python_deepagents")
+
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_google_adk",
+    pyproject_toml = "//python/google_adk:pyproject.toml",
+    python_version = "3.10",
+    uv_lock = "//python/google_adk:uv.lock",
+)
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_google_adk",
+    pyproject_toml = "//python/google_adk:pyproject.toml",
+    python_version = "3.14",
+    uv_lock = "//python/google_adk:uv.lock",
+)
+use_repo(pip, "python_google_adk")
+
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_google_genai",
+    pyproject_toml = "//python/google_genai:pyproject.toml",
+    python_version = "3.10",
+    uv_lock = "//python/google_genai:uv.lock",
+)
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_google_genai",
+    pyproject_toml = "//python/google_genai:pyproject.toml",
+    python_version = "3.14",
+    uv_lock = "//python/google_genai:uv.lock",
+)
+use_repo(pip, "python_google_genai")
+
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_langgraph",
+    pyproject_toml = "//python/langgraph:pyproject.toml",
+    python_version = "3.10",
+    uv_lock = "//python/langgraph:uv.lock",
+)
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_langgraph",
+    pyproject_toml = "//python/langgraph:pyproject.toml",
+    python_version = "3.14",
+    uv_lock = "//python/langgraph:uv.lock",
+)
+use_repo(pip, "python_langgraph")
+
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_langsmith",
+    pyproject_toml = "//python/langsmith:pyproject.toml",
+    python_version = "3.10",
+    uv_lock = "//python/langsmith:uv.lock",
+)
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_langsmith",
+    pyproject_toml = "//python/langsmith:pyproject.toml",
+    python_version = "3.14",
+    uv_lock = "//python/langsmith:uv.lock",
+)
+use_repo(pip, "python_langsmith")
+
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_mcp",
+    pyproject_toml = "//python/mcp:pyproject.toml",
+    python_version = "3.10",
+    uv_lock = "//python/mcp:uv.lock",
+)
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_mcp",
+    pyproject_toml = "//python/mcp:pyproject.toml",
+    python_version = "3.14",
+    uv_lock = "//python/mcp:uv.lock",
+)
+use_repo(pip, "python_mcp")
+
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_openai_agents",
+    pyproject_toml = "//python/openai_agents:pyproject.toml",
+    python_version = "3.10",
+    uv_lock = "//python/openai_agents:uv.lock",
+)
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_openai_agents",
+    pyproject_toml = "//python/openai_agents:pyproject.toml",
+    python_version = "3.14",
+    uv_lock = "//python/openai_agents:uv.lock",
+)
+use_repo(pip, "python_openai_agents")
+
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_strands_agents",
+    pyproject_toml = "//python/strands_agents:pyproject.toml",
+    python_version = "3.10",
+    uv_lock = "//python/strands_agents:uv.lock",
+)
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_strands_agents",
+    pyproject_toml = "//python/strands_agents:pyproject.toml",
+    python_version = "3.14",
+    uv_lock = "//python/strands_agents:uv.lock",
+)
+use_repo(pip, "python_strands_agents")
+
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_typesafe",
+    pyproject_toml = "//python/typesafe:pyproject.toml",
+    python_version = "3.10",
+    uv_lock = "//python/typesafe:uv.lock",
+)
+pip.parse(
+    enable_implicit_namespace_pkgs = True,
+    hub_name = "python_typesafe",
+    pyproject_toml = "//python/typesafe:pyproject.toml",
+    python_version = "3.14",
+    uv_lock = "//python/typesafe:uv.lock",
+)
+use_repo(pip, "python_typesafe")

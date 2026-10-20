@@ -6,6 +6,7 @@
  */
 
 import { getCurrentRunTree, traceable } from 'langsmith/traceable';
+import type { UpdateDefinition } from '@temporalio/common';
 import {
   condition,
   continueAsNew,
@@ -62,7 +63,7 @@ function syncInnerRun(name: string): void {
 export const comprehensiveSignal = defineSignal<[string]>('signal');
 export const completeSignal = defineSignal('complete');
 export const comprehensiveQuery = defineQuery<string, [string]>('query');
-export const comprehensiveUpdate = defineUpdate<string, [string]>('update');
+export const comprehensiveUpdate: UpdateDefinition<string, [string]> = defineUpdate<string, [string]>('update');
 
 /** Child workflow, used raw and wrapped. */
 export async function ComprehensiveChildWorkflow(input: string): Promise<string> {

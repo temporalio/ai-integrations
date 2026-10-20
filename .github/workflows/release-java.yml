@@ -52,9 +52,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
+      - uses: ./.github/actions/setup-bazel
       - name: Dispatch inputs are consistent with the ref
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -80,7 +78,7 @@ jobs:
         id: tag
         env:
           TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
+        run: bazel run //java/_tools:release -- parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
       - name: Java plugin exists
         env:
           LANGUAGE: ${{ steps.tag.outputs.language }}
@@ -102,7 +100,7 @@ jobs:
         env:
           PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
           VERSION: ${{ steps.tag.outputs.version }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
+        run: bazel run //java/_tools:release -- check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
       - name: Decide whether publication is allowed
         id: gate
         env:
@@ -120,7 +118,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py check-published-release --tag "$TAG"
+        run: bazel run //java/_tools:release -- check-published-release --tag "$TAG"
 
   test:
     name: Test
@@ -146,13 +144,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
-      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
-        with:
-          distribution: temurin
-          java-version: "21"
+      - uses: ./.github/actions/setup-bazel
       - name: Check whether an earlier attempt may have uploaded
         id: recovery
         env:
@@ -161,7 +153,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          uv run --project scripts --locked python scripts/release/release_tool.py check-java-stage-recovery \
+          bazel run //java/_tools:release -- check-java-stage-recovery \
             --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --event "$EVENT_NAME"
       - name: Download tested distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -192,7 +184,7 @@ jobs:
           if [ "$RECOVER_ONLY" = "true" ]; then
             RECOVERY_ARGS+=(--recover-only)
           fi
-          uv run --project scripts --locked python scripts/release/maven_release.py stage \
+          bazel run //java/_tools:release -- stage \
             --plugin-dir "$PLUGIN_DIR" --version "$VERSION" --dist dist --state-dir release-state \
             --deployment-id "$DEPLOYMENT_ID" --smoke "${RECOVERY_ARGS[@]}"
       - name: Preserve signed bundle and deployment ID for recovery
@@ -236,13 +228,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
-      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
-        with:
-          distribution: temurin
-          java-version: "21"
+      - uses: ./.github/actions/setup-bazel
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist-java-${{ needs.prepare.outputs.plugin }}
@@ -259,5 +245,5 @@ jobs:
           CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
           GRADLE_USER_HOME: ${{ runner.temp }}/gradle-consumer
         run: |
-          uv run --project scripts --locked python scripts/release/maven_release.py publish \
+          bazel run //java/_tools:release -- publish \
             --plugin-dir "$PLUGIN_DIR" --version "$VERSION" --dist dist --state-dir release-state --smoke

@@ -1,5 +1,3 @@
-# Schema: ../../AGENTS.md#repository-invariants
-
 [plugin]
 name = "openai_agents"
 language = "python"

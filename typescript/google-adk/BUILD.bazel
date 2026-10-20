@@ -1,0 +1,741 @@
+load("@npm_google_adk//:defs.bzl", "npm_link_all_packages")
+load("//bazel:typescript.bzl", "typescript_integration", "typescript_module")
+
+exports_files([
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "plugin.toml",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+typescript_module(
+    name = "__tests__/absorbed-failure.test",
+    srcs = [
+        "src/__tests__/absorbed-failure.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":__tests__/workflows",
+        ":crypto-shim",
+        ":node_modules/@temporalio/common",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/adk-converter",
+    srcs = [
+        "src/__tests__/adk-converter.ts",
+    ],
+    deps = [
+        ":node_modules/@google/adk",
+        ":node_modules/@temporalio/common",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/adk-first-interceptor",
+    srcs = [
+        "src/__tests__/adk-first-interceptor.ts",
+    ],
+    deps = [
+        ":node_modules/@google/adk",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/agent.test",
+    srcs = [
+        "src/__tests__/agent.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":__tests__/workflows",
+        ":crypto-shim",
+        ":node_modules/ava",
+        ":testing",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/auto-route.test",
+    srcs = [
+        "src/__tests__/auto-route.test.ts",
+    ],
+    deps = [
+        ":__tests__/graph-workflows",
+        ":__tests__/helpers",
+        ":crypto-shim",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/cancellation.test",
+    srcs = [
+        "src/__tests__/cancellation.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":__tests__/stub-mcp-server",
+        ":__tests__/workflows",
+        ":activities",
+        ":crypto-shim",
+        ":model",
+        ":node_modules/@google/adk",
+        ":node_modules/@google/genai",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/compiled-cjs.test",
+    srcs = [
+        "src/__tests__/compiled-cjs.test.ts",
+    ],
+    deps = [
+        ":__tests__/adk-converter",
+        ":__tests__/helpers",
+        ":__tests__/workflows",
+        ":crypto-shim",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/crypto-shim.test",
+    srcs = [
+        "src/__tests__/crypto-shim.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":__tests__/test-activities",
+        ":__tests__/workflows",
+        ":crypto-shim",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/dynamic.test",
+    srcs = [
+        "src/__tests__/dynamic.test.ts",
+    ],
+    deps = [
+        ":__tests__/graph-workflows",
+        ":__tests__/helpers",
+        ":__tests__/test-activities",
+        ":__tests__/test-models",
+        ":crypto-shim",
+        ":node_modules/@temporalio/common",
+        ":node_modules/ava",
+        ":node_modules/zod",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/errors.test",
+    srcs = [
+        "src/__tests__/errors.test.ts",
+    ],
+    deps = [
+        ":activities",
+        ":error-types",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/graph-workflows",
+    srcs = [
+        "src/__tests__/graph-workflows.ts",
+    ],
+    deps = [
+        ":node_modules/@google/adk",
+        ":node_modules/@google/genai",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/zod",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/graph.test",
+    srcs = [
+        "src/__tests__/graph.test.ts",
+    ],
+    deps = [
+        ":__tests__/graph-workflows",
+        ":__tests__/helpers",
+        ":__tests__/test-activities",
+        ":__tests__/test-models",
+        ":crypto-shim",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/helpers",
+    srcs = [
+        "src/__tests__/helpers.ts",
+    ],
+    deps = [
+        ":__tests__/helpers/environment",
+        ":__tests__/workflows",
+        ":crypto-shim",
+        ":node_modules/@google/adk",
+        ":node_modules/@google/genai",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+        ":testing",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/helpers/environment",
+    srcs = [
+        "src/__tests__/helpers/environment.ts",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/hitl.test",
+    srcs = [
+        "src/__tests__/hitl.test.ts",
+    ],
+    deps = [
+        ":__tests__/graph-workflows",
+        ":__tests__/helpers",
+        ":__tests__/test-activities",
+        ":__tests__/test-models",
+        ":__tests__/workflows",
+        ":crypto-shim",
+        ":node_modules/@google/adk",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+        ":testing",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/mcp-resources.test",
+    srcs = [
+        "src/__tests__/mcp-resources.test.ts",
+    ],
+    deps = [
+        ":__tests__/graph-workflows",
+        ":__tests__/helpers",
+        ":__tests__/stub-mcp-server",
+        ":__tests__/test-activities",
+        ":__tests__/test-models",
+        ":activities",
+        ":crypto-shim",
+        ":node_modules/@google/adk",
+        ":node_modules/@temporalio/activity",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/ava",
+        ":testing",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/mcp.test",
+    srcs = [
+        "src/__tests__/mcp.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":__tests__/stub-mcp-server",
+        ":__tests__/workflows",
+        ":activities",
+        ":crypto-shim",
+        ":node_modules/@google/adk",
+        ":node_modules/@google/genai",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/ava",
+        ":testing",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/model.test",
+    srcs = [
+        "src/__tests__/model.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":__tests__/workflows",
+        ":crypto-shim",
+        ":node_modules/@google/adk",
+        ":node_modules/@temporalio/common",
+        ":node_modules/ava",
+        ":testing",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/net-shim.test",
+    srcs = [
+        "src/__tests__/net-shim.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/plugin.test",
+    srcs = [
+        "src/__tests__/plugin.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":absorbed-failure",
+        ":auto-route",
+        ":crypto-shim",
+        ":load-polyfills",
+        ":node_modules/@google/adk",
+        ":node_modules/@modelcontextprotocol/sdk",
+        ":node_modules/@opentelemetry/api",
+        ":node_modules/@opentelemetry/resources",
+        ":node_modules/@opentelemetry/sdk-trace-base",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+        ":testing",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/published-artifact.test",
+    srcs = [
+        "src/__tests__/published-artifact.test.ts",
+    ],
+    deps = [
+        ":crypto-shim",
+        ":node_modules/ava",
+        ":testing",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/replay.test",
+    srcs = [
+        "src/__tests__/replay.test.ts",
+    ],
+    data = [
+        "src/__tests__/histories/graph_workflow.json",
+        "src/__tests__/histories/hitl_workflow.json",
+    ],
+    deps = [
+        ":__tests__/graph-workflows",
+        ":__tests__/helpers",
+        ":__tests__/test-activities",
+        ":__tests__/test-models",
+        ":__tests__/workflows",
+        ":crypto-shim",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+        ":testing",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/streaming.test",
+    srcs = [
+        "src/__tests__/streaming.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":__tests__/workflows",
+        ":activities",
+        ":crypto-shim",
+        ":node_modules/@google/adk",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/@temporalio/workflow-streams",
+        ":node_modules/ava",
+        ":testing",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/stub-mcp-server",
+    srcs = [
+        "src/__tests__/stub-mcp-server.ts",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/telemetry.test",
+    srcs = [
+        "src/__tests__/telemetry.test.ts",
+    ],
+    deps = [
+        ":__tests__/adk-first-interceptor",
+        ":__tests__/graph-workflows",
+        ":__tests__/helpers",
+        ":__tests__/test-activities",
+        ":__tests__/workflows",
+        ":crypto-shim",
+        ":node_modules/@opentelemetry/api",
+        ":node_modules/@opentelemetry/resources",
+        ":node_modules/@opentelemetry/sdk-trace-base",
+        ":node_modules/@temporalio/interceptors-opentelemetry",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-activities",
+    srcs = [
+        "src/__tests__/test-activities.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/activity",
+        ":node_modules/@temporalio/common",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-environment-startup.test",
+    srcs = [
+        "src/__tests__/test-environment-startup.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers/environment",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-models",
+    srcs = [
+        "src/__tests__/test-models.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":node_modules/@google/adk",
+        ":node_modules/@google/genai",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/tools.test",
+    srcs = [
+        "src/__tests__/tools.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":__tests__/workflows",
+        ":crypto-shim",
+        ":node_modules/@temporalio/common",
+        ":node_modules/ava",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/workflows",
+    srcs = [
+        "src/__tests__/workflows.ts",
+    ],
+    deps = [
+        ":__tests__/graph-workflows",
+        ":node_modules/@google/adk",
+        ":node_modules/@google/genai",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/@temporalio/workflow-streams",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "abort",
+    srcs = [
+        "src/abort.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "absorbed-failure",
+    srcs = [
+        "src/absorbed-failure.ts",
+    ],
+    deps = [
+        ":error-types",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "activities",
+    srcs = [
+        "src/activities.ts",
+    ],
+    deps = [
+        ":error-types",
+        ":mcp",
+        ":model",
+        ":node_modules/@google/adk",
+        ":node_modules/@google/genai",
+        ":node_modules/@temporalio/activity",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow-streams",
+    ],
+)
+
+typescript_module(
+    name = "auto-route",
+    srcs = [
+        "src/auto-route.ts",
+    ],
+    deps = [
+        ":model",
+        ":node_modules/@google/adk",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "confirmation",
+    srcs = [
+        "src/confirmation.ts",
+    ],
+    deps = [
+        ":node_modules/@google/adk",
+    ],
+)
+
+# These modules import each other and compile together.
+typescript_module(
+    name = "crypto-shim",
+    srcs = [
+        "src/crypto-shim.ts",
+        "src/index.ts",
+        "src/plugin.ts",
+    ],
+    deps = [
+        ":absorbed-failure",
+        ":activities",
+        ":auto-route",
+        ":load-polyfills",
+        ":mcp",
+        ":node_modules/@google/adk",
+        ":node_modules/@modelcontextprotocol/sdk",
+        ":node_modules/@opentelemetry/api",
+        ":node_modules/@temporalio/plugin",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "error-types",
+    srcs = [
+        "src/error-types.ts",
+    ],
+)
+
+typescript_module(
+    name = "hitl",
+    srcs = [
+        "src/hitl.ts",
+    ],
+    deps = [
+        ":error-types",
+        ":node_modules/@google/adk",
+        ":node_modules/@google/genai",
+        ":node_modules/@temporalio/common",
+        ":node_modules/zod",
+    ],
+)
+
+typescript_module(
+    name = "load-polyfills",
+    srcs = [
+        "src/load-polyfills.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/@ungap/structured-clone",
+        ":node_modules/headers-polyfill",
+        ":node_modules/web-streams-polyfill",
+    ],
+)
+
+typescript_module(
+    name = "mcp",
+    srcs = [
+        "src/mcp.ts",
+    ],
+    deps = [
+        ":abort",
+        ":confirmation",
+        ":error-types",
+        ":model",
+        ":node_modules/@google/adk",
+        ":node_modules/@google/genai",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "model",
+    srcs = [
+        "src/model.ts",
+    ],
+    deps = [
+        ":abort",
+        ":absorbed-failure",
+        ":error-types",
+        ":node_modules/@google/adk",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "nodes",
+    srcs = [
+        "src/nodes.ts",
+    ],
+    deps = [
+        ":crypto-shim",
+        ":error-types",
+        ":model",
+        ":node_modules/@google/adk",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "testing",
+    srcs = [
+        "src/testing.ts",
+    ],
+    deps = [
+        ":mcp",
+        ":node_modules/@google/adk",
+        ":node_modules/@google/genai",
+    ],
+)
+
+typescript_module(
+    name = "tools",
+    srcs = [
+        "src/tools.ts",
+    ],
+    deps = [
+        ":abort",
+        ":confirmation",
+        ":error-types",
+        ":model",
+        ":node_modules/@google/adk",
+        ":node_modules/@google/genai",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "workflow",
+    srcs = [
+        "src/workflow.ts",
+    ],
+    deps = [
+        ":absorbed-failure",
+        ":error-types",
+        ":hitl",
+        ":load-polyfills",
+        ":mcp",
+        ":model",
+        ":nodes",
+        ":tools",
+    ],
+)
+
+typescript_integration(
+    modules = [
+        ":abort",
+        ":absorbed-failure",
+        ":activities",
+        ":auto-route",
+        ":confirmation",
+        ":crypto-shim",
+        ":error-types",
+        ":hitl",
+        ":load-polyfills",
+        ":mcp",
+        ":model",
+        ":nodes",
+        ":testing",
+        ":tools",
+        ":workflow",
+    ],
+    test_modules = [
+        ":__tests__/absorbed-failure.test",
+        ":__tests__/adk-converter",
+        ":__tests__/adk-first-interceptor",
+        ":__tests__/agent.test",
+        ":__tests__/auto-route.test",
+        ":__tests__/cancellation.test",
+        ":__tests__/compiled-cjs.test",
+        ":__tests__/crypto-shim.test",
+        ":__tests__/dynamic.test",
+        ":__tests__/errors.test",
+        ":__tests__/graph-workflows",
+        ":__tests__/graph.test",
+        ":__tests__/helpers",
+        ":__tests__/helpers/environment",
+        ":__tests__/hitl.test",
+        ":__tests__/mcp-resources.test",
+        ":__tests__/mcp.test",
+        ":__tests__/model.test",
+        ":__tests__/net-shim.test",
+        ":__tests__/plugin.test",
+        ":__tests__/published-artifact.test",
+        ":__tests__/replay.test",
+        ":__tests__/streaming.test",
+        ":__tests__/stub-mcp-server",
+        ":__tests__/telemetry.test",
+        ":__tests__/test-activities",
+        ":__tests__/test-environment-startup.test",
+        ":__tests__/test-models",
+        ":__tests__/tools.test",
+        ":__tests__/workflows",
+    ],
+)

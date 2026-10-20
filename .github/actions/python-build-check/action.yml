@@ -1,35 +1,17 @@
-name: Python build check
-description: >-
-  Build a Python plugin's wheel and sdist (make build), verify the wheel layout
-  and metadata (scripts/ci/check_wheel.py), and smoke-test both artifacts in
-  isolated environments (scripts/ci/smoke.py). Shared by CI and the release
-  pipeline so the same bytes are checked the same way.
+name: Build and verify Python distribution
+description: Build the tested Bazel wheel and source distribution, then check their installed layout
 inputs:
   plugin-dir:
-    description: Plugin directory relative to the repository root (e.g. python/openai_agents)
     required: true
+    description: Plugin directory relative to repository root
 runs:
   using: composite
   steps:
-    - name: Build wheel and sdist
-      shell: bash
+    - shell: bash
       env:
         PLUGIN_DIR: ${{ inputs.plugin-dir }}
-      run: cd "$GITHUB_WORKSPACE/$PLUGIN_DIR" && make build
-    - name: Verify wheel and sdist
-      shell: bash
-      env:
-        PLUGIN_DIR: ${{ inputs.plugin-dir }}
-      run: >-
-        uv run --project "$GITHUB_WORKSPACE/scripts" --locked
-        python "$GITHUB_WORKSPACE/scripts/ci/check_wheel.py"
-        --plugin-dir "$GITHUB_WORKSPACE/$PLUGIN_DIR" --dist "$GITHUB_WORKSPACE/$PLUGIN_DIR/dist"
-        --repo-root "$GITHUB_WORKSPACE"
-    - name: Smoke-test artifacts in isolated environments
-      shell: bash
-      env:
-        PLUGIN_DIR: ${{ inputs.plugin-dir }}
-      run: >-
-        uv run --project "$GITHUB_WORKSPACE/scripts" --locked
-        python "$GITHUB_WORKSPACE/scripts/ci/smoke.py"
-        --plugin "$GITHUB_WORKSPACE/$PLUGIN_DIR" --dist "$GITHUB_WORKSPACE/$PLUGIN_DIR/dist"
+      run: |
+        bazel build "//$PLUGIN_DIR:dist"
+        bazel test "//$PLUGIN_DIR:package_test"
+        bazel run //python/_tools:check_wheel -- --plugin-dir "$PLUGIN_DIR" --dist "bazel-bin/$PLUGIN_DIR/dist"
+        bazel run //python/_tools:smoke -- --plugin "$PLUGIN_DIR" --dist "bazel-bin/$PLUGIN_DIR/dist"

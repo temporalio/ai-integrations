@@ -299,13 +299,13 @@ Use Workflow state for per-run memory, or an external database (Postgres/Redis/e
 Install dependencies:
 
 ```sh
-make sync
+bazel run //python/_tools:dev -- venv --plugin-dir python/langgraph
 ```
 
 Run the test suite:
 
 ```sh
-make test
+bazel test //python/langgraph:tests
 ```
 
 Tests start a local Temporal dev server automatically — no external server needed.

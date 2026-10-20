@@ -143,5 +143,5 @@
     "!lib/__tests__",
     "LICENSE"
   ],
-  "packageManager": "pnpm@10.27.0"
+  "packageManager": "pnpm@10.34.5"
 }

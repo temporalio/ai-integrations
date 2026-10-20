@@ -177,7 +177,7 @@ let sharedEnv: TestWorkflowEnvironment | undefined;
 /** Register a per-file shared `TestWorkflowEnvironment`; `withTracingWorker` will reuse it. */
 export function useSharedEnv(test: TestFn<unknown>): void {
   test.before(async () => {
-    sharedEnv = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+    sharedEnv = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal({ server: process.env.TEMPORAL_CLI_PATH ? { executable: { type: 'existing-path', path: process.env.TEMPORAL_CLI_PATH } } : undefined }));
   });
   test.after.always(async () => {
     await sharedEnv?.teardown();
@@ -200,7 +200,7 @@ function getBundle(plugin: LangSmithPlugin, workflowsPath: string, optionsKey: s
 }
 
 export async function withTracingWorker<T>(args: HarnessArgs<T>): Promise<T> {
-  const privateEnv = sharedEnv ? undefined : await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+  const privateEnv = sharedEnv ? undefined : await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal({ server: process.env.TEMPORAL_CLI_PATH ? { executable: { type: 'existing-path', path: process.env.TEMPORAL_CLI_PATH } } : undefined }));
   const env = sharedEnv ?? privateEnv!;
   try {
     const taskQueue = args.taskQueue ?? `langsmith-test-${randomUUID()}`;

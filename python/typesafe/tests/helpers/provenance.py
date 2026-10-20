@@ -1,6 +1,6 @@
 """Prove that the installed plugin distribution is exactly what this checkout built.
 
-Keep in sync with ``scripts/ci/smoke.py``, which runs the same checks against the built wheel in
+Keep in sync with ``python/_tools/ci/smoke.py``, which runs the same checks against the built wheel in
 an isolated environment.
 
 The plugin installs into the SDK-owned ``temporalio`` package. Reject editable
@@ -44,18 +44,22 @@ def check_provenance(
     try:
         dist = importlib_metadata.distribution(dist_name)
     except importlib_metadata.PackageNotFoundError as exc:
-        raise ProvenanceError(f"{dist_name} is not installed; run `make sync`") from exc
+        raise ProvenanceError(
+            f"{dist_name} is not installed; run `bazel run //python/_tools:dev -- venv --plugin-dir python/<plugin>`"
+        ) from exc
 
     direct_url = dist.read_text("direct_url.json")
     if direct_url and json.loads(direct_url).get("dir_info", {}).get("editable"):
         raise ProvenanceError(
             f"{dist_name} is installed editable, so temporalio.* cannot resolve to src/; "
-            "run `make sync` (it exports UV_NO_EDITABLE=1)"
+            "run `bazel run //python/_tools:dev -- venv --plugin-dir python/<plugin>` (installs non-editable wheels)"
         )
 
     files = dist.files
     if files is None:
-        raise ProvenanceError(f"{dist_name} has no RECORD; reinstall with `make sync`")
+        raise ProvenanceError(
+            f"{dist_name} has no RECORD; reinstall with `bazel run //python/_tools:dev -- venv --plugin-dir python/<plugin>`"
+        )
 
     owned: set[str] = set()
     for record_path in files:
@@ -65,7 +69,7 @@ def check_provenance(
         owned.add(os.path.normpath(str(path)))
         if not path.is_file():
             raise ProvenanceError(
-                f"{record_path} is in RECORD but missing on disk; run `make sync`"
+                f"{record_path} is in RECORD but missing on disk; run `bazel run //python/_tools:dev -- venv --plugin-dir python/<plugin>`"
             )
         digest = (
             base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest())
@@ -74,12 +78,14 @@ def check_provenance(
         )
         if record_path.hash.mode != "sha256" or digest != record_path.hash.value:
             raise ProvenanceError(
-                f"{record_path} differs from RECORD (overwritten by another distribution?); run `make sync`"
+                f"{record_path} differs from RECORD (overwritten by another distribution?); run `bazel run //python/_tools:dev -- venv --plugin-dir python/<plugin>`"
             )
 
     pkg_dir = Path(str(dist.locate_file(pkg_rel)))
     if not pkg_dir.is_dir():
-        raise ProvenanceError(f"{pkg_dir} does not exist; run `make sync`")
+        raise ProvenanceError(
+            f"{pkg_dir} does not exist; run `bazel run //python/_tools:dev -- venv --plugin-dir python/<plugin>`"
+        )
     extras = {
         os.path.normpath(str(path))
         for path in pkg_dir.rglob("*")
@@ -89,7 +95,7 @@ def check_provenance(
     } - owned
     if extras:
         raise ProvenanceError(
-            f"files under {pkg_dir} are not owned by {dist_name}: {sorted(extras)}; run `make sync`"
+            f"files under {pkg_dir} are not owned by {dist_name}: {sorted(extras)}; run `bazel run //python/_tools:dev -- venv --plugin-dir python/<plugin>`"
         )
 
     prefix = pkg_rel.rstrip("/") + "/"

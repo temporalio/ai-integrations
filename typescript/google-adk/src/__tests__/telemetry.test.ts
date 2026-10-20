@@ -210,7 +210,7 @@ test.serial('adkSpansExportWhenAdkEvaluatesBeforeInterceptorFactories', async (t
         taskQueue,
         plugins: [otelPlugin, makeAdkPlugin()],
         maxCachedWorkflows: 0,
-        workflowInterceptorModules: [path.resolve(__dirname, '../../src/__tests__/adk-first-interceptor.ts')],
+        workflowInterceptorModules: [path.resolve(__dirname, 'adk-first-interceptor.js')],
       },
       () => env.client.workflow.execute(agentRunnerTwoTurnsWorkflow, { taskQueue, workflowId, args: ['hi'] })
     );

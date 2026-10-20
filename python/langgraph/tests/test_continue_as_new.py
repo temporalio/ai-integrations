@@ -2,11 +2,9 @@ from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
-from langgraph.graph.state import (  # pyright: ignore[reportMissingTypeStubs]
-    RunnableConfig,
-)
 from typing_extensions import TypedDict
 
 from temporalio import workflow

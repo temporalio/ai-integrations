@@ -1,0 +1,238 @@
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import check_conventions
+import pytest
+from conftest import commit_all
+
+
+def run(repo: Path, nightly: bool = False) -> list[str]:
+    return check_conventions.Checker(repo).run()
+
+
+def test_empty_repo_passes(repo: Path) -> None:
+    assert run(repo) == []
+
+
+def test_valid_plugin_passes(plugin_repo: Path) -> None:
+    assert run(plugin_repo) == []
+
+
+def test_python_version_is_the_development_placeholder(plugin_repo: Path) -> None:
+    pyproject = plugin_repo / "python/fakeplug/pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text().replace('version = "0.0.0"', 'version = "0.1.0"')
+    )
+    assert any(
+        "tag-authoritative development placeholder" in x for x in run(plugin_repo)
+    )
+
+
+def test_namespace_init_files_are_forbidden(plugin_repo: Path) -> None:
+    (plugin_repo / "python/fakeplug/src/temporalio/__init__.py").write_text("")
+    (plugin_repo / "python/fakeplug/src/temporalio/contrib").mkdir()
+    (plugin_repo / "python/fakeplug/src/temporalio/contrib/__init__.py").write_text("")
+    v = run(plugin_repo)
+    assert any("src/temporalio/__init__.py" in x for x in v) and any(
+        "src/temporalio/contrib/__init__.py" in x for x in v
+    )
+
+
+def test_license_is_a_committed_identical_copy(plugin_repo: Path) -> None:
+    lic = plugin_repo / "python/fakeplug/LICENSE"
+    assert run(plugin_repo) == []  # committed copy identical to the root file
+    lic.write_text("MIT\n")
+    assert any("differs from the root LICENSE" in x for x in run(plugin_repo))
+    lic.unlink()
+    lic.mkdir()
+    assert any("must be a regular file" in x for x in run(plugin_repo))
+    lic.rmdir()
+    lic.write_bytes((plugin_repo / "LICENSE").read_bytes())
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(plugin_repo),
+            "rm",
+            "-q",
+            "--cached",
+            "python/fakeplug/LICENSE",
+        ],
+        check=True,
+    )
+    assert any("must be committed" in x for x in run(plugin_repo))
+
+
+def test_changelog_and_smoke_test_files_are_forbidden(plugin_repo: Path) -> None:
+    (plugin_repo / "python/fakeplug/CHANGELOG.md").write_text("# x\n")
+    (plugin_repo / "python/fakeplug/smoke_test.py").write_text("")
+    commit_all(plugin_repo, "add forbidden files")
+    v = run(plugin_repo)
+    assert any("CHANGELOG.md" in x for x in v) and any("smoke_test.py" in x for x in v)
+
+
+def test_relative_readme_links_are_forbidden(plugin_repo: Path) -> None:
+    (plugin_repo / "python/fakeplug/README.md").write_text(
+        "see [streams](../workflow_streams/README.md)\n"
+    )
+    assert any("relative link" in x for x in run(plugin_repo))
+
+
+@pytest.mark.parametrize(
+    "readme",
+    ['"README.pypi.md"', '{file = "README.pypi.md", content-type = "text/markdown"}'],
+)
+def test_configured_published_readme_is_checked(plugin_repo: Path, readme: str) -> None:
+    plugin = plugin_repo / "python/fakeplug"
+    (plugin / "README.md").write_text("Local [SDK docs](../opentelemetry)\n")
+    manifest = plugin / "pyproject.toml"
+    manifest.write_text(
+        manifest.read_text().replace('readme = "README.md"', f"readme = {readme}")
+    )
+    published = plugin / "README.pypi.md"
+    assert any(
+        "published README README.pypi.md is missing" in x for x in run(plugin_repo)
+    )
+    published.write_text(
+        "Published [SDK docs](https://github.com/temporalio/sdk-python)\n"
+    )
+    assert run(plugin_repo) == []
+    published.write_text("Published [SDK docs](../opentelemetry)\n")
+    assert any("README.pypi.md:1: relative link" in x for x in run(plugin_repo))
+
+
+def test_plugin_folder_suffix_and_language_lockfile(plugin_repo: Path) -> None:
+    (plugin_repo / "python/uv.lock").write_text("")
+    (plugin_repo / "python/foo_plugin").mkdir()
+    (plugin_repo / "python/foo_plugin/pyproject.toml").write_text(
+        "[project]\nname='x'\nversion='0'\n"
+    )
+    v = run(plugin_repo)
+    assert any("language-level lockfiles" in x for x in v) and any(
+        "must not end in -plugin/_plugin" in x for x in v
+    )
+
+
+def test_python_code_is_forbidden_in_shared(plugin_repo: Path) -> None:
+    shared = plugin_repo / "python/_shared"
+    shared.mkdir()
+    (shared / "ruff.toml").write_text('target-version = "py310"\n')
+    assert run(plugin_repo) == []
+    (shared / "fixtures.py").write_text("VALUE = 1\n")
+    assert run(plugin_repo) == []
+    commit_all(plugin_repo, "add forbidden shared source")
+    assert any("Python code must be duplicated" in x for x in run(plugin_repo))
+
+
+@pytest.mark.parametrize(
+    "support_file", sorted(check_conventions.STANDARD_TEST_SUPPORT)
+)
+def test_standard_test_support_matches_templates(
+    plugin_repo: Path, support_file: str
+) -> None:
+    template = plugin_repo / "python/_template"
+    plugin = plugin_repo / "python/fakeplug"
+    for plugin_rel, template_rel in check_conventions.STANDARD_TEST_SUPPORT.items():
+        canonical = template / template_rel
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        canonical.write_text(f"# canonical {plugin_rel}\n")
+        rendered = plugin / plugin_rel
+        rendered.parent.mkdir(parents=True, exist_ok=True)
+        rendered.write_bytes(canonical.read_bytes())
+    assert run(plugin_repo) == []
+    (plugin / support_file).write_text("# drifted\n")
+    assert any(
+        support_file in x and "differs from canonical" in x for x in run(plugin_repo)
+    )
+
+
+def test_plugin_toml_agreement(plugin_repo: Path) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(
+        meta.read_text().replace(
+            'coordinate = "temporalio-fakeplug"', 'coordinate = "temporalio-other"'
+        )
+    )
+    v = run(plugin_repo)
+    assert any("coordinate must be 'temporalio-fakeplug'" in x for x in v)
+    assert any("project.name" in x for x in v)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ['["temporalio.fakeplug"]', '{ value = "temporalio.fakeplug" }'],
+)
+def test_malformed_root_api_is_reported(plugin_repo: Path, malformed: str) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(
+        meta.read_text().replace(
+            'root-api = "temporalio.fakeplug"', f"root-api = {malformed}"
+        )
+    )
+    assert any("root-api must be 'temporalio.fakeplug'" in x for x in run(plugin_repo))
+
+
+def test_unrelated_root_api_is_rejected(plugin_repo: Path) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(meta.read_text().replace("temporalio.fakeplug", "other.fakeplug"))
+    assert any("root-api must be 'temporalio.fakeplug'" in x for x in run(plugin_repo))
+
+
+def test_maturity_classifier_must_agree(plugin_repo: Path) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(
+        meta.read_text().replace(
+            'maturity = "pre-release"', 'maturity = "generally-available"'
+        )
+    )
+    assert any(
+        "Development Status :: 5 - Production/Stable" in x for x in run(plugin_repo)
+    )
+
+
+@pytest.mark.parametrize("maturity", ["experimental", "preview", "ga"])
+def test_legacy_maturity_values_are_rejected(plugin_repo: Path, maturity: str) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(
+        meta.read_text().replace('maturity = "pre-release"', f'maturity = "{maturity}"')
+    )
+    assert any("plugin.toml maturity must be one of" in x for x in run(plugin_repo))
+
+
+def test_no_secrets_or_owners_in_plugin_toml(plugin_repo: Path) -> None:
+    meta = plugin_repo / "python/fakeplug/plugin.toml"
+    meta.write_text(
+        meta.read_text().replace("[ci]\n", '[ci]\nlive-secrets = ["OPENAI_API_KEY"]\n')
+    )
+    assert any("live-secrets" in x for x in run(plugin_repo))
+
+
+def test_path_sources_and_required_version(plugin_repo: Path) -> None:
+    pp = plugin_repo / "python/fakeplug/pyproject.toml"
+    pp.write_text(
+        pp.read_text().replace(
+            'required-version = ">=0.12.5,<0.13"', 'required-version = ">=0.11"'
+        )
+        + '\n[tool.uv.sources]\ntemporalio-mcp = { path = "../mcp" }\n'
+    )
+    v = run(plugin_repo)
+    assert any("path/workspace source" in x for x in v) and any(
+        "required-version" in x for x in v
+    )
+
+
+def test_exclude_newer_requires_temporalio_exemption(plugin_repo: Path) -> None:
+    pp = plugin_repo / "python/fakeplug/pyproject.toml"
+    pp.write_text(
+        pp.read_text().replace("exclude-newer-package = { temporalio = false }\n", "")
+    )
+    assert any("temporalio is not exempted" in x for x in run(plugin_repo))
+
+
+def test_cli_exit_codes(plugin_repo: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert check_conventions.main(["--repo-root", str(plugin_repo)]) == 0
+    (plugin_repo / "python/fakeplug/src/temporalio/__init__.py").write_text("")
+    assert check_conventions.main(["--repo-root", str(plugin_repo)]) == 1
+    assert "FAIL" in capsys.readouterr().out

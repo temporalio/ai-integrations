@@ -1,0 +1,56 @@
+load("//bazel:python.bzl", "python_integration")
+
+python_integration(
+    test_data = {
+        "tests/test_readme.py": ["README.md"],
+        "tests/test_continue_as_new.py": [
+            "tests/histories/legacy_cache_carried_across_can.json",
+            "tests/histories/legacy_dedup_repeated_tool_calls.json",
+        ],
+        "tests/test_legacy_cache_replay.py": [
+            "tests/histories/legacy_cache_carried_across_can.json",
+            "tests/histories/legacy_dedup_repeated_tool_calls.json",
+        ],
+        "tests/test_replay.py": [
+            "tests/histories/legacy_cache_carried_across_can.json",
+            "tests/histories/legacy_dedup_repeated_tool_calls.json",
+        ],
+    },
+    test_deps = {
+        "tests/conftest.py": [
+            "tests/__init__.py",
+            "tests/helpers/__init__.py",
+            "tests/helpers/environment.py",
+            "tests/helpers/plugin_meta.py",
+            "tests/helpers/provenance.py",
+        ],
+        "tests/test_backend_factories.py": [
+            "tests/helpers/backend_worker.py",
+            "tests/helpers/deepagents.py",
+        ],
+        "tests/test_backends.py": [
+            "tests/helpers/deepagents.py",
+        ],
+        "tests/test_model_activity.py": [
+            "tests/helpers/deepagents.py",
+        ],
+        "tests/test_native_e2e.py": [
+            "tests/helpers/deepagents.py",
+        ],
+        "tests/test_sandbox_passthrough.py": [
+            "tests/helpers/deepagents.py",
+        ],
+        "tests/test_side_effects.py": [
+            "tests/helpers/deepagents.py",
+        ],
+        "tests/test_streaming.py": [
+            "tests/helpers/deepagents.py",
+        ],
+        "tests/test_subagents.py": [
+            "tests/helpers/deepagents.py",
+        ],
+        "tests/test_tools.py": [
+            "tests/helpers/deepagents.py",
+        ],
+    },
+)

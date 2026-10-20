@@ -2,6 +2,7 @@ import test from 'ava';
 import { Agent, Runner, type FunctionTool, type RunContext, type RunResult } from '@openai/agents-core';
 import { SandboxAgent } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
+import { setActivator } from '@temporalio/workflow/lib/global-attributes';
 import { agentAsTool, extractToolOutput } from '../workflow/agent-tools';
 import { temporalSandboxClient } from '../workflow/sandbox-client';
 import { TemporalOpenAIRunner } from '../workflow/runner';
@@ -81,7 +82,7 @@ test.serial('agentAsTool: nested SandboxAgent inherits parent sandbox config', a
     return { interruptions: [], finalOutput: output };
   } as any;
   const originalActivator = globalThis.__TEMPORAL_ACTIVATOR__;
-  globalThis.__TEMPORAL_ACTIVATOR__ = { info: { workflowId: 'test', runId: 'test' } } as any;
+  setActivator({ info: { workflowId: 'test', runId: 'test' } } as any);
   try {
     const runner = new TemporalOpenAIRunner();
     for (const sandbox of sandboxes) {
@@ -91,7 +92,7 @@ test.serial('agentAsTool: nested SandboxAgent inherits parent sandbox config', a
     t.deepEqual(receivedSandboxes, sandboxes);
     t.is(parent.tools[0], tool);
   } finally {
-    globalThis.__TEMPORAL_ACTIVATOR__ = originalActivator;
+    setActivator(originalActivator);
     Runner.prototype.run = originalRunnerRun;
     TemporalOpenAIRunner.prototype.run = originalTemporalRun;
   }
@@ -107,13 +108,13 @@ test.serial('agentAsTool: nested SandboxAgent without parent sandbox config fail
     return { interruptions: [], finalOutput: output };
   } as any;
   const originalActivator = globalThis.__TEMPORAL_ACTIVATOR__;
-  globalThis.__TEMPORAL_ACTIVATOR__ = { info: { workflowId: 'test', runId: 'test' } } as any;
+  setActivator({ info: { workflowId: 'test', runId: 'test' } } as any);
   try {
     const err = await t.throwsAsync(() => new TemporalOpenAIRunner().run(parent, 'hi'));
     t.true(err instanceof ApplicationFailure);
     t.is((err as ApplicationFailure).type, 'SandboxConfigurationError');
   } finally {
-    globalThis.__TEMPORAL_ACTIVATOR__ = originalActivator;
+    setActivator(originalActivator);
     Runner.prototype.run = originalRunnerRun;
   }
 });

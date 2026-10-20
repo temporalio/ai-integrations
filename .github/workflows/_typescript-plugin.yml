@@ -1,6 +1,4 @@
-# Shared workflow for independently installed TypeScript integrations.
 name: TypeScript plugin
-
 on:
   workflow_call:
     inputs:
@@ -10,24 +8,22 @@ on:
       deps:
         type: string
         default: locked
-      ref:
+      version:
         type: string
         default: ""
-      version:
+      ref:
         type: string
         default: ""
       artifact-name:
         type: string
         default: ""
-
 permissions: {}
-
 defaults:
   run:
     shell: bash
-
 jobs:
   matrix:
+    name: matrix
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -38,16 +34,16 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
+      - uses: ./.github/actions/setup-bazel
       - id: matrix
         env:
           PLUGIN: ${{ inputs.plugin }}
-        run: python3 scripts/ci/matrix.py --plugin-dir "typescript/$PLUGIN" --github-output "$GITHUB_OUTPUT"
-
+        run: bazel run //typescript/_tools:ci -- matrix --plugin-dir "typescript/$PLUGIN" --github-output "$GITHUB_OUTPUT"
   test:
     name: ${{ inputs.plugin }} (${{ matrix.os }}, node${{ matrix.runtime }})
     needs: matrix
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     strategy:
@@ -55,52 +51,40 @@ jobs:
       matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
     env:
       PLUGIN_DIR: typescript/${{ inputs.plugin }}
+      RUNTIME: ${{ matrix.runtime }}
+      RELEASE_VERSION: ${{ inputs.version || '0.0.0' }}
+      SPRING_BOOT: ${{ matrix.spring_boot || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
-      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
-        with:
-          version: 10.27.0
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version: ${{ matrix.runtime }}
-          check-latest: true
-          cache: pnpm
-          cache-dependency-path: typescript/${{ inputs.plugin }}/pnpm-lock.yaml
-      - name: Install GNU make (Windows)
-        if: runner.os == 'Windows'
-        run: choco install make -y --no-progress
-      - name: Sync dependencies
-        env:
-          DEPS: ${{ inputs.deps }}
+      - uses: ./.github/actions/setup-bazel
+      - name: Resolve latest compatible dependencies
+        if: inputs.deps == 'latest'
         run: |
-          cd "$PLUGIN_DIR"
-          case "$DEPS" in
-            locked) make sync ;;
-            latest) make sync-latest ;;
-            *) echo "::error::unknown deps mode '$DEPS'"; exit 1 ;;
-          esac
-      - name: Inject release version
-        if: inputs.version != ''
-        env:
-          VERSION: ${{ inputs.version }}
-        run: cd "$PLUGIN_DIR" && npm version "$VERSION" --no-git-tag-version --ignore-scripts
+          bazel run //typescript/_tools:dev -- update --plugin-dir "$PLUGIN_DIR"
+          bazel mod deps --lockfile_mode=update
       - name: Lint and test
-        run: cd "$PLUGIN_DIR" && make lint && make test
-      - name: Build and verify npm package
+        run: |
+          config=( --config=node${RUNTIME%%.*} )
+          bazel test "${config[@]}" --//bazel:release_version="$RELEASE_VERSION" "//$PLUGIN_DIR:tests" "//$PLUGIN_DIR:lint"
+      - name: Build and verify tested distributions
         if: matrix.dist
         run: |
-          cd "$PLUGIN_DIR"
-          make build
-          python3 ../../scripts/ci/check_npm_package.py --plugin-dir .
-          node ../_shared/smoke.mjs
+          config=( --config=node${RUNTIME%%.*} )
+          bazel build "${config[@]}" --//bazel:release_version="$RELEASE_VERSION" "//$PLUGIN_DIR:dist"
+          mkdir -p "$PLUGIN_DIR/dist"
+          cp -R "bazel-bin/$PLUGIN_DIR/dist/." "$PLUGIN_DIR/dist/"
+          for archive in "$PLUGIN_DIR"/dist/*.tgz; do
+            bazel run //typescript/_tools:package -- check --plugin-dir "$PLUGIN_DIR" --archive "$archive" --version "$RELEASE_VERSION"
+            bazel run //typescript/_tools:package -- smoke --plugin-dir "$PLUGIN_DIR" --archive "$archive"
+          done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: matrix.dist && inputs.artifact-name != ''
         with:
           name: ${{ inputs.artifact-name }}
-          path: typescript/${{ inputs.plugin }}/dist/*.tgz
+          path: typescript/${{ inputs.plugin }}/dist
           if-no-files-found: error
           overwrite: true
           retention-days: 30

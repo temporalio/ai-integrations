@@ -1,0 +1,68 @@
+load("@aspect_rules_js//npm:defs.bzl", "npm_package")
+load("@aspect_rules_ts//ts:defs.bzl", "ts_config", "ts_project")
+
+exports_files(["package.json"])
+
+ts_config(
+    name = "tsconfig",
+    src = "tsconfig.json",
+    deps = [
+        "//typescript/_shared:tsconfig",
+        "//typescript/strands-agents:node_modules/@tsconfig/node20",
+    ],
+)
+
+ts_project(
+    name = "build",
+    srcs = glob(["src/**/*.ts"]),
+    composite = True,
+    incremental = True,
+    out_dir = "lib",
+    root_dir = "src",
+    source_map = True,
+    tsconfig = ":tsconfig",
+    visibility = ["//typescript/strands-agents:__subpackages__"],
+    deps = [
+        "//typescript/strands-agents:node_modules/@eslint/js",
+        "//typescript/strands-agents:node_modules/@modelcontextprotocol/sdk",
+        "//typescript/strands-agents:node_modules/@strands-agents/sdk",
+        "//typescript/strands-agents:node_modules/@temporalio/activity",
+        "//typescript/strands-agents:node_modules/@temporalio/client",
+        "//typescript/strands-agents:node_modules/@temporalio/common",
+        "//typescript/strands-agents:node_modules/@temporalio/envconfig",
+        "//typescript/strands-agents:node_modules/@temporalio/plugin",
+        "//typescript/strands-agents:node_modules/@temporalio/proto",
+        "//typescript/strands-agents:node_modules/@temporalio/testing",
+        "//typescript/strands-agents:node_modules/@temporalio/worker",
+        "//typescript/strands-agents:node_modules/@temporalio/workflow",
+        "//typescript/strands-agents:node_modules/@temporalio/workflow-streams",
+        "//typescript/strands-agents:node_modules/@tsconfig/node20",
+        "//typescript/strands-agents:node_modules/@types/node",
+        "//typescript/strands-agents:node_modules/@types/stack-utils",
+        "//typescript/strands-agents:node_modules/@ungap/structured-clone",
+        "//typescript/strands-agents:node_modules/ava",
+        "//typescript/strands-agents:node_modules/eslint",
+        "//typescript/strands-agents:node_modules/eslint-config-prettier",
+        "//typescript/strands-agents:node_modules/eslint-import-resolver-typescript",
+        "//typescript/strands-agents:node_modules/eslint-plugin-import",
+        "//typescript/strands-agents:node_modules/headers-polyfill",
+        "//typescript/strands-agents:node_modules/long",
+        "//typescript/strands-agents:node_modules/protobufjs",
+        "//typescript/strands-agents:node_modules/stack-utils",
+        "//typescript/strands-agents:node_modules/tsx",
+        "//typescript/strands-agents:node_modules/typescript",
+        "//typescript/strands-agents:node_modules/typescript-eslint",
+        "//typescript/strands-agents:node_modules/web-streams-polyfill",
+        "//typescript/strands-agents:node_modules/zod",
+    ],
+)
+
+npm_package(
+    name = "pkg",
+    srcs = [
+        "package.json",
+        ":build",
+    ],
+    package = "@temporalio/test-helpers",
+    visibility = ["//typescript/strands-agents:__subpackages__"],
+)

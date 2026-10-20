@@ -1,0 +1,158 @@
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+exports_files([
+    "uv.lock",
+    "pyproject.toml",
+    "installed_runner.py",
+])
+
+py_binary(
+    name = "build_dist",
+    srcs = ["build_dist.py"],
+    legacy_create_init = False,
+    python_version = "3.14",
+    visibility = ["//visibility:public"],
+    deps = ["@python_tools//uv_build"],
+)
+
+py_library(
+    name = "tools",
+    srcs = glob([
+        "ci/*.py",
+        "release/*.py",
+    ]),
+    imports = [
+        "ci",
+        "release",
+    ],
+    deps = ["@python_tools//packaging"],
+)
+
+py_binary(
+    name = "ci_tool",
+    srcs = ["cli.py"],
+    data = ["@plugin_metadata//:plugins.json"],
+    main = "cli.py",
+    python_version = "3.14",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":tools",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+py_binary(
+    name = "release_tool",
+    srcs = ["release/release_tool.py"],
+    main = "release/release_tool.py",
+    python_version = "3.14",
+    visibility = ["//visibility:public"],
+    deps = [":tools"],
+)
+
+[py_test(
+    name = source[:-3],
+    size = "large",
+    srcs = [
+        "test_main.py",
+        "tests/conftest.py",
+        source,
+    ] + (["build_dist.py"] if source == "tests/test_build_dist.py" else []) + (["installed_runner.py"] if source == "tests/test_installed_runner.py" else []),
+    args = [source],
+    data = [
+        "new_python_plugin.py",
+        "pyproject.toml",
+        "//:repository_files",
+        "//python:template",
+        "//python/_shared:config",
+    ],
+    imports = ["."],
+    legacy_create_init = False,
+    main = "test_main.py",
+    python_version = "3.14",
+    deps = [
+        ":runtime",
+        ":tools",
+        "@python_tools//pytest",
+        "@python_tools//pyyaml",
+        "@python_tools//uv_build",
+        "@rules_python//python/runfiles",
+    ],
+) for source in glob(["tests/test_*.py"])]
+
+test_suite(
+    name = "tool_tests",
+    tests = [":" + source[:-3] for source in glob(["tests/test_*.py"])],
+)
+
+py_binary(
+    name = "dev",
+    srcs = ["dev.py"],
+    python_version = "3.14",
+    visibility = ["//visibility:public"],
+    deps = [":runtime"],
+)
+
+py_binary(
+    name = "check_wheel",
+    srcs = ["ci/check_wheel.py"],
+    python_version = "3.14",
+    visibility = ["//visibility:public"],
+    deps = [":tools"],
+)
+
+py_binary(
+    name = "smoke",
+    srcs = ["ci/smoke.py"],
+    python_version = "3.14",
+    visibility = ["//visibility:public"],
+    deps = [":runtime"],
+)
+
+py_binary(
+    name = "smoke_from_index",
+    srcs = ["release/smoke_from_index.py"],
+    data = ["ci/smoke.py"],
+    python_version = "3.14",
+    visibility = ["//visibility:public"],
+    deps = [":runtime"],
+)
+
+py_binary(
+    name = "new_plugin",
+    srcs = ["new_python_plugin.py"],
+    data = [
+        "//:LICENSE",
+        "//python:template",
+    ],
+    main = "new_python_plugin.py",
+    python_version = "3.14",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "check_typecheck_resolution",
+    srcs = ["check_typecheck_resolution.py"],
+    python_version = "3.14",
+    visibility = ["//visibility:public"],
+    deps = [":runtime"],
+)
+
+py_library(
+    name = "runtime",
+    srcs = ["uv_tool.py"],
+    imports = ["."],
+    deps = ["@python_tools//uv"],
+)
+
+alias(
+    name = "ci",
+    actual = ":ci_tool",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "release",
+    actual = ":release_tool",
+    visibility = ["//visibility:public"],
+)

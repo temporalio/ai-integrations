@@ -1,0 +1,22 @@
+load("@aspect_rules_js//js:defs.bzl", "js_library")
+load("@aspect_rules_ts//ts:defs.bzl", "ts_config")
+
+js_library(
+    name = "config",
+    srcs = glob([
+        "*.json",
+        "*.mjs",
+    ]),
+    visibility = ["//visibility:public"],
+)
+
+exports_files(glob([
+    "*.json",
+    "*.mjs",
+]))
+
+ts_config(
+    name = "tsconfig",
+    src = "tsconfig.json",
+    visibility = ["//visibility:public"],
+)

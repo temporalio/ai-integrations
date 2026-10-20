@@ -48,9 +48,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
+      - uses: ./.github/actions/setup-bazel
       - name: Dispatch inputs are consistent with the ref
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -70,7 +68,7 @@ jobs:
           TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
         run: |
           case "$TAG" in go/*/v*) ;; *) echo "::error::expected a go/<plugin>/v<version> tag"; exit 1 ;; esac
-          uv run --project scripts --locked python scripts/release/release_tool.py parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
+          bazel run //go/_tools:release -- parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
       - name: Pin source and require main-reachable release tags
         id: source
         env:
@@ -90,7 +88,7 @@ jobs:
         env:
           PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
           VERSION: ${{ steps.tag.outputs.version }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
+        run: bazel run //go/_tools:release -- check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
       - name: Decide whether to verify the public module
         id: gate
         env:
@@ -107,13 +105,13 @@ jobs:
         if: steps.gate.outputs.verify == 'true'
         env:
           PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py check-go-vanity --plugin-dir "$PLUGIN_DIR"
+        run: bazel run //go/_tools:release -- check-go-vanity --plugin-dir "$PLUGIN_DIR"
       - name: Verify the published GitHub release
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py check-published-release --tag "$TAG"
+        run: bazel run //go/_tools:release -- check-published-release --tag "$TAG"
 
   test:
     name: Test
@@ -139,18 +137,9 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: ${{ needs.prepare.outputs.go_runtime }}
-          check-latest: true
-          cache-dependency-path: |
-            go/${{ needs.prepare.outputs.plugin }}/go.mod
-            go/${{ needs.prepare.outputs.plugin }}/go.sum
+      - uses: ./.github/actions/setup-bazel
       - name: Verify public source bytes and build a clean consumer
         env:
           PLUGIN_DIR: ${{ needs.prepare.outputs.plugin_dir }}
           VERSION: ${{ needs.prepare.outputs.version }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py verify-go-module --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
+        run: bazel run //go/_tools:release -- verify-go-module --plugin-dir "$PLUGIN_DIR" --version "$VERSION"

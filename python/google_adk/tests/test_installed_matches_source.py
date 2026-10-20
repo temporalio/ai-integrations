@@ -40,9 +40,9 @@ def test_installed_matches_source() -> None:
     actual = _digests(installed_dir)
     assert set(actual) == set(expected), (
         f"installed file set differs from src/: missing={sorted(set(expected) - set(actual))} "
-        f"extra={sorted(set(actual) - set(expected))}; run `make sync`"
+        f"extra={sorted(set(actual) - set(expected))}; run `bazel run //python/_tools:dev -- venv --plugin-dir python/<plugin>`"
     )
     mismatched = sorted(rel for rel in expected if expected[rel] != actual[rel])
     assert not mismatched, (
-        f"installed files differ from src/: {mismatched}; run `make sync`"
+        f"installed files differ from src/: {mismatched}; run `bazel run //python/_tools:dev -- venv --plugin-dir python/<plugin>`"
     )

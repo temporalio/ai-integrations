@@ -26,7 +26,11 @@ async function main() {
     plugins: [plugin],
     logger: new DefaultLogger('WARN'),
   });
-  const env = await TestWorkflowEnvironment.createLocal();
+  const env = await TestWorkflowEnvironment.createLocal({
+    server: process.env.TEMPORAL_CLI_PATH
+      ? { executable: { type: 'existing-path', path: process.env.TEMPORAL_CLI_PATH } }
+      : undefined,
+  });
   try {
     const taskQueue = 'strands-package-smoke';
     const worker = await Worker.create({

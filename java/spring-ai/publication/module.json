@@ -1,0 +1,168 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "io.temporal",
+    "module": "spring-ai",
+    "version": "0.0.0",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.1.0"
+    }
+  },
+  "variants": [
+    {
+      "name": "apiElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-api"
+      },
+      "dependencies": [
+        {
+          "group": "org.springframework.boot",
+          "module": "spring-boot-dependencies",
+          "version": {
+            "requires": "4.0.8"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          },
+          "endorseStrictVersions": true
+        },
+        {
+          "group": "org.springframework.ai",
+          "module": "spring-ai-bom",
+          "version": {
+            "requires": "2.0.1"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          },
+          "endorseStrictVersions": true
+        },
+        {
+          "group": "org.springframework.boot",
+          "module": "spring-boot-autoconfigure"
+        },
+        {
+          "group": "org.springframework.ai",
+          "module": "spring-ai-client-chat"
+        }
+      ],
+      "files": [
+        {
+          "name": "spring-ai-0.0.0.jar",
+          "url": "spring-ai-0.0.0.jar",
+          "size": 112506,
+          "sha512": "8116a0ac8b555b939192a65def9083b55ab8bef55ca3f2012130408b0ee0a1cd2f25dc2b9cfbb728a02ed9e7bc9a8540ca1e8a0686ed83766724d52620953171",
+          "sha256": "022a460eb0492b304fc02dbe22a7d3ab4a46816570e1a29a49cdab8022463c8b",
+          "sha1": "83baee640c5c7b57e9628617cf3854465da417e6",
+          "md5": "4dc500519df434032a31972e6bbb42c7"
+        }
+      ]
+    },
+    {
+      "name": "runtimeElements",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.jvm.version": 17,
+        "org.gradle.libraryelements": "jar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "org.springframework.boot",
+          "module": "spring-boot-starter"
+        },
+        {
+          "group": "org.springframework.boot",
+          "module": "spring-boot-dependencies",
+          "version": {
+            "requires": "4.0.8"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          },
+          "endorseStrictVersions": true
+        },
+        {
+          "group": "org.springframework.ai",
+          "module": "spring-ai-bom",
+          "version": {
+            "requires": "2.0.1"
+          },
+          "attributes": {
+            "org.gradle.category": "platform"
+          },
+          "endorseStrictVersions": true
+        },
+        {
+          "group": "org.springframework.boot",
+          "module": "spring-boot-autoconfigure"
+        },
+        {
+          "group": "org.springframework.ai",
+          "module": "spring-ai-client-chat"
+        }
+      ],
+      "files": [
+        {
+          "name": "spring-ai-0.0.0.jar",
+          "url": "spring-ai-0.0.0.jar",
+          "size": 112506,
+          "sha512": "8116a0ac8b555b939192a65def9083b55ab8bef55ca3f2012130408b0ee0a1cd2f25dc2b9cfbb728a02ed9e7bc9a8540ca1e8a0686ed83766724d52620953171",
+          "sha256": "022a460eb0492b304fc02dbe22a7d3ab4a46816570e1a29a49cdab8022463c8b",
+          "sha1": "83baee640c5c7b57e9628617cf3854465da417e6",
+          "md5": "4dc500519df434032a31972e6bbb42c7"
+        }
+      ]
+    },
+    {
+      "name": "sourcesElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "spring-ai-0.0.0-sources.jar",
+          "url": "spring-ai-0.0.0-sources.jar",
+          "size": 53197,
+          "sha512": "d6c46ce7fdda3f739937a6036da2e78173ab5957414d372b2856def46e4c1e9236bd3185d0489919d47edeae9eee8799d7278f0b2ee598addcbc1262b3a34c53",
+          "sha256": "6c86b62b838c0093ace788f9c88eb6949e4d89a0e907f440923213dd7654ec91",
+          "sha1": "9fd18908d2b54326447ff240dc19e009c1ba3aac",
+          "md5": "88ecae96e6f00162531c776f68ee9f8d"
+        }
+      ]
+    },
+    {
+      "name": "javadocElements",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "javadoc",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "spring-ai-0.0.0-javadoc.jar",
+          "url": "spring-ai-0.0.0-javadoc.jar",
+          "size": 4413757,
+          "sha512": "a6e2eb1dac0b2b543c1b331b7c4103ff19d57e2e37e4b38863c4ee2e7bf2fd248424c139f462d7e6502887fab3dcc89561bd0980e83f25f1e1ba937d11c5cfe0",
+          "sha256": "f92defbbb32a4823e96eaddb22199de6e4ea0eb0d75eb14924afbe02fa4b9bd7",
+          "sha1": "7f57107421c27a13654716f8cee597a94a963fb0",
+          "md5": "19b34cb5e3af1aba32fd07122ccdc01a"
+        }
+      ]
+    }
+  ]
+}

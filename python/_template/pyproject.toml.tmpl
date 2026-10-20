@@ -8,7 +8,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]   # committed copy of the repository's root LICENSE
 classifiers = [
-  "__MATURITY_CLASSIFIER__",   # maturity; must agree with plugin.toml (see AGENTS.md for the mapping)
+  "__MATURITY_CLASSIFIER__",   # maturity; must agree with plugin.toml
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
@@ -54,7 +54,7 @@ dev = [
 
 [tool.uv]
 default-groups = ["dev"]
-required-version = ">=0.12.5,<0.13"              # same value in scripts/pyproject.toml; CI reads it via setup-uv version-file
+required-version = ">=0.12.5,<0.13"              # same policy as python/_tools/pyproject.toml; Bazel pins the executable
 exclude-newer = "2 weeks"                        # org supply-chain cooldown for third-party packages
 exclude-newer-package = { temporalio = false }   # the SDK is exempt: releases must be adoptable on day one
 link-mode = "copy"

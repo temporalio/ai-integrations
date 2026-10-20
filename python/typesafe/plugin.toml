@@ -1,5 +1,3 @@
-# Schema: ../../AGENTS.md#repository-invariants
-
 [plugin]
 name = "typesafe"
 language = "python"

@@ -233,7 +233,7 @@ its configuration options.
 ## Develop
 
 ```bash
-make sync   # install (non-editable) into .venv
-make lint
-make test
+bazel run //python/_tools:dev -- venv --plugin-dir python/typesafe
+bazel test //python/typesafe:lint
+bazel test //python/typesafe:tests
 ```

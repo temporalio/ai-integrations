@@ -1,11 +1,17 @@
 *.log
 dist/
 
-# TypeScript
-node_modules/
-lib/
-*.tsbuildinfo
-.test-results/
+# Bazel
+/bazel-*
+/user.bazelrc
+/.bazel-cache/
+**/.venv-bazel
+
+# Java
+.gradle/
+build/
+java/*/bin/
+java/*/gradle/dependency-locks/*.latest.lockfile
 
 # Python
 *.py[cod]
@@ -16,8 +22,8 @@ lib/
 __pycache__/
 junit/
 
-# Java
-.gradle/
-build/
-java/*/bin/
-java/*/gradle/dependency-locks/*.latest.lockfile
+# TypeScript
+node_modules/
+lib/
+*.tsbuildinfo
+.test-results/

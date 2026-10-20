@@ -1,0 +1,14 @@
+"""Keep host installations and build outputs outside the Bazel graph."""
+
+ignore_directories([
+    "**/.gradle",
+    "**/.mypy_cache",
+    "**/.pytest_cache",
+    "**/.ruff_cache",
+    "**/.venv",
+    "**/__pycache__",
+    "**/build",
+    "**/dist",
+    "**/lib",
+    "**/node_modules",
+])

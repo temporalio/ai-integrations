@@ -1,0 +1,248 @@
+load("@npm_vercel_ai_sdk//:defs.bzl", "npm_link_all_packages")
+load("//bazel:typescript.bzl", "typescript_integration", "typescript_module")
+
+exports_files([
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "plugin.toml",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+typescript_module(
+    name = "__tests__/activities/ai-sdk",
+    srcs = [
+        "src/__tests__/activities/ai-sdk.ts",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/base64.test",
+    srcs = [
+        "src/__tests__/base64.test.ts",
+    ],
+    deps = [
+        ":base64",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/helpers/environment",
+    srcs = [
+        "src/__tests__/helpers/environment.ts",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-ai-sdk-streaming",
+    srcs = [
+        "src/__tests__/test-ai-sdk-streaming.ts",
+    ],
+    deps = [
+        ":activities",
+        ":node_modules/@ai-sdk/provider",
+        ":node_modules/@temporalio/client",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-ai-sdk",
+    srcs = [
+        "src/__tests__/test-ai-sdk.ts",
+    ],
+    deps = [
+        ":__tests__/activities/ai-sdk",
+        ":__tests__/helpers/environment",
+        ":__tests__/workflows/ai-sdk",
+        ":__tests__/workflows/otel-interceptors",
+        ":index",
+        ":node_modules/@ai-sdk/mcp",
+        ":node_modules/@ai-sdk/openai",
+        ":node_modules/@ai-sdk/provider",
+        ":node_modules/@modelcontextprotocol/sdk",
+        ":node_modules/@opentelemetry/api",
+        ":node_modules/@opentelemetry/context-async-hooks",
+        ":node_modules/@opentelemetry/core",
+        ":node_modules/@opentelemetry/resources",
+        ":node_modules/@opentelemetry/sdk-trace-base",
+        ":node_modules/@opentelemetry/semantic-conventions",
+        ":node_modules/@temporalio/client",
+        ":node_modules/@temporalio/interceptors-opentelemetry",
+        ":node_modules/@temporalio/proto",
+        ":node_modules/@temporalio/test-helpers",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ai",
+        ":node_modules/ava",
+        "//typescript/vercel-ai-sdk/tests/helpers:build",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-environment-startup.test",
+    srcs = [
+        "src/__tests__/test-environment-startup.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers/environment",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/workflows/ai-sdk",
+    srcs = [
+        "src/__tests__/workflows/ai-sdk.ts",
+    ],
+    deps = [
+        ":__tests__/activities/ai-sdk",
+        ":node_modules/@ai-sdk/otel",
+        ":node_modules/@ai-sdk/provider",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/@temporalio/workflow-streams",
+        ":node_modules/ai",
+        ":node_modules/zod",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/workflows/otel-interceptors",
+    srcs = [
+        "src/__tests__/workflows/otel-interceptors.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/interceptors-opentelemetry",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+# These modules import each other and compile together.
+typescript_module(
+    name = "activities",
+    srcs = [
+        "src/activities.ts",
+        "src/mcp.ts",
+    ],
+    deps = [
+        ":node_modules/@ai-sdk/mcp",
+        ":node_modules/@ai-sdk/provider",
+        ":node_modules/@temporalio/activity",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/@temporalio/workflow-streams",
+        ":node_modules/ai",
+    ],
+)
+
+typescript_module(
+    name = "base64",
+    srcs = [
+        "src/base64.ts",
+    ],
+    deps = [
+        ":node_modules/base64-js",
+    ],
+)
+
+typescript_module(
+    name = "index",
+    srcs = [
+        "src/index.ts",
+    ],
+    deps = [
+        ":activities",
+        ":plugin",
+        ":provider",
+    ],
+)
+
+typescript_module(
+    name = "load-polyfills",
+    srcs = [
+        "src/load-polyfills.ts",
+    ],
+    deps = [
+        ":base64",
+        ":node_modules/@types/ungap__structured-clone",
+        ":node_modules/@ungap/structured-clone",
+        ":node_modules/headers-polyfill",
+        ":node_modules/web-streams-polyfill",
+    ],
+)
+
+typescript_module(
+    name = "plugin",
+    srcs = [
+        "src/plugin.ts",
+    ],
+    deps = [
+        ":activities",
+        ":node_modules/@ai-sdk/provider",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/plugin",
+        ":node_modules/@temporalio/worker",
+        ":preload-polyfills",
+    ],
+)
+
+typescript_module(
+    name = "preload-polyfills",
+    srcs = [
+        "src/preload-polyfills.ts",
+    ],
+    deps = [
+        ":load-polyfills",
+    ],
+)
+
+typescript_module(
+    name = "provider",
+    srcs = [
+        "src/provider.ts",
+    ],
+    deps = [
+        ":node_modules/@ai-sdk/provider",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "workflow",
+    srcs = [
+        "src/workflow.ts",
+    ],
+    deps = [
+        ":activities",
+        ":provider",
+    ],
+)
+
+typescript_integration(
+    modules = [
+        ":activities",
+        ":base64",
+        ":index",
+        ":load-polyfills",
+        ":plugin",
+        ":preload-polyfills",
+        ":provider",
+        ":workflow",
+    ],
+    test_modules = [
+        ":__tests__/activities/ai-sdk",
+        ":__tests__/base64.test",
+        ":__tests__/helpers/environment",
+        ":__tests__/test-ai-sdk",
+        ":__tests__/test-ai-sdk-streaming",
+        ":__tests__/test-environment-startup.test",
+        ":__tests__/workflows/ai-sdk",
+        ":__tests__/workflows/otel-interceptors",
+    ],
+)

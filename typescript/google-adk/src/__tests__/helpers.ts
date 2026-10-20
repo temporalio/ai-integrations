@@ -60,7 +60,7 @@ export function uid(prefix: string): string {
 export function setupTestEnv(test: TestFn): () => TestWorkflowEnvironment {
   let env: TestWorkflowEnvironment;
   test.before(async () => {
-    env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
+    env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal({ server: process.env.TEMPORAL_CLI_PATH ? { executable: { type: 'existing-path', path: process.env.TEMPORAL_CLI_PATH } } : undefined }));
   });
   test.after.always(async () => {
     await env?.teardown();
@@ -95,11 +95,10 @@ export const reverseDef: MockMCPToolDefinition = {
   handler: (args) => ({ reversed: String(args.value).split('').reverse().join('') }),
 };
 
-// The test workflows are bundled from their TypeScript source. `here` is
-// `lib/__tests__` at runtime, so resolve back to the `src/__tests__` source that
-// ships alongside it.
-/** Absolute path to the test workflows source bundled into the sandbox. */
-export const workflowsPath = path.resolve(here, '../../src/__tests__/workflows.ts');
+// Bazel compiles these fixtures before running tests. Bundle that output so
+// startup does not require another TypeScript compiler and its native binding.
+/** Absolute path to the compiled test workflows bundled into the sandbox. */
+export const workflowsPath = path.resolve(here, 'workflows.js');
 
 /** A model that always raises a non-retryable (HTTP 400) error. */
 export class ThrowingLlm extends BaseLlm {

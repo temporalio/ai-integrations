@@ -1,0 +1,177 @@
+load("@gazelle//:def.bzl", "gazelle")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+exports_files([
+    "go.mod",
+    "go.sum",
+    "plugin.toml",
+])
+
+# gazelle:prefix go.temporal.io/googleadk
+# gazelle:resolve go go.temporal.io/googleadk //go/googleadk:googleadk
+# gazelle:resolve go go.temporal.io/googleadk/internal/pluginwarn //go/googleadk/internal/pluginwarn:pluginwarn
+gazelle(
+    name = "gazelle",
+    prefix = "go.temporal.io/googleadk",
+)
+
+go_library(
+    name = "googleadk",
+    srcs = [
+        "activities.go",
+        "common.go",
+        "context.go",
+        "continueasnew.go",
+        "doc.go",
+        "hitl.go",
+        "mcp.go",
+        "model.go",
+        "plugin.go",
+        "telemetry.go",
+        "testing.go",
+        "tool.go",
+    ],
+    importpath = "go.temporal.io/googleadk",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_google_uuid//:uuid",
+        "@io_opentelemetry_go_otel//:go_default_library",
+        "@io_opentelemetry_go_otel_log//:go_default_library",
+        "@io_opentelemetry_go_otel_log//global:go_default_library",
+        "@io_opentelemetry_go_otel_metric//:go_default_library",
+        "@io_opentelemetry_go_otel_sdk//trace:go_default_library",
+        "@io_opentelemetry_go_otel_sdk_log//:go_default_library",
+        "@io_opentelemetry_go_otel_sdk_metric//:go_default_library",
+        "@io_opentelemetry_go_otel_trace//:go_default_library",
+        "@io_temporal_go_sdk//activity:go_default_library",
+        "@io_temporal_go_sdk//log:go_default_library",
+        "@io_temporal_go_sdk//temporal:go_default_library",
+        "@io_temporal_go_sdk//worker:go_default_library",
+        "@io_temporal_go_sdk//workflow:go_default_library",
+        "@io_temporal_go_sdk_contrib_workflowstreams//:go_default_library",
+        "@org_golang_google_adk_v2//agent:go_default_library",
+        "@org_golang_google_adk_v2//memory:go_default_library",
+        "@org_golang_google_adk_v2//model:go_default_library",
+        "@org_golang_google_adk_v2//model/gemini:go_default_library",
+        "@org_golang_google_adk_v2//platform:go_default_library",
+        "@org_golang_google_adk_v2//session:go_default_library",
+        "@org_golang_google_adk_v2//tool:go_default_library",
+        "@org_golang_google_adk_v2//tool/toolconfirmation:go_default_library",
+        "@org_golang_google_adk_v2//tool/toolutils:go_default_library",
+        "@org_golang_google_genai//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "googleadk_test",
+    size = "large",
+    timeout = "long",
+    srcs = [
+        "aggregate_internal_test.go",
+        "aggregate_terminal_internal_test.go",
+        "childworkflow_test.go",
+        "context_test.go",
+        "continueasnew_scopes_test.go",
+        "continueasnew_test.go",
+        "converter_test.go",
+        "gemini_e2e_test.go",
+        "harness_test.go",
+        "heartbeat_test.go",
+        "hitl_test.go",
+        "integration_test.go",
+        "mcp_closed_internal_test.go",
+        "mcp_hitl_test.go",
+        "mcp_lifecycle_test.go",
+        "mcp_test.go",
+        "model_test.go",
+        "nested_fanout_test.go",
+        "plugin_test.go",
+        "registry_internal_test.go",
+        "run_test.go",
+        "streaming_test.go",
+        "telemetry_internal_test.go",
+        "telemetry_liveops_test.go",
+        "telemetry_otelv2_probe_test.go",
+        "telemetry_surface_internal_test.go",
+        "telemetry_test.go",
+        "tool_schema_test.go",
+        "tool_test.go",
+        "tool_validation_test.go",
+    ],
+    data = ["//bazel/temporal:cli"],
+    embed = [":googleadk"],
+    env = {"TEMPORAL_CLI_RUNFILE": "$(rlocationpath //bazel/temporal:cli)"},
+    tags = ["no-remote-exec"],
+    deps = [
+        "@com_github_google_uuid//:uuid",
+        "@com_github_nexus_rpc_sdk_go//nexus:go_default_library",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@io_opentelemetry_go_otel//:go_default_library",
+        "@io_opentelemetry_go_otel_log//:go_default_library",
+        "@io_opentelemetry_go_otel_log//embedded:go_default_library",
+        "@io_opentelemetry_go_otel_log//global:go_default_library",
+        "@io_opentelemetry_go_otel_log//noop:go_default_library",
+        "@io_opentelemetry_go_otel_metric//:go_default_library",
+        "@io_opentelemetry_go_otel_metric//embedded:go_default_library",
+        "@io_opentelemetry_go_otel_metric//noop:go_default_library",
+        "@io_opentelemetry_go_otel_sdk//trace:go_default_library",
+        "@io_opentelemetry_go_otel_sdk//trace/tracetest:go_default_library",
+        "@io_opentelemetry_go_otel_sdk_log//:go_default_library",
+        "@io_opentelemetry_go_otel_sdk_metric//:go_default_library",
+        "@io_opentelemetry_go_otel_sdk_metric//metricdata:go_default_library",
+        "@io_opentelemetry_go_otel_trace//:go_default_library",
+        "@io_opentelemetry_go_otel_trace//embedded:go_default_library",
+        "@io_opentelemetry_go_otel_trace//noop:go_default_library",
+        "@io_temporal_go_sdk//activity:go_default_library",
+        "@io_temporal_go_sdk//client:go_default_library",
+        "@io_temporal_go_sdk//converter:go_default_library",
+        "@io_temporal_go_sdk//temporal:go_default_library",
+        "@io_temporal_go_sdk//testsuite:go_default_library",
+        "@io_temporal_go_sdk//worker:go_default_library",
+        "@io_temporal_go_sdk//workflow:go_default_library",
+        "@io_temporal_go_sdk_contrib_workflowstreams//:go_default_library",
+        "@org_golang_google_adk_v2//agent:go_default_library",
+        "@org_golang_google_adk_v2//agent/llmagent:go_default_library",
+        "@org_golang_google_adk_v2//model:go_default_library",
+        "@org_golang_google_adk_v2//model/gemini:go_default_library",
+        "@org_golang_google_adk_v2//platform:go_default_library",
+        "@org_golang_google_adk_v2//runner:go_default_library",
+        "@org_golang_google_adk_v2//session:go_default_library",
+        "@org_golang_google_adk_v2//tool:go_default_library",
+        "@org_golang_google_adk_v2//tool/agenttool:go_default_library",
+        "@org_golang_google_adk_v2//tool/functiontool:go_default_library",
+        "@org_golang_google_genai//:go_default_library",
+    ],
+)
+
+alias(
+    name = "build",
+    actual = ":googleadk",
+)
+
+test_suite(
+    name = "tests",
+    tests = [
+        ":googleadk_test",
+        "//go/googleadk/internal/pluginwarn:pluginwarn_test",
+    ],
+)
+
+go_test(
+    name = "lint",
+    srcs = ["//go/_tools:format_test.go"],
+    data = [":format_sources"],
+    env = {"GO_PLUGIN_FILES": "$(rlocationpaths :format_sources)"},
+    deps = ["@rules_go//go/runfiles"],
+)
+
+filegroup(
+    name = "format_sources",
+    srcs = glob(["*.go"]) + ["//go/googleadk/internal/pluginwarn:format_sources"],
+)
+
+alias(
+    name = "dist",
+    actual = ":build",
+)

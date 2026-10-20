@@ -33,5 +33,3 @@ Worker environment. See the [integration guide](https://docs.temporal.io/develop
 for model, tool, streaming and MCP configuration. That guide currently uses the
 SDK-owned `@temporalio/ai-sdk` name; this repository owns the new
 `@temporalio/vercel-ai-sdk` coordinate.
-
-Development details are in [typescript/README.md](../README.md).

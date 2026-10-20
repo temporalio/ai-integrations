@@ -6,9 +6,10 @@
  * the unit under test.
  */
 import { condition, defineQuery, defineSignal, defineUpdate, setHandler } from '@temporalio/workflow';
+import type { UpdateDefinition } from '@temporalio/common';
 
 export const pingQuery = defineQuery<string>('ping');
-export const noopUpdate = defineUpdate<string, [string]>('noopUpdate');
+export const noopUpdate: UpdateDefinition<string, [string]> = defineUpdate<string, [string]>('noopUpdate');
 export const finishSignal = defineSignal('finish');
 
 export async function readonlyTracingWorkflow(): Promise<string> {

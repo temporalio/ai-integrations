@@ -1,0 +1,36 @@
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+load("//bazel:go.bzl", "go_command")
+load("//bazel:node.bzl", "node_command")
+
+exports_files(glob([
+    "*.bzl",
+    "*.MODULE.bazel",
+]))
+
+string_flag(
+    name = "release_version",
+    build_setting_default = "0.0.0",
+    visibility = ["//visibility:public"],
+)
+
+string_flag(
+    name = "spring_boot",
+    build_setting_default = "4.0.8",
+    visibility = ["//visibility:public"],
+)
+
+go_command(
+    name = "go",
+    visibility = ["//visibility:public"],
+)
+
+node_command(
+    name = "node",
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "python310",
+    flag_values = {"@rules_python//python/config_settings:python_version": "3.10"},
+    visibility = ["//visibility:public"],
+)

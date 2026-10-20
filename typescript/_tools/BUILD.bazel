@@ -1,0 +1,83 @@
+load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_library", "js_test")
+load("@aspect_rules_ts//ts:defs.bzl", "ts_project")
+load("@npm_tools//:defs.bzl", "npm_link_all_packages")
+
+exports_files([
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+ts_project(
+    name = "build",
+    srcs = glob(["src/**/*.ts"]),
+    declaration = True,
+    out_dir = "lib",
+    root_dir = "src",
+    tsconfig = "tsconfig.json",
+    visibility = ["//visibility:public"],
+    deps = [":node_modules"],
+)
+
+[js_binary(
+    name = name,
+    data = [
+        ":build",
+        ":node_modules",
+    ] + (["//bazel/temporal:cli"] if name == "package" else []),
+    entry_point = "lib/" + file + ".js",
+    env = {"TEMPORAL_CLI_RUNFILE": "$(rlocationpath //bazel/temporal:cli)"} if name == "package" else {},
+    no_copy_to_bin = ["//bazel/temporal:cli"] if name == "package" else [],
+    visibility = ["//visibility:public"],
+) for name, file in [
+    ("release", "release"),
+    ("package", "package"),
+    ("ci", "ci"),
+    ("dev", "dev"),
+]]
+
+js_test(
+    name = "unit_tests",
+    data = [
+        ":build",
+        ":node_modules",
+    ],
+    entry_point = "lib/tools.test.js",
+)
+
+js_test(
+    name = "compilation_test",
+    data = [
+        ":build",
+        ":node_modules/typescript",
+        "//typescript/_tools/testdata/compilation:fixtures",
+    ],
+    entry_point = "lib/compilation.test.js",
+    include_transitive_types = True,
+)
+
+test_suite(
+    name = "tool_tests",
+    tests = [
+        ":compilation_test",
+        ":unit_tests",
+    ],
+)
+
+js_library(
+    name = "test_runtime",
+    srcs = [
+        ":lib/real-node.js",
+        ":lib/test-runner.js",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [":node_modules/@bazel/runfiles"],
+)
+
+js_library(
+    name = "lint_runtime",
+    srcs = [":lib/lint-runner.js"],
+    visibility = ["//visibility:public"],
+)

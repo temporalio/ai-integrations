@@ -1,0 +1,96 @@
+"""Checksummed Temporal binaries; SDK tests never download executables."""
+
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "temporal_cli_darwin_amd64",
+    build_file_content = 'exports_files(["temporal"])',
+    sha256 = "48cdd6c84c56e27ae8e4d9a47052b89289a9c552dee029b49dd312c6fb72873f",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.9.1/temporal_cli_1.9.1_darwin_amd64.tar.gz"],
+)
+
+http_archive(
+    name = "temporal_cli_darwin_arm64",
+    build_file_content = 'exports_files(["temporal"])',
+    sha256 = "41e0425378fcb4fb5766340b97435e20fe47bbff2d7bf644ec2d51f7662b7c56",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.9.1/temporal_cli_1.9.1_darwin_arm64.tar.gz"],
+)
+
+http_archive(
+    name = "temporal_cli_linux_amd64",
+    build_file_content = 'exports_files(["temporal"])',
+    sha256 = "09a0326a51db84d02735e53542b9ebd8c4758daf47482a9ab0abce15844e60d5",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.9.1/temporal_cli_1.9.1_linux_amd64.tar.gz"],
+)
+
+http_archive(
+    name = "temporal_cli_linux_arm64",
+    build_file_content = 'exports_files(["temporal"])',
+    sha256 = "6c57c352d52fc3df34412376fd9ba6f74b7e3ace8e426e6cba8600156d36a145",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.9.1/temporal_cli_1.9.1_linux_arm64.tar.gz"],
+)
+
+http_archive(
+    name = "temporal_cli_windows_amd64",
+    build_file_content = 'exports_files(["temporal.exe"])',
+    sha256 = "42637464c337a3da203fbd4e8c688e4b2d511fd42bd19c337c0422e923a7b619",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.9.1/temporal_cli_1.9.1_windows_amd64.tar.gz"],
+)
+
+http_archive(
+    name = "temporal_cli_windows_arm64",
+    build_file_content = 'exports_files(["temporal.exe"])',
+    sha256 = "cfdfe43e69a2261191148294b1f7e3a7088ef8d3dc1ab1909b115b1784b6c6fe",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.9.1/temporal_cli_1.9.1_windows_arm64.tar.gz"],
+)
+
+http_archive(
+    name = "temporal_cli_python_darwin_amd64",
+    build_file_content = 'exports_files(["temporal"])',
+    sha256 = "10736201a82ad618485f3eb31c82c80afc381797d182f61d3d3f0b822a06e8e4",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.8.3-server-1.32.0-162.0/temporal_cli_1.8.3-server-1.32.0-162.0_darwin_amd64.tar.gz"],
+)
+
+http_archive(
+    name = "temporal_cli_python_darwin_arm64",
+    build_file_content = 'exports_files(["temporal"])',
+    sha256 = "7052789d55c53ada1c01b73893e7ac72553d11d10fee9469d1405752ebb1b1cd",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.8.3-server-1.32.0-162.0/temporal_cli_1.8.3-server-1.32.0-162.0_darwin_arm64.tar.gz"],
+)
+
+http_archive(
+    name = "temporal_cli_python_linux_amd64",
+    build_file_content = 'exports_files(["temporal"])',
+    sha256 = "fd26655b40f5a4ebeb3e632676f63c6c939bd2d05aec9d61dc23df190a950909",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.8.3-server-1.32.0-162.0/temporal_cli_1.8.3-server-1.32.0-162.0_linux_amd64.tar.gz"],
+)
+
+http_archive(
+    name = "temporal_cli_python_linux_arm64",
+    build_file_content = 'exports_files(["temporal"])',
+    sha256 = "ebf79ea0692965d30d2ae5b95d9a518e4dacf3e43708fcdf87a6fcb0edd58f95",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.8.3-server-1.32.0-162.0/temporal_cli_1.8.3-server-1.32.0-162.0_linux_arm64.tar.gz"],
+)
+
+http_archive(
+    name = "temporal_cli_python_windows_amd64",
+    build_file_content = 'exports_files(["temporal.exe"])',
+    sha256 = "04e03a3528a64f3ccb8011fa14e4936427fb626cfeaa0e6427de667fcfaa510b",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.8.3-server-1.32.0-162.0/temporal_cli_1.8.3-server-1.32.0-162.0_windows_amd64.tar.gz"],
+)
+
+http_archive(
+    name = "temporal_cli_python_windows_arm64",
+    build_file_content = 'exports_files(["temporal.exe"])',
+    sha256 = "fc7cc175bb5747e24c8ede822272238c5a9bf4e7e6e919c57d64e7cef9c8c757",
+    urls = ["https://github.com/temporalio/cli/releases/download/v1.8.3-server-1.32.0-162.0/temporal_cli_1.8.3-server-1.32.0-162.0_windows_arm64.tar.gz"],
+)
+
+# Consumer smoke tests exercise Maven and Gradle metadata using the existing pinned Gradle.
+http_archive(
+    name = "gradle_consumer",
+    build_file_content = 'exports_files(["bin/gradle", "bin/gradle.bat"])\nfilegroup(name="distribution", srcs=glob(["bin/**", "lib/**"]), visibility=["//visibility:public"])\n',
+    sha256 = "a17ddd85a26b6a7f5ddb71ff8b05fc5104c0202c6e64782429790c933686c806",
+    strip_prefix = "gradle-9.1.0",
+    urls = ["https://services.gradle.org/distributions/gradle-9.1.0-bin.zip"],
+)

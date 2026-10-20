@@ -82,11 +82,12 @@ requests across the default three Activity attempts.
 ## Development
 
 ```bash
-./gradlew spotlessCheck test stageDist
+bazel test //java/spring-ai:tests
+bazel build //java/spring-ai:dist
 ```
 
 The full Java/OS matrix runs for each supported Boot version, using committed locks.
-Deliberately update locks with `./gradlew resolveAndLockAll --write-locks`
+Deliberately update locks with `bazel run //java/_tools:dev -- update --plugin-dir java/spring-ai`
 (and `-PspringBootVersion=4.1.1` for that compatibility lane).
 
 Nightly CI and manual runs with `latest-deps=true` test stable releases in Temporal
@@ -94,8 +95,8 @@ Nightly CI and manual runs with `latest-deps=true` test stable releases in Tempo
 To run that check locally:
 
 ```bash
-./gradlew -PdependencyMode=latest resolveAndLockAll --write-locks --refresh-dependencies
-./gradlew -PdependencyMode=latest spotlessCheck test stageDist
+bazel run //java/_tools:dev -- update --plugin-dir java/spring-ai
+bazel test //java/spring-ai:tests
 ```
 
 Latest mode writes a separate ignored lockfile and reuses its selected versions

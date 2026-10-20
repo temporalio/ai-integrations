@@ -54,9 +54,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
+      - uses: ./.github/actions/setup-bazel
       - name: Dispatch inputs are consistent with the ref
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -76,7 +74,7 @@ jobs:
           TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
         run: |
           case "$TAG" in typescript/*/v*) ;; *) echo "::error::expected typescript/<plugin>/v<version>"; exit 1 ;; esac
-          uv run --project scripts --locked python scripts/release/release_tool.py parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
+          bazel run //typescript/_tools:release -- parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
       - name: Pin source and require main-reachable release tags
         id: source
         env:
@@ -94,7 +92,7 @@ jobs:
         env:
           PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
           VERSION: ${{ steps.tag.outputs.version }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
+        run: bazel run //typescript/_tools:release -- check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
       - name: Validate publication recovery
         id: recovery
         if: github.event_name == 'workflow_dispatch' && inputs.recover-run != ''
@@ -107,7 +105,7 @@ jobs:
           if [ "$REF_TYPE" != "tag" ]; then
             echo "::error::npm artifact recovery must be dispatched on the release tag"; exit 1
           fi
-          uv run --project scripts --locked python scripts/release/release_tool.py check-recovery-run --tag "$TAG" --run-id "$RUN_ID" --github-output "$GITHUB_OUTPUT"
+          bazel run //typescript/_tools:release -- check-recovery-run --tag "$TAG" --run-id "$RUN_ID" --github-output "$GITHUB_OUTPUT"
       - name: Decide whether to publish
         id: gate
         env:
@@ -128,7 +126,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py check-published-release --tag "$TAG" --github-output "$GITHUB_OUTPUT"
+        run: bazel run //typescript/_tools:release -- check-published-release --tag "$TAG" --github-output "$GITHUB_OUTPUT"
 
   test:
     name: Test
@@ -175,9 +173,7 @@ jobs:
           check-latest: true
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
+      - uses: ./.github/actions/setup-bazel
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: npm-dist-${{ needs.prepare.outputs.plugin }}
@@ -186,13 +182,16 @@ jobs:
           run-id: ${{ needs.prepare.outputs.artifact_run_id }}
       - name: Check whether these exact bytes are already published
         id: existing
-        run: uv run --project scripts --locked python scripts/release/release_tool.py npm-registry-state --coordinate "$COORDINATE" --version "$VERSION" --dist "$PLUGIN_DIR/dist" --github-output "$GITHUB_OUTPUT"
+        run: bazel run //typescript/_tools:release -- npm-registry-state --coordinate "$COORDINATE" --version "$VERSION" --dist "$PLUGIN_DIR/dist" --github-output "$GITHUB_OUTPUT"
       - name: Publish with npm trusted publishing
         if: steps.existing.outputs.exists == 'false'
         run: npm publish "$PLUGIN_DIR"/dist/*.tgz --access public --tag "$DIST_TAG" --ignore-scripts
       - name: Verify public npm bytes
-        run: uv run --project scripts --locked python scripts/release/release_tool.py npm-registry-state --coordinate "$COORDINATE" --version "$VERSION" --dist "$PLUGIN_DIR/dist" --require-present --attempts 12 --delay 10
+        run: bazel run //typescript/_tools:release -- npm-registry-state --coordinate "$COORDINATE" --version "$VERSION" --dist "$PLUGIN_DIR/dist" --require-present --attempts 12 --delay 10
       - name: Install the public version in a clean consumer
         env:
           NPM_REGISTRY_VERSION: ${{ needs.prepare.outputs.version }}
-        run: cd "$PLUGIN_DIR" && node ../_shared/smoke.mjs
+        run: |
+          for archive in "$PLUGIN_DIR"/dist/*.tgz; do
+            bazel run //typescript/_tools:package -- smoke --plugin-dir "$PLUGIN_DIR" --archive "$archive"
+          done

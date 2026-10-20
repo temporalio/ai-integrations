@@ -1,7 +1,7 @@
 # Repository CI entry point. One workflow for every language; the plugin is a
 # parameter of the per-language reusable workflow (never a per-plugin copy).
 #
-#   changes      -> which plugins the event touches (scripts/ci/detect_changes.py)
+#   changes      -> which plugins the event touches (Bazel metadata selection)
 #   conventions  -> repository invariants + tooling tests (always)
 #   python       -> _python-plugin.yml once per changed Python plugin (locked deps; newest on nightly)
 #   typescript   -> _typescript-plugin.yml once per changed TypeScript plugin
@@ -54,6 +54,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - uses: ./.github/actions/setup-bazel
       - name: Detect changed plugins
         id: detect
         env:
@@ -62,7 +63,7 @@ jobs:
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
-        run: python3 scripts/ci/detect_changes.py --github-output "$GITHUB_OUTPUT"
+        run: bazel run //python/_tools:ci -- select --github-output "$GITHUB_OUTPUT"
 
   conventions:
     name: Conventions and tooling tests
@@ -73,15 +74,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
-          enable-cache: true
-          cache-dependency-glob: scripts/uv.lock
+      - uses: ./.github/actions/setup-bazel
       - name: Check repository conventions
-        run: uv run --project scripts --locked python scripts/ci/check_conventions.py
+        run: |
+          bazel run //:buildifier.check
+          bazel run //python/_tools:ci -- conventions
+          bazel run //typescript/_tools:ci -- conventions
+          bazel run //java/_tools:ci -- conventions
+          bazel run //go/_tools:ci -- conventions
       - name: Tooling unit tests
-        run: uv run --project scripts --locked pytest scripts/tests -q
+        run: bazel test //python/_tools:tool_tests //typescript/_tools:tool_tests //java/_tools:tool_tests //go/_tools:tool_tests
 
   python:
     name: Python
@@ -156,12 +158,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: ./.github/actions/setup-bazel
       - name: Open, update, or close nightly issues
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-        run: python3 scripts/ci/nightly_report.py
+        run: bazel run //python/_tools:ci -- nightly
 
   ci-status:
     name: ci-status

@@ -17,12 +17,15 @@ import io.temporal.worker.Worker;
 import io.temporal.worker.WorkerFactory;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
@@ -36,7 +39,19 @@ import org.springframework.context.annotation.Configuration;
 class SpringBootAutoConfigurationTest {
   @Test
   @Timeout(30)
-  void discoversAutoConfiguredMcpClientListAndExecutesToolsThroughActivities() {
+  void discoversAutoConfiguredMcpClientListAndExecutesToolsThroughActivities(
+      @TempDir Path directory) throws IOException {
+    Path javaArgs = directory.resolve("mcp-server.args");
+    String classpath =
+        System.getProperty("mcp.test.classpath", System.getProperty("java.class.path"));
+    // Bazel's classpath can exceed the Windows process command-line limit.
+    Files.writeString(
+        javaArgs,
+        "-cp\n\""
+            + classpath.replace("\\", "\\\\").replace("\"", "\\\"")
+            + "\"\n"
+            + StdioMcpTestServer.class.getName()
+            + "\n");
     new ApplicationContextRunner()
         .withUserConfiguration(Application.class)
         .withPropertyValues(
@@ -46,11 +61,7 @@ class SpringBootAutoConfigurationTest {
             "spring.temporal.workers[0].workflow-classes[0]=" + McpWorkflowImpl.class.getName(),
             "spring.ai.mcp.client.stdio.connections.filesystem.command="
                 + Path.of(System.getProperty("java.home"), "bin", "java"),
-            "spring.ai.mcp.client.stdio.connections.filesystem.args[0]=-cp",
-            "spring.ai.mcp.client.stdio.connections.filesystem.args[1]="
-                + System.getProperty("mcp.test.classpath"),
-            "spring.ai.mcp.client.stdio.connections.filesystem.args[2]="
-                + StdioMcpTestServer.class.getName())
+            "spring.ai.mcp.client.stdio.connections.filesystem.args[0]=@" + javaArgs)
         .run(
             context -> {
               assertNull(context.getStartupFailure());

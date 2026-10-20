@@ -1,0 +1,8 @@
+filegroup(
+    name = "config",
+    srcs = glob([
+        "*.json",
+        "*.toml",
+    ]),
+    visibility = ["//visibility:public"],
+)

@@ -10,11 +10,9 @@ pytestmark = pytest.mark.skipif(
     sys.version_info < (3, 11),
     reason="langgraph.types.interrupt() requires Python >= 3.11 for async context propagation",
 )
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
-from langgraph.graph.state import (  # pyright: ignore[reportMissingTypeStubs]
-    RunnableConfig,
-)
 from typing_extensions import TypedDict
 
 from temporalio import workflow

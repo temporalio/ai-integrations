@@ -1,0 +1,47 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+
+exports_files([
+    "go.mod",
+    "go.sum",
+    "format_test.go",
+])
+
+go_library(
+    name = "tools",
+    srcs = glob(
+        ["*.go"],
+        exclude = ["*_test.go"],
+    ),
+    importpath = "temporal.io/ai-integrations/go-tools",
+    deps = [
+        "@com_github_pelletier_go_toml_v2//:go-toml",
+        "@org_golang_x_mod//semver",
+        "@rules_go//go/runfiles",
+    ],
+)
+
+[go_binary(
+    name = name,
+    data = [
+        "//bazel:go",
+        "@plugin_metadata//:plugins.json",
+    ],
+    embed = [":tools"],
+    visibility = ["//visibility:public"],
+    x_defs = {
+        "main.goRunfile": "$(rlocationpath //bazel:go)",
+        "main.metadataRunfile": "$(rlocationpath @plugin_metadata//:plugins.json)",
+    },
+) for name in [
+    "ci",
+    "release",
+    "dev",
+    "lint",
+]]
+
+go_test(
+    name = "tool_tests",
+    srcs = glob(["*_test.go"]),
+    embed = [":tools"],
+    deps = ["@rules_go//go/runfiles"],
+)

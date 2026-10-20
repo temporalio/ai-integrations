@@ -1,0 +1,451 @@
+load("@npm_langsmith//:defs.bzl", "npm_link_all_packages")
+load("//bazel:typescript.bzl", "typescript_integration", "typescript_module")
+
+exports_files([
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "plugin.toml",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+typescript_module(
+    name = "__tests__/activities/comprehensive",
+    srcs = [
+        "src/__tests__/activities/comprehensive.ts",
+    ],
+    deps = [
+        ":node_modules/langsmith",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/activities/langsmith",
+    srcs = [
+        "src/__tests__/activities/langsmith.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/common",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/helpers",
+    srcs = [
+        "src/__tests__/helpers.ts",
+    ],
+    deps = [
+        ":__tests__/helpers/environment",
+        ":__tests__/workflows/langsmith",
+        ":index",
+        ":node_modules/@temporalio/client",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+        ":node_modules/langsmith",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/helpers/environment",
+    srcs = [
+        "src/__tests__/helpers/environment.ts",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/stubs/nexus",
+    srcs = [
+        "src/__tests__/stubs/nexus.ts",
+    ],
+    deps = [
+        ":node_modules/langsmith",
+        ":node_modules/nexus-rpc",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-client-args",
+    srcs = [
+        "src/__tests__/test-client-args.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":client-interceptor",
+        ":node_modules/@temporalio/client",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-comprehensive",
+    srcs = [
+        "src/__tests__/test-comprehensive.ts",
+    ],
+    deps = [
+        ":__tests__/activities/comprehensive",
+        ":__tests__/helpers",
+        ":__tests__/stubs/nexus",
+        ":__tests__/workflows/comprehensive",
+        ":node_modules/ava",
+        ":node_modules/langsmith",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-continue-as-new",
+    srcs = [
+        "src/__tests__/test-continue-as-new.ts",
+    ],
+    deps = [
+        ":__tests__/activities/langsmith",
+        ":__tests__/helpers",
+        ":__tests__/workflows/langsmith",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-env",
+    srcs = [
+        "src/__tests__/test-env.ts",
+    ],
+    deps = [
+        ":__tests__/activities/langsmith",
+        ":__tests__/helpers",
+        ":__tests__/workflows/langsmith",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-environment-startup.test",
+    srcs = [
+        "src/__tests__/test-environment-startup.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers/environment",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-errors",
+    srcs = [
+        "src/__tests__/test-errors.ts",
+    ],
+    deps = [
+        ":__tests__/activities/langsmith",
+        ":__tests__/helpers",
+        ":__tests__/workflows/langsmith",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-flush",
+    srcs = [
+        "src/__tests__/test-flush.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":index",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-parenting-edge-cases",
+    srcs = [
+        "src/__tests__/test-parenting-edge-cases.ts",
+    ],
+    deps = [
+        ":__tests__/activities/langsmith",
+        ":__tests__/helpers",
+        ":__tests__/workflows/langsmith",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-query-filter",
+    srcs = [
+        "src/__tests__/test-query-filter.ts",
+    ],
+    deps = [
+        ":__tests__/activities/langsmith",
+        ":__tests__/helpers",
+        ":__tests__/workflows/langsmith",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-readonly-determinism",
+    srcs = [
+        "src/__tests__/test-readonly-determinism.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":__tests__/workflows/langsmith",
+        ":index",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-replay-parenting",
+    srcs = [
+        "src/__tests__/test-replay-parenting.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":__tests__/workflows/langsmith",
+        ":index",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-replay",
+    srcs = [
+        "src/__tests__/test-replay.ts",
+    ],
+    deps = [
+        ":__tests__/activities/langsmith",
+        ":__tests__/helpers",
+        ":__tests__/workflows/langsmith",
+        ":index",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-side-effects",
+    srcs = [
+        "src/__tests__/test-side-effects.ts",
+    ],
+    deps = [
+        ":__tests__/activities/langsmith",
+        ":__tests__/helpers",
+        ":__tests__/workflows/langsmith",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-signal-child",
+    srcs = [
+        "src/__tests__/test-signal-child.ts",
+    ],
+    deps = [
+        ":__tests__/activities/langsmith",
+        ":__tests__/helpers",
+        ":__tests__/workflows/langsmith",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-signal-start",
+    srcs = [
+        "src/__tests__/test-signal-start.ts",
+    ],
+    deps = [
+        ":__tests__/activities/langsmith",
+        ":__tests__/helpers",
+        ":__tests__/workflows/langsmith",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-unit",
+    srcs = [
+        "src/__tests__/test-unit.ts",
+    ],
+    deps = [
+        ":__tests__/helpers",
+        ":index",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+        ":propagation",
+        ":run-tree",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/workflows/comprehensive",
+    srcs = [
+        "src/__tests__/workflows/comprehensive.ts",
+    ],
+    deps = [
+        ":__tests__/activities/comprehensive",
+        ":__tests__/stubs/nexus",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/langsmith",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/workflows/langsmith",
+    srcs = [
+        "src/__tests__/workflows/langsmith.ts",
+    ],
+    deps = [
+        ":__tests__/activities/langsmith",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/langsmith",
+    ],
+)
+
+typescript_module(
+    name = "activity-interceptor",
+    srcs = [
+        "src/activity-interceptor.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/activity",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/langsmith",
+        ":propagation",
+        ":run-tree",
+        ":sinks",
+    ],
+)
+
+typescript_module(
+    name = "async-hooks-shim",
+    srcs = [
+        "src/async-hooks-shim.ts",
+    ],
+)
+
+typescript_module(
+    name = "client-interceptor",
+    srcs = [
+        "src/client-interceptor.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/client",
+        ":node_modules/langsmith",
+        ":propagation",
+        ":run-tree",
+        ":sinks",
+    ],
+)
+
+# These modules import each other and compile together.
+typescript_module(
+    name = "index",
+    srcs = [
+        "src/index.ts",
+        "src/plugin.ts",
+    ],
+    deps = [
+        ":activity-interceptor",
+        ":async-hooks-shim",
+        ":client-interceptor",
+        ":node_modules/@temporalio/client",
+        ":node_modules/@temporalio/plugin",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/langsmith",
+        ":node_modules/nexus-rpc",
+        ":sinks",
+        ":workflow-interceptors",
+    ],
+)
+
+typescript_module(
+    name = "propagation",
+    srcs = [
+        "src/propagation.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/common",
+    ],
+)
+
+typescript_module(
+    name = "run-tree",
+    srcs = [
+        "src/run-tree.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/langsmith",
+        ":propagation",
+        ":sinks",
+    ],
+)
+
+typescript_module(
+    name = "sinks",
+    srcs = [
+        "src/sinks.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/worker",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/langsmith",
+    ],
+)
+
+typescript_module(
+    name = "workflow-interceptors",
+    srcs = [
+        "src/workflow-interceptors.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/langsmith",
+        ":propagation",
+        ":run-tree",
+    ],
+)
+
+typescript_integration(
+    modules = [
+        ":activity-interceptor",
+        ":async-hooks-shim",
+        ":client-interceptor",
+        ":index",
+        ":propagation",
+        ":run-tree",
+        ":sinks",
+        ":workflow-interceptors",
+    ],
+    test_modules = [
+        ":__tests__/activities/comprehensive",
+        ":__tests__/activities/langsmith",
+        ":__tests__/helpers",
+        ":__tests__/helpers/environment",
+        ":__tests__/stubs/nexus",
+        ":__tests__/test-client-args",
+        ":__tests__/test-comprehensive",
+        ":__tests__/test-continue-as-new",
+        ":__tests__/test-env",
+        ":__tests__/test-environment-startup.test",
+        ":__tests__/test-errors",
+        ":__tests__/test-flush",
+        ":__tests__/test-parenting-edge-cases",
+        ":__tests__/test-query-filter",
+        ":__tests__/test-readonly-determinism",
+        ":__tests__/test-replay",
+        ":__tests__/test-replay-parenting",
+        ":__tests__/test-side-effects",
+        ":__tests__/test-signal-child",
+        ":__tests__/test-signal-start",
+        ":__tests__/test-unit",
+        ":__tests__/workflows/comprehensive",
+        ":__tests__/workflows/langsmith",
+    ],
+)

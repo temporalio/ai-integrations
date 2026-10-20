@@ -1,0 +1,41 @@
+load("@buildifier_prebuilt//:rules.bzl", "buildifier")
+
+exports_files([
+    "LICENSE",
+    "MODULE.bazel",
+])
+
+filegroup(
+    name = "repository_files",
+    srcs = glob([
+        ".github/**/*.yml",
+        "*.md",
+        ".bazel*",
+        "*.bazel",
+    ]),
+    visibility = ["//visibility:public"],
+)
+
+buildifier(
+    name = "buildifier",
+    exclude_patterns = [
+        "*/node_modules/*",
+        "*/.venv/*",
+        "*/lib/*",
+        "*/build/*",
+    ],
+    lint_mode = "fix",
+    mode = "fix",
+)
+
+buildifier(
+    name = "buildifier.check",
+    exclude_patterns = [
+        "*/node_modules/*",
+        "*/.venv/*",
+        "*/lib/*",
+        "*/build/*",
+    ],
+    lint_mode = "warn",
+    mode = "check",
+)

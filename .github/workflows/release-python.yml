@@ -84,9 +84,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
+      - uses: ./.github/actions/setup-bazel
       - name: Dispatch inputs are consistent with the ref
         if: github.event_name == 'workflow_dispatch'
         env:
@@ -104,7 +102,7 @@ jobs:
         id: tag
         env:
           TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
+        run: bazel run //python/_tools:release -- parse-tag "$TAG" --github-output "$GITHUB_OUTPUT"
       - name: Tag is reachable from main
         # fetch-depth 0 above already brought origin/main; no extra fetch (credentials are not persisted).
         env:
@@ -120,7 +118,7 @@ jobs:
         env:
           PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
           VERSION: ${{ steps.tag.outputs.version }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py --repo-root "$PWD" check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION" --check-testpypi
+        run: bazel run //python/_tools:release -- --repo-root "$PWD" check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION" --check-testpypi
       - name: Validate publication recovery
         id: recovery
         if: github.event_name == 'workflow_dispatch' && inputs.recover-run != ''
@@ -134,7 +132,7 @@ jobs:
           if [ "$REF_TYPE" != "branch" ] || [ "$REF_NAME" != "main" ]; then
             echo "::error::publication recovery must be dispatched on main with an existing tag input"; exit 1
           fi
-          uv run --project scripts --locked python scripts/release/release_tool.py check-recovery-run --tag "$TAG" --run-id "$RUN_ID" --github-output "$GITHUB_OUTPUT"
+          bazel run //python/_tools:release -- check-recovery-run --tag "$TAG" --run-id "$RUN_ID" --github-output "$GITHUB_OUTPUT"
       - name: Decide whether PyPI publication is allowed
         id: gate
         env:
@@ -164,7 +162,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py check-published-release --tag "$TAG" --github-output "$GITHUB_OUTPUT"
+        run: bazel run //python/_tools:release -- check-published-release --tag "$TAG" --github-output "$GITHUB_OUTPUT"
       - name: Link published release notes
         if: steps.gate.outputs.publish == 'true'
         env:
@@ -224,9 +222,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
+      - uses: ./.github/actions/setup-bazel
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist-${{ needs.prepare.outputs.plugin }}-locked
@@ -239,7 +235,7 @@ jobs:
         env:
           COORDINATE: ${{ needs.prepare.outputs.coordinate }}
           VERSION: ${{ needs.prepare.outputs.version }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py verify-index-files --coordinate "$COORDINATE" --version "$VERSION" --dist dist --index testpypi
+        run: bazel run //python/_tools:release -- verify-index-files --coordinate "$COORDINATE" --version "$VERSION" --dist dist --index testpypi
       - name: Install from TestPyPI into a clean project and smoke-test
         env:
           COORDINATE: ${{ needs.prepare.outputs.coordinate }}
@@ -248,7 +244,7 @@ jobs:
           REQUIRES_PYTHON: ${{ needs.prepare.outputs.requires_python }}
           SMOKE_IMPORTS: ${{ needs.prepare.outputs.smoke_imports }}
           INDEX_URL: https://test.pypi.org/simple/
-        run: bash scripts/release/smoke_from_index.sh
+        run: bazel run //python/_tools:smoke_from_index
 
   publish-pypi:
     name: Publish to PyPI
@@ -290,9 +286,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version-file: scripts/pyproject.toml
+      - uses: ./.github/actions/setup-bazel
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist-${{ needs.prepare.outputs.plugin }}-locked
@@ -303,7 +297,7 @@ jobs:
         env:
           COORDINATE: ${{ needs.prepare.outputs.coordinate }}
           VERSION: ${{ needs.prepare.outputs.version }}
-        run: uv run --project scripts --locked python scripts/release/release_tool.py verify-index-files --coordinate "$COORDINATE" --version "$VERSION" --dist dist --index pypi
+        run: bazel run //python/_tools:release -- verify-index-files --coordinate "$COORDINATE" --version "$VERSION" --dist dist --index pypi
       - name: Install from PyPI into a clean project and smoke-test
         env:
           COORDINATE: ${{ needs.prepare.outputs.coordinate }}
@@ -312,4 +306,4 @@ jobs:
           REQUIRES_PYTHON: ${{ needs.prepare.outputs.requires_python }}
           SMOKE_IMPORTS: ${{ needs.prepare.outputs.smoke_imports }}
           # Same rule as TestPyPI: only a plugin the SDK still bundles may overlap it.
-        run: bash scripts/release/smoke_from_index.sh
+        run: bazel run //python/_tools:smoke_from_index

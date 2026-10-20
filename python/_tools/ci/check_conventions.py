@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""Repository-invariant checks for temporalio/ai-integrations.
+
+Runs on every PR (job `conventions`) and nightly. Exits non-zero
+with a list of violations. Passes on a repository with zero plugins.
+
+Checks:
+  * plugin folder names never end in `-plugin` / `_plugin`
+  * no language-level lockfiles (python/uv.lock, typescript/pnpm-lock.yaml, ...)
+  * python/_shared contains configuration and Bazel logic, never Python source or stubs
+  * every Python plugin has pyproject.toml, uv.lock, plugin.toml, BUILD.bazel, README.md,
+    and {root-api}/{__init__.py,py.typed} under src/
+  * NO src/temporalio/__init__.py and NO src/temporalio/contrib/__init__.py (namespace invariant)
+  * LICENSE is a committed regular file byte-identical to the root LICENSE; pyproject declares license = "MIT"
+    and license-files = ["LICENSE"]; no CHANGELOG*, no smoke_test.py in the plugin dir
+  * plugin.toml schema and agreement with pyproject.toml (name/coordinate/root-api/
+    maturity classifier/requires-python floor/module-name/required-version)
+  * no [tool.uv.sources] path or workspace entries
+  * the project's published README has no relative markdown links (PyPI renders it)
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _common import (  # noqa: E402
+    LANGUAGES,
+    Plugin,
+    discover_plugins,
+    load_toml,
+    repo_root,
+)
+
+MATURITY_CLASSIFIER = {
+    "generally-available": "Development Status :: 5 - Production/Stable",
+    "public-preview": "Development Status :: 4 - Beta",
+    "pre-release": "Development Status :: 3 - Alpha",
+}
+REGISTRIES = {"python": "pypi", "typescript": "npm", "java": "maven", "go": "goproxy"}
+LANGUAGE_LOCKFILES = (
+    "uv.lock",
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "yarn.lock",
+    "go.sum",
+    "gradle.lockfile",
+)
+RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
+STANDARD_TEST_SUPPORT = {
+    "tests/helpers/environment.py": "tests/helpers/environment.py.tmpl",
+    "tests/helpers/plugin_meta.py": "tests/helpers/plugin_meta.py.tmpl",
+    "tests/helpers/provenance.py": "tests/helpers/provenance.py.tmpl",
+    "tests/test_env.py": "tests/test_env.py.tmpl",
+    "tests/test_installed_matches_source.py": "tests/test_installed_matches_source.py.tmpl",
+}
+STANDARD_TYPESCRIPT_TEST_SUPPORT = {
+    "src/__tests__/helpers/environment.ts": "src/__tests__/helpers/environment.ts.tmpl",
+    "src/__tests__/test-environment-startup.test.ts": "src/__tests__/test-environment-startup.test.ts.tmpl",
+}
+PYTHON_DEVELOPMENT_VERSION = "0.0.0"
+
+
+class Checker:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.violations: list[str] = []
+
+    def fail(self, msg: str) -> None:
+        self.violations.append(msg)
+
+    # -- helpers -----------------------------------------------------------------
+    def tracked_files(self, rel_dir: str) -> set[str]:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(self.root), "ls-files", "--", rel_dir],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return set()
+        return {line.strip() for line in out.splitlines() if line.strip()}
+
+    def scripts_required_version(self) -> str | None:
+        path = self.root / "python/_tools" / "pyproject.toml"
+        if not path.is_file():
+            return None
+        return load_toml(path).get("tool", {}).get("uv", {}).get("required-version")
+
+    # -- checks ------------------------------------------------------------------
+    def check_language_roots(self, discovered: dict[str, list[Plugin]]) -> None:
+        for language in LANGUAGES:
+            lang_dir = self.root / language
+            if not lang_dir.is_dir():
+                continue
+            for lock in LANGUAGE_LOCKFILES:
+                if (lang_dir / lock).exists():
+                    self.fail(
+                        f"{language}/{lock}: language-level lockfiles are forbidden; each plugin owns its own"
+                    )
+            for child in lang_dir.iterdir():
+                if child.is_dir() and not child.name.startswith(("_", ".")):
+                    if child.name.endswith(("-plugin", "_plugin")):
+                        self.fail(
+                            f"{language}/{child.name}: plugin folders must not end in -plugin/_plugin"
+                        )
+                    if child not in [p.path for p in discovered[language]]:
+                        self.fail(
+                            f"{language}/{child.name}: directory has no {language} manifest; non-plugin folders must start with `_`"
+                        )
+        shared_python = self.root / "python" / "_shared"
+        if shared_python.is_dir():
+            for tracked in sorted(self.tracked_files("python/_shared")):
+                path = self.root / tracked
+                if path.suffix in {".py", ".pyi", ".pyw", ".pyx"}:
+                    self.fail(
+                        f"{path.relative_to(self.root)}: Python code must be duplicated into each plugin, not shared"
+                    )
+
+    def check_python_plugin(self, plugin: Plugin) -> None:
+        d = plugin.path
+        rel = plugin.rel
+        name = plugin.name
+        for required in (
+            "pyproject.toml",
+            "uv.lock",
+            "plugin.toml",
+            "BUILD.bazel",
+            "README.md",
+        ):
+            if not (d / required).is_file():
+                self.fail(f"{rel}: missing {required}")
+
+        pyproject: dict[str, Any] | None = None
+        meta: dict[str, Any] | None = None
+        if (d / "pyproject.toml").is_file() and (d / "plugin.toml").is_file():
+            try:
+                pyproject = load_toml(d / "pyproject.toml")
+                meta = load_toml(d / "plugin.toml")
+            except Exception as exc:  # noqa: BLE001
+                self.fail(f"{rel}: cannot parse TOML: {exc}")
+
+        root_api = (
+            meta.get("plugin", {}).get("root-api")
+            if isinstance(meta, dict) and isinstance(meta.get("plugin"), dict)
+            else None
+        )
+        package_parts = (
+            root_api.split(".")
+            if isinstance(root_api, str) and root_api == f"temporalio.{name}"
+            else ["temporalio", name]
+        )
+        package_rel = Path("src", *package_parts)
+        pkg = d / package_rel
+        if not (pkg / "__init__.py").is_file():
+            self.fail(f"{rel}: missing {package_rel}/__init__.py")
+        if not (pkg / "py.typed").is_file():
+            self.fail(f"{rel}: missing {package_rel}/py.typed")
+        for forbidden in (
+            "src/temporalio/__init__.py",
+            "src/temporalio/contrib/__init__.py",
+        ):
+            if (d / forbidden).exists():
+                self.fail(
+                    f"{rel}: {forbidden} must not exist (namespace invariant; the SDK owns these packages)"
+                )
+
+        tracked = {p.split("/", 2)[-1] for p in self.tracked_files(rel)}
+        # LICENSE: every plugin ships the license text in its wheel and sdist, so each plugin directory
+        # carries a committed copy that must stay byte-identical to the root LICENSE (`cp LICENSE python/<name>/`).
+        license_path = d / "LICENSE"
+        if not license_path.exists() or not stat.S_ISREG(license_path.lstat().st_mode):
+            self.fail(f"{rel}: LICENSE must be a regular file")
+        elif "LICENSE" not in tracked:
+            self.fail(
+                f"{rel}: LICENSE must be committed (copy the root LICENSE: `cp LICENSE {rel}/LICENSE`)"
+            )
+        elif license_path.read_bytes() != (self.root / "LICENSE").read_bytes():
+            self.fail(f"{rel}: LICENSE differs from the root LICENSE; re-copy it")
+        for f in sorted(tracked):
+            base = f.rsplit("/", 1)[-1]
+            if "/" not in f and base.upper().startswith("CHANGELOG"):
+                self.fail(
+                    f"{rel}: {f} is committed; release notes are generated from history, no changelog files"
+                )
+            if base == "smoke_test.py":
+                self.fail(
+                    f"{rel}: {f} is committed; the generic python/_tools/ci/smoke.py replaces per-plugin smoke scripts"
+                )
+
+        if pyproject is None or meta is None:
+            return
+        self.check_plugin_toml(plugin, meta, pyproject)
+        self.check_pyproject(plugin, pyproject)
+        self.check_readme(plugin, pyproject)
+        self.check_standard_test_support(plugin)
+
+    def check_standard_test_support(self, plugin: Plugin) -> None:
+        template_rel_root = f"{plugin.language}/_template"
+        template_root = self.root / template_rel_root
+        if not template_root.is_dir():
+            return
+        support_files = {
+            "python": STANDARD_TEST_SUPPORT,
+            "typescript": STANDARD_TYPESCRIPT_TEST_SUPPORT,
+        }[plugin.language]
+        for plugin_rel, template_rel in support_files.items():
+            plugin_path = plugin.path / plugin_rel
+            template_path = template_root / template_rel
+            if not plugin_path.is_file():
+                self.fail(
+                    f"{plugin.rel}: missing standard test support file {plugin_rel}"
+                )
+            elif not template_path.is_file():
+                self.fail(
+                    f"{template_rel_root}/{template_rel}: missing canonical test support template"
+                )
+            elif plugin_path.read_bytes() != template_path.read_bytes():
+                self.fail(
+                    f"{plugin.rel}/{plugin_rel}: differs from canonical {template_rel_root}/{template_rel}"
+                )
+
+    def check_plugin_toml(
+        self, plugin: Plugin, meta: dict[str, Any], pyproject: dict[str, Any]
+    ) -> None:
+        rel = plugin.rel
+        p = meta.get("plugin")
+        if not isinstance(p, dict):
+            self.fail(f"{rel}: plugin.toml missing [plugin] table")
+            return
+        expected_coordinate = "temporalio-" + plugin.name.replace("_", "-")
+        root_api = p.get("root-api")
+        expected_root_api = "temporalio." + plugin.name
+        if p.get("name") != plugin.name:
+            self.fail(
+                f"{rel}: plugin.toml name {p.get('name')!r} must equal the folder name {plugin.name!r}"
+            )
+        if p.get("language") != plugin.language:
+            self.fail(f"{rel}: plugin.toml language must be {plugin.language!r}")
+        if p.get("coordinate") != expected_coordinate:
+            self.fail(
+                f"{rel}: plugin.toml coordinate must be {expected_coordinate!r} (got {p.get('coordinate')!r})"
+            )
+        if p.get("registry") != REGISTRIES[plugin.language]:
+            self.fail(
+                f"{rel}: plugin.toml registry must be {REGISTRIES[plugin.language]!r}"
+            )
+        if root_api != expected_root_api:
+            self.fail(
+                f"{rel}: plugin.toml root-api must be {expected_root_api!r} (got {root_api!r})"
+            )
+        maturity = p.get("maturity")
+        if maturity not in MATURITY_CLASSIFIER:
+            self.fail(
+                f"{rel}: plugin.toml maturity must be one of {sorted(MATURITY_CLASSIFIER)}"
+            )
+        for banned in ("owners", "live-secrets", "secrets"):
+            if banned in p or banned in meta.get("ci", {}):
+                self.fail(
+                    f"{rel}: plugin.toml must not contain {banned!r} (ownership is CODEOWNERS; CI has no secrets)"
+                )
+        versions = meta.get("ci", {}).get("runtime-versions")
+        if not isinstance(versions, list) or not versions:
+            self.fail(
+                f"{rel}: plugin.toml [ci] runtime-versions must be a non-empty list"
+            )
+            versions = []
+        smoke_imports = meta.get("smoke", {}).get("imports", [])
+        if smoke_imports and not all(
+            isinstance(i, str) and isinstance(root_api, str) and i.startswith(root_api)
+            for i in smoke_imports
+        ):
+            self.fail(
+                f"{rel}: plugin.toml [smoke] imports must be modules under {root_api}"
+            )
+
+        project = pyproject.get("project", {})
+        if project.get("name") != p.get("coordinate"):
+            self.fail(
+                f"{rel}: pyproject project.name {project.get('name')!r} must equal plugin.toml coordinate {p.get('coordinate')!r}"
+            )
+        classifiers = project.get("classifiers", [])
+        status_classifiers = [
+            c for c in classifiers if c.startswith("Development Status ::")
+        ]
+        expected_classifier = MATURITY_CLASSIFIER.get(maturity or "")
+        if expected_classifier and status_classifiers != [expected_classifier]:
+            self.fail(
+                f"{rel}: classifiers must contain exactly {expected_classifier!r} for maturity {maturity!r} (got {status_classifiers})"
+            )
+        requires = project.get("requires-python", "")
+        m = re.search(r">=\s*(\d+\.\d+)", requires)
+        if not m:
+            self.fail(
+                f"{rel}: requires-python must contain a >=X.Y floor (got {requires!r})"
+            )
+        elif versions and str(versions[0]) != m.group(1):
+            self.fail(
+                f"{rel}: first [ci] runtime-versions entry {versions[0]!r} must equal the requires-python floor {m.group(1)!r}"
+            )
+        module_name = (
+            pyproject.get("tool", {})
+            .get("uv", {})
+            .get("build-backend", {})
+            .get("module-name")
+        )
+        if module_name != root_api:
+            self.fail(
+                f"{rel}: [tool.uv.build-backend] module-name must be {root_api!r} (got {module_name!r})"
+            )
+
+    def check_pyproject(self, plugin: Plugin, pyproject: dict[str, Any]) -> None:
+        rel = plugin.rel
+        project = pyproject.get("project", {})
+        if project.get("version") != PYTHON_DEVELOPMENT_VERSION:
+            self.fail(
+                f"{rel}: pyproject [project] version must be the tag-authoritative development placeholder "
+                f"{PYTHON_DEVELOPMENT_VERSION!r} (got {project.get('version')!r})"
+            )
+        if project.get("license") != "MIT":
+            self.fail(
+                f'{rel}: pyproject [project] license must be the SPDX expression "MIT"'
+            )
+        if project.get("license-files") != ["LICENSE"]:
+            self.fail(f'{rel}: pyproject [project] license-files must be ["LICENSE"]')
+        if any(c.startswith("License ::") for c in project.get("classifiers", [])):
+            self.fail(
+                f"{rel}: drop License :: classifiers; PEP 639 uses the license expression instead"
+            )
+        uv_cfg = pyproject.get("tool", {}).get("uv", {})
+        for dep, source in uv_cfg.get("sources", {}).items():
+            entries = source if isinstance(source, list) else [source]
+            for entry in entries:
+                if isinstance(entry, dict) and (
+                    "path" in entry or "workspace" in entry
+                ):
+                    self.fail(
+                        f"{rel}: [tool.uv.sources] {dep} uses a path/workspace source; cross-plugin deps must use published coordinates"
+                    )
+        expected_rv = self.scripts_required_version()
+        if expected_rv and uv_cfg.get("required-version") != expected_rv:
+            self.fail(
+                f"{rel}: [tool.uv] required-version must equal python/_tools/pyproject.toml's {expected_rv!r} (got {uv_cfg.get('required-version')!r})"
+            )
+        exclude_newer_pkg = uv_cfg.get("exclude-newer-package", {})
+        if (
+            "exclude-newer" in uv_cfg
+            and exclude_newer_pkg.get("temporalio") is not False
+        ):
+            self.fail(
+                f"{rel}: exclude-newer is set but temporalio is not exempted (`exclude-newer-package = {{ temporalio = false }}`)"
+            )
+
+    def check_readme(self, plugin: Plugin, pyproject: dict[str, Any]) -> None:
+        configured = pyproject.get("project", {}).get("readme", "README.md")
+        filename = (
+            configured.get("file") if isinstance(configured, dict) else configured
+        )
+        if (
+            not isinstance(filename, str)
+            or Path(filename).is_absolute()
+            or ".." in Path(filename).parts
+        ):
+            self.fail(
+                f"{plugin.rel}: project.readme must name a file inside the plugin directory"
+            )
+            return
+        readme = plugin.path / filename
+        if not readme.is_file():
+            self.fail(f"{plugin.rel}: published README {filename} is missing")
+            return
+        for lineno, line in enumerate(
+            readme.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+        ):
+            if RELATIVE_LINK.search(line):
+                self.fail(
+                    f"{plugin.rel}/{filename}:{lineno}: relative link; use absolute https://github.com/... URLs (PyPI renders this file)"
+                )
+
+    def run(self) -> list[str]:
+        discovered = discover_plugins(self.root)
+        self.check_language_roots(discovered)
+        for plugin in discovered["python"]:
+            self.check_python_plugin(plugin)
+        return self.violations
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--repo-root", type=Path, default=None)
+    args = parser.parse_args(argv)
+    violations = Checker(repo_root(args.repo_root)).run()
+    if violations:
+        print(f"FAIL: {len(violations)} convention violation(s):")
+        for v in violations:
+            print(f"  - {v}")
+        return 1
+    print("OK: repository conventions satisfied")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

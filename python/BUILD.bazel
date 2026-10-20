@@ -1,0 +1,13 @@
+exports_files(["_deps.MODULE.bazel"])
+
+filegroup(
+    name = "template",
+    srcs = glob(
+        ["_template/**"],
+        exclude = [
+            "**/__pycache__/**",
+            "**/*.pyc",
+        ],
+    ),
+    visibility = ["//visibility:public"],
+)

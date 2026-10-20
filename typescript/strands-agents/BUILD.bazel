@@ -1,0 +1,300 @@
+load("@npm_strands_agents//:defs.bzl", "npm_link_all_packages")
+load("//bazel:typescript.bzl", "typescript_integration", "typescript_module")
+
+exports_files([
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "plugin.toml",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+typescript_module(
+    name = "__tests__/activities/strands",
+    srcs = [
+        "src/__tests__/activities/strands.ts",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/helpers/environment",
+    srcs = [
+        "src/__tests__/helpers/environment.ts",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-environment-startup.test",
+    srcs = [
+        "src/__tests__/test-environment-startup.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers/environment",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-json-schema",
+    srcs = [
+        "src/__tests__/test-json-schema.ts",
+    ],
+    deps = [
+        ":json-schema",
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/ava",
+        ":node_modules/zod",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-mcp-connection-eviction",
+    srcs = [
+        "src/__tests__/test-mcp-connection-eviction.ts",
+    ],
+    deps = [
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/ava",
+        ":temporal-mcp-client",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-strands",
+    srcs = [
+        "src/__tests__/test-strands.ts",
+    ],
+    deps = [
+        ":__tests__/activities/strands",
+        ":__tests__/helpers/environment",
+        ":__tests__/workflows/strands",
+        ":index",
+        ":node_modules/@modelcontextprotocol/sdk",
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/test-helpers",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/@temporalio/workflow-streams",
+        ":node_modules/ava",
+        "//typescript/strands-agents/tests/helpers:build",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/workflows/strands",
+    srcs = [
+        "src/__tests__/workflows/strands.ts",
+    ],
+    deps = [
+        ":index",
+        ":load-polyfills",
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/@temporalio/workflow-streams",
+        ":node_modules/zod",
+    ],
+)
+
+typescript_module(
+    name = "empty-module",
+    srcs = [
+        "src/empty-module.ts",
+    ],
+    deps = [
+        ":node_modules/@modelcontextprotocol/sdk",
+    ],
+)
+
+typescript_module(
+    name = "failure-converter",
+    srcs = [
+        "src/failure-converter.ts",
+    ],
+    deps = [
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/@temporalio/common",
+    ],
+)
+
+typescript_module(
+    name = "heartbeat",
+    srcs = [
+        "src/heartbeat.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/activity",
+    ],
+)
+
+typescript_module(
+    name = "index",
+    srcs = [
+        "src/index.ts",
+    ],
+    deps = [
+        ":failure-converter",
+        ":load-polyfills",
+        ":plugin",
+        ":temporal-activity-tool",
+        ":temporal-agent",
+        ":temporal-mcp-client",
+        ":temporal-model",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "json-schema",
+    srcs = [
+        "src/json-schema.ts",
+    ],
+    deps = [
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/zod",
+    ],
+)
+
+typescript_module(
+    name = "load-polyfills",
+    srcs = [
+        "src/load-polyfills.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/@ungap/structured-clone",
+        ":node_modules/headers-polyfill",
+        ":node_modules/web-streams-polyfill",
+    ],
+)
+
+typescript_module(
+    name = "model-activity",
+    srcs = [
+        "src/model-activity.ts",
+    ],
+    deps = [
+        ":heartbeat",
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow-streams",
+    ],
+)
+
+typescript_module(
+    name = "plugin",
+    srcs = [
+        "src/plugin.ts",
+    ],
+    deps = [
+        ":empty-module",
+        ":failure-converter",
+        ":model-activity",
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/@temporalio/activity",
+        ":node_modules/@temporalio/client",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/plugin",
+        ":node_modules/@temporalio/worker",
+        ":temporal-mcp-client",
+    ],
+)
+
+typescript_module(
+    name = "temporal-activity-tool",
+    srcs = [
+        "src/temporal-activity-tool.ts",
+    ],
+    deps = [
+        ":failure-converter",
+        ":json-schema",
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/zod",
+    ],
+)
+
+typescript_module(
+    name = "temporal-agent",
+    srcs = [
+        "src/temporal-agent.ts",
+    ],
+    deps = [
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":temporal-mcp-client",
+        ":temporal-model",
+    ],
+)
+
+# These modules import each other and compile together.
+typescript_module(
+    name = "temporal-mcp-client",
+    srcs = [
+        "src/temporal-mcp-client.ts",
+        "src/temporal-mcp-tool.ts",
+    ],
+    deps = [
+        ":json-schema",
+        ":node_modules/@modelcontextprotocol/sdk",
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/@temporalio/activity",
+        ":node_modules/@temporalio/workflow",
+        ":temporal-activity-tool",
+    ],
+)
+
+typescript_module(
+    name = "temporal-model",
+    srcs = [
+        "src/temporal-model.ts",
+    ],
+    deps = [
+        ":model-activity",
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "workflow",
+    srcs = [
+        "src/workflow.ts",
+    ],
+    deps = [
+        ":node_modules/@strands-agents/sdk",
+        ":node_modules/@temporalio/workflow",
+        ":temporal-activity-tool",
+    ],
+)
+
+typescript_integration(
+    modules = [
+        ":empty-module",
+        ":failure-converter",
+        ":heartbeat",
+        ":index",
+        ":json-schema",
+        ":load-polyfills",
+        ":model-activity",
+        ":plugin",
+        ":temporal-activity-tool",
+        ":temporal-agent",
+        ":temporal-mcp-client",
+        ":temporal-model",
+        ":workflow",
+    ],
+    test_modules = [
+        ":__tests__/activities/strands",
+        ":__tests__/helpers/environment",
+        ":__tests__/test-environment-startup.test",
+        ":__tests__/test-json-schema",
+        ":__tests__/test-mcp-connection-eviction",
+        ":__tests__/test-strands",
+        ":__tests__/workflows/strands",
+    ],
+)

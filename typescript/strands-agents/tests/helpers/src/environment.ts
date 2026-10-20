@@ -69,6 +69,7 @@ export async function createLocalTestEnvironment(
   return await TestWorkflowEnvironment.createLocal({
     ...(opts || {}),
     server: {
+      ...(process.env.TEMPORAL_CLI_PATH ? { executable: { type: 'existing-path' as const, path: process.env.TEMPORAL_CLI_PATH } } : {}),
       searchAttributes: Object.values(defaultSAKeys),
       ...(opts?.server || {}),
       extraArgs: [

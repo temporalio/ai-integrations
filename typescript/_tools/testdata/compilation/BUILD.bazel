@@ -1,0 +1,37 @@
+load("@aspect_rules_js//js:defs.bzl", "js_library")
+load("@aspect_rules_ts//ts:defs.bzl", "ts_config")
+load("//bazel:typescript.bzl", "typescript_module")
+
+alias(
+    name = "node_modules/@types/node",
+    actual = "//typescript/_tools:node_modules/@types/node",
+)
+
+ts_config(
+    name = "tsconfig",
+    src = "tsconfig.json",
+)
+
+typescript_module(
+    name = "dependency",
+    srcs = ["src/dependency.ts"],
+)
+
+typescript_module(
+    name = "consumer",
+    srcs = ["src/consumer.ts"],
+    deps = [":dependency"],
+)
+
+js_library(
+    name = "fixtures",
+    srcs = [
+        "src/consumer.ts",
+        "src/dependency.ts",
+        "tsconfig.json",
+        ":lib/dependency.d.ts",
+        ":tsconfig_consumer_compile.json",
+        ":tsconfig_dependency_compile.json",
+    ],
+    visibility = ["//visibility:public"],
+)

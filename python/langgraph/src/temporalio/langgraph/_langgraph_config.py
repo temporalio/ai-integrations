@@ -5,6 +5,7 @@
 import dataclasses
 from typing import Any, Callable
 
+from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.config import var_child_runnable_config
 from langgraph._internal._constants import (
     CONFIG_KEY_CHECKPOINT_ID,
@@ -19,7 +20,6 @@ from langgraph._internal._constants import (
     CONFIG_KEY_THREAD_ID,
 )
 from langgraph._internal._scratchpad import PregelScratchpad
-from langgraph.graph.state import RunnableConfig
 from langgraph.pregel._algo import LazyAtomicCounter
 from langgraph.runtime import ExecutionInfo, Runtime
 

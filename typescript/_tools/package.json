@@ -1,0 +1,21 @@
+{
+  "name": "ai-integrations-typescript-tools",
+  "private": true,
+  "version": "0.0.0",
+  "type": "commonjs",
+  "packageManager": "pnpm@10.34.5",
+  "dependencies": {
+    "@bazel/runfiles": "^6.5.0",
+    "semver": "^7.7.2",
+    "smol-toml": "^1.4.2",
+    "tar": "^7.5.0",
+    "yaml": "^2.8.1",
+    "pnpm": "10.34.5",
+    "npm": "11.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/semver": "^7.7.0",
+    "typescript": "^5.9.3"
+  }
+}

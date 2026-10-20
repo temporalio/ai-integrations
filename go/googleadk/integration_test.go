@@ -14,6 +14,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -66,7 +69,9 @@ func devServer(t *testing.T) (client.Client, func()) {
 	// `go test` reads, tripping its "test I/O incomplete after exiting" WaitDelay
 	// check and failing the package even though every test passed. Detaching its
 	// stdio makes that harmless (and the CI runner reaps the orphan on job exit).
-	opts := testsuite.DevServerOptions{Stdout: io.Discard, Stderr: io.Discard}
+	serverPath, pathErr := temporalCLIPath()
+	require.NoError(t, pathErr)
+	opts := testsuite.DevServerOptions{Stdout: io.Discard, Stderr: io.Discard, ExistingPath: serverPath}
 	var srv *testsuite.DevServer
 	var err error
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -87,6 +92,63 @@ func devServer(t *testing.T) (client.Client, func()) {
 		t.Fatalf("dev server unavailable (first use downloads the Temporal CLI, which needs network): %v", err)
 	}
 	return srv.Client(), func() { _ = srv.Stop() }
+}
+
+// temporalCLIPath supports Bazel's directory and manifest-only Windows runfiles.
+// Ordinary go test can still use TEMPORAL_CLI_PATH or the SDK's downloader.
+func temporalCLIPath() (string, error) {
+	name := os.Getenv("TEMPORAL_CLI_RUNFILE")
+	if name == "" {
+		return os.Getenv("TEMPORAL_CLI_PATH"), nil
+	}
+	if manifest := os.Getenv("RUNFILES_MANIFEST_FILE"); manifest != "" {
+		contents, err := os.ReadFile(manifest)
+		if err != nil {
+			return "", err
+		}
+		for _, line := range strings.Split(string(contents), "\n") {
+			escaped := strings.HasPrefix(line, " ")
+			key, target, found := strings.Cut(strings.TrimPrefix(line, " "), " ")
+			if !found {
+				target = key
+			}
+			if escaped {
+				key = strings.NewReplacer(`\s`, " ", `\n`, "\n", `\b`, `\`).Replace(key)
+				target = strings.NewReplacer(`\n`, "\n", `\b`, `\`).Replace(target)
+			}
+			if key == name {
+				return filepath.FromSlash(target), nil
+			}
+		}
+		return "", fmt.Errorf("Temporal CLI runfile %q is missing from the manifest", name)
+	}
+	directory := os.Getenv("RUNFILES_DIR")
+	if directory == "" {
+		directory = os.Getenv("TEST_SRCDIR")
+	}
+	if directory == "" {
+		return "", errors.New("Temporal CLI runfiles directory is missing")
+	}
+	return filepath.Join(directory, filepath.FromSlash(name)), nil
+}
+
+func TestTemporalCLIManifest(t *testing.T) {
+	manifest := filepath.Join(t.TempDir(), "MANIFEST")
+	t.Setenv("TEMPORAL_CLI_RUNFILE", "temporal_cli/temporal.exe")
+	t.Setenv("RUNFILES_MANIFEST_FILE", manifest)
+	for _, line := range []string{
+		"temporal_cli/temporal.exe C:/Program Files/Temporal/temporal.exe\n",
+		` temporal_cli/temporal.exe C:\bProgram Files\bTemporal\btemporal.exe` + "\n",
+	} {
+		require.NoError(t, os.WriteFile(manifest, []byte(line), 0600))
+		path, err := temporalCLIPath()
+		require.NoError(t, err)
+		assert.Contains(t, path, "Program Files")
+		assert.True(t, strings.HasSuffix(path, "temporal.exe"))
+	}
+	t.Setenv("TEMPORAL_CLI_RUNFILE", "missing")
+	_, err := temporalCLIPath()
+	require.ErrorContains(t, err, "missing from the manifest")
 }
 
 // startWorker boots a real worker for the test workflows with the plugin

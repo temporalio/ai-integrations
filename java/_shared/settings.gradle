@@ -1,5 +1,0 @@
-// Apply from each plugin's initial pluginManagement block, before plugins resolve.
-pluginManagement.repositories {
-    mavenCentral()
-    gradlePluginPortal()
-}

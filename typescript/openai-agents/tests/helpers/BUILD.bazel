@@ -1,0 +1,73 @@
+load("@aspect_rules_js//npm:defs.bzl", "npm_package")
+load("@aspect_rules_ts//ts:defs.bzl", "ts_config", "ts_project")
+
+exports_files(["package.json"])
+
+ts_config(
+    name = "tsconfig",
+    src = "tsconfig.json",
+    deps = [
+        "//typescript/_shared:tsconfig",
+        "//typescript/openai-agents:node_modules/@tsconfig/node20",
+    ],
+)
+
+ts_project(
+    name = "build",
+    srcs = glob(["src/**/*.ts"]),
+    composite = True,
+    incremental = True,
+    out_dir = "lib",
+    root_dir = "src",
+    source_map = True,
+    tsconfig = ":tsconfig",
+    visibility = ["//typescript/openai-agents:__subpackages__"],
+    deps = [
+        "//typescript/openai-agents:node_modules/@eslint/js",
+        "//typescript/openai-agents:node_modules/@openai/agents-core",
+        "//typescript/openai-agents:node_modules/@openai/agents-openai",
+        "//typescript/openai-agents:node_modules/@opentelemetry/api",
+        "//typescript/openai-agents:node_modules/@opentelemetry/core",
+        "//typescript/openai-agents:node_modules/@opentelemetry/sdk-trace-base",
+        "//typescript/openai-agents:node_modules/@opentelemetry/semantic-conventions",
+        "//typescript/openai-agents:node_modules/@temporalio/activity",
+        "//typescript/openai-agents:node_modules/@temporalio/client",
+        "//typescript/openai-agents:node_modules/@temporalio/common",
+        "//typescript/openai-agents:node_modules/@temporalio/envconfig",
+        "//typescript/openai-agents:node_modules/@temporalio/plugin",
+        "//typescript/openai-agents:node_modules/@temporalio/proto",
+        "//typescript/openai-agents:node_modules/@temporalio/testing",
+        "//typescript/openai-agents:node_modules/@temporalio/worker",
+        "//typescript/openai-agents:node_modules/@temporalio/workflow",
+        "//typescript/openai-agents:node_modules/@temporalio/workflow-streams",
+        "//typescript/openai-agents:node_modules/@tsconfig/node20",
+        "//typescript/openai-agents:node_modules/@types/node",
+        "//typescript/openai-agents:node_modules/@types/stack-utils",
+        "//typescript/openai-agents:node_modules/@ungap/structured-clone",
+        "//typescript/openai-agents:node_modules/ava",
+        "//typescript/openai-agents:node_modules/eslint",
+        "//typescript/openai-agents:node_modules/eslint-config-prettier",
+        "//typescript/openai-agents:node_modules/eslint-import-resolver-typescript",
+        "//typescript/openai-agents:node_modules/eslint-plugin-import",
+        "//typescript/openai-agents:node_modules/headers-polyfill",
+        "//typescript/openai-agents:node_modules/long",
+        "//typescript/openai-agents:node_modules/nexus-rpc",
+        "//typescript/openai-agents:node_modules/openai",
+        "//typescript/openai-agents:node_modules/protobufjs",
+        "//typescript/openai-agents:node_modules/stack-utils",
+        "//typescript/openai-agents:node_modules/tsx",
+        "//typescript/openai-agents:node_modules/typescript",
+        "//typescript/openai-agents:node_modules/typescript-eslint",
+        "//typescript/openai-agents:node_modules/web-streams-polyfill",
+    ],
+)
+
+npm_package(
+    name = "pkg",
+    srcs = [
+        "package.json",
+        ":build",
+    ],
+    package = "@temporalio/test-helpers",
+    visibility = ["//typescript/openai-agents:__subpackages__"],
+)

@@ -1,0 +1,115 @@
+node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
+node.toolchain(node_version = "24.13.0")
+node.toolchain(
+    name = "node22",
+    node_version = "22.20.0",
+)
+use_repo(node, "node22_toolchains", "nodejs_toolchains")
+
+pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
+pnpm.pnpm(pnpm_version = "10.34.5")
+use_repo(pnpm, "pnpm")
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm_tools",
+    data = [
+        "//typescript/_tools:package.json",
+        "//typescript/_tools:pnpm-workspace.yaml",
+    ],
+    lifecycle_hooks = {
+        "@temporalio/core-bridge": ["postinstall"],
+        "esbuild": ["postinstall"],
+        "protobufjs": ["postinstall"],
+    },
+    pnpm_lock = "//typescript/_tools:pnpm-lock.yaml",
+    update_pnpm_lock = False,
+)
+use_repo(npm, "npm_tools")
+
+npm.npm_translate_lock(
+    name = "npm_google_adk",
+    data = [
+        "//typescript/google-adk:package.json",
+        "//typescript/google-adk:pnpm-workspace.yaml",
+    ],
+    lifecycle_hooks = {
+        "@temporalio/core-bridge": ["postinstall"],
+        "esbuild": ["postinstall"],
+        "protobufjs": ["postinstall"],
+    },
+    pnpm_lock = "//typescript/google-adk:pnpm-lock.yaml",
+    update_pnpm_lock = False,
+)
+use_repo(npm, "npm_google_adk")
+
+npm.npm_translate_lock(
+    name = "npm_langsmith",
+    data = [
+        "//typescript/langsmith:package.json",
+        "//typescript/langsmith:pnpm-workspace.yaml",
+    ],
+    lifecycle_hooks = {
+        "@temporalio/core-bridge": ["postinstall"],
+        "esbuild": ["postinstall"],
+        "protobufjs": ["postinstall"],
+    },
+    pnpm_lock = "//typescript/langsmith:pnpm-lock.yaml",
+    update_pnpm_lock = False,
+)
+use_repo(npm, "npm_langsmith")
+
+npm.npm_translate_lock(
+    name = "npm_openai_agents",
+    data = [
+        "//typescript/openai-agents:package.json",
+        "//typescript/openai-agents:pnpm-workspace.yaml",
+        "//typescript/openai-agents:tests/helpers/package.json",
+    ],
+    lifecycle_hooks = {
+        "@temporalio/core-bridge": ["postinstall"],
+        "esbuild": ["postinstall"],
+        "protobufjs": ["postinstall"],
+    },
+    pnpm_lock = "//typescript/openai-agents:pnpm-lock.yaml",
+    update_pnpm_lock = False,
+)
+use_repo(npm, "npm_openai_agents")
+
+npm.npm_translate_lock(
+    name = "npm_strands_agents",
+    data = [
+        "//typescript/strands-agents:package.json",
+        "//typescript/strands-agents:pnpm-workspace.yaml",
+        "//typescript/strands-agents:tests/helpers/package.json",
+    ],
+    lifecycle_hooks = {
+        "@temporalio/core-bridge": ["postinstall"],
+        "esbuild": ["postinstall"],
+        "protobufjs": ["postinstall"],
+    },
+    pnpm_lock = "//typescript/strands-agents:pnpm-lock.yaml",
+    update_pnpm_lock = False,
+)
+use_repo(npm, "npm_strands_agents")
+
+npm.npm_translate_lock(
+    name = "npm_vercel_ai_sdk",
+    data = [
+        "//typescript/vercel-ai-sdk:package.json",
+        "//typescript/vercel-ai-sdk:pnpm-workspace.yaml",
+        "//typescript/vercel-ai-sdk:tests/helpers/package.json",
+    ],
+    lifecycle_hooks = {
+        "@temporalio/core-bridge": ["postinstall"],
+        "esbuild": ["postinstall"],
+        "protobufjs": ["postinstall"],
+    },
+    pnpm_lock = "//typescript/vercel-ai-sdk:pnpm-lock.yaml",
+    update_pnpm_lock = False,
+)
+use_repo(npm, "npm_vercel_ai_sdk")
+
+typescript = use_extension("@aspect_rules_ts//ts:extensions.bzl", "typescript")
+typescript.deps(version = "5.9.3")
+use_repo(typescript, "npm_typescript")

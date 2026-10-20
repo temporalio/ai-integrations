@@ -1,0 +1,1059 @@
+load("@npm_openai_agents//:defs.bzl", "npm_link_all_packages")
+load("//bazel:typescript.bzl", "typescript_integration", "typescript_module")
+
+exports_files([
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "plugin.toml",
+])
+
+npm_link_all_packages(name = "node_modules")
+
+typescript_module(
+    name = "__tests__/activities/openai-agents-comprehensive",
+    srcs = [
+        "src/__tests__/activities/openai-agents-comprehensive.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/activities/openai-agents",
+    srcs = [
+        "src/__tests__/activities/openai-agents.ts",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/activity-backed-model.test",
+    srcs = [
+        "src/__tests__/activity-backed-model.test.ts",
+    ],
+    deps = [
+        ":__tests__/stubs/openai-agents-fakes",
+        ":common/model-activity-options",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/ava",
+        ":workflow/activity-backed-model",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/agent-sink-bridge.test",
+    srcs = [
+        "src/__tests__/agent-sink-bridge.test.ts",
+    ],
+    deps = [
+        ":common/agent-sink-types",
+        ":common/trace-context",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@opentelemetry/api",
+        ":node_modules/ava",
+        ":worker/agent-sink-bridge",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/agent-sink-processor.test",
+    srcs = [
+        "src/__tests__/agent-sink-processor.test.ts",
+    ],
+    deps = [
+        ":common/agent-sink-types",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/ava",
+        ":workflow/agent-sink-processor",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/agent-tools.test",
+    srcs = [
+        "src/__tests__/agent-tools.test.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/ava",
+        ":workflow/agent-tools",
+        ":workflow/runner",
+        ":workflow/sandbox-client",
+        ":workflow/tools",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/classifier.test",
+    srcs = [
+        "src/__tests__/classifier.test.ts",
+    ],
+    deps = [
+        ":common/serialized-model",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/ava",
+        ":node_modules/openai",
+        ":worker/activities",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/client-trace-interceptor.test",
+    srcs = [
+        "src/__tests__/client-trace-interceptor.test.ts",
+    ],
+    deps = [
+        ":client/trace-interceptor",
+        ":common/headers",
+        ":node_modules/@temporalio/client",
+        ":node_modules/ava",
+        ":otel",
+        ":worker/seeded-ids",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/convert-agent.test",
+    srcs = [
+        "src/__tests__/convert-agent.test.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/ava",
+        ":workflow/activity-backed-model",
+        ":workflow/convert-agent",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/errors.test",
+    srcs = [
+        "src/__tests__/errors.test.ts",
+    ],
+    deps = [
+        ":common/errors",
+        ":node_modules/@temporalio/common",
+        ":node_modules/ava",
+        ":workflow/runner",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/helpers/environment",
+    srcs = [
+        "src/__tests__/helpers/environment.ts",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/helpers/openai-agents-spans",
+    srcs = [
+        "src/__tests__/helpers/openai-agents-spans.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@opentelemetry/api",
+        ":node_modules/@opentelemetry/core",
+        ":otel",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/helpers/test-fn",
+    srcs = [
+        "src/__tests__/helpers/test-fn.ts",
+    ],
+    deps = [
+        ":__tests__/helpers/environment",
+        ":node_modules/@temporalio/test-helpers",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+        "//typescript/openai-agents/tests/helpers:build",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/hosted-tool-credentials.test",
+    srcs = [
+        "src/__tests__/hosted-tool-credentials.test.ts",
+    ],
+    deps = [
+        ":__tests__/stubs/openai-agents-fakes",
+        ":common/serialized-model",
+        ":common/trace-context",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/client",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+        ":worker/activities",
+        ":worker/hosted-tool-credentials",
+        ":workflow/activity-backed-model",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/nexus-tools.test",
+    srcs = [
+        "src/__tests__/nexus-tools.test.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/ava",
+        ":node_modules/nexus-rpc",
+        ":workflow/nexus-tools",
+        ":workflow/tools",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/openai-sandbox.test",
+    srcs = [
+        "src/__tests__/openai-sandbox.test.ts",
+    ],
+    deps = [
+        ":__tests__/stubs/sandbox-fakes",
+        ":common/sandbox-activity-types",
+        ":common/worker-env-vars",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/ava",
+        ":worker/sandbox-provider",
+        ":workflow/runner",
+        ":workflow/sandbox-client",
+        ":workflow/sandbox-session",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/polyfills.test",
+    srcs = [
+        "src/__tests__/polyfills.test.ts",
+    ],
+    deps = [
+        ":node_modules/ava",
+        ":workflow/load-polyfills",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/runner-layering.test",
+    srcs = [
+        "src/__tests__/runner-layering.test.ts",
+    ],
+    deps = [
+        ":common/model-activity-options",
+        ":node_modules/ava",
+        ":workflow/runner",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/serialized-model.test",
+    srcs = [
+        "src/__tests__/serialized-model.test.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/ava",
+        ":worker/activities",
+        ":workflow/activity-backed-model",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/session.test",
+    srcs = [
+        "src/__tests__/session.test.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/ava",
+        ":workflow/runner",
+        ":workflow/session",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/stateful-mcp-cancel.test",
+    srcs = [
+        "src/__tests__/stateful-mcp-cancel.test.ts",
+    ],
+    deps = [
+        ":common/trace-context",
+        ":node_modules/@temporalio/activity",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/streaming-activity.test",
+    srcs = [
+        "src/__tests__/streaming-activity.test.ts",
+    ],
+    deps = [
+        ":__tests__/stubs/openai-agents-fakes",
+        ":common/serialized-model",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/client",
+        ":node_modules/@temporalio/testing",
+        ":node_modules/ava",
+        ":worker/activities",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/stubs/openai-agents-comprehensive",
+    srcs = [
+        "src/__tests__/stubs/openai-agents-comprehensive.ts",
+    ],
+    deps = [
+        ":__tests__/stubs/openai-agents-fakes",
+        ":__tests__/workflows/openai-agents-comprehensive",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/nexus-rpc",
+        ":node_modules/openai",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/stubs/openai-agents-fakes",
+    srcs = [
+        "src/__tests__/stubs/openai-agents-fakes.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/stubs/openai-agents",
+    srcs = [
+        "src/__tests__/stubs/openai-agents.ts",
+    ],
+    deps = [
+        ":__tests__/stubs/openai-agents-fakes",
+        ":node_modules/@openai/agents-core",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/stubs/sandbox-fakes",
+    srcs = [
+        "src/__tests__/stubs/sandbox-fakes.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-environment-startup.test",
+    srcs = [
+        "src/__tests__/test-environment-startup.test.ts",
+    ],
+    deps = [
+        ":__tests__/helpers/environment",
+        ":node_modules/ava",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-openai-agents-comprehensive",
+    srcs = [
+        "src/__tests__/test-openai-agents-comprehensive.ts",
+    ],
+    deps = [
+        ":__tests__/activities/openai-agents-comprehensive",
+        ":__tests__/helpers/environment",
+        ":__tests__/helpers/openai-agents-spans",
+        ":__tests__/stubs/openai-agents-comprehensive",
+        ":__tests__/stubs/openai-agents-fakes",
+        ":__tests__/stubs/sandbox-fakes",
+        ":__tests__/workflows/openai-agents-comprehensive",
+        ":common/trace-context",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/client",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/test-helpers",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+        "//typescript/openai-agents/tests/helpers:build",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-openai-agents-readonly-tracing",
+    srcs = [
+        "src/__tests__/test-openai-agents-readonly-tracing.ts",
+    ],
+    deps = [
+        ":__tests__/helpers/openai-agents-spans",
+        ":__tests__/helpers/test-fn",
+        ":__tests__/stubs/openai-agents",
+        ":__tests__/workflows/openai-agents-readonly-tracing",
+        ":common/trace-context",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/client",
+        ":node_modules/@temporalio/test-helpers",
+        "//typescript/openai-agents/tests/helpers:build",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-openai-agents",
+    srcs = [
+        "src/__tests__/test-openai-agents.ts",
+    ],
+    deps = [
+        ":__tests__/helpers/test-fn",
+        ":__tests__/stubs/openai-agents",
+        ":__tests__/stubs/openai-agents-fakes",
+        ":__tests__/workflows/openai-agents",
+        ":common/trace-context",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/client",
+        ":node_modules/@temporalio/proto",
+        ":node_modules/@temporalio/test-helpers",
+        ":node_modules/@temporalio/workflow-streams",
+        "//typescript/openai-agents/tests/helpers:build",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/test-openai-sandbox",
+    srcs = [
+        "src/__tests__/test-openai-sandbox.ts",
+    ],
+    deps = [
+        ":__tests__/helpers/openai-agents-spans",
+        ":__tests__/helpers/test-fn",
+        ":__tests__/stubs/openai-agents",
+        ":__tests__/stubs/sandbox-fakes",
+        ":__tests__/workflows/openai-sandbox",
+        ":common/trace-context",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/client",
+        ":node_modules/@temporalio/test-helpers",
+        "//typescript/openai-agents/tests/helpers:build",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/worker-env-vars.test",
+    srcs = [
+        "src/__tests__/worker-env-vars.test.ts",
+    ],
+    deps = [
+        ":__tests__/stubs/openai-agents",
+        ":__tests__/stubs/sandbox-fakes",
+        ":common/sandbox-activity-types",
+        ":common/trace-context",
+        ":common/worker-env-vars",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/ava",
+        ":worker/sandbox-provider",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/workflows/openai-agents-comprehensive",
+    srcs = [
+        "src/__tests__/workflows/openai-agents-comprehensive.ts",
+    ],
+    deps = [
+        ":__tests__/activities/openai-agents-comprehensive",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/nexus-rpc",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/workflows/openai-agents-readonly-tracing",
+    srcs = [
+        "src/__tests__/workflows/openai-agents-readonly-tracing.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/workflows/openai-agents",
+    srcs = [
+        "src/__tests__/workflows/openai-agents.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/@temporalio/workflow-streams",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "__tests__/workflows/openai-sandbox",
+    srcs = [
+        "src/__tests__/workflows/openai-sandbox.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":workflow",
+    ],
+)
+
+typescript_module(
+    name = "client/trace-interceptor",
+    srcs = [
+        "src/client/trace-interceptor.ts",
+    ],
+    deps = [
+        ":common/headers",
+        ":common/model-activity-options",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/client",
+    ],
+)
+
+typescript_module(
+    name = "common/agent-sink-types",
+    srcs = [
+        "src/common/agent-sink-types.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "common/errors",
+    srcs = [
+        "src/common/errors.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/common",
+    ],
+)
+
+typescript_module(
+    name = "common/headers",
+    srcs = [
+        "src/common/headers.ts",
+    ],
+    deps = [
+        ":common/model-activity-options",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@opentelemetry/api",
+        ":node_modules/@temporalio/common",
+    ],
+)
+
+typescript_module(
+    name = "common/mcp-types",
+    srcs = [
+        "src/common/mcp-types.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+    ],
+)
+
+typescript_module(
+    name = "common/model-activity-options",
+    srcs = [
+        "src/common/model-activity-options.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "common/sandbox-activity-types",
+    srcs = [
+        "src/common/sandbox-activity-types.ts",
+    ],
+    deps = [
+        ":common/worker-env-vars",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+    ],
+)
+
+typescript_module(
+    name = "common/serialized-model",
+    srcs = [
+        "src/common/serialized-model.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+    ],
+)
+
+# These modules import each other and compile together.
+typescript_module(
+    name = "common/trace-context",
+    srcs = [
+        "src/common/trace-context.ts",
+        "src/common/tracing-bridge.ts",
+        "src/index.ts",
+        "src/worker/activity-tracing.ts",
+        "src/worker/base-tracing-processor.ts",
+        "src/worker/plugin.ts",
+        "src/worker/stateful-mcp-provider.ts",
+        "src/worker/trace-interceptor.ts",
+        "src/workflow/span-helpers.ts",
+        "src/workflow/trace-interceptor.ts",
+    ],
+    deps = [
+        ":client/trace-interceptor",
+        ":common/agent-sink-types",
+        ":common/headers",
+        ":common/mcp-types",
+        ":common/model-activity-options",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@opentelemetry/api",
+        ":node_modules/@temporalio/activity",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/plugin",
+        ":node_modules/@temporalio/worker",
+        ":node_modules/@temporalio/workflow",
+        ":worker/activities",
+        ":worker/agent-sink-bridge",
+        ":worker/heartbeat",
+        ":worker/hosted-tool-credentials",
+        ":worker/mcp-provider",
+        ":worker/sandbox-provider",
+        ":worker/seeded-ids",
+        ":workflow/agent-sink-processor",
+        ":workflow/plugin-config-store",
+        ":workflow/preload-polyfills",
+        ":workflow/tracing",
+    ],
+)
+
+typescript_module(
+    name = "common/worker-env-vars",
+    srcs = [
+        "src/common/worker-env-vars.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+    ],
+)
+
+typescript_module(
+    name = "otel",
+    srcs = [
+        "src/otel.ts",
+    ],
+    deps = [
+        ":common/trace-context",
+        ":node_modules/@opentelemetry/sdk-trace-base",
+        ":worker/seeded-ids",
+    ],
+)
+
+typescript_module(
+    name = "worker/activities",
+    srcs = [
+        "src/worker/activities.ts",
+    ],
+    deps = [
+        ":common/serialized-model",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow-streams",
+        ":node_modules/openai",
+        ":worker/heartbeat",
+        ":worker/hosted-tool-credentials",
+    ],
+)
+
+typescript_module(
+    name = "worker/agent-sink-bridge",
+    srcs = [
+        "src/worker/agent-sink-bridge.ts",
+    ],
+    deps = [
+        ":common/agent-sink-types",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/worker",
+    ],
+)
+
+typescript_module(
+    name = "worker/heartbeat",
+    srcs = [
+        "src/worker/heartbeat.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/activity",
+    ],
+)
+
+typescript_module(
+    name = "worker/hosted-tool-credentials",
+    srcs = [
+        "src/worker/hosted-tool-credentials.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+    ],
+)
+
+typescript_module(
+    name = "worker/mcp-provider",
+    srcs = [
+        "src/worker/mcp-provider.ts",
+    ],
+    deps = [
+        ":common/mcp-types",
+        ":node_modules/@openai/agents-core",
+    ],
+)
+
+typescript_module(
+    name = "worker/sandbox-provider",
+    srcs = [
+        "src/worker/sandbox-provider.ts",
+    ],
+    deps = [
+        ":common/sandbox-activity-types",
+        ":common/worker-env-vars",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+    ],
+)
+
+typescript_module(
+    name = "worker/seeded-ids",
+    srcs = [
+        "src/worker/seeded-ids.ts",
+    ],
+)
+
+typescript_module(
+    name = "workflow",
+    srcs = [
+        "src/workflow.ts",
+    ],
+    deps = [
+        ":common/mcp-types",
+        ":common/worker-env-vars",
+        ":workflow/agent-tools",
+        ":workflow/mcp-client",
+        ":workflow/nexus-tools",
+        ":workflow/runner",
+        ":workflow/sandbox-client",
+        ":workflow/session",
+        ":workflow/stateful-mcp-client",
+        ":workflow/tools",
+    ],
+)
+
+typescript_module(
+    name = "workflow/activity-backed-model",
+    srcs = [
+        "src/workflow/activity-backed-model.ts",
+    ],
+    deps = [
+        ":common/model-activity-options",
+        ":common/serialized-model",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "workflow/agent-sink-processor",
+    srcs = [
+        "src/workflow/agent-sink-processor.ts",
+    ],
+    deps = [
+        ":common/agent-sink-types",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/workflow",
+        ":workflow/plugin-config-store",
+    ],
+)
+
+typescript_module(
+    name = "workflow/agent-tools",
+    srcs = [
+        "src/workflow/agent-tools.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":workflow/runner",
+        ":workflow/tools",
+    ],
+)
+
+typescript_module(
+    name = "workflow/convert-agent",
+    srcs = [
+        "src/workflow/convert-agent.ts",
+    ],
+    deps = [
+        ":common/model-activity-options",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":workflow/activity-backed-model",
+    ],
+)
+
+typescript_module(
+    name = "workflow/load-polyfills",
+    srcs = [
+        "src/workflow/load-polyfills.ts",
+    ],
+    deps = [
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/@ungap/structured-clone",
+        ":node_modules/headers-polyfill",
+        ":node_modules/web-streams-polyfill",
+    ],
+)
+
+typescript_module(
+    name = "workflow/mcp-client",
+    srcs = [
+        "src/workflow/mcp-client.ts",
+    ],
+    deps = [
+        ":common/mcp-types",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "workflow/nexus-tools",
+    srcs = [
+        "src/workflow/nexus-tools.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":node_modules/nexus-rpc",
+        ":workflow/tools",
+    ],
+)
+
+typescript_module(
+    name = "workflow/plugin-config-store",
+    srcs = [
+        "src/workflow/plugin-config-store.ts",
+    ],
+    deps = [
+        ":common/model-activity-options",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "workflow/preload-polyfills",
+    srcs = [
+        "src/workflow/preload-polyfills.ts",
+    ],
+    deps = [
+        ":workflow/load-polyfills",
+    ],
+)
+
+typescript_module(
+    name = "workflow/runner",
+    srcs = [
+        "src/workflow/runner.ts",
+    ],
+    deps = [
+        ":common/errors",
+        ":common/model-activity-options",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":workflow/agent-sink-processor",
+        ":workflow/convert-agent",
+        ":workflow/plugin-config-store",
+        ":workflow/sandbox-client",
+        ":workflow/tracing",
+    ],
+)
+
+typescript_module(
+    name = "workflow/sandbox-client",
+    srcs = [
+        "src/workflow/sandbox-client.ts",
+    ],
+    deps = [
+        ":common/sandbox-activity-types",
+        ":common/trace-context",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":workflow/sandbox-session",
+    ],
+)
+
+typescript_module(
+    name = "workflow/sandbox-session",
+    srcs = [
+        "src/workflow/sandbox-session.ts",
+    ],
+    deps = [
+        ":common/sandbox-activity-types",
+        ":common/trace-context",
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "workflow/session",
+    srcs = [
+        "src/workflow/session.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "workflow/stateful-mcp-client",
+    srcs = [
+        "src/workflow/stateful-mcp-client.ts",
+    ],
+    deps = [
+        ":common/mcp-types",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+        ":workflow/plugin-config-store",
+    ],
+)
+
+typescript_module(
+    name = "workflow/tools",
+    srcs = [
+        "src/workflow/tools.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/common",
+        ":node_modules/@temporalio/workflow",
+    ],
+)
+
+typescript_module(
+    name = "workflow/tracing",
+    srcs = [
+        "src/workflow/tracing.ts",
+    ],
+    deps = [
+        ":node_modules/@openai/agents-core",
+        ":node_modules/@temporalio/workflow",
+        ":workflow/agent-sink-processor",
+    ],
+)
+
+typescript_integration(
+    modules = [
+        ":client/trace-interceptor",
+        ":common/agent-sink-types",
+        ":common/errors",
+        ":common/headers",
+        ":common/mcp-types",
+        ":common/model-activity-options",
+        ":common/sandbox-activity-types",
+        ":common/serialized-model",
+        ":common/trace-context",
+        ":common/worker-env-vars",
+        ":otel",
+        ":worker/activities",
+        ":worker/agent-sink-bridge",
+        ":worker/heartbeat",
+        ":worker/hosted-tool-credentials",
+        ":worker/mcp-provider",
+        ":worker/sandbox-provider",
+        ":worker/seeded-ids",
+        ":workflow",
+        ":workflow/activity-backed-model",
+        ":workflow/agent-sink-processor",
+        ":workflow/agent-tools",
+        ":workflow/convert-agent",
+        ":workflow/load-polyfills",
+        ":workflow/mcp-client",
+        ":workflow/nexus-tools",
+        ":workflow/plugin-config-store",
+        ":workflow/preload-polyfills",
+        ":workflow/runner",
+        ":workflow/sandbox-client",
+        ":workflow/sandbox-session",
+        ":workflow/session",
+        ":workflow/stateful-mcp-client",
+        ":workflow/tools",
+        ":workflow/tracing",
+    ],
+    test_modules = [
+        ":__tests__/activities/openai-agents",
+        ":__tests__/activities/openai-agents-comprehensive",
+        ":__tests__/activity-backed-model.test",
+        ":__tests__/agent-sink-bridge.test",
+        ":__tests__/agent-sink-processor.test",
+        ":__tests__/agent-tools.test",
+        ":__tests__/classifier.test",
+        ":__tests__/client-trace-interceptor.test",
+        ":__tests__/convert-agent.test",
+        ":__tests__/errors.test",
+        ":__tests__/helpers/environment",
+        ":__tests__/helpers/openai-agents-spans",
+        ":__tests__/helpers/test-fn",
+        ":__tests__/hosted-tool-credentials.test",
+        ":__tests__/nexus-tools.test",
+        ":__tests__/openai-sandbox.test",
+        ":__tests__/polyfills.test",
+        ":__tests__/runner-layering.test",
+        ":__tests__/serialized-model.test",
+        ":__tests__/session.test",
+        ":__tests__/stateful-mcp-cancel.test",
+        ":__tests__/streaming-activity.test",
+        ":__tests__/stubs/openai-agents",
+        ":__tests__/stubs/openai-agents-comprehensive",
+        ":__tests__/stubs/openai-agents-fakes",
+        ":__tests__/stubs/sandbox-fakes",
+        ":__tests__/test-environment-startup.test",
+        ":__tests__/test-openai-agents",
+        ":__tests__/test-openai-agents-comprehensive",
+        ":__tests__/test-openai-agents-readonly-tracing",
+        ":__tests__/test-openai-sandbox",
+        ":__tests__/worker-env-vars.test",
+        ":__tests__/workflows/openai-agents",
+        ":__tests__/workflows/openai-agents-comprehensive",
+        ":__tests__/workflows/openai-agents-readonly-tracing",
+        ":__tests__/workflows/openai-sandbox",
+    ],
+)
