@@ -23,16 +23,18 @@ wrap an existing Temporal Activity with `activityAsTool`.
 npm install @temporalio/google-adk
 ```
 
-The supported peer range is `@google/adk` `>=2.0.0 <2.1.0` and `@google/genai`
-`^2.9.0`. The ceiling is exact by design: the plugin's Workflow-sandbox shims are
-keyed to what ADK reaches at module load, so an ADK minor outside this range can
-break the Workflow bundle. `@modelcontextprotocol/sdk` is an optional peer: install
-it if you use `TemporalMCPToolset` (ADK 2.0 made it optional too).
+The supported peer range is `@google/adk` `>=2.0.0 <2.4.0` and `@google/genai`
+`^2.9.0` (ADK 2.3 itself requires `@google/genai` 2.29.1 or newer; keep your own
+copy inside ADK's range so the Workflow bundle holds one). The ceiling is exact by
+design: the plugin's Workflow-sandbox shims are keyed to what ADK reaches at
+module load, so an ADK minor outside this range can break the Workflow bundle.
+`@modelcontextprotocol/sdk` is an optional peer: install it if you use
+`TemporalMCPToolset` (ADK 2.0 made it optional too).
 
 Provide Gemini credentials to the Worker as usual, for example with
 `GOOGLE_GENAI_API_KEY`, `GOOGLE_API_KEY` or `GEMINI_API_KEY`.
 
-### Upgrading from ADK 1.5
+### Upgrading ADK
 
 Versions of this plugin for `@google/adk` 1.5 are not compatible with 2.0, and a
 Workflow started under 1.5 cannot be replayed by a Worker on 2.0: ADK's internals
@@ -40,6 +42,12 @@ and its id generation changed. Drain in-flight Workflows before switching, or ru
 the two versions on separate task queues. Nothing in your Workflow code has to
 change; raw model strings (`model: 'gemini-2.5-flash'`) now work inside a Workflow
 without `TemporalModel` (see [Model routing](#model-routing)).
+
+ADK minors within the range also change the agent loop in ways a history records
+(2.1 resumes run-time tool gates that 2.0 refused; 2.3 returns a node's input-schema
+rejection to the model as a tool error), so treat an ADK minor upgrade like a
+Workflow code change: drain in-flight Workflows, or move between the versions
+with Worker Versioning or separate task queues.
 
 ## Hello world
 
@@ -322,6 +330,8 @@ const runner = new InMemoryRunner({ agent: graph });
 - **Node as tool.** A `Workflow` (or any node) in an `LlmAgent`'s `tools` becomes a
   tool. Give it a Zod object `inputSchema` for real parameters; a genai `Schema`
   advertises a single `request` string, which only a string-typed schema accepts.
+  An object-typed one rejects it: ADK 2.3 returns that rejection to the model as
+  a tool error, earlier releases end the turn with no tool response.
 - **Retries and timeouts.** Prefer Temporal's `activity.retry` and timeouts. ADK's
   `retryConfig` re-runs the whole node on top of them (match an Activity failure
   with `exceptions: ['ActivityFailure']`; ADK matches error names), its backoff is
@@ -482,10 +492,12 @@ export async function reviewWorkflow(prompt: string): Promise<unknown> {
   enforced on an `LlmAgent` turn; ADK's workflow `ToolNode` does not route through
   confirmation. Declare the gate this
   way rather than calling `toolContext.requestConfirmation()` from a tool body:
-  ADK 2.0.0 binds an approval only to a tool whose `checkRequireConfirmation`
-  says the call needs one, and refuses a gate requested only at run time — the
-  same limit applies to `SecurityPlugin`'s `CONFIRM` outcome — ending the
-  Workflow with `GoogleAdkIntentMismatchError` (`confirmation_not_required`).
+  a declared gate resumes on every supported ADK version, whereas a gate
+  requested only at run time — `SecurityPlugin`'s `CONFIRM` outcome included —
+  resumes only from ADK 2.1 on; ADK 2.0.0 bound an approval to a tool whose
+  `checkRequireConfirmation` said the call needs one and refused the rest,
+  ending the Workflow with `GoogleAdkIntentMismatchError`
+  (`confirmation_not_required`).
 
   ```typescript
   activityAsTool({ name: 'deploy', description: 'Deploy.', parameters, requireConfirmation: true });
@@ -647,12 +659,16 @@ Cautions:
 ## Determinism notes
 
 - ADK generates ids — event, invocation and session ids, function-call ids,
-  `RequestInput` interrupt ids — with `randomUUID()`. The sandbox has no `crypto`,
-  so the plugin serves ADK a `crypto` module whose values come from a **named
+  `RequestInput` interrupt ids — with `randomUUID()`, which reads the `crypto`
+  global first. The sandbox has none, so the plugin installs one — `randomUUID`
+  and `getRandomValues` only, no `subtle` — whose values come from a **named
   workflow random stream**: replay-stable, and independent of the Workflow's own
-  `Math.random()` sequence. Those ids are **not cryptographically random** inside
-  a Workflow; nor is ADK's OAuth2 `state`, which is one reason credential flows
-  are unsupported there.
+  `Math.random()` sequence. (ADK's own `node:crypto` import, and the `uuid`
+  package's, are redirected to the same stream; the ids are identical either
+  way.) The global is bundle-wide: your Workflow code and other bundled packages
+  see that `crypto` too. Its
+  values are **not cryptographically random**; nor is ADK's OAuth2 `state`,
+  which is one reason credential flows are unsupported there.
 - ADK's node retry backoff and timeouts are durable timers; the retry jitter is
   drawn from the Workflow's `Math.random()`.
 - ADK resumes a paused run from the session events: completed nodes are
@@ -667,8 +683,10 @@ Cautions:
 - **Live / bidirectional streaming**: `Runner.runLive`, `StreamingMode.BIDI` and
   `BaseLlm.connect` (`TemporalModel.connect` throws `GoogleAdkUnsupported`; ADK
   itself rejects `StreamingMode.BIDI` in `runAsync`).
-- **Node-only ADK services.** The Workflow bundle uses ADK's web surface. It type-
-  checks against ADK's full typings, but these are `undefined` at run time in a
+- **Node-only ADK services.** The Workflow bundle uses ADK's browser-safe
+  `common` surface — the module set behind its web entry, taken from the
+  per-file ESM build. It type-checks against ADK's full typings, but these are
+  `undefined` at run time in a
   Workflow: the MCP classes (`MCPToolset`, `MCPSessionManager` — use
   `TemporalMCPToolset`), a2a, `DatabaseSessionService`, `GcsArtifactService` /
   `FileArtifactService`, the local code executors (`UnsafeLocalCodeExecutor`,
@@ -707,7 +725,7 @@ Cautions:
   `GoogleAdkPluginOptions.modelProvider` build it on the Worker.
 - `X is not a constructor` / `X is not a function` for an ADK symbol inside a
   Workflow means the symbol is one of the node-only services above: the Workflow
-  bundle resolves ADK's web surface, which omits it. Use it worker-side.
+  bundle resolves ADK's `common` surface, which omits it. Use it worker-side.
 - A cryptic sandbox error during a model call (`fetch is not defined`, or a
   `… is not a function` from a worker-only module such as `google-auth-library`)
   means a `BaseLlm` performed I/O inside the Workflow — for instance
