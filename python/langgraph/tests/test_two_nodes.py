@@ -1,8 +1,11 @@
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
+from langgraph.runtime import Runtime
 from typing_extensions import TypedDict
 
 from temporalio import workflow
@@ -13,14 +16,43 @@ from temporalio.worker import Worker
 
 class State(TypedDict):
     value: str
+    context_type_a: str
+    context_type_b: str
 
 
-async def node_a(state: State) -> dict[str, str]:
-    return {"value": state["value"] + "a"}
+@dataclass
+class Context:
+    user_id: str
 
 
-async def node_b(state: State) -> dict[str, str]:
-    return {"value": state["value"] + "b"}
+class DictContext(TypedDict):
+    user_id: str
+
+
+def context_user_id(context: Context | DictContext | None) -> str:
+    if context is None:
+        return ""
+    if isinstance(context, dict):
+        return context["user_id"]
+    return context.user_id
+
+
+async def node_a(
+    state: State, runtime: Runtime[Context | DictContext]
+) -> dict[str, str]:
+    return {
+        "value": state["value"] + "a" + context_user_id(runtime.context),
+        "context_type_a": type(runtime.context).__name__,
+    }
+
+
+async def node_b(
+    state: State, runtime: Runtime[Context | DictContext]
+) -> dict[str, str]:
+    return {
+        "value": state["value"] + "b" + context_user_id(runtime.context),
+        "context_type_b": type(runtime.context).__name__,
+    }
 
 
 @workflow.defn
@@ -29,13 +61,39 @@ class TwoNodesWorkflow:
         self.app = graph("my-graph").compile()
 
     @workflow.run
-    async def run(self, input: str) -> Any:
-        return await self.app.ainvoke({"value": input})
+    async def run(self, input: str, context_kind: str = "none") -> Any:
+        context = (
+            Context(user_id="alice")
+            if context_kind == "dataclass"
+            else {"user_id": "alice"}
+            if context_kind in ("dict", "typeddict")
+            else None
+        )
+        return await self.app.ainvoke({"value": input}, context=context)
 
 
-async def test_two_nodes(client: Client):
-    g = StateGraph(State)
-    g.add_node("node_a", node_a, metadata={"execute_in": "activity"})
+@pytest.mark.parametrize("first_node_execution", ["activity", "workflow"])
+@pytest.mark.parametrize(
+    ("context_kind", "expected_context_type"),
+    [
+        ("none", "NoneType"),
+        ("dataclass", "Context"),
+        ("dict", "Context"),
+        ("typeddict", "dict"),
+    ],
+)
+async def test_two_nodes(
+    client: Client, first_node_execution: str, context_kind: str, expected_context_type: str
+):
+    schema = (
+        DictContext
+        if context_kind == "typeddict"
+        else Context
+        if context_kind in ("dataclass", "dict")
+        else None
+    )
+    g = StateGraph(State, context_schema=schema)
+    g.add_node("node_a", node_a, metadata={"execute_in": first_node_execution})
     g.add_node("node_b", node_b, metadata={"execute_in": "activity"})
     g.add_edge(START, "node_a")
     g.add_edge("node_a", "node_b")
@@ -57,9 +115,13 @@ async def test_two_nodes(client: Client):
     ):
         result = await client.execute_workflow(
             TwoNodesWorkflow.run,
-            "",
+            args=["", context_kind],
             id=f"test-workflow-{uuid4()}",
             task_queue=task_queue,
         )
 
-    assert result == {"value": "ab"}
+    assert result == {
+        "value": "ab" if context_kind == "none" else "aalicebalice",
+        "context_type_a": expected_context_type,
+        "context_type_b": expected_context_type,
+    }
