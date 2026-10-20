@@ -1,54 +1,34 @@
-# Each language mirrors the Dependabot settings in its temporalio/sdk-* repository.
 version: 2
 updates:
-  # sdk-python: security advisories only because uv support is not yet mature enough
-  # for routine version bumps. Nightly checks provide the dependency-drift signal.
   - package-ecosystem: "uv"
     directories:
       - "/python/*"
       - "/scripts"
+    versioning-strategy: increase-if-necessary
     schedule:
       interval: "weekly"
-    cooldown:
-      default-days: 14
     open-pull-requests-limit: 0
-  # sdk-typescript: weekly non-major updates, with development dependencies grouped.
   - package-ecosystem: "npm"
     directories:
       - "/typescript/*"
+    versioning-strategy: increase-if-necessary
     schedule:
       interval: "weekly"
-    cooldown:
-      default-days: 14
-    groups:
-      development-dependencies:
-        dependency-type: "development"
-    ignore:
-      - dependency-name: "*"
-        update-types:
-          - "version-update:semver-major"
-  # sdk-java: security advisories only.
+    open-pull-requests-limit: 0
   - package-ecosystem: "gradle"
     directories:
       - "/java/*"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 0
-    cooldown:
-      default-days: 14
-  # sdk-go: security advisories only.
   - package-ecosystem: "gomod"
     directories:
       - "/go/*"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 0
-    cooldown:
-      default-days: 14
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    cooldown:
-      default-days: 14
     open-pull-requests-limit: 0
