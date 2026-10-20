@@ -120,7 +120,20 @@ def set_langgraph_config(
         and context_schema is not None
         and dataclasses.is_dataclass(context_schema)
     ):
-        context = context_schema(**context)
+        non_init_fields = {
+            field.name for field in dataclasses.fields(context_schema) if not field.init
+        }
+        init_values = {
+            name: value
+            for name, value in context.items()
+            if name not in non_init_fields
+        }
+        restored_context = context_schema(**init_values)
+        # Restore non-init fields even for frozen dataclasses.
+        for name in non_init_fields:
+            if name in context:
+                object.__setattr__(restored_context, name, context[name])
+        context = restored_context
 
     execution_info_dict = config.get("execution_info")
     runtime: Runtime[Any] = Runtime(

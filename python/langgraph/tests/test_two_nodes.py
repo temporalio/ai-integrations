@@ -1,5 +1,5 @@
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
@@ -31,6 +31,14 @@ class Context:
     user_id: str
 
 
+@dataclass
+class ComputedContext(Context):
+    label: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.label = self.user_id.upper()
+
+
 class DictContext(TypedDict):
     user_id: str
 
@@ -40,6 +48,8 @@ def context_user_id(context: Context | DictContext | None) -> str:
         return ""
     if isinstance(context, dict):
         return context["user_id"]
+    if isinstance(context, ComputedContext):
+        return f"{context.user_id}:{context.label}"
     return context.user_id
 
 
@@ -70,13 +80,17 @@ class TwoNodesWorkflow:
 
     @workflow.run
     async def run(self, input: str, context_kind: str = "none") -> Any:
-        context = (
-            Context(user_id="alice")
-            if context_kind == "dataclass"
-            else {"user_id": "alice"}
-            if context_kind in ("dict", "typeddict")
-            else None
-        )
+        context: Context | DictContext | None
+        if context_kind == "computed":
+            computed_context = ComputedContext(user_id="alice")
+            computed_context.label = "saved"
+            context = computed_context
+        elif context_kind == "dataclass":
+            context = Context(user_id="alice")
+        elif context_kind in ("dict", "typeddict"):
+            context = DictContext(user_id="alice")
+        else:
+            context = None
         return await self.app.ainvoke({"value": input}, context=context)
 
 
@@ -86,6 +100,7 @@ class TwoNodesWorkflow:
     [
         ("none", "NoneType"),
         pytest.param("dataclass", "Context", marks=requires_async_context),
+        pytest.param("computed", "ComputedContext", marks=requires_async_context),
         pytest.param("dict", "Context", marks=requires_async_context),
         pytest.param("typeddict", "dict", marks=requires_async_context),
     ],
@@ -97,7 +112,9 @@ async def test_two_nodes(
     expected_context_type: str,
 ):
     schema: type[Any] | None = (
-        DictContext
+        ComputedContext
+        if context_kind == "computed"
+        else DictContext
         if context_kind == "typeddict"
         else Context
         if context_kind in ("dataclass", "dict")
@@ -131,8 +148,11 @@ async def test_two_nodes(
             task_queue=task_queue,
         )
 
+    expected_value = "ab" if context_kind == "none" else "aalicebalice"
+    if context_kind == "computed":
+        expected_value = "aalice:savedbalice:saved"
     assert result == {
-        "value": "ab" if context_kind == "none" else "aalicebalice",
+        "value": expected_value,
         "context_type_a": expected_context_type,
         "context_type_b": expected_context_type,
     }
