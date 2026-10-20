@@ -29,6 +29,7 @@ installed on the machine assembling the worker.
 
 from __future__ import annotations
 
+import base64
 import contextvars
 import dataclasses
 import hashlib
@@ -151,14 +152,15 @@ def load_object(data: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Backend protocol result (de)serialization
+# Backend protocol value (de)serialization
 # ---------------------------------------------------------------------------
 
 _BACKEND_DATACLASS_KEY = "__deepagents_dataclass__"
+_BACKEND_BYTES_KEY = "__deepagents_bytes__"
 
 
 def dump_backend_result(value: Any) -> Any:
-    """Encode a backend op's return value for the activity boundary.
+    """Encode a backend op's arguments or return value for the activity boundary.
 
     Backend protocol results (``WriteResult`` / ``ReadResult`` / ``GrepResult``
     and their nested ``FileInfo`` / ``GrepMatch`` items, …) are plain
@@ -168,10 +170,14 @@ def dump_backend_result(value: Any) -> Any:
     Tag deepagents dataclasses with their import path so
     :func:`load_backend_result` rebuilds the real type; anything else (str,
     dict, a custom backend's own types) passes through with today's
-    plain-JSON behavior.
+    plain-JSON behavior. ``bytes`` (``upload_files`` content,
+    ``FileDownloadResponse.content``) is tagged and base64-encoded: JSON has no
+    bytes type, and file content need not be valid UTF-8.
     """
     import dataclasses
 
+    if isinstance(value, bytes):
+        return {_BACKEND_BYTES_KEY: base64.b64encode(value).decode("ascii")}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         cls = type(value)
         dumped_fields = {
@@ -207,6 +213,8 @@ def load_backend_result(value: Any) -> Any:
     import importlib
     import warnings
 
+    if isinstance(value, dict) and _BACKEND_BYTES_KEY in value:
+        return base64.b64decode(value[_BACKEND_BYTES_KEY])
     if isinstance(value, dict) and _BACKEND_DATACLASS_KEY in value:
         path = value[_BACKEND_DATACLASS_KEY]
         module_name, _, qualname = path.partition(":")

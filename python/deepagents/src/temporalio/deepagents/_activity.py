@@ -425,7 +425,10 @@ class DeepAgentActivities:
                 type="DeepAgentsUnknownBackendOp",
                 non_retryable=True,
             )
-        result = method(*input.args, **input.kwargs)
+        result = method(
+            *_serde.load_backend_result(input.args),
+            **_serde.load_backend_result(input.kwargs),
+        )
         if asyncio.iscoroutine(result):
             result = await result
         # Protocol results are plain dataclasses whose attributes the
