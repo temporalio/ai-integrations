@@ -29,6 +29,8 @@ from tests.test_two_nodes import (
 
 @pytest.mark.parametrize("context_kind", ["none", "dataclass"])
 async def test_replay(client: Client, context_kind: str):
+    if context_kind != "none" and sys.version_info < (3, 11):
+        pytest.skip("LangGraph async context propagation requires Python >= 3.11")
     g = StateGraph(
         State,
         context_schema=Context if context_kind == "dataclass" else None,

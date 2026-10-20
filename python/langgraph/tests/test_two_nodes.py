@@ -1,3 +1,4 @@
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -90,6 +91,8 @@ async def test_two_nodes(
     context_kind: str,
     expected_context_type: str,
 ):
+    if context_kind != "none" and sys.version_info < (3, 11):
+        pytest.skip("LangGraph async context propagation requires Python >= 3.11")
     schema: type[Any] | None = (
         DictContext
         if context_kind == "typeddict"
