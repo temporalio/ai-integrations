@@ -29,7 +29,10 @@ from tests.test_two_nodes import (
 
 @pytest.mark.parametrize("context_kind", ["none", "dataclass"])
 async def test_replay(client: Client, context_kind: str):
-    g = StateGraph(State, context_schema=Context if context_kind == "dataclass" else None)
+    g = StateGraph(
+        State,
+        context_schema=Context if context_kind == "dataclass" else None,
+    )
     g.add_node("node_a", node_a, metadata={"execute_in": "activity"})
     g.add_node("node_b", node_b, metadata={"execute_in": "activity"})
     g.add_edge(START, "node_a")
