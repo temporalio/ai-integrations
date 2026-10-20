@@ -122,19 +122,21 @@ plugin = LangGraphPlugin(
 
 ### Runtime Context
 
-LangGraph's run-scoped context (`context_schema`) is reconstructed on the Activity side, so nodes and tasks can read from and write to `runtime.context`:
+LangGraph's run-scoped context is available through `runtime.context` in nodes and tasks. Graph API Activity nodes rebuild dataclass contexts from the registered graph's `context_schema`, so they support attribute access just like native LangGraph:
 
 ```python
+from dataclasses import dataclass
+
 from langgraph.runtime import Runtime
-from typing_extensions import TypedDict
 
 from temporalio.langgraph import graph
 
-class Context(TypedDict):
+@dataclass
+class Context:
     user_id: str
 
 async def my_node(state: State, runtime: Runtime[Context]) -> dict:
-    return {"user": runtime.context["user_id"]}
+    return {"user": runtime.context.user_id}
 
 # In the Workflow:
 g = graph("my-graph").compile()
@@ -142,6 +144,8 @@ await g.ainvoke({...}, context=Context(user_id="alice"))
 ```
 
 Your `context` object must be serializable by the configured Temporal payload converter, since it crosses the Activity boundary.
+
+`TypedDict` contexts still use dictionary access, such as `runtime.context["user_id"]`. Dataclass reconstruction uses the dataclass constructor; it does not restore nested custom types on its own. Functional API tasks do not yet restore dataclass contexts and should use dictionary contexts. Pydantic context reconstruction is not included in this support.
 
 ## Summaries
 

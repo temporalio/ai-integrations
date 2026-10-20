@@ -19,6 +19,7 @@ from tests.test_interrupt import (
     node as interrupt_node,
 )
 from tests.test_two_nodes import (
+    Context,
     State,
     TwoNodesWorkflow,
     node_a,
@@ -26,8 +27,9 @@ from tests.test_two_nodes import (
 )
 
 
-async def test_replay(client: Client):
-    g = StateGraph(State)
+@pytest.mark.parametrize("context_kind", ["none", "dataclass"])
+async def test_replay(client: Client, context_kind: str):
+    g = StateGraph(State, context_schema=Context if context_kind == "dataclass" else None)
     g.add_node("node_a", node_a, metadata={"execute_in": "activity"})
     g.add_node("node_b", node_b, metadata={"execute_in": "activity"})
     g.add_edge(START, "node_a")
@@ -47,7 +49,7 @@ async def test_replay(client: Client):
     ):
         handle = await client.start_workflow(
             TwoNodesWorkflow.run,
-            "",
+            args=["", context_kind],
             id=f"test-workflow-{uuid4()}",
             task_queue=task_queue,
         )

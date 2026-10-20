@@ -230,7 +230,10 @@ class LangGraphPlugin(SimplePlugin):
                     # activity wrapper is always used. wrap_activity handles
                     # sync vs. async user functions inside the activity itself.
                     runnable.afunc = self.execute(
-                        f"{graph_name}.{node_name}", user_func, opts
+                        f"{graph_name}.{node_name}",
+                        user_func,
+                        opts,
+                        context_schema=graph.context_schema,
                     )
                     runnable.func = None
 
@@ -290,6 +293,8 @@ class LangGraphPlugin(SimplePlugin):
         activity_name: str,
         func: Callable,
         kwargs: dict[str, Any] | None = None,
+        *,
+        context_schema: type[Any] | None = None,
     ) -> Callable:
         """Prepare a node or task to execute as an activity or inline in the workflow."""
         opts = kwargs or {}
@@ -310,6 +315,7 @@ class LangGraphPlugin(SimplePlugin):
         if execute_in == "activity":
             wrapped = wrap_activity(
                 func,
+                context_schema=context_schema,
                 streaming_topic=self._streaming_topic,
                 streaming_batch_interval=self._streaming_batch_interval,
             )

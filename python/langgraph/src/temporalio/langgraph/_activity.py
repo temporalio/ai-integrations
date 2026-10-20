@@ -110,6 +110,7 @@ def _command_from_payload(payload: dict[str, Any]) -> Command:
 def wrap_activity(
     func: Callable,
     *,
+    context_schema: type[Any] | None = None,
     streaming_topic: str | None = None,
     streaming_batch_interval: timedelta = timedelta(milliseconds=100),
 ) -> Callable[[ActivityInput], Awaitable[ActivityOutput]]:
@@ -133,7 +134,9 @@ def wrap_activity(
                 effective_writer = thread_safe_writer
 
             runtime = set_langgraph_config(
-                input.langgraph_config, stream_writer=effective_writer
+                input.langgraph_config,
+                context_schema=context_schema,
+                stream_writer=effective_writer,
             )
             kwargs = dict(input.kwargs)
             if accepts_runtime:

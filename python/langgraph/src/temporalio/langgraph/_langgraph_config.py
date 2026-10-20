@@ -96,6 +96,7 @@ def get_langgraph_config() -> dict[str, Any]:
 def set_langgraph_config(
     config: dict[str, Any],
     *,
+    context_schema: type[Any] | None = None,
     stream_writer: Callable[[Any], None] | None = None,
 ) -> Runtime:
     """Restore a LangGraph runnable config from a serialized dict.
@@ -113,9 +114,17 @@ def set_langgraph_config(
             null_resume_box[0] = None
         return val
 
+    context = config.get("context")
+    if (
+        isinstance(context, dict)
+        and context_schema is not None
+        and dataclasses.is_dataclass(context_schema)
+    ):
+        context = context_schema(**context)
+
     execution_info_dict = config.get("execution_info")
     runtime = Runtime(
-        context=config.get("context"),
+        context=context,
         stream_writer=stream_writer or (lambda _: None),
         previous=config.get("previous"),
         execution_info=(

@@ -38,7 +38,8 @@ def context_user_id(context: Context | DictContext | None) -> str:
 
 
 async def node_a(
-    state: State, runtime: Runtime[Context | DictContext]
+    state: State,
+    runtime: Runtime[Context | DictContext],
 ) -> dict[str, str]:
     return {
         "value": state["value"] + "a" + context_user_id(runtime.context),
@@ -47,7 +48,8 @@ async def node_a(
 
 
 async def node_b(
-    state: State, runtime: Runtime[Context | DictContext]
+    state: State,
+    runtime: Runtime[Context | DictContext],
 ) -> dict[str, str]:
     return {
         "value": state["value"] + "b" + context_user_id(runtime.context),
@@ -83,7 +85,10 @@ class TwoNodesWorkflow:
     ],
 )
 async def test_two_nodes(
-    client: Client, first_node_execution: str, context_kind: str, expected_context_type: str
+    client: Client,
+    first_node_execution: str,
+    context_kind: str,
+    expected_context_type: str,
 ):
     schema = (
         DictContext
