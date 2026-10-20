@@ -123,7 +123,7 @@ def set_langgraph_config(
         context = context_schema(**context)
 
     execution_info_dict = config.get("execution_info")
-    runtime = Runtime(
+    runtime: Runtime[Any] = Runtime(
         context=context,
         stream_writer=stream_writer or (lambda _: None),
         previous=config.get("previous"),

@@ -39,7 +39,7 @@ def context_user_id(context: Context | DictContext | None) -> str:
 
 async def node_a(
     state: State,
-    runtime: Runtime[Context | DictContext],
+    runtime: Runtime[Any],
 ) -> dict[str, str]:
     return {
         "value": state["value"] + "a" + context_user_id(runtime.context),
@@ -49,7 +49,7 @@ async def node_a(
 
 async def node_b(
     state: State,
-    runtime: Runtime[Context | DictContext],
+    runtime: Runtime[Any],
 ) -> dict[str, str]:
     return {
         "value": state["value"] + "b" + context_user_id(runtime.context),
