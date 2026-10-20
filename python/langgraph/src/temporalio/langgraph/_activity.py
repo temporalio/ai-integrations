@@ -200,6 +200,8 @@ def wrap_execute_activity(
             )
 
         langgraph_config = get_langgraph_config()
+        if runtime is not None:
+            langgraph_config["context"] = runtime.context
 
         # Check task result cache (for continue-as-new deduplication).
         key = (

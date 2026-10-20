@@ -226,6 +226,13 @@ class LangGraphPlugin(SimplePlugin):
                             f"'workflow'."
                         )
                     opts = _merge_activity_opts(default_activity_options, node_opts)
+                    if opts["execute_in"] == "activity":
+                        # Capture context even when the user calls get_runtime()
+                        # without declaring a runtime parameter.
+                        runnable.func_accepts["runtime"] = (
+                            "N/A",
+                            inspect.Parameter.empty,
+                        )
                     # Route all LangGraph node calls through afunc so the async
                     # activity wrapper is always used. wrap_activity handles
                     # sync vs. async user functions inside the activity itself.

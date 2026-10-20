@@ -1,4 +1,3 @@
-import sys
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -6,18 +5,13 @@ from uuid import uuid4
 
 import pytest
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
-from langgraph.runtime import Runtime
+from langgraph.runtime import Runtime, get_runtime
 from typing_extensions import TypedDict
 
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.langgraph import LangGraphPlugin, graph
 from temporalio.worker import Worker
-
-requires_async_context = pytest.mark.skipif(
-    sys.version_info < (3, 11),
-    reason="LangGraph async context propagation requires Python >= 3.11",
-)
 
 
 class State(TypedDict):
@@ -64,10 +58,8 @@ async def node_a(
     }
 
 
-async def node_b(
-    state: State,
-    runtime: Runtime[Any],
-) -> dict[str, str]:
+async def node_b(state: State) -> dict[str, str]:
+    runtime = get_runtime()
     return {
         "value": state["value"] + "b" + context_user_id(runtime.context),
         "context_type_b": type(runtime.context).__name__,
@@ -100,10 +92,10 @@ class TwoNodesWorkflow:
     ("context_kind", "expected_context_type"),
     [
         ("none", "NoneType"),
-        pytest.param("dataclass", "Context", marks=requires_async_context),
-        pytest.param("computed", "ComputedContext", marks=requires_async_context),
-        pytest.param("dict", "Context", marks=requires_async_context),
-        pytest.param("typeddict", "dict", marks=requires_async_context),
+        ("dataclass", "Context"),
+        ("computed", "ComputedContext"),
+        ("dict", "Context"),
+        ("typeddict", "dict"),
     ],
 )
 async def test_two_nodes(

@@ -145,8 +145,6 @@ await g.ainvoke({...}, context=Context(user_id="alice"))
 
 Your `context` object must be serializable by the configured Temporal payload converter, since it crosses the Activity boundary.
 
-Use Python 3.11 or later for async run-context propagation. On Python 3.10, context can arrive as `None` in Activity nodes, including for `TypedDict` schemas.
-
 `TypedDict` contexts still use dictionary access, such as `runtime.context["user_id"]`. Dataclass reconstruction uses the dataclass constructor; it does not restore nested custom types on its own. Functional API tasks do not yet restore dataclass contexts and should use dictionary contexts. Pydantic context reconstruction is not included in this support.
 
 ## Summaries

@@ -24,14 +24,10 @@ from tests.test_two_nodes import (
     TwoNodesWorkflow,
     node_a,
     node_b,
-    requires_async_context,
 )
 
 
-@pytest.mark.parametrize(
-    "context_kind",
-    ["none", pytest.param("dataclass", marks=requires_async_context)],
-)
+@pytest.mark.parametrize("context_kind", ["none", "dataclass"])
 async def test_replay(client: Client, context_kind: str):
     g = StateGraph(
         State,
