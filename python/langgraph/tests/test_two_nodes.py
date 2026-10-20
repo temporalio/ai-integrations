@@ -90,7 +90,7 @@ async def test_two_nodes(
     context_kind: str,
     expected_context_type: str,
 ):
-    schema = (
+    schema: type[Any] | None = (
         DictContext
         if context_kind == "typeddict"
         else Context
