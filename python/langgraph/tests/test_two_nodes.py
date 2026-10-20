@@ -48,8 +48,9 @@ def context_user_id(context: Context | DictContext | None) -> str:
         return ""
     if isinstance(context, dict):
         return context["user_id"]
-    if isinstance(context, ComputedContext):
-        return f"{context.user_id}:{context.label}"
+    label = getattr(context, "label", None)
+    if label is not None:
+        return f"{context.user_id}:{label}"
     return context.user_id
 
 
