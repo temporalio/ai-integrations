@@ -14,6 +14,11 @@ from temporalio.client import Client
 from temporalio.langgraph import LangGraphPlugin, graph
 from temporalio.worker import Worker
 
+requires_async_context = pytest.mark.skipif(
+    sys.version_info < (3, 11),
+    reason="LangGraph async context propagation requires Python >= 3.11",
+)
+
 
 class State(TypedDict):
     value: str
@@ -80,9 +85,9 @@ class TwoNodesWorkflow:
     ("context_kind", "expected_context_type"),
     [
         ("none", "NoneType"),
-        ("dataclass", "Context"),
-        ("dict", "Context"),
-        ("typeddict", "dict"),
+        pytest.param("dataclass", "Context", marks=requires_async_context),
+        pytest.param("dict", "Context", marks=requires_async_context),
+        pytest.param("typeddict", "dict", marks=requires_async_context),
     ],
 )
 async def test_two_nodes(
@@ -91,8 +96,6 @@ async def test_two_nodes(
     context_kind: str,
     expected_context_type: str,
 ):
-    if context_kind != "none" and sys.version_info < (3, 11):
-        pytest.skip("LangGraph async context propagation requires Python >= 3.11")
     schema: type[Any] | None = (
         DictContext
         if context_kind == "typeddict"
