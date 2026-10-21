@@ -13,7 +13,8 @@ from langgraph.func import entrypoint, task  # pyright: ignore[reportMissingType
 from langgraph.runtime import Runtime, get_runtime
 
 
-def read_context(value: int, runtime: Runtime[Any]) -> dict[str, Any]:
+def read_context(value: int, runtime: Runtime[Any] | None = None) -> dict[str, Any]:
+    assert runtime is not None
     context = get_runtime().context
     assert runtime.context is context
     if context is None:

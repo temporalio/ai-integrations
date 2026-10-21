@@ -87,7 +87,7 @@ class TwoNodesWorkflow:
 
     @workflow.run
     async def run(self, input: str, context_kind: str = "none") -> Any:
-        context: Context | ModelContext | dict[str, Any] | None
+        context: Context | ModelContext | DictContext | dict[str, Any] | None
         if context_kind == "computed":
             computed_context = ComputedContext(user_id="alice")
             computed_context.label = "saved"
