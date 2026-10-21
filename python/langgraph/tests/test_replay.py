@@ -37,7 +37,7 @@ async def test_replay(client: Client, context_kind: str):
         if context_kind == "dataclass"
         else ModelContext
         if context_kind == "model"
-        else None,
+        else None
     )
     g = StateGraph(State, context_schema=schema)
     g.add_node("node_a", node_a, metadata={"execute_in": "activity"})
