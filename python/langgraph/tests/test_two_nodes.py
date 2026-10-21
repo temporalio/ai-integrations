@@ -143,9 +143,9 @@ async def test_two_nodes(
 
     task_queue = f"my-graph-{uuid4()}"
     if context_kind in ("model", "model_dict"):
-        client = Client(
-            **{**client.config(), "data_converter": pydantic_data_converter}
-        )
+        client_config = client.config()
+        client_config["data_converter"] = pydantic_data_converter
+        client = Client(**client_config)
 
     async with Worker(
         client,

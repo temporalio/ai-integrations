@@ -159,9 +159,9 @@ class TestFunctionalAPIBasicExecution:
             activity_options=_execute_in_activity("read_context"),
             default_activity_options=_DEFAULT_ACTIVITY_OPTIONS,
         )
-        client = Client(
-            **{**client.config(), "data_converter": pydantic_data_converter}
-        )
+        client_config = client.config()
+        client_config["data_converter"] = pydantic_data_converter
+        client = Client(**client_config)
         task_queue = f"functional-context-{uuid4()}"
         async with Worker(
             client,

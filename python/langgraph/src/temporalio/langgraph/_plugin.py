@@ -177,8 +177,11 @@ class LangGraphPlugin(SimplePlugin):
         self._streaming_topic = streaming_topic
         self._streaming_batch_interval = streaming_batch_interval
         self._context_schemas: dict[str, type[Any]] = {}
-        for registered in [*(graphs or {}).values(), *(entrypoints or {}).values()]:
-            schema = registered.context_schema
+        schemas: list[type[Any] | None] = [
+            *(graph.context_schema for graph in (graphs or {}).values()),
+            *(program.context_schema for program in (entrypoints or {}).values()),
+        ]
+        for schema in schemas:
             if schema is not None and is_context_schema(schema):
                 schema_id = context_schema_id(schema)
                 previous = self._context_schemas.get(schema_id)
