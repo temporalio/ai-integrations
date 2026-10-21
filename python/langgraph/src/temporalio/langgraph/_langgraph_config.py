@@ -22,6 +22,17 @@ from langgraph._internal._scratchpad import PregelScratchpad
 from langgraph.graph.state import RunnableConfig
 from langgraph.pregel._algo import LazyAtomicCounter
 from langgraph.runtime import ExecutionInfo, Runtime
+from pydantic import BaseModel
+
+
+def is_context_schema(schema: type[Any]) -> bool:
+    """Return whether a context class can be restored after payload conversion."""
+    return dataclasses.is_dataclass(schema) or issubclass(schema, BaseModel)
+
+
+def context_schema_id(schema: type[Any]) -> str:
+    """Identify a registered context class without serializing the class itself."""
+    return f"{schema.__module__}.{schema.__qualname__}"
 
 
 def strip_runnable_config(config: RunnableConfig | None) -> RunnableConfig:
@@ -134,6 +145,13 @@ def set_langgraph_config(
             if name in context:
                 object.__setattr__(restored_context, name, context[name])
         context = restored_context
+    elif (
+        context is not None
+        and context_schema is not None
+        and issubclass(context_schema, BaseModel)
+        and not isinstance(context, context_schema)
+    ):
+        context = context_schema.model_validate(context)
 
     execution_info_dict = config.get("execution_info")
     runtime: Runtime[Any] = Runtime(

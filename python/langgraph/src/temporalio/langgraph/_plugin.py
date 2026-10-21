@@ -22,6 +22,7 @@ from temporalio.langgraph._interceptor import (
     _workflow_entrypoints,
     _workflow_graphs,
 )
+from temporalio.langgraph._langgraph_config import context_schema_id, is_context_schema
 from temporalio.langgraph._task_cache import (
     get_task_cache,
     set_task_cache,
@@ -175,6 +176,15 @@ class LangGraphPlugin(SimplePlugin):
         self.activities: list = []
         self._streaming_topic = streaming_topic
         self._streaming_batch_interval = streaming_batch_interval
+        self._context_schemas: dict[str, type[Any]] = {}
+        for registered in [*(graphs or {}).values(), *(entrypoints or {}).values()]:
+            schema = registered.context_schema
+            if schema is not None and is_context_schema(schema):
+                schema_id = context_schema_id(schema)
+                previous = self._context_schemas.get(schema_id)
+                if previous is not None and previous is not schema:
+                    raise ValueError(f"Conflicting context schema ID: {schema_id!r}")
+                self._context_schemas[schema_id] = schema
 
         # Graph API: Wrap graph nodes as Temporal Activities.
         if graphs:
@@ -323,13 +333,18 @@ class LangGraphPlugin(SimplePlugin):
             wrapped = wrap_activity(
                 func,
                 context_schema=context_schema,
+                context_schemas=self._context_schemas,
                 streaming_topic=self._streaming_topic,
                 streaming_batch_interval=self._streaming_batch_interval,
             )
             a = activity.defn(name=activity_name)(wrapped)
             self.activities.append(a)
             return wrap_execute_activity(
-                a, task_id=task_id(func), summary_fn=summary_fn, **opts
+                a,
+                task_id=task_id(func),
+                summary_fn=summary_fn,
+                context_schemas=self._context_schemas,
+                **opts,
             )
         elif execute_in == "workflow":
             return wrap_workflow(

@@ -122,7 +122,7 @@ plugin = LangGraphPlugin(
 
 ### Runtime Context
 
-LangGraph's run-scoped context is available through `runtime.context` in nodes and tasks. Graph API Activity nodes rebuild dataclass contexts from the registered graph's `context_schema`, so they support attribute access just like native LangGraph:
+LangGraph's run-scoped context is available through `runtime.context` in nodes and tasks. Activity nodes and Functional API tasks restore dataclass and Pydantic v2 contexts from registered `context_schema` classes, so they support attribute access just like native LangGraph:
 
 ```python
 from dataclasses import dataclass
@@ -145,7 +145,13 @@ await g.ainvoke({...}, context=Context(user_id="alice"))
 
 Your `context` object must be serializable by the configured Temporal payload converter, since it crosses the Activity boundary.
 
-`TypedDict` contexts still use dictionary access, such as `runtime.context["user_id"]`. Dataclass reconstruction uses the dataclass constructor; it does not restore nested custom types on its own. Functional API tasks do not yet restore dataclass contexts and should use dictionary contexts. Pydantic context reconstruction is not included in this support.
+Functional API entrypoints declare the schema with `@entrypoint(context_schema=Context)` and must be registered with the plugin. Their tasks can read it through `get_runtime().context`. A task shared by several entrypoints receives the context type for the current call.
+
+For Pydantic v2 contexts, configure `temporalio.contrib.pydantic.pydantic_data_converter` on the Client used by the Worker and compatible converters on other Clients communicating with the same executions. The plugin rebuilds models with `model_validate`, including nested BaseModels. Validators run again after decoding and must be safe to repeat. The plugin does not replace your configured converter.
+
+`TypedDict` and plain dictionary contexts still use dictionary access, such as `runtime.context["user_id"]`. Dataclass reconstruction uses the dataclass constructor and preserves saved `init=False` fields; it does not restore nested custom types on its own. Scalar or list RootModel contexts, custom serializers that change the context shape, and Pydantic v1 are outside this support. Functional API support still requires Python 3.11 or later.
+
+**Breaking change:** class-based contexts now reach Activity nodes and tasks as their declared type. Replace dictionary-based workarounds such as `runtime.context["user_id"]` with `runtime.context.user_id`. Passing a dictionary to a declared class schema does not preserve dictionary access: LangGraph converts it to the schema type. Context schema IDs also extend the serialized Activity input. See the [implementation plan](CONTEXT-RESTORATION-PLAN.md) for the scope and the separate compatibility project.
 
 ## Summaries
 

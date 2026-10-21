@@ -7,6 +7,7 @@ import pytest
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 
 from temporalio.client import Client
+from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.langgraph import LangGraphPlugin
 from temporalio.worker import Replayer, Worker
 from tests.test_interrupt import (
@@ -20,6 +21,7 @@ from tests.test_interrupt import (
 )
 from tests.test_two_nodes import (
     Context,
+    ModelContext,
     State,
     TwoNodesWorkflow,
     node_a,
@@ -27,11 +29,15 @@ from tests.test_two_nodes import (
 )
 
 
-@pytest.mark.parametrize("context_kind", ["none", "dataclass"])
+@pytest.mark.parametrize("context_kind", ["none", "dataclass", "model"])
 async def test_replay(client: Client, context_kind: str):
     g = StateGraph(
         State,
-        context_schema=Context if context_kind == "dataclass" else None,
+        context_schema=Context
+        if context_kind == "dataclass"
+        else ModelContext
+        if context_kind == "model"
+        else None,
     )
     g.add_node("node_a", node_a, metadata={"execute_in": "activity"})
     g.add_node("node_b", node_b, metadata={"execute_in": "activity"})
@@ -39,6 +45,10 @@ async def test_replay(client: Client, context_kind: str):
     g.add_edge("node_a", "node_b")
 
     task_queue = f"my-graph-{uuid4()}"
+    if context_kind == "model":
+        client = Client(
+            **{**client.config(), "data_converter": pydantic_data_converter}
+        )
     plugin = LangGraphPlugin(
         graphs={"my-graph": g},
         default_activity_options={"start_to_close_timeout": timedelta(seconds=10)},

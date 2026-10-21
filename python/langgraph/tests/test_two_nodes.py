@@ -6,10 +6,12 @@ from uuid import uuid4
 import pytest
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.runtime import Runtime, get_runtime
+from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from temporalio import workflow
 from temporalio.client import Client
+from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.langgraph import LangGraphPlugin, graph
 from temporalio.worker import Worker
 
@@ -37,11 +39,23 @@ class DictContext(TypedDict):
     user_id: str
 
 
-def context_user_id(context: Context | DictContext | None) -> str:
+class Tenant(BaseModel):
+    name: str
+
+
+class ModelContext(BaseModel):
+    user_id: str = Field(alias="userId")
+    tenant: Tenant
+
+
+def context_user_id(context: Context | ModelContext | DictContext | None) -> str:
     if context is None:
         return ""
     if isinstance(context, dict):
         return context["user_id"]
+    tenant = getattr(context, "tenant", None)
+    if tenant is not None:
+        return f"{context.user_id}:{tenant.name}"
     label = getattr(context, "label", None)
     if label is not None:
         return f"{context.user_id}:{label}"
@@ -73,7 +87,7 @@ class TwoNodesWorkflow:
 
     @workflow.run
     async def run(self, input: str, context_kind: str = "none") -> Any:
-        context: Context | DictContext | None
+        context: Context | ModelContext | dict[str, Any] | None
         if context_kind == "computed":
             computed_context = ComputedContext(user_id="alice")
             computed_context.label = "saved"
@@ -82,6 +96,10 @@ class TwoNodesWorkflow:
             context = Context(user_id="alice")
         elif context_kind in ("dict", "typeddict"):
             context = DictContext(user_id="alice")
+        elif context_kind == "model":
+            context = ModelContext(userId="alice", tenant=Tenant(name="acme"))
+        elif context_kind == "model_dict":
+            context = {"userId": "alice", "tenant": {"name": "acme"}}
         else:
             context = None
         return await self.app.ainvoke({"value": input}, context=context)
@@ -96,6 +114,8 @@ class TwoNodesWorkflow:
         ("computed", "ComputedContext"),
         ("dict", "Context"),
         ("typeddict", "dict"),
+        ("model", "ModelContext"),
+        ("model_dict", "ModelContext"),
     ],
 )
 async def test_two_nodes(
@@ -107,6 +127,8 @@ async def test_two_nodes(
     schema: type[Any] | None = (
         ComputedContext
         if context_kind == "computed"
+        else ModelContext
+        if context_kind in ("model", "model_dict")
         else DictContext
         if context_kind == "typeddict"
         else Context
@@ -120,6 +142,10 @@ async def test_two_nodes(
     g.add_edge("node_a", "node_b")
 
     task_queue = f"my-graph-{uuid4()}"
+    if context_kind in ("model", "model_dict"):
+        client = Client(
+            **{**client.config(), "data_converter": pydantic_data_converter}
+        )
 
     async with Worker(
         client,
@@ -144,6 +170,8 @@ async def test_two_nodes(
     expected_value = "ab" if context_kind == "none" else "aalicebalice"
     if context_kind == "computed":
         expected_value = "aalice:savedbalice:saved"
+    elif context_kind in ("model", "model_dict"):
+        expected_value = "aalice:acmebalice:acme"
     assert result == {
         "value": expected_value,
         "context_type_a": expected_context_type,

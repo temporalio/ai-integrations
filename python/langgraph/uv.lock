@@ -1216,6 +1216,7 @@ source = { editable = "." }
 dependencies = [
     { name = "langchain-core" },
     { name = "langgraph" },
+    { name = "pydantic" },
     { name = "temporalio" },
     { name = "typing-extensions" },
 ]
@@ -1240,6 +1241,7 @@ dev = [
 requires-dist = [
     { name = "langchain-core", specifier = ">=0.3.0" },
     { name = "langgraph", specifier = ">=1.2.0" },
+    { name = "pydantic", specifier = ">=2.7.4,<3" },
     { name = "temporalio", specifier = ">=1.34.0,<2" },
     { name = "typing-extensions", specifier = ">=4.2.0,<5" },
 ]
