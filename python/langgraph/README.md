@@ -151,7 +151,23 @@ For Pydantic v2 contexts, configure `temporalio.contrib.pydantic.pydantic_data_c
 
 `TypedDict` and plain dictionary contexts still use dictionary access, such as `runtime.context["user_id"]`. Dataclass reconstruction uses the dataclass constructor and preserves saved `init=False` fields; it does not restore nested custom types on its own. Scalar or list RootModel contexts, custom serializers that change the context shape, and Pydantic v1 are outside this support. Functional API support still requires Python 3.11 or later.
 
-**Breaking change:** class-based contexts now reach Activity nodes and tasks as their declared type. Replace dictionary-based workarounds such as `runtime.context["user_id"]` with `runtime.context.user_id`. Passing a dictionary to a declared class schema does not preserve dictionary access: LangGraph converts it to the schema type. Context schema IDs also extend the serialized Activity input. See the [implementation plan](CONTEXT-RESTORATION-PLAN.md) for the scope and the separate compatibility project.
+## Migrating from 0.1.0 to 1.0
+
+This guide covers the 1.0 target based on the API on `main`, compared with the `python/langgraph/v0.1.0` release tag.
+
+| Breaking change | How to migrate |
+|---|---|
+| Activity nodes and Functional API tasks now receive declared dataclass and Pydantic v2 contexts as objects rather than decoded dictionaries ([#126](https://github.com/temporalio/ai-integrations/pull/126)). | Replace `runtime.context["user_id"]` with `runtime.context.user_id` (also for `get_runtime().context`). If you want key access, declare a `TypedDict` or bare `dict` schema and pass dictionary contexts. Passing a dictionary to a class schema still produces the declared class. |
+| Dataclass and Pydantic context types must be registered before scheduling an Activity. Undeclared types now raise `ValueError`. | Set `StateGraph(State, context_schema=Context)` or `@entrypoint(context_schema=Context)`, then register that graph or entrypoint in `LangGraphPlugin`. Register every concrete context type you pass. |
+| Parameterized schemas such as `context_schema=dict[str, Any]` currently raise `TypeError` when constructing the plugin. | Use `context_schema=dict` or a `TypedDict` class. This is a limitation of current `main`. |
+| Pydantic context models are rebuilt with `model_validate`, so validation runs again after decoding. | Use Pydantic `>=2.7.4,<3` and configure `pydantic_data_converter` as described above. Keep validators safe to repeat and ensure aliases accept the converter's output. Dataclass constructors also run again. |
+| Cached `Command` results now use a separate `<key>:command` entry so routing survives Continue-as-New ([#78](https://github.com/temporalio/ai-integrations/pull/78)). | Treat `cache()` as opaque. Old serialized Commands under plain keys remain dictionaries and do not regain routing. Start new executions with a fresh cache; do not carry a 0.1.0 Command cache into 1.0. |
+
+Typed Activity inputs now carry a context schema ID derived from the class's module and qualified name. Register the same classes on Workflow and Activity Workers, and keep those names stable while their Activities may still run or retry. Conflicting registrations and unknown IDs raise `ValueError`.
+
+Before deploying, test the updated nodes and tasks and replay representative 0.1.0 histories with your new code. An old payload being readable does not guarantee the same application behavior: unregistered contexts can fail during replay, and Functional API Activities scheduled by 0.1.0 have no schema ID and still receive decoded dictionaries.
+
+Let existing runs and pending or retrying Activities finish on 0.1.0 Workers before switching. If they must stay running, keep them on 0.1.0 using pinned Worker Deployments or separate task queues, and start new executions on 1.0 with fresh caches. Do not mix both versions on the same unversioned task queue.
 
 ## Summaries
 
