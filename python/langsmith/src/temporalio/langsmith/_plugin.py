@@ -40,6 +40,7 @@ class LangSmithPlugin(SimplePlugin):
         *,
         client: langsmith.Client | None = None,
         project_name: str | None = None,
+        address: str | None = None,
         add_temporal_runs: bool = False,
         default_metadata: dict[str, Any] | None = None,
         default_tags: list[str] | None = None,
@@ -50,6 +51,8 @@ class LangSmithPlugin(SimplePlugin):
             client: A langsmith.Client instance. If None, one will be created
                 automatically (using LANGSMITH_API_KEY env var).
             project_name: LangSmith project name for traces.
+            address: LangSmith agent/environment address for traces, mutually
+                exclusive with project_name. Requires LangSmith 0.14.4 or later.
             add_temporal_runs: Whether to create LangSmith runs for Temporal
                 operations. Defaults to False.
             default_metadata: Default metadata to attach to all runs.
@@ -58,6 +61,7 @@ class LangSmithPlugin(SimplePlugin):
         interceptor = LangSmithInterceptor(
             client=client,
             project_name=project_name,
+            address=address,
             add_temporal_runs=add_temporal_runs,
             default_metadata=default_metadata,
             default_tags=default_tags,
