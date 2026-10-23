@@ -18,17 +18,20 @@ inside a ``@workflow.defn`` with no other changes:
 
 The plugin auto-propagates from a ``Client`` to any ``Worker`` built from it, so
 add it on exactly one side. If one instance is on the Client and one on the
-Worker, the Worker instance does not add an activity that is already
-registered: the same callable, a wrapper of it (``__wrapped__``), or, for a
-second instance, the Client instance's copy of the same built-in activity. The
-Worker keeps what the Client side registered, instead of failing with "More
-than one activity named ...". Any other repeated activity name, such as two
-instances on one side or a caller activity with a plugin activity's name, is
-left to the Worker, which refuses it.
+Worker, the Worker instance does not add an activity whose name (or, for a
+dynamic activity, the dynamic slot) is already registered, and still
+registered after its own step, by the same callable, a wrapper of it
+(``__wrapped__``), or, for a second instance, the Client instance's copy of the
+same built-in activity. The Worker keeps what the Client side registered,
+instead of failing with "More than one activity named ...". Any other repeated
+activity name, such as two instances on one side or a caller activity with a
+plugin activity's name, and any second dynamic activity, is left to the Worker,
+which refuses it.
 """
 
 from __future__ import annotations
 
+import inspect
 import sys
 import warnings
 from collections.abc import AsyncGenerator, Mapping, Sequence
@@ -37,6 +40,7 @@ from dataclasses import replace
 from datetime import timedelta
 from typing import Any, Callable
 
+from temporalio import activity as activity_mod
 from temporalio.converter import DataConverter
 from temporalio.deepagents import _serde, _tools
 from temporalio.deepagents._activity import DeepAgentActivities
@@ -275,30 +279,63 @@ class DeepAgentsPlugin(SimplePlugin):
         after: Sequence[Any],
         client_instance: DeepAgentsPlugin,
     ) -> list[Any]:
-        """Drop the activities this call added that repeat a registration.
+        """Drop the activities this call added that repeat a kept registration.
 
-        An added activity repeats one when a callable registered before this
-        call is it or wraps it, or, for one of this instance's built-in
-        activities, the Client instance's copy of it. Dropping such a repeat
-        never changes which code runs; any other repeat reaches the Worker's
-        duplicate-name check.
+        An activity registered before this call that is still in ``after``
+        keeps its activity name, or the dynamic slot if it is dynamic. An added
+        activity with that name or slot repeats it when the kept callable is it
+        or wraps it, or, for one of this instance's built-in activities, is or
+        wraps the Client instance's copy of it. Dropping such a repeat never
+        changes which code runs under the name; any other repeat reaches the
+        Worker's duplicate-name or duplicate-dynamic check.
         """
-        registered = [link for act in before for link in _wrapped_chain(act)]
+        remaining = list(before)
+        added: list[bool] = []
+        kept_keys: dict[tuple[str | None], list[Any]] = {}
+        for act in after:
+            index = _index_of(act, remaining)
+            added.append(index is None)
+            if index is not None:
+                del remaining[index]
+                key = _activity_key(act)
+                if key is not None:
+                    kept_keys.setdefault(key, []).extend(_wrapped_chain(act))
         counterparts = list(
             zip(self._builtin_activities, client_instance._builtin_activities)
         )
-        remaining = list(before)
         kept: list[Any] = []
-        for act in after:
-            if act in remaining:
-                remaining.remove(act)
-            elif act in registered or any(
-                act == own and client_copy in registered
+        for act, is_added in zip(after, added):
+            key = _activity_key(act) if is_added else None
+            chain = kept_keys.get(key, []) if key is not None else []
+            if _index_of(act, chain) is not None or any(
+                _same_callable(act, own) and _index_of(client_copy, chain) is not None
                 for own, client_copy in counterparts
             ):
                 continue
             kept.append(act)
         return kept
+
+
+def _same_callable(a: Any, b: Any) -> bool:
+    """Whether ``a`` and ``b`` are one callable, without calling ``__eq__``.
+
+    Two bound methods of one function on one object count as one callable;
+    any other pair must be the same object. Callables that only compare equal
+    are different registrations.
+    """
+    if a is b:
+        return True
+    return (
+        inspect.ismethod(a)
+        and inspect.ismethod(b)
+        and a.__self__ is b.__self__
+        and a.__func__ is b.__func__
+    )
+
+
+def _index_of(act: Any, acts: Sequence[Any]) -> int | None:
+    """The index of the first entry of ``acts`` that is ``act``, or ``None``."""
+    return next((i for i, other in enumerate(acts) if _same_callable(act, other)), None)
 
 
 def _wrapped_chain(act: Any) -> list[Any]:
@@ -308,6 +345,16 @@ def _wrapped_chain(act: Any) -> list[Any]:
         chain.append(act)
         act = getattr(act, "__wrapped__", None)
     return chain
+
+
+def _activity_key(act: Any) -> tuple[str | None] | None:
+    """``(name,)`` for the activity ``act`` registers, or ``None`` if it has none.
+
+    A dynamic activity has no name, so its key is ``(None,)``: the one dynamic
+    slot a Worker has.
+    """
+    defn = activity_mod._Definition.from_callable(act)
+    return (defn.name,) if defn is not None else None
 
 
 async def _temporal_aio_to_thread(
