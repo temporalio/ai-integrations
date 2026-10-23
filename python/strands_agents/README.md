@@ -627,6 +627,8 @@ Worker(
 
 Each factory returns a fully configured `MCPClient`, so you can pass options like `tool_filters`, `prefix`, `elicitation_callback`, or `tasks_config` to it.
 
+The MCP activities work with the MCP Python SDK 1.x and 2.0 to 2.1 (`mcp>=1.9.4,<2.2`), the same range that current Strands releases accept.
+
 By default, `TemporalMCPClient` re-lists the server's tools (via `{name}-list-tools`) on every agent turn, so an MCP server that is restarted mid-workflow — with tools added, removed, or renamed — is picked up. To list the tools just once at the beginning of the workflow and reuse that schema for the workflow's lifetime (one fewer activity per turn), set `cache_tools=True`:
 
 ```python

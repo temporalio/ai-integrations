@@ -2,9 +2,11 @@ import asyncio
 import sys
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import uuid4
 
-from mcp import StdioServerParameters, stdio_client
+from mcp import ClientSession, StdioServerParameters, stdio_client
 from strands.tools.mcp.mcp_client import MCPClient
 
 from temporalio import workflow
@@ -326,3 +328,39 @@ async def test_mcp_lists_tools_each_turn_when_uncached(client: Client):
         workflows=[MCPNoCacheWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+async def test_list_tools_reads_mcp2_field_names():
+    """mcp 2 renamed nextCursor, inputSchema and outputSchema to snake_case."""
+    schema = {"type": "object"}
+    pages = [
+        SimpleNamespace(
+            tools=[
+                SimpleNamespace(
+                    name="a", description="A", input_schema=schema, output_schema=None
+                )
+            ],
+            next_cursor="page-2",
+        ),
+        SimpleNamespace(
+            tools=[
+                SimpleNamespace(
+                    name="b", description="", input_schema=schema, output_schema=schema
+                )
+            ],
+            next_cursor=None,
+        ),
+    ]
+
+    class TwoPageSession:
+        async def list_tools(self, **_kwargs: Any) -> Any:
+            return pages.pop(0)
+
+    tools = await _temporal_mcp_client._paginate_list_tools(
+        cast(ClientSession, cast(object, TwoPageSession()))
+    )
+    infos = _temporal_mcp_client._tool_infos(_echo_client_factory(), tools)
+    assert [(i.name, i.input_schema, i.output_schema) for i in infos] == [
+        ("a", schema, None),
+        ("b", schema, schema),
+    ]
