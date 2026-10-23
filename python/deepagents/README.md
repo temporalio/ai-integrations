@@ -372,6 +372,14 @@ worker is unaffected, and the original function is restored when the worker
 stops. If you would rather be explicit, use `create_temporal_deep_agent` or
 pass `TemporalModel("provider:name")` yourself.
 
+Each plugin instance registers four Activities: `deepagents.invoke_model`,
+`deepagents.invoke_model_streaming`, `deepagents.invoke_tool` and
+`deepagents.backend_op`. If one instance is on the Client and one on the
+Worker, the Worker keeps the Client's Activities and skips the Worker's. Any
+other repeated Activity name fails at Worker start with `ValueError: More than
+one activity named ...`, as it does without the plugin. That includes two
+instances on the same side and a caller Activity with one of these names.
+
 ## Composing with other plugins
 
 This plugin carries no tracing context of its own. For observability, compose it

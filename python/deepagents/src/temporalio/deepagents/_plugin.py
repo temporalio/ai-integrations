@@ -17,9 +17,11 @@ inside a ``@workflow.defn`` with no other changes:
 * pushes the model / tool dispatch defaults down to the seams that read them.
 
 The plugin auto-propagates from a ``Client`` to any ``Worker`` built from it, so
-add it on exactly one side. ``configure_worker`` additionally de-duplicates
-activities by name, so a user who mistakenly adds it on both sides gets a clean
-no-op instead of a "More than one activity named ..." crash.
+add it on exactly one side. If one instance is on the Client and one on the
+Worker, the Worker keeps the Client instance's activities and skips the Worker
+instance's, instead of failing with "More than one activity named ...". Any other
+repeated activity name, such as two instances on one side or a caller activity
+with a plugin activity's name, is left to the Worker, which refuses it.
 """
 
 from __future__ import annotations
@@ -32,7 +34,6 @@ from dataclasses import replace
 from datetime import timedelta
 from typing import Any, Callable
 
-from temporalio import activity as activity_mod
 from temporalio.converter import DataConverter
 from temporalio.deepagents import _serde, _tools
 from temporalio.deepagents._activity import DeepAgentActivities
@@ -133,7 +134,7 @@ class DeepAgentsPlugin(SimplePlugin):
             backends=backends,
             streaming_batch_interval=streaming_batch_interval,
         )
-        activities = [
+        self._activity_list = [
             self._activities.invoke_model,
             self._activities.invoke_model_streaming,
             self._activities.invoke_tool,
@@ -142,7 +143,7 @@ class DeepAgentsPlugin(SimplePlugin):
 
         super().__init__(
             "langchain.DeepAgentsPlugin",
-            activities=activities,
+            activities=self._activity_list,
             data_converter=self._configure_data_converter,
             workflow_runner=self._make_workflow_runner(),
             workflow_failure_exception_types=[DeepAgentsWorkflowError],
@@ -238,12 +239,28 @@ class DeepAgentsPlugin(SimplePlugin):
     # -- worker config -------------------------------------------------------
 
     def configure_worker(self, config: Any) -> Any:
-        """Deduplicate activity registrations after the base configuration."""
+        """Skip this instance's activities if the Client's instance added them."""
+        existing = list(config.get("activities") or [])
         config = super().configure_worker(config)
-        activities = config.get("activities")
-        if activities:
-            config["activities"] = _dedupe_activities(activities)
+        if self._client_instance_registered(config, existing):
+            config["activities"] = existing
         return config
+
+    def _client_instance_registered(self, config: Any, existing: list[Any]) -> bool:
+        """Whether this is the Worker's call with one instance on each side.
+
+        The Worker runs the Client's plugins first, so the Client's instance has
+        already added its activities to ``existing``.
+        """
+        client = config.get("client")
+        client_plugins = client.config().get("plugins", []) if client else []
+        on_client = [p for p in client_plugins if isinstance(p, DeepAgentsPlugin)]
+        on_worker = [
+            p for p in config.get("plugins") or [] if isinstance(p, DeepAgentsPlugin)
+        ]
+        if len(on_client) != 1 or len(on_worker) != 1 or on_worker[0] is not self:
+            return False
+        return any(act in on_client[0]._activity_list for act in existing)
 
 
 async def _temporal_aio_to_thread(
@@ -294,23 +311,3 @@ def _install_langsmith_temporal_override() -> None:
         langsmith.set_runtime_overrides(aio_to_thread=_temporal_aio_to_thread)
     except Exception:
         pass
-
-
-def _dedupe_activities(activities: Sequence[Any]) -> list[Any]:
-    """Drop duplicate activity registrations by defn name, keeping the first.
-
-    Guards the "plugin added on both Client and Worker" trap, where the plugin's
-    activities would otherwise be appended twice and the worker would reject the
-    duplicate names.
-    """
-    seen: set[str] = set()
-    out: list[Any] = []
-    for act in activities:
-        defn = activity_mod._Definition.from_callable(act)
-        name = defn.name if defn is not None else getattr(act, "__name__", repr(act))
-        key = name or repr(act)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(act)
-    return out
