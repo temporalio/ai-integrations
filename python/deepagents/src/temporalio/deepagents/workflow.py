@@ -21,11 +21,16 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, is_cancelled_exception
 
 # Reserved key under which the CAN result cache rides inside a state snapshot.
 _CACHE_KEY = "__temporal_cache__"
 _INPUT_CARRIED_KEY = "__temporal_input_in_transcript__"
+
+# Runs recorded before this patch wrapped a cancellation in
+# DeepAgentsWorkflowError; replaying them keeps that, so Workflow code that
+# caught the wrapper takes the same path.
+_RAISE_CANCELLATION_PATCH = "deepagents.raise-cancellation"
 
 # Checkpointer classes that keep their state in the workflow's own memory and are
 # therefore rehydrated for free by deterministic replay. Anything else does its
@@ -277,6 +282,11 @@ async def run_deep_agent(
         # workflow-failure type rather than the framework's generic exception.
         cause = exc.__cause__
         if cause is not None and workflow.is_failure_exception(cause):
+            # Re-raise a cancellation so the Workflow closes as cancelled.
+            if is_cancelled_exception(cause) and workflow.patched(
+                _RAISE_CANCELLATION_PATCH
+            ):
+                raise cause
             raise DeepAgentsWorkflowError(f"Deep Agents run failed: {exc}") from cause
         raise
 

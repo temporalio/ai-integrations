@@ -362,6 +362,12 @@ count.
   and the plugin warns if you pass one — prefer the snapshot + continue-as-new
   path above.
 
+When a Temporal failure ends the agent run, `run_deep_agent` raises
+`DeepAgentsWorkflowError` with that failure as its cause. A cancellation is
+the exception: it is raised as is, so an uncaught cancellation closes the
+workflow as cancelled. Use `temporalio.exceptions.is_cancelled_exception(err)`
+to tell it apart in an `except` block.
+
 ## Runtime behavior
 
 While a worker built with this plugin is running, the plugin wraps
