@@ -41,6 +41,22 @@ export interface LangSmithTraceContext extends Record<string, string> {
   baggage: string;
 }
 
+/** The `baggage` item naming a run's project. */
+export const PROJECT_BAGGAGE_ITEM = 'langsmith-project';
+/** The `baggage` item naming a run's agent address, as its LRN. */
+export const ADDRESS_BAGGAGE_ITEM = 'langsmith-address';
+
+/** The decoded value of a LangSmith `baggage` item, or `undefined` when absent. */
+export function baggageItem(baggage: string | undefined, key: string): string | undefined {
+  for (const item of baggage?.split(',') ?? []) {
+    const [itemKey, value] = item.split('=');
+    if (itemKey === key && value !== undefined) {
+      return decodeURIComponent(value);
+    }
+  }
+  return undefined;
+}
+
 /** Case-insensitive key prefixes scrubbed from runs and propagated headers. */
 const SENSITIVE_KEY_PREFIXES: readonly string[] = [
   'auth',

@@ -35,6 +35,8 @@ import {
 } from '@temporalio/workflow';
 import {
   HEADER_KEY,
+  PROJECT_BAGGAGE_ITEM,
+  baggageItem,
   encodeContextString,
   isInternalQuery,
   readContextHeader,
@@ -115,7 +117,13 @@ const sharedStore = AsyncLocalStorageProviderSingleton.getInstance() as RunTreeS
 
 /** Reconstruct the propagated parent run from a Payload-keyed header map. */
 function reconstructParent(headers: Record<string, unknown> | undefined): RunTree | undefined {
-  return runTreeFromContext(readContextHeader(headers as Record<string, never> | undefined));
+  const context = readContextHeader(headers as Record<string, never> | undefined);
+  const parent = runTreeFromContext(context);
+  if (parent) {
+    // Only the header's project: LangSmith's env fallback resolves "default" in the isolate.
+    parent.project_name = baggageItem(context?.baggage, PROJECT_BAGGAGE_ITEM);
+  }
+  return parent;
 }
 
 /**
@@ -139,6 +147,7 @@ function asReplaySafeParent(
       dotted_order: parent.dotted_order,
       parent_run_id: parent.parent_run_id,
       project_name: parent.project_name,
+      address: parent.address,
     },
     generateNewUuid4
   );

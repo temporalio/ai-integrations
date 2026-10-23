@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import importlib
 import json
 import logging
 import random
@@ -27,9 +29,23 @@ import temporalio.workflow
 from temporalio.api.common.v1 import Payload
 from temporalio.exceptions import ApplicationError, ApplicationErrorCategory
 
+
+def _env_address_error_types() -> tuple[type[Exception], ...]:
+    # langsmith.address from 0.14.4, langsmith._address in 0.14.2 and 0.14.3.
+    for module in ("langsmith.address", "langsmith._address"):
+        try:
+            return (importlib.import_module(module).EnvAddressError,)
+        except ImportError:
+            pass
+    return ()
+
+
+_env_address_errors = _env_address_error_types()
+
 # Used by _log_future_exception, which runs on the executor thread, and by
-# _end_run_on_exception outside workflows.  Workflow code logs through
-# temporalio.workflow.logger instead — the sandbox blocks logging I/O here.
+# _end_run_on_exception and _log_untraced_once outside workflows.  Workflow
+# code logs through temporalio.workflow.logger instead — the sandbox blocks
+# logging I/O here.
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -384,13 +400,15 @@ class _RootReplaySafeRunTreeFactory(_ReplaySafeRunTree):
     ) -> None:
         """Create a root factory with the given LangSmith client."""
         # Create a minimal RunTree for the factory — it will never be posted
-        factory_run = RunTree(
+        factory_run_args: dict[str, Any] = dict(
             name="__root_factory__",
             run_type="chain",
             ls_client=ls_client,
         )
+        # Only a project passed at construction outranks the env's address.
         if session_name is not None:
-            factory_run.session_name = session_name
+            factory_run_args["project_name"] = session_name
+        factory_run = RunTree(**factory_run_args)
         if replicas is not None:
             factory_run.replicas = replicas
         object.__setattr__(self, "_run", factory_run)
@@ -466,6 +484,18 @@ def _end_run_on_exception(run_tree: _ReplaySafeRunTree, **kwargs: Any) -> None:
             pass
 
 
+def _log_untraced(exc: Exception) -> None:
+    # workflow.logger drops replayed records, which would use up the one log.
+    if not _is_replaying():
+        _log_untraced_once(str(exc))
+
+
+@functools.cache
+def _log_untraced_once(message: str) -> None:
+    log = temporalio.workflow.logger if temporalio.workflow.in_workflow() else logger
+    log.warning("LangSmith is not tracing this call: %s", message)
+
+
 @contextmanager
 def _maybe_run(
     client: langsmith.Client,
@@ -485,6 +515,9 @@ def _maybe_run(
     - If add_temporal_runs is False **or** ``langsmith.utils.tracing_is_enabled()``
       returns False, yields None (no run created).
       Context propagation is handled unconditionally by callers.
+    - If the env can't address the run (``EnvAddressError``), logs that once
+      and yields None, as LangSmith's own entry points do. In a workflow with
+      no parent run, tracing is also disabled for the body.
     - When a run IS created, uses :class:`_ReplaySafeRunTree` for
       replay and event loop safety, then sets it as ambient context via
       ``tracing_context(parent=run_tree)`` so ``get_current_run_tree()``
@@ -544,7 +577,22 @@ def _maybe_run(
         run_tree_args["extra"] = {"metadata": metadata}
     if tags:
         run_tree_args["tags"] = tags
-    run_tree = _ReplaySafeRunTree(RunTree(**run_tree_args), executor=executor)
+    run_tree: _ReplaySafeRunTree | None
+    try:
+        run_tree = _ReplaySafeRunTree(RunTree(**run_tree_args), executor=executor)
+    except _env_address_errors as exc:
+        _log_untraced(exc)
+        run_tree = None
+    # Yielding inside the except would chain body errors onto the EnvAddressError.
+    if run_tree is None:
+        if parent is None and temporalio.workflow.in_workflow():
+            # Without a replay-safe root, workflow @traceable calls would build
+            # plain RunTrees, so the workflow runs untraced.
+            with tracing_context(enabled=False):
+                yield None
+        else:
+            yield None
+        return
     run_tree.post()
     try:
         with tracing_context(parent=run_tree, client=client):
@@ -815,22 +863,23 @@ class _LangSmithWorkflowInboundInterceptor(
         # _RootReplaySafeRunTreeFactory so @traceable calls get a
         # _ReplaySafeRunTree parent via create_child. The factory is
         # invisible in LangSmith.
-        # tracing_parent can be None when add_temporal_runs=True but no parent was
+        # The parent stays None when add_temporal_runs=True but no parent was
         # propagated via headers — maybe_run will later create a root run in that case.
-        tracing_parent: _ReplaySafeRunTree | _RootReplaySafeRunTreeFactory | None = (
-            parent
-            if parent is not None or self._config._add_temporal_runs
-            else _RootReplaySafeRunTreeFactory(
-                ls_client=self._config._client,
-                executor=self._config._executor,
-                session_name=self._config._project_name,
-            )
-        )
         tracing_args: dict[str, Any] = {
             "client": self._config._client,
             "project_name": self._config._project_name,
-            "parent": tracing_parent,
+            "parent": parent,
         }
+        if parent is None and not self._config._add_temporal_runs:
+            try:
+                tracing_args["parent"] = _RootReplaySafeRunTreeFactory(
+                    ls_client=self._config._client,
+                    executor=self._config._executor,
+                    session_name=self._config._project_name,
+                )
+            except _env_address_errors as exc:
+                _log_untraced(exc)
+                tracing_args["enabled"] = False
         info = temporalio.workflow.info()
         extra_metadata = {
             "temporalWorkflowID": info.workflow_id,

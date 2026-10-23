@@ -158,7 +158,7 @@ export function dumpTraces(records: CollectedRun[]): string {
 /** Options for {@link withTracingWorker}. */
 export interface HarnessArgs<T> {
   /** Collector to use as the plugin's LangSmith client. */
-  collector: InMemoryRunCollector;
+  collector: Pick<InMemoryRunCollector, 'asClient'>;
   /** Plugin options other than `client` (which is the collector). */
   options?: Omit<LangSmithPluginOptions, 'client'>;
   /** Activity implementations to register on the worker. */

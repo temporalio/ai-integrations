@@ -5,6 +5,7 @@
  * @module
  */
 
+import { RunTree } from 'langsmith/run_trees';
 import { getCurrentRunTree, traceable } from 'langsmith/traceable';
 import {
   condition,
@@ -97,6 +98,32 @@ function registerHandlers(state: { lastSignal: string; done: boolean }): void {
       syncInnerRun('validator_inner_call');
     },
   });
+}
+
+/** Crosses an activity, a child workflow and a Nexus operation, then runs a workflow-body `traceable`. */
+export async function DestinationWorkflow(endpoint: string): Promise<string> {
+  await comprehensiveActivity('a');
+  await executeChild(ComprehensiveChildWorkflow, {
+    args: ['b'],
+    workflowId: `${workflowInfo().workflowId}-child`,
+  });
+  await createNexusServiceClient({ service: comprehensiveNexusService, endpoint }).executeOperation(
+    comprehensiveNexusService.operations.greet,
+    { name: 'c' },
+    {}
+  );
+  return workflowInnerCall('d');
+}
+
+/** Runs workflow-body `traceable`s that name their own project and their own address, then one that names neither. */
+export async function OwnDestinationWorkflow(address: string): Promise<string> {
+  const ownAddress = RunTree.fromHeaders({
+    'langsmith-trace': '20240101T000000000000Z00000000-0000-4000-8000-000000000000',
+    baggage: `langsmith-address=${encodeURIComponent(address)}`,
+  })?.address;
+  const projectResult = await traceable(async () => 'p', { name: 'own_project_call', project_name: 'own-project' })();
+  const addressResult = await traceable(async () => 'a', { name: 'own_address_call', address: ownAddress })();
+  return projectResult + addressResult + (await workflowInnerCall('d'));
 }
 
 export async function ComprehensiveWorkflow(iteration: number): Promise<string> {

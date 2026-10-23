@@ -5,8 +5,11 @@
  */
 
 import { isTracingEnabled, type Client } from 'langsmith';
+import { RunTree } from 'langsmith/run_trees';
 import type { Sinks } from '@temporalio/workflow';
 import type { InjectedSinks } from '@temporalio/worker';
+
+import { ADDRESS_BAGGAGE_ITEM, PROJECT_BAGGAGE_ITEM } from './propagation';
 
 /** Plain-JSON description of a LangSmith run crossing the isolate→worker boundary. */
 export interface SerializedRun {
@@ -26,8 +29,12 @@ export interface SerializedRun {
   extra?: Record<string, unknown>;
   tags?: string[];
   project_name?: string;
+  /** Agent address LRN; set instead of `project_name` for an addressed run. */
+  address?: string;
   events?: Record<string, unknown>[];
 }
+
+type Destination = Pick<RunTree, 'project_name' | 'address'>;
 
 /** Runtime configuration shared by the client and activity interceptors. */
 export interface EmitterConfig {
@@ -56,8 +63,29 @@ export interface LangSmithSinks extends Sinks {
   };
 }
 
+/**
+ * The run's destination as LangSmith resolves it on the Worker, where env is readable: the run's own,
+ * else LangSmith's env defaults. `undefined` when LangSmith won't trace it.
+ */
+function resolveDestination(client: Client, run: SerializedRun): Destination | undefined {
+  // `fromHeaders` is the one LangSmith API that rebuilds an address from its LRN on every 0.10.x.
+  const baggage = run.address
+    ? `${ADDRESS_BAGGAGE_ITEM}=${encodeURIComponent(run.address)}`
+    : run.project_name
+      ? `${PROJECT_BAGGAGE_ITEM}=${encodeURIComponent(run.project_name)}`
+      : '';
+  const resolved = RunTree.fromHeaders(
+    { 'langsmith-trace': run.dotted_order, baggage },
+    { client, tracingEnabled: true }
+  );
+  return resolved?.tracingEnabled ? { project_name: resolved.project_name, address: resolved.address } : undefined;
+}
+
 // langsmith's CreateRunParams omits tags, but createRun spreads them into the request at runtime.
-function toCreateParams(run: SerializedRun): Parameters<Client['createRun']>[0] & { tags?: string[] } {
+function toCreateParams(
+  run: SerializedRun,
+  destination: Destination
+): Parameters<Client['createRun']>[0] & { tags?: string[] } {
   return {
     id: run.id,
     trace_id: run.trace_id,
@@ -69,7 +97,8 @@ function toCreateParams(run: SerializedRun): Parameters<Client['createRun']>[0] 
     inputs: run.inputs ?? {},
     extra: run.extra,
     tags: run.tags,
-    project_name: run.project_name,
+    project_name: destination.project_name,
+    address: destination.address,
   };
 }
 
@@ -97,7 +126,11 @@ export function createLangSmithSinks(client: Client): InjectedSinks<LangSmithSin
           if (!isTracingEnabled()) {
             return;
           }
-          void Promise.resolve(client.createRun(toCreateParams(run))).catch(() => {
+          const destination = resolveDestination(client, run);
+          if (!destination) {
+            return;
+          }
+          void Promise.resolve(client.createRun(toCreateParams(run, destination))).catch(() => {
             /* swallow: emission must never fail the workflow */
           });
         },
@@ -105,7 +138,7 @@ export function createLangSmithSinks(client: Client): InjectedSinks<LangSmithSin
       },
       updateRun: {
         fn: (_info, run) => {
-          if (!isTracingEnabled()) {
+          if (!isTracingEnabled() || !resolveDestination(client, run)) {
             return;
           }
           void Promise.resolve(client.updateRun(run.id, toUpdateParams(run))).catch(() => {

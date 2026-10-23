@@ -22,7 +22,7 @@ import type { Client } from 'langsmith';
 import { ApplicationFailure, ApplicationFailureCategory } from '@temporalio/common';
 import { getRandomStream, proxySinks, workflowInfo } from '@temporalio/workflow';
 
-import { scrubSensitive, type LangSmithTraceContext } from './propagation';
+import { ADDRESS_BAGGAGE_ITEM, baggageItem, scrubSensitive, type LangSmithTraceContext } from './propagation';
 import { LANGSMITH_SINK_NAME, type EmitterConfig, type LangSmithSinks, type SerializedRun } from './sinks';
 
 /** Named random stream for recorded-path run ids; isolated from the workflow's main RNG. */
@@ -130,6 +130,8 @@ function serializeRun(run: RunTree): SerializedRun {
     extra,
     tags: run.tags,
     project_name: run.project_name,
+    // LangSmith's address type varies across 0.10.x; its baggage form is the LRN.
+    address: run.address ? baggageItem(run.toHeaders().baggage, ADDRESS_BAGGAGE_ITEM) : undefined,
     events: run.events as Record<string, unknown>[] | undefined,
   };
 }
@@ -168,8 +170,11 @@ export function runHeaders(run: RunTree | undefined): LangSmithTraceContext | un
   return run ? (run.toHeaders() as LangSmithTraceContext) : undefined;
 }
 
-/** Emit a short-lived marker run. */
+/** Emit a short-lived marker run, unless LangSmith turned tracing off for it (an env it can't address). */
 export async function emitMarkerRun(marker: RunTree): Promise<void> {
+  if (!marker.tracingEnabled) {
+    return;
+  }
   await marker.postRun();
   await marker.end({});
   await marker.patchRun();
@@ -194,6 +199,17 @@ interface RunTreeParams {
   inputs?: Record<string, unknown>;
 }
 
+/** A run's destination from `parent`: the plugin's `projectName` if set, else the parent's address or project. */
+export function inheritedDestination(
+  config: EmitterConfig,
+  parent: RunTree | undefined
+): Pick<RunTreeConfig, 'project_name' | 'address'> {
+  if (config.projectName !== undefined) {
+    return { project_name: config.projectName };
+  }
+  return parent?.address ? { address: parent.address } : { project_name: parent?.project_name };
+}
+
 /**
  * Build an emitter-side {@link RunTree} (client / activity / Nexus); force-enables
  * tracing so nested body `traceable` runs emit — tracing gate is `isTracingEnabled()`.
@@ -205,7 +221,7 @@ export function buildRunTree(config: EmitterConfig, params: RunTreeParams): RunT
     inputs: params.inputs ?? {},
     parent_run: params.parent,
     client: config.client,
-    project_name: config.projectName ?? params.parent?.project_name,
+    ...inheritedDestination(config, params.parent),
     tags: config.tags,
     extra: { metadata: scrubSensitive(config.metadata) ?? {} },
     tracingEnabled: true,
@@ -232,6 +248,11 @@ export class ReplaySafeRunTree extends RunTree {
   constructor(config: RunTreeConfig, generateNewUuid4?: () => string) {
     super(ReplaySafeRunTree.fill(config, generateNewUuid4));
     this.generateNewUuid4 = generateNewUuid4;
+    if (!config.project_name && !config.address) {
+      // The isolate can't read env, so LangSmith's env fallback is "default"; the Worker resolves it instead.
+      this.project_name = undefined;
+      this.address = undefined;
+    }
   }
 
   private static fill(config: RunTreeConfig, generateNewUuid4?: () => string): RunTreeConfig {
@@ -267,7 +288,7 @@ export class ReplaySafeRunTree extends RunTree {
         parent_run: this,
         parent_run_id: this.id,
         trace_id: this.trace_id,
-        project_name: config.project_name ?? this.project_name,
+        ...(config.project_name || config.address ? {} : { project_name: this.project_name, address: this.address }),
       },
       this.generateNewUuid4
     );
