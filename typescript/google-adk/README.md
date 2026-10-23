@@ -685,6 +685,18 @@ Cautions:
 - Register `GoogleAdkPlugin` on the Worker. Passing it directly to `Client` does
   not register the model/MCP Activities. If composing plugins, place
   observability and governance plugins before this one.
+- The plugin registers Activities named `adk-invokeModel` and
+  `adk-invokeModelStreaming`, plus `<name>-listTools`, `<name>-callTool`,
+  `<name>-listResources` and `<name>-readResource` for each MCP toolset. If the
+  Worker already has a different Activity with one of these names (your own
+  Activity, another integration's MCP Activity, or a second `GoogleAdkPlugin`
+  with a different `modelProvider` or toolset factory), `Worker.create` fails
+  with `Duplicate registration of Activity '<name>'`. Earlier versions kept the
+  last one without a warning. Rename the other Activity or MCP server, or put
+  every model provider and toolset in one `GoogleAdkPlugin`. The same instance
+  on the `NativeConnection` and the Worker, or two instances built from the
+  same options object, still work. `modelProvider` is read once, when the
+  plugin is constructed, and is called as a method of the options object.
 - Model calls use Temporal retries. The plugin disables nested GenAI SDK retries
   for model requests and honors `retry-after` where available.
 - `heartbeatTimeout` detects a dead worker, not a stalled call: when set, the model
