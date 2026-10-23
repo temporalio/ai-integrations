@@ -18,6 +18,7 @@ import { Context } from '@temporalio/activity';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { msOptionalToNumber, type Duration } from '@temporalio/common/lib/time';
 import type { McpClientFactories, McpClientFactory } from './mcp';
+import { withSources } from './activity-sources';
 
 const encoder = new TextEncoder();
 
@@ -396,12 +397,13 @@ export function createActivities(
       });
     },
   };
+  withSources(activities, [provider]);
   if (mcpClientFactories !== undefined) {
     const idleMs = msOptionalToNumber(options?.mcpConnectionIdleTimeout) ?? MCP_CONNECTION_IDLE_MS;
     Object.entries(mcpClientFactories).forEach(([name, func]) => {
       activities = {
         ...activities,
-        ...activitiesForName(name, func, idleMs),
+        ...withSources(activitiesForName(name, func, idleMs), [func, idleMs]),
       };
     });
   }

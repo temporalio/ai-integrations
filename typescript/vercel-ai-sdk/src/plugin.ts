@@ -1,8 +1,9 @@
 import type { ProviderV4 } from '@ai-sdk/provider';
 import { SimplePlugin } from '@temporalio/plugin';
-import type { BundleOptions } from '@temporalio/worker';
+import type { BundleOptions, WorkerOptions } from '@temporalio/worker';
 import type { Duration } from '@temporalio/common/lib/time';
 import { createActivities, _evictMcpConnectionsForServer } from './activities';
+import { refuseReplacedActivities } from './activity-sources';
 import type { McpClientFactories } from './mcp';
 
 /**
@@ -58,6 +59,19 @@ export class AiSdkPlugin extends SimplePlugin {
         }
       },
     });
+  }
+
+  /**
+   * Adds the model and MCP Activities to the Worker.
+   *
+   * @throws TypeError if the Worker already has a different Activity with one
+   * of these names: a caller Activity, another integration's Activity, or an
+   * `AiSdkPlugin` with a different `modelProvider`, MCP client factory or
+   * `mcpConnectionIdleTimeout`.
+   */
+  override configureWorker(options: WorkerOptions): WorkerOptions {
+    refuseReplacedActivities('AiSdkPlugin', options.activities, this.options.activities as object);
+    return super.configureWorker(options);
   }
 
   override configureBundler(options: BundleOptions): BundleOptions {

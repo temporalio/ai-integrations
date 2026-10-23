@@ -34,4 +34,12 @@ for model, tool, streaming and MCP configuration. That guide currently uses the
 SDK-owned `@temporalio/ai-sdk` name; this repository owns the new
 `@temporalio/vercel-ai-sdk` coordinate.
 
+The plugin registers Activities named `invokeModel`, `invokeModelStreaming` and
+`invokeEmbeddingModel`, plus `<server>-listTools` and `<server>-callTool` for
+each MCP server. If the Worker already has a different Activity with one of
+these names (your own Activity, another integration's MCP Activity, or an
+`AiSdkPlugin` with different options), `Worker.create` fails with
+`Duplicate registration of Activity '<name>'`. Earlier versions kept the last
+one without a warning. Rename the other Activity or MCP server.
+
 Development details are in [typescript/README.md](../README.md).
