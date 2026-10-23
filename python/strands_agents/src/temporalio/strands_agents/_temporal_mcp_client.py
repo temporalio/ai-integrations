@@ -24,6 +24,11 @@ class _MCPToolInfo:
     description: str
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None = None
+    # Name the agent and model see: ``name`` with the client's ``prefix`` applied.
+    # ``name`` stays the server-side name, which the call-tool activity uses.
+    # ``None`` (an older recorded result) means ``name``.
+    agent_name: str | None = None
+    annotations: dict[str, Any] | None = None
 
 
 @dataclass
@@ -170,6 +175,8 @@ def _tool_infos(client: MCPClient, tools: Sequence[Tool]) -> list[_MCPToolInfo]:
                 description=tool.description or "",
                 input_schema=tool.inputSchema,
                 output_schema=tool.outputSchema,
+                agent_name=agent_tool.tool_name,
+                annotations=agent_tool.tool_spec.get("annotations"),
             )
         )
     return infos

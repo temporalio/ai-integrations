@@ -27,20 +27,22 @@ class TemporalMCPTool(AgentTool):
 
     @property
     def tool_name(self) -> str:
-        """Name of the underlying MCP tool."""
-        return self._info.name
+        """Name the agent sees: the MCP tool name with any client prefix."""
+        return self._info.agent_name or self._info.name
 
     @property
     def tool_spec(self) -> ToolSpec:
         """Strands ToolSpec built from the cached MCP tool info."""
         spec: ToolSpec = {
-            "name": self._info.name,
+            "name": self.tool_name,
             "description": self._info.description
             or f"Tool which performs {self._info.name}",
             "inputSchema": {"json": self._info.input_schema},
         }
         if self._info.output_schema:
             spec["outputSchema"] = {"json": self._info.output_schema}
+        if self._info.annotations:
+            spec["annotations"] = self._info.annotations
         return spec
 
     @property
