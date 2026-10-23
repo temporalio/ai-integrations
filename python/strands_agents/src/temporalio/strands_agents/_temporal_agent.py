@@ -75,6 +75,7 @@ class TemporalAgent(Agent):
         streaming_topic: str | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
         sandbox: TemporalSandbox | None = None,
+        model_state: dict[str, Any] | None = None,
         **agent_kwargs: Any,
     ) -> None:
         """Build a TemporalAgent from a registered model name and activity options."""
@@ -109,6 +110,10 @@ class TemporalAgent(Agent):
         super().__init__(model=temporal_model, sandbox=sandbox, **agent_kwargs)
         self._concurrency = _WorkflowConcurrencyController(self._concurrency.mode)
         self._temporal_model = temporal_model
+        # A model state carried from an earlier run, such as a stateful model's
+        # last response id across Continue-As-New.
+        if model_state:
+            self._model_state = dict(model_state)
 
         # Strands invokes ToolProvider.load_tools() once at construction on a
         # separate run_async thread that has no workflow runtime, so a
@@ -180,6 +185,15 @@ class TemporalAgent(Agent):
             )
         if not isinstance(self.conversation_manager, NullConversationManager):
             self.conversation_manager = NullConversationManager()
+
+    @property
+    def model_state(self) -> dict[str, Any]:
+        """A copy of the model state, such as a stateful model's last response id.
+
+        Carry it with the messages across Continue-As-New and pass it back as
+        ``TemporalAgent(model_state=...)``.
+        """
+        return dict(self._model_state)
 
     def take_snapshot(self, *_args: Any, **_kwargs: Any) -> Any:
         """Disabled; Temporal's event history is the source of truth."""
