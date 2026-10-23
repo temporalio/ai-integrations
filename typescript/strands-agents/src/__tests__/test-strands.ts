@@ -13,6 +13,7 @@ import { auditLog, auditTool, deleteState, deleteThing, getWeather, getWeatherCa
 import {
   activityToolAgent,
   approveSignal,
+  compressionAgent,
   defaultModelAgent,
   failingActivityToolAgent,
   failingMcpToolAgent,
@@ -193,6 +194,45 @@ test('TemporalAgent without `model:` resolves to the single registered factory',
     });
     t.is(result, 'reply from default');
   });
+});
+
+test('TemporalAgent gives Strands the worker model id and context window', async (t) => {
+  t.timeout(60_000);
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  const userTurns: string[][] = [];
+  class WindowStub extends StubModel {
+    override getConfig(): BaseModelConfig {
+      return { modelId: 'window-stub', contextWindowLimit: 1000 };
+    }
+    override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+      userTurns.push(messages.filter((m) => m.role === 'user').map((m) => (m.content[0] as TextBlock).text));
+      yield* super.stream(messages, options);
+    }
+  }
+  // The first reply reports 800 input tokens: 80% of the model's 1,000-token window, over the
+  // default compression threshold of 70%, but only 0.4% of Strands' 200,000-token fallback.
+  const firstTurn = [
+    ...textTurn('first'),
+    { type: 'modelMetadataEvent', usage: { inputTokens: 800, outputTokens: 1, totalTokens: 801 } },
+  ];
+
+  const worker = await createWorker({
+    plugins: [
+      new StrandsPlugin({
+        models: { test: () => new WindowStub([firstTurn as ModelStreamEvent[], textTurn('second')]) },
+      }),
+    ],
+  });
+
+  const config = await worker.runUntil(
+    executeWorkflow(compressionAgent, { args: [['turn 1', 'turn 2']], workflowExecutionTimeout: '30 seconds' })
+  );
+  // Compression dropped the first turn before the second model call, as it does natively.
+  t.deepEqual(
+    { config, userTurns },
+    { config: { modelId: 'window-stub', contextWindowLimit: 1000 }, userTurns: [['turn 1'], ['turn 2']] }
+  );
 });
 
 test('invokeModel reconstructs Message instances from wire data', async (t) => {

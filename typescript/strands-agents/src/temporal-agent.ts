@@ -80,6 +80,18 @@ export class TemporalAgent extends Agent {
     }
   }
 
+  /**
+   * Read the worker model's id and context window before Strands initializes the agent, so its
+   * traces and proactive compression use them from the first model call.
+   *
+   * Not `async`: when there is nothing to read, this returns Strands' own `initialize()` promise,
+   * so runs recorded without the read schedule their commands in the same order as before.
+   */
+  override initialize(): Promise<void> {
+    const loading = this.model instanceof TemporalModel ? this.model.loadConfig() : undefined;
+    return loading ? loading.then(() => super.initialize()) : super.initialize();
+  }
+
   override takeSnapshot(): never {
     throw new Error(SNAPSHOT_DISABLED);
   }
