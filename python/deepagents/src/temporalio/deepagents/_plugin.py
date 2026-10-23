@@ -18,10 +18,13 @@ inside a ``@workflow.defn`` with no other changes:
 
 The plugin auto-propagates from a ``Client`` to any ``Worker`` built from it, so
 add it on exactly one side. If one instance is on the Client and one on the
-Worker, the Worker keeps the Client instance's activities and skips the Worker
-instance's, instead of failing with "More than one activity named ...". Any other
-repeated activity name, such as two instances on one side or a caller activity
-with a plugin activity's name, is left to the Worker, which refuses it.
+Worker, the Worker instance does not add an activity that is already
+registered: the same callable, a wrapper of it (``__wrapped__``), or, for a
+second instance, the Client instance's copy of the same built-in activity. The
+Worker keeps what the Client side registered, instead of failing with "More
+than one activity named ...". Any other repeated activity name, such as two
+instances on one side or a caller activity with a plugin activity's name, is
+left to the Worker, which refuses it.
 """
 
 from __future__ import annotations
@@ -134,16 +137,17 @@ class DeepAgentsPlugin(SimplePlugin):
             backends=backends,
             streaming_batch_interval=streaming_batch_interval,
         )
-        self._activity_list = [
+        # Kept apart from the public ``activities`` setting, which callers may change.
+        self._builtin_activities = (
             self._activities.invoke_model,
             self._activities.invoke_model_streaming,
             self._activities.invoke_tool,
             self._activities.backend_op,
-        ]
+        )
 
         super().__init__(
             "langchain.DeepAgentsPlugin",
-            activities=self._activity_list,
+            activities=list(self._builtin_activities),
             data_converter=self._configure_data_converter,
             workflow_runner=self._make_workflow_runner(),
             workflow_failure_exception_types=[DeepAgentsWorkflowError],
@@ -239,18 +243,21 @@ class DeepAgentsPlugin(SimplePlugin):
     # -- worker config -------------------------------------------------------
 
     def configure_worker(self, config: Any) -> Any:
-        """Skip this instance's activities if the Client's instance added them."""
-        existing = list(config.get("activities") or [])
+        """Skip activities the Client's instance already registered."""
+        before = list(config.get("activities") or [])
         config = super().configure_worker(config)
-        if self._client_instance_registered(config, existing):
-            config["activities"] = existing
+        client_instance = self._client_instance(config)
+        if client_instance is not None:
+            config["activities"] = self._without_repeats(
+                before, config.get("activities") or [], client_instance
+            )
         return config
 
-    def _client_instance_registered(self, config: Any, existing: list[Any]) -> bool:
-        """Whether this is the Worker's call with one instance on each side.
+    def _client_instance(self, config: Any) -> DeepAgentsPlugin | None:
+        """The Client's instance, if this is the Worker's only instance.
 
-        The Worker runs the Client's plugins first, so the Client's instance has
-        already added its activities to ``existing``.
+        Only one instance on the Client and one on the Worker qualify. They can
+        be the same object, which the Worker then calls twice.
         """
         client = config.get("client")
         client_plugins = client.config().get("plugins", []) if client else []
@@ -258,9 +265,49 @@ class DeepAgentsPlugin(SimplePlugin):
         on_worker = [
             p for p in config.get("plugins") or [] if isinstance(p, DeepAgentsPlugin)
         ]
-        if len(on_client) != 1 or len(on_worker) != 1 or on_worker[0] is not self:
-            return False
-        return any(act in on_client[0]._activity_list for act in existing)
+        if len(on_client) == 1 and len(on_worker) == 1 and on_worker[0] is self:
+            return on_client[0]
+        return None
+
+    def _without_repeats(
+        self,
+        before: Sequence[Any],
+        after: Sequence[Any],
+        client_instance: DeepAgentsPlugin,
+    ) -> list[Any]:
+        """Drop the activities this call added that repeat a registration.
+
+        An added activity repeats one when a callable registered before this
+        call is it or wraps it, or, for one of this instance's built-in
+        activities, the Client instance's copy of it. Dropping such a repeat
+        never changes which code runs; any other repeat reaches the Worker's
+        duplicate-name check.
+        """
+        registered = [link for act in before for link in _wrapped_chain(act)]
+        counterparts = list(
+            zip(self._builtin_activities, client_instance._builtin_activities)
+        )
+        remaining = list(before)
+        kept: list[Any] = []
+        for act in after:
+            if act in remaining:
+                remaining.remove(act)
+            elif act in registered or any(
+                act == own and client_copy in registered
+                for own, client_copy in counterparts
+            ):
+                continue
+            kept.append(act)
+        return kept
+
+
+def _wrapped_chain(act: Any) -> list[Any]:
+    """``act`` and the callables it wraps, following ``__wrapped__``."""
+    chain: list[Any] = []
+    while act is not None and len(chain) < 100:
+        chain.append(act)
+        act = getattr(act, "__wrapped__", None)
+    return chain
 
 
 async def _temporal_aio_to_thread(

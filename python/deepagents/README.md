@@ -375,10 +375,14 @@ pass `TemporalModel("provider:name")` yourself.
 Each plugin instance registers four Activities: `deepagents.invoke_model`,
 `deepagents.invoke_model_streaming`, `deepagents.invoke_tool` and
 `deepagents.backend_op`. If one instance is on the Client and one on the
-Worker, the Worker keeps the Client's Activities and skips the Worker's. Any
-other repeated Activity name fails at Worker start with `ValueError: More than
-one activity named ...`, as it does without the plugin. That includes two
-instances on the same side and a caller Activity with one of these names.
+Worker, the Worker instance does not add an Activity that is already
+registered: the same function, a wrapper of it, or the Client instance's copy
+of the same built-in Activity. So the Worker keeps what the Client side
+registered, including any wrapper a later Client plugin put around it, and any
+other Activity given to the Worker instance is still added. Any other repeated
+Activity name fails at Worker start with `ValueError: More than one activity
+named ...`, as it does without the plugin. That includes two instances on the
+same side and a caller Activity with one of these names.
 
 ## Composing with other plugins
 
