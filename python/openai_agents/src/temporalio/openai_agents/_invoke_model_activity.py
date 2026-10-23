@@ -394,7 +394,10 @@ def _retry_after(e: APIStatusError) -> timedelta | None:
     retry_date = email.utils.parsedate_tz(retry_after_header)
     if retry_date is None:
         return None
-    seconds = email.utils.mktime_tz(retry_date) - time.time()
+    try:
+        seconds = email.utils.mktime_tz(retry_date) - time.time()
+    except (OverflowError, ValueError):  # a date outside the supported years
+        return None
     return timedelta(seconds=seconds) if seconds > 0 else None
 
 

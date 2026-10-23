@@ -3136,6 +3136,7 @@ def test_retry_after_http_date_propagated():
     [
         {"retry-after": email.utils.formatdate(time.time() + 30, usegmt=True)},
         {"retry-after": "soon"},
+        {"retry-after": "Wed, 21 Oct 10000 07:28:00 GMT"},
         {"retry-after-ms": "soon"},
     ],
 )
