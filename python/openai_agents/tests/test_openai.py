@@ -3137,7 +3137,10 @@ def test_retry_after_http_date_propagated():
         {"retry-after": email.utils.formatdate(time.time() + 30, usegmt=True)},
         {"retry-after": "soon"},
         {"retry-after": "Wed, 21 Oct 10000 07:28:00 GMT"},
+        {"retry-after": "Wed, 2000000000 Oct 2026 07:28:00 GMT"},
+        {"retry-after": "1e20"},
         {"retry-after-ms": "soon"},
+        {"retry-after-ms": "1e20"},
     ],
 )
 def test_retry_after_does_not_change_non_retryable_status(headers: dict[str, str]):

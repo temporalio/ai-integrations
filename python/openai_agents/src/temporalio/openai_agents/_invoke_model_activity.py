@@ -375,13 +375,13 @@ def _retry_after(e: APIStatusError) -> timedelta | None:
     """Read the delay the provider asks for, as the OpenAI client does.
 
     ``retry-after-ms`` wins over ``retry-after``, which is a number of seconds or an HTTP date.
-    Values that cannot be parsed are ignored.
+    Values that cannot be parsed, or that do not fit in a ``timedelta``, are ignored.
     """
     retry_after_ms_header = e.response.headers.get("retry-after-ms")
     if retry_after_ms_header is not None:
         try:
             return timedelta(milliseconds=float(retry_after_ms_header))
-        except ValueError:
+        except (OverflowError, ValueError):
             pass
 
     retry_after_header = e.response.headers.get("retry-after")
@@ -389,16 +389,16 @@ def _retry_after(e: APIStatusError) -> timedelta | None:
         return None
     try:
         return timedelta(seconds=float(retry_after_header))
-    except ValueError:
+    except (OverflowError, ValueError):
         pass
     retry_date = email.utils.parsedate_tz(retry_after_header)
     if retry_date is None:
         return None
     try:
-        seconds = email.utils.mktime_tz(retry_date) - time.time()
-    except (OverflowError, ValueError):  # a date outside the supported years
+        delay = timedelta(seconds=email.utils.mktime_tz(retry_date) - time.time())
+    except (OverflowError, ValueError):  # a date outside the supported range
         return None
-    return timedelta(seconds=seconds) if seconds > 0 else None
+    return delay if delay > timedelta(0) else None
 
 
 def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
