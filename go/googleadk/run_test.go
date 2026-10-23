@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -58,6 +61,44 @@ func TestMultiAgentSubAgents(t *testing.T) {
 
 	// Two durable model calls: the root turn that transfers, and the specialist.
 	assert.GreaterOrEqual(t, counter.get(googleadk.InvokeModelActivityName), 2)
+}
+
+// TestRemoteSubAgentRejected proves a tree holding ADK's remote A2A agent fails
+// with a clear error before any model call or A2A request. The remote agent
+// would send from Workflow code, and every replay would send again.
+func TestRemoteSubAgentRejected(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	var s testsuite.WorkflowTestSuite
+	env, counter := newEnv(t, &s, googleadk.Config{
+		Models: map[string]googleadk.ModelFactory{
+			"root-model": scriptedModelFactory(
+				googleadk.FunctionCallResponse("c1", "transfer_to_agent", map[string]any{"agent_name": "remote"}),
+			),
+		},
+	})
+
+	env.ExecuteWorkflow(agentRunWorkflow, runInput{
+		ModelName:   "root-model",
+		UserMessage: "ask the remote agent",
+		SubAgents: []subAgentSpec{{
+			Name:          "remote",
+			Description:   "remote A2A agent",
+			RemoteCardURL: srv.URL,
+		}},
+	})
+
+	require.True(t, env.IsWorkflowCompleted())
+	assert.Zero(t, requests.Load(), "no A2A request may leave Workflow code")
+	assert.Zero(t, counter.get(googleadk.InvokeModelActivityName), "the run must fail before the first model call")
+	err := env.GetWorkflowError()
+	require.Error(t, err, "a tree with a remote A2A agent must fail the run")
+	assert.Contains(t, err.Error(), `agent "remote" is a remote A2A agent`)
 }
 
 // errorModel is a model.LLM that always fails with a genai.APIError of the given

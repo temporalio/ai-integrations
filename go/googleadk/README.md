@@ -472,3 +472,18 @@ an upgrade would newly pass through ungated.
 - **Not yet:** `RunLive` (bidirectional streaming), sub-agent-as-child-workflow,
   live memory/artifact tools that require in-workflow network I/O, and DB/Vertex
   session services. These raise or are documented rather than silently degrading.
+- **Rejected:** ADK's remote A2A agents (`remoteagent.NewA2A`, which the
+  deprecated `agent/remoteagent` package also uses). They fetch their agent card
+  and send messages from Workflow code, so every replay would send them again.
+  A model call from an agent with a remote agent below it returns an error and
+  schedules no Activity. Call the remote agent from an Activity instead, for
+  example a tool built with `ActivityAsTool` that uses `a2aclient`. The check
+  runs on model calls, so it misses a remote agent that runs before any model
+  call, such as a remote root agent.
+
+  Runs that passed this check's place before it existed keep their remote
+  agents, so their histories still replay (`workflow.GetVersion` change ID
+  `googleadk-reject-remote-agents`). An earlier version of this package cannot
+  replay a run that took the check. To roll back, keep this version and set
+  `worker.Options.PreferredVersionProvider` to return `workflow.DefaultVersion`
+  for that change ID: new runs then keep their remote agents.

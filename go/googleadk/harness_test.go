@@ -19,6 +19,7 @@ import (
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
+	remoteagent "google.golang.org/adk/v2/agent/remoteagent/v2"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
@@ -42,6 +43,9 @@ type subAgentSpec struct {
 	Name        string
 	Description string
 	ModelName   string
+	// RemoteCardURL, when set, makes the child ADK's remote A2A agent, with its
+	// agent card at this URL, instead of an LLM agent.
+	RemoteCardURL string
 }
 
 // runInput is the serializable input to agentRunWorkflow.
@@ -237,6 +241,18 @@ func agentRunWorkflow(ctx workflow.Context, in runInput) (runResult, error) {
 
 	var subAgents []agent.Agent
 	for _, sa := range in.SubAgents {
+		if sa.RemoteCardURL != "" {
+			remote, rerr := remoteagent.NewA2A(remoteagent.A2AConfig{
+				Name:              sa.Name,
+				Description:       sa.Description,
+				AgentCardProvider: remoteagent.NewAgentCardProvider(sa.RemoteCardURL),
+			})
+			if rerr != nil {
+				return runResult{}, rerr
+			}
+			subAgents = append(subAgents, remote)
+			continue
+		}
 		child, cerr := llmagent.New(llmagent.Config{
 			Name:        sa.Name,
 			Description: sa.Description,

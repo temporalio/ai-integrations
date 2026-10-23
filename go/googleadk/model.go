@@ -3,7 +3,9 @@ package googleadk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"iter"
+	"reflect"
 	"strings"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"go.temporal.io/sdk/contrib/workflowstreams"
 	"go.temporal.io/sdk/workflow"
 
+	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )
@@ -103,6 +106,10 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 			yield(nil, errMissingContext)
 			return
 		}
+		if err := rejectRemoteAgents(ctx, wfCtx); err != nil {
+			yield(nil, err)
+			return
+		}
 		ao := m.activityOptions
 		if ao.StartToCloseTimeout == 0 {
 			ao.StartToCloseTimeout = defaultModelTimeout
@@ -131,6 +138,70 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 		}
 		yield(&resp, nil)
 	}
+}
+
+// remoteAgentChangeID is the workflow.GetVersion change ID of the remote agent
+// check. Runs that passed the check's place before it existed keep running
+// their remote agents, so their histories still replay.
+const remoteAgentChangeID = "googleadk-reject-remote-agents"
+
+// rejectRemoteAgents returns an error when an agent below the agent making
+// this model call was built by ADK's remoteagent.NewA2A. That agent fetches its
+// card and sends its messages from Workflow code, which History does not
+// record, so a replay sends them again.
+func rejectRemoteAgents(ctx context.Context, wfCtx workflow.Context) error {
+	ic, ok := ctx.(agent.InvocationContext)
+	if !ok {
+		return nil
+	}
+	remote := findRemoteAgent(ic.Agent())
+	if remote == nil {
+		return nil
+	}
+	if workflow.GetVersion(wfCtx, remoteAgentChangeID, workflow.DefaultVersion, 1) == workflow.DefaultVersion {
+		return nil
+	}
+	return fmt.Errorf("googleadk: agent %q is a remote A2A agent; it sends its requests from "+
+		"Workflow code, and they repeat on replay. Call the remote agent from an Activity "+
+		"instead, for example a tool built with ActivityAsTool", remote.Name())
+}
+
+// findRemoteAgent returns the first remote A2A agent below a, or nil.
+func findRemoteAgent(a agent.Agent) agent.Agent {
+	if a == nil {
+		return nil
+	}
+	for _, sub := range a.SubAgents() {
+		if isRemoteAgent(sub) {
+			return sub
+		}
+		if found := findRemoteAgent(sub); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+// isRemoteAgent reports whether a was built by remoteagent.NewA2A, which the
+// deprecated agent/remoteagent package also calls. ADK keeps the agent type
+// in internal state, so it is read with reflection.
+func isRemoteAgent(a agent.Agent) bool {
+	v := reflect.ValueOf(a)
+	for v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return false
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return false
+	}
+	f, ok := v.Type().FieldByName("AgentType")
+	if !ok {
+		return false
+	}
+	t, err := v.FieldByIndexErr(f.Index)
+	return err == nil && t.Kind() == reflect.String && t.String() == "RemoteAgent"
 }
 
 func (m *TemporalModel) modelSummary(req *model.LLMRequest) string {
