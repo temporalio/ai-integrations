@@ -806,6 +806,11 @@ Certain tools are not suitable for a distributed computing environment, so these
 | OpenAI         |    Yes    |
 | LiteLLM        |    Yes    |
 
+Without `model_provider`, the plugin uses an `OpenAIProvider` on the client set with the framework's
+`set_default_openai_client`, as it is: give that client `max_retries=0` to leave retries to Temporal.
+Without one, it uses the key set with `set_default_openai_key`, or else `OPENAI_API_KEY`, with the
+client's own retries turned off. Set them before you create the Worker.
+
 ### Model Response format
 
 | Model Response | Supported            |
