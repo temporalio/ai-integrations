@@ -1,3 +1,6 @@
+import os
+import time
+
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("echo-server")
@@ -10,4 +13,6 @@ def echo(message: str) -> str:
 
 
 if __name__ == "__main__":
+    # Lets a test delay the server's answer to initialize.
+    time.sleep(float(os.environ.get("ECHO_SERVER_START_DELAY", "0")))
     mcp.run()

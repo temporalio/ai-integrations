@@ -8,7 +8,9 @@ from mcp import StdioServerParameters, stdio_client
 from strands.tools.mcp.mcp_client import MCPClient
 
 from temporalio import workflow
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowFailureError
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.strands_agents import (
     StrandsPlugin,
     TemporalAgent,
@@ -326,3 +328,66 @@ async def test_mcp_lists_tools_each_turn_when_uncached(client: Client):
         workflows=[MCPNoCacheWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+@workflow.defn
+class MCPSlowStartWorkflow:
+    def __init__(self) -> None:
+        echo = TemporalMCPClient(
+            server="echo_slow",
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        self.agent = TemporalAgent(
+            model="mock",
+            start_to_close_timeout=timedelta(seconds=30),
+            tools=[echo],
+        )
+
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await self.agent.invoke_async(prompt)
+        return str(result)
+
+
+async def test_mcp_startup_timeout(client: Client):
+    """A server slower than the client's startup_timeout fails to connect, as natively."""
+    task_queue = f"test_mcp_startup_timeout-{uuid4()}"
+    plugin = StrandsPlugin(
+        models={"mock": lambda: MockModel(["Done!"])},
+        mcp_clients={
+            "echo_slow": lambda: MCPClient(
+                lambda: stdio_client(
+                    StdioServerParameters(
+                        command=sys.executable,
+                        args=[str(Path(__file__).parent / "echo_mcp_server.py")],
+                        env={"ECHO_SERVER_START_DELAY": "3"},
+                    )
+                ),
+                startup_timeout=1,
+            )
+        },
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[MCPSlowStartWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            MCPSlowStartWorkflow.run,
+            "echo hello",
+            id=f"test_mcp_startup_timeout_{uuid4()}",
+            task_queue=task_queue,
+        )
+        try:
+            await handle.result()
+            raise AssertionError("the run completed")
+        except WorkflowFailureError as err:
+            assert isinstance(err.cause, ActivityError)
+            cause = err.cause.cause
+            assert isinstance(cause, ApplicationError)
+            assert cause.type == "MCPClientInitializationError"
+            assert "startup_timeout (1 seconds)" in cause.message

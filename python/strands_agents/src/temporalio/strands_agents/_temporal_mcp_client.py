@@ -11,6 +11,7 @@ from mcp.types import PaginatedRequestParams, Tool
 from strands.tools import ToolProvider
 from strands.tools.mcp import MCPAgentTool, MCPClient
 from strands.tools.mcp.mcp_types import MCPToolResult
+from strands.types.exceptions import MCPClientInitializationError
 from strands.types.tools import AgentTool
 
 from temporalio import activity, workflow
@@ -229,6 +230,11 @@ class _ConnectionRecord:
 
     async def _run(self, client_factory: Callable[[], MCPClient]) -> None:
         client = client_factory()
+        # Apply the client's startup_timeout to opening the transport and
+        # initialize(), as MCPClient.start() does natively.
+        deadline = asyncio.get_running_loop().call_later(
+            client._startup_timeout, self._on_startup_timeout, client._startup_timeout
+        )
         try:
             async with client._transport_callable() as (read_stream, write_stream, *_):
                 async with ClientSession(
@@ -237,18 +243,36 @@ class _ConnectionRecord:
                     elicitation_callback=client._elicitation_callback,
                 ) as session:
                     await session.initialize()
+                    deadline.cancel()
                     self._ready.set_result((client, session))
                     await self._stop.wait()
         except BaseException as err:
+            deadline.cancel()
             # A failed connect should not be cached; drop it so the next call
             # retries instead of awaiting a permanently rejected future.
             if not self._ready.done():
                 self._ready.set_exception(err)
             # Only unpublish this record; a replacement may already be cached
             # under the same server name.
-            if _CONNECTIONS.get(self._server) is self:
-                del _CONNECTIONS[self._server]
+            self._uncache()
             raise
+
+    def _on_startup_timeout(self, startup_timeout: float) -> None:
+        if self._ready.done():
+            return
+        # Fail waiting callers now; closing the transport can take longer.
+        failure = MCPClientInitializationError(
+            "MCP server initialization did not finish within "
+            f"startup_timeout ({startup_timeout} seconds)"
+        )
+        failure.__cause__ = TimeoutError()
+        self._ready.set_exception(failure)
+        self._uncache()
+        self._owner.cancel()
+
+    def _uncache(self) -> None:
+        if _CONNECTIONS.get(self._server) is self:
+            del _CONNECTIONS[self._server]
 
     def acquire(self) -> None:
         """Mark a call in flight; pause idle eviction while calls are active."""
