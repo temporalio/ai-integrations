@@ -114,6 +114,8 @@ Before its first invocation in a workflow, each `TemporalAgent` reads the worker
 
 If you scaled `compression_threshold` by the model's window divided by 200,000 to work around the missing limit, remove that scaling: the threshold now applies to the model's own window.
 
+A worker model that keeps the conversation server-side, such as `OpenAIResponsesModel(stateful=True)`, works as it does natively: each model call gets the agent's model state, such as the last response id, and the agent clears its messages after each turn. As in Strands, such an agent cannot use a `conversation_manager` or `context_manager`; because `TemporalAgent` learns that the model is stateful when it reads the config, it raises `ValueError` at the agent's first invocation instead of at construction. Remove the manager from those agents.
+
 ## Retries
 
 `TemporalAgent` disables Strands' built-in `ModelRetryStrategy` so retries are handled exclusively by Temporal. The plugin's default Bedrock model also disables Botocore retries. When supplying your own model factory, disable that provider client's retries as shown in the Bedrock example above.

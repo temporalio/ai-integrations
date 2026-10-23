@@ -4,6 +4,7 @@ from typing import Any
 
 from strands import Agent
 from strands.agent._concurrency import _ConcurrencyController, _InflightInvocation
+from strands.agent.conversation_manager import NullConversationManager
 from strands.hooks import BeforeModelCallEvent, HookCallback
 from strands.types.agent import AgentInput
 from strands.types.content import Messages
@@ -86,6 +87,9 @@ class TemporalAgent(Agent):
                 "TemporalAgent(...) or pass retry_strategy=None."
             )
         agent_kwargs["retry_strategy"] = None
+        self._manager_given = agent_kwargs.get(
+            "conversation_manager"
+        ) is not None or agent_kwargs.get("context_manager") not in (None, False)
 
         temporal_model = TemporalModel(
             model_name=model,
@@ -162,7 +166,20 @@ class TemporalAgent(Agent):
         deduplication and cancellation of overlapping invocations unchanged.
         """
         await self._temporal_model._load_config()
+        if self._temporal_model.stateful:
+            self._use_server_side_state()
         return await super()._convert_prompt_to_messages(prompt)
+
+    def _use_server_side_state(self) -> None:
+        # What Strands' Agent does at construction for a stateful model, which
+        # TemporalAgent can only learn once the worker model's config is read.
+        if self._manager_given:
+            raise ValueError(
+                "context_manager and conversation_manager cannot be used with a "
+                "stateful model. The model manages conversation state server-side."
+            )
+        if not isinstance(self.conversation_manager, NullConversationManager):
+            self.conversation_manager = NullConversationManager()
 
     def take_snapshot(self, *_args: Any, **_kwargs: Any) -> Any:
         """Disabled; Temporal's event history is the source of truth."""

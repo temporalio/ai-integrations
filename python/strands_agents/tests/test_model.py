@@ -1,7 +1,11 @@
 import asyncio
+from collections.abc import AsyncIterable
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
+
+from strands.agent.conversation_manager import SlidingWindowConversationManager
+from strands.types.streaming import StreamEvent
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -155,3 +159,90 @@ async def test_model_config_reaches_workflow(client: Client):
         workflows=[ModelConfigWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+class StatefulMockModel(MockModel):
+    """Keeps the conversation "server-side", as OpenAIResponsesModel(stateful=True) does."""
+
+    calls: list[dict[str, Any]] = []
+
+    @property
+    def stateful(self) -> bool:
+        return True
+
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterable[StreamEvent]:
+        model_state = kwargs.get("model_state")
+        StatefulMockModel.calls.append(
+            {
+                "previous_response_id": (model_state or {}).get("response_id"),
+                "messages": len(args[0]),
+            }
+        )
+        if model_state is not None:
+            model_state["response_id"] = f"resp_{len(StatefulMockModel.calls)}"
+        async for event in super().stream(*args, **kwargs):
+            yield event
+
+
+@workflow.defn
+class StatefulModelWorkflow:
+    @workflow.run
+    async def run(self, give_manager: bool) -> list[int] | str:
+        kwargs: dict[str, Any] = {}
+        if give_manager:
+            kwargs["conversation_manager"] = SlidingWindowConversationManager()
+        agent = TemporalAgent(
+            model="stateful", start_to_close_timeout=timedelta(seconds=15), **kwargs
+        )
+        messages_after_turn = []
+        try:
+            for turn in ("turn one", "turn two"):
+                await agent.invoke_async(turn)
+                messages_after_turn.append(len(agent.messages))
+        except ValueError as err:
+            return f"refused: {err}"
+        return messages_after_turn
+
+
+async def test_stateful_model_keeps_state_server_side(client: Client):
+    """A stateful worker model gets its response id back and the agent clears its messages."""
+    task_queue = f"test_stateful_model_keeps_state_server_side-{uuid4()}"
+    StatefulMockModel.calls = []
+    plugin = StrandsPlugin(
+        models={"stateful": lambda: StatefulMockModel(["one", "two", "three"])}
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StatefulModelWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            StatefulModelWorkflow.run,
+            False,
+            id=f"test_stateful_model_{uuid4()}",
+            task_queue=task_queue,
+        )
+        assert await handle.result() == [0, 0]
+        assert StatefulMockModel.calls == [
+            {"previous_response_id": None, "messages": 1},
+            {"previous_response_id": "resp_1", "messages": 1},
+        ]
+
+        refused = await client.execute_workflow(
+            StatefulModelWorkflow.run,
+            True,
+            id=f"test_stateful_model_manager_{uuid4()}",
+            task_queue=task_queue,
+        )
+        assert refused == (
+            "refused: context_manager and conversation_manager cannot be used with "
+            "a stateful model. The model manages conversation state server-side."
+        )
+
+    await Replayer(
+        workflows=[StatefulModelWorkflow],
+        plugins=[plugin],
+    ).replay_workflow(await handle.fetch_history())
