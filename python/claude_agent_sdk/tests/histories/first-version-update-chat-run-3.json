@@ -1,0 +1,67 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-10-02T00:39:10.024847760Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1049685",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "UpdateChatWorkflow"
+        },
+        "taskQueue": {
+          "name": "old-update-chat-22c175c8",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "eyJjaGVja3BvaW50IjoiY3BfZDg0OWNjOWFjOGVhIiwiZm9ya19uZXh0IjpmYWxzZSwicGVuZGluZyI6e30sInJlY2VudF9jYWxsX2lkcyI6WyJ0b29sdV9mNmJkYjM4Zl8wMSIsInRvb2x1X2Y2YmRiMzhmXzAyIiwidG9vbHVfZjZiZGIzOGZfMDQiLCJ0b29sdV9mNmJkYjM4Zl8wNSIsInRvb2x1X2Y2YmRiMzhmXzA3IiwidG9vbHVfZjZiZGIzOGZfMDgiLCJ0b29sdV9mNmJkYjM4Zl8xMCIsInRvb2x1X2Y2YmRiMzhmXzExIl0sInJ1bnMiOjMsInNlZ21lbnRfaW5kZXgiOjEyLCJzZWdtZW50cyI6MTIsInNlc3Npb25faWQiOiJmNmJkYjM4Zi03Y2RlLTQ4ZTQtOTlhOC1mZjZjMWIwNjJlODIiLCJzdHJlYW0iOm51bGwsInRhc2tfcHJvbXB0IjpudWxsLCJ0YXNrX3NlZ21lbnRzIjowLCJ0b29sX2NhbGxzIjo4LCJ0b3RhbF9jb3N0X3VzZCI6MC4xMTk5OTk5OTk5OTk5OTk5OH0="
+            },
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "ZmFsc2U="
+            }
+          ]
+        },
+        "workflowRunTimeout": "0s",
+        "workflowTaskTimeout": "10s",
+        "continuedExecutionRunId": "a9969192-900a-446e-b57d-ccc2e8e82be3",
+        "initiator": "CONTINUE_AS_NEW_INITIATOR_WORKFLOW",
+        "originalExecutionRunId": "40dda22d-3490-4c77-a76f-cc534b877ca1",
+        "firstExecutionRunId": "01a0fa0c-f9f0-7164-9cf4-bae2af3770a5",
+        "attempt": 1,
+        "firstWorkflowTaskBackoff": "1.527123699s",
+        "prevAutoResetPoints": {
+          "points": [
+            {
+              "runId": "01a0fa0c-f9f0-7164-9cf4-bae2af3770a5",
+              "firstWorkflowTaskCompletedId": "4",
+              "createTime": "2026-10-02T00:39:09.600507914Z",
+              "expireTime": "2026-10-03T00:39:09.789849359Z",
+              "resettable": true,
+              "buildId": "68dec449e0464cd62a9faf2d36041bbb"
+            }
+          ]
+        },
+        "workflowId": "old-update-chat-22c175c8",
+        "priority": {}
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-10-02T00:39:10.041778182Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_TERMINATED",
+      "taskId": "1049692",
+      "workflowExecutionTerminatedEventAttributes": {
+        "reason": "terminated by user via frontend",
+        "identity": "21751@vm"
+      }
+    }
+  ]
+}
