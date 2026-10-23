@@ -6,11 +6,15 @@ These define @task and @entrypoint functions used in functional API E2E tests.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any
 
 import langgraph.types
+from langchain_core.messages import AIMessage
 from langgraph.func import entrypoint, task  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.runtime import Runtime, get_runtime
+from pydantic import BaseModel
+from typing_extensions import TypedDict
 
 
 def read_context(value: int, runtime: Runtime[Any] | None = None) -> dict[str, Any]:
@@ -49,6 +53,47 @@ async def simple_functional_entrypoint(value: int) -> dict:
     return {"result": result}
 
 
+class Score(BaseModel):
+    value: int
+
+
+@dataclass
+class Label:
+    text: str
+
+
+class Values(TypedDict):
+    score: Score
+    label: Label
+    message: Any
+    data: bytes
+
+
+@task
+def make_values(value: int) -> Values:
+    return Values(
+        score=Score(value=value),
+        label=Label(text="ten"),
+        message=AIMessage(content="hi", id="m1"),
+        data=b"\x00\xff",
+    )
+
+
+def type_names(values: Values) -> dict[str, str]:
+    return {key: type(item).__name__ for key, item in values.items()}
+
+
+@task
+def describe_values(values: Values) -> dict[str, str]:
+    return type_names(values)
+
+
+@entrypoint()
+async def typed_values_entrypoint(value: int) -> dict:
+    values = await make_values(value)
+    return {"result": [type_names(values), await describe_values(values)]}
+
+
 # Track task execution count for continue-as-new testing
 _task_execution_counts: dict[str, int] = {}
 
@@ -68,15 +113,15 @@ def expensive_task_a(x: int) -> int:
 
 
 @task
-def expensive_task_b(x: int) -> int:
+def expensive_task_b(x: int) -> Score:
     _task_execution_counts["task_b"] = _task_execution_counts.get("task_b", 0) + 1
-    return x + 100
+    return Score(value=x + 100)
 
 
 @task
-def expensive_task_c(x: int) -> int:
+def expensive_task_c(score: Score) -> int:
     _task_execution_counts["task_c"] = _task_execution_counts.get("task_c", 0) + 1
-    return x * 2
+    return score.value * 2
 
 
 @entrypoint()
@@ -85,7 +130,7 @@ async def continue_as_new_entrypoint(value: int) -> dict:
     result_a = await expensive_task_a(value)
     result_b = await expensive_task_b(result_a)
     result_c = await expensive_task_c(result_b)
-    return {"result": result_c}
+    return {"result": result_c, "task_b_type": type(result_b).__name__}
 
 
 @task

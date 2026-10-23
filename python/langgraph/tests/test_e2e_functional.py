@@ -38,12 +38,14 @@ from tests.e2e_functional_entrypoints import (
     add_ten,
     ask_human,
     continue_as_new_entrypoint,
+    describe_values,
     double_value,
     expensive_task_a,
     expensive_task_b,
     expensive_task_c,
     get_task_execution_counts,
     interrupt_entrypoint,
+    make_values,
     partial_execution_entrypoint,
     read_context,
     reset_task_execution_counts,
@@ -54,6 +56,7 @@ from tests.e2e_functional_entrypoints import (
     step_3,
     step_4,
     step_5,
+    typed_values_entrypoint,
     waiting_task,
 )
 from tests.e2e_functional_workflows import (
@@ -209,8 +212,23 @@ class TestFunctionalAPIBasicExecution:
                 [triple_value, add_five],
                 35,
             ),
+            (
+                SimpleFunctionalE2EWorkflow,
+                typed_values_entrypoint,
+                "e2e_simple_functional",
+                [make_values, describe_values],
+                [
+                    {
+                        "score": "Score",
+                        "label": "Label",
+                        "message": "AIMessage",
+                        "data": "bytes",
+                    }
+                ]
+                * 2,
+            ),
         ],
-        ids=["v1", "v2"],
+        ids=["v1", "v2", "typed-values"],
     )
     async def test_simple_entrypoint(
         self,
@@ -219,7 +237,7 @@ class TestFunctionalAPIBasicExecution:
         entrypoint_func: Any,
         entrypoint_name: str,
         tasks: list,
-        expected_result: int,
+        expected_result: Any,
     ) -> None:
         task_queue = f"e2e-functional-{uuid4()}"
 
@@ -254,7 +272,7 @@ class TestFunctionalAPIContinueAsNew:
         """10 * 3 = 30 -> + 100 = 130 -> * 2 = 260. Each task executes once."""
         reset_task_execution_counts()
 
-        tasks = [expensive_task_a, expensive_task_b, expensive_task_c]
+        tasks: list[Any] = [expensive_task_a, expensive_task_b, expensive_task_c]
         task_queue = f"e2e-continue-as-new-{uuid4()}"
 
         async with Worker(
@@ -282,7 +300,7 @@ class TestFunctionalAPIContinueAsNew:
                 execution_timeout=timedelta(seconds=60),
             )
 
-        assert result["result"] == 260
+        assert result == {"result": 260, "task_b_type": "Score"}
 
         counts = get_task_execution_counts()
         assert counts.get("task_a", 0) == 1, (

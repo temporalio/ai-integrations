@@ -4,6 +4,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.runtime import Runtime, get_runtime
 from pydantic import BaseModel, Field
@@ -16,10 +17,16 @@ from temporalio.langgraph import LangGraphPlugin, graph
 from temporalio.worker import Worker
 
 
+class Answer(BaseModel):
+    value: int
+
+
 class State(TypedDict):
     value: str
     context_type_a: str
     context_type_b: str
+    answer: Answer
+    answer_type_b: str
 
 
 @dataclass
@@ -65,10 +72,11 @@ def context_user_id(context: Context | ModelContext | DictContext | None) -> str
 async def node_a(
     state: State,
     runtime: Runtime[Any],
-) -> dict[str, str]:
+) -> dict[str, Any]:
     return {
         "value": state["value"] + "a" + context_user_id(runtime.context),
         "context_type_a": type(runtime.context).__name__,
+        "answer": Answer(value=1),
     }
 
 
@@ -77,6 +85,7 @@ async def node_b(state: State) -> dict[str, str]:
     return {
         "value": state["value"] + "b" + context_user_id(runtime.context),
         "context_type_b": type(runtime.context).__name__,
+        "answer_type_b": type(state["answer"]).__name__,
     }
 
 
@@ -176,4 +185,85 @@ async def test_two_nodes(
         "value": expected_value,
         "context_type_a": expected_context_type,
         "context_type_b": expected_context_type,
+        "answer": {"value": 1},
+        "answer_type_b": "Answer",
+    }
+
+
+class ModelState(BaseModel):
+    value: str
+    answer: Answer | None = None
+    messages: list[BaseMessage] = []
+    state_type_a: str = ""
+    state_type_b: str = ""
+    answer_type_b: str = ""
+    message_b: str = ""
+
+
+async def model_node_a(state: ModelState) -> dict[str, Any]:
+    return {
+        "answer": Answer(value=1),
+        "messages": [
+            AIMessage(
+                content="", tool_calls=[{"name": "search", "args": {}, "id": "call-1"}]
+            )
+        ],
+        "state_type_a": type(state).__name__,
+    }
+
+
+async def model_node_b(state: ModelState) -> dict[str, str]:
+    message = state.messages[-1]
+    tool_calls = getattr(message, "tool_calls", [{}])
+    return {
+        "state_type_b": type(state).__name__,
+        "answer_type_b": type(getattr(state, "answer", None)).__name__,
+        "message_b": f"{type(message).__name__}:{tool_calls[0].get('name')}",
+    }
+
+
+@pytest.mark.parametrize("pydantic_converter", [False, True])
+@pytest.mark.parametrize("first_node_execution", ["activity", "workflow"])
+async def test_two_nodes_pydantic_state(
+    client: Client, first_node_execution: str, pydantic_converter: bool
+):
+    g = StateGraph(ModelState)
+    g.add_node("node_a", model_node_a, metadata={"execute_in": first_node_execution})
+    g.add_node("node_b", model_node_b, metadata={"execute_in": "activity"})
+    g.add_edge(START, "node_a")
+    g.add_edge("node_a", "node_b")
+
+    task_queue = f"my-graph-{uuid4()}"
+    if pydantic_converter:
+        client_config = client.config()
+        client_config["data_converter"] = pydantic_data_converter
+        client = Client(**client_config)
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[TwoNodesWorkflow],
+        plugins=[
+            LangGraphPlugin(
+                graphs={"my-graph": g},
+                default_activity_options={
+                    "start_to_close_timeout": timedelta(seconds=10)
+                },
+            )
+        ],
+    ):
+        result = await client.execute_workflow(
+            TwoNodesWorkflow.run,
+            "",
+            id=f"test-workflow-{uuid4()}",
+            task_queue=task_queue,
+        )
+
+    assert result.pop("messages")[0]["tool_calls"][0]["name"] == "search"
+    assert result == {
+        "value": "",
+        "answer": {"value": 1},
+        "state_type_a": "ModelState",
+        "state_type_b": "ModelState",
+        "answer_type_b": "Answer",
+        "message_b": "AIMessage:search",
     }
