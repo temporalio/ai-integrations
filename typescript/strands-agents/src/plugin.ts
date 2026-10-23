@@ -1,18 +1,10 @@
-import type { McpClient } from '@strands-agents/sdk';
-import { BedrockModel, type Model } from '@strands-agents/sdk';
+import type { McpClient, Model } from '@strands-agents/sdk';
 import type { Duration } from '@temporalio/common';
 import { msOptionalToNumber } from '@temporalio/common/lib/time';
 import type { BundleOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
-import { ModelActivity } from './model-activity';
-import type { InvokeModelInput, InvokeModelStreamingInput } from './model-activity';
-import {
-  buildCallToolActivity,
-  buildListToolsActivity,
-  callToolActivityName,
-  listToolsActivityName,
-  _evictConnection,
-} from './temporal-mcp-client';
+import { addStrandsActivities, type McpRegistration } from './plugin-activities';
+import { _evictConnection } from './temporal-mcp-client';
 
 /**
  * Options for {@link StrandsPlugin}.
@@ -21,7 +13,11 @@ import {
  *   use and the constructed model is cached for the worker's lifetime.
  *   `TemporalAgent({ model: 'name', ... })` selects which factory to invoke.
  *   If omitted, the plugin registers a single `BedrockModel` factory under
- *   the name `'bedrock'` to match Strands' own implicit default.
+ *   the name `'bedrock'` to match Strands' own implicit default, unless
+ *   another `StrandsPlugin` on the same worker has `models`. Several
+ *   `StrandsPlugin`s on one worker serve all their models; worker creation
+ *   fails if two register different factories under one name, or each have a
+ *   different single model (the default for a `TemporalAgent` without `model`).
  *
  * - `mcpClients` — name → MCP client factory map. Workflow-side
  *   `TemporalMCPClient({ server: 'name' })` selects a factory by name; the
@@ -62,30 +58,19 @@ export interface StrandsPluginOptions {
  */
 export class StrandsPlugin extends SimplePlugin {
   constructor(options: StrandsPluginOptions = {}) {
-    let modelFactories = options.models;
-    let defaultName: string | undefined;
-    if (modelFactories === undefined) {
-      modelFactories = { bedrock: () => new BedrockModel({}) };
-      defaultName = 'bedrock';
-    } else {
-      const names = Object.keys(modelFactories);
-      if (names.length === 1) {
-        defaultName = names[0];
-      }
-    }
-
-    const modelActivity = new ModelActivity(modelFactories, defaultName);
-    const activities: Record<string, (...args: never[]) => unknown> = {
-      invokeModel: (input: InvokeModelInput) => modelActivity.invokeModel(input),
-      invokeModelStreaming: (input: InvokeModelStreamingInput) => modelActivity.invokeModelStreaming(input),
+    const factories = options.models ?? {};
+    const names = Object.keys(factories);
+    const models = {
+      supplied: options.models !== undefined,
+      factories,
+      defaultName: names.length === 1 ? names[0] : undefined,
     };
-
     const mcpClients = options.mcpClients ?? {};
     const idleMs = msOptionalToNumber(options.mcpConnectionIdleTimeout);
-    for (const [server, factory] of Object.entries(mcpClients)) {
-      activities[listToolsActivityName(server)] = buildListToolsActivity(server, factory, idleMs);
-      activities[callToolActivityName(server)] = buildCallToolActivity(server, factory, idleMs);
-    }
+    // `Object.fromEntries` keeps a server named `__proto__` as an own entry.
+    const mcpServers: Record<string, McpRegistration> = Object.fromEntries(
+      Object.entries(mcpClients).map(([server, factory]) => [server, { factory, idleMs }])
+    );
 
     const runContext = async (next: () => Promise<void>): Promise<void> => {
       try {
@@ -101,7 +86,8 @@ export class StrandsPlugin extends SimplePlugin {
 
     super({
       name: 'StrandsPlugin',
-      activities,
+      // Merge with another StrandsPlugin on the same Worker, and refuse to replace any other Activity.
+      activities: (existing) => addStrandsActivities({ ...existing }, models, mcpServers),
       runContext,
       dataConverter: {
         failureConverterPath: require.resolve('./failure-converter'),

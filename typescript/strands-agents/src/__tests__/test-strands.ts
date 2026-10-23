@@ -5,7 +5,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { ApplicationFailure } from '@temporalio/common';
 import type { BaseContext } from '@temporalio/test-helpers';
 import { test as anyTest, createBaseBundlerOptions, helpers, TestWorkflowEnvironment } from '@temporalio/test-helpers';
-import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
+import { bundleWorkflowCode, DefaultLogger, Worker, type WorkerOptions } from '@temporalio/worker';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { StrandsPlugin } from '..';
 import { startLocalWithRetry } from './helpers/environment';
@@ -193,6 +193,65 @@ test('TemporalAgent without `model:` resolves to the single registered factory',
     });
     t.is(result, 'reply from default');
   });
+
+  // A second StrandsPlugin with only MCP clients keeps that default instead of adding Bedrock's.
+  const twoPlugins = await createWorker({
+    plugins: [
+      new StrandsPlugin({ models: { onlyModel: () => new StubModel([textTurn('reply from default')]) } }),
+      new StrandsPlugin({ mcpClients: { beta: () => new StubMcpClient([]) } }),
+    ],
+  });
+  await twoPlugins.runUntil(async () => {
+    const result = await executeWorkflow(defaultModelAgent, { args: ['hi'], workflowExecutionTimeout: '30 seconds' });
+    t.is(result, 'reply from default');
+  });
+});
+
+test('StrandsPlugin refuses to replace a different Activity with the same name', (t) => {
+  const claude = (): Model => new StubModel([]);
+  const gpt = (): Model => new StubModel([]);
+  const mcp = (): McpClient => new StubMcpClient([]);
+  // Worker.create runs each plugin's configureWorker in turn.
+  const configure = (activities: object, ...plugins: StrandsPlugin[]): WorkerOptions =>
+    plugins.reduce((options, plugin) => plugin.configureWorker(options), {
+      taskQueue: 'q',
+      activities,
+    } as WorkerOptions);
+
+  const refused = [
+    () => configure({ invokeModel: async () => 'caller' }, new StrandsPlugin({ models: { claude } })),
+    () => configure({ 'beta-callTool': async () => 'caller' }, new StrandsPlugin({ mcpClients: { beta: mcp } })),
+    () => configure({}, new StrandsPlugin({ models: { claude } }), new StrandsPlugin({ models: { claude: gpt } })),
+    () => configure({}, new StrandsPlugin({ models: { claude } }), new StrandsPlugin({ models: { gpt } })),
+    () =>
+      configure(
+        {},
+        new StrandsPlugin({ mcpClients: { beta: mcp } }),
+        new StrandsPlugin({ mcpClients: { beta: () => mcp() } })
+      ),
+  ];
+  t.deepEqual(
+    refused.map((f) => t.throws(f, { instanceOf: TypeError })?.message.split(':')[0]),
+    [
+      "Duplicate registration of Activity 'invokeModel'",
+      "Duplicate registration of Activity 'beta-callTool'",
+      "Duplicate registration of model 'claude'",
+      "Conflicting default models 'claude' and 'gpt'",
+      "Duplicate registration of MCP server 'beta'",
+    ]
+  );
+
+  // The same plugin twice (on the connection and the worker), or the same options twice, still work.
+  const plugin = new StrandsPlugin({ models: { claude }, mcpClients: { beta: mcp } });
+  const options = { models: { claude, gpt }, mcpClients: { beta: mcp } };
+  const caller = async (): Promise<string> => 'caller';
+  t.notThrows(() => configure({ caller }, plugin, plugin));
+  t.notThrows(() => configure({ caller }, new StrandsPlugin(options), new StrandsPlugin(options)));
+  // Names that are also Object.prototype properties are ordinary names.
+  t.notThrows(() => configure({}, new StrandsPlugin(options), new StrandsPlugin({ models: { constructor: claude } })));
+  const protoServer = Object.defineProperty({}, '__proto__', { value: mcp, enumerable: true });
+  const proto = configure({}, new StrandsPlugin({ mcpClients: protoServer }));
+  t.true(Object.hasOwn(proto.activities ?? {}, '__proto__-listTools'));
 });
 
 test('invokeModel reconstructs Message instances from wire data', async (t) => {

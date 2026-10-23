@@ -91,6 +91,8 @@ new StrandsPlugin({
 
 Each `TemporalAgent` carries its own activity options (timeouts, retry policy, task queue, streaming topic) and dispatches to the shared model activity, which resolves the model name against the registered factories at runtime. A name not present in `models` throws inside the activity.
 
+The plugin's activities are named `invokeModel`, `invokeModelStreaming`, and `{name}-listTools` and `{name}-callTool` for each MCP client. If a worker already has a different activity with one of these names, creating the worker fails with `Duplicate registration of Activity '<name>'`; rename your activity, or run the other integration on its own worker. You can split `models` and `mcpClients` over several `StrandsPlugin`s on one worker: they serve all their models together, and a plugin without `models` adds the default `BedrockModel` only when no other one has `models`. Creating the worker fails if two of them register different factories under one model or MCP server name (or different `mcpConnectionIdleTimeout`s for one server), or each has a different single model, because a `TemporalAgent` without `model` then has no single default.
+
 ## Retries
 
 `TemporalAgent` disables Strands' built-in `ModelRetryStrategy` so retries are handled exclusively by Temporal. Configure retries via `activityOptions.retry` on `TemporalAgent`, and on the activity options accepted by `workflow.activityAsTool`, `workflow.activityAsHook`, and `TemporalMCPClient`:
