@@ -87,6 +87,12 @@ class ToolActivityInput:
     tool_call_id: str
     args: dict[str, Any]
     config: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # The path and class name of each LangChain message in ``args``, from
+    # ``_serde.find_tool_arg_messages``. Input from older workflow code lacks it
+    # and passes through unchanged.
+    arg_messages: list[tuple[list[str | int], str]] = dataclasses.field(
+        default_factory=list
+    )
 
 
 @dataclasses.dataclass
@@ -381,7 +387,7 @@ class DeepAgentActivities:
         config = _serde.rebuild_runnable_config(input.config)
         tool_call = {
             "name": input.tool_name,
-            "args": input.args,
+            "args": _serde.load_tool_arg_messages(input.args, input.arg_messages),
             "id": input.tool_call_id,
             "type": "tool_call",
         }
