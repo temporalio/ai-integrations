@@ -8,7 +8,7 @@ they never appear in workflow event history.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import AsyncExitStack, contextmanager
 from datetime import timedelta
 from typing import Any, Callable
@@ -90,7 +90,7 @@ def _classify_status_error(err: BaseException) -> ApplicationError | None:
 
 
 @contextmanager
-def _classify_errors() -> Iterator[None]:
+def _classify_errors() -> Generator[None, None, None]:
     """Raise Gemini API failures as ``ApplicationError`` classified for retry.
 
     Covers both error families the SDK raises: ``genai.errors.APIError`` (Files

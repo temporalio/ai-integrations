@@ -7,7 +7,7 @@ import json
 import logging
 import random
 import uuid
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Any, ClassVar, NoReturn, Protocol
@@ -479,7 +479,7 @@ def _maybe_run(
     parent: RunTree | None = None,
     project_name: str | None = None,
     executor: ThreadPoolExecutor,
-) -> Iterator[None]:
+) -> Generator[None, None, None]:
     """Create a LangSmith run, handling errors.
 
     - If add_temporal_runs is False **or** ``langsmith.utils.tracing_is_enabled()``
@@ -613,7 +613,7 @@ class LangSmithInterceptor(
         run_type: str = "chain",
         parent: RunTree | None = None,
         extra_metadata: dict[str, Any] | None = None,
-    ) -> Iterator[None]:
+    ) -> Generator[None, None, None]:
         """Create a LangSmith run with this interceptor's config already applied."""
         metadata = {**self._default_metadata, **(extra_metadata or {})}
         with _maybe_run(
@@ -677,14 +677,18 @@ class _LangSmithClientOutboundInterceptor(temporalio.client.OutboundInterceptor)
         self._config = config
 
     @contextmanager
-    def _traced_call(self, name: str, input: _InputWithHeaders) -> Iterator[None]:
+    def _traced_call(
+        self, name: str, input: _InputWithHeaders
+    ) -> Generator[None, None, None]:
         """Wrap a client call with a LangSmith run and inject context into headers."""
         with self._config.maybe_run(name):
             input.headers = _inject_current_context(input.headers)
             yield
 
     @contextmanager
-    def _traced_start(self, name: str, input: _InputWithHeaders) -> Iterator[None]:
+    def _traced_start(
+        self, name: str, input: _InputWithHeaders
+    ) -> Generator[None, None, None]:
         """Wrap a start operation, injecting ambient parent context before creating the run.
 
         Unlike ``_traced_call``, this injects headers *before* ``maybe_run``
@@ -798,7 +802,7 @@ class _LangSmithWorkflowInboundInterceptor(
         self,
         name: str,
         headers: Mapping[str, Payload] | None = None,
-    ) -> Iterator[None]:
+    ) -> Generator[None, None, None]:
         """Workflow-specific run creation with metadata.
 
         Extracts parent from headers (if provided) and sets up
@@ -896,7 +900,9 @@ class _LangSmithWorkflowOutboundInterceptor(
         self._config = config
 
     @contextmanager
-    def _traced_outbound(self, name: str, input: _InputWithHeaders) -> Iterator[None]:
+    def _traced_outbound(
+        self, name: str, input: _InputWithHeaders
+    ) -> Generator[None, None, None]:
         """Outbound workflow run creation with context injection into input.headers.
 
         Uses ambient context so ``@traceable`` step functions that wrap

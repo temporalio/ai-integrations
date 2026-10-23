@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Awaitable, Iterator
+from collections.abc import Awaitable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -20,7 +20,7 @@ _current_agent: ContextVar[Agent[Any] | None] = ContextVar(
 
 
 @contextmanager
-def capture_scope() -> Iterator[None]:
+def capture_scope() -> Generator[None, None, None]:
     """Discard agents captured inside the block when it exits, including on error.
 
     Must be entered and exited in the same task. Entering removes any agent captured by an

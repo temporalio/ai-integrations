@@ -1,7 +1,7 @@
 import asyncio
 import socket
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -238,7 +238,7 @@ async def test_stdio_transport(client: TemporalClient) -> None:
 
 
 @asynccontextmanager
-async def streamable_http_server() -> AsyncIterator[str]:
+async def streamable_http_server() -> AsyncGenerator[str, None]:
     server = MCPServer("http-echo")
 
     @server.tool()

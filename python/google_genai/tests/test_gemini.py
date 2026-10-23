@@ -25,7 +25,7 @@ import io
 import json
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -2011,7 +2011,7 @@ class _FakeGeminiHttpServer:
 @contextmanager
 def _gemini_client_failing_with(
     status: int,
-) -> Iterator[tuple[GeminiClient, list[str]]]:
+) -> Generator[tuple[GeminiClient, list[str]], None, None]:
     """Yield a real ``genai.Client`` whose every HTTP request answers ``status``."""
     server = _FakeGeminiHttpServer(status)
     server.start()
