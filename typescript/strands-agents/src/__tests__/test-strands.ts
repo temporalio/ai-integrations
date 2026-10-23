@@ -229,6 +229,12 @@ test('StrandsPlugin refuses to replace a different Activity with the same name',
         new StrandsPlugin({ mcpClients: { beta: mcp } }),
         new StrandsPlugin({ mcpClients: { beta: () => mcp() } })
       ),
+    () =>
+      configure(
+        {},
+        new StrandsPlugin({ mcpClients: { beta: mcp } }),
+        new StrandsPlugin({ mcpClients: { beta: mcp }, mcpConnectionIdleTimeout: '1 minute' })
+      ),
   ];
   t.deepEqual(
     refused.map((f) => t.throws(f, { instanceOf: TypeError })?.message.split(':')[0]),
@@ -237,6 +243,7 @@ test('StrandsPlugin refuses to replace a different Activity with the same name',
       "Duplicate registration of Activity 'beta-callTool'",
       "Duplicate registration of model 'claude'",
       "Conflicting default models 'claude' and 'gpt'",
+      "Duplicate registration of MCP server 'beta'",
       "Duplicate registration of MCP server 'beta'",
     ]
   );
@@ -247,6 +254,13 @@ test('StrandsPlugin refuses to replace a different Activity with the same name',
   const caller = async (): Promise<string> => 'caller';
   t.notThrows(() => configure({ caller }, plugin, plugin));
   t.notThrows(() => configure({ caller }, new StrandsPlugin(options), new StrandsPlugin(options)));
+  // Omitting mcpConnectionIdleTimeout is the same as passing its five-minute default, in either order.
+  for (const mcpConnectionIdleTimeout of ['5 minutes', 300_000] as const) {
+    const explicit = new StrandsPlugin({ mcpClients: { beta: mcp }, mcpConnectionIdleTimeout });
+    const omitted = new StrandsPlugin({ mcpClients: { beta: mcp } });
+    t.notThrows(() => configure({}, explicit, omitted));
+    t.notThrows(() => configure({}, omitted, explicit));
+  }
   // Names that are also Object.prototype properties are ordinary names.
   t.notThrows(() => configure({}, new StrandsPlugin(options), new StrandsPlugin({ models: { constructor: claude } })));
   const protoServer = Object.defineProperty({}, '__proto__', { value: mcp, enumerable: true });

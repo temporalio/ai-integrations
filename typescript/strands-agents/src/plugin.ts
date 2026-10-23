@@ -4,7 +4,7 @@ import { msOptionalToNumber } from '@temporalio/common/lib/time';
 import type { BundleOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
 import { addStrandsActivities, type McpRegistration } from './plugin-activities';
-import { _evictConnection } from './temporal-mcp-client';
+import { _evictConnection, MCP_CONNECTION_IDLE_MS } from './temporal-mcp-client';
 
 /**
  * Options for {@link StrandsPlugin}.
@@ -66,7 +66,8 @@ export class StrandsPlugin extends SimplePlugin {
       defaultName: names.length === 1 ? names[0] : undefined,
     };
     const mcpClients = options.mcpClients ?? {};
-    const idleMs = msOptionalToNumber(options.mcpConnectionIdleTimeout);
+    // The effective timeout, so that omitting it and passing the default register the same server.
+    const idleMs = msOptionalToNumber(options.mcpConnectionIdleTimeout) ?? MCP_CONNECTION_IDLE_MS;
     // `Object.fromEntries` keeps a server named `__proto__` as an own entry.
     const mcpServers: Record<string, McpRegistration> = Object.fromEntries(
       Object.entries(mcpClients).map(([server, factory]) => [server, { factory, idleMs }])

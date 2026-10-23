@@ -20,7 +20,8 @@ export interface ModelRegistration {
 /** An MCP server one {@link StrandsPlugin} serves. */
 export interface McpRegistration {
   factory: () => McpClient;
-  idleMs?: number;
+  /** The effective idle timeout: `mcpConnectionIdleTimeout` or its default, in milliseconds. */
+  idleMs: number;
 }
 
 type Registration = { kind: 'model'; models: ModelRegistration } | { kind: 'mcp'; server: McpRegistration };
