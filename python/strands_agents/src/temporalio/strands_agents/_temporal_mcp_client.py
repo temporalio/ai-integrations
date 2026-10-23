@@ -222,6 +222,11 @@ class _ConnectionRecord:
         self._ready: asyncio.Future[tuple[MCPClient, ClientSession]] = (
             loop.create_future()
         )
+        # Every caller may have been cancelled before the connect fails; mark
+        # the failure retrieved so asyncio does not log it as unhandled.
+        self._ready.add_done_callback(
+            lambda ready: ready.cancelled() or ready.exception()
+        )
         self._idle_handle: asyncio.TimerHandle | None = None
         self._idle_task: asyncio.Task[None] | None = None
         self._inflight = 0
@@ -258,15 +263,16 @@ class _ConnectionRecord:
             raise
 
     def _on_startup_timeout(self, startup_timeout: float) -> None:
-        if self._ready.done():
-            return
-        # Fail waiting callers now; closing the transport can take longer.
-        failure = MCPClientInitializationError(
-            "MCP server initialization did not finish within "
-            f"startup_timeout ({startup_timeout} seconds)"
-        )
-        failure.__cause__ = TimeoutError()
-        self._ready.set_exception(failure)
+        # _run cancels this timer once initialize() returns or the owner
+        # fails, so initialization is unfinished here.
+        if not self._ready.done():
+            # Fail waiting callers now; closing the transport can take longer.
+            failure = MCPClientInitializationError(
+                "MCP server initialization did not finish within "
+                f"startup_timeout ({startup_timeout} seconds)"
+            )
+            failure.__cause__ = TimeoutError()
+            self._ready.set_exception(failure)
         self._uncache()
         self._owner.cancel()
 
@@ -325,8 +331,9 @@ class _ConnectionRecord:
     async def _maybe_evict(self) -> None:
         # A call may have acquired the connection between the timer firing and
         # this task running; only evict if it is still idle. It must also still
-        # be the cached record: a failed call may have unpublished it and a
-        # replacement taken its place, which is not ours to close.
+        # be the cached record: a record that has left the cache (startup
+        # timeout, failed call, eviction) must not evict the connection that
+        # replaced it.
         if self._inflight == 0 and _CONNECTIONS.get(self._server) is self:
             await _evict_connection(self._server)
 
@@ -343,7 +350,8 @@ class _ConnectionRecord:
 
     async def session(self) -> tuple[MCPClient, ClientSession]:
         """Return the live client and session, or raise the connect failure."""
-        return await self._ready
+        # Callers share _ready; one caller's cancellation must not cancel it.
+        return await asyncio.shield(self._ready)
 
 
 async def get_connection(
