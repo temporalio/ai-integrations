@@ -40,7 +40,6 @@ class ProviderChatModelTest {
   private OpenAIClient client;
 
   @BeforeEach
-  @SuppressWarnings("unchecked")
   void setUp() {
     client = mock(OpenAIClient.class, RETURNS_DEEP_STUBS);
     ChatCompletion reply =
@@ -60,7 +59,7 @@ class ProviderChatModelTest {
                             .build())
                     .build())
             .build();
-    HttpResponseFor<ChatCompletion> rawResponse = mock(HttpResponseFor.class);
+    HttpResponseFor<ChatCompletion> rawResponse = mock();
     when(rawResponse.parse()).thenReturn(reply);
     when(rawResponse.headers()).thenReturn(Headers.builder().build());
     when(client

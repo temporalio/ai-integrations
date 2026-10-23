@@ -37,7 +37,6 @@ import org.springframework.ai.tool.definition.ToolDefinition;
  */
 class AnthropicThinkingContinuationTest {
   @Test
-  @SuppressWarnings("unchecked")
   void toolContinuationPreservesSignedAndRedactedThinkingInOrder() throws Exception {
     AnthropicClient sdk = mock(AnthropicClient.class, RETURNS_DEEP_STUBS);
     Message first =
@@ -59,7 +58,7 @@ class AnthropicThinkingContinuationTest {
             """
             [{"type":"text","text":"done","citations":[]}]
             """);
-    HttpResponseFor<Message> rawResponse = mock(HttpResponseFor.class);
+    HttpResponseFor<Message> rawResponse = mock();
     when(rawResponse.parse()).thenReturn(first, last);
     when(rawResponse.headers()).thenReturn(Headers.builder().build());
     when(sdk.messages()
