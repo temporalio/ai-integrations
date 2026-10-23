@@ -25,6 +25,11 @@ import {
 
 export type MCPServerProvider = StatelessMCPServerProvider | StatefulMCPServerProvider;
 
+// Every Activity function an OpenAIAgentsPlugin builds. configureWorker lets these be replaced, so
+// one instance can be on both the NativeConnection and the Worker, and chained instances keep the
+// last one's Activities.
+const pluginActivityFunctions = new WeakSet<object>();
+
 /**
  * Options controlling trace interceptor behavior on both the Activity side
  * (directly) and the Workflow side (via header propagation).
@@ -92,6 +97,8 @@ export interface OpenAIAgentsPluginOptions {
  * @experimental The OpenAI Agents plugin is an experimental feature; APIs may change without notice.
  */
 export class OpenAIAgentsPlugin extends SimplePlugin {
+  private readonly activityNames: readonly string[];
+
   constructor(options: OpenAIAgentsPluginOptions) {
     const modelActivities = createModelActivity(options.modelProvider, options.hostedToolCredentials);
 
@@ -116,6 +123,9 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
       }
       seenNames.add(provider.name);
       allActivities = { ...allActivities, ...provider._getActivities() };
+    }
+    for (const fn of Object.values(allActivities)) {
+      pluginActivityFunctions.add(fn);
     }
 
     const activityInterceptorOptions: OpenAIAgentsTraceInterceptorOptions = {
@@ -157,9 +167,20 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
         nexus: [() => ({ inbound: new OpenAIAgentsTraceNexusInboundInterceptor() })],
       },
     });
+    this.activityNames = Object.keys(allActivities);
   }
 
   override configureWorker(options: WorkerOptions): WorkerOptions {
+    const existing = options.activities as Record<string, unknown> | undefined;
+    for (const name of this.activityNames) {
+      const fn = existing && Object.prototype.propertyIsEnumerable.call(existing, name) ? existing[name] : undefined;
+      if (typeof fn === 'function' && !pluginActivityFunctions.has(fn)) {
+        throw new TypeError(
+          `Duplicate registration of Activity '${name}': OpenAIAgentsPlugin would replace a different Activity ` +
+            'with this name. Rename or remove the other registration.'
+        );
+      }
+    }
     return super.configureWorker(this.injectSinks(options));
   }
 
