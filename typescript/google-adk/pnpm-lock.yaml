@@ -39,20 +39,20 @@ importers:
         version: 4.3.0
       zod:
         specifier: ^4.2.1
-        version: 4.6.5
+        version: 4.6.6
     devDependencies:
       '@eslint/js':
         specifier: ^9.26.0
         version: 9.39.5
       '@google/adk':
         specifier: '>=2.0.0 <2.1.0'
-        version: 2.0.0(@grpc/grpc-js@1.14.5)(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))(express@5.2.1)
+        version: 2.0.0(@grpc/grpc-js@1.14.5)(@modelcontextprotocol/sdk@1.31.0(zod@4.6.6))(express@5.2.1)
       '@google/genai':
         specifier: ^2.9.0
-        version: 2.24.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))
+        version: 2.24.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.6))
       '@modelcontextprotocol/sdk':
         specifier: ^1.26.0
-        version: 1.31.0(zod@4.6.5)
+        version: 1.31.0(zod@4.6.6)
       '@opentelemetry/api':
         specifier: ^1.9.0
         version: 1.9.1
@@ -736,24 +736,28 @@ packages:
   '@opentelemetry/sdk-trace-base@1.30.1':
     resolution: {integrity: sha512-jVPgBbH1gCy2Lb7X0AVQ8XAfgg0pJ4nvl8/IiQA6nxOsPvS+0zMJaFSs2ltXe0J6C8dqjcnpyqINDJmU30+uOg==}
     engines: {node: '>=14'}
+    deprecated: Use @opentelemetry/sdk-trace package
     peerDependencies:
       '@opentelemetry/api': '>=1.0.0 <1.10.0'
 
   '@opentelemetry/sdk-trace-base@2.1.0':
     resolution: {integrity: sha512-uTX9FBlVQm4S2gVQO1sb5qyBLq/FPjbp+tmGoxu4tIgtYGmBYB44+KX/725RFDe30yBSaA9Ml9fqphe1hbUyLQ==}
     engines: {node: ^18.19.0 || >=20.6.0}
+    deprecated: Use @opentelemetry/sdk-trace package
     peerDependencies:
       '@opentelemetry/api': '>=1.3.0 <1.10.0'
 
   '@opentelemetry/sdk-trace-base@2.11.0':
     resolution: {integrity: sha512-H19x/TX/LZdqiYOjM7fqtSxwlplC5pgelavqbQdHbhdq0q/AI/TGkM2dfGuuynTXmJPeF2HoZVoPDu+TGoW78A==}
     engines: {node: ^18.19.0 || >=20.6.0}
+    deprecated: Use @opentelemetry/sdk-trace package
     peerDependencies:
       '@opentelemetry/api': '>=1.3.0 <1.10.0'
 
   '@opentelemetry/sdk-trace-node@2.11.0':
     resolution: {integrity: sha512-CuvCMJmZxswhNLlM2LfuLOW3h3fZujA4hsG4B+Sz4dX2zvaXO8Ng74cnDHWD64gLszTlhiG3c0iNUjj4g+0/sA==}
     engines: {node: ^18.19.0 || >=20.6.0}
+    deprecated: Use @opentelemetry/sdk-trace package
     peerDependencies:
       '@opentelemetry/api': '>=1.0.0 <1.10.0'
 
@@ -3318,8 +3322,8 @@ packages:
     peerDependencies:
       zod: ^3.25.28 || ^4
 
-  zod@4.6.5:
-    resolution: {integrity: sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==}
+  zod@4.6.6:
+    resolution: {integrity: sha512-4UmzQUF5fxvfcYHlbjBmejU+w+hbDnWFx4aS8kBx7nPBHcO2SqPbpAG8snbdg+Xse4pRefR98hgjFgIMCI/UhA==}
 
 snapshots:
 
@@ -3480,9 +3484,9 @@ snapshots:
       '@eslint/core': 0.17.0
       levn: 0.4.1
 
-  '@google-cloud/vertexai@1.12.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))':
+  '@google-cloud/vertexai@1.12.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.6))':
     dependencies:
-      '@google/genai': 1.52.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))
+      '@google/genai': 1.52.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.6))
       google-auth-library: 9.15.1
     transitivePeerDependencies:
       - '@modelcontextprotocol/sdk'
@@ -3491,11 +3495,11 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@google/adk@2.0.0(@grpc/grpc-js@1.14.5)(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))(express@5.2.1)':
+  '@google/adk@2.0.0(@grpc/grpc-js@1.14.5)(@modelcontextprotocol/sdk@1.31.0(zod@4.6.6))(express@5.2.1)':
     dependencies:
       '@a2a-js/sdk': 0.3.14(@grpc/grpc-js@1.14.5)(express@5.2.1)
-      '@google-cloud/vertexai': 1.12.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))
-      '@google/genai': 2.24.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))
+      '@google-cloud/vertexai': 1.12.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.6))
+      '@google/genai': 2.24.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.6))
       '@mikro-orm/core': 6.6.16
       '@mikro-orm/reflection': 6.6.16(@mikro-orm/core@6.6.16)
       '@opentelemetry/api': 1.9.0
@@ -3515,10 +3519,10 @@ snapshots:
       jsonpath-plus: 10.4.0
       lodash-es: 4.18.1
       winston: 3.19.0
-      zod: 4.6.5
-      zod-to-json-schema: 3.25.2(zod@4.6.5)
+      zod: 4.6.6
+      zod-to-json-schema: 3.25.2(zod@4.6.6)
     optionalDependencies:
-      '@modelcontextprotocol/sdk': 1.31.0(zod@4.6.5)
+      '@modelcontextprotocol/sdk': 1.31.0(zod@4.6.6)
       express: 5.2.1
     transitivePeerDependencies:
       - '@bufbuild/protobuf'
@@ -3528,27 +3532,27 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@google/genai@1.52.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))':
+  '@google/genai@1.52.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.6))':
     dependencies:
       google-auth-library: 10.9.1
       p-retry: 4.6.2
       protobufjs: 7.6.6
       ws: 8.22.0
     optionalDependencies:
-      '@modelcontextprotocol/sdk': 1.31.0(zod@4.6.5)
+      '@modelcontextprotocol/sdk': 1.31.0(zod@4.6.6)
     transitivePeerDependencies:
       - bufferutil
       - supports-color
       - utf-8-validate
 
-  '@google/genai@2.24.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))':
+  '@google/genai@2.24.0(@modelcontextprotocol/sdk@1.31.0(zod@4.6.6))':
     dependencies:
       google-auth-library: 10.9.1
       p-retry: 4.6.2
       protobufjs: 7.6.6
       ws: 8.22.0
     optionalDependencies:
-      '@modelcontextprotocol/sdk': 1.31.0(zod@4.6.5)
+      '@modelcontextprotocol/sdk': 1.31.0(zod@4.6.6)
     transitivePeerDependencies:
       - bufferutil
       - supports-color
@@ -3759,7 +3763,7 @@ snapshots:
       globby: 11.1.0
       ts-morph: 27.0.2
 
-  '@modelcontextprotocol/sdk@1.31.0(zod@4.6.5)':
+  '@modelcontextprotocol/sdk@1.31.0(zod@4.6.6)':
     dependencies:
       '@hono/node-server': 2.1.3(hono@4.13.12)
       ajv: 8.20.0
@@ -3776,8 +3780,8 @@ snapshots:
       json-schema-typed: 8.0.2
       pkce-challenge: 5.0.1
       raw-body: 3.0.2
-      zod: 4.6.5
-      zod-to-json-schema: 3.25.2(zod@4.6.5)
+      zod: 4.6.6
+      zod-to-json-schema: 3.25.2(zod@4.6.6)
     transitivePeerDependencies:
       - supports-color
 
@@ -6799,8 +6803,8 @@ snapshots:
 
   yocto-queue@1.2.2: {}
 
-  zod-to-json-schema@3.25.2(zod@4.6.5):
+  zod-to-json-schema@3.25.2(zod@4.6.6):
     dependencies:
-      zod: 4.6.5
+      zod: 4.6.6
 
-  zod@4.6.5: {}
+  zod@4.6.6: {}
