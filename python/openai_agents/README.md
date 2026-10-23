@@ -934,8 +934,9 @@ A trace's own tracing key, set with `RunConfig(tracing={"api_key": ...})` or
 Activities in headers, which are stored in Event History, so it cannot pass the key, and their spans
 would be exported with another key. Starting a Workflow, or scheduling an Activity or child
 Workflow, under such a trace raises `ValueError`. Set the tracing key on every client and Worker
-process instead, with `set_tracing_export_api_key` or `OPENAI_API_KEY`. Runs that started before
-this check keep running without it.
+process instead, with `set_tracing_export_api_key` or `OPENAI_API_KEY`. A run that started on an
+earlier version and already passed such a trace to an Activity keeps doing so, so that it replays;
+a run that does it for the first time after the upgrade gets the error.
 
 ## OpenTelemetry Integration
 
