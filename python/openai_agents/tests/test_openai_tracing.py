@@ -8,6 +8,7 @@ import opentelemetry.trace
 import pytest
 from agents import (
     Agent,
+    RunConfig,
     Runner,
     Span,
     Trace,
@@ -53,7 +54,7 @@ from temporalio.worker.workflow_sandbox import (
     SandboxedWorkflowRunner,
     SandboxRestrictions,
 )
-from tests.helpers import assert_event_subsequence, new_worker
+from tests.helpers import assert_event_subsequence, assert_eventually, new_worker
 from tests.test_openai import (
     ResearchWorkflow,
     research_mock_model,
@@ -785,6 +786,61 @@ async def test_custom_span_without_trace_context(
     assert len(spans) == 0, (
         f"Expected no spans without trace context, but found: {[s.name for s in spans]}"
     )
+
+
+@workflow.defn
+class RunTracingKeyWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        agent = Agent[None](
+            name="Assistant", instructions="You are a helpful assistant."
+        )
+        result = await Runner.run(
+            agent,
+            "Hello",
+            run_config=RunConfig(tracing={"api_key": "sk-tracing-run"}),
+        )
+        return result.final_output
+
+
+async def test_trace_tracing_key_refused(client: Client):
+    async with AgentEnvironment(
+        model=TestModel.returning_responses([ResponseBuilders.output_message("test")])
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, RunTracingKeyWorkflow) as worker:
+            # A run's own tracing key could not reach the model Activity's spans.
+            workflow_handle = await client.start_workflow(
+                RunTracingKeyWorkflow.run,
+                id=f"run-tracing-key-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+
+            async def check():
+                async for evt in workflow_handle.fetch_history_events():
+                    if evt.HasField(
+                        "workflow_task_failed_event_attributes"
+                    ) and "cannot pass a trace's own tracing key" in (
+                        evt.workflow_task_failed_event_attributes.failure.message
+                    ):
+                        return
+                raise AssertionError("The run's tracing key was not refused")
+
+            await assert_eventually(check)
+            await workflow_handle.terminate()
+
+            # Neither could a client trace's key reach the Workflow's spans.
+            with env.openai_agents_plugin.tracing_context():
+                with trace("Client trace", tracing={"api_key": "sk-tracing-client"}):
+                    with pytest.raises(
+                        ValueError, match="cannot pass a trace's own tracing key"
+                    ):
+                        await client.start_workflow(
+                            RunTracingKeyWorkflow.run,
+                            id=f"client-tracing-key-{uuid.uuid4()}",
+                            task_queue=worker.task_queue,
+                        )
 
 
 async def test_otel_tracing_in_runner(

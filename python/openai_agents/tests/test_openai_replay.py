@@ -16,6 +16,7 @@ from tests.test_openai import (
     RunModelProviderWorkflow,
     ToolsWorkflow,
 )
+from tests.test_openai_tracing import RunTracingKeyWorkflow
 
 
 @pytest.mark.parametrize(
@@ -28,6 +29,7 @@ from tests.test_openai import (
         "output-guardrail-workflow-history.json",
         "research-workflow-history.json",
         "run-model-provider-workflow-history.json",
+        "run-tracing-key-workflow-history.json",
         "tools-workflow-history.json",
     ],
 )
@@ -49,6 +51,7 @@ async def test_replay(file_name: str) -> None:
                 InputGuardrailWorkflow,
                 OutputGuardrailWorkflow,
                 RunModelProviderWorkflow,
+                RunTracingKeyWorkflow,
             ],
             plugins=[OpenAIAgentsPlugin()],
         ).replay_workflow(WorkflowHistory.from_json("fake", history_json))

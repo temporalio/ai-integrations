@@ -929,6 +929,14 @@ SQLite storage is not suited to a distributed workflow environment.
 | :--------------- | :-------: |
 | OpenAI platform  |    Yes    |
 
+A trace's own tracing key, set with `RunConfig(tracing={"api_key": ...})` or
+`trace(..., tracing={"api_key": ...})`, is not supported. The plugin passes traces to Workflows and
+Activities in headers, which are stored in Event History, so it cannot pass the key, and their spans
+would be exported with another key. Starting a Workflow, or scheduling an Activity or child
+Workflow, under such a trace raises `ValueError`. Set the tracing key on every client and Worker
+process instead, with `set_tracing_export_api_key` or `OPENAI_API_KEY`. Runs that started before
+this check keep running without it.
+
 ## OpenTelemetry Integration
 
 ⚠️ **Public Preview** - This functionality is subject to change prior to General Availability.
