@@ -9,7 +9,12 @@ from strands.types.exceptions import (
 )
 
 import temporalio.api.failure.v1
-from temporalio.converter import DefaultFailureConverter, PayloadConverter
+from temporalio.converter import (
+    DefaultFailureConverter,
+    DefaultFailureConverterWithEncodedAttributes,
+    FailureConverter,
+    PayloadConverter,
+)
 from temporalio.exceptions import ApplicationError
 
 # Activity-side: when a Strands ``InterruptException`` would otherwise be
@@ -67,3 +72,33 @@ class StrandsFailureConverter(DefaultFailureConverter):
             )
             return
         super().to_failure(exception, payload_converter, failure)
+
+
+class StrandsFailureConverterWithEncodedAttributes(StrandsFailureConverter):
+    """``StrandsFailureConverter`` that moves message and stack trace to encoded attributes.
+
+    It encodes like ``DefaultFailureConverterWithEncodedAttributes`` and decodes like
+    ``StrandsFailureConverter``.
+    """
+
+    def __init__(self) -> None:
+        """Create the converter with encoded attributes."""
+        super().__init__(encode_common_attributes=True)
+
+
+def strands_failure_converter_class(
+    base: type[FailureConverter],
+) -> type[StrandsFailureConverter]:
+    """Return the Strands failure converter class to use in place of ``base``.
+
+    Only ``DefaultFailureConverterWithEncodedAttributes`` is kept, as
+    ``StrandsFailureConverterWithEncodedAttributes``. Every other class is replaced
+    with ``StrandsFailureConverter``, so the failures that Workflow code reads stay
+    the same.
+    """
+    if base in (
+        DefaultFailureConverterWithEncodedAttributes,
+        StrandsFailureConverterWithEncodedAttributes,
+    ):
+        return StrandsFailureConverterWithEncodedAttributes
+    return StrandsFailureConverter
