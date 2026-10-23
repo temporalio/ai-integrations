@@ -1,0 +1,20 @@
+# Schema: ../../AGENTS.md#repository-invariants
+
+[plugin]
+name = "claude_agent_sdk"
+language = "python"
+coordinate = "temporalio-claude-agent-sdk"
+registry = "pypi"
+root-api = "temporalio.claude_agent_sdk"
+maturity = "pre-release"
+docs = "https://docs.temporal.io/develop/python/integrations/claude-agent-sdk"
+
+
+[release]
+allow-final = true
+
+[ci]
+runtime-versions = ["3.10", "3.14"]
+
+[smoke]
+imports = ["temporalio.claude_agent_sdk"]
