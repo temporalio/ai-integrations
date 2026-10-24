@@ -7,6 +7,7 @@ from botocore.config import Config as BotocoreConfig
 from strands.models import BedrockModel, Model
 from strands.models.bedrock import DEFAULT_READ_TIMEOUT
 from strands.tools.mcp import MCPClient
+from strands.types.exceptions import ContextWindowOverflowException
 
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.converter import DataConverter, DefaultPayloadConverter
@@ -128,6 +129,9 @@ class StrandsPlugin(SimplePlugin):
             workflow_runner=_workflow_runner,
             data_converter=_data_converter,
             activities=activities or None,
+            # Strands re-raises this when its conversation manager cannot reduce the
+            # context any further; fail the workflow instead of retrying the task forever.
+            workflow_failure_exception_types=[ContextWindowOverflowException],
             run_context=run_context,
         )
 
