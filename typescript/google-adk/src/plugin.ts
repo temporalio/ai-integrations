@@ -27,7 +27,10 @@ const ADK_PACKAGE = '@google/adk';
  * with `Can't resolve 'uuid'`. The plugin therefore depends on `uuid` itself
  * and answers ADK's request with its own copy's CJS entry, whose `crypto`
  * import the deterministic shim serves ({@link CRYPTO_SHIM_ISSUER_PATTERN}), so
- * the ids are the same whatever the consumer's layout or webpack target.
+ * the ids are the same whatever the consumer's layout or webpack target. On
+ * the Worker, where the same layout fails ADK's `require('uuid')` as soon as
+ * the plugin imports ADK, the resolution hook in `./adk-uuid-resolution`
+ * answers the request with the same copy.
  */
 const UUID_PACKAGE = 'uuid';
 

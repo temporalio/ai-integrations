@@ -123,10 +123,15 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   workspace or lockfile. Shared make, TypeScript and ESLint configuration lives
   in `typescript/_shared/`.
 - Coordinates and root APIs are `@temporalio/<name>`. The development version is
-  `0.0.0`. Node 22.12.0 is the minimum (provider packages require Node 22 and
-  unflagged CommonJS loading of ES modules); CI tests the latest Node 22.x and 24.x
-  using major selectors with `check-latest: true`. Use pnpm 10.27.0
-  and `make sync`, `make lint`, `make test`, `make build`.
+  `0.0.0`. Node 22.12.0 is the repository minimum (provider packages require Node 22
+  and unflagged CommonJS loading of ES modules); a plugin whose dependencies require
+  more declares its own floor in `engines` (`google-adk`: 22.17.0, which
+  `@mikro-orm/core` 7 requires through `@google/adk` 2.1 and later). CI tests the
+  latest Node 22.x and 24.x using major selectors with `check-latest: true`; a plugin
+  may name its floor's `major.minor` as the first `[ci] runtime-versions` entry so the
+  minimum cell runs that line's latest patch instead of the latest 22.x, which such a
+  plugin then does not test (`google-adk` tests 22.17 and 24). Use pnpm 10.27.0 and
+  `make sync`, `make lint`, `make test`, `make build`.
 - SDK and Workflow Streams dependencies use published npm coordinates. The
   unpublished SDK test helpers are copied into each consuming plugin's
   `tests/helpers/`, with a private development-only link. Never use a local

@@ -92,3 +92,29 @@ def test_typescript_rejects_wrong_runtime_floor_and_missing_lock(repo: Path) -> 
     checker.check_typescript_plugin(plugin)
     assert any("missing pnpm-lock.yaml" in error for error in checker.violations)
     assert any("Node engine floor" in error for error in checker.violations)
+
+
+def _set_runtime(plugin: Plugin, floor: str, versions: str) -> None:
+    manifest = plugin.path / "package.json"
+    package = json.loads(manifest.read_text())
+    package["engines"] = {"node": floor}
+    manifest.write_text(json.dumps(package))
+    meta = plugin.path / "plugin.toml"
+    meta.write_text(meta.read_text().replace('runtime-versions = ["22", "24"]', f"runtime-versions = {versions}"))
+
+
+def test_typescript_accepts_the_engine_floor_minor_as_the_minimum_runtime(repo: Path) -> None:
+    plugin = _plugin(repo)
+    _set_runtime(plugin, ">=22.17.0", '["22.17", "24"]')
+    checker = Checker(repo)
+    checker.check_typescript_plugin(plugin)
+    assert checker.violations == []
+
+
+@pytest.mark.parametrize("versions", ['["22.12", "24"]', '["22.17.0", "24"]', '["22", "24.1"]', '["23", "24"]'])
+def test_typescript_rejects_runtime_versions_off_the_engine_floor(repo: Path, versions: str) -> None:
+    plugin = _plugin(repo)
+    _set_runtime(plugin, ">=22.17.0", versions)
+    checker = Checker(repo)
+    checker.check_typescript_plugin(plugin)
+    assert any("Node engine floor" in error for error in checker.violations)

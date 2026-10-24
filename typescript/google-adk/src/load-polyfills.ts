@@ -37,20 +37,21 @@ if (inWorkflowContext()) {
     globals.structuredClone = require('@ungap/structured-clone').default;
   }
 
-  if (typeof globals.crypto === 'undefined') {
-    // ADK's id generator (`utils/env_aware_utils.js`, `randomUUID()`) reads
-    // `globalThis.crypto.randomUUID` / `.getRandomValues` before falling back
-    // to its `node:crypto` import, the `uuid` package ADK's retry plugins
-    // import reads only the global, and ADK 2.1+'s single-file web bundle has
-    // `node:crypto` pre-resolved to a stand-in that throws. So the plugin's
-    // deterministic shim is also the sandbox's `crypto` global: `randomUUID`
-    // and `getRandomValues` only (no `subtle`), every value drawn from the
-    // plugin's named workflow random stream. It is the same draw the bundler
-    // plugin's `node:crypto` redirect serves, so ids regenerate identically
-    // under replay whichever path ADK takes. Yields to a `crypto` the sandbox
-    // already provides.
-    globals.crypto = webcrypto;
-  }
+  // ADK's id generator (`utils/env_aware_utils.js`, `randomUUID()`) reads
+  // `globalThis.crypto.randomUUID` / `.getRandomValues` before falling back
+  // to its `node:crypto` import, the `uuid` package ADK's retry plugins
+  // import reads only the global, and ADK 2.1+'s single-file web bundle has
+  // `node:crypto` pre-resolved to a stand-in that throws. So the plugin's
+  // deterministic shim is also the sandbox's `crypto` global: `randomUUID`
+  // and `getRandomValues` only (no `subtle`), every value drawn from the
+  // plugin's named workflow random stream. It is the same draw the bundler
+  // plugin's `node:crypto` redirect serves, so ids regenerate identically
+  // under replay whichever path ADK takes. Unlike the other globals here it
+  // does not yield to one the sandbox already has (it has none today): the
+  // ids ADK draws, which a human-in-the-loop answer is matched against under
+  // replay, must keep coming from this stream whatever a later sandbox or
+  // SDK puts there.
+  globals.crypto = webcrypto;
 
   if (typeof globals.ReadableStream === 'undefined') {
     // eslint-disable-next-line @typescript-eslint/no-require-imports,import/no-unassigned-import
