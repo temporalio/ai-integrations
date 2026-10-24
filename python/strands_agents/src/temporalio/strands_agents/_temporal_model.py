@@ -16,6 +16,7 @@ from ._model_activity import (
     ModelActivity,
     _InvokeModelInput,
     _StreamingInvokeModelInput,
+    decode_event,
 )
 
 
@@ -145,4 +146,4 @@ class TemporalModel(Model):
                 **self._options,
             )
         for event in events:
-            yield event
+            yield decode_event(event)

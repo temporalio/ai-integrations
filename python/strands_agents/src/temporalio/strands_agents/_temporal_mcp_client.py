@@ -11,6 +11,7 @@ from mcp.types import PaginatedRequestParams, Tool
 from strands.tools import ToolProvider
 from strands.tools.mcp import MCPAgentTool, MCPClient
 from strands.tools.mcp.mcp_types import MCPToolResult
+from strands.types.session import encode_bytes_values
 from strands.types.tools import AgentTool
 
 from temporalio import activity, workflow
@@ -334,7 +335,11 @@ def build_call_tool_activity(
             return client_factory()._handle_tool_execution_error(args.tool_use_id, err)
         try:
             result = await session.call_tool(args.tool_name, args.arguments)
-            return client._handle_tool_result(args.tool_use_id, result)
+            # Image content comes back as bytes, which JSON cannot carry; tag it
+            # as base64 so the result is recorded once, not re-run on every retry.
+            return encode_bytes_values(
+                client._handle_tool_result(args.tool_use_id, result)
+            )
         except Exception as err:
             # The session may be broken; drop it so the next call reconnects.
             await _evict_connection(server)

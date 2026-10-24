@@ -1,6 +1,7 @@
 from typing import Any
 
 from strands.types._events import ToolResultEvent
+from strands.types.session import decode_bytes_values
 from strands.types.tools import AgentTool, ToolGenerator, ToolResult, ToolSpec, ToolUse
 
 from temporalio import workflow
@@ -70,4 +71,4 @@ class TemporalMCPTool(AgentTool):
         except ActivityError as error:
             yield _activity_error_event(tool_use["toolUseId"], error)
             return
-        yield ToolResultEvent(result)
+        yield ToolResultEvent(decode_bytes_values(result))
