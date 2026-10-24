@@ -1,6 +1,7 @@
 package io.temporal.googleadk;
 
 import static io.temporal.googleadk.TestSupport.history;
+import static io.temporal.googleadk.TestSupport.timerDurations;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -22,6 +23,7 @@ import io.temporal.worker.Worker;
 import io.temporal.workflow.Workflow;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -54,7 +56,7 @@ class TemporalAdkWorkflowTest {
     client = testEnv.getWorkflowClient();
     worker = testEnv.newWorker(TASK_QUEUE);
     worker.registerWorkflowImplementationTypes(
-        HelpersWorkflowImpl.class, AwaitFailureWorkflowImpl.class);
+        HelpersWorkflowImpl.class, AwaitFailureWorkflowImpl.class, IntervalWorkflowImpl.class);
     testEnv.start();
   }
 
@@ -85,6 +87,38 @@ class TemporalAdkWorkflowTest {
     worker.replayWorkflowExecution(history);
   }
 
+  /**
+   * RxJava's periodic tasks schedule each tick from the worker's clock, so a worker that reported
+   * wall-clock time while the workflow skipped ahead stretched every period. Each scheduler emits
+   * at one, two, and three seconds of workflow time; a tick trails its second only by the real time
+   * the server spends on the workflow task, which the bound below allows for generously, and the
+   * timers prove the period.
+   */
+  @Test
+  @Timeout(90)
+  void interval_ticksOncePerPeriodOfWorkflowTime() throws Exception {
+    IntervalWorkflow workflow =
+        client.newWorkflowStub(
+            IntervalWorkflow.class, WorkflowOptions.newBuilder().setTaskQueue(TASK_QUEUE).build());
+
+    List<Long> offsets = workflow.ticks();
+
+    assertEquals(6, offsets.size(), "three ticks per scheduler: " + offsets);
+    for (int i = 0; i < offsets.size(); i++) {
+      long second = (i % 3 + 1) * 1000;
+      assertTrue(
+          offsets.get(i) >= second && offsets.get(i) < second + 10_000,
+          "tick " + i + " must follow " + second + " ms of workflow time closely: " + offsets);
+    }
+    WorkflowExecutionHistory history = history(client, workflow);
+    List<Duration> timers = timerDurations(history);
+    assertEquals(6, timers.size(), "every tick waits on a workflow timer: " + timers);
+    assertTrue(
+        timers.stream().allMatch(timer -> timer.compareTo(Duration.ofSeconds(1)) <= 0),
+        "a tick's timer never exceeds the period: " + timers);
+    worker.replayWorkflowExecution(history);
+  }
+
   @Test
   @Timeout(90)
   void await_rethrowsTheFlowError() {
@@ -110,6 +144,30 @@ class TemporalAdkWorkflowTest {
   public interface AwaitFailureWorkflow {
     @WorkflowMethod
     void awaitFailure();
+  }
+
+  @WorkflowInterface
+  public interface IntervalWorkflow {
+    /** Returns the workflow time of each tick, relative to the start, per scheduler. */
+    @WorkflowMethod
+    List<Long> ticks();
+  }
+
+  public static class IntervalWorkflowImpl implements IntervalWorkflow {
+    @Override
+    public List<Long> ticks() {
+      List<Long> offsets = new ArrayList<>(ticks(WorkflowScheduler.parallel()));
+      offsets.addAll(ticks(WorkflowScheduler.sequential()));
+      return offsets;
+    }
+
+    private static List<Long> ticks(WorkflowScheduler scheduler) {
+      long start = Workflow.currentTimeMillis();
+      return TemporalAdk.await(
+          Flowable.interval(1, TimeUnit.SECONDS, scheduler)
+              .take(3)
+              .map(tick -> Workflow.currentTimeMillis() - start));
+    }
   }
 
   public static class AwaitFailureWorkflowImpl implements AwaitFailureWorkflow {

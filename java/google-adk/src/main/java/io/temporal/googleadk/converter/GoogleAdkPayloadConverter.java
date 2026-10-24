@@ -21,11 +21,11 @@ import java.util.Optional;
  * <p>ADK's request, response, event, and session types are AutoValue classes that omit absent
  * optionals, ignore unknown properties, and keep a few live members (such as the tool instances on
  * a request) out of JSON. Temporal's default converter writes every absent optional as {@code null}
- * and cannot read ADK's types back. This converter uses one mapper for everything, so a workflow
- * input, result, signal, or query may freely mix ADK types with your own: Temporal's defaults
- * (field visibility, ISO-8601 dates, the Java time and {@code Optional} modules) stay in place,
- * absent optionals are omitted, unknown properties are ignored, and a request's transient members
- * are skipped.
+ * and serializes a request's live tool instances, which it cannot read back. This converter uses
+ * one mapper for everything, so a workflow input, result, signal, or query may freely mix ADK types
+ * with your own: Temporal's defaults (field visibility, ISO-8601 dates, the Java time and {@code
+ * Optional} modules) stay in place, absent optionals are omitted, unknown properties are ignored,
+ * and a request's transient members are skipped.
  */
 public final class GoogleAdkPayloadConverter implements PayloadConverter {
 

@@ -33,6 +33,7 @@ import io.temporal.worker.Worker;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -57,6 +58,11 @@ class FailureClassificationTest {
             .model(
                 "overloaded",
                 new ThrowingModel("overloaded", new ServerException(503, "UNAVAILABLE", "busy")))
+            .model(
+                "bad_request_future",
+                new FutureFailingModel(
+                    "bad_request_future",
+                    new ClientException(400, "INVALID_ARGUMENT", "bad prompt")))
             .model("silent", new SilentModel())
             .build();
     testEnv =
@@ -80,6 +86,15 @@ class FailureClassificationTest {
   @Timeout(90)
   void clientError_isNonRetryable() {
     ApplicationFailure failure = failureOf("bad_request");
+    assertEquals("googleadk.ModelError", failure.getType());
+    assertTrue(failure.isNonRetryable());
+    assertTrue(failure.getOriginalMessage().contains("400"), failure.getOriginalMessage());
+  }
+
+  @Test
+  @Timeout(90)
+  void clientErrorRaisedThroughAFuture_isNonRetryable() {
+    ApplicationFailure failure = failureOf("bad_request_future");
     assertEquals("googleadk.ModelError", failure.getType());
     assertTrue(failure.isNonRetryable());
     assertTrue(failure.getOriginalMessage().contains("400"), failure.getOriginalMessage());
@@ -175,6 +190,26 @@ class FailureClassificationTest {
     @Override
     public Flowable<LlmResponse> generateContent(LlmRequest llmRequest, boolean stream) {
       return Flowable.error(failure);
+    }
+
+    @Override
+    public BaseLlmConnection connect(LlmRequest llmRequest) {
+      throw new UnsupportedOperationException();
+    }
+  }
+
+  /** A model that fails the way ADK's Gemini model does: through a future wrapped in a flow. */
+  static final class FutureFailingModel extends BaseLlm {
+    private final RuntimeException failure;
+
+    FutureFailingModel(String name, RuntimeException failure) {
+      super(name);
+      this.failure = failure;
+    }
+
+    @Override
+    public Flowable<LlmResponse> generateContent(LlmRequest llmRequest, boolean stream) {
+      return Flowable.fromFuture(CompletableFuture.failedFuture(failure));
     }
 
     @Override

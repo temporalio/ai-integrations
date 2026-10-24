@@ -18,8 +18,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * ({@link Async#procedure}), so sibling agents and tools wait on their activities concurrently; the
  * {@linkplain #sequential() sequential} scheduler runs tasks one after another on the calling
  * thread. A delayed task waits on a workflow timer and runs in order of its due time and, for equal
- * due times, of its submission, as RxJava's time-based operators expect. Both schedulers are
- * deterministic and replay-safe.
+ * due times, of its submission, as RxJava's time-based operators expect, and the scheduler and its
+ * workers report workflow time as the current time, so periodic tasks keep their period in workflow
+ * time. Both schedulers are deterministic and replay-safe.
  */
 public final class WorkflowScheduler extends Scheduler {
 
@@ -81,12 +82,18 @@ public final class WorkflowScheduler extends Scheduler {
         return task;
       }
       Duration pause = Duration.ofMillis(unit.toMillis(delay));
-      delayed.add(
-          new DelayedTask(Workflow.currentTimeMillis() + pause.toMillis(), submissions++, task));
+      DelayedTask entry =
+          new DelayedTask(Workflow.currentTimeMillis() + pause.toMillis(), submissions++, task);
+      delayed.add(entry);
       Async.procedure(
           () -> {
             Workflow.sleep(pause);
             drainDue();
+            // The sleeper's own task runs even if the clock reads earlier than its due time, after
+            // whatever is queued ahead of it, so submission order holds for equal due times.
+            while (!delayed.isEmpty() && delayed.peek().compareTo(entry) <= 0) {
+              delayed.poll().task.run();
+            }
           });
       return task;
     }
@@ -120,6 +127,12 @@ public final class WorkflowScheduler extends Scheduler {
     @Override
     public boolean isDisposed() {
       return disposed.get();
+    }
+
+    /** Returns workflow time, which RxJava's periodic tasks use to place their next tick. */
+    @Override
+    public long now(TimeUnit unit) {
+      return unit.convert(Workflow.currentTimeMillis(), TimeUnit.MILLISECONDS);
     }
   }
 

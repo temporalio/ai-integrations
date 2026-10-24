@@ -8,6 +8,7 @@ import io.temporal.api.history.v1.HistoryEvent;
 import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowStub;
 import io.temporal.common.WorkflowExecutionHistory;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -35,6 +36,15 @@ final class TestSupport {
     return history.getEvents().stream()
         .filter(HistoryEvent::hasActivityTaskScheduledEventAttributes)
         .map(e -> e.getActivityTaskScheduledEventAttributes().getActivityId())
+        .collect(Collectors.toList());
+  }
+
+  /** Returns the duration of every started timer, in history order. */
+  static List<Duration> timerDurations(WorkflowExecutionHistory history) {
+    return history.getEvents().stream()
+        .filter(HistoryEvent::hasTimerStartedEventAttributes)
+        .map(e -> e.getTimerStartedEventAttributes().getStartToFireTimeout())
+        .map(timeout -> Duration.ofSeconds(timeout.getSeconds(), timeout.getNanos()))
         .collect(Collectors.toList());
   }
 

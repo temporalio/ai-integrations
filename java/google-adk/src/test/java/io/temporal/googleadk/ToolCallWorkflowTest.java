@@ -52,16 +52,15 @@ class ToolCallWorkflowTest {
   private static final String TASK_QUEUE = "google-adk-tools";
   private static final String MODEL = "scripted";
 
+  private final ScriptedModel model =
+      ScriptedModel.responding(MODEL, ToolCallWorkflowTest::respond);
   private TestWorkflowEnvironment testEnv;
   private WorkflowClient client;
   private Worker worker;
 
   @BeforeEach
   void setUp() {
-    GoogleAdkPlugin plugin =
-        GoogleAdkPlugin.newBuilder()
-            .model(MODEL, ScriptedModel.responding(MODEL, ToolCallWorkflowTest::respond))
-            .build();
+    GoogleAdkPlugin plugin = GoogleAdkPlugin.newBuilder().model(MODEL, model).build();
     testEnv =
         TestWorkflowEnvironment.newInstance(
             TestEnvironmentOptions.newBuilder()
@@ -116,6 +115,9 @@ class ToolCallWorkflowTest {
         4,
         new HashSet<>(scheduledActivityIds(history)).size(),
         "every activity must be scheduled exactly once");
+    assertTrue(
+        model.requests().get(1).tools().containsKey("getWeather"),
+        "the worker-side model sees the activity-backed tool in the request's tool map");
     worker.replayWorkflowExecution(history);
   }
 
@@ -130,6 +132,14 @@ class ToolCallWorkflowTest {
     assertEquals(
         List.of(ModelActivity.INVOKE_MODEL, ModelActivity.INVOKE_MODEL),
         scheduledActivityTypes(history));
+    LlmRequest first = model.requests().get(0);
+    assertEquals(
+        List.of("addNumbers"),
+        List.copyOf(first.tools().keySet()),
+        "the worker-side model sees the in-workflow tool in the request's tool map");
+    assertEquals(
+        FunctionTool.create(MathTools.class, "addNumbers").declaration(),
+        first.tools().get("addNumbers").declaration());
     worker.replayWorkflowExecution(history);
   }
 

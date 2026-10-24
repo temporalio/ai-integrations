@@ -81,6 +81,14 @@ heartbeat timeout (the activity heartbeats while the model runs), with
 `TemporalModel.newBuilder(name).activityOptions(...)`. The activity summary shown in the Temporal
 UI is `InvokeModel: <model>` unless `summary(...)` computes one from the request.
 
+The request's tool instances stay in the workflow; they are not part of the activity's payload. On
+the worker the integration rebuilds `LlmRequest.tools()` from the function declarations in the
+request's config as declaration-only stand-ins, so models that read the tool map (ADK's Claude,
+LangChain4j, and Spring AI adapters) see the same tools as Gemini, which reads the config. If a
+Spring AI chat model executes tools itself (a tool advisor, or an older Spring AI with internal tool
+execution), those stand-ins cannot run on the worker; keep tool execution with ADK, which is Spring
+AI 2.0's default.
+
 Streamed calls (`RunConfig.StreamingMode.SSE`) use the same activity: the worker collects the
 partial chunks and the final response, and the workflow replays them in order, so ADK's partial
 events keep their shape. Chunks reach the workflow only when the activity completes; the
@@ -107,10 +115,12 @@ session on first use (`autoCreateSession`); pass your own `RunConfig` to change 
 ADK runs `ParallelAgent` sub-agents and `PARALLEL_SUBSCRIBE` tool calls on the invocation's
 scheduler. `WorkflowScheduler.parallel()` (the default) starts each task on its own workflow
 thread, so sibling model calls are scheduled together and wait concurrently;
-`TemporalAdk.runnerBuilder(WorkflowScheduler.sequential())` runs them one at a time. Both replay
-deterministically. Note that ADK's default `ToolExecutionMode.PARALLEL` still runs
-activity-backed tools one after another, because each call blocks the workflow thread until its
-activity completes; set `RunConfig.toolExecutionMode(PARALLEL_SUBSCRIBE)` to run them together.
+`TemporalAdk.runnerBuilder(WorkflowScheduler.sequential())` runs them one at a time. Both report
+workflow time as the current time, so delays and periodic tasks (`Flowable.delay`, `interval`,
+`timeout`) follow workflow time, and both replay deterministically. Note that ADK's default
+`ToolExecutionMode.PARALLEL` still runs activity-backed tools one after another, because each call
+blocks the workflow thread until its activity completes; set
+`RunConfig.toolExecutionMode(PARALLEL_SUBSCRIBE)` to run them together.
 
 Always build runners used in a workflow with `TemporalAdk.runnerBuilder()`. A runner built with
 `Runner.builder()` alone fans out on ordinary threads, where model calls fail and the run never
@@ -244,24 +254,36 @@ The plugin replaces the client's `json/plain` payload converter with `GoogleAdkP
 Temporal's default Jackson configuration for your own types, plus the settings ADK's types need
 (absent optionals omitted, unknown properties ignored, and a request's transient tool instances
 skipped) applied to ADK and GenAI types only, so your other payloads keep Temporal's exact wire
-format. If your client uses
+format. The SDK's own `DefaultDataConverter.STANDARD_INSTANCE` is never modified: a client that
+relies on it gets a new default converter with ADK support. A `DefaultDataConverter` your
+application created, whether set on the client or registered with `GlobalDataConverter.register`,
+is extended in place, because the SDK offers no way to copy one, so do not share that instance
+with clients that should not see ADK types. If your client uses
 a codec or another non-default converter, build it around
 `GoogleAdkDataConverter.newDefaultInstance()` and set `customizeDataConverter(false)` on the
 plugin; the plugin fails at client construction otherwise. If you register Jackson modules of your
 own, construct `GoogleAdkPayloadConverter` from your mapper and pass the converter to
 `DefaultDataConverter.withPayloadConverterOverrides`.
 
-Model failures reach the workflow as `ActivityFailure` with an `ApplicationFailure` cause of
-type `googleadk.ModelError` (`FailureTypes.MODEL_ERROR`). GenAI API errors with status 408, 409,
-429, or 5xx are retryable; other 4xx responses, missing models, and factory errors are not. A
-response the model reports as an error (for example a safety block) is not a failure: ADK emits it
-as a final event with an error code and no text, exactly as outside Temporal. MCP failures use
-`googleadk.McpError`: an unknown toolset or tool is non-retryable, a failing server call is
-retried, while a call the tool rejects outright (for example because of a null argument value) is
-not. With a heartbeat timeout on the activity options, model and MCP activities heartbeat while
-they run and return as soon as the server cancels them; the underlying model or server call still
-runs to completion on a background thread. Errors thrown by tools that run on
-the workflow thread follow ADK's contract and go back to the model.
+Model failures reach the workflow as `ActivityFailure` with an `ApplicationFailure` cause of type
+`googleadk.ModelError` (`FailureTypes.MODEL_ERROR`). GenAI API errors with status 408, 409, 429, or
+5xx are retryable; other 4xx responses, missing models, and factory errors are not. The status is
+found through the wrappers RxJava and futures add around the error, so ADK's Gemini model, which
+raises it from a future, is classified the same way. A response the model reports as an error (for
+example a safety block) is not a failure: ADK emits it as a final event with an error code and no
+text, exactly as outside Temporal. MCP failures use `googleadk.McpError`: an unknown toolset or tool
+is non-retryable, a failing server call is retried, while a call the tool rejects outright (for
+example because of a null argument value) is not. Model and MCP calls run on a background thread,
+including the work a model does before it returns a flow (ADK's Claude model and its non-streaming
+LangChain4j model block there), a toolset factory, and the session start `McpToolset` performs on
+subscription, so with a heartbeat timeout on the activity options the activities heartbeat while
+they run and return as soon as the server cancels them. The background call is left to finish on
+its own and its result is dropped: an interrupt would not stop the request of any ADK model
+(Gemini's completes on its HTTP client's own thread), and ADK's MCP classes answer one by retrying
+on a new session, which would run a cancelled tool call twice. An MCP toolset is released only after
+its last background call has finished, and a stdio server's process with it; each toolset is
+released on its own, so a server that never answers keeps only its own toolset alive. Errors thrown
+by tools that run on the workflow thread follow ADK's contract and go back to the model.
 
 Exceptions ADK itself raises on the workflow thread (for example `LlmCallsLimitExceededException`
 when `RunConfig.maxLlmCalls` is exceeded, or a `SessionException`) propagate out of
@@ -292,6 +314,8 @@ examples.
   installed, they are emitted again on every replay.
 - `App` resumability and event compaction are ADK experimental features; they work with the
   runner builder returned here but are not covered by this integration's tests.
+- Gemini context caching is inactive through the plugin: a request's cache configuration and
+  metadata are not part of its JSON, so they do not reach the worker.
 
 ## Development
 
