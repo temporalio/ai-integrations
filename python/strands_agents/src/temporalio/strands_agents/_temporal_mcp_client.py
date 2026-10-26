@@ -291,8 +291,10 @@ class _ConnectionRecord:
 
     async def _maybe_evict(self) -> None:
         # A call may have acquired the connection between the timer firing and
-        # this task running; only evict if it is still idle.
-        if self._inflight == 0:
+        # this task running; only evict if it is still idle. It must also still
+        # be the cached record: a failed call may have unpublished it and a
+        # replacement taken its place, which is not ours to close.
+        if self._inflight == 0 and _CONNECTIONS.get(self._server) is self:
             await _evict_connection(self._server)
 
     async def aclose(self) -> None:
@@ -337,6 +339,12 @@ async def _evict_connection(server: str) -> None:
     record = _CONNECTIONS.pop(server, None)
     if record is not None:
         await record.aclose()
+
+
+async def drain_closing() -> None:
+    """Wait for the broken connections still being closed in the background."""
+    while pending := [task for task in _CLOSING if not task.done()]:
+        await asyncio.wait(pending)
 
 
 def build_call_tool_activity(

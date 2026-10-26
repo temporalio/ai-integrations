@@ -21,6 +21,7 @@ from ._temporal_mcp_client import (
     _evict_connection,
     build_call_tool_activity,
     build_list_tools_activity,
+    drain_closing,
 )
 from ._worker_env_ref import AllowAllWorkerEnvVars
 
@@ -122,6 +123,9 @@ class StrandsPlugin(SimplePlugin):
             finally:
                 for server in mcp_clients:
                     await _evict_connection(server)
+                # Broken connections were already unpublished, so the loop above
+                # misses them; wait for their background close to finish too.
+                await drain_closing()
 
         super().__init__(
             "aws.StrandsPlugin",
