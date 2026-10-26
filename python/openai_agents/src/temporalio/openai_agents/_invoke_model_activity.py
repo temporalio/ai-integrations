@@ -213,6 +213,10 @@ class ActivityModelInput(TypedDict, total=False):
     previous_response_id: str | None
     conversation_id: str | None
     prompt: Any | None
+    # Set by the workflow when neither the agent nor the run named a model: whether
+    # the agent's settings are the SDK's implicit defaults, and the run-level overrides.
+    implicit_model_settings: bool
+    run_model_settings: ModelSettings | None
 
 
 class StreamingActivityModelInput(ActivityModelInput, total=False):
@@ -329,7 +333,7 @@ def _build_tools_and_handoffs(
 
 
 def _align_implicit_model_settings(
-    model_name: str | None, model: Model, model_settings: ModelSettings
+    input: ActivityModelInput, model: Model
 ) -> ModelSettings:
     """Align implicit default model settings with the model the provider resolved.
 
@@ -337,15 +341,21 @@ def _align_implicit_model_settings(
     own default model, such as a gpt-5 reasoning effort and ``verbosity``. The SDK swaps
     them for the settings that fit the model name actually used once that name is known.
     Inside a workflow the name is only known here, after this activity's provider resolves
-    the model, so the same swap happens here. Settings the agent set explicitly, and models
-    that do not expose a ``model`` name, pass through unchanged.
+    the model, so the same swap happens here. The workflow records whether the agent's
+    settings were those implicit defaults, judged in its own environment, and the
+    run-level overrides, which are re-applied after the swap. Explicit agent settings,
+    inputs from older workflow workers, and models that do not expose a ``model`` name
+    pass through unchanged.
     """
-    if model_name is not None or model_settings != get_default_model_settings():
+    model_settings = input["model_settings"]
+    if input.get("model_name") is not None or not input.get("implicit_model_settings"):
         return model_settings
     resolved_name = getattr(model, "model", None)
     if not isinstance(resolved_name, str):
         return model_settings
-    return get_default_model_settings(resolved_name)
+    return get_default_model_settings(resolved_name).resolve(
+        input.get("run_model_settings")
+    )
 
 
 def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
@@ -411,9 +421,7 @@ class ModelActivity:
     async def invoke_model_activity(self, input: ActivityModelInput) -> ModelResponse:
         """Activity that invokes a model with the given input."""
         model = self._model_provider.get_model(input.get("model_name"))
-        model_settings = _align_implicit_model_settings(
-            input.get("model_name"), model, input["model_settings"]
-        )
+        model_settings = _align_implicit_model_settings(input, model)
         tools, handoffs = _build_tools_and_handoffs(input, self._env_refs)
 
         try:
@@ -458,9 +466,7 @@ class ModelActivity:
         trip ``heartbeat_timeout``.
         """
         model = self._model_provider.get_model(input.get("model_name"))
-        model_settings = _align_implicit_model_settings(
-            input.get("model_name"), model, input["model_settings"]
-        )
+        model_settings = _align_implicit_model_settings(input, model)
         tools, handoffs = _build_tools_and_handoffs(input, self._env_refs)
 
         topic = input["streaming_topic"]
