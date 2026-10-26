@@ -6,7 +6,7 @@ workflow is needed.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
@@ -42,7 +42,7 @@ class _FakeMCP:
         self.opened.append(client_id)
 
         @asynccontextmanager
-        async def transport() -> AsyncIterator[tuple[str, None]]:
+        async def transport() -> AsyncGenerator[tuple[str, None], None]:
             yield client_id, None
 
         # The fake transport yields a connection id where MCP streams belong.
