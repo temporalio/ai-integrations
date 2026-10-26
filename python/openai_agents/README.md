@@ -801,10 +801,18 @@ Certain tools are not suitable for a distributed computing environment, so these
 
 ### Model Providers
 
-| Model Provider | Supported |
-| :------------- | :-------: |
-| OpenAI         |    Yes    |
-| LiteLLM        |    Yes    |
+| Model Provider                                              | Supported |
+| :---------------------------------------------------------- | :-------: |
+| OpenAI                                                      |    Yes    |
+| LiteLLM                                                     |    Yes    |
+| Any OpenAI-compatible API, through a custom `ModelProvider` |    Yes    |
+
+Pass a custom provider with `OpenAIAgentsPlugin(model_provider=...)`. When an agent names no
+model, the provider's `get_model(None)` chooses it. The Agents SDK gives such an agent the
+default settings for the SDK's own default model, which include a reasoning effort and
+`verbosity`; the model activity replaces them with the SDK's defaults for the model the
+provider resolved, as the SDK itself does for a named model, so an endpoint that rejects
+unknown fields never sees them. Settings the agent sets explicitly are sent unchanged.
 
 ### Model Response format
 

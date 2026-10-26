@@ -52,6 +52,7 @@ from agents.items import (
     TResponseStreamEvent,
 )
 from agents.mcp import MCPServer
+from agents.models import get_default_model_settings
 from agents.sandbox.capabilities.tools import SandboxApplyPatchTool
 from agents.tool import CustomTool
 from agents.tool_context import ToolContext
@@ -3124,3 +3125,131 @@ async def test_multiple_handoffs_workflow(client: Client):
                 "I'll analyze the requirements and create a plan."
                 in planner_response_data
             )
+
+
+class RecordingNamedModel(Model):
+    """Model that exposes its name and records the settings each call used."""
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+        self.settings: list[ModelSettings] = []
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> ModelResponse:
+        self.settings.append(model_settings)
+        return ResponseBuilders.output_message("done")
+
+    def stream_response(
+        self, *args: Any, **kwargs: Any
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        raise NotImplementedError()
+
+
+class RecordingUnnamedModel(RecordingNamedModel):
+    """The same model without a ``model`` attribute."""
+
+    def __init__(self) -> None:
+        super().__init__("unnamed")
+        del self.model
+
+
+class FixedModelProvider(ModelProvider):
+    """Provider that chooses the model when the agent names none."""
+
+    def __init__(self, model: Model) -> None:
+        self._model = model
+
+    def get_model(self, model_name: str | None) -> Model:
+        return self._model
+
+
+@workflow.defn
+class ImplicitSettingsAgent:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        # Names no model, so the agent carries the SDK's implicit default settings.
+        agent = Agent(name="Assistant", instructions="Reply briefly.")
+        return (await Runner.run(agent, input=prompt)).final_output
+
+
+@workflow.defn
+class ExplicitSettingsAgent:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        agent = Agent(
+            name="Assistant",
+            instructions="Reply briefly.",
+            model_settings=ModelSettings(temperature=0.2, verbosity="high"),
+        )
+        return (await Runner.run(agent, input=prompt)).final_output
+
+
+async def _run_with_model(client: Client, model: Model, workflow_type: type) -> None:
+    async with AgentEnvironment(
+        model_provider=FixedModelProvider(model),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, workflow_type) as worker:
+            await client.execute_workflow(
+                workflow_type.__name__,
+                "Hello",
+                id=f"implicit-settings-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                result_type=str,
+            )
+
+
+async def test_implicit_model_settings_follow_the_provider_model(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    # gpt-5 as the SDK default makes the implicit settings carry a reasoning
+    # effort and verbosity, which non-OpenAI endpoints reject.
+    monkeypatch.setenv("OPENAI_DEFAULT_MODEL", "gpt-5")
+    assert get_default_model_settings().verbosity == "low"
+
+    model = RecordingNamedModel("gpt-oss-120b")
+    await _run_with_model(client, model, ImplicitSettingsAgent)
+    assert model.settings == [ModelSettings()]
+
+
+async def test_implicit_model_settings_kept_for_a_gpt_5_provider_model(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("OPENAI_DEFAULT_MODEL", "gpt-5")
+
+    model = RecordingNamedModel("gpt-5")
+    await _run_with_model(client, model, ImplicitSettingsAgent)
+    assert model.settings == [get_default_model_settings("gpt-5")]
+    assert model.settings[0].verbosity == "low"
+
+
+async def test_implicit_model_settings_kept_for_an_unnamed_provider_model(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("OPENAI_DEFAULT_MODEL", "gpt-5")
+
+    model = RecordingUnnamedModel()
+    await _run_with_model(client, model, ImplicitSettingsAgent)
+    assert model.settings == [get_default_model_settings()]
+
+
+async def test_explicit_model_settings_reach_the_provider_model_unchanged(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("OPENAI_DEFAULT_MODEL", "gpt-5")
+
+    model = RecordingNamedModel("gpt-oss-120b")
+    await _run_with_model(client, model, ExplicitSettingsAgent)
+    assert model.settings == [ModelSettings(temperature=0.2, verbosity="high")]
