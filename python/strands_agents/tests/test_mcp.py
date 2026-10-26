@@ -7,6 +7,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 from mcp import ClientSession, StdioServerParameters, stdio_client
+from mcp.types import Tool
 from strands.tools.mcp.mcp_client import MCPClient
 
 from temporalio import workflow
@@ -331,22 +332,21 @@ async def test_mcp_lists_tools_each_turn_when_uncached(client: Client):
 
 
 async def test_list_tools_reads_mcp2_field_names():
-    """mcp 2 renamed nextCursor, inputSchema and outputSchema to snake_case."""
+    """mcp 2 renamed nextCursor, inputSchema and outputSchema to snake_case.
+
+    The pages use mcp 2's ``next_cursor``. The tools are the installed mcp's own
+    ``Tool``, because ``_tool_infos`` hands them to Strands, which reads the
+    field names of the installed mcp line.
+    """
     schema = {"type": "object"}
     pages = [
         SimpleNamespace(
-            tools=[
-                SimpleNamespace(
-                    name="a", description="A", input_schema=schema, output_schema=None
-                )
-            ],
+            tools=[Tool(name="a", description="A", inputSchema=schema)],
             next_cursor="page-2",
         ),
         SimpleNamespace(
             tools=[
-                SimpleNamespace(
-                    name="b", description="", input_schema=schema, output_schema=schema
-                )
+                Tool(name="b", description="", inputSchema=schema, outputSchema=schema)
             ],
             next_cursor=None,
         ),
