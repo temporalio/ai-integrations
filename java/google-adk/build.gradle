@@ -4,7 +4,7 @@ plugins {
     id 'com.diffplug.spotless' version '7.0.2'
 }
 
-description = 'Temporal Google ADK integration (Pre-release)'
+description = 'Temporal Google ADK integration (Public Preview)'
 def latestDependencies = providers.gradleProperty('dependencyMode').getOrElse('locked') == 'latest'
 ext {
     javaRelease = 17

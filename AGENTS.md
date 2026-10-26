@@ -40,7 +40,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
 | `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
 | `java/spring-ai` | `io.temporal:spring-ai` | 0.1.0 | Public Preview | `io.temporal.springai` |
-| `java/google-adk` | `io.temporal:google-adk` | 0.0.1 | Pre-release | `io.temporal.googleadk` |
+| `java/google-adk` | `io.temporal:google-adk` | 0.1.0 | Public Preview | `io.temporal.googleadk` |
 | `go/googleadk` | `go.temporal.io/googleadk` | 0.1.0 (new coordinate) | Public Preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
