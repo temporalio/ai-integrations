@@ -32,7 +32,7 @@
  * this module out of the bundle's interceptor list.
  */
 
-import { ApigeeLlm, Gemini, LLMRegistry } from '@google/adk';
+import { ApigeeLlm, Gemini, LLMRegistry, getLogger, type Logger, setLogger } from '@google/adk';
 import { inWorkflowContext, type WorkflowInterceptorsFactory } from '@temporalio/workflow';
 
 import { TemporalModel } from './model';
@@ -59,6 +59,31 @@ class AutoRoutedTemporalModel extends TemporalModel {
 // ts-prune-ignore-next (loaded by path from workflowInterceptorModules)
 export const interceptors: WorkflowInterceptorsFactory = () => ({});
 
+/**
+ * `LLMRegistry.register` reports every pattern it replaces at INFO —
+ * "Updating LLM class for <pattern> from <class> to <class>", with both classes
+ * stringified to their full source — so the five re-registrations below would
+ * each put a multi-kilobyte line on the Worker's console per Workflow run (ADK
+ * >= 2.1's default logger writes through `console`; ADK 2.0's went through the
+ * inert winston shim). The replacement is this module's purpose, not an event
+ * worth reporting, so ADK's logger is swapped out only for the duration of the
+ * call and the user's own logger (or the default) is restored afterwards.
+ */
+const SILENT_LOGGER: Logger = {
+  setLogLevel() {},
+  log() {},
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+};
+
 if (inWorkflowContext()) {
-  LLMRegistry.register(AutoRoutedTemporalModel);
+  const previous = getLogger();
+  setLogger(SILENT_LOGGER);
+  try {
+    LLMRegistry.register(AutoRoutedTemporalModel);
+  } finally {
+    setLogger(previous);
+  }
 }

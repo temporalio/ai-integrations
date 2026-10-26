@@ -9,6 +9,8 @@ import com.openai.client.OpenAIClient;
 import com.openai.client.OpenAIClientAsync;
 import com.openai.core.ObjectMappers;
 import com.openai.core.RequestOptions;
+import com.openai.core.http.Headers;
+import com.openai.core.http.HttpResponseFor;
 import com.openai.models.chat.completions.ChatCompletion;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.openai.models.chat.completions.ChatCompletionMessage;
@@ -57,11 +59,28 @@ class ProviderChatModelTest {
                             .build())
                     .build())
             .build();
+    HttpResponseFor<ChatCompletion> rawResponse = mock();
+    when(rawResponse.parse()).thenReturn(reply);
+    when(rawResponse.headers()).thenReturn(Headers.builder().build());
+    when(client
+            .chat()
+            .completions()
+            .withRawResponse()
+            .create(any(ChatCompletionCreateParams.class), any(RequestOptions.class)))
+        .thenReturn(rawResponse);
+    // Mirror the SDK's delegation so both parsed and raw-response Spring AI calls work.
     when(client
             .chat()
             .completions()
             .create(any(ChatCompletionCreateParams.class), any(RequestOptions.class)))
-        .thenReturn(reply);
+        .thenAnswer(
+            invocation ->
+                client
+                    .chat()
+                    .completions()
+                    .withRawResponse()
+                    .create(invocation.getArgument(0), invocation.getArgument(1))
+                    .parse());
   }
 
   @Test
@@ -237,7 +256,8 @@ class ProviderChatModelTest {
   private ChatCompletionCreateParams request() {
     ArgumentCaptor<ChatCompletionCreateParams> captor =
         ArgumentCaptor.forClass(ChatCompletionCreateParams.class);
-    verify(client.chat().completions()).create(captor.capture(), any(RequestOptions.class));
+    verify(client.chat().completions().withRawResponse())
+        .create(captor.capture(), any(RequestOptions.class));
     return captor.getValue();
   }
 

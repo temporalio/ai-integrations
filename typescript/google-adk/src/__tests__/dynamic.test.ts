@@ -8,6 +8,7 @@ import { ActivityFailure, ApplicationFailure, CancelledFailure } from '@temporal
 
 import { GoogleAdkPlugin } from '../index';
 import {
+  adkAtLeast,
   countScheduledActivities,
   findInCauseChain,
   setupTestEnv,
@@ -131,16 +132,25 @@ test.serial('a Workflow with a genai Schema is a tool taking a single request st
     });
     t.true(asString.text.includes('enriched-7'), asString.text);
     t.true(asString.text.includes('enrich_flow(request)'), asString.text);
-    // An object-typed genai schema cannot be satisfied through that single string:
-    // the graph produces no output, and since a `NodeTool` is long-running, a
-    // missing result defers the tool response — the turn ends with nothing. Use a
-    // Zod object schema for real parameters.
+    // An object-typed genai schema cannot be satisfied through that single string.
+    // Use a Zod object schema for real parameters.
     const asObject = await env.client.workflow.execute(workflowAsTool, {
       taskQueue,
       workflowId: uid('wf-dyn-tool-genai-object'),
       args: ['genai-object'],
     });
-    t.is(asObject.text, '');
+    if (adkAtLeast(2, 3)) {
+      // ADK 2.3 hands the node's input-schema rejection to the model as a tool
+      // error response.
+      t.true(asObject.text.startsWith('tool=enrich_flow; response={"error":'), asObject.text);
+      t.regex(asObject.text, /input does not match its inputSchema/);
+    } else {
+      // Earlier releases produce no output, and since a `NodeTool` is long-running,
+      // a missing result defers the tool response — the turn ends with nothing.
+      t.is(asObject.text, '');
+    }
+    // Either way the Workflow completes with neither an output nor an error of
+    // its own.
     t.is(asObject.output, undefined);
     t.is(asObject.errorMessage, undefined);
   });

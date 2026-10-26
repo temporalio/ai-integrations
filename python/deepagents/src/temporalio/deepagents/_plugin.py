@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import sys
 import warnings
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
@@ -178,7 +178,7 @@ class DeepAgentsPlugin(SimplePlugin):
     # -- run context ---------------------------------------------------------
 
     @asynccontextmanager
-    async def _run_context(self) -> AsyncIterator[None]:
+    async def _run_context(self) -> AsyncGenerator[None, None]:
         """Patch Deep Agents' model resolution seam for the worker's lifetime.
 
         The patch (on ``deepagents.graph.resolve_model``, the seam

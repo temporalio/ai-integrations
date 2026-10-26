@@ -17,6 +17,8 @@ from temporalio import activity, workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
+from ._bytes_values import encode_tool_result
+
 
 @dataclass
 class _MCPToolInfo:
@@ -24,6 +26,11 @@ class _MCPToolInfo:
     description: str
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None = None
+    # Name the agent and model see: ``name`` with the client's ``prefix`` applied.
+    # ``name`` stays the server-side name, which the call-tool activity uses.
+    # ``None`` (an older recorded result) means ``name``.
+    agent_name: str | None = None
+    annotations: dict[str, Any] | None = None
 
 
 @dataclass
@@ -170,6 +177,8 @@ def _tool_infos(client: MCPClient, tools: Sequence[Tool]) -> list[_MCPToolInfo]:
                 description=tool.description or "",
                 input_schema=tool.inputSchema,
                 output_schema=tool.outputSchema,
+                agent_name=agent_tool.tool_name,
+                annotations=agent_tool.tool_spec.get("annotations"),
             )
         )
     return infos
@@ -183,6 +192,10 @@ _MCP_CONNECTION_IDLE = timedelta(minutes=5)
 # Server name -> live connection held open in the activity worker process.
 # Activities run in the worker process , so this module state is shared across activity invocations on the worker
 _CONNECTIONS: dict[str, _ConnectionRecord] = {}
+
+# Strong references to the tasks closing broken connections, so the event loop
+# (which holds tasks only weakly) cannot drop one part way through.
+_CLOSING: set[asyncio.Task[None]] = set()
 
 
 class _ConnectionRecord:
@@ -211,6 +224,7 @@ class _ConnectionRecord:
         self._idle_handle: asyncio.TimerHandle | None = None
         self._idle_task: asyncio.Task[None] | None = None
         self._inflight = 0
+        self._broken = False
         self._owner = asyncio.create_task(self._run(client_factory))
 
     async def _run(self, client_factory: Callable[[], MCPClient]) -> None:
@@ -230,7 +244,10 @@ class _ConnectionRecord:
             # retries instead of awaiting a permanently rejected future.
             if not self._ready.done():
                 self._ready.set_exception(err)
-            _CONNECTIONS.pop(self._server, None)
+            # Only unpublish this record; a replacement may already be cached
+            # under the same server name.
+            if _CONNECTIONS.get(self._server) is self:
+                del _CONNECTIONS[self._server]
             raise
 
     def acquire(self) -> None:
@@ -240,9 +257,35 @@ class _ConnectionRecord:
             self._idle_handle.cancel()
             self._idle_handle = None
 
+    def mark_broken(self) -> None:
+        """Stop handing this connection out after a failed call.
+
+        The record is unpublished at once so new calls open a fresh connection,
+        but it is not disconnected until the calls still using it have called
+        ``release()``.
+        """
+        # Already evicted or replaced; whoever did that is closing it.
+        if _CONNECTIONS.get(self._server) is not self:
+            return
+        self._broken = True
+        del _CONNECTIONS[self._server]
+        if self._idle_handle is not None:
+            self._idle_handle.cancel()
+            self._idle_handle = None
+
     def release(self) -> None:
-        """Mark a call done; arm idle eviction once no calls remain in flight."""
+        """Mark a call done.
+
+        Once no calls remain in flight, disconnect a broken connection or arm
+        idle eviction for a healthy one.
+        """
         self._inflight -= 1
+        if self._broken:
+            if self._inflight == 0:
+                task = asyncio.ensure_future(self.aclose())
+                _CLOSING.add(task)
+                task.add_done_callback(_CLOSING.discard)
+            return
         # Only the record still cached under this server arms a timer; a record
         # already evicted or never cached must not schedule one, or it could
         # later evict a different, healthy connection for the same server.
@@ -257,8 +300,10 @@ class _ConnectionRecord:
 
     async def _maybe_evict(self) -> None:
         # A call may have acquired the connection between the timer firing and
-        # this task running; only evict if it is still idle.
-        if self._inflight == 0:
+        # this task running; only evict if it is still idle. It must also still
+        # be the cached record: a failed call may have unpublished it and a
+        # replacement taken its place, which is not ours to close.
+        if self._inflight == 0 and _CONNECTIONS.get(self._server) is self:
             await _evict_connection(self._server)
 
     async def aclose(self) -> None:
@@ -305,6 +350,12 @@ async def _evict_connection(server: str) -> None:
         await record.aclose()
 
 
+async def drain_closing() -> None:
+    """Wait for the broken connections still being closed in the background."""
+    while pending := [task for task in _CLOSING if not task.done()]:
+        await asyncio.wait(pending)
+
+
 def build_call_tool_activity(
     server: str,
     client_factory: Callable[[], MCPClient],
@@ -327,14 +378,19 @@ def build_call_tool_activity(
             return client_factory()._handle_tool_execution_error(args.tool_use_id, err)
         try:
             result = await session.call_tool(args.tool_name, args.arguments)
-            return client._handle_tool_result(args.tool_use_id, result)
+            # Image content comes back as bytes, which JSON cannot carry; tag it
+            # as base64 so the result is recorded once, not re-run on every retry.
+            return encode_tool_result(
+                client._handle_tool_result(args.tool_use_id, result)
+            )
         except Exception as err:
-            # The session may be broken; drop it so the next call reconnects.
-            await _evict_connection(server)
+            # The session may be broken; stop handing it out so the next call
+            # opens a fresh connection. Calls still using this one finish first.
+            record.mark_broken()
             return client._handle_tool_execution_error(args.tool_use_id, err)
         finally:
-            # No more in-flight call on this connection; let idle eviction
-            # resume (no-op if the connection was just evicted above).
+            # Closes the connection if it was marked broken and this was the
+            # last call using it; otherwise lets idle eviction resume.
             record.release()
 
     return call_tool
@@ -359,10 +415,13 @@ def build_list_tools_activity(
         try:
             return _tool_infos(client, await _paginate_list_tools(session))
         except Exception:
-            # The session may be broken; drop it so the next call reconnects.
-            await _evict_connection(server)
+            # The session may be broken; stop handing it out so the next call
+            # opens a fresh connection. Calls still using this one finish first.
+            record.mark_broken()
             raise
         finally:
+            # Closes the connection if it was marked broken and this was the
+            # last call using it; otherwise lets idle eviction resume.
             record.release()
 
     return list_tools
