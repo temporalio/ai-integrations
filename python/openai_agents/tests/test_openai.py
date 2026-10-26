@@ -1,5 +1,7 @@
 import asyncio
+import email.utils
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -1555,6 +1557,34 @@ def test_should_retry_false_stays_non_retryable():
         )
     assert err.value.non_retryable
     assert err.value.next_retry_delay == timedelta(milliseconds=5000)
+
+
+def test_retry_after_http_date_propagated():
+    retry_at = email.utils.formatdate(time.time() + 30, usegmt=True)
+    with pytest.raises(ApplicationError) as err:
+        _raise_for_openai_status(_openai_status_error(429, {"retry-after": retry_at}))
+    assert not err.value.non_retryable
+    assert err.value.next_retry_delay is not None
+    assert timedelta(seconds=28) < err.value.next_retry_delay <= timedelta(seconds=30)
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"retry-after": email.utils.formatdate(time.time() + 30, usegmt=True)},
+        {"retry-after": "soon"},
+        {"retry-after": "Wed, 21 Oct 10000 07:28:00 GMT"},
+        {"retry-after": "Wed, 2000000000 Oct 2026 07:28:00 GMT"},
+        {"retry-after": "1e20"},
+        {"retry-after-ms": "soon"},
+        {"retry-after-ms": "1e20"},
+    ],
+)
+def test_retry_after_does_not_change_non_retryable_status(headers: dict[str, str]):
+    with pytest.raises(ApplicationError) as err:
+        _raise_for_openai_status(_openai_status_error(400, headers))
+    assert err.value.non_retryable
+    assert err.value.type == "APIStatusError"
 
 
 def test_retry_after_ms_takes_precedence_over_retry_after():
