@@ -1,4 +1,4 @@
-import type { MCPServer } from '@openai/agents-core';
+import type { MCPServer, MCPToolMetaResolver } from '@openai/agents-core';
 import type { Duration, RetryPolicy } from '@temporalio/common';
 import { proxyActivities } from '@temporalio/workflow';
 import { MCP_CALL_TOOL_SUFFIX, MCP_LIST_TOOLS_SUFFIX, MCP_STATELESS_SUFFIX } from '../common/mcp-types';
@@ -10,6 +10,11 @@ export interface StatelessMcpServerOptions {
   taskQueue?: string;
   retryPolicy?: RetryPolicy;
   factoryArgument?: unknown;
+  /**
+   * Builds each tool call's MCP `_meta` in the Workflow, as for a native MCP server. It gets the
+   * run context and must be deterministic.
+   */
+  toolMetaResolver?: MCPToolMetaResolver;
 }
 
 export function statelessMcpServer(name: string, options?: StatelessMcpServerOptions): MCPServer {
@@ -30,6 +35,7 @@ export function statelessMcpServer(name: string, options?: StatelessMcpServerOpt
 
   return {
     cacheToolsList: shouldCache,
+    toolMetaResolver: options?.toolMetaResolver,
     get name() {
       return name;
     },
@@ -49,10 +55,11 @@ export function statelessMcpServer(name: string, options?: StatelessMcpServerOpt
       }
       return tools;
     },
-    async callTool(toolName: string, args: Record<string, unknown> | null) {
+    async callTool(toolName: string, args: Record<string, unknown> | null, meta?: Record<string, unknown> | null) {
       return activities[callToolActivityName]!({
         toolName,
         args,
+        ...(meta != null ? { meta } : {}),
         ...(factoryArg !== undefined ? { factoryArgument: factoryArg } : {}),
       });
     },

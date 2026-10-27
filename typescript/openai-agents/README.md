@@ -511,6 +511,18 @@ export async function statefulMcpWorkflow(prompt: string): Promise<string> {
 
 Dedicated Worker startup and heartbeat failures surface as `ApplicationFailure` type (exported as `DEDICATED_WORKER_FAILURE_TYPE`).
 
+### MCP request metadata
+
+A `toolMetaResolver` builds each tool call's MCP `_meta` from the run context, which exists only in the Workflow. Pass it as the `toolMetaResolver` option of `statelessMcpServer()` or `statefulMcpServer()`; it runs in Workflow code and must be deterministic. The call-tool Activity passes its result to the server's `callTool`. The Worker skips a `toolMetaResolver` on the factory's server and logs a warning.
+
+```ts
+const server = statelessMcpServer('tickets', {
+  toolMetaResolver: ({ runContext }) => ({ tenant: (runContext.context as { tenant: string }).tenant }),
+});
+```
+
+The `_meta` values are recorded in the call-tool Activity input in Workflow History, so don't put secrets in them.
+
 ## Sandbox agents
 
 > **Experimental** — sandbox support is subject to change prior to General Availability.

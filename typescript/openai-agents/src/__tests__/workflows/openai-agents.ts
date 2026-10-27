@@ -1,4 +1,4 @@
-import { Agent } from '@openai/agents-core';
+import { Agent, type MCPToolMetaContext } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
@@ -97,6 +97,29 @@ export async function mcpFactoryArgWorkflow(prompt: string): Promise<string> {
   const runner = new TemporalOpenAIRunner();
   const result = await runner.run(agent, prompt, { maxTurns: 5 });
   return result.finalOutput ?? '';
+}
+
+export async function mcpToolMetaWorkflow(stateful: boolean): Promise<string> {
+  const toolMetaResolver = ({ runContext, toolName }: MCPToolMetaContext) => ({
+    tenant: (runContext.context as { tenant: string }).tenant,
+    tool: toolName,
+  });
+  const server = stateful
+    ? statefulMcpServer('metaStateful', { toolMetaResolver })
+    : statelessMcpServer('metaStateless', { toolMetaResolver });
+  await server.connect();
+  try {
+    const agent = new Agent({
+      name: 'McpToolMetaAgent',
+      instructions: 'You have access to MCP tools.',
+      model: 'gpt-4o-mini',
+      mcpServers: [server],
+    });
+    const result = await new TemporalOpenAIRunner().run(agent, 'Hello', { context: { tenant: 'tenant-7' } });
+    return result.finalOutput ?? '';
+  } finally {
+    await server.close();
+  }
 }
 
 export async function summaryOverrideStringWorkflow(prompt: string): Promise<string> {

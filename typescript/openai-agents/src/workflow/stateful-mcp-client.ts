@@ -1,3 +1,4 @@
+import type { MCPToolMetaResolver } from '@openai/agents-core';
 import {
   ActivityFailure,
   ApplicationFailure,
@@ -45,6 +46,11 @@ export interface StatefulMcpServerOptions {
    * mid-run.
    */
   cacheToolsList?: boolean;
+  /**
+   * Builds each tool call's MCP `_meta` in the Workflow, as for a native MCP server. It gets the
+   * run context and must be deterministic.
+   */
+  toolMetaResolver?: MCPToolMetaResolver;
 }
 
 const DEDICATED_WORKER_SCHEDULE_FAILURE_MESSAGE =
@@ -91,6 +97,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
   private _sessionScope: CancellationScope | undefined;
   private _sessionPromise: Promise<void> | undefined;
   private _connected = false;
+  toolMetaResolver?: MCPToolMetaResolver;
 
   constructor(name: string, options?: StatefulMcpServerOptions) {
     this._name = `${name}${MCP_STATEFUL_SUFFIX}`;
@@ -107,6 +114,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     };
     this._factoryArgument = options?.factoryArgument;
     this._cacheToolsList = options?.cacheToolsList ?? true;
+    this.toolMetaResolver = options?.toolMetaResolver;
   }
 
   get name(): string {
@@ -178,10 +186,18 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     return handleWorkerFailure(() => scheduleActivity(this._name + MCP_LIST_TOOLS_SUFFIX, [], this._operationConfig));
   }
 
-  async callTool(toolName: string, args: Record<string, unknown> | null): Promise<any> {
+  async callTool(
+    toolName: string,
+    args: Record<string, unknown> | null,
+    meta?: Record<string, unknown> | null
+  ): Promise<any> {
     this.assertConnected();
     return handleWorkerFailure(() =>
-      scheduleActivity(this._name + MCP_CALL_TOOL_SUFFIX, [{ toolName, args }], this._operationConfig)
+      scheduleActivity(
+        this._name + MCP_CALL_TOOL_SUFFIX,
+        [{ toolName, args, ...(meta != null ? { meta } : {}) }],
+        this._operationConfig
+      )
     );
   }
 
