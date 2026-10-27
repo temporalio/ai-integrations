@@ -40,6 +40,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
 | `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
 | `java/spring-ai` | `io.temporal:spring-ai` | 0.1.0 | Public Preview | `io.temporal.springai` |
+| `java/google-adk` | `io.temporal:google-adk` | 0.1.0 | Public Preview | `io.temporal.googleadk` |
 | `go/googleadk` | `go.temporal.io/googleadk` | 0.1.0 (new coordinate) | Public Preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
@@ -96,8 +97,11 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 ## Java conventions
 
 - Each Java plugin owns a Gradle wrapper with distribution checksum, `build.gradle`,
-  `settings.gradle`, `plugin.toml`, and per-Spring-Boot dependency locks. Shared build
-  conventions live in `java/_shared/java.gradle`.
+  `settings.gradle`, `plugin.toml`, and committed dependency locks. Plugins with a
+  `spring-boot-versions` matrix lock once per Boot version
+  (`gradle/dependency-locks/spring-boot-<version>.lockfile`); the others keep one
+  `gradle/dependency-locks/dependencies.lockfile`. Shared build conventions live in
+  `java/_shared/java.gradle`.
 - Every Java plugin starts `settings.gradle` with a `pluginManagement` block applying
   `../_shared/settings.gradle`. The shared script checks Maven Central before the
   Gradle Plugin Portal; the conventions check enforces this entry point for every plugin.
@@ -123,10 +127,15 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   workspace or lockfile. Shared make, TypeScript and ESLint configuration lives
   in `typescript/_shared/`.
 - Coordinates and root APIs are `@temporalio/<name>`. The development version is
-  `0.0.0`. Node 22.12.0 is the minimum (provider packages require Node 22 and
-  unflagged CommonJS loading of ES modules); CI tests the latest Node 22.x and 24.x
-  using major selectors with `check-latest: true`. Use pnpm 10.27.0
-  and `make sync`, `make lint`, `make test`, `make build`.
+  `0.0.0`. Node 22.12.0 is the repository minimum (provider packages require Node 22
+  and unflagged CommonJS loading of ES modules); a plugin whose dependencies require
+  more declares its own floor in `engines` (`google-adk`: 22.17.0, which
+  `@mikro-orm/core` 7 requires through `@google/adk` 2.1 and later). CI tests the
+  latest Node 22.x and 24.x using major selectors with `check-latest: true`; a plugin
+  may name its floor's `major.minor` as the first `[ci] runtime-versions` entry so the
+  minimum cell runs that line's latest patch instead of the latest 22.x, which such a
+  plugin then does not test (`google-adk` tests 22.17 and 24). Use pnpm 10.27.0 and
+  `make sync`, `make lint`, `make test`, `make build`.
 - SDK and Workflow Streams dependencies use published npm coordinates. The
   unpublished SDK test helpers are copied into each consuming plugin's
   `tests/helpers/`, with a private development-only link. Never use a local

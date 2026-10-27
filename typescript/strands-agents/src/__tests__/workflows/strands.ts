@@ -3,8 +3,10 @@ import '../../load-polyfills';
 import { z } from 'zod';
 import {
   AfterToolCallEvent,
+  SlidingWindowConversationManager,
   StructuredOutputError,
   tool,
+  type BaseModelConfig,
   type InterruptResponseContent,
   type InterruptResponseContentData,
 } from '@strands-agents/sdk';
@@ -24,6 +26,39 @@ export async function helloAgent(prompt: string): Promise<string> {
   const agent = new TemporalAgent({ model: 'test', printer: false });
   const result = await agent.invoke(prompt);
   return result.toString();
+}
+
+/**
+ * Runs each prompt as a turn of one agent with Strands' proactive compression, then returns the
+ * config the agent's model reports in workflow code.
+ */
+export async function compressionAgent(prompts: string[]): Promise<BaseModelConfig> {
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    conversationManager: new SlidingWindowConversationManager({ proactiveCompression: true }),
+  });
+  for (const prompt of prompts) {
+    await agent.invoke(prompt);
+  }
+  return agent.model.getConfig();
+}
+
+/**
+ * Runs the prompt twice on one agent and returns each reply, or the activity error that ended the
+ * turn, and the config the agent's model reports in workflow code.
+ */
+export async function retryConfigAgent(prompt: string): Promise<{ turns: string[]; config: BaseModelConfig }> {
+  const agent = new TemporalAgent({ model: 'test', printer: false });
+  const turns: string[] = [];
+  for (let i = 0; i < 2; i++) {
+    try {
+      turns.push((await agent.invoke(prompt)).toString());
+    } catch (err) {
+      turns.push(`error: ${(err as ActivityFailure).cause?.message}`);
+    }
+  }
+  return { turns, config: agent.model.getConfig() };
 }
 
 /**

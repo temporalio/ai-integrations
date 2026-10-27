@@ -23,8 +23,9 @@ STRANDS_INTERRUPT_TYPE = "StrandsInterrupt"
 # Strands' model/session exceptions that are deterministic failures (token
 # limits, context overflow, structured-output validation, session I/O). They
 # won't succeed on retry, so they cross the boundary as non-retryable typed
-# ApplicationErrors. TemporalAgent.invoke_async rewraps these as
-# StrandsWorkflowError on the workflow side so users can `except` cleanly.
+# ApplicationErrors. Only ContextWindowOverflowException is rebuilt on the workflow
+# side (TemporalModel.stream), because Strands recovers from it by reducing the
+# conversation; the others reach the workflow as an ActivityError.
 _TERMINAL_EXCEPTIONS: tuple[type[BaseException], ...] = (
     MaxTokensReachedException,
     ContextWindowOverflowException,

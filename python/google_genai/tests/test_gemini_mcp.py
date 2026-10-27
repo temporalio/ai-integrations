@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -59,7 +59,7 @@ _ECHO_SERVER = str(Path(__file__).parent / "echo_mcp_server.py")
 
 
 @asynccontextmanager
-async def _echo_session() -> AsyncIterator[ClientSession]:
+async def _echo_session() -> AsyncGenerator[ClientSession, None]:
     """Yield an initialized session to the echo MCP server over in-memory streams."""
     from mcp.shared.memory import create_connected_server_and_client_session
 
@@ -71,7 +71,7 @@ async def _echo_session() -> AsyncIterator[ClientSession]:
 
 
 @asynccontextmanager
-async def _echo_stdio_session() -> AsyncIterator[ClientSession]:
+async def _echo_stdio_session() -> AsyncGenerator[ClientSession, None]:
     """Yield an initialized session to the echo server run as a stdio subprocess."""
     params = StdioServerParameters(command=sys.executable, args=[_ECHO_SERVER])
     async with stdio_client(params) as (read, write):
