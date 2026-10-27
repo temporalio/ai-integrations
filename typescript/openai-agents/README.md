@@ -389,6 +389,26 @@ const agent = new Agent({
 });
 ```
 
+The Operation gets the model's arguments as one object. For an Operation whose input is a string, number or other scalar, such as `nexus.operation<string, string>()`, set `inputProperty` to the property whose value it should get:
+
+```ts
+const confirmTool = nexusOperationAsTool(
+  bookingService.operations.confirm,
+  {
+    name: 'confirm',
+    description: 'Confirm a booking by its reference',
+    parameters: {
+      type: 'object',
+      properties: { ref: { type: 'string' } },
+      required: ['ref'],
+      additionalProperties: false,
+    },
+    inputProperty: 'ref',
+  },
+  { service: bookingService, endpoint: 'booking-endpoint' }
+);
+```
+
 ### Nested agent tools
 
 Use `agentAsTool` to expose another `Agent` as a tool while keeping nested model calls durable:

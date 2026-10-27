@@ -1,7 +1,8 @@
 import { Agent } from '@openai/agents-core';
+import * as nexus from 'nexus-rpc';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
-import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
+import { TemporalOpenAIRunner, nexusOperationAsTool, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
 export interface StreamingAgentResult {
   finalOutput: string;
@@ -81,6 +82,37 @@ export async function localActivityAgentWorkflow(prompt: string): Promise<string
   });
   const runner = new TemporalOpenAIRunner();
   const result = await runner.run(agent, prompt);
+  return result.finalOutput ?? '';
+}
+
+export const bookingService = nexus.service('booking', {
+  confirm: nexus.operation<string, string>(),
+});
+
+export async function nexusToolInputPropertyWorkflow(endpoint: string): Promise<string> {
+  const confirmTool = nexusOperationAsTool(
+    bookingService.operations.confirm,
+    {
+      name: 'confirm',
+      description: 'Confirm a booking by its reference.',
+      parameters: {
+        type: 'object',
+        properties: { ref: { type: 'string' } },
+        required: ['ref'],
+        additionalProperties: false,
+      },
+      inputProperty: 'ref',
+    },
+    { service: bookingService, endpoint }
+  );
+  const agent = new Agent({
+    name: 'Booker',
+    instructions: 'Confirm the booking.',
+    model: 'gpt-4o-mini',
+    tools: [confirmTool],
+  });
+  const runner = new TemporalOpenAIRunner();
+  const result = await runner.run(agent, 'Confirm BK-7.');
   return result.finalOutput ?? '';
 }
 
