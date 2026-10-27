@@ -55,6 +55,19 @@ test('convertAgent: modelNameOverride replaces agent.model in the ActivityBacked
   t.is((model as any).modelName, 'override-model');
 });
 
+test('convertAgent: modelNameDefault applies only to agents that set no model', (t) => {
+  const own = new Agent({ name: 'Own', model: 'own-model' });
+  const none = new Agent({ name: 'None' });
+  const lead = new Agent({ name: 'Lead', handoffs: [own, handoff(none)] });
+  const converted = convertAgent(lead, DEFAULT_MODEL_PARAMS, undefined, undefined, 'default-model');
+  const modelName = (a: Agent<any, any>) => ((a as any).model as ActivityBackedModel as any).modelName;
+  t.is(modelName(converted), 'default-model');
+  t.is(modelName(converted.handoffs[0] as Agent<any, any>), 'own-model');
+  t.is(modelName((converted.handoffs[1] as Handoff<any, any>).agent), 'default-model');
+  const overridden = convertAgent(own, DEFAULT_MODEL_PARAMS, undefined, 'override-model', 'default-model');
+  t.is(modelName(overridden), 'override-model');
+});
+
 test('convertAgent: raw function tool on handoff target Agent is caught', (t) => {
   const rawFn = function () {};
   const specialist = new Agent({ name: 'Specialist', model: 'm', tools: [rawFn as any] });

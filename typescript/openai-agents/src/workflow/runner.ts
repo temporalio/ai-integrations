@@ -33,7 +33,43 @@ import { ensureTracingProcessorRegistered } from './tracing';
 import { flushOpenSpans } from './agent-sink-processor';
 import { getCurrentPluginConfig } from './plugin-config-store';
 
-const agentAsToolSandboxConfig = Symbol.for('@temporalio/openai-agents/agentAsToolSandboxConfig');
+const agentAsToolParentRun = Symbol.for('@temporalio/openai-agents/agentAsToolParentRun');
+
+/**
+ * What an `agentAsTool` run takes from the run that calls it, as upstream `agent.asTool()` does.
+ */
+export interface AgentToolParentRun {
+  sandbox?: SandboxRunConfig;
+  /** The run's model, used for nested agents that set no model of their own. */
+  model?: string;
+  /** The run's model settings, without the ones that pick the outer agent's tools. */
+  modelSettings?: ModelSettings;
+  /** The runner's `defaultModelParams`. */
+  defaultModelParams?: ModelActivityOptions;
+}
+
+// The model each `agentAsTool` runner uses for agents that set none.
+const agentToolDefaultModels = new WeakMap<TemporalOpenAIRunner, string>();
+
+/** Builds the runner for an `agentAsTool` run. Not exported from the package. */
+export function agentToolRunner(
+  defaultModelParams: ModelActivityOptions | undefined,
+  defaultModel: string | undefined
+): TemporalOpenAIRunner {
+  const runner = new TemporalOpenAIRunner(defaultModelParams === undefined ? undefined : { defaultModelParams });
+  if (defaultModel !== undefined) agentToolDefaultModels.set(runner, defaultModel);
+  return runner;
+}
+
+/**
+ * Like upstream `getSafeInheritedAgentToolModelSettings`: `toolChoice` and `parallelToolCalls`
+ * belong to the outer agent's tools, so a nested run does not take them.
+ */
+function agentToolModelSettings(modelSettings: ModelSettings | undefined): ModelSettings | undefined {
+  if (modelSettings === undefined) return undefined;
+  const { toolChoice: _toolChoice, parallelToolCalls: _parallelToolCalls, ...rest } = modelSettings;
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}
 
 export interface TemporalRunOptions<TContext = undefined> {
   /** Run context passed to agents and tools */
@@ -181,23 +217,23 @@ function validateSandboxRunConfig(agent: Agent<any, any>, sandbox: SandboxRunCon
   }
 }
 
-function propagateAgentToolSandboxConfig(
+function propagateAgentToolParentRun(
   agent: Agent<any, any>,
-  sandbox: SandboxRunConfig,
+  parent: AgentToolParentRun,
   seen: Set<Agent<any, any>> = new Set()
 ): void {
   if (seen.has(agent)) return;
   seen.add(agent);
   agent.tools = agent.tools.map((tool) => {
     if (tool.type !== 'function') return tool;
-    const configureSandbox = (
-      tool as typeof tool & { [agentAsToolSandboxConfig]?: (sandbox: SandboxRunConfig) => typeof tool }
-    )[agentAsToolSandboxConfig];
-    if (typeof configureSandbox !== 'function') return tool;
-    return configureSandbox(sandbox);
+    const configureParentRun = (
+      tool as typeof tool & { [agentAsToolParentRun]?: (parent: AgentToolParentRun) => typeof tool }
+    )[agentAsToolParentRun];
+    if (typeof configureParentRun !== 'function') return tool;
+    return configureParentRun(parent);
   });
   for (const handoff of agent.handoffs ?? []) {
-    propagateAgentToolSandboxConfig(handoff instanceof Handoff ? handoff.agent : handoff, sandbox, seen);
+    propagateAgentToolParentRun(handoff instanceof Handoff ? handoff.agent : handoff, parent, seen);
   }
 }
 
@@ -212,11 +248,13 @@ function propagateAgentToolSandboxConfig(
  */
 export class TemporalOpenAIRunner {
   private readonly modelParams: ModelActivityOptions;
+  private readonly defaultModelParams: ModelActivityOptions | undefined;
 
   constructor(options?: TemporalOpenAIRunnerOptions) {
     ensureTracingProcessorRegistered();
     const fromHeader = getCurrentPluginConfig();
     this.modelParams = layerModelParams(options?.defaultModelParams, fromHeader?.modelParams);
+    this.defaultModelParams = options?.defaultModelParams;
   }
 
   /**
@@ -271,9 +309,17 @@ export class TemporalOpenAIRunner {
 
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
-    const converted = convertAgent(agent, this.modelParams, undefined, modelOverride);
-    if (options?.runConfig?.sandbox !== undefined) {
-      propagateAgentToolSandboxConfig(converted, options.runConfig.sandbox);
+    const defaultModel = agentToolDefaultModels.get(this);
+    const converted = convertAgent(agent, this.modelParams, undefined, modelOverride, defaultModel);
+    const parentRun: AgentToolParentRun = {
+      sandbox: options?.runConfig?.sandbox,
+      model: modelOverride ?? defaultModel,
+      modelSettings: agentToolModelSettings(options?.runConfig?.modelSettings),
+      defaultModelParams:
+        Object.keys(definedFields(this.defaultModelParams)).length > 0 ? this.defaultModelParams : undefined,
+    };
+    if (Object.values(parentRun).some((value) => value !== undefined)) {
+      propagateAgentToolParentRun(converted, parentRun);
     }
 
     let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;

@@ -1,7 +1,7 @@
 import { Agent } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
-import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
+import { TemporalOpenAIRunner, agentAsTool, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
 export interface StreamingAgentResult {
   finalOutput: string;
@@ -107,6 +107,23 @@ export async function summaryOverrideStringWorkflow(prompt: string): Promise<str
   });
   const runner = new TemporalOpenAIRunner();
   const result = await runner.run(agent, prompt);
+  return result.finalOutput ?? '';
+}
+
+export async function agentToolRunConfigWorkflow(prompt: string): Promise<string> {
+  const expert = new Agent({ name: 'Expert', instructions: 'Answer as the expert.' });
+  const specialist = new Agent({ name: 'Specialist', instructions: 'Answer as the specialist.', model: 'own-model' });
+  const lead = new Agent({
+    name: 'Lead',
+    instructions: 'Use the tools.',
+    tools: [agentAsTool(expert, { toolName: 'ask_expert' }), agentAsTool(specialist, { toolName: 'ask_specialist' })],
+  });
+  const runner = new TemporalOpenAIRunner({
+    defaultModelParams: { startToCloseTimeout: '17 seconds', summary: 'runner default' },
+  });
+  const result = await runner.run(lead, prompt, {
+    runConfig: { model: 'run-model', modelSettings: { temperature: 0.33, toolChoice: 'auto' } },
+  });
   return result.finalOutput ?? '';
 }
 

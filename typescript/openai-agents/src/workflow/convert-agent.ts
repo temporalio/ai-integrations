@@ -1,4 +1,4 @@
-import { type Agent, Handoff } from '@openai/agents-core';
+import { Agent, Handoff } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
 import type { ModelActivityOptions } from '../common/model-activity-options';
 import { ActivityBackedModel } from './activity-backed-model';
@@ -6,13 +6,15 @@ import { ActivityBackedModel } from './activity-backed-model';
 /**
  * Recursively converts an agent graph: validate tools, replace each agent's
  * model with an ActivityBackedModel, and clone handoffs. Uses a seen-map to
- * handle circular handoff references.
+ * handle circular handoff references. `modelNameOverride` replaces every
+ * agent's model; `modelNameDefault` is used only by agents that set none.
  */
 export function convertAgent(
   agent: Agent<any, any>,
   modelParams: ModelActivityOptions,
   seen?: Map<Agent<any, any>, Agent<any, any>>,
-  modelNameOverride?: string
+  modelNameOverride?: string,
+  modelNameDefault?: string
 ): Agent<any, any> {
   seen = seen ?? new Map();
   if (seen.has(agent)) return seen.get(agent)!;
@@ -42,7 +44,11 @@ export function convertAgent(
       nonRetryable: true,
     });
   }
-  const modelName = modelNameOverride ?? (typeof rawModel === 'string' ? rawModel : undefined);
+  const ownModel = typeof rawModel === 'string' ? rawModel : undefined;
+  const modelName =
+    modelNameOverride ??
+    (ownModel === undefined || ownModel === Agent.DEFAULT_MODEL_PLACEHOLDER ? modelNameDefault : undefined) ??
+    ownModel;
   if (modelName === undefined) {
     throw ApplicationFailure.create({
       message:
@@ -62,10 +68,10 @@ export function convertAgent(
 
   const convertedHandoffs = (agent.handoffs ?? []).map((h) => {
     if (h instanceof Handoff) {
-      const convertedHandoffAgent = convertAgent(h.agent, modelParams, seen, modelNameOverride);
+      const convertedHandoffAgent = convertAgent(h.agent, modelParams, seen, modelNameOverride, modelNameDefault);
       return h.clone({ agent: convertedHandoffAgent });
     }
-    return convertAgent(h, modelParams, seen, modelNameOverride);
+    return convertAgent(h, modelParams, seen, modelNameOverride, modelNameDefault);
   });
 
   converted.handoffs = convertedHandoffs;

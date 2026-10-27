@@ -1,7 +1,7 @@
 import type { Agent, FunctionTool, RunContext, RunResult } from '@openai/agents-core';
-import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
-import { TemporalOpenAIRunner } from './runner';
+import { patched } from '@temporalio/workflow';
+import { agentToolRunner, type AgentToolParentRun, type TemporalRunOptions } from './runner';
 import { ToolSerializationError } from './tools';
 
 export interface AgentAsToolOptions<TAgent extends Agent<any, any>> {
@@ -10,13 +10,22 @@ export interface AgentAsToolOptions<TAgent extends Agent<any, any>> {
   customOutputExtractor?: (result: RunResult<any, TAgent>) => string | Promise<string>;
 }
 
-const agentAsToolSandboxConfig = Symbol.for('@temporalio/openai-agents/agentAsToolSandboxConfig');
+const agentAsToolParentRun = Symbol.for('@temporalio/openai-agents/agentAsToolParentRun');
+
+// Nested runs recorded before agentAsTool took the run's model, model settings and runner defaults
+// replay without them.
+const AGENT_TOOL_RUN_CONFIG_PATCH = '@temporalio/openai-agents/agent-tool-run-config';
 
 type TemporalAgentTool = FunctionTool & {
-  [agentAsToolSandboxConfig]: (sandbox: SandboxRunConfig) => TemporalAgentTool;
+  [agentAsToolParentRun]: (parent: AgentToolParentRun) => TemporalAgentTool;
 };
 
 /**
+ * The nested run takes the calling run's sandbox, its `runConfig.model` (for
+ * agents that set no model), its `runConfig.modelSettings` (without `toolChoice`
+ * and `parallelToolCalls`) and its runner's `defaultModelParams`, as upstream
+ * `agent.asTool()` does.
+ *
  * Nested approval interruptions are not supported: `invoke` throws
  * `ApplicationFailure` of type `NestedAgentInterruption`. Handle approvals
  * at the top-level runner instead.
@@ -25,7 +34,7 @@ export function agentAsTool<TAgent extends Agent<any, any>>(
   agent: TAgent,
   options: AgentAsToolOptions<TAgent>
 ): FunctionTool {
-  const createTool = (sandbox?: SandboxRunConfig): TemporalAgentTool =>
+  const createTool = (parent?: AgentToolParentRun): TemporalAgentTool =>
     ({
       type: 'function',
       name: options.toolName,
@@ -44,17 +53,28 @@ export function agentAsTool<TAgent extends Agent<any, any>>(
         } catch (e) {
           throw new ToolSerializationError(`Failed to parse tool input for '${options.toolName}': ${e}`);
         }
-        const runner = new TemporalOpenAIRunner();
+        const inherited =
+          parent !== undefined &&
+          (parent.model !== undefined ||
+            parent.modelSettings !== undefined ||
+            parent.defaultModelParams !== undefined) &&
+          patched(AGENT_TOOL_RUN_CONFIG_PATCH)
+            ? parent
+            : undefined;
+        const runConfig: NonNullable<TemporalRunOptions['runConfig']> = {};
+        if (parent?.sandbox !== undefined) runConfig.sandbox = parent.sandbox;
+        if (inherited?.modelSettings !== undefined) runConfig.modelSettings = inherited.modelSettings;
+        const runner = agentToolRunner(inherited?.defaultModelParams, inherited?.model);
         const result = await runner.run(
           agent,
           parsed.input,
-          sandbox === undefined ? undefined : { runConfig: { sandbox } }
+          Object.keys(runConfig).length > 0 ? { runConfig } : undefined
         );
         return extractToolOutput(result, agent.name, options);
       },
       needsApproval: async () => false,
       isEnabled: async () => true,
-      [agentAsToolSandboxConfig]: createTool,
+      [agentAsToolParentRun]: createTool,
     }) as TemporalAgentTool;
 
   return createTool();

@@ -416,6 +416,8 @@ const triage = new Agent({
 });
 ```
 
+As with upstream `agent.asTool()`, the nested run takes the calling run's `runConfig.model` for agents that set no model of their own, its `runConfig.modelSettings` without `toolChoice` and `parallelToolCalls`, and its runner's `defaultModelParams`. This is behind a `patched()` marker, so histories recorded with an earlier version still replay.
+
 Nested approval interruptions are not supported. If a nested run pauses for approval, the tool invocation fails with `ApplicationFailure` type `NestedAgentInterruption`.
 
 ## MCP servers

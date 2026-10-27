@@ -14,6 +14,7 @@ import {
   StatelessMCPServerProvider,
 } from '..';
 import {
+  agentToolRunConfigWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   summaryOverrideStringWorkflow,
@@ -26,7 +27,13 @@ import {
   streamingNoTopicWorkflow,
 } from './workflows/openai-agents';
 import { makeTestFunction } from './helpers/test-fn';
-import { FakeModelProvider, textResponse, toolCallResponse } from './stubs/openai-agents';
+import {
+  FakeModelProvider,
+  multiToolCallResponse,
+  textResponse,
+  toolCallResponse,
+  type FakeModel,
+} from './stubs/openai-agents';
 import { StreamingFakeModelProvider, streamingTextEvents } from './stubs/openai-agents-fakes';
 import EventType = temporal.api.enums.v1.EventType;
 
@@ -263,6 +270,64 @@ test('summary string is passed through to model activity', async (t) => {
           `Expected summary metadata to contain 'Custom model summary', got: ${summaryText}`
         );
       }
+    }
+  });
+});
+
+test('agentAsTool runs take the run model, model settings and runner defaults', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const requests: { model: string; instructions: string; modelSettings: Record<string, unknown> }[] = [];
+  let leadCalls = 0;
+  const provider = {
+    getModel(name?: string) {
+      return {
+        async getResponse(request: any) {
+          requests.push({
+            model: name ?? '',
+            instructions: request.systemInstructions,
+            modelSettings: request.modelSettings,
+          });
+          if (request.systemInstructions === 'Answer as the expert.') return textResponse('expert answer');
+          if (request.systemInstructions === 'Answer as the specialist.') return textResponse('specialist answer');
+          return leadCalls++ === 0
+            ? multiToolCallResponse([
+                { name: 'ask_expert', args: { input: 'q1' } },
+                { name: 'ask_specialist', args: { input: 'q2' } },
+              ])
+            : textResponse('done');
+        },
+      } as unknown as FakeModel;
+    },
+  };
+  const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(agentToolRunConfigWorkflow, {
+      args: ['Hello'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    t.is(await handle.result(), 'done');
+
+    const first = (instructions: string) => requests.find((r) => r.instructions === instructions);
+    // A nested agent with no model gets the run model; one with its own model keeps it, as natively.
+    t.is(first('Answer as the expert.')?.model, 'run-model');
+    t.is(first('Answer as the specialist.')?.model, 'own-model');
+    for (const instructions of ['Use the tools.', 'Answer as the expert.', 'Answer as the specialist.']) {
+      t.is(first(instructions)?.modelSettings.temperature, 0.33, instructions);
+    }
+    // toolChoice picks the outer agent's tools, so nested runs don't take it.
+    t.is(first('Use the tools.')?.modelSettings.toolChoice, 'auto');
+    t.is(first('Answer as the expert.')?.modelSettings.toolChoice, undefined);
+
+    const { events } = await handle.fetchHistory();
+    const modelActivities = (events ?? []).filter(
+      (e) => e.activityTaskScheduledEventAttributes?.activityType?.name === 'invokeModelActivity'
+    );
+    t.is(modelActivities.length, 4);
+    for (const e of modelActivities) {
+      t.is(Number(e.activityTaskScheduledEventAttributes?.startToCloseTimeout?.seconds), 17);
+      const summary = Buffer.from(e.userMetadata?.summary?.data ?? []).toString('utf-8');
+      t.true(summary.includes('runner default'), summary);
     }
   });
 });
