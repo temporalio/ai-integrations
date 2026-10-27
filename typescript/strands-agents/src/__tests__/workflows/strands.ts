@@ -11,7 +11,6 @@ import {
   type InterruptResponseContentData,
 } from '@strands-agents/sdk';
 import {
-  ActivityFailure,
   ApplicationFailure,
   defineSignal,
   proxyActivities,
@@ -232,25 +231,6 @@ export async function lastFailureOfRetry(): Promise<string | undefined> {
     throw ApplicationFailure.create({ message: 'first attempt failed', type: 'Custom' });
   }
   return workflowInfo().lastFailure?.message;
-}
-
-/**
- * Same as {@link lastFailureOfRetry}; the test's own workflow interceptor awaits a failing activity
- * before it starts this workflow.
- */
-export async function lastFailureOfRetryAfterActivity(): Promise<string | undefined> {
-  return await lastFailureOfRetry();
-}
-
-/** Calls `guardedActivity` and returns its result, or the message of the failure that stopped it. */
-export async function callGuardedActivity(): Promise<string> {
-  const { guardedActivity } = proxyActivities<{ guardedActivity(): Promise<string> }>({
-    startToCloseTimeout: '10 seconds',
-    retry: { maximumAttempts: 1 },
-  });
-  return await guardedActivity().catch((err: unknown) =>
-    err instanceof ActivityFailure && err.cause instanceof Error ? err.cause.message : String(err)
-  );
 }
 
 export const approveSignal = defineSignal<[string]>('approve');

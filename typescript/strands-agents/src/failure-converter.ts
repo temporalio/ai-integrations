@@ -7,7 +7,6 @@ import {
   type ProtoFailure,
   type SerializationContext,
 } from '@temporalio/common';
-import { inWorkflowContext, patched, workflowInfo } from '@temporalio/workflow';
 
 export const STRANDS_INTERRUPT_TYPE = 'StrandsInterrupt';
 
@@ -78,64 +77,17 @@ export class StrandsFailureConverter extends DefaultFailureConverter implements 
 export const failureConverter: FailureConverter = new StrandsFailureConverter();
 
 /**
- * Patch that marks the runs in which workflow code decodes failures with the caller's failure
- * converter. Runs recorded before it keep Strands' converter for decoding in workflow code, so they
- * get the same errors on replay.
- */
-export const CALLER_FAILURE_CONVERTER_PATCH = 'strands-agents.caller-failure-converter';
-
-// Workflow module state, so one copy per workflow run.
-let callerConverter: FailureConverter | undefined;
-let decided = false;
-let callerDecodesInWorkflow = false;
-// The SDK decodes the previous run's failure (`workflowInfo().lastFailure`) while it initializes a
-// run, before the decision below can be made. That is the run's first decode; a caller's workflow
-// interceptor can decode more failures before the decision, so only the first is kept.
-let earlyDecode:
-  | { failure: ProtoFailure; payloadConverter: PayloadConverter; context?: SerializationContext; error: Error }
-  | undefined;
-
-/**
- * Decide, when a workflow run starts, whether its workflow code decodes failures with the caller's
- * failure converter. Called by the plugin's workflow interceptor; does nothing without a caller
- * converter. In a run that does, `workflowInfo().lastFailure` is decoded again with the caller's
- * converter, before workflow code reads it.
- */
-export function decideCallerFailureConverter(): void {
-  if (callerConverter === undefined || decided) return;
-  decided = true;
-  callerDecodesInWorkflow = patched(CALLER_FAILURE_CONVERTER_PATCH);
-  const early = earlyDecode;
-  earlyDecode = undefined;
-  // `workflowInfo()` returns the run's info object; there is no public setter for `lastFailure`.
-  const info = workflowInfo() as unknown as { lastFailure?: Error };
-  if (callerDecodesInWorkflow && early !== undefined && info.lastFailure === early.error) {
-    info.lastFailure = callerConverter.failureToError(early.failure, early.payloadConverter, early.context);
-  }
-}
-
-/**
  * Put Strands' rewrite of interrupt and terminal errors in front of the caller's failure converter,
  * so both apply. {@link StrandsPlugin} loads this through a generated module when the client or
- * worker already has a `failureConverterPath`.
- *
- * Encoding only changes what history stores, not what workflow code sees, so it always uses the
- * caller's converter. Decoding in workflow code uses it only in runs that recorded
- * {@link CALLER_FAILURE_CONVERTER_PATCH}; others keep {@link StrandsFailureConverter}.
+ * worker already has a `failureConverterPath`. Decoding uses the caller's converter.
  */
 export function composeFailureConverter(caller: FailureConverter): FailureConverter {
-  callerConverter = caller;
   return {
     errorToFailure(err, payloadConverter, context) {
       return caller.errorToFailure(rewriteChain(err), payloadConverter, context);
     },
     failureToError(failure, payloadConverter, context) {
-      if (!inWorkflowContext() || callerDecodesInWorkflow) {
-        return caller.failureToError(failure, payloadConverter, context);
-      }
-      const error = failureConverter.failureToError(failure, payloadConverter, context);
-      if (!decided && earlyDecode === undefined) earlyDecode = { failure, payloadConverter, context, error };
-      return error;
+      return caller.failureToError(failure, payloadConverter, context);
     },
   };
 }

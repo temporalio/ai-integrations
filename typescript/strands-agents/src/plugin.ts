@@ -2,7 +2,7 @@ import type { McpClient } from '@strands-agents/sdk';
 import { BedrockModel, type Model } from '@strands-agents/sdk';
 import type { Duration } from '@temporalio/common';
 import { msOptionalToNumber } from '@temporalio/common/lib/time';
-import type { BundleOptions, ReplayWorkerOptions, WorkerInterceptors, WorkerOptions } from '@temporalio/worker';
+import type { BundleOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
 import { failureConverterPathFor } from './failure-converter-path';
 import { ModelActivity } from './model-activity';
@@ -112,16 +112,7 @@ export class StrandsPlugin extends SimplePlugin {
         ...existing,
         failureConverterPath: failureConverterPathFor(existing?.failureConverterPath),
       }),
-      workerInterceptors: { workflowModules: [require.resolve('./workflow-interceptors')] },
     });
-  }
-
-  override configureWorker(options: WorkerOptions): WorkerOptions {
-    return keepActivityInbound(options, super.configureWorker(options));
-  }
-
-  override configureReplayWorker(options: ReplayWorkerOptions): ReplayWorkerOptions {
-    return keepActivityInbound(options, super.configureReplayWorker(options));
   }
 
   /**
@@ -190,16 +181,6 @@ export class StrandsPlugin extends SimplePlugin {
       },
     };
   }
-}
-
-/**
- * `SimplePlugin` rebuilds the worker's `interceptors` from the fields it knows when it adds the
- * plugin's workflow module, which drops the caller's `activityInbound` interceptors. Put them back.
- */
-function keepActivityInbound<T extends { interceptors?: WorkerInterceptors }>(original: T, configured: T): T {
-  const activityInbound = original.interceptors?.activityInbound;
-  if (activityInbound === undefined) return configured;
-  return { ...configured, interceptors: { ...configured.interceptors, activityInbound } };
 }
 
 /**
