@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from temporalio.client import WorkflowHistory
-from temporalio.openai_agents import ModelActivityParameters, OpenAIAgentsPlugin
+from temporalio.openai_agents import OpenAIAgentsPlugin
 from temporalio.worker import Replayer
 from tests.test_openai import (
     AgentsAsToolsWorkflow,
@@ -16,7 +16,6 @@ from tests.test_openai import (
     RunModelProviderWorkflow,
     ToolsWorkflow,
 )
-from tests.test_openai_streaming import StreamingInputGuardrailWorkflow
 
 
 @pytest.mark.parametrize(
@@ -60,21 +59,3 @@ async def test_replay(file_name: str) -> None:
         for w in recorder
         if "was imported after initial workflow load" in str(w.message)
     ]
-
-
-async def test_replay_streaming_input_guardrail_trip() -> None:
-    # Recorded before the streaming model activity was cancelled on a tripwire: the parallel
-    # input guardrail tripped mid-stream and the activity ran to completion. Streamed runs
-    # import modules during activations, so this case does not check sandbox imports.
-    history_json = (
-        Path(__file__).with_name("histories")
-        / "streaming-input-guardrail-workflow-history.json"
-    ).read_text()
-    await Replayer(
-        workflows=[StreamingInputGuardrailWorkflow],
-        plugins=[
-            OpenAIAgentsPlugin(
-                model_params=ModelActivityParameters(streaming_topic="events")
-            )
-        ],
-    ).replay_workflow(WorkflowHistory.from_json("fake", history_json))

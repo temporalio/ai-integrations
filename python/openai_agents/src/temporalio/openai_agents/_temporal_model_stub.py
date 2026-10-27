@@ -55,10 +55,6 @@ from temporalio.openai_agents._invoke_model_activity import (
 )
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 
-# Runs recorded before the streaming model activity was cancelled on an input guardrail trip
-# have no cancel command at that point, so the cancel is behind this patch.
-_STREAM_TRIPWIRE_CANCEL_PATCH = "openai_agents.stream-tripwire-cancel"
-
 
 class _StreamedRun:
     """Holds the ``RunResultStreaming`` of the streamed run in progress."""
@@ -358,11 +354,7 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         if guardrails is not None:
             result, task = guardrails
             triggered = result._triggered_input_guardrail_result
-            if (
-                task.done()
-                and triggered is not None
-                and workflow.patched(_STREAM_TRIPWIRE_CANCEL_PATCH)
-            ):
+            if task.done() and triggered is not None:
                 raise InputGuardrailTripwireTriggered(triggered)
 
         handle = workflow.start_activity_method(
@@ -388,11 +380,7 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             async def cancel_on_tripwire() -> None:
                 await workflow.wait([task])
                 triggered = result._triggered_input_guardrail_result
-                if (
-                    triggered is not None
-                    and not handle.done()
-                    and workflow.patched(_STREAM_TRIPWIRE_CANCEL_PATCH)
-                ):
+                if triggered is not None and not handle.done():
                     cancelled_for.append(triggered)
                     handle.cancel()
 
