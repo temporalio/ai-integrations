@@ -1,5 +1,6 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
+import { randomUUID } from 'crypto';
 import {
   addTraceProcessor,
   createMCPToolStaticFilter,
@@ -10,6 +11,7 @@ import {
   withTrace,
 } from '@openai/agents-core';
 import type { MCPServer, Model, ModelProvider, Span, SpanData, TracingProcessor } from '@openai/agents-core';
+import * as nexus from 'nexus-rpc';
 import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
 import type { ApplicationFailure } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
@@ -26,6 +28,8 @@ import {
   type TracingApiKeyContext,
 } from '..';
 import {
+  bookingService,
+  nexusToolInputPropertyWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   mcpToolFilterResumeWorkflow,
@@ -160,6 +164,40 @@ test('A Workflow module with ES module imports bundles one copy of @openai/agent
     const esModuleBuild = new Set(code.match(/@openai[\\/]agents-core[\\/]dist[\\/][^"'\s]*\.mjs/g));
     t.deepEqual([...esModuleBuild].slice(0, 3), [], `${name}: ${esModuleBuild.size} modules from the ES module build`);
   }
+});
+
+test('nexusOperationAsTool inputProperty gives a scalar-input Operation one property of the arguments', async (t) => {
+  const { createWorker, startWorkflow, taskQueue } = helpers(t);
+
+  const received: unknown[] = [];
+  const handler = nexus.serviceHandler(bookingService, {
+    async confirm(_ctx, ref) {
+      received.push(ref);
+      return `confirmed ${ref}`;
+    },
+  });
+  const endpoint = `booking-${randomUUID()}`;
+  const endpointIdentifier = await t.context.env.createNexusEndpoint(endpoint, taskQueue);
+  try {
+    const worker = await createWorker({
+      nexusServices: [handler],
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider([toolCallResponse('confirm', { ref: 'BK-7' }), textResponse('Done')]),
+        }),
+      ],
+    });
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(nexusToolInputPropertyWorkflow, {
+        args: [endpoint],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      t.is(await handle.result(), 'Done');
+    });
+  } finally {
+    await t.context.env.deleteNexusEndpoint(endpointIdentifier);
+  }
+  t.deepEqual(received, ['BK-7']);
 });
 
 function* mcpFactoryArgGenerator() {

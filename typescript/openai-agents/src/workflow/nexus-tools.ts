@@ -1,6 +1,6 @@
 import type { FunctionTool, RunContext } from '@openai/agents-core';
 import type * as nexus from 'nexus-rpc';
-import type { Duration } from '@temporalio/common';
+import { ApplicationFailure, type Duration } from '@temporalio/common';
 import { createNexusServiceClient } from '@temporalio/workflow';
 import { ToolSerializationError, type JsonObjectSchema } from './tools';
 
@@ -9,6 +9,13 @@ export interface NexusOperationToolDefinition<TOp extends nexus.OperationDefinit
   name: string;
   description: string;
   parameters: JsonObjectSchema<nexus.OperationInput<TOp>>;
+  /**
+   * Name of one property in `parameters`. When set, the Operation gets that
+   * property's value as its input instead of the whole arguments object.
+   * Use it for an Operation whose input is a string, number or other scalar,
+   * such as `nexus.operation<string, string>()`.
+   */
+  inputProperty?: string;
 }
 
 export interface NexusOperationAsToolOptions<TService extends nexus.ServiceDefinition> {
@@ -35,6 +42,14 @@ export function nexusOperationAsTool<
   definition: NexusOperationToolDefinition<TOp>,
   options: NexusOperationAsToolOptions<TService>
 ): FunctionTool {
+  const { inputProperty } = definition;
+  if (inputProperty !== undefined && !Object.hasOwn(definition.parameters.properties, inputProperty)) {
+    throw ApplicationFailure.create({
+      message: `nexusOperationAsTool('${definition.name}'): inputProperty '${inputProperty}' is not a property in parameters.`,
+      type: 'AgentsWorkflowError',
+      nonRetryable: true,
+    });
+  }
   const tool = {
     type: 'function',
     name: definition.name,
@@ -42,7 +57,7 @@ export function nexusOperationAsTool<
     parameters: definition.parameters as any,
     strict: options.strict ?? true,
     invoke: async (_runContext: RunContext<any>, input: string): Promise<string> => {
-      let parsedInput: nexus.OperationInput<TOp>;
+      let parsedInput: any;
       try {
         parsedInput = JSON.parse(input);
       } catch (e) {
@@ -52,7 +67,9 @@ export function nexusOperationAsTool<
         service: options.service,
         endpoint: options.endpoint,
       });
-      const result = await client.executeOperation(operation, parsedInput, {
+      const operationInput: nexus.OperationInput<TOp> =
+        inputProperty === undefined ? parsedInput : parsedInput?.[inputProperty];
+      const result = await client.executeOperation(operation, operationInput, {
         scheduleToCloseTimeout: options.scheduleToCloseTimeout,
       });
       if (result === undefined) return '';
