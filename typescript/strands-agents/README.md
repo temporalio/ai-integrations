@@ -95,6 +95,8 @@ Before its first model call, each `TemporalAgent` reads the model's `modelId` an
 
 The read is a new activity, so a run whose agent ran before you deploy this version fails to replay on it with a nondeterminism error. Let those runs finish first, or use Worker Versioning.
 
+The plugin's activities are named `invokeModel`, `invokeModelStreaming`, and `{name}-listTools` and `{name}-callTool` for each MCP client. If the worker already has a different activity with one of these names, creating the worker fails with `Duplicate registration of Activity '<name>'`; rename your activity, or run the other integration on its own worker.
+
 ## Retries
 
 `TemporalAgent` disables Strands' built-in `ModelRetryStrategy` so retries are handled exclusively by Temporal. Configure retries via `activityOptions.retry` on `TemporalAgent`, and on the activity options accepted by `workflow.activityAsTool`, `workflow.activityAsHook`, and `TemporalMCPClient`:
