@@ -231,6 +231,24 @@ class ActivityWeatherService:
         )
 
 
+# A string annotation naming a module-level alias must resolve in this module.
+CityName = str
+
+
+@activity.defn
+class ActivityWeatherClass:
+    def __init__(self, conditions: str) -> None:
+        self.conditions = conditions
+
+    async def __call__(self, city: "CityName") -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
 @nexusrpc.service
 class WeatherService:
     get_weather_nexus_operation: nexusrpc.Operation[WeatherInput, Weather]
@@ -282,6 +300,12 @@ def weather_mock_model():
                 call_id="call-get-weather-method",
                 item_id="item-get-weather-method",
             ),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo"}',
+                "ActivityWeatherClass",
+                call_id="call-get-weather-class",
+                item_id="item-get-weather-class",
+            ),
             ResponseBuilders.output_message("Test weather result"),
         ]
     )
@@ -320,6 +344,10 @@ class ToolsWorkflow:
                 ),
                 openai_agents.workflow.activity_as_tool(
                     ActivityWeatherService.get_weather_method,
+                    start_to_close_timeout=timedelta(seconds=10),
+                ),
+                openai_agents.workflow.activity_as_tool(
+                    ActivityWeatherClass,
                     start_to_close_timeout=timedelta(seconds=10),
                 ),
                 openai_agents.workflow.activity_as_tool(
@@ -374,6 +402,7 @@ async def test_tool_workflow(client: Client):
                 get_weather_country,
                 get_weather_context,
                 ActivityWeatherService().get_weather_method,
+                ActivityWeatherClass("Cloudy"),
             ],
         ) as worker:
             workflow_handle = await client.start_workflow(
@@ -388,11 +417,19 @@ async def test_tool_workflow(client: Client):
             assert result == "Test weather result"
 
             events = []
+            class_activity_inputs = []
             async for e in workflow_handle.fetch_history_events():
                 if e.HasField("activity_task_completed_event_attributes"):
                     events.append(e)
+                attrs = e.activity_task_scheduled_event_attributes
+                if attrs.activity_type.name == "ActivityWeatherClass":
+                    class_activity_inputs.append(
+                        [p.data.decode() for p in attrs.input.payloads]
+                    )
 
-            assert len(events) == 11
+            # The callable class's __call__ gets the model's arguments, not its constructor.
+            assert class_activity_inputs == [['"Tokyo"']]
+            assert len(events) == 13
             assert (
                 "function_call"
                 in events[0]
@@ -454,8 +491,20 @@ async def test_tool_workflow(client: Client):
                 .data.decode()
             )
             assert (
-                "Test weather result"
+                "function_call"
                 in events[10]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Cloudy"
+                in events[11]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Test weather result"
+                in events[12]
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
             )

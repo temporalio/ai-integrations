@@ -129,7 +129,8 @@ def activity_as_tool(
     For undocumented arguments, refer to :py:mod:`workflow` and :py:meth:`start_activity`
 
     Args:
-        fn: A Temporal activity function to convert to a tool.
+        fn: A Temporal activity function to convert to a tool, a method passed as
+            ``Class.method``, or a callable-class activity passed as its class.
         strict_json_schema: Whether the tool should follow a strict schema.
             See https://openai.github.io/openai-agents-python/ref/tool/#agents.tool.FunctionTool.strict_json_schema
         failure_error_function: Formats the error text returned to the model
@@ -171,6 +172,15 @@ def activity_as_tool(
             "Input activity must have a name to be made into a tool",
             "invalid_tool",
         )
+    if inspect.isclass(fn):
+        # Workflow code references a callable-class activity by its class, but the worker's
+        # registered instance runs __call__, so build the tool from __call__ without `self`.
+        call = functools.partial(fn.__call__, None)
+        setattr(call, "__name__", fn.__name__)
+        # A partial has no module globals, so resolve postponed annotations against __call__'s.
+        call.__annotations__ = typing.get_type_hints(fn.__call__, include_extras=True)
+        call.__doc__ = fn.__call__.__doc__ or fn.__doc__
+        fn = typing.cast(Callable, call)
     # If the provided callable has a first argument of `self`, partially apply it with the same metadata
     # The actual instance will be picked up by the activity execution, the partially applied function will never actually be executed
     params = list(inspect.signature(fn).parameters.keys())
