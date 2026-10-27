@@ -535,14 +535,13 @@ async def test_streamed_run_runs_sync_function_tools(client: Client):
     assert outputs == [5]
 
 
-class SlowStreamingModel(StreamingTestModel):
-    """Streaming test model that sends five deltas 300 ms apart, then completes.
+class HoldingStreamingModel(StreamingTestModel):
+    """Streaming test model that sends its first delta, then waits up to 10 s before the rest.
 
-    Records the deltas it sent and whether its stream was cancelled.
+    Records whether its stream was cancelled during the wait.
     """
 
     def __init__(self) -> None:
-        self.sent: list[str] = []
         self.cancelled = False
 
     async def stream_response(
@@ -556,23 +555,7 @@ class SlowStreamingModel(StreamingTestModel):
         tracing: ModelTracing,
         **kwargs: Any,
     ) -> AsyncIterator[TResponseStreamEvent]:
-        try:
-            for i in range(5):
-                await asyncio.sleep(0.3)
-                self.sent.append(f"part {i} ")
-                yield ResponseTextDeltaEvent(
-                    content_index=0,
-                    delta=f"part {i} ",
-                    item_id="item1",
-                    output_index=0,
-                    sequence_number=i,
-                    type="response.output_text.delta",
-                    logprobs=[],
-                )
-        except asyncio.CancelledError:
-            self.cancelled = True
-            raise
-        async for event in super().stream_response(
+        events = super().stream_response(
             system_instructions,
             input,
             model_settings,
@@ -581,9 +564,15 @@ class SlowStreamingModel(StreamingTestModel):
             handoffs,
             tracing,
             **kwargs,
-        ):
-            if event.type == "response.completed":
-                yield event
+        )
+        yield await anext(events)
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        async for event in events:
+            yield event
 
 
 @input_guardrail
@@ -602,6 +591,11 @@ class StreamingInputGuardrailWorkflow:
     @workflow.init
     def __init__(self, prompt: str) -> None:
         self.stream = WorkflowStream()
+        self.subscriber_done = False
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.subscriber_done = True
 
     @workflow.run
     async def run(self, prompt: str) -> str:
@@ -615,8 +609,8 @@ class StreamingInputGuardrailWorkflow:
             async for _ in result.stream_events():
                 pass
         except InputGuardrailTripwireTriggered:
-            # Stay open so the stream topic can take the activity's last events.
-            await workflow.sleep(3)
+            # Stay open until the subscriber has read the activity's last event.
+            await workflow.wait_condition(lambda: self.subscriber_done)
             return "refused"
         return result.final_output
 
@@ -626,7 +620,7 @@ async def test_streaming_input_guardrail_trip_stops_the_topic(client: Client):
     """A parallel input guardrail that trips while the model is streaming cancels the
     streaming activity: topic subscribers get an error event, not the rest of the answer
     and ``response.completed``."""
-    model = SlowStreamingModel()
+    model = HoldingStreamingModel()
     async with AgentEnvironment(
         model=model,
         model_params=ModelActivityParameters(
@@ -663,9 +657,9 @@ async def test_streaming_input_guardrail_trip_stops_the_topic(client: Client):
                     if item.data.type in ("error", "response.completed"):
                         break
 
-            collect_task = asyncio.create_task(collect_events())
+            await asyncio.wait_for(collect_events(), timeout=20.0)
+            await handle.signal(StreamingInputGuardrailWorkflow.finish)
             result = await handle.result()
-            await asyncio.wait_for(collect_task, timeout=10.0)
 
     assert result == "refused"
     published_types = [e.type for e in published]
@@ -674,4 +668,3 @@ async def test_streaming_input_guardrail_trip_stops_the_topic(client: Client):
     assert isinstance(last, ResponseErrorEvent)
     assert last.code == "cancelled"
     assert model.cancelled
-    assert len(model.sent) < 5
