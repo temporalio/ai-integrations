@@ -12,12 +12,21 @@ import {
   buildListToolsActivity,
   callToolActivityName,
   listToolsActivityName,
+  MCP_CONNECTION_IDLE_MS,
   _evictConnection,
 } from './temporal-mcp-client';
 
-// Every Activity function a StrandsPlugin builds. configureWorker lets these be replaced, so one
-// instance can be on both the NativeConnection and the Worker.
-const pluginActivityFunctions = new WeakSet<object>();
+// What each Activity a StrandsPlugin builds was built from: its name, then what it depends on.
+// configureWorker lets one of these replace another with the same entries: that is the same
+// instance, or one built from the same options, registered twice (e.g. on the NativeConnection
+// and the Worker).
+const activitySources = new WeakMap<object, readonly unknown[]>();
+
+function sameSources(a: object, b: object): boolean {
+  const x = activitySources.get(a);
+  const y = activitySources.get(b);
+  return x !== undefined && y !== undefined && x.length === y.length && x.every((v, i) => v === y[i]);
+}
 
 /**
  * Options for {@link StrandsPlugin}.
@@ -66,8 +75,6 @@ export interface StrandsPluginOptions {
  * ```
  */
 export class StrandsPlugin extends SimplePlugin {
-  private readonly activityNames: readonly string[];
-
   constructor(options: StrandsPluginOptions = {}) {
     let modelFactories = options.models;
     let defaultName: string | undefined;
@@ -87,15 +94,23 @@ export class StrandsPlugin extends SimplePlugin {
       invokeModelStreaming: (input: InvokeModelStreamingInput) => modelActivity.invokeModelStreaming(input),
       [GET_MODEL_CONFIG_ACTIVITY]: (input: GetModelConfigInput) => modelActivity.getModelConfig(input),
     };
+    // Without `models`, every plugin builds the same default.
+    const modelSources = options.models === undefined ? [] : [options.models, defaultName];
+    for (const [name, fn] of Object.entries(activities)) {
+      activitySources.set(fn, [name, ...modelSources]);
+    }
 
     const mcpClients = options.mcpClients ?? {};
     const idleMs = msOptionalToNumber(options.mcpConnectionIdleTimeout);
     for (const [server, factory] of Object.entries(mcpClients)) {
-      activities[listToolsActivityName(server)] = buildListToolsActivity(server, factory, idleMs);
-      activities[callToolActivityName(server)] = buildCallToolActivity(server, factory, idleMs);
-    }
-    for (const fn of Object.values(activities)) {
-      pluginActivityFunctions.add(fn);
+      const serverActivities = {
+        [listToolsActivityName(server)]: buildListToolsActivity(server, factory, idleMs),
+        [callToolActivityName(server)]: buildCallToolActivity(server, factory, idleMs),
+      };
+      for (const [name, fn] of Object.entries(serverActivities)) {
+        activities[name] = fn;
+        activitySources.set(fn, [name, factory, idleMs ?? MCP_CONNECTION_IDLE_MS]);
+      }
     }
 
     const runContext = async (next: () => Promise<void>): Promise<void> => {
@@ -118,17 +133,24 @@ export class StrandsPlugin extends SimplePlugin {
         failureConverterPath: require.resolve('./failure-converter'),
       },
     });
-    this.activityNames = Object.keys(activities);
   }
 
+  /**
+   * Adds the model and MCP Activities to the Worker.
+   *
+   * @throws TypeError if the Worker already has a different Activity with one of these names: a
+   * caller Activity, another integration's Activity, or one from a `StrandsPlugin` with different
+   * options.
+   */
   override configureWorker(options: WorkerOptions): WorkerOptions {
     const existing = options.activities as Record<string, unknown> | undefined;
-    for (const name of this.activityNames) {
-      const fn = existing && Object.prototype.propertyIsEnumerable.call(existing, name) ? existing[name] : undefined;
-      if (typeof fn === 'function' && !pluginActivityFunctions.has(fn)) {
+    for (const [name, fn] of Object.entries(this.options.activities as object)) {
+      const other = existing && Object.prototype.propertyIsEnumerable.call(existing, name) ? existing[name] : undefined;
+      if (typeof other === 'function' && other !== fn && !sameSources(other, fn)) {
         throw new TypeError(
           `Duplicate registration of Activity '${name}': StrandsPlugin would replace a different Activity ` +
-            'with this name. Rename or remove the other registration.'
+            'with this name. Rename or remove the other registration, or give each StrandsPlugin on this Worker ' +
+            'the same options.'
         );
       }
     }

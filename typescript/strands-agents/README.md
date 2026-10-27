@@ -95,7 +95,7 @@ Before its first model call, each `TemporalAgent` reads the model's `modelId` an
 
 The read is a new activity, so a run whose agent ran before you deploy this version fails to replay on it with a nondeterminism error. Let those runs finish first, or use Worker Versioning.
 
-The plugin's activities are named `invokeModel`, `invokeModelStreaming`, and `{name}-listTools` and `{name}-callTool` for each MCP client. If the worker already has a different activity with one of these names, creating the worker fails with `Duplicate registration of Activity '<name>'`; rename your activity, or run the other integration on its own worker.
+The plugin's activities are named `invokeModel`, `invokeModelStreaming`, and `{name}-listTools` and `{name}-callTool` for each MCP client. If the worker already has a different activity with one of these names (your own activity, another integration's activity, or one from a second `StrandsPlugin` with different options), creating the worker fails with `Duplicate registration of Activity '<name>'`. Rename your activity, run the other integration on its own worker, or put every model and MCP client in one `StrandsPlugin`. The same instance on the `NativeConnection` and the worker, or two instances built from the same options object, still work.
 
 ## Retries
 
