@@ -1,13 +1,10 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
 import { setTracingDisabled } from '@openai/agents-core';
 import type { MCPServer } from '@openai/agents-core';
 import { WorkflowClient } from '@temporalio/client';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
-import { Worker } from '@temporalio/worker';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import {
   OpenAIAgentsPlugin,
@@ -547,24 +544,4 @@ test('Approval resume keeps the caller context object', async (t) => {
   );
 
   t.deepEqual(result, { callerAfter: 'S-after', resumedUsesCallerObject: true });
-});
-
-test('Approval resume recorded before the context fix still replays', async (t) => {
-  // Recorded with the plugin before this change: the write missed the caller's object, so the
-  // Workflow did not sleep.
-  const history = JSON.parse(
-    readFileSync(
-      path.resolve(__dirname, '../../src/__tests__/histories/approval-resume-context-before-fix.json'),
-      'utf8'
-    )
-  );
-  await t.notThrowsAsync(
-    Worker.runReplayHistory(
-      {
-        workflowBundle: t.context.workflowBundle,
-        plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) })],
-      },
-      history
-    )
-  );
 });

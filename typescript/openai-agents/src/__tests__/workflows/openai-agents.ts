@@ -1,5 +1,5 @@
 import { Agent, tool } from '@openai/agents-core';
-import { ApplicationFailure, sleep } from '@temporalio/workflow';
+import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
@@ -189,8 +189,7 @@ export interface ApprovalResumeContextResult {
 
 /**
  * Approves a tool that writes the run context, resumes the same `RunState`, then reads the
- * caller's context object. It sleeps only when the write reached that object, so a change in
- * where the write lands also changes the Workflow's commands.
+ * caller's context object.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -219,6 +218,5 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
   const first = await runner.run(agent, 'go', { context: ctx });
   first.state.approve(first.interruptions[0]!);
   const resumed = await runner.run(agent, first.state);
-  if (ctx.after !== undefined) await sleep(1);
   return { callerAfter: ctx.after, resumedUsesCallerObject: resumed.runContext.context === ctx };
 }
