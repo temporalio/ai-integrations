@@ -1,5 +1,5 @@
-import { Agent, type MCPToolFilterContext } from '@openai/agents-core';
-import { ApplicationFailure } from '@temporalio/workflow';
+import { Agent, type MCPToolFilterContext, tool } from '@openai/agents-core';
+import { ApplicationFailure, sleep } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
@@ -131,13 +131,16 @@ export async function mcpToolFilterWorkflow(stateful: boolean): Promise<string[]
 }
 
 class FilterSession {
+  expired = false;
+
   isAdmin(): boolean {
+    if (this.expired) throw new Error('session expired');
     return true;
   }
 }
 
 export async function mcpToolFilterResumeWorkflow(): Promise<string> {
-  // Resuming from a RunState rebuilds the context from JSON, so `session` loses `isAdmin()`.
+  // The session expires before the resume, so the filter throws while the resume lists tools.
   const toolFilter = async ({ runContext }: MCPToolFilterContext) =>
     (runContext.context as { session: FilterSession }).session.isAdmin();
   const agent = new Agent({
@@ -147,7 +150,9 @@ export async function mcpToolFilterResumeWorkflow(): Promise<string> {
     mcpServers: [statelessMcpServer('filterStateless', { toolFilter })],
   });
   const runner = new TemporalOpenAIRunner();
-  const result = await runner.run(agent, 'Hello', { context: { session: new FilterSession() } });
+  const session = new FilterSession();
+  const result = await runner.run(agent, 'Hello', { context: { session } });
+  session.expired = true;
   await runner.run(agent, result.state);
   return 'resumed';
 }
@@ -239,4 +244,50 @@ export async function tracingApiKeyWorkflow(apiKey?: string): Promise<string> {
   const runner = new TemporalOpenAIRunner();
   const result = await runner.run(agent, 'Hello', apiKey ? { tracing: { apiKey } } : undefined);
   return result.finalOutput ?? '';
+}
+
+interface ResumeContext {
+  original: string;
+  after?: string;
+}
+
+export interface ApprovalResumeContextResult {
+  callerAfter: string | undefined;
+  resumedUsesCallerObject: boolean;
+}
+
+/**
+ * Approves a tool that writes the run context, resumes the same `RunState`, then reads the
+ * caller's context object. It sleeps only when the write reached that object, so a change in
+ * where the write lands also changes the Workflow's commands.
+ */
+export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
+  const setAfter = tool({
+    name: 'set_after',
+    description: 'Set a value after approval.',
+    parameters: {
+      type: 'object' as const,
+      properties: { value: { type: 'string' } },
+      required: ['value'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    execute: async (args, runContext) => {
+      (runContext!.context as ResumeContext).after = (args as { value: string }).value;
+      return 'ok';
+    },
+  });
+  const agent = new Agent<ResumeContext>({
+    name: 'ResumeContextAgent',
+    instructions: 'Set the value.',
+    model: 'gpt-4o-mini',
+    tools: [setAfter],
+  });
+  const runner = new TemporalOpenAIRunner();
+  const ctx: ResumeContext = { original: 'orig' };
+  const first = await runner.run(agent, 'go', { context: ctx });
+  first.state.approve(first.interruptions[0]!);
+  const resumed = await runner.run(agent, first.state);
+  if (ctx.after !== undefined) await sleep(1);
+  return { callerAfter: ctx.after, resumedUsesCallerObject: resumed.runContext.context === ctx };
 }

@@ -1,5 +1,7 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import {
   addTraceProcessor,
   createMCPToolStaticFilter,
@@ -14,7 +16,7 @@ import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
 import type { ApplicationFailure } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
-import { bundleWorkflowCode } from '@temporalio/worker';
+import { bundleWorkflowCode, Worker } from '@temporalio/worker';
 import type { NativeConnection } from '@temporalio/worker';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import {
@@ -26,6 +28,7 @@ import {
   type TracingApiKeyContext,
 } from '..';
 import {
+  approvalResumeContextWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   mcpToolFilterResumeWorkflow,
@@ -843,5 +846,45 @@ test('tracingApiKey gives spans that cross a Temporal boundary the key the Worke
     contexts.find((c) => c.traceId === runTraceId && c.traceName !== undefined),
     { workflowId: runWorkflowId, workflowType: 'tracingApiKeyWorkflow' },
     'the Activity context names the Workflow that scheduled it'
+  );
+});
+
+test('Approval resume keeps the caller context object', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([
+          toolCallResponse('set_after', { value: 'S-after' }),
+          textResponse('done'),
+        ]),
+      }),
+    ],
+  });
+
+  const result = await worker.runUntil(
+    executeWorkflow(approvalResumeContextWorkflow, { workflowExecutionTimeout: '30 seconds' })
+  );
+
+  t.deepEqual(result, { callerAfter: 'S-after', resumedUsesCallerObject: true });
+});
+
+test('Approval resume recorded before the context fix still replays', async (t) => {
+  // Recorded with the plugin before this change: the write missed the caller's object, so the
+  // Workflow did not sleep.
+  const history = JSON.parse(
+    readFileSync(
+      path.resolve(__dirname, '../../src/__tests__/histories/approval-resume-context-before-fix.json'),
+      'utf8'
+    )
+  );
+  await t.notThrowsAsync(
+    Worker.runReplayHistory(
+      {
+        workflowBundle: t.context.workflowBundle,
+        plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) })],
+      },
+      history
+    )
   );
 });
