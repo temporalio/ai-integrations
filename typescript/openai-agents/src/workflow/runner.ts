@@ -19,7 +19,6 @@ import {
 } from '@openai/agents-core';
 import { SandboxAgent, type SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
-import { patched } from '@temporalio/workflow';
 import {
   DEFAULT_MODEL_ACTIVITY_OPTIONS,
   STREAMING_LOCAL_ACTIVITY_UNSUPPORTED,
@@ -35,13 +34,6 @@ import { flushOpenSpans } from './agent-sink-processor';
 import { getCurrentPluginConfig } from './plugin-config-store';
 
 const agentAsToolSandboxConfig = Symbol.for('@temporalio/openai-agents/agentAsToolSandboxConfig');
-
-/**
- * Runs that resumed a `RunState` before the resumed run kept the state's own context keep
- * resuming with a JSON copy on replay: a tool that writes the caller's context object can
- * change the commands that follow.
- */
-const KEEP_RESUME_CONTEXT_PATCH = 'openai-agents.keep-resume-context';
 
 export interface TemporalRunOptions<TContext = undefined> {
   /** Run context passed to agents and tools */
@@ -293,14 +285,11 @@ export class TemporalOpenAIRunner {
       // Pass the state's own context, as the upstream Runner uses it, so resumed tools write the
       // caller's object rather than a JSON copy.
       // Restoring lists tools, which runs MCP tool filters; their errors fail the run, as in the run below.
-      const serialized = input.toString();
-      const restored = (await (
-        patched(KEEP_RESUME_CONTEXT_PATCH)
-          ? RunState.fromStringWithContext(converted, serialized, input._context)
-          : RunState.fromString(converted, serialized)
-      ).catch((error: unknown) => {
-        throw normalizeAgentsRunError(error);
-      })) as RunState<TContext, TAgent>;
+      const restored = (await RunState.fromStringWithContext(converted, input.toString(), input._context).catch(
+        (error: unknown) => {
+          throw normalizeAgentsRunError(error);
+        }
+      )) as RunState<TContext, TAgent>;
       // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
       restored.clearTrace();
       preparedInput = restored;
