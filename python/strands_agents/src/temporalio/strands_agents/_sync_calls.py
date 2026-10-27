@@ -18,9 +18,6 @@ from strands.multiagent.swarm import Swarm
 
 from temporalio import workflow
 
-# Runs that made a sync call before this check existed made it unrecorded;
-# they keep doing so on replay.
-_REFUSE_SYNC_CALLS_PATCH = "strands-refuse-sync-agent-calls"
 _GUARDED = "__temporal_strands_sync_guard__"
 
 
@@ -44,7 +41,7 @@ def _targets() -> list[tuple[type, str]]:
 def _guard(name: str, method: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(method)
     def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if workflow.in_workflow() and workflow.patched(_REFUSE_SYNC_CALLS_PATCH):
+        if workflow.in_workflow():
             raise RuntimeError(
                 f"{type(self).__name__}.{name}() runs the call on a new thread, "
                 "outside the Workflow sandbox, so its model calls and other I/O "

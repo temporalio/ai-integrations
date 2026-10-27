@@ -75,7 +75,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Note: Use `agent.invoke_async(message)` instead of `agent(message)`. The synchronous form runs the call on a new thread, outside the workflow sandbox, where its model calls and other I/O would not be recorded. So in workflow code the sync calls of Strands' `Agent`, `A2AAgent`, `Graph` and `Swarm`, and `Agent.structured_output()`, raise `RuntimeError`. Call agents that do their own I/O, such as an `A2AAgent`, from an activity, for example with `activity_as_tool`. Runs that made such a call before this check was added keep making it when they replay.
+Note: Use `agent.invoke_async(message)` instead of `agent(message)`. The synchronous form runs the call on a new thread, outside the workflow sandbox, where its model calls and other I/O would not be recorded. So in workflow code the sync calls of Strands' `Agent`, `A2AAgent`, `Graph` and `Swarm`, and `Agent.structured_output()`, raise `RuntimeError`. Call agents that do their own I/O, such as an `A2AAgent`, from an activity, for example with `activity_as_tool`. A run that made such a call before you deploy this version fails on it when it replays: let those runs finish first, or use Worker Versioning.
 
 ## Models
 
