@@ -323,6 +323,30 @@ const agent = new Agent({
 
 The generic type is compile-time only. At runtime the Activity is invoked by name through `proxyActivities`.
 
+To give the Activity a copy of the run's `context`, set `includeContext: true`. The Activity then gets the copy as its second argument:
+
+```ts
+// activities.ts
+export async function lookup(input: { key: string }, context: { tenant: string }): Promise<string> {
+  // ...
+}
+
+// workflow code
+const lookupTool = activityAsTool<typeof activities.lookup>({
+  name: 'lookup',
+  description: 'Look up a key',
+  parameters: {
+    type: 'object',
+    properties: { key: { type: 'string' } },
+    required: ['key'],
+    additionalProperties: false,
+  },
+  includeContext: true,
+});
+```
+
+The copy is part of the Activity's input, so it is stored in the Workflow's History. Changes the Activity makes to it do not reach the run.
+
 ### Inline and hosted tools
 
 For deterministic computation, use `tool()` from `@openai/agents-core` directly. Inline tools run in the Workflow sandbox and must not perform I/O, consume nondeterministic randomness, or read wall-clock time beyond Temporal's deterministic replacements.
@@ -723,7 +747,7 @@ Any OpenAI Agents SDK `ModelProvider` can be passed as `modelProvider`. The prov
 | Run state and approvals | Supported                | Serialize with `result.state.toString()` and rehydrate with `RunState.fromString`              |
 | Guardrails              | Supported                | Guardrail callbacks must be deterministic                                                      |
 | Tracing                 | Supported                | OpenAI hosted traces, custom `TracingProcessor`s, OTel, and optional `temporal:*` spans        |
-| Agent context           | Supported                | Activity tools receive a copy                                                                  |
+| Agent context           | Supported                | Activity tools receive a copy with `includeContext: true`                                      |
 | `continueAsNew`         | Supported                | Plugin config propagates to the continuation                                                   |
 | Child Workflows         | Supported                | Plugin config propagates to children                                                           |
 | Local Activities        | Supported                | Set `useLocalActivity: true` in `modelParams`                                                  |

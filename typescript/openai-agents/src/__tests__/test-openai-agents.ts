@@ -12,7 +12,9 @@ import {
   StatefulMCPServerProvider,
   StatelessMCPServerProvider,
 } from '..';
+import { activityAsTool } from '../workflow';
 import {
+  activityToolContextWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   summaryOverrideStringWorkflow,
@@ -39,6 +41,12 @@ setTracingDisabled(false);
   new OpenAIAgentsPlugin({ modelProvider: _provider, modelParams: { summary: { provide: () => 'x' } } });
   // @ts-expect-error — modelParams.summary must be string, not function/object
   new OpenAIAgentsTraceClientInterceptor({ modelParams: { summary: { provide: () => 'x' } } });
+  // @ts-expect-error — an Activity with a second parameter needs includeContext: true
+  activityAsTool<(input: { key: string }, context: unknown) => Promise<string>>({
+    name: 'lookup',
+    description: '',
+    parameters: { type: 'object', properties: { key: { type: 'string' } } },
+  });
 }
 
 const test = makeTestFunction({
@@ -98,6 +106,34 @@ test('Local activity mode uses local activities for model calls', async (t) => {
     );
     t.is(modelActivities.length, 0, `Expected no regular invokeModelActivity, got ${modelActivities.length}`);
   });
+});
+
+test('activityAsTool includeContext gives the Activity a copy of the run context', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+
+  const received: unknown[][] = [];
+  const worker = await createWorker({
+    activities: {
+      async lookup(...args: unknown[]): Promise<string> {
+        received.push(args);
+        return 'found';
+      },
+    },
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([toolCallResponse('lookup', { key: 'k' }), textResponse('Done')]),
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(activityToolContextWorkflow, {
+      args: ['t-1'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    t.is(await handle.result(), 'Done');
+  });
+  t.deepEqual(received, [[{ key: 'k' }, { tenant: 't-1' }]]);
 });
 
 function* mcpFactoryArgGenerator() {

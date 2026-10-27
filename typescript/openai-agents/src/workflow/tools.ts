@@ -16,20 +16,27 @@ export interface JsonObjectSchema<_T = unknown> {
   additionalProperties?: boolean;
 }
 
-type ActivityInput<TActivity extends (input: any) => Promise<any>> = Parameters<TActivity>[0];
+type ActivityInput<TActivity extends (...args: any[]) => Promise<any>> = Parameters<TActivity>[0];
 
 /**
  * Definition for wrapping a Temporal Activity as an agent tool. `TActivity` is
  * the Activity function type (e.g. `typeof activities.getWeather`); its first
  * argument shape types `parameters`.
  */
-export interface ActivityToolDefinition<TActivity extends (input: any) => Promise<any>> {
+export interface ActivityToolDefinition<TActivity extends (...args: any[]) => Promise<any>> {
   /** Activity name — must match the registered Activity on the Worker. */
   name: string;
   /** Tool description shown to the model. */
   description: string;
   /** Explicit JSON schema for the tool parameters (not Zod). */
   parameters: JsonObjectSchema<ActivityInput<TActivity>>;
+  /**
+   * When `true`, the Activity gets a copy of the run's context
+   * (`runContext.context`) as its second argument. The copy is part of the
+   * Activity's input, so it is stored in the Workflow's History, and changes
+   * the Activity makes to it do not reach the run.
+   */
+  includeContext?: boolean;
 }
 
 export interface ActivityAsToolOptions {
@@ -48,8 +55,17 @@ export interface ActivityAsToolOptions {
 export function activityAsTool<TActivity extends (input: any) => Promise<any>>(
   definition: ActivityToolDefinition<TActivity>,
   options?: ActivityAsToolOptions
+): FunctionTool;
+/** With `includeContext: true`, the Activity can take the context copy as a second parameter. */
+export function activityAsTool<TActivity extends (input: any, context: any) => Promise<any>>(
+  definition: ActivityToolDefinition<TActivity> & { includeContext: true },
+  options?: ActivityAsToolOptions
+): FunctionTool;
+export function activityAsTool(
+  definition: ActivityToolDefinition<(...args: any[]) => Promise<any>>,
+  options?: ActivityAsToolOptions
 ): FunctionTool {
-  const activities = proxyActivities<Record<string, (input: any) => Promise<any>>>({
+  const activities = proxyActivities<Record<string, (...args: any[]) => Promise<any>>>({
     startToCloseTimeout: options?.startToCloseTimeout ?? '1 minute',
     heartbeatTimeout: options?.heartbeatTimeout,
     taskQueue: options?.taskQueue,
@@ -62,14 +78,15 @@ export function activityAsTool<TActivity extends (input: any) => Promise<any>>(
     description: definition.description,
     parameters: definition.parameters as any,
     strict: options?.strict ?? true,
-    invoke: async (_runContext: RunContext<any>, input: string): Promise<string> => {
-      let parsedInput: ActivityInput<TActivity>;
+    invoke: async (runContext: RunContext<any>, input: string): Promise<string> => {
+      let parsedInput: unknown;
       try {
         parsedInput = JSON.parse(input);
       } catch (e) {
         throw new ToolSerializationError(`Failed to parse tool input for '${definition.name}': ${e}`);
       }
-      const result = await activities[definition.name]!(parsedInput);
+      const args = definition.includeContext ? [parsedInput, runContext.context] : [parsedInput];
+      const result = await activities[definition.name]!(...args);
       if (result === undefined) return '';
       return typeof result === 'string' ? result : JSON.stringify(result);
     },

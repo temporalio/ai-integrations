@@ -1,7 +1,7 @@
 import { Agent } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
-import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
+import { TemporalOpenAIRunner, activityAsTool, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
 export interface StreamingAgentResult {
   finalOutput: string;
@@ -81,6 +81,32 @@ export async function localActivityAgentWorkflow(prompt: string): Promise<string
   });
   const runner = new TemporalOpenAIRunner();
   const result = await runner.run(agent, prompt);
+  return result.finalOutput ?? '';
+}
+
+export async function activityToolContextWorkflow(tenant: string): Promise<string> {
+  const lookupTool = activityAsTool<(input: { key: string }, context: { tenant: string }) => Promise<string>>(
+    {
+      name: 'lookup',
+      description: 'Look up a key.',
+      parameters: {
+        type: 'object',
+        properties: { key: { type: 'string' } },
+        required: ['key'],
+        additionalProperties: false,
+      },
+      includeContext: true,
+    },
+    { startToCloseTimeout: '10s' }
+  );
+  const agent = new Agent({
+    name: 'LookupAgent',
+    instructions: 'Use lookup.',
+    model: 'gpt-4o-mini',
+    tools: [lookupTool],
+  });
+  const runner = new TemporalOpenAIRunner();
+  const result = await runner.run(agent, 'go', { context: { tenant } });
   return result.finalOutput ?? '';
 }
 
