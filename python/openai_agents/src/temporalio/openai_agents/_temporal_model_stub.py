@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
+from contextvars import ContextVar
 from typing import Any
 
 from agents import (
@@ -13,10 +15,13 @@ from agents import (
     Handoff,
     HostedMCPTool,
     ImageGenerationTool,
+    InputGuardrailResult,
+    InputGuardrailTripwireTriggered,
     Model,
     ModelResponse,
     ModelSettings,
     ModelTracing,
+    RunResultStreaming,
     Tool,
     TResponseInputItem,
     WebSearchTool,
@@ -32,6 +37,7 @@ from agents.tool import (
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 
 from temporalio import workflow
+from temporalio.exceptions import ActivityError
 from temporalio.openai_agents._errors import AgentsWorkflowError
 from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
@@ -48,6 +54,32 @@ from temporalio.openai_agents._invoke_model_activity import (
     ToolInput,
 )
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
+
+# Runs recorded before the streaming model activity was cancelled on an input guardrail trip
+# have no cancel command at that point, so the cancel is behind this patch.
+_STREAM_TRIPWIRE_CANCEL_PATCH = "openai_agents.stream-tripwire-cancel"
+
+
+class _StreamedRun:
+    """Holds the ``RunResultStreaming`` of the streamed run in progress."""
+
+    result: RunResultStreaming | None = None
+
+
+# Set by the runner around ``Runner.run_streamed``; the run loop task copies it.
+_current_streamed_run: ContextVar[_StreamedRun | None] = ContextVar(
+    "temporal_openai_agents_streamed_run", default=None
+)
+
+
+def _parallel_input_guardrails() -> tuple[RunResultStreaming, asyncio.Task[Any]] | None:
+    """Return the streamed run in progress and its parallel input guardrails task, if any."""
+    streamed_run = _current_streamed_run.get()
+    result = streamed_run.result if streamed_run is not None else None
+    task = result._input_guardrails_task if result is not None else None
+    if result is None or task is None:
+        return None
+    return result, task
 
 
 class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
@@ -318,7 +350,22 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             "streaming_batch_interval": self.model_params.streaming_batch_interval,
         }
 
-        events = await workflow.execute_activity_method(
+        # The activity publishes each event to the topic as the model sends it, but the
+        # framework only checks the parallel input guardrails against the events it yields
+        # after the activity returns. So once one of them trips, don't start the activity,
+        # or cancel it: it then publishes an error event and stops.
+        guardrails = _parallel_input_guardrails()
+        if guardrails is not None:
+            result, task = guardrails
+            triggered = result._triggered_input_guardrail_result
+            if (
+                task.done()
+                and triggered is not None
+                and workflow.patched(_STREAM_TRIPWIRE_CANCEL_PATCH)
+            ):
+                raise InputGuardrailTripwireTriggered(triggered)
+
+        handle = workflow.start_activity_method(
             ModelActivity.invoke_model_activity_streaming,
             streaming_input,
             summary=summary,
@@ -332,5 +379,32 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             versioning_intent=self.model_params.versioning_intent,
             priority=self.model_params.priority,
         )
+
+        cancelled_for: list[InputGuardrailResult] = []
+        watcher: asyncio.Task[None] | None = None
+        if guardrails is not None and not guardrails[1].done():
+            result, task = guardrails
+
+            async def cancel_on_tripwire() -> None:
+                await workflow.wait([task])
+                triggered = result._triggered_input_guardrail_result
+                if (
+                    triggered is not None
+                    and not handle.done()
+                    and workflow.patched(_STREAM_TRIPWIRE_CANCEL_PATCH)
+                ):
+                    cancelled_for.append(triggered)
+                    handle.cancel()
+
+            watcher = asyncio.create_task(cancel_on_tripwire())
+        try:
+            events = await handle
+        except ActivityError:
+            if cancelled_for:
+                raise InputGuardrailTripwireTriggered(cancelled_for[0]) from None
+            raise
+        finally:
+            if watcher is not None:
+                watcher.cancel()
         for event in events:
             yield event

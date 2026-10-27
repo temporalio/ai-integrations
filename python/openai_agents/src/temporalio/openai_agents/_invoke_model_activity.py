@@ -3,6 +3,7 @@
 Implements mapping of OpenAI datastructures to Pydantic friendly types.
 """
 
+import asyncio
 import enum
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -44,7 +45,7 @@ from openai import (
     APIStatusError,
     AsyncOpenAI,
 )
-from openai.types.responses import CustomToolParam
+from openai.types.responses import CustomToolParam, ResponseErrorEvent
 from openai.types.responses.tool_param import Mcp
 from typing_extensions import Required, TypedDict
 
@@ -517,5 +518,17 @@ class ModelActivity:
                     events_topic.publish(event)
             except APIStatusError as e:
                 _raise_for_openai_status(e)
+            except asyncio.CancelledError:
+                # Tell subscribers the response ends here, for example because a parallel
+                # input guardrail tripped. Leaving the context manager flushes it.
+                events_topic.publish(
+                    ResponseErrorEvent(
+                        type="error",
+                        code="cancelled",
+                        message="The model call was cancelled.",
+                        sequence_number=len(events),
+                    )
+                )
+                raise
 
         return events

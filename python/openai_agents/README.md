@@ -818,6 +818,16 @@ retries the same way as any other workflow_streams publisher — see
 the conventional `RETRY` event pattern for surfacing the transition to
 consumers.
 
+Input guardrails run in parallel with the model call by default. When one
+trips while the model is streaming, the plugin cancels the streaming
+activity, and the run raises `InputGuardrailTripwireTriggered` as
+`stream_events()` does. The cancel reaches the activity through its
+heartbeat, so set `heartbeat_timeout`: the activity then stops and
+publishes an `error` event with the code `cancelled` to the topic.
+Subscribers can still get the events the model sent before that, as a
+native `stream_events()` consumer can. When the guardrail has already
+tripped, the plugin does not start the model call.
+
 ## Feature Support
 
 This integration is presently subject to certain limitations.
