@@ -1,11 +1,13 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { setTracingDisabled } from '@openai/agents-core';
 import type { MCPServer } from '@openai/agents-core';
 import { WorkflowClient } from '@temporalio/client';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
-import { bundleWorkflowCode } from '@temporalio/worker';
+import { bundleWorkflowCode, Worker } from '@temporalio/worker';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import {
   OpenAIAgentsPlugin,
@@ -330,6 +332,26 @@ test('agentAsTool runs take the run model, model settings and runner defaults', 
       t.true(summary.includes('runner default'), summary);
     }
   });
+});
+
+test('agentAsTool runs recorded before they took the runner defaults still replay', async (t) => {
+  // Recorded with the plugin before this change: the nested model call was an Activity, where the
+  // runner's useLocalActivity would now make it a local Activity.
+  const history = JSON.parse(
+    readFileSync(
+      path.resolve(__dirname, '../../src/__tests__/histories/agent-tool-local-activity-before-fix.json'),
+      'utf8'
+    )
+  );
+  await t.notThrowsAsync(
+    Worker.runReplayHistory(
+      {
+        workflowBundle: t.context.workflowBundle,
+        plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) })],
+      },
+      history
+    )
+  );
 });
 
 test('Stateful MCP: not connected produces ApplicationFailure', async (t) => {

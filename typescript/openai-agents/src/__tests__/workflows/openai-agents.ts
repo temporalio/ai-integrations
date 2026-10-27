@@ -127,6 +127,18 @@ export async function agentToolRunConfigWorkflow(prompt: string): Promise<string
   return result.finalOutput ?? '';
 }
 
+export async function agentToolLocalActivityWorkflow(prompt: string): Promise<string> {
+  const expert = new Agent({ name: 'Expert', instructions: 'Answer as the expert.' });
+  const lead = new Agent({
+    name: 'Lead',
+    instructions: 'Use the tools.',
+    model: 'lead-model',
+    tools: [agentAsTool(expert, { toolName: 'ask_expert' })],
+  });
+  const runner = new TemporalOpenAIRunner({ defaultModelParams: { useLocalActivity: true } });
+  return (await runner.run(lead, prompt)).finalOutput ?? '';
+}
+
 export async function statefulMcpNotConnectedWorkflow(): Promise<string> {
   const server = statefulMcpServer('testStateful');
   try {

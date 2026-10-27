@@ -14,7 +14,7 @@ const agentAsToolParentRun = Symbol.for('@temporalio/openai-agents/agentAsToolPa
 
 // Nested runs recorded before agentAsTool took the run's model, model settings and runner defaults
 // replay without them.
-const AGENT_TOOL_RUN_CONFIG_PATCH = '@temporalio/openai-agents/agent-tool-run-config';
+const AGENT_TOOL_RUN_CONFIG_PATCH = 'openai-agents.agent-tool-run-config';
 
 type TemporalAgentTool = FunctionTool & {
   [agentAsToolParentRun]: (parent: AgentToolParentRun) => TemporalAgentTool;
