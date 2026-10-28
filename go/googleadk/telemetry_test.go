@@ -708,6 +708,7 @@ func runTelemetryScenario(t *testing.T, c client.Client, taskQueue string) (cm *
 		TaskQueue: taskQueue,
 	}, telemetryAgentWorkflow, telemetryRunInput{ModelName: "fake-model", UserMessage: "weather in SF?"})
 	require.NoError(t, err)
+	cleanupWorkflow(t, c, run)
 	var res telemetryRunResult
 	require.NoError(t, run.Get(ctx, &res))
 	require.Contains(t, strings.Join(res.Texts, " "), "It is sunny.")
@@ -734,8 +735,7 @@ func replayTelemetryHistory(t *testing.T, c client.Client, wf any, wfID, runID s
 // replay-safe wrappers sit between the global proxies and the in-memory
 // exporters.
 func TestReplayTelemetry(t *testing.T) {
-	c, stop := devServer(t)
-	defer stop()
+	c := devServer(t)
 
 	t.Run("WrappersSuppressReplayDuplicates", func(t *testing.T) {
 		capture := newTelemetryCapture()
@@ -746,7 +746,7 @@ func TestReplayTelemetry(t *testing.T) {
 			googleadk.NewReplaySafeMeterProvider(mp),
 		)
 
-		cm, wfID, runID := runTelemetryScenario(t, c, "adk-telemetry-gated")
+		cm, wfID, runID := runTelemetryScenario(t, c, testTaskQueue(t))
 
 		// The gate must not suppress first-execution telemetry: exactly one
 		// copy of every signal from the single real run.
@@ -790,7 +790,7 @@ func TestReplayTelemetry(t *testing.T) {
 		tp, lp, mp := capture.providers()
 		pointGlobalsAt(t, tp, lp, mp)
 
-		cm, wfID, runID := runTelemetryScenario(t, c, "adk-telemetry-ungated")
+		cm, wfID, runID := runTelemetryScenario(t, c, testTaskQueue(t))
 		baseline := capture.snapshot(t)
 		require.GreaterOrEqual(t, baseline.spansByName["generate_content fake-model"], 2)
 		require.GreaterOrEqual(t, baseline.counterValue, int64(100))
@@ -837,7 +837,7 @@ func TestReplayTelemetry(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		t.Cleanup(cancel)
-		const taskQueue = "adk-telemetry-gate-kinds"
+		taskQueue := testTaskQueue(t)
 		w := worker.New(c, taskQueue, worker.Options{})
 		w.RegisterWorkflow(instrumentGateWorkflow)
 		require.NoError(t, w.Start())
@@ -848,6 +848,7 @@ func TestReplayTelemetry(t *testing.T) {
 			TaskQueue: taskQueue,
 		}, instrumentGateWorkflow)
 		require.NoError(t, err)
+		cleanupWorkflow(t, c, run)
 		require.NoError(t, run.Get(ctx, nil))
 
 		// At-least-once: a workflow task retry can legitimately repeat live

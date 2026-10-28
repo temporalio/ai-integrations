@@ -116,6 +116,7 @@ func startQueryProbe(t *testing.T, c client.Client, taskQueue string, in queryPr
 		TaskQueue: taskQueue,
 	}, queryReplayProbeWorkflow, in)
 	require.NoError(t, err)
+	cleanupWorkflow(t, c, run)
 	h.run = run
 	return h
 }
@@ -183,8 +184,7 @@ func (h *queryProbeHarness) signal(done bool) {
 // query handler observes IsReplaying false, and its telemetry records without
 // even needing the IsReadOnly leg of the gate.
 func TestQueryHandlerGateOnCommandFreeHistory(t *testing.T) {
-	c, stop := devServer(t)
-	defer stop()
+	c := devServer(t)
 
 	capture := newTelemetryCapture()
 	_, lp, mp := capture.providers()
@@ -194,7 +194,7 @@ func TestQueryHandlerGateOnCommandFreeHistory(t *testing.T) {
 		googleadk.NewReplaySafeMeterProvider(mp),
 	)
 
-	h := startQueryProbe(t, c, "adk-telemetry-query-signal", queryProbeInput{PendingCommand: false})
+	h := startQueryProbe(t, c, testTaskQueue(t), queryProbeInput{PendingCommand: false})
 
 	rep := h.query()
 	require.False(t, rep.Replaying, "a query served from the live worker must not observe IsReplaying")
@@ -227,8 +227,7 @@ func TestQueryHandlerGateOnCommandFreeHistory(t *testing.T) {
 // the once-per-request recording survives regardless of the trailing history
 // shape or worker cache state.
 func TestQueryHandlerGateWithPendingCommandOrCompletion(t *testing.T) {
-	c, stop := devServer(t)
-	defer stop()
+	c := devServer(t)
 
 	capture := newTelemetryCapture()
 	_, lp, mp := capture.providers()
@@ -238,7 +237,7 @@ func TestQueryHandlerGateWithPendingCommandOrCompletion(t *testing.T) {
 		googleadk.NewReplaySafeMeterProvider(mp),
 	)
 
-	h := startQueryProbe(t, c, "adk-telemetry-query-timer", queryProbeInput{PendingCommand: true})
+	h := startQueryProbe(t, c, testTaskQueue(t), queryProbeInput{PendingCommand: true})
 
 	rep := h.query()
 	require.False(t, rep.Replaying, "a query served from the live worker must not observe IsReplaying")
@@ -361,8 +360,7 @@ func updateReplayProbeWorkflow(ctx workflow.Context) error {
 // and the workflow replayer) re-execute accepted update HANDLERS, whose
 // emissions the gate suppresses, but never validators.
 func TestUpdateValidatorTelemetryIsNeverReplaySuppressed(t *testing.T) {
-	c, stop := devServer(t)
-	defer stop()
+	c := devServer(t)
 
 	capture := newTelemetryCapture()
 	_, lp, mp := capture.providers()
@@ -375,7 +373,7 @@ func TestUpdateValidatorTelemetryIsNeverReplaySuppressed(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	t.Cleanup(cancel)
-	const taskQueue = "adk-telemetry-update-validator"
+	taskQueue := testTaskQueue(t)
 
 	var w worker.Worker
 	newWorker := func() {
@@ -395,6 +393,7 @@ func TestUpdateValidatorTelemetryIsNeverReplaySuppressed(t *testing.T) {
 		TaskQueue: taskQueue,
 	}, updateReplayProbeWorkflow)
 	require.NoError(t, err)
+	cleanupWorkflow(t, c, run)
 
 	sendUpdate := func(n int) {
 		t.Helper()
