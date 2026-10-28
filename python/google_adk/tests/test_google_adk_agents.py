@@ -593,22 +593,46 @@ async def test_single_agent_telemetry(
     finally:
         GoogleADKInstrumentor().uninstrument()
 
-    print("\n".join(dump_spans(exporter.get_finished_spans(), with_attributes=False)))
-    assert dump_spans(exporter.get_finished_spans(), with_attributes=False) == [
-        "StartWorkflow:WeatherAgent",
-        "  RunWorkflow:WeatherAgent",
-        "    invocation [test_app]",
-        "      agent_run [test_agent]",
-        "        execute_tool get_weather",
-        "          StartActivity:get_weather",
-        "            RunActivity:get_weather",
-        "        call_llm",
-        "          StartActivity:invoke_model",
-        "            RunActivity:invoke_model",
-        "        call_llm",
-        "          StartActivity:invoke_model",
-        "            RunActivity:invoke_model",
-    ]
+    spans = dump_spans(exporter.get_finished_spans(), with_attributes=False)
+    print("\n".join(spans))
+    # ADK 2.12 uses start_span for native invocation and agent spans, bypassing
+    # OpenInference's start_as_current_span suppression. Accept both complete
+    # trees so parentage and duplicate exports after cache eviction stay checked,
+    # including if a later OpenInference release suppresses the native spans again.
+    assert spans in (
+        [
+            "StartWorkflow:WeatherAgent",
+            "  RunWorkflow:WeatherAgent",
+            "    invocation [test_app]",
+            "      agent_run [test_agent]",
+            "        execute_tool get_weather",
+            "          StartActivity:get_weather",
+            "            RunActivity:get_weather",
+            "        call_llm",
+            "          StartActivity:invoke_model",
+            "            RunActivity:invoke_model",
+            "        call_llm",
+            "          StartActivity:invoke_model",
+            "            RunActivity:invoke_model",
+        ],
+        [
+            "StartWorkflow:WeatherAgent",
+            "  RunWorkflow:WeatherAgent",
+            "    invocation [test_app]",
+            "      invocation",
+            "        agent_run [test_agent]",
+            "          invoke_agent test_agent",
+            "            execute_tool get_weather",
+            "              StartActivity:get_weather",
+            "                RunActivity:get_weather",
+            "            call_llm",
+            "              StartActivity:invoke_model",
+            "                RunActivity:invoke_model",
+            "            call_llm",
+            "              StartActivity:invoke_model",
+            "                RunActivity:invoke_model",
+        ],
+    ), "\n".join(spans)
 
 
 async def test_unsetting_timeout():
