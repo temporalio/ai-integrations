@@ -128,8 +128,6 @@ def _convert_agent(
     return new_agent
 
 
-_INLINE_SYNC_FUNCTION_TOOLS_PATCH = "openai_agents.inline-sync-function-tools"
-
 # True during an agent run, so the Workflow loop runs sync function tools inline.
 _in_agent_run: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_in_agent_run", default=False
@@ -161,12 +159,8 @@ def _run_sync_function_tool_calls_inline(loop: asyncio.AbstractEventLoop) -> Non
     def inline_run_in_executor(
         executor: Any, func: Callable[..., Any], *args: Any
     ) -> asyncio.Future[Any]:
-        # Runs that started before this change got that error from these tools. They
-        # keep getting it, so their histories replay.
         if not (
-            _in_agent_run.get()
-            and _called_by_sync_function_tool(sys._getframe(1))
-            and workflow.patched(_INLINE_SYNC_FUNCTION_TOOLS_PATCH)
+            _in_agent_run.get() and _called_by_sync_function_tool(sys._getframe(1))
         ):
             return run_in_executor(executor, func, *args)
         future = loop.create_future()
