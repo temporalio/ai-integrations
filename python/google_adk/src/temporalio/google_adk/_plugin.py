@@ -7,7 +7,7 @@ import random
 import time
 import uuid
 import warnings
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from types import FrameType
 from typing import TYPE_CHECKING, Any
@@ -199,7 +199,7 @@ class GoogleAdkPlugin(SimplePlugin):
         """
 
         @asynccontextmanager
-        async def run_context() -> AsyncIterator[None]:
+        async def run_context() -> AsyncGenerator[None, None]:
             setup_deterministic_runtime()
             yield
 

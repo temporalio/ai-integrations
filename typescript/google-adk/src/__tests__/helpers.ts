@@ -3,6 +3,7 @@
  * factory that wires the plugin, model test doubles, and a history helper.
  */
 
+import { createRequire } from 'node:module';
 import path from 'node:path';
 
 import type { TestFn } from 'ava';
@@ -33,6 +34,20 @@ import { FakeLlm, type MockMCPToolDefinition } from '../testing';
 import { startLocalWithRetry } from './helpers/environment';
 
 const here = __dirname;
+
+/**
+ * The installed `@google/adk` version. The peer range spans releases whose
+ * behavior differs in places (ADK 2.1 resumes run-time tool gates, ADK 2.3
+ * reports a node's input-schema rejection as a tool error), and the tests pin
+ * each release's behavior rather than accept either: see {@link adkAtLeast}.
+ */
+export const ADK_VERSION: string = createRequire(__filename)('@google/adk/package.json').version;
+
+/** Whether the installed `@google/adk` is `major.minor` or newer. */
+export function adkAtLeast(major: number, minor: number): boolean {
+  const [installedMajor = 0, installedMinor = 0] = ADK_VERSION.split('.').map(Number);
+  return installedMajor > major || (installedMajor === major && installedMinor >= minor);
+}
 
 function isSet(env: string | undefined, def: boolean): boolean {
   if (env === undefined) return def;
