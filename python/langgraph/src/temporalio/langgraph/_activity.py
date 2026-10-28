@@ -170,6 +170,28 @@ def _unwrap(hint: Any) -> Any:
     return hint
 
 
+@cache
+def _dataclass_fields(cls: Any) -> dict[str, FieldInfo]:
+    fields = getattr(cls, "__pydantic_fields__", None)  # Pydantic dataclasses
+    if fields is not None:
+        return fields
+    hints = _class_hints(cls)
+    return {
+        f.name: FieldInfo.from_annotated_attribute(hints.get(f.name, Any), f.default)
+        for f in dataclasses.fields(cls)
+    }
+
+
+def _field_info(owner: Any, name: str | int) -> FieldInfo | None:
+    """Return Pydantic's settings for field ``name`` of a model or dataclass."""
+    cls: Any = type(owner)
+    if isinstance(owner, BaseModel):
+        return cls.model_fields.get(str(name))
+    if dataclasses.is_dataclass(owner):
+        return _dataclass_fields(cls).get(str(name))
+    return None
+
+
 def _field_hint(owner: Any, name: str) -> Any:
     if isinstance(owner, BaseModel):
         field = type(owner).model_fields.get(name)
@@ -235,8 +257,10 @@ def _written_as_base(value: Any, hint: Any) -> bool:
     return type(value) not in classes and any(_is_instance(value, c) for c in classes)
 
 
-def _excluded(field: FieldInfo, value: Any) -> bool:
-    """Whether Pydantic leaves a field holding ``value`` out of its model's JSON."""
+def _excluded(field: FieldInfo | None, value: Any) -> bool:
+    """Whether Pydantic leaves a field holding ``value`` out of its owner's JSON."""
+    if field is None:
+        return False
     exclude_if = getattr(field, "exclude_if", None)  # Newer Pydantic versions
     return bool(field.exclude) or (exclude_if is not None and bool(exclude_if(value)))
 
@@ -261,10 +285,8 @@ def _custom_serialized(owner: Any, key: str | int, hint: Any) -> bool:
         for serializer in decorators.field_serializers.values():
             if key in serializer.info.fields or "*" in serializer.info.fields:
                 return True
-    if isinstance(owner, BaseModel):
-        field = type(owner).model_fields.get(str(key))
-        hint = (hint, *field.metadata) if field else hint  # The hint lacks these
-    return _has_serializer(hint)
+    field = _field_info(owner, key)
+    return _has_serializer((hint, *field.metadata) if field else hint)
 
 
 @cache
@@ -273,16 +295,26 @@ def _adapter(cls: Any) -> TypeAdapter[Any]:
 
 
 def _dump(value: Any) -> Any:
-    """Return ``value`` as Pydantic writes a field of its class, or ``_MISSING``.
+    """Return ``value`` the way Pydantic writes its class to JSON, or ``_MISSING``.
 
-    Unlike the payload converter, this applies the serializers set on a
-    dataclass's fields.
+    Unlike the payload converter, this applies every serializer Pydantic uses
+    for JSON, including those on a dataclass's fields.
     """
     cls: Any = type(value)
     try:
-        return _adapter(cls).dump_python(value)
+        return _adapter(cls).dump_python(value, mode="json")
     except Exception:
         return _MISSING
+
+
+def _path_key(key: Any) -> bool:
+    """Whether dict key ``key`` can go in a recorded path."""
+    return isinstance(key, (str, int)) and not isinstance(key, bool)
+
+
+def _plain_key(plain: dict[Any, Any], key: str | int) -> Any:
+    """Return ``key`` as it appears in ``plain``. JSON writes int keys as strings."""
+    return str(key) if key not in plain else key
 
 
 def _children(node: dict[Any, Any]) -> list[Any]:
@@ -321,14 +353,11 @@ def _plain_item(plain: Any, owner: Any, key: str | int) -> Any:
         return plain[key] if isinstance(key, int) and key < len(plain) else _MISSING
     if not isinstance(plain, dict):
         return _MISSING
-    if key in plain:
-        return plain[key]
-    field = (
-        type(owner).model_fields.get(str(key)) if isinstance(owner, BaseModel) else None
-    )
-    for alias in (field.serialization_alias, field.alias) if field else ():
-        if alias in plain:
-            return plain[alias]
+    field = _field_info(owner, key)
+    aliases = (field.serialization_alias, field.alias) if field else ()
+    for name in (_plain_key(plain, key), *aliases):
+        if name in plain:
+            return plain[name]
     return _MISSING
 
 
@@ -419,7 +448,7 @@ class ValueTypes:
         if isinstance(value, dict):
             items = {
                 key: self.encode(item, [*path, key], value_types)
-                if isinstance(key, str)
+                if _path_key(key)
                 else item
                 for key, item in value.items()
             }
@@ -452,12 +481,15 @@ class ValueTypes:
             items = [
                 (field.name, getattr(value, field.name), _field_hint(value, field.name))
                 for field in dataclasses.fields(value)
+                if not _excluded(
+                    _field_info(value, field.name), getattr(value, field.name)
+                )
             ]
         elif isinstance(value, dict):
             items = [
                 (key, item, _item_hint(hint, value, key))
                 for key, item in value.items()
-                if isinstance(key, str)
+                if _path_key(key)
             ]
         elif isinstance(value, (list, tuple)):
             items = [
@@ -505,7 +537,8 @@ class ValueTypes:
             if children:
                 value = dict(value) if isinstance(value, dict) else list(value)
                 for key in children:
-                    value[key] = rebuild(value[key], node[key])
+                    found = _plain_key(value, key) if isinstance(value, dict) else key
+                    value[found] = rebuild(value[found], node[key])
             return value if type_id is None else _command_from_payload(value)
 
         def fix(current: Any, plain: Any, node: dict[Any, Any]) -> Any:
@@ -543,8 +576,10 @@ class ValueTypes:
             else set()
         )
         if isinstance(plain, dict):
+            # JSON writes int keys as strings.
+            children = {str(key): node[key] for key in _children(node)}
             return {
-                key: self._init_values(item, node[key]) if key in node else item
+                key: self._init_values(item, children[key]) if key in children else item
                 for key, item in plain.items()
                 if key not in non_init
             }

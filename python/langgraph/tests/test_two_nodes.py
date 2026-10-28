@@ -9,6 +9,7 @@ from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTy
 from langgraph.runtime import Runtime, get_runtime
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     PlainSerializer,
     RootModel,
@@ -207,6 +208,12 @@ def hidden_message() -> BaseMessage:
     return AIMessage(content="not-in-history")
 
 
+def search_message() -> BaseMessage:
+    return AIMessage(
+        content="", tool_calls=[{"name": "search", "args": {}, "id": "call-1"}]
+    )
+
+
 def redact(message: BaseMessage) -> dict[str, str]:
     return {"type": message.type, "content": "redacted"}
 
@@ -226,16 +233,32 @@ class Computed:
 
 @dataclass
 class SecretContext(Context):
-    token: Annotated[str, PlainSerializer(lambda _: "redacted")] = "not-in-history"
+    token: Annotated[str, PlainSerializer(lambda _: "redacted", when_used="json")] = (
+        "not-in-history"
+    )
+
+
+@dataclass
+class Envelope:
+    message: Annotated[BaseMessage, Field(alias="msg")] = field(
+        default_factory=search_message
+    )
+    hidden: Annotated[BaseMessage, Field(exclude=True)] = field(
+        default_factory=hidden_message
+    )
 
 
 class ModelState(BaseModel):
+    model_config = ConfigDict(serialize_by_alias=True, validate_by_name=True)
+
     value: str
     answer: Answer | None = None
     messages: list[BaseMessage] = []
     union_messages: list[BaseMessage] | tuple[BaseMessage, ...] = []
     overlap_messages: list[BaseMessage] | list[AIMessage] = []
     root_messages: Messages = Messages([])
+    int_messages: dict[int, BaseMessage] = {}
+    envelope: Envelope = Field(default_factory=Envelope)
     hidden: BaseMessage = Field(default_factory=hidden_message, exclude=True)
     hidden_if: BaseMessage = Field(
         default_factory=hidden_message, exclude_if=lambda _: True
@@ -261,9 +284,7 @@ class ModelState(BaseModel):
 
 
 async def model_node_a(state: ModelState) -> dict[str, Any]:
-    message = AIMessage(
-        content="", tool_calls=[{"name": "search", "args": {}, "id": "call-1"}]
-    )
+    message = search_message()
     context = ComputedContext(user_id="alice")
     context.label = "saved"
     return {
@@ -272,6 +293,7 @@ async def model_node_a(state: ModelState) -> dict[str, Any]:
         "union_messages": [message],
         "overlap_messages": [HumanMessage(content="hi"), message],
         "root_messages": [message],
+        "int_messages": {1: message},
         "computed": Computed(context),
         "state_type_a": type(state).__name__,
     }
@@ -288,6 +310,8 @@ async def model_node_b(state: ModelState) -> dict[str, Any]:
         state.union_messages,
         state.overlap_messages,
         state.root_messages.root,
+        list(state.int_messages.values()),
+        [state.envelope.message],
     ]
     return {
         "state_type_b": type(state).__name__,
@@ -336,7 +360,13 @@ async def test_two_nodes_pydantic_state(
         history = await handle.fetch_history()
 
     assert result.pop("messages")[0]["tool_calls"][0]["name"] == "search"
-    for key in ("union_messages", "overlap_messages", "root_messages", "computed"):
+    for key in (
+        "union_messages",
+        "overlap_messages",
+        "root_messages",
+        "int_messages",
+        "computed",
+    ):
         del result[key]
     assert result == {
         "value": "",
@@ -344,7 +374,7 @@ async def test_two_nodes_pydantic_state(
         "state_type_a": "ModelState",
         "state_type_b": "ModelState",
         "answer_type_b": "Answer",
-        "message_b": ["AIMessage:search"] * 4,
+        "message_b": ["AIMessage:search"] * 6,
         "label_b": "saved",
     }
     # Excluded and custom-serialized fields stay out of the Activity payloads.
