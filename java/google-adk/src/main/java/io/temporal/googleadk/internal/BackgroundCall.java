@@ -1,5 +1,8 @@
 package io.temporal.googleadk.internal;
 
+import com.google.adk.telemetry.Tracing;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.context.Scope;
 import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.schedulers.Schedulers;
 import java.util.ArrayList;
@@ -45,6 +48,7 @@ public final class BackgroundCall {
     List<T> items = new CopyOnWriteArrayList<>();
     CompletableFuture<List<T>> result = new CompletableFuture<>();
     AtomicBoolean finished = new AtomicBoolean();
+    Context context = Context.current();
     // Subscribed before the flow, so that an abandonment that already happened completes the
     // result before the I/O thread can start the call.
     abandon.subscribe(ignored -> {}, ignored -> {}, () -> result.complete(snapshot(items)));
@@ -54,7 +58,9 @@ public final class BackgroundCall {
                 // Abandoned before the I/O thread picked the call up: do not start it at all.
                 return Flowable.<T>empty();
               }
-              return flow.get();
+              try (Scope scope = context.makeCurrent()) {
+                return flow.get().compose(Tracing.withContext(context));
+              }
             })
         .subscribeOn(Schedulers.io())
         .doOnTerminate(

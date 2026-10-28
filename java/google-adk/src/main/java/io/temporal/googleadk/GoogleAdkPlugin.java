@@ -75,6 +75,11 @@ public final class GoogleAdkPlugin extends SimplePlugin {
     if (builder.customizeDataConverter) {
       simple.customizeDataConverter(GoogleAdkDataConverter::withAdkTypes);
     }
+    if (builder.tracing != null) {
+      simple
+          .addContextPropagators(builder.tracing.propagation)
+          .addWorkerInterceptors(builder.tracing.propagation);
+    }
     return simple;
   }
 
@@ -103,8 +108,19 @@ public final class GoogleAdkPlugin extends SimplePlugin {
     private final Map<String, Supplier<BaseToolset>> toolsets = new LinkedHashMap<>();
     private Function<String, BaseLlm> modelFactory = LlmRegistry::getLlm;
     private boolean customizeDataConverter = true;
+    private GoogleAdkTracing tracing;
 
     private Builder() {}
+
+    /**
+     * Propagates native ADK trace context into Activities and Workflow threads. The application
+     * must register {@link GoogleAdkTracing#wrap} globally before ADK initializes and retain
+     * ownership of that tracing instance until its Workers shut down.
+     */
+    public Builder tracing(GoogleAdkTracing tracing) {
+      this.tracing = Objects.requireNonNull(tracing, "tracing");
+      return this;
+    }
 
     /** Serves the given model name with a model created once, on first use, by the supplier. */
     public Builder model(String modelName, Supplier<BaseLlm> model) {

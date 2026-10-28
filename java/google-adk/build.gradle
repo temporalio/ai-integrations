@@ -20,12 +20,24 @@ dependencies {
     compileOnly "io.temporal:temporal-sdk:$temporalVersion"
     compileOnly 'com.google.code.findbugs:jsr305:3.0.2'
     api "com.google.adk:google-adk:$adkVersion"
+    api 'io.opentelemetry:opentelemetry-sdk-trace:1.51.0'
+    api 'io.opentelemetry:opentelemetry-api:1.51.0'
 
     testImplementation platform('org.junit:junit-bom:5.11.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testImplementation "io.temporal:temporal-sdk:$temporalVersion"
     testImplementation "io.temporal:temporal-testing:$temporalVersion"
     testImplementation 'org.mockito:mockito-core:5.23.0'
+    testImplementation 'io.opentelemetry:opentelemetry-sdk:1.51.0'
+    testImplementation 'io.opentelemetry:opentelemetry-sdk-testing:1.51.0'
     testRuntimeOnly 'ch.qos.logback:logback-classic:1.5.18'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    doFirst {
+        def classpathFile = layout.buildDirectory.file('test-runtime-classpath.txt').get().asFile
+        classpathFile.setText(sourceSets.test.runtimeClasspath.asPath, 'UTF-8')
+        systemProperty 'googleadk.test.classpath-file', classpathFile.absolutePath
+    }
 }

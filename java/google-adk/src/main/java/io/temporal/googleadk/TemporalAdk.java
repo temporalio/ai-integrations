@@ -121,18 +121,34 @@ public final class TemporalAdk {
     List<T> items = new ArrayList<>();
     AtomicReference<Throwable> failure = new AtomicReference<>();
     AtomicBoolean done = new AtomicBoolean();
-    Disposable subscription =
-        flowable.subscribe(
-            items::add,
-            error -> {
-              failure.set(error);
-              done.set(true);
-            },
-            () -> done.set(true));
+    GoogleAdkTracing.Turn turn = GoogleAdkTracing.beginTurn();
+    Disposable subscription = null;
     try {
+      subscription =
+          flowable.subscribe(
+              items::add,
+              error -> {
+                failure.set(error);
+                done.set(true);
+              },
+              () -> done.set(true));
       Workflow.await(done::get);
+      if (failure.get() instanceof Error error) throw error;
+    } catch (Error error) {
+      turn.discard();
+      throw error;
+    } catch (RuntimeException failureDuringAwait) {
+      turn.fail(failureDuringAwait);
+      throw failureDuringAwait;
     } finally {
-      subscription.dispose();
+      try {
+        if (subscription != null) subscription.dispose();
+      } catch (Error error) {
+        turn.discard();
+        throw error;
+      } finally {
+        turn.close();
+      }
     }
     Throwable error = failure.get();
     if (error instanceof RuntimeException) {
