@@ -46,9 +46,9 @@ dev = [
   "google-adk[mcp]>=2.10.0,<3",  # Exercise the optional MCP toolsets in tests.
   "openinference-instrumentation-google-adk>=1.0.0",
   "litellm>=1.83.0",
-  "pyright==1.1.403",
-  "basedpyright==1.34.0",
-  "mypy==1.18.2",
+  "pyright>=1.1.414,<2",
+  "basedpyright>=1.40.2,<2",
+  "mypy>=1.20.2,<2",
   "ruff>=0.15.12,<0.16",
   "pydocstyle>=6.3,<7",
   "pytest~=9.0",
@@ -95,6 +95,8 @@ ignore_missing_imports = true
 [tool.pyright]
 extends = "../_shared/pyrightconfig.json"
 include = ["src", "tests"]
+# ADK's LlmAgent is concrete despite inheriting ABC without abstract members.
+reportEmptyAbstractUsage = "none"
 
 # Resolve the plugin's own modules from source rather than from site-packages.
 [[tool.pyright.executionEnvironments]]

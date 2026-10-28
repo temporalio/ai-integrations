@@ -2,9 +2,11 @@
 
 Each plugin is an independent pnpm project with its own manifest and lockfile.
 There is no language-level workspace or lockfile. Node.js 22.12 or later and
-pnpm 10.27.0 are required.
+pnpm 10.27.0 are required; a plugin whose dependencies need more declares its
+own floor in `engines` (`google-adk`: 22.17.0).
 CI selects `"22"` and `"24"` with `check-latest: true` to test the latest release
-in each major series.
+in each major series; a plugin may name its floor's `major.minor` as its first
+runtime instead (`google-adk` tests 22.17 and 24).
 
 ```bash
 cd typescript/openai-agents

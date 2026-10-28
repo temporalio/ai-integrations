@@ -6,6 +6,7 @@ from strands.types.tools import AgentTool, ToolGenerator, ToolResult, ToolSpec, 
 from temporalio import workflow
 from temporalio.exceptions import ActivityError
 
+from ._bytes_values import decode_tool_result
 from ._temporal_activity_tool import _activity_error_event
 from ._temporal_mcp_client import _CallToolArgs, _MCPToolInfo
 
@@ -27,20 +28,22 @@ class TemporalMCPTool(AgentTool):
 
     @property
     def tool_name(self) -> str:
-        """Name of the underlying MCP tool."""
-        return self._info.name
+        """Name the agent sees: the MCP tool name with any client prefix."""
+        return self._info.agent_name or self._info.name
 
     @property
     def tool_spec(self) -> ToolSpec:
         """Strands ToolSpec built from the cached MCP tool info."""
         spec: ToolSpec = {
-            "name": self._info.name,
+            "name": self.tool_name,
             "description": self._info.description
             or f"Tool which performs {self._info.name}",
             "inputSchema": {"json": self._info.input_schema},
         }
         if self._info.output_schema:
             spec["outputSchema"] = {"json": self._info.output_schema}
+        if self._info.annotations:
+            spec["annotations"] = self._info.annotations
         return spec
 
     @property
@@ -68,4 +71,4 @@ class TemporalMCPTool(AgentTool):
         except ActivityError as error:
             yield _activity_error_event(tool_use["toolUseId"], error)
             return
-        yield ToolResultEvent(result)
+        yield ToolResultEvent(decode_tool_result(result))

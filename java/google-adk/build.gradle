@@ -1,0 +1,31 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'com.diffplug.spotless' version '7.0.2'
+}
+
+description = 'Temporal Google ADK integration (Public Preview)'
+def latestDependencies = providers.gradleProperty('dependencyMode').getOrElse('locked') == 'latest'
+ext {
+    javaRelease = 17
+    temporalVersion = latestDependencies ? '1.+' : '1.40.0'
+    adkVersion = latestDependencies ? '1.+' : '1.12.0'
+    latestDependencyGroups = ['io.temporal', 'com.google.adk']
+}
+
+apply from: '../_shared/java.gradle'
+
+dependencies {
+    // Consumers supply the SDK, including when using its shaded artifact.
+    compileOnly "io.temporal:temporal-sdk:$temporalVersion"
+    compileOnly 'com.google.code.findbugs:jsr305:3.0.2'
+    api "com.google.adk:google-adk:$adkVersion"
+
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testImplementation "io.temporal:temporal-sdk:$temporalVersion"
+    testImplementation "io.temporal:temporal-testing:$temporalVersion"
+    testImplementation 'org.mockito:mockito-core:5.23.0'
+    testRuntimeOnly 'ch.qos.logback:logback-classic:1.5.18'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}

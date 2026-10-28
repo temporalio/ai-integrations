@@ -23,16 +23,49 @@ wrap an existing Temporal Activity with `activityAsTool`.
 npm install @temporalio/google-adk
 ```
 
-The supported peer range is `@google/adk` `>=2.0.0 <2.1.0` and `@google/genai`
-`^2.9.0`. The ceiling is exact by design: the plugin's Workflow-sandbox shims are
-keyed to what ADK reaches at module load, so an ADK minor outside this range can
-break the Workflow bundle. `@modelcontextprotocol/sdk` is an optional peer: install
-it if you use `TemporalMCPToolset` (ADK 2.0 made it optional too).
+The supported peer range is `@google/adk` `>=2.0.0 <2.4.0` and `@google/genai`
+`^2.9.0` (ADK 2.3 itself requires `@google/genai` 2.29.1 or newer; keep your own
+copy inside ADK's range so the Workflow bundle holds one). The ceiling is exact by
+design: the plugin's Workflow-sandbox shims are keyed to what ADK reaches at
+module load, so an ADK minor outside this range can break the Workflow bundle.
+`@modelcontextprotocol/sdk` is an optional peer: install it if you use
+`TemporalMCPToolset` (ADK 2.0 made it optional too).
+
+Node.js 22.17.0 or newer is required (the package's `engines` field). The floor
+is the one `@mikro-orm/core` 7 declares, a dependency of ADK 2.1 and later; the
+plugin repeats it. An older Node is refused under `engine-strict`, and otherwise
+installs with a warning from npm and none from pnpm, outside what MikroORM, and
+so the plugin, supports.
+
+ADK 2.1 through 2.3 also import the `uuid` package without declaring it. The
+plugin depends on `uuid`, the Workflow bundle resolves ADK's import to that
+copy, and on the Worker the plugin resolves it to the same copy whenever Node
+cannot resolve it on its own. Under a hoisting layout (npm, Yarn, pnpm's
+default) Node finds a copy anyway. Under a strict layout such as pnpm with
+`hoist=false` the plugin's answer exists once the plugin is loaded, and for
+CommonJS modules only (what the plugin itself and a `tsconfig` with `module:
+commonjs` produce): import it (any entry point) before `@google/adk` in every
+process that loads ADK, the Worker, and a client that imports a Workflow module
+such as the one below. The plugin does not hook Node's ES module loader, so in
+an ES module project a module that imports `@google/adk`, the Workflow module
+included, still fails there (`Cannot find package 'uuid'`). Declaring the
+dependency for ADK fixes the layout for both, with no import order to mind:
+
+```yaml
+# pnpm-workspace.yaml
+packageExtensions:
+  '@google/adk':
+    dependencies:
+      uuid: '^11'
+```
+
+Under such a layout the Worker's bundler also resolves `@temporalio/workflow`
+from your project, so declare it as a dependency of your application.
 
 Provide Gemini credentials to the Worker as usual, for example with
 `GOOGLE_GENAI_API_KEY`, `GOOGLE_API_KEY` or `GEMINI_API_KEY`.
 
-### Upgrading from ADK 1.5
+### Upgrading ADK
 
 Versions of this plugin for `@google/adk` 1.5 are not compatible with 2.0, and a
 Workflow started under 1.5 cannot be replayed by a Worker on 2.0: ADK's internals
@@ -41,6 +74,12 @@ the two versions on separate task queues. Nothing in your Workflow code has to
 change; raw model strings (`model: 'gemini-2.5-flash'`) now work inside a Workflow
 without `TemporalModel` (see [Model routing](#model-routing)).
 
+ADK minors within the range also change the agent loop in ways a history records
+(2.1 resumes run-time tool gates that 2.0 refused; 2.3 returns a node's input-schema
+rejection to the model as a tool error), so treat an ADK minor upgrade like a
+Workflow code change: drain in-flight Workflows, or move between the versions
+with Worker Versioning or separate task queues.
+
 ## Hello world
 
 Register `GoogleAdkPlugin` on the Worker. Everything else is ordinary ADK code.
@@ -48,8 +87,9 @@ Register `GoogleAdkPlugin` on the Worker. Everything else is ordinary ADK code.
 ### `workflows.ts`
 
 ```typescript
-import { InMemoryRunner, LlmAgent, isFinalResponse, stringifyContent } from '@google/adk';
+// The plugin before ADK: in a CommonJS project this loads it first (see Install).
 import { TemporalModel } from '@temporalio/google-adk/workflow';
+import { InMemoryRunner, LlmAgent, isFinalResponse, stringifyContent } from '@google/adk';
 
 export async function askAgent(prompt: string): Promise<string> {
   const agent = new LlmAgent({
@@ -79,14 +119,18 @@ export async function askAgent(prompt: string): Promise<string> {
 import { Worker } from '@temporalio/worker';
 import { GoogleAdkPlugin } from '@temporalio/google-adk';
 
-const worker = await Worker.create({
-  taskQueue: 'adk',
-  workflowsPath: require.resolve('./workflows'),
-  // Register the plugin on the Worker. This installs the model Activities and
-  // the Workflow bundler configuration required by @google/adk.
-  plugins: [new GoogleAdkPlugin()],
-});
-await worker.run();
+async function main() {
+  const worker = await Worker.create({
+    taskQueue: 'adk',
+    workflowsPath: require.resolve('./workflows'),
+    // Register the plugin on the Worker. This installs the model Activities and
+    // the Workflow bundler configuration required by @google/adk.
+    plugins: [new GoogleAdkPlugin()],
+  });
+  await worker.run();
+}
+
+main();
 ```
 
 ### `client.ts`
@@ -95,16 +139,20 @@ await worker.run();
 import { Client } from '@temporalio/client';
 import { askAgent } from './workflows';
 
-// No plugin is needed on the Client for this package. The Worker registration
-// above is what makes TemporalModel calls execute as Activities.
-const client = new Client();
+async function main() {
+  // No plugin is needed on the Client for this package. The Worker registration
+  // above is what makes TemporalModel calls execute as Activities.
+  const client = new Client();
 
-const result = await client.workflow.execute(askAgent, {
-  taskQueue: 'adk',
-  workflowId: 'adk-hello',
-  args: ['Write a haiku about durable execution.'],
-});
-console.log(result);
+  const result = await client.workflow.execute(askAgent, {
+    taskQueue: 'adk',
+    workflowId: 'adk-hello',
+    args: ['Write a haiku about durable execution.'],
+  });
+  console.log(result);
+}
+
+main();
 ```
 
 ## Usage
@@ -322,6 +370,8 @@ const runner = new InMemoryRunner({ agent: graph });
 - **Node as tool.** A `Workflow` (or any node) in an `LlmAgent`'s `tools` becomes a
   tool. Give it a Zod object `inputSchema` for real parameters; a genai `Schema`
   advertises a single `request` string, which only a string-typed schema accepts.
+  An object-typed one rejects it: ADK 2.3 returns that rejection to the model as
+  a tool error, earlier releases end the turn with no tool response.
 - **Retries and timeouts.** Prefer Temporal's `activity.retry` and timeouts. ADK's
   `retryConfig` re-runs the whole node on top of them (match an Activity failure
   with `exceptions: ['ActivityFailure']`; ADK matches error names), its backoff is
@@ -482,10 +532,12 @@ export async function reviewWorkflow(prompt: string): Promise<unknown> {
   enforced on an `LlmAgent` turn; ADK's workflow `ToolNode` does not route through
   confirmation. Declare the gate this
   way rather than calling `toolContext.requestConfirmation()` from a tool body:
-  ADK 2.0.0 binds an approval only to a tool whose `checkRequireConfirmation`
-  says the call needs one, and refuses a gate requested only at run time — the
-  same limit applies to `SecurityPlugin`'s `CONFIRM` outcome — ending the
-  Workflow with `GoogleAdkIntentMismatchError` (`confirmation_not_required`).
+  a declared gate resumes on every supported ADK version, whereas a gate
+  requested only at run time — `SecurityPlugin`'s `CONFIRM` outcome included —
+  resumes only from ADK 2.1 on; ADK 2.0.0 bound an approval to a tool whose
+  `checkRequireConfirmation` said the call needs one and refused the rest,
+  ending the Workflow with `GoogleAdkIntentMismatchError`
+  (`confirmation_not_required`).
 
   ```typescript
   activityAsTool({ name: 'deploy', description: 'Deploy.', parameters, requireConfirmation: true });
@@ -647,12 +699,17 @@ Cautions:
 ## Determinism notes
 
 - ADK generates ids — event, invocation and session ids, function-call ids,
-  `RequestInput` interrupt ids — with `randomUUID()`. The sandbox has no `crypto`,
-  so the plugin serves ADK a `crypto` module whose values come from a **named
+  `RequestInput` interrupt ids — with `randomUUID()`, which reads the `crypto`
+  global first. The plugin installs one in the sandbox (which has none of its
+  own, and would be overridden if it grew one) — `randomUUID` and
+  `getRandomValues` only, no `subtle` — whose values come from a **named
   workflow random stream**: replay-stable, and independent of the Workflow's own
-  `Math.random()` sequence. Those ids are **not cryptographically random** inside
-  a Workflow; nor is ADK's OAuth2 `state`, which is one reason credential flows
-  are unsupported there.
+  `Math.random()` sequence. (ADK's own `node:crypto` import, and the `uuid`
+  package's, are redirected to the same stream; the ids are identical either
+  way.) The global is bundle-wide: your Workflow code and other bundled packages
+  see that `crypto` too. Its
+  values are **not cryptographically random**; nor is ADK's OAuth2 `state`,
+  which is one reason credential flows are unsupported there.
 - ADK's node retry backoff and timeouts are durable timers; the retry jitter is
   drawn from the Workflow's `Math.random()`.
 - ADK resumes a paused run from the session events: completed nodes are
@@ -667,8 +724,10 @@ Cautions:
 - **Live / bidirectional streaming**: `Runner.runLive`, `StreamingMode.BIDI` and
   `BaseLlm.connect` (`TemporalModel.connect` throws `GoogleAdkUnsupported`; ADK
   itself rejects `StreamingMode.BIDI` in `runAsync`).
-- **Node-only ADK services.** The Workflow bundle uses ADK's web surface. It type-
-  checks against ADK's full typings, but these are `undefined` at run time in a
+- **Node-only ADK services.** The Workflow bundle uses ADK's browser-safe
+  `common` surface — the module set behind its web entry, taken from the
+  per-file ESM build. It type-checks against ADK's full typings, but these are
+  `undefined` at run time in a
   Workflow: the MCP classes (`MCPToolset`, `MCPSessionManager` — use
   `TemporalMCPToolset`), a2a, `DatabaseSessionService`, `GcsArtifactService` /
   `FileArtifactService`, the local code executors (`UnsafeLocalCodeExecutor`,
@@ -693,6 +752,10 @@ Cautions:
   on a stalled call is `startToCloseTimeout`, one minute by default.
 - Streaming topic delivery is at-least-once. The deterministic Workflow value is
   the Activity result, not the stream side channel.
+- ADK's own log lines from inside a Workflow (ADK 2.1 and later: an `[ADK]`
+  warning that `Workflow` graphs are experimental, plugin registrations) reach
+  the Worker log through the sandbox console, with the Workflow's context, once
+  per run that touches them. They are harmless.
 - Cancelling a Workflow cancels its in-flight model and MCP Activities. Both pass
   the Activity's cancellation signal down to the model / MCP client, and once that
   signal has fired the resulting error is raised as a cancellation instead of
@@ -707,12 +770,18 @@ Cautions:
   `GoogleAdkPluginOptions.modelProvider` build it on the Worker.
 - `X is not a constructor` / `X is not a function` for an ADK symbol inside a
   Workflow means the symbol is one of the node-only services above: the Workflow
-  bundle resolves ADK's web surface, which omits it. Use it worker-side.
+  bundle resolves ADK's `common` surface, which omits it. Use it worker-side.
 - A cryptic sandbox error during a model call (`fetch is not defined`, or a
   `… is not a function` from a worker-only module such as `google-auth-library`)
   means a `BaseLlm` performed I/O inside the Workflow — for instance
   `autoRouteModels: false` with a raw Gemini string, or a custom `BaseLlm`
   instance placed directly on an agent. Route it through `TemporalModel`.
+- `Cannot find module 'uuid'` from inside `@google/adk`, on the Worker or in a
+  client that imports its Workflow module, means ADK was loaded under a strict
+  package layout before the plugin could answer that import. `Cannot find
+  package 'uuid' imported from …/@google/adk/…` (`ERR_MODULE_NOT_FOUND`) means
+  an ES module imported ADK, whose loader the plugin does not hook. See
+  [Install](#install) for the import order and for the layout fix.
 
 ## License
 

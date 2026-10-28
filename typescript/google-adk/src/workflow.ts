@@ -7,8 +7,13 @@
  * @module
  */
 
-// Side-effect import: install Workflow-sandbox polyfills (gated internally on
+// Side-effect imports, first. The resolution hook answers ADK's undeclared
+// `uuid` import when Node loads this entry (a client importing its Workflow
+// module, a test) and is inert in the Workflow bundle; the polyfill loader
+// installs the Workflow-sandbox polyfills (gated internally on
 // `inWorkflowContext()`) before any ADK code runs in the bundle.
+// eslint-disable-next-line import/no-unassigned-import
+import './adk-uuid-resolution';
 // eslint-disable-next-line import/no-unassigned-import
 import './load-polyfills';
 

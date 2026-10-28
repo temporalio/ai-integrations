@@ -2,6 +2,7 @@ from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
+from typing import Any, cast
 
 from google.adk.models import BaseLlm, LLMRegistry
 from google.adk.models.llm_request import LlmRequest
@@ -111,7 +112,8 @@ def _with_serializable_response_schema(llm_request: LlmRequest) -> LlmRequest:
     if isinstance(schema, type) and issubclass(schema, BaseModel):
         response_schema = schema.model_json_schema()
     else:
-        response_schema = TypeAdapter(schema).json_schema()
+        # google-genai exposes runtime schema objects without TypeForm annotations.
+        response_schema = TypeAdapter(cast(Any, schema)).json_schema()
     if (
         isinstance(schema, type)
         and issubclass(schema, Enum)
