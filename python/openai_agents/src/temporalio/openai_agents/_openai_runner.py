@@ -41,10 +41,6 @@ from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
 
-# Runs that started before the runner waited for its tools' Nexus operations on cancellation
-# closed in the Workflow Task that recorded the cancel request, so they replay without waiting.
-_WAIT_FOR_NEXUS_TOOL_CANCEL_PATCH = "openai_agents.wait-for-nexus-tool-cancel"
-
 # Pending Nexus operations started by tools, one set per active agent run in a Workflow,
 # outermost first. A tool adds its operation to every set, so an outer run also waits for the
 # operations of an agent that runs as a tool.
@@ -78,7 +74,7 @@ async def _wait_for_tool_operations(operations: set[asyncio.Future[None]]) -> No
     A further cancel request, such as the Workflow's after the caller cancelled the run,
     does not end the wait; the caller re-raises the run's cancellation afterwards.
     """
-    if operations and workflow.patched(_WAIT_FOR_NEXUS_TOOL_CANCEL_PATCH):
+    if operations:
         pending = list(operations)
         while not all(operation.done() for operation in pending):
             with contextlib.suppress(asyncio.CancelledError):
