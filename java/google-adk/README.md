@@ -71,12 +71,9 @@ Gemini models from the environment (`GOOGLE_API_KEY`, or the Vertex AI variables
 factory with `modelFactory(...)` to change that. Disable the model SDK's own retries in your
 factory; Temporal's retry policy on the activity replaces them.
 
-The registration name selects the worker-side model. When a request still uses that name, the
-worker substitutes the resolved model's own `model()` before calling the provider. A different
-request model set by a before-model callback is preserved. This applies to both explicit
-registrations and `modelFactory`. ADK's workflow-side model-capability checks still use the
-`TemporalModel` name, so use the provider's model name when features such as combining tools
-with an output schema depend on it; an arbitrary alias is not equivalent for those checks.
+Registration aliases resolve to the provider's model name unless a before-model callback overrides it.
+ADK's workflow-side capability checks still use the `TemporalModel` name, so use provider names
+when those checks apply.
 
 ## What the integration gives you
 
