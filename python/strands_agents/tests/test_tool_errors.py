@@ -4,6 +4,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from mcp.types import Tool
 from strands.hooks import HookProvider, HookRegistry
 from strands.hooks.events import AfterToolCallEvent
 from strands.types.content import Messages, SystemContentBlock
@@ -13,8 +14,8 @@ from strands.types.tools import ToolChoice, ToolResult, ToolSpec
 from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.exceptions import ApplicationError
+from temporalio.mcp import TemporalMCPClient
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
-from temporalio.strands_agents._temporal_mcp_client import _CallToolArgs, _MCPToolInfo
 from temporalio.strands_agents._temporal_mcp_tool import TemporalMCPTool
 from temporalio.strands_agents.workflow import activity_as_tool
 from temporalio.worker import Replayer, Worker
@@ -77,8 +78,8 @@ async def failing_activity_tool(location: str) -> None:
     raise ApplicationError(f"Unknown location: {location}", non_retryable=True)
 
 
-@activity.defn(name="failing-mcp-call-tool")
-async def failing_mcp_call_tool(_args: _CallToolArgs) -> None:
+@activity.defn(name="temporalio.mcp.failing-mcp.call-tool")
+async def failing_mcp_call_tool(_request: dict[str, Any]) -> None:
     raise ApplicationError("MCP server unavailable", non_retryable=True)
 
 
@@ -96,9 +97,17 @@ class _FailingToolWorkflow:
         else:
             tools = [
                 TemporalMCPTool(
-                    "failing-mcp",
-                    _MCPToolInfo("list_files", "List files", {"type": "object"}),
-                    {"start_to_close_timeout": timedelta(seconds=15)},
+                    TemporalMCPClient(
+                        "failing-mcp",
+                        activity_config={
+                            "start_to_close_timeout": timedelta(seconds=15)
+                        },
+                    ),
+                    Tool(
+                        name="list_files",
+                        description="List files",
+                        input_schema={"type": "object"},
+                    ),
                 )
             ]
         hook = _ToolResultHook()

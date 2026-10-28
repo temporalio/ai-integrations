@@ -593,11 +593,16 @@ class ChatWorkflow:
 
 ## MCP
 
-`StrandsPlugin(mcp_clients=...)` takes a mapping of `name → MCPClient factory`, mirroring the `models=` pattern. The plugin registers per-server `{name}-call-tool` and `{name}-list-tools` activities. Workflow-side, `TemporalMCPClient(server="name")` is a pure handle: it references the server by name, discovers tools by running `{name}-list-tools`, and carries the per-call activity options.
+MCP support runs on [`temporalio-mcp`](https://github.com/temporalio/ai-integrations/tree/main/python/mcp) and the MCP Python SDK v2. Install it with the `mcp` extra:
+
+```bash
+uv add "temporalio-strands-agents[mcp]"
+```
+
+`StrandsPlugin(mcp_clients=...)` takes a mapping of `name → mcp.Client factory`, mirroring the `models=` pattern. The plugin registers the `temporalio-mcp` activities for each server, such as `temporalio.mcp.{name}.list-tools` and `temporalio.mcp.{name}.call-tool`. Workflow-side, `TemporalMCPClient(server="name")` is a pure handle: it references the server by name, discovers tools by running `list-tools`, and carries the per-call activity options.
 
 ```python
-from mcp import StdioServerParameters, stdio_client
-from strands.tools.mcp.mcp_client import MCPClient
+from mcp import Client, StdioServerParameters, stdio_client
 from temporalio.strands_agents import TemporalMCPClient
 
 # workflow
@@ -615,34 +620,45 @@ Worker(
     ...,
     plugins=[StrandsPlugin(
         mcp_clients={
-            "echo": lambda: MCPClient(
-                lambda: stdio_client(
-                    StdioServerParameters(command="...", args=[...]),
-                ),
+            "echo": lambda: Client(
+                stdio_client(StdioServerParameters(command="...", args=[...])),
             ),
         },
     )],
 )
 ```
 
-Each factory returns a fully configured `MCPClient`, so you can pass options like `tool_filters`, `prefix`, `elicitation_callback`, or `tasks_config` to it.
+Connection options such as `elicitation_callback` or `read_timeout_seconds` go on the `mcp.Client`. A tool call that needs several rounds (`InputRequiredResult`) runs all of them inside one call-tool activity, through the `mcp.Client`'s callbacks.
 
-The MCP activities list tools and call them with the MCP Python SDK 1.x and 2.0 to 2.1 (`mcp>=1.9.4,<2.2`), the same range that current Strands releases accept. With MCP 2 they do not yet handle multi-round tool calls: a tool that returns `InputRequiredResult` fails with a tool error.
+`TemporalMCPClient` takes `prefix` and `tool_filters`, which work as on Strands' `MCPClient`: the agent sees `{prefix}_{name}`, and filters match the server's tool name. A callable filter receives the workflow-side tool and runs in the workflow, so it must be deterministic:
 
-By default, `TemporalMCPClient` re-lists the server's tools (via `{name}-list-tools`) on every agent turn, so an MCP server that is restarted mid-workflow — with tools added, removed, or renamed — is picked up. To list the tools just once at the beginning of the workflow and reuse that schema for the workflow's lifetime (one fewer activity per turn), set `cache_tools=True`:
+```python
+github = TemporalMCPClient(
+    server="github",
+    prefix="gh",
+    tool_filters={"allowed": ["search_issues", re.compile("get_.*")]},
+    start_to_close_timeout=timedelta(seconds=30),
+)
+```
+
+A tool that reports an error returns a failed tool result to the agent. An MCP protocol error fails the call-tool activity, which the agent also receives as a failed tool result; a lost connection fails the attempt and is retried under the activity's `retry_policy`. See the [`temporalio-mcp` README](https://github.com/temporalio/ai-integrations/tree/main/python/mcp#errors-and-retries) for which errors are retried.
+
+By default, `TemporalMCPClient` re-lists the server's tools (via `list-tools`) on every agent turn, so an MCP server that is restarted mid-workflow — with tools added, removed, or renamed — is picked up. To list the tools just once at the beginning of the workflow and reuse that schema for the workflow's lifetime (one fewer activity per turn), set `cache_tools=True`:
 
 ```python
 echo = TemporalMCPClient(server="echo", cache_tools=True, start_to_close_timeout=timedelta(seconds=30))
 ```
 
-To amortize connection setup, the `{name}-call-tool` and `{name}-list-tools` activities share a worker-process MCP connection that is opened lazily and reused across calls. The connection is disconnected after it sits idle for `mcp_connection_idle_timeout` (default 5 minutes); the timer resets on every reuse:
+To amortize connection setup, the MCP activities share a worker-process connection that is opened lazily and reused across calls. The connection is disconnected after it sits idle for `mcp_connection_idle_timeout` (default 5 minutes); the timer resets on every reuse:
 
 ```python
 StrandsPlugin(
-    mcp_clients={"echo": lambda: MCPClient(...)},
+    mcp_clients={"echo": lambda: Client(...)},
     mcp_connection_idle_timeout=timedelta(seconds=30),
 )
 ```
+
+Earlier versions used Strands' `MCPClient` factories and the `{name}-list-tools` and `{name}-call-tool` activities. Workflows started on those versions that use MCP tools must finish on workers running them before those workers are upgraded.
 
 ## Observability
 

@@ -1,12 +1,13 @@
-from collections.abc import AsyncGenerator, Callable, Collection
-from contextlib import asynccontextmanager
+from __future__ import annotations
+
+from collections.abc import Callable, Collection
 from dataclasses import replace
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from botocore.config import Config as BotocoreConfig
 from strands.models import BedrockModel, Model
 from strands.models.bedrock import DEFAULT_READ_TIMEOUT
-from strands.tools.mcp import MCPClient
 from strands.types.exceptions import ContextWindowOverflowException
 
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -18,13 +19,10 @@ from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 from ._failure_converter import StrandsFailureConverter
 from ._model_activity import ModelActivity
 from ._sandbox_activity import SandboxActivities, SandboxFactory
-from ._temporal_mcp_client import (
-    _evict_connection,
-    build_call_tool_activity,
-    build_list_tools_activity,
-    drain_closing,
-)
 from ._worker_env_ref import AllowAllWorkerEnvVars
+
+if TYPE_CHECKING:
+    from mcp import Client
 
 
 def _default_bedrock_model() -> Model:
@@ -46,15 +44,17 @@ class StrandsPlugin(SimplePlugin):
     on first use, then cached for the worker's lifetime. Use the same name in
     ``TemporalAgent(model=...)`` inside the workflow.
 
-    When ``mcp_clients`` is supplied, registers per-server
-    ``{server}-call-tool`` and ``{server}-list-tools`` activities for each
-    entry. Workflow-side ``TemporalMCPClient(server="...")`` discovers tools by
-    running ``{server}-list-tools``; whether it lists once per workflow or once
-    per agent turn is controlled by its ``cache_tools`` option.
+    When ``mcp_clients`` is supplied, registers the ``temporalio-mcp``
+    activities (``temporalio.mcp.{server}.list-tools``,
+    ``temporalio.mcp.{server}.call-tool`` and the other MCP operations) for each
+    entry. Each factory returns an ``mcp.Client`` (MCP Python SDK v2) and needs
+    the ``mcp`` extra. Workflow-side ``TemporalMCPClient(server="...")``
+    discovers tools by running ``list-tools``; whether it lists once per
+    workflow or once per agent turn is controlled by its ``cache_tools`` option.
 
     ``mcp_connection_idle_timeout`` controls how long a worker-process MCP
-    connection is kept open between ``call-tool`` activities before it is
-    disconnected; the timer resets on every reuse. Defaults to 5 minutes.
+    connection is kept open between activities before it is disconnected; the
+    timer resets on every reuse. Defaults to 5 minutes.
 
     When ``sandboxes`` is supplied, registers one stable set of activities that
     dispatches each operation by sandbox name. Each factory receives the
@@ -71,7 +71,7 @@ class StrandsPlugin(SimplePlugin):
         self,
         *,
         models: dict[str, Callable[[], Model]] | None = None,
-        mcp_clients: dict[str, Callable[[], MCPClient]] | None = None,
+        mcp_clients: dict[str, Callable[[], Client]] | None = None,
         sandboxes: dict[str, SandboxFactory] | None = None,
         mcp_connection_idle_timeout: timedelta | None = None,
         resolvable_worker_env_vars: Collection[str] | AllowAllWorkerEnvVars = (),
@@ -106,29 +106,27 @@ class StrandsPlugin(SimplePlugin):
         if sandbox_activities is not None:
             activities.extend(sandbox_activities.activities())
 
-        mcp_clients = mcp_clients or {}
-        for server, client_factory in mcp_clients.items():
-            activities.append(
-                build_call_tool_activity(
-                    server, client_factory, mcp_connection_idle_timeout
-                )
-            )
-            activities.append(
-                build_list_tools_activity(
-                    server, client_factory, mcp_connection_idle_timeout
-                )
-            )
-
-        @asynccontextmanager
-        async def run_context() -> AsyncGenerator[None, None]:
+        mcp_activities = None
+        if mcp_clients:
             try:
-                yield
-            finally:
-                for server in mcp_clients:
-                    await _evict_connection(server)
-                # Broken connections were already unpublished, so the loop above
-                # misses them; wait for their background close to finish too.
-                await drain_closing()
+                from temporalio.mcp._activities import _MCPActivities
+                from temporalio.mcp._client import _mcp_client_backend_factory
+            except ImportError as err:
+                raise RuntimeError(
+                    "mcp_clients requires the 'mcp' extra and MCP Python SDK v2; "
+                    "install temporalio-strands-agents[mcp]"
+                ) from err
+
+            mcp_activities = _MCPActivities(
+                {
+                    server: _mcp_client_backend_factory(server, factory)
+                    for server, factory in mcp_clients.items()
+                },
+                idle_timeout=timedelta(minutes=5)
+                if mcp_connection_idle_timeout is None
+                else mcp_connection_idle_timeout,
+            )
+            activities.extend(mcp_activities.activities)
 
         super().__init__(
             "aws.StrandsPlugin",
@@ -138,7 +136,7 @@ class StrandsPlugin(SimplePlugin):
             # Strands re-raises this when its conversation manager cannot reduce the
             # context any further; fail the workflow instead of retrying the task forever.
             workflow_failure_exception_types=[ContextWindowOverflowException],
-            run_context=run_context,
+            run_context=mcp_activities.run_context if mcp_activities else None,
         )
 
 
@@ -152,6 +150,7 @@ def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
                 "strands",
                 "strands_tools",
                 "mcp",
+                "mcp_types",
                 # ``pydantic`` is already in the SDK default passthrough; extend it
                 # to its compiled validation core and ``Annotated`` helper.
                 "pydantic_core",

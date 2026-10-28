@@ -73,8 +73,10 @@ def _normalize_list_result(
 class _MCPActivities:
     """Build framework-neutral MCP operation Activities for named backends.
 
-    ``temporalio-openai-agents`` builds on this class and on ``_backend``; a
-    change to either is a coordinated release across both packages.
+    ``temporalio-openai-agents`` builds on this class and on ``_backend``, and
+    ``temporalio-strands-agents`` on this class and on
+    ``_client._mcp_client_backend_factory``; a change to any of them is a
+    coordinated release across those packages.
     """
 
     def __init__(

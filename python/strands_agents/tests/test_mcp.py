@@ -1,23 +1,14 @@
-import asyncio
 import sys
 from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, cast
 from uuid import uuid4
 
-from mcp import ClientSession, StdioServerParameters, stdio_client
-from mcp.types import Tool
-from strands.tools.mcp.mcp_client import MCPClient
+from mcp import Client as MCPClient
+from mcp import StdioServerParameters, stdio_client
 
 from temporalio import workflow
 from temporalio.client import Client
-from temporalio.strands_agents import (
-    StrandsPlugin,
-    TemporalAgent,
-    TemporalMCPClient,
-    _temporal_mcp_client,
-)
+from temporalio.strands_agents import StrandsPlugin, TemporalAgent, TemporalMCPClient
 from temporalio.worker import Replayer, Worker
 from tests.common import get_activities
 from tests.mock_model import MockModel
@@ -25,7 +16,7 @@ from tests.mock_model import MockModel
 
 def _echo_client_factory() -> MCPClient:
     return MCPClient(
-        lambda: stdio_client(
+        stdio_client(
             StdioServerParameters(
                 command=sys.executable,
                 args=[str(Path(__file__).parent / "echo_mcp_server.py")],
@@ -65,16 +56,7 @@ async def test_mcp(client: Client):
                 ]
             )
         },
-        mcp_clients={
-            "echo": lambda: MCPClient(
-                lambda: stdio_client(
-                    StdioServerParameters(
-                        command=sys.executable,
-                        args=[str(Path(__file__).parent / "echo_mcp_server.py")],
-                    )
-                )
-            ),
-        },
+        mcp_clients={"echo": _echo_client_factory},
     )
 
     async with Worker(
@@ -95,9 +77,9 @@ async def test_mcp(client: Client):
     history = await handle.fetch_history()
     assert get_activities(history) == [
         "strands_get_model_config",
-        "echo-list-tools",
+        "temporalio.mcp.echo.list-tools",
         "invoke_model",
-        "echo-call-tool",
+        "temporalio.mcp.echo.call-tool",
         "invoke_model",
     ]
 
@@ -167,19 +149,16 @@ async def test_mcp_reuses_connection(client: Client):
         )
         assert await handle.result() == "Done!\n"
 
-    # The worker context has exited, so its run_context finally evicted the
-    # cached connection.
-    assert "echo_cached" not in _temporal_mcp_client._CONNECTIONS
     assert factory_calls[0] == 1
 
     history = await handle.fetch_history()
     assert get_activities(history) == [
         "strands_get_model_config",
-        "echo_cached-list-tools",
+        "temporalio.mcp.echo_cached.list-tools",
         "invoke_model",
-        "echo_cached-call-tool",
+        "temporalio.mcp.echo_cached.call-tool",
         "invoke_model",
-        "echo_cached-call-tool",
+        "temporalio.mcp.echo_cached.call-tool",
         "invoke_model",
     ]
 
@@ -210,7 +189,7 @@ class MCPIdleWorkflow:
 
 
 async def test_mcp_connection_idle_timeout(client: Client):
-    """A short idle timeout evicts the cached connection while the worker runs."""
+    """A zero idle timeout closes the connection after every activity."""
     task_queue = f"test_mcp_connection_idle_timeout-{uuid4()}"
     factory_calls = [0]
 
@@ -228,10 +207,7 @@ async def test_mcp_connection_idle_timeout(client: Client):
             )
         },
         mcp_clients={"echo_idle": counting_factory},
-        # Short window so the cached call connection is evicted mid-run rather
-        # than only at worker shutdown. The idle timer only arms once the call
-        # releases the connection, so this can't tear it down mid-call.
-        mcp_connection_idle_timeout=timedelta(milliseconds=100),
+        mcp_connection_idle_timeout=timedelta(0),
     )
 
     async with Worker(
@@ -249,20 +225,8 @@ async def test_mcp_connection_idle_timeout(client: Client):
         )
         assert await handle.result() == "Done!\n"
 
-        # A connection was opened lazily (on the first list-tools/call-tool).
-        # How many times depends on whether the short idle timer fires between
-        # activities, so this only asserts that at least one was opened; the
-        # eviction-while-alive behavior is what the polling loop below checks.
-        assert factory_calls[0] >= 1
-
-        # Still inside the worker context: the short idle timer evicts the
-        # cached call connection on its own. Asserting eviction here -- with the
-        # worker alive -- proves it came from the idle timer, not shutdown.
-        for _ in range(100):
-            if "echo_idle" not in _temporal_mcp_client._CONNECTIONS:
-                break
-            await asyncio.sleep(0.1)
-        assert "echo_idle" not in _temporal_mcp_client._CONNECTIONS
+    # One connection for list-tools and another for call-tool.
+    assert factory_calls[0] == 2
 
 
 @workflow.defn
@@ -320,47 +284,11 @@ async def test_mcp_lists_tools_each_turn_when_uncached(client: Client):
     activities = get_activities(history)
     # One list-tools per model call -- the tools are re-listed every turn rather
     # than once for the workflow.
-    assert activities.count("echo_nocache-list-tools") == activities.count(
-        "invoke_model"
-    )
-    assert activities.count("echo_nocache-list-tools") == 3
+    list_tools = "temporalio.mcp.echo_nocache.list-tools"
+    assert activities.count(list_tools) == activities.count("invoke_model")
+    assert activities.count(list_tools) == 3
 
     await Replayer(
         workflows=[MCPNoCacheWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
-
-
-async def test_list_tools_reads_mcp2_field_names():
-    """mcp 2 renamed nextCursor, inputSchema and outputSchema to snake_case.
-
-    The pages use mcp 2's ``next_cursor``. The tools are the installed mcp's own
-    ``Tool``, because ``_tool_infos`` hands them to Strands, which reads the
-    field names of the installed mcp line.
-    """
-    schema = {"type": "object"}
-    pages = [
-        SimpleNamespace(
-            tools=[Tool(name="a", description="A", inputSchema=schema)],
-            next_cursor="page-2",
-        ),
-        SimpleNamespace(
-            tools=[
-                Tool(name="b", description="", inputSchema=schema, outputSchema=schema)
-            ],
-            next_cursor=None,
-        ),
-    ]
-
-    class TwoPageSession:
-        async def list_tools(self, **_kwargs: Any) -> Any:
-            return pages.pop(0)
-
-    tools = await _temporal_mcp_client._paginate_list_tools(
-        cast(ClientSession, cast(object, TwoPageSession()))
-    )
-    infos = _temporal_mcp_client._tool_infos(_echo_client_factory(), tools)
-    assert [(i.name, i.input_schema, i.output_schema) for i in infos] == [
-        ("a", schema, None),
-        ("b", schema, schema),
-    ]

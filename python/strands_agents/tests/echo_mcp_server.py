@@ -1,14 +1,9 @@
-try:
-    from mcp.server.fastmcp import FastMCP
-except ImportError:  # mcp 2 renamed FastMCP to MCPServer
-    from mcp.server.mcpserver import (  # type: ignore[no-redef]  # pyright: ignore[reportMissingImports]
-        MCPServer as FastMCP,
-    )
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("echo-server")
+mcp = MCPServer("echo-server")
 
 
-@mcp.tool()  # pyright: ignore[reportUntypedFunctionDecorator]
+@mcp.tool()
 def echo(message: str) -> str:
     """Return the input message unchanged."""
     return message

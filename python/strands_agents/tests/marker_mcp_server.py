@@ -1,9 +1,9 @@
 import base64
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult, ImageContent, TextContent
 
-mcp = FastMCP("marker-server")
+mcp = MCPServer("marker-server")
 
 # A PNG signature and header chunk: valid bytes, but not valid UTF-8.
 PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
@@ -18,10 +18,10 @@ def lookup() -> CallToolResult:
             ImageContent(
                 type="image",
                 data=base64.b64encode(PNG).decode(),
-                mimeType="image/png",
+                mime_type="image/png",
             ),
         ],
-        structuredContent={
+        structured_content={
             "__bytes_encoded__": True,
             "data": "SGVsbG8=",
             "other": "retained",

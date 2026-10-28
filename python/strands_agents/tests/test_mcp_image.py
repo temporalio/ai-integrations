@@ -3,8 +3,8 @@ from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
+from mcp import Client as MCPClient
 from mcp import StdioServerParameters, stdio_client
-from strands.tools.mcp.mcp_client import MCPClient
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -70,7 +70,7 @@ async def test_mcp_image_tool_result(client: Client, tmp_path: Path):
         models={"mock": lambda: RecordingModel(script)},
         mcp_clients={
             "image": lambda: MCPClient(
-                lambda: stdio_client(
+                stdio_client(
                     StdioServerParameters(
                         command=sys.executable,
                         args=[str(Path(__file__).parent / "image_mcp_server.py")],
@@ -109,9 +109,9 @@ async def test_mcp_image_tool_result(client: Client, tmp_path: Path):
     history = await handle.fetch_history()
     assert get_activities(history) == [
         "strands_get_model_config",
-        "image-list-tools",
+        "temporalio.mcp.image.list-tools",
         "invoke_model",
-        "image-call-tool",
+        "temporalio.mcp.image.call-tool",
         "invoke_model",
     ]
 
