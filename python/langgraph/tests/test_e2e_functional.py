@@ -221,6 +221,9 @@ class TestFunctionalAPIBasicExecution:
                     {
                         "score": "Score",
                         "label": "Label",
+                        # The converter can't rebuild a Protocol field, so this
+                        # stays a dict.
+                        "envelope": "dict",
                         "message": "AIMessage",
                         "data": "bytes",
                     }

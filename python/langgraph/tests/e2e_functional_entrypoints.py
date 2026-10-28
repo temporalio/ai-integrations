@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import langgraph.types
 from langchain_core.messages import AIMessage
@@ -62,9 +62,19 @@ class Label:
     text: str
 
 
+class MessageLike(Protocol):
+    content: Any
+
+
+@dataclass
+class Envelope:
+    message: MessageLike
+
+
 class Values(TypedDict):
     score: Score
     label: Label
+    envelope: Envelope
     message: Any
     data: bytes
 
@@ -74,6 +84,7 @@ def make_values(value: int) -> Values:
     return Values(
         score=Score(value=value),
         label=Label(text="ten"),
+        envelope=Envelope(message=AIMessage(content="hi")),
         message=AIMessage(content="hi", id="m1"),
         data=b"\x00\xff",
     )

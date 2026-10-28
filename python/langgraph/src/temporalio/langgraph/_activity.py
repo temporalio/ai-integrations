@@ -22,7 +22,8 @@ from typing import (
 from langchain_core.messages import BaseMessage
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command, Interrupt, Send, TimeoutPolicy
-from pydantic import BaseModel
+from pydantic import BaseModel, RootModel
+from pydantic.fields import FieldInfo
 from typing_extensions import NotRequired, Required, is_typeddict
 
 from temporalio import activity, workflow
@@ -171,13 +172,30 @@ def _field_hint(owner: Any, name: str) -> Any:
     return _class_hints(cls).get(name, Any)
 
 
-def _item_hint(hint: Any, key: str | int) -> Any:
-    """Return the declared type of an item in a container of type ``hint``."""
+def _is_instance(value: Any, cls: Any) -> bool:
+    try:
+        return isinstance(value, cls)
+    except TypeError:  # Protocols that aren't runtime checkable, TypedDicts, Any
+        return False
+
+
+def _holds(hint: Any, value: Any) -> bool:
+    """Whether the class of ``value`` fits ``hint``, ignoring type arguments."""
+    hint = _unwrap(hint)
+    return _is_instance(value, dict if is_typeddict(hint) else get_origin(hint) or hint)
+
+
+def _item_hint(hint: Any, owner: Any, key: str | int) -> Any:
+    """Return the declared type of item ``key`` of ``owner``, of type ``hint``."""
     hint = _unwrap(hint)
     origin = get_origin(hint)
     args = [arg for arg in get_args(hint) if arg is not type(None)]
     if origin in _UNIONS:
-        return _item_hint(args[0], key) if len(args) == 1 else Any
+        # The serializer writes the container with a member its class fits.
+        hints = [_item_hint(arg, owner, key) for arg in args if _holds(arg, owner)]
+        if len(hints) > 1:
+            return typing.Union[tuple(hints)]  # pyright: ignore[reportDeprecated]
+        return hints[0] if hints else Any
     if is_typeddict(hint):
         return _class_hints(hint).get(str(key), Any)
     if origin is tuple:
@@ -199,10 +217,14 @@ def _written_as_base(value: Any, hint: Any) -> bool:
     """
     hint = _unwrap(hint)
     members = get_args(hint) if get_origin(hint) in _UNIONS else (hint,)
-    classes = tuple(
-        m for m in map(_unwrap, members) if isinstance(m, type) and m is not Any
-    )
-    return bool(classes) and type(value) not in classes and isinstance(value, classes)
+    classes = [m for m in map(_unwrap, members) if isinstance(m, type) and m is not Any]
+    return type(value) not in classes and any(_is_instance(value, c) for c in classes)
+
+
+def _excluded(field: FieldInfo, value: Any) -> bool:
+    """Whether Pydantic leaves a field holding ``value`` out of its model's JSON."""
+    exclude_if = getattr(field, "exclude_if", None)  # Newer Pydantic versions
+    return bool(field.exclude) or (exclude_if is not None and bool(exclude_if(value)))
 
 
 def _children(node: dict[Any, Any]) -> list[Any]:
@@ -235,6 +257,8 @@ def _put(owner: Any, key: str | int, value: Any) -> Any:
 
 def _plain_item(plain: Any, owner: Any, key: str | int) -> Any:
     """Return the plain JSON the converter wrote for ``owner``'s item ``key``."""
+    if isinstance(owner, RootModel) and key == "root":
+        return plain  # A RootModel is written as its root value.
     if isinstance(plain, list):
         return plain[key] if isinstance(key, int) and key < len(plain) else _MISSING
     if not isinstance(plain, dict):
@@ -360,7 +384,8 @@ class ValueTypes:
         if isinstance(value, BaseModel):
             items = [
                 (name, getattr(value, name), _field_hint(value, name))
-                for name in type(value).model_fields
+                for name, field in type(value).model_fields.items()
+                if not _excluded(field, getattr(value, name))
             ]
             items += [
                 (key, item, Any) for key, item in (value.model_extra or {}).items()
@@ -372,13 +397,13 @@ class ValueTypes:
             ]
         elif isinstance(value, dict):
             items = [
-                (key, item, _item_hint(hint, key))
+                (key, item, _item_hint(hint, value, key))
                 for key, item in value.items()
                 if isinstance(key, str)
             ]
         elif isinstance(value, (list, tuple)):
             items = [
-                (index, item, _item_hint(hint, index))
+                (index, item, _item_hint(hint, value, index))
                 for index, item in enumerate(value)
             ]
         else:
@@ -410,7 +435,8 @@ class ValueTypes:
             """Rebuild a value from its plain JSON."""
             type_id = node.get(_TYPE_ID)
             if type_id is not None and type_id != _COMMAND_TYPE_ID:
-                return fix(self._rebuild(type_id, value, converter), value, node)
+                rebuilt = self._rebuild(type_id, value, converter)
+                return value if rebuilt is _MISSING else fix(rebuilt, value, node)
             children = _children(node)
             if children:
                 value = dict(value) if isinstance(value, dict) else list(value)
@@ -445,16 +471,21 @@ class ValueTypes:
                 f"Unknown value type ID: {type_id!r}. Workers must register "
                 "the same graphs and tasks."
             )
-        if not dataclasses.is_dataclass(cls):
-            return converter.from_payload(converter.to_payload(value), cls)
-        # Restore saved init=False fields, as for run context.
-        non_init = {field.name for field in dataclasses.fields(cls) if not field.init}
-        init_values = {k: v for k, v in value.items() if k not in non_init}
-        restored = converter.from_payload(converter.to_payload(init_values), cls)
-        for name in non_init:
-            if name in value:
-                object.__setattr__(restored, name, value[name])
-        return restored
+        try:
+            if not dataclasses.is_dataclass(cls):
+                return converter.from_payload(converter.to_payload(value), cls)
+            # Restore saved init=False fields, as for run context.
+            non_init = {f.name for f in dataclasses.fields(cls) if not f.init}
+            init_values = {k: v for k, v in value.items() if k not in non_init}
+            restored = converter.from_payload(converter.to_payload(init_values), cls)
+            for name in non_init:
+                if name in value:
+                    object.__setattr__(restored, name, value[name])
+            return restored
+        except Exception:
+            # A value the converter can't rebuild, such as a dataclass with a
+            # Protocol field, keeps its plain JSON form, as before.
+            return _MISSING
 
 
 def wrap_activity(

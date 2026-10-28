@@ -7,10 +7,11 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.runtime import Runtime, get_runtime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, RootModel
 from typing_extensions import TypedDict
 
 from temporalio import workflow
+from temporalio.api.history.v1 import History
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.langgraph import LangGraphPlugin, graph
@@ -190,35 +191,54 @@ async def test_two_nodes(
     }
 
 
+class Messages(RootModel[list[BaseMessage]]):
+    pass
+
+
+def hidden_message() -> BaseMessage:
+    return AIMessage(content="not-in-history")
+
+
 class ModelState(BaseModel):
     value: str
     answer: Answer | None = None
     messages: list[BaseMessage] = []
+    union_messages: list[BaseMessage] | tuple[BaseMessage, ...] = []
+    root_messages: Messages = Messages([])
+    hidden: BaseMessage = Field(default_factory=hidden_message, exclude=True)
+    hidden_if: BaseMessage = Field(
+        default_factory=hidden_message, exclude_if=lambda _: True
+    )
     state_type_a: str = ""
     state_type_b: str = ""
     answer_type_b: str = ""
-    message_b: str = ""
+    message_b: list[str] = []
 
 
 async def model_node_a(state: ModelState) -> dict[str, Any]:
+    message = AIMessage(
+        content="", tool_calls=[{"name": "search", "args": {}, "id": "call-1"}]
+    )
     return {
         "answer": Answer(value=1),
-        "messages": [
-            AIMessage(
-                content="", tool_calls=[{"name": "search", "args": {}, "id": "call-1"}]
-            )
-        ],
+        "messages": [message],
+        "union_messages": [message],
+        "root_messages": [message],
         "state_type_a": type(state).__name__,
     }
 
 
-async def model_node_b(state: ModelState) -> dict[str, str]:
-    message = state.messages[-1]
-    tool_calls = getattr(message, "tool_calls", [{}])
+def describe(message: BaseMessage) -> str:
+    names = [call["name"] for call in getattr(message, "tool_calls", [])]
+    return f"{type(message).__name__}:{','.join(names)}"
+
+
+async def model_node_b(state: ModelState) -> dict[str, Any]:
+    messages = [state.messages, state.union_messages, state.root_messages.root]
     return {
         "state_type_b": type(state).__name__,
         "answer_type_b": type(getattr(state, "answer", None)).__name__,
-        "message_b": f"{type(message).__name__}:{tool_calls[0].get('name')}",
+        "message_b": [describe(m[-1]) for m in messages],
     }
 
 
@@ -251,19 +271,24 @@ async def test_two_nodes_pydantic_state(
             )
         ],
     ):
-        result = await client.execute_workflow(
+        handle = await client.start_workflow(
             TwoNodesWorkflow.run,
             "",
             id=f"test-workflow-{uuid4()}",
             task_queue=task_queue,
         )
+        result = await handle.result()
+        history = await handle.fetch_history()
 
     assert result.pop("messages")[0]["tool_calls"][0]["name"] == "search"
+    del result["union_messages"], result["root_messages"]
     assert result == {
         "value": "",
         "answer": {"value": 1},
         "state_type_a": "ModelState",
         "state_type_b": "ModelState",
         "answer_type_b": "Answer",
-        "message_b": "AIMessage:search",
+        "message_b": ["AIMessage:search"] * 3,
     }
+    # Excluded fields stay out of the Activity payloads.
+    assert b"not-in-history" not in History(events=history.events).SerializeToString()
