@@ -22,7 +22,7 @@ from typing import (
 from langchain_core.messages import BaseMessage
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command, Interrupt, Send, TimeoutPolicy
-from pydantic import BaseModel, RootModel
+from pydantic import BaseModel, PlainSerializer, RootModel, WrapSerializer
 from pydantic.fields import FieldInfo
 from typing_extensions import NotRequired, Required, is_typeddict
 
@@ -235,6 +235,32 @@ def _excluded(field: FieldInfo, value: Any) -> bool:
     return bool(field.exclude) or (exclude_if is not None and bool(exclude_if(value)))
 
 
+def _has_serializer(hint: Any) -> bool:
+    """Whether ``hint``, or a tuple of hints and metadata, sets a custom serializer."""
+    if isinstance(hint, (PlainSerializer, WrapSerializer)):
+        return True
+    if isinstance(hint, tuple):
+        return any(map(_has_serializer, hint))
+    if get_origin(hint) in (Annotated, Required, NotRequired, *_UNIONS):
+        return any(map(_has_serializer, get_args(hint)))  # Includes metadata
+    return False
+
+
+def _custom_serialized(owner: Any, key: str | int, hint: Any) -> bool:
+    """Whether Pydantic writes ``owner``'s item ``key`` with a custom serializer."""
+    decorators = getattr(type(owner), "__pydantic_decorators__", None)
+    if decorators is not None:
+        if decorators.model_serializers:
+            return True
+        for serializer in decorators.field_serializers.values():
+            if key in serializer.info.fields or "*" in serializer.info.fields:
+                return True
+    if isinstance(owner, BaseModel):
+        field = type(owner).model_fields.get(str(key))
+        hint = (hint, *field.metadata) if field else hint  # The hint lacks these
+    return _has_serializer(hint)
+
+
 def _children(node: dict[Any, Any]) -> list[Any]:
     return [key for key in node if key is not _TYPE_ID and key is not _SENT]
 
@@ -417,6 +443,9 @@ class ValueTypes:
         else:
             return
         for key, item, item_hint in items:
+            # A custom serializer may leave data out, so record nothing in it.
+            if _custom_serialized(value, key, item_hint):
+                continue
             item_path = [*path, key]
             type_id = self._type_id(type(item))
             if type_id is not None:
@@ -443,7 +472,9 @@ class ValueTypes:
             """Rebuild a value from its plain JSON."""
             type_id = node.get(_TYPE_ID)
             if type_id is not None and type_id != _COMMAND_TYPE_ID:
-                rebuilt = self._rebuild(type_id, value, converter)
+                rebuilt = self._rebuild(
+                    type_id, self._init_values(value, node), converter
+                )
                 return value if rebuilt is _MISSING else fix(rebuilt, value, node)
             children = _children(node)
             if children:
@@ -458,6 +489,11 @@ class ValueTypes:
             type_id = node.get(_TYPE_ID)
             if type_id is not None and type(current) is not self._classes.get(type_id):
                 return rebuild(plain, node)
+            if dataclasses.is_dataclass(current) and isinstance(plain, dict):
+                # Restore saved init=False fields, as for run context.
+                for field in dataclasses.fields(current):
+                    if not field.init and field.name in plain:
+                        object.__setattr__(current, field.name, plain[field.name])
             for key in _children(node):
                 item = _get(current, key)
                 item_plain = _plain_item(plain, current, key)
@@ -470,6 +506,30 @@ class ValueTypes:
 
         return rebuild(value, tree)
 
+    def _init_values(self, plain: Any, node: dict[Any, Any]) -> Any:
+        """Copy ``plain`` without the init=False fields of the dataclasses in ``node``.
+
+        The default converter passes every field it finds to ``__init__``.
+        """
+        cls = self._classes.get(node.get(_TYPE_ID, ""))
+        non_init = (
+            {f.name for f in dataclasses.fields(cls) if not f.init}
+            if dataclasses.is_dataclass(cls)
+            else set()
+        )
+        if isinstance(plain, dict):
+            return {
+                key: self._init_values(item, node[key]) if key in node else item
+                for key, item in plain.items()
+                if key not in non_init
+            }
+        if isinstance(plain, list):
+            return [
+                self._init_values(item, node[index]) if index in node else item
+                for index, item in enumerate(plain)
+            ]
+        return plain
+
     def _rebuild(self, type_id: str, value: Any, converter: PayloadConverter) -> Any:
         if type_id == _COMMAND_TYPE_ID:
             return _command_from_payload(value)
@@ -480,16 +540,7 @@ class ValueTypes:
                 "the same graphs and tasks."
             )
         try:
-            if not dataclasses.is_dataclass(cls):
-                return converter.from_payload(converter.to_payload(value), cls)
-            # Restore saved init=False fields, as for run context.
-            non_init = {f.name for f in dataclasses.fields(cls) if not f.init}
-            init_values = {k: v for k, v in value.items() if k not in non_init}
-            restored = converter.from_payload(converter.to_payload(init_values), cls)
-            for name in non_init:
-                if name in value:
-                    object.__setattr__(restored, name, value[name])
-            return restored
+            return converter.from_payload(converter.to_payload(value), cls)
         except Exception:
             # A value the converter can't rebuild, such as a dataclass with a
             # Protocol field, keeps its plain JSON form, as before.
