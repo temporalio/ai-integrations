@@ -206,15 +206,17 @@ export async function structuredOutputAgent(prompt: string): Promise<unknown> {
 }
 
 /**
- * Fails an activity, then fails the workflow with a Strands error as the cause, so a test can check
- * how both failures are stored.
+ * Fails an activity once per message, then fails the workflow with a Strands error as the cause, so
+ * a test can check how the failures are stored.
  */
-export async function failTwice(message: string): Promise<never> {
+export async function failTwice(message: string, activityMessages: string[] = [message]): Promise<never> {
   const { failingActivity } = proxyActivities<{ failingActivity(message: string): Promise<void> }>({
     startToCloseTimeout: '10 seconds',
     retry: { maximumAttempts: 1 },
   });
-  await failingActivity(message).catch(() => undefined);
+  for (const activityMessage of activityMessages) {
+    await failingActivity(activityMessage).catch(() => undefined);
+  }
   throw ApplicationFailure.create({ message, nonRetryable: true, cause: new StructuredOutputError('no output') });
 }
 

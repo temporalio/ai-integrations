@@ -80,29 +80,19 @@ export const failureConverter: FailureConverter = new StrandsFailureConverter();
  * Put Strands' rewrite of interrupt and terminal errors in front of the caller's failure converter,
  * so both apply. {@link StrandsPlugin} loads this through a generated module when the client or
  * worker already has a `failureConverterPath`. Decoding uses the caller's converter.
+ *
+ * The result inherits from the caller's converter and overrides `errorToFailure`, as
+ * {@link StrandsFailureConverter} overrides the SDK's. `DefaultFailureConverter` and its subclasses
+ * encode each `cause` through `this.errorToFailure`, so the rewrite applies to every error the SDK
+ * walks, and the thrown errors themselves are not changed or copied.
  */
 export function composeFailureConverter(caller: FailureConverter): FailureConverter {
-  return {
-    errorToFailure(err, payloadConverter, context) {
-      return caller.errorToFailure(rewriteChain(err), payloadConverter, context);
-    },
-    failureToError(failure, payloadConverter, context) {
-      return caller.failureToError(failure, payloadConverter, context);
-    },
+  const composed: FailureConverter = Object.create(caller);
+  composed.errorToFailure = function (err, payloadConverter, context) {
+    return caller.errorToFailure.call(this, rewriteError(err), payloadConverter, context);
   };
-}
-
-/**
- * Rewrite `err` and every error in its `cause` chain, as {@link StrandsFailureConverter} does through
- * its own recursion, which the caller's converter does not call. `err` itself is not changed: an
- * error whose cause was rewritten is replaced with an object that inherits from it. That object
- * defines its own `cause`, since assigning one fails when `err`'s is read-only, as in a frozen error.
- */
-function rewriteChain(err: unknown): unknown {
-  const rewritten = rewriteError(err);
-  if (rewritten !== err || !(err instanceof Error) || err.cause === undefined) return rewritten;
-  const cause = rewriteChain(err.cause);
-  return cause === err.cause
-    ? err
-    : Object.defineProperty(Object.create(err) as Error, 'cause', { value: cause, writable: true, configurable: true });
+  composed.failureToError = function (failure, payloadConverter, context) {
+    return caller.failureToError(failure, payloadConverter, context);
+  };
+  return composed;
 }
