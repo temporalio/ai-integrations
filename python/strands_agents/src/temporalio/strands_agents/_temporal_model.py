@@ -14,6 +14,7 @@ from temporalio.common import Priority, RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
+from ._bytes_values import decode_event
 from ._model_activity import (
     ModelActivity,
     _InvokeModelInput,
@@ -167,4 +168,4 @@ class TemporalModel(Model):
                 raise ContextWindowOverflowException(cause.message) from error
             raise
         for event in events:
-            yield event
+            yield decode_event(event)

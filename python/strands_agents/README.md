@@ -175,6 +175,8 @@ async for item in WorkflowStreamClient.create(client, workflow_id).subscribe(
     print(item.data)
 ```
 
+Events are published as your data converter writes them, so a `StreamEvent`-typed subscriber receives `bytes` fields such as `redactedContent` as `bytes`. If the model emits `redactedContent` that is not valid UTF-8 and the data converter is the Pydantic one (the plugin's default), which cannot write it, subscribers receive the event with `redactedContent` empty (`b""`) and the model activity does not fail. The workflow itself always gets the real bytes, and the default converter carries any bytes to subscribers.
+
 ## Sandboxes
 
 `TemporalSandbox` implements Strands' sandbox API by scheduling every command,
