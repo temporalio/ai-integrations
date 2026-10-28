@@ -57,7 +57,10 @@ dependencyLocking {
     lockAllConfigurations()
     lockMode = LockMode.STRICT
     def suffix = dependencyMode == 'latest' ? '.latest.lockfile' : '.lockfile'
-    lockFile = file("gradle/dependency-locks/spring-boot-${springBootVersion}$suffix")
+    // Plugins with a Spring Boot dimension lock per Boot version; the others keep one lock.
+    def bootVersion = project.hasProperty('springBootVersion') ? project.property('springBootVersion') : ''
+    def lockName = bootVersion ? "spring-boot-${bootVersion}" : 'dependencies'
+    lockFile = file("gradle/dependency-locks/${lockName}$suffix")
 }
 tasks.register('resolveAndLockAll') {
     dependsOn 'spotlessJava'

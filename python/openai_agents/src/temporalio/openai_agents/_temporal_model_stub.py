@@ -22,6 +22,7 @@ from agents import (
     WebSearchTool,
 )
 from agents.items import TResponseStreamEvent
+from agents.models import get_default_model_settings
 from agents.tool import (
     ApplyPatchTool,
     CustomTool,
@@ -59,11 +60,13 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         model_params: ModelActivityParameters,
         agent: Agent[Any] | None,
         current_agent: Callable[[], Agent[Any] | None] | None = None,
+        current_run_model_settings: Callable[[], ModelSettings | None] | None = None,
     ) -> None:
         self.model_name = model_name
         self.model_params = model_params
         self.agent = agent
         self._current_agent = current_agent
+        self._current_run_model_settings = current_run_model_settings
 
     def _build_activity_input(
         self,
@@ -177,6 +180,21 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         agent = self.agent
         if agent is None and self._current_agent is not None:
             agent = self._current_agent()
+
+        if self.model_name is None and agent is not None:
+            # Neither the agent nor the run named a model, so the activity's provider
+            # will choose one. Record here, against this worker's environment, whether
+            # the agent's settings are the SDK's implicit defaults for an unnamed model,
+            # plus the run-level overrides, so the activity can align the defaults with
+            # the model it resolves and then re-apply the overrides.
+            activity_input["implicit_model_settings"] = (
+                agent.model_settings == get_default_model_settings()
+            )
+            activity_input["run_model_settings"] = (
+                self._current_run_model_settings()
+                if self._current_run_model_settings is not None
+                else None
+            )
 
         if self.model_params.summary_override:
             summary = (
