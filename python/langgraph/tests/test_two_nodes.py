@@ -16,7 +16,7 @@ from pydantic import (
     field_serializer,
     model_serializer,
 )
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 from temporalio import workflow
 from temporalio.api.history.v1 import History
@@ -229,6 +229,7 @@ class Note(BaseModel):
 @dataclass
 class Computed:
     context: ComputedContext
+    pair: tuple[int, ...] = field(init=False, default=())
 
 
 @dataclass
@@ -236,6 +237,23 @@ class SecretContext(Context):
     token: Annotated[str, PlainSerializer(lambda _: "redacted", when_used="json")] = (
         "not-in-history"
     )
+
+
+@dataclass
+class TokenContext(Context):
+    token: str = "not-in-history"
+
+
+class Encoded(BaseModel):
+    model_config = ConfigDict(
+        json_encoders={Context: lambda _: {"user_id": "redacted"}}
+    )
+
+    context: Context = Field(default_factory=lambda: TokenContext(user_id="alice"))
+
+
+class HiddenItems(TypedDict):
+    message: NotRequired[Annotated[BaseMessage, Field(exclude=True)]]
 
 
 @dataclass
@@ -268,6 +286,10 @@ class ModelState(BaseModel):
         default_factory=hidden_message
     )
     note: Note = Field(default_factory=Note)
+    encoded: Encoded = Field(default_factory=Encoded)
+    hidden_items: HiddenItems = Field(
+        default_factory=lambda: HiddenItems(message=hidden_message())
+    )
     secret_context: Context = Field(
         default_factory=lambda: SecretContext(user_id="alice")
     )
@@ -287,6 +309,8 @@ async def model_node_a(state: ModelState) -> dict[str, Any]:
     message = search_message()
     context = ComputedContext(user_id="alice")
     context.label = "saved"
+    computed = Computed(context)
+    computed.pair = (3, 4)
     return {
         "answer": Answer(value=1),
         "messages": [message],
@@ -294,7 +318,7 @@ async def model_node_a(state: ModelState) -> dict[str, Any]:
         "overlap_messages": [HumanMessage(content="hi"), message],
         "root_messages": [message],
         "int_messages": {1: message},
-        "computed": Computed(context),
+        "computed": computed,
         "state_type_a": type(state).__name__,
     }
 
@@ -313,11 +337,12 @@ async def model_node_b(state: ModelState) -> dict[str, Any]:
         list(state.int_messages.values()),
         [state.envelope.message],
     ]
+    computed = state.computed
     return {
         "state_type_b": type(state).__name__,
         "answer_type_b": type(getattr(state, "answer", None)).__name__,
         "message_b": [describe(m[-1]) for m in messages],
-        "label_b": state.computed.context.label if state.computed else "",
+        "label_b": f"{computed.context.label}:{computed.pair}" if computed else "",
     }
 
 
@@ -375,7 +400,7 @@ async def test_two_nodes_pydantic_state(
         "state_type_b": "ModelState",
         "answer_type_b": "Answer",
         "message_b": ["AIMessage:search"] * 6,
-        "label_b": "saved",
+        "label_b": "saved:(3, 4)",
     }
     # Excluded and custom-serialized fields stay out of the Activity payloads.
     assert b"not-in-history" not in History(events=history.events).SerializeToString()

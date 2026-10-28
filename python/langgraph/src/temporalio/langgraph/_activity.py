@@ -265,6 +265,16 @@ def _excluded(field: FieldInfo | None, value: Any) -> bool:
     return bool(field.exclude) or (exclude_if is not None and bool(exclude_if(value)))
 
 
+def _hint_excluded(hint: Any, value: Any) -> bool:
+    """Whether a ``Field()`` in ``hint``, as in a TypedDict, leaves ``value`` out."""
+    while get_origin(hint) in (Annotated, Required, NotRequired):
+        metadata = getattr(hint, "__metadata__", ())
+        if any(isinstance(m, FieldInfo) and _excluded(m, value) for m in metadata):
+            return True
+        hint = get_args(hint)[0]
+    return False
+
+
 def _has_serializer(hint: Any) -> bool:
     """Whether ``hint``, or a tuple of hints and metadata, sets a custom serializer."""
     if isinstance(hint, (PlainSerializer, WrapSerializer)):
@@ -278,7 +288,13 @@ def _has_serializer(hint: Any) -> bool:
 
 def _custom_serialized(owner: Any, key: str | int, hint: Any) -> bool:
     """Whether Pydantic writes ``owner``'s item ``key`` with a custom serializer."""
-    decorators = getattr(type(owner), "__pydantic_decorators__", None)
+    cls: Any = type(owner)
+    config = getattr(cls, "model_config", None) or getattr(
+        cls, "__pydantic_config__", None
+    )
+    if isinstance(config, dict) and config.get("json_encoders"):
+        return True  # They apply by type anywhere in ``owner``.
+    decorators = getattr(cls, "__pydantic_decorators__", None)
     if decorators is not None:
         if decorators.model_serializers:
             return True
@@ -303,6 +319,14 @@ def _dump(value: Any) -> Any:
     cls: Any = type(value)
     try:
         return _adapter(cls).dump_python(value, mode="json")
+    except Exception:
+        return _MISSING
+
+
+def _convert(converter: PayloadConverter, value: Any, hint: Any) -> Any:
+    """Rebuild plain JSON ``value`` as ``hint`` with ``converter``, or ``_MISSING``."""
+    try:
+        return converter.from_payload(converter.to_payload(value), hint)
     except Exception:
         return _MISSING
 
@@ -499,8 +523,11 @@ class ValueTypes:
         else:
             return
         for key, item, item_hint in items:
-            # A custom serializer may leave data out, so record nothing in it.
-            if _custom_serialized(value, key, item_hint):
+            # A custom serializer or an exclusion may leave data out, so record
+            # nothing in it.
+            if _custom_serialized(value, key, item_hint) or _hint_excluded(
+                item_hint, item
+            ):
                 continue
             item_path = [*path, key]
             type_id = self._type_id(type(item))
@@ -548,10 +575,14 @@ class ValueTypes:
             if type_id is not None and type(current) is not self._classes.get(type_id):
                 return rebuild(plain, node)
             if dataclasses.is_dataclass(current) and isinstance(plain, dict):
-                # Restore saved init=False fields, as for run context.
+                # Restore saved init=False fields, with their declared types.
                 for field in dataclasses.fields(current):
                     if not field.init and field.name in plain:
-                        object.__setattr__(current, field.name, plain[field.name])
+                        saved = plain[field.name]
+                        hint = _field_hint(current, field.name)
+                        typed = _convert(converter, saved, hint)
+                        saved = saved if typed is _MISSING else typed
+                        object.__setattr__(current, field.name, saved)
             for key in _children(node):
                 item = _get(current, key)
                 item_plain = _plain_item(plain, current, key)
@@ -599,12 +630,9 @@ class ValueTypes:
                 f"Unknown value type ID: {type_id!r}. Workers must register "
                 "the same graphs and tasks."
             )
-        try:
-            return converter.from_payload(converter.to_payload(value), cls)
-        except Exception:
-            # A value the converter can't rebuild, such as a dataclass with a
-            # Protocol field, keeps its plain JSON form, as before.
-            return _MISSING
+        # A value the converter can't rebuild, such as a dataclass with a
+        # Protocol field, keeps its plain JSON form, as before.
+        return _convert(converter, value, cls)
 
 
 def wrap_activity(
