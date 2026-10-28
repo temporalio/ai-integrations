@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -79,7 +79,7 @@ class LangSmithPlugin(SimplePlugin):
             return runner
 
         @asynccontextmanager
-        async def run_context() -> AsyncIterator[None]:
+        async def run_context() -> AsyncGenerator[None, None]:
             try:
                 yield
             finally:

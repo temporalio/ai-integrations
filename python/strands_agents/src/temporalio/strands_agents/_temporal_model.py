@@ -5,18 +5,25 @@ from typing import Any
 
 from strands.models import Model
 from strands.types.content import Messages, SystemContentBlock
+from strands.types.exceptions import ContextWindowOverflowException
 from strands.types.streaming import StreamEvent
 from strands.types.tools import ToolChoice, ToolSpec
 
 from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
+from ._bytes_values import decode_event
 from ._model_activity import (
     ModelActivity,
     _InvokeModelInput,
     _StreamingInvokeModelInput,
 )
+
+# Patch id for rebuilding ContextWindowOverflowException from a failed model Activity.
+# Never change it: it is recorded in histories as a marker.
+_CONTEXT_WINDOW_OVERFLOW_PATCH = "strands-agents.context-window-overflow-recovery"
 
 
 def _filter_serializable(state: dict[str, Any]) -> dict[str, Any]:
@@ -114,35 +121,51 @@ class TemporalModel(Model):
     ) -> AsyncIterable[StreamEvent]:
         """Run the model via the registered Temporal activity and yield events."""
         clean_state = _filter_serializable(invocation_state) if invocation_state else {}
-        if self._streaming_topic is not None:
-            events = await workflow.execute_activity_method(
-                ModelActivity.invoke_model_streaming,
-                _StreamingInvokeModelInput(
-                    model_name=self._model_name,
-                    messages=messages,
-                    invocation_state=clean_state,
-                    tool_specs=tool_specs,
-                    system_prompt=system_prompt,
-                    tool_choice=tool_choice,
-                    system_prompt_content=system_prompt_content,
-                    streaming_topic=self._streaming_topic,
-                    streaming_batch_interval_seconds=self._streaming_batch_interval.total_seconds(),
-                ),
-                **self._options,
-            )
-        else:
-            events = await workflow.execute_activity_method(
-                ModelActivity.invoke_model,
-                _InvokeModelInput(
-                    model_name=self._model_name,
-                    messages=messages,
-                    invocation_state=clean_state,
-                    tool_specs=tool_specs,
-                    system_prompt=system_prompt,
-                    tool_choice=tool_choice,
-                    system_prompt_content=system_prompt_content,
-                ),
-                **self._options,
-            )
+        try:
+            if self._streaming_topic is not None:
+                events = await workflow.execute_activity_method(
+                    ModelActivity.invoke_model_streaming,
+                    _StreamingInvokeModelInput(
+                        model_name=self._model_name,
+                        messages=messages,
+                        invocation_state=clean_state,
+                        tool_specs=tool_specs,
+                        system_prompt=system_prompt,
+                        tool_choice=tool_choice,
+                        system_prompt_content=system_prompt_content,
+                        streaming_topic=self._streaming_topic,
+                        streaming_batch_interval_seconds=self._streaming_batch_interval.total_seconds(),
+                    ),
+                    **self._options,
+                )
+            else:
+                events = await workflow.execute_activity_method(
+                    ModelActivity.invoke_model,
+                    _InvokeModelInput(
+                        model_name=self._model_name,
+                        messages=messages,
+                        invocation_state=clean_state,
+                        tool_specs=tool_specs,
+                        system_prompt=system_prompt,
+                        tool_choice=tool_choice,
+                        system_prompt_content=system_prompt_content,
+                    ),
+                    **self._options,
+                )
+        except ActivityError as error:
+            # Model providers raise ContextWindowOverflowException when the prompt is
+            # too long, and Strands recovers by reducing the conversation and retrying.
+            # The activity fails with a typed ApplicationError, so rebuild the Strands
+            # exception here, where Strands' event loop can catch it. Histories recorded
+            # before this change let the ActivityError propagate, and a Workflow may have
+            # handled it by scheduling other work, so they keep that behavior.
+            cause = error.__cause__
+            if (
+                isinstance(cause, ApplicationError)
+                and cause.type == ContextWindowOverflowException.__name__
+                and workflow.patched(_CONTEXT_WINDOW_OVERFLOW_PATCH)
+            ):
+                raise ContextWindowOverflowException(cause.message) from error
+            raise
         for event in events:
-            yield event
+            yield decode_event(event)

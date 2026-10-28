@@ -1,0 +1,20 @@
+# Schema: ../../AGENTS.md#repository-invariants
+
+[plugin]
+name = "google-adk"
+language = "java"
+coordinate = "io.temporal:google-adk"
+registry = "maven"
+root-api = "io.temporal.googleadk"
+maturity = "public-preview"
+docs = "https://github.com/temporalio/ai-integrations/tree/main/java/google-adk"
+
+[release]
+allow-final = true
+
+[ci]
+runtime-versions = ["17", "25"]
+
+[smoke]
+dependencies = ["io.temporal:temporal-sdk:1.40.0"]
+imports = ["io.temporal.googleadk.GoogleAdkPlugin"]

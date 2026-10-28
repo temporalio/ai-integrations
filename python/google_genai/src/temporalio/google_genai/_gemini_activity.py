@@ -8,8 +8,10 @@ they never appear in workflow event history.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from contextlib import AsyncExitStack
+import base64
+import io
+from collections.abc import Generator, Sequence
+from contextlib import AsyncExitStack, contextmanager
 from datetime import timedelta
 from typing import Any, Callable
 
@@ -66,6 +68,62 @@ def _classify_api_error(err: genai_errors.APIError) -> ApplicationError:
         type=type(err).__name__,
         non_retryable=not retryable,
     )
+
+
+def _classify_status_error(err: BaseException) -> ApplicationError | None:
+    """Map a status error from the vendored Interactions/Agents client, or None.
+
+    The Interactions and Agents resources use google-genai's vendored client,
+    whose ``APIStatusError`` family (``BadRequestError``, ``RateLimitError``, ...)
+    does not derive from ``genai.errors.APIError`` and carries the HTTP status
+    in ``status_code`` rather than ``code``. The classes live in a private
+    module, so match on the attribute instead of importing them. Errors without
+    an HTTP error status (connection failures, timeouts) return None and stay
+    retryable. The retryable set is the one `_classify_api_error` uses.
+    """
+    status = getattr(err, "status_code", None)
+    if isinstance(status, bool) or not isinstance(status, int) or status < 400:
+        return None
+    return ApplicationError(
+        str(err),
+        type=type(err).__name__,
+        non_retryable=status not in _RETRYABLE_HTTP_STATUS,
+    )
+
+
+@contextmanager
+def _classify_errors() -> Generator[None, None, None]:
+    """Raise Gemini API failures as ``ApplicationError`` classified for retry.
+
+    Covers both error families the SDK raises: ``genai.errors.APIError`` (Files
+    and File Search stores) and the vendored client's status errors
+    (Interactions and Agents).
+    """
+    try:
+        yield
+    except genai_errors.APIError as err:
+        raise _classify_api_error(err) from err
+    except Exception as err:
+        classified = _classify_status_error(err)
+        if classified is None:
+            raise
+        raise classified from err
+
+
+def _upload_source(
+    file_base64: str | None, file_bytes: bytes | None, file_path: str | None
+) -> Any:
+    """Pick what to hand the SDK's upload: the in-memory content or the path.
+
+    ``file_base64`` is the content as the plugin now sends it. ``file_bytes`` is
+    the field earlier versions used, which activities scheduled by them still
+    carry.
+    """
+    if file_base64 is not None:
+        return io.BytesIO(base64.b64decode(file_base64))
+    if file_bytes is not None:
+        return io.BytesIO(file_bytes)
+    return file_path
 
 
 async def _drain_interaction_stream(
@@ -186,25 +244,24 @@ class GeminiApiCaller:
             req: _GeminiUploadFileRequest,
         ) -> types.File:
             """Upload a file using the real genai.Client on the worker."""
-            if req.file_bytes is not None:
-                import io
+            file_arg = _upload_source(req.file_base64, req.file_bytes, req.file_path)
 
-                file_arg: Any = io.BytesIO(req.file_bytes)
-            else:
-                file_arg = req.file_path
-
-            return await self._client.aio.files.upload(file=file_arg, config=req.config)
+            with _classify_errors():
+                return await self._client.aio.files.upload(
+                    file=file_arg, config=req.config
+                )
 
         @activity.defn
         async def gemini_files_download(
             req: _GeminiDownloadFileRequest,
         ) -> bytes | None:
             """Download a file using the real genai.Client on the worker."""
-            return await self._client.aio.files.download(
-                file=req.file,
-                destination=req.destination,
-                config=req.config,
-            )
+            with _classify_errors():
+                return await self._client.aio.files.download(
+                    file=req.file,
+                    destination=req.destination,
+                    config=req.config,
+                )
 
         @activity.defn
         async def gemini_files_register(
@@ -224,38 +281,36 @@ class GeminiApiCaller:
                     "Pass extra_credentials to GoogleGenAIPlugin or initialize "
                     "the genai.Client with credentials."
                 )
-            return await self._client.aio.files.register_files(
-                auth=auth,
-                uris=req.uris,
-                config=req.config,
-            )
+            with _classify_errors():
+                return await self._client.aio.files.register_files(
+                    auth=auth,
+                    uris=req.uris,
+                    config=req.config,
+                )
 
         @activity.defn
         async def gemini_file_search_stores_upload(
             req: _GeminiUploadToFileSearchStoreRequest,
         ) -> types.UploadToFileSearchStoreOperation:
             """Upload a file to a file search store on the worker."""
-            if req.file_bytes is not None:
-                import io
+            file_arg = _upload_source(req.file_base64, req.file_bytes, req.file_path)
 
-                file_arg: Any = io.BytesIO(req.file_bytes)
-            else:
-                file_arg = req.file_path
-
-            return (
-                await self._client.aio.file_search_stores.upload_to_file_search_store(
-                    file_search_store_name=req.file_search_store_name,
-                    file=file_arg,
-                    config=req.config,
+            with _classify_errors():
+                return await (
+                    self._client.aio.file_search_stores.upload_to_file_search_store(
+                        file_search_store_name=req.file_search_store_name,
+                        file=file_arg,
+                        config=req.config,
+                    )
                 )
-            )
 
         @activity.defn
         async def gemini_interactions_create(
             req: _GeminiInteractionRequest,
         ) -> dict[str, Any]:
             """Create an interaction using the real genai.Client on the worker."""
-            interaction = await self._client.aio.interactions.create(**req.params)
+            with _classify_errors():
+                interaction = await self._client.aio.interactions.create(**req.params)
             assert isinstance(interaction, Interaction)
             return interaction.model_dump(by_alias=True, exclude_none=True, mode="json")
 
@@ -264,18 +319,22 @@ class GeminiApiCaller:
             req: _GeminiInteractionRequest,
         ) -> _GeminiInteractionStreamedResponse:
             """Create a streamed interaction, collecting all SSE events."""
-            stream = await self._client.aio.interactions.create(
-                stream=True, **req.params
-            )
-            assert not isinstance(stream, Interaction)
-            return await _drain_interaction_stream(stream)
+            with _classify_errors():
+                stream = await self._client.aio.interactions.create(
+                    stream=True, **req.params
+                )
+                assert not isinstance(stream, Interaction)
+                return await _drain_interaction_stream(stream)
 
         @activity.defn
         async def gemini_interactions_get(
             req: _GeminiInteractionIdRequest,
         ) -> dict[str, Any]:
             """Get an interaction using the real genai.Client on the worker."""
-            interaction = await self._client.aio.interactions.get(req.id, **req.params)
+            with _classify_errors():
+                interaction = await self._client.aio.interactions.get(
+                    req.id, **req.params
+                )
             return interaction.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         @activity.defn
@@ -283,27 +342,30 @@ class GeminiApiCaller:
             req: _GeminiInteractionIdRequest,
         ) -> _GeminiInteractionStreamedResponse:
             """Get a streamed interaction, collecting all SSE events."""
-            stream = await self._client.aio.interactions.get(
-                req.id, stream=True, **req.params
-            )
-            assert not isinstance(stream, Interaction)
-            return await _drain_interaction_stream(stream)
+            with _classify_errors():
+                stream = await self._client.aio.interactions.get(
+                    req.id, stream=True, **req.params
+                )
+                assert not isinstance(stream, Interaction)
+                return await _drain_interaction_stream(stream)
 
         @activity.defn
         async def gemini_interactions_delete(
             req: _GeminiInteractionIdRequest,
         ) -> Any:
             """Delete an interaction using the real genai.Client on the worker."""
-            return await self._client.aio.interactions.delete(req.id, **req.params)
+            with _classify_errors():
+                return await self._client.aio.interactions.delete(req.id, **req.params)
 
         @activity.defn
         async def gemini_interactions_cancel(
             req: _GeminiInteractionIdRequest,
         ) -> dict[str, Any]:
             """Cancel an interaction using the real genai.Client on the worker."""
-            interaction = await self._client.aio.interactions.cancel(
-                req.id, **req.params
-            )
+            with _classify_errors():
+                interaction = await self._client.aio.interactions.cancel(
+                    req.id, **req.params
+                )
             return interaction.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         @activity.defn
@@ -311,7 +373,8 @@ class GeminiApiCaller:
             req: _GeminiInteractionRequest,
         ) -> dict[str, Any]:
             """Create a managed agent using the real genai.Client on the worker."""
-            agent = await self._client.aio.agents.create(**req.params)
+            with _classify_errors():
+                agent = await self._client.aio.agents.create(**req.params)
             return agent.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         @activity.defn
@@ -319,7 +382,8 @@ class GeminiApiCaller:
             req: _GeminiInteractionRequest,
         ) -> dict[str, Any]:
             """List managed agents using the real genai.Client on the worker."""
-            response = await self._client.aio.agents.list(**req.params)
+            with _classify_errors():
+                response = await self._client.aio.agents.list(**req.params)
             return response.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         @activity.defn
@@ -327,7 +391,8 @@ class GeminiApiCaller:
             req: _GeminiInteractionIdRequest,
         ) -> dict[str, Any]:
             """Get a managed agent using the real genai.Client on the worker."""
-            agent = await self._client.aio.agents.get(req.id, **req.params)
+            with _classify_errors():
+                agent = await self._client.aio.agents.get(req.id, **req.params)
             return agent.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         @activity.defn
@@ -335,7 +400,8 @@ class GeminiApiCaller:
             req: _GeminiInteractionIdRequest,
         ) -> dict[str, Any]:
             """Delete a managed agent using the real genai.Client on the worker."""
-            response = await self._client.aio.agents.delete(req.id, **req.params)
+            with _classify_errors():
+                response = await self._client.aio.agents.delete(req.id, **req.params)
             return response.model_dump(by_alias=True, exclude_none=True, mode="json")
 
         return [
