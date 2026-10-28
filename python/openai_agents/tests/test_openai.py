@@ -364,11 +364,26 @@ class HeldService:
 
 @workflow.defn
 class HeldWorkflow:
-    """Backs the held operation and runs until it is cancelled."""
+    """Backs the held operation and runs until it is cancelled.
+
+    When its name ends in ``-slow``, a cancelled run ends only after the ``release`` Signal.
+    """
+
+    def __init__(self) -> None:
+        self.released = False
+
+    @workflow.signal
+    def release(self) -> None:
+        self.released = True
 
     @workflow.run
     async def run(self, name: str) -> str:
-        await workflow.wait_condition(lambda: False)
+        try:
+            await workflow.wait_condition(lambda: False)
+        except asyncio.CancelledError:
+            if name.endswith("-slow"):
+                await workflow.wait_condition(lambda: self.released)
+            raise
         return name
 
 
@@ -383,6 +398,14 @@ class HeldServiceHandler:
 
 @workflow.defn
 class NexusToolCancelWorkflow:
+    def __init__(self) -> None:
+        self.run_task: asyncio.Task[Any] | None = None
+
+    @workflow.signal
+    def cancel_run(self) -> None:
+        assert self.run_task
+        self.run_task.cancel()
+
     @workflow.run
     async def run(self, question: str) -> str:
         agent = Agent[str](
@@ -396,7 +419,10 @@ class NexusToolCancelWorkflow:
                 ),
             ],
         )
-        result = await Runner.run(starting_agent=agent, input=question)
+        self.run_task = asyncio.create_task(
+            Runner.run(starting_agent=agent, input=question)
+        )
+        result = await self.run_task
         return result.final_output
 
 
@@ -613,11 +639,16 @@ async def test_nexus_tool_workflow(client: Client, env: WorkflowEnvironment):
 
 
 @pytest.mark.requires_local_server
-async def test_nexus_tool_cancel_workflow(client: Client, env: WorkflowEnvironment):
+@pytest.mark.parametrize("cancel_run_first", [False, True])
+async def test_nexus_tool_cancel_workflow(
+    client: Client, env: WorkflowEnvironment, cancel_run_first: bool
+):
     if env.supports_time_skipping:
         pytest.skip("Nexus tests don't work with time-skipping server")
 
-    held_id = f"held-{uuid.uuid4()}"
+    # With cancel_run_first, the Workflow cancels its run, and is itself cancelled while the
+    # operation delays its cancellation until released.
+    held_id = f"held-{uuid.uuid4()}" + ("-slow" if cancel_run_first else "")
     async with AgentEnvironment(
         model=TestModel.returning_responses(
             [ResponseBuilders.tool_call(json.dumps({"input": held_id}), "hold")]
@@ -662,7 +693,48 @@ async def test_nexus_tool_cancel_workflow(client: Client, env: WorkflowEnvironme
 
             await assert_eventually(operation_started)
             try:
-                await workflow_handle.cancel()
+                if cancel_run_first:
+                    await workflow_handle.signal(NexusToolCancelWorkflow.cancel_run)
+
+                    async def cancel_request_delivered() -> None:
+                        events = [
+                            e async for e in workflow_handle.fetch_history_events()
+                        ]
+                        assert any(
+                            e.HasField(
+                                "nexus_operation_cancel_request_completed_event_attributes"
+                            )
+                            for e in events
+                        )
+
+                    await assert_eventually(cancel_request_delivered)
+                    await workflow_handle.cancel()
+
+                    async def workflow_cancel_handled() -> None:
+                        events = [
+                            e async for e in workflow_handle.fetch_history_events()
+                        ]
+                        requested = [
+                            i
+                            for i, e in enumerate(events)
+                            if e.HasField(
+                                "workflow_execution_cancel_requested_event_attributes"
+                            )
+                        ]
+                        assert requested and any(
+                            e.HasField("workflow_task_completed_event_attributes")
+                            for e in events[requested[0] :]
+                        )
+
+                    await assert_eventually(workflow_cancel_handled)
+                    # The second cancellation does not end the wait for the operation, which
+                    # has not finished cancelling.
+                    assert (await workflow_handle.describe()).status == (
+                        WorkflowExecutionStatus.RUNNING
+                    )
+                    await held_handle.signal(HeldWorkflow.release)
+                else:
+                    await workflow_handle.cancel()
                 with pytest.raises(WorkflowFailureError) as err:
                     await workflow_handle.result()
                 assert isinstance(err.value.cause, CancelledError)

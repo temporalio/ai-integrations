@@ -75,9 +75,14 @@ async def _wait_for_tool_operations(operations: set[asyncio.Future[None]]) -> No
     Workflow would then close in the same Workflow Task, before Temporal delivers the cancel
     requests of the tools' Nexus operations. Waiting keeps their cancellation type, which
     is ``WAIT_COMPLETED``, as when Workflow code calls ``execute_operation`` itself.
+    A further cancel request, such as the Workflow's after the caller cancelled the run,
+    does not end the wait; the caller re-raises the run's cancellation afterwards.
     """
     if operations and workflow.patched(_WAIT_FOR_NEXUS_TOOL_CANCEL_PATCH):
-        await asyncio.wait(list(operations))
+        pending = list(operations)
+        while not all(operation.done() for operation in pending):
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait(pending)
 
 
 # Recursively replace models in all agents
