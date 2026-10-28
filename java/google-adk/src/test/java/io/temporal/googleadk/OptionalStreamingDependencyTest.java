@@ -12,6 +12,8 @@ import io.temporal.googleadk.testing.ScriptedModel;
 import io.temporal.testing.TestActivityEnvironment;
 import io.temporal.testing.TestEnvironmentOptions;
 import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
@@ -19,13 +21,16 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 
 class OptionalStreamingDependencyTest {
   @Test
   @Timeout(30)
-  void executesTheDefaultModelActivityWithoutWorkflowStreamsAtRuntime() throws Exception {
-    String original = System.getProperty("googleadk.test.classpath");
-    assertNotNull(original);
+  void executesTheDefaultModelActivityWithoutWorkflowStreamsAtRuntime(@TempDir Path temporary)
+      throws Exception {
+    String classpathFile = System.getProperty("googleadk.test.classpath-file");
+    assertNotNull(classpathFile);
+    String original = Files.readString(Path.of(classpathFile), StandardCharsets.UTF_8);
     String isolated =
         Arrays.stream(original.split(Pattern.quote(File.pathSeparator)))
             .filter(
@@ -36,30 +41,36 @@ class OptionalStreamingDependencyTest {
                         .startsWith("temporal-workflowstreams-"))
             .collect(Collectors.joining(File.pathSeparator));
     assertNotEquals(original, isolated);
+    String repeatedEntry = isolated.split(Pattern.quote(File.pathSeparator))[0];
+    while (isolated.length() < 40_000) {
+      isolated += File.pathSeparator + repeatedEntry;
+    }
+    Path arguments = temporary.resolve("probe.args");
+    Files.writeString(
+        arguments,
+        "-cp\n\""
+            + isolated.replace("\\", "\\\\").replace("\"", "\\\"")
+            + "\"\n"
+            + DefaultActivityProbe.class.getName()
+            + "\n",
+        StandardCharsets.UTF_8);
+    Path output = temporary.resolve("probe.log");
     String executable = System.getProperty("os.name").startsWith("Windows") ? "java.exe" : "java";
     Process process =
         new ProcessBuilder(
                 Path.of(System.getProperty("java.home"), "bin", executable).toString(),
-                "-cp",
-                isolated,
-                DefaultActivityProbe.class.getName())
+                "@" + arguments)
             .redirectErrorStream(true)
+            .redirectOutput(output.toFile())
             .start();
     try {
-      assertTrue(process.waitFor(20, TimeUnit.SECONDS));
-      assertEquals(
-          0,
-          process.exitValue(),
-          () -> {
-            try {
-              return new String(
-                  process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-            } catch (java.io.IOException e) {
-              return e.toString();
-            }
-          });
+      assertTrue(process.waitFor(20, TimeUnit.SECONDS), "consumer timed out: " + output);
+      assertEquals(0, process.exitValue(), Files.readString(output, StandardCharsets.UTF_8));
     } finally {
-      process.destroyForcibly();
+      if (process.isAlive()) {
+        process.destroyForcibly();
+        process.waitFor(5, TimeUnit.SECONDS);
+      }
     }
   }
 

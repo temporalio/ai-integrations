@@ -6,7 +6,10 @@ plugins {
 
 test {
     doFirst {
-        systemProperty 'googleadk.test.classpath', sourceSets.test.runtimeClasspath.asPath
+        def classpathFile = layout.buildDirectory.file('test-runtime-classpath.txt').get().asFile
+        classpathFile.parentFile.mkdirs()
+        classpathFile.setText(sourceSets.test.runtimeClasspath.asPath, 'UTF-8')
+        systemProperty 'googleadk.test.classpath-file', classpathFile.absolutePath
     }
 }
 
