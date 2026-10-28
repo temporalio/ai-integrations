@@ -6,6 +6,7 @@ from strands.types.tools import AgentTool, ToolGenerator, ToolResult, ToolSpec, 
 from temporalio import workflow
 from temporalio.exceptions import ActivityError
 
+from ._bytes_values import decode_tool_result
 from ._temporal_activity_tool import _activity_error_event
 from ._temporal_mcp_client import _CallToolArgs, _MCPToolInfo
 
@@ -70,4 +71,4 @@ class TemporalMCPTool(AgentTool):
         except ActivityError as error:
             yield _activity_error_event(tool_use["toolUseId"], error)
             return
-        yield ToolResultEvent(result)
+        yield ToolResultEvent(decode_tool_result(result))
