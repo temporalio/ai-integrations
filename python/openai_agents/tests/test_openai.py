@@ -1165,6 +1165,37 @@ async def test_carried_input_items(client: Client):
             assert result == "test"
 
 
+@workflow.defn
+class InputIteratorWorkflow:
+    """Runs a turn on input whose content the Workflow gives as an iterator."""
+
+    @workflow.run
+    async def run(self) -> str:
+        content = iter([{"type": "input_text", "text": "Hi"}])
+        item: dict[str, Any] = {"content": content, "role": "user"}
+        result = await Runner.run(
+            Agent(name="Assistant", instructions="Answer."),
+            cast(list[TResponseInputItem], [item]),
+        )
+        kept = item["content"] is content
+        return f"{result.final_output}; content kept: {kept}"
+
+
+async def test_input_iterator_kept(client: Client):
+    # The framework can copy this iterator, so the runner leaves it in place.
+    async with AgentEnvironment(model=hello_mock_model()) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, InputIteratorWorkflow) as worker:
+            result = await client.execute_workflow(
+                InputIteratorWorkflow.run,
+                id=f"input-iterator-workflow-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            assert result == "test; content kept: True"
+
+
 class InputGuardrailModel(Model):
     __test__ = False
     responses: list[ModelResponse] = [

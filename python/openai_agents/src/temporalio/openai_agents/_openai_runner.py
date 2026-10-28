@@ -1,8 +1,9 @@
 import dataclasses
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Iterable
 from typing import Any, Callable
 
+import pydantic
 from agents import (
     Agent,
     AgentsException,
@@ -163,27 +164,33 @@ def _coerce_run_config(value: object) -> RunConfig:
 
 _LIST_INPUT_ITERATORS_PATCH = "openai_agents.list-input-iterators"
 
+# The iterator type pydantic decodes ``Iterable`` fields to. It cannot be
+# copied, and pydantic_core does not export it.
+_DecodedIterator: type[Iterable[Any]] = type(
+    pydantic.TypeAdapter(Iterable[Any]).validate_python(())
+)
 
-def _has_iterator(value: Any) -> bool:
-    if isinstance(value, Iterator):
+
+def _has_decoded_iterator(value: Any) -> bool:
+    if isinstance(value, _DecodedIterator):
         return True
     if isinstance(value, dict):
-        return any(_has_iterator(item) for item in value.values())
+        return any(_has_decoded_iterator(item) for item in value.values())
     if isinstance(value, list):
-        return any(_has_iterator(item) for item in value)
+        return any(_has_decoded_iterator(item) for item in value)
     return False
 
 
-def _list_iterators(value: Any) -> Any:
-    """Replace iterators in ``value`` with lists, in place, and return it."""
-    if isinstance(value, Iterator):
-        return [_list_iterators(item) for item in value]
+def _list_decoded_iterators(value: Any) -> Any:
+    """Replace decoded iterators in ``value`` with lists, in place, and return it."""
+    if isinstance(value, _DecodedIterator):
+        return [_list_decoded_iterators(item) for item in value]
     if isinstance(value, dict):
         for key, item in value.items():
-            value[key] = _list_iterators(item)
+            value[key] = _list_decoded_iterators(item)
     elif isinstance(value, list):
         for index, item in enumerate(value):
-            value[index] = _list_iterators(item)
+            value[index] = _list_decoded_iterators(item)
     return value
 
 
@@ -194,14 +201,15 @@ def _make_input_copyable(input: object) -> None:
     message's ``content``, as one-shot iterators. The framework deep-copies the
     input of every run and cannot copy them, so the run raised ``TypeError``.
     The items are rebuilt in place, so the caller's copy does not keep a used
-    iterator. Runs that started before this change keep the old behavior.
+    iterator. Other iterators, which the framework can copy, are left as they
+    are. Runs that started before this change keep the old behavior.
     """
     if (
         isinstance(input, list)
-        and _has_iterator(input)
+        and _has_decoded_iterator(input)
         and workflow.patched(_LIST_INPUT_ITERATORS_PATCH)
     ):
-        _list_iterators(input)
+        _list_decoded_iterators(input)
 
 
 class TemporalOpenAIRunner(AgentRunner):
