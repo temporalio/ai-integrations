@@ -8,6 +8,8 @@ from agents import (
     AgentsException,
     FunctionTool,
     Handoff,
+    ModelProvider,
+    MultiProvider,
     RunConfig,
     RunContextWrapper,
     RunResult,
@@ -30,6 +32,7 @@ from temporalio.openai_agents._errors import (
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._temporal_model_provider import (
     _current_run_model_settings,
+    _TemporalModelProvider,
     capture_scope,
     install_model_provider,
 )
@@ -139,6 +142,39 @@ def _has_sandbox_agent(agent: Agent[Any], seen: set[int] | None = None) -> bool:
     return False
 
 
+# Runs without this patch marker started before the plugin refused
+# ``RunConfig.model_provider``. They keep the old behavior, the Worker's provider, so that
+# they replay.
+_REFUSE_RUN_MODEL_PROVIDER_PATCH = "openai_agents.refuse-run-model-provider"
+
+
+def _is_default_model_provider(provider: ModelProvider) -> bool:
+    """Whether ``provider`` is an unconfigured ``MultiProvider``, as ``RunConfig()`` makes."""
+    if type(provider) is not MultiProvider:
+        return False
+    return _multi_provider_settings(provider) == _multi_provider_settings(
+        MultiProvider()
+    )
+
+
+def _multi_provider_settings(provider: MultiProvider) -> dict[str, Any]:
+    # Caches filled on use are not settings.
+    caches = {"_fallback_providers", "_ws_model_cache_by_loop"}
+    settings: dict[str, Any] = {
+        name: value
+        for name, value in vars(provider).items()
+        if name not in caches and name != "openai_provider"
+    }
+    openai_settings = vars(provider.openai_provider)
+    if "_stored_api_key" in openai_settings:
+        # No client was passed, so ``_client`` caches the one built on first use.
+        caches.add("_client")
+    settings["openai_provider"] = {
+        name: value for name, value in openai_settings.items() if name not in caches
+    }
+    return settings
+
+
 def _coerce_run_config(value: object) -> RunConfig:
     """openai-agents >= 0.19 also accepts a plain dict for ``run_config``.
 
@@ -234,6 +270,21 @@ class TemporalOpenAIRunner(AgentRunner):
                     run_config.model, model_params=self.model_params, agent=None
                 ),
             )
+
+        # Model calls run in an Activity on the Worker's provider, so a provider set on the
+        # run would be silently ignored. A nested run, such as an agent used as a tool,
+        # inherits the plugin's provider.
+        if not isinstance(
+            run_config.model_provider, _TemporalModelProvider
+        ) and not _is_default_model_provider(run_config.model_provider):
+            if workflow.patched(_REFUSE_RUN_MODEL_PROVIDER_PATCH):
+                raise ValueError(
+                    "Temporal workflows do not support RunConfig.model_provider. Model "
+                    "calls use the provider set on the Worker with "
+                    "OpenAIAgentsPlugin(model_provider=...). To use several providers, "
+                    "set a MultiProvider with a prefix map there and choose a provider "
+                    "by model name."
+                )
 
         run_config = install_model_provider(self.model_params, run_config)
 
