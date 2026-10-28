@@ -4,9 +4,11 @@ import { helpers } from '@temporalio/test-helpers';
 import { OpenAIAgentsPlugin, OpenAIAgentsTraceClientInterceptor, SandboxClientProvider } from '..';
 import { installAgentSdkCollector } from './helpers/openai-agents-spans';
 import { makeTestFunction } from './helpers/test-fn';
-import { FakeModelProvider, textResponse, toolCallResponse } from './stubs/openai-agents';
+import { FakeModelProvider, handoffResponse, textResponse, toolCallResponse } from './stubs/openai-agents';
 import { FakeSandboxClient, FakeSandboxSession } from './stubs/sandbox-fakes';
 import {
+  customHandoffSandboxAgentWithoutConfigWorkflow,
+  customHandoffSandboxToolWorkflow,
   sandboxAgentWorkflow,
   sandboxApprovalResumeWorkflow,
   sandboxArchiveLimitsWorkflow,
@@ -222,4 +224,44 @@ test('addTemporalSpans: sandbox exec emits sandbox:* spans carrying only safe me
   } finally {
     await agentSdk.teardown();
   }
+});
+
+for (const inGraph of [false, true]) {
+  test(`A custom Handoff target ${inGraph ? 'also in the handoff graph' : 'returned only by the callback'} gets the sandbox config`, async (t) => {
+    const { createWorker, executeWorkflow } = helpers(t);
+    const session = new FakeSandboxSession();
+    const client = new FakeSandboxClient(session);
+    const worker = await createWorker({
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider([
+            handoffResponse('transfer_to_desk'),
+            toolCallResponse('ask_sandbox', { input: 'go' }),
+            toolCallResponse('run_command', { cmd: 'echo hello' }),
+            textResponse('sandbox done'),
+            textResponse('vip answer'),
+          ]),
+          sandboxClientProviders: [new SandboxClientProvider('fake', client)],
+        }),
+      ],
+    });
+
+    await worker.runUntil(async () => {
+      t.is(await executeWorkflow(customHandoffSandboxToolWorkflow, { args: [inGraph] }), 'vip: vip answer');
+    });
+    t.is(session.execCalls[0]?.cmd, 'echo hello');
+  });
+}
+
+test('A custom Handoff returning a SandboxAgent without runConfig.sandbox fails the Workflow', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([handoffResponse('transfer_to_desk')]) })],
+  });
+
+  await worker.runUntil(async () => {
+    const err = await t.throwsAsync(executeWorkflow(customHandoffSandboxAgentWithoutConfigWorkflow));
+    t.regex(String((err as any)?.cause?.message), /runConfig\.sandbox is not configured/);
+    t.is((err as any)?.cause?.type, 'SandboxConfigurationError');
+  });
 });

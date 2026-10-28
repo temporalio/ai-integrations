@@ -1,7 +1,6 @@
 import {
   type Agent,
   type AgentInputItem,
-  Handoff,
   MemorySession,
   Runner,
   RunState,
@@ -17,7 +16,7 @@ import {
   type StreamedRunResult,
   type TracingConfig,
 } from '@openai/agents-core';
-import { SandboxAgent, type SandboxRunConfig } from '@openai/agents-core/sandbox';
+import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import {
   DEFAULT_MODEL_ACTIVITY_OPTIONS,
@@ -27,13 +26,11 @@ import {
   type SerializableModelActivityOptions,
 } from '../common/model-activity-options';
 import { unwrapTemporalFailure } from '../common/errors';
-import { convertAgent } from './convert-agent';
+import { convertAgent, requireSandboxRunConfig } from './convert-agent';
 import { TemporalSandboxClient } from './sandbox-client';
 import { ensureTracingProcessorRegistered } from './tracing';
 import { flushOpenSpans } from './agent-sink-processor';
 import { getCurrentPluginConfig } from './plugin-config-store';
-
-const agentAsToolSandboxConfig = Symbol.for('@temporalio/openai-agents/agentAsToolSandboxConfig');
 
 export interface TemporalRunOptions<TContext = undefined> {
   /** Run context passed to agents and tools */
@@ -133,34 +130,13 @@ function definedFields<T extends object>(obj: T | undefined): Partial<T> {
   return result;
 }
 
-/** Whether a `SandboxAgent` is reachable from `agent` through its handoff graph. */
-function hasSandboxAgent(agent: Agent<any, any>, seen: Set<Agent<any, any>> = new Set()): boolean {
-  if (agent instanceof SandboxAgent) return true;
-  if (seen.has(agent)) return false;
-  seen.add(agent);
-  for (const handoff of agent.handoffs ?? []) {
-    const target = handoff instanceof Handoff ? handoff.agent : handoff;
-    if (hasSandboxAgent(target, seen)) return true;
-  }
-  return false;
-}
-
 /**
  * `runConfig.sandbox.client` must be a `TemporalSandboxClient` so every sandbox
  * operation is dispatched as an Activity rather than run inline in the Workflow.
  */
 function validateSandboxRunConfig(agent: Agent<any, any>, sandbox: SandboxRunConfig | undefined): void {
-  if (!hasSandboxAgent(agent) && sandbox === undefined) return;
-  if (sandbox === undefined) {
-    throw ApplicationFailure.create({
-      message:
-        'A SandboxAgent was provided but runConfig.sandbox is not configured. ' +
-        'Set runConfig.sandbox with a client created via temporalSandboxClient(name) ' +
-        'from @temporalio/openai-agents/workflow.',
-      type: 'SandboxConfigurationError',
-      nonRetryable: true,
-    });
-  }
+  requireSandboxRunConfig(agent, sandbox);
+  if (sandbox === undefined) return;
   if (sandbox.client == null) {
     throw ApplicationFailure.create({
       message:
@@ -178,26 +154,6 @@ function validateSandboxRunConfig(agent: Agent<any, any>, sandbox: SandboxRunCon
       type: 'SandboxConfigurationError',
       nonRetryable: true,
     });
-  }
-}
-
-function propagateAgentToolSandboxConfig(
-  agent: Agent<any, any>,
-  sandbox: SandboxRunConfig,
-  seen: Set<Agent<any, any>> = new Set()
-): void {
-  if (seen.has(agent)) return;
-  seen.add(agent);
-  agent.tools = agent.tools.map((tool) => {
-    if (tool.type !== 'function') return tool;
-    const configureSandbox = (
-      tool as typeof tool & { [agentAsToolSandboxConfig]?: (sandbox: SandboxRunConfig) => typeof tool }
-    )[agentAsToolSandboxConfig];
-    if (typeof configureSandbox !== 'function') return tool;
-    return configureSandbox(sandbox);
-  });
-  for (const handoff of agent.handoffs ?? []) {
-    propagateAgentToolSandboxConfig(handoff instanceof Handoff ? handoff.agent : handoff, sandbox, seen);
   }
 }
 
@@ -271,10 +227,7 @@ export class TemporalOpenAIRunner {
 
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
-    const converted = convertAgent(agent, this.modelParams, undefined, modelOverride);
-    if (options?.runConfig?.sandbox !== undefined) {
-      propagateAgentToolSandboxConfig(converted, options.runConfig.sandbox);
-    }
+    const converted = convertAgent(agent, this.modelParams, undefined, modelOverride, options?.runConfig?.sandbox);
 
     let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
     if (input instanceof RunState) {
