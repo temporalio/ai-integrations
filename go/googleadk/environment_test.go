@@ -39,6 +39,22 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// Only initial provisioning uses retries. The SDK loses the process handle
+// after a readiness failure, so retrying that path would leak another server.
+func startDevServerWithRetry(start func() (*testsuite.DevServer, error)) (*testsuite.DevServer, error) {
+	var startupErr error
+	for attempt := 1; ; attempt++ {
+		srv, err := start()
+		if err == nil {
+			return srv, nil
+		}
+		startupErr = errors.Join(startupErr, fmt.Errorf("attempt %d: %w", attempt, err))
+		if attempt >= 2 || errors.Is(err, context.Canceled) || strings.HasPrefix(err.Error(), "failed connecting after timeout,") {
+			return nil, startupErr
+		}
+	}
+}
+
 // devServer returns a test-owned client connected to the package's shared
 // server. Workers and workflows must finish before this test's cleanup closes
 // the client; TestMain owns the server and its original startup client.
@@ -49,22 +65,12 @@ func devServer(t *testing.T) client.Client {
 		// console. Detached stdio keeps that process from holding go test's
 		// output pipes open; the CI runner reaps it when the job exits.
 		opts := testsuite.DevServerOptions{Stdout: io.Discard, Stderr: io.Discard}
-		for attempt := 1; attempt <= 2; attempt++ {
+		devServerState.server, devServerState.err = startDevServerWithRetry(func() (*testsuite.DevServer, error) {
 			// The first use may need to download the CLI on a slow runner.
 			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-			srv, err := testsuite.StartDevServer(ctx, opts)
-			cancel()
-			if err == nil {
-				devServerState.server, devServerState.err = srv, nil
-				return
-			}
-			devServerState.err = errors.Join(devServerState.err, fmt.Errorf("attempt %d: %w", attempt, err))
-			// A readiness failure happens after spawning the process, but the
-			// SDK returns no handle to stop it. Do not spawn another server.
-			if errors.Is(err, context.Canceled) || strings.HasPrefix(err.Error(), "failed connecting after timeout,") {
-				return
-			}
-		}
+			defer cancel()
+			return testsuite.StartDevServer(ctx, opts)
+		})
 	})
 	if devServerState.err != nil {
 		t.Fatalf("dev server unavailable (first use downloads the Temporal CLI, which needs network): %v", devServerState.err)
