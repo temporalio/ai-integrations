@@ -49,7 +49,7 @@ func startWorker(t *testing.T, c client.Client, taskQueue string, cfg googleadk.
 // query, which works even after completion), while the aggregated final response
 // is returned into the workflow so the agent loop stays deterministic.
 func TestStreamingIntegration(t *testing.T) {
-	c := devServer(t)
+	c := testClient(t)
 	taskQueue := testTaskQueue(t)
 
 	cm := &chunkedModel{name: "stream-model", chunks: []string{"Hello", ", ", "world"}}
@@ -59,7 +59,7 @@ func TestStreamingIntegration(t *testing.T) {
 		},
 	})
 	ctx := context.Background()
-	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+	run := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
 		ID:        taskQueue + "-streaming",
 		TaskQueue: taskQueue,
 	}, agentRunWorkflow, runInput{
@@ -67,8 +67,6 @@ func TestStreamingIntegration(t *testing.T) {
 		UserMessage:    "greet",
 		StreamingTopic: "run-stream",
 	})
-	require.NoError(t, err)
-	cleanupWorkflow(t, c, run)
 
 	var res runResult
 	require.NoError(t, run.Get(ctx, &res))
@@ -90,7 +88,7 @@ func TestStreamingIntegration(t *testing.T) {
 // guarantee. A replay failure here is exactly the non-determinism the plugin's
 // NewContext (time/uuid/task providers) exists to prevent.
 func TestReplaySingleAndMultiAgent(t *testing.T) {
-	c := devServer(t)
+	c := testClient(t)
 	taskQueue := testTaskQueue(t)
 
 	models := map[string]googleadk.ModelFactory{
@@ -126,9 +124,7 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 	type execution struct{ id, runID string }
 	var executions []execution
 	for id, in := range inputs {
-		run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: taskQueue}, agentRunWorkflow, in)
-		require.NoError(t, err)
-		cleanupWorkflow(t, c, run)
+		run := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{ID: id, TaskQueue: taskQueue}, agentRunWorkflow, in)
 		var res runResult
 		require.NoError(t, run.Get(ctx, &res))
 		executions = append(executions, execution{run.GetID(), run.GetRunID()})
@@ -145,12 +141,10 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 	// replaying cleanly below. It drives its own two-pass workflow rather than
 	// agentRunWorkflow, so it is started directly and appended to the same
 	// replay set.
-	mcRun, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+	mcRun := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
 		ID:        taskQueue + "-multiconfirm",
 		TaskQueue: taskQueue,
 	}, multiConfirmHitlWorkflow)
-	require.NoError(t, err)
-	cleanupWorkflow(t, c, mcRun)
 	var mcRes multiConfirmResult
 	require.NoError(t, mcRun.Get(ctx, &mcRes))
 	require.Equal(t, 3, mcRes.PendingCount, "all three guarded tools must pause before the batched resume")

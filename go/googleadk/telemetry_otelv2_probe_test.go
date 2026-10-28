@@ -150,7 +150,7 @@ func newIDGeneratedCapture() (*googleadk.ReplaySafeTracerProvider, *startRecordi
 // ----------------------------------------------------------------------------
 
 func TestSpanIDsDeterministicAcrossReplay(t *testing.T) {
-	c := devServer(t)
+	c := testClient(t)
 
 	tp, starts, spans := newIDGeneratedCapture()
 	capture := newTelemetryCapture()
@@ -185,7 +185,7 @@ func TestSpanIDsDeterministicAcrossReplay(t *testing.T) {
 	require.NoError(t, w.Start())
 	t.Cleanup(w.Stop)
 
-	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+	run := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
 		ID:        taskQueue + "-" + time.Now().Format("150405.000"),
 		TaskQueue: taskQueue,
 	}, agentRunWorkflow, runInput{
@@ -193,8 +193,6 @@ func TestSpanIDsDeterministicAcrossReplay(t *testing.T) {
 		UserMessage: "fan out",
 		Tools:       []toolSpec{{Name: "tool_a", Description: "a"}, {Name: "tool_b", Description: "b"}},
 	})
-	require.NoError(t, err)
-	cleanupWorkflow(t, c, run)
 	require.NoError(t, run.Get(ctx, nil))
 
 	liveStarts := starts.from(0)
@@ -367,12 +365,10 @@ func startStraddle(t *testing.T, c client.Client, taskQueue string) *straddleHar
 		}
 	})
 
-	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+	run := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
 		ID:        taskQueue + "-" + time.Now().Format("150405.000"),
 		TaskQueue: taskQueue,
 	}, straddleAgentWorkflow, telemetryRunInput{ModelName: "fake-model", UserMessage: "weather?"})
-	require.NoError(t, err)
-	cleanupWorkflow(t, c, run)
 	h.run = run
 
 	select {
@@ -422,7 +418,7 @@ func (h *straddleHarness) finish() {
 // workflow-time start. Nothing is exported at eviction teardown, and a
 // subsequent replayer pass re-creates the same identities without exporting.
 func TestStraddleSpanExportedOnceComplete(t *testing.T) {
-	c := devServer(t)
+	c := testClient(t)
 
 	tp, starts, spans := newIDGeneratedCapture()
 	capture := newTelemetryCapture()
@@ -527,7 +523,7 @@ func taskRetrySpanWorkflow(ctx workflow.Context, failFirstAttempt bool) error {
 var retryProbeArmed atomic.Bool
 
 func TestTaskRetryReexportsSpan(t *testing.T) {
-	c := devServer(t)
+	c := testClient(t)
 
 	runProbe := func(t *testing.T, taskQueue string, tp trace.TracerProvider) []sdktrace.ReadOnlySpan {
 		t.Helper()
@@ -545,12 +541,10 @@ func TestTaskRetryReexportsSpan(t *testing.T) {
 		t.Cleanup(w.Stop)
 
 		retryProbeArmed.Store(true)
-		run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		run := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
 			ID:        taskQueue + "-" + time.Now().Format("150405.000"),
 			TaskQueue: taskQueue,
 		}, taskRetrySpanWorkflow, true)
-		require.NoError(t, err)
-		cleanupWorkflow(t, c, run)
 		require.NoError(t, run.Get(ctx, nil))
 		return nil
 	}
@@ -621,7 +615,7 @@ func derivedTracerWorkflow(ctx workflow.Context) error {
 }
 
 func TestDerivedTracerSpansGatedAndDeterministic(t *testing.T) {
-	c := devServer(t)
+	c := testClient(t)
 
 	tp, starts, spans := newIDGeneratedCapture()
 	capture := newTelemetryCapture()
@@ -640,12 +634,10 @@ func TestDerivedTracerSpansGatedAndDeterministic(t *testing.T) {
 	require.NoError(t, w.Start())
 	t.Cleanup(w.Stop)
 
-	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+	run := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
 		ID:        taskQueue + "-" + time.Now().Format("150405.000"),
 		TaskQueue: taskQueue,
 	}, derivedTracerWorkflow)
-	require.NoError(t, err)
-	cleanupWorkflow(t, c, run)
 	require.NoError(t, run.Get(ctx, nil))
 
 	liveStarts := starts.from(0)
@@ -688,7 +680,7 @@ func TestDerivedTracerSpansGatedAndDeterministic(t *testing.T) {
 // gen_ai.usage.* attributes — and the catch-up replay re-creates them
 // non-recording, so they can never be completed or re-exported.
 func TestStraddleSpanLegacyControl(t *testing.T) {
-	c := devServer(t)
+	c := testClient(t)
 
 	spans := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spans))

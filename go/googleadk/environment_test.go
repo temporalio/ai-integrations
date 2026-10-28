@@ -55,10 +55,9 @@ func startDevServerWithRetry(start func() (*testsuite.DevServer, error)) (*tests
 	}
 }
 
-// devServer returns a test-owned client connected to the package's shared
-// server. Workers and workflows must finish before this test's cleanup closes
-// the client; TestMain owns the server and its original startup client.
-func devServer(t *testing.T) client.Client {
+// testClient lazily starts the package's shared server and returns its default
+// client. TestMain closes both after all tests and their cleanups finish.
+func testClient(t *testing.T) client.Client {
 	t.Helper()
 	devServerState.once.Do(func() {
 		// On Windows the SDK may fail to stop a server without an attached
@@ -75,22 +74,19 @@ func devServer(t *testing.T) client.Client {
 	if devServerState.err != nil {
 		t.Fatalf("dev server unavailable (first use downloads the Temporal CLI, which needs network): %v", devServerState.err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	c, err := client.DialContext(ctx, client.Options{HostPort: devServerState.server.FrontendHostPort()})
-	require.NoError(t, err)
-	t.Cleanup(c.Close)
-	return c
+	return devServerState.server.Client()
 }
 
 func testTaskQueue(t *testing.T) string {
 	return t.Name() + "-" + uuid.NewString()
 }
 
-// A failed test must not leave work running against the shared server. This
-// cleanup runs before the worker and client cleanups registered at setup.
-func cleanupWorkflow(t *testing.T, c client.Client, run client.WorkflowRun) {
+// startTestWorkflow starts a workflow and registers termination at test cleanup,
+// so an early assertion failure cannot leave it running on the shared server.
+func startTestWorkflow(t *testing.T, c client.Client, ctx context.Context, options client.StartWorkflowOptions, wf any, args ...any) client.WorkflowRun {
 	t.Helper()
+	run, err := c.ExecuteWorkflow(ctx, options, wf, args...)
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -100,4 +96,5 @@ func cleanupWorkflow(t *testing.T, c client.Client, run client.WorkflowRun) {
 			t.Errorf("failed terminating test workflow %s: %v", run.GetID(), err)
 		}
 	})
+	return run
 }

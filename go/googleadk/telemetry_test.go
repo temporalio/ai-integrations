@@ -703,12 +703,10 @@ func runTelemetryScenario(t *testing.T, c client.Client, taskQueue string) (cm *
 	require.NoError(t, w.Start())
 	t.Cleanup(w.Stop)
 
-	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+	run := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
 		ID:        taskQueue + "-" + time.Now().Format("150405.000"),
 		TaskQueue: taskQueue,
 	}, telemetryAgentWorkflow, telemetryRunInput{ModelName: "fake-model", UserMessage: "weather in SF?"})
-	require.NoError(t, err)
-	cleanupWorkflow(t, c, run)
 	var res telemetryRunResult
 	require.NoError(t, run.Get(ctx, &res))
 	require.Contains(t, strings.Join(res.Texts, " "), "It is sunny.")
@@ -735,7 +733,7 @@ func replayTelemetryHistory(t *testing.T, c client.Client, wf any, wfID, runID s
 // replay-safe wrappers sit between the global proxies and the in-memory
 // exporters.
 func TestReplayTelemetry(t *testing.T) {
-	c := devServer(t)
+	c := testClient(t)
 
 	t.Run("WrappersSuppressReplayDuplicates", func(t *testing.T) {
 		capture := newTelemetryCapture()
@@ -843,12 +841,10 @@ func TestReplayTelemetry(t *testing.T) {
 		require.NoError(t, w.Start())
 		t.Cleanup(w.Stop)
 
-		run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		run := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
 			ID:        taskQueue + "-" + time.Now().Format("150405.000"),
 			TaskQueue: taskQueue,
 		}, instrumentGateWorkflow)
-		require.NoError(t, err)
-		cleanupWorkflow(t, c, run)
 		require.NoError(t, run.Get(ctx, nil))
 
 		// At-least-once: a workflow task retry can legitimately repeat live

@@ -15,31 +15,31 @@ func sharedServerWorkflow(ctx workflow.Context) error {
 }
 
 // The first subtest leaves a running workflow for cleanup. The next subtest
-// must reconnect to the same server after that client's and worker's cleanup,
-// find the original history, and observe that the workflow was terminated.
-func TestDevServerSharedAcrossTests(t *testing.T) {
+// must reuse the same client and server after the worker stops, find the
+// original history, and observe that the workflow was terminated.
+func TestClientSharedAcrossTests(t *testing.T) {
+	var firstClient client.Client
 	var run client.WorkflowRun
 	if !t.Run("StartWorkflow", func(t *testing.T) {
-		c := devServer(t)
+		c := testClient(t)
+		firstClient = c
 		taskQueue := testTaskQueue(t)
 		w := worker.New(c, taskQueue, worker.Options{})
 		w.RegisterWorkflow(sharedServerWorkflow)
 		require.NoError(t, w.Start())
 		t.Cleanup(w.Stop)
 
-		var err error
-		run, err = c.ExecuteWorkflow(t.Context(), client.StartWorkflowOptions{
+		run = startTestWorkflow(t, c, t.Context(), client.StartWorkflowOptions{
 			ID:        taskQueue,
 			TaskQueue: taskQueue,
 		}, sharedServerWorkflow)
-		require.NoError(t, err)
-		cleanupWorkflow(t, c, run)
 	}) {
 		return
 	}
 
-	t.Run("ReuseServer", func(t *testing.T) {
-		c := devServer(t)
+	t.Run("ReuseClient", func(t *testing.T) {
+		c := testClient(t)
+		require.Same(t, firstClient, c)
 		description, err := c.DescribeWorkflowExecution(t.Context(), run.GetID(), run.GetRunID())
 		require.NoError(t, err)
 		require.Equal(t, enumspb.WORKFLOW_EXECUTION_STATUS_TERMINATED, description.WorkflowExecutionInfo.Status)
