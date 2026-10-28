@@ -30,11 +30,7 @@ failures are tracked in a `nightly` issue for the plugin.
 Tests must not require provider credentials. Use deterministic local models,
 mock transports or in-process servers. Tests that need Temporal use
 `testClient(t)` to lazily share a local dev server and its default client within
-the package's test process. Initial startup may download the Temporal CLI and
-gets up to two 90-second attempts; cancellation and readiness failures propagate
-immediately. Each test owns its workers and uses unique task queues.
-`startTestWorkflow` registers cleanup for unfinished workflows, and
-`TestMain` closes the shared client and stops the server after all tests finish.
+the package's test process.
 
 Repository conventions are in
 [`AGENTS.md`](../AGENTS.md).
