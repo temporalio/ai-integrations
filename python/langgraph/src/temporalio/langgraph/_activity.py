@@ -186,16 +186,21 @@ def _holds(hint: Any, value: Any) -> bool:
 
 
 def _item_hint(hint: Any, owner: Any, key: str | int) -> Any:
-    """Return the declared type of item ``key`` of ``owner``, of type ``hint``."""
+    """Return the declared type of item ``key`` of ``owner``, of type ``hint``.
+
+    A tuple holds the item's type under each union member the serializer may
+    write ``owner`` with.
+    """
+    if isinstance(hint, tuple):
+        return tuple(_item_hint(member, owner, key) for member in hint)
     hint = _unwrap(hint)
     origin = get_origin(hint)
     args = [arg for arg in get_args(hint) if arg is not type(None)]
     if origin in _UNIONS:
-        # The serializer writes the container with a member its class fits.
-        hints = [_item_hint(arg, owner, key) for arg in args if _holds(arg, owner)]
-        if len(hints) > 1:
-            return typing.Union[tuple(hints)]  # pyright: ignore[reportDeprecated]
-        return hints[0] if hints else Any
+        # Pydantic writes the whole container with one member its class fits,
+        # picked from all of its items, so keep the item's type under each.
+        hints = tuple(_item_hint(arg, owner, key) for arg in args if _holds(arg, owner))
+        return hints[0] if len(hints) == 1 else hints or Any
     if is_typeddict(hint):
         return _class_hints(hint).get(str(key), Any)
     if origin is tuple:
@@ -213,8 +218,11 @@ def _written_as_base(value: Any, hint: Any) -> bool:
     """Whether a serializer following ``hint`` writes ``value`` as a base class.
 
     Pydantic writes a value of a subclass of the declared class with the
-    declared class's fields only.
+    declared class's fields only. For a tuple of types from ``_item_hint``,
+    it may write ``value`` following any of them.
     """
+    if isinstance(hint, tuple):
+        return any(_written_as_base(value, member) for member in hint)
     hint = _unwrap(hint)
     members = get_args(hint) if get_origin(hint) in _UNIONS else (hint,)
     classes = [m for m in map(_unwrap, members) if isinstance(m, type) and m is not Any]

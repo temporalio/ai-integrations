@@ -4,7 +4,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.runtime import Runtime, get_runtime
 from pydantic import BaseModel, Field, RootModel
@@ -204,6 +204,7 @@ class ModelState(BaseModel):
     answer: Answer | None = None
     messages: list[BaseMessage] = []
     union_messages: list[BaseMessage] | tuple[BaseMessage, ...] = []
+    overlap_messages: list[BaseMessage] | list[AIMessage] = []
     root_messages: Messages = Messages([])
     hidden: BaseMessage = Field(default_factory=hidden_message, exclude=True)
     hidden_if: BaseMessage = Field(
@@ -223,6 +224,7 @@ async def model_node_a(state: ModelState) -> dict[str, Any]:
         "answer": Answer(value=1),
         "messages": [message],
         "union_messages": [message],
+        "overlap_messages": [HumanMessage(content="hi"), message],
         "root_messages": [message],
         "state_type_a": type(state).__name__,
     }
@@ -234,7 +236,12 @@ def describe(message: BaseMessage) -> str:
 
 
 async def model_node_b(state: ModelState) -> dict[str, Any]:
-    messages = [state.messages, state.union_messages, state.root_messages.root]
+    messages = [
+        state.messages,
+        state.union_messages,
+        state.overlap_messages,
+        state.root_messages.root,
+    ]
     return {
         "state_type_b": type(state).__name__,
         "answer_type_b": type(getattr(state, "answer", None)).__name__,
@@ -281,14 +288,15 @@ async def test_two_nodes_pydantic_state(
         history = await handle.fetch_history()
 
     assert result.pop("messages")[0]["tool_calls"][0]["name"] == "search"
-    del result["union_messages"], result["root_messages"]
+    for key in ("union_messages", "overlap_messages", "root_messages"):
+        del result[key]
     assert result == {
         "value": "",
         "answer": {"value": 1},
         "state_type_a": "ModelState",
         "state_type_b": "ModelState",
         "answer_type_b": "Answer",
-        "message_b": ["AIMessage:search"] * 3,
+        "message_b": ["AIMessage:search"] * 4,
     }
     # Excluded fields stay out of the Activity payloads.
     assert b"not-in-history" not in History(events=history.events).SerializeToString()
