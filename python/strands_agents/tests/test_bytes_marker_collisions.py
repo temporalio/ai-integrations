@@ -237,7 +237,11 @@ async def test_lookalike_json_across_a_workflow(client: Client):
     ]
 
     history = await handle.fetch_history()
-    assert get_activities(history) == ["invoke_model", "invoke_model"]
+    assert get_activities(history) == [
+        "strands_get_model_config",
+        "invoke_model",
+        "invoke_model",
+    ]
     await Replayer(workflows=[LookalikeToolWorkflow], plugins=[plugin]).replay_workflow(
         history
     )
@@ -349,6 +353,7 @@ async def test_mcp_structured_content_and_metadata_that_look_like_bytes(
 
     history = await handle.fetch_history()
     assert get_activities(history) == [
+        "strands_get_model_config",
         "marker-list-tools",
         "invoke_model",
         "marker-call-tool",

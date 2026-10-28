@@ -153,7 +153,11 @@ async def test_overflow_is_recovered_by_conversation_manager(client: Client):
 
     assert model.seen == control_model.seen
     history = await handle.fetch_history()
-    assert get_activities(history) == ["invoke_model", "invoke_model"]
+    assert get_activities(history) == [
+        "strands_get_model_config",
+        "invoke_model",
+        "invoke_model",
+    ]
     assert [
         event
         for event in history.events
