@@ -514,7 +514,10 @@ workflow-history compatibility and can still run with MCP Python SDK v1 when
 the `mcp` extra is not installed. New integrations should use `mcp_servers` and
 `temporal_mcp_server()`, which require the `mcp` extra and MCP Python SDK v2.
 The legacy stateful path retains its dedicated per-workflow worker and
-persistent-session behavior.
+persistent-session behavior. To require tool approval on these servers, pass
+`require_approval` to `stateless_mcp_server()` or `stateful_mcp_server()`;
+as with `temporal_mcp_server()`, a policy set on the factory's server is not
+used.
 
 ### Hosted MCP Tool
 
