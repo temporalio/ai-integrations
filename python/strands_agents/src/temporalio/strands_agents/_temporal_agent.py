@@ -4,6 +4,7 @@ from typing import Any
 
 from strands import Agent
 from strands.agent._concurrency import _ConcurrencyController, _InflightInvocation
+from strands.agent.conversation_manager import NullConversationManager
 from strands.hooks import BeforeModelCallEvent, HookCallback
 from strands.types.agent import AgentInput
 from strands.types.content import Messages
@@ -74,6 +75,7 @@ class TemporalAgent(Agent):
         streaming_topic: str | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
         sandbox: TemporalSandbox | None = None,
+        model_state: dict[str, Any] | None = None,
         **agent_kwargs: Any,
     ) -> None:
         """Build a TemporalAgent from a registered model name and activity options."""
@@ -86,6 +88,9 @@ class TemporalAgent(Agent):
                 "TemporalAgent(...) or pass retry_strategy=None."
             )
         agent_kwargs["retry_strategy"] = None
+        self._manager_given = agent_kwargs.get(
+            "conversation_manager"
+        ) is not None or agent_kwargs.get("context_manager") not in (None, False)
 
         temporal_model = TemporalModel(
             model_name=model,
@@ -105,6 +110,10 @@ class TemporalAgent(Agent):
         super().__init__(model=temporal_model, sandbox=sandbox, **agent_kwargs)
         self._concurrency = _WorkflowConcurrencyController(self._concurrency.mode)
         self._temporal_model = temporal_model
+        # A model state carried from an earlier run, such as a stateful model's
+        # last response id across Continue-As-New.
+        if model_state:
+            self._model_state = dict(model_state)
 
         # Strands invokes ToolProvider.load_tools() once at construction on a
         # separate run_async thread that has no workflow runtime, so a
@@ -162,7 +171,29 @@ class TemporalAgent(Agent):
         deduplication and cancellation of overlapping invocations unchanged.
         """
         await self._temporal_model._load_config()
+        if self._temporal_model.stateful:
+            self._use_server_side_state()
         return await super()._convert_prompt_to_messages(prompt)
+
+    def _use_server_side_state(self) -> None:
+        # What Strands' Agent does at construction for a stateful model, which
+        # TemporalAgent can only learn once the worker model's config is read.
+        if self._manager_given:
+            raise ValueError(
+                "context_manager and conversation_manager cannot be used with a "
+                "stateful model. The model manages conversation state server-side."
+            )
+        if not isinstance(self.conversation_manager, NullConversationManager):
+            self.conversation_manager = NullConversationManager()
+
+    @property
+    def model_state(self) -> dict[str, Any]:
+        """A copy of the model state, such as a stateful model's last response id.
+
+        Carry it with the messages across Continue-As-New and pass it back as
+        ``TemporalAgent(model_state=...)``.
+        """
+        return dict(self._model_state)
 
     def take_snapshot(self, *_args: Any, **_kwargs: Any) -> Any:
         """Disabled; Temporal's event history is the source of truth."""

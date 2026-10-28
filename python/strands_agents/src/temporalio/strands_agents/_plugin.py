@@ -92,7 +92,13 @@ class StrandsPlugin(SimplePlugin):
         if models:
             ma = ModelActivity(models, default_name=default_name)
             activities.extend(
-                [ma.invoke_model, ma.invoke_model_streaming, ma.get_model_config]
+                [
+                    ma.invoke_model,
+                    ma.invoke_model_streaming,
+                    ma.invoke_stateful_model,
+                    ma.invoke_stateful_model_streaming,
+                    ma.get_model_config,
+                ]
             )
 
         sandbox_activities = (
