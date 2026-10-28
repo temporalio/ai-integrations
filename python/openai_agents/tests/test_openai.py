@@ -30,6 +30,7 @@ from agents import (
     ModelResponse,
     ModelSettings,
     ModelTracing,
+    MultiProvider,
     OpenAIChatCompletionsModel,
     OutputGuardrailTripwireTriggered,
     RunConfig,
@@ -1818,6 +1819,72 @@ async def test_session(client: Client):
                         return
 
             await assert_eventually(check)
+
+
+class RunModelProvider(ModelProvider):
+    """A provider set on the run, as the framework's custom provider example does."""
+
+    def get_model(self, model_name: str | None) -> Model:
+        raise AssertionError("the plugin never asks a run's provider for a model")
+
+
+@workflow.defn
+class RunModelProviderWorkflow:
+    @workflow.run
+    async def run(self, provider: str) -> str:
+        model_provider = (
+            RunModelProvider()
+            if provider == "custom"
+            else MultiProvider(openai_use_responses=False)
+        )
+        agent = Agent[None](
+            name="Assistant", instructions="You are a helpful assistant."
+        )
+        result = await Runner.run(
+            agent, "Hello", run_config=RunConfig(model_provider=model_provider)
+        )
+        return result.final_output
+
+
+def test_reused_default_model_provider_is_not_refused(monkeypatch: pytest.MonkeyPatch):
+    from temporalio.openai_agents._openai_runner import _is_default_model_provider
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    provider = MultiProvider()
+    # A native run fills the OpenAI provider's client cache; that is not configuration.
+    provider.get_model("gpt-4o")
+    assert _is_default_model_provider(provider)
+    assert not _is_default_model_provider(MultiProvider(openai_use_responses=False))
+
+
+@pytest.mark.parametrize("provider", ["custom", "configured"])
+async def test_run_model_provider_refused(client: Client, provider: str):
+    async with AgentEnvironment(model=hello_mock_model()) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(
+            client,
+            RunModelProviderWorkflow,
+        ) as worker:
+            workflow_handle = await client.start_workflow(
+                RunModelProviderWorkflow.run,
+                provider,
+                id=f"run-model-provider-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+
+            async def check():
+                async for evt in workflow_handle.fetch_history_events():
+                    if evt.HasField(
+                        "workflow_task_failed_event_attributes"
+                    ) and "do not support RunConfig.model_provider" in (
+                        evt.workflow_task_failed_event_attributes.failure.message
+                    ):
+                        return
+                raise AssertionError("RunConfig.model_provider was not refused")
+
+            await assert_eventually(check)
+            await workflow_handle.terminate()
 
 
 @workflow.defn

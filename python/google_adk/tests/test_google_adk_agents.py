@@ -593,21 +593,24 @@ async def test_single_agent_telemetry(
     finally:
         GoogleADKInstrumentor().uninstrument()
 
-    print("\n".join(dump_spans(exporter.get_finished_spans(), with_attributes=False)))
-    assert dump_spans(exporter.get_finished_spans(), with_attributes=False) == [
+    spans = dump_spans(exporter.get_finished_spans(), with_attributes=False)
+    print("\n".join(spans))
+    assert spans == [
         "StartWorkflow:WeatherAgent",
         "  RunWorkflow:WeatherAgent",
         "    invocation [test_app]",
-        "      agent_run [test_agent]",
-        "        execute_tool get_weather",
-        "          StartActivity:get_weather",
-        "            RunActivity:get_weather",
-        "        call_llm",
-        "          StartActivity:invoke_model",
-        "            RunActivity:invoke_model",
-        "        call_llm",
-        "          StartActivity:invoke_model",
-        "            RunActivity:invoke_model",
+        "      invocation",
+        "        agent_run [test_agent]",
+        "          invoke_agent test_agent",
+        "            execute_tool get_weather",
+        "              StartActivity:get_weather",
+        "                RunActivity:get_weather",
+        "            call_llm",
+        "              StartActivity:invoke_model",
+        "                RunActivity:invoke_model",
+        "            call_llm",
+        "              StartActivity:invoke_model",
+        "                RunActivity:invoke_model",
     ]
 
 

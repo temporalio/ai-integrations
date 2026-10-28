@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import AsyncIterable
 from datetime import timedelta
@@ -14,9 +15,12 @@ from temporalio.common import Priority, RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
+from ._bytes_values import decode_event
 from ._model_activity import (
     ModelActivity,
     _InvokeModelInput,
+    _ModelConfig,
+    _ModelConfigInput,
     _StreamingInvokeModelInput,
 )
 
@@ -90,14 +94,56 @@ class TemporalModel(Model):
             "summary": summary,
             "priority": priority,
         }
+        self._config: dict[str, Any] = {}
+        self._config_loaded = False
+        self._config_load: asyncio.Task[None] | None = None
 
     def update_config(self, **_model_config: Any) -> None:
         """No-op; the real model is configured worker-side via the plugin's factories."""
         return None
 
     def get_config(self) -> dict[str, Any]:
-        """Return an empty config; configuration lives on the worker-side model."""
-        return {}
+        """Return the worker-side model's ``model_id`` and ``context_window_limit``.
+
+        They are empty until ``TemporalAgent`` loads them before its first
+        invocation.
+        """
+        return dict(self._config)
+
+    @property
+    def config(self) -> dict[str, Any]:
+        """The loaded config; Strands' tracing reads ``model_id`` from it."""
+        return self._config
+
+    async def _load_config(self) -> None:
+        """Read the worker-side model's config once, as an activity.
+
+        Callers that overlap share one read: a later invocation after the
+        first was cancelled, or reentrant invocations. A caller's cancellation
+        does not cancel the shared read; a failed read is retried by the next
+        invocation.
+        """
+        if self._config_loaded:
+            return
+        if self._config_load is None:
+            self._config_load = asyncio.create_task(self._read_config())
+        await asyncio.shield(self._config_load)
+
+    async def _read_config(self) -> None:
+        try:
+            result: _ModelConfig = await workflow.execute_activity_method(
+                ModelActivity.get_model_config,
+                _ModelConfigInput(model_name=self._model_name),
+                **self._options,
+            )
+        except BaseException:
+            self._config_load = None
+            raise
+        if result.model_id is not None:
+            self._config["model_id"] = result.model_id
+        if result.context_window_limit is not None:
+            self._config["context_window_limit"] = result.context_window_limit
+        self._config_loaded = True
 
     def structured_output(self, *_args: Any, **_kwargs: Any) -> Any:
         """Not supported; use ``TemporalAgent(structured_output_model=...)`` instead."""
@@ -167,4 +213,4 @@ class TemporalModel(Model):
                 raise ContextWindowOverflowException(cause.message) from error
             raise
         for event in events:
-            yield event
+            yield decode_event(event)

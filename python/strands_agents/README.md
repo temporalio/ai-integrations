@@ -110,6 +110,10 @@ Worker(..., plugins=[StrandsPlugin(models={
 
 Each `TemporalAgent` carries its own activity options (timeouts, retry policy, task queue, streaming topic) and dispatches to the shared model activity, which resolves the model name against the registered factories at runtime. A name not present in `models` raises `ValueError` inside the activity.
 
+Before its first invocation in a workflow, each `TemporalAgent` reads the worker model's `model_id` and `context_window_limit` with the `strands_get_model_config` activity, using the agent's activity options. `agent.model.get_config()` returns them, so proactive compression, `context_manager="auto"` and Strands' tracing use the real model's window and id, as they do natively. No other part of the model's config is sent to the workflow. The read is a new activity, so a run whose agent ran before you deploy this version fails to replay on it: let those runs finish first, or use Worker Versioning.
+
+If you scaled `compression_threshold` by the model's window divided by 200,000 to work around the missing limit, remove that scaling: the threshold now applies to the model's own window.
+
 ## Retries
 
 `TemporalAgent` disables Strands' built-in `ModelRetryStrategy` so retries are handled exclusively by Temporal. The plugin's default Bedrock model also disables Botocore retries. When supplying your own model factory, disable that provider client's retries as shown in the Bedrock example above.
@@ -174,6 +178,8 @@ async for item in WorkflowStreamClient.create(client, workflow_id).subscribe(
 ):
     print(item.data)
 ```
+
+Events are published as your data converter writes them, so a `StreamEvent`-typed subscriber receives `bytes` fields such as `redactedContent` as `bytes`. If the model emits `redactedContent` that is not valid UTF-8 and the data converter is the Pydantic one (the plugin's default), which cannot write it, subscribers receive the event with `redactedContent` empty (`b""`) and the model activity does not fail. The workflow itself always gets the real bytes, and the default converter carries any bytes to subscribers.
 
 ## Sandboxes
 
