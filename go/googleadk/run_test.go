@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -99,6 +100,38 @@ func TestRemoteSubAgentRejected(t *testing.T) {
 	err := env.GetWorkflowError()
 	require.Error(t, err, "a tree with a remote A2A agent must fail the run")
 	assert.Contains(t, err.Error(), `agent "remote" is a remote A2A agent`)
+}
+
+// TestRemoteSubAgentErrorNotRetried proves an A2A error the remote agent
+// answers with fails the SendA2AMessage Activity once, without retries, and
+// the turn ends as it would without Temporal: ADK turns the error into an
+// event.
+func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
+	url, _ := startA2AServer(t, func() (a2a.Event, error) { return nil, a2a.ErrInvalidParams })
+
+	var s testsuite.WorkflowTestSuite
+	env, counter := newEnv(t, &s, googleadk.Config{
+		Models: map[string]googleadk.ModelFactory{
+			"root-model": scriptedModelFactory(
+				googleadk.FunctionCallResponse("c1", "transfer_to_agent", map[string]any{"agent_name": "remote"}),
+			),
+		},
+	})
+
+	env.ExecuteWorkflow(agentRunWorkflow, runInput{
+		ModelName:   "root-model",
+		UserMessage: "ask the remote agent",
+		SubAgents: []subAgentSpec{{
+			Name:             "remote",
+			Description:      "remote A2A agent",
+			RemoteCardURL:    url,
+			RemoteActivities: true,
+		}},
+	})
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+	assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName), "a remote A2A error must not be retried")
 }
 
 // errorModel is a model.LLM that always fails with a genai.APIError of the given

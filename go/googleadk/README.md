@@ -207,15 +207,19 @@ the model SDK's own retries (see below), or override the fallbacks.
   `SendA2AMessage` Activities (a cancellation in `CancelA2ATask`), so a replay
   reads them from History instead of sending them again. The Activities use
   a2a-go's default client. A streamed reply reaches the workflow when the stream
-  ends.
+  ends. A send that times out or fails on the network is retried, which sends
+  the message again, so set a `StartToCloseTimeout` longer than the remote agent
+  takes to answer. An A2A error the remote agent answers with is not retried;
+  ADK turns it into an error event.
 - **Deterministic by construction.** `NewContext` binds ADK's `platform.Now` to
   `workflow.Now`, `platform.NewUUID` to a deterministic generator drawn from the
   workflow random stream, and `platform.RunTasks` to a `workflow.Go` fan-out, so
   the agent loop replays deterministically. Concurrent tool fan-out is on by
   default; use `NewContext(ctx, googleadk.WithSequentialToolFanout())` for a
   serial fallback.
-- **Typed failures.** Model / tool / MCP failures surface as Temporal
-  `ApplicationError`s tagged `googleadk.ModelError` / `.ToolError` / `.McpError`.
+- **Typed failures.** Model / tool / MCP / A2A failures surface as Temporal
+  `ApplicationError`s tagged `googleadk.ModelError` / `.ToolError` / `.McpError`
+  / `.A2AError`.
   Classify with `IsNonRetryable(err)`; never string-match. Upstream HTTP status
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs

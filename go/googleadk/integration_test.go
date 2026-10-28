@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -158,7 +159,9 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 	c, stop := devServer(t)
 	defer stop()
 
-	a2aURL, a2aRequests := startA2AServer(t, "remote answer")
+	a2aURL, a2aRequests := startA2AServer(t, func() (a2a.Event, error) {
+		return a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil
+	})
 
 	models := map[string]googleadk.ModelFactory{
 		"root-model": scriptedModelFactory(

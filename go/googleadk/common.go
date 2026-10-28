@@ -31,6 +31,9 @@ const (
 	ErrorTypeTool = "googleadk.ToolError"
 	// ErrorTypeMCP tags failures originating from an MCP list/call.
 	ErrorTypeMCP = "googleadk.McpError"
+	// ErrorTypeA2A tags failures originating from an A2A card fetch, message
+	// or cancellation.
+	ErrorTypeA2A = "googleadk.A2AError"
 )
 
 const (

@@ -9,10 +9,10 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 
 	"go.temporal.io/sdk/activity"
-	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
 	remoteagent "google.golang.org/adk/v2/agent/remoteagent/v2"
+	"google.golang.org/adk/v2/platform"
 )
 
 // NewA2AAgentCardProvider returns an AgentCardProvider for ADK's remote A2A
@@ -117,6 +117,12 @@ func (c *a2aClient) send(ctx context.Context, req *a2a.SendMessageRequest, strea
 	if !ok {
 		return nil, errMissingContext
 	}
+	// a2a-go gives the message a random ID in Workflow code, and ADK stores
+	// the request in the turn's last event. Use an ID from the workflow's
+	// random stream so a replay rebuilds the same events.
+	if req.Message != nil {
+		req.Message.ID = platform.NewUUID(ctx)
+	}
 	actx := workflow.WithActivityOptions(wfCtx, resolveToolActivityOptions(c.activityOptions, ""))
 	var events []a2a.StreamResponse
 	in := a2aSendInput{Card: c.card, Request: req, Stream: stream}
@@ -160,10 +166,11 @@ type a2aCancelInput struct {
 // file path) with remoteagent.NewAgentCardProvider.
 func (a *Activities) ResolveA2AAgentCard(ctx context.Context, source string) (*a2a.AgentCard, error) {
 	card, err := remoteagent.NewAgentCardProvider(source)(ctx)
-	if errors.Is(err, remoteagent.ErrUnsupportedCardSource) {
-		return nil, temporal.NewNonRetryableApplicationError(err.Error(), "", err)
+	if err != nil {
+		retryable := !errors.Is(err, remoteagent.ErrUnsupportedCardSource)
+		return nil, newApplicationError(ErrorTypeA2A, retryable, err, "resolve A2A agent card: %v", err)
 	}
-	return card, err
+	return card, nil
 }
 
 // SendA2AMessage sends a message to a remote A2A agent with a2a-go's default
@@ -174,7 +181,7 @@ func (a *Activities) SendA2AMessage(ctx context.Context, in a2aSendInput) ([]a2a
 	// must not be heartbeat-timed-out and sent the message again.
 	stopHeartbeats := startPeriodicHeartbeats(ctx)
 	defer stopHeartbeats()
-	client, err := a2aclient.NewFromCard(ctx, in.Card)
+	client, err := newA2AClient(ctx, in.Card)
 	if err != nil {
 		return nil, err
 	}
@@ -186,14 +193,14 @@ func (a *Activities) SendA2AMessage(ctx context.Context, in a2aSendInput) ([]a2a
 	if !in.Stream {
 		res, err := client.SendMessage(ctx, in.Request)
 		if err != nil {
-			return nil, err
+			return nil, a2aError("send A2A message", err)
 		}
 		return []a2a.StreamResponse{{Event: res}}, nil
 	}
 	var events []a2a.StreamResponse
 	for ev, err := range client.SendStreamingMessage(ctx, in.Request) {
 		if err != nil {
-			return nil, err
+			return nil, a2aError("send A2A message", err)
 		}
 		events = append(events, a2a.StreamResponse{Event: ev})
 	}
@@ -202,7 +209,7 @@ func (a *Activities) SendA2AMessage(ctx context.Context, in a2aSendInput) ([]a2a
 
 // CancelA2ATask cancels a remote A2A task with a2a-go's default client.
 func (a *Activities) CancelA2ATask(ctx context.Context, in a2aCancelInput) (*a2a.Task, error) {
-	client, err := a2aclient.NewFromCard(ctx, in.Card)
+	client, err := newA2AClient(ctx, in.Card)
 	if err != nil {
 		return nil, err
 	}
@@ -211,5 +218,30 @@ func (a *Activities) CancelA2ATask(ctx context.Context, in a2aCancelInput) (*a2a
 			activity.GetLogger(ctx).Warn("failed to destroy A2A client", "error", err)
 		}
 	}()
-	return client.CancelTask(ctx, in.Request)
+	task, err := client.CancelTask(ctx, in.Request)
+	if err != nil {
+		return nil, a2aError("cancel A2A task", err)
+	}
+	return task, nil
+}
+
+// newA2AClient builds a2a-go's default client for card. A failure comes from
+// the card, such as one with no supported transport, so it is non-retryable.
+func newA2AClient(ctx context.Context, card *a2a.AgentCard) (*a2aclient.Client, error) {
+	client, err := a2aclient.NewFromCard(ctx, card)
+	if err != nil {
+		return nil, newApplicationError(ErrorTypeA2A, false, err, "create A2A client: %v", err)
+	}
+	return client, nil
+}
+
+// a2aError tags an A2A call failure. An A2A error the remote agent answered
+// with, such as a task it does not know, is non-retryable: sending again
+// cannot fix it, and ADK turns the failed call into an error event, as it does
+// without Temporal. Internal and server errors, and errors that never reached
+// the agent, stay retryable.
+func a2aError(op string, err error) error {
+	var remote *a2a.Error
+	retryable := !errors.As(err, &remote) || errors.Is(err, a2a.ErrInternalError) || errors.Is(err, a2a.ErrServerError)
+	return newApplicationError(ErrorTypeA2A, retryable, err, "%s: %v", op, err)
 }

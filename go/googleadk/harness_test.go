@@ -57,8 +57,9 @@ type subAgentSpec struct {
 }
 
 // startA2AServer starts an in-process A2A server that answers every message
-// with reply, and returns its URL and a count of the requests it received.
-func startA2AServer(t *testing.T, reply string) (string, *atomic.Int32) {
+// with what reply returns, and returns its URL and a count of the requests it
+// received.
+func startA2AServer(t *testing.T, reply func() (a2a.Event, error)) (string, *atomic.Int32) {
 	t.Helper()
 	var requests atomic.Int32
 	mux := http.NewServeMux()
@@ -76,7 +77,7 @@ func startA2AServer(t *testing.T, reply string) (string, *atomic.Int32) {
 	}
 	executor := a2asrv.AgentExecutorFunc(func(context.Context, *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
 		return func(yield func(a2a.Event, error) bool) {
-			yield(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart(reply)), nil)
+			yield(reply())
 		}
 	})
 	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
