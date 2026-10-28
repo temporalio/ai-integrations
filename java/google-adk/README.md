@@ -94,8 +94,107 @@ AI 2.0's default.
 Streamed calls (`RunConfig.StreamingMode.SSE`) use the same activity: the worker collects the
 partial chunks and the final response, and the workflow replays them in order, so ADK's partial
 events keep their shape. Chunks reach the workflow only when the activity completes; the
-integration does not stream tokens out of a workflow. Live (bidirectional) connections are not
-supported.
+Activity can also publish them to external subscribers while it is running, as described below.
+Live (bidirectional) connections are not supported.
+
+### Live model output
+
+Add the experimental Workflow Streams module at the same version as your Temporal SDK. It is
+optional: applications using only the ordinary model Activity do not need it.
+Live delivery currently requires the unshaded `temporal-sdk` artifact. Ordinary model Activities
+retain support for the shaded SDK.
+
+```groovy
+implementation 'io.temporal:temporal-workflowstreams:1.40.0'
+```
+
+Host a `WorkflowStream` in the Workflow and configure the model's `streamingTopic`. With ADK's
+SSE mode, the model Activity publishes responses in batches every 100 milliseconds while
+retaining all responses for its durable result. The Workflow's agent still receives those
+responses after the Activity completes. No subscriber is needed for publishing or completion.
+
+The following Workflow also publishes an authoritative turn-completion marker after ADK returns.
+It waits up to ten seconds for the client to acknowledge that marker, so a client can consume the
+tail before the Workflow closes. Without a subscriber, or after subscriber disposal, the deadline
+still lets the Workflow finish.
+
+```java
+@WorkflowInterface
+public interface LiveChatWorkflow {
+  @WorkflowMethod String chat(String message);
+  @SignalMethod void streamConsumed();
+}
+
+public class LiveChatWorkflowImpl implements LiveChatWorkflow {
+  private final WorkflowStream output;
+  private boolean consumed;
+
+  @WorkflowInit
+  public LiveChatWorkflowImpl(String message) {
+    output = WorkflowStream.newInstance();
+  }
+
+  @Override
+  public String chat(String message) {
+    LlmAgent agent = LlmAgent.builder()
+        .name("assistant")
+        .model(TemporalModel.newBuilder("gemini-2.5-flash")
+            .streamingTopic("model-output").build())
+        .instruction("Answer concisely.").build();
+    Runner runner = TemporalAdk.runnerBuilder().appName("live-chat").agent(agent).build();
+    List<Event> events = TemporalAdk.run(runner, "user", "session",
+        Content.fromParts(Part.fromText(message)),
+        RunConfig.builder().autoCreateSession(true)
+            .streamingMode(RunConfig.StreamingMode.SSE).build());
+    output.topic("turn-status").publish("complete");
+    Workflow.await(Duration.ofSeconds(10), () -> consumed);
+    return events.get(events.size() - 1).content().map(Content::text).orElse("");
+  }
+
+  @Override
+  public void streamConsumed() {
+    consumed = true;
+  }
+}
+```
+
+Subscribe when starting the Workflow. Stream items contain codec-free ADK JSON; the Activity
+client's custom converter and payload codecs apply once to the outer publish Signal, not again
+to each nested item. Decode model items with `GoogleAdkPayloadConverter`:
+
+```java
+WorkflowClient.start(workflow::chat, "Say hello.");
+try (WorkflowStreamClient stream = WorkflowStreamClient.newInstance(client, workflowId);
+    WorkflowStreamSubscription subscription = stream.subscribe(
+        SubscribeOptions.newBuilder().setTopics("model-output", "turn-status")
+            .setFromOffset(0).build())) {
+  for (WorkflowStreamItem item : subscription) {
+    if (item.getTopic().equals("turn-status")) {
+      workflow.streamConsumed();
+      break;
+    }
+    ModelStreamEvent event = new GoogleAdkPayloadConverter()
+        .fromData(item.getPayload(), ModelStreamEvent.class, ModelStreamEvent.class);
+    System.out.println(event.kind() + ": " + event.response());
+  }
+}
+```
+
+Each `ModelStreamEvent` identifies its Workflow ID, Run ID, Activity ID, attempt, and zero-based
+sequence. Retried Activities reuse the Activity ID, increase the attempt, and restart the sequence.
+`RESPONSE` carries an ADK partial or final response; `COMPLETE`, `FAILED`, and `CANCELLED` describe
+one provider attempt. Terminal records are best effort and can be absent after initialization,
+transport, or Worker failures. `COMPLETE` does not commit the Activity result or finish an agent
+turn: a later publishing failure can still cause an Activity retry. Use the Workflow's result or
+turn marker as the final outcome.
+
+The publisher flushes before a successful Activity completes, limits each publish Signal RPC and
+batch retry window to five seconds, and stops forwarding an abandoned provider's late output.
+Publishing failures fail the Activity according to its retry policy; an existing provider or
+cancellation failure remains primary. These deadlines bound transport waits, not subscriber
+acknowledgement. Workflow Streams targets the current Run for the Workflow ID, so consumers must
+check Run IDs when following Continue-As-New. Truncate stream history periodically for long-running
+or high-volume agents; the final Activity response must still fit Temporal payload limits.
 
 ### Running the agent
 
@@ -309,7 +408,8 @@ examples.
 
 ## Limitations
 
-- No token-level streaming out of the workflow and no live (bidirectional) mode.
+- Live output requires an explicitly configured topic and a hosted Workflow Stream; no live
+  (bidirectional) mode is supported.
 - Tools that run on the workflow thread must be deterministic; ADK's code executor, memory, and
   artifact services that perform I/O are not supported inside workflows.
 - ADK's OpenTelemetry tracing is global. Spans are no-ops without an installed SDK; with one

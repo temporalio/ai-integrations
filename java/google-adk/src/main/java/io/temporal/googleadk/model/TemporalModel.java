@@ -34,8 +34,9 @@ import java.util.function.Function;
  *
  * <p>Streamed calls ({@code RunConfig.StreamingMode.SSE}) are served by the same activity: the
  * worker collects every chunk the model emits and the workflow replays them in order, so ADK's
- * partial events keep their shape. Chunks reach the workflow only when the activity completes. Live
- * (bidirectional) connections are not supported inside workflows.
+ * partial events keep their shape. Chunks reach the workflow only when the activity completes.
+ * Configuring {@link Builder#streamingTopic} also sends them to external Workflow Streams
+ * subscribers while the Activity is running. Live (bidirectional) connections are not supported.
  */
 public final class TemporalModel extends BaseLlm {
 
@@ -45,11 +46,13 @@ public final class TemporalModel extends BaseLlm {
 
   private final ActivityOptions activityOptions;
   private final Function<LlmRequest, String> summary;
+  private final String streamingTopic;
 
   private TemporalModel(Builder builder) {
     super(builder.modelName);
     this.activityOptions = builder.activityOptions;
     this.summary = builder.summary;
+    this.streamingTopic = builder.streamingTopic;
   }
 
   /** Creates a model with the default activity options. */
@@ -79,7 +82,9 @@ public final class TemporalModel extends BaseLlm {
                   .build();
           ModelActivity activity = Workflow.newActivityStub(ModelActivity.class, options);
           InvokeModelOutput output =
-              activity.invokeModel(new InvokeModelInput(model(), llmRequest, stream));
+              activity.invokeModel(
+                  new InvokeModelInput(
+                      model(), llmRequest, stream, stream ? streamingTopic : null));
           return Flowable.fromIterable(output.responses());
         });
   }
@@ -95,6 +100,7 @@ public final class TemporalModel extends BaseLlm {
     private final String modelName;
     private ActivityOptions activityOptions = DEFAULT_ACTIVITY_OPTIONS;
     private Function<LlmRequest, String> summary;
+    private String streamingTopic;
 
     private Builder(String modelName) {
       this.modelName = Objects.requireNonNull(modelName, "modelName");
@@ -107,6 +113,23 @@ public final class TemporalModel extends BaseLlm {
     /** Sets the activity options for each model call; a summary set here is overridden. */
     public Builder activityOptions(ActivityOptions activityOptions) {
       this.activityOptions = Objects.requireNonNull(activityOptions, "activityOptions");
+      return this;
+    }
+
+    /**
+     * Publishes streamed model responses and an attempt-terminal event to this Workflow Streams
+     * topic while the model Activity runs. The Workflow must host a {@code WorkflowStream}; the
+     * application must supply the SDK-matched {@code temporal-workflowstreams} dependency. Calls
+     * without SSE streaming do not publish. Activity retries use a new attempt number and restart
+     * their sequence at zero. Terminal records are best effort; the durable Activity result remains
+     * authoritative.
+     */
+    public Builder streamingTopic(String streamingTopic) {
+      Objects.requireNonNull(streamingTopic, "streamingTopic");
+      if (streamingTopic.isBlank()) {
+        throw new IllegalArgumentException("streamingTopic must not be blank");
+      }
+      this.streamingTopic = streamingTopic;
       return this;
     }
 
