@@ -88,7 +88,8 @@ type Config struct {
 
 // Activities holds the worker-side registries and implements the Temporal
 // Activities dispatched from the workflow side: InvokeModel (by TemporalModel),
-// and ListMcpTools / CallMcpTool (by the MCP proxy). Ordinary function tools run
+// ListMcpTools / CallMcpTool (by the MCP proxy), and ResolveA2AAgentCard /
+// SendA2AMessage / CancelA2ATask (by the A2A providers). Ordinary function tools run
 // in-workflow and need no registration here; ActivityAsTool dispatches the
 // user's own already-registered activity by name. Build one with NewActivities
 // and register it with Register.
@@ -162,16 +163,19 @@ type activityRegistry interface {
 	RegisterActivityWithOptions(a any, options activity.RegisterOptions)
 }
 
-// registerAll wires InvokeModel, ListMcpTools and CallMcpTool onto r under
-// their stable Activity names.
+// registerAll wires InvokeModel, the MCP Activities and the A2A Activities onto
+// r under their stable Activity names.
 func (a *Activities) registerAll(r activityRegistry) {
 	r.RegisterActivityWithOptions(a.InvokeModel, activity.RegisterOptions{Name: InvokeModelActivityName})
 	r.RegisterActivityWithOptions(a.ListMcpTools, activity.RegisterOptions{Name: ListMcpToolsActivityName})
 	r.RegisterActivityWithOptions(a.CallMcpTool, activity.RegisterOptions{Name: CallMcpToolActivityName})
+	r.RegisterActivityWithOptions(a.ResolveA2AAgentCard, activity.RegisterOptions{Name: ResolveA2AAgentCardActivityName})
+	r.RegisterActivityWithOptions(a.SendA2AMessage, activity.RegisterOptions{Name: SendA2AMessageActivityName})
+	r.RegisterActivityWithOptions(a.CancelA2ATask, activity.RegisterOptions{Name: CancelA2ATaskActivityName})
 }
 
-// Register wires InvokeModel, ListMcpTools and CallMcpTool onto the worker under
-// their stable Activity names. NewPlugin is the standard wiring — it performs
+// Register wires InvokeModel, the MCP Activities and the A2A Activities onto the
+// worker under their stable Activity names. NewPlugin is the standard wiring — it performs
 // this registration at worker start; Register remains for the workflow/activity
 // test environments (which construct no real worker, so plugins do not run
 // there) and manual setups.

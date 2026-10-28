@@ -11,11 +11,14 @@ import (
 
 // Activity type names registered worker-side by Activities.Register and
 // dispatched by name from the workflow side (the TemporalModel, ActivityAsTool
-// tools, and the MCP proxy).
+// tools, the MCP proxy, and the A2A card and client providers).
 const (
-	InvokeModelActivityName  = "googleadk.InvokeModel"
-	ListMcpToolsActivityName = "googleadk.ListMcpTools"
-	CallMcpToolActivityName  = "googleadk.CallMcpTool"
+	InvokeModelActivityName         = "googleadk.InvokeModel"
+	ListMcpToolsActivityName        = "googleadk.ListMcpTools"
+	CallMcpToolActivityName         = "googleadk.CallMcpTool"
+	ResolveA2AAgentCardActivityName = "googleadk.ResolveA2AAgentCard"
+	SendA2AMessageActivityName      = "googleadk.SendA2AMessage"
+	CancelA2ATaskActivityName       = "googleadk.CancelA2ATask"
 )
 
 // Stable ApplicationError.Type strings. Callers classify failures on these

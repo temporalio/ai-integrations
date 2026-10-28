@@ -200,6 +200,14 @@ the model SDK's own retries (see below), or override the fallbacks.
   closes any cached toolset that implements `Close() error` at worker stop
   automatically; with manual wiring, call `Activities.Close` yourself after
   `worker.Run` returns.
+- **Remote A2A agents.** Build ADK's remote agent (`remoteagent.NewA2A`) with
+  `AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, activityOptions)`
+  and `ClientProvider: googleadk.NewA2AClientProvider(activityOptions)`. The card
+  fetch and each message then run in the `ResolveA2AAgentCard` and
+  `SendA2AMessage` Activities (a cancellation in `CancelA2ATask`), so a replay
+  reads them from History instead of sending them again. The Activities use
+  a2a-go's default client. A streamed reply reaches the workflow when the stream
+  ends.
 - **Deterministic by construction.** `NewContext` binds ADK's `platform.Now` to
   `workflow.Now`, `platform.NewUUID` to a deterministic generator drawn from the
   workflow random stream, and `platform.RunTasks` to a `workflow.Go` fan-out, so
@@ -466,20 +474,21 @@ an upgrade would newly pass through ungated.
 ## Supported & not-yet-supported
 
 - **Supported:** single- and multi-agent (`SubAgents`) trees, in-workflow function
-  tools, `ActivityAsTool`, stateless MCP, Gemini built-in tools (executed
-  server-side inside `InvokeModel`), HITL tool confirmation, continue-as-new state
-  carry, the in-memory session service, and SSE streaming.
+  tools, `ActivityAsTool`, stateless MCP, remote A2A agents built with the
+  plugin's providers, Gemini built-in tools (executed server-side inside
+  `InvokeModel`), HITL tool confirmation, continue-as-new state carry, the
+  in-memory session service, and SSE streaming.
 - **Not yet:** `RunLive` (bidirectional streaming), sub-agent-as-child-workflow,
   live memory/artifact tools that require in-workflow network I/O, and DB/Vertex
   session services. These raise or are documented rather than silently degrading.
-- **Rejected:** ADK's remote A2A agents (`remoteagent.NewA2A`, which the
-  deprecated `agent/remoteagent` package also uses). They fetch their agent card
-  and send messages from Workflow code, so every replay would send them again.
-  A model call from an agent with a remote agent below it returns an error and
-  schedules no Activity. Call the remote agent from an Activity instead, for
-  example a tool built with `ActivityAsTool` that uses `a2aclient`. The check
-  runs on model calls, so it misses a remote agent that runs before any model
-  call, such as a remote root agent.
+- **Rejected:** ADK's remote A2A agents built without
+  `NewA2AClientProvider`, or that fetch their card without
+  `NewA2AAgentCardProvider` (a static `AgentCard` is fine). This includes every
+  agent from the deprecated `agent/remoteagent` package. They fetch their agent
+  card and send messages from Workflow code, so every replay would send them
+  again. A model call from an agent with such a remote agent below it returns an
+  error and schedules no Activity. The check runs on model calls, so it misses a
+  remote agent that runs before any model call, such as a remote root agent.
 
   An open run that made such a model call on an earlier version fails to replay
   on this one with a non-determinism error. Let those runs finish before you

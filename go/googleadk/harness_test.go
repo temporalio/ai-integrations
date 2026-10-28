@@ -2,11 +2,16 @@ package googleadk_test
 
 import (
 	"context"
+	"iter"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/stretchr/testify/require"
 
@@ -46,6 +51,37 @@ type subAgentSpec struct {
 	// RemoteCardURL, when set, makes the child ADK's remote A2A agent, with its
 	// agent card at this URL, instead of an LLM agent.
 	RemoteCardURL string
+	// RemoteActivities makes that remote agent fetch its card and send its
+	// messages in the plugin's Activities.
+	RemoteActivities bool
+}
+
+// startA2AServer starts an in-process A2A server that answers every message
+// with reply, and returns its URL and a count of the requests it received.
+func startA2AServer(t *testing.T, reply string) (string, *atomic.Int32) {
+	t.Helper()
+	var requests atomic.Int32
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		mux.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	card := &a2a.AgentCard{
+		Name: "remote", Description: "Answers questions.", Version: "1.0.0",
+		SupportedInterfaces: []*a2a.AgentInterface{{
+			URL: srv.URL + "/", ProtocolBinding: a2a.TransportProtocolJSONRPC, ProtocolVersion: a2a.Version,
+		}},
+		DefaultInputModes: []string{"text/plain"}, DefaultOutputModes: []string{"text/plain"},
+	}
+	executor := a2asrv.AgentExecutorFunc(func(context.Context, *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
+		return func(yield func(a2a.Event, error) bool) {
+			yield(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart(reply)), nil)
+		}
+	})
+	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
+	mux.Handle("/", a2asrv.NewJSONRPCHandler(a2asrv.NewHandler(executor)))
+	return srv.URL, &requests
 }
 
 // runInput is the serializable input to agentRunWorkflow.
@@ -242,11 +278,16 @@ func agentRunWorkflow(ctx workflow.Context, in runInput) (runResult, error) {
 	var subAgents []agent.Agent
 	for _, sa := range in.SubAgents {
 		if sa.RemoteCardURL != "" {
-			remote, rerr := remoteagent.NewA2A(remoteagent.A2AConfig{
+			cfg := remoteagent.A2AConfig{
 				Name:              sa.Name,
 				Description:       sa.Description,
 				AgentCardProvider: remoteagent.NewAgentCardProvider(sa.RemoteCardURL),
-			})
+			}
+			if sa.RemoteActivities {
+				cfg.AgentCardProvider = googleadk.NewA2AAgentCardProvider(sa.RemoteCardURL, workflow.ActivityOptions{})
+				cfg.ClientProvider = googleadk.NewA2AClientProvider(workflow.ActivityOptions{})
+			}
+			remote, rerr := remoteagent.NewA2A(cfg)
 			if rerr != nil {
 				return runResult{}, rerr
 			}

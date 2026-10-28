@@ -14,9 +14,9 @@ import (
 )
 
 // NewPlugin wires the integration as a Temporal worker plugin: it builds the
-// worker-side Activities from cfg, registers InvokeModel, ListMcpTools and
-// CallMcpTool at worker start, and closes the cached MCP toolsets at worker
-// stop. Add it to worker.Options.Plugins:
+// worker-side Activities from cfg, registers InvokeModel, the MCP Activities and
+// the A2A Activities at worker start, and closes the cached MCP toolsets at
+// worker stop. Add it to worker.Options.Plugins:
 //
 //	adkPlugin, err := googleadk.NewPlugin(googleadk.Config{
 //		Models:      map[string]googleadk.ModelFactory{ /* ... */ },
