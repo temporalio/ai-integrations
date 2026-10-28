@@ -224,6 +224,11 @@ class Computed:
     context: ComputedContext
 
 
+@dataclass
+class SecretContext(Context):
+    token: Annotated[str, PlainSerializer(lambda _: "redacted")] = "not-in-history"
+
+
 class ModelState(BaseModel):
     value: str
     answer: Answer | None = None
@@ -240,6 +245,9 @@ class ModelState(BaseModel):
         default_factory=hidden_message
     )
     note: Note = Field(default_factory=Note)
+    secret_context: Context = Field(
+        default_factory=lambda: SecretContext(user_id="alice")
+    )
     computed: Computed | None = None
     state_type_a: str = ""
     state_type_b: str = ""

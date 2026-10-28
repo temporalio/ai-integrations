@@ -22,7 +22,13 @@ from typing import (
 from langchain_core.messages import BaseMessage
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command, Interrupt, Send, TimeoutPolicy
-from pydantic import BaseModel, PlainSerializer, RootModel, WrapSerializer
+from pydantic import (
+    BaseModel,
+    PlainSerializer,
+    RootModel,
+    TypeAdapter,
+    WrapSerializer,
+)
 from pydantic.fields import FieldInfo
 from typing_extensions import NotRequired, Required, is_typeddict
 
@@ -261,6 +267,24 @@ def _custom_serialized(owner: Any, key: str | int, hint: Any) -> bool:
     return _has_serializer(hint)
 
 
+@cache
+def _adapter(cls: Any) -> TypeAdapter[Any]:
+    return TypeAdapter(cls)
+
+
+def _dump(value: Any) -> Any:
+    """Return ``value`` as Pydantic writes a field of its class, or ``_MISSING``.
+
+    Unlike the payload converter, this applies the serializers set on a
+    dataclass's fields.
+    """
+    cls: Any = type(value)
+    try:
+        return _adapter(cls).dump_python(value)
+    except Exception:
+        return _MISSING
+
+
 def _children(node: dict[Any, Any]) -> list[Any]:
     return [key for key in node if key is not _TYPE_ID and key is not _SENT]
 
@@ -449,9 +473,10 @@ class ValueTypes:
             item_path = [*path, key]
             type_id = self._type_id(type(item))
             if type_id is not None:
-                entry = [item_path, type_id]
-                if _written_as_base(item, item_hint):
-                    entry.append(item)
+                entry: list[Any] = [item_path, type_id]
+                whole = _dump(item) if _written_as_base(item, item_hint) else _MISSING
+                if whole is not _MISSING:
+                    entry.append(whole)
                 value_types.append(entry)
             self._record(item, item_path, value_types, item_hint)
 
