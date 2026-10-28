@@ -385,3 +385,69 @@ async def test_stateful_model_state_crosses_continue_as_new(client: Client):
         {"previous_response_id": None, "messages": 1},
         {"previous_response_id": "resp_1", "messages": 1},
     ]
+
+
+class UsageMockModel(ConfiguredMockModel):
+    """Records the user turns of each call; the first reply reports 800 input tokens."""
+
+    def __init__(self, responses: list[str | dict[str, Any]]) -> None:
+        super().__init__(responses)
+        self.user_turns: list[list[str]] = []
+
+    async def stream(
+        self, messages: Any, *args: Any, **kwargs: Any
+    ) -> AsyncIterable[StreamEvent]:  # type: ignore[override]
+        self.user_turns.append(
+            [m["content"][0]["text"] for m in messages if m["role"] == "user"]
+        )
+        async for event in super().stream(messages, *args, **kwargs):
+            yield event
+        if len(self.user_turns) == 1:
+            # 80% of the model's 1,000-token window, over the default compression
+            # threshold of 70%, but only 0.4% of Strands' 200,000-token fallback.
+            yield {
+                "metadata": {
+                    "usage": {
+                        "inputTokens": 800,
+                        "outputTokens": 1,
+                        "totalTokens": 801,
+                    },
+                    "metrics": {"latencyMs": 0},
+                }
+            }
+
+
+@workflow.defn
+class CompressionWorkflow:
+    @workflow.run
+    async def run(self, prompts: list[str]) -> None:
+        agent = TemporalAgent(
+            model="usage",
+            start_to_close_timeout=timedelta(seconds=15),
+            conversation_manager=SlidingWindowConversationManager(
+                proactive_compression=True
+            ),
+        )
+        for prompt in prompts:
+            await agent.invoke_async(prompt)
+
+
+async def test_proactive_compression_uses_model_context_window(client: Client):
+    """Compression drops the first turn before the second model call, as it does natively."""
+    task_queue = f"test_proactive_compression-{uuid4()}"
+    model = UsageMockModel(["first", "second"])
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[CompressionWorkflow],
+        plugins=[StrandsPlugin(models={"usage": lambda: model})],
+    ):
+        await client.execute_workflow(
+            CompressionWorkflow.run,
+            ["turn 1", "turn 2"],
+            id=f"test_proactive_compression_{uuid4()}",
+            task_queue=task_queue,
+        )
+
+    assert model.user_turns == [["turn 1"], ["turn 2"]]
