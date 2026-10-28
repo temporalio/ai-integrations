@@ -9,9 +9,6 @@ root-api = "temporalio.langgraph"
 maturity = "public-preview"
 docs = "https://docs.temporal.io/develop/python/integrations/langgraph"
 
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["3.10", "3.14"]
 

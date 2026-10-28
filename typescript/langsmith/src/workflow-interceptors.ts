@@ -10,7 +10,7 @@
  * @internal
  */
 
-import type { RunTree, RunTreeConfig } from 'langsmith/run_trees';
+import type { RunTree } from 'langsmith/run_trees';
 import { AsyncLocalStorageProviderSingleton } from 'langsmith/singletons/traceable';
 import type {
   ContinueAsNewInput,
@@ -45,6 +45,7 @@ import {
   ReplaySafeRunTree,
   _RootReplaySafeRunTreeFactory,
   RUN_TYPE,
+  type Destination,
   asOutputs,
   describeError,
   emitMarkerRun,
@@ -72,9 +73,12 @@ import { destination, type ReplicaRouting } from './routing';
  */
 export interface WorkflowLangSmithConfig {
   addTemporalRuns: boolean;
-  projectName?: string;
-  address?: RunTreeConfig['address'];
   replicas?: ReplicaRouting[];
+  /**
+   * The plugin's project or address, else LangSmith's env defaults, resolved outside the isolate when the bundle is
+   * built. New roots use this destination; propagated parents retain their own. Absent when neither names one.
+   */
+  destination?: Destination;
   tags?: string[];
   metadata?: Record<string, unknown>;
 }
@@ -116,9 +120,18 @@ AsyncLocalStorageProviderSingleton.initializeGlobalInstance(
 );
 const sharedStore = AsyncLocalStorageProviderSingleton.getInstance() as RunTreeStore;
 
-/** Reconstruct the propagated parent run from a Payload-keyed header map. */
-function reconstructParent(headers: Record<string, unknown> | undefined): RunTree | undefined {
-  return runTreeFromContext(readContextHeader(headers as Record<string, never> | undefined));
+/**
+ * Reconstruct the propagated parent run from a Payload-keyed header map. A header naming no destination takes
+ * `config.destination`, as LangSmith would take its env defaults outside the isolate. This plugin never propagates a
+ * run with no destination (see {@link runHeaders}), so such a header comes from an older release; if the Worker has
+ * no destination either, LangSmith fills in `"default"` for it here.
+ */
+function reconstructParent(
+  headers: Record<string, unknown> | undefined,
+  config: WorkflowLangSmithConfig
+): RunTree | undefined {
+  const context = readContextHeader(headers as Record<string, never> | undefined);
+  return runTreeFromContext(context, config.destination);
 }
 
 /**
@@ -154,27 +167,49 @@ function asReplaySafeParent(
  * A placeholder parent for the no-propagated-parent case. Installed as the ambient
  * so a workflow-body `traceable` always nests via `createChild`; never emitted,
  * and its children are independent roots (see {@link _RootReplaySafeRunTreeFactory}).
+ * It's needed even with no destination: without a parent, LangSmith mints the run
+ * id with `crypto`, which the isolate lacks. With no destination it's never emitted
+ * or propagated, and neither is any child that names no project or address of its own.
  */
-function placeholderRoot(config: WorkflowLangSmithConfig, generateNewUuid4?: () => string): _RootReplaySafeRunTreeFactory {
+function placeholderRoot(
+  config: WorkflowLangSmithConfig,
+  generateNewUuid4?: () => string
+): _RootReplaySafeRunTreeFactory {
   return new _RootReplaySafeRunTreeFactory(
-    {
-      name: workflowInfo().workflowType,
-      run_type: RUN_TYPE.CHAIN,
-      project_name: config.projectName,
-      address: config.address,
-      replicas: config.replicas,
-    },
-    generateNewUuid4
+    { name: workflowInfo().workflowType, run_type: RUN_TYPE.CHAIN, ...config.destination, replicas: config.replicas },
+    generateNewUuid4,
+    config.destination === undefined
   );
 }
 
-/** Emit a short-lived marker run as a child of `parent`. */
+/**
+ * The active run for a Temporal-operation run's body: the run itself, or, for a run with no destination, the
+ * propagated parent (else a placeholder root), so code below an incoming parent still nests under it.
+ */
+function bodyAmbient(
+  config: WorkflowLangSmithConfig,
+  run: ReplaySafeRunTree,
+  parent: ReplaySafeRunTree | undefined,
+  generateNewUuid4?: () => string
+): ReplaySafeRunTree {
+  if (!run.untraced) {
+    return run;
+  }
+  return parent ?? placeholderRoot(config, generateNewUuid4);
+}
+
+/**
+ * Emit a short-lived marker run as a child of `parent`. With no destination in `config` the marker has none either,
+ * but it's built and awaited all the same: the isolate's awaits, and so the order of its commands, must not depend
+ * on the Worker's env, or a history recorded under one env fails to replay under another.
+ */
 async function emitMarker(
+  config: WorkflowLangSmithConfig,
   parent: ReplaySafeRunTree,
   name: string,
   inputs: Record<string, unknown>
 ): Promise<ReplaySafeRunTree> {
-  const marker = parent.createChild({ name, run_type: RUN_TYPE.CHAIN, inputs });
+  const marker = parent.createChild({ name, run_type: RUN_TYPE.CHAIN, inputs }, config.destination === undefined);
   await emitMarkerRun(marker);
   return marker;
 }
@@ -194,13 +229,14 @@ function buildReplaySafeRunTree(
       name: params.name,
       run_type: params.runType,
       parent_run: params.parent,
-      ...destination(params.parent, { project_name: config.projectName, address: config.address }),
+      ...destination(params.parent, config.destination),
       replicas: params.parent?.replicas ?? config.replicas,
       tags: config.tags,
       extra: { metadata: scrubSensitive(config.metadata) ?? {} },
       inputs: params.inputs,
     },
-    params.generateNewUuid4
+    params.generateNewUuid4,
+    config.destination === undefined
   );
 }
 
@@ -208,7 +244,7 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
   constructor(private readonly config: WorkflowLangSmithConfig) {}
 
   async execute(input: WorkflowExecuteInput, next: Next<WorkflowInboundCallsInterceptor, 'execute'>): Promise<unknown> {
-    const parent = reconstructParent(input.headers);
+    const parent = reconstructParent(input.headers, this.config);
     return this.runInbound(
       runWorkflowRunName(workflowInfo().workflowType),
       RUN_TYPE.CHAIN,
@@ -219,7 +255,7 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
   }
 
   async handleSignal(input: SignalInput, next: Next<WorkflowInboundCallsInterceptor, 'handleSignal'>): Promise<void> {
-    const parent = reconstructParent(input.headers);
+    const parent = reconstructParent(input.headers, this.config);
     await this.runInbound(handleSignalRunName(input.signalName), RUN_TYPE.CHAIN, parent, { args: input.args }, () =>
       next(input)
     );
@@ -229,7 +265,7 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
     if (isInternalQuery(input.queryName)) {
       return next(input);
     }
-    const parent = reconstructParent(input.headers);
+    const parent = reconstructParent(input.headers, this.config);
     return this.runInbound(
       handleQueryRunName(input.queryName),
       RUN_TYPE.CHAIN,
@@ -246,7 +282,7 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
     input: UpdateInput,
     next: Next<WorkflowInboundCallsInterceptor, 'handleUpdate'>
   ): Promise<unknown> {
-    const parent = reconstructParent(input.headers);
+    const parent = reconstructParent(input.headers, this.config);
     return this.runInbound(handleUpdateRunName(input.name), RUN_TYPE.CHAIN, parent, { args: input.args }, () =>
       next(input)
     );
@@ -256,29 +292,29 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
     // Read-only: mint run ids from the nondeterministic unsafe random source so the validator
     // never draws from the Workflow main PRNG (which a clean replay would not advance).
     const generateNewUuid4 = workflowInfo().unsafe.random.uuid4;
+    const parent = asReplaySafeParent(reconstructParent(input.headers, this.config), generateNewUuid4);
     if (!this.config.addTemporalRuns) {
       // Propagation only: install the reconstructed parent (or a placeholder parent
       // when none was propagated, to keep a validator-body `traceable` off the
       // no-parent `crypto` path) so the validator body nests under the update's
       // trace.
-      const ambient =
-        asReplaySafeParent(reconstructParent(input.headers), generateNewUuid4) ?? placeholderRoot(this.config, generateNewUuid4);
+      const ambient = parent ?? placeholderRoot(this.config, generateNewUuid4);
       sharedStore.run(ambient, () => next(input));
       return;
     }
     const run = buildReplaySafeRunTree(this.config, {
       name: validateUpdateRunName(input.name),
       runType: RUN_TYPE.CHAIN,
-      parent: asReplaySafeParent(reconstructParent(input.headers), generateNewUuid4),
+      parent,
       inputs: { args: input.args },
       generateNewUuid4,
     });
     // Validators are synchronous and must not be made async; emit start/end
-    // around the synchronous call, with the run installed as the active store so
-    // a `traceable` in the validator body nests under it.
+    // around the synchronous call, with the run (see {@link bodyAmbient}) installed
+    // as the active store so a `traceable` in the validator body nests under it.
     void run.postRun();
     try {
-      sharedStore.run(run, () => next(input));
+      sharedStore.run(bodyAmbient(this.config, run, parent, generateNewUuid4), () => next(input));
       void run.end({});
     } catch (err) {
       void run.end(undefined, describeError(err));
@@ -289,7 +325,7 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
   }
 
   /**
-   * Open the inbound run, install it as the active run for the whole `next`
+   * Open the inbound run, install it (see {@link bodyAmbient}) as the active run for the whole `next`
    * async scope, and close it. The real ALS scopes the run to this branch, so a
    * handler running concurrently with the workflow body never leaks its run into
    * the body's context.
@@ -302,6 +338,7 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
     next: () => Promise<unknown>,
     generateNewUuid4?: () => string
   ): Promise<unknown> {
+    const replaySafeParent = asReplaySafeParent(parent, generateNewUuid4);
     if (!this.config.addTemporalRuns) {
       // Propagation only: install the reconstructed parent as the active run so
       // user `traceable` runs nest under it; never emit a Temporal-operation run.
@@ -309,13 +346,13 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
       // `undefined` so a workflow-body `traceable` takes LangSmith's
       // `createChild` branch (deterministic id) rather than the no-parent branch
       // that mints a uuid via `crypto`, which the isolate lacks.
-      const ambient = asReplaySafeParent(parent, generateNewUuid4) ?? placeholderRoot(this.config, generateNewUuid4);
+      const ambient = replaySafeParent ?? placeholderRoot(this.config, generateNewUuid4);
       return sharedStore.run(ambient, next);
     }
     const run = buildReplaySafeRunTree(this.config, {
       name,
       runType,
-      parent: asReplaySafeParent(parent, generateNewUuid4),
+      parent: replaySafeParent,
       inputs,
       generateNewUuid4,
     });
@@ -332,7 +369,7 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
         throw err;
       }
     };
-    return sharedStore.run(run, body);
+    return sharedStore.run(bodyAmbient(this.config, run, replaySafeParent, generateNewUuid4), body);
   }
 }
 
@@ -395,7 +432,7 @@ class LangSmithWorkflowOutbound implements WorkflowOutboundCallsInterceptor {
   ): Promise<StartNexusOperationOutput> {
     const ambient = sharedStore.getStore();
     if (this.config.addTemporalRuns && ambient instanceof ReplaySafeRunTree) {
-      await emitMarker(ambient, startNexusOperationRunName(input.service, input.operation), {});
+      await emitMarker(this.config, ambient, startNexusOperationRunName(input.service, input.operation), {});
     }
     const ctx = runHeaders(ambient);
     const headers = ctx ? { ...input.headers, [HEADER_KEY]: encodeContextString(ctx) } : input.headers;
@@ -410,7 +447,7 @@ class LangSmithWorkflowOutbound implements WorkflowOutboundCallsInterceptor {
   ): Promise<R> {
     const ambient = sharedStore.getStore();
     if (this.config.addTemporalRuns && ambient instanceof ReplaySafeRunTree) {
-      await emitMarker(ambient, name, { args: input.args ?? [] });
+      await emitMarker(this.config, ambient, name, { args: input.args ?? [] });
     }
     const headers = withContextHeader(input.headers, runHeaders(ambient));
     return next(headers);
@@ -425,7 +462,9 @@ class LangSmithWorkflowOutbound implements WorkflowOutboundCallsInterceptor {
     const ambient = sharedStore.getStore();
     let propagate: RunTree | undefined = ambient;
     if (this.config.addTemporalRuns && ambient instanceof ReplaySafeRunTree) {
-      propagate = await emitMarker(ambient, name, { args: input.args ?? [] });
+      const marker = await emitMarker(this.config, ambient, name, { args: input.args ?? [] });
+      // A marker with no destination is never propagated, so the remote handler nests under the ambient run instead.
+      propagate = marker.untraced ? ambient : marker;
     }
     const headers = withContextHeader(input.headers, runHeaders(propagate));
     return next(headers);

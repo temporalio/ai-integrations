@@ -8,9 +8,6 @@ registry = "pypi"
 root-api = "temporalio.mcp"
 maturity = "pre-release"
 
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["3.10", "3.14"]
 

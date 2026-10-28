@@ -13,7 +13,9 @@ from langgraph.types import Command, Interrupt, Send, TimeoutPolicy
 from temporalio import workflow
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.langgraph._langgraph_config import (
+    context_schema_id,
     get_langgraph_config,
+    is_context_schema,
     set_langgraph_config,
     strip_runnable_config,
 )
@@ -110,6 +112,8 @@ def _command_from_payload(payload: dict[str, Any]) -> Command:
 def wrap_activity(
     func: Callable,
     *,
+    context_schema: type[Any] | None = None,
+    context_schemas: dict[str, type[Any]] | None = None,
     streaming_topic: str | None = None,
     streaming_batch_interval: timedelta = timedelta(milliseconds=100),
 ) -> Callable[[ActivityInput], Awaitable[ActivityOutput]]:
@@ -132,8 +136,16 @@ def wrap_activity(
 
                 effective_writer = thread_safe_writer
 
+            schema = context_schema
+            schema_id = input.langgraph_config.get("context_schema_id")
+            if schema_id is not None:
+                schema = (context_schemas or {}).get(schema_id)
+                if schema is None:
+                    raise ValueError(f"Unknown context schema ID: {schema_id!r}")
             runtime = set_langgraph_config(
-                input.langgraph_config, stream_writer=effective_writer
+                input.langgraph_config,
+                context_schema=schema,
+                stream_writer=effective_writer,
             )
             kwargs = dict(input.kwargs)
             if accepts_runtime:
@@ -165,6 +177,7 @@ def wrap_execute_activity(
     afunc: Callable[[ActivityInput], Awaitable[ActivityOutput]],
     task_id: str = "",
     summary_fn: Callable[[tuple[Any, ...], dict[str, Any]], str | None] | None = None,
+    context_schemas: dict[str, type[Any]] | None = None,
     **execute_activity_kwargs: Any,
 ) -> Callable[..., Any]:
     """Wrap an activity function to be called via workflow.execute_activity with caching."""
@@ -197,6 +210,17 @@ def wrap_execute_activity(
             )
 
         langgraph_config = get_langgraph_config()
+        if runtime is not None:
+            langgraph_config["context"] = runtime.context
+        context_type = type(langgraph_config.get("context"))
+        if is_context_schema(context_type):
+            schema_id = context_schema_id(context_type)
+            if schema_id not in (context_schemas or {}):
+                raise ValueError(
+                    f"Context type {schema_id!r} is not registered. "
+                    "Declare it as a graph or entrypoint context_schema."
+                )
+            langgraph_config["context_schema_id"] = schema_id
 
         # Check task result cache (for continue-as-new deduplication).
         key = (

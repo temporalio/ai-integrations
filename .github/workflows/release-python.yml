@@ -39,7 +39,7 @@ on:
         type: string
         default: ""
       publish-prerelease-to-pypi:
-        description: For a pre-release tag ref, also publish to PyPI (ignored while plugin.toml [release] allow-final is false)
+        description: For a pre-release tag ref, also publish to PyPI
         type: boolean
         default: false
 
@@ -73,7 +73,6 @@ jobs:
       root_api: ${{ steps.tag.outputs.root_api }}
       smoke_imports: ${{ steps.tag.outputs.smoke_imports }}
       tag: ${{ steps.tag.outputs.tag }}
-      allow_final: ${{ steps.tag.outputs.allow_final }}
       requires_python: ${{ steps.tag.outputs.requires_python }}
       recovery: ${{ steps.recovery.outputs.recovery || 'false' }}
       artifact_run_id: ${{ steps.recovery.outputs.artifact_run_id || github.run_id }}
@@ -140,7 +139,6 @@ jobs:
         id: gate
         env:
           PRERELEASE: ${{ steps.tag.outputs.prerelease }}
-          ALLOW_FINAL: ${{ steps.tag.outputs.allow_final }}
           OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish-prerelease-to-pypi }}
           REF_TYPE: ${{ github.ref_type }}
           RECOVERY: ${{ steps.recovery.outputs.recovery }}
@@ -154,9 +152,8 @@ jobs:
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "::notice::dry run: validation, tests and the build run; nothing is uploaded"
           fi
-          # Finals reach PyPI; pre-releases only via the dispatch override, and never while the plugin
-          # is still in the SDK-cutover transition (allow-final = false).
-          if [ "$PRERELEASE" = "false" ] || { [ "$OVERRIDE" = "true" ] && [ "$ALLOW_FINAL" = "true" ]; }; then
+          # Finals reach PyPI; pre-releases require the explicit dispatch override.
+          if [ "$PRERELEASE" = "false" ] || { [ "$OVERRIDE" = "true" ]; }; then
             echo "publish_pypi=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish_pypi=false" >> "$GITHUB_OUTPUT"
@@ -251,8 +248,6 @@ jobs:
           REQUIRES_PYTHON: ${{ needs.prepare.outputs.requires_python }}
           SMOKE_IMPORTS: ${{ needs.prepare.outputs.smoke_imports }}
           INDEX_URL: https://test.pypi.org/simple/
-          # A plugin the SDK still bundles (allow-final = false) may overlap it; any other must not.
-          ALLOW_OVERLAP_WITH_CORE: ${{ needs.prepare.outputs.allow_final == 'true' && '0' || '1' }}
         run: bash scripts/release/smoke_from_index.sh
 
   publish-pypi:
@@ -317,5 +312,4 @@ jobs:
           REQUIRES_PYTHON: ${{ needs.prepare.outputs.requires_python }}
           SMOKE_IMPORTS: ${{ needs.prepare.outputs.smoke_imports }}
           # Same rule as TestPyPI: only a plugin the SDK still bundles may overlap it.
-          ALLOW_OVERLAP_WITH_CORE: ${{ needs.prepare.outputs.allow_final == 'true' && '0' || '1' }}
         run: bash scripts/release/smoke_from_index.sh

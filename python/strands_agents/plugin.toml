@@ -9,9 +9,6 @@ root-api = "temporalio.strands_agents"
 maturity = "public-preview"
 docs = "https://docs.temporal.io/develop/python/integrations/strands-agents"
 
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["3.10", "3.14"]
 

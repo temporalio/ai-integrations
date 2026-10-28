@@ -7,9 +7,6 @@ root-api = "@temporalio/langsmith"
 maturity = "public-preview"
 docs = "https://docs.temporal.io/develop/typescript/integrations/langsmith"
 
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["22", "24"]
 

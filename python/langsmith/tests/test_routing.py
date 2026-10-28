@@ -160,7 +160,7 @@ def test_native_project_context_overrides_agent_factory() -> None:
     client = make_mock_ls_client(InMemoryRunCollector())
     with ThreadPoolExecutor(max_workers=1) as executor:
         factory = _RootReplaySafeRunTreeFactory(
-            ls_client=client, executor=executor, address=ADDRESS
+            ls_client=client, executor=executor, destination={"address": ADDRESS}
         )
 
         @traceable(address=OTHER_ADDRESS)

@@ -21,8 +21,6 @@ Policy (AGENTS.md, "Release runbook"):
     0.1.0 (public-preview), or 0.0.1 (pre-release); pre-releases of that version are allowed
   * an existing coordinate only ever moves strictly forward (max published incl. yanked)
   * TestPyPI versions move forward too, except that its newest version may be re-run
-  * final (non pre-release) versions additionally require plugin.toml
-    [release] allow-final = true and no TRANSITION(sdk-cutover) markers in the plugin
   * Python versions are canonical PEP 440; Java versions are X.Y.Z[-RCN];
     Go and TypeScript versions are canonical SemVer; local versions and build metadata (+...) are forbidden
 """
@@ -37,17 +35,23 @@ import re
 import subprocess
 import sys
 import time
-import tomllib
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote
 
+import tomllib
+from go_release import (
+    GoReleaseError,
+    GoVersion,
+    check_vanity,
+    fetch_versions,
+    verify_module,
+)
+from npm_release import NpmReleaseError, NpmVersion, registry_state
+from npm_release import fetch_versions as fetch_npm_versions
 from packaging.version import InvalidVersion, Version
-
-from go_release import GoReleaseError, GoVersion, check_vanity, fetch_versions, verify_module
-from npm_release import NpmReleaseError, NpmVersion, fetch_versions as fetch_npm_versions, registry_state
 
 # \Z (not $) so a trailing newline cannot ride along into GITHUB_OUTPUT.
 TAG_RE = re.compile(r"^(?P<language>python|typescript|java|go)/(?P<plugin>[a-z0-9][a-z0-9_.-]*)/v(?P<version>.+)\Z")
@@ -66,7 +70,6 @@ FIRST_VERSION = {
     "public-preview": Version("0.1.0"),
     "pre-release": Version("0.0.1"),
 }
-TRANSITION_MARKER = "TRANSITION(sdk-cutover)"
 DEFAULT_REPO = "temporalio/ai-integrations"
 
 
@@ -154,7 +157,6 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
         out["coordinate"] = meta["plugin"]["coordinate"]
         out["root_api"] = meta["plugin"]["root-api"]
         out["smoke_imports"] = ",".join(meta.get("smoke", {}).get("imports", []))
-        out["allow_final"] = "true" if meta.get("release", {}).get("allow-final") else "false"
         out["maturity"] = meta["plugin"]["maturity"]
         out["github_prerelease"] = "true" if github_prerelease(release_version(out["language"], out["version"]), out["maturity"]) else "false"
         if out["language"] == "python":
@@ -297,22 +299,6 @@ def check_staging_policy(version: Version, staged: list[Version]) -> str | None:
     return None
 
 
-def transition_markers(repo_root: Path, plugin_dir: str) -> list[str]:
-    """List plugin files containing the transition marker. Fails closed on any git error."""
-    try:
-        out = subprocess.run(
-            ["git", "grep", "-l", TRANSITION_MARKER, "--", plugin_dir],
-            capture_output=True, text=True, cwd=repo_root,
-        )
-    except FileNotFoundError as exc:
-        raise PolicyError(f"git is required to check for {TRANSITION_MARKER} markers: {exc}") from exc
-    # git grep exits 1 for "no match"; anything else (not a repo, bad pathspec, ...) is an error
-    # and must not be mistaken for "no markers".
-    if out.returncode not in (0, 1):
-        raise PolicyError(f"git grep for {TRANSITION_MARKER} failed in {repo_root} ({out.returncode}): {out.stderr.strip()}")
-    return [line for line in out.stdout.splitlines() if line.strip()]
-
-
 def cmd_check_version_policy(args: argparse.Namespace) -> int:
     plugin_dir = Path(args.plugin_dir)
     meta = _load(plugin_dir / "plugin.toml")
@@ -344,17 +330,6 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
                   "smoke-testpypi verifies that the served files are this run's artifacts")
         else:
             print(f"OK: {coordinate} {version} is not yet on TestPyPI")
-    if not version.is_prerelease:
-        if not meta.get("release", {}).get("allow-final"):
-            raise PolicyError(
-                f"{coordinate} {version} is a final release but plugin.toml [release] allow-final is false "
-                "(final releases are not enabled; publish a pre-release instead)"
-            )
-        repo_root = Path(args.repo_root).resolve()
-        markers = transition_markers(repo_root, os.path.relpath(plugin_dir.resolve(), repo_root))
-        if markers:
-            raise PolicyError(f"final release blocked: {TRANSITION_MARKER} markers remain in {markers}")
-        print("OK: final-release gates satisfied (allow-final = true, no transition markers)")
     return 0
 
 
@@ -475,7 +450,6 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str, *, ref:
     else:
         meta = _load(meta_path) if meta_path.is_file() else {"plugin": {}}
     coordinate = meta["plugin"].get("coordinate", parts["plugin"])
-    root_api = meta["plugin"].get("root-api", "")
     prev = previous_tag(repo_root, parts["language"], parts["plugin"], version)
     source = ref or tag
     revision = f"{prev[0]}..{source}" if prev else source
@@ -488,14 +462,6 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str, *, ref:
             f"First standalone release of `{coordinate}`.",
             "",
         ]
-        upstream = meta["plugin"].get("upstream")
-        if upstream and ":" in upstream:
-            up_repo, up_path = upstream.split(":", 1)
-            lines += [
-                f"This code previously shipped inside the Temporal SDK; its full history was imported with authorship preserved "
-                f"from https://github.com/{up_repo}/commits/main/{up_path}.",
-                "",
-            ]
     lines += ["## What's changed", ""]
     entries = [line for line in log.splitlines() if line.strip()]
     if not entries:
@@ -529,15 +495,6 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str, *, ref:
              if parts["language"] == "java" else
              "- This pre-release is published to **TestPyPI only** to validate the release pipeline."),
         ]
-        if parts["language"] == "java" and not meta.get("release", {}).get("allow-final", False):
-            lines += ["- Final publication remains blocked until the SDK publishing cutover is complete."]
-        elif not meta.get("release", {}).get("allow-final", False):
-            # Only a plugin the SDK still bundles shares files with it.
-            lines += [
-                f"- Do **not** install it alongside a `temporalio` release that still embeds `{root_api or coordinate}`; both distributions "
-                "write the same files and whichever installs last wins. Wait for the SDK cutover release.",
-                "- docs.temporal.io still describes the SDK-embedded install until the cutover.",
-            ]
         lines.append("")
     return "\n".join(lines)
 

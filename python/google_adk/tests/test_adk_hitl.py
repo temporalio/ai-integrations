@@ -14,7 +14,6 @@
 
 """Integration tests for durable human-in-the-loop with ADK in Temporal workflows."""
 
-import asyncio
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import timedelta
@@ -36,7 +35,7 @@ from google.genai.types import Content, FunctionCall, Part
 
 import temporalio.google_adk.workflow
 from temporalio import activity, workflow
-from temporalio.client import Client, WorkflowHandle
+from temporalio.client import Client, WorkflowUpdateStage
 from temporalio.google_adk import (
     GoogleAdkPlugin,
     HitlRequest,
@@ -66,6 +65,21 @@ class _HitlLoopMixin:
     def __init__(self) -> None:
         self._pending: dict[str, HitlRequest] = {}
         self._responses: dict[str, Any] = {}
+
+    @workflow.update
+    async def wait_for_pending(
+        self, count: int = 1, expected_ids: set[str] | None = None
+    ) -> list[HitlRequest]:
+        # Wait in the workflow so checking readiness does not repeatedly replay
+        # its history when max_cached_workflows=0.
+        await workflow.wait_condition(
+            lambda: (
+                set(self._pending) == expected_ids
+                if expected_ids is not None
+                else len(self._pending) >= count
+            )
+        )
+        return list(self._pending.values())
 
     async def _drive(self, runner: Runner, first_message: types.Content) -> str:
         session = await runner.session_service.create_session(
@@ -116,10 +130,6 @@ class _HitlLoopMixin:
 @workflow.defn
 class HumanInputGraphWorkflow(_HitlLoopMixin):
     """A graph human-input node maps onto a durable Temporal wait."""
-
-    @workflow.query
-    def pending_requests(self) -> list[HitlRequest]:
-        return list(self._pending.values())
 
     @workflow.update
     async def respond(self, interrupt_id: str, response: Any) -> None:
@@ -194,10 +204,6 @@ class ConfirmationModel(BaseLlm):
 class ConfirmationAgentWorkflow(_HitlLoopMixin):
     """Tool confirmation gates an activity_as_tool: the activity only runs on approval."""
 
-    @workflow.query
-    def pending_requests(self) -> list[HitlRequest]:
-        return list(self._pending.values())
-
     @workflow.update
     async def respond(self, interrupt_id: str, response: Any) -> None:
         self._responses[interrupt_id] = response
@@ -225,10 +231,6 @@ class ConfirmationAgentWorkflow(_HitlLoopMixin):
 @workflow.defn
 class MultiPendingGraphWorkflow(_HitlLoopMixin):
     """Two parallel human-input branches; partial responses keep the rest pending."""
-
-    @workflow.query
-    def pending_requests(self) -> list[HitlRequest]:
-        return list(self._pending.values())
 
     @workflow.update
     async def respond(self, interrupt_id: str, response: Any) -> None:
@@ -265,10 +267,6 @@ class MultiPendingGraphWorkflow(_HitlLoopMixin):
 @workflow.defn
 class DefaultInterruptIdWorkflow(_HitlLoopMixin):
     """A RequestInput with no explicit id relies on the platform uuid seam."""
-
-    @workflow.query
-    def pending_requests(self) -> list[HitlRequest]:
-        return list(self._pending.values())
 
     @workflow.update
     async def respond(self, interrupt_id: str, response: Any) -> None:
@@ -310,25 +308,6 @@ def _worker(client: Client) -> Worker:
         ],
         max_cached_workflows=0,
     )
-
-
-async def _wait_for_pending(
-    handle: WorkflowHandle,
-    query: Any,
-    count: int = 1,
-    expected_ids: set[str] | None = None,
-) -> list[HitlRequest]:
-    async def _poll() -> list[HitlRequest]:
-        while True:
-            pending = await handle.query(query)
-            if expected_ids is not None:
-                if {p.interrupt_id for p in pending} == expected_ids:
-                    return pending
-            elif len(pending) >= count:
-                return pending
-            await asyncio.sleep(0.1)
-
-    return await asyncio.wait_for(_poll(), timeout=20)
 
 
 def test_pending_hitl_requests_only_reports_long_running_calls():
@@ -383,8 +362,8 @@ async def test_human_input_node_update_resume(client: Client):
             task_queue=TASK_QUEUE,
             execution_timeout=timedelta(seconds=60),
         )
-        pending = await _wait_for_pending(
-            handle, HumanInputGraphWorkflow.pending_requests
+        pending = await handle.execute_update(
+            HumanInputGraphWorkflow.wait_for_pending, args=[1, None]
         )
         assert pending[0].kind == "input"
         assert pending[0].interrupt_id == "approval"
@@ -417,8 +396,8 @@ async def test_tool_confirmation_activity_as_tool(client: Client, confirmed: boo
             task_queue=TASK_QUEUE,
             execution_timeout=timedelta(seconds=60),
         )
-        pending = await _wait_for_pending(
-            handle, ConfirmationAgentWorkflow.pending_requests
+        pending = await handle.execute_update(
+            ConfirmationAgentWorkflow.wait_for_pending, args=[1, None]
         )
         assert pending[0].kind == "tool_confirmation"
         assert pending[0].original_function_call is not None
@@ -452,17 +431,25 @@ async def test_hitl_multiple_pending_partial_response(client: Client):
             task_queue=TASK_QUEUE,
             execution_timeout=timedelta(seconds=60),
         )
-        await _wait_for_pending(
-            handle, MultiPendingGraphWorkflow.pending_requests, expected_ids={"a", "b"}
+        pending = await handle.execute_update(
+            MultiPendingGraphWorkflow.wait_for_pending, args=[2, None]
+        )
+        assert {request.interrupt_id for request in pending} == {"a", "b"}
+
+        # Accept the readiness Update before responding, so it must wait for
+        # the pending set to change and survive the forced replay on resume.
+        remaining = await handle.start_update(
+            MultiPendingGraphWorkflow.wait_for_pending,
+            args=[1, {"b"}],
+            wait_for_stage=WorkflowUpdateStage.ACCEPTED,
         )
 
         # Answer only one; the other must stay pending.
         await handle.execute_update(
             MultiPendingGraphWorkflow.respond, args=["a", "yes-a"]
         )
-        await _wait_for_pending(
-            handle, MultiPendingGraphWorkflow.pending_requests, expected_ids={"b"}
-        )
+        pending = await remaining.result()
+        assert {request.interrupt_id for request in pending} == {"b"}
 
         await handle.execute_update(
             MultiPendingGraphWorkflow.respond, args=["b", "yes-b"]
@@ -482,8 +469,8 @@ async def test_default_interrupt_id_replay_safe(client: Client):
             task_queue=TASK_QUEUE,
             execution_timeout=timedelta(seconds=60),
         )
-        pending = await _wait_for_pending(
-            handle, DefaultInterruptIdWorkflow.pending_requests
+        pending = await handle.execute_update(
+            DefaultInterruptIdWorkflow.wait_for_pending, args=[1, None]
         )
         # The generated id must be a workflow-deterministic uuid.
         interrupt_id = pending[0].interrupt_id

@@ -2,9 +2,11 @@
 
 Each plugin is an independent pnpm project with its own manifest and lockfile.
 There is no language-level workspace or lockfile. Node.js 22.12 or later and
-pnpm 10.27.0 are required.
+pnpm 10.27.0 are required; a plugin whose dependencies need more declares its
+own floor in `engines` (`google-adk`: 22.17.0).
 CI selects `"22"` and `"24"` with `check-latest: true` to test the latest release
-in each major series.
+in each major series; a plugin may name its floor's `major.minor` as its first
+runtime instead (`google-adk` tests 22.17 and 24).
 
 ```bash
 cd typescript/openai-agents
@@ -28,17 +30,8 @@ declared Temporal Worker and testing versions, and runs the entrypoint. Strands
 uses this to bundle and execute a workflow with a local model against the provider
 version npm selects from its peer range, independently of the development lockfile.
 
-The initial histories come from sdk-typescript `main` at
-`046dcef5e3d5d08710c4a07d805f17fea41e5ae5`. The separate ownership cutover renames
-`@temporalio/ai-sdk` to `@temporalio/vercel-ai-sdk` and
-`@temporalio/google-adk-agents` to `@temporalio/google-adk`. The other three
-coordinates keep their names. Active upstream metadata is removed; development
-now belongs here. Package names, subpath imports and README examples use the new
-coordinates. Workflow activity names remain intact. The Google ADK random-stream
-identifier follows the new package name, as explicitly requested for the cutover.
-
-The SDK's unpublished `@temporalio/test-helpers` sources are copied at that same
-commit into `tests/helpers/` in Vercel AI SDK, OpenAI Agents and Strands Agents.
+The SDK's unpublished `@temporalio/test-helpers` sources are copied into
+`tests/helpers/` in Vercel AI SDK, OpenAI Agents and Strands Agents.
 Each copy builds and resolves against its plugin's environment through a private
 development-only link. No plugin depends on another plugin's checkout.
 

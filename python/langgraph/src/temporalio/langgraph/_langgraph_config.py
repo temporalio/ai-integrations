@@ -22,6 +22,17 @@ from langgraph._internal._scratchpad import PregelScratchpad
 from langgraph.graph.state import RunnableConfig
 from langgraph.pregel._algo import LazyAtomicCounter
 from langgraph.runtime import ExecutionInfo, Runtime
+from pydantic import BaseModel
+
+
+def is_context_schema(schema: type[Any]) -> bool:
+    """Return whether a context class can be restored after payload conversion."""
+    return dataclasses.is_dataclass(schema) or issubclass(schema, BaseModel)
+
+
+def context_schema_id(schema: type[Any]) -> str:
+    """Identify a registered context class without serializing the class itself."""
+    return f"{schema.__module__}.{schema.__qualname__}"
 
 
 def strip_runnable_config(config: RunnableConfig | None) -> RunnableConfig:
@@ -96,6 +107,7 @@ def get_langgraph_config() -> dict[str, Any]:
 def set_langgraph_config(
     config: dict[str, Any],
     *,
+    context_schema: type[Any] | None = None,
     stream_writer: Callable[[Any], None] | None = None,
 ) -> Runtime:
     """Restore a LangGraph runnable config from a serialized dict.
@@ -113,9 +125,37 @@ def set_langgraph_config(
             null_resume_box[0] = None
         return val
 
+    context = config.get("context")
+    if (
+        isinstance(context, dict)
+        and context_schema is not None
+        and dataclasses.is_dataclass(context_schema)
+    ):
+        non_init_fields = {
+            field.name for field in dataclasses.fields(context_schema) if not field.init
+        }
+        init_values = {
+            name: value
+            for name, value in context.items()
+            if name not in non_init_fields
+        }
+        restored_context = context_schema(**init_values)
+        # Restore non-init fields even for frozen dataclasses.
+        for name in non_init_fields:
+            if name in context:
+                object.__setattr__(restored_context, name, context[name])
+        context = restored_context
+    elif (
+        context is not None
+        and context_schema is not None
+        and issubclass(context_schema, BaseModel)
+        and not isinstance(context, context_schema)
+    ):
+        context = context_schema.model_validate(context)
+
     execution_info_dict = config.get("execution_info")
-    runtime = Runtime(
-        context=config.get("context"),
+    runtime: Runtime[Any] = Runtime(
+        context=context,
         stream_writer=stream_writer or (lambda _: None),
         previous=config.get("previous"),
         execution_info=(

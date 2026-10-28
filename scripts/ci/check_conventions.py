@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Repository-invariant checks for temporalio/ai-integrations.
 
-Runs on every PR (job `conventions`) and nightly (`--nightly`). Exits non-zero
+Runs on every PR (job `conventions`) and nightly. Exits non-zero
 with a list of violations. Passes on a repository with zero plugins.
 
 Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
@@ -18,7 +18,6 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
     maturity classifier/requires-python floor/module-name/required-version)
   * no [tool.uv.sources] path or workspace entries
   * the project's published README has no relative markdown links (PyPI renders it)
-  * --nightly: coordinates with [release] allow-final = false must not exist on PyPI yet
 """
 
 from __future__ import annotations
@@ -29,13 +28,17 @@ import re
 import stat
 import subprocess
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import LANGUAGES, Plugin, discover_plugins, load_toml, repo_root  # noqa: E402
+from _common import (  # noqa: E402
+    LANGUAGES,
+    Plugin,
+    discover_plugins,
+    load_toml,
+    repo_root,
+)
 
 MATURITY_CLASSIFIER = {
     "generally-available": "Development Status :: 5 - Production/Stable",
@@ -45,8 +48,6 @@ MATURITY_CLASSIFIER = {
 REGISTRIES = {"python": "pypi", "typescript": "npm", "java": "maven", "go": "goproxy"}
 LANGUAGE_LOCKFILES = ("uv.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "go.sum", "gradle.lockfile")
 RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
-MAX_PR_COMMITS_WITHOUT_LABEL = 20
-HISTORY_IMPORT_LABEL = "history-import"
 STANDARD_TEST_SUPPORT = {
     "tests/helpers/environment.py": "tests/helpers/environment.py.tmpl",
     "tests/helpers/plugin_meta.py": "tests/helpers/plugin_meta.py.tmpl",
@@ -139,8 +140,8 @@ class Checker:
         package_parts = (
             root_api.split(".")
             if isinstance(root_api, str)
-            and root_api in {f"temporalio.contrib.{name}", f"temporalio.{name}"}
-            else ["temporalio", "contrib", name]
+            and root_api == f"temporalio.{name}"
+            else ["temporalio", name]
         )
         package_rel = Path("src", *package_parts)
         pkg = d / package_rel
@@ -225,8 +226,6 @@ class Checker:
             self.fail(f"{rel}: root-api must be under io.temporal")
         if p.get("maturity") not in MATURITY_CLASSIFIER:
             self.fail(f"{rel}: invalid maturity")
-        if not isinstance(meta.get("release", {}).get("allow-final"), bool):
-            self.fail(f"{rel}: allow-final must be boolean")
         ci = meta.get("ci", {})
         runtimes = ci.get("runtime-versions", [])
         if not runtimes or not all(isinstance(v, str) and v.isdigit() for v in runtimes):
@@ -240,6 +239,10 @@ class Checker:
                 self.fail(f"{rel}: invalid Spring Boot version {boot!r}")
             elif not (d / f"gradle/dependency-locks/spring-boot-{boot}.lockfile").is_file():
                 self.fail(f"{rel}: missing dependency lock for Spring Boot {boot}")
+        if not ci.get("spring-boot-versions") and not (
+            d / "gradle/dependency-locks/dependencies.lockfile"
+        ).is_file():
+            self.fail(f"{rel}: missing gradle/dependency-locks/dependencies.lockfile")
         imports = meta.get("smoke", {}).get("imports", [])
         if not imports or not all(isinstance(i, str) and i.startswith(root_api + ".") for i in imports):
             self.fail(f"{rel}: smoke imports must name classes under root-api")
@@ -276,13 +279,17 @@ class Checker:
             self.fail(f"{rel}: package.json must name {coordinate} with development version 0.0.0")
         if p.get("maturity") not in MATURITY_CLASSIFIER:
             self.fail(f"{rel}: invalid maturity")
-        if not isinstance(meta.get("release", {}).get("allow-final"), bool):
-            self.fail(f"{rel}: allow-final must be boolean")
         versions = meta.get("ci", {}).get("runtime-versions", [])
         floor = package.get("engines", {}).get("node", "").removeprefix(">=")
-        if (not versions or not all(isinstance(version, str) and version.isdigit() for version in versions)
-                or versions[0] != floor.split(".")[0]):
-            self.fail(f"{rel}: runtime-versions must list Node majors starting with the Node engine floor's major")
+        # Majors select the newest release of each line. The first entry may name the
+        # floor's major.minor instead, so the minimum cell runs the floor itself when a
+        # plugin's dependencies require more than the repository minimum.
+        floor_parts = floor.split(".")
+        if (not versions or not all(isinstance(version, str) and version.isdigit() for version in versions[1:])
+                or not isinstance(versions[0], str)
+                or versions[0] not in (floor_parts[0], ".".join(floor_parts[:2]))):
+            self.fail(f"{rel}: runtime-versions must list Node majors starting with the Node engine floor's major "
+                      "(or its major.minor)")
         if meta.get("smoke", {}).get("imports") != [coordinate]:
             self.fail(f"{rel}: smoke imports must name the root package")
         for section in ("dependencies", "peerDependencies", "optionalDependencies", "devDependencies"):
@@ -311,7 +318,6 @@ class Checker:
         expected_coordinate = "temporalio-" + plugin.name.replace("_", "-")
         root_api = p.get("root-api")
         expected_root_api = "temporalio." + plugin.name
-        transitional_root_api = "temporalio.contrib." + plugin.name
         if p.get("name") != plugin.name:
             self.fail(f"{rel}: plugin.toml name {p.get('name')!r} must equal the folder name {plugin.name!r}")
         if p.get("language") != plugin.language:
@@ -320,26 +326,14 @@ class Checker:
             self.fail(f"{rel}: plugin.toml coordinate must be {expected_coordinate!r} (got {p.get('coordinate')!r})")
         if p.get("registry") != REGISTRIES[plugin.language]:
             self.fail(f"{rel}: plugin.toml registry must be {REGISTRIES[plugin.language]!r}")
-        release = meta.get("release", {})
-        is_transitional_root = (
-            root_api == transitional_root_api
-            and isinstance(p.get("upstream"), str)
-            and release.get("allow-final") is False
-        )
-        if root_api != expected_root_api and not is_transitional_root:
-            self.fail(
-                f"{rel}: plugin.toml root-api must be {expected_root_api!r}; "
-                f"{transitional_root_api!r} is allowed only for an upstream-backed migration "
-                f"with [release] allow-final = false (got {root_api!r})"
-            )
+        if root_api != expected_root_api:
+            self.fail(f"{rel}: plugin.toml root-api must be {expected_root_api!r} (got {root_api!r})")
         maturity = p.get("maturity")
         if maturity not in MATURITY_CLASSIFIER:
             self.fail(f"{rel}: plugin.toml maturity must be one of {sorted(MATURITY_CLASSIFIER)}")
         for banned in ("owners", "live-secrets", "secrets"):
             if banned in p or banned in meta.get("ci", {}):
                 self.fail(f"{rel}: plugin.toml must not contain {banned!r} (ownership is CODEOWNERS; CI has no secrets)")
-        if not isinstance(release.get("allow-final"), bool):
-            self.fail(f"{rel}: plugin.toml [release] allow-final must be a boolean")
         versions = meta.get("ci", {}).get("runtime-versions")
         if not isinstance(versions, list) or not versions:
             self.fail(f"{rel}: plugin.toml [ci] runtime-versions must be a non-empty list")
@@ -410,32 +404,8 @@ class Checker:
             if RELATIVE_LINK.search(line):
                 self.fail(f"{plugin.rel}/{filename}:{lineno}: relative link; use absolute https://github.com/... URLs (PyPI renders this file)")
 
-    def check_nightly(self, plugins: list[Plugin]) -> None:
-        for plugin in plugins:
-            meta_path = plugin.path / "plugin.toml"
-            if not meta_path.is_file():
-                continue
-            meta = load_toml(meta_path)
-            if meta.get("release", {}).get("allow-final") is not False:
-                continue
-            coordinate = meta.get("plugin", {}).get("coordinate")
-            if not coordinate:
-                continue
-            url = f"https://pypi.org/pypi/{coordinate}/json"
-            try:
-                with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310
-                    status = resp.status
-            except urllib.error.HTTPError as exc:
-                status = exc.code
-            except urllib.error.URLError as exc:
-                print(f"::warning::{plugin.rel}: could not query PyPI ({exc}); skipping name-squat watch", file=sys.stderr)
-                continue
-            if status == 200:
-                self.fail(f"{plugin.rel}: {coordinate} already exists on PyPI while [release] allow-final = false (name-squat or unexpected publish)")
-            elif status != 404:
-                print(f"::warning::{plugin.rel}: PyPI returned {status} for {coordinate}", file=sys.stderr)
 
-    def run(self, nightly: bool) -> list[str]:
+    def run(self) -> list[str]:
         discovered = discover_plugins(self.root)
         self.check_language_roots(discovered)
         for plugin in discovered["python"]:
@@ -444,17 +414,14 @@ class Checker:
             self.check_java_plugin(plugin)
         for plugin in discovered["typescript"]:
             self.check_typescript_plugin(plugin)
-        if nightly:
-            self.check_nightly(discovered["python"])
         return self.violations
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo-root", type=Path, default=None)
-    parser.add_argument("--nightly", action="store_true", help="also run the PyPI name-squat watch")
     args = parser.parse_args(argv)
-    violations = Checker(repo_root(args.repo_root)).run(nightly=args.nightly)
+    violations = Checker(repo_root(args.repo_root)).run()
     if violations:
         print(f"FAIL: {len(violations)} convention violation(s):")
         for v in violations:

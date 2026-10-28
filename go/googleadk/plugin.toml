@@ -1,5 +1,4 @@
 # Schema: ../../AGENTS.md#repository-invariants.
-# Import provenance is recorded in scripts/migrate/IMPORTS.md.
 
 [plugin]
 name = "googleadk"
@@ -9,9 +8,6 @@ registry = "goproxy"
 root-api = "googleadk"
 maturity = "public-preview"
 docs = "https://github.com/temporalio/ai-integrations/blob/main/go/googleadk/README.md"
-
-[release]
-allow-final = true
 
 [ci]
 runtime-versions = ["1.26.6", "1.27"]

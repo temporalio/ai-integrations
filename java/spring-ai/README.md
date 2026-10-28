@@ -47,10 +47,6 @@ definitions and execute only in the workflow. Retry, per-model Activity options,
 response metadata, and media-size guards retain their behavior. Optional vector-store,
 embedding, and MCP modules are detected through Spring auto-configuration.
 
-The [archived Spring AI 1 usage guide](https://github.com/temporalio/ai-integrations/blob/main/java/spring-ai/_upstream/README.md)
-records the imported implementation. Maintenance is now owned by ai-integrations;
-there is no active upstream sync relationship.
-
 ## Provider retries
 
 For OpenAI chat Activities, native OpenAI HTTP errors retain their status, error
@@ -105,6 +101,4 @@ To run that check locally:
 Latest mode writes a separate ignored lockfile and reuses its selected versions
 through testing and building. Ordinary CI uses the committed locks.
 
-The imported implementation and tests, as well as the migration adaptations,
-are relicensed under the repository's MIT
-license. Historical upstream commits retain their original licensing records.
+The implementation and tests use the repository's MIT license.

@@ -7,6 +7,7 @@ variable propagation (see langgraph.config.get_config).
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from datetime import timedelta
 from typing import Any
@@ -30,8 +31,9 @@ from pytest import raises
 from temporalio import workflow
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
+from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.langgraph import LangGraphPlugin, entrypoint
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 from tests.e2e_functional_entrypoints import (
     add_ten,
     ask_human,
@@ -43,6 +45,7 @@ from tests.e2e_functional_entrypoints import (
     get_task_execution_counts,
     interrupt_entrypoint,
     partial_execution_entrypoint,
+    read_context,
     reset_task_execution_counts,
     simple_functional_entrypoint,
     slow_entrypoint,
@@ -54,6 +57,7 @@ from tests.e2e_functional_entrypoints import (
     waiting_task,
 )
 from tests.e2e_functional_workflows import (
+    ContextFunctionalWorkflow,
     ContinueAsNewFunctionalWorkflow,
     ContinueAsNewInput,
     PartialExecutionInput,
@@ -61,6 +65,7 @@ from tests.e2e_functional_workflows import (
     SimpleFunctionalE2EWorkflow,
     SlowFunctionalWorkflow,
 )
+from tests.test_two_nodes import Context, DictContext, ModelContext
 
 _DEFAULT_ACTIVITY_OPTIONS = {"start_to_close_timeout": timedelta(seconds=30)}
 
@@ -126,6 +131,67 @@ class InterruptV2FunctionalWorkflow:
 
 
 class TestFunctionalAPIBasicExecution:
+    async def test_context(self, client: Client) -> None:
+        context_task = task(read_context)
+
+        def make_entrypoint(schema: type[Any] | None):
+            @lg_entrypoint(context_schema=schema)
+            async def run(value: int) -> dict:
+                return await context_task(value)
+
+            return run
+
+        cases: list[tuple[str, type[Any] | None, dict[str, Any] | None, str, str]] = [
+            ("dataclass", Context, {"user_id": "alice"}, "Context", "alice"),
+            (
+                "model",
+                ModelContext,
+                {"userId": "bob", "tenant": {"name": "acme"}},
+                "ModelContext",
+                "bob:acme",
+            ),
+            ("dictionary", DictContext, {"user_id": "carol"}, "dict", "carol"),
+            ("none", None, None, "NoneType", ""),
+        ]
+        plugin = LangGraphPlugin(
+            entrypoints={name: make_entrypoint(schema) for name, schema, *_ in cases},
+            tasks=[context_task],
+            activity_options=_execute_in_activity("read_context"),
+            default_activity_options=_DEFAULT_ACTIVITY_OPTIONS,
+        )
+        client_config = client.config()
+        client_config["data_converter"] = pydantic_data_converter
+        client = Client(**client_config)
+        task_queue = f"functional-context-{uuid4()}"
+        async with Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[ContextFunctionalWorkflow],
+            plugins=[plugin],
+        ):
+            handles = await asyncio.gather(
+                *(
+                    client.start_workflow(
+                        ContextFunctionalWorkflow.run,
+                        args=[name, context],
+                        id=f"functional-context-{uuid4()}",
+                        task_queue=task_queue,
+                        execution_timeout=timedelta(seconds=30),
+                    )
+                    for name, _, context, *_ in cases
+                )
+            )
+            results = await asyncio.gather(*(handle.result() for handle in handles))
+        for result, (_, _, _, context_type, user_id) in zip(results, cases):
+            assert result == {
+                "value": 10,
+                "user_id": user_id,
+                "context_type": context_type,
+            }
+        replayer = Replayer(workflows=[ContextFunctionalWorkflow], plugins=[plugin])
+        for handle in handles:
+            await replayer.replay_workflow(await handle.fetch_history())
+
     @pytest.mark.parametrize(
         "workflow_cls,entrypoint_func,entrypoint_name,tasks,expected_result",
         [

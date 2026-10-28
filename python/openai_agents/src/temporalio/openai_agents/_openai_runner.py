@@ -1,11 +1,15 @@
 import dataclasses
+import weakref
 from collections.abc import AsyncIterator, Awaitable
 from typing import Any, Callable
 
 from agents import (
     Agent,
     AgentsException,
+    FunctionTool,
     Handoff,
+    ModelProvider,
+    MultiProvider,
     RunConfig,
     RunContextWrapper,
     RunResult,
@@ -27,6 +31,8 @@ from temporalio.openai_agents._errors import (
 )
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._temporal_model_provider import (
+    _current_run_model_settings,
+    _TemporalModelProvider,
     capture_scope,
     install_model_provider,
 )
@@ -41,28 +47,39 @@ def _convert_agent(
     model_params: ModelActivityParameters,
     agent: Agent[Any],
     seen: dict[int, Agent] | None,
+    *,
+    visited: set[int] | None = None,
 ) -> Agent[Any]:
     if seen is None:
         seen = dict()
+    if visited is None:
+        visited = set()
 
-    # Short circuit if this model was already seen to prevent looping from circular handoffs
-    if id(agent) in seen:
-        return seen[id(agent)]
+    new_agent = seen.get(id(agent))
+    if new_agent is not None and id(agent) in visited:
+        return new_agent
 
     # This agent has already been processed in some other run
     if isinstance(agent.model, _TemporalModelStub):
         return agent
 
-    # Save the new version of the agent so that we can replace loops
-    new_agent = dataclasses.replace(agent)
-    seen[id(agent)] = new_agent
+    visited.add(id(agent))
+    if new_agent is None:
+        new_agent = dataclasses.replace(agent)
+        seen[id(agent)] = new_agent
+    else:
+        for field in dataclasses.fields(agent):
+            if field.init:
+                setattr(new_agent, field.name, getattr(agent, field.name))
 
     name = _model_name(agent)
 
     new_handoffs: list[Agent | Handoff] = []
     for handoff in agent.handoffs:
         if isinstance(handoff, Agent):
-            new_handoffs.append(_convert_agent(model_params, handoff, seen))
+            new_handoffs.append(
+                _convert_agent(model_params, handoff, seen, visited=visited)
+            )
         elif isinstance(handoff, Handoff):
             original_invoke = handoff.on_invoke_handoff
 
@@ -77,9 +94,15 @@ def _convert_agent(
                 handoff_agent = await invoke_func(context, args)
                 return _convert_agent(model_params, handoff_agent, seen)
 
-            new_handoffs.append(
-                dataclasses.replace(handoff, on_invoke_handoff=on_invoke)
+            new_handoff = dataclasses.replace(handoff, on_invoke_handoff=on_invoke)
+            handoff_agent = (
+                handoff._agent_ref() if handoff._agent_ref is not None else None
             )
+            if isinstance(handoff_agent, Agent):
+                new_handoff._agent_ref = weakref.ref(
+                    _convert_agent(model_params, handoff_agent, seen, visited=visited)
+                )
+            new_handoffs.append(new_handoff)
         else:
             raise TypeError(f"Unknown handoff type: {type(handoff)}")
 
@@ -87,8 +110,20 @@ def _convert_agent(
         model_name=name,
         model_params=model_params,
         agent=agent,
+        current_run_model_settings=_current_run_model_settings.get,
     )
     new_agent.handoffs = new_handoffs
+    new_agent.tools = [
+        dataclasses.replace(
+            tool,
+            _agent_instance=_convert_agent(
+                model_params, tool._agent_instance, seen, visited=visited
+            ),
+        )
+        if isinstance(tool, FunctionTool) and isinstance(tool._agent_instance, Agent)
+        else tool
+        for tool in agent.tools
+    ]
     return new_agent
 
 
@@ -105,6 +140,39 @@ def _has_sandbox_agent(agent: Agent[Any], seen: set[int] | None = None) -> bool:
         if isinstance(handoff, Agent) and _has_sandbox_agent(handoff, seen):
             return True
     return False
+
+
+# Runs without this patch marker started before the plugin refused
+# ``RunConfig.model_provider``. They keep the old behavior, the Worker's provider, so that
+# they replay.
+_REFUSE_RUN_MODEL_PROVIDER_PATCH = "openai_agents.refuse-run-model-provider"
+
+
+def _is_default_model_provider(provider: ModelProvider) -> bool:
+    """Whether ``provider`` is an unconfigured ``MultiProvider``, as ``RunConfig()`` makes."""
+    if type(provider) is not MultiProvider:
+        return False
+    return _multi_provider_settings(provider) == _multi_provider_settings(
+        MultiProvider()
+    )
+
+
+def _multi_provider_settings(provider: MultiProvider) -> dict[str, Any]:
+    # Caches filled on use are not settings.
+    caches = {"_fallback_providers", "_ws_model_cache_by_loop"}
+    settings: dict[str, Any] = {
+        name: value
+        for name, value in vars(provider).items()
+        if name not in caches and name != "openai_provider"
+    }
+    openai_settings = vars(provider.openai_provider)
+    if "_stored_api_key" in openai_settings:
+        # No client was passed, so ``_client`` caches the one built on first use.
+        caches.add("_client")
+    settings["openai_provider"] = {
+        name: value for name, value in openai_settings.items() if name not in caches
+    }
+    return settings
 
 
 def _coerce_run_config(value: object) -> RunConfig:
@@ -148,7 +216,7 @@ class TemporalOpenAIRunner(AgentRunner):
         self,
         starting_agent: Agent[TContext],
         kwargs: RunOptions[TContext],
-    ) -> Agent[Any]:
+    ) -> tuple[Agent[Any], RunConfig]:
         """Workflow-only validation and ``kwargs`` rewrite shared by ``run()`` and ``run_streamed()``."""
         for t in starting_agent.tools:
             if callable(t):
@@ -203,6 +271,21 @@ class TemporalOpenAIRunner(AgentRunner):
                 ),
             )
 
+        # Model calls run in an Activity on the Worker's provider, so a provider set on the
+        # run would be silently ignored. A nested run, such as an agent used as a tool,
+        # inherits the plugin's provider.
+        if not isinstance(
+            run_config.model_provider, _TemporalModelProvider
+        ) and not _is_default_model_provider(run_config.model_provider):
+            if workflow.patched(_REFUSE_RUN_MODEL_PROVIDER_PATCH):
+                raise ValueError(
+                    "Temporal workflows do not support RunConfig.model_provider. Model "
+                    "calls use the provider set on the Worker with "
+                    "OpenAIAgentsPlugin(model_provider=...). To use several providers, "
+                    "set a MultiProvider with a prefix map there and choose a provider "
+                    "by model name."
+                )
+
         run_config = install_model_provider(self.model_params, run_config)
 
         # run_config.sandbox is global for the entire run — configure it if any agent needs it.
@@ -235,7 +318,7 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         kwargs["run_config"] = run_config
-        return _convert_agent(self.model_params, starting_agent, None)
+        return _convert_agent(self.model_params, starting_agent, None), run_config
 
     async def run(
         self,
@@ -251,9 +334,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 **kwargs,
             )
 
-        converted_agent = self._prepare_workflow_run(starting_agent, kwargs)
+        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
-        with capture_scope():
+        with capture_scope(run_config.model_settings):
             try:
                 return await self._runner.run(
                     starting_agent=converted_agent,
@@ -323,13 +406,16 @@ class TemporalOpenAIRunner(AgentRunner):
                 "heartbeats or the workflow stream signal channel)."
             )
 
-        converted_agent = self._prepare_workflow_run(starting_agent, kwargs)
+        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
-        streamed_result = self._runner.run_streamed(
-            starting_agent=converted_agent,
-            input=input,
-            **kwargs,
-        )
+        # The streaming loop runs in a task created inside run_streamed, which copies
+        # this context, so the scope only needs to cover the call itself.
+        with capture_scope(run_config.model_settings):
+            streamed_result = self._runner.run_streamed(
+                starting_agent=converted_agent,
+                input=input,
+                **kwargs,
+            )
 
         # Mirror the AgentsException -> AgentsWorkflowError rewrap done
         # in run() above. The streaming runner attaches the actual run

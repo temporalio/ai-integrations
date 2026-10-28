@@ -9,9 +9,6 @@ root-api = "temporalio.openai_agents"
 maturity = "generally-available"
 docs = "https://docs.temporal.io/develop/python/integrations/openai-agents"
 
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["3.10", "3.14"]
 

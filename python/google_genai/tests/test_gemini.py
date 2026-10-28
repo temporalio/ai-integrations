@@ -17,13 +17,19 @@ Tests cover:
 - TemporalAsyncClient configuration
 - Interactions API (create, batched streaming, get, cancel, delete)
 - Managed agents (create, get, list, delete); webhooks unsupported
+- Error classification: permanent 4xx fails fast, transient statuses stay retryable
 """
 
+import base64
 import inspect
 import io
 import json
+import threading
 import uuid
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Callable, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -39,7 +45,7 @@ from google.genai.types import HttpResponse as SdkHttpResponse
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.google_genai import (
     GoogleGenAIError,
     GoogleGenAIPlugin,
@@ -54,6 +60,7 @@ from temporalio.google_genai._models import (
     _GeminiInteractionIdRequest,
     _GeminiInteractionRequest,
     _GeminiInteractionStreamedResponse,
+    _GeminiRegisterFilesRequest,
     _GeminiUploadFileRequest,
     _GeminiUploadToFileSearchStoreRequest,
 )
@@ -72,6 +79,7 @@ from temporalio.google_genai._temporal_files import (
     TemporalAsyncFiles,
 )
 from temporalio.google_genai._temporal_interactions import _deserialize
+from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Replayer
 from temporalio.workflow import ActivityConfig
 from tests.helpers import new_worker
@@ -275,7 +283,7 @@ class GeminiApiCallTracker:
         return types.File(
             name="files/test-uploaded-file",
             uri="https://fake.uri/files/test-uploaded-file",
-            size_bytes=len(req.file_bytes) if req.file_bytes else 0,
+            size_bytes=len(base64.b64decode(req.file_base64)) if req.file_base64 else 0,
         )
 
     @activity.defn
@@ -767,6 +775,21 @@ class FileSearchStoreUploadWorkflow:
 
 
 @workflow.defn
+class FileSearchStoreUploadBytesWorkflow:
+    """Workflow that uploads in-memory content to a file search store."""
+
+    @workflow.run
+    async def run(self, store_name: str, data: bytes) -> str:
+        client = TemporalAsyncClient()
+        op = await client.file_search_stores.upload_to_file_search_store(
+            file_search_store_name=store_name,
+            file=io.BytesIO(data),
+            config=types.UploadToFileSearchStoreConfig(mime_type="text/plain"),
+        )
+        return op.name or ""
+
+
+@workflow.defn
 class RegisterFilesWorkflow:
     """Workflow that calls files.register_files."""
 
@@ -1204,6 +1227,7 @@ async def test_file_upload_str_path(client: Client):
     assert len(api_tracker.file_upload_requests) == 1
     req = api_tracker.file_upload_requests[0]
     assert req.file_path == "/tmp/test.txt"
+    assert req.file_base64 is None
     assert req.file_bytes is None
     assert req.config is not None
     assert req.config.display_name == "Test File"
@@ -1224,7 +1248,9 @@ async def test_file_upload_bytes(client: Client):
 
     assert len(api_tracker.file_upload_requests) == 1
     req = api_tracker.file_upload_requests[0]
-    assert req.file_bytes == b"hello world"
+    assert req.file_base64 is not None
+    assert base64.b64decode(req.file_base64) == b"hello world"
+    assert req.file_bytes is None
     assert req.file_path is None
     assert req.config is not None
     assert req.config.display_name == "Bytes File"
@@ -1289,6 +1315,28 @@ async def test_file_search_store_upload(client: Client):
     assert req.file_path == "/tmp/doc.txt"
     assert req.config is not None
     assert req.config.display_name == "Test Doc"
+    assert result == "operations/test-op"
+
+
+async def test_file_search_store_upload_bytes(client: Client):
+    """Upload in-memory content to a file search store sends it through the activity."""
+    new_client, api_tracker = apply_plugin(client, [])
+
+    async with new_worker(new_client, FileSearchStoreUploadBytesWorkflow) as worker:
+        result = await new_client.execute_workflow(
+            FileSearchStoreUploadBytesWorkflow.run,
+            args=["fileSearchStores/my-store", b"hello world"],
+            id=f"gemini-fss-upload-bytes-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+
+    assert len(api_tracker.file_search_store_upload_requests) == 1
+    req = api_tracker.file_search_store_upload_requests[0]
+    assert req.file_search_store_name == "fileSearchStores/my-store"
+    assert req.file_base64 is not None
+    assert base64.b64decode(req.file_base64) == b"hello world"
+    assert req.file_bytes is None
+    assert req.file_path is None
     assert result == "operations/test-op"
 
 
@@ -1921,6 +1969,264 @@ def test_classify_api_error_retryable_vs_non_retryable():
     server_err = errors.ServerError.__new__(errors.ServerError)
     server_err.code = 503
     assert _classify_api_error(server_err).non_retryable is False
+
+
+class _StatusCodeError(Exception):
+    """Stand-in for the vendored client's ``APIStatusError`` family."""
+
+    def __init__(self, status_code: int | None) -> None:
+        super().__init__(f"Error code: {status_code}")
+        self.status_code = status_code
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 422])
+def test_classify_status_error_client_errors_are_non_retryable(status: int):
+    """Permanent client errors from the vendored client fail the workflow fast."""
+    from temporalio.google_genai._gemini_activity import _classify_status_error
+
+    classified = _classify_status_error(_StatusCodeError(status))
+    assert classified is not None
+    assert classified.non_retryable is True
+    assert classified.type == "_StatusCodeError"
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
+def test_classify_status_error_transient_statuses_stay_retryable(status: int):
+    """Transient statuses from the vendored client keep the retry policy."""
+    from temporalio.google_genai._gemini_activity import _classify_status_error
+
+    classified = _classify_status_error(_StatusCodeError(status))
+    assert classified is not None
+    assert classified.non_retryable is False
+
+
+@pytest.mark.parametrize("error", [_StatusCodeError(None), _StatusCodeError(200)])
+def test_classify_status_error_ignores_errors_without_an_error_status(
+    error: Exception,
+):
+    """Connection errors and timeouts carry no HTTP status and stay retryable."""
+    from temporalio.google_genai._gemini_activity import _classify_status_error
+
+    assert _classify_status_error(error) is None
+    assert _classify_status_error(ValueError("boom")) is None
+
+
+class _FakeGeminiHttpServer:
+    """Local HTTP server that answers every request with one error status."""
+
+    def __init__(self, status: int) -> None:
+        self.hits: list[str] = []
+        hits = self.hits
+        body = json.dumps(
+            {"error": {"code": status, "message": "fake error", "status": "FAKE"}}
+        ).encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def _respond(self) -> None:
+                length = int(self.headers.get("content-length") or 0)
+                if length:
+                    self.rfile.read(length)
+                hits.append(f"{self.command} {self.path}")
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = do_DELETE = _respond
+
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                pass
+
+        self._server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self._server.server_port}"
+
+    def start(self) -> None:
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+@contextmanager
+def _gemini_client_failing_with(
+    status: int,
+) -> Generator[tuple[GeminiClient, list[str]], None, None]:
+    """Yield a real ``genai.Client`` whose every HTTP request answers ``status``."""
+    server = _FakeGeminiHttpServer(status)
+    server.start()
+    try:
+        yield (
+            GeminiClient(
+                api_key="fake-test-key",
+                http_options=types.HttpOptions(base_url=server.url),
+            ),
+            server.hits,
+        )
+    finally:
+        server.stop()
+
+
+_INTERACTION_ID_REQ = _GeminiInteractionIdRequest(id="interactions/test-123")
+_AGENT_ID_REQ = _GeminiInteractionIdRequest(id="test-agent")
+_INTERACTION_REQ = _GeminiInteractionRequest(
+    params={"model": "gemini-2.5-flash", "input": "hi"}
+)
+
+# (activity name, request) for every activity that does not go through
+# gemini_api_client_async_request[_streamed].
+_DIRECT_CALL_ACTIVITIES: list[tuple[str, Any]] = [
+    ("gemini_interactions_create", _INTERACTION_REQ),
+    ("gemini_interactions_create_streamed", _INTERACTION_REQ),
+    ("gemini_interactions_get", _INTERACTION_ID_REQ),
+    ("gemini_interactions_get_streamed", _INTERACTION_ID_REQ),
+    ("gemini_interactions_delete", _INTERACTION_ID_REQ),
+    ("gemini_interactions_cancel", _INTERACTION_ID_REQ),
+    ("gemini_agents_create", _GeminiInteractionRequest(params={"id": "test-agent"})),
+    ("gemini_agents_list", _GeminiInteractionRequest()),
+    ("gemini_agents_get", _AGENT_ID_REQ),
+    ("gemini_agents_delete", _AGENT_ID_REQ),
+    (
+        "gemini_files_upload",
+        _GeminiUploadFileRequest(
+            file_bytes=b"hello",
+            config=types.UploadFileConfig(mime_type="text/plain"),
+        ),
+    ),
+    ("gemini_files_download", _GeminiDownloadFileRequest(file="files/test-file")),
+    ("gemini_files_register", _GeminiRegisterFilesRequest(uris=["gs://bucket/obj"])),
+    (
+        "gemini_file_search_stores_upload",
+        _GeminiUploadToFileSearchStoreRequest(
+            file_search_store_name="fileSearchStores/test-store",
+            file_bytes=b"hello",
+            config=types.UploadToFileSearchStoreConfig(mime_type="text/plain"),
+        ),
+    ),
+]
+
+
+async def _run_real_activity(
+    gemini: GeminiClient, activity_name: str, req: Any
+) -> None:
+    """Run one real ``GeminiApiCaller`` activity against ``gemini``."""
+    from google.auth.credentials import Credentials
+
+    from temporalio.google_genai._gemini_activity import GeminiApiCaller
+
+    class StaticCredentials(Credentials):
+        def refresh(self, request: Any) -> None:
+            self.token = "fake-token"
+
+    caller = GeminiApiCaller(gemini, credentials=StaticCredentials())
+    fn = next(a for a in caller.activities() if a.__name__ == activity_name)
+    await ActivityEnvironment().run(fn, req)
+
+
+@pytest.mark.parametrize(
+    ("activity_name", "req"),
+    _DIRECT_CALL_ACTIVITIES,
+    ids=[name for name, _ in _DIRECT_CALL_ACTIVITIES],
+)
+async def test_activity_permanent_http_error_is_non_retryable(
+    activity_name: str, req: Any
+):
+    """A 400 from the Gemini API fails the activity without retrying.
+
+    The Interactions and Agents resources raise the vendored client's
+    ``BadRequestError``; Files and File Search stores raise
+    ``genai.errors.ClientError``. Both must map to a non-retryable
+    ``ApplicationError`` like ``models.generate_content`` does.
+    """
+    with _gemini_client_failing_with(400) as (gemini, _hits):
+        with pytest.raises(ApplicationError) as exc_info:
+            await _run_real_activity(gemini, activity_name, req)
+
+    assert exc_info.value.non_retryable is True
+    assert exc_info.value.type in ("BadRequestError", "ClientError")
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+async def test_interactions_activity_auth_and_missing_errors_are_non_retryable(
+    status: int,
+):
+    """Other permanent statuses are non-retryable and keep the error type."""
+    expected_type = {
+        401: "AuthenticationError",
+        403: "PermissionDeniedError",
+        404: "NotFoundError",
+    }[status]
+    with _gemini_client_failing_with(status) as (gemini, hits):
+        with pytest.raises(ApplicationError) as exc_info:
+            await _run_real_activity(
+                gemini, "gemini_interactions_create", _INTERACTION_REQ
+            )
+
+    assert exc_info.value.non_retryable is True
+    assert exc_info.value.type == expected_type
+    assert len(hits) == 1
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_interactions_activity_transient_http_error_stays_retryable(
+    status: int,
+):
+    """Rate limits and 5xx keep the activity's retry policy."""
+    with _gemini_client_failing_with(status) as (gemini, _hits):
+        with pytest.raises(ApplicationError) as exc_info:
+            await _run_real_activity(
+                gemini, "gemini_interactions_create", _INTERACTION_REQ
+            )
+
+    assert exc_info.value.non_retryable is False
+    assert exc_info.value.type in ("RateLimitError", "InternalServerError")
+
+
+@workflow.defn
+class InteractionCreateFailureWorkflow:
+    """Creates an interaction with the default retry policy (retry until timeout)."""
+
+    @workflow.run
+    async def run(self) -> str:
+        client = TemporalAsyncClient(
+            activity_config=ActivityConfig(
+                schedule_to_close_timeout=timedelta(seconds=8),
+                retry_policy=RetryPolicy(
+                    initial_interval=timedelta(milliseconds=100),
+                    backoff_coefficient=1.0,
+                ),
+            )
+        )
+        interaction = await client.interactions.create(
+            model="gemini-2.5-flash", input="hi"
+        )
+        assert isinstance(interaction, Interaction)
+        return str(interaction.id)
+
+
+async def test_workflow_fails_fast_on_permanent_interactions_error(client: Client):
+    """A 400 from the Interactions API fails the workflow after one attempt."""
+    with _gemini_client_failing_with(400) as (gemini, hits):
+        config = client.config()
+        config["plugins"] = [GoogleGenAIPlugin(gemini)]
+        new_client = Client(**config)
+
+        async with new_worker(new_client, InteractionCreateFailureWorkflow) as worker:
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await new_client.execute_workflow(
+                    InteractionCreateFailureWorkflow.run,
+                    id=f"gemini-interactions-400-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                )
+
+    activity_error = exc_info.value.cause
+    assert isinstance(activity_error, ActivityError)
+    cause = activity_error.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.non_retryable is True
+    assert cause.type == "BadRequestError"
+    assert len(hits) == 1
 
 
 def test_google_genai_error_is_application_error():

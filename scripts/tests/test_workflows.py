@@ -9,9 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import yaml
-
 import release_tool
+import yaml
 
 REPO = Path(__file__).resolve().parents[2]
 WORKFLOWS = sorted((REPO / ".github" / "workflows").glob("*.yml"))
@@ -270,19 +269,15 @@ def test_publication_does_not_modify_the_reviewed_github_release(language: str) 
             assert "publish-release" not in step.get("run", "")
 
 
-def test_release_smoke_is_strict_unless_the_sdk_still_bundles_the_plugin() -> None:
+def test_release_smoke_verifies_tested_artifacts() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())
-    # smoke.py: "0" is strict; only allow-final = false (the plugin the SDK still ships) may overlap.
-    expected = "${{ needs.prepare.outputs.allow_final == 'true' && '0' || '1' }}"
     for job in ("smoke-testpypi", "smoke-pypi"):
         smoke = [s for s in doc["jobs"][job]["steps"] if "smoke_from_index.sh" in s.get("run", "")]
-        assert len(smoke) == 1 and smoke[0]["env"]["ALLOW_OVERLAP_WITH_CORE"] == expected, job
         assert smoke[0]["env"]["REQUIRES_PYTHON"] == "${{ needs.prepare.outputs.requires_python }}", job
         verify = [s for s in doc["jobs"][job]["steps"] if "verify-index-files" in s.get("run", "")]
         assert len(verify) == 1, f"{job} must prove the index serves the tested artifacts"
         index = job.split("-", 1)[1]
         assert f"--index {index}" in verify[0]["run"]
-    assert doc["jobs"]["prepare"]["outputs"]["allow_final"] == "${{ steps.tag.outputs.allow_final }}"
 
 
 def test_release_publishes_the_tested_artifacts() -> None:
@@ -332,24 +327,23 @@ def test_release_publication_gate(ref_type: str, recovery: str, skip: str, publi
     gate = next(s for s in doc["jobs"]["prepare"]["steps"] if s.get("id") == "gate")
     output = tmp_path / "outputs"
     env = dict(os.environ, REF_TYPE=ref_type, RECOVERY=recovery, SKIP_PUBLISH=skip,
-               PRERELEASE="false", ALLOW_FINAL="true", OVERRIDE="false", GITHUB_OUTPUT=str(output))
+               PRERELEASE="false", OVERRIDE="false", GITHUB_OUTPUT=str(output))
     subprocess.run(["bash", "-c", gate["run"]], env=env, check=True, capture_output=True, text=True)
     assert f"publish={'true' if publish else 'false'}\n" in output.read_text()
 
 
-@pytest.mark.parametrize("prerelease,allow_final,override,publish_pypi", [
-    ("false", "true", "false", True), ("false", "true", "true", True),
-    ("true", "true", "false", False), ("true", "true", "true", True),
-    ("true", "false", "false", False), ("true", "false", "true", False),
+@pytest.mark.parametrize("prerelease,override,publish_pypi", [
+    ("false", "false", True), ("false", "true", True),
+    ("true", "false", False), ("true", "true", True),
 ])
-def test_registry_routing_uses_version_and_cutover_policy(
-    prerelease: str, allow_final: str, override: str, publish_pypi: bool, tmp_path: Path,
+def test_registry_routing_uses_version_and_dispatch_override(
+    prerelease: str, override: str, publish_pypi: bool, tmp_path: Path,
 ) -> None:
     jobs = yaml.safe_load((REPO / ".github/workflows/release-python.yml").read_text())["jobs"]
     gate = next(s for s in jobs["prepare"]["steps"] if s.get("id") == "gate")
     output = tmp_path / "outputs"
     env = dict(os.environ, REF_TYPE="tag", RECOVERY="", SKIP_PUBLISH="false", PRERELEASE=prerelease,
-               ALLOW_FINAL=allow_final, OVERRIDE=override, GITHUB_OUTPUT=str(output))
+               OVERRIDE=override, GITHUB_OUTPUT=str(output))
     subprocess.run(["bash", "-c", gate["run"]], env=env, check=True, capture_output=True, text=True)
     assert f"publish_pypi={'true' if publish_pypi else 'false'}\n" in output.read_text()
 

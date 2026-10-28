@@ -36,7 +36,7 @@ def pytest_runtest_setup(item):  # type: ignore[reportMissingParameterType]
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register markers retained by the upstream-owned test suite."""
+    """Register markers used by the test suite."""
     config.addinivalue_line(
         "markers",
         "requires_local_server: test requires behavior specific to the local dev server",
@@ -48,15 +48,10 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     if hasattr(session.config, "workerinput"):
         return
     plugin = load_plugin_meta(PLUGIN_ROOT)
-    allow_overlap = (not plugin.allow_final) or os.environ.get(
-        "ALLOW_OVERLAP_WITH_CORE"
-    ) == "1"
     try:
         check_provenance(
             plugin.coordinate,
             plugin.package_relpath,
-            allow_overlap=allow_overlap,
-            warn=lambda message: print(f"provenance: {message}"),
         )
     except ProvenanceError as exc:
         pytest.exit(f"provenance guard failed: {exc}", returncode=1)

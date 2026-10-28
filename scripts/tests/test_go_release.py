@@ -9,9 +9,8 @@ import urllib.error
 import zipfile
 from pathlib import Path
 
-import pytest
-
 import go_release
+import pytest
 import release_tool
 from conftest import commit_all, git
 
@@ -27,8 +26,6 @@ coordinate = "go.temporal.io/fakeplug"
 registry = "goproxy"
 root-api = "fakeplug"
 maturity = "public-preview"
-[release]
-allow-final = false
 [ci]
 runtime-versions = ["1.26.6", "1.27"]
 ''')
@@ -93,12 +90,7 @@ def test_go_registry_ordering_and_first_release_after_tagging(go_repo: Path, tmp
     assert release_tool.main([*args, "--version", "0.1.0-rc.3"]) == 1
     assert release_tool.main([*args, "--version", "0.1.0-rc.11"]) == 0
     assert release_tool.main([*args, "--version", "0.1.0-rc.12"]) == 0
-    assert release_tool.main([*args, "--version", "0.1.0"]) == 1  # allow-final gate
-    manifest = go_repo / "go/fakeplug/plugin.toml"
-    manifest.write_text(manifest.read_text().replace("allow-final = false", "allow-final = true"))
     assert release_tool.main([*args, "--version", "0.1.0"]) == 0
-    (go_repo / "go/fakeplug/plugin.go").write_text("// TRANSITION(sdk-cutover)\npackage fakeplug\n")
-    assert release_tool.main([*args, "--version", "0.1.0"]) == 1
 
 
 @pytest.mark.parametrize("code,missing", [(404, True), (410, True), (403, False), (500, False)])
@@ -220,7 +212,7 @@ def test_go_release_notes_use_semver_boundaries_and_go_installation(go_repo: Pat
     notes = release_tool.release_notes(go_repo, "go/fakeplug", "go/fakeplug/v0.1.0-rc.11", "temporalio/ai-integrations")
     assert "go get go.temporal.io/fakeplug@v0.1.0-rc.11" in notes
     assert "go/fakeplug/v0.1.0-rc.2...go/fakeplug/v0.1.0-rc.11" in notes
-    assert "TestPyPI" not in notes and "SDK cutover" not in notes
+    assert "TestPyPI" not in notes
     git(go_repo, "tag", "go/fakeplug/v0.1.0")
     final = release_tool.release_notes(go_repo, "go/fakeplug", "go/fakeplug/v0.1.0", "temporalio/ai-integrations")
     assert "First standalone release" in final and "Fix Go plugin" in final and "Add Go plugin" in final

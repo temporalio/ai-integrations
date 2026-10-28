@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from check_conventions import Checker
 from conftest import commit_all
 
@@ -21,15 +20,13 @@ coordinate = "io.temporal:example"
 root-api = "io.temporal.example"
 registry = "maven"
 maturity = "pre-release"
-[release]
-allow-final = false
 [ci]
 runtime-versions = ["17", "25"]
 [smoke]
 imports = ["io.temporal.example.Public"]
 ''')
     for name in ("build.gradle", "README.md", "gradlew", "gradlew.bat",
-                 "gradle/wrapper/gradle-wrapper.jar"):
+                 "gradle/wrapper/gradle-wrapper.jar", "gradle/dependency-locks/dependencies.lockfile"):
         path = plugin / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
@@ -51,7 +48,7 @@ rootProject.name = 'example'
 
 
 def test_new_java_plugin_uses_shared_repositories(java_repo: Path) -> None:
-    assert Checker(java_repo).run(nightly=False) == []
+    assert Checker(java_repo).run() == []
 
 
 @pytest.mark.parametrize("settings", [
@@ -77,13 +74,20 @@ pluginManagement {
 ])
 def test_java_plugin_cannot_bypass_shared_repositories(java_repo: Path, settings: str) -> None:
     (java_repo / "java/example/settings.gradle").write_text(settings)
-    violations = Checker(java_repo).run(nightly=False)
+    violations = Checker(java_repo).run()
     assert len(violations) == 1
     assert "java/example/settings.gradle: must start with the shared pluginManagement block" in violations[0]
 
 
 def test_java_plugin_requires_shared_settings(java_repo: Path) -> None:
     (java_repo / "java/_shared/settings.gradle").unlink()
-    assert Checker(java_repo).run(nightly=False) == [
+    assert Checker(java_repo).run() == [
         "java/_shared/settings.gradle: missing shared plugin repository configuration"
     ]
+
+
+def test_java_plugin_without_boot_matrix_requires_a_dependency_lock(java_repo: Path) -> None:
+    (java_repo / "java/example/gradle/dependency-locks/dependencies.lockfile").unlink()
+    commit_all(java_repo, "drop the dependency lock")
+    failures = Checker(java_repo).run()
+    assert any("dependencies.lockfile" in failure for failure in failures), failures

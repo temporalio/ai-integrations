@@ -7,9 +7,6 @@ root-api = "@temporalio/vercel-ai-sdk"
 maturity = "generally-available"
 docs = "https://docs.temporal.io/develop/typescript/integrations/ai-sdk"
 
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["22", "24"]
 

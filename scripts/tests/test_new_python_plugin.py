@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import ast
 import importlib.util
-import tomllib
 from pathlib import Path
 from types import ModuleType
 
-import pytest
-from conftest import commit_all, init_repo
-
 import check_conventions
+import pytest
+import tomllib
+from conftest import commit_all, init_repo
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -41,12 +40,8 @@ def test_new_plugin_is_top_level_and_release_ready(tmp_path: Path, maturity: str
     metadata = tomllib.loads((plugin / "plugin.toml").read_text())
     assert metadata["plugin"]["maturity"] == maturity
     assert metadata["plugin"]["root-api"] == "temporalio.fakeplug"
-    assert "upstream" not in metadata["plugin"]
-    assert metadata["release"]["allow-final"] is True
     assert (plugin / "src/temporalio/fakeplug/__init__.py").is_file()
     assert not (plugin / "src/temporalio/contrib").exists()
-    assert "TRANSITION(sdk-cutover)" not in (plugin / "plugin.toml").read_text()
-    assert "TRANSITION(sdk-cutover)" not in (plugin / "pyproject.toml").read_text()
     assert (plugin / "tests/test_installed_matches_source.py").is_file()
     assert (plugin / "tests/helpers/environment.py").is_file()
     assert (plugin / "tests/test_env.py").is_file()
@@ -58,38 +53,4 @@ def test_new_plugin_is_top_level_and_release_ready(tmp_path: Path, maturity: str
 
     (plugin / "uv.lock").write_text("version = 1\n")
     commit_all(repo, "add generated plugin")
-    assert check_conventions.Checker(repo).run(nightly=False) == []
-
-
-def test_upstream_mode_uses_transitional_layout(tmp_path: Path) -> None:
-    repo = init_repo(tmp_path / "repo")
-    package = repo / "python/fakeplug/src/temporalio/contrib/fakeplug"
-    package.mkdir(parents=True)
-    (package / "__init__.py").write_text('"""Imported package."""\n')
-    scaffolder = load_scaffolder()
-    scaffolder.REPO_ROOT = repo
-    scaffolder.TEMPLATE = REPO / "python/_template"
-
-    upstream = "temporalio/sdk-python:temporalio/contrib/fakeplug"
-    assert (
-        scaffolder.main(
-            [
-                "fakeplug",
-                "--description",
-                "A migrated integration",
-                "--existing",
-                "--upstream",
-                upstream,
-            ]
-        )
-        == 0
-    )
-
-    plugin = repo / "python/fakeplug"
-    metadata = tomllib.loads((plugin / "plugin.toml").read_text())
-    assert metadata["plugin"]["maturity"] == "pre-release"
-    assert metadata["plugin"]["root-api"] == "temporalio.contrib.fakeplug"
-    assert metadata["plugin"]["upstream"] == upstream
-    assert metadata["release"]["allow-final"] is False
-    assert (package / "py.typed").is_file()
-    assert not (plugin / "src/temporalio/fakeplug").exists()
+    assert check_conventions.Checker(repo).run() == []

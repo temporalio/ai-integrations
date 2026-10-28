@@ -98,7 +98,7 @@ jobs:
             echo "::error::release tags must point at a commit on main"; exit 1
           fi
           echo "::warning::branch dry run: this commit is not on main"
-      - name: Version policy and final cutover gates
+      - name: Version policy
         env:
           PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
           VERSION: ${{ steps.tag.outputs.version }}

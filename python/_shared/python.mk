@@ -26,17 +26,14 @@ PYTEST := $(UV_RUN) pytest -n auto --dist=worksteal
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
 
-# Reinstall the plugin last so its files win while a plugin is being migrated from a distribution
-# that ships the same namespace paths. Keeping this shared behavior makes future migrations safe.
+# Install the plugin as a non-editable wheel.
 sync: ## Install locked dependencies and this plugin (non-editable); creates uv.lock on first run
 	@test -f uv.lock || uv lock
 	uv sync --locked
-	uv sync --locked --reinstall-package $(DIST)
 
 sync-latest: ## Re-lock to the newest allowed versions and install (nightly lane; lock not committed)
 	uv lock --upgrade
 	uv sync --locked
-	uv sync --locked --reinstall-package $(DIST)
 
 format: ## Fix import order and formatting
 	$(UV_RUN) ruff check --select I --fix

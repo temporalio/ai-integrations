@@ -180,8 +180,9 @@ and `projectName` are mutually exclusive. Agent addressing is a LangSmith beta
 feature that must be enabled for the workspace.
 
 Native `traceable(fn, { address: ... })` and runtime traceable configuration
-also select destinations for new traces inside Workflows. An existing parent's
-destination takes precedence over plugin defaults and child configuration.
+also select destinations inside Workflows, including on a child run. An
+inherited destination takes precedence over plugin defaults; explicit
+`traceable` destination options retain LangSmith's native behavior.
 Destinations follow the trace through Activities, child Workflows, and Nexus,
 including with `addTemporalRuns: false`.
 

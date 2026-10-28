@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import textwrap
@@ -47,7 +46,6 @@ def make_python_plugin(
     version: str = "0.0.0",
     maturity: str = "pre-release",
     dependencies: list[str] | None = None,
-    allow_final: bool = False,
 ) -> Path:
     classifier = {
         "generally-available": "Development Status :: 5 - Production/Stable",
@@ -56,7 +54,7 @@ def make_python_plugin(
     }[maturity]
     coordinate = "temporalio-" + name.replace("_", "-")
     d = root / "python" / name
-    pkg = d / "src" / "temporalio" / "contrib" / name
+    pkg = d / "src" / "temporalio" / name
     pkg.mkdir(parents=True, exist_ok=True)
     (pkg / "__init__.py").write_text('"""Fake plugin."""\n\n__all__ = ["hello"]\n\n\ndef hello() -> str:\n    return "hi"\n')
     (pkg / "_impl.py").write_text("VALUE = 1\n")
@@ -80,7 +78,7 @@ def make_python_plugin(
         build-backend = "uv_build"
 
         [tool.uv.build-backend]
-        module-name = "temporalio.contrib.{name}"
+        module-name = "temporalio.{name}"
 
         [tool.uv]
         required-version = "{REQUIRED_VERSION}"
@@ -93,19 +91,15 @@ def make_python_plugin(
         language = "python"
         coordinate = "{coordinate}"
         registry = "pypi"
-        root-api = "temporalio.contrib.{name}"
+        root-api = "temporalio.{name}"
         maturity = "{maturity}"
         docs = "https://docs.temporal.io/"
-        upstream = "temporalio/sdk-python:temporalio/contrib/{name}"
-
-        [release]
-        allow-final = {str(allow_final).lower()}
 
         [ci]
         runtime-versions = ["3.10", "3.14"]
 
         [smoke]
-        imports = ["temporalio.contrib.{name}._impl"]
+        imports = ["temporalio.{name}._impl"]
     ''').lstrip())
     (d / "Makefile").write_text("DIST := " + coordinate + "\ninclude ../_shared/python.mk\n")
     (d / "README.md").write_text("# fake\n\nSee https://github.com/temporalio/ai-integrations for details.\n")

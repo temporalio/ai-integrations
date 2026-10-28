@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
@@ -39,6 +40,18 @@ _PATCH_TRACING_CTX = f"{_MOD}.tracing_context"
 _PATCH_EXTRACT_NEXUS = f"{_MOD}._extract_nexus_context"
 _PATCH_INJECT_NEXUS = f"{_MOD}._inject_nexus_context"
 _PATCH_GET_CURRENT_RUN = f"{_MOD}.get_current_run_tree"
+
+_DESTINATION = {"project_name": "test-project"}
+
+
+@pytest.fixture(autouse=True)
+def stub_env_destination() -> Iterator[None]:
+    """Stub the interceptor's startup destination probe.
+
+    The probe builds a ``RunTree``, which these tests patch and count.
+    """
+    with patch(f"{_MOD}._env_destination", return_value=_DESTINATION):
+        yield
 
 
 def _make_mock_run() -> MagicMock:
@@ -211,6 +224,7 @@ class TestReplaySafety:
             mock_client,
             "TestRun",
             add_temporal_runs=True,
+            destination=_DESTINATION,
             executor=_make_executor(),
         ):
             pass
@@ -236,6 +250,7 @@ class TestReplaySafety:
             mock_client,
             "TestRun",
             add_temporal_runs=True,
+            destination=_DESTINATION,
             executor=_make_executor(),
         ):
             pass
@@ -255,6 +270,7 @@ class TestReplaySafety:
             mock_client,
             "TestRun",
             add_temporal_runs=True,
+            destination=_DESTINATION,
             executor=_make_executor(),
         ):
             pass
@@ -283,6 +299,7 @@ class TestErrorHandling:
                 mock_client,
                 "TestRun",
                 add_temporal_runs=True,
+                destination=_DESTINATION,
                 executor=_make_executor(),
             ):
                 raise RuntimeError("boom")
@@ -308,6 +325,7 @@ class TestErrorHandling:
                 mock_client,
                 "TestRun",
                 add_temporal_runs=True,
+                destination=_DESTINATION,
                 executor=_make_executor(),
             ):
                 raise ApplicationError(
@@ -333,6 +351,7 @@ class TestErrorHandling:
                 mock_client,
                 "TestRun",
                 add_temporal_runs=True,
+                destination=_DESTINATION,
                 executor=_make_executor(),
             ):
                 raise ApplicationError("bad", non_retryable=True)
@@ -354,6 +373,7 @@ class TestErrorHandling:
             mock_client,
             "TestRun",
             add_temporal_runs=True,
+            destination=_DESTINATION,
             executor=_make_executor(),
         ):
             pass
@@ -376,6 +396,7 @@ class TestErrorHandling:
                 mock_client,
                 "TestRun",
                 add_temporal_runs=True,
+                destination=_DESTINATION,
                 executor=_make_executor(),
             ):
                 raise asyncio.CancelledError()
@@ -398,6 +419,7 @@ class TestErrorHandling:
                 MagicMock(),
                 "TestRun",
                 add_temporal_runs=True,
+                destination=_DESTINATION,
                 executor=_make_executor(),
             ):
                 raise _ContinueAsNew()
@@ -432,6 +454,7 @@ class TestErrorHandling:
                 MagicMock(),
                 "TestRun",
                 add_temporal_runs=True,
+                destination=_DESTINATION,
                 executor=_make_executor(),
             ):
                 raise raised
@@ -1101,6 +1124,7 @@ class TestLazyClientPrevention:
             mock_client,
             "TestRun",
             add_temporal_runs=True,
+            destination=_DESTINATION,
             executor=_make_executor(),
         ):
             pass
@@ -1132,6 +1156,7 @@ class TestAddTemporalRunsToggle:
             mock_client,
             "TestRun",
             add_temporal_runs=False,
+            destination=_DESTINATION,
             executor=_make_executor(),
         ) as run:
             assert run is None

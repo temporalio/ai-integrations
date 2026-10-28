@@ -3,14 +3,13 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
-
 import check_conventions
-from conftest import commit_all, make_python_plugin
+import pytest
+from conftest import commit_all
 
 
 def run(repo: Path, nightly: bool = False) -> list[str]:
-    return check_conventions.Checker(repo).run(nightly=nightly)
+    return check_conventions.Checker(repo).run()
 
 
 def test_empty_repo_passes(repo: Path) -> None:
@@ -29,6 +28,7 @@ def test_python_version_is_the_development_placeholder(plugin_repo: Path) -> Non
 
 def test_namespace_init_files_are_forbidden(plugin_repo: Path) -> None:
     (plugin_repo / "python/fakeplug/src/temporalio/__init__.py").write_text("")
+    (plugin_repo / "python/fakeplug/src/temporalio/contrib").mkdir()
     (plugin_repo / "python/fakeplug/src/temporalio/contrib/__init__.py").write_text("")
     v = run(plugin_repo)
     assert any("src/temporalio/__init__.py" in x for x in v) and any("src/temporalio/contrib/__init__.py" in x for x in v)
@@ -62,9 +62,9 @@ def test_relative_readme_links_are_forbidden(plugin_repo: Path) -> None:
 
 
 @pytest.mark.parametrize("readme", ['"README.pypi.md"', '{file = "README.pypi.md", content-type = "text/markdown"}'])
-def test_published_readme_is_checked_instead_of_imported_readme(plugin_repo: Path, readme: str) -> None:
+def test_configured_published_readme_is_checked(plugin_repo: Path, readme: str) -> None:
     plugin = plugin_repo / "python/fakeplug"
-    (plugin / "README.md").write_text("Imported [SDK docs](../opentelemetry)\n")
+    (plugin / "README.md").write_text("Local [SDK docs](../opentelemetry)\n")
     manifest = plugin / "pyproject.toml"
     manifest.write_text(manifest.read_text().replace('readme = "README.md"', f"readme = {readme}"))
     published = plugin / "README.pypi.md"
@@ -118,49 +118,15 @@ def test_plugin_toml_agreement(plugin_repo: Path) -> None:
     assert any("project.name" in x for x in v)
 
 
-def test_top_level_temporalio_root_api_is_allowed(plugin_repo: Path) -> None:
-    meta = plugin_repo / "python/fakeplug/plugin.toml"
-    meta.write_text(
-        meta.read_text().replace("temporalio.contrib.fakeplug", "temporalio.fakeplug")
-    )
-    pyproject = plugin_repo / "python/fakeplug/pyproject.toml"
-    pyproject.write_text(
-        pyproject.read_text().replace(
-            "temporalio.contrib.fakeplug", "temporalio.fakeplug"
-        )
-    )
-    old_package = plugin_repo / "python/fakeplug/src/temporalio/contrib/fakeplug"
-    new_package = plugin_repo / "python/fakeplug/src/temporalio/fakeplug"
-    old_package.rename(new_package)
-    assert run(plugin_repo) == []
-
-
-def test_contrib_root_api_requires_upstream(plugin_repo: Path) -> None:
-    meta = plugin_repo / "python/fakeplug/plugin.toml"
-    meta.write_text(
-        meta.read_text().replace(
-            'upstream = "temporalio/sdk-python:temporalio/contrib/fakeplug"\n',
-            "",
-        )
-    )
-    assert any("allowed only for an upstream-backed migration" in x for x in run(plugin_repo))
-
-
-def test_contrib_root_api_requires_final_releases_disabled(plugin_repo: Path) -> None:
-    meta = plugin_repo / "python/fakeplug/plugin.toml"
-    meta.write_text(meta.read_text().replace("allow-final = false", "allow-final = true"))
-    assert any("allowed only for an upstream-backed migration" in x for x in run(plugin_repo))
-
-
 @pytest.mark.parametrize(
     "malformed",
-    ['["temporalio.contrib.fakeplug"]', '{ value = "temporalio.contrib.fakeplug" }'],
+    ['["temporalio.fakeplug"]', '{ value = "temporalio.fakeplug" }'],
 )
 def test_malformed_root_api_is_reported(plugin_repo: Path, malformed: str) -> None:
     meta = plugin_repo / "python/fakeplug/plugin.toml"
     meta.write_text(
         meta.read_text().replace(
-            'root-api = "temporalio.contrib.fakeplug"', f"root-api = {malformed}"
+            'root-api = "temporalio.fakeplug"', f"root-api = {malformed}"
         )
     )
     assert any("root-api must be 'temporalio.fakeplug'" in x for x in run(plugin_repo))
@@ -168,7 +134,7 @@ def test_malformed_root_api_is_reported(plugin_repo: Path, malformed: str) -> No
 
 def test_unrelated_root_api_is_rejected(plugin_repo: Path) -> None:
     meta = plugin_repo / "python/fakeplug/plugin.toml"
-    meta.write_text(meta.read_text().replace("temporalio.contrib.fakeplug", "other.fakeplug"))
+    meta.write_text(meta.read_text().replace("temporalio.fakeplug", "other.fakeplug"))
     assert any("root-api must be 'temporalio.fakeplug'" in x for x in run(plugin_repo))
 
 
@@ -203,13 +169,6 @@ def test_exclude_newer_requires_temporalio_exemption(plugin_repo: Path) -> None:
     pp = plugin_repo / "python/fakeplug/pyproject.toml"
     pp.write_text(pp.read_text().replace("exclude-newer-package = { temporalio = false }\n", ""))
     assert any("temporalio is not exempted" in x for x in run(plugin_repo))
-
-
-def test_pr_commit_count_does_not_imply_history_import(plugin_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
-    monkeypatch.setenv("PR_COMMITS", "25")
-    monkeypatch.setenv("PR_LABELS", '["enhancement"]')
-    assert run(plugin_repo) == []
 
 
 def test_cli_exit_codes(plugin_repo: Path, capsys: pytest.CaptureFixture[str]) -> None:

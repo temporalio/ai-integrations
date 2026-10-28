@@ -1,4 +1,6 @@
+import { existsSync } from 'node:fs';
 import { builtinModules, createRequire } from 'node:module';
+import path from 'node:path';
 
 import type { BaseLlm } from '@google/adk';
 import { SimplePlugin } from '@temporalio/plugin';
@@ -17,42 +19,96 @@ const OTEL_API_PACKAGE = '@opentelemetry/api';
 const ADK_PACKAGE = '@google/adk';
 
 /**
- * Resolves the `@google/adk` entry the Workflow bundle uses: ADK's **web**
- * build (`dist/web/index_web.js`, the `common.ts` surface). ADK 2.0 publishes
- * the same sources three ways, and which one webpack picks for the bare
- * `@google/adk` specifier depends on the *consumer's* environment: the Worker
- * bundler sets no webpack `target`, so webpack falls back to the app's
+ * ADK >= 2.1's `plugins/reflect_retry_model_plugin.js` (on the `common`
+ * surface) imports `uuid` without declaring it: its single-file web bundle
+ * inlined the package, and the node builds resolve it only through whatever
+ * the host layout hoists. Under a strict layout (pnpm `hoist=false`, Yarn PnP)
+ * nothing is reachable from ADK's own directory and the Workflow bundle fails
+ * with `Can't resolve 'uuid'`. The plugin therefore depends on `uuid` itself
+ * and answers ADK's request with its own copy's CJS entry, whose `crypto`
+ * import the deterministic shim serves ({@link CRYPTO_SHIM_ISSUER_PATTERN}), so
+ * the ids are the same whatever the consumer's layout or webpack target. On
+ * the Worker, where the same layout fails ADK's `require('uuid')` as soon as
+ * the plugin imports ADK, the resolution hook in `./adk-uuid-resolution`
+ * answers the request with the same copy.
+ */
+const UUID_PACKAGE = 'uuid';
+
+/**
+ * Resolves the `@google/adk` entry the Workflow bundle uses: ADK's `common.ts`
+ * surface, taken from its **per-file ESM build** (`dist/esm/common.js`). ADK
+ * publishes the same sources three ways, and which one webpack picks for the
+ * bare `@google/adk` specifier depends on the *consumer's* environment: the
+ * Worker bundler sets no webpack `target`, so webpack falls back to the app's
  * browserslist config when there is one and to `web` otherwise, and the
  * `browser` export condition applies only when the resolved target is
  * browser-only. Left to that default, a `"browserslist": ["node 20"]` in an app
- * would flip the bundle to the node ESM barrel, whose closure reaches ADK's
- * optional peer dependencies (`express`, `@a2a-js/sdk`, the MikroORM drivers,
- * …) — uninstalled, hence build errors.
+ * would flip the bundle to the node ESM barrel (`dist/esm/index.js`), whose
+ * closure installs the winston logger and reaches ADK's optional peer
+ * dependencies (`express`, `@a2a-js/sdk`, the MikroORM drivers, …) —
+ * uninstalled, hence build errors.
  *
- * The web surface is what a Workflow needs and nothing more: the runner, the
- * agent loop, the workflow (graph) runtime, HITL, plugins, compactors. It omits
- * the node-only services (a2a, database sessions, GCS artifacts, telemetry
- * setup, `LocalEnvironment`, the agent registry) and MCP — MCP traffic is
- * routed through Activities on the worker, where the full barrel is used. The
- * agent-loop sources are identical across builds. The `./dist/web/*` subpath
- * is part of ADK's `exports` map, so ordinary Node resolution finds it.
+ * `common.ts` is what a Workflow needs and nothing more: the runner, the agent
+ * loop, the workflow (graph) runtime, HITL, plugins, compactors. It omits the
+ * node-only services (a2a, database sessions, GCS artifacts, telemetry setup,
+ * `LocalEnvironment`, the agent registry) and MCP — MCP traffic is routed
+ * through Activities on the worker, where the full barrel is used. It is the
+ * exact module set behind ADK's browser entry (`index_web.ts` re-exports it),
+ * but taken from the per-file build rather than from `dist/web/index_web.js`:
+ * ADK 2.0 published that web build per file as well, while ADK 2.1 and later
+ * ship it as a single esbuild bundle that inlines its own copies of
+ * `@opentelemetry/api`, `@google/genai`, `zod` and `uuid` and pre-resolves
+ * `node:crypto` to a stand-in that throws. A second `@opentelemetry/api` copy
+ * silently drops every ADK span ({@link adkOtelApiEntry}), and an inlined
+ * dependency is beyond the reach of the request-level shims below; the
+ * per-file build keeps each one an ordinary import the bundle can pin.
+ *
+ * `dist/esm/common.js` is not on ADK's `exports` map, so it is located from
+ * the package root (`package.json` is exported) and aliased by absolute path,
+ * which webpack resolves without consulting `exports`. Its files carry the
+ * `createRequire` banner (see {@link MODULE_SHIM_SOURCE}) and import
+ * `node:crypto` and `node:async_hooks`, which the shims below answer.
  */
-function adkWebEntry(): string {
-  return require.resolve(`${ADK_PACKAGE}/dist/web/index_web.js`);
+function adkWorkflowEntry(): string {
+  const packageRoot = path.dirname(require.resolve(`${ADK_PACKAGE}/package.json`));
+  const entry = path.join(packageRoot, 'dist', 'esm', 'common.js');
+  if (!existsSync(entry)) {
+    throw new Error(
+      `@temporalio/google-adk: ${entry} does not exist. This @google/adk release lays out its build ` +
+        'differently from the releases the plugin supports (see its peerDependencies range).'
+    );
+  }
+  return entry;
 }
 
 /**
- * Whether a module request was issued from inside `@google/adk`'s own files,
- * so a shim can be scoped to ADK without changing what any other package in
- * the bundle sees. Matches both path separators.
+ * Matches the resource path of a module inside `@google/adk`'s own files, so a
+ * shim can be scoped to ADK without changing what any other package in the
+ * bundle sees. Matches both path separators.
  */
 const ADK_ISSUER_PATTERN = /[\\/]@google[\\/]adk[\\/]/;
 
 /**
+ * Issuers whose `crypto` / `node:crypto` requests the deterministic shim
+ * answers: ADK's own files, and the installed `uuid` package, which ADK >= 2.1
+ * imports for its retry plugins. `uuid`'s browser build reads the `crypto`
+ * global (which the polyfill loader supplies), but its node build — the one a
+ * consumer's webpack target or browserslist can select — imports `randomUUID`
+ * / `randomFillSync` from the `crypto` builtin, and `uuid` is strict ESM, so
+ * the bundler's empty-module alias would fail the build on the missing
+ * exports. Any installed `uuid` copy matches — the one ADK's request is pinned
+ * to ({@link UUID_PACKAGE}) and one a user's own Workflow code imports, which
+ * then draws from the same stream; the `node_modules` segment keeps a user's
+ * own `uuid/` source directory out.
+ */
+const CRYPTO_SHIM_ISSUER_PATTERN = /[\\/](?:@google[\\/]adk|node_modules[\\/]uuid)[\\/]/;
+
+/**
  * Resolves the `@opentelemetry/api` copy that `@google/adk` itself resolves.
- * ADK pins an exact api version while other packages in the Workflow bundle
- * (notably `@temporalio/interceptors-opentelemetry`) may resolve a different
- * one, so without intervention the bundle can contain two api copies. ADK's
+ * ADK's own `@opentelemetry/api` dependency can resolve to a different copy
+ * than other packages in the Workflow bundle (notably
+ * `@temporalio/interceptors-opentelemetry`) resolve, so without intervention
+ * the bundle can contain two api copies. ADK's
  * `telemetry/tracing.js` caches `trace.getTracer(...)` at module load; if that
  * binds a different api copy than the one the OTel interceptor registers its
  * tracer provider on, every ADK span is silently lost (the workflow still
@@ -131,10 +187,10 @@ const PROCESS_SHIM_SOURCE =
 /**
  * ESM source for the `os` builtin shim. ADK 1.x's `code_executors/
  * unsafe_local_code_executor.js` evaluated `os.platform()` at **module load**;
- * that file is not on ADK 2.0's web surface (the build the Workflow bundle now
- * pins), but several web-surface modules still import `node:os` for use inside
- * function bodies, and an inert surface keeps any future load-time reach from
- * failing the bundle. The bundler aliases the disallowed `os` builtin to an
+ * that file is not on ADK's `common` surface (the build the Workflow bundle
+ * pins), but modules on it have imported `node:os` for use inside function
+ * bodies, and an inert surface keeps any future load-time reach from failing
+ * the bundle. The bundler aliases the disallowed `os` builtin to an
  * empty module, so `os.platform` would be `undefined`; this shim returns
  * deterministic, side-effect-free constants instead — no real OS
  * introspection, nothing that could differ between the original execution and
@@ -165,9 +221,9 @@ const OS_SHIM_SOURCE =
  * packages. This shim supplies an inert load surface: `JsonType`/`MikroORM` are
  * inert classes, the decorators are no-op factories, `LockMode` is an empty enum.
  *
- * Retained defensively: the DB session subtree is not on ADK 2.0's web surface
- * (the build the Workflow bundle pins), so this shim is only reached if a
- * consumer's own webpack hook re-aliases `@google/adk` to the node barrel.
+ * Retained defensively: the DB session subtree is not on ADK's `common`
+ * surface (the build the Workflow bundle pins), so this shim is only reached if
+ * a consumer's own webpack hook re-aliases `@google/adk` to the node barrel.
  */
 const MIKRO_ORM_SHIM_SOURCE =
   'class JsonType {}' +
@@ -228,17 +284,18 @@ const ASYNC_HOOKS_SHIM_SOURCE =
   'export const AsyncLocalStorage=globalThis.AsyncLocalStorage;export default {AsyncLocalStorage};\n';
 
 /**
- * ESM source replacing `@google/adk`'s `dist/web/models/apigee_llm.js`. ADK
- * 2.0.0's web build is compiled per file for old browser targets, and esbuild
- * lowers `ApigeeLlm`'s async-generator methods into nested `function*` bodies
- * that still say `super.generateContentAsync(...)` — `'super' keyword outside
- * a method`, a syntax error for webpack (and V8), so the whole bundle fails to
- * build. The class is unusable in a Workflow anyway (it proxies Gemini over the
- * network), so this inert stand-in keeps the module graph loading: same
- * `supportedModels` pattern (the registry registers it at load, and the
- * auto-route overwrites that entry), same `BaseLlm` brand symbol, and methods
- * that fail with a message naming the actual fix. The upstream web build is
- * repaired in ADK 2.1 (it is bundled there).
+ * ESM source replacing `@google/adk`'s `models/apigee_llm.js`. ADK 2.0.0's
+ * per-file *web* build compiled it for old browser targets, and esbuild lowered
+ * `ApigeeLlm`'s async-generator methods into nested `function*` bodies that
+ * still say `super.generateContentAsync(...)` — `'super' keyword outside a
+ * method`, a syntax error for webpack (and V8), so the whole bundle failed to
+ * build. The per-file ESM build the bundle pins ({@link adkWorkflowEntry})
+ * parses, but the class is unusable in a Workflow regardless (it proxies Gemini
+ * over the network), so the inert stand-in stays: same `supportedModels`
+ * pattern (the registry registers it at load, and the auto-route overwrites
+ * that entry), same `BaseLlm` brand symbol, and methods that fail with a
+ * message naming the actual fix. It also keeps a consumer whose own webpack
+ * hook re-aliases `@google/adk` to that 2.0 web build building.
  */
 const APIGEE_LLM_SHIM_SOURCE =
   "var BASE_MODEL_SYMBOL=Symbol.for('google.adk.baseModel');" +
@@ -341,12 +398,13 @@ function disallowedBuiltins(): readonly string[] {
  * globals like `Event`/`Buffer` the sandbox lacks). The cut is at the
  * **third-party-package** boundary rather than ADK's own modules.
  *
- * With the bundle pinned to ADK 2.0's web surface ({@link adkWebEntry}), most
- * of these are no longer reached at all — the web surface omits the a2a, DB
+ * With the bundle pinned to ADK's `common` surface ({@link adkWorkflowEntry}),
+ * most of these are no longer reached at all — that surface omits the a2a, DB
  * session, GCS artifact, telemetry-setup and MCP subtrees that imported them.
- * The still-reached ones are `google-auth-library`, `@google-cloud/vertexai`
- * and `adm-zip`. The rest are retained as a safety net for a consumer whose
- * own webpack hook re-aliases `@google/adk` to the node barrel.
+ * ADK 2.0's `common` still reached `google-auth-library`,
+ * `@google-cloud/vertexai` and `adm-zip`; ADK 2.1 moved those exports to the
+ * node barrel. The rest are retained as a safety net for a consumer whose own
+ * webpack hook re-aliases `@google/adk` to the node barrel.
  *
  * The two packages ADK dereferences *at module load* are handled as shims
  * instead, not here: `@mikro-orm/core` and `winston` — see
@@ -360,7 +418,7 @@ const ADK_NODE_ONLY_SERVICE_PACKAGES: readonly string[] = [
   'google-auth-library',
   'gaxios',
   'node-fetch',
-  // ADK 2.0's `skills/loader.js` (on the web surface) imports the zip reader
+  // ADK 2.0's `skills/loader.js` (on its `common` surface) imports the zip reader
   // for `loadSkillFromZipBuffer`, dereferencing it only inside that function;
   // the package itself reaches `fs`/`zlib`/`Buffer` at load.
   'adm-zip',
@@ -413,38 +471,48 @@ function isCryptoRequest(request: string): boolean {
   return request === 'crypto' || request === `${NODE_SCHEME}crypto`;
 }
 
-/** Whether the module issuing a request lives inside `@google/adk`. */
-function issuedByAdk(data: ResolveDataLike): boolean {
-  const issuer = data.contextInfo?.issuer ?? data.context ?? '';
-  return ADK_ISSUER_PATTERN.test(issuer);
+/** The resource path (or, failing that, the directory) of the module issuing a request. */
+function issuerOf(data: ResolveDataLike): string {
+  return data.contextInfo?.issuer ?? data.context ?? '';
 }
 
 /**
  * The webpack plugin that makes the `@google/adk` barrel load inside the
- * Workflow sandbox. It does five things:
+ * Workflow sandbox. It does six things:
  *
- *  1. **Deterministic `crypto` for ADK**: in `beforeResolve`, a `crypto` /
- *     `node:crypto` request issued from inside `@google/adk` is redirected to
- *     the plugin's {@link ./crypto-shim | crypto shim}, whose `randomUUID` /
- *     `getRandomValues` draw from a named workflow random stream. ADK's id
- *     generator (`utils/env_aware_utils.js`) falls through to that import when
- *     no `crypto` global exists, and the sandbox has none; without the shim the
- *     first `createEvent()` in a Workflow throws. The redirect is scoped to ADK
- *     issuers so no other package in the bundle sees a `crypto` it did not have
- *     before. The shim is a real module (not a `data:` URI) because it imports
- *     `@temporalio/workflow`.
- *  2. **`apigee_llm.js` replacement**: ADK's own request for that module, also
+ *  1. **Deterministic `crypto`**: in `beforeResolve`, a `crypto` /
+ *     `node:crypto` request issued from inside `@google/adk` (or the `uuid`
+ *     package it imports, see {@link CRYPTO_SHIM_ISSUER_PATTERN}) is redirected
+ *     to the plugin's {@link ./crypto-shim | crypto shim}, whose `randomUUID`
+ *     / `getRandomValues` / `randomFillSync` draw from a named workflow random
+ *     stream. ADK's id generator (`utils/env_aware_utils.js`) falls through to
+ *     that import when no `crypto` global exists; without the shim the first
+ *     `createEvent()` in a Workflow throws. The module redirect is scoped to
+ *     those issuers; no other package's `crypto` *import* changes. The shim is
+ *     a real module (not a `data:` URI) because it imports
+ *     `@temporalio/workflow`. The same shim is also the sandbox's `crypto`
+ *     *global*, installed bundle-wide by the `load-polyfills` interceptor
+ *     module (recipe step 3 in {@link GoogleAdkPlugin.configureBundler}; the
+ *     README's determinism notes document it): ADK's id generator reads
+ *     `globalThis.crypto` first — its `node:crypto` import is only the Node 18
+ *     fallback — and ADK 2.1+'s single-file web bundle (which a consumer's own
+ *     alias could still select) has `node:crypto` pre-resolved to a stand-in
+ *     that throws, leaving no request to redirect.
+ *  2. **`uuid` for ADK**: a `uuid` request issued from inside `@google/adk` is
+ *     redirected to this plugin's own `uuid` dependency ({@link UUID_PACKAGE}),
+ *     which ADK does not declare.
+ *  3. **`apigee_llm.js` replacement**: ADK's own request for that module, also
  *     scoped to ADK issuers, is redirected to {@link APIGEE_LLM_SHIM_SOURCE};
  *     the published web file is a syntax error webpack cannot parse.
- *  3. **Shim redirects** ({@link REQUEST_SHIM_SOURCES}): redirect the
+ *  4. **Shim redirects** ({@link REQUEST_SHIM_SOURCES}): redirect the
  *     load-dereferenced requests to their inline `data:` URI shims.
- *  4. **`node:` scheme strip**: every other `node:<name>` → bare `<name>`. The
+ *  5. **`node:` scheme strip**: every other `node:<name>` → bare `<name>`. The
  *     Worker bundler aliases each disallowed builtin to `false` by its **bare**
  *     name; a `node:`-prefixed request never reaches `resolve.alias` — webpack's
  *     scheme handler intercepts it first and throws `UnhandledSchemeError` (a
  *     hard *build* failure). Stripping the scheme lets the bundler's bare-name
  *     policy take over.
- *  5. **`process` provide**: a `ProvidePlugin` injects the deterministic
+ *  6. **`process` provide**: a `ProvidePlugin` injects the deterministic
  *     `process` shim ({@link PROCESS_SHIM_SOURCE}) wherever `process` is a free
  *     variable.
  */
@@ -456,6 +524,9 @@ function googleAdkSandboxCompatPlugin(): unknown {
   const processShimUri = toDataUri(PROCESS_SHIM_SOURCE);
   const apigeeShimUri = toDataUri(APIGEE_LLM_SHIM_SOURCE);
   const cryptoShimPath = require.resolve('./crypto-shim');
+  // The CJS entry: its `require('crypto')` is answered by the shim above, with
+  // no strict-ESM export check to satisfy, whatever the consumer's webpack target.
+  const uuidEntry = require.resolve(UUID_PACKAGE);
   return {
     name: 'google-adk-sandbox-compat',
     apply(compiler: WebpackCompilerLike): void {
@@ -467,9 +538,14 @@ function googleAdkSandboxCompatPlugin(): unknown {
         nmf.hooks.beforeResolve.tap('GoogleAdkSandboxCompat', (data) => {
           const request = data.request;
           if (!request) return;
-          if (issuedByAdk(data)) {
-            if (isCryptoRequest(request)) {
-              data.request = cryptoShimPath;
+          const issuer = issuerOf(data);
+          if (isCryptoRequest(request) && CRYPTO_SHIM_ISSUER_PATTERN.test(issuer)) {
+            data.request = cryptoShimPath;
+            return;
+          }
+          if (ADK_ISSUER_PATTERN.test(issuer)) {
+            if (request === UUID_PACKAGE) {
+              data.request = uuidEntry;
               return;
             }
             if (APIGEE_LLM_REQUEST.test(request)) {
@@ -504,8 +580,8 @@ function googleAdkSandboxCompatPlugin(): unknown {
  *  - `@opentelemetry/api` → the copy `@google/adk` resolves
  *    ({@link adkOtelApiEntry}); two api copies in one bundle silently drop
  *    every ADK span. `@opentelemetry/api-logs` is untouched.
- *  - `@google/adk` → ADK's web build ({@link adkWebEntry}), so the sandbox
- *    surface does not depend on the consumer's webpack target.
+ *  - `@google/adk` → ADK's per-file `common` surface ({@link adkWorkflowEntry}),
+ *    so the sandbox surface does not depend on the consumer's webpack target.
  *
  * Precedence is identical in both `resolve.alias` forms: alias entries
  * resolve first-match-first, the pins are placed first, so they win the bare
@@ -523,7 +599,7 @@ function addSandboxCompat(
     const alias = cfg.resolve?.alias;
     const pins: ReadonlyArray<readonly [string, string]> = [
       [OTEL_API_PACKAGE, adkOtelApiEntry()],
-      [ADK_PACKAGE, adkWebEntry()],
+      [ADK_PACKAGE, adkWorkflowEntry()],
     ];
     if (Array.isArray(alias)) {
       alias.unshift(...pins.map(([name, target]) => ({ name, onlyModule: true, alias: target })));
@@ -627,8 +703,8 @@ export class GoogleAdkPlugin extends SimplePlugin {
    *     `apigee_llm.js` redirects, and the `process` provide) and two
    *     exact-match `resolve.alias` pins (see {@link addSandboxCompat}):
    *     `@opentelemetry/api` to the single copy ADK resolves, and `@google/adk`
-   *     to ADK's web build ({@link adkWebEntry}) so the sandbox surface does not
-   *     depend on the consumer's webpack target.
+   *     to ADK's per-file `common` surface ({@link adkWorkflowEntry}) so the
+   *     sandbox surface does not depend on the consumer's webpack target.
    *  2. **`ignoreModules`** stubs (`alias → false`) two groups: ADK's node-only
    *     third-party packages ({@link ADK_NODE_ONLY_SERVICE_PACKAGES}) and every
    *     disallowed Node builtin ({@link disallowedBuiltins}). The builtins are
@@ -643,7 +719,9 @@ export class GoogleAdkPlugin extends SimplePlugin {
    *     then imports workflows), so the web globals
    *     `@google/adk`/`@google/genai` and ADK's OpenTelemetry chain
    *     dereference at module load (`ReadableStream`, `performance`, …) exist
-   *     no matter what order the user's own imports evaluate in. The module
+   *     no matter what order the user's own imports evaluate in, and the
+   *     deterministic `crypto` global ADK's id generator reads is in place
+   *     before the first `createSession()` / `createEvent()`. The module
    *     exports an `interceptors` factory that registers nothing, per the
    *     documented interceptor-module contract. (A webpack entry preload would
    *     not work: entry code evaluates at bundle load, before any activator,

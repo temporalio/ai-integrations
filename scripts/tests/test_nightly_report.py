@@ -17,8 +17,14 @@ def _job(name: str, conclusion: str | None) -> dict:
 def test_classify_aggregates_results_by_plugin() -> None:
     failing, passing = nightly_report.classify(
         [
-            _job("Python (openai_agents) / openai_agents (ubuntu-latest, py3.14)", "success"),
-            _job("Python (openai_agents) / openai_agents (ubuntu-latest, py3.10)", "failure"),
+            _job(
+                "Python (openai_agents) / openai_agents (ubuntu-latest, py3.14)",
+                "success",
+            ),
+            _job(
+                "Python (openai_agents) / openai_agents (ubuntu-latest, py3.10)",
+                "failure",
+            ),
             _job("Python (mcp) / mcp (macos-latest, py3.14)", "success"),
             _job("Python (mcp) / matrix", "success"),
             _job("Python (mcp) / mcp (windows-latest, py3.14)", None),
@@ -31,12 +37,20 @@ def test_classify_aggregates_results_by_plugin() -> None:
 
 
 def test_report_matches_ci_workflow_job_names() -> None:
-    workflow = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
-    for language, expected_name in (("python", "Python"), ("java", "Java"), ("go", "Go"), ("typescript", "TypeScript")):
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    )
+    for language, expected_name in (
+        ("python", "Python"),
+        ("java", "Java"),
+        ("go", "Go"),
+        ("typescript", "TypeScript"),
+    ):
         names = {
             job["name"]
             for job in workflow["jobs"].values()
-            if isinstance(job, dict) and str(job.get("uses", "")).endswith(f"_{language}-plugin.yml")
+            if isinstance(job, dict)
+            and str(job.get("uses", "")).endswith(f"_{language}-plugin.yml")
         }
         assert names == {expected_name}, (
             f"ci.yml renamed a {language} job; update JOB_RE in scripts/ci/nightly_report.py"
@@ -44,14 +58,20 @@ def test_report_matches_ci_workflow_job_names() -> None:
         match = nightly_report.JOB_RE.match(f"{expected_name} (fakeplug) / matrix")
         assert match is not None and match.group("plugin") == "fakeplug"
         assert match.group("language") == expected_name
-    assert {"python", "java", "go", "typescript"}.issubset(workflow["jobs"]["nightly-report"]["needs"])
+    assert {"python", "java", "go", "typescript"}.issubset(
+        workflow["jobs"]["nightly-report"]["needs"]
+    )
 
 
 def test_typescript_and_python_langsmith_have_separate_nightly_issues() -> None:
-    failing, passing = nightly_report.classify([
-        _job("TypeScript (langsmith) / langsmith (ubuntu-latest, node24)", "failure"),
-        _job("Python (langsmith) / langsmith (ubuntu-latest, py3.14)", "success"),
-    ])
+    failing, passing = nightly_report.classify(
+        [
+            _job(
+                "TypeScript (langsmith) / langsmith (ubuntu-latest, node24)", "failure"
+            ),
+            _job("Python (langsmith) / langsmith (ubuntu-latest, py3.14)", "success"),
+        ]
+    )
     assert failing == {"typescript/langsmith"}
     assert passing == {"langsmith"}
 
@@ -72,9 +92,11 @@ def test_classify_go_failures_and_keep_language_identities_separate() -> None:
 
 
 def test_java_failures_are_aggregated_by_plugin() -> None:
-    failing, passing = nightly_report.classify([
-        _job("Java (spring-ai) / spring-ai (windows-latest, java25)", "failure"),
-        _job("Java (spring-ai) / matrix", "success"),
-    ])
+    failing, passing = nightly_report.classify(
+        [
+            _job("Java (spring-ai) / spring-ai (windows-latest, java25)", "failure"),
+            _job("Java (spring-ai) / matrix", "success"),
+        ]
+    )
     assert failing == {"spring-ai"}
     assert not passing

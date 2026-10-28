@@ -9,9 +9,6 @@ root-api = "temporalio.google_genai"
 maturity = "public-preview"
 docs = "https://docs.temporal.io/develop/python/integrations/google-genai"
 
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["3.10", "3.14"]
 

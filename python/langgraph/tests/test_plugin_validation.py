@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+from dataclasses import make_dataclass
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from langchain_core.runnables import RunnableLambda
 from langgraph.func import task  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
+from langgraph.runtime import Runtime
 from langgraph.types import RetryPolicy  # pyright: ignore[reportMissingTypeStubs]
 from pytest import raises
 from typing_extensions import TypedDict
 
 from temporalio.langgraph import LangGraphPlugin
+from temporalio.langgraph._activity import (
+    ActivityInput,
+    wrap_activity,
+    wrap_execute_activity,
+)
+from tests.test_two_nodes import Context, ModelContext
 
 
 class State(TypedDict):
@@ -87,3 +97,45 @@ def test_task_retry_policy_raises() -> None:
 
     with raises(ValueError, match="retry_policy"):
         LangGraphPlugin(tasks=[my_task])
+
+
+def test_context_schema_id_conflict_raises() -> None:
+    first = make_dataclass("Collision", [("user_id", str)])
+    second = make_dataclass("Collision", [("user_id", str)])
+    with raises(ValueError, match="Conflicting context schema ID"):
+        LangGraphPlugin(
+            graphs={
+                "first": StateGraph(State, context_schema=first),
+                "second": StateGraph(State, context_schema=second),
+            }
+        )
+
+
+@pytest.mark.parametrize("unknown_id", [False, True])
+async def test_context_payload_errors(unknown_id: bool) -> None:
+    schema_id = f"{ModelContext.__module__}.{ModelContext.__qualname__}"
+    wrapped = wrap_activity(async_node, context_schemas={schema_id: ModelContext})
+    input = ActivityInput(
+        args=({},),
+        kwargs={},
+        langgraph_config={
+            "context_schema_id": "unknown" if unknown_id else schema_id,
+            "context": {"userId": 123, "tenant": {"name": "acme"}},
+        },
+    )
+    with raises(
+        ValueError, match="Unknown context schema ID" if unknown_id else "userId"
+    ):
+        await wrapped(input)
+
+
+async def test_unregistered_context_type_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "temporalio.workflow.info",
+        lambda: SimpleNamespace(run_id="unregistered-context"),
+    )
+    wrapped = wrap_execute_activity(wrap_activity(async_node))
+    with raises(ValueError, match="is not registered"):
+        await wrapped({}, runtime=Runtime(context=Context(user_id="alice")))

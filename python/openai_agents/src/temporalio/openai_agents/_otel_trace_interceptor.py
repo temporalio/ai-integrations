@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
@@ -61,7 +61,7 @@ class OTelOpenAIAgentsContextPropagationInterceptor(
     def context_from_header(
         self,
         input: _InputWithHeaders,
-    ) -> Iterator[None]:
+    ) -> Generator[None, None, None]:
         """Use propagated IDs as a remote parent without recording replicas."""
         span_info = self.get_header_contents(input)
         with super().context_from_header(input=input):

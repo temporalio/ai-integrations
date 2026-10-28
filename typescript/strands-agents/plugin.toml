@@ -7,9 +7,6 @@ root-api = "@temporalio/strands-agents"
 maturity = "pre-release"
 docs = "https://docs.temporal.io/develop/typescript/integrations/strands-agents"
 
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["22", "24"]
 

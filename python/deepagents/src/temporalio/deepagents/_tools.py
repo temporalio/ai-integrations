@@ -620,8 +620,8 @@ class TemporalBackend:
         activity_input = _activity.BackendOpInput(
             backend_ref=self._ref,
             op=op,
-            args=list(args),
-            kwargs=dict(kwargs),
+            args=_serde.dump_backend_result(list(args)),
+            kwargs=_serde.dump_backend_result(dict(kwargs)),
             backend_factory=self._backend_factory,
             factory_argument=self._factory_argument,
         )

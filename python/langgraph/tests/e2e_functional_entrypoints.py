@@ -6,9 +6,30 @@ These define @task and @entrypoint functions used in functional API E2E tests.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import langgraph.types
 from langgraph.func import entrypoint, task  # pyright: ignore[reportMissingTypeStubs]
+from langgraph.runtime import Runtime, get_runtime
+
+
+def read_context(value: int, runtime: Runtime[Any] | None = None) -> dict[str, Any]:
+    assert runtime is not None
+    context = get_runtime().context
+    assert runtime.context is context
+    if context is None:
+        user_id = ""
+    elif isinstance(context, dict):
+        user_id = context["user_id"]
+    else:
+        user_id = context.user_id
+        if hasattr(context, "tenant"):
+            user_id += f":{context.tenant.name}"
+    return {
+        "value": value,
+        "user_id": user_id,
+        "context_type": type(context).__name__,
+    }
 
 
 @task

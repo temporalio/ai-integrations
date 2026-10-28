@@ -8,10 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from packaging.version import Version
-
 import release_tool
-from conftest import commit_all, git, make_python_plugin
+from conftest import commit_all, git
+from packaging.version import Version
 
 
 def test_parse_tag_valid() -> None:
@@ -57,8 +56,6 @@ coordinate = "io.temporal:spring-ai"
 root-api = "io.temporal.springai"
 maturity = "{maturity}"
 
-[release]
-allow-final = false
 ''')
     output = tmp_path / "outputs"
     assert release_tool.main(["--repo-root", str(tmp_path), "parse-tag", f"java/spring-ai/v{version}",
@@ -228,7 +225,7 @@ def test_java_rerun_cannot_allow_upload_when_prior_job_lookup_fails(
 @pytest.mark.parametrize("event", ["release", "push"])
 @pytest.mark.parametrize("github_repo,cli_repo,run_repo", [
     pytest.param(None, None, "temporalio/ai-integrations", id="default-repo"),
-    pytest.param("temporalio/ai-integrations", None, "temporalio/ai-integrations", id="upstream-repo"),
+    pytest.param("temporalio/ai-integrations", None, "temporalio/ai-integrations", id="repository-default"),
     pytest.param("contributor/ai-integrations", None, "contributor/ai-integrations", id="fork-repo"),
     pytest.param("contributor/ai-integrations", "temporalio/ai-integrations", "temporalio/ai-integrations", id="explicit-repo"),
 ])
@@ -410,33 +407,12 @@ def _registry(tmp_path: Path, versions: list[str] | None) -> Path:
     return f
 
 
-def test_cli_policy_prerelease_with_no_published_versions(plugin_repo: Path, tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", ["0.0.1rc1", "0.0.1"])
+def test_cli_policy_first_release(plugin_repo: Path, tmp_path: Path, version: str) -> None:
     reg = _registry(tmp_path, None)
     rc = release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
-                            "--version", "0.0.1rc1", "--registry-json", str(reg), "--testpypi-json", str(tmp_path / "absent.json")])
+                            "--version", version, "--registry-json", str(reg), "--testpypi-json", str(tmp_path / "absent.json")])
     assert rc == 0
-
-
-def test_cli_policy_final_blocked_by_allow_final(plugin_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    reg = _registry(tmp_path, None)
-    rc = release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
-                            "--version", "0.0.1", "--registry-json", str(reg)])
-    assert rc == 1 and "allow-final is false" in capsys.readouterr().out
-
-
-def test_cli_policy_final_blocked_by_transition_markers(repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    d = make_python_plugin(repo, "fakeplug", allow_final=True)
-    (d / "src/temporalio/contrib/fakeplug/_impl.py").write_text("# TRANSITION(sdk-cutover): remove\nVALUE = 1\n")
-    commit_all(repo, "plugin")
-    reg = _registry(tmp_path, None)
-    policy = ["--repo-root", str(repo), "check-version-policy", "--plugin-dir", str(d), "--version", "0.0.1", "--registry-json", str(reg),
-              "--testpypi-json", str(tmp_path / "absent.json")]
-    rc = release_tool.main(policy)
-    out = capsys.readouterr().out
-    assert rc == 1 and "TRANSITION(sdk-cutover)" in out
-    (d / "src/temporalio/contrib/fakeplug/_impl.py").write_text("VALUE = 1\n")
-    commit_all(repo, "clean")
-    assert release_tool.main(policy) == 0
 
 
 def test_cli_policy_warns_when_the_version_is_already_on_testpypi(plugin_repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -462,22 +438,6 @@ def test_cli_policy_does_not_touch_testpypi_unless_asked(plugin_repo: Path, tmp_
     reg = _registry(tmp_path, None)
     assert release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"),
                               "--version", "0.0.1rc1", "--registry-json", str(reg)]) == 0
-
-
-def test_transition_markers_fail_closed_on_git_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def broken(*_args, **_kwargs):
-        return subprocess.CompletedProcess(args=[], returncode=128, stdout="", stderr="fatal: not a git repository")
-
-    monkeypatch.setattr(release_tool.subprocess, "run", broken)
-    with pytest.raises(release_tool.PolicyError, match="git grep"):
-        release_tool.transition_markers(tmp_path, "python/fakeplug")
-
-    def missing(*_args, **_kwargs):
-        raise FileNotFoundError("git")
-
-    monkeypatch.setattr(release_tool.subprocess, "run", missing)
-    with pytest.raises(release_tool.PolicyError, match="git is required"):
-        release_tool.transition_markers(tmp_path, "python/fakeplug")
 
 
 def _dist(tmp_path: Path) -> tuple[Path, dict[str, str]]:
@@ -568,10 +528,7 @@ def test_cli_policy_existing_versions(plugin_repo: Path, tmp_path: Path, capsys:
     assert release_tool.main([*args, "--version", "0.1.0rc2"]) == 0
     assert "::warning::" in capsys.readouterr().out
     assert release_tool.main([*args, "--version", "0.1.0rc1"]) == 1
-    # A re-run of a final still meets the final-release gates (allow-final is false for this fixture).
-    reg_final = _registry(tmp_path, ["0.1.0"])
-    assert release_tool.main([*args[:-4], "--registry-json", str(reg_final), "--testpypi-json", str(tmp_path / "absent.json"), "--version", "0.1.0"]) == 1
-    assert "allow-final is false" in capsys.readouterr().out
+    assert release_tool.main(["--repo-root", str(plugin_repo), "check-version-policy", "--plugin-dir", str(plugin_repo / "python/fakeplug"), "--version", "0.1.0", "--registry-json", str(reg)]) == 0
 
 
 def test_release_notes_initial_and_incremental(plugin_repo: Path, tmp_path: Path) -> None:
@@ -581,12 +538,11 @@ def test_release_notes_initial_and_incremental(plugin_repo: Path, tmp_path: Path
     assert not notes.startswith("# temporalio-fakeplug 0.1.0rc1")
     assert "First standalone release of `temporalio-fakeplug`" in notes
     assert "add fake plugin" in notes
-    assert "TestPyPI only" in notes and "temporalio.contrib.fakeplug" in notes
-    assert "commits/main/temporalio/contrib/fakeplug" in notes
+    assert "TestPyPI only" in notes
     assert "commits/refs/tags/python/fakeplug/v0.1.0rc1/python/fakeplug" in notes
     assert "tree/refs/tags/python/fakeplug/v0.1.0rc1/python/fakeplug" in notes
 
-    (repo / "python/fakeplug/src/temporalio/contrib/fakeplug/_impl.py").write_text("VALUE = 2\n")
+    (repo / "python/fakeplug/src/temporalio/fakeplug/_impl.py").write_text("VALUE = 2\n")
     commit_all(repo, "Fix the thing (#12)")
     (repo / "README.md").write_text("# other\n")
     commit_all(repo, "Unrelated root change (#13)")
@@ -644,17 +600,8 @@ def test_release_notes_before_tag_creation_use_the_tested_commit(
     assert (f"compare/{previous}...{tag}" in notes) is incremental
     if language == "typescript" and "-" in version:
         assert f"npm install {coordinate}@{version}" in notes
-        assert "TestPyPI" not in notes and "SDK cutover" not in notes
+        assert "TestPyPI" not in notes
     assert tag not in git(repo, "tag", "--list").splitlines()
-
-
-def test_prerelease_notes_warn_about_sdk_overlap_only_while_the_sdk_bundles_the_plugin(repo: Path) -> None:
-    make_python_plugin(repo, "fakeplug", allow_final=True)
-    commit_all(repo, "plugin")
-    git(repo, "tag", "python/fakeplug/v0.1.0rc1")
-    notes = release_tool.release_notes(repo, "python/fakeplug", "python/fakeplug/v0.1.0rc1", "temporalio/ai-integrations")
-    assert "TestPyPI only" in notes
-    assert "still embeds" not in notes and "SDK cutover" not in notes
 
 
 def test_draft_release_waits_for_new_release_visibility(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -814,7 +761,7 @@ def test_release_notes_ignores_other_plugins_tags(plugin_repo: Path) -> None:
     assert "First standalone release" in notes
 
 
-def _java_plugin(repo: Path, *, allow_final: bool = False) -> Path:
+def _java_plugin(repo: Path) -> Path:
     directory = repo / "java/spring-ai"
     directory.mkdir(parents=True)
     (directory / "plugin.toml").write_text(f'''[plugin]
@@ -824,8 +771,6 @@ coordinate = "io.temporal:spring-ai"
 registry = "maven"
 maturity = "public-preview"
 root-api = "io.temporal.springai"
-[release]
-allow-final = {str(allow_final).lower()}
 ''')
     return directory
 
@@ -834,7 +779,7 @@ allow-final = {str(allow_final).lower()}
     ('0.1.0-RC1', 0), ('0.1.0', 0), ('0.0.1', 1), ('0.1.1-RC1', 1), ('1.41.0-RC1', 1),
 ])
 def test_new_maven_preview_starts_at_0_1_0(repo: Path, tmp_path: Path, version: str, status: int) -> None:
-    directory = _java_plugin(repo, allow_final=True)
+    directory = _java_plugin(repo)
     commit_all(repo, 'New Java Public Preview coordinate')
     assert release_tool.main([
         '--repo-root', str(repo), 'check-version-policy', '--plugin-dir', str(directory),
@@ -842,7 +787,7 @@ def test_new_maven_preview_starts_at_0_1_0(repo: Path, tmp_path: Path, version: 
     ]) == status
 
 
-def test_maven_policy_continues_existing_versions_and_blocks_final_cutover(repo: Path, tmp_path: Path, capsys) -> None:
+def test_maven_policy_continues_existing_versions(repo: Path, tmp_path: Path, capsys) -> None:
     directory = _java_plugin(repo)
     commit_all(repo, "Java plugin")
     metadata = tmp_path / "metadata.xml"
@@ -851,15 +796,6 @@ def test_maven_policy_continues_existing_versions_and_blocks_final_cutover(repo:
     assert release_tool.main([*args, "--version", "0.1.2-RC1"]) == 0
     assert release_tool.main([*args, "--version", "0.1.0"]) == 1
     assert "not greater" in capsys.readouterr().out
-    assert release_tool.main([*args, "--version", "0.1.2"]) == 1
-    assert "allow-final is false" in capsys.readouterr().out
-    (directory / "plugin.toml").write_text((directory / "plugin.toml").read_text().replace("false", "true"))
-    (directory / "README.md").write_text("TRANSITION(sdk-cutover): SDK still publishes this artifact\n")
-    commit_all(repo, "cutover pending")
-    assert release_tool.main([*args, "--version", "0.1.2"]) == 1
-    assert "TRANSITION(sdk-cutover)" in capsys.readouterr().out
-    (directory / "README.md").write_text("SDK publishing stopped\n")
-    commit_all(repo, "cutover complete")
     assert release_tool.main([*args, "--version", "0.1.2"]) == 0
 
 
@@ -888,5 +824,4 @@ def test_java_candidate_notes_describe_private_staging(repo: Path) -> None:
     git(repo, "tag", tag)
     notes = release_tool.release_notes(repo, "java/spring-ai", tag, "temporalio/ai-integrations")
     assert "privately staged" in notes and "Maven Central Portal" in notes
-    assert "Final publication remains blocked" in notes
     assert "TestPyPI" not in notes and "whichever installs last" not in notes

@@ -32,6 +32,4 @@ mock transports or in-process servers. Tests that need Temporal start a local
 dev server and may download the Temporal CLI on first use.
 
 Repository conventions are in
-[`AGENTS.md`](../AGENTS.md). History imports and re-syncs follow
-[`scripts/migrate/README.md`](../scripts/migrate/README.md), with provenance
-recorded in [`IMPORTS.md`](../scripts/migrate/IMPORTS.md).
+[`AGENTS.md`](../AGENTS.md).

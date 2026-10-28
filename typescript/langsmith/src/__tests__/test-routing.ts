@@ -193,12 +193,9 @@ for (const addTemporalRuns of [false, true]) {
           for (const name of ['routing-step', 'routing-activity', 'routing-child', 'nexus_inner_call']) {
             const runs = collector.records.filter((run) => run.name === name);
             t.true(runs.length > 0, `missing ${name}`);
-            // An emitted RunWorkflow is a real parent, so its project outranks native child options.
-            const expectedAddress = addTemporalRuns && (source === 'decorator' || source === 'runtime')
-              ? undefined : ROUTING_ADDRESS;
             for (const run of runs) {
-              t.is(run.address, expectedAddress, name);
-              t.is(run.project_name, expectedAddress ? undefined : 'fallback', name);
+              t.is(run.address, ROUTING_ADDRESS, name);
+              t.is(run.project_name, undefined, name);
               t.truthy(run.end_time, name);
             }
           }

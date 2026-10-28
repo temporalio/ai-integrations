@@ -7,9 +7,6 @@ root-api = "io.temporal.springai"
 maturity = "public-preview"
 docs = "https://github.com/temporalio/ai-integrations/tree/main/java/spring-ai"
 
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["17", "25"]
 spring-boot-versions = ["4.0.8", "4.1.1"]

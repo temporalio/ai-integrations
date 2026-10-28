@@ -17,10 +17,7 @@ In-env (stdlib only; runs inside the target environment, Python 3.10+):
   small normaliser), and checks provenance: not an editable install, every file
   in our RECORD matches its hash,
   no files under our package directory that we do not own, and no other
-  distribution ships our module path. $ALLOW_OVERLAP_WITH_CORE=1 downgrades the
-  overlap check to a warning for plugins being migrated from another distribution;
-  the orchestrator sets it automatically while plugin.toml has
-  [release] allow-final = false.
+  distribution ships our module path.
 """
 
 from __future__ import annotations
@@ -48,7 +45,7 @@ class ProvenanceError(RuntimeError):
     pass
 
 
-def check_provenance(dist_name: str, pkg_rel: str, allow_overlap: bool = False, warn=print) -> None:
+def check_provenance(dist_name: str, pkg_rel: str) -> None:
     """Assert the installed files for `dist_name` are exactly the ones its wheel shipped.
 
     Raises ProvenanceError with a remediation hint on failure.
@@ -81,7 +78,7 @@ def check_provenance(dist_name: str, pkg_rel: str, allow_overlap: bool = False, 
         digest = base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest()).rstrip(b"=").decode()
         if digest != f.hash.value:
             raise ProvenanceError(
-                f"{f} differs from the hash recorded by {dist_name} (overwritten by another distribution, e.g. the SDK's embedded copy). "
+                f"{f} differs from the hash recorded by {dist_name} (overwritten by another distribution). "
                 "Run `make sync` so our files are written last."
             )
 
@@ -93,10 +90,6 @@ def check_provenance(dist_name: str, pkg_rel: str, allow_overlap: bool = False, 
         for p in pkg_dir.rglob("*")
         if p.is_file() and "__pycache__" not in p.parts and not p.name.endswith(".pyc")
     } - owned
-    if allow_overlap:
-        # During migration the SDK still ships a package README, while plugins
-        # move that file to their distribution root (same exception as pytest).
-        extras.discard(os.path.normpath(str(pkg_dir / "README.md")))
     if extras:
         raise ProvenanceError(
             f"files under {pkg_rel} not owned by {dist_name}: {sorted(extras)}. "
@@ -116,10 +109,7 @@ def check_provenance(dist_name: str, pkg_rel: str, allow_overlap: bool = False, 
             others.append(name)
     if others:
         msg = f"{pkg_rel} is also shipped by {sorted(others)}"
-        if allow_overlap:
-            warn(f"WARN: {msg} (allowed while this plugin is being migrated)")
-        else:
-            raise ProvenanceError(msg + "; raise the dependency floor past the overlapping distribution")
+        raise ProvenanceError(msg + "; raise the dependency floor past the overlapping distribution")
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +156,7 @@ def versions_equal(a: str, b: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def run_in_env(coordinate: str, root_api: str, imports: list[str], expected_version: str | None, allow_overlap: bool) -> int:
+def run_in_env(coordinate: str, root_api: str, imports: list[str], expected_version: str | None) -> int:
     failures: list[str] = []
     for module in [root_api, *imports]:
         try:
@@ -184,7 +174,7 @@ def run_in_env(coordinate: str, root_api: str, imports: list[str], expected_vers
     except md.PackageNotFoundError:
         failures.append(f"{coordinate} is not installed")
     try:
-        check_provenance(coordinate, root_api.replace(".", "/"), allow_overlap=allow_overlap)
+        check_provenance(coordinate, root_api.replace(".", "/"))
         print("OK: provenance guard passed")
     except ProvenanceError as exc:
         failures.append(str(exc))
@@ -215,11 +205,6 @@ def run_isolated(plugin_dir: Path, dist: Path, keep: bool = False) -> int:
     root_api = meta["plugin"]["root-api"]
     imports = list(meta.get("smoke", {}).get("imports", []))
     expected_version = project["version"]
-    allow_overlap = os.environ.get("ALLOW_OVERLAP_WITH_CORE")
-    if allow_overlap is None:
-        allow_overlap = "0" if meta.get("release", {}).get("allow-final") else "1"
-        print(f"ALLOW_OVERLAP_WITH_CORE not set; defaulting to {allow_overlap} from plugin.toml [release] allow-final")
-
     artifacts = sorted(dist.glob("*.whl")) + sorted(dist.glob("*.tar.gz"))
     if not artifacts:
         print(f"FAIL: no artifacts in {dist}")
@@ -238,13 +223,11 @@ def run_isolated(plugin_dir: Path, dist: Path, keep: bool = False) -> int:
             py = _venv_python(venv)
             env = {**os.environ, "VIRTUAL_ENV": str(venv), "UV_LINK_MODE": "copy"}
             subprocess.run([uv, "pip", "install", "--quiet", "--python", str(py), str(artifact)], check=True, env=env)
-            # Install ours last so its files win any overlap with the SDK's embedded copy.
-            subprocess.run([uv, "pip", "install", "--quiet", "--python", str(py), "--no-deps", "--reinstall", str(artifact)], check=True, env=env)
             cmd = [str(py), str(Path(__file__).resolve()), "--in-env", "--coordinate", coordinate, "--root-api", root_api]
             if imports:
                 cmd += ["--imports", ",".join(imports)]
             result = subprocess.run(
-                cmd, env={**env, "EXPECTED_VERSION": expected_version, "ALLOW_OVERLAP_WITH_CORE": allow_overlap}, cwd=str(tmp)
+                cmd, env={**env, "EXPECTED_VERSION": expected_version}, cwd=str(tmp)
             )
             if result.returncode != 0:
                 rc = 1
@@ -282,8 +265,7 @@ def main(argv: list[str] | None = None) -> int:
             imports = imports or list(meta.get("smoke", {}).get("imports", []))
         if not coordinate or not root_api:
             parser.error("--in-env requires --coordinate and --root-api (or --plugin on Python >= 3.11)")
-        allow = os.environ.get("ALLOW_OVERLAP_WITH_CORE", "0").lower() in {"1", "true", "yes"}
-        return run_in_env(coordinate, root_api, imports, os.environ.get("EXPECTED_VERSION"), allow)
+        return run_in_env(coordinate, root_api, imports, os.environ.get("EXPECTED_VERSION"))
 
     if not args.plugin or not args.dist:
         parser.error("orchestrator mode requires --plugin and --dist")

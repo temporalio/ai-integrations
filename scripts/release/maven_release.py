@@ -17,7 +17,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +25,7 @@ import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 
+import tomllib
 from release_tool import JAVA_VERSION_RE, MAVEN_CENTRAL, PolicyError, _write_outputs
 
 PORTAL = "https://central.sonatype.com/api/v1/publisher"
@@ -382,7 +382,7 @@ def stage(args: argparse.Namespace, coordinate: str, raw: dict[str, bytes]) -> d
 def publish(args: argparse.Namespace, coordinate: str, raw: dict[str, bytes]) -> dict:
     if "-RC" in args.version:
         raise PolicyError("candidates cannot be published to Maven Central")
-    # Defense in depth: a direct CLI invocation has the same final/cutover policy as the workflow.
+    # Defense in depth: a direct CLI invocation has the same version policy as the workflow.
     subprocess.run([sys.executable, str(Path(__file__).with_name("release_tool.py")), "check-version-policy",
                     "--plugin-dir", str(args.plugin_dir), "--version", args.version], check=True)
     state = load_state(args.state_dir, coordinate, args.version, raw)

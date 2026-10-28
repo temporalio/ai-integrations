@@ -7,9 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 import check_wheel
+import pytest
 import smoke
 from conftest import build_plugin, init_repo, make_python_plugin, uv_available
 
@@ -78,18 +77,18 @@ def test_smoke_in_env_detects_editable_and_version_mismatch(built: tuple[Path, P
     venv = tmp_path / "venv"
     subprocess.run(["uv", "venv", "--quiet", str(venv)], check=True)
     py = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    env = {**os.environ, "UV_LINK_MODE": "copy"}
+    env = {**os.environ, "UV_LINK_MODE": "copy", "UV_NO_EDITABLE": "0"}
     subprocess.run(["uv", "pip", "install", "--quiet", "--python", str(py), "--editable", str(plugin)], check=True, env=env)
-    r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"],
+    r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.fakeplug"],
                        env={**env, "EXPECTED_VERSION": "0.0.0"}, capture_output=True, text=True)
     assert r.returncode == 1 and "editable mode" in r.stdout
 
     wheel = next(dist.glob("*.whl"))
     subprocess.run(["uv", "pip", "install", "--quiet", "--python", str(py), "--reinstall", str(wheel)], check=True, env=env)
-    r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"],
+    r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.fakeplug"],
                        env={**env, "EXPECTED_VERSION": "9.9.9"}, capture_output=True, text=True)
     assert r.returncode == 1 and "installed version" in r.stdout
-    r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"],
+    r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.fakeplug"],
                        env={**env, "EXPECTED_VERSION": "0.0.0"}, capture_output=True, text=True)
     assert r.returncode == 0, r.stdout
 
@@ -101,25 +100,23 @@ def test_smoke_in_env_detects_overwritten_and_stray_files(built: tuple[Path, Pat
     py = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     wheel = next(dist.glob("*.whl"))
     subprocess.run(["uv", "pip", "install", "--quiet", "--python", str(py), str(wheel)], check=True, env={**os.environ, "UV_LINK_MODE": "copy"})
-    site = subprocess.run([str(py), "-c", "import temporalio.contrib.fakeplug as m, pathlib; print(pathlib.Path(m.__file__).parent)"],
+    site = subprocess.run([str(py), "-c", "import temporalio.fakeplug as m, pathlib; print(pathlib.Path(m.__file__).parent)"],
                           check=True, capture_output=True, text=True).stdout.strip()
     pkg_dir = Path(site)
-    (pkg_dir / "README.md").write_text("SDK package README left behind during migration\n")
-    args = [str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"]
-    env = {**os.environ, "EXPECTED_VERSION": "0.0.0", "ALLOW_OVERLAP_WITH_CORE": "0"}
+    (pkg_dir / "README.md").write_text("Unowned package README\n")
+    args = [str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.fakeplug"]
+    env = {**os.environ, "EXPECTED_VERSION": "0.0.0"}
     r = subprocess.run(args, env=env, capture_output=True, text=True)
     assert r.returncode == 1 and "README.md" in r.stdout
-    r = subprocess.run(args, env={**env, "ALLOW_OVERLAP_WITH_CORE": "1"}, capture_output=True, text=True)
-    assert r.returncode == 0, r.stdout
     (pkg_dir / "README.md").unlink()
     (pkg_dir / "_impl.py").write_text("VALUE = 'tampered'\n")
-    r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"],
+    r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.fakeplug"],
                        env={**os.environ, "EXPECTED_VERSION": "0.0.0"}, capture_output=True, text=True)
     assert r.returncode == 1 and "differs from the hash" in r.stdout
     subprocess.run(["uv", "pip", "install", "--quiet", "--python", str(py), "--reinstall", str(wheel)], check=True, env={**os.environ, "UV_LINK_MODE": "copy"})
     (pkg_dir / "stray.py").write_text("x = 1\n")
-    r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.contrib.fakeplug"],
-                       env={**os.environ, "EXPECTED_VERSION": "0.0.0", "ALLOW_OVERLAP_WITH_CORE": "1"}, capture_output=True, text=True)
+    r = subprocess.run([str(py), smoke.__file__, "--in-env", "--coordinate", "temporalio-fakeplug", "--root-api", "temporalio.fakeplug"],
+                       env={**os.environ, "EXPECTED_VERSION": "0.0.0"}, capture_output=True, text=True)
     assert r.returncode == 1 and "not owned by" in r.stdout
 
 

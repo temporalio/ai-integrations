@@ -57,9 +57,13 @@ function reconstructParentRun(config: EmitterConfig, ctx: LangSmithTraceContext 
 
 /**
  * Run `fn` with `op` installed as the active LangSmith run, emitting the run
- * around the call. Shared by activity and Nexus handlers.
+ * around the call unless LangSmith turned tracing off for it (an env it can't
+ * address). Shared by activity and Nexus handlers.
  */
 async function traceOperation<T>(op: RunTree, fn: () => Promise<T>): Promise<T> {
+  if (!op.tracingEnabled) {
+    return withRunTree(op, fn);
+  }
   await op.postRun();
   try {
     const result = await withRunTree(op, fn);

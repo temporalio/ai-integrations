@@ -7,9 +7,6 @@ root-api = "@temporalio/openai-agents"
 maturity = "generally-available"
 docs = "https://docs.temporal.io/develop/typescript/integrations/openai-agents"
 
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["22", "24"]
 
