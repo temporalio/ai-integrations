@@ -22,6 +22,7 @@ from temporalio.claude_agent_sdk import (
     SubprocessConnector,
 )
 from temporalio.claude_agent_sdk._activities import ConnectionActivities
+from temporalio.claude_agent_sdk._constants import CONNECTION_LOST
 from temporalio.claude_agent_sdk._errors import activity_error, sdk_error
 from temporalio.claude_agent_sdk._types import (
     CloseActivityInput,
@@ -74,22 +75,69 @@ async def test_a_read_returns_the_next_output_until_claude_code_exits(
     assert launched.task_queue == OWN_QUEUE
     handle = launched.handle
     await run(activities.write, WriteActivityInput(handle, '{"n": 1}\n'))
-    assert await run(activities.read, ReadActivityInput(handle)) == ReadResult(
+    assert await run(activities.read, ReadActivityInput(handle, 0)) == ReadResult(
         [{"n": 1}]
     )
     await run(activities.write, WriteActivityInput(handle, '{"n": 2}\n'))
-    assert await run(activities.read, ReadActivityInput(handle)) == ReadResult(
+    assert await run(activities.read, ReadActivityInput(handle, 1)) == ReadResult(
         [{"n": 2}]
     )
 
     await run(activities.end_input, EndInputActivityInput(handle))
 
-    assert await run(activities.read, ReadActivityInput(handle)) == ReadResult()
+    assert await run(activities.read, ReadActivityInput(handle, 2)) == ReadResult()
     await run(activities.close, CloseActivityInput(handle))
     # A retried close, such as after its result was lost, does nothing.
     await run(activities.close, CloseActivityInput(handle))
     assert len(cli.cli_pids()) == 1
     assert cli.running() == []
+
+
+# Stands in for Claude Code: records whether it got SIGTERM or saw its stdin close.
+SIGTERM_OR_EOF = """
+import pathlib, signal, sys
+seen = pathlib.Path(sys.argv[1])
+def on_sigterm(signum, frame):
+    seen.write_text("SIGTERM")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, on_sigterm)
+seen.with_suffix(".ready").touch()
+sys.stdin.read()
+seen.write_text("EOF")
+"""
+
+
+async def test_shutting_down_stops_claude_code_with_sigterm_before_its_stdin_closes(
+    cli: LocalCli, activities: ConnectionActivities, tmp_path: Path
+) -> None:
+    """On SIGTERM, Claude Code leaves a pending tool permission for the resumed session to ask."""
+    stand_in = tmp_path / "claude.py"
+    stand_in.write_text(SIGTERM_OR_EOF)
+    seen = tmp_path / "seen"
+    launched = await ActivityEnvironment().run(
+        activities.connect,
+        request(cli, f'exec "{sys.executable}" "{stand_in}" "{seen}"'),
+    )
+    while not seen.with_suffix(".ready").exists():
+        await asyncio.sleep(0.05)
+    reading = asyncio.create_task(
+        ActivityEnvironment().run(
+            activities.read, ReadActivityInput(launched.handle, 0)
+        )
+    )
+    await asyncio.sleep(0.1)
+
+    await activities.shut_down()
+
+    assert seen.read_text() == "SIGTERM"
+    assert cli.running() == []
+    # The read fails for good, so the Workflow resumes the session now, not
+    # after its retry times out on this Worker's task queue.
+    with pytest.raises(ApplicationError) as failed:
+        await reading
+    assert failed.value.type == "CLIConnectionError"
+    assert failed.value.non_retryable
+    assert failed.value.message == CONNECTION_LOST
 
 
 async def test_a_read_returns_at_most_about_a_mebibyte(
@@ -103,7 +151,7 @@ async def test_a_read_returns_at_most_about_a_mebibyte(
 
     counts: list[int] = []
     while True:
-        read = ReadActivityInput(launched.handle)
+        read = ReadActivityInput(launched.handle, sum(counts))
         result = await ActivityEnvironment().run(activities.read, read)
         counts.append(len(result.output))
         if not result.output:
@@ -143,18 +191,75 @@ async def test_a_read_returns_all_the_output_already_written(cli: LocalCli) -> N
 
 
 async def test_a_cancelled_read_leaves_the_next_output_to_its_retry(
-    cli: LocalCli,
+    cli: LocalCli, activities: ConnectionActivities
 ) -> None:
     """Such as an attempt that timed out, cancelled while its retry runs."""
-    process = await SubprocessConnector().connect(request(cli))
+    run = ActivityEnvironment().run
+    handle = (await run(activities.connect, request(cli))).handle
 
-    attempt = asyncio.create_task(process.read())
+    attempt_env = ActivityEnvironment()
+    attempt = asyncio.create_task(
+        attempt_env.run(activities.read, ReadActivityInput(handle, 0))
+    )
     await asyncio.sleep(0.1)
-    attempt.cancel()
-    await process.write('{"n": 1}\n')
+    attempt_env.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await attempt
+    await run(activities.write, WriteActivityInput(handle, '{"n": 1}\n'))
 
-    assert await process.read() == [{"n": 1}]
-    await process.close()
+    assert await run(activities.read, ReadActivityInput(handle, 0)) == ReadResult(
+        [{"n": 1}]
+    )
+    await run(activities.close, CloseActivityInput(handle))
+
+
+async def test_a_read_whose_result_was_lost_returns_the_same_output_again(
+    cli: LocalCli, activities: ConnectionActivities
+) -> None:
+    """Such as an attempt the server timed out while this Worker still ran it. The server drops its result."""
+    run = ActivityEnvironment().run
+    handle = (await run(activities.connect, request(cli))).handle
+    await run(activities.write, WriteActivityInput(handle, '{"n": 1}\n'))
+    read = ReadActivityInput(handle, 0)
+    assert await run(activities.read, read) == ReadResult([{"n": 1}])
+
+    # The retry still says the Workflow received nothing.
+    assert await run(activities.read, read) == ReadResult([{"n": 1}])
+    await run(activities.close, CloseActivityInput(handle))
+
+
+async def test_a_read_retries_an_error_the_connector_says_a_retry_can_fix() -> None:
+    """Such as a dropped network call to a remote Claude Code."""
+    reads: list[str] = []
+
+    class FlakyProcess:
+        async def write(self, data: str) -> None:
+            del data
+
+        async def end_input(self) -> None: ...
+        async def close(self) -> None: ...
+        async def shut_down(self) -> None: ...
+
+        async def read(self) -> list[Output]:
+            reads.append("read")
+            if len(reads) == 1:
+                raise ConnectionResetError("dropped")
+            return [{"n": 1}]
+
+    class FlakyConnector:
+        async def connect(self, request: ConnectActivityInput) -> ClaudeCodeProcess:
+            del request
+            return FlakyProcess()
+
+    run = ActivityEnvironment().run
+    activities = ConnectionActivities(FlakyConnector(), OWN_QUEUE)
+    handle = (await run(activities.connect, ConnectActivityInput([], {}))).handle
+    read = ReadActivityInput(handle, 0)
+
+    with pytest.raises(ConnectionResetError):
+        await run(activities.read, read)
+
+    assert await run(activities.read, read) == ReadResult([{"n": 1}])
 
 
 async def test_a_read_returns_stderr_before_the_output(cli: LocalCli) -> None:
@@ -174,7 +279,7 @@ async def test_a_nonzero_exit_fails_the_read_for_good(
     launched = await run(activities.connect, request(cli, "exit 3"))
 
     with pytest.raises(ApplicationError) as raised:
-        await run(activities.read, ReadActivityInput(launched.handle))
+        await run(activities.read, ReadActivityInput(launched.handle, 0))
 
     assert raised.value.type == "ProcessError"
     assert raised.value.non_retryable

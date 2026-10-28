@@ -9,10 +9,6 @@ root-api = "temporalio.claude_agent_sdk"
 maturity = "pre-release"
 docs = "https://docs.temporal.io/develop/python/integrations/claude-agent-sdk"
 
-
-[release]
-allow-final = true
-
 [ci]
 runtime-versions = ["3.10", "3.14"]
 

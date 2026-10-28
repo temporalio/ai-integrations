@@ -74,6 +74,7 @@ class ReadActivityInput:
     """The read Activity's input."""
 
     handle: str
+    received: int
 
 
 @dataclass
@@ -94,7 +95,9 @@ class ReadResult:
 class ClaudeCodeProcess(Protocol):
     """A running Claude Code's stdin and stdout.
 
-    Every method must be safe to call from overlapping Activity attempts.
+    ``write``, ``end_input`` and ``close`` must be safe to call from overlapping
+    Activity attempts. The plugin calls ``read`` one at a time and cancels it
+    only by closing.
     """
 
     async def write(self, data: str) -> None:
@@ -108,7 +111,9 @@ class ClaudeCodeProcess(Protocol):
     async def read(self) -> list[Output]:
         """Wait for Claude Code's next output, and return it with any more that is already there.
 
-        Keep the result under Temporal's payload limit.
+        Keep the result under Temporal's payload limit. The plugin keeps it
+        until the Workflow confirms it got it, so a lost Activity result loses
+        no output.
 
         Returns:
             At least one output, or an empty list once Claude Code exited with
@@ -122,6 +127,15 @@ class ClaudeCodeProcess(Protocol):
 
     async def close(self) -> None:
         """Stop Claude Code and everything it started."""
+        ...
+
+    async def shut_down(self) -> None:
+        """Stop Claude Code because the Worker that holds this connection is shutting down.
+
+        Stop it the way SIGTERM does, so the session can be resumed later.
+        Any turn in progress, including one waiting on a tool permission, is
+        left unfinished, and the resumed session picks it up from there.
+        """
         ...
 
 

@@ -7,14 +7,19 @@ import json
 import re
 import sys
 import uuid
+from collections.abc import Callable
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from temporalio.api.common.v1 import WorkflowExecution
 from temporalio.api.enums.v1 import EventType
+from temporalio.api.workflowservice.v1 import ResetWorkflowExecutionRequest
 from temporalio.claude_agent_sdk import ClaudeAgentSDKPlugin
 from temporalio.client import WorkflowFailureError, WorkflowHandle
+from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError, CancelledError
 from temporalio.worker import Replayer, Worker
 from tests.helpers.harness import (
@@ -29,9 +34,11 @@ from tests.helpers.workflows import (
     Chat,
     ChatWorkflow,
     CliRunWorkflow,
+    ForkingWorkflow,
     Hook,
     OneShotWorkflow,
     ResumingWorkflow,
+    StreamingWorkflow,
     bash,
     tool_use,
     until,
@@ -98,6 +105,12 @@ async def test_a_denied_tool_does_not_run_and_the_model_reads_why(
     assert not notes(harness).exists()
 
 
+async def until_a_person_is_asked(handle: WorkflowHandle[Any, Any]) -> None:
+    """Wait until the chat waits on a person to decide a tool call."""
+    while not await handle.query(ChatWorkflow.pending_approvals):
+        await asyncio.sleep(0.05)
+
+
 async def chat_until_a_worker_is_lost(
     harness: Harness, chat: Chat, plugin: ClaudeAgentSDKPlugin
 ) -> WorkflowHandle[Any, Any]:
@@ -112,8 +125,7 @@ async def chat_until_a_worker_is_lost(
         handle = await harness.client.start_workflow(
             ChatWorkflow.run, chat, id=task_queue, task_queue=task_queue
         )
-        while not await handle.query(ChatWorkflow.pending_approvals):
-            await asyncio.sleep(0.05)
+        await until_a_person_is_asked(handle)
     return handle
 
 
@@ -315,8 +327,7 @@ async def test_cancelling_the_workflow_while_a_person_decides_stops_claude_code(
     chat = Chat(["write it"], str(harness.cli_path))
     async with harness.start(ChatWorkflow, chat) as handle:
         await until(lambda: harness.asked)
-        while not await handle.query(ChatWorkflow.pending_approvals):
-            await asyncio.sleep(0.05)
+        await until_a_person_is_asked(handle)
         assert len(harness.running()) == 1
 
         await handle.cancel()
@@ -339,6 +350,91 @@ async def test_cancelling_the_workflow_while_a_person_decides_stops_claude_code(
     assert len(stops) == 1
     assert harness.running() == []
     assert not notes(harness).exists()
+
+
+async def reset(
+    harness: Harness, handle: WorkflowHandle[Any, Any], task: int
+) -> WorkflowHandle[Any, Any]:
+    """Reset the Workflow to the end of its Workflow Task number ``task``, from 0, and return its new run."""
+    finished = [
+        event.event_id
+        async for event in handle.fetch_history_events()
+        if event.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED
+    ]
+    response = await harness.client.workflow_service.reset_workflow_execution(
+        ResetWorkflowExecutionRequest(
+            namespace=harness.client.namespace,
+            workflow_execution=WorkflowExecution(workflow_id=handle.id),
+            reason="test",
+            workflow_task_finish_event_id=finished[task],
+            request_id=str(uuid.uuid4()),
+        )
+    )
+    return harness.client.get_workflow_handle(handle.id, run_id=response.run_id)
+
+
+async def test_a_workflow_reset_to_its_start_runs_a_new_claude_code(
+    harness: Harness,
+) -> None:
+    """Such as one reset while a person decides: the new run asks again."""
+    harness.answers = ANSWERS
+    chat = Chat(["write it"], str(harness.cli_path))
+    async with harness.start(ChatWorkflow, chat) as handle:
+        await until_a_person_is_asked(handle)
+
+        new_run = await reset(harness, handle, 0)
+
+        await until_a_person_is_asked(new_run)
+    assert len(harness.cli_pids()) == 2
+
+
+async def test_a_workflow_reset_after_its_claude_code_closed_fails_with_a_way_to_resume(
+    harness: Harness,
+) -> None:
+    """Such as a finished chat reset to its first turn, whose Claude Code is gone."""
+    harness.answers = {"hi": "Hello."}
+    chat = Chat(["hi"], str(harness.cli_path))
+    async with harness.start(ChatWorkflow, chat) as handle:
+        await handle.result()
+
+        # The second Workflow Task, after the launch.
+        new_run = await reset(harness, handle, 1)
+
+        with pytest.raises(WorkflowFailureError) as raised:
+            await new_run.result()
+    error = raised.value.cause
+    assert isinstance(error, ApplicationError)
+    assert error.type == "CLIConnectionError"
+    assert "options.resume" in error.message
+
+
+async def test_a_fork_continues_a_session_under_a_new_id_and_leaves_it_as_it_was(
+    harness: Harness,
+) -> None:
+    conversations: dict[str, str] = {}
+
+    def record(name: str, text: str) -> Callable[[dict[str, Any]], str]:
+        def answer(request: dict[str, Any]) -> str:
+            conversations[name] = json.dumps(request["messages"])
+            return text
+
+        return answer
+
+    harness.answers = {
+        "remember blue": "Remembered.",
+        "which color": record("fork", "Blue."),
+        "anything else": record("original", "No."),
+    }
+    async with harness.start(
+        ForkingWorkflow, "remember blue", "which color", "anything else"
+    ) as handle:
+        original, fork, *ran_in = await handle.result()
+
+    assert ran_in == [original, fork, original]
+    # The fork has the original's history; the original never gets the fork's turn.
+    assert "remember blue" in conversations["fork"]
+    assert "remember blue" in conversations["original"]
+    assert "which color" not in conversations["original"]
 
 
 def decision(behavior: str, reason: str | None = None) -> dict[str, Any]:
@@ -461,3 +557,24 @@ async def test_a_turn_claude_code_starts_on_its_own_while_idle_is_watched(
     assert asked_about(messages) == ["toolu_2"]
     assert results(messages) == [["Started."], ["Finished."]]
     assert len(harness.cli_pids()) == 1
+
+
+async def test_partial_messages_go_to_the_stream_and_whole_ones_to_the_workflow(
+    harness: Harness,
+) -> None:
+    harness.answers = {"hi": "Hello."}
+    async with harness.start(StreamingWorkflow, "hi") as handle:
+        stream = WorkflowStreamClient.create(harness.client, handle.id)
+        deltas: list[str] = []
+        async for item in stream.subscribe("events", poll_cooldown=timedelta(0)):
+            event = item.data["event"]
+            if event["type"] == "content_block_delta":
+                deltas.append(event["delta"]["text"])
+            if event["type"] == "message_stop":
+                break
+        await handle.signal(StreamingWorkflow.finish)
+        messages = await handle.result()
+
+    assert deltas == ["Hello."]
+    # The Workflow gets no StreamEvent.
+    assert messages == [["AssistantMessage", ["Hello."]], ["Result", "Hello."]]

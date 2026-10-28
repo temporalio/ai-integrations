@@ -10,7 +10,14 @@ from claude_agent_sdk import (
     ProcessError,
 )
 
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+    TimeoutError,
+    TimeoutType,
+)
+
+from ._constants import CONNECTION_LOST
 
 
 def activity_error(error: ClaudeSDKError) -> ApplicationError:
@@ -32,6 +39,10 @@ def sdk_error(error: ActivityError) -> ClaudeSDKError:
     """The Claude Agent SDK error for an Activity that failed for good."""
     sdk: ClaudeSDKError
     match error.cause:
+        case TimeoutError(type=TimeoutType.SCHEDULE_TO_START):
+            # No Worker started the Activity, and only the Worker connected to
+            # Claude Code polls its task queue.
+            sdk = CLIConnectionError(CONNECTION_LOST)
         case ApplicationError(
             type=ProcessError.__name__, message=message, details=(exit_code, stderr)
         ):

@@ -30,7 +30,6 @@ class _SubprocessConnection(SubprocessCLITransport):
     def __init__(self, request: ConnectActivityInput) -> None:
         self._args = request.args
         self._next: asyncio.Future[dict[str, Any] | None] | None = None
-        self._reading = asyncio.Lock()
 
         # The Claude Agent SDK reads stderr on its own task and passes each line
         # to this callback as it arrives, not when a read asks for it. Keep the
@@ -61,46 +60,44 @@ class _SubprocessConnection(SubprocessCLITransport):
         return [self._cli_path, *self._args]
 
     async def read(self) -> list[Output]:
-        async with self._reading:
-            output: list[Output] = []
-            size = 2  # The surrounding JSON list.
-            limit = PayloadLimitsConfig().payloads_warn_size
+        output: list[Output] = []
+        size = 2  # The surrounding JSON list.
+        limit = PayloadLimitsConfig().payloads_warn_size
 
-            def fits(item: Output) -> bool:
-                nonlocal size
-                next_size = size + len(json.dumps(item).encode())
-                if output:
-                    next_size += 2  # The JSON comma and space.
-                if output and next_size > limit:
-                    return False
-                size = next_size
-                return True
+        def fits(item: Output) -> bool:
+            nonlocal size
+            next_size = size + len(json.dumps(item).encode())
+            if output:
+                next_size += 2  # The JSON comma and space.
+            if output and next_size > limit:
+                return False
+            size = next_size
+            return True
 
-            try:
-                # Shielded, so a cancelled attempt leaves the message to its retry.
-                message = await asyncio.shield(self._pending())
-            except ClaudeSDKError:
-                # Claude Code failed. Return its stderr first, if any; the next
-                # read raises it again.
-                if not self._stderr:
-                    raise
-                message = None
-
-            while self._stderr and fits(self._stderr[0]):
-                output.append(self._stderr.pop(0))
-
+        try:
+            message = await self._pending()
+        except ClaudeSDKError:
+            # Claude Code failed. Return its stderr first, if any; the next
+            # read raises it again.
             if not self._stderr:
-                try:
-                    while message is not None and fits(message):
-                        self._next = None
-                        output.append(message)
-                        message = await self._next_message()
-                except ClaudeSDKError:
-                    # Claude Code failed. The next read raises it again, after this
-                    # one returns what came before it.
-                    pass
+                raise
+            message = None
 
-            return output
+        while self._stderr and fits(self._stderr[0]):
+            output.append(self._stderr.pop(0))
+
+        if not self._stderr:
+            try:
+                while message is not None and fits(message):
+                    self._next = None
+                    output.append(message)
+                    message = await self._next_message()
+            except ClaudeSDKError:
+                # Claude Code failed. The next read raises it again, after this
+                # one returns what came before it.
+                pass
+
+        return output
 
     async def close(self) -> None:
         pending = self._next
@@ -112,6 +109,13 @@ class _SubprocessConnection(SubprocessCLITransport):
         finally:
             if pending is not None:
                 await asyncio.gather(pending, return_exceptions=True)
+
+    async def shut_down(self) -> None:
+        # SIGTERM before stdin closes. Closing stdin first makes Claude Code
+        # record a pending permission as failed.
+        if self._process is not None and self._process.returncode is None:
+            self._process.terminate()
+        await self.close()
 
     def _pending(self) -> asyncio.Future[dict[str, Any] | None]:
         """Claude Code's next message, read from the pipe once and kept until a read returns it."""

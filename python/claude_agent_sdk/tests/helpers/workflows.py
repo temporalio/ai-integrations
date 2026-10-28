@@ -18,6 +18,7 @@ from temporalio.claude_agent_sdk import (
     TemporalTransport,
 )
 from temporalio.client import Client, WorkflowHandle
+from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.worker import Interceptor, Replayer, Worker
 
 
@@ -182,6 +183,35 @@ class OneShotWorkflow:
 
 
 @workflow.defn
+class StreamingWorkflow:
+    """Sends the prompt with ``include_partial_messages`` and publishes the stream events to the ``events`` topic. Returns the messages once told to ``finish``."""
+
+    @workflow.init
+    def __init__(self, prompt: str) -> None:
+        del prompt
+        self.events = WorkflowStream().topic("events")
+        self.finished = False
+
+    @workflow.run
+    async def run(self, prompt: str) -> list[Any]:
+        options = sdk.ClaudeAgentOptions(include_partial_messages=True)
+        transport = TemporalTransport(options, stream=self.events)
+        messages: list[Any] = []
+        async with sdk.ClaudeSDKClient(options=options, transport=transport) as client:
+            await client.query(prompt)
+            async for message in client.receive_response():
+                if not isinstance(message, sdk.SystemMessage):
+                    messages.append(describe(message))
+        # Subscribers read the stream only while the Workflow runs.
+        await workflow.wait_condition(lambda: self.finished)
+        return messages
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.finished = True
+
+
+@workflow.defn
 class ResumingWorkflow:
     """Sends the prompt, asks a person about each tool call, and resumes the session if Claude Code goes away, as the README shows."""
 
@@ -240,6 +270,36 @@ class ResumingWorkflow:
     @workflow.update
     def decide(self, tool_use_id: str) -> None:
         self.decisions[tool_use_id] = True
+
+
+@workflow.defn
+class ForkingWorkflow:
+    """Asks in a new session, then in a fork of it, then in the original again."""
+
+    @workflow.run
+    async def run(self, first: str, in_fork: str, in_original: str) -> list[str]:
+        """The session IDs the Workflow chose, then the one each turn ran in."""
+        original = str(workflow.uuid4())
+        fork = str(workflow.uuid4())
+        turns = [
+            (first, sdk.ClaudeAgentOptions(session_id=original)),
+            (
+                in_fork,
+                sdk.ClaudeAgentOptions(
+                    resume=original, fork_session=True, session_id=fork
+                ),
+            ),
+            (in_original, sdk.ClaudeAgentOptions(resume=original)),
+        ]
+        ran_in: list[str] = []
+        for prompt, options in turns:
+            transport = TemporalTransport(options)
+            async with sdk.ClaudeSDKClient(options, transport=transport) as client:
+                await client.query(prompt)
+                async for message in client.receive_response():
+                    if isinstance(message, sdk.ResultMessage):
+                        ran_in.append(message.session_id)
+        return [original, fork, *ran_in]
 
 
 @workflow.defn

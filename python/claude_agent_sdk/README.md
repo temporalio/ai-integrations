@@ -138,7 +138,9 @@ has exited with status 0. Raise the
 Claude Agent SDK's errors, such as `ProcessError` or `CLINotFoundError`, only for failures no retry
 can fix, and `CLIConnectionError` only once Claude Code is surely gone. Raise any other error, such
 as a dropped network call, to have it retried. Activities can be retried and can overlap, so make
-each method safe to call more than once.
+`write`, `end_input` and `close` safe to call more than once. The plugin calls `read` one at a
+time, and keeps what it returns until the Workflow confirms it got it, so a lost Activity result
+loses no output.
 
 Make Claude Code stop when the Worker that started it stops, such as when its connection drops.
 Otherwise it keeps running, spending tokens and running tools, and can write to the session after
@@ -179,8 +181,8 @@ not a file path.
 ### When Claude Code Stops
 
 As in the Claude Agent SDK, the transport raises when Claude Code stops: `ProcessError` if it
-exited with an error, and `CLIConnectionError` if it's gone, such as when its Worker went away.
-The transport never starts another Claude Code by itself.
+exited with an error, and `CLIConnectionError` if it's gone, such as when the Worker connected to
+it went away. The transport never starts another Claude Code by itself.
 
 To continue the conversation, choose the session ID in the Workflow, and start a new client with
 `options.resume` set to it. With `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`, the new Claude Code
@@ -211,6 +213,46 @@ while True:
 anything, so the Workflow can resume it even mid-turn. The new Claude Code reads the session from
 its config directory, so it must run where that directory is, such as on a volume every Worker
 mounts.
+
+When a Worker shuts down, the plugin stops each Claude Code that Worker is connected to, as SIGTERM does.
+Claude Code then leaves a turn in progress, including a pending tool approval, for the resumed
+session to continue, so a person is asked again. Process managers stop a Worker with SIGTERM, but
+Python exits on SIGTERM without shutting the Worker down, so turn it into a shutdown:
+
+```python
+stop = asyncio.Event()
+asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
+async with Worker(client, task_queue="my-task-queue", workflows=[MyWorkflow], plugins=[ClaudeAgentSDKPlugin()]):
+    await stop.wait()
+```
+
+### Long Conversations
+
+Claude Code's output reaches the Workflow as Activity results, so every turn adds to Workflow
+history. A long conversation eventually fills it. When `workflow.info().is_continue_as_new_suggested()`
+is true, finish the current turn, disconnect, and continue as new with the session ID. The next run
+resumes the session, as above:
+
+```python
+await workflow.wait_condition(
+    lambda: workflow.info().is_continue_as_new_suggested()
+    and workflow.all_handlers_finished()
+)
+await client.disconnect()
+workflow.continue_as_new(session_id)
+
+# In the next run
+options = ClaudeAgentOptions(resume=session_id)
+```
+
+Wait for `workflow.all_handlers_finished()` first, so no message in flight loses its reply.
+
+Prompts and Claude Code's output, such as tool results and images, are Temporal payloads, so each
+must fit within the server's payload size limit. For larger ones, configure
+[external storage](https://github.com/temporalio/sdk-python#external-storage) on the client's data
+converter. Reading a large image or PDF also needs a higher `max_buffer_size` in
+`ClaudeAgentOptions`: as without Temporal, the Claude Agent SDK rejects any message over 1 MB by
+default.
 
 ### Secrets
 
@@ -404,6 +446,43 @@ class StreamingWorkflow:
 
 Callers subscribe to `events` as above; each item's data is a `stream_event` message. `include_partial_messages` and `stream` go together:
 passing one without the other raises `ValueError`.
+
+If the Workflow resumes a turn that was cut off (see [When Claude Code Stops](#when-claude-code-stops)),
+the new Claude Code generates that reply again, so callers see the partial first attempt followed by
+the full retry.
+
+## Observability
+
+To trace a Workflow and the Claude Code it runs as one trace, register
+[`OpenTelemetryPlugin`](https://github.com/temporalio/sdk-python/tree/main/temporalio/contrib/opentelemetry)
+on the client, and turn on Claude Code's
+[tracing](https://code.claude.com/docs/en/agent-sdk/observability) where it runs:
+
+```python
+import opentelemetry.trace
+from temporalio.contrib.opentelemetry import OpenTelemetryPlugin, create_tracer_provider
+
+opentelemetry.trace.set_tracer_provider(create_tracer_provider())
+client = await Client.connect("localhost:7233", plugins=[OpenTelemetryPlugin()])
+```
+
+```shell
+export CLAUDE_CODE_ENABLE_TELEMETRY=1
+export CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1
+export OTEL_TRACES_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+```
+
+As in the Claude Agent SDK, `SubprocessConnector`
+[passes Claude Code the active trace context](https://code.claude.com/docs/en/agent-sdk/observability#link-traces-to-your-application)
+in `TRACEPARENT` and `TRACESTATE` when it starts it. Claude Code reads them then, so the spans of
+every turn, such as `claude_code.interaction`, `claude_code.llm_request` and `claude_code.tool`,
+are children of the connect Activity's span. A custom connector can do the same with
+`opentelemetry.propagate.inject`.
+
+Set these variables in the Worker's environment rather than in `options.env`, which is recorded in
+Workflow history, especially `OTEL_EXPORTER_OTLP_HEADERS` if it holds an API key.
 
 ## Hardening
 

@@ -26,14 +26,13 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowTopicHandle
 from temporalio.exceptions import (
     ActivityError,
-    TimeoutError,
-    TimeoutType,
     is_cancelled_exception,
 )
 
 from ._constants import (
     CLOSE,
     CONNECT,
+    CONNECTION_LOST,
     END_INPUT,
     READ,
     STDIN_LABELS,
@@ -97,6 +96,13 @@ class TemporalTransport(Transport):
         self._activity_options: TransportActivityOptions = activity_options or {}
 
         self._connection: Connection | None = None
+
+        self._received = 0
+
+        # The Worker connected to Claude Code shut down or went away. Nothing is
+        # left to close, so skip the close Activity rather than wait out its
+        # timeout.
+        self._connection_lost = False
         self._closed = False
 
         self._stream = stream
@@ -122,7 +128,7 @@ class TemporalTransport(Transport):
                 CONNECT, self._connect_input(), result_type=Connection, **options
             )
         except ActivityError as error:
-            raise _as_sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
+            raise self._sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
 
     async def write(self, data: str) -> None:
         """Send the Claude Agent SDK's prompts, requests, and answers to the CLI."""
@@ -154,7 +160,7 @@ class TemporalTransport(Transport):
                     **options,
                 )
             except ActivityError as error:
-                raise _as_sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
+                raise self._sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
 
     async def read_messages(self) -> AsyncIterator[dict[str, Any]]:
         """Yield each of the CLI's messages once until it exits, including turns Claude Code starts on its own."""
@@ -175,7 +181,7 @@ class TemporalTransport(Transport):
             while True:
                 result: ReadResult = await workflow.execute_activity(
                     READ,
-                    ReadActivityInput(self._connection.handle),
+                    ReadActivityInput(self._connection.handle, self._received),
                     result_type=ReadResult,
                     **options,
                 )
@@ -183,10 +189,12 @@ class TemporalTransport(Transport):
                 if not result.output:  # Claude Code has stopped
                     break
 
+                self._received += len(result.output)
+
                 for message in self._handle_output(result.output):
                     yield message
         except ActivityError as error:
-            raise _as_sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
+            raise self._sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
 
     async def end_input(self) -> None:
         """End the CLI's stdin, after the writes before it."""
@@ -208,7 +216,7 @@ class TemporalTransport(Transport):
                     END_INPUT, EndInputActivityInput(self._connection.handle), **options
                 )
             except ActivityError as error:
-                raise _as_sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
+                raise self._sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
 
     async def close(self) -> None:
         """Stop the CLI and everything it started."""
@@ -217,7 +225,7 @@ class TemporalTransport(Transport):
 
         self._closed = True
 
-        if self._connection is None:
+        if self._connection is None or self._connection_lost:
             return
 
         options: dict[str, Any] = {
@@ -235,6 +243,18 @@ class TemporalTransport(Transport):
         except ActivityError as error:
             if is_cancelled_exception(error):
                 raise
+
+    def _sdk_error(self, error: ActivityError) -> BaseException:
+        """The Claude Agent SDK's error for a failed Activity, noting whether the connection to Claude Code is lost.
+
+        A cancellation stays as it is.
+        """
+        if is_cancelled_exception(error):
+            return error
+        sdk = sdk_error(error)
+        if isinstance(sdk, CLIConnectionError) and str(sdk) == CONNECTION_LOST:
+            self._connection_lost = True
+        return sdk
 
     def is_ready(self) -> bool:
         """Whether Claude Code started and the transport isn't closed."""
@@ -302,23 +322,6 @@ class TemporalTransport(Transport):
             user=options.user,
             max_buffer_size=options.max_buffer_size,
         )
-
-
-def _as_sdk_error(error: ActivityError) -> BaseException:
-    """The Claude Agent SDK's error for a failed Activity; a cancellation stays as it is."""
-    if is_cancelled_exception(error):
-        return error
-    cause = error.cause
-    if isinstance(cause, TimeoutError) and cause.type == TimeoutType.SCHEDULE_TO_START:
-        # No Worker started the Activity, and only the Worker that reaches
-        # Claude Code polls its task queue.
-        sdk = CLIConnectionError(
-            "Claude Code stopped with its Worker. To continue the conversation, "
-            "start a new client with options.resume set to the session ID."
-        )
-        sdk.__cause__ = error
-        return sdk
-    return sdk_error(error)
 
 
 def _is_json_object(settings: str | None) -> bool:

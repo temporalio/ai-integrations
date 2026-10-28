@@ -19,3 +19,9 @@ READ: Final = "claude-agent-sdk-read"
 CLOSE: Final = "claude-agent-sdk-close"
 
 WORKER_GONE_TIMEOUT: Final = timedelta(seconds=30)
+
+CONNECTION_LOST: Final = (
+    "Lost the connection to Claude Code: the Worker connected to it shut down or "
+    "went away. To continue the conversation, start a new client with "
+    "options.resume set to the session ID."
+)

@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import signal
+import sys
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -64,8 +65,10 @@ class LocalCli:
 
     def kill_processes(self) -> None:
         """Kill each CLI started so far."""
+        # Windows has no SIGKILL. No test runs there, but the type checkers do.
+        kill_signal = signal.SIGTERM if sys.platform == "win32" else signal.SIGKILL
         for pid in self.running():
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, kill_signal)
 
 
 def _running(pid: int) -> bool:
