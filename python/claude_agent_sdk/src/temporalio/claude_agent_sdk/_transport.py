@@ -99,9 +99,8 @@ class TemporalTransport(Transport):
 
         self._received = 0
 
-        # The Worker connected to Claude Code shut down or went away. Nothing is
-        # left to close, so skip the close Activity rather than wait out its
-        # timeout.
+        # The Worker connected to Claude Code shut down or went away. Skip any
+        # Activity on its task queue rather than wait out its timeout.
         self._connection_lost = False
         self._closed = False
 
@@ -153,14 +152,9 @@ class TemporalTransport(Transport):
                 "schedule_to_start_timeout": WORKER_GONE_TIMEOUT,
                 **self._activity_options.get("write", {}),
             }
-            try:
-                await workflow.execute_activity(
-                    WRITE,
-                    WriteActivityInput(self._connection.handle, data),
-                    **options,
-                )
-            except ActivityError as error:
-                raise self._sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
+            await self._execute(
+                WRITE, WriteActivityInput(self._connection.handle, data), options
+            )
 
     async def read_messages(self) -> AsyncIterator[dict[str, Any]]:
         """Yield each of the CLI's messages once until it exits, including turns Claude Code starts on its own."""
@@ -177,24 +171,21 @@ class TemporalTransport(Transport):
             **self._activity_options.get("read", {}),
         }
 
-        try:
-            while True:
-                result: ReadResult = await workflow.execute_activity(
-                    READ,
-                    ReadActivityInput(self._connection.handle, self._received),
-                    result_type=ReadResult,
-                    **options,
-                )
+        while True:
+            result: ReadResult = await self._execute(
+                READ,
+                ReadActivityInput(self._connection.handle, self._received),
+                options,
+                result_type=ReadResult,
+            )
 
-                if not result.output:  # Claude Code has stopped
-                    break
+            if not result.output:  # Claude Code has stopped
+                break
 
-                self._received += len(result.output)
+            self._received += len(result.output)
 
-                for message in self._handle_output(result.output):
-                    yield message
-        except ActivityError as error:
-            raise self._sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
+            for message in self._handle_output(result.output):
+                yield message
 
     async def end_input(self) -> None:
         """End the CLI's stdin, after the writes before it."""
@@ -211,12 +202,9 @@ class TemporalTransport(Transport):
                 **self._activity_options.get("end_input", {}),
             }
 
-            try:
-                await workflow.execute_activity(
-                    END_INPUT, EndInputActivityInput(self._connection.handle), **options
-                )
-            except ActivityError as error:
-                raise self._sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
+            await self._execute(
+                END_INPUT, EndInputActivityInput(self._connection.handle), options
+            )
 
     async def close(self) -> None:
         """Stop the CLI and everything it started."""
@@ -243,6 +231,17 @@ class TemporalTransport(Transport):
         except ActivityError as error:
             if is_cancelled_exception(error):
                 raise
+
+    async def _execute(
+        self, activity: str, arg: Any, options: dict[str, Any], **result: Any
+    ) -> Any:
+        """Run an Activity on the connected Worker, unless the connection is lost."""
+        if self._connection_lost:
+            raise CLIConnectionError(CONNECTION_LOST)
+        try:
+            return await workflow.execute_activity(activity, arg, **result, **options)
+        except ActivityError as error:
+            raise self._sdk_error(error)  # noqa: B904 - sdk_error sets the cause.
 
     def _sdk_error(self, error: ActivityError) -> BaseException:
         """The Claude Agent SDK's error for a failed Activity, noting whether the connection to Claude Code is lost.

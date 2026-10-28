@@ -16,6 +16,7 @@ from claude_agent_sdk import (
     ProcessError,
 )
 
+from temporalio.activity import ActivityCancellationDetails
 from temporalio.claude_agent_sdk import (
     ClaudeCodeProcess,
     ConnectActivityInput,
@@ -140,6 +141,70 @@ async def test_shutting_down_stops_claude_code_with_sigterm_before_its_stdin_clo
     assert failed.value.message == CONNECTION_LOST
 
 
+async def test_a_read_the_worker_shutdown_cancelled_fails_for_good(
+    cli: LocalCli, activities: ConnectionActivities
+) -> None:
+    """Such as when Claude Code takes a while to exit on SIGTERM."""
+    handle = (await ActivityEnvironment().run(activities.connect, request(cli))).handle
+    env = ActivityEnvironment()
+    reading = asyncio.create_task(
+        env.run(activities.read, ReadActivityInput(handle, 0))
+    )
+    await asyncio.sleep(0.1)
+
+    env.cancel(ActivityCancellationDetails(worker_shutdown=True))
+
+    # Not cancelled, which Temporal would retry on this Worker's task queue.
+    with pytest.raises(ApplicationError) as failed:
+        await reading
+    assert failed.value.non_retryable
+    assert failed.value.message == CONNECTION_LOST
+    await activities.shut_down()
+
+
+class WritesOnSigterm:
+    """Stands in for Claude Code that writes once it gets SIGTERM."""
+
+    def __init__(self) -> None:
+        self.stopped = asyncio.Event()
+
+    async def read(self) -> list[Output]:
+        await self.stopped.wait()
+        return [{"n": 0}]
+
+    async def terminate(self) -> None:
+        self.stopped.set()
+
+    async def write(self, data: str) -> None:
+        del data
+
+    async def end_input(self) -> None: ...
+    async def close(self) -> None: ...
+
+
+async def test_a_read_that_got_output_during_a_shutdown_returns_it() -> None:
+    """Only the next read fails, so no output is dropped."""
+    process = WritesOnSigterm()
+
+    class Connector:
+        async def connect(self, request: ConnectActivityInput) -> WritesOnSigterm:
+            del request
+            return process
+
+    activities = ConnectionActivities(Connector(), OWN_QUEUE)
+    run = ActivityEnvironment().run
+    handle = (await run(activities.connect, ConnectActivityInput([], {}))).handle
+    reading = asyncio.create_task(run(activities.read, ReadActivityInput(handle, 0)))
+    await asyncio.sleep(0.1)
+
+    await activities.shut_down()
+
+    assert await reading == ReadResult([{"n": 0}])
+    with pytest.raises(ApplicationError) as failed:
+        await run(activities.read, ReadActivityInput(handle, 1))
+    assert failed.value.message == CONNECTION_LOST
+
+
 async def test_a_read_returns_at_most_about_a_mebibyte(
     cli: LocalCli, activities: ConnectionActivities
 ) -> None:
@@ -238,7 +303,7 @@ async def test_a_read_retries_an_error_the_connector_says_a_retry_can_fix() -> N
 
         async def end_input(self) -> None: ...
         async def close(self) -> None: ...
-        async def shut_down(self) -> None: ...
+        async def terminate(self) -> None: ...
 
         async def read(self) -> list[Output]:
             reads.append("read")

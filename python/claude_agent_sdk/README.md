@@ -184,45 +184,70 @@ As in the Claude Agent SDK, the transport raises when Claude Code stops: `Proces
 exited with an error, and `CLIConnectionError` if it's gone, such as when the Worker connected to
 it went away. The transport never starts another Claude Code by itself.
 
-To continue the conversation, choose the session ID in the Workflow, and start a new client with
-`options.resume` set to it. With `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`, the new Claude Code
-re-runs the turn that was cut off, so the new client only reads its reply:
+To continue the conversation, take the session ID from Claude Code's init message, and on
+`CLIConnectionError` start a new client with `options.resume` set to it. With
+`CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`, the new Claude Code re-runs the turn that was cut off, so
+the new client only reads its reply:
 
 ```python
-import dataclasses
+from claude_agent_sdk import CLIConnectionError, ResultMessage, SystemMessage
 
-from claude_agent_sdk import CLIConnectionError
+session_id = None  # Claude Code's, once it has the prompt
 
-session_id = str(workflow.uuid4())
-options = ClaudeAgentOptions(
-    session_id=session_id, env={"CLAUDE_CODE_RESUME_INTERRUPTED_TURN": "1"}
-)
 while True:
     try:
+        options = ClaudeAgentOptions(
+            env={"CLAUDE_CODE_RESUME_INTERRUPTED_TURN": "1"}, resume=session_id
+        )
         async with ClaudeSDKClient(options=options, transport=TemporalTransport(options)) as client:
-            if options.resume is None:
+            # Keep sending the prompt until Claude Code reports a session, which
+            # means it received it. After that, a resume finishes the turn.
+            if session_id is None:
                 await client.query(prompt)
+
             async for message in client.receive_response():
-                ...
-        break
+                if isinstance(message, SystemMessage) and message.subtype == "init":
+                    session_id = message.data["session_id"]
+                elif isinstance(message, ResultMessage):
+                    return message.result
+
     except CLIConnectionError:
-        options = dataclasses.replace(options, session_id=None, resume=session_id)
+        # Resume the session if Claude Code started it, or start again.
+        pass
 ```
 
-`workflow.uuid4()` is the same on replay, and the session has its ID before Claude Code writes
-anything, so the Workflow can resume it even mid-turn. The new Claude Code reads the session from
-its config directory, so it must run where that directory is, such as on a volume every Worker
-mounts.
+As with the Claude Agent SDK, output Claude Code wrote after the Worker's last read is lost when the
+Worker stops. If that was a turn's final result, the resumed session has nothing to finish. An app
+that needs it can read the turn from the session transcript with the Claude Agent SDK's
+`get_session_messages(session_id)`, called from an Activity since it reads a file.
+
+The new Claude Code reads the session from its config directory, so it must run where that
+directory is, such as on a volume every Worker mounts.
+
+If the Worker goes away between reads, or crashes, the Workflow notices after 30 s, the
+`schedule_to_start_timeout` of the Activities on that Worker's task queue. To notice sooner, lower
+it with `activity_options`. Too low, and a busy Worker can be mistaken for a gone one, which starts
+a second Claude Code on the same session:
+
+```python
+gone = {"schedule_to_start_timeout": timedelta(seconds=10)}
+transport = TemporalTransport(
+    options,
+    activity_options={"write": gone, "end_input": gone, "read": gone, "close": gone},
+)
+```
 
 When a Worker shuts down, the plugin stops each Claude Code that Worker is connected to, as SIGTERM does.
 Claude Code then leaves a turn in progress, including a pending tool approval, for the resumed
-session to continue, so a person is asked again. Process managers stop a Worker with SIGTERM, but
-Python exits on SIGTERM without shutting the Worker down, so turn it into a shutdown:
+session to continue, so a person is asked again. A read in progress raises `CLIConnectionError`
+in the Workflow, so it can resume the session. Process managers stop a Worker with SIGTERM, but
+Python exits on SIGTERM without shutting the Worker down, so turn it into a shutdown. Leaving
+`async with Worker(...)` waits for the plugin to stop Claude Code:
 
 ```python
-stop = asyncio.Event()
-asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
 async with Worker(client, task_queue="my-task-queue", workflows=[MyWorkflow], plugins=[ClaudeAgentSDKPlugin()]):
+    stop = asyncio.Event()
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
     await stop.wait()
 ```
 

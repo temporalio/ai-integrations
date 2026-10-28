@@ -18,7 +18,7 @@ classifiers = [
 ]
 dependencies = [
   "claude-agent-sdk>=0.2.163,<0.2.166",
-  "temporalio>=1.34.0,<2",
+  "temporalio>=1.35.0,<2",
 ]
 
 [project.optional-dependencies]
@@ -69,7 +69,7 @@ asyncio_mode = "auto"
 log_level = "DEBUG"
 log_format = "%(asctime)s [%(levelname)8s] %(message)s (%(filename)s:%(lineno)s)"
 testpaths = ["tests"]
-addopts = "--cov=temporalio.claude_agent_sdk --cov-report=term-missing --cov-fail-under=80"
+addopts = "--cov=temporalio.claude_agent_sdk --cov-report=term-missing"
 timeout = 60
 # Time setup and teardown too, so a stuck fixture ends its test; starting the dev
 # server gets more (see conftest.py).

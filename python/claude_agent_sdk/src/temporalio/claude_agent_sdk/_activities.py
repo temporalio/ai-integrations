@@ -142,8 +142,15 @@ class ConnectionActivities:
                     try:
                         connection.unreceived = await connection.read_process()
                     finally:
-                        # Report a lost connection if a shutdown began during a read.
-                        if self._shutting_down and not activity.is_cancelled():
+                        # Report a lost connection if a shutdown began during a
+                        # read that got no output, or cancelled it. Temporal
+                        # would retry a cancelled read on this Worker's task
+                        # queue, which no Worker polls once it's gone.
+                        cancel = activity.cancellation_details()
+                        if not connection.unreceived and (
+                            (cancel is not None and cancel.worker_shutdown)
+                            or (self._shutting_down and not activity.is_cancelled())
+                        ):
                             raise CLIConnectionError(CONNECTION_LOST)
 
                 return ReadResult(list(connection.unreceived))
@@ -168,8 +175,13 @@ class ConnectionActivities:
         """Stop every Claude Code this process started, leaving their sessions resumable."""
         self._shutting_down = True
         connections, self._connections = self._connections, {}
+
+        async def stop(process: ClaudeCodeProcess) -> None:
+            await process.terminate()
+            await process.close()
+
         await asyncio.gather(
-            *(connection.process.shut_down() for connection in connections.values()),
+            *(stop(connection.process) for connection in connections.values()),
             return_exceptions=True,
         )
 

@@ -6,6 +6,7 @@ import asyncio
 import json
 from typing import Any
 
+import anyio
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKError
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
@@ -110,12 +111,13 @@ class _SubprocessConnection(SubprocessCLITransport):
             if pending is not None:
                 await asyncio.gather(pending, return_exceptions=True)
 
-    async def shut_down(self) -> None:
-        # SIGTERM before stdin closes. Closing stdin first makes Claude Code
-        # record a pending permission as failed.
+    async def terminate(self) -> None:
+        # SIGTERM, and let Claude Code exit before close() closes stdin. Seeing
+        # stdin close first makes it record a pending permission as failed.
         if self._process is not None and self._process.returncode is None:
             self._process.terminate()
-        await self.close()
+            with anyio.move_on_after(5):
+                await self._process.wait()
 
     def _pending(self) -> asyncio.Future[dict[str, Any] | None]:
         """Claude Code's next message, read from the pipe once and kept until a read returns it."""

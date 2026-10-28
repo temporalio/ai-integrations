@@ -174,6 +174,7 @@ async def test_a_workflow_resumes_the_session_its_lost_worker_cut_off_mid_turn(
         )
         while not await handle.query(ResumingWorkflow.pending_approvals):
             await asyncio.sleep(0.05)
+    assert harness.running() == []
 
     async with Worker(
         harness.client,
@@ -191,6 +192,35 @@ async def test_a_workflow_resumes_the_session_its_lost_worker_cut_off_mid_turn(
 
     assert notes(harness).read_text() == "hi\n"
     assert harness.asked.count("write it") == 2
+
+
+async def test_a_worker_run_returns_once_the_plugin_stopped_claude_code(
+    harness: Harness,
+) -> None:
+    # A program ends once run() returns, and asyncio.run cancels the tasks still
+    # running, so the plugin's shutdown must finish first.
+    harness.answers = ANSWERS
+    chat = Chat(["write it"], str(harness.cli_path))
+    task_queue = str(uuid.uuid4())
+    tasks_before = asyncio.all_tasks()
+    worker = Worker(
+        harness.client,
+        task_queue=task_queue,
+        workflows=[ChatWorkflow],
+        plugins=[ClaudeAgentSDKPlugin()],
+    )
+    running = asyncio.create_task(worker.run())
+    handle = await harness.client.start_workflow(
+        ChatWorkflow.run, chat, id=task_queue, task_queue=task_queue
+    )
+    await until_a_person_is_asked(handle)
+    assert len(harness.running()) == 1
+
+    await worker.shutdown()
+    await running
+
+    assert harness.running() == []
+    assert asyncio.all_tasks() - tasks_before == set()
 
 
 async def test_a_cli_that_cannot_run_fails_the_workflow(harness: Harness) -> None:

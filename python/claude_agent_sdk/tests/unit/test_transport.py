@@ -112,8 +112,8 @@ def test_settings_are_json_not_a_file_path() -> None:
         TemporalTransport(options)
 
 
-async def test_once_the_connection_is_lost_close_runs_no_activity() -> None:
-    """Only that Worker polls its task queue, so a close Activity would wait out its timeout."""
+async def test_once_the_connection_is_lost_no_activity_runs() -> None:
+    """Only that Worker polls its task queue, so an Activity would wait out its timeout."""
     transport = TemporalTransport(ClaudeAgentOptions())
     transport._connection = Connection("handle", "gone-queue")  # pyright: ignore[reportPrivateUsage]
     gone = ActivityError(
@@ -131,6 +131,9 @@ async def test_once_the_connection_is_lost_close_runs_no_activity() -> None:
 
     assert isinstance(raised, CLIConnectionError)
     # Outside a Workflow, an Activity would raise.
+    with pytest.raises(CLIConnectionError) as failed:
+        await transport.write('{"type": "user"}\n')
+    assert str(failed.value) == CONNECTION_LOST
     await transport.close()
     assert not transport.is_ready()
 

@@ -100,21 +100,13 @@ class ClaudeAgentSDKPlugin(SimplePlugin):
             interceptors=worker.config().get("interceptors", []),
         )
 
-        stopped = False
-        try:
-            async with own:
-                try:
-                    await super().run_worker(worker, next)
-                    stopped = True
-                finally:
-                    # Stop each Claude Code this Worker started, so a resumed
-                    # session continues its turn. Before the own Worker shuts
-                    # down, since its reads wait for Claude Code's output, and
-                    # shielded, since the Worker may cancel this plugin.
-                    await asyncio.shield(self._connection_activities.shut_down())
-        except asyncio.CancelledError:
-            # Remove this once the minimum temporalio includes
-            # https://github.com/temporalio/sdk-python/pull/2000, which waits
-            # for plugins instead of cancelling them.
-            if not stopped:
-                raise
+        async with own:
+            try:
+                await super().run_worker(worker, next)
+            finally:
+                # Stop each Claude Code this Worker started, so a resumed
+                # session continues its turn. Before the own Worker shuts
+                # down, since its reads wait for Claude Code's output.
+                # Shielded, since a Worker cancels this plugin once its
+                # plugin_shutdown_timeout passes.
+                await asyncio.shield(self._connection_activities.shut_down())

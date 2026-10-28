@@ -126,15 +126,20 @@ class ClaudeCodeProcess(Protocol):
         ...
 
     async def close(self) -> None:
-        """Stop Claude Code and everything it started."""
+        """Close Claude Code's stdin and wait for it to exit, forcing it if it doesn't in time.
+
+        Claude Code treats the end of its input as the end of the session: it
+        wraps up, failing a pending tool permission, and exits.
+        """
         ...
 
-    async def shut_down(self) -> None:
-        """Stop Claude Code because the Worker that holds this connection is shutting down.
+    async def terminate(self) -> None:
+        """Stop Claude Code as SIGTERM does, without waiting.
 
-        Stop it the way SIGTERM does, so the session can be resumed later.
-        Any turn in progress, including one waiting on a tool permission, is
-        left unfinished, and the resumed session picks it up from there.
+        Claude Code stops where it is, instead of wrapping up as it does when
+        its input ends, so a resumed session continues the turn, including a
+        pending tool permission. The plugin calls this on Worker shutdown,
+        then ``close``.
         """
         ...
 
