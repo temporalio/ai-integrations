@@ -8,11 +8,12 @@ import static org.mockito.Mockito.*;
 
 import com.anthropic.client.AnthropicClient;
 import com.anthropic.client.AnthropicClientAsync;
-import com.anthropic.core.JsonValue;
+import com.anthropic.core.ObjectMappers;
 import com.anthropic.core.RequestOptions;
 import com.anthropic.core.http.Headers;
 import com.anthropic.core.http.HttpResponseFor;
 import com.anthropic.models.messages.*;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import io.temporal.client.WorkflowOptions;
 import io.temporal.client.WorkflowStub;
 import io.temporal.springai.activity.ChatModelActivityImpl;
@@ -23,9 +24,6 @@ import io.temporal.testing.WorkflowReplayer;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
 import java.time.Duration;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.ai.anthropic.AnthropicChatModel;
@@ -39,44 +37,28 @@ import org.springframework.ai.tool.definition.ToolDefinition;
  */
 class AnthropicThinkingContinuationTest {
   @Test
-  @SuppressWarnings("unchecked")
   void toolContinuationPreservesSignedAndRedactedThinkingInOrder() throws Exception {
     AnthropicClient sdk = mock(AnthropicClient.class, RETURNS_DEEP_STUBS);
-    Usage usage =
-        Usage.builder()
-            .inputTokens(1)
-            .outputTokens(1)
-            .cacheCreation(Optional.empty())
-            .cacheCreationInputTokens(0)
-            .cacheReadInputTokens(0)
-            .inferenceGeo(Optional.empty())
-            .outputTokensDetails(Optional.empty())
-            .serverToolUse(Optional.empty())
-            .serviceTier(Optional.empty())
-            .build();
     Message first =
-        message("first", usage, StopReason.TOOL_USE)
-            .addContent(
-                ThinkingBlock.builder()
-                    .thinking("considering")
-                    .signature("first-signature")
-                    .build())
-            .addContent(RedactedThinkingBlock.builder().data("opaque-redacted-data").build())
-            .addContent(
-                ThinkingBlock.builder().thinking("ready").signature("second-signature").build())
-            .addContent(
-                ToolUseBlock.builder()
-                    .id("toolu")
-                    .name("echo")
-                    .caller(DirectCaller.builder().build())
-                    .input(JsonValue.from(Map.of()))
-                    .build())
-            .build();
+        message(
+            "first",
+            "tool_use",
+            """
+            [
+              {"type":"thinking","thinking":"considering","signature":"first-signature"},
+              {"type":"redacted_thinking","data":"opaque-redacted-data"},
+              {"type":"thinking","thinking":"ready","signature":"second-signature"},
+              {"type":"tool_use","id":"toolu","name":"echo","caller":{"type":"direct"},"input":{}}
+            ]
+            """);
     Message last =
-        message("last", usage, StopReason.END_TURN)
-            .addContent(TextBlock.builder().text("done").citations(List.of()).build())
-            .build();
-    HttpResponseFor<Message> rawResponse = mock(HttpResponseFor.class);
+        message(
+            "last",
+            "end_turn",
+            """
+            [{"type":"text","text":"done","citations":[]}]
+            """);
+    HttpResponseFor<Message> rawResponse = mock();
     when(rawResponse.parse()).thenReturn(first, last);
     when(rawResponse.headers()).thenReturn(Headers.builder().build());
     when(sdk.messages()
@@ -132,15 +114,22 @@ class AnthropicThinkingContinuationTest {
     assertEquals("toolu", blocks.get(3).asToolUse().id());
   }
 
-  private Message.Builder message(String id, Usage usage, StopReason reason) {
-    return Message.builder()
-        .id(id)
-        .model("claude-test")
-        .usage(usage)
-        .stopReason(reason)
-        .stopSequence(Optional.empty())
-        .container(Optional.empty())
-        .stopDetails(Optional.empty());
+  private Message message(String id, String reason, String content) throws JsonProcessingException {
+    // Decode a provider response so new nullable SDK fields do not require version-specific
+    // setters.
+    return ObjectMappers.jsonMapper()
+        .readValue(
+            """
+            {
+              "id":"%s","type":"message","role":"assistant","model":"claude-test",
+              "content":%s,"stop_reason":"%s","stop_sequence":null,
+              "container":null,"stop_details":null,"diagnostics":null,
+              "usage":{"input_tokens":1,"output_tokens":1,
+                       "cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+            }
+            """
+                .formatted(id, content, reason),
+            Message.class);
   }
 
   @WorkflowInterface

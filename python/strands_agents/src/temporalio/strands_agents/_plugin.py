@@ -7,6 +7,7 @@ from botocore.config import Config as BotocoreConfig
 from strands.models import BedrockModel, Model
 from strands.models.bedrock import DEFAULT_READ_TIMEOUT
 from strands.tools.mcp import MCPClient
+from strands.types.exceptions import ContextWindowOverflowException
 
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.converter import DataConverter, DefaultPayloadConverter
@@ -21,6 +22,7 @@ from ._temporal_mcp_client import (
     _evict_connection,
     build_call_tool_activity,
     build_list_tools_activity,
+    drain_closing,
 )
 from ._worker_env_ref import AllowAllWorkerEnvVars
 
@@ -122,12 +124,18 @@ class StrandsPlugin(SimplePlugin):
             finally:
                 for server in mcp_clients:
                     await _evict_connection(server)
+                # Broken connections were already unpublished, so the loop above
+                # misses them; wait for their background close to finish too.
+                await drain_closing()
 
         super().__init__(
             "aws.StrandsPlugin",
             workflow_runner=_workflow_runner,
             data_converter=_data_converter,
             activities=activities or None,
+            # Strands re-raises this when its conversation manager cannot reduce the
+            # context any further; fail the workflow instead of retrying the task forever.
+            workflow_failure_exception_types=[ContextWindowOverflowException],
             run_context=run_context,
         )
 

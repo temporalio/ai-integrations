@@ -22,12 +22,14 @@ from agents import (
     ModelResponse,
     ModelSettings,
     ModelTracing,
+    RunConfig,
     Runner,
     Tool,
     TResponseInputItem,
     Usage,
 )
 from agents.items import TResponseStreamEvent
+from agents.models import get_default_model_settings
 from openai.types.responses import (
     Response,
     ResponseCompletedEvent,
@@ -41,6 +43,7 @@ from openai.types.responses.response_usage import (
     InputTokensDetails,
     OutputTokensDetails,
 )
+from openai.types.shared import Reasoning
 from openai.types.shared.response_format_text import ResponseFormatText
 
 from temporalio import workflow
@@ -348,3 +351,88 @@ async def test_streaming_rejects_local_activity(client: Client):
                 )
 
     assert "use_local_activity" in str(exc_info.value.cause)
+
+
+class RecordingStreamingModel(StreamingTestModel):
+    """Streaming test model that exposes a model name and records each call's settings."""
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+        self.settings: list[ModelSettings] = []
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        self.settings.append(model_settings)
+        async for event in super().stream_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            **kwargs,
+        ):
+            yield event
+
+
+@workflow.defn
+class StreamingRunOverrideWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        # Names no model; the run sets a reasoning effort explicitly.
+        agent = Agent[None](name="Assistant", instructions="You are a test agent.")
+        result = Runner.run_streamed(
+            starting_agent=agent,
+            input=prompt,
+            run_config=RunConfig(
+                model_settings=ModelSettings(reasoning=Reasoning(effort="low"))
+            ),
+        )
+        async for _ in result.stream_events():
+            pass
+        return result.final_output
+
+
+async def test_streamed_run_level_model_settings_survive_the_alignment(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    # Same case as the non-streamed test: implicit gpt-5 defaults merged
+    # with a run-level effort of "low" equal the defaults, the provider
+    # resolves gpt-5.4, and the run-level effort must survive.
+    monkeypatch.setenv("OPENAI_DEFAULT_MODEL", "gpt-5")
+    model = RecordingStreamingModel("gpt-5.4")
+    async with AgentEnvironment(
+        model=model,
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            streaming_topic="events",
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, StreamingRunOverrideWorkflow, max_cached_workflows=0
+        ) as worker:
+            await client.execute_workflow(
+                StreamingRunOverrideWorkflow.run,
+                "Hello",
+                id=f"openai-streaming-settings-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+    assert model.settings == [
+        get_default_model_settings("gpt-5.4").resolve(
+            ModelSettings(reasoning=Reasoning(effort="low"))
+        )
+    ]
+    assert model.settings[0].reasoning is not None
+    assert model.settings[0].reasoning.effort == "low"

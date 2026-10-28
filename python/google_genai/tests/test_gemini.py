@@ -20,12 +20,13 @@ Tests cover:
 - Error classification: permanent 4xx fails fast, transient statuses stay retryable
 """
 
+import base64
 import inspect
 import io
 import json
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -282,7 +283,7 @@ class GeminiApiCallTracker:
         return types.File(
             name="files/test-uploaded-file",
             uri="https://fake.uri/files/test-uploaded-file",
-            size_bytes=len(req.file_bytes) if req.file_bytes else 0,
+            size_bytes=len(base64.b64decode(req.file_base64)) if req.file_base64 else 0,
         )
 
     @activity.defn
@@ -774,6 +775,21 @@ class FileSearchStoreUploadWorkflow:
 
 
 @workflow.defn
+class FileSearchStoreUploadBytesWorkflow:
+    """Workflow that uploads in-memory content to a file search store."""
+
+    @workflow.run
+    async def run(self, store_name: str, data: bytes) -> str:
+        client = TemporalAsyncClient()
+        op = await client.file_search_stores.upload_to_file_search_store(
+            file_search_store_name=store_name,
+            file=io.BytesIO(data),
+            config=types.UploadToFileSearchStoreConfig(mime_type="text/plain"),
+        )
+        return op.name or ""
+
+
+@workflow.defn
 class RegisterFilesWorkflow:
     """Workflow that calls files.register_files."""
 
@@ -1211,6 +1227,7 @@ async def test_file_upload_str_path(client: Client):
     assert len(api_tracker.file_upload_requests) == 1
     req = api_tracker.file_upload_requests[0]
     assert req.file_path == "/tmp/test.txt"
+    assert req.file_base64 is None
     assert req.file_bytes is None
     assert req.config is not None
     assert req.config.display_name == "Test File"
@@ -1231,7 +1248,9 @@ async def test_file_upload_bytes(client: Client):
 
     assert len(api_tracker.file_upload_requests) == 1
     req = api_tracker.file_upload_requests[0]
-    assert req.file_bytes == b"hello world"
+    assert req.file_base64 is not None
+    assert base64.b64decode(req.file_base64) == b"hello world"
+    assert req.file_bytes is None
     assert req.file_path is None
     assert req.config is not None
     assert req.config.display_name == "Bytes File"
@@ -1296,6 +1315,28 @@ async def test_file_search_store_upload(client: Client):
     assert req.file_path == "/tmp/doc.txt"
     assert req.config is not None
     assert req.config.display_name == "Test Doc"
+    assert result == "operations/test-op"
+
+
+async def test_file_search_store_upload_bytes(client: Client):
+    """Upload in-memory content to a file search store sends it through the activity."""
+    new_client, api_tracker = apply_plugin(client, [])
+
+    async with new_worker(new_client, FileSearchStoreUploadBytesWorkflow) as worker:
+        result = await new_client.execute_workflow(
+            FileSearchStoreUploadBytesWorkflow.run,
+            args=["fileSearchStores/my-store", b"hello world"],
+            id=f"gemini-fss-upload-bytes-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+        )
+
+    assert len(api_tracker.file_search_store_upload_requests) == 1
+    req = api_tracker.file_search_store_upload_requests[0]
+    assert req.file_search_store_name == "fileSearchStores/my-store"
+    assert req.file_base64 is not None
+    assert base64.b64decode(req.file_base64) == b"hello world"
+    assert req.file_bytes is None
+    assert req.file_path is None
     assert result == "operations/test-op"
 
 
@@ -2011,7 +2052,7 @@ class _FakeGeminiHttpServer:
 @contextmanager
 def _gemini_client_failing_with(
     status: int,
-) -> Iterator[tuple[GeminiClient, list[str]]]:
+) -> Generator[tuple[GeminiClient, list[str]], None, None]:
     """Yield a real ``genai.Client`` whose every HTTP request answers ``status``."""
     server = _FakeGeminiHttpServer(status)
     server.start()

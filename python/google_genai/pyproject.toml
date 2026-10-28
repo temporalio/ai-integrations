@@ -42,9 +42,9 @@ module-name = "temporalio.google_genai"
 dev = [
   "mcp>=1.24,<2",  # Exercise the optional client-side MCP adapter in tests.
   "httpx>=0.28.1",
-  "pyright==1.1.403",
-  "basedpyright==1.34.0",
-  "mypy==1.18.2",
+  "pyright>=1.1.414,<2",
+  "basedpyright>=1.40.2,<2",
+  "mypy>=1.20.2,<2",
   "ruff>=0.15.12,<0.16",
   "pydocstyle>=6.3,<7",
   "pytest~=9.0",

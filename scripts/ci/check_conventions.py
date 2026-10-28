@@ -239,6 +239,10 @@ class Checker:
                 self.fail(f"{rel}: invalid Spring Boot version {boot!r}")
             elif not (d / f"gradle/dependency-locks/spring-boot-{boot}.lockfile").is_file():
                 self.fail(f"{rel}: missing dependency lock for Spring Boot {boot}")
+        if not ci.get("spring-boot-versions") and not (
+            d / "gradle/dependency-locks/dependencies.lockfile"
+        ).is_file():
+            self.fail(f"{rel}: missing gradle/dependency-locks/dependencies.lockfile")
         imports = meta.get("smoke", {}).get("imports", [])
         if not imports or not all(isinstance(i, str) and i.startswith(root_api + ".") for i in imports):
             self.fail(f"{rel}: smoke imports must name classes under root-api")
@@ -277,9 +281,15 @@ class Checker:
             self.fail(f"{rel}: invalid maturity")
         versions = meta.get("ci", {}).get("runtime-versions", [])
         floor = package.get("engines", {}).get("node", "").removeprefix(">=")
-        if (not versions or not all(isinstance(version, str) and version.isdigit() for version in versions)
-                or versions[0] != floor.split(".")[0]):
-            self.fail(f"{rel}: runtime-versions must list Node majors starting with the Node engine floor's major")
+        # Majors select the newest release of each line. The first entry may name the
+        # floor's major.minor instead, so the minimum cell runs the floor itself when a
+        # plugin's dependencies require more than the repository minimum.
+        floor_parts = floor.split(".")
+        if (not versions or not all(isinstance(version, str) and version.isdigit() for version in versions[1:])
+                or not isinstance(versions[0], str)
+                or versions[0] not in (floor_parts[0], ".".join(floor_parts[:2]))):
+            self.fail(f"{rel}: runtime-versions must list Node majors starting with the Node engine floor's major "
+                      "(or its major.minor)")
         if meta.get("smoke", {}).get("imports") != [coordinate]:
             self.fail(f"{rel}: smoke imports must name the root package")
         for section in ("dependencies", "peerDependencies", "optionalDependencies", "devDependencies"):
