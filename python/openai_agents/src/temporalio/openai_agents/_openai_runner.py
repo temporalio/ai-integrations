@@ -1,8 +1,10 @@
 import asyncio
+import contextlib
 import contextvars
 import dataclasses
+import sys
 import weakref
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Generator
 from typing import Any, Callable
 
 from agents import (
@@ -17,13 +19,10 @@ from agents import (
     RunState,
     SQLiteSession,
     TContext,
-    Tool,
     TResponseInputItem,
 )
 from agents.run import DEFAULT_AGENT_RUNNER, AgentRunner, RunOptions
 from agents.sandbox import SandboxAgent
-from agents.tool import _SYNC_FUNCTION_TOOL_MARKER
-from agents.tool_context import ToolContext
 from typing_extensions import Unpack
 
 from temporalio import workflow
@@ -123,7 +122,7 @@ def _convert_agent(
             ),
         )
         if isinstance(tool, FunctionTool) and isinstance(tool._agent_instance, Agent)
-        else _inline_sync_function_tool(tool)
+        else tool
         for tool in agent.tools
     ]
     return new_agent
@@ -131,42 +130,30 @@ def _convert_agent(
 
 _INLINE_SYNC_FUNCTION_TOOLS_PATCH = "openai_agents.inline-sync-function-tools"
 
-# True while a sync function tool runs, so the Workflow loop runs its thread call inline.
-_running_sync_function_tool: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "_running_sync_function_tool", default=False
+# True during an agent run, so the Workflow loop runs sync function tools inline.
+_in_agent_run: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_in_agent_run", default=False
 )
 
 
-def _inline_sync_function_tool(tool: Tool) -> Tool:
-    """Run a sync function tool in the Workflow instead of in a thread.
+@contextlib.contextmanager
+def _inline_sync_function_tools() -> Generator[None, None, None]:
+    """Run the sync function tools of the agent run in this scope in the Workflow.
 
     The Agents SDK runs a sync function tool with ``asyncio.to_thread``. The Workflow
     event loop has no threads, so the tool failed before its body ran and the model
-    got an empty error.
+    got an empty error. Tools are not changed, only how the loop runs that call.
     """
-    if not isinstance(tool, FunctionTool) or not getattr(
-        tool.on_invoke_tool, _SYNC_FUNCTION_TOOL_MARKER, False
-    ):
-        return tool
-    invoke_tool = tool.on_invoke_tool
-
-    async def on_invoke_tool(ctx: ToolContext[Any], input: str) -> Any:
-        # Runs that started before this change got that error from these tools. They
-        # keep getting it, so their histories replay.
-        if not workflow.patched(_INLINE_SYNC_FUNCTION_TOOLS_PATCH):
-            return await invoke_tool(ctx, input)
-        _run_executor_calls_inline(asyncio.get_running_loop())
-        token = _running_sync_function_tool.set(True)
-        try:
-            return await invoke_tool(ctx, input)
-        finally:
-            _running_sync_function_tool.reset(token)
-
-    return dataclasses.replace(tool, on_invoke_tool=on_invoke_tool)
+    _run_sync_function_tool_calls_inline(asyncio.get_running_loop())
+    token = _in_agent_run.set(True)
+    try:
+        yield
+    finally:
+        _in_agent_run.reset(token)
 
 
-def _run_executor_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
-    """Make the Workflow loop run executor calls inline while a sync function tool runs."""
+def _run_sync_function_tool_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
+    """Make the Workflow loop run a sync function tool's thread call inline."""
     if getattr(loop, "_runs_sync_function_tools_inline", False):
         return
     run_in_executor = loop.run_in_executor
@@ -174,7 +161,13 @@ def _run_executor_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
     def inline_run_in_executor(
         executor: Any, func: Callable[..., Any], *args: Any
     ) -> asyncio.Future[Any]:
-        if not _running_sync_function_tool.get():
+        # Runs that started before this change got that error from these tools. They
+        # keep getting it, so their histories replay.
+        if not (
+            _in_agent_run.get()
+            and _called_by_sync_function_tool(sys._getframe(1))
+            and workflow.patched(_INLINE_SYNC_FUNCTION_TOOLS_PATCH)
+        ):
             return run_in_executor(executor, func, *args)
         future = loop.create_future()
         future.set_result(func(*args))
@@ -182,6 +175,18 @@ def _run_executor_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
 
     setattr(loop, "run_in_executor", inline_run_in_executor)
     setattr(loop, "_runs_sync_function_tools_inline", True)
+
+
+def _called_by_sync_function_tool(frame: Any) -> bool:
+    """Whether this is ``asyncio.to_thread`` called by a sync ``@function_tool``.
+
+    Those are the only ``asyncio.to_thread`` calls in ``agents.tool``.
+    """
+    return (
+        frame.f_code is asyncio.to_thread.__code__
+        and frame.f_back is not None
+        and frame.f_back.f_globals.get("__name__") == "agents.tool"
+    )
 
 
 def _has_sandbox_agent(agent: Agent[Any], seen: set[int] | None = None) -> bool:
@@ -345,7 +350,7 @@ class TemporalOpenAIRunner(AgentRunner):
 
         converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
-        with capture_scope(run_config.model_settings):
+        with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             try:
                 return await self._runner.run(
                     starting_agent=converted_agent,
@@ -419,7 +424,7 @@ class TemporalOpenAIRunner(AgentRunner):
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
-        with capture_scope(run_config.model_settings):
+        with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             streamed_result = self._runner.run_streamed(
                 starting_agent=converted_agent,
                 input=input,

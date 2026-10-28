@@ -16,6 +16,7 @@ from agents import (
     AgentOutputSchemaBase,
     CodeInterpreterTool,
     FileSearchTool,
+    FunctionTool,
     GuardrailFunctionOutput,
     Handoff,
     HostedMCPTool,
@@ -34,6 +35,7 @@ from agents import (
     OutputGuardrailTripwireTriggered,
     RunConfig,
     RunContextWrapper,
+    RunHooks,
     Runner,
     SQLiteSession,
     Tool,
@@ -1377,27 +1379,44 @@ def workflow_tool_mock_model():
     )
 
 
+class WorkflowToolHooks(RunHooks):
+    def __init__(self) -> None:
+        self.tool_callables: list[str] = []
+
+    async def on_agent_start(
+        self, context: RunContextWrapper[Any], agent: Agent[Any]
+    ) -> None:
+        # Hooks get the tools as made, so each still has its Python callable.
+        self.tool_callables = [
+            tool.__wrapped__.__name__
+            for tool in agent.tools
+            if isinstance(tool, FunctionTool)
+        ]
+
+
 @workflow.defn
 class WorkflowToolWorkflow:
     def __init__(self) -> None:
         self.notes: list[str] = []
 
     @workflow.run
-    async def run(self) -> list[str]:
+    async def run(self) -> dict[str, list[str]]:
         agent: Agent = Agent(
             name="Assistant",
             instructions="You are a helpful assistant.",
             model="gpt-4o",
             tools=[function_tool(self.run_tool), function_tool(self.add_note)],
         )
+        hooks = WorkflowToolHooks()
         await Runner.run(
             agent,
             "My phone number is 650-123-4567. Where do you think I live?",
+            hooks=hooks,
         )
         # Acting on what a sync tool did ties this run's commands to the tool running.
         if self.notes:
             await workflow.sleep(timedelta(milliseconds=1))
-        return self.notes
+        return {"notes": self.notes, "tool_callables": hooks.tool_callables}
 
     async def run_tool(self):
         print("Tool ran with self:", self)
@@ -1429,7 +1448,10 @@ async def test_workflow_method_tools(client: Client):
             task_queue=worker.task_queue,
         )
         # The sync tool ran in the Workflow, and the model got its result.
-        assert await workflow_handle.result() == ["call back"]
+        assert await workflow_handle.result() == {
+            "notes": ["call back"],
+            "tool_callables": ["run_tool", "add_note"],
+        }
         model_inputs = [
             e.activity_task_scheduled_event_attributes.input.payloads[0].data.decode()
             async for e in workflow_handle.fetch_history_events()
