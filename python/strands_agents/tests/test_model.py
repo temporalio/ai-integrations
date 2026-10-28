@@ -72,7 +72,10 @@ class ModelConfigWorkflow:
             agent.invoke_async(prompt),
             return_exceptions=True,
         )
-        await agent.invoke_async(prompt)
+        completed = await asyncio.gather(
+            agent.invoke_async(prompt, idempotency_token="completed"),
+            agent.invoke_async(prompt, idempotency_token="completed"),
+        )
 
         # A duplicate of a first invocation that is cancelled while the config
         # loads is aborted, not run; the next invocation reuses the read.
@@ -91,6 +94,7 @@ class ModelConfigWorkflow:
         await other.invoke_async(prompt)
         return {
             "invocations": [str(first), type(second).__name__],
+            "deduplicated": [str(result) for result in completed],
             "cancelled": [type(r).__name__ for r in cancelled],
             "prompts": [
                 block["text"]
@@ -131,6 +135,7 @@ async def test_model_config_reaches_workflow(client: Client):
         )
         assert await handle.result() == {
             "invocations": ["Done!\n", "ConcurrencyException"],
+            "deduplicated": ["Again!\n", "Again!\n"],
             "cancelled": ["CancelledError", "IdempotencyAbortedError"],
             "prompts": ["Hello"],
             "context_window_limit": 1000,

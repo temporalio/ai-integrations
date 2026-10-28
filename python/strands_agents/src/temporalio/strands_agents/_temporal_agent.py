@@ -1,11 +1,14 @@
+import asyncio
 from datetime import timedelta
 from typing import Any
 
 from strands import Agent
+from strands.agent._concurrency import _ConcurrencyController, _InflightInvocation
 from strands.hooks import BeforeModelCallEvent, HookCallback
 from strands.types.agent import AgentInput
 from strands.types.content import Messages
 
+from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
@@ -19,6 +22,24 @@ _SNAPSHOT_DISABLED = (
     "a finer granularity than Strands snapshots. Remove the snapshot call "
     "and rely on Temporal's durable execution instead."
 )
+
+
+class _WorkflowInflightInvocation(_InflightInvocation):
+    def register_waiter(self) -> asyncio.Future:
+        # Strands uses asyncio.wrap_future to notify duplicates across threads.
+        # On Python <3.13 that calls loop methods the Workflow loop does not
+        # implement. Workflow invocations share one loop, so wait on its state.
+        return asyncio.create_task(workflow.wait_condition(lambda: self.settled))
+
+
+class _WorkflowConcurrencyController(_ConcurrencyController):
+    def _check_idempotency(
+        self, idempotency_token: Any
+    ) -> tuple[_InflightInvocation | None, Any]:
+        waiting_on, registered_token = super()._check_idempotency(idempotency_token)
+        if registered_token is not None:
+            self._inflight = _WorkflowInflightInvocation()
+        return waiting_on, registered_token
 
 
 class TemporalAgent(Agent):
@@ -82,6 +103,7 @@ class TemporalAgent(Agent):
             streaming_batch_interval=streaming_batch_interval,
         )
         super().__init__(model=temporal_model, sandbox=sandbox, **agent_kwargs)
+        self._concurrency = _WorkflowConcurrencyController(self._concurrency.mode)
         self._temporal_model = temporal_model
 
         # Strands invokes ToolProvider.load_tools() once at construction on a

@@ -287,7 +287,11 @@ async def test_bytes_across_a_workflow(client: Client):
     assert second[1]["content"][0] == REDACTED_BLOCK
 
     history = await handle.fetch_history()
-    assert get_activities(history) == ["invoke_model", "invoke_model"]
+    assert get_activities(history) == [
+        "strands_get_model_config",
+        "invoke_model",
+        "invoke_model",
+    ]
 
     await Replayer(
         workflows=[BytesWorkflow],
@@ -377,8 +381,11 @@ async def _stream_run(
         await asyncio.wait_for(collect_task, timeout=10.0)
 
     run.history = await handle.fetch_history()
-    # One activity ran, and it completed: the first attempt did not fail.
-    assert get_activities(run.history) == ["invoke_model_streaming"]
+    # The config read and streaming call each completed without a retry.
+    assert get_activities(run.history) == [
+        "strands_get_model_config",
+        "invoke_model_streaming",
+    ]
     assert not [
         event
         for event in run.history.events

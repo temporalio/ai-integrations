@@ -1,4 +1,4 @@
-"""Histories recorded before bytes support still replay.
+"""Histories recorded before the model config read fail replay.
 
 The fixtures in ``histories/`` were recorded on ``5e91c26`` (upstream main
 before the bytes change) against a local dev server, by running the workflows
@@ -15,8 +15,8 @@ below unchanged. Each shape is recorded twice, because the wire format of
 either form back into ``bytes`` for the workflow. ``{server}-call-tool`` was read
 without a type hint, so the workflow saw the string (or the list of ints) as is.
 
-The workflows decode these results with the code under test: a result shape it
-cannot read makes the replay fail.
+These histories have no model config Activity. The new config read deliberately
+breaks their replay before the recorded model or MCP results are read.
 """
 
 from datetime import timedelta
@@ -28,6 +28,7 @@ from temporalio import workflow
 from temporalio.client import WorkflowHistory
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent, TemporalMCPClient
 from temporalio.worker import Replayer, UnsandboxedWorkflowRunner
+from temporalio.workflow import NondeterminismError
 from tests.mock_model import MockModel
 
 HISTORIES = Path(__file__).parent / "histories"
@@ -112,16 +113,24 @@ def _replayer(workflow_class: type, converter: str) -> Replayer:
 
 
 @pytest.mark.parametrize("converter", CONVERTERS)
-async def test_replay_recorded_redacted_content(converter: str):
-    """A recorded ``redactedContent`` result decodes to the bytes the model sent."""
-    await _replayer(LegacyRedactedContentWorkflow, converter).replay_workflow(
-        _legacy_history(f"legacy_redacted_content_{converter}")
-    )
+async def test_rejects_pre_config_redacted_content_history(converter: str):
+    """The config read conflicts with the recorded first model call."""
+    with pytest.raises(
+        NondeterminismError,
+        match="scheduled event 'invoke_model'.*activity command 'strands_get_model_config'",
+    ):
+        await _replayer(LegacyRedactedContentWorkflow, converter).replay_workflow(
+            _legacy_history(f"legacy_redacted_content_{converter}")
+        )
 
 
 @pytest.mark.parametrize("converter", CONVERTERS)
-async def test_replay_recorded_mcp_image(converter: str):
-    """A recorded MCP image result, whose bytes were ASCII, still replays."""
-    await _replayer(LegacyMCPImageWorkflow, converter).replay_workflow(
-        _legacy_history(f"legacy_mcp_ascii_image_{converter}")
-    )
+async def test_rejects_pre_config_mcp_image_history(converter: str):
+    """The config read conflicts with the recorded first MCP tool listing."""
+    with pytest.raises(
+        NondeterminismError,
+        match="scheduled event 'image-list-tools'.*activity command 'strands_get_model_config'",
+    ):
+        await _replayer(LegacyMCPImageWorkflow, converter).replay_workflow(
+            _legacy_history(f"legacy_mcp_ascii_image_{converter}")
+        )
