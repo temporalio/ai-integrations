@@ -5,7 +5,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextvars
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from typing import Any, Protocol
 
@@ -33,7 +33,7 @@ class _InputWithHeaders(Protocol):
 def temporal_span(
     add_temporal_spans: bool,
     span_name: str,
-) -> Iterator[None]:
+) -> Generator[None, None, None]:
     """Create a temporal span context manager.
 
     Args:
@@ -216,7 +216,7 @@ class OpenAIAgentsContextPropagationInterceptor(
     def context_from_header(
         self,
         input: _InputWithHeaders,
-    ) -> Iterator[None]:
+    ) -> Generator[None, None, None]:
         """Restore the caller's trace context for an inbound operation."""
         previous_trace: Trace | None = Scope.get_current_trace()
         previous_span: Span[Any] | None = Scope.get_current_span()
@@ -452,7 +452,9 @@ class _ContextPropagationWorkflowOutboundInterceptor(
         input: _InputWithHeaders,
         span_name: str,
         data: dict[str, Any],
-    ) -> Iterator[tuple[contextvars.Context, Callable[[asyncio.Future[Any]], None]]]:
+    ) -> Generator[
+        tuple[contextvars.Context, Callable[[asyncio.Future[Any]], None]], None, None
+    ]:
         context: contextvars.Context = contextvars.copy_context()
         span_scope: AbstractContextManager[None] = self.root().maybe_span(
             span_name=span_name, data=data

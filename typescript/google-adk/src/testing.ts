@@ -9,6 +9,11 @@
  *     '@temporalio/google-adk/testing';
  */
 
+// Side-effect import, first: answers ADK's undeclared `uuid` import before
+// this entry reaches `@google/adk`.
+// eslint-disable-next-line import/no-unassigned-import
+import './adk-uuid-resolution';
+
 import type { FunctionDeclaration } from '@google/genai';
 import {
   BaseLlm,

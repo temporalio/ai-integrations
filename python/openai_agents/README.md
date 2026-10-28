@@ -801,10 +801,29 @@ Certain tools are not suitable for a distributed computing environment, so these
 
 ### Model Providers
 
-| Model Provider | Supported |
-| :------------- | :-------: |
-| OpenAI         |    Yes    |
-| LiteLLM        |    Yes    |
+| Model Provider                                              | Supported |
+| :---------------------------------------------------------- | :-------: |
+| OpenAI                                                      |    Yes    |
+| LiteLLM                                                     |    Yes    |
+| Any OpenAI-compatible API, through a custom `ModelProvider` |    Yes    |
+
+Pass a custom provider with `OpenAIAgentsPlugin(model_provider=...)`. When an agent names no
+model, the provider's `get_model(None)` chooses it. The Agents SDK gives such an agent the
+default settings for the SDK's own default model, which include a reasoning effort and
+`verbosity`; the model activity replaces them with the SDK's defaults for the model the
+provider resolved, as the SDK itself does for a named model, so an endpoint that rejects
+unknown fields never sees them. The workflow decides whether the settings were those
+implicit defaults, so an activity worker with a different `OPENAI_DEFAULT_MODEL` gets the
+same result, and `RunConfig.model_settings` is re-applied after the replacement. Settings
+the agent sets explicitly are sent unchanged.
+
+Model calls run in an Activity on the Worker, so they use the provider set on the Worker with
+`OpenAIAgentsPlugin(model_provider=...)`. To use several providers, set a `MultiProvider` with a
+prefix map there and choose a provider by model name. A Workflow cannot set its own provider:
+`Runner.run` raises `ValueError` when `RunConfig.model_provider` is anything other than the default.
+A run that started on an earlier version and already passed its own provider keeps using the
+Worker's provider, so that it replays; a run that passes one for the first time after the upgrade
+gets the error.
 
 ### Model Response format
 
