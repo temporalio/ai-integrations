@@ -162,8 +162,6 @@ def _coerce_run_config(value: object) -> RunConfig:
     return RunConfig(**value)
 
 
-_LIST_INPUT_ITERATORS_PATCH = "openai_agents.list-input-iterators"
-
 # The iterator type pydantic decodes ``Iterable`` fields to. It cannot be
 # copied, and pydantic_core does not export it.
 _DecodedIterator: type[Iterable[Any]] = type(
@@ -202,13 +200,9 @@ def _make_input_copyable(input: object) -> None:
     input of every run and cannot copy them, so the run raised ``TypeError``.
     The items are rebuilt in place, so the caller's copy does not keep a used
     iterator. Other iterators, which the framework can copy, are left as they
-    are. Runs that started before this change keep the old behavior.
+    are.
     """
-    if (
-        isinstance(input, list)
-        and _has_decoded_iterator(input)
-        and workflow.patched(_LIST_INPUT_ITERATORS_PATCH)
-    ):
+    if isinstance(input, list) and _has_decoded_iterator(input):
         _list_decoded_iterators(input)
 
 
