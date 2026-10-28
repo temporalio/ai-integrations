@@ -249,6 +249,26 @@ class ActivityWeatherClass:
         )
 
 
+@activity.defn
+class ActivityWeatherStaticCall:
+    @staticmethod
+    async def __call__(city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Foggy")
+
+
+@activity.defn
+class ActivityWeatherClassMethodCall:
+    @classmethod
+    async def __call__(cls, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Windy")
+
+
 @nexusrpc.service
 class WeatherService:
     get_weather_nexus_operation: nexusrpc.Operation[WeatherInput, Weather]
@@ -306,6 +326,18 @@ def weather_mock_model():
                 call_id="call-get-weather-class",
                 item_id="item-get-weather-class",
             ),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo"}',
+                "ActivityWeatherStaticCall",
+                call_id="call-get-weather-static-call",
+                item_id="item-get-weather-static-call",
+            ),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo"}',
+                "ActivityWeatherClassMethodCall",
+                call_id="call-get-weather-class-method-call",
+                item_id="item-get-weather-class-method-call",
+            ),
             ResponseBuilders.output_message("Test weather result"),
         ]
     )
@@ -348,6 +380,14 @@ class ToolsWorkflow:
                 ),
                 openai_agents.workflow.activity_as_tool(
                     ActivityWeatherClass,
+                    start_to_close_timeout=timedelta(seconds=10),
+                ),
+                openai_agents.workflow.activity_as_tool(
+                    ActivityWeatherStaticCall,
+                    start_to_close_timeout=timedelta(seconds=10),
+                ),
+                openai_agents.workflow.activity_as_tool(
+                    ActivityWeatherClassMethodCall,
                     start_to_close_timeout=timedelta(seconds=10),
                 ),
                 openai_agents.workflow.activity_as_tool(
@@ -403,6 +443,8 @@ async def test_tool_workflow(client: Client):
                 get_weather_context,
                 ActivityWeatherService().get_weather_method,
                 ActivityWeatherClass("Cloudy"),
+                ActivityWeatherStaticCall(),
+                ActivityWeatherClassMethodCall(),
             ],
         ) as worker:
             workflow_handle = await client.start_workflow(
@@ -417,19 +459,23 @@ async def test_tool_workflow(client: Client):
             assert result == "Test weather result"
 
             events = []
-            class_activity_inputs = []
+            class_activity_inputs: dict[str, list[str]] = {}
             async for e in workflow_handle.fetch_history_events():
                 if e.HasField("activity_task_completed_event_attributes"):
                     events.append(e)
                 attrs = e.activity_task_scheduled_event_attributes
-                if attrs.activity_type.name == "ActivityWeatherClass":
-                    class_activity_inputs.append(
-                        [p.data.decode() for p in attrs.input.payloads]
-                    )
+                if attrs.activity_type.name.startswith("ActivityWeather"):
+                    class_activity_inputs[attrs.activity_type.name] = [
+                        p.data.decode() for p in attrs.input.payloads
+                    ]
 
-            # The callable class's __call__ gets the model's arguments, not its constructor.
-            assert class_activity_inputs == [['"Tokyo"']]
-            assert len(events) == 13
+            # Each callable class's __call__ gets the model's arguments, not its constructor.
+            assert class_activity_inputs == {
+                "ActivityWeatherClass": ['"Tokyo"'],
+                "ActivityWeatherStaticCall": ['"Tokyo"'],
+                "ActivityWeatherClassMethodCall": ['"Tokyo"'],
+            }
+            assert len(events) == 17
             assert (
                 "function_call"
                 in events[0]
@@ -503,8 +549,32 @@ async def test_tool_workflow(client: Client):
                 .data.decode()
             )
             assert (
-                "Test weather result"
+                "function_call"
                 in events[12]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Foggy"
+                in events[13]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "function_call"
+                in events[14]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Windy"
+                in events[15]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Test weather result"
+                in events[16]
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
             )

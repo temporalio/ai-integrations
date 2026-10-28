@@ -175,7 +175,11 @@ def activity_as_tool(
     if inspect.isclass(fn):
         # Workflow code references a callable-class activity by its class, but the worker's
         # registered instance runs __call__, so build the tool from __call__ without `self`.
-        call = functools.partial(fn.__call__, None)
+        # A static or class __call__ has no `self` to drop.
+        if inspect.isfunction(inspect.getattr_static(fn, "__call__")):
+            call = functools.partial(fn.__call__, None)
+        else:
+            call = functools.partial(fn.__call__)
         setattr(call, "__name__", fn.__name__)
         # A partial has no module globals, so resolve postponed annotations against __call__'s.
         call.__annotations__ = typing.get_type_hints(fn.__call__, include_extras=True)
