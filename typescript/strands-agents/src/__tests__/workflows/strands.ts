@@ -3,6 +3,7 @@ import '../../load-polyfills';
 import { z } from 'zod';
 import {
   AfterToolCallEvent,
+  SlidingWindowConversationManager,
   tool,
   type InterruptResponseContent,
   type InterruptResponseContentData,
@@ -15,6 +16,23 @@ export async function helloAgent(prompt: string): Promise<string> {
   const agent = new TemporalAgent({ model: 'test', printer: false });
   const result = await agent.invoke(prompt);
   return result.toString();
+}
+
+/**
+ * Runs each prompt as a turn of one agent with Strands' proactive compression, then returns the
+ * model id and context window the agent's model reports in workflow code.
+ */
+export async function compressionAgent(prompts: string[]): Promise<{ modelId?: string; contextWindowLimit?: number }> {
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    conversationManager: new SlidingWindowConversationManager({ proactiveCompression: true }),
+  });
+  for (const prompt of prompts) {
+    await agent.invoke(prompt);
+  }
+  const { modelId, contextWindowLimit } = agent.model.getConfig();
+  return { modelId, contextWindowLimit };
 }
 
 /**

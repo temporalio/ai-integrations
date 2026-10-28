@@ -49,6 +49,23 @@ class _StreamingInvokeModelInput(_InvokeModelInput):
     streaming_batch_interval_seconds: float = 0.1
 
 
+@dataclass
+class _ModelConfigInput:
+    model_name: str | None
+
+
+@dataclass
+class _ModelConfig:
+    """The Worker model's settings that Strands reads in Workflow code.
+
+    Only these fields cross into History: a provider config can hold
+    credentials or clients.
+    """
+
+    model_id: str | None = None
+    context_window_limit: int | None = None
+
+
 class ModelActivity:
     """Holds the registered model factories and exposes the model activities."""
 
@@ -85,6 +102,22 @@ class ModelActivity:
                 )
             self._models[name] = self._factories[name]()
         return self._models[name]
+
+    @activity.defn(name="strands_get_model_config")
+    async def get_model_config(self, input: _ModelConfigInput) -> _ModelConfig:
+        """Return the named model's id and context window limit."""
+        model = self._get_model(input.model_name)
+        config = model.get_config()
+        model_id = (
+            config.get("model_id")
+            if isinstance(config, dict)
+            else getattr(config, "model_id", None)
+        )
+        limit = model.context_window_limit
+        return _ModelConfig(
+            model_id=model_id if isinstance(model_id, str) else None,
+            context_window_limit=limit if isinstance(limit, int) else None,
+        )
 
     @activity.defn
     @auto_heartbeater

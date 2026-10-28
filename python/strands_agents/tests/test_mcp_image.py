@@ -108,6 +108,7 @@ async def test_mcp_image_tool_result(client: Client, tmp_path: Path):
 
     history = await handle.fetch_history()
     assert get_activities(history) == [
+        "strands_get_model_config",
         "image-list-tools",
         "invoke_model",
         "image-call-tool",
