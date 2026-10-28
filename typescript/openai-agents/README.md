@@ -323,6 +323,22 @@ const agent = new Agent({
 
 The generic type is compile-time only. At runtime the Activity is invoked by name through `proxyActivities`.
 
+The Activity gets the model's arguments as one object. For an Activity whose parameter is a string, number or other scalar, such as `greet(name: string)`, set `inputProperty` to the property whose value it should get:
+
+```ts
+const greetTool = activityAsTool<typeof activities.greet>({
+  name: 'greet',
+  description: 'Greet a person by name',
+  parameters: {
+    type: 'object',
+    properties: { name: { type: 'string' } },
+    required: ['name'],
+    additionalProperties: false,
+  },
+  inputProperty: 'name',
+});
+```
+
 ### Inline and hosted tools
 
 For deterministic computation, use `tool()` from `@openai/agents-core` directly. Inline tools run in the Workflow sandbox and must not perform I/O, consume nondeterministic randomness, or read wall-clock time beyond Temporal's deterministic replacements.

@@ -3,6 +3,7 @@
 import { setTracingDisabled } from '@openai/agents-core';
 import type { MCPServer } from '@openai/agents-core';
 import { WorkflowClient } from '@temporalio/client';
+import type { ApplicationFailure } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
@@ -12,7 +13,9 @@ import {
   StatefulMCPServerProvider,
   StatelessMCPServerProvider,
 } from '..';
+import { activityAsTool } from '../workflow';
 import {
+  activityToolInputPropertyWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   summaryOverrideStringWorkflow,
@@ -98,6 +101,44 @@ test('Local activity mode uses local activities for model calls', async (t) => {
     );
     t.is(modelActivities.length, 0, `Expected no regular invokeModelActivity, got ${modelActivities.length}`);
   });
+});
+
+test('activityAsTool inputProperty gives a scalar Activity one property of the arguments', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+
+  const received: unknown[][] = [];
+  const worker = await createWorker({
+    activities: {
+      async greet(...args: unknown[]): Promise<string> {
+        received.push(args);
+        return `Hello, ${args[0]}!`;
+      },
+    },
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([toolCallResponse('greet', { name: 'Ada' }), textResponse('Done')]),
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(activityToolInputPropertyWorkflow, {
+      args: ['Greet Ada.'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    t.is(await handle.result(), 'Done');
+  });
+  t.deepEqual(received, [['Ada']]);
+
+  const err = t.throws(() =>
+    activityAsTool({
+      name: 'greet',
+      description: '',
+      parameters: { type: 'object', properties: { name: { type: 'string' } } },
+      inputProperty: 'nmae',
+    })
+  ) as ApplicationFailure;
+  t.is(err.type, 'AgentsWorkflowError');
 });
 
 function* mcpFactoryArgGenerator() {
