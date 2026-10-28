@@ -87,7 +87,8 @@ class ToolActivityInput:
     tool_call_id: str
     args: dict[str, Any]
     config: dict[str, Any] = dataclasses.field(default_factory=dict)
-    # The path and class name of each LangChain message in ``args``, from
+    # The path and class name of each LangChain message, ``Document`` or
+    # ``tool_arg_types`` value in ``args``, from
     # ``_serde.find_tool_arg_messages``. Input from older workflow code lacks it
     # and passes through unchanged.
     arg_messages: list[tuple[list[str | int], str]] = dataclasses.field(
