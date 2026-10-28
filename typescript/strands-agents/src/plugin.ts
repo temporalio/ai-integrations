@@ -5,7 +5,8 @@ import { msOptionalToNumber } from '@temporalio/common/lib/time';
 import type { BundleOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
 import { ModelActivity } from './model-activity';
-import type { InvokeModelInput, InvokeModelStreamingInput } from './model-activity';
+import type { GetModelConfigInput, InvokeModelInput, InvokeModelStreamingInput } from './model-activity';
+import { GET_MODEL_CONFIG_ACTIVITY } from './temporal-model';
 import {
   buildCallToolActivity,
   buildListToolsActivity,
@@ -78,6 +79,7 @@ export class StrandsPlugin extends SimplePlugin {
     const activities: Record<string, (...args: never[]) => unknown> = {
       invokeModel: (input: InvokeModelInput) => modelActivity.invokeModel(input),
       invokeModelStreaming: (input: InvokeModelStreamingInput) => modelActivity.invokeModelStreaming(input),
+      [GET_MODEL_CONFIG_ACTIVITY]: (input: GetModelConfigInput) => modelActivity.getModelConfig(input),
     };
 
     const mcpClients = options.mcpClients ?? {};
