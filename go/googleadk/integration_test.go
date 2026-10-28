@@ -36,12 +36,29 @@ const integrationTaskQueue = "google-adk-integration"
 
 // devServerState remembers the first StartDevServer outcome. The first start
 // also downloads the CLI, which can take over 30s on slow runners and is not
-// cached when it fails, so it gets a longer deadline and one retry; if both
-// fail, every dev-server test fails fast instead of re-downloading.
+// cached when it fails, so it gets a longer deadline. Each startup gets three
+// attempts; if the first startup exhausts them, later tests fail fast.
 var devServerState struct {
 	sync.Mutex
 	attempted bool
 	err       error
+}
+
+// startDevServerWithRetry makes up to three startup attempts, one second apart.
+// Cancellation propagates immediately; panics are not recovered.
+func startDevServerWithRetry(start func() (*testsuite.DevServer, error)) (*testsuite.DevServer, error) {
+	var err error
+	for attempt := 1; ; attempt++ {
+		srv, startErr := start()
+		if startErr == nil {
+			return srv, nil
+		}
+		err = errors.Join(err, fmt.Errorf("attempt %d: %w", attempt, startErr))
+		if attempt >= 3 || errors.Is(startErr, context.Canceled) {
+			return nil, err
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 // devServer starts a local Temporal dev server and fails the test if one cannot
@@ -53,9 +70,9 @@ func devServer(t *testing.T) (client.Client, func()) {
 	if devServerState.err != nil {
 		t.Fatalf("dev server unavailable, see the first dev-server test failure: %v", devServerState.err)
 	}
-	attempts, timeout := 1, 30*time.Second
+	timeout := 30 * time.Second
 	if !devServerState.attempted {
-		attempts, timeout = 2, 90*time.Second
+		timeout = 90 * time.Second
 	}
 	// Redirect the dev-server process's stdio to io.Discard rather than letting it
 	// inherit the test binary's os.Stdout/os.Stderr (testsuite's default on every
@@ -67,19 +84,11 @@ func devServer(t *testing.T) (client.Client, func()) {
 	// check and failing the package even though every test passed. Detaching its
 	// stdio makes that harmless (and the CI runner reaps the orphan on job exit).
 	opts := testsuite.DevServerOptions{Stdout: io.Discard, Stderr: io.Discard}
-	var srv *testsuite.DevServer
-	var err error
-	for attempt := 1; attempt <= attempts; attempt++ {
+	srv, err := startDevServerWithRetry(func() (*testsuite.DevServer, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		var startErr error
-		srv, startErr = testsuite.StartDevServer(ctx, opts)
-		cancel()
-		if startErr == nil {
-			err = nil
-			break
-		}
-		err = errors.Join(err, fmt.Errorf("attempt %d: %w", attempt, startErr))
-	}
+		defer cancel()
+		return testsuite.StartDevServer(ctx, opts)
+	})
 	if !devServerState.attempted {
 		devServerState.attempted, devServerState.err = true, err
 	}

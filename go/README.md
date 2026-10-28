@@ -29,7 +29,8 @@ failures are tracked in a `nightly` issue for the plugin.
 
 Tests must not require provider credentials. Use deterministic local models,
 mock transports or in-process servers. Tests that need Temporal start a local
-dev server and may download the Temporal CLI on first use.
+dev server and may download the Temporal CLI on first use. Server startup gets
+three attempts with one-second delays; cancellation propagates immediately.
 
 Repository conventions are in
 [`AGENTS.md`](../AGENTS.md).

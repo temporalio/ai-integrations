@@ -2,14 +2,10 @@ import { mock } from 'node:test';
 import test from 'ava';
 import { startLocalWithRetry } from './helpers/environment';
 
-const STARTUP_TIMEOUT =
-  'Failed to start ephemeral server: ephemeral server at 127.0.0.1:49225 did not start within 5s. ' +
-  "Make sure another download isn't stuck and delete the temp file.: Server connection error: Connection refused";
-
 test.afterEach.always(() => mock.reset());
 
-for (const timeouts of [0, 1, 2]) {
-  test.serial(`local server starts after ${timeouts} startup timeouts`, async (t) => {
+for (const failures of [0, 1, 2]) {
+  test.serial(`local server starts after ${failures} setup failures`, async (t) => {
     const environment = {};
     // Configuration stays opaque to the retry policy, just as in the Python helper.
     const options = {
@@ -18,43 +14,58 @@ for (const timeouts of [0, 1, 2]) {
     };
     let attempts = 0;
     const start = mock.fn(async (_options: typeof options) => {
-      if (attempts++ < timeouts) throw new Error(STARTUP_TIMEOUT);
+      if (attempts++ < failures) throw new TypeError('server setup failed');
       return environment;
     });
-    mock.method(console, 'warn', () => undefined);
+    const warn = mock.method(console, 'warn', () => undefined);
 
     t.is(await startLocalWithRetry(() => start(options)), environment);
-    t.is(start.mock.callCount(), timeouts + 1);
+    t.is(start.mock.callCount(), failures + 1);
+    t.is(warn.mock.callCount(), failures);
     for (const call of start.mock.calls) {
       t.is(call.arguments[0], options);
     }
   });
 }
 
-test.serial('local server startup stops after three timeouts', async (t) => {
-  const error = new Error(STARTUP_TIMEOUT);
+test.serial('different startup errors share the three-attempt limit', async (t) => {
+  const error = new Error('server startup failed');
+  const errors = [new Error('download failed'), new TypeError('invalid archive'), error];
+  let attempt = 0;
   const start = mock.fn(async () => {
-    throw error;
+    throw errors[attempt++];
   });
-  mock.method(console, 'warn', () => undefined);
+  const warn = mock.method(console, 'warn', () => undefined);
 
   t.is(await t.throwsAsync(startLocalWithRetry(start)), error);
   t.is(start.mock.callCount(), 3);
+  t.is(warn.mock.callCount(), 2);
 });
 
-for (const [name, error] of [
-  ['invalid configuration', new Error('Failed to start ephemeral server: invalid configuration')],
-  ['download failure', new Error('Failed to start ephemeral server: download failed')],
-  ['connection failure', new Error('Failed to start ephemeral server: Connection refused')],
-  ['unrelated timeout', new Error('request did not start within 5s.')],
-  ['cancellation', new DOMException('Cancelled', 'AbortError')],
-] as const) {
-  test.serial(`local server startup does not retry ${name}`, async (t) => {
+test.serial('local server startup retries non-Error rejections', async (t) => {
+  const error = { message: 'server setup failed' };
+  const start = mock.fn(async () => {
+    throw error;
+  });
+  const warn = mock.method(console, 'warn', () => undefined);
+
+  t.is(await startLocalWithRetry(start).catch((caught: unknown) => caught), error);
+  t.is(start.mock.callCount(), 3);
+  t.is(warn.mock.callCount(), 2);
+});
+
+for (const error of [
+  new DOMException('Cancelled', 'AbortError'),
+  Object.assign(new Error('Cancelled'), { name: 'AbortError' }),
+]) {
+  test.serial(`local server startup does not retry cancellation from ${error.constructor.name}`, async (t) => {
     const start = mock.fn(async () => {
       throw error;
     });
+    const warn = mock.method(console, 'warn', () => undefined);
 
     t.is(await t.throwsAsync(startLocalWithRetry(start)), error);
     t.is(start.mock.callCount(), 1);
+    t.is(warn.mock.callCount(), 0);
   });
 }
