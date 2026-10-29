@@ -1,6 +1,7 @@
-import { type Agent, Handoff, MemorySession, type Tool } from '@openai/agents-core';
+import { Agent, Handoff, MemorySession, type RunContext, type Tool } from '@openai/agents-core';
 import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
+import { inWorkflowContext } from '@temporalio/workflow';
 import { type AgentToolRecord, getAgentToolRecord, isUnrecordedAgentTool } from './agent-tools';
 import { validateTemporalSandboxClient } from './sandbox-client';
 
@@ -35,6 +36,47 @@ function checkTool(
   modelOverride: string | undefined,
   seen: Set<Agent<any, any>>
 ): void {
+  const record = checkToolOptions(tool, owner);
+  if (record === undefined) return;
+  const nestedModel = typeof record.runConfig?.model === 'string' ? record.runConfig.model : modelOverride;
+  checkAgent(record.agent, nestedModel, seen);
+}
+
+interface RunningAgentCheckState {
+  original: Agent<any, any>['getSystemPrompt'];
+}
+
+const runningAgentCheckState = Symbol.for('@temporalio/openai-agents/runningAgentCheck');
+
+/**
+ * Checks each agent again just before it calls its model, in the Workflow: an agent that a custom
+ * `Handoff`'s callback returns, or that an `agent.on(...)` listener changes, isn't in the graph
+ * `checkAgent` sees before the run. Upstream calls `getSystemPrompt` once per model call, after it
+ * picks the model and before it calls it, so the wrapper rejects a `Model` object and unsafe
+ * `asTool()` tools there. The agents behind those tools are checked when they run.
+ */
+export function installRunningAgentCheck(): void {
+  const prototype = Agent.prototype as unknown as Record<symbol, RunningAgentCheckState | undefined>;
+  if (prototype[runningAgentCheckState] !== undefined) return;
+  const state: RunningAgentCheckState = { original: Agent.prototype.getSystemPrompt };
+  function getSystemPrompt(this: Agent<any, any>, runContext: RunContext<any>): Promise<string | undefined> {
+    if (inWorkflowContext()) {
+      rejectModelObject(this);
+      for (const tool of this.tools ?? []) checkToolOptions(tool, this);
+    }
+    return state.original.call(this, runContext);
+  }
+  Object.defineProperty(Agent.prototype, runningAgentCheckState, { value: state });
+  Agent.prototype.getSystemPrompt = getSystemPrompt;
+}
+
+installRunningAgentCheck();
+
+/**
+ * Rejects a raw function, an unrecorded `asTool()` tool, and `asTool()` options that would run in the
+ * Workflow. Returns the record of an `asTool()` tool, so the caller can check its agent.
+ */
+function checkToolOptions(tool: Tool<any>, owner: Agent<any, any>): AgentToolRecord | undefined {
   // Reject raw functions: authoring mistake — use tool() or activityAsTool().
   if (typeof tool === 'function') {
     throw ApplicationFailure.create({
@@ -58,11 +100,10 @@ function checkTool(
         nonRetryable: true,
       });
     }
-    return;
+    return undefined;
   }
   checkAgentToolOptions(record, tool.name);
-  const nestedModel = typeof record.runConfig?.model === 'string' ? record.runConfig.model : modelOverride;
-  checkAgent(record.agent, nestedModel, seen);
+  return record;
 }
 
 function rejectModelObject(agent: Agent<any, any>): void {

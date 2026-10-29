@@ -19,6 +19,7 @@ import {
 } from '@openai/agents-core';
 import { SandboxAgent, type SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
+import { CancellationScope } from '@temporalio/workflow';
 import {
   DEFAULT_MODEL_ACTIVITY_OPTIONS,
   STREAMING_LOCAL_ACTIVITY_UNSUPPORTED,
@@ -275,14 +276,28 @@ export class TemporalOpenAIRunner {
       tracing: options?.tracing,
     };
 
+    // A tool can turn a CancelledFailure into its output: upstream `asTool()` returns a nested run's
+    // failure to the parent model. A run that then ends on that output, for example with
+    // `toolUseBehavior: 'stop_on_first_tool'`, must not complete when its scope was cancelled.
+    const scope = CancellationScope.current();
     try {
       if (options?.stream === true) {
-        return (await innerRunner.run(agent, preparedInput as any, {
+        const streamed = (await innerRunner.run(agent, preparedInput as any, {
           ...sharedRunOptions,
           stream: true,
         })) as StreamedRunResult<TContext, TAgent>;
+        // Upstream's stream loop ends through these internal methods, which its typings omit.
+        const completion = streamed as unknown as { _done(): void; _raiseError(error: unknown): void };
+        const done = completion._done.bind(streamed);
+        completion._done = () => {
+          if (!scope.consideredCancelled) return done();
+          scope.cancelRequested.then(done, (cancellation) => completion._raiseError(cancellation));
+        };
+        return streamed;
       }
-      return (await innerRunner.run(agent, preparedInput as any, sharedRunOptions)) as RunResult<any, TAgent>;
+      const result = (await innerRunner.run(agent, preparedInput as any, sharedRunOptions)) as RunResult<any, TAgent>;
+      if (scope.consideredCancelled) await scope.cancelRequested;
+      return result;
     } catch (error) {
       throw normalizeAgentsRunError(error);
     } finally {

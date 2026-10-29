@@ -99,6 +99,7 @@ Differences from the upstream runner:
 
 - `runConfig.model` must be a model name string. The Worker's `modelProvider` resolves it inside the model Activity. As upstream, it applies to agents that set no model of their own.
 - `signal` is not supported. Use Temporal cancellation APIs, such as `CancellationScope`, to cancel Workflow work.
+- If the cancellation scope `run()` started in is cancelled, `run()` throws the `CancelledFailure`, and a streamed run fails with it, even if the run ended on a tool's output. As upstream, an `agent.asTool()` tool returns a nested run's failure, including a cancelled model Activity, as its output, and with `toolUseBehavior: 'stop_on_first_tool'` the run ends on that output.
 
 ### Run state and approvals
 
@@ -425,6 +426,8 @@ The runner rejects nested setups that would run model calls or sandbox operation
 - `asTool({ runConfig: { modelProvider } })`, or a `Model` object as `runConfig.model`;
 - a `runConfig.sandbox` or `runOptions.sandbox` whose client isn't from `temporalSandboxClient(name)`;
 - a `MemorySession` as `runOptions.session`.
+
+The runner also checks each agent just before it calls its model. This covers agents the check before the run can't see: one that a custom `Handoff`'s callback returns, or one that an `agent.on(...)` listener changes. Its model must be a name, and its `asTool()` tools must pass the checks above. In the outer run, the run fails. In a nested run, the error goes back to the parent model as the tool's output, and the model isn't called. The check wraps `Agent.prototype.getSystemPrompt`, which the framework calls once per model call, so an `Agent` subclass that overrides it must call `super.getSystemPrompt()`.
 
 ## MCP servers
 

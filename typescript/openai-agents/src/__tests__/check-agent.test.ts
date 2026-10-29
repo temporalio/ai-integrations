@@ -1,9 +1,9 @@
 import test from 'ava';
-import { Agent, MemorySession, handoff } from '@openai/agents-core';
+import { Agent, MemorySession, RunContext, handoff } from '@openai/agents-core';
 import { SandboxAgent } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import { getAgentToolRecord, installAgentToolInterception } from '../workflow/agent-tools';
-import { checkAgent } from '../workflow/check-agent';
+import { checkAgent, installRunningAgentCheck } from '../workflow/check-agent';
 import { temporalSandboxClient } from '../workflow/sandbox-client';
 
 test('checkAgent: raw function in tools throws AgentsWorkflowError', (t) => {
@@ -78,6 +78,15 @@ test('installAgentToolInterception: records tools of Agent subclasses with the o
   (options as any).runConfig = { modelProvider: {} };
   t.is(record?.agent, agent);
   t.is(record?.runConfig, runConfig);
+});
+
+test('installRunningAgentCheck: installing again keeps one wrapper, which checks nothing outside a Workflow', async (t) => {
+  const getSystemPrompt = Agent.prototype.getSystemPrompt;
+  installRunningAgentCheck();
+  t.is(Agent.prototype.getSystemPrompt, getSystemPrompt);
+  const fakeModel = { getResponse: async () => ({}) as any, async *getStreamedResponse() {} };
+  const agent = new Agent({ name: 'X', instructions: 'Answer.', model: fakeModel as any });
+  t.is(await agent.getSystemPrompt(new RunContext()), 'Answer.');
 });
 
 test('checkAgent: asTool() agents and their own tools are checked, and nothing is changed', (t) => {

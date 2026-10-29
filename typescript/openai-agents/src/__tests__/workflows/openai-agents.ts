@@ -194,6 +194,87 @@ export async function agentToolRejectedWorkflow(kind: AgentToolRejection): Promi
   }
 }
 
+export type RunningAgentRejection =
+  | 'handoff-callback-model-object'
+  | 'handoff-callback-model-provider'
+  | 'agent-start-model-object'
+  | 'nested-agent-start-model-object';
+
+/**
+ * An agent the run reaches only as it goes, through a custom `Handoff`'s callback or an `agent_start`
+ * listener, with a `Model` object or an `asTool()` tool that would call a model in the Workflow.
+ * Returns the run's failure, or its output when a nested run's failure became the tool's output.
+ */
+export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection): Promise<string> {
+  const inlineModel: Model = {
+    async getResponse() {
+      throw new Error('the inline model ran in the Workflow');
+    },
+    // eslint-disable-next-line require-yield
+    async *getStreamedResponse() {
+      throw new Error('the inline model ran in the Workflow');
+    },
+  };
+  const declared = new Agent({ name: 'Declared', instructions: 'Answer as declared.', model: 'declared-model' });
+  const nested = new Agent({ name: 'Nested', instructions: 'Answer as nested.', model: 'nested-model' });
+  let lead: Agent<any, any>;
+  if (kind === 'handoff-callback-model-object' || kind === 'handoff-callback-model-provider') {
+    const picked =
+      kind === 'handoff-callback-model-object'
+        ? new Agent({ name: 'Picked', model: inlineModel })
+        : new Agent({
+            name: 'Picked',
+            model: 'picked-model',
+            tools: [
+              nested.asTool({ toolName: 'ask_nested', runConfig: { modelProvider: { getModel: () => inlineModel } } }),
+            ],
+          });
+    const desk = new Handoff(declared, async () => picked);
+    desk.toolName = 'transfer_to_desk';
+    lead = new Agent({ name: 'Lead', instructions: 'Route.', model: 'lead-model', handoffs: [desk] });
+  } else if (kind === 'agent-start-model-object') {
+    lead = new Agent({ name: 'Lead', instructions: 'Route.', model: 'lead-model' });
+    lead.on('agent_start', () => (lead.model = inlineModel));
+  } else {
+    nested.on('agent_start', () => (nested.model = inlineModel));
+    lead = new Agent({
+      name: 'Lead',
+      instructions: 'Use the tool.',
+      model: 'lead-model',
+      tools: [nested.asTool({ toolName: 'ask_nested' })],
+      toolUseBehavior: 'stop_on_first_tool',
+    });
+  }
+  try {
+    return (await new TemporalOpenAIRunner().run(lead, 'go')).finalOutput ?? '';
+  } catch (err: unknown) {
+    if (err instanceof ApplicationFailure) return `${err.type}: ${err.message}`;
+    throw err;
+  }
+}
+
+/**
+ * The lead calls `Nested` through `asTool()`. With `stopOnFirstTool`, the run ends on the tool's
+ * output, so a cancellation that `asTool()` returned as text would otherwise complete the run.
+ */
+export async function nestedToolCancelWorkflow(input: { stopOnFirstTool: boolean; stream: boolean }): Promise<string> {
+  new WorkflowStream();
+  const nested = new Agent({ name: 'Nested', instructions: 'Answer as nested.', model: 'nested-model' });
+  const lead = new Agent({
+    name: 'Lead',
+    instructions: 'Use the tool.',
+    model: 'lead-model',
+    tools: [nested.asTool({ toolName: 'ask_nested' })],
+    toolUseBehavior: input.stopOnFirstTool ? 'stop_on_first_tool' : 'run_llm_again',
+  });
+  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
+  if (!input.stream) return (await runner.run(lead, 'go')).finalOutput ?? '';
+  const result = await runner.run(lead, 'go', { stream: true });
+  for await (const _event of result);
+  await result.completed;
+  return result.finalOutput ?? '';
+}
+
 /**
  * `Nested` is both a handoff target and an `asTool()` source of `Parent`, and pauses on an approval.
  * `legacyTool` stands in for the plugin's former `agentAsTool`, a function tool not linked to an agent.

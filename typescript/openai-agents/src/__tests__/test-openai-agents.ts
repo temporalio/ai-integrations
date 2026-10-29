@@ -3,7 +3,8 @@
 import { setTracingDisabled } from '@openai/agents-core';
 import type { MCPServer, Model, ModelProvider, ModelRequest, ModelResponse, StreamEvent } from '@openai/agents-core';
 import type { ExecutionContext } from 'ava';
-import { WorkflowClient, type WorkflowHandle } from '@temporalio/client';
+import { WorkflowClient, WorkflowFailedError, type WorkflowHandle } from '@temporalio/client';
+import { CancelledFailure } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
 import { helpers, type BaseContext } from '@temporalio/test-helpers';
 import { Worker, bundleWorkflowCode } from '@temporalio/worker';
@@ -26,6 +27,8 @@ import {
   summaryAgentWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
+  nestedToolCancelWorkflow,
+  runningAgentRejectedWorkflow,
   summaryOverrideStringWorkflow,
   statefulMcpNotConnectedWorkflow,
   statefulMcpIsolationWorkflow,
@@ -35,6 +38,7 @@ import {
   streamingLocalActivityWorkflow,
   streamingNoTopicWorkflow,
   type AgentToolRejection,
+  type RunningAgentRejection,
 } from './workflows/openai-agents';
 import { makeTestFunction } from './helpers/test-fn';
 import {
@@ -386,6 +390,116 @@ test('agent.asTool() setups that would run a model or sandbox in the Workflow fa
     }
   });
 });
+
+test('Agents picked or changed during the run are checked before they call their model', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const provider = {
+    getModel() {
+      return {
+        async getResponse(request: any) {
+          if (request.systemInstructions === 'Use the tool.') return toolCallResponse('ask_nested', { input: 'q' });
+          return handoffResponse('transfer_to_desk');
+        },
+      } as unknown as FakeModel;
+    },
+  };
+  const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider: provider })] });
+  // [expected result, model Activities the run schedules]
+  const expected: Record<RunningAgentRejection, [RegExp, number]> = {
+    'handoff-callback-model-object': [/^AgentsWorkflowError: .*Agent 'Picked' has a Model object/, 1],
+    'handoff-callback-model-provider': [
+      /^AgentsWorkflowError: .*asTool\('ask_nested'\) sets runConfig.modelProvider/,
+      1,
+    ],
+    'agent-start-model-object': [/^AgentsWorkflowError: .*Agent 'Lead' has a Model object/, 0],
+    // A nested run's failure is the tool's output, as upstream; the run ends on it.
+    'nested-agent-start-model-object': [
+      /^An error occurred while running the tool.*Agent 'Nested' has a Model object/,
+      1,
+    ],
+  };
+
+  await worker.runUntil(async () => {
+    for (const [kind, [result, modelActivities]] of Object.entries(expected)) {
+      const handle = await startWorkflow(runningAgentRejectedWorkflow, {
+        args: [kind as RunningAgentRejection],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      const output = await handle.result();
+      t.regex(output, result, kind);
+      t.notRegex(output, /the inline model ran/, kind);
+      const { events } = await handle.fetchHistory();
+      const scheduled = (events ?? []).filter((e) => e.activityTaskScheduledEventAttributes != null);
+      t.is(scheduled.length, modelActivities, `${kind}: model Activities`);
+      await replay(t, handle);
+    }
+  });
+});
+
+for (const [title, stopOnFirstTool, stream, expectCancelled] of [
+  ['Cancelling during a nested model call cancels a run that stops on the tool', true, false, true],
+  ['Cancelling during a nested model call cancels a streamed run that stops on the tool', true, true, true],
+  ['Cancelling during a nested model call cancels a run that calls the model again', false, false, true],
+  ['A run that stops on a nested tool completes when not cancelled', true, false, false],
+] as const) {
+  test(title, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    let nestedStarted!: () => void;
+    const nestedCalled = new Promise<void>((resolve) => (nestedStarted = resolve));
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    const provider = {
+      getModel() {
+        return {
+          async getResponse(request: any) {
+            if (request.systemInstructions === 'Answer as nested.') {
+              nestedStarted();
+              if (expectCancelled) await released;
+              return textResponse('nested answer');
+            }
+            const toolAnswered =
+              Array.isArray(request.input) && request.input.some((item: any) => item.type === 'function_call_result');
+            return toolAnswered ? textResponse('lead answer') : toolCallResponse('ask_nested', { input: 'q' });
+          },
+          async *getStreamedResponse() {
+            yield {
+              type: 'response_done',
+              response: {
+                id: 'resp_lead',
+                usage: { requests: 1, inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+                output: toolCallResponse('ask_nested', { input: 'q' }).output,
+              },
+            } as unknown as StreamEvent;
+          },
+        } as unknown as FakeModel;
+      },
+    };
+    const worker = await createWorker({
+      plugins: [new OpenAIAgentsPlugin({ modelProvider: provider, modelParams: { streamingTopic: 'events' } })],
+    });
+
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(nestedToolCancelWorkflow, {
+        args: [{ stopOnFirstTool, stream }],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      if (!expectCancelled) {
+        t.is(await handle.result(), 'nested answer');
+        await replay(t, handle);
+        return;
+      }
+      // If the run ends before its nested model call, the assertions below report how.
+      await Promise.race([nestedCalled, handle.result().catch(() => undefined)]);
+      await handle.cancel();
+      const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+      release();
+      t.true(err?.cause instanceof CancelledFailure, String(err?.cause));
+      const { events } = await handle.fetchHistory();
+      t.is(events?.at(-1)?.eventType, EventType.EVENT_TYPE_WORKFLOW_EXECUTION_CANCELED);
+      await replay(t, handle);
+    });
+  });
+}
 
 for (const [title, legacyFirstRun, nestedCall] of [
   ['a handoff to an agent that is also an asTool() source resumes after continueAsNew', false, 'handoff'],
