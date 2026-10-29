@@ -18,6 +18,7 @@
     }
   },
   "scripts": {
+    "prepare-openai-agents": "node scripts/prepare-openai-agents.mjs",
     "build": "tsc --build tests/helpers tsconfig.json",
     "lint": "pnpm run build && eslint --config ../_shared/eslint.config.mjs src",
     "test": "ava",
@@ -80,11 +81,11 @@
     "web-streams-polyfill": "^4.2.0"
   },
   "peerDependencies": {
-    "@openai/agents-core": "~0.14.3",
-    "@openai/agents-openai": "~0.14.3",
+    "@openai/agents-core": "~0.21.0",
+    "@openai/agents-openai": "~0.21.0",
     "@opentelemetry/sdk-trace-base": "^1.25.1",
     "long": "^5.3.2",
-    "openai": "^6.46.0",
+    "openai": "^7.2.0",
     "protobufjs": "^8.7.1"
   },
   "peerDependenciesMeta": {
@@ -93,8 +94,8 @@
     }
   },
   "devDependencies": {
-    "@openai/agents-core": "~0.14.3",
-    "@openai/agents-openai": "~0.14.3",
+    "@openai/agents-core": "github:openai/openai-agents-js#52fcb5769c74844b198affe377e75fe04b1732a3&path:/packages/agents-core",
+    "@openai/agents-openai": "github:openai/openai-agents-js#52fcb5769c74844b198affe377e75fe04b1732a3&path:/packages/agents-openai",
     "@opentelemetry/core": "^1.25.1",
     "@opentelemetry/sdk-trace-base": "^1.25.1",
     "@opentelemetry/semantic-conventions": "^1.25.1",
@@ -105,7 +106,7 @@
     "ava": "^5.3.1",
     "long": "^5.3.2",
     "nexus-rpc": "^0.0.3",
-    "openai": "^6.46.0",
+    "openai": "^7.2.0",
     "protobufjs": "^8.7.1",
     "@tsconfig/node20": "^20.1.4",
     "@types/node": "^20.19.39",

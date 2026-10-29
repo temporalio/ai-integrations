@@ -730,3 +730,9 @@ Any OpenAI Agents SDK `ModelProvider` can be passed as `modelProvider`. The prov
 | Model override per run  | Supported                | `runConfig.model` accepts a string model name                                                  |
 | Streaming               | Supported (experimental) | `run(agent, input, { stream: true })`; requires `streamingTopic` and a hosted `WorkflowStream` |
 | Voice agents            | Not supported            |                                                                                                |
+
+## Development
+
+Run `make sync` before `make lint`, `make test`, or `make build`. The OpenAI Agents
+development dependencies are pinned to an upstream commit. The first sync builds
+their source using upstream's locked build tools; later syncs reuse the built packages.
