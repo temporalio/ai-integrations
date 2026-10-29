@@ -27,6 +27,8 @@ class State(TypedDict):
     context_type_b: str
     answer: Answer
     answer_type_b: str
+    answers: dict[int, Answer]
+    answers_type_b: str
 
 
 @dataclass
@@ -77,6 +79,7 @@ async def node_a(
         "value": state["value"] + "a" + context_user_id(runtime.context),
         "context_type_a": type(runtime.context).__name__,
         "answer": Answer(value=1),
+        "answers": {1: Answer(value=1)},
     }
 
 
@@ -86,6 +89,7 @@ async def node_b(state: State) -> dict[str, str]:
         "value": state["value"] + "b" + context_user_id(runtime.context),
         "context_type_b": type(runtime.context).__name__,
         "answer_type_b": type(state["answer"]).__name__,
+        "answers_type_b": type(next(iter(state["answers"].values()))).__name__,
     }
 
 
@@ -187,6 +191,8 @@ async def test_two_nodes(
         "context_type_b": expected_context_type,
         "answer": {"value": 1},
         "answer_type_b": "Answer",
+        "answers": {"1": {"value": 1}},
+        "answers_type_b": "Answer",
     }
 
 

@@ -415,3 +415,8 @@ def test_cache_key_reads_values():
     assert cache_key("task", (Tags({"a", "b"}),), {}) == cache_key(
         "task", (Tags({"b", "a"}),), {}
     )
+    # A plain value with the same contents is a different argument.
+    assert cache_key("task", (Tags({"a"}),), {}) != cache_key(
+        "task", ({"names": ["a"]},), {}
+    )
+    assert cache_key("task", ({"a"},), {}) != cache_key("task", (["a"],), {})

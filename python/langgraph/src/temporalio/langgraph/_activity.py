@@ -270,7 +270,7 @@ class ValueTypes:
         if isinstance(value, dict):
             items = {
                 key: self.encode(item, [*path, key], value_types)
-                if isinstance(key, str)
+                if isinstance(key, (str, int)) and not isinstance(key, bool)
                 else item
                 for key, item in value.items()
             }
@@ -301,7 +301,13 @@ class ValueTypes:
             if children:
                 value = dict(value) if isinstance(value, dict) else list(value)
                 for key in children:
-                    value[key] = rebuild(value[key], node[key])
+                    # JSON writes an int key as a string.
+                    found = (
+                        str(key)
+                        if isinstance(value, dict) and key not in value
+                        else key
+                    )
+                    value[found] = rebuild(value[found], node[key])
             if _TYPE_ID in node:
                 value = self._rebuild(node[_TYPE_ID], value, converter)
             return value

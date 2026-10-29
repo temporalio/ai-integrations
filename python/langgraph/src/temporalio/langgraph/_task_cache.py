@@ -61,20 +61,26 @@ def _canonical(value: Any) -> Any:
     """Return a JSON form of ``value`` that is the same in every process.
 
     ``str()`` can depend on set order or object identity, so models,
-    dataclasses and sets get their contents instead.
+    dataclasses and sets give their class and contents instead. The class
+    keeps them apart from a plain dict or list with the same contents.
     """
+    cls = type(value)
     try:
         if isinstance(value, (set, frozenset)):
-            return sorted(
+            contents: Any = sorted(
                 value, key=lambda item: dumps(item, sort_keys=True, default=_canonical)
             )
-        if isinstance(value, BaseModel):
-            return value.model_dump()
-        if dataclasses.is_dataclass(value) and not isinstance(value, type):
-            return dataclasses.asdict(value)
+        elif isinstance(value, BaseModel):
+            contents = dict(value)
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            contents = {
+                f.name: getattr(value, f.name, None) for f in dataclasses.fields(value)
+            }
+        else:
+            return str(value)
     except Exception:
-        pass
-    return str(value)
+        return str(value)
+    return {"__class__": f"{cls.__module__}.{cls.__qualname__}", "__value__": contents}
 
 
 def cache_key(
