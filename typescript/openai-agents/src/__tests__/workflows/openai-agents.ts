@@ -1,4 +1,4 @@
-import { Agent, Handoff, RunState, tool, type Model, type Tool } from '@openai/agents-core';
+import { Agent, Handoff, RunState, tool, type Model, type ModelProvider, type Tool } from '@openai/agents-core';
 import { SandboxAgent } from '@openai/agents-core/sandbox';
 import { ApplicationFailure, continueAsNew } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
@@ -198,11 +198,17 @@ export type RunningAgentRejection =
   | 'handoff-callback-model-object'
   | 'handoff-callback-model-provider'
   | 'agent-start-model-object'
-  | 'nested-agent-start-model-object';
+  | 'nested-agent-start-model-object'
+  | 'tool-start-model-provider'
+  | 'tool-start-run-model-object'
+  | 'input-builder-model-provider'
+  | 'tool-start-run-model-name';
 
 /**
  * An agent the run reaches only as it goes, through a custom `Handoff`'s callback or an `agent_start`
  * listener, with a `Model` object or an `asTool()` tool that would call a model in the Workflow.
+ * The `tool-start-*` and `input-builder-*` kinds change an `asTool()` tool's `runConfig` after the
+ * lead's model call, when the tool is invoked; `tool-start-run-model-name` is the supported control.
  * Returns the run's failure, or its output when a nested run's failure became the tool's output.
  */
 export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection): Promise<string> {
@@ -235,6 +241,41 @@ export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection):
   } else if (kind === 'agent-start-model-object') {
     lead = new Agent({ name: 'Lead', instructions: 'Route.', model: 'lead-model' });
     lead.on('agent_start', () => (lead.model = inlineModel));
+  } else if (
+    kind === 'tool-start-model-provider' ||
+    kind === 'tool-start-run-model-object' ||
+    kind === 'input-builder-model-provider' ||
+    kind === 'tool-start-run-model-name'
+  ) {
+    // The run model reaches `Nested` only through the tool's runConfig, which the changes replace.
+    const modelLess = new Agent({ name: 'Nested', instructions: 'Answer as nested.' });
+    const runConfig: { model?: string | Model; modelProvider?: ModelProvider } = { model: 'nested-run-model' };
+    const change = () => {
+      if (kind === 'tool-start-run-model-object') runConfig.model = inlineModel;
+      else if (kind === 'tool-start-run-model-name') runConfig.model = 'changed-run-model';
+      else runConfig.modelProvider = { getModel: () => inlineModel };
+    };
+    lead = new Agent({
+      name: 'Lead',
+      instructions: 'Use the tool.',
+      model: 'lead-model',
+      tools: [
+        modelLess.asTool({
+          toolName: 'ask_nested',
+          runConfig,
+          ...(kind === 'input-builder-model-provider'
+            ? {
+                inputBuilder: ({ params }: { params: unknown }) => {
+                  change();
+                  return (params as { input: string }).input;
+                },
+              }
+            : {}),
+        }),
+      ],
+      toolUseBehavior: 'stop_on_first_tool',
+    });
+    if (kind !== 'input-builder-model-provider') lead.on('agent_tool_start', change);
   } else {
     nested.on('agent_start', () => (nested.model = inlineModel));
     lead = new Agent({

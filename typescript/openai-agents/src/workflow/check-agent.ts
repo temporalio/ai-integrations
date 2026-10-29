@@ -1,9 +1,7 @@
-import { Agent, Handoff, MemorySession, type RunContext, type Tool } from '@openai/agents-core';
-import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
+import { Agent, Handoff, type RunContext, type Tool } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
 import { inWorkflowContext } from '@temporalio/workflow';
-import { type AgentToolRecord, getAgentToolRecord, isUnrecordedAgentTool } from './agent-tools';
-import { validateTemporalSandboxClient } from './sandbox-client';
+import { type AgentToolRecord, checkAgentToolOptions, getAgentToolRecord, isUnrecordedAgentTool } from './agent-tools';
 
 /**
  * Checks an agent graph before a run, without changing it: the agents reached through handoffs and
@@ -53,7 +51,8 @@ const runningAgentCheckState = Symbol.for('@temporalio/openai-agents/runningAgen
  * `Handoff`'s callback returns, or that an `agent.on(...)` listener changes, isn't in the graph
  * `checkAgent` sees before the run. Upstream calls `getSystemPrompt` once per model call, after it
  * picks the model and before it calls it, so the wrapper rejects a `Model` object and unsafe
- * `asTool()` tools there. The agents behind those tools are checked when they run.
+ * `asTool()` tools there. The agents behind those tools are checked when they run, and the tools'
+ * options again when they are invoked.
  */
 export function installRunningAgentCheck(): void {
   const prototype = Agent.prototype as unknown as Record<symbol, RunningAgentCheckState | undefined>;
@@ -115,44 +114,6 @@ function rejectModelObject(agent: Agent<any, any>): void {
         'In Temporal workflows, all models must be specified as strings — use ' +
         'runConfig.model to override, or declare a string model on the agent.',
       type: 'AgentsWorkflowError',
-      nonRetryable: true,
-    });
-  }
-}
-
-/** Rejects `asTool()` options that would run model calls or sandbox operations in the Workflow. */
-function checkAgentToolOptions({ agent, runConfig, runOptions }: AgentToolRecord, toolName: string): void {
-  const where = `Agent '${agent.name}' asTool('${toolName}')`;
-  if (runConfig?.modelProvider !== undefined) {
-    throw ApplicationFailure.create({
-      message:
-        `${where} sets runConfig.modelProvider. Nested runs must use the runner's provider, which ` +
-        'sends model calls to Activities; set a string runConfig.model instead.',
-      type: 'AgentsWorkflowError',
-      nonRetryable: true,
-    });
-  }
-  if (runConfig?.model !== undefined && typeof runConfig.model !== 'string') {
-    throw ApplicationFailure.create({
-      message:
-        `${where} sets runConfig.model to a Model object. In Temporal workflows, all models must be ` +
-        'specified as strings.',
-      type: 'AgentsWorkflowError',
-      nonRetryable: true,
-    });
-  }
-  for (const [sandbox, field] of [
-    [runConfig?.sandbox, 'runConfig.sandbox'],
-    [runOptions?.sandbox, 'runOptions.sandbox'],
-  ] as [SandboxRunConfig | undefined, string][]) {
-    if (sandbox !== undefined) validateTemporalSandboxClient(sandbox, `${where} ${field}`);
-  }
-  if (runOptions?.session instanceof MemorySession) {
-    throw ApplicationFailure.create({
-      message:
-        `${where} sets runOptions.session to a MemorySession, which is not safe inside a Workflow. ` +
-        'Pass WorkflowSafeMemorySession from @temporalio/openai-agents/workflow.',
-      type: 'UnsafeSessionError',
       nonRetryable: true,
     });
   }

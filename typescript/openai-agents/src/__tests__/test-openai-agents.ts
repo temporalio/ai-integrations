@@ -393,11 +393,14 @@ test('agent.asTool() setups that would run a model or sandbox in the Workflow fa
 
 test('Agents picked or changed during the run are checked before they call their model', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
+  const models: string[] = [];
   const provider = {
-    getModel() {
+    getModel(model: string) {
+      models.push(model);
       return {
         async getResponse(request: any) {
           if (request.systemInstructions === 'Use the tool.') return toolCallResponse('ask_nested', { input: 'q' });
+          if (request.systemInstructions === 'Answer as nested.') return textResponse('nested answer');
           return handoffResponse('transfer_to_desk');
         },
       } as unknown as FakeModel;
@@ -417,6 +420,18 @@ test('Agents picked or changed during the run are checked before they call their
       /^An error occurred while running the tool.*Agent 'Nested' has a Model object/,
       1,
     ],
+    // The tool checks its options again when it is invoked, after the lead's model call.
+    'tool-start-model-provider': [/^AgentsWorkflowError: .*asTool\('ask_nested'\) sets runConfig.modelProvider/, 1],
+    'tool-start-run-model-object': [
+      /^AgentsWorkflowError: .*asTool\('ask_nested'\) sets runConfig.model to a Model object/,
+      1,
+    ],
+    // inputBuilder runs inside the tool, so upstream returns its failure as the tool's output.
+    'input-builder-model-provider': [
+      /^An error occurred while running the tool.*asTool\('ask_nested'\) sets runConfig.modelProvider/,
+      1,
+    ],
+    'tool-start-run-model-name': [/^nested answer$/, 2],
   };
 
   await worker.runUntil(async () => {
@@ -434,6 +449,9 @@ test('Agents picked or changed during the run are checked before they call their
       await replay(t, handle);
     }
   });
+  // The control's change to the tool's runConfig.model reaches the nested model Activity.
+  t.true(models.includes('changed-run-model'), models.join(', '));
+  t.false(models.includes('nested-run-model'), models.join(', '));
 });
 
 for (const [title, stopOnFirstTool, stream, expectCancelled] of [

@@ -427,7 +427,7 @@ The runner rejects nested setups that would run model calls or sandbox operation
 - a `runConfig.sandbox` or `runOptions.sandbox` whose client isn't from `temporalSandboxClient(name)`;
 - a `MemorySession` as `runOptions.session`.
 
-The runner also checks each agent just before it calls its model. This covers agents the check before the run can't see: one that a custom `Handoff`'s callback returns, or one that an `agent.on(...)` listener changes. Its model must be a name, and its `asTool()` tools must pass the checks above. In the outer run, the run fails. In a nested run, the error goes back to the parent model as the tool's output, and the model isn't called. The check wraps `Agent.prototype.getSystemPrompt`, which the framework calls once per model call, so an `Agent` subclass that overrides it must call `super.getSystemPrompt()`.
+The runner also checks each agent just before it calls its model. This covers agents the check before the run can't see: one that a custom `Handoff`'s callback returns, or one that an `agent.on(...)` listener changes. Its model must be a name, and its `asTool()` tools must pass the checks above. Each `asTool()` tool checks its options again when it's called, and after its `inputBuilder` runs, because the framework reads them only then: an `agent_tool_start` listener can change them after the model call. In the outer run, the run fails. In a nested run, the error goes back to the parent model as the tool's output, and the model isn't called. The check wraps `Agent.prototype.getSystemPrompt`, which the framework calls once per model call, so an `Agent` subclass that overrides it must call `super.getSystemPrompt()`.
 
 ## MCP servers
 
