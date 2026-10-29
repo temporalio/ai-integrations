@@ -11,6 +11,11 @@ const SNAPSHOT_DISABLED =
   'granularity than Strands snapshots. Remove the snapshot call and rely on ' +
   "Temporal's durable execution instead.";
 
+// Strands' own message, which its Agent throws at construction for a stateful model.
+const STATEFUL_MANAGER_REFUSED =
+  'contextManager and conversationManager cannot be used with a stateful model. ' +
+  'The model manages conversation state server-side.';
+
 const RETRY_STRATEGY_DISABLED =
   'TemporalAgent disables Strands retries; configure retries via retryPolicy ' +
   'in the model activity options on TemporalAgent, and on the activity options ' +
@@ -51,6 +56,8 @@ export interface TemporalAgentOptions extends Omit<AgentConfig, 'model' | 'retry
  * {@link activityAsTool}, {@link activityAsHook}, and {@link TemporalMCPClient}.
  */
 export class TemporalAgent extends Agent {
+  private readonly managerGiven: boolean;
+
   constructor(options: TemporalAgentOptions = {}) {
     const { model, activityOptions, streamingTopic, streamingBatchInterval, ...rest } = options;
     if ((rest as { retryStrategy?: unknown }).retryStrategy !== undefined) {
@@ -67,6 +74,7 @@ export class TemporalAgent extends Agent {
       model: temporalModel,
       retryStrategy: null,
     });
+    this.managerGiven = Boolean(rest.conversationManager || rest.contextManager);
 
     // Strands lists each MCP client's tools once at agent initialization and
     // reuses that list for every turn. For clients with `cacheTools: false`,
@@ -81,15 +89,25 @@ export class TemporalAgent extends Agent {
   }
 
   /**
-   * Read the worker model's id and context window before Strands initializes the agent, so its
-   * traces and proactive compression use them from the first model call.
+   * Read the worker model's id, context window and stateful flag before Strands initializes the
+   * agent, so its traces, proactive compression and stateful handling use them from the first
+   * model call.
    *
    * Not `async`: once the config is read, this returns Strands' own `initialize()` promise, so it
    * adds no microtask before Strands' hooks and model call.
    */
   override initialize(): Promise<void> {
     const loading = this.model instanceof TemporalModel ? this.model.loadConfig() : undefined;
-    return loading ? loading.then(() => super.initialize()) : super.initialize();
+    return loading ? loading.then(() => this.initializeWithConfig()) : this.initializeWithConfig();
+  }
+
+  private initializeWithConfig(): Promise<void> {
+    // Strands' Agent refuses these managers for a stateful model at construction, before
+    // TemporalAgent can read the worker model's stateful flag, so refuse them here.
+    if (this.model.stateful && this.managerGiven) {
+      return Promise.reject(new Error(STATEFUL_MANAGER_REFUSED));
+    }
+    return super.initialize();
   }
 
   override takeSnapshot(): never {

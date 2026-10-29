@@ -7,11 +7,18 @@ import type {
   GetModelConfigInput,
   InvokeModelInput,
   InvokeModelStreamingInput,
+  InvokeStatefulModelInput,
+  InvokeStatefulModelResult,
+  InvokeStatefulModelStreamingInput,
   ModelConfigInfo,
 } from './model-activity';
 
 /** Name of the activity that returns the worker model's {@link ModelConfigInfo}. */
 export const GET_MODEL_CONFIG_ACTIVITY = 'strandsGetModelConfig';
+
+/** Names of the activities that run a stateful model with the agent's model state. */
+export const INVOKE_STATEFUL_MODEL_ACTIVITY = 'strandsInvokeStatefulModel';
+export const INVOKE_STATEFUL_MODEL_STREAMING_ACTIVITY = 'strandsInvokeStatefulModelStreaming';
 
 /**
  * Options for {@link TemporalModel}.
@@ -43,6 +50,7 @@ export class TemporalModel extends Model<BaseModelConfig> {
   private readonly streamingTopic?: string;
   private readonly streamingBatchInterval: Duration;
   private config: ModelConfigInfo = {};
+  private isStateful = false;
   private configLoaded = false;
 
   constructor(options: TemporalModelOptions = {}) {
@@ -65,10 +73,15 @@ export class TemporalModel extends Model<BaseModelConfig> {
     return { ...this.config };
   }
 
+  /** Whether the worker model keeps the conversation server-side, once {@link loadConfig} has read it. */
+  override get stateful(): boolean {
+    return this.isStateful;
+  }
+
   /**
-   * Read the worker model's id and context window through an activity, once per instance, so that
-   * Strands' traces and proactive compression use the real model's values. {@link TemporalAgent}
-   * calls this before Strands initializes the agent.
+   * Read the worker model's id, context window and stateful flag through an activity, once per
+   * instance, so that Strands' traces, proactive compression and stateful handling use the real
+   * model's values. {@link TemporalAgent} calls this before Strands initializes the agent.
    *
    * Returns `undefined`, without awaiting anything, when the config was already read, so callers
    * can go on synchronously.
@@ -81,8 +94,10 @@ export class TemporalModel extends Model<BaseModelConfig> {
       startToCloseTimeout: '10 minutes',
       ...this.activityOptions,
     });
-    return activities[GET_MODEL_CONFIG_ACTIVITY]({ modelName: this.modelName }).then((config) => {
+    return activities[GET_MODEL_CONFIG_ACTIVITY]({ modelName: this.modelName }).then(({ stateful, ...config }) => {
       this.config = config;
+      // A result recorded before the flag existed has none: the model ran as stateless then.
+      this.isStateful = stateful === true;
       this.configLoaded = true;
     });
   }
@@ -91,10 +106,34 @@ export class TemporalModel extends Model<BaseModelConfig> {
     const proxiedActivities = workflow.proxyActivities<{
       invokeModel(input: InvokeModelInput): Promise<ModelStreamEvent[]>;
       invokeModelStreaming(input: InvokeModelStreamingInput): Promise<ModelStreamEvent[]>;
+      [INVOKE_STATEFUL_MODEL_ACTIVITY](input: InvokeStatefulModelInput): Promise<InvokeStatefulModelResult>;
+      [INVOKE_STATEFUL_MODEL_STREAMING_ACTIVITY](
+        input: InvokeStatefulModelStreamingInput
+      ): Promise<InvokeStatefulModelResult>;
     }>({
       startToCloseTimeout: '10 minutes',
       ...this.activityOptions,
     });
+
+    if (this.isStateful) {
+      // The agent's model state is a live store; send a copy of its values, and copy the updated
+      // values back, as the model would have written them natively.
+      const { modelState, ...rest } = options ?? {};
+      const input = { modelName: this.modelName, messages, options: rest, modelState: modelState?.getAll() ?? {} };
+      const result = this.streamingTopic
+        ? await proxiedActivities[INVOKE_STATEFUL_MODEL_STREAMING_ACTIVITY]({
+            ...input,
+            streamingTopic: this.streamingTopic,
+            streamingBatchInterval: this.streamingBatchInterval,
+          })
+        : await proxiedActivities[INVOKE_STATEFUL_MODEL_ACTIVITY](input);
+      if (modelState) {
+        modelState.clear();
+        for (const [key, value] of Object.entries(result.modelState)) modelState.set(key, value);
+      }
+      yield* result.events;
+      return;
+    }
 
     const events = this.streamingTopic
       ? await proxiedActivities.invokeModelStreaming({

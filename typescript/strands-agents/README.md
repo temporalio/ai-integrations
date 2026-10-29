@@ -95,6 +95,10 @@ Before its first model call, each `TemporalAgent` reads the model's `modelId` an
 
 The read is a new activity, so a run whose agent ran before you deploy this version fails to replay on it with a nondeterminism error. Let those runs finish first, or use Worker Versioning.
 
+A worker model that keeps the conversation server-side, such as `OpenAIModel` with `stateful: true`, works as it does natively: each model call gets the agent's `modelState`, such as the last response id, and the agent clears its messages after each turn. As in Strands, such an agent cannot use a `conversationManager` or `contextManager`; because `TemporalAgent` learns that the model is stateful when it reads the config, it throws at the agent's first invocation instead of at construction.
+
+Stateful model calls run as their own activities, `strandsInvokeStatefulModel` and `strandsInvokeStatefulModelStreaming`. While you roll out this version, a worker running an earlier version does not register them, so it fails such a call and Temporal retries it until an upgraded worker takes it. Upgrade every worker on the task queue before a retry policy with a low `maximumAttempts` runs out, or route upgraded workflows to upgraded workers with Worker Versioning.
+
 ## Retries
 
 `TemporalAgent` disables Strands' built-in `ModelRetryStrategy` so retries are handled exclusively by Temporal. Configure retries via `activityOptions.retry` on `TemporalAgent`, and on the activity options accepted by `workflow.activityAsTool`, `workflow.activityAsHook`, and `TemporalMCPClient`:
@@ -234,24 +238,26 @@ const client = new Client({ /* ... */, plugins: [new StrandsPlugin({ models })] 
 
 ## Continue-as-new
 
-A chat-style workflow accumulates history with every turn and will eventually hit Temporal's per-workflow history limit. `workflowInfo().continueAsNewSuggested` flips true once the server decides history has grown large enough; check it after each turn and hand off to a fresh run, carrying `agent.messages` as input:
+A chat-style workflow accumulates history with every turn and will eventually hit Temporal's per-workflow history limit. `workflowInfo().continueAsNewSuggested` flips true once the server decides history has grown large enough; check it after each turn and hand off to a fresh run, carrying `agent.messages` and `agent.modelState` as input. A stateful model clears the messages after each turn and keeps its context in the model state, such as the last response id; a run that carries only the messages starts the model's conversation over:
 
 ```ts
 import { defineSignal, setHandler, condition, continueAsNew, workflowInfo } from '@temporalio/workflow';
 import { TemporalAgent } from '@temporalio/strands-agents';
-import type { Message } from '@strands-agents/sdk';
+import type { JSONValue, Message } from '@strands-agents/sdk';
 
 export const userSays = defineSignal<[string]>('userSays');
 export const endChat = defineSignal('endChat');
 
 export interface ChatInput {
   messages?: Message[];
+  modelState?: Record<string, JSONValue>;
 }
 
 export async function chatWorkflow(input: ChatInput = {}): Promise<void> {
   const agent = new TemporalAgent({
     activityOptions: { startToCloseTimeout: '60 seconds' },
     messages: input.messages,
+    modelState: input.modelState,
   });
 
   const pending: string[] = [];
@@ -264,7 +270,7 @@ export async function chatWorkflow(input: ChatInput = {}): Promise<void> {
     if (done) return;
     await agent.invoke(pending.shift()!);
     if (workflowInfo().continueAsNewSuggested) {
-      await continueAsNew<typeof chatWorkflow>({ messages: agent.messages });
+      await continueAsNew<typeof chatWorkflow>({ messages: agent.messages, modelState: agent.modelState.getAll() });
     }
   }
 }
