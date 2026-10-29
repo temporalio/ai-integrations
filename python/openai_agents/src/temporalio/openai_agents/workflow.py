@@ -4,11 +4,15 @@ import dataclasses
 import functools
 import inspect
 import json
+import sys
 import typing
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import timedelta
 from typing import Any
+
+if sys.version_info >= (3, 14):
+    import annotationlib  # type: ignore[reportUnreachable]
 
 import nexusrpc
 from agents import (
@@ -113,17 +117,31 @@ def _call_function(method: Any) -> Callable | None:
     return method if inspect.isfunction(method) else None
 
 
+def _generated_class_doc(cls: type) -> str | None:
+    """Return the docstring dataclasses or namedtuple writes for a class that has none."""
+    if dataclasses.is_dataclass(cls):
+        try:
+            # Format it as dataclasses does: 3.14 leaves forward references unevaluated.
+            if sys.version_info >= (3, 14):
+                signature = inspect.signature(  # type: ignore[reportUnreachable]
+                    cls, annotation_format=annotationlib.Format.FORWARDREF
+                )
+            else:
+                signature = inspect.signature(cls)
+        except (TypeError, ValueError):
+            return cls.__name__
+        return cls.__name__ + str(signature).replace(" -> None", "")
+    fields = getattr(cls, "_fields", None)
+    if issubclass(cls, tuple) and isinstance(fields, tuple):
+        names = ", ".join(fields) + ("," if len(fields) == 1 else "")
+        return f"{cls.__name__}({names})"
+    return None
+
+
 def _class_doc(cls: type) -> str | None:
     """Return a class's own docstring, unless dataclasses or namedtuple wrote it."""
     doc = cls.__doc__
-    # Both write "Name(fields)" as the docstring of a class that has none.
-    if (
-        doc
-        and doc.startswith(f"{cls.__name__}(")
-        and (dataclasses.is_dataclass(cls) or issubclass(cls, tuple))
-    ):
-        return None
-    return doc
+    return None if doc == _generated_class_doc(cls) else doc
 
 
 def _tool_stand_in(

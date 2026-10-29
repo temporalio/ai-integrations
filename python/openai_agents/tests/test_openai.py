@@ -554,9 +554,7 @@ class ActivityWeatherDataclass:
 @activity.defn
 @dataclass
 class ActivityWeatherDocumentedDataclass:
-    """
-    Get the weather for a given city.
-    """
+    """ActivityWeatherDocumentedDataclass(city) gets the weather for a given city."""
 
     conditions: str
 
@@ -598,7 +596,7 @@ class ActivityWeatherDerived(WeatherBase):
         (
             ActivityWeatherDocumentedDataclass,
             "city",
-            "Get the weather for a given city.",
+            "ActivityWeatherDocumentedDataclass(city) gets the weather for a given city.",
         ),
         # The overridden __call__'s docstring, not the base class's.
         (ActivityWeatherDerived, "city", "Get the weather for a given city."),
