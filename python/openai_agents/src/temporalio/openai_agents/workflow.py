@@ -4,7 +4,6 @@ import dataclasses
 import functools
 import inspect
 import json
-import types
 import typing
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
@@ -103,6 +102,44 @@ async def _tool_argument_error(
     return result
 
 
+def _call_function(method: Any) -> Callable | None:
+    """Return the function under a function, staticmethod, classmethod or partialmethod."""
+    while isinstance(method, (staticmethod, classmethod, functools.partialmethod)):
+        method = (
+            method.func
+            if isinstance(method, functools.partialmethod)
+            else method.__func__
+        )
+    return method if inspect.isfunction(method) else None
+
+
+def _class_doc(cls: type) -> str | None:
+    """Return a class's own docstring, unless dataclasses or namedtuple wrote it."""
+    doc = cls.__doc__
+    # Both write "Name(fields)" as the docstring of a class that has none.
+    if (
+        doc
+        and doc.startswith(f"{cls.__name__}(")
+        and (dataclasses.is_dataclass(cls) or issubclass(cls, tuple))
+    ):
+        return None
+    return doc
+
+
+def _tool_stand_in(
+    call: Callable, name: str, hints: dict[str, Any], doc: str | None
+) -> Callable:
+    """Wrap ``call`` with the name, docstring and annotations function_schema should read.
+
+    A partial has no module globals, so ``hints`` are resolved in the function's own module.
+    """
+    stand_in = functools.partial(call)
+    setattr(stand_in, "__name__", name)
+    stand_in.__annotations__ = hints
+    stand_in.__doc__ = doc
+    return stand_in
+
+
 def activity_as_tool(
     fn: Callable,
     *,
@@ -147,7 +184,10 @@ def activity_as_tool(
         An OpenAI agent tool that wraps the provided activity.
 
     Raises:
-        ApplicationError: If the function is not properly decorated as a Temporal activity.
+        ApplicationError: If the function is not properly decorated as a Temporal activity,
+            or is a callable-class activity passed as an instance, or whose ``__call__`` is
+            not a function, staticmethod, classmethod or ``functools.partialmethod``, can't
+            be read, or takes keyword-only arguments or ``**kwargs``.
 
     Example:
         >>> @activity.defn
@@ -174,54 +214,60 @@ def activity_as_tool(
             "Input activity must have a name to be made into a tool",
             "invalid_tool",
         )
-    call: Callable = fn
-    func: Callable = fn
-    doc = fn.__doc__
+    if not inspect.isclass(fn) and hasattr(type(fn), "__temporal_activity_definition"):
+        raise ApplicationError(
+            f"Pass the activity class {type(fn).__name__}, not an instance of it",
+            "invalid_tool",
+        )
     if inspect.isclass(fn):
         # Workflow code references a callable-class activity by its class, but the worker's
         # registered instance runs __call__, so build the tool from __call__ as an instance binds
-        # it: without the `self` of a method or partialmethod, and with every parameter of a
-        # static or class method. The tool never calls this stand-in binding.
-        method = next(
-            (vars(c)["__call__"] for c in fn.__mro__ if "__call__" in vars(c)), None
-        )
-        if method is None:
+        # it: without the receiver of a method, classmethod or partialmethod, and with every
+        # parameter of a staticmethod. The tool never calls this stand-in binding.
+        calls = [vars(c)["__call__"] for c in fn.__mro__ if "__call__" in vars(c)]
+        func = _call_function(calls[0]) if calls else None
+        if func is None:
             raise ApplicationError(
-                f"Activity class {fn.__name__} has no __call__ method", "invalid_tool"
+                f"Activity class {fn.__name__} needs a __call__ that is a function, "
+                "staticmethod, classmethod or functools.partialmethod",
+                "invalid_tool",
             )
-        call = method.__get__(object(), fn) if hasattr(method, "__get__") else method
-        # Read annotations and docs from the function under any partials and bound methods.
-        func = call
-        while isinstance(func, (functools.partial, types.MethodType)):
-            func = func.func if isinstance(func, functools.partial) else func.__func__
-        doc = func.__doc__
-        # A dataclass without a docstring gets its constructor's signature as one.
-        if not doc and not dataclasses.is_dataclass(fn):
-            doc = inspect.getdoc(fn)
-    try:
-        params = list(inspect.signature(call).parameters.values())
-    except ValueError as e:
-        raise ApplicationError(
-            f"Cannot build a tool from {fn.__name__}: {e}", "invalid_tool"
-        ) from e
-    # If the provided callable has a first argument of `self`, partially apply it
-    # The actual instance will be picked up by the activity execution, the partially applied function will never actually be executed
-    if params and params[0].name == "self":
-        call = functools.partial(call, None)
-        params = params[1:]
-    # run_activity passes only positional arguments.
-    if any(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params):
-        raise ApplicationError(
-            f"Activity {fn.__name__} cannot have keyword-only arguments", "invalid_tool"
+        try:
+            call = calls[0].__get__(object(), fn)
+            parameters = inspect.signature(call).parameters.values()
+            hints = typing.get_type_hints(func, include_extras=True)
+        except (NameError, TypeError, ValueError) as e:
+            raise ApplicationError(
+                f"Cannot build a tool from {fn.__name__}.__call__: {e}", "invalid_tool"
+            ) from e
+        # @activity.defn checks the constructor's signature, not __call__'s, and run_activity
+        # passes only positional arguments.
+        if any(
+            p.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.VAR_KEYWORD)
+            for p in parameters
+        ):
+            raise ApplicationError(
+                f"Activity class {fn.__name__} cannot take keyword-only arguments or "
+                "**kwargs in __call__",
+                "invalid_tool",
+            )
+        # The docstring of __call__ or of a __call__ it overrides, else the class's own.
+        doc = next(
+            (f.__doc__ for f in map(_call_function, calls) if f and f.__doc__),
+            _class_doc(fn),
         )
-    if call is not fn:
-        # A partial has no module globals, so give it annotations resolved in the function's
-        # own module, and the activity's name and docstring.
-        stand_in = functools.partial(call)
-        setattr(stand_in, "__name__", fn.__name__)
-        stand_in.__annotations__ = typing.get_type_hints(func, include_extras=True)
-        stand_in.__doc__ = doc
-        fn = stand_in
+        fn = _tool_stand_in(call, fn.__name__, hints, doc)
+    else:
+        # If the provided callable has a first argument of `self`, partially apply it with the same metadata
+        # The actual instance will be picked up by the activity execution, the partially applied function will never actually be executed
+        params = list(inspect.signature(fn).parameters.keys())
+        if len(params) > 0 and params[0] == "self":
+            fn = _tool_stand_in(
+                functools.partial(fn, None),
+                fn.__name__,
+                typing.get_type_hints(fn, include_extras=True),
+                inspect.getdoc(fn),
+            )
     schema = function_schema(fn)
 
     async def run_activity(ctx: RunContextWrapper[Any], input: str) -> Any:

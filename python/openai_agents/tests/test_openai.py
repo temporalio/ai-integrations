@@ -1,3 +1,4 @@
+import abc
 import asyncio
 import functools
 import json
@@ -251,26 +252,6 @@ class ActivityWeatherClass:
         )
 
 
-@activity.defn
-class ActivityWeatherStaticCall:
-    @staticmethod
-    async def __call__(city: str) -> Weather:
-        """
-        Get the weather for a given city.
-        """
-        return Weather(city=city, temperature_range="14-20C", conditions="Foggy")
-
-
-@activity.defn
-class ActivityWeatherClassMethodCall:
-    @classmethod
-    async def __call__(cls, city: str) -> Weather:
-        """
-        Get the weather for a given city.
-        """
-        return Weather(city=city, temperature_range="14-20C", conditions="Windy")
-
-
 @nexusrpc.service
 class WeatherService:
     get_weather_nexus_operation: nexusrpc.Operation[WeatherInput, Weather]
@@ -328,18 +309,6 @@ def weather_mock_model():
                 call_id="call-get-weather-class",
                 item_id="item-get-weather-class",
             ),
-            ResponseBuilders.tool_call(
-                '{"city":"Tokyo"}',
-                "ActivityWeatherStaticCall",
-                call_id="call-get-weather-static-call",
-                item_id="item-get-weather-static-call",
-            ),
-            ResponseBuilders.tool_call(
-                '{"city":"Tokyo"}',
-                "ActivityWeatherClassMethodCall",
-                call_id="call-get-weather-class-method-call",
-                item_id="item-get-weather-class-method-call",
-            ),
             ResponseBuilders.output_message("Test weather result"),
         ]
     )
@@ -382,14 +351,6 @@ class ToolsWorkflow:
                 ),
                 openai_agents.workflow.activity_as_tool(
                     ActivityWeatherClass,
-                    start_to_close_timeout=timedelta(seconds=10),
-                ),
-                openai_agents.workflow.activity_as_tool(
-                    ActivityWeatherStaticCall,
-                    start_to_close_timeout=timedelta(seconds=10),
-                ),
-                openai_agents.workflow.activity_as_tool(
-                    ActivityWeatherClassMethodCall,
                     start_to_close_timeout=timedelta(seconds=10),
                 ),
                 openai_agents.workflow.activity_as_tool(
@@ -445,8 +406,6 @@ async def test_tool_workflow(client: Client):
                 get_weather_context,
                 ActivityWeatherService().get_weather_method,
                 ActivityWeatherClass("Cloudy"),
-                ActivityWeatherStaticCall(),
-                ActivityWeatherClassMethodCall(),
             ],
         ) as worker:
             workflow_handle = await client.start_workflow(
@@ -461,24 +420,20 @@ async def test_tool_workflow(client: Client):
             assert result == "Test weather result"
 
             events = []
-            class_activity_inputs: dict[str, list[str]] = {}
+            class_activity_inputs = []
             async for e in workflow_handle.fetch_history_events():
                 if e.HasField("activity_task_completed_event_attributes"):
                     events.append(e)
                 elif e.HasField("activity_task_scheduled_event_attributes"):
                     attrs = e.activity_task_scheduled_event_attributes
-                    if attrs.activity_type.name.startswith("ActivityWeather"):
-                        class_activity_inputs[attrs.activity_type.name] = [
-                            p.data.decode() for p in attrs.input.payloads
-                        ]
+                    if attrs.activity_type.name == "ActivityWeatherClass":
+                        class_activity_inputs.append(
+                            [p.data.decode() for p in attrs.input.payloads]
+                        )
 
-            # Each callable class's __call__ gets the model's arguments, not its constructor.
-            assert class_activity_inputs == {
-                "ActivityWeatherClass": ['"Tokyo"'],
-                "ActivityWeatherStaticCall": ['"Tokyo"'],
-                "ActivityWeatherClassMethodCall": ['"Tokyo"'],
-            }
-            assert len(events) == 17
+            # The callable class's __call__ gets the model's arguments, not its constructor.
+            assert class_activity_inputs == [['"Tokyo"']]
+            assert len(events) == 13
             assert (
                 "function_call"
                 in events[0]
@@ -552,32 +507,8 @@ async def test_tool_workflow(client: Client):
                 .data.decode()
             )
             assert (
-                "function_call"
-                in events[12]
-                .activity_task_completed_event_attributes.result.payloads[0]
-                .data.decode()
-            )
-            assert (
-                "Foggy"
-                in events[13]
-                .activity_task_completed_event_attributes.result.payloads[0]
-                .data.decode()
-            )
-            assert (
-                "function_call"
-                in events[14]
-                .activity_task_completed_event_attributes.result.payloads[0]
-                .data.decode()
-            )
-            assert (
-                "Windy"
-                in events[15]
-                .activity_task_completed_event_attributes.result.payloads[0]
-                .data.decode()
-            )
-            assert (
                 "Test weather result"
-                in events[16]
+                in events[12]
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
             )
@@ -594,6 +525,21 @@ class ActivityWeatherPartialMethodCall:
     __call__ = functools.partialmethod(get_weather, "Rainy")
 
 
+# In these two, `self` is a real parameter: binding __call__ has already dropped the receiver.
+@activity.defn
+class ActivityWeatherStaticCall(abc.ABC):
+    @staticmethod
+    async def __call__(self: str) -> Weather:  # type: ignore[reportSelfClsParameterName]
+        return Weather(city=self, temperature_range="14-20C", conditions="Foggy")
+
+
+@activity.defn
+class ActivityWeatherClassMethodCall:
+    @classmethod
+    async def __call__(cls, self: str) -> Weather:  # type: ignore[reportSelfClsParameterName]
+        return Weather(city=self, temperature_range="14-20C", conditions="Windy")
+
+
 @activity.defn
 @dataclass
 class ActivityWeatherDataclass:
@@ -605,36 +551,66 @@ class ActivityWeatherDataclass:
         )
 
 
-class WeatherBase:
+@activity.defn
+@dataclass
+class ActivityWeatherDocumentedDataclass:
     """
     Get the weather for a given city.
     """
+
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+class WeatherBase:
+    """
+    Weather tools.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
 
 
 @activity.defn
 class ActivityWeatherDerived(WeatherBase):
     async def __call__(self, city: str) -> Weather:
-        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+        return Weather(city=city, temperature_range="14-20C", conditions="Cloudy")
 
 
 @pytest.mark.parametrize(
-    "cls, description",
+    "cls, parameter, description",
     [
+        # Not abc.ABC's docstring: only the class's own is a fallback.
+        (ActivityWeatherStaticCall, "self", ""),
+        (ActivityWeatherClassMethodCall, "self", ""),
         # Before Python 3.13 the SDK runs an async partialmethod as sync, so
         # test_tool_workflow can't run this form; the tool's schema is the part this plugin builds.
-        (ActivityWeatherPartialMethodCall, "Get the weather for a given city."),
+        (ActivityWeatherPartialMethodCall, "city", "Get the weather for a given city."),
         # Not the docstring a dataclass writes from its constructor.
-        (ActivityWeatherDataclass, ""),
-        (ActivityWeatherDerived, "Get the weather for a given city."),
+        (ActivityWeatherDataclass, "city", ""),
+        (
+            ActivityWeatherDocumentedDataclass,
+            "city",
+            "Get the weather for a given city.",
+        ),
+        # The overridden __call__'s docstring, not the base class's.
+        (ActivityWeatherDerived, "city", "Get the weather for a given city."),
     ],
 )
-def test_callable_class_tool_schema(cls: type, description: str):
+def test_callable_class_tool_schema(cls: type, parameter: str, description: str):
     tool = openai_agents.workflow.activity_as_tool(
         cls, start_to_close_timeout=timedelta(seconds=10)
     )
     assert isinstance(tool, FunctionTool)
     assert tool.params_json_schema["properties"] == {
-        "city": {"title": "City", "type": "string"}
+        parameter: {"title": parameter.title(), "type": "string"}
     }
     assert tool.description == description
 
@@ -660,18 +636,26 @@ class ActivityWeatherKeywordOnlyCall:
         return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
 
 
+@activity.defn
+class ActivityWeatherKwargsCall:
+    async def __call__(self, city: str, **extra: str) -> Weather:  # type: ignore[reportUnusedParameter]
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
 @pytest.mark.parametrize(
-    "cls, message",
+    "target, message",
     [
-        (ActivityWeatherNoCall, "has no __call__ method"),
+        (ActivityWeatherNoCall, "needs a __call__ that is a function"),
         (ActivityWeatherNoParamCall, "invalid method signature"),
-        (ActivityWeatherKeywordOnlyCall, "cannot have keyword-only arguments"),
+        (ActivityWeatherKeywordOnlyCall, "cannot take keyword-only arguments"),
+        (ActivityWeatherKwargsCall, r"or \*\*kwargs in __call__"),
+        (ActivityWeatherClass("Cloudy"), "not an instance of it"),
     ],
 )
-def test_invalid_callable_class_tool(cls: type, message: str):
+def test_invalid_callable_class_tool(target: Any, message: str):
     with pytest.raises(ApplicationError, match=message):
         openai_agents.workflow.activity_as_tool(
-            cls, start_to_close_timeout=timedelta(seconds=10)
+            target, start_to_close_timeout=timedelta(seconds=10)
         )
 
 
