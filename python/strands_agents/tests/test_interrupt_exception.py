@@ -129,7 +129,11 @@ async def test_in_workflow_tool_interrupt(client: Client):
 
     history = await handle.fetch_history()
     # No activity call for the in-workflow @tool — only model calls.
-    assert get_activities(history) == ["invoke_model", "invoke_model"]
+    assert get_activities(history) == [
+        "strands_get_model_config",
+        "invoke_model",
+        "invoke_model",
+    ]
 
     await Replayer(
         workflows=[InWorkflowToolInterruptWorkflow],
@@ -179,6 +183,7 @@ async def test_activity_tool_interrupt(client: Client):
     # activity_delete appears twice: once for the call that raised
     # InterruptException, once for the resume call that returned successfully.
     assert get_activities(history) == [
+        "strands_get_model_config",
         "invoke_model",
         "activity_delete",
         "activity_delete",

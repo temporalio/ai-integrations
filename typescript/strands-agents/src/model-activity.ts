@@ -50,6 +50,23 @@ export interface InvokeModelStreamingInput extends InvokeModelInput {
 }
 
 /**
+ * Input for the model config activity: the factory name, as in {@link InvokeModelInput}.
+ */
+export interface GetModelConfigInput {
+  modelName?: string;
+}
+
+/**
+ * The parts of the worker model's config that Strands reads in workflow code: the model id for
+ * traces, and the context window for proactive compression. Nothing else is returned, so provider
+ * settings such as credentials never reach the workflow history.
+ */
+export interface ModelConfigInfo {
+  modelId?: string;
+  contextWindowLimit?: number;
+}
+
+/**
  * Holds the model factory map and exposes the model activities.
  *
  * Models are constructed lazily on first use and cached for the worker's
@@ -91,6 +108,11 @@ export class ModelActivity {
       this.models.set(resolved, model);
     }
     return model;
+  }
+
+  async getModelConfig(input: GetModelConfigInput): Promise<ModelConfigInfo> {
+    const { modelId, contextWindowLimit } = this.getModel(input.modelName).getConfig();
+    return { modelId, contextWindowLimit };
   }
 
   async invokeModel(input: InvokeModelInput): Promise<ModelStreamEvent[]> {
