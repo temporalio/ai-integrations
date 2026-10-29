@@ -25,10 +25,6 @@ from ._model_activity import (
     _StreamingInvokeModelInput,
 )
 
-# Patch id for rebuilding ContextWindowOverflowException from a failed model Activity.
-# Never change it: it is recorded in histories as a marker.
-_CONTEXT_WINDOW_OVERFLOW_PATCH = "strands-agents.context-window-overflow-recovery"
-
 
 def _filter_serializable(state: dict[str, Any]) -> dict[str, Any]:
     """Keep invocation_state entries that JSON-serialize; drop the rest with a debug log."""
@@ -234,14 +230,11 @@ class TemporalModel(Model):
             # Model providers raise ContextWindowOverflowException when the prompt is
             # too long, and Strands recovers by reducing the conversation and retrying.
             # The activity fails with a typed ApplicationError, so rebuild the Strands
-            # exception here, where Strands' event loop can catch it. Histories recorded
-            # before this change let the ActivityError propagate, and a Workflow may have
-            # handled it by scheduling other work, so they keep that behavior.
+            # exception here, where Strands' event loop can catch it.
             cause = error.__cause__
             if (
                 isinstance(cause, ApplicationError)
                 and cause.type == ContextWindowOverflowException.__name__
-                and workflow.patched(_CONTEXT_WINDOW_OVERFLOW_PATCH)
             ):
                 raise ContextWindowOverflowException(cause.message) from error
             raise
