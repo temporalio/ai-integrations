@@ -344,6 +344,26 @@ test('a history recorded before the model config read fails to replay', async (t
   t.regex(err!.message, /\[TMPRL1100\].*'invokeModel'.*'strandsGetModelConfig'/);
 });
 
+test('a history whose code depends on when a handler finishes can fail to replay', async (t) => {
+  // Recorded with `handlerTiming` on main at 63d7aec, before the plugin's workflow interceptor: the
+  // Signal handler had finished one microtask later, so the run scheduled `finished`. The
+  // interceptor's handler wrapper finishes it later, so replay schedules `unfinished`.
+  const history = await loadHistory(
+    path.resolve(__dirname, '../../src/__tests__/histories/handler-timing-before-workflow-interceptor.json')
+  );
+  const err = await t.throwsAsync(
+    Worker.runReplayHistory(
+      {
+        workflowBundle: t.context.workflowBundle,
+        plugins: [new StrandsPlugin({ models: { test: () => new StubModel([]) } })],
+      },
+      history
+    ),
+    { instanceOf: DeterminismViolationError }
+  );
+  t.regex(err!.message, /\[TMPRL1100\].*'finished'.*'unfinished'/);
+});
+
 test('invokeModel reconstructs Message instances from wire data', async (t) => {
   // Strands content-block and Message classes have lossy `toJSON()` methods.
   // After Temporal's default payload converter serializes activity input,
