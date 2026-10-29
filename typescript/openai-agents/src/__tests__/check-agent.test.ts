@@ -90,6 +90,35 @@ test('installRunningAgentCheck: installing again keeps one wrapper, which checks
   t.is(await agent.getSystemPrompt(new RunContext()), 'Answer.');
 });
 
+test("checkAgent: installs the check before each model call on another copy's Agent class, once", async (t) => {
+  // Stands in for the Agent class of another copy of @openai/agents-core, and a subclass of it.
+  class OtherCopyAgent {
+    name = 'Other';
+    model = 'm';
+    async getSystemPrompt() {
+      return 'Answer.';
+    }
+  }
+  class OtherCopySubclass extends OtherCopyAgent {
+    override async getSystemPrompt() {
+      return `${await super.getSystemPrompt()}!`;
+    }
+  }
+  const getSystemPrompt = OtherCopyAgent.prototype.getSystemPrompt;
+  const subclassGetSystemPrompt = OtherCopySubclass.prototype.getSystemPrompt;
+  checkAgent(new OtherCopySubclass() as unknown as Agent);
+  const wrapper = OtherCopyAgent.prototype.getSystemPrompt;
+  t.not(wrapper, getSystemPrompt);
+  t.is(OtherCopySubclass.prototype.getSystemPrompt, subclassGetSystemPrompt);
+  checkAgent(new OtherCopyAgent() as unknown as Agent);
+  t.is(OtherCopyAgent.prototype.getSystemPrompt, wrapper);
+  t.is(await new OtherCopySubclass().getSystemPrompt(), 'Answer.!');
+
+  const err = t.throws(() => checkAgent({ name: 'Plain', model: 'm' } as unknown as Agent)) as ApplicationFailure;
+  t.is(err.type, 'AgentsWorkflowError');
+  t.regex(err.message, /Agent 'Plain' is not an @openai\/agents-core Agent/);
+});
+
 test('installRunnerCheck: installing again keeps one wrapper, which checks nothing outside a Workflow', async (t) => {
   const run = Runner.prototype.run;
   installRunnerCheck();

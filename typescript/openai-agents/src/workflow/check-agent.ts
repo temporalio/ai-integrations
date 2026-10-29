@@ -17,6 +17,7 @@ export function checkAgent(agent: Agent<any, any>, modelOverride?: string, seen 
   if (seen.has(agent)) return;
   seen.add(agent);
 
+  checkAgentCopy(agent);
   rejectModelObject(agent);
   if (typeof agent.model !== 'string' && modelOverride === undefined) {
     throw ApplicationFailure.create({
@@ -56,11 +57,15 @@ const runningAgentCheckState = Symbol.for('@temporalio/openai-agents/runningAgen
  * picks the model and before it calls it, so the wrapper rejects a `Model` object and unsafe
  * `asTool()` tools there. The agents behind those tools are checked when they run, and the config
  * their nested runs use when those runs start.
+ *
+ * `prototype` is the `Agent` prototype of the `@openai/agents-core` copy to check. The runner calls
+ * this for each agent its runs reach (see `installRunnerCheck`), so agents from another copy, such
+ * as a dependency's, are checked too.
  */
-export function installRunningAgentCheck(): void {
-  const prototype = Agent.prototype as unknown as Record<symbol, RunningAgentCheckState | undefined>;
-  if (prototype[runningAgentCheckState] !== undefined) return;
-  const state: RunningAgentCheckState = { original: Agent.prototype.getSystemPrompt };
+export function installRunningAgentCheck(prototype: object = Agent.prototype): void {
+  const target = prototype as Agent<any, any> & Record<symbol, RunningAgentCheckState | undefined>;
+  if (target[runningAgentCheckState] !== undefined) return;
+  const state: RunningAgentCheckState = { original: target.getSystemPrompt };
   function getSystemPrompt(this: Agent<any, any>, runContext: RunContext<any>): Promise<string | undefined> {
     if (inWorkflowContext()) {
       rejectModelObject(this);
@@ -68,14 +73,35 @@ export function installRunningAgentCheck(): void {
     }
     return state.original.call(this, runContext);
   }
-  Object.defineProperty(Agent.prototype, runningAgentCheckState, { value: state });
-  Agent.prototype.getSystemPrompt = getSystemPrompt;
+  Object.defineProperty(target, runningAgentCheckState, { value: state });
+  target.getSystemPrompt = getSystemPrompt;
 }
 
 installRunningAgentCheck();
 
+/**
+ * Installs the check before each model call on the `Agent` class of `agent`'s copy of
+ * `@openai/agents-core`: the furthest prototype that defines `getSystemPrompt`, so subclasses that
+ * call `super` are covered.
+ */
+function checkAgentCopy(agent: Agent<any, any>): void {
+  let base: object | undefined;
+  for (let p = Object.getPrototypeOf(agent); p !== null; p = Object.getPrototypeOf(p)) {
+    if (Object.prototype.hasOwnProperty.call(p, 'getSystemPrompt')) base = p;
+  }
+  if (base === undefined) {
+    throw ApplicationFailure.create({
+      message: `Agent '${agent.name}' is not an @openai/agents-core Agent, so it cannot be checked before it calls its model.`,
+      type: 'AgentsWorkflowError',
+      nonRetryable: true,
+    });
+  }
+  installRunningAgentCheck(base);
+}
+
 interface RunnerCheckState {
   original: (this: Runner, agent: Agent<any, any>, input: unknown, options?: RunOptionsLike) => Promise<unknown>;
+  watched: WeakSet<Runner>;
 }
 
 interface RunOptionsLike {
@@ -93,13 +119,25 @@ const runnerCheckState = Symbol.for('@temporalio/openai-agents/runnerCheck');
  * run uses. The model provider must be the runner's, which sends model calls to Activities. The run
  * gets a frozen copy of its sandbox config, which upstream reads as it goes, so a later change to the
  * caller's object, such as an `agent_start` listener's, doesn't reach it.
+ *
+ * Upstream emits `agent_start` on the runner before each agent's first model call, including an
+ * agent that a custom `Handoff`'s callback returns, so the run installs the check before each model
+ * call on the copy of `@openai/agents-core` of every agent it starts.
  */
 export function installRunnerCheck(): void {
   const prototype = Runner.prototype as unknown as Record<symbol, RunnerCheckState | undefined>;
   if (prototype[runnerCheckState] !== undefined) return;
-  const state: RunnerCheckState = { original: Runner.prototype.run as RunnerCheckState['original'] };
+  const state: RunnerCheckState = {
+    original: Runner.prototype.run as RunnerCheckState['original'],
+    watched: new WeakSet(),
+  };
   async function run(this: Runner, agent: Agent<any, any>, input: unknown, options?: RunOptionsLike) {
     if (!inWorkflowContext()) return state.original.call(this, agent, input, options);
+    if (!state.watched.has(this)) {
+      state.watched.add(this);
+      this.on('agent_start', (_context, started) => checkAgentCopy(started));
+    }
+    checkAgentCopy(agent);
     const where = `The run of agent '${agent.name}'`;
     if (!(this.config.modelProvider instanceof ActivityBackedModelProvider)) {
       throw ApplicationFailure.create({

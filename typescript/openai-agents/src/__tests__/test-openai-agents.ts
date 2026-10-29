@@ -1,5 +1,8 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { setTracingDisabled } from '@openai/agents-core';
 import type { MCPServer, Model, ModelProvider, ModelRequest, ModelResponse, StreamEvent } from '@openai/agents-core';
 import type { ExecutionContext } from 'ava';
@@ -40,6 +43,7 @@ import {
   type AgentToolRejection,
   type RunningAgentRejection,
 } from './workflows/openai-agents';
+import type { AgentCopyCase } from './workflows/openai-agents-copies';
 import { makeTestFunction } from './helpers/test-fn';
 import {
   FakeModelProvider,
@@ -463,6 +467,70 @@ test('Agents picked or changed during the run are checked before they call their
   // The control's change to the tool's runConfig.model reaches the nested model Activity.
   t.true(models.includes('changed-run-model'), models.join(', '));
   t.false(models.includes('nested-run-model'), models.join(', '));
+});
+
+test('Agents from another copy of @openai/agents-core are checked before they call their model', async (t) => {
+  const { createWorker, taskQueue } = helpers(t);
+  // Bundle a copy of the package under another name, as a dependency that ships its own copy would.
+  const packageDir = fs.realpathSync(path.dirname(path.dirname(require.resolve('@openai/agents-core'))));
+  const copyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agents-core-copy-'));
+  t.teardown(() => fs.rmSync(copyDir, { recursive: true, force: true }));
+  fs.cpSync(packageDir, copyDir, { recursive: true, filter: (src) => !/\.(d\.ts|map)$/.test(src) });
+  const provider = {
+    getModel() {
+      return {
+        async getResponse(request: any) {
+          if (request.systemInstructions === 'Route.') return handoffResponse('transfer_to_desk');
+          if (request.systemInstructions === 'Switch.') return toolCallResponse('switch_model', {});
+          if (request.systemInstructions === 'Answer as declared.') return textResponse('declared answer');
+          return textResponse('copy answer');
+        },
+      } as unknown as FakeModel;
+    },
+  };
+  const plugin = new OpenAIAgentsPlugin({ modelProvider: provider });
+  const workflowBundle = await bundleWorkflowCode({
+    workflowsPath: require.resolve('./workflows/openai-agents-copies'),
+    plugins: [plugin],
+    webpackConfigHook: (config) => ({
+      ...config,
+      resolve: {
+        ...config.resolve,
+        alias: { ...(config.resolve?.alias as object), 'agents-core-copy$': path.join(copyDir, 'dist', 'index.js') },
+        // The copy's own dependencies, such as `debug` and `zod`.
+        modules: [...(config.resolve?.modules ?? ['node_modules']), path.dirname(path.dirname(packageDir))],
+      },
+    }),
+  });
+  const worker = await createWorker({ workflowBundle, plugins: [plugin] });
+  // [expected result, model Activities the run schedules]
+  const expected: Record<AgentCopyCase, [RegExp, number]> = {
+    'agent-start-model-object': [/^AgentsWorkflowError: .*Agent 'Lead' has a Model object/, 0],
+    'handoff-callback-model-object': [/^AgentsWorkflowError: .*Agent 'Picked' has a Model object/, 1],
+    'tool-model-object': [/^AgentsWorkflowError: .*Agent 'Lead' has a Model object/, 1],
+    'string-model': [/^copy answer$/, 1],
+  };
+  await worker.runUntil(async () => {
+    for (const [kind, [result, modelActivities]] of Object.entries(expected)) {
+      // By name: the Workflow module needs the bundle's `agents-core-copy`.
+      const handle = await t.context.env.client.workflow.start('agentCopyWorkflow', {
+        taskQueue,
+        workflowId: `agent-copy-${kind}-${Date.now()}`,
+        args: [kind],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      const output: string = await handle.result();
+      t.regex(output, result, kind);
+      t.notRegex(output, /the inline model ran/, kind);
+      const { events } = await handle.fetchHistory();
+      const scheduled = (events ?? []).filter((e) => e.activityTaskScheduledEventAttributes != null);
+      t.is(scheduled.length, modelActivities, `${kind}: model Activities`);
+      await Worker.runReplayHistory(
+        { workflowBundle, plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) })] },
+        await handle.fetchHistory()
+      );
+    }
+  });
 });
 
 for (const [title, stopOnFirstTool, stream, expectCancelled] of [
