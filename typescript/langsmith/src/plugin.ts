@@ -20,6 +20,7 @@
  */
 
 import { Client } from 'langsmith';
+import { RunTree } from 'langsmith/run_trees';
 
 import type * as nexus from 'nexus-rpc';
 import { SimplePlugin } from '@temporalio/plugin';
@@ -29,6 +30,7 @@ import { createActivityInboundInterceptor, createNexusInboundInterceptor } from 
 import { createClientInterceptor } from './client-interceptor';
 import { createLangSmithSinks } from './sinks';
 import type { EmitterConfig } from './sinks';
+import type { Destination } from './run-tree';
 import type { WorkflowLangSmithConfig } from './workflow-interceptors';
 
 // Derived: @temporalio/worker doesn't export WebpackConfiguration from its root.
@@ -90,7 +92,7 @@ export interface LangSmithPluginOptions {
 export class LangSmithPlugin extends SimplePlugin {
   private readonly client: Client;
   private readonly emitter: EmitterConfig;
-  private readonly workflowConfig: WorkflowLangSmithConfig;
+  private readonly workflowConfig: Omit<WorkflowLangSmithConfig, 'destination'>;
   // Absolute paths so the workflow bundler resolves them under strict pnpm.
   private readonly workflowInterceptorModule = require.resolve('./workflow-interceptors');
   // Target of the `node:async_hooks` rewrite; re-exports the runtime-injected ALS.
@@ -104,13 +106,13 @@ export class LangSmithPlugin extends SimplePlugin {
     this.emitter = {
       client: this.client,
       addTemporalRuns,
-      projectName: options.projectName,
+      // LangSmith treats an empty project name as unset, so the plugin does too.
+      projectName: options.projectName || undefined,
       tags: options.tags,
       metadata: options.metadata,
     };
     this.workflowConfig = {
       addTemporalRuns,
-      projectName: options.projectName,
       tags: options.tags,
       metadata: options.metadata,
     };
@@ -171,8 +173,16 @@ export class LangSmithPlugin extends SimplePlugin {
     const prevHook = base.webpackConfigHook;
     const webpackConfigHook = (config: WebpackConfiguration): WebpackConfiguration => {
       const merged = prevHook ? prevHook(config) : config;
+      // Resolved here, where LangSmith can read env; inside the isolate it can only fall back to `"default"`.
+      const workflowConfig: WorkflowLangSmithConfig = {
+        ...this.workflowConfig,
+        destination:
+          this.emitter.projectName !== undefined
+            ? { project_name: this.emitter.projectName }
+            : envDestination(this.client),
+      };
       // Double-encode so the injected token is a string literal in the bundle.
-      const definitions = { [CONFIG_GLOBAL]: JSON.stringify(JSON.stringify(this.workflowConfig)) };
+      const definitions = { [CONFIG_GLOBAL]: JSON.stringify(JSON.stringify(workflowConfig)) };
       const plugins = [...(merged.plugins ?? [])];
       plugins.push(bundleRewritesPlugin(this.asyncHooksShimModule, definitions) as (typeof plugins)[number]);
       return { ...merged, plugins };
@@ -200,6 +210,22 @@ export class LangSmithPlugin extends SimplePlugin {
       /* swallow: telemetry flush must never fail worker shutdown */
     }
   }
+}
+
+/**
+ * The destination LangSmith's env defaults (`LANGSMITH_PROJECT`, `LANGSMITH_AGENT_ID` and
+ * `LANGSMITH_AGENT_ENVIRONMENT`) name, as LangSmith's own `RunTree` constructor resolves it for a run that names none;
+ * `undefined` when the env can't address a run. The probe run is never posted.
+ *
+ * @internal
+ */
+export function envDestination(client: Client): Destination | undefined {
+  // `tracingEnabled: false` stops LangSmith warning here about an env it can't use; its `Client` already warned once.
+  const probe = new RunTree({ name: 'temporal-langsmith-destination-probe', client, tracingEnabled: false });
+  if (probe.project_name) {
+    return { project_name: probe.project_name };
+  }
+  return probe.address ? { address: probe.address } : undefined;
 }
 
 /**
