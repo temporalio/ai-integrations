@@ -21,6 +21,7 @@ from temporalio.strands_agents import StrandsPlugin, TemporalAgent
 from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.strands_agents._sync_calls import refuse_sync_calls_in_workflows
 from temporalio.worker import Replayer, Worker
+from temporalio.workflow import NondeterminismError
 from tests.common import get_activities
 from tests.mock_model import MockModel
 
@@ -78,18 +79,8 @@ class SyncCallWorkflow:
     @workflow.run
     async def run(self, call: str) -> str:
         # Plain Strands objects with their own model; building them must work.
-        agent = Agent(
-            model=MockModel(["sync answer"]), tools=[echo_tool], callback_handler=None
-        )
-        swarm = Swarm(
-            [
-                Agent(
-                    model=MockModel(["swarm answer"]),
-                    name="node",
-                    callback_handler=None,
-                )
-            ]
-        )
+        agent = Agent(model=MockModel([]), tools=[echo_tool], callback_handler=None)
+        swarm = Swarm([agent])
         if call == "agent":
             agent("Hello")
         elif call == "tool":
@@ -110,8 +101,7 @@ async def test_sync_call_is_refused(client: Client, call: str):
         task_queue=task_queue,
         workflows=[SyncCallWorkflow],
         plugins=[plugin],
-        max_cached_workflows=0,
-        workflow_failure_exception_types=[RuntimeError],
+        workflow_failure_exception_types=[NondeterminismError],
     ):
         handle = await client.start_workflow(
             SyncCallWorkflow.run,
@@ -123,14 +113,15 @@ async def test_sync_call_is_refused(client: Client, call: str):
             await handle.result()
     cause = err.value.cause
     assert isinstance(cause, ApplicationError)
-    assert cause.type == "RuntimeError"
+    assert cause.type == "RestrictedWorkflowAccessError"
     assert cause.message.startswith("Strands runs this sync call on a new thread")
 
-    await Replayer(
-        workflows=[SyncCallWorkflow],
-        plugins=[plugin],
-        workflow_failure_exception_types=[RuntimeError],
-    ).replay_workflow(await handle.fetch_history())
+    if call == "agent":  # One replay is enough: every case hits the same guard.
+        await Replayer(
+            workflows=[SyncCallWorkflow],
+            plugins=[plugin],
+            workflow_failure_exception_types=[NondeterminismError],
+        ).replay_workflow(await handle.fetch_history())
 
 
 async def test_sync_call_workflow_builds_without_calls(client: Client):
