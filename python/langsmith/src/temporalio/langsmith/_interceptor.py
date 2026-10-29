@@ -549,7 +549,20 @@ def _maybe_run(
     if parent is None:
         parent = _get_current_run_for_propagation()
 
-    if parent is None and destination is None:
+    run_tree_args: dict[str, Any] = dict(
+        name=name,
+        run_type=run_type,
+        inputs=inputs or {},
+        ls_client=client,
+    )
+    if parent is not None:
+        # RunTree(parent_run=...) inherits IDs but not the destination.
+        run_tree_args["project_name"] = parent.session_name
+        run_tree_args["address"] = getattr(parent, "address", None)
+        run_tree_args["parent_run"] = parent
+    elif destination is not None:
+        run_tree_args.update(destination)
+    else:
         if temporalio.workflow.in_workflow():
             # Without a replay-safe root, workflow @traceable calls would build
             # plain RunTrees, so the workflow runs untraced.
@@ -559,12 +572,6 @@ def _maybe_run(
             yield None
         return
 
-    run_tree_args: dict[str, Any] = dict(
-        name=name,
-        run_type=run_type,
-        inputs=inputs or {},
-        ls_client=client,
-    )
     # Deterministic IDs so replayed workflows produce identical runs
     # instead of duplicates (see _get_workflow_random for details).
     rng = _get_workflow_random()
@@ -574,13 +581,6 @@ def _maybe_run(
     if rng is not None:
         run_tree_args["id"] = _uuid_from_random(rng)
         run_tree_args["start_time"] = temporalio.workflow.now()
-    if parent is not None:
-        # RunTree(parent_run=...) inherits IDs but not the destination.
-        run_tree_args["project_name"] = parent.session_name
-        run_tree_args["address"] = getattr(parent, "address", None)
-        run_tree_args["parent_run"] = parent
-    elif destination is not None:
-        run_tree_args.update(destination)
     if metadata:
         run_tree_args["extra"] = {"metadata": metadata}
     if tags:
