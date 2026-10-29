@@ -32,8 +32,6 @@ from dataclasses import replace
 from datetime import timedelta
 from typing import Any, Callable
 
-from pydantic import BaseModel
-
 from temporalio import activity as activity_mod
 from temporalio.converter import DataConverter
 from temporalio.deepagents import _serde, _tools
@@ -61,10 +59,6 @@ class DeepAgentsPlugin(SimplePlugin):
             ActivityConfig]``) for the model activities — timeouts, retry policy.
         tool_activity_options: ``ActivityConfig`` (or ``Mapping[tool_name,
             ActivityConfig]``) default for tools wrapped with ``tool_as_activity``.
-        tool_arg_types: Pydantic classes, such as your own LangChain message
-            subclasses, that a tool wrapped with ``tool_as_activity`` gets as
-            objects in its arguments. The classes in ``langchain_core.messages``
-            and ``Document`` always are. Pass the same classes on every worker.
         backends: Map of names to worker-side backend factories used by
             ``TemporalBackend("name", ...)``. Factories accept zero arguments or
             one positional ``factory_argument`` and return a backend, synchronously
@@ -91,7 +85,6 @@ class DeepAgentsPlugin(SimplePlugin):
         model_provider: Callable[[str], Any] | None = None,
         model_activity_options: Any = None,
         tool_activity_options: Any = None,
-        tool_arg_types: Sequence[type[BaseModel]] | None = None,
         backends: Mapping[str, Callable[..., Any]] | None = None,
         streaming_topic: str | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
@@ -132,7 +125,6 @@ class DeepAgentsPlugin(SimplePlugin):
         # wired-via-composition: consumed on the tool dispatch path in _tools.py
         # (_resolve_tool_options), renamed to ``options`` at the callsite.
         _tools.set_tool_defaults(self._tool_activity_options)
-        _serde.set_tool_arg_types(tool_arg_types or ())
 
         # The activities that carry the nondeterministic work. model_provider and
         # the batch interval are captured here so API keys never enter an input.

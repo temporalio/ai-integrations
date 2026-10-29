@@ -70,10 +70,9 @@ async def last_user_message(state: Annotated[dict, InjectedState]) -> str:
 
 @tool
 async def message_summary(state: Annotated[dict, InjectedState]) -> str:
-    """List the conversation's and the notes' message types and contents."""
-    messages = [*state["messages"], *state.get("notes", [])]
+    """List the conversation's message types and contents."""
     return ",".join(
-        f"{type(m).__name__}:{getattr(m, 'content', '?')}" for m in messages
+        f"{type(m).__name__}:{getattr(m, 'content', '?')}" for m in state["messages"]
     )
 
 
@@ -103,6 +102,15 @@ class NotesState(AgentState):
 
 class NotesMiddleware(AgentMiddleware[NotesState]):
     state_schema = NotesState
+
+
+@tool
+async def note_sources(state: Annotated[NotesState, InjectedState]) -> str:
+    """List the notes' types and sources."""
+    return ",".join(
+        f"{type(n).__name__}:{getattr(n, 'source', '?')}"
+        for n in state.get("notes", [])
+    )
 
 
 class Record(BaseModel):
@@ -256,6 +264,7 @@ class InjectedStateToolWorkflow:
             saved_artifact,
             echo_record,
             echo_model,
+            note_sources,
         )
         tools = [
             tool_as_activity(t, start_to_close_timeout=timedelta(seconds=10))
@@ -301,11 +310,10 @@ async def test_wrapped_tool_reads_messages_from_injected_state(
         {"name": "saved_artifact", "args": {}, "id": "artifact-call"},
         {"name": "echo_record", "args": {"record": record}, "id": "record-call"},
         {"name": "echo_model", "args": {"record": record}, "id": "model-call"},
+        {"name": "note_sources", "args": {}, "id": "notes-call"},
     ]
     responses = [AIMessage(content="", tool_calls=calls), AIMessage(content="done")]
-    plugin = DeepAgentsPlugin(
-        model_provider=mock_model_provider(responses), tool_arg_types=[CitedMessage]
-    )
+    plugin = DeepAgentsPlugin(model_provider=mock_model_provider(responses))
     async with Worker(
         env.client,
         task_queue="da-injected-state",
@@ -321,14 +329,16 @@ async def test_wrapped_tool_reads_messages_from_injected_state(
 
     # The wrapped tools get what the same tools get without Temporal: LangChain
     # messages, including the legacy chat and function messages, the tool
-    # result's Document artifact and a message subclass in tool_arg_types.
+    # result's Document artifact and a message subclass the tool's state
+    # annotation names.
     assert out == [
         "user said: Weather in Paris?",
         "ChatMessage:be brief,FunctionMessage:sunny,AIMessage:,ToolMessage:saved,"
-        "HumanMessage:Weather in Paris?,AIMessage:,CitedMessage:see notes",
+        "HumanMessage:Weather in Paris?,AIMessage:",
         "Document:notes",
         "keep:ordinary value",
         "keep:ordinary value",
+        "CitedMessage:wiki",
     ]
 
 
@@ -355,7 +365,7 @@ async def test_invoke_tool_rebuilds_only_recorded_messages(recorded: bool) -> No
         tool_name="message_summary", tool_call_id="c-1", args=args
     )
     if recorded:
-        input.arg_messages = _serde.find_tool_arg_messages(args)
+        input.arg_messages = _serde.find_tool_arg_messages(args, {})
     output = await ActivityEnvironment().run(
         DeepAgentActivities().invoke_tool, send(input)
     )
@@ -376,10 +386,10 @@ async def test_invoke_tool_rebuilds_only_recorded_messages(recorded: bool) -> No
             tool_name="message_summary",
             tool_call_id="c-2",
             args={"chunks": chunks},
-            arg_messages=_serde.find_tool_arg_messages({"chunks": chunks}),
+            arg_messages=_serde.find_tool_arg_messages({"chunks": chunks}, {}),
         )
         sent = send(input)
-        rebuilt = _serde.load_tool_arg_messages(sent.args, sent.arg_messages)
+        rebuilt = _serde.load_tool_arg_messages(sent.args, sent.arg_messages, {})
         assert rebuilt == {"chunks": chunks}
 
 

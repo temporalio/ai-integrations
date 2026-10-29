@@ -325,6 +325,7 @@ def tool_as_activity(
     register_tool(base_tool)
 
     tool_name = base_tool.name
+    arg_types = _serde.tool_arg_types(base_tool)
     opts = _resolve_tool_options(tool_name, activity_options)
     opts.setdefault("start_to_close_timeout", start_to_close_timeout)
 
@@ -340,6 +341,7 @@ def tool_as_activity(
         output = await call_tool(
             activity_input,
             summary=f"tool:{tool_name}",
+            arg_types=arg_types,
             **opts,
         )
         message = _serde.load_object(output.message)
