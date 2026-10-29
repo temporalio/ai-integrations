@@ -638,9 +638,9 @@ def _maybe_run(
     - If add_temporal_runs is False **or** ``langsmith.utils.tracing_is_enabled()``
       returns False, yields None (no run created).
       Context propagation is handled unconditionally by callers.
-    - With no ``destination`` (no plugin project and an env LangSmith can't
-      address), yields None. In a workflow with no parent run, tracing is also
-      disabled for the body.
+    - With no parent or ``destination`` (no plugin project and an env LangSmith
+      can't address), yields None. In a workflow, tracing is also disabled for
+      the body.
     - When a run IS created, uses :class:`_ReplaySafeRunTree` for
       replay and event loop safety, then sets it as ambient context via
       ``tracing_context(parent=run_tree)`` so ``get_current_run_tree()``
@@ -666,7 +666,8 @@ def _maybe_run(
         metadata: Extra metadata to attach to the run.
         tags: Tags to attach to the run.
         parent: Parent run for nesting.
-        destination: The run's project or address, resolved once at startup.
+        destination: Fallback project or address for runs with no parent,
+            resolved once at startup.
         executor: ThreadPoolExecutor for background I/O.
     """
     if not add_temporal_runs or not langsmith.utils.tracing_is_enabled():
@@ -677,8 +678,22 @@ def _maybe_run(
     if parent is None:
         parent = _get_current_run_for_propagation()
 
-    if destination is None:
-        if parent is None and temporalio.workflow.in_workflow():
+    run_tree_args: dict[str, Any] = dict(
+        name=name,
+        run_type=run_type,
+        inputs=inputs or {},
+        ls_client=client,
+    )
+    if parent is not None:
+        # RunTree(parent_run=...) inherits IDs but not the destination.
+        run_tree_args["project_name"] = parent.session_name
+        run_tree_args["address"] = getattr(parent, "address", None)
+        run_tree_args["parent_run"] = parent
+        run_tree_args["replicas"] = parent.replicas
+    elif destination is not None:
+        run_tree_args.update(destination)
+    else:
+        if temporalio.workflow.in_workflow():
             # Without a replay-safe root, workflow @traceable calls would build
             # plain RunTrees, so the workflow runs untraced.
             with tracing_context(enabled=False):
@@ -687,12 +702,6 @@ def _maybe_run(
             yield None
         return
 
-    run_tree_args: dict[str, Any] = dict(
-        name=name,
-        run_type=run_type,
-        inputs=inputs or {},
-        ls_client=client,
-    )
     # Deterministic IDs so replayed workflows produce identical runs
     # instead of duplicates (see _get_workflow_random for details).
     rng = _get_workflow_random()
@@ -702,10 +711,6 @@ def _maybe_run(
     if rng is not None:
         run_tree_args["id"] = _uuid_from_random(rng)
         run_tree_args["start_time"] = temporalio.workflow.now()
-    run_tree_args.update(_destination(None, None, parent) or destination)
-    if parent is not None:
-        run_tree_args["parent_run"] = parent
-        run_tree_args["replicas"] = parent.replicas
     if metadata:
         run_tree_args["extra"] = {"metadata": metadata}
     if tags:
@@ -777,16 +782,16 @@ class LangSmithInterceptor(
         # LangSmith treats an empty project name as unset, so the plugin does too.
         self._project_name = project_name or None
         self._address = address
-        # Where the plugin's own runs, and runs with no parent, go: its
-        # project, else LangSmith's env defaults. None when neither names one.
+        # The plugin project/address or env destination is a fallback for roots.
+        # None when no destination is set and the env is invalid.
         self._destination = _destination(
             self._project_name, self._address
         ) or _env_destination(client)
         if self._destination is None:
             logger.warning(
                 "LangSmith can't name a destination from the environment, so "
-                "the Temporal plugin creates no runs of its own and traces "
-                "nothing that starts without a parent run."
+                "the Temporal plugin traces nothing that starts without a "
+                "parent run."
             )
         self._add_temporal_runs = add_temporal_runs
         self._default_metadata = default_metadata or {}
