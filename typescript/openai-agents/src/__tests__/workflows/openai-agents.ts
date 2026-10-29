@@ -1,8 +1,14 @@
-import { Agent, RunState, tool, type Model, type Tool } from '@openai/agents-core';
+import { Agent, Handoff, RunState, tool, type Model, type Tool } from '@openai/agents-core';
 import { SandboxAgent } from '@openai/agents-core/sandbox';
 import { ApplicationFailure, continueAsNew } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
-import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer, temporalSandboxClient } from '../../workflow';
+import {
+  TemporalOpenAIRunner,
+  activityAsTool,
+  statelessMcpServer,
+  statefulMcpServer,
+  temporalSandboxClient,
+} from '../../workflow';
 
 export interface StreamingAgentResult {
   finalOutput: string;
@@ -134,8 +140,7 @@ export type AgentToolRejection =
   | 'model-provider'
   | 'raw-sandbox'
   | 'raw-sandbox-run-options'
-  | 'unrecorded'
-  | 'name-collision';
+  | 'unrecorded';
 
 /** Returns the failure for an `asTool()` setup that would run a model or sandbox in the Workflow. */
 export async function agentToolRejectedWorkflow(kind: AgentToolRejection): Promise<string> {
@@ -171,14 +176,12 @@ export async function agentToolRejectedWorkflow(kind: AgentToolRejection): Promi
         runOptions: { sandbox: rawSandbox },
       }),
     unrecorded: () => ({ ...nested.asTool({ toolName: 'ask_nested' }) }),
-    'name-collision': () => new Agent({ name: 'Nested', model: 'other-model' }).asTool({ toolName: 'ask_nested' }),
   };
   const lead = new Agent({
     name: 'Lead',
     instructions: 'Use the tool.',
     model: 'lead-model',
     tools: [tools[kind]()],
-    handoffs: kind === 'name-collision' ? [nested] : [],
   });
   try {
     await new TemporalOpenAIRunner().run(lead, 'go', {
@@ -402,4 +405,95 @@ export async function statefulMcpSlowConnectHeartbeatWorkflow(): Promise<string>
   } finally {
     await server.cleanup();
   }
+}
+
+export interface AgentHooksResult {
+  events: string[];
+  nextTurnOutput: string;
+}
+
+/**
+ * `agent.on(...)` listeners, as in the upstream lifecycle hooks guide. The tool-end
+ * listener writes the tool result into the run context, and a second turn runs only
+ * when it did, so the Workflow's commands depend on the hook.
+ */
+export async function agentHooksWorkflow(): Promise<AgentHooksResult> {
+  const fetchValue = activityAsTool<(input: { value: string }) => Promise<string>>({
+    name: 'fetchValue',
+    description: 'Fetch a value',
+    parameters: {
+      type: 'object',
+      properties: { value: { type: 'string' } },
+      required: ['value'],
+      additionalProperties: false,
+    },
+  });
+  const agent = new Agent<{ hookValue?: string }>({
+    name: 'HookAgent',
+    instructions: (runContext) => `hook=${runContext.context.hookValue ?? ''}`,
+    model: 'gpt-4o-mini',
+    tools: [fetchValue],
+  });
+  const events: string[] = [];
+  agent.on('agent_start', (_ctx, started) => events.push(`agent_start:${started === agent}`));
+  agent.on('agent_tool_end', (runContext, tool, result) => {
+    events.push(`agent_tool_end:${tool.name}`);
+    runContext.context.hookValue = result;
+  });
+  agent.on('agent_end', (_ctx, output) => events.push(`agent_end:${output}`));
+
+  const runner = new TemporalOpenAIRunner();
+  const context: { hookValue?: string } = {};
+  await runner.run(agent, 'go', { context });
+  if (context.hookValue === undefined) return { events, nextTurnOutput: '' };
+  const next = await runner.run(agent, 'again', { context });
+  return { events, nextTurnOutput: next.finalOutput ?? '' };
+}
+
+/**
+ * A custom `Handoff` whose callback picks the desk from the run context, as the
+ * upstream handoffs guide describes. Each desk has its own Activity tool.
+ */
+export async function customHandoffWorkflow(tier: string): Promise<string> {
+  const deskTool = (name: string) =>
+    activityAsTool<(input: Record<string, never>) => Promise<string>>({
+      name,
+      description: `Look up the ${name} desk`,
+      parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+    });
+  const standard = new Agent<{ tier: string }>({
+    name: 'standard',
+    model: 'gpt-4o-mini',
+    tools: [deskTool('standardDesk')],
+  });
+  const vip = new Agent<{ tier: string }>({ name: 'vip', model: 'gpt-4o-mini', tools: [deskTool('vipDesk')] });
+  const desk = new Handoff(standard, async (runContext) => (runContext.context.tier === 'vip' ? vip : standard));
+  desk.toolName = 'transfer_to_desk';
+  desk.toolDescription = 'Route to the right desk';
+  const router = new Agent<{ tier: string }>({ name: 'router', model: 'gpt-4o-mini', handoffs: [desk] });
+  const result = await new TemporalOpenAIRunner().run(router, 'help', { context: { tier } });
+  return `${result.lastAgent?.name}: ${result.finalOutput}`;
+}
+
+/** A summary provider labels each model call with the agent it gets: lead, nested expert, handoff target. */
+export async function summaryAgentWorkflow(): Promise<string> {
+  const expert = new Agent({ name: 'expert', model: 'm', instructions: 'Answer as the expert.' });
+  const billing = new Agent({ name: 'billing', model: 'm', instructions: 'Answer as billing.' });
+  const lead = new Agent({
+    name: 'lead',
+    model: 'm',
+    instructions: 'Use the tools.',
+    tools: [expert.asTool({ toolName: 'ask_expert' })],
+    handoffs: [billing],
+  });
+  const runner = new TemporalOpenAIRunner({
+    defaultModelParams: { summary: { provide: (agent) => `agent:${agent?.name ?? 'none'}` } },
+  });
+  return (await runner.run(lead, 'go')).finalOutput ?? '';
+}
+
+/** `runConfig.model` with an agent that sets its own model. */
+export async function runModelOverrideWorkflow(): Promise<string> {
+  const agent = new Agent({ name: 'own', model: 'own-model', instructions: 'Answer.' });
+  return (await new TemporalOpenAIRunner().run(agent, 'go', { runConfig: { model: 'run-model' } })).finalOutput ?? '';
 }

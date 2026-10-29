@@ -1,7 +1,7 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
 import { setTracingDisabled } from '@openai/agents-core';
-import type { MCPServer } from '@openai/agents-core';
+import type { MCPServer, Model, ModelProvider, ModelRequest, ModelResponse, StreamEvent } from '@openai/agents-core';
 import type { ExecutionContext } from 'ava';
 import { WorkflowClient, type WorkflowHandle } from '@temporalio/client';
 import { temporal } from '@temporalio/proto';
@@ -15,11 +15,15 @@ import {
   StatelessMCPServerProvider,
 } from '..';
 import {
+  agentHooksWorkflow,
   agentToolRejectedWorkflow,
   agentToolRunConfigWorkflow,
   agentToolStreamWorkflow,
   agentToolOptionsReuseWorkflow,
+  customHandoffWorkflow,
+  runModelOverrideWorkflow,
   sharedAgentApprovalWorkflow,
+  summaryAgentWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   summaryOverrideStringWorkflow,
@@ -363,7 +367,6 @@ test('agent.asTool() setups that would run a model or sandbox in the Workflow fa
       /asTool\('ask_nested'\) runOptions.sandbox.client must be created/,
     ],
     unrecorded: ['AgentsWorkflowError', /tool 'ask_nested' looks like an agent.asTool\(\) tool/],
-    'name-collision': ['AgentsWorkflowError', /different agent with the same name is a handoff target/],
   };
 
   await worker.runUntil(async () => {
@@ -387,7 +390,7 @@ test('agent.asTool() setups that would run a model or sandbox in the Workflow fa
 for (const [title, legacyFirstRun, nestedCall] of [
   ['a handoff to an agent that is also an asTool() source resumes after continueAsNew', false, 'handoff'],
   ['an approval inside a nested asTool() run resumes after continueAsNew', false, 'tool'],
-  ['state saved before agent.asTool() replaced a function tool resumes with the handoff run model', true, 'handoff'],
+  ['state saved before agent.asTool() replaced a function tool resumes', true, 'handoff'],
 ] as const) {
   test(title, async (t) => {
     const { createWorker, startWorkflow } = helpers(t);
@@ -424,9 +427,9 @@ for (const [title, legacyFirstRun, nestedCall] of [
       t.is(result.savedIdentity, nestedCall === 'handoff' ? 'Nested' : 'Parent');
       t.is(result.output, nestedCall === 'handoff' ? 'nested done' : 'parent done');
       t.is(result.executions, 1, 'the approved action runs once');
-      // One Agent object is both the handoff target and the tool source, so both take the run model.
+      // Nested sets its own model, which wins over runConfig.model wherever it runs, as upstream.
       const nestedModels = calls.filter((c) => c.instructions === 'Answer as nested.').map((c) => c.model);
-      t.deepEqual(nestedModels, ['run-model', 'run-model']);
+      t.deepEqual(nestedModels, ['own-model', 'own-model']);
       await replay(t, handle);
     });
   });
@@ -806,4 +809,110 @@ test('Streaming: useLocalActivity fails fast before scheduling an Activity', asy
     const result = await handle.result();
     t.is(result, 'StreamingLocalActivityUnsupported');
   });
+});
+
+/** Calls fetchValue, ends after the tool result, then answers a second turn with its instructions. */
+function hookProbeModelProvider(): ModelProvider {
+  let calls = 0;
+  const model: Model = {
+    async getResponse(request: ModelRequest): Promise<ModelResponse> {
+      calls++;
+      if (calls === 1) return toolCallResponse('fetchValue', { value: 'S-hook' });
+      if (calls === 2) return textResponse('done');
+      return textResponse(`next turn saw: ${request.systemInstructions}`);
+    },
+    // eslint-disable-next-line require-yield
+    async *getStreamedResponse(): AsyncIterable<StreamEvent> {
+      throw new Error('Streaming not supported');
+    },
+  };
+  return { getModel: () => model };
+}
+
+test('agent.on listeners run and their context writes reach later turns', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const plugin = new OpenAIAgentsPlugin({ modelProvider: hookProbeModelProvider() });
+  const worker = await createWorker({
+    plugins: [plugin],
+    activities: { fetchValue: async ({ value }: { value: string }) => value },
+  });
+
+  const result = await worker.runUntil(executeWorkflow(agentHooksWorkflow, { workflowExecutionTimeout: '30 seconds' }));
+
+  t.deepEqual(result.events, [
+    'agent_start:true',
+    'agent_tool_end:fetchValue',
+    'agent_end:done',
+    'agent_start:true',
+    'agent_end:next turn saw: hook=S-hook',
+  ]);
+  t.is(result.nextTurnOutput, 'next turn saw: hook=S-hook');
+});
+
+const deskActivities = {
+  standardDesk: async () => 'standard desk',
+  vipDesk: async () => 'vip desk',
+};
+
+test('A custom Handoff hands off to the agent its callback returns', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const modelProvider = new FakeModelProvider([
+    handoffResponse('transfer_to_desk'),
+    textResponse('vip answer'),
+    handoffResponse('transfer_to_desk'),
+    textResponse('standard answer'),
+  ]);
+  const worker = await createWorker({
+    plugins: [new OpenAIAgentsPlugin({ modelProvider })],
+    activities: deskActivities,
+  });
+
+  const results = await worker.runUntil(async () => [
+    await executeWorkflow(customHandoffWorkflow, { args: ['vip'], workflowExecutionTimeout: '30 seconds' }),
+    await executeWorkflow(customHandoffWorkflow, { args: ['standard'], workflowExecutionTimeout: '30 seconds' }),
+  ]);
+
+  t.deepEqual(results, ['vip: vip answer', 'standard: standard answer']);
+});
+
+test('A ModelSummaryProvider gets the running agent; nested agent.asTool() calls get none', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const modelProvider = new FakeModelProvider([
+    toolCallResponse('ask_expert', { input: 'q' }),
+    textResponse('expert answer'),
+    handoffResponse('transfer_to_billing'),
+    textResponse('billing done'),
+  ]);
+  const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider })] });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(summaryAgentWorkflow, { workflowExecutionTimeout: '30 seconds' });
+    t.is(await handle.result(), 'billing done');
+    const { events } = await handle.fetchHistory();
+    const summaries = (events ?? [])
+      .filter((e) => e.activityTaskScheduledEventAttributes?.activityType?.name === 'invokeModelActivity')
+      .map((e) =>
+        Buffer.from(e.userMetadata?.summary?.data ?? [])
+          .toString('utf-8')
+          .replace(/"/g, '')
+      );
+    t.deepEqual(summaries, ['agent:lead', 'agent:none', 'agent:lead', 'agent:billing']);
+  });
+});
+
+test('runConfig.model leaves an agent that sets its own model on that model, as upstream', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const names: string[] = [];
+  const provider = {
+    getModel(name?: string) {
+      return {
+        async getResponse() {
+          names.push(name ?? '');
+          return textResponse('ok');
+        },
+      } as unknown as FakeModel;
+    },
+  };
+  const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider: provider })] });
+  await worker.runUntil(executeWorkflow(runModelOverrideWorkflow, { workflowExecutionTimeout: '30 seconds' }));
+  t.deepEqual(names, ['own-model']);
 });

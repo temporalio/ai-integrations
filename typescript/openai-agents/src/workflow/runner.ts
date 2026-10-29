@@ -28,7 +28,7 @@ import {
 } from '../common/model-activity-options';
 import { unwrapTemporalFailure } from '../common/errors';
 import { ActivityBackedModelProvider } from './activity-backed-model';
-import { convertAgent } from './convert-agent';
+import { checkAgent } from './check-agent';
 import { validateTemporalSandboxClient } from './sandbox-client';
 import { ensureTracingProcessorRegistered } from './tracing';
 import { flushOpenSpans } from './agent-sink-processor';
@@ -230,15 +230,13 @@ export class TemporalOpenAIRunner {
 
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
-    const converted = convertAgent(agent, this.modelParams, undefined, modelOverride);
+    checkAgent(agent, modelOverride);
 
     let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
     if (input instanceof RunState) {
-      // Round-trip through fromString so the rehydrated state's agent graph carries our converted
-      // agent (with ActivityBackedModel); setCurrentAgent only swaps the top-level ref, not nested ones.
-      // It also drops upstream's live-session identity, which would otherwise resolve manifest
-      // environment references on the Workflow thread rather than in the resume Activity.
-      const restored = (await RunState.fromString(converted, input.toString())) as RunState<TContext, TAgent>;
+      // Round-trip through fromString to drop upstream's live-session identity, which would otherwise
+      // resolve manifest environment references on the Workflow thread rather than in the resume Activity.
+      const restored = (await RunState.fromString(agent, input.toString())) as RunState<TContext, TAgent>;
       // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
       restored.clearTrace();
       preparedInput = restored;
@@ -246,13 +244,25 @@ export class TemporalOpenAIRunner {
       preparedInput = input;
     }
 
-    // Handoff agents carry their model. Nested `agent.asTool()` runs take the model, provider and
-    // settings from this config, as upstream, so their model calls are Activities too.
+    // The agent a ModelSummaryProvider gets. Model calls made during a tool call belong to a
+    // nested `agent.asTool()` run, whose agent this runner doesn't see, so they get none.
+    let runningAgent: Agent<any, any> | undefined =
+      preparedInput instanceof RunState ? preparedInput._currentAgent : agent;
+    let toolCalls = 0;
+
+    // Every agent runs as written: the provider sends each model name to the model Activity.
+    // Nested `agent.asTool()` runs take the model, provider and settings from this config, as upstream.
     const innerRunner = new Runner({
       ...runnerConfigOverrides,
       model: modelOverride,
-      modelProvider: new ActivityBackedModelProvider(this.modelParams),
+      modelProvider: new ActivityBackedModelProvider(this.modelParams, () =>
+        toolCalls === 0 ? runningAgent : undefined
+      ),
     });
+    innerRunner.on('agent_start', (_context, started) => (runningAgent = started));
+    innerRunner.on('agent_handoff', (_context, _from, to) => (runningAgent = to));
+    innerRunner.on('agent_tool_start', () => toolCalls++);
+    innerRunner.on('agent_tool_end', () => toolCalls--);
 
     const sharedRunOptions = {
       maxTurns: options?.maxTurns,
@@ -267,12 +277,12 @@ export class TemporalOpenAIRunner {
 
     try {
       if (options?.stream === true) {
-        return (await innerRunner.run(converted, preparedInput as any, {
+        return (await innerRunner.run(agent, preparedInput as any, {
           ...sharedRunOptions,
           stream: true,
         })) as StreamedRunResult<TContext, TAgent>;
       }
-      return (await innerRunner.run(converted, preparedInput as any, sharedRunOptions)) as RunResult<any, TAgent>;
+      return (await innerRunner.run(agent, preparedInput as any, sharedRunOptions)) as RunResult<any, TAgent>;
     } catch (error) {
       throw normalizeAgentsRunError(error);
     } finally {

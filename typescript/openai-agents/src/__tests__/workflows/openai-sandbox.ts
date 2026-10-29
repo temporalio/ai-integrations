@@ -1,4 +1,4 @@
-import { Agent, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
+import { Agent, Handoff, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
 import {
   Capability,
   Manifest,
@@ -202,4 +202,40 @@ export async function sandboxValidationWorkflow(): Promise<string> {
   }
 
   return 'OK';
+}
+
+/**
+ * A custom `Handoff` whose callback returns `vip`, which asks a nested `SandboxAgent` through
+ * `agent.asTool()`. With `inGraph`, `vip` is also a handoff of the router, so the runner sees it up front.
+ */
+export async function customHandoffSandboxToolWorkflow(inGraph: boolean): Promise<string> {
+  const specialist = new SandboxAgent({
+    name: 'sandbox-specialist',
+    model: 'gpt-4o-mini',
+    capabilities: [new TestSandboxCapability()],
+  });
+  const vip = new Agent({
+    name: 'vip',
+    model: 'gpt-4o-mini',
+    tools: [specialist.asTool({ toolName: 'ask_sandbox' })],
+  });
+  const standard = new Agent({ name: 'standard', model: 'gpt-4o-mini' });
+  const desk = new Handoff(standard, async () => vip);
+  desk.toolName = 'transfer_to_desk';
+  const router = new Agent({ name: 'router', model: 'gpt-4o-mini', handoffs: inGraph ? [desk, vip] : [desk] });
+  const result = await new TemporalOpenAIRunner().run(router, 'help', {
+    runConfig: { sandbox: { client: temporalSandboxClient('fake') } },
+  });
+  return `${result.lastAgent?.name}: ${result.finalOutput}`;
+}
+
+/** A custom `Handoff` whose callback returns a `SandboxAgent`, with no `runConfig.sandbox`. */
+export async function customHandoffSandboxAgentWithoutConfigWorkflow(): Promise<string> {
+  const specialist = new SandboxAgent({ name: 'sandbox-specialist', model: 'gpt-4o-mini' });
+  const standard = new Agent({ name: 'standard', model: 'gpt-4o-mini' });
+  const desk = new Handoff(standard, async () => specialist);
+  desk.toolName = 'transfer_to_desk';
+  const router = new Agent({ name: 'router', model: 'gpt-4o-mini', handoffs: [desk] });
+  await new TemporalOpenAIRunner().run(router, 'help');
+  return 'FAIL: should have thrown';
 }
