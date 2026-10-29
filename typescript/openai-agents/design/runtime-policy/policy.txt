@@ -1,0 +1,25 @@
+{"mode":"policy","node":"v24.22.0","core":"0.14.3"}
+time=2026-10-29T17:58:46.563 level=WARN msg="Cluster Id in Cluster Metadata config is not a valid uuid. Generating a new Cluster Id" component=metadata-initializer
+Temporal CLI 1.9.1 (Server 1.32.0, UI 2.54.1)
+
+Temporal Server:      localhost:40827
+Temporal Persistence: in-memory
+Temporal Metrics:     http://localhost:40247/metrics
+{"kind":"copy-listener","output":"AgentsWorkflowError: Runtime policy: agent 'Lead' selected a Model object","separateCopies":true,"patched":false,"liveInline":0,"replayInline":0,"activities":[],"modelRequests":[]}
+{"kind":"copy-handoff","output":"AgentsWorkflowError: Runtime policy: agent 'Picked' selected a Model object","separateCopies":true,"patched":false,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity"],"modelRequests":["lead-model"]}
+{"kind":"same-listener","output":"AgentsWorkflowError: Runtime policy: agent 'Lead' selected a Model object","separateCopies":true,"patched":false,"liveInline":0,"replayInline":0,"activities":[],"modelRequests":[]}
+{"kind":"same-handoff","output":"AgentsWorkflowError: Runtime policy: agent 'Picked' selected a Model object","separateCopies":true,"patched":false,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity"],"modelRequests":["lead-model"]}
+{"kind":"schema-provider","output":"An error occurred while running the tool. Please try again. Error: ApplicationFailure: Runtime policy: the effective model provider must dispatch Activities","separateCopies":true,"patched":false,"guardCalls":0,"interruptions":0,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity"],"modelRequests":["lead-model"]}
+{"kind":"undefined-provider","output":"An error occurred while running the tool. Please try again. Error: ApplicationFailure: Runtime policy: the effective model provider must dispatch Activities","separateCopies":true,"patched":false,"guardCalls":0,"interruptions":0,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity"],"modelRequests":["lead-model"]}
+{"kind":"input-model","output":"An error occurred while running the tool. Please try again. Error: ApplicationFailure: Runtime policy: runConfig.model must be a name","separateCopies":true,"patched":false,"guardCalls":0,"interruptions":0,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity"],"modelRequests":["lead-model"]}
+{"kind":"tool-provider","output":"An error occurred while running the tool. Please try again. Error: ApplicationFailure: Runtime policy: the effective model provider must dispatch Activities","separateCopies":true,"patched":false,"guardCalls":0,"interruptions":0,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity"],"modelRequests":["lead-model"]}
+{"kind":"copy-native","output":"An error occurred while running the tool. Please try again. Error: ApplicationFailure: Runtime policy: the effective model provider must dispatch Activities","separateCopies":true,"patched":false,"guardCalls":0,"interruptions":0,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity"],"modelRequests":["lead-model"]}
+{"kind":"copy-string","output":"nested answer","separateCopies":true,"patched":false,"guardCalls":0,"interruptions":0,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity"],"modelRequests":["lead-model"]}
+{"kind":"native","output":"nested answer","separateCopies":true,"patched":false,"guardCalls":0,"interruptions":0,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity","invokeModelActivity"],"modelRequests":["lead-model","nested-model"]}
+{"kind":"input-guard","output":"BLOCKED","separateCopies":true,"patched":false,"guardCalls":1,"interruptions":0,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity"],"modelRequests":["lead-model"]}
+{"kind":"output-guard","output":"BLOCKED","separateCopies":true,"patched":false,"guardCalls":1,"interruptions":0,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity","invokeModelActivity"],"modelRequests":["lead-model","nested-model"]}
+[boundaryProof(policy-approval)] Accessed finalOutput before agent run is completed.
+{"kind":"approval","output":"undefined","separateCopies":true,"patched":false,"guardCalls":0,"interruptions":1,"liveInline":0,"replayInline":0,"activities":["invokeModelActivity"],"modelRequests":["lead-model"]}
+PASS policy: 14 cases, each replayed
+Module not found: Error: Unsupported agents-core runtime: /work/typescript/openai-agents/node_modules/@openai/agents-core-copy/package.json
+PASS mixed-version bundle rejection: an unmodified SDK copy never reaches execution
