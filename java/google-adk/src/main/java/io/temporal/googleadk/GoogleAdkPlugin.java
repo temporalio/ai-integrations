@@ -113,16 +113,24 @@ public final class GoogleAdkPlugin extends SimplePlugin {
     private Builder() {}
 
     /**
-     * Propagates native ADK trace context into Activities and Workflow threads. The application
-     * must register {@link GoogleAdkTracing#wrap} globally before ADK initializes and retain
-     * ownership of that tracing instance until its Workers shut down.
+     * Routes native ADK spans from this plugin's Workers to {@code tracing} and propagates their
+     * W3C context into model and tool Activities. Register {@link GoogleAdkTracing#wrap} as the
+     * global OpenTelemetry before any ADK code runs, and close {@code tracing} after the Workers
+     * shut down.
      */
     public Builder tracing(GoogleAdkTracing tracing) {
       this.tracing = Objects.requireNonNull(tracing, "tracing");
       return this;
     }
 
-    /** Serves the given model name with a model created once, on first use, by the supplier. */
+    /**
+     * Serves a registration name with a model created once, on first use, by the supplier.
+     *
+     * <p>The registration name selects the worker-side model. A request that still names the
+     * registration is sent using the supplied model's own name; a different name set by a
+     * before-model callback is preserved. ADK's workflow-side capability checks still see the
+     * {@code TemporalModel} name, so prefer the provider's model name when those checks matter.
+     */
     public Builder model(String modelName, Supplier<BaseLlm> model) {
       models.put(
           Objects.requireNonNull(modelName, "modelName"), Objects.requireNonNull(model, "model"));

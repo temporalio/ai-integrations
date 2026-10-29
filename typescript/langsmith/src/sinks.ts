@@ -5,6 +5,7 @@
  */
 
 import { isTracingEnabled, type Client } from 'langsmith';
+import type { RunTree } from 'langsmith/run_trees';
 import type { Sinks } from '@temporalio/workflow';
 import type { InjectedSinks } from '@temporalio/worker';
 
@@ -26,6 +27,8 @@ export interface SerializedRun {
   extra?: Record<string, unknown>;
   tags?: string[];
   project_name?: string;
+  /** Agent address, set instead of `project_name` for an addressed run, in the installed LangSmith's own form. */
+  address?: RunTree['address'];
   events?: Record<string, unknown>[];
 }
 
@@ -70,6 +73,7 @@ function toCreateParams(run: SerializedRun): Parameters<Client['createRun']>[0] 
     extra: run.extra,
     tags: run.tags,
     project_name: run.project_name,
+    address: run.address,
   };
 }
 

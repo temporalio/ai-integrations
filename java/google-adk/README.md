@@ -71,6 +71,10 @@ Gemini models from the environment (`GOOGLE_API_KEY`, or the Vertex AI variables
 factory with `modelFactory(...)` to change that. Disable the model SDK's own retries in your
 factory; Temporal's retry policy on the activity replaces them.
 
+Registration aliases resolve to the provider's model name unless a before-model callback overrides it.
+ADK's workflow-side capability checks still use the `TemporalModel` name, so use provider names
+when those checks apply.
+
 ## What the integration gives you
 
 ### Model calls as activities

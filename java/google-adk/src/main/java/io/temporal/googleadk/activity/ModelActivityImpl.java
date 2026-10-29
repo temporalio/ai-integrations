@@ -54,7 +54,11 @@ public final class ModelActivityImpl implements ModelActivity {
           "InvokeModel requires a request", FailureTypes.MODEL_ERROR);
     }
     BaseLlm model = resolve(input.model());
-    LlmRequest request = withDeclaredTools(input.request());
+    LlmRequest request =
+        withDeclaredTools(
+            input.request().model().filter(input.model()::equals).isPresent()
+                ? input.request().toBuilder().model(model.model()).build()
+                : input.request());
     ActivityExecutionContext context = Activity.getExecutionContext();
     // Completing this processor abandons the model call once the server cancels the activity. The
     // whole call runs on an I/O thread, including any blocking work the model does before it
