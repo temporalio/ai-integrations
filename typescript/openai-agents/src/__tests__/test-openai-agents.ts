@@ -1,7 +1,7 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
 import { setTracingDisabled } from '@openai/agents-core';
-import type { MCPServer } from '@openai/agents-core';
+import type { MCPServer, ModelProvider } from '@openai/agents-core';
 import { WorkflowClient } from '@temporalio/client';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
@@ -16,6 +16,7 @@ import {
 import {
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
+  mcpInvalidateToolsCacheWorkflow,
   summaryOverrideStringWorkflow,
   statefulMcpNotConnectedWorkflow,
   statefulMcpIsolationWorkflow,
@@ -203,6 +204,90 @@ test('factoryArgument is passed through to MCP activities', async (t) => {
     t.truthy(result, 'Workflow should complete successfully');
 
     t.deepEqual(receivedFactoryArg, { tenantId: 'tenant-42' }, 'factoryArgument should be passed to listTools');
+  });
+});
+
+test('MCP invalidateToolsCache makes the next run list tools again', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  const tool = (name: string) => ({
+    name,
+    description: name,
+    inputSchema: { type: 'object' as const, properties: {}, required: [] as string[], additionalProperties: false },
+  });
+  // Each server lists old_tool first and new_tool after that, as if its catalog changed.
+  let statelessLists = 0;
+  const stateless = new StatelessMCPServerProvider('catalog', (): MCPServer => ({
+    cacheToolsList: false,
+    name: 'catalog',
+    async connect() {},
+    async close() {},
+    async listTools() {
+      statelessLists++;
+      return [tool(statelessLists === 1 ? 'old_tool' : 'new_tool')];
+    },
+    async callTool() {
+      throw new Error('not used');
+    },
+    async invalidateToolsCache() {},
+  }));
+  // The stateful server also caches its own list, as a native server with cacheToolsList does.
+  let statefulLists = 0;
+  const stateful = new StatefulMCPServerProvider(
+    'catalog',
+    (): MCPServer => {
+      let cached: ReturnType<typeof tool>[] | undefined;
+      return {
+        cacheToolsList: true,
+        name: 'catalog',
+        async connect() {},
+        async close() {},
+        async listTools() {
+          if (!cached) {
+            statefulLists++;
+            cached = [tool(statefulLists === 1 ? 'old_tool' : 'new_tool')];
+          }
+          return cached;
+        },
+        async callTool() {
+          throw new Error('not used');
+        },
+        async invalidateToolsCache() {
+          cached = undefined;
+        },
+      };
+    },
+    t.context.env.nativeConnection
+  );
+  // Answers with the names of the tools it was offered.
+  const toolNamesModel: ModelProvider = {
+    getModel: () => ({
+      async getResponse(request) {
+        return textResponse(JSON.stringify(request.tools.map((offered) => offered.name)));
+      },
+      // eslint-disable-next-line require-yield
+      async *getStreamedResponse() {
+        throw new Error('not used');
+      },
+    }),
+  };
+  const worker = await createWorker({
+    plugins: [new OpenAIAgentsPlugin({ modelProvider: toolNamesModel, mcpServerProviders: [stateless, stateful] })],
+  });
+
+  await worker.runUntil(async () => {
+    const result = {
+      stateless: await executeWorkflow(mcpInvalidateToolsCacheWorkflow, {
+        args: [false],
+        workflowExecutionTimeout: '30 seconds',
+      }),
+      stateful: await executeWorkflow(mcpInvalidateToolsCacheWorkflow, {
+        args: [true],
+        workflowExecutionTimeout: '30 seconds',
+      }),
+    };
+    // The run after invalidateToolsCache() gets the server's new tool list.
+    t.deepEqual(result, { stateless: [['old_tool'], ['new_tool']], stateful: [['old_tool'], ['new_tool']] });
   });
 });
 

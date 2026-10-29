@@ -1,7 +1,12 @@
-import type { MCPServer } from '@openai/agents-core';
+import { invalidateServerToolsCache, type MCPServer } from '@openai/agents-core';
 import type { Duration, RetryPolicy } from '@temporalio/common';
-import { proxyActivities } from '@temporalio/workflow';
-import { MCP_CALL_TOOL_SUFFIX, MCP_LIST_TOOLS_SUFFIX, MCP_STATELESS_SUFFIX } from '../common/mcp-types';
+import { patched, proxyActivities } from '@temporalio/workflow';
+import {
+  MCP_CALL_TOOL_SUFFIX,
+  MCP_INVALIDATE_TOOLS_CACHE_PATCH,
+  MCP_LIST_TOOLS_SUFFIX,
+  MCP_STATELESS_SUFFIX,
+} from '../common/mcp-types';
 
 export interface StatelessMcpServerOptions {
   cacheToolsList?: boolean;
@@ -58,6 +63,11 @@ export function statelessMcpServer(name: string, options?: StatelessMcpServerOpt
     },
     async invalidateToolsCache() {
       cachedTools = undefined;
+      // The agent SDK also caches the tool list by server name, as native
+      // servers' invalidateToolsCache() expects. Clear it too.
+      if (shouldCache && patched(MCP_INVALIDATE_TOOLS_CACHE_PATCH)) {
+        await invalidateServerToolsCache(name);
+      }
     },
   };
 }

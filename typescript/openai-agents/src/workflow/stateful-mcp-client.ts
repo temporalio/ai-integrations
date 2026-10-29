@@ -1,3 +1,4 @@
+import { invalidateServerToolsCache } from '@openai/agents-core';
 import {
   ActivityFailure,
   ApplicationFailure,
@@ -10,15 +11,18 @@ import {
   type ActivityOptions,
   CancellationScope,
   isCancellation,
+  patched,
   scheduleActivity,
   workflowInfo,
 } from '@temporalio/workflow';
 import {
   DEDICATED_WORKER_FAILURE_TYPE,
   MCP_CALL_TOOL_SUFFIX,
+  MCP_INVALIDATE_TOOLS_CACHE_PATCH,
   MCP_LIST_TOOLS_SUFFIX,
   MCP_SERVER_SESSION_SUFFIX,
   MCP_STATEFUL_SUFFIX,
+  type StatefulMcpListToolsArgs,
   type StatefulMcpServerSessionArgs,
   type StatefulTemporalMCPServer,
 } from '../common/mcp-types';
@@ -91,6 +95,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
   private _sessionScope: CancellationScope | undefined;
   private _sessionPromise: Promise<void> | undefined;
   private _connected = false;
+  private _invalidateServerCache = false;
 
   constructor(name: string, options?: StatefulMcpServerOptions) {
     this._name = `${name}${MCP_STATEFUL_SUFFIX}`;
@@ -175,7 +180,9 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
 
   async listTools(): Promise<any[]> {
     this.assertConnected();
-    return handleWorkerFailure(() => scheduleActivity(this._name + MCP_LIST_TOOLS_SUFFIX, [], this._operationConfig));
+    const args: StatefulMcpListToolsArgs[] = this._invalidateServerCache ? [{ invalidateToolsCache: true }] : [];
+    this._invalidateServerCache = false;
+    return handleWorkerFailure(() => scheduleActivity(this._name + MCP_LIST_TOOLS_SUFFIX, args, this._operationConfig));
   }
 
   async callTool(toolName: string, args: Record<string, unknown> | null): Promise<any> {
@@ -186,8 +193,13 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
   }
 
   async invalidateToolsCache(): Promise<void> {
-    // Caching is owned by the upstream agent SDK; nothing to invalidate on the
-    // Workflow-side handle.
+    // Clear the agent SDK's tool cache for this server, as native servers'
+    // invalidateToolsCache() does, and have the next listing clear the
+    // Worker-side server's own cache.
+    if (patched(MCP_INVALIDATE_TOOLS_CACHE_PATCH)) {
+      await invalidateServerToolsCache(this._name);
+      this._invalidateServerCache = true;
+    }
   }
 }
 

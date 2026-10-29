@@ -7,6 +7,7 @@ import {
   MCP_LIST_TOOLS_SUFFIX,
   MCP_SERVER_SESSION_SUFFIX,
   MCP_STATEFUL_SUFFIX,
+  type StatefulMcpListToolsArgs,
   type StatefulMcpServerSessionArgs,
 } from '../common/mcp-types';
 import { startAdaptiveHeartbeat } from './heartbeat';
@@ -76,7 +77,13 @@ export class StatefulMCPServerProvider {
     };
 
     // Operation Activities — registered on the per-run Task Queue.
-    const listTools = async () => getServerOrThrow().listTools();
+    const listTools = async (input?: StatefulMcpListToolsArgs) => {
+      const server = getServerOrThrow();
+      if (input?.invalidateToolsCache) {
+        await server.invalidateToolsCache();
+      }
+      return server.listTools();
+    };
 
     const callTool = async (input: CallToolArgs) => getServerOrThrow().callTool(input.toolName, input.args);
 

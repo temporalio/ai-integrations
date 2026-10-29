@@ -99,6 +99,30 @@ export async function mcpFactoryArgWorkflow(prompt: string): Promise<string> {
   return result.finalOutput ?? '';
 }
 
+/**
+ * Runs the agent twice with the same MCP server and invalidates the server's
+ * tool cache between the runs. Returns the tool names the model got each time.
+ */
+export async function mcpInvalidateToolsCacheWorkflow(stateful: boolean): Promise<string[][]> {
+  const server = stateful ? statefulMcpServer('catalog') : statelessMcpServer('catalog');
+  await server.connect();
+  try {
+    const agent = new Agent({
+      name: 'CatalogAgent',
+      instructions: 'You have access to MCP tools.',
+      model: 'gpt-4o-mini',
+      mcpServers: [server],
+    });
+    const runner = new TemporalOpenAIRunner();
+    const first = await runner.run(agent, 'Which tools do you have?');
+    await server.invalidateToolsCache();
+    const second = await runner.run(agent, 'Which tools do you have now?');
+    return [JSON.parse(first.finalOutput ?? '[]'), JSON.parse(second.finalOutput ?? '[]')];
+  } finally {
+    await server.close();
+  }
+}
+
 export async function summaryOverrideStringWorkflow(prompt: string): Promise<string> {
   const agent = new Agent({
     name: 'SummaryAgent',

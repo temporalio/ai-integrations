@@ -6,6 +6,19 @@ export const MCP_SERVER_SESSION_SUFFIX = '-server-session';
 export const MCP_STATEFUL_SUFFIX = '-stateful';
 export const MCP_STATELESS_SUFFIX = '-stateless';
 
+/**
+ * Patch ID for MCP tool cache invalidation. Runs recorded before it reused the
+ * agent SDK's cached tool list after `invalidateToolsCache()`, so they keep
+ * doing so on replay.
+ */
+export const MCP_INVALIDATE_TOOLS_CACHE_PATCH = 'openai-agents-mcp-invalidate-tools-cache';
+
+// Input shape of the stateful `${name}-stateful-list-tools` Activity.
+export interface StatefulMcpListToolsArgs {
+  /** Invalidate the Worker-side server's own tool cache before listing. */
+  invalidateToolsCache?: boolean;
+}
+
 /** Error type for dedicated-Worker scheduling and heartbeat failures. */
 export const DEDICATED_WORKER_FAILURE_TYPE = 'DedicatedWorkerFailure';
 
