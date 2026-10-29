@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/a2aproject/a2a-go/v2/a2aclient"
+
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/worker"
 
@@ -84,15 +86,22 @@ type Config struct {
 	// its toolset is cached on the Activities value and shared across calls; see
 	// MCPFactory for the full lifecycle contract.
 	MCPToolsets map[string]MCPFactory
+
+	// A2AClientFactory builds the a2a-go clients the SendA2AMessage and
+	// CancelA2ATask Activities use, for example with call interceptors that
+	// add credentials. When nil, the Activities use a2a-go's JSON-RPC and REST
+	// transports over HTTP clients with no timeout of their own, so the
+	// Activity's timeouts bound each call. A factory of your own uses its own
+	// transports: a2a-go's default ones stop every call at 3 minutes, and an
+	// HTTP error status they report as text is retried.
+	A2AClientFactory *a2aclient.Factory
 }
 
 // Activities holds the worker-side registries and implements the Temporal
-// Activities dispatched from the workflow side: InvokeModel (by TemporalModel),
-// ListMcpTools / CallMcpTool (by the MCP proxy), and ResolveA2AAgentCard /
-// SendA2AMessage / CancelA2ATask (by the A2A providers). Ordinary function tools run
-// in-workflow and need no registration here; ActivityAsTool dispatches the
-// user's own already-registered activity by name. Build one with NewActivities
-// and register it with Register.
+// Activities the workflow side dispatches by name (registerAll lists them).
+// Ordinary function tools run in-workflow and need no registration here;
+// ActivityAsTool dispatches the user's own already-registered activity by name.
+// Build one with NewActivities and register it with Register.
 type Activities struct {
 	models map[string]ModelFactory
 	mcp    map[string]MCPFactory
@@ -107,6 +116,8 @@ type Activities struct {
 	mcpMu     sync.Mutex
 	mcpCache  map[string]tool.Toolset
 	mcpClosed bool
+
+	a2aClientFactory *a2aclient.Factory
 }
 
 // NewActivities validates cfg and returns the worker-side Activities. It returns
@@ -117,6 +128,8 @@ func NewActivities(cfg Config) (*Activities, error) {
 		models:   make(map[string]ModelFactory, len(cfg.Models)),
 		mcp:      make(map[string]MCPFactory, len(cfg.MCPToolsets)),
 		mcpCache: make(map[string]tool.Toolset),
+
+		a2aClientFactory: cfg.A2AClientFactory,
 	}
 	for name, f := range cfg.Models {
 		if f == nil {
@@ -163,8 +176,7 @@ type activityRegistry interface {
 	RegisterActivityWithOptions(a any, options activity.RegisterOptions)
 }
 
-// registerAll wires InvokeModel, the MCP Activities and the A2A Activities onto
-// r under their stable Activity names.
+// registerAll wires the Activities onto r under their stable Activity names.
 func (a *Activities) registerAll(r activityRegistry) {
 	r.RegisterActivityWithOptions(a.InvokeModel, activity.RegisterOptions{Name: InvokeModelActivityName})
 	r.RegisterActivityWithOptions(a.ListMcpTools, activity.RegisterOptions{Name: ListMcpToolsActivityName})
@@ -174,11 +186,11 @@ func (a *Activities) registerAll(r activityRegistry) {
 	r.RegisterActivityWithOptions(a.CancelA2ATask, activity.RegisterOptions{Name: CancelA2ATaskActivityName})
 }
 
-// Register wires InvokeModel, the MCP Activities and the A2A Activities onto the
-// worker under their stable Activity names. NewPlugin is the standard wiring — it performs
-// this registration at worker start; Register remains for the workflow/activity
-// test environments (which construct no real worker, so plugins do not run
-// there) and manual setups.
+// Register wires the Activities onto the worker under their stable Activity
+// names. NewPlugin is the standard wiring — it performs this registration at
+// worker start; Register remains for the workflow/activity test environments
+// (which construct no real worker, so plugins do not run there) and manual
+// setups.
 func (a *Activities) Register(r worker.Registry) {
 	a.registerAll(r)
 }

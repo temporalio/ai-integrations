@@ -2,32 +2,44 @@ package googleadk
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
+	"net/http"
+	"reflect"
+	"strings"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
+	"github.com/a2aproject/a2a-go/v2/a2aclient/agentcard"
 
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
+	"google.golang.org/genai"
+
+	"google.golang.org/adk/v2/agent"
 	remoteagent "google.golang.org/adk/v2/agent/remoteagent/v2"
 	"google.golang.org/adk/v2/platform"
+	"google.golang.org/adk/v2/plugin"
 )
 
+// a2aCancelTimeout bounds the cancellation ADK sends for a remote task a run
+// leaves unfinished, as ADK's own cleanup does.
+const a2aCancelTimeout = 5 * time.Second
+
 // NewA2AAgentCardProvider returns an AgentCardProvider for ADK's remote A2A
-// agent (remoteagent.NewA2A) that fetches the agent card in the
-// ResolveA2AAgentCard Activity, so a replay reads the card from History
-// instead of fetching it again. source is an http(s) URL or a file path on the
-// worker, as for remoteagent.NewAgentCardProvider. A zero StartToCloseTimeout
-// in ao falls back to the default one-minute tool timeout.
-//
-// Use it with NewA2AClientProvider:
+// agent (remoteagent.NewA2A) that fetches the agent card from source, an
+// http(s) URL or a file path on the worker, in the ResolveA2AAgentCard
+// Activity. Use it with NewA2AClientProvider:
 //
 //	remote, err := remoteagent.NewA2A(remoteagent.A2AConfig{
-//	    Name:              "remote",
-//	    AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, workflow.ActivityOptions{}),
-//	    ClientProvider:    googleadk.NewA2AClientProvider(workflow.ActivityOptions{}),
+//		Name:              "remote",
+//		AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, workflow.ActivityOptions{}),
+//		ClientProvider:    googleadk.NewA2AClientProvider(workflow.ActivityOptions{}),
 //	})
 func NewA2AAgentCardProvider(source string, ao workflow.ActivityOptions) remoteagent.AgentCardProvider {
 	// A method value, not a func literal, so remoteAgentSendsFromWorkflow can
@@ -45,21 +57,21 @@ func (p a2aCardProvider) resolve(ctx context.Context) (*a2a.AgentCard, error) {
 	if !ok {
 		return nil, errMissingContext
 	}
-	actx := workflow.WithActivityOptions(wfCtx, resolveToolActivityOptions(p.activityOptions, ""))
 	var card a2a.AgentCard
-	if err := workflow.ExecuteActivity(actx, ResolveA2AAgentCardActivityName, p.source).Get(wfCtx, &card); err != nil {
+	if err := executeA2AActivity(wfCtx, p.activityOptions, ResolveA2AAgentCardActivityName, invocationAgentName(ctx), p.source, &card); err != nil {
 		return nil, err
 	}
 	return &card, nil
 }
 
 // NewA2AClientProvider returns a ClientProvider for ADK's remote A2A agent
-// (remoteagent.NewA2A) whose client sends each request in an Activity:
-// SendA2AMessage for messages and CancelA2ATask for cancellations. History
-// records the replies, so a replay does not send the requests again. The
-// Activities use a2a-go's default client. A zero StartToCloseTimeout in ao
-// falls back to the default one-minute tool timeout; raise it for remote
-// agents that take longer to answer.
+// (remoteagent.NewA2A) whose client sends each message in the SendA2AMessage
+// Activity and each cancellation in CancelA2ATask. A cancellation gets 5
+// seconds and one attempt, as in ADK, whatever ao says.
+//
+// The client sets the message ID from the workflow's random stream when it
+// sends. ADK's BeforeRequestCallbacks run earlier and see the random ID a2a-go
+// gave the message, which differs on every replay.
 func NewA2AClientProvider(ao workflow.ActivityOptions) remoteagent.A2AClientProvider {
 	// A method value, for the same reason as in NewA2AAgentCardProvider.
 	return a2aClientProvider{activityOptions: ao}.create
@@ -69,78 +81,82 @@ type a2aClientProvider struct {
 	activityOptions workflow.ActivityOptions
 }
 
-func (p a2aClientProvider) create(_ context.Context, card *a2a.AgentCard) (remoteagent.A2AClient, error) {
-	return &a2aClient{card: card, activityOptions: p.activityOptions}, nil
+func (p a2aClientProvider) create(ctx context.Context, card *a2a.AgentCard) (remoteagent.A2AClient, error) {
+	return &a2aClient{card: card, agentName: invocationAgentName(ctx), activityOptions: p.activityOptions}, nil
 }
 
 // a2aClient is the workflow-side client NewA2AClientProvider builds. Each call
 // runs an Activity; the live a2a-go client exists only worker-side.
 type a2aClient struct {
 	card            *a2a.AgentCard
+	agentName       string
 	activityOptions workflow.ActivityOptions
 }
 
 func (c *a2aClient) SendMessage(ctx context.Context, req *a2a.SendMessageRequest) (a2a.SendMessageResult, error) {
-	events, err := c.send(ctx, req, false)
+	res, err := c.send(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}
-	if len(events) == 0 {
-		return nil, errors.New("googleadk: SendA2AMessage returned no result")
+	if len(res.Events) == 1 {
+		if reply, ok := res.Events[0].Event.(a2a.SendMessageResult); ok {
+			return reply, nil
+		}
 	}
-	res, ok := events[0].Event.(a2a.SendMessageResult)
-	if !ok {
-		return nil, errors.New("googleadk: SendA2AMessage returned an event that is not a message or task")
-	}
-	return res, nil
+	return nil, errors.New("googleadk: SendA2AMessage returned no message or task")
 }
 
 // SendStreamingMessage sends the message in one Activity and yields its events
-// once the stream ends, so the workflow sees the same events on every replay.
+// once the stream ends, followed by the error that ended it, if any.
 func (c *a2aClient) SendStreamingMessage(ctx context.Context, req *a2a.SendMessageRequest) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {
-		events, err := c.send(ctx, req, true)
+		res, err := c.send(ctx, req, true)
 		if err != nil {
 			yield(nil, err)
 			return
 		}
-		for _, e := range events {
+		for _, e := range res.Events {
 			if !yield(e.Event, nil) {
 				return
 			}
 		}
+		if res.Error != "" {
+			yield(nil, errors.New(res.Error))
+		}
 	}
 }
 
-func (c *a2aClient) send(ctx context.Context, req *a2a.SendMessageRequest, stream bool) ([]a2a.StreamResponse, error) {
+func (c *a2aClient) send(ctx context.Context, req *a2a.SendMessageRequest, stream bool) (a2aSendResult, error) {
 	wfCtx, ok := workflowContext(ctx)
 	if !ok {
-		return nil, errMissingContext
+		return a2aSendResult{}, errMissingContext
 	}
-	// a2a-go gives the message a random ID in Workflow code, and ADK stores
-	// the request in the turn's last event. Use an ID from the workflow's
-	// random stream so a replay rebuilds the same events.
+	// ADK stores the request in the turn's last event, so a replay must
+	// rebuild the same message ID.
 	if req.Message != nil {
 		req.Message.ID = platform.NewUUID(ctx)
 	}
-	actx := workflow.WithActivityOptions(wfCtx, resolveToolActivityOptions(c.activityOptions, ""))
-	var events []a2a.StreamResponse
+	var res a2aSendResult
 	in := a2aSendInput{Card: c.card, Request: req, Stream: stream}
-	if err := workflow.ExecuteActivity(actx, SendA2AMessageActivityName, in).Get(wfCtx, &events); err != nil {
-		return nil, err
-	}
-	return events, nil
+	err := executeA2AActivity(wfCtx, c.activityOptions, SendA2AMessageActivityName, c.agentName, in, &res)
+	return res, err
 }
 
+// CancelTask runs on a disconnected context, so it goes out even after the
+// workflow is cancelled: ADK sends it on a context without cancellation.
 func (c *a2aClient) CancelTask(ctx context.Context, req *a2a.CancelTaskRequest) (*a2a.Task, error) {
 	wfCtx, ok := workflowContext(ctx)
 	if !ok {
 		return nil, errMissingContext
 	}
-	actx := workflow.WithActivityOptions(wfCtx, resolveToolActivityOptions(c.activityOptions, ""))
+	wfCtx, _ = workflow.NewDisconnectedContext(wfCtx)
+	ao := c.activityOptions
+	ao.StartToCloseTimeout = a2aCancelTimeout
+	ao.ScheduleToCloseTimeout = a2aCancelTimeout
+	ao.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 1}
 	var task a2a.Task
 	in := a2aCancelInput{Card: c.card, Request: req}
-	if err := workflow.ExecuteActivity(actx, CancelA2ATaskActivityName, in).Get(wfCtx, &task); err != nil {
+	if err := executeA2AActivity(wfCtx, ao, CancelA2ATaskActivityName, c.agentName, in, &task); err != nil {
 		return nil, err
 	}
 	return &task, nil
@@ -149,11 +165,40 @@ func (c *a2aClient) CancelTask(ctx context.Context, req *a2a.CancelTaskRequest) 
 // Destroy does nothing: the workflow-side client holds no connection.
 func (c *a2aClient) Destroy() error { return nil }
 
+// executeA2AActivity runs an A2A Activity, with the agent's name as its
+// summary, and decodes its result into out. A zero StartToCloseTimeout in ao
+// falls back to the one-minute tool default.
+func executeA2AActivity(wfCtx workflow.Context, ao workflow.ActivityOptions, name, agentName string, in, out any) error {
+	ao = resolveToolActivityOptions(ao, "")
+	ao.Summary = agentName
+	return workflow.ExecuteActivity(workflow.WithActivityOptions(wfCtx, ao), name, in).Get(wfCtx, out)
+}
+
+// invocationAgentName returns the name of the agent ctx runs, or "".
+func invocationAgentName(ctx context.Context) string {
+	if ic, ok := ctx.(agent.InvocationContext); ok && ic.Agent() != nil {
+		return ic.Agent().Name()
+	}
+	return ""
+}
+
 // a2aSendInput is the serializable payload for SendA2AMessage.
 type a2aSendInput struct {
 	Card    *a2a.AgentCard
 	Request *a2a.SendMessageRequest
 	Stream  bool
+}
+
+// a2aSendResult is the serializable result of SendA2AMessage.
+type a2aSendResult struct {
+	// Events is the reply: one message or task, or the streamed events.
+	Events []a2a.StreamResponse
+	// Error is the error that ended the stream after Events. It comes back
+	// with the events instead of failing the Activity because the remote agent
+	// has started the task: a retry would send the message again and start a
+	// second one. ADK keeps the events, turns the error into an error event and
+	// cancels the task, as without Temporal.
+	Error string
 }
 
 // a2aCancelInput is the serializable payload for CancelA2ATask.
@@ -165,83 +210,210 @@ type a2aCancelInput struct {
 // ResolveA2AAgentCard fetches the agent card from source (an http(s) URL or a
 // file path) with remoteagent.NewAgentCardProvider.
 func (a *Activities) ResolveA2AAgentCard(ctx context.Context, source string) (*a2a.AgentCard, error) {
+	stopHeartbeats := startPeriodicHeartbeats(ctx)
+	defer stopHeartbeats()
 	card, err := remoteagent.NewAgentCardProvider(source)(ctx)
 	if err != nil {
-		retryable := !errors.Is(err, remoteagent.ErrUnsupportedCardSource)
-		return nil, newApplicationError(ErrorTypeA2A, retryable, err, "resolve A2A agent card: %v", err)
+		return nil, a2aError("resolve A2A agent card", err)
 	}
 	return card, nil
 }
 
-// SendA2AMessage sends a message to a remote A2A agent with a2a-go's default
-// client and returns its reply: one message or task, or every streamed event
-// when Stream is set.
-func (a *Activities) SendA2AMessage(ctx context.Context, in a2aSendInput) ([]a2a.StreamResponse, error) {
-	// No-op unless the caller set a HeartbeatTimeout; then a slow remote agent
-	// must not be heartbeat-timed-out and sent the message again.
+// SendA2AMessage sends a message to a remote A2A agent and returns its reply.
+// A streamed reply comes back whole, with the chunks of each artifact merged.
+func (a *Activities) SendA2AMessage(ctx context.Context, in a2aSendInput) (a2aSendResult, error) {
+	return withA2AClient(ctx, a, in.Card, "send A2A message", func(client *a2aclient.Client) (a2aSendResult, error) {
+		if !in.Stream {
+			reply, err := client.SendMessage(ctx, in.Request)
+			if err != nil {
+				return a2aSendResult{}, err
+			}
+			return a2aSendResult{Events: []a2a.StreamResponse{{Event: reply}}}, nil
+		}
+		var res a2aSendResult
+		for ev, err := range client.SendStreamingMessage(ctx, in.Request) {
+			if err != nil && len(res.Events) == 0 {
+				return a2aSendResult{}, err
+			}
+			if err != nil {
+				res.Error = fmt.Sprintf("send A2A message: %v", err)
+				return res, nil
+			}
+			res.Events = appendA2AEvent(res.Events, ev)
+		}
+		return res, nil
+	})
+}
+
+// CancelA2ATask cancels a remote A2A task.
+func (a *Activities) CancelA2ATask(ctx context.Context, in a2aCancelInput) (*a2a.Task, error) {
+	return withA2AClient(ctx, a, in.Card, "cancel A2A task", func(client *a2aclient.Client) (*a2a.Task, error) {
+		return client.CancelTask(ctx, in.Request)
+	})
+}
+
+// withA2AClient runs call with an A2A client for card, heartbeating while it
+// runs, and tags its error with op.
+func withA2AClient[T any](ctx context.Context, a *Activities, card *a2a.AgentCard, op string, call func(*a2aclient.Client) (T, error)) (T, error) {
 	stopHeartbeats := startPeriodicHeartbeats(ctx)
 	defer stopHeartbeats()
-	client, err := newA2AClient(ctx, in.Card)
+	var zero T
+	factory := a.a2aClientFactory
+	if factory == nil {
+		factory = defaultA2AClientFactory
+	}
+	client, err := factory.CreateFromCard(ctx, card)
 	if err != nil {
-		return nil, err
+		// The card names no transport the factory supports, which a retry
+		// cannot change.
+		return zero, newApplicationError(ErrorTypeA2A, false, err, "create A2A client: %v", err)
 	}
 	defer func() {
 		if err := client.Destroy(); err != nil {
 			activity.GetLogger(ctx).Warn("failed to destroy A2A client", "error", err)
 		}
 	}()
-	if !in.Stream {
-		res, err := client.SendMessage(ctx, in.Request)
-		if err != nil {
-			return nil, a2aError("send A2A message", err)
-		}
-		return []a2a.StreamResponse{{Event: res}}, nil
+	res, err := call(client)
+	if err != nil {
+		return zero, a2aError(op, err)
 	}
-	var events []a2a.StreamResponse
-	for ev, err := range client.SendStreamingMessage(ctx, in.Request) {
-		if err != nil {
-			return nil, a2aError("send A2A message", err)
-		}
-		events = append(events, a2a.StreamResponse{Event: ev})
-	}
-	return events, nil
+	return res, nil
 }
 
-// CancelA2ATask cancels a remote A2A task with a2a-go's default client.
-func (a *Activities) CancelA2ATask(ctx context.Context, in a2aCancelInput) (*a2a.Task, error) {
-	client, err := newA2AClient(ctx, in.Card)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if err := client.Destroy(); err != nil {
-			activity.GetLogger(ctx).Warn("failed to destroy A2A client", "error", err)
+// appendA2AEvent appends a streamed event to events. A chunk that continues
+// the artifact of the event before it is merged into that event, so the result
+// grows with the reply rather than with the number of chunks. ADK joins the
+// chunks of an artifact into one event either way.
+func appendA2AEvent(events []a2a.StreamResponse, ev a2a.Event) []a2a.StreamResponse {
+	chunk, ok := ev.(*a2a.TaskArtifactUpdateEvent)
+	if ok && chunk.Append && chunk.Artifact != nil && len(events) > 0 {
+		last, ok := events[len(events)-1].Event.(*a2a.TaskArtifactUpdateEvent)
+		if ok && !last.LastChunk && last.Artifact != nil && last.TaskID == chunk.TaskID &&
+			last.Artifact.ID == chunk.Artifact.ID &&
+			reflect.DeepEqual(last.Metadata, chunk.Metadata) &&
+			reflect.DeepEqual(last.Artifact.Metadata, chunk.Artifact.Metadata) {
+			for _, p := range chunk.Artifact.Parts {
+				last.Artifact.Parts = appendA2APart(last.Artifact.Parts, p)
+			}
+			last.LastChunk = chunk.LastChunk
+			return events
 		}
-	}()
-	task, err := client.CancelTask(ctx, in.Request)
-	if err != nil {
-		return nil, a2aError("cancel A2A task", err)
 	}
-	return task, nil
+	return append(events, a2a.StreamResponse{Event: ev})
 }
 
-// newA2AClient builds a2a-go's default client for card. A failure comes from
-// the card, such as one with no supported transport, so it is non-retryable.
-func newA2AClient(ctx context.Context, card *a2a.AgentCard) (*a2aclient.Client, error) {
-	client, err := a2aclient.NewFromCard(ctx, card)
-	if err != nil {
-		return nil, newApplicationError(ErrorTypeA2A, false, err, "create A2A client: %v", err)
+// appendA2APart appends p to parts, joining it to a last text part of the same
+// media type when neither carries metadata.
+func appendA2APart(parts a2a.ContentParts, p *a2a.Part) a2a.ContentParts {
+	if n := len(parts); n > 0 && p != nil && parts[n-1] != nil {
+		last := parts[n-1]
+		lastText, ok1 := last.Content.(a2a.Text)
+		text, ok2 := p.Content.(a2a.Text)
+		if ok1 && ok2 && last.Filename == p.Filename && last.MediaType == p.MediaType &&
+			len(last.Metadata) == 0 && len(p.Metadata) == 0 {
+			parts[n-1] = &a2a.Part{Content: lastText + text, Filename: last.Filename, MediaType: last.MediaType}
+			return parts
+		}
 	}
-	return client, nil
+	return append(parts, p)
 }
 
-// a2aError tags an A2A call failure. An A2A error the remote agent answered
-// with, such as a task it does not know, is non-retryable: sending again
-// cannot fix it, and ADK turns the failed call into an error event, as it does
-// without Temporal. Internal and server errors, and errors that never reached
-// the agent, stay retryable.
+// a2aError tags a failed A2A call and decides whether Temporal retries it:
+//   - a call that failed with an HTTP status is retried for 408, 409, 429 and
+//     5xx, as a model call is;
+//   - an A2A error the remote agent answers with is not: sending again would
+//     start another task, and ADK turns the failed call into an error event,
+//     as without Temporal;
+//   - a card source ADK cannot read, or a reply that is not valid JSON, is
+//     not;
+//   - anything else, such as a network error or a card file missing on this
+//     worker, is.
 func a2aError(op string, err error) error {
+	retryable := true
+	var status *a2aHTTPStatusError
+	var cardStatus *agentcard.ErrStatusNotOK
 	var remote *a2a.Error
-	retryable := !errors.As(err, &remote) || errors.Is(err, a2a.ErrInternalError) || errors.Is(err, a2a.ErrServerError)
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	switch {
+	case errors.As(err, &status):
+		retryable = retryableHTTPStatus(status.code)
+	case errors.As(err, &cardStatus):
+		retryable = retryableHTTPStatus(cardStatus.StatusCode)
+	case errors.As(err, &remote), errors.Is(err, remoteagent.ErrUnsupportedCardSource),
+		errors.As(err, &syntaxErr), errors.As(err, &typeErr):
+		retryable = false
+	}
 	return newApplicationError(ErrorTypeA2A, retryable, err, "%s: %v", op, err)
+}
+
+// defaultA2AClientFactory builds the A2A clients when Config.A2AClientFactory
+// is nil: a2a-go's JSON-RPC and REST transports over HTTP clients with no
+// timeout of their own, so the Activity's timeouts bound each call. a2a-go's
+// own default client stops every call at 3 minutes.
+var defaultA2AClientFactory = a2aclient.NewFactory(
+	a2aclient.WithJSONRPCTransport(&http.Client{Transport: a2aStatusTransport{}}),
+	a2aclient.WithRESTTransport(&http.Client{Transport: a2aStatusTransport{keepJSONErrors: true}}),
+)
+
+// a2aStatusTransport turns an HTTP error status into an a2aHTTPStatusError, so
+// a2aError can decide retries from the status. a2a-go's JSON-RPC transport
+// reports the status only as text, and its REST transport drops it when the
+// body is not JSON. With keepJSONErrors, a JSON error body is left to a2a-go,
+// which turns it into an A2A error.
+type a2aStatusTransport struct {
+	keepJSONErrors bool
+}
+
+func (t a2aStatusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil || resp.StatusCode == http.StatusOK {
+		return resp, err
+	}
+	if t.keepJSONErrors && strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+		return resp, nil
+	}
+	_ = resp.Body.Close()
+	return nil, &a2aHTTPStatusError{code: resp.StatusCode, status: resp.Status}
+}
+
+// a2aHTTPStatusError is an HTTP error status from a remote A2A agent.
+type a2aHTTPStatusError struct {
+	code   int
+	status string
+}
+
+func (e *a2aHTTPStatusError) Error() string { return "unexpected HTTP status: " + e.status }
+
+// NewRunnerPlugin returns an ADK runner plugin that fails each run, before
+// any agent runs, when root or an agent below it is a remote A2A agent that
+// sends its requests from Workflow code. Add it to the runner of root:
+//
+//	adkPlugin, err := googleadk.NewRunnerPlugin(root)
+//	// ...
+//	r, err := runner.New(runner.Config{
+//		Agent: root,
+//		// ...
+//		PluginConfig: runner.PluginConfig{Plugins: []*plugin.Plugin{adkPlugin}},
+//	})
+//
+// Without it, only model calls check, and only the agents below the agent that
+// makes the call. The runner plugin also catches a remote root agent, one
+// under a sequential, loop or parallel agent, and one reached by transfer. It
+// does not see a remote agent wrapped as a tool with agenttool, which is not
+// part of the tree.
+func NewRunnerPlugin(root agent.Agent) (*plugin.Plugin, error) {
+	return plugin.New(plugin.Config{
+		Name: "googleadk",
+		BeforeRunCallback: func(agent.InvocationContext) (*genai.Content, error) {
+			remote := root
+			if !remoteAgentSendsFromWorkflow(root) {
+				remote = findRemoteAgent(root)
+			}
+			if remote != nil {
+				return nil, remoteAgentError(remote)
+			}
+			return nil, nil
+		},
+	})
 }

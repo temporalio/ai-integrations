@@ -205,12 +205,30 @@ the model SDK's own retries (see below), or override the fallbacks.
   and `ClientProvider: googleadk.NewA2AClientProvider(activityOptions)`. The card
   fetch and each message then run in the `ResolveA2AAgentCard` and
   `SendA2AMessage` Activities (a cancellation in `CancelA2ATask`), so a replay
-  reads them from History instead of sending them again. The Activities use
-  a2a-go's default client. A streamed reply reaches the workflow when the stream
-  ends. A send that times out or fails on the network is retried, which sends
-  the message again, so set a `StartToCloseTimeout` longer than the remote agent
-  takes to answer. An A2A error the remote agent answers with is not retried;
-  ADK turns it into an error event.
+  reads them from History instead of sending them again. Like ADK's own
+  provider, the card provider fetches the card on every run of the agent; set a
+  static `AgentCard` to skip the fetch.
+  - The Activities build a2a-go's JSON-RPC and REST clients with no HTTP timeout
+    of their own, so the Activity's timeouts bound each call. Set
+    `Config.A2AClientFactory` to use your own `a2aclient.Factory`, for example
+    with call interceptors that add credentials. It then uses its own HTTP
+    clients: a2a-go's defaults stop every call at 3 minutes and report an HTTP
+    error status only as text, which the plugin retries.
+  - A call that fails with an HTTP status follows the rule under **Typed
+    failures**. An A2A error
+    the remote agent answers with is not retried; ADK turns it into an error
+    event. A send that times out or fails on the network is retried, which sends
+    the message again, so set a `StartToCloseTimeout` longer than the remote
+    agent takes to answer.
+  - A streamed reply reaches the workflow when the stream ends, with the chunks
+    of each artifact merged. If the stream fails after its first events, the
+    workflow gets those events and the error, without a retry, and ADK cancels
+    the unfinished task as it does without Temporal. A cancellation gets 5
+    seconds and one attempt, and still goes out after the workflow is
+    cancelled.
+  - The client sets the message ID from the workflow's random stream when it
+    sends. ADK's `BeforeRequestCallbacks` run earlier and see a2a-go's random
+    ID, which differs on every replay.
 - **Deterministic by construction.** `NewContext` binds ADK's `platform.Now` to
   `workflow.Now`, `platform.NewUUID` to a deterministic generator drawn from the
   workflow random stream, and `platform.RunTasks` to a `workflow.Go` fan-out, so
@@ -491,8 +509,12 @@ an upgrade would newly pass through ungated.
   agent from the deprecated `agent/remoteagent` package. They fetch their agent
   card and send messages from Workflow code, so every replay would send them
   again. A model call from an agent with such a remote agent below it returns an
-  error and schedules no Activity. The check runs on model calls, so it misses a
-  remote agent that runs before any model call, such as a remote root agent.
+  error and schedules no Activity. That check misses a remote agent that is not
+  below an agent making a model call: a remote root agent, one under a
+  sequential, loop or parallel agent, and one reached by transfer. To catch
+  those, add `googleadk.NewRunnerPlugin(root)` to the runner's plugins: it fails
+  every run, before any agent runs, while the tree under `root` holds such an
+  agent. Neither check sees a remote agent wrapped as a tool with `agenttool`.
 
   An open run that made such a model call on an earlier version fails to replay
   on this one with a non-determinism error. Let those runs finish before you

@@ -4,12 +4,11 @@ import (
 	"context"
 	"errors"
 	"iter"
-	"net/http"
-	"net/http/httptest"
-	"sync/atomic"
 	"testing"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2aclient"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -64,74 +63,215 @@ func TestMultiAgentSubAgents(t *testing.T) {
 	assert.GreaterOrEqual(t, counter.get(googleadk.InvokeModelActivityName), 2)
 }
 
-// TestRemoteSubAgentRejected proves a tree holding ADK's remote A2A agent fails
-// with a clear error before any model call or A2A request. The remote agent
-// would send from Workflow code, and every replay would send again.
+// TestRemoteSubAgentRejected proves a remote A2A agent that would send from
+// Workflow code fails the run with a clear error before it sends anything: on
+// the model call of an agent above it, or, with the runner plugin, right
+// before it runs. Every replay of such an agent would send again.
 func TestRemoteSubAgentRejected(t *testing.T) {
-	var requests atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
-		http.NotFound(w, r)
-	}))
-	defer srv.Close()
-
-	var s testsuite.WorkflowTestSuite
-	env, counter := newEnv(t, &s, googleadk.Config{
-		Models: map[string]googleadk.ModelFactory{
-			"root-model": scriptedModelFactory(
-				googleadk.FunctionCallResponse("c1", "transfer_to_agent", map[string]any{"agent_name": "remote"}),
-			),
+	workflowSide := func(url string) []subAgentSpec {
+		sa := remoteSubAgent(url)
+		sa.WorkflowSideA2A = true
+		return []subAgentSpec{sa}
+	}
+	for _, tc := range []struct {
+		name string
+		in   func(url string) runInput
+		// wantSent is set for the control: the remote agent runs and sends.
+		wantSent bool
+	}{
+		{
+			name: "below the agent making a model call",
+			in: func(url string) runInput {
+				return runInput{ModelName: "root-model", UserMessage: "ask the remote agent", SubAgents: workflowSide(url)}
+			},
 		},
-	})
+		{
+			name: "under a sequential agent, with the runner plugin",
+			in: func(url string) runInput {
+				return runInput{SequentialRoot: true, RunnerPlugin: true, UserMessage: "ask the remote agent", SubAgents: workflowSide(url)}
+			},
+		},
+		{
+			name: "under a sequential agent, without the runner plugin",
+			in: func(url string) runInput {
+				return runInput{SequentialRoot: true, UserMessage: "ask the remote agent", SubAgents: workflowSide(url)}
+			},
+			wantSent: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			url, requests := startA2AServer(t, a2aServer{
+				Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil),
+			})
+			var s testsuite.WorkflowTestSuite
+			env, counter := newEnv(t, &s, googleadk.Config{
+				Models: map[string]googleadk.ModelFactory{"root-model": transferToRemoteModel()},
+			})
 
-	env.ExecuteWorkflow(agentRunWorkflow, runInput{
-		ModelName:   "root-model",
-		UserMessage: "ask the remote agent",
-		SubAgents: []subAgentSpec{{
-			Name:          "remote",
-			Description:   "remote A2A agent",
-			RemoteCardURL: srv.URL,
-		}},
-	})
+			env.ExecuteWorkflow(agentRunWorkflow, tc.in(url))
 
-	require.True(t, env.IsWorkflowCompleted())
-	assert.Zero(t, requests.Load(), "no A2A request may leave Workflow code")
-	assert.Zero(t, counter.get(googleadk.InvokeModelActivityName), "the run must fail before the first model call")
-	err := env.GetWorkflowError()
-	require.Error(t, err, "a tree with a remote A2A agent must fail the run")
-	assert.Contains(t, err.Error(), `agent "remote" is a remote A2A agent`)
+			require.True(t, env.IsWorkflowCompleted())
+			if tc.wantSent {
+				require.NoError(t, env.GetWorkflowError())
+				assert.Positive(t, requests.Load(), "without the runner plugin, the remote agent sends from Workflow code")
+				return
+			}
+			assert.Zero(t, requests.Load(), "no A2A request may leave Workflow code")
+			assert.Zero(t, counter.get(googleadk.InvokeModelActivityName), "the run must fail before the first model call")
+			err := env.GetWorkflowError()
+			require.Error(t, err, "a tree with a remote A2A agent must fail the run")
+			assert.Contains(t, err.Error(), `agent "remote" is a remote A2A agent`)
+		})
+	}
 }
 
-// TestRemoteSubAgentErrorNotRetried proves an A2A error the remote agent
-// answers with fails the SendA2AMessage Activity once, without retries, and
-// the turn ends as it would without Temporal: ADK turns the error into an
-// event.
+// bearerInterceptor adds "Authorization: Bearer <token>" to every A2A call.
+type bearerInterceptor struct {
+	a2aclient.PassthroughInterceptor
+	token string
+}
+
+func (i bearerInterceptor) Before(ctx context.Context, req *a2aclient.Request) (context.Context, any, error) {
+	req.ServiceParams.Append("Authorization", "Bearer "+i.token)
+	return ctx, nil, nil
+}
+
+// TestRemoteSubAgentErrorNotRetried proves an A2A call the remote agent
+// refuses fails the SendA2AMessage Activity once, without retries, and the
+// turn ends as it would without Temporal: ADK turns the error into an event.
+// The last case is the control for the HTTP 401 one: the caller's
+// A2AClientFactory adds the credentials and the remote agent answers.
 func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
-	url, _ := startA2AServer(t, func() (a2a.Event, error) { return nil, a2a.ErrInvalidParams })
-
-	var s testsuite.WorkflowTestSuite
-	env, counter := newEnv(t, &s, googleadk.Config{
-		Models: map[string]googleadk.ModelFactory{
-			"root-model": scriptedModelFactory(
-				googleadk.FunctionCallResponse("c1", "transfer_to_agent", map[string]any{"agent_name": "remote"}),
-			),
+	for _, tc := range []struct {
+		name      string
+		server    a2aServer
+		factory   *a2aclient.Factory
+		wantError string
+		wantText  string
+	}{
+		{name: "A2A error", server: a2aServer{Reply: a2aReply(nil, a2a.ErrInvalidParams)}, wantError: "invalid params"},
+		{name: "executor error", server: a2aServer{Reply: a2aReply(nil, errors.New("boom"))}, wantError: "internal error"},
+		{
+			name:      "HTTP 401",
+			server:    a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), Token: "secret"},
+			wantError: "401 Unauthorized",
 		},
-	})
+		{
+			name:     "credentials from the A2AClientFactory",
+			server:   a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), Token: "secret"},
+			factory:  a2aclient.NewFactory(a2aclient.WithCallInterceptors(bearerInterceptor{token: "secret"})),
+			wantText: "remote answer",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			url, _ := startA2AServer(t, tc.server)
+			var s testsuite.WorkflowTestSuite
+			env, counter := newEnv(t, &s, googleadk.Config{
+				Models:           map[string]googleadk.ModelFactory{"root-model": transferToRemoteModel()},
+				A2AClientFactory: tc.factory,
+			})
 
-	env.ExecuteWorkflow(agentRunWorkflow, runInput{
-		ModelName:   "root-model",
-		UserMessage: "ask the remote agent",
-		SubAgents: []subAgentSpec{{
-			Name:             "remote",
-			Description:      "remote A2A agent",
-			RemoteCardURL:    url,
-			RemoteActivities: true,
-		}},
-	})
+			env.ExecuteWorkflow(agentRunWorkflow, runInput{
+				ModelName:   "root-model",
+				UserMessage: "ask the remote agent",
+				SubAgents:   []subAgentSpec{remoteSubAgent(url)},
+			})
 
-	require.True(t, env.IsWorkflowCompleted())
-	require.NoError(t, env.GetWorkflowError())
-	assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName), "a remote A2A error must not be retried")
+			require.True(t, env.IsWorkflowCompleted())
+			require.NoError(t, env.GetWorkflowError())
+			var res runResult
+			require.NoError(t, env.GetWorkflowResult(&res))
+			assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName), "a refused A2A call must not be retried")
+			if tc.wantError != "" {
+				require.Len(t, res.Errors, 1, "ADK turns the failed call into an error event")
+				assert.Contains(t, res.Errors[0], tc.wantError)
+			} else {
+				assert.Empty(t, res.Errors)
+				assert.Contains(t, res.Texts, tc.wantText)
+			}
+		})
+	}
+}
+
+// TestRemoteSubAgentStreaming proves a streamed reply reaches ADK through one
+// SendA2AMessage Activity, with the chunks of an artifact merged so the result
+// grows with the reply rather than with the number of chunks, and that an
+// error after the first events comes back with those events instead of a
+// retry that would send the message again: ADK keeps them, records the error
+// and cancels the unfinished task, as without Temporal.
+func TestRemoteSubAgentStreaming(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		server     a2aServer
+		wantTexts  []string
+		wantError  string
+		wantCancel int
+	}{
+		{
+			name: "chunks merged",
+			server: a2aServer{Reply: func(ec *a2asrv.ExecutorContext, yield func(a2a.Event, error) bool) {
+				first := a2a.NewArtifactEvent(ec, a2a.NewTextPart("Hello"))
+				last := a2a.NewArtifactUpdateEvent(ec, first.Artifact.ID, a2a.NewTextPart("!"))
+				last.LastChunk = true
+				for _, ev := range []a2a.Event{
+					a2a.NewSubmittedTask(ec, ec.Message),
+					first,
+					a2a.NewArtifactUpdateEvent(ec, first.Artifact.ID, a2a.NewTextPart(", world")),
+					last,
+					a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil),
+				} {
+					if !yield(ev, nil) {
+						return
+					}
+				}
+			}},
+			// Unmerged, ADK would also yield the partial chunks "Hello",
+			// ", world" and "!".
+			wantTexts: []string{"Hello, world!"},
+		},
+		{
+			name: "error after events",
+			server: a2aServer{
+				Reply: func(ec *a2asrv.ExecutorContext, yield func(a2a.Event, error) bool) {
+					_ = yield(a2a.NewSubmittedTask(ec, ec.Message), nil) &&
+						yield(a2a.NewArtifactEvent(ec, a2a.NewTextPart("partial")), nil)
+				},
+				StreamErrorAfter: 2,
+			},
+			wantTexts:  []string{"partial"},
+			wantError:  "send A2A message",
+			wantCancel: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			url, _ := startA2AServer(t, tc.server)
+			var s testsuite.WorkflowTestSuite
+			env, counter := newEnv(t, &s, googleadk.Config{
+				Models: map[string]googleadk.ModelFactory{"root-model": transferToRemoteModel()},
+			})
+
+			env.ExecuteWorkflow(agentRunWorkflow, runInput{
+				ModelName:   "root-model",
+				UserMessage: "ask the remote agent",
+				SubAgents:   []subAgentSpec{remoteSubAgent(url)},
+				SSE:         true,
+			})
+
+			require.True(t, env.IsWorkflowCompleted())
+			require.NoError(t, env.GetWorkflowError())
+			var res runResult
+			require.NoError(t, env.GetWorkflowResult(&res))
+			assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName))
+			assert.Equal(t, tc.wantTexts, res.Texts)
+			if tc.wantError != "" {
+				require.Len(t, res.Errors, 1)
+				assert.Contains(t, res.Errors[0], tc.wantError)
+			} else {
+				assert.Empty(t, res.Errors)
+			}
+			assert.Equal(t, tc.wantCancel, counter.get(googleadk.CancelA2ATaskActivityName), "ADK cancels a task the run leaves unfinished")
+		})
+	}
 }
 
 // errorModel is a model.LLM that always fails with a genai.APIError of the given

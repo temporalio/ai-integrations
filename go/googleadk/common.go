@@ -10,8 +10,7 @@ import (
 )
 
 // Activity type names registered worker-side by Activities.Register and
-// dispatched by name from the workflow side (the TemporalModel, ActivityAsTool
-// tools, the MCP proxy, and the A2A card and client providers).
+// dispatched by name from the workflow side.
 const (
 	InvokeModelActivityName         = "googleadk.InvokeModel"
 	ListMcpToolsActivityName        = "googleadk.ListMcpTools"
@@ -81,6 +80,12 @@ func IsNonRetryable(err error) bool {
 		return appErr.NonRetryable()
 	}
 	return false
+}
+
+// retryableHTTPStatus reports whether a call that failed with an HTTP status
+// may succeed on a retry: 408, 409, 429 and 5xx may, other statuses may not.
+func retryableHTTPStatus(code int) bool {
+	return code == 408 || code == 409 || code == 429 || (code >= 500 && code < 600)
 }
 
 // newApplicationError builds a typed Temporal ApplicationError. retryable=false

@@ -152,6 +152,12 @@ func rejectRemoteAgents(ctx context.Context) error {
 	if remote == nil {
 		return nil
 	}
+	return remoteAgentError(remote)
+}
+
+// remoteAgentError is the error that refuses remote, a remote A2A agent that
+// sends from Workflow code.
+func remoteAgentError(remote agent.Agent) error {
 	return fmt.Errorf("googleadk: agent %q is a remote A2A agent that sends its requests from "+
 		"Workflow code, and they repeat on replay. Set its ClientProvider to "+
 		"googleadk.NewA2AClientProvider and its AgentCardProvider to "+
@@ -187,6 +193,9 @@ func remoteAgentSendsFromWorkflow(a agent.Agent) bool {
 		return false
 	}
 	cfg := reflectField(reflectField(v, "Config"), "A2A")
+	if !cfg.IsValid() || cfg.IsZero() {
+		return false // a remote agent of another kind, which this check does not know
+	}
 	if !isMethodValue(reflectField(cfg, "ClientProvider"), a2aClientProvider{}.create) {
 		return true
 	}
@@ -208,15 +217,7 @@ func reflectField(v reflect.Value, name string) reflect.Value {
 	if v.Kind() != reflect.Struct {
 		return reflect.Value{}
 	}
-	f, ok := v.Type().FieldByName(name)
-	if !ok {
-		return reflect.Value{}
-	}
-	fv, err := v.FieldByIndexErr(f.Index)
-	if err != nil {
-		return reflect.Value{}
-	}
-	return fv
+	return v.FieldByName(name)
 }
 
 // isMethodValue reports whether v holds the method value fn, for any
@@ -563,7 +564,7 @@ func classifyModelError(err error) error {
 	code := apiErrorCode(err)
 	retryable := true
 	if code != 0 {
-		retryable = code == 408 || code == 409 || code == 429 || (code >= 500 && code < 600)
+		retryable = retryableHTTPStatus(code)
 	}
 	return newApplicationError(ErrorTypeModel, retryable, err, "model call failed: %v", err)
 }

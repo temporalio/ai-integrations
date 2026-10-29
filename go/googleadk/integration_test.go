@@ -84,18 +84,18 @@ func TestStreamingIntegration(t *testing.T) {
 }
 
 // TestReplaySingleAndMultiAgent runs real single-agent, multi-agent, remote
-// A2A sub-agent, and multi-decision HITL workflows against the dev server, then
-// replays each recorded history with worker.WorkflowReplayer — the canonical
-// determinism guarantee. A replay failure here is exactly the non-determinism
-// the plugin's NewContext (time/uuid/task providers) exists to prevent. The
-// replay must also send no A2A request: the remote agent's card and messages
-// come from History.
+// A2A sub-agent (plain and streamed), and multi-decision HITL workflows against
+// the dev server, then replays each recorded history with
+// worker.WorkflowReplayer — the canonical determinism guarantee. A replay
+// failure here is exactly the non-determinism the plugin's NewContext
+// (time/uuid/task providers) exists to prevent. The replay must also send no
+// A2A request: the remote agent's card and messages come from History.
 func TestReplaySingleAndMultiAgent(t *testing.T) {
 	c := testClient(t)
 	taskQueue := testTaskQueue(t)
 
-	a2aURL, a2aRequests := startA2AServer(t, func() (a2a.Event, error) {
-		return a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil
+	a2aURL, a2aRequests := startA2AServer(t, a2aServer{
+		Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil),
 	})
 
 	models := map[string]googleadk.ModelFactory{
@@ -103,11 +103,10 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 			googleadk.FunctionCallResponse("c1", "transfer_to_agent", map[string]any{"agent_name": "specialist"}),
 			googleadk.TextResponse("(root fallback)"),
 		),
-		"specialist-model": scriptedModelFactory(googleadk.TextResponse("specialist answer")),
-		"solo-model":       scriptedModelFactory(googleadk.TextResponse("hello from solo")),
-		"remote-root-model": scriptedModelFactory(
-			googleadk.FunctionCallResponse("c1", "transfer_to_agent", map[string]any{"agent_name": "remote"}),
-		),
+		"specialist-model":         scriptedModelFactory(googleadk.TextResponse("specialist answer")),
+		"solo-model":               scriptedModelFactory(googleadk.TextResponse("hello from solo")),
+		"remote-root-model":        transferToRemoteModel(),
+		"remote-stream-root-model": transferToRemoteModel(),
 	}
 	for name, factory := range multiConfirmModels() {
 		models[name] = factory
@@ -132,22 +131,26 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 		taskQueue + "-remote": {
 			ModelName:   "remote-root-model",
 			UserMessage: "ask the remote agent",
-			SubAgents: []subAgentSpec{{
-				Name:             "remote",
-				Description:      "remote A2A agent",
-				RemoteCardURL:    a2aURL,
-				RemoteActivities: true,
-			}},
+			SubAgents:   []subAgentSpec{remoteSubAgent(a2aURL)},
+		},
+		taskQueue + "-remote-stream": {
+			ModelName:   "remote-stream-root-model",
+			UserMessage: "ask the remote agent",
+			SubAgents:   []subAgentSpec{remoteSubAgent(a2aURL)},
+			SSE:         true,
 		},
 	}
 
 	type execution struct{ id, runID string }
 	var executions []execution
+	runs := map[string]client.WorkflowRun{}
 	for id, in := range inputs {
-		run := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{ID: id, TaskQueue: taskQueue}, agentRunWorkflow, in)
+		runs[id] = startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{ID: id, TaskQueue: taskQueue}, agentRunWorkflow, in)
+	}
+	for id, run := range runs {
 		var res runResult
 		require.NoError(t, run.Get(ctx, &res))
-		if in.ModelName == "remote-root-model" {
+		if len(inputs[id].SubAgents) == 1 && inputs[id].SubAgents[0].RemoteCardURL != "" {
 			require.Contains(t, res.Texts, "remote answer")
 		}
 		executions = append(executions, execution{run.GetID(), run.GetRunID()})
