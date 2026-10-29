@@ -13,7 +13,7 @@ import type { z } from 'zod';
 import * as workflow from '@temporalio/workflow';
 import type { ActivityOptions } from '@temporalio/workflow';
 import { ActivityFailure, ApplicationFailure } from '@temporalio/common';
-import { STRANDS_INTERRUPT_TYPE } from './failure-converter';
+import { STRANDS_INTERRUPT_TYPE } from './strands-errors';
 import { toJsonSchema } from './json-schema';
 
 /**

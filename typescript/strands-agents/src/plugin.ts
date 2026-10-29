@@ -4,7 +4,7 @@ import type { Duration } from '@temporalio/common';
 import { msOptionalToNumber } from '@temporalio/common/lib/time';
 import type { ActivityInboundCallsInterceptor, BundleOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
-import { rewriteError } from './failure-converter';
+import { rewriteError } from './strands-errors';
 import { ModelActivity } from './model-activity';
 import type { GetModelConfigInput, InvokeModelInput, InvokeModelStreamingInput } from './model-activity';
 import { GET_MODEL_CONFIG_ACTIVITY } from './temporal-model';

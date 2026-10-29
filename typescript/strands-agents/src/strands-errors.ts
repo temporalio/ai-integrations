@@ -1,13 +1,5 @@
 import { ContextWindowOverflowError, MaxTokensError, StructuredOutputError } from '@strands-agents/sdk';
-import {
-  ApplicationFailure,
-  ApplicationFailureCategory,
-  DefaultFailureConverter,
-  type FailureConverter,
-  type PayloadConverter,
-  type ProtoFailure,
-  type SerializationContext,
-} from '@temporalio/common';
+import { ApplicationFailure, ApplicationFailureCategory } from '@temporalio/common';
 
 export const STRANDS_INTERRUPT_TYPE = 'StrandsInterrupt';
 
@@ -67,26 +59,3 @@ export function rewriteError(err: unknown): unknown {
   }
   return rewriteTerminalError(err);
 }
-
-/**
- * Failure converter that encodes Strands `InterruptError`s as typed,
- * non-retryable {@link ApplicationFailure}s and marks deterministic Strands
- * model errors as non-retryable, also when they are the `cause` of another
- * error.
- *
- * {@link StrandsPlugin} does not install it: the plugin rewrites the errors
- * activities throw in an activity interceptor and keeps the client's and
- * worker's own failure converter.
- */
-export class StrandsFailureConverter extends DefaultFailureConverter implements FailureConverter {
-  override errorToFailure(
-    err: unknown,
-    payloadConverter: PayloadConverter,
-    context?: SerializationContext
-  ): ProtoFailure {
-    return super.errorToFailure(rewriteError(err), payloadConverter, context);
-  }
-}
-
-// ts-prune-ignore-next
-export const failureConverter: FailureConverter = new StrandsFailureConverter();
