@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import functools
-import typing
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-import pydantic
 from agents import (
     Agent,
     AgentOutputSchema,
@@ -34,9 +31,7 @@ from agents.tool import (
 )
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 
-import temporalio.api.common.v1
 from temporalio import workflow
-from temporalio.common import RawValue
 from temporalio.openai_agents._errors import AgentsWorkflowError
 from temporalio.openai_agents._invoke_model_activity import (
     ActivityModelInput,
@@ -59,34 +54,8 @@ from temporalio.openai_agents._model_parameters import ModelActivityParameters
 # event fails strict validation, the converter's lenient fallback then picks a
 # union member from a process-wide openai cache that only some processes have
 # filled, so another Worker process could read response.completed as another
-# event. The streaming result is decoded here instead, with the full type.
-_STREAM_EVENTS_PATCH = "openai_agents.stream-events-discriminator"
+# event. The converter gets the full type instead.
 _STREAM_EVENTS_TYPE: Any = list[TResponseStreamEvent]
-_SDK_STREAM_EVENTS_TYPE: Any = typing.get_type_hints(
-    ModelActivity.invoke_model_activity_streaming
-)["return"]
-
-
-@functools.cache
-def _stream_events_adapter() -> pydantic.TypeAdapter[list[TResponseStreamEvent]]:
-    return pydantic.TypeAdapter(_STREAM_EVENTS_TYPE)
-
-
-def _decode_stream_events(
-    payload: temporalio.api.common.v1.Payload,
-) -> list[TResponseStreamEvent]:
-    try:
-        # Events that pass strict validation decode as before.
-        return _stream_events_adapter().validate_json(payload.data)
-    except pydantic.ValidationError:
-        pass
-    # Runs that decoded such a result before this change keep the SDK's type.
-    type_hint = (
-        _STREAM_EVENTS_TYPE
-        if workflow.patched(_STREAM_EVENTS_PATCH)
-        else _SDK_STREAM_EVENTS_TYPE
-    )
-    return workflow.payload_converter().from_payload(payload, type_hint)
 
 
 class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
@@ -357,12 +326,12 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             "streaming_batch_interval": self.model_params.streaming_batch_interval,
         }
 
-        # Scheduled by name, so the result arrives undecoded (a callable's
-        # declared return type would replace result_type).
-        raw_events: RawValue = await workflow.execute_activity(
+        # Scheduled by name, so that result_type applies (a callable's declared
+        # return type would replace it).
+        events: list[TResponseStreamEvent] = await workflow.execute_activity(
             ModelActivity.invoke_model_activity_streaming.__name__,
             streaming_input,
-            result_type=RawValue,
+            result_type=_STREAM_EVENTS_TYPE,
             summary=summary,
             task_queue=self.model_params.task_queue,
             schedule_to_close_timeout=self.model_params.schedule_to_close_timeout,
@@ -374,5 +343,5 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             versioning_intent=self.model_params.versioning_intent,
             priority=self.model_params.priority,
         )
-        for event in _decode_stream_events(raw_events.payload):
+        for event in events:
             yield event

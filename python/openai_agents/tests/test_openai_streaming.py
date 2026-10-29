@@ -7,12 +7,13 @@ via the configured stream topic.
 """
 
 import asyncio
+import base64
+import json
 import logging
 import uuid
 import weakref
 from collections.abc import AsyncIterator
 from datetime import timedelta
-from pathlib import Path
 from typing import Any
 
 import openai._models
@@ -52,9 +53,22 @@ from openai.types.shared import Reasoning
 from openai.types.shared.response_format_text import ResponseFormatText
 
 from temporalio import workflow
-from temporalio.client import Client, WorkflowFailureError, WorkflowHistory
+from temporalio.api.common.v1 import Payload
+from temporalio.api.enums.v1 import EventType
+from temporalio.client import Client, WorkflowFailureError
 from temporalio.contrib.workflow_streams import WorkflowStream, WorkflowStreamClient
-from temporalio.openai_agents import ModelActivityParameters, OpenAIAgentsPlugin
+from temporalio.converter import (
+    ActivitySerializationContext,
+    DataConverter,
+    EncodingPayloadConverter,
+    SerializationContext,
+    WithSerializationContext,
+)
+from temporalio.openai_agents import (
+    ModelActivityParameters,
+    OpenAIAgentsPlugin,
+    OpenAIPayloadConverter,
+)
 from temporalio.openai_agents.testing import AgentEnvironment
 from temporalio.worker import Replayer
 from tests.helpers import new_worker
@@ -228,6 +242,77 @@ def empty_openai_discriminator_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+class Base64TextJSONConverter(EncodingPayloadConverter, WithSerializationContext):
+    """JSON with ``text`` and ``delta`` strings base64-encoded on the wire.
+
+    It records the context it decoded each streamed result in.
+    """
+
+    contexts: list[SerializationContext | None] = []
+
+    def __init__(self, context: SerializationContext | None = None) -> None:
+        self._json = OpenAIPayloadConverter().converters[b"json/plain"]
+        self._context = context
+
+    @property
+    def encoding(self) -> str:
+        return "json/x-base64-text"
+
+    def with_context(self, context: SerializationContext) -> "Base64TextJSONConverter":
+        return Base64TextJSONConverter(context)
+
+    @staticmethod
+    def _map_text(value: Any, convert: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: convert(item)
+                if key in ("text", "delta") and isinstance(item, str)
+                else Base64TextJSONConverter._map_text(item, convert)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [Base64TextJSONConverter._map_text(item, convert) for item in value]
+        return value
+
+    def to_payload(self, value: Any) -> Payload | None:
+        payload = self._json.to_payload(value)
+        if payload is None:
+            return None
+        data = self._map_text(
+            json.loads(payload.data), lambda s: base64.b64encode(s.encode()).decode()
+        )
+        return Payload(
+            metadata={"encoding": self.encoding.encode()},
+            data=json.dumps(data).encode(),
+        )
+
+    def from_payload(self, payload: Payload, type_hint: type | None = None) -> Any:
+        if b"response.completed" in payload.data:
+            Base64TextJSONConverter.contexts.append(self._context)
+        data = self._map_text(
+            json.loads(payload.data), lambda s: base64.b64decode(s).decode()
+        )
+        return self._json.from_payload(
+            Payload(
+                metadata={"encoding": b"json/plain"}, data=json.dumps(data).encode()
+            ),
+            type_hint,
+        )
+
+
+class Base64TextPayloadConverter(OpenAIPayloadConverter):
+    """An accepted OpenAIPayloadConverter with its own JSON wire form."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._set_converters(
+            *(
+                Base64TextJSONConverter() if c.encoding == "json/plain" else c
+                for c in self.converters.values()
+            )
+        )
+
+
 @workflow.defn
 class StreamingOpenAIWorkflow:
     """Test workflow that opts into streaming via ``Runner.run_streamed``.
@@ -260,26 +345,6 @@ class StreamingOpenAIWorkflow:
     @workflow.query
     def get_workflow_event_types(self) -> list[str]:
         return self.workflow_event_types
-
-
-@workflow.defn
-class StreamingFallbackWorkflow:
-    """Takes another path when its streamed run fails, as Workflow code may."""
-
-    def __init__(self) -> None:
-        self.stream = WorkflowStream()
-
-    @workflow.run
-    async def run(self, prompt: str) -> str:
-        agent = Agent[None](name="Assistant", instructions="You are a test agent.")
-        result = Runner.run_streamed(starting_agent=agent, input=prompt)
-        try:
-            async for _ in result.stream_events():
-                pass
-        except ModelBehaviorError:
-            await workflow.sleep(timedelta(milliseconds=10))
-            return "fallback"
-        return result.final_output
 
 
 @workflow.defn
@@ -420,31 +485,52 @@ async def test_streaming_drifted_event_in_fresh_process(
 
 
 @pytest.mark.asyncio
-async def test_streaming_drifted_history_from_before_the_fix_replays(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """A run recorded before this fix keeps its decoding on replay.
+async def test_streaming_uses_configured_payload_converter(client: Client):
+    """Streamed results decode with an accepted OpenAIPayloadConverter subclass.
 
-    It read its drifted final event as another event, in a process with an
-    empty openai discriminator cache, and took its fallback path. Replayed in
-    the same state, it must take that path again.
+    Its wire form differs from plain JSON, and it gets the Activity's
+    serialization context, as before the fix.
     """
-    empty_openai_discriminator_cache(monkeypatch)
-    history = WorkflowHistory.from_json(
-        "fake",
-        (
-            Path(__file__).with_name("histories")
-            / "streaming-fallback-workflow-history.json"
-        ).read_text(),
+    Base64TextJSONConverter.contexts.clear()
+    config = client.config()
+    config["data_converter"] = DataConverter(
+        payload_converter_class=Base64TextPayloadConverter
     )
-    await Replayer(
-        workflows=[StreamingFallbackWorkflow],
-        plugins=[
-            OpenAIAgentsPlugin(
-                model_params=ModelActivityParameters(streaming_topic="events")
+    client = Client(**config)
+    async with AgentEnvironment(
+        model=StreamingTestModel(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            streaming_topic="events",
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, StreamingOpenAIWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await client.start_workflow(
+                StreamingOpenAIWorkflow.run,
+                "Hello",
+                id=f"openai-streaming-converter-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
             )
-        ],
-    ).replay_workflow(history)
+            assert await handle.result() == "Hello world!"
+            history = await handle.fetch_history()
+
+    (completed,) = (
+        e
+        for e in history.events
+        if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED
+    )
+    (result,) = completed.activity_task_completed_event_attributes.result.payloads
+    assert result.metadata["encoding"] == b"json/x-base64-text"
+    assert b"Hello world!" not in result.data
+    assert any(
+        isinstance(c, ActivitySerializationContext)
+        and c.activity_type == "invoke_model_activity_streaming"
+        for c in Base64TextJSONConverter.contexts
+    ), Base64TextJSONConverter.contexts
 
 
 @pytest.mark.asyncio
