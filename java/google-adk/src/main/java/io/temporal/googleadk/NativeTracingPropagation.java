@@ -18,6 +18,10 @@ import io.temporal.common.interceptors.WorkflowOutboundCallsInterceptorBase;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+/**
+ * Carries W3C trace context through Temporal headers and selects the Worker's tracing instance on
+ * Workflow and Activity threads.
+ */
 final class NativeTracingPropagation extends WorkerInterceptorBase implements ContextPropagator {
   private static final String HEADER = "io.temporal.googleadk.traceparent";
   private final ThreadLocal<Context> incoming = ThreadLocal.withInitial(Context::root);
@@ -135,7 +139,9 @@ final class NativeTracingPropagation extends WorkerInterceptorBase implements Co
 
       @Override
       public QueryOutput handleQuery(QueryInput input) {
-        try (Scope scope = incoming.get().with(GoogleAdkTracing.SELECTED, tracing).makeCurrent()) {
+        // Queries are not replayed, so a native span in a query handler must not consume the
+        // deterministic identifier sequence; it uses the application's provider instead.
+        try {
           return super.handleQuery(input);
         } finally {
           incoming.remove();

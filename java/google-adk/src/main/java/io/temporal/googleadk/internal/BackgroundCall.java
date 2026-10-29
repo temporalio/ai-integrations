@@ -1,6 +1,5 @@
 package io.temporal.googleadk.internal;
 
-import com.google.adk.telemetry.Tracing;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.context.Scope;
 import io.reactivex.rxjava3.core.Flowable;
@@ -59,7 +58,7 @@ public final class BackgroundCall {
                 return Flowable.<T>empty();
               }
               try (Scope scope = context.makeCurrent()) {
-                return flow.get().compose(Tracing.withContext(context));
+                return withContext(flow.get(), context);
               }
             })
         .subscribeOn(Schedulers.io())
@@ -98,6 +97,20 @@ public final class BackgroundCall {
       Thread.currentThread().interrupt();
       throw new IllegalStateException("Interrupted while waiting for a background call", e);
     }
+  }
+
+  /**
+   * Subscribes with the caller's trace context current, so work a provider starts on subscription
+   * is parented correctly. ADK's own transformer would initialize its tracer and lock the global
+   * OpenTelemetry instance on every Activity, so it is not used here.
+   */
+  private static <T> Flowable<T> withContext(Flowable<T> flow, Context context) {
+    return Flowable.unsafeCreate(
+        subscriber -> {
+          try (Scope scope = context.makeCurrent()) {
+            flow.subscribe(subscriber);
+          }
+        });
   }
 
   private static <T> List<T> snapshot(List<T> items) {

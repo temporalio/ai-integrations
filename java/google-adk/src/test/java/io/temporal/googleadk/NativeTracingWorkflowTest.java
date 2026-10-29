@@ -1,6 +1,7 @@
 package io.temporal.googleadk;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -23,6 +24,7 @@ import io.opentelemetry.api.trace.TraceState;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.context.Scope;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.resources.Resource;
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.data.SpanData;
@@ -62,63 +64,110 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import javax.annotation.Nullable;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.EnumSource;
 
+/**
+ * Each scenario runs the documented bootstrap and real ADK agents in its own JVM, because {@code
+ * GlobalOpenTelemetry.set} is one-shot per process.
+ */
 class NativeTracingWorkflowTest {
   private static final String MODEL = "scripted";
+  private static final String SERVICE = "native-tracing-test";
+  private static final String TRACE_ID = "11111111111111111111111111111111";
+  private static final String PARENT_SPAN_ID = "2222222222222222";
+
+  /** The scenarios; the flags drive the shared harness in {@link Bootstrap#run}. */
+  enum Scenario {
+    /** Native attributes, parentage, incoming tracestate, resource, pure and Activity tools. */
+    TOOLS(false, false, true),
+    /** A parked second Workflow evicts the first mid-turn; it replays, then exports once. */
+    EVICTION(true, true, false),
+    /** A history that ends mid-turn replays on a fresh Worker without exporting. */
+    UNFINISHED(true, false, false),
+    /** A tool starts a nested turn, which shares the outer turn's buffer across an eviction. */
+    NESTED(true, true, false),
+    /** A ParallelAgent fans out on several Workflow threads. */
+    PARALLEL(false, false, false),
+    /** Two root turns overlap on separate Workflow threads and keep separate traces. */
+    OVERLAP(false, false, false),
+    /** The turn runs in an Update handler. */
+    UPDATE(false, false, false),
+    /** The turn runs in a Signal handler. */
+    SIGNAL(false, false, false),
+    /** The model and a tool Activity fail once and are retried. */
+    RETRY(false, false, true),
+    /** The model fails permanently; the failing span carries an error status. */
+    FAILURE(false, false, false),
+    /** The Workflow is canceled while the model Activity runs. */
+    CANCEL(true, false, false),
+    /** A Worker without tracing exports nothing natively. */
+    LEGACY(false, false, false),
+    /** Two tracing instances and an unconfigured Worker keep separate exporters. */
+    MULTIPLE(false, false, false),
+    /**
+     * The Worker factory is replaced while a model Activity is pending. Needs a real Temporal
+     * service ({@code -Dgoogleadk.test.target=host:port}), so CI excludes it.
+     */
+    RESTART(true, false, false);
+
+    /** The model blocks until the test releases it, so the Workflow can be disturbed mid-turn. */
+    final boolean gated;
+
+    /** The Worker caches one Workflow, so a parked second Workflow evicts the first. */
+    final boolean evicts;
+
+    /** The agent has a pure tool and an Activity tool. */
+    final boolean tools;
+
+    Scenario(boolean gated, boolean evicts, boolean tools) {
+      this.gated = gated;
+      this.evicts = evicts;
+      this.tools = tools;
+    }
+
+    /** The Workflow input that selects this scenario's agent. */
+    String mode() {
+      return name().toLowerCase(Locale.ROOT);
+    }
+  }
 
   @ParameterizedTest
-  @ValueSource(
-      strings = {
-        "tools",
-        "eviction",
-        "unfinished",
-        "nested",
-        "parallel",
-        "overlap",
-        "update",
-        "signal",
-        "retry",
-        "failure",
-        "cancel",
-        "legacy",
-        "multiple"
-      })
-  void nativeTracingUsesDocumentedBootstrapInAnIsolatedProcess(String scenario) throws Exception {
-    Path output = Files.createTempFile("adk-native-tracing-", ".log");
-    Path arguments = Files.createTempFile("adk-native-tracing-", ".args");
-    String classpath =
-        Files.readString(Path.of(System.getProperty("googleadk.test.classpath-file")));
+  @EnumSource(value = Scenario.class, mode = EnumSource.Mode.EXCLUDE, names = "RESTART")
+  void nativeTracingUsesDocumentedBootstrapInAnIsolatedProcess(
+      Scenario scenario, @TempDir Path temporary) throws Exception {
+    String classpathFile = System.getProperty("googleadk.test.classpath-file");
+    assertNotNull(classpathFile, "run through Gradle; see build.gradle");
+    Path arguments = temporary.resolve("bootstrap.args");
     Files.writeString(
         arguments,
         "-cp\n"
-            + argument(classpath)
+            + argument(Files.readString(Path.of(classpathFile)))
             + "\n"
             + argument(Bootstrap.class.getName())
             + "\n"
-            + argument(scenario)
+            + argument(scenario.name())
             + "\n");
-    Process process = null;
+    Path output = temporary.resolve("bootstrap.log");
+    Process process =
+        new ProcessBuilder(
+                Path.of(System.getProperty("java.home"), "bin", "java").toString(), "@" + arguments)
+            .redirectErrorStream(true)
+            .redirectOutput(output.toFile())
+            .start();
     try {
-      process =
-          new ProcessBuilder(
-                  Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-                  "@" + arguments)
-              .redirectErrorStream(true)
-              .redirectOutput(output.toFile())
-              .start();
       assertTrue(process.waitFor(70, TimeUnit.SECONDS), () -> read(output));
       assertEquals(0, process.exitValue(), () -> read(output));
       assertTrue(read(output).contains("PASS " + scenario), () -> read(output));
     } finally {
-      if (process != null) process.destroyForcibly().waitFor(10, TimeUnit.SECONDS);
-      Files.deleteIfExists(arguments);
-      Files.deleteIfExists(output);
+      if (process.isAlive()) process.destroyForcibly().waitFor(10, TimeUnit.SECONDS);
     }
   }
 
@@ -135,133 +184,110 @@ class NativeTracingWorkflowTest {
   }
 
   public static final class Bootstrap {
-    public static void main(String[] args) throws Exception {
-      String mode = args[0];
-      InMemorySpanExporter nativeExporter = InMemorySpanExporter.create();
-      InMemorySpanExporter appExporter = InMemorySpanExporter.create();
-      try (OpenTelemetrySdk application =
-              OpenTelemetrySdk.builder()
-                  .setTracerProvider(
-                      SdkTracerProvider.builder()
-                          .addSpanProcessor(SimpleSpanProcessor.create(appExporter))
-                          .build())
-                  .build();
-          GoogleAdkTracing tracing = GoogleAdkTracing.create(nativeExporter)) {
-        GlobalOpenTelemetry.set(GoogleAdkTracing.wrap(application));
-        if (mode.equals("multiple")) {
-          run("tools", tracing, nativeExporter, appExporter);
-          int originalSize = nativeExporter.getFinishedSpanItems().size();
-          appExporter.reset();
-          InMemorySpanExporter secondExporter = InMemorySpanExporter.create();
-          try (GoogleAdkTracing second = GoogleAdkTracing.create(secondExporter)) {
-            run("tools", second, secondExporter, appExporter);
-            assertEquals(
-                originalSize,
-                nativeExporter.getFinishedSpanItems().size(),
-                "Worker B must not use A's exporter");
+    public static void main(String[] args) {
+      try {
+        Scenario scenario = Scenario.valueOf(args[0]);
+        InMemorySpanExporter nativeExporter = InMemorySpanExporter.create();
+        InMemorySpanExporter appExporter = InMemorySpanExporter.create();
+        try (OpenTelemetrySdk application =
+                OpenTelemetrySdk.builder()
+                    .setTracerProvider(
+                        SdkTracerProvider.builder()
+                            .addSpanProcessor(SimpleSpanProcessor.create(appExporter))
+                            .build())
+                    .build();
+            GoogleAdkTracing tracing = GoogleAdkTracing.create(nativeExporter, resource())) {
+          GlobalOpenTelemetry.set(GoogleAdkTracing.wrap(application));
+          if (scenario == Scenario.MULTIPLE) {
+            multiple(tracing, nativeExporter, appExporter);
+          } else {
+            run(scenario, tracing, nativeExporter, appExporter);
           }
-          appExporter.reset();
-          try (Fixture unconfigured =
-              new Fixture(null, ScriptedModel.of(MODEL, ScriptedModel.text("done")), "plain")) {
-            assertEquals("done", unconfigured.workflow.run("plain"));
-          }
-          assertTrue(
-              appExporter.getFinishedSpanItems().stream()
-                  .anyMatch(s -> "invoke_agent".equals(operation(s))),
-              "a Worker that did not opt in keeps the application's native ADK provider");
-          flush(tracing);
-          assertEquals(originalSize, nativeExporter.getFinishedSpanItems().size());
-        } else run(mode, tracing, nativeExporter, appExporter);
+        }
+        System.out.println("PASS " + scenario);
+        System.exit(0);
+      } catch (Throwable failure) {
+        failure.printStackTrace();
+        System.exit(1);
       }
-      System.out.println("PASS " + mode);
     }
 
-    private static void run(
-        String mode,
+    private static Resource resource() {
+      return Resource.builder().put("service.name", SERVICE).build();
+    }
+
+    private static void multiple(
         GoogleAdkTracing tracing,
         InMemorySpanExporter nativeExporter,
         InMemorySpanExporter appExporter)
         throws Exception {
-      boolean gated =
-          List.of("eviction", "restart", "unfinished", "nested", "cancel").contains(mode);
+      run(Scenario.TOOLS, tracing, nativeExporter, appExporter);
+      int exported = nativeExporter.getFinishedSpanItems().size();
+      appExporter.reset();
+      InMemorySpanExporter secondExporter = InMemorySpanExporter.create();
+      try (GoogleAdkTracing second = GoogleAdkTracing.create(secondExporter, resource())) {
+        run(Scenario.TOOLS, second, secondExporter, appExporter);
+        assertEquals(
+            exported,
+            nativeExporter.getFinishedSpanItems().size(),
+            "Worker B must not use A's exporter");
+      }
+      appExporter.reset();
+      try (Fixture unconfigured =
+          new Fixture(null, ScriptedModel.of(MODEL, ScriptedModel.text("done")), null)) {
+        assertEquals("done", unconfigured.workflow.run("plain"));
+      }
+      assertTrue(
+          appExporter.getFinishedSpanItems().stream()
+              .anyMatch(span -> "invoke_agent".equals(operation(span))),
+          "a Worker that did not opt in keeps the application's native ADK provider");
+      flush(tracing);
+      assertEquals(exported, nativeExporter.getFinishedSpanItems().size());
+    }
+
+    private static void run(
+        Scenario scenario,
+        GoogleAdkTracing tracing,
+        InMemorySpanExporter nativeExporter,
+        InMemorySpanExporter appExporter)
+        throws Exception {
+      String mode = scenario.mode();
       CountDownLatch entered = new CountDownLatch(1);
-      CountDownLatch release = new CountDownLatch(gated ? 1 : 0);
+      CountDownLatch release = new CountDownLatch(scenario.gated ? 1 : 0);
       AtomicInteger requests = new AtomicInteger();
       LookupImpl.attempts.set(0);
-      LookupImpl.retry = mode.equals("retry");
+      LookupImpl.retry = scenario == Scenario.RETRY;
       ScriptedModel model =
           ScriptedModel.responding(
               MODEL,
-              request -> {
-                int call = requests.incrementAndGet();
-                Span span =
-                    GlobalOpenTelemetry.getTracer("application-model")
-                        .spanBuilder("provider-call")
-                        .startSpan();
-                try (Scope scope = span.makeCurrent()) {
-                  if (!mode.equals("nested") || call == 3) {
-                    entered.countDown();
-                    try {
-                      if (!release.await(25, TimeUnit.SECONDS))
-                        throw new IllegalStateException("provider gate timed out");
-                    } catch (InterruptedException interrupted) {
-                      Thread.currentThread().interrupt();
-                      throw new IllegalStateException(interrupted);
-                    }
-                  }
-                  if (mode.equals("failure"))
-                    throw ApplicationFailure.newNonRetryableFailure(
-                        "invalid model request", "InvalidRequest");
-                  if (mode.equals("retry") && call == 1)
-                    throw ApplicationFailure.newFailure("temporary provider failure", "Transient");
-                  if (mode.equals("tools") || mode.equals("retry")) return response(request);
-                  if (mode.equals("nested")
-                      && request.tools().containsKey("nestedTurn")
-                      && TestSupport.functionResponse(request, "nestedTurn").isEmpty())
-                    return ScriptedModel.functionCall("nestedTurn", Map.of());
-                  return ScriptedModel.text("done");
-                } catch (RuntimeException failure) {
-                  span.setStatus(StatusCode.ERROR, failure.getMessage());
-                  throw failure;
-                } finally {
-                  span.end();
-                }
-              });
-      try (Fixture fixture = new Fixture(mode.equals("legacy") ? null : tracing, model, mode)) {
+              request -> provide(scenario, request, requests.incrementAndGet(), entered, release));
+      try (Fixture fixture =
+          new Fixture(scenario == Scenario.LEGACY ? null : tracing, model, scenario)) {
         TracedWorkflow workflow = fixture.workflow;
-        if (mode.equals("tools")) {
+        if (scenario == Scenario.TOOLS) {
           SpanContext incoming =
               SpanContext.createFromRemoteParent(
-                  "11111111111111111111111111111111",
-                  "2222222222222222",
+                  TRACE_ID,
+                  PARENT_SPAN_ID,
                   TraceFlags.getSampled(),
                   TraceState.builder().put("vendor", "test").build());
           try (Scope scope = Context.root().with(Span.wrap(incoming)).makeCurrent()) {
             WorkflowClient.start(workflow::run, mode);
           }
-        } else WorkflowClient.start(workflow::run, mode);
-        if (mode.equals("update")) assertEquals("done", workflow.ask());
-        if (mode.equals("signal")) workflow.askSignal();
+        } else {
+          WorkflowClient.start(workflow::run, mode);
+        }
+        if (scenario == Scenario.UPDATE) assertEquals("done", workflow.ask());
+        if (scenario == Scenario.SIGNAL) workflow.askSignal();
         assertTrue(entered.await(10, TimeUnit.SECONDS));
-        if (gated) {
-          if (mode.equals("eviction") || mode.equals("nested")) fixture.evict();
-          if (mode.equals("restart")) fixture.restart();
-          if (mode.equals("unfinished")) {
-            WorkflowExecutionHistory partial =
-                fixture
-                    .environment
-                    .getWorkflowClient()
-                    .fetchHistory(WorkflowStub.fromTyped(workflow).getExecution().getWorkflowId());
-            try (Fixture replay = new Fixture(tracing, model, "replay")) {
-              replay.worker.replayWorkflowExecution(partial);
-            }
-          }
+        if (scenario.gated) {
+          disturb(scenario, fixture, tracing, model);
           flush(tracing);
           assertEquals(
               0,
               nativeExporter.getFinishedSpanItems().size(),
               "unfinished turns, nested calls and eviction must not export spans");
-          if (mode.equals("cancel")) {
+          if (scenario == Scenario.CANCEL) {
             WorkflowStub.fromTyped(workflow).cancel();
             assertThrows(
                 WorkflowFailedException.class,
@@ -269,147 +295,215 @@ class NativeTracingWorkflowTest {
           }
           release.countDown();
         }
-        if (mode.equals("failure"))
+        if (scenario == Scenario.FAILURE) {
           assertThrows(
               WorkflowFailedException.class,
               () -> WorkflowStub.fromTyped(workflow).getResult(String.class));
-        else if (!mode.equals("cancel"))
+        } else if (scenario != Scenario.CANCEL) {
           assertEquals("done", WorkflowStub.fromTyped(workflow).getResult(String.class));
+        }
         flush(tracing);
         List<SpanData> spans = nativeExporter.getFinishedSpanItems();
-        if (mode.equals("tools")) {
-          assertTrue(
-              spans.stream()
-                  .anyMatch(
-                      span ->
-                          "invoke_agent".equals(operation(span))
-                              && "assistant"
-                                  .equals(
-                                      span.getAttributes()
-                                          .get(AttributeKey.stringKey("gen_ai.agent.name")))));
-          assertTrue(
-              spans.stream()
-                  .anyMatch(
-                      span ->
-                          "scripted"
-                              .equals(
-                                  span.getAttributes()
-                                      .get(AttributeKey.stringKey("gen_ai.request.model")))));
-          assertTrue(
-              spans.stream()
-                  .anyMatch(
-                      span ->
-                          "session"
-                              .equals(
-                                  span.getAttributes()
-                                      .get(
-                                          AttributeKey.stringKey("gcp.vertex.agent.session_id")))));
-          assertTrue(
-              spans.stream()
-                  .anyMatch(
-                      span -> {
-                        String response =
-                            span.getAttributes()
-                                .get(AttributeKey.stringKey("gcp.vertex.agent.llm_response"));
-                        return response != null && response.contains("done");
-                      }));
-          assertTrue(
-              spans.stream().anyMatch(span -> span.getParentSpanId().equals("2222222222222222")));
-          for (SpanData span : spans) {
-            assertEquals("11111111111111111111111111111111", span.getTraceId());
-            assertEquals("test", span.getSpanContext().getTraceState().get("vendor"));
-            if ("call_llm".equals(operation(span)))
-              assertTrue(
-                  spans.stream()
-                      .anyMatch(
-                          parent ->
-                              parent.getSpanId().equals(span.getParentSpanId())
-                                  && "invoke_agent".equals(operation(parent))));
-          }
-          for (SpanData span : appExporter.getFinishedSpanItems())
-            assertEquals("test", span.getSpanContext().getTraceState().get("vendor"));
+        List<SpanData> appSpans = appExporter.getFinishedSpanItems();
+        if (scenario == Scenario.TOOLS) assertNativeAttributesAndParentage(spans, appSpans);
+        if (scenario == Scenario.LEGACY) {
+          assertEquals(0, spans.size());
+        } else {
+          assertNativeOperations(scenario, spans, appSpans, requests.get());
         }
-        if (!mode.equals("legacy")) {
-          assertTrue(
-              spans.stream().anyMatch(s -> "invoke_agent".equals(operation(s))), spans.toString());
-          if (!mode.equals("cancel"))
-            assertTrue(
-                spans.stream().anyMatch(s -> "call_llm".equals(operation(s))), spans.toString());
-          if (mode.equals("tools") || mode.equals("retry")) {
-            for (String tool : List.of("lookup", "doubleIt"))
-              assertTrue(
-                  spans.stream()
-                      .anyMatch(
-                          s ->
-                              "execute_tool".equals(operation(s))
-                                  && tool.equals(
-                                      s.getAttributes()
-                                          .get(AttributeKey.stringKey("gen_ai.tool.name")))),
-                  spans.toString());
-          }
-          assertEquals(
-              spans.size(),
-              spans.stream().map(SpanData::getSpanId).distinct().count(),
-              "each native operation exports once");
-          if (!mode.equals("overlap"))
-            assertEquals(1, spans.stream().map(SpanData::getTraceId).distinct().count());
-          for (SpanData span : appExporter.getFinishedSpanItems()) {
-            if (span.getName().equals("provider-call") || span.getName().equals("lookup-activity"))
-              assertTrue(
-                  spans.stream()
-                      .anyMatch(parent -> parent.getSpanId().equals(span.getParentSpanId())),
-                  "Activity/RxJava context lost: " + span);
-          }
-          if (mode.equals("failure"))
-            assertTrue(
-                spans.stream().anyMatch(s -> s.getStatus().getStatusCode() == StatusCode.ERROR));
-          if (mode.equals("retry")) {
-            assertEquals(4, requests.get());
-            assertEquals(2, LookupImpl.attempts.get());
-            assertEquals(
-                2,
-                appExporter.getFinishedSpanItems().stream()
-                    .filter(s -> s.getStatus().getStatusCode() == StatusCode.ERROR)
-                    .count());
-          }
-        } else assertEquals(0, spans.size());
-        if (mode.equals("eviction") || mode.equals("nested"))
+        if (scenario.evicts) {
           assertTrue(
               fixture.executions.get() >= 3,
               "a parked second Workflow must force the first to replay");
-        int count = requests.get();
-        WorkflowExecutionHistory history =
-            fixture
-                .environment
-                .getWorkflowClient()
-                .fetchHistory(WorkflowStub.fromTyped(workflow).getExecution().getWorkflowId());
-        try (Fixture replay = new Fixture(tracing, model, "replay")) {
-          replay.worker.replayWorkflowExecution(history);
         }
-        flush(tracing);
-        assertEquals(
-            spans.size(),
-            nativeExporter.getFinishedSpanItems().size(),
-            "a fresh Worker replays completed and legacy history without exporting");
-        assertEquals(count, requests.get(), "replay makes no provider calls");
-        Span unrelated =
-            GlobalOpenTelemetry.getTracer("application").spanBuilder("unrelated").startSpan();
-        unrelated.end();
-        Span outside =
-            GlobalOpenTelemetry.getTracer("gcp.vertex.agent")
-                .spanBuilder("outside-workflow")
-                .startSpan();
-        outside.end();
-        assertTrue(
-            appExporter.getFinishedSpanItems().stream()
-                .anyMatch(s -> s.getName().equals("unrelated")));
-        assertTrue(
-            appExporter.getFinishedSpanItems().stream()
-                .anyMatch(s -> s.getName().equals("outside-workflow")));
+        assertFreshWorkerReplayExportsNothing(
+            fixture, tracing, model, nativeExporter, spans.size(), requests);
+        assertOtherInstrumentationStaysWithTheApplication(appExporter);
         flush(tracing);
         assertEquals(spans.size(), nativeExporter.getFinishedSpanItems().size());
       } finally {
         release.countDown();
+      }
+    }
+
+    /** The provider: a gate the test releases, then one scripted response per scenario. */
+    private static LlmResponse provide(
+        Scenario scenario,
+        LlmRequest request,
+        int call,
+        CountDownLatch entered,
+        CountDownLatch release) {
+      Span span =
+          GlobalOpenTelemetry.getTracer("application-model")
+              .spanBuilder("provider-call")
+              .startSpan();
+      try (Scope scope = span.makeCurrent()) {
+        if (scenario != Scenario.NESTED || call == 3) {
+          entered.countDown();
+          if (!release.await(25, TimeUnit.SECONDS)) {
+            throw new IllegalStateException("provider gate timed out");
+          }
+        }
+        if (scenario == Scenario.FAILURE) {
+          throw ApplicationFailure.newNonRetryableFailure(
+              "invalid model request", "InvalidRequest");
+        }
+        if (scenario == Scenario.RETRY && call == 1) {
+          throw ApplicationFailure.newFailure("temporary provider failure", "Transient");
+        }
+        if (scenario.tools) return response(request);
+        if (scenario == Scenario.NESTED
+            && request.tools().containsKey("nestedTurn")
+            && TestSupport.functionResponse(request, "nestedTurn").isEmpty()) {
+          return ScriptedModel.functionCall("nestedTurn", Map.of());
+        }
+        return ScriptedModel.text("done");
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException(interrupted);
+      } catch (RuntimeException failure) {
+        span.setStatus(StatusCode.ERROR, failure.getMessage());
+        throw failure;
+      } finally {
+        span.end();
+      }
+    }
+
+    /** Disturbs the Workflow while the model is blocked, so the turn must replay. */
+    private static void disturb(
+        Scenario scenario, Fixture fixture, GoogleAdkTracing tracing, ScriptedModel model)
+        throws Exception {
+      switch (scenario) {
+        case EVICTION, NESTED -> fixture.evict();
+        case RESTART -> fixture.restart();
+        case UNFINISHED -> {
+          WorkflowExecutionHistory partial = fixture.history();
+          try (Fixture replay = new Fixture(tracing, model, null)) {
+            replay.worker.replayWorkflowExecution(partial);
+          }
+        }
+        default -> {}
+      }
+    }
+
+    private static void assertNativeAttributesAndParentage(
+        List<SpanData> spans, List<SpanData> appSpans) {
+      assertTrue(
+          spans.stream()
+              .anyMatch(
+                  span ->
+                      "invoke_agent".equals(operation(span))
+                          && "assistant".equals(attribute(span, "gen_ai.agent.name"))));
+      assertTrue(
+          spans.stream().anyMatch(span -> MODEL.equals(attribute(span, "gen_ai.request.model"))));
+      assertTrue(
+          spans.stream()
+              .anyMatch(span -> "session".equals(attribute(span, "gcp.vertex.agent.session_id"))));
+      assertTrue(
+          spans.stream()
+              .anyMatch(
+                  span -> {
+                    String response = attribute(span, "gcp.vertex.agent.llm_response");
+                    return response != null && response.contains("done");
+                  }));
+      assertTrue(spans.stream().anyMatch(span -> span.getParentSpanId().equals(PARENT_SPAN_ID)));
+      for (SpanData span : spans) {
+        assertEquals(TRACE_ID, span.getTraceId());
+        assertEquals("test", span.getSpanContext().getTraceState().get("vendor"));
+        assertEquals(
+            SERVICE, span.getResource().getAttribute(AttributeKey.stringKey("service.name")));
+        if ("call_llm".equals(operation(span))) {
+          assertTrue(
+              spans.stream()
+                  .anyMatch(
+                      parent ->
+                          parent.getSpanId().equals(span.getParentSpanId())
+                              && "invoke_agent".equals(operation(parent))));
+        }
+      }
+      for (SpanData span : appSpans) {
+        assertEquals("test", span.getSpanContext().getTraceState().get("vendor"));
+      }
+    }
+
+    private static void assertNativeOperations(
+        Scenario scenario, List<SpanData> spans, List<SpanData> appSpans, int requests) {
+      assertTrue(
+          spans.stream().anyMatch(s -> "invoke_agent".equals(operation(s))), spans.toString());
+      if (scenario != Scenario.CANCEL) {
+        assertTrue(spans.stream().anyMatch(s -> "call_llm".equals(operation(s))), spans.toString());
+      }
+      if (scenario.tools) {
+        for (String tool : List.of("lookup", "doubleIt")) {
+          assertTrue(
+              spans.stream()
+                  .anyMatch(
+                      s ->
+                          "execute_tool".equals(operation(s))
+                              && tool.equals(attribute(s, "gen_ai.tool.name"))),
+              spans.toString());
+        }
+      }
+      assertEquals(
+          spans.size(),
+          spans.stream().map(SpanData::getSpanId).distinct().count(),
+          "each native operation exports once");
+      if (scenario != Scenario.OVERLAP) {
+        assertEquals(1, spans.stream().map(SpanData::getTraceId).distinct().count());
+      }
+      for (SpanData span : appSpans) {
+        if (span.getName().equals("provider-call") || span.getName().equals("lookup-activity")) {
+          assertTrue(
+              spans.stream().anyMatch(parent -> parent.getSpanId().equals(span.getParentSpanId())),
+              "Activity/RxJava context lost: " + span);
+        }
+      }
+      if (scenario == Scenario.FAILURE) {
+        assertTrue(spans.stream().anyMatch(s -> s.getStatus().getStatusCode() == StatusCode.ERROR));
+      }
+      if (scenario == Scenario.RETRY) {
+        assertEquals(4, requests);
+        assertEquals(2, LookupImpl.attempts.get());
+        assertEquals(
+            2,
+            appSpans.stream()
+                .filter(s -> s.getStatus().getStatusCode() == StatusCode.ERROR)
+                .count());
+      }
+    }
+
+    private static void assertFreshWorkerReplayExportsNothing(
+        Fixture fixture,
+        GoogleAdkTracing tracing,
+        ScriptedModel model,
+        InMemorySpanExporter nativeExporter,
+        int exported,
+        AtomicInteger requests)
+        throws Exception {
+      int calls = requests.get();
+      WorkflowExecutionHistory history = fixture.history();
+      try (Fixture replay = new Fixture(tracing, model, null)) {
+        replay.worker.replayWorkflowExecution(history);
+      }
+      flush(tracing);
+      assertEquals(
+          exported,
+          nativeExporter.getFinishedSpanItems().size(),
+          "a fresh Worker replays completed and legacy history without exporting");
+      assertEquals(calls, requests.get(), "replay makes no provider calls");
+    }
+
+    private static void assertOtherInstrumentationStaysWithTheApplication(
+        InMemorySpanExporter appExporter) {
+      GlobalOpenTelemetry.getTracer("application").spanBuilder("unrelated").startSpan().end();
+      GlobalOpenTelemetry.getTracer("gcp.vertex.agent")
+          .spanBuilder("outside-workflow")
+          .startSpan()
+          .end();
+      for (String name : List.of("unrelated", "outside-workflow")) {
+        assertTrue(
+            appExporter.getFinishedSpanItems().stream().anyMatch(s -> s.getName().equals(name)),
+            name);
       }
     }
 
@@ -420,12 +514,14 @@ class NativeTracingWorkflowTest {
       final AtomicInteger executions = new AtomicInteger();
       final List<WorkerFactory> extras = new ArrayList<>();
 
-      Fixture(GoogleAdkTracing tracing, ScriptedModel model, String mode) {
+      /** A null scenario is a plain Worker for replay or for the opted-out comparison. */
+      Fixture(
+          @Nullable GoogleAdkTracing tracing, ScriptedModel model, @Nullable Scenario scenario) {
         GoogleAdkPlugin.Builder plugin = GoogleAdkPlugin.newBuilder().model(MODEL, model);
         if (tracing != null) plugin.tracing(tracing);
         WorkerFactoryOptions options =
             WorkerFactoryOptions.newBuilder()
-                .setWorkflowCacheSize(List.of("eviction", "nested").contains(mode) ? 1 : 600)
+                .setWorkflowCacheSize(scenario != null && scenario.evicts ? 1 : 600)
                 .setWorkflowHostLocalTaskQueueScheduleToStartTimeout(Duration.ofMillis(100))
                 .setWorkerInterceptors(
                     new WorkerInterceptorBase() {
@@ -448,17 +544,18 @@ class NativeTracingWorkflowTest {
                 .setWorkflowClientOptions(
                     WorkflowClientOptions.newBuilder().setPlugins(plugin.build()).build());
         String target = System.getProperty("googleadk.test.target");
-        if (target != null)
+        if (target != null) {
           environmentOptions
               .setUseExternalService(true)
               .setTarget(target)
               .setWorkflowServiceStubsOptions(
                   WorkflowServiceStubsOptions.newBuilder().setTarget(target).build());
+        }
         environment = TestWorkflowEnvironment.newInstance(environmentOptions.build());
         worker = environment.newWorker("native-tracing");
         worker.registerWorkflowImplementationTypes(TracedWorkflowImpl.class);
         worker.registerActivitiesImplementations(new LookupImpl());
-        if (mode.equals("restart")) {
+        if (scenario == Scenario.RESTART) {
           WorkerFactory activityFactory =
               WorkerFactory.newInstance(environment.getWorkflowClient());
           activityFactory.newWorker("native-models");
@@ -472,6 +569,12 @@ class NativeTracingWorkflowTest {
                 .newWorkflowStub(
                     TracedWorkflow.class,
                     WorkflowOptions.newBuilder().setTaskQueue("native-tracing").build());
+      }
+
+      WorkflowExecutionHistory history() {
+        return environment
+            .getWorkflowClient()
+            .fetchHistory(WorkflowStub.fromTyped(workflow).getExecution().getWorkflowId());
       }
 
       void evict() {
@@ -509,8 +612,14 @@ class NativeTracingWorkflowTest {
       assertTrue(tracing.forceFlush().join(10, TimeUnit.SECONDS).isSuccess());
     }
 
+    private static String attribute(SpanData span, String key) {
+      return span.getAttributes().get(AttributeKey.stringKey(key));
+    }
+
+    /** ADK sets the operation name only on some spans; the span name identifies the rest. */
     private static String operation(SpanData span) {
-      return span.getAttributes().get(AttributeKey.stringKey("gen_ai.operation.name"));
+      String operation = attribute(span, "gen_ai.operation.name");
+      return operation != null ? operation : span.getName();
     }
 
     private static LlmResponse response(LlmRequest request) {
@@ -602,62 +711,69 @@ class NativeTracingWorkflowTest {
 
     @Override
     public String run(String mode) {
-      if (mode.equals("park")) {
-        Workflow.await(() -> false);
-        return "parked";
+      switch (mode) {
+        case "park" -> {
+          Workflow.await(() -> false);
+          return "parked";
+        }
+        case "update", "signal" -> {
+          Workflow.await(() -> finished);
+          return "done";
+        }
+        case "restart" -> {
+          TemporalModel model =
+              TemporalModel.newBuilder(MODEL)
+                  .activityOptions(
+                      ActivityOptions.newBuilder()
+                          .setTaskQueue("native-models")
+                          .setStartToCloseTimeout(Duration.ofSeconds(40))
+                          .build())
+                  .build();
+          Runner runner =
+              TemporalAdk.runnerBuilder()
+                  .appName("native-tracing")
+                  .agent(LlmAgent.builder().name("restart").model(model).build())
+                  .build();
+          return TestSupport.lastText(
+              TemporalAdk.run(
+                  runner, "user", "session", Content.fromParts(Part.fromText("hello"))));
+        }
+        case "nested" -> {
+          Runner runner =
+              TemporalAdk.runnerBuilder()
+                  .appName("native-tracing")
+                  .agent(
+                      LlmAgent.builder()
+                          .name("outer")
+                          .model(TemporalModel.create(MODEL))
+                          .tools(FunctionTool.create(new NestedTool(), "nestedTurn"))
+                          .build())
+                  .build();
+          return TestSupport.lastText(
+              TemporalAdk.run(
+                  runner, "user", "session", Content.fromParts(Part.fromText("hello"))));
+        }
+        case "overlap" -> {
+          Promise<String> first = Async.function(() -> turn("first", false));
+          Promise<String> second = Async.function(() -> turn("second", false));
+          assertEquals("done", first.get());
+          return second.get();
+        }
+        case "parallel" -> {
+          ParallelAgent parallel =
+              ParallelAgent.builder()
+                  .name("parallel")
+                  .subAgents(agent("first", false), agent("second", false))
+                  .build();
+          Runner runner =
+              TemporalAdk.runnerBuilder().appName("native-tracing").agent(parallel).build();
+          TemporalAdk.run(runner, "user", "session", Content.fromParts(Part.fromText("hello")));
+          return "done";
+        }
+        default -> {
+          return turn("assistant", mode.equals("tools") || mode.equals("retry"));
+        }
       }
-      if (mode.equals("update") || mode.equals("signal")) {
-        Workflow.await(() -> finished);
-        return "done";
-      }
-      if (mode.equals("restart")) {
-        TemporalModel model =
-            TemporalModel.newBuilder(MODEL)
-                .activityOptions(
-                    ActivityOptions.newBuilder()
-                        .setTaskQueue("native-models")
-                        .setStartToCloseTimeout(Duration.ofSeconds(40))
-                        .build())
-                .build();
-        Runner runner =
-            TemporalAdk.runnerBuilder()
-                .appName("native-tracing")
-                .agent(LlmAgent.builder().name("restart").model(model).build())
-                .build();
-        return TestSupport.lastText(
-            TemporalAdk.run(runner, "user", "session", Content.fromParts(Part.fromText("hello"))));
-      }
-      if (mode.equals("nested")) {
-        Runner runner =
-            TemporalAdk.runnerBuilder()
-                .appName("native-tracing")
-                .agent(
-                    LlmAgent.builder()
-                        .name("outer")
-                        .model(TemporalModel.create(MODEL))
-                        .tools(FunctionTool.create(new NestedTool(), "nestedTurn"))
-                        .build())
-                .build();
-        return TestSupport.lastText(
-            TemporalAdk.run(runner, "user", "session", Content.fromParts(Part.fromText("hello"))));
-      }
-      if (mode.equals("overlap")) {
-        Promise<String> first = Async.function(() -> turn("first", false));
-        Promise<String> second = Async.function(() -> turn("second", false));
-        assertEquals("done", first.get());
-        return second.get();
-      }
-      if (mode.equals("parallel")) {
-        LlmAgent first = agent("first", false);
-        LlmAgent second = agent("second", false);
-        ParallelAgent parallel =
-            ParallelAgent.builder().name("parallel").subAgents(first, second).build();
-        Runner runner =
-            TemporalAdk.runnerBuilder().appName("native-tracing").agent(parallel).build();
-        TemporalAdk.run(runner, "user", "session", Content.fromParts(Part.fromText("hello")));
-        return "done";
-      }
-      return turn("assistant", mode.equals("tools") || mode.equals("retry"));
     }
 
     private static LlmAgent agent(String name, boolean tools) {
