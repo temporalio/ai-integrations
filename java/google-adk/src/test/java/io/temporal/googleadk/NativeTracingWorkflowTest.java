@@ -616,10 +616,9 @@ class NativeTracingWorkflowTest {
       return span.getAttributes().get(AttributeKey.stringKey(key));
     }
 
-    /** ADK sets the operation name only on some spans; the span name identifies the rest. */
+    /** ADK sets this on agent and tool spans; the plugin adds it to call_llm spans. */
     private static String operation(SpanData span) {
-      String operation = attribute(span, "gen_ai.operation.name");
-      return operation != null ? operation : span.getName();
+      return attribute(span, "gen_ai.operation.name");
     }
 
     private static LlmResponse response(LlmRequest request) {

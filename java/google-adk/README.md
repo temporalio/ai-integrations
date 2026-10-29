@@ -337,9 +337,9 @@ GoogleAdkPlugin plugin =
 code runs, because ADK captures its tracer once in a static initializer; do not call the SDK's
 `buildAndRegisterGlobal()`. `applicationTelemetry` may be `OpenTelemetry.noop()`, in which case
 only native spans from Workflows are exported. Native ADK spans on the Workflow threads of
-Workers using this plugin go to `tracing`; other instrumentation, ADK calls outside Workflows,
-metrics, logs, and Workers without `tracing(...)` keep the application's configuration. The
-plugin propagates W3C trace context into model and tool Activities and across Workflow and
+Workers whose plugin set `tracing(...)` go to that instance; other instrumentation, ADK calls
+outside Workflows, metrics, logs, and Workers without it keep the application's configuration.
+The plugin propagates W3C trace context into model and tool Activities and across Workflow and
 model-provider RxJava threads.
 
 Drive agents through `TemporalAdk.run` or `TemporalAdk.await`. Workflow spans stay in memory

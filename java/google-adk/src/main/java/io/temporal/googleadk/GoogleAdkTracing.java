@@ -239,7 +239,7 @@ public final class GoogleAdkTracing implements AutoCloseable {
 
   private record CompletedSpan(SpanProcessor processor, ReadableSpan span) {}
 
-  /** Flushes exported native spans without closing the provider; join the result to wait. */
+  /** Flushes native spans pending export without closing the provider; join the result to wait. */
   public CompletableResultCode forceFlush() {
     return provider.forceFlush();
   }
