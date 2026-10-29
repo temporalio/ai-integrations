@@ -83,6 +83,10 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - No changelog files. `scripts/release/release_tool.py release-notes` derives notes from commit subjects touching the plugin directory since its previous tag.
 - Every GitHub Action is pinned to a full commit SHA with a `# vN` comment (org opengrep rule).
 
+## Plugin behavior
+
+- Match the upstream framework's behavior wherever Temporal allows it: what its code does and its tests pin, even where its docs say otherwise. Don't keep or add a plugin-specific rule that departs from it, and say in the PR when upstream's docs contradict its code.
+
 ## Python conventions
 
 - Layout: `python/<name>/{pyproject.toml, uv.lock, plugin.toml, Makefile, README.md, LICENSE, src/temporalio/<name>/, tests/}`.
