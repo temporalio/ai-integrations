@@ -614,7 +614,7 @@ addTraceProcessor(new BatchTraceProcessor(new OpenAITracingExporter()));
 
 ### Tracing keys per run
 
-The exporter sends each span with its trace's key, or with its default key (`OPENAI_API_KEY` or `setTracingExportApiKey()`) when the trace has none. The plugin does not write tracing keys into Workflow history, so a trace that crosses a Temporal boundary arrives without its key. A key a run sets in Workflow code with `tracing: { apiKey }` still applies to that run's Workflow spans. Spans made in Activities and Nexus handlers, and the Workflow spans of a trace that a Client started with `tracingApiKey`, use the exporter's default key.
+The exporter sends each span with its trace's key, or with its default key (`OPENAI_API_KEY` or `setTracingExportApiKey()`) when the trace has none. The plugin does not write tracing keys into Workflow history, so a trace that crosses a Temporal boundary arrives without its key. A key a run sets in Workflow code with `tracing: { apiKey }` applies to that run's Workflow spans only when the run starts its own trace. When the Workflow runs inside a trace a Client started, the run joins that trace and the Agents SDK ignores the run's key. Spans made in Activities (including stateful MCP operations) and Nexus handlers, and the Workflow spans of a trace that a Client started, with or without `tracingApiKey`, use the exporter's default key.
 
 To send those spans with another key, resolve it on the Worker with `tracingApiKey`. It gets the trace ID, and when known the trace name and the Workflow ID and type, and returns a key or `undefined` for the default:
 

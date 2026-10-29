@@ -570,15 +570,49 @@ test('tracingApiKey gives spans that cross a Temporal boundary the key the Worke
 
   const runWorkflowId = `tracing-key-run-${Date.now()}`;
   const traceWorkflowId = `tracing-key-trace-${Date.now()}`;
+  const mcpWorkflowId = `tracing-key-mcp-${Date.now()}`;
   const contexts: TracingApiKeyContext[] = [];
+  // connect() runs in the session Activity on the main Worker; listTools() and
+  // callTool() run on the dedicated per-run Worker.
+  const mcpProvider = new StatefulMCPServerProvider(
+    'isolationTest',
+    (): MCPServer => ({
+      cacheToolsList: false,
+      name: 'isolationTest',
+      connect: () => withCustomSpan(async () => {}, { data: { name: 'mcp-connect' } }),
+      async close() {},
+      listTools: () =>
+        withCustomSpan(
+          async () => [
+            {
+              name: 'get_marker',
+              description: 'Returns marker',
+              inputSchema: {
+                type: 'object' as const,
+                properties: {},
+                required: [] as string[],
+                additionalProperties: false,
+              },
+            },
+          ],
+          { data: { name: 'mcp-list-tools' } }
+        ),
+      callTool: () =>
+        withCustomSpan(async () => [{ type: 'text', text: 'marker' }], { data: { name: 'mcp-call-tool' } }),
+      async invalidateToolsCache() {},
+    }),
+    (t.context as any).env.nativeConnection
+  );
   const worker = await createWorker({
     plugins: [
       new OpenAIAgentsPlugin({
         modelProvider: new SpanningModelProvider(),
+        mcpServerProviders: [mcpProvider],
         tracingApiKey: (context) => {
           contexts.push(context);
           if (context.workflowId === runWorkflowId) return 'sk-resolved-run';
           if (context.workflowId === traceWorkflowId) return 'sk-resolved-trace';
+          if (context.workflowId === mcpWorkflowId) return 'sk-resolved-mcp';
           return undefined;
         },
       }),
@@ -603,9 +637,16 @@ test('tracingApiKey gives spans that cross a Temporal boundary the key the Worke
       'tracing-key-client-trace',
       async () => {
         clientTraceId = getCurrentTrace()!.traceId;
+        // The run's own key does not apply inside the client's trace.
         await wfClient.execute(tracingApiKeyWorkflow, {
           taskQueue,
           workflowId: traceWorkflowId,
+          args: ['sk-run'],
+          workflowExecutionTimeout: '30 seconds',
+        });
+        await wfClient.execute(statefulMcpIsolationWorkflow, {
+          taskQueue,
+          workflowId: mcpWorkflowId,
           workflowExecutionTimeout: '30 seconds',
         });
       },
@@ -626,6 +667,9 @@ test('tracingApiKey gives spans that cross a Temporal boundary the key the Worke
   t.deepEqual(keysIn(runTraceId, 'agent'), ['sk-run'], 'the run keeps its own key on its Workflow spans');
   t.deepEqual(keysIn(clientTraceId, 'model-call'), ['sk-resolved-trace'], 'Activity span in a keyed client trace');
   t.deepEqual(keysIn(clientTraceId, 'agent'), ['sk-resolved-trace'], 'Workflow span in a keyed client trace');
+  t.deepEqual(keysIn(clientTraceId, 'mcp-connect'), ['sk-resolved-mcp'], 'stateful MCP span on the main Worker');
+  t.deepEqual(keysIn(clientTraceId, 'mcp-list-tools'), ['sk-resolved-mcp'], 'listTools span on the dedicated Worker');
+  t.deepEqual(keysIn(clientTraceId, 'mcp-call-tool'), ['sk-resolved-mcp'], 'callTool span on the dedicated Worker');
   t.like(
     contexts.find((c) => c.traceId === runTraceId && c.traceName !== undefined),
     { workflowId: runWorkflowId, workflowType: 'tracingApiKeyWorkflow' },

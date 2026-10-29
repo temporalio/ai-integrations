@@ -27,11 +27,14 @@ export interface TracingApiKeyContext {
 /**
  * Returns the tracing export API key for a trace, Worker-side, or `undefined`
  * to leave the exporter's default key. The plugin calls it for spans that have
- * no key of their own: spans made in Activities and Nexus handlers, and
- * Workflow spans in a trace started outside the Workflow. A key that a run set
- * in Workflow code with `tracing: { apiKey }` still applies to that run's
- * Workflow spans. The plugin does not send keys to the Workflow or write them
- * to Workflow history.
+ * no key of their own: spans made in Activities (including stateful MCP
+ * operations) and Nexus handlers, and Workflow spans in a trace started outside
+ * the Workflow. A key that a run set in Workflow code with
+ * `tracing: { apiKey }` applies to that run's Workflow spans only when the run
+ * starts its own trace. Inside a trace started by a Client, the run joins that
+ * trace and the Agents SDK ignores the run's key, so its Workflow spans get
+ * the key this returns. The plugin does not send keys to the Workflow or write
+ * them to Workflow history.
  *
  * Called often, so keep it fast. A throw fails the Activity or Nexus operation,
  * and drops the Workflow span with a warning.
@@ -49,6 +52,16 @@ export interface OpenAIAgentsTraceInterceptorOptions {
   tracingApiKey?: TracingApiKeyResolver;
 }
 
+// The resolver of the Worker that runs each Activity, so an Activity that
+// starts its own Worker (stateful MCP) can pass it on without putting it in
+// Activity arguments. The SDK gives interceptors the Activity's own Context.
+const tracingApiKeyResolvers = new WeakMap<ActivityContext, TracingApiKeyResolver>();
+
+/** The `tracingApiKey` resolver of the Worker running the Activity with this Context. */
+export function tracingApiKeyResolverFor(ctx: ActivityContext): TracingApiKeyResolver | undefined {
+  return tracingApiKeyResolvers.get(ctx);
+}
+
 /**
  * Activity inbound interceptor: restores agent trace context and optionally
  * wraps execution in a `temporal:executeActivity` custom span.
@@ -61,6 +74,7 @@ export class OpenAIAgentsTraceActivityInboundInterceptor implements ActivityInbo
     private readonly options?: OpenAIAgentsTraceInterceptorOptions
   ) {
     this.ctx = ctx;
+    if (options?.tracingApiKey) tracingApiKeyResolvers.set(ctx, options.tracingApiKey);
   }
 
   async execute(input: ActivityExecuteInput, next: Next<ActivityInboundCallsInterceptor, 'execute'>): Promise<unknown> {
