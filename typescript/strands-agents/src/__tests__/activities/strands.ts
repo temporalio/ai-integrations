@@ -28,7 +28,7 @@ export const deleteState = { calls: 0 };
 export async function deleteThing(input: { name: string }): Promise<string> {
   deleteState.calls += 1;
   if (deleteState.calls === 1) {
-    // Throw an interrupt-shaped error: the strands plugin's failure converter
+    // Throw an interrupt-shaped error: the strands plugin's activity interceptor
     // detects `interrupts: InterruptLike[]` structurally and re-raises an
     // ApplicationFailure of type STRANDS_INTERRUPT_TYPE that the workflow-side
     // TemporalActivityTool routes through `toolContext.interrupt()`.

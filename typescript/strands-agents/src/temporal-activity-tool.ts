@@ -37,7 +37,8 @@ export interface ActivityAsToolOptions {
  * {@link workflow.executeActivity}.
  *
  * When the activity fails with an {@link ApplicationFailure} whose `type`
- * matches {@link STRANDS_INTERRUPT_TYPE} — see {@link StrandsFailureConverter} —
+ * matches {@link STRANDS_INTERRUPT_TYPE} — {@link StrandsPlugin} turns an
+ * interrupt the activity throws into one —
  * `stream()` re-throws an {@link InterruptError} so the agent loop handles
  * the interrupt the same way as a hook- or tool-body interrupt. Other
  * failures are converted to an error {@link ToolResultBlock}.

@@ -2,9 +2,9 @@ import type { McpClient } from '@strands-agents/sdk';
 import { BedrockModel, type Model } from '@strands-agents/sdk';
 import type { Duration } from '@temporalio/common';
 import { msOptionalToNumber } from '@temporalio/common/lib/time';
-import type { BundleOptions } from '@temporalio/worker';
+import type { ActivityInboundCallsInterceptor, BundleOptions, WorkerOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
-import { failureConverterPathFor } from './failure-converter-path';
+import { rewriteError } from './failure-converter';
 import { ModelActivity } from './model-activity';
 import type { GetModelConfigInput, InvokeModelInput, InvokeModelStreamingInput } from './model-activity';
 import { GET_MODEL_CONFIG_ACTIVITY } from './temporal-model';
@@ -48,17 +48,29 @@ export interface StrandsPluginOptions {
 }
 
 /**
+ * Rethrows Strands' interrupt and terminal errors from activities as typed, non-retryable
+ * failures. The worker turns any other error an activity throws into a retryable
+ * `ApplicationFailure` before a failure converter sees it, so this cannot be left to one.
+ */
+const strandsActivityInbound: ActivityInboundCallsInterceptor = {
+  async execute(input, next) {
+    try {
+      return await next(input);
+    } catch (err) {
+      throw rewriteError(err);
+    }
+  },
+};
+
+/**
  * Temporal plugin that runs Strands Agents inside Temporal workflows. Model,
  * MCP tool, and (via {@link workflow.activityAsTool}) custom-tool invocations
  * are routed through Temporal Activities for durable execution, retries, and
  * timeouts.
  *
- * Register on the worker (and on the client when using `activityAsTool` with
- * interrupts, so the client-side data converter picks up the failure
- * converter):
+ * Register on the worker:
  *
  * ```ts
- * const client = await Client.connect({ plugins: [new StrandsPlugin({...})] });
  * const worker = new Worker({ ..., plugins: [new StrandsPlugin({...})] });
  * ```
  */
@@ -106,13 +118,19 @@ export class StrandsPlugin extends SimplePlugin {
       name: 'StrandsPlugin',
       activities,
       runContext,
-      // Keep a failure converter the client or worker already has: Strands' rewrite runs first,
-      // then the caller's converter.
-      dataConverter: (existing) => ({
-        ...existing,
-        failureConverterPath: failureConverterPathFor(existing?.failureConverterPath),
-      }),
+      workerInterceptors: {
+        activity: [() => ({ inbound: strandsActivityInbound })],
+      },
     });
+  }
+
+  override configureWorker(options: WorkerOptions): WorkerOptions {
+    // `SimplePlugin` rebuilds the worker's `interceptors` when it adds the plugin's activity
+    // interceptor, which drops the caller's `activityInbound` interceptors. Put them back.
+    const configured = super.configureWorker(options);
+    const activityInbound = options.interceptors?.activityInbound;
+    if (activityInbound === undefined) return configured;
+    return { ...configured, interceptors: { ...configured.interceptors, activityInbound } };
   }
 
   /**
@@ -140,9 +158,6 @@ export class StrandsPlugin extends SimplePlugin {
    *   `eventsource-parser/stream`) with a stub module. MCP v2 bundles its
    *   transports into the client entrypoint, so their static EventSource
    *   imports must also be stubbed. Transport I/O only runs worker-side.
-   *
-   * - Replace the plugin's own `failure-converter-path` module, which writes files
-   *   and only runs when a client or worker is configured, with the same stub.
    *
    * - Inline async chunks so the bundle stays a single file — webpack's
    *   default JSONP chunk loader references `self`/`document`, neither of
@@ -190,7 +205,7 @@ export class StrandsPlugin extends SimplePlugin {
 interface WebpackApi {
   NormalModuleReplacementPlugin: new (
     resourceRegExp: RegExp,
-    newResource: (resource: { request: string; context: string }) => void
+    newResource: (resource: { request: string }) => void
   ) => WebpackPlugin;
 }
 
@@ -224,9 +239,6 @@ function emptyModuleRewritesPlugin(): WebpackPlugin {
       const { NormalModuleReplacementPlugin } = compiler.webpack;
       new NormalModuleReplacementPlugin(ignorePattern, (resource) => {
         resource.request = empty;
-      }).apply(compiler);
-      new NormalModuleReplacementPlugin(/^\.\/failure-converter-path$/, (resource) => {
-        if (resource.context === __dirname) resource.request = empty;
       }).apply(compiler);
     },
   };

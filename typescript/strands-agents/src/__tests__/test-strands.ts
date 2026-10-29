@@ -800,7 +800,7 @@ test('TemporalAgent surfaces structured output via structuredOutputSchema', asyn
   });
 });
 
-test('activity-tool interrupt round-trips through failure converter and resume', async (t) => {
+test('activity-tool interrupt pauses the agent and resumes', async (t) => {
   deleteState.calls = 0;
   const { createWorker, startWorkflow } = helpers(t);
 
@@ -815,16 +815,26 @@ test('activity-tool interrupt round-trips through failure converter and resume',
     activities: { deleteThing },
   });
 
-  await worker.runUntil(async () => {
+  const history = await worker.runUntil(async () => {
     const handle = await startWorkflow(interruptAgent, {
       args: ['delete foo'],
       workflowExecutionTimeout: '30 seconds',
     });
     await handle.signal(approveSignal, 'approve');
     t.is(await handle.result(), 'done');
+    return handle.fetchHistory();
   });
   // First activity invocation threw the interrupt; second succeeded after resume.
   t.is(deleteState.calls, 2);
+  // The interrupt failed the first activity without a retry, and the resumed agent scheduled a
+  // second one; a retried activity would have run both calls in one.
+  const events = history.events ?? [];
+  const failure = events.find((e) => e.activityTaskFailedEventAttributes)?.activityTaskFailedEventAttributes?.failure;
+  t.deepEqual(
+    [failure?.applicationFailureInfo?.type, failure?.applicationFailureInfo?.nonRetryable],
+    ['StrandsInterrupt', true]
+  );
+  t.is(events.filter((e) => e.activityTaskScheduledEventAttributes?.activityType?.name === 'deleteThing').length, 2);
 });
 
 test('streamingTopic publishes model events to a WorkflowStream subscriber', async (t) => {

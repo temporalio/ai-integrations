@@ -4,7 +4,6 @@ import { z } from 'zod';
 import {
   AfterToolCallEvent,
   SlidingWindowConversationManager,
-  StructuredOutputError,
   tool,
   type BaseModelConfig,
   type InterruptResponseContent,
@@ -17,7 +16,6 @@ import {
   proxyActivities,
   setHandler,
   condition,
-  workflowInfo,
 } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalAgent, TemporalMCPClient, type TemporalAgentOptions, workflow as strandsWorkflow } from '../..';
@@ -207,46 +205,22 @@ export async function structuredOutputAgent(prompt: string): Promise<unknown> {
 }
 
 /**
- * Fails an activity once per message, then fails the workflow with a Strands error as the cause, so
- * a test can check how the failures are stored.
+ * Calls an activity that fails once per message, then fails with how workflow code decoded each
+ * activity failure, so a test can check how the failures are stored and decoded.
  */
-export async function failTwice(message: string, activityMessages: string[] = [message]): Promise<never> {
+export async function failActivities(messages: string[]): Promise<never> {
   const { failingActivity } = proxyActivities<{ failingActivity(message: string): Promise<void> }>({
     startToCloseTimeout: '10 seconds',
     retry: { maximumAttempts: 1 },
   });
-  // How workflow code decoded each activity failure's causes, returned in the failure's details.
-  const decoded: Record<string, unknown[]> = {};
-  for (const activityMessage of activityMessages) {
-    await failingActivity(activityMessage).catch((err: unknown) => {
-      const causes: unknown[] = [];
-      for (let cause = err instanceof ActivityFailure ? err.cause : undefined; cause; cause = cause.cause as Error) {
-        causes.push(cause instanceof ApplicationFailure ? [cause.type, cause.message, cause.details] : cause.message);
-      }
-      decoded[activityMessage] = causes;
+  const decoded: unknown[] = [];
+  for (const message of messages) {
+    await failingActivity(message).catch((err: unknown) => {
+      const cause = err instanceof ActivityFailure ? err.cause : undefined;
+      decoded.push(cause instanceof ApplicationFailure ? [cause.type, cause.nonRetryable, cause.details] : null);
     });
   }
-  throw ApplicationFailure.create({
-    message,
-    nonRetryable: true,
-    cause: new StructuredOutputError('no output'),
-    details: [decoded],
-  });
-}
-
-/** Fails with a frozen failure whose cause is a Strands error, so its `cause` is read-only. */
-export async function failFrozen(message: string): Promise<never> {
-  throw Object.freeze(
-    ApplicationFailure.create({ message, nonRetryable: true, cause: new StructuredOutputError('no output') })
-  );
-}
-
-/** Fails its first attempt with a `Custom` failure; the retry returns how it sees that failure. */
-export async function lastFailureOfRetry(): Promise<string | undefined> {
-  if (workflowInfo().attempt === 1) {
-    throw ApplicationFailure.create({ message: 'first attempt failed', type: 'Custom' });
-  }
-  return workflowInfo().lastFailure?.message;
+  throw ApplicationFailure.create({ message: 'workflow failed', nonRetryable: true, details: decoded });
 }
 
 export const approveSignal = defineSignal<[string]>('approve');
