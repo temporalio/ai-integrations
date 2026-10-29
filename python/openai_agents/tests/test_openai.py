@@ -222,19 +222,19 @@ async def get_weather_context(ctx: RunContextWrapper[str], city: str) -> Weather
     return Weather(city=city, temperature_range="14-20C", conditions=ctx.context)
 
 
+# A string annotation naming a module-level alias must resolve in this module.
+CityName = str
+
+
 class ActivityWeatherService:
     @activity.defn
-    async def get_weather_method(self, city: str) -> Weather:
+    async def get_weather_method(self, city: "CityName") -> Weather:
         """
         Get the weather for a given city.
         """
         return Weather(
             city=city, temperature_range="14-20C", conditions="Sunny with wind."
         )
-
-
-# A string annotation naming a module-level alias must resolve in this module.
-CityName = str
 
 
 @activity.defn
@@ -465,11 +465,12 @@ async def test_tool_workflow(client: Client):
             async for e in workflow_handle.fetch_history_events():
                 if e.HasField("activity_task_completed_event_attributes"):
                     events.append(e)
-                attrs = e.activity_task_scheduled_event_attributes
-                if attrs.activity_type.name.startswith("ActivityWeather"):
-                    class_activity_inputs[attrs.activity_type.name] = [
-                        p.data.decode() for p in attrs.input.payloads
-                    ]
+                elif e.HasField("activity_task_scheduled_event_attributes"):
+                    attrs = e.activity_task_scheduled_event_attributes
+                    if attrs.activity_type.name.startswith("ActivityWeather"):
+                        class_activity_inputs[attrs.activity_type.name] = [
+                            p.data.decode() for p in attrs.input.payloads
+                        ]
 
             # Each callable class's __call__ gets the model's arguments, not its constructor.
             assert class_activity_inputs == {
@@ -593,17 +594,85 @@ class ActivityWeatherPartialMethodCall:
     __call__ = functools.partialmethod(get_weather, "Rainy")
 
 
-def test_partialmethod_call_tool_drops_only_self():
-    # On Python 3.10 the SDK runs an async partialmethod as sync, so test_tool_workflow can't
-    # run this form; the tool's schema is the part this plugin builds.
+@activity.defn
+@dataclass
+class ActivityWeatherDataclass:
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+class WeatherBase:
+    """
+    Get the weather for a given city.
+    """
+
+
+@activity.defn
+class ActivityWeatherDerived(WeatherBase):
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "cls, description",
+    [
+        # Before Python 3.13 the SDK runs an async partialmethod as sync, so
+        # test_tool_workflow can't run this form; the tool's schema is the part this plugin builds.
+        (ActivityWeatherPartialMethodCall, "Get the weather for a given city."),
+        # Not the docstring a dataclass writes from its constructor.
+        (ActivityWeatherDataclass, ""),
+        (ActivityWeatherDerived, "Get the weather for a given city."),
+    ],
+)
+def test_callable_class_tool_schema(cls: type, description: str):
     tool = openai_agents.workflow.activity_as_tool(
-        ActivityWeatherPartialMethodCall, start_to_close_timeout=timedelta(seconds=10)
+        cls, start_to_close_timeout=timedelta(seconds=10)
     )
     assert isinstance(tool, FunctionTool)
     assert tool.params_json_schema["properties"] == {
         "city": {"title": "City", "type": "string"}
     }
-    assert tool.description == "Get the weather for a given city."
+    assert tool.description == description
+
+
+@activity.defn
+class ActivityWeatherNoCall:
+    pass
+
+
+async def get_weather_no_city() -> Weather:
+    return Weather(city="Tokyo", temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherNoParamCall:
+    # Bound to an instance, a function with no parameters can't take `self`.
+    __call__ = get_weather_no_city
+
+
+@activity.defn
+class ActivityWeatherKeywordOnlyCall:
+    async def __call__(self, *, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "cls, message",
+    [
+        (ActivityWeatherNoCall, "has no __call__ method"),
+        (ActivityWeatherNoParamCall, "invalid method signature"),
+        (ActivityWeatherKeywordOnlyCall, "cannot have keyword-only arguments"),
+    ],
+)
+def test_invalid_callable_class_tool(cls: type, message: str):
+    with pytest.raises(ApplicationError, match=message):
+        openai_agents.workflow.activity_as_tool(
+            cls, start_to_close_timeout=timedelta(seconds=10)
+        )
 
 
 @activity.defn

@@ -28,6 +28,7 @@ from tests.test_openai import (
         "output-guardrail-workflow-history.json",
         "research-workflow-history.json",
         "run-model-provider-workflow-history.json",
+        "tools-workflow-callable-class-history.json",
         "tools-workflow-history.json",
     ],
 )

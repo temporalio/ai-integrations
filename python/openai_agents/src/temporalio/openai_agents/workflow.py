@@ -1,8 +1,10 @@
 """Workflow-specific primitives for working with the OpenAI Agents SDK in a workflow context"""
 
+import dataclasses
 import functools
 import inspect
 import json
+import types
 import typing
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
@@ -172,38 +174,54 @@ def activity_as_tool(
             "Input activity must have a name to be made into a tool",
             "invalid_tool",
         )
+    call: Callable = fn
+    func: Callable = fn
+    doc = fn.__doc__
     if inspect.isclass(fn):
         # Workflow code references a callable-class activity by its class, but the worker's
         # registered instance runs __call__, so build the tool from __call__ as an instance binds
         # it: without the `self` of a method or partialmethod, and with every parameter of a
         # static or class method. The tool never calls this stand-in binding.
-        method = inspect.getattr_static(fn, "__call__")
-        if hasattr(method, "__get__"):
-            method = method.__get__(object(), fn)
-        call = functools.partial(method)
-        setattr(call, "__name__", fn.__name__)
-        # A partial has no module globals, so resolve postponed annotations against the
-        # function's own.
-        func = method
-        while isinstance(func, functools.partial):
-            func = func.func
-        call.__annotations__ = typing.get_type_hints(func, include_extras=True)
-        call.__doc__ = func.__doc__ or fn.__doc__
-        fn = typing.cast(Callable, call)
-    # If the provided callable has a first argument of `self`, partially apply it with the same metadata
-    # The actual instance will be picked up by the activity execution, the partially applied function will never actually be executed
-    params = list(inspect.signature(fn).parameters.keys())
-    if len(params) > 0 and params[0] == "self":
-        partial = functools.partial(fn, None)
-        setattr(partial, "__name__", fn.__name__)
-        partial.__annotations__ = getattr(fn, "__annotations__")
-        setattr(
-            partial,
-            "__temporal_activity_definition",
-            getattr(fn, "__temporal_activity_definition"),
+        method = next(
+            (vars(c)["__call__"] for c in fn.__mro__ if "__call__" in vars(c)), None
         )
-        partial.__doc__ = fn.__doc__
-        fn = partial
+        if method is None:
+            raise ApplicationError(
+                f"Activity class {fn.__name__} has no __call__ method", "invalid_tool"
+            )
+        call = method.__get__(object(), fn) if hasattr(method, "__get__") else method
+        # Read annotations and docs from the function under any partials and bound methods.
+        func = call
+        while isinstance(func, (functools.partial, types.MethodType)):
+            func = func.func if isinstance(func, functools.partial) else func.__func__
+        doc = func.__doc__
+        # A dataclass without a docstring gets its constructor's signature as one.
+        if not doc and not dataclasses.is_dataclass(fn):
+            doc = inspect.getdoc(fn)
+    try:
+        params = list(inspect.signature(call).parameters.values())
+    except ValueError as e:
+        raise ApplicationError(
+            f"Cannot build a tool from {fn.__name__}: {e}", "invalid_tool"
+        ) from e
+    # If the provided callable has a first argument of `self`, partially apply it
+    # The actual instance will be picked up by the activity execution, the partially applied function will never actually be executed
+    if params and params[0].name == "self":
+        call = functools.partial(call, None)
+        params = params[1:]
+    # run_activity passes only positional arguments.
+    if any(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params):
+        raise ApplicationError(
+            f"Activity {fn.__name__} cannot have keyword-only arguments", "invalid_tool"
+        )
+    if call is not fn:
+        # A partial has no module globals, so give it annotations resolved in the function's
+        # own module, and the activity's name and docstring.
+        stand_in = functools.partial(call)
+        setattr(stand_in, "__name__", fn.__name__)
+        stand_in.__annotations__ = typing.get_type_hints(func, include_extras=True)
+        stand_in.__doc__ = doc
+        fn = stand_in
     schema = function_schema(fn)
 
     async def run_activity(ctx: RunContextWrapper[Any], input: str) -> Any:
