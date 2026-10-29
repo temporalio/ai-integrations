@@ -10,9 +10,9 @@ ext {
     javaRelease = 17
     temporalVersion = latestDependencies ? '1.+' : '1.40.0'
     adkVersion = latestDependencies ? '1.+' : '1.12.0'
-    // The OpenTelemetry version ADK resolves; the tracing API exposes these types.
-    otelVersion = latestDependencies ? '1.+' : '1.51.0'
-    latestDependencyGroups = ['io.temporal', 'com.google.adk', 'io.opentelemetry']
+    // The version ADK pins; the tracing API exposes these types. Bump it together with ADK.
+    otelVersion = '1.51.0'
+    latestDependencyGroups = ['io.temporal', 'com.google.adk']
 }
 
 apply from: '../_shared/java.gradle'
