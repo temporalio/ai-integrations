@@ -16,6 +16,7 @@ import io.reactivex.rxjava3.core.Flowable;
 import io.temporal.activity.ActivityCancellationType;
 import io.temporal.activity.ActivityOptions;
 import io.temporal.api.common.v1.Payload;
+import io.temporal.api.history.v1.HistoryEvent;
 import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowClientOptions;
 import io.temporal.client.WorkflowOptions;
@@ -23,6 +24,10 @@ import io.temporal.client.WorkflowStub;
 import io.temporal.common.RetryOptions;
 import io.temporal.common.WorkflowExecutionHistory;
 import io.temporal.common.converter.CodecDataConverter;
+import io.temporal.common.interceptors.WorkflowClientCallsInterceptor;
+import io.temporal.common.interceptors.WorkflowClientCallsInterceptorBase;
+import io.temporal.common.interceptors.WorkflowClientInterceptor;
+import io.temporal.common.interceptors.WorkflowClientInterceptorBase;
 import io.temporal.failure.ActivityFailure;
 import io.temporal.failure.ApplicationFailure;
 import io.temporal.failure.CanceledFailure;
@@ -44,6 +49,7 @@ import io.temporal.workflow.WorkflowMethod;
 import io.temporal.workflowstreams.SubscribeOptions;
 import io.temporal.workflowstreams.WorkflowStream;
 import io.temporal.workflowstreams.WorkflowStreamClient;
+import io.temporal.workflowstreams.WorkflowStreamConstants;
 import io.temporal.workflowstreams.WorkflowStreamListener;
 import io.temporal.workflowstreams.WorkflowStreamSubscriptionHandle;
 import java.time.Duration;
@@ -181,7 +187,7 @@ class LiveStreamingWorkflowTest {
         fixture.model.release.countDown();
         assertEquals(ModelStreamEvent.Kind.FAILED, subscriber.next().kind());
         fixture.workflow.finish();
-        assertEquals("failed", fixture.result().get(10, TimeUnit.SECONDS));
+        assertEquals("failed:test", fixture.result().get(10, TimeUnit.SECONDS));
         assertEquals(1, fixture.model.calls.get());
         fixture.replay();
       }
@@ -195,7 +201,7 @@ class LiveStreamingWorkflowTest {
       try (Subscriber subscriber = fixture.subscribe()) {
         subscriber.next();
         WorkflowStub.fromTyped(fixture.workflow).cancel();
-        assertEquals(ModelStreamEvent.Kind.CANCELLED, subscriber.next().kind());
+        assertEquals(ModelStreamEvent.Kind.CANCELED, subscriber.next().kind());
         assertEquals(1, fixture.model.finished.getCount());
         fixture.model.release.countDown();
         assertTrue(fixture.model.finished.await(5, TimeUnit.SECONDS));
@@ -212,7 +218,7 @@ class LiveStreamingWorkflowTest {
   }
 
   @Test
-  void enablingLiveDeliveryReplaysPreFeatureActivityInputs() throws Exception {
+  void enablingLiveDeliveryReplaysHistoriesRecordedWithoutATopic() throws Exception {
     try (Fixture fixture = new Fixture(LegacyWorkflowImpl.class)) {
       fixture.model.release.countDown();
       fixture.start(true, false);
@@ -237,8 +243,33 @@ class LiveStreamingWorkflowTest {
             converter.toPayload(live).orElseThrow(),
             InvokeModelInput.class,
             InvokeModelInput.class));
+  }
+
+  @Test
+  void streamingTopicRejectsBlankNames() {
     assertThrows(
         IllegalArgumentException.class, () -> TemporalModel.newBuilder(MODEL).streamingTopic(" "));
+  }
+
+  @Test
+  void publishingFailuresFailTheActivityAsStreamErrors() throws Exception {
+    RejectingPublishInterceptor publishes = new RejectingPublishInterceptor();
+    try (Fixture fixture = new Fixture(LiveWorkflowImpl.class, null, publishes)) {
+      fixture.model.release.countDown();
+      fixture.start(true, false);
+      assertEquals(
+          "failed:" + FailureTypes.STREAM_ERROR, fixture.result().get(30, TimeUnit.SECONDS));
+      assertEquals(2, fixture.model.calls.get(), "a publishing failure is retried");
+      assertTrue(publishes.rejected.get() > 0);
+      HistoryEvent failed =
+          fixture.client.fetchHistory(fixture.id).getEvents().stream()
+              .filter(HistoryEvent::hasActivityTaskFailedEventAttributes)
+              .findFirst()
+              .orElseThrow();
+      String message = failed.getActivityTaskFailedEventAttributes().getFailure().getMessage();
+      assertTrue(message.contains("topic '" + TOPIC + "'"), message);
+      fixture.replay();
+    }
   }
 
   private record LegacyInput(String model, LlmRequest request, boolean stream) {}
@@ -272,7 +303,7 @@ class LiveStreamingWorkflowTest {
               .activityOptions(
                   ActivityOptions.newBuilder()
                       .setStartToCloseTimeout(Duration.ofSeconds(20))
-                      .setHeartbeatTimeout(Duration.ofMillis(300))
+                      .setHeartbeatTimeout(Duration.ofSeconds(2))
                       .setCancellationType(ActivityCancellationType.WAIT_CANCELLATION_COMPLETED)
                       .setRetryOptions(RetryOptions.newBuilder().setMaximumAttempts(2).build())
                       .build());
@@ -295,7 +326,10 @@ class LiveStreamingWorkflowTest {
       } catch (CanceledFailure e) {
         result = "cancelled";
       } catch (ActivityFailure e) {
-        result = "failed";
+        result =
+            e.getCause() instanceof ApplicationFailure failure
+                ? "failed:" + failure.getType()
+                : "failed";
       }
       if (holdOpen) {
         output.topic("turn-status").publish("complete");
@@ -336,13 +370,15 @@ class LiveStreamingWorkflowTest {
       this(implementation, null);
     }
 
-    Fixture(Class<?> implementation, PayloadCodec codec) {
+    Fixture(
+        Class<?> implementation, PayloadCodec codec, WorkflowClientInterceptor... interceptors) {
       GoogleAdkPlugin plugin =
           GoogleAdkPlugin.newBuilder()
               .model(MODEL, model)
               .customizeDataConverter(codec == null)
               .build();
-      var options = WorkflowClientOptions.newBuilder().setPlugins(plugin);
+      var options =
+          WorkflowClientOptions.newBuilder().setPlugins(plugin).setInterceptors(interceptors);
       if (codec != null) {
         options.setDataConverter(
             new CodecDataConverter(GoogleAdkDataConverter.newDefaultInstance(), List.of(codec)));
@@ -396,6 +432,26 @@ class LiveStreamingWorkflowTest {
     public void close() {
       model.release.countDown();
       environment.close();
+    }
+  }
+
+  /** Rejects every Workflow Streams publish Signal, as an unreachable service would. */
+  private static final class RejectingPublishInterceptor extends WorkflowClientInterceptorBase {
+    final AtomicInteger rejected = new AtomicInteger();
+
+    @Override
+    public WorkflowClientCallsInterceptor workflowClientCallsInterceptor(
+        WorkflowClientCallsInterceptor next) {
+      return new WorkflowClientCallsInterceptorBase(next) {
+        @Override
+        public WorkflowSignalOutput signal(WorkflowSignalInput input) {
+          if (input.getSignalName().equals(WorkflowStreamConstants.PUBLISH_SIGNAL_NAME)) {
+            rejected.incrementAndGet();
+            throw new IllegalStateException("publish rejected");
+          }
+          return super.signal(input);
+        }
+      };
     }
   }
 

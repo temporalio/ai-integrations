@@ -34,9 +34,9 @@ import java.util.function.Function;
  *
  * <p>Streamed calls ({@code RunConfig.StreamingMode.SSE}) are served by the same activity: the
  * worker collects every chunk the model emits and the workflow replays them in order, so ADK's
- * partial events keep their shape. Chunks reach the workflow only when the activity completes.
- * Configuring {@link Builder#streamingTopic} also sends them to external Workflow Streams
- * subscribers while the Activity is running. Live (bidirectional) connections are not supported.
+ * partial events keep their shape. Chunks reach the workflow only when the activity completes;
+ * {@link Builder#streamingTopic} also publishes them to a Workflow Stream while the Activity runs.
+ * Live (bidirectional) connections are not supported.
  */
 public final class TemporalModel extends BaseLlm {
 
@@ -117,12 +117,12 @@ public final class TemporalModel extends BaseLlm {
     }
 
     /**
-     * Publishes streamed model responses and an attempt-terminal event to this Workflow Streams
-     * topic while the model Activity runs. The Workflow must host a {@code WorkflowStream}; the
-     * application must supply the SDK-matched {@code temporal-workflowstreams} dependency. Calls
-     * without SSE streaming do not publish. Activity retries use a new attempt number and restart
-     * their sequence at zero. Terminal records are best effort; the durable Activity result remains
-     * authoritative.
+     * Publishes streamed responses and one attempt-terminal record to this Workflow Streams topic
+     * while the model Activity runs. The Workflow must host a {@code WorkflowStream}, and the
+     * Worker running the Activity needs the SDK-matched {@code temporal-workflowstreams} artifact
+     * with the unshaded SDK. Calls without SSE streaming do not publish. Retries restart the
+     * sequence under the next attempt; terminal records are best effort, and the Activity result
+     * remains authoritative.
      */
     public Builder streamingTopic(String streamingTopic) {
       Objects.requireNonNull(streamingTopic, "streamingTopic");

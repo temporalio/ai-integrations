@@ -94,7 +94,7 @@ public final class ModelActivityImpl implements ModelActivity {
         if (publisher != null) {
           publisher.failed(
               e instanceof ActivityCompletionException
-                  ? ModelStreamEvent.Kind.CANCELLED
+                  ? ModelStreamEvent.Kind.CANCELED
                   : ModelStreamEvent.Kind.FAILED,
               e);
         }
@@ -102,6 +102,16 @@ public final class ModelActivityImpl implements ModelActivity {
       }
     } catch (ApplicationFailure | ActivityCompletionException e) {
       throw e;
+    } catch (ModelStreamPublisher.PublishFailure e) {
+      throw ApplicationFailure.newFailureWithCause(
+          "Live delivery of model "
+              + input.model()
+              + " output to topic '"
+              + input.streamingTopic()
+              + "' failed: "
+              + e.getMessage(),
+          FailureTypes.STREAM_ERROR,
+          e.getCause());
     } catch (RuntimeException e) {
       throw Failures.modelFailure(input.model(), e);
     }
@@ -114,7 +124,7 @@ public final class ModelActivityImpl implements ModelActivity {
     }
     if (input.streamingTopic().isBlank()) {
       throw ApplicationFailure.newNonRetryableFailure(
-          "streamingTopic must not be blank", FailureTypes.MODEL_ERROR);
+          "streamingTopic must not be blank", FailureTypes.STREAM_ERROR);
     }
     try {
       return new ModelStreamPublisher(context, input.model(), input.streamingTopic());
@@ -122,7 +132,7 @@ public final class ModelActivityImpl implements ModelActivity {
       throw ApplicationFailure.newNonRetryableFailureWithCause(
           "Live streaming requires matching io.temporal:temporal-sdk and temporal-workflowstreams"
               + " artifacts; use the unshaded SDK for live streaming",
-          FailureTypes.MODEL_ERROR,
+          FailureTypes.STREAM_ERROR,
           e);
     }
   }

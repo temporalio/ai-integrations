@@ -30,7 +30,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
 
-/** Publishes on the provider thread using identity and a client captured on the Activity thread. */
+/**
+ * Publishes one model Activity attempt's responses to a Workflow Stream topic. Responses are
+ * accepted on the provider's thread and batched; the terminal record is delivered synchronously on
+ * the Activity thread. Transport and encoding failures surface as {@link PublishFailure}.
+ */
 public final class ModelStreamPublisher implements AutoCloseable {
   private static final Duration PUBLISH_TIMEOUT = Duration.ofSeconds(5);
   private static final ScheduledExecutorService DEADLINES =
@@ -47,7 +51,7 @@ public final class ModelStreamPublisher implements AutoCloseable {
   private long sequence;
   private boolean closed;
 
-  /** Creates a publisher for the current Activity's parent Workflow. */
+  /** Creates a publisher for the current Activity's Workflow. */
   public ModelStreamPublisher(ActivityExecutionContext context, String model, String topic) {
     this(context, model, topic, PUBLISH_TIMEOUT);
   }
@@ -70,6 +74,12 @@ public final class ModelStreamPublisher implements AutoCloseable {
     this.topic = client.topic(topic);
   }
 
+  /**
+   * Clones the Worker's client with a gRPC deadline on every publish Signal. The SDK retries a
+   * Signal for up to a minute unless the calling context carries a deadline, and it re-applies the
+   * service stubs' plugins to a client built from those stubs, so the clone borrows the stubs
+   * without their plugins.
+   */
   private static WorkflowClient boundedClient(WorkflowClient source, Duration timeout) {
     Objects.requireNonNull(
         source.getWorkflowServiceStubs().getRawChannel(), "Workflow Service channel");
@@ -104,25 +114,27 @@ public final class ModelStreamPublisher implements AutoCloseable {
             .build());
   }
 
-  /** Forwards a response while the Activity is still collecting its durable result. */
+  /** Queues a response for the next batch while the Activity is still collecting its result. */
   public synchronized void accept(LlmResponse response) {
     if (!closed) {
       publish(ModelStreamEvent.Kind.RESPONSE, response);
     }
   }
 
-  /** Publishes one terminal record and prevents abandoned provider calls from publishing later. */
+  /**
+   * Publishes one terminal record behind the buffered responses and waits for their delivery. Later
+   * output of an abandoned provider call is dropped.
+   */
   public synchronized void terminal(ModelStreamEvent.Kind kind) {
-    if (!closed) {
-      if (kind == ModelStreamEvent.Kind.COMPLETE) {
-        client.flush();
-      }
-      closed = true;
-      publish(kind, null);
+    if (closed) {
+      return;
     }
+    closed = true;
+    publish(kind, null);
+    transport(client::flush);
   }
 
-  /** Preserves the primary provider/cancellation failure when terminal publishing also fails. */
+  /** Publishes a terminal record for a failed attempt without displacing the primary failure. */
   public void failed(ModelStreamEvent.Kind kind, Throwable failure) {
     try {
       terminal(kind);
@@ -132,7 +144,7 @@ public final class ModelStreamPublisher implements AutoCloseable {
   }
 
   private void publish(ModelStreamEvent.Kind kind, @Nullable LlmResponse response) {
-    topic.publish(
+    ModelStreamEvent event =
         new ModelStreamEvent(
             info.getWorkflowId(),
             info.getWorkflowRunId(),
@@ -141,17 +153,32 @@ public final class ModelStreamPublisher implements AutoCloseable {
             info.getAttempt(),
             sequence++,
             kind,
-            response),
-        kind != ModelStreamEvent.Kind.RESPONSE);
+            response);
+    transport(() -> topic.publish(event, false));
   }
 
-  /** Stops further publishing and flushes buffered records before the Activity completes. */
+  /** Stops publishing and delivers anything still buffered. */
   @Override
   public void close() {
     synchronized (this) {
       closed = true;
     }
-    client.close();
+    transport(client::close);
+  }
+
+  private static void transport(Runnable action) {
+    try {
+      action.run();
+    } catch (RuntimeException e) {
+      throw new PublishFailure(e);
+    }
+  }
+
+  /** A Workflow Streams transport or encoding failure, as opposed to a model failure. */
+  public static final class PublishFailure extends RuntimeException {
+    PublishFailure(RuntimeException cause) {
+      super(cause.getMessage() != null ? cause.getMessage() : cause.toString(), cause);
+    }
   }
 
   private static final class BorrowedService implements WorkflowServiceStubs {

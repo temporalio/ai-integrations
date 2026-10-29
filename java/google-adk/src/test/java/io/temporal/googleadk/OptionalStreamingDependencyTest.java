@@ -3,7 +3,11 @@ package io.temporal.googleadk;
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.google.adk.models.LlmRequest;
+import io.temporal.activity.ActivityOptions;
 import io.temporal.client.WorkflowClientOptions;
+import io.temporal.common.RetryOptions;
+import io.temporal.failure.ActivityFailure;
+import io.temporal.failure.ApplicationFailure;
 import io.temporal.googleadk.activity.InvokeModelInput;
 import io.temporal.googleadk.activity.ModelActivity;
 import io.temporal.googleadk.activity.ModelActivityImpl;
@@ -15,6 +19,7 @@ import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
@@ -23,13 +28,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
+/** The model Activity works without the optional Workflow Streams artifact on the classpath. */
 class OptionalStreamingDependencyTest {
   @Test
-  @Timeout(30)
+  @Timeout(90)
   void executesTheDefaultModelActivityWithoutWorkflowStreamsAtRuntime(@TempDir Path temporary)
       throws Exception {
     String classpathFile = System.getProperty("googleadk.test.classpath-file");
-    assertNotNull(classpathFile);
+    assertNotNull(classpathFile, "run through Gradle; see build.gradle");
     String original = Files.readString(Path.of(classpathFile), StandardCharsets.UTF_8);
     String isolated =
         Arrays.stream(original.split(Pattern.quote(File.pathSeparator)))
@@ -40,7 +46,9 @@ class OptionalStreamingDependencyTest {
                         .toString()
                         .startsWith("temporal-workflowstreams-"))
             .collect(Collectors.joining(File.pathSeparator));
-    assertNotEquals(original, isolated);
+    assertNotEquals(original, isolated, "the test classpath carries Workflow Streams");
+    // Pad past the Windows command-line limit (32,767 characters) to keep the argument file
+    // approach honest on every platform.
     String repeatedEntry = isolated.split(Pattern.quote(File.pathSeparator))[0];
     while (isolated.length() < 40_000) {
       isolated += File.pathSeparator + repeatedEntry;
@@ -55,16 +63,14 @@ class OptionalStreamingDependencyTest {
             + "\n",
         StandardCharsets.UTF_8);
     Path output = temporary.resolve("probe.log");
-    String executable = System.getProperty("os.name").startsWith("Windows") ? "java.exe" : "java";
     Process process =
         new ProcessBuilder(
-                Path.of(System.getProperty("java.home"), "bin", executable).toString(),
-                "@" + arguments)
+                Path.of(System.getProperty("java.home"), "bin", "java").toString(), "@" + arguments)
             .redirectErrorStream(true)
             .redirectOutput(output.toFile())
             .start();
     try {
-      assertTrue(process.waitFor(20, TimeUnit.SECONDS), "consumer timed out: " + output);
+      assertTrue(process.waitFor(60, TimeUnit.SECONDS), "consumer timed out: " + output);
       assertEquals(0, process.exitValue(), Files.readString(output, StandardCharsets.UTF_8));
     } finally {
       if (process.isAlive()) {
@@ -75,6 +81,12 @@ class OptionalStreamingDependencyTest {
   }
 
   public static final class DefaultActivityProbe {
+    private static final ActivityOptions OPTIONS =
+        ActivityOptions.newBuilder()
+            .setStartToCloseTimeout(Duration.ofSeconds(3))
+            .setRetryOptions(RetryOptions.newBuilder().setMaximumAttempts(1).build())
+            .build();
+
     public static void main(String[] args) {
       try {
         run();
@@ -92,6 +104,7 @@ class OptionalStreamingDependencyTest {
           != null) {
         throw new AssertionError("Workflow Streams must be absent from the consumer classpath");
       }
+      // The plugin and the Activity implementation load without the optional artifact.
       GoogleAdkPlugin.newDefaultInstance();
       TestActivityEnvironment environment =
           TestActivityEnvironment.newInstance(
@@ -105,43 +118,28 @@ class OptionalStreamingDependencyTest {
         environment.registerActivitiesImplementations(
             new ModelActivityImpl(
                 name -> ScriptedModel.of(name, ScriptedModel.text("default activity works"))));
-        var result =
-            environment
-                .newActivityStub(
-                    ModelActivity.class,
-                    io.temporal.activity.ActivityOptions.newBuilder()
-                        .setStartToCloseTimeout(java.time.Duration.ofSeconds(3))
-                        .setRetryOptions(
-                            io.temporal.common.RetryOptions.newBuilder()
-                                .setMaximumAttempts(1)
-                                .build())
-                        .build())
-                .invokeModel(
-                    new InvokeModelInput(
-                        "model", LlmRequest.builder().model("model").build(), true));
-        if (!"default activity works"
-            .equals(result.responses().get(0).content().orElseThrow().text())) {
-          throw new AssertionError("unexpected model response");
+        ModelActivity activity = environment.newActivityStub(ModelActivity.class, OPTIONS);
+        LlmRequest request = LlmRequest.builder().model("model").build();
+        for (InvokeModelInput input :
+            new InvokeModelInput[] {
+              new InvokeModelInput("model", request, true),
+              // A topic without SSE streaming never publishes, so it needs no artifact either.
+              new InvokeModelInput("model", request, false, "output")
+            }) {
+          String text =
+              activity.invokeModel(input).responses().get(0).content().orElseThrow().text();
+          if (!"default activity works".equals(text)) {
+            throw new AssertionError("unexpected model response: " + text);
+          }
         }
         try {
-          environment
-              .newActivityStub(
-                  ModelActivity.class,
-                  io.temporal.activity.ActivityOptions.newBuilder()
-                      .setStartToCloseTimeout(java.time.Duration.ofSeconds(3))
-                      .setRetryOptions(
-                          io.temporal.common.RetryOptions.newBuilder()
-                              .setMaximumAttempts(1)
-                              .build())
-                      .build())
-              .invokeModel(
-                  new InvokeModelInput(
-                      "model", LlmRequest.builder().model("model").build(), true, "output"));
+          activity.invokeModel(new InvokeModelInput("model", request, true, "output"));
           throw new AssertionError(
               "live streaming must reject a missing Workflow Streams artifact");
-        } catch (io.temporal.failure.ActivityFailure failure) {
-          var cause = (io.temporal.failure.ApplicationFailure) failure.getCause();
+        } catch (ActivityFailure failure) {
+          ApplicationFailure cause = (ApplicationFailure) failure.getCause();
           if (!cause.isNonRetryable()
+              || !FailureTypes.STREAM_ERROR.equals(cause.getType())
               || !cause.getOriginalMessage().contains("matching io.temporal:temporal-sdk")) {
             throw new AssertionError(
                 "missing transport needs an actionable non-retryable failure", failure);

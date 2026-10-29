@@ -17,6 +17,7 @@ import io.temporal.api.workflowservice.v1.SignalWorkflowExecutionResponse;
 import io.temporal.api.workflowservice.v1.WorkflowServiceGrpc;
 import io.temporal.client.WorkflowClient;
 import io.temporal.common.SimplePlugin;
+import io.temporal.googleadk.model.ModelStreamEvent;
 import io.temporal.googleadk.testing.ScriptedModel;
 import io.temporal.serviceclient.WorkflowServiceStubs;
 import io.temporal.serviceclient.WorkflowServiceStubsOptions;
@@ -90,10 +91,13 @@ class ModelStreamPublisherTest {
       publisher.accept(ScriptedModel.partialText("first"));
       assertTrue(received.await(3, TimeUnit.SECONDS), "the real signal RPC must reach the server");
       long start = System.nanoTime();
-      assertThrows(RuntimeException.class, publisher::close);
+      assertThrows(
+          ModelStreamPublisher.PublishFailure.class,
+          () -> publisher.terminal(ModelStreamEvent.Kind.COMPLETE));
       assertTrue(
           Duration.ofNanos(System.nanoTime() - start).compareTo(Duration.ofSeconds(2)) < 0,
           "a blackholed signal RPC must not use the client's much longer default retry timeout");
+      assertThrows(ModelStreamPublisher.PublishFailure.class, publisher::close);
       assertEquals(0, source.getOptions().getInterceptors().length);
       assertEquals(
           1,

@@ -4,15 +4,6 @@ plugins {
     id 'com.diffplug.spotless' version '7.0.2'
 }
 
-test {
-    doFirst {
-        def classpathFile = layout.buildDirectory.file('test-runtime-classpath.txt').get().asFile
-        classpathFile.parentFile.mkdirs()
-        classpathFile.setText(sourceSets.test.runtimeClasspath.asPath, 'UTF-8')
-        systemProperty 'googleadk.test.classpath-file', classpathFile.absolutePath
-    }
-}
-
 description = 'Temporal Google ADK integration (Public Preview)'
 def latestDependencies = providers.gradleProperty('dependencyMode').getOrElse('locked') == 'latest'
 ext {
@@ -39,4 +30,14 @@ dependencies {
     testImplementation 'org.mockito:mockito-core:5.23.0'
     testRuntimeOnly 'ch.qos.logback:logback-classic:1.5.18'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// Subprocess tests read the test runtime classpath from a file; Windows limits command lines.
+test {
+    doFirst {
+        def classpathFile = layout.buildDirectory.file('test-runtime-classpath.txt').get().asFile
+        classpathFile.parentFile.mkdirs()
+        classpathFile.setText(sourceSets.test.runtimeClasspath.asPath, 'UTF-8')
+        systemProperty 'googleadk.test.classpath-file', classpathFile.absolutePath
+    }
 }

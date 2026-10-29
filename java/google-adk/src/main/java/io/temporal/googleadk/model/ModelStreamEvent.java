@@ -6,10 +6,10 @@ import com.google.adk.models.LlmResponse;
 import javax.annotation.Nullable;
 
 /**
- * A live model response or terminal record for one model Activity attempt. The workflow/run,
- * Activity ID, attempt, and zero-based sequence identify a record; a retried Activity restarts its
- * sequence with a higher attempt number. Terminal records have no response. A completed attempt is
- * not necessarily the final agent turn, and the Activity result is authoritative.
+ * A live model response or the terminal record of one model Activity attempt. The Workflow ID, Run
+ * ID, Activity ID, attempt, and zero-based sequence identify a record; a retried Activity keeps its
+ * ID, increments the attempt, and restarts the sequence. Terminal records carry no response and are
+ * best effort: the Activity result is authoritative.
  */
 public record ModelStreamEvent(
     @JsonProperty("workflowId") String workflowId,
@@ -21,19 +21,19 @@ public record ModelStreamEvent(
     @JsonProperty("kind") Kind kind,
     @JsonProperty("response") @Nullable LlmResponse response) {
 
-  /** Creates a live event. */
+  /** Creates an event. */
   @JsonCreator
   public ModelStreamEvent {}
 
-  /** The model response or disposition of this Activity attempt. */
+  /** What a record carries. */
   public enum Kind {
-    /** An ADK response, including partial and final responses. */
+    /** An ADK response, partial or final. */
     RESPONSE,
-    /** The provider completed successfully with at least one response. */
+    /** The provider completed with at least one response. */
     COMPLETE,
-    /** The attempt failed; its Activity retry policy may start another attempt. */
+    /** The attempt failed; the Activity's retry policy may start another. */
     FAILED,
-    /** The Activity observed cancellation or timeout while the provider was running. */
-    CANCELLED
+    /** The attempt was abandoned: canceled, timed out, paused, reset, or the Worker shut down. */
+    CANCELED
   }
 }
