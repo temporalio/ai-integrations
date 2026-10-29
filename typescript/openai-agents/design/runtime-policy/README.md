@@ -86,11 +86,11 @@ The same [Worker proof](proof.cjs), with [Workflow definitions](workflows.cjs), 
 | Approval assigned after tool creation | One interruption; no nested model Activity | Same behavior |
 | A loaded SDK copy lacks the new contract | Not a baseline requirement | Bundle is rejected before Workflow execution |
 
-Results are in [baseline.txt](baseline.txt), [policy.txt](policy.txt), and the saved `histories-baseline/` and `histories-policy/` directories. The baseline's success status asserts the two defective outcomes; it does not mean the baseline is safe.
+The recorded run passed all 14 cases on each build. Running the proof creates `results/baseline.txt`, `results/policy.txt`, and the `results/histories-baseline/` and `results/histories-policy/` directories. Generated histories and logs are excluded from the PR. The baseline's success status asserts the two defective outcomes; it does not mean the baseline is safe.
 
-The existing focused controls cover run defaults and model inheritance, options reuse, shared-agent and nested approvals across `continueAsNew`, early and late streaming handlers, cancellation, agent listeners, custom handoffs, and sandbox lifecycle and mutation. See [controls.txt](controls.txt).
+The existing focused controls cover run defaults and model inheritance, options reuse, shared-agent and nested approvals across `continueAsNew`, early and late streaming handlers, cancellation, agent listeners, custom handoffs, and sandbox lifecycle and mutation. All 21 selected existing tests passed; a rerun writes `results/controls.txt`.
 
-For ordinary native nested calls and a separate-copy string-model agent, the compatibility check replays both builds' histories with each build, including self-replays. It carries a waiting native nested run through Worker replacement in both directions, with no Workflow cache, and checks its completed result. A deliberately renamed Activity must fail replay with `[TMPRL1100]`. See [replay.txt](replay.txt) and [replay.cjs](replay.cjs). The rollback target here is the unchanged PR head, not the plugin's released version.
+For ordinary native nested calls and a separate-copy string-model agent, the compatibility check replays both builds' histories with each build, including self-replays. It carries a Workflow held after its native nested run has completed through Worker replacement in both directions, with no Workflow cache, and checks the Workflow’s completed result. Recovery of a native nested run that is still pending across Worker replacement remains unverified. A deliberately renamed Activity must fail replay with `[TMPRL1100]`. All eight finished-history combinations, both held-run replacements and the negative control passed. [replay.cjs](replay.cjs) writes its results to `results/replay.txt`. The rollback target here is the unchanged PR head, not the plugin's released version.
 
 ## Behavior and remaining limits
 
@@ -104,7 +104,7 @@ The main-to-#270 upgrade breaks already accepted for clone removal and native to
 
 ## Delivery
 
-1. Propose and review the two execution hooks in `openai/openai-agents-js`. The [request draft](upstream-request.md) describes the contract; no upstream issue or PR was posted for this study.
+1. Propose and review the two execution hooks in `openai/openai-agents-js`. The contract above describes the request; no upstream issue or PR was posted for this study.
 2. After an upstream release, require that release and the bundle check in `temporalio/ai-integrations`. Replace the three prototype interceptions and registry with the policy. Keep the coupled clone-removal, identity and native-tool changes together, with their existing upgrade guidance.
 3. Run the existing focused controls and the full supported CI matrix, then review the simplified implementation once. An upstream API acceptance or release is not established by this local proof.
 
@@ -112,7 +112,7 @@ The main-to-#270 upgrade breaks already accepted for clone removal and native to
 
 Use a disposable worktree at the baseline commit, and mount it as `/work` in the named existing image. Mount this proposal worktree as `/proposal`, and preserve the image's pnpm path. On a fresh checkout, first run `make sync` in `/work/typescript/openai-agents` to restore its locked dependencies. Then run [run.sh](run.sh) inside the container with `/work/typescript/openai-agents` as its argument. It uses the project's frozen lockfile and writes only to those disposable mounts and the container's own dependency cache. No provider credentials are needed.
 
-[prepare.py](prepare.py) contains the exact dependency and plugin changes. [runtime-policy.ts](runtime-policy.ts) is the Temporal-side policy, and [require-runtime-hooks.cjs](require-runtime-hooks.cjs) is the demonstrated bundle check. The SDK change is a prototype at two consumption points; its public export and cross-copy capability check are part of the proposal. The container image records the executed environment; it is not required to run the scripts. They need Python 3, make, Node 24.22.0, pnpm 10.27.0 and Temporal CLI 1.9.1 at `/usr/local/bin/temporal`. The dependency and source changes apply only to the disposable baseline worktree, not this proposal branch.
+[prepare.py](prepare.py) contains the exact disposable dependency and plugin changes; separate patch files would duplicate it. [runtime-policy.ts](runtime-policy.ts) is the Temporal-side policy, and [require-runtime-hooks.cjs](require-runtime-hooks.cjs) is the demonstrated bundle check. The SDK change is a prototype at two consumption points; its public export and cross-copy capability check are part of the proposal. The container image records the executed environment; it is not required to run the scripts. They need Python 3, make, Node 24.22.0, pnpm 10.27.0 and Temporal CLI 1.9.1 at `/usr/local/bin/temporal`. The dependency and source changes apply only to the disposable baseline worktree, not this proposal branch.
 
 The same check can run without the image, using a disposable worktree at the named baseline:
 

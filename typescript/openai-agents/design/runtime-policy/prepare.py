@@ -86,7 +86,7 @@ if mode == 'policy':
 else:
     (plugin / 'src/workflow/runtime-policy.ts').unlink(missing_ok=True)
 
-for name in ('proof.cjs', 'workflows.cjs', 'replay.cjs', 'require-runtime-hooks.cjs', 'upstream.cjs'):
+for name in ('proof.cjs', 'workflows.cjs', 'replay.cjs', 'require-runtime-hooks.cjs'):
     shutil.copyfile(evidence / name, plugin / ('boundary-' + name))
 print(json.dumps({'mode': mode, 'core': str(core), 'duplicate': str(duplicate),
                   'version': json.loads((core / 'package.json').read_text())['version']}))
