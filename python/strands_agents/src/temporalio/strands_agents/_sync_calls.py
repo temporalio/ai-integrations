@@ -41,7 +41,9 @@ def _targets() -> list[tuple[type, str]]:
 def _guard(name: str, method: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(method)
     def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if workflow.in_workflow():
+        # The sandbox imports Workflow modules before the Workflow runtime is
+        # attached, so module-level code there is Workflow code too.
+        if workflow.in_workflow() or workflow.unsafe.in_sandbox():
             raise RuntimeError(
                 f"{type(self).__name__}.{name}() runs the call on a new thread, "
                 "outside the Workflow sandbox, so its model calls and other I/O "

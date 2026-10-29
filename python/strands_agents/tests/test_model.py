@@ -102,6 +102,43 @@ async def test_sync_agent_call_is_refused(client: Client):
     ).replay_workflow(await handle.fetch_history())
 
 
+async def test_sync_agent_call_in_sandbox_import_is_refused(client: Client):
+    """The sandbox imports Workflow modules before the Workflow runtime is attached."""
+    task_queue = f"test_sync_agent_call_in_sandbox_import_is_refused-{uuid4()}"
+    plugin = StrandsPlugin(models={"mock": lambda: MockModel([])})
+
+    # Imported after the plugin installs its guard: an ordinary import still
+    # makes the sync call.
+    from tests import sync_import_workflow
+
+    assert sync_import_workflow.import_result == "import answer"
+    workflow_cls = sync_import_workflow.SyncImportWorkflow
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[workflow_cls],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            workflow_cls.run,
+            id=f"test_sync_agent_call_in_sandbox_import_is_refused_{uuid4()}",
+            task_queue=task_queue,
+        )
+        assert (await handle.result()).startswith(
+            "refused: Agent.__call__() runs the call on a new thread"
+        )
+
+    history = await handle.fetch_history()
+    assert get_activities(history) == []
+
+    await Replayer(
+        workflows=[workflow_cls],
+        plugins=[plugin],
+    ).replay_workflow(history)
+
+
 class ConfiguredMockModel(MockModel):
     def get_config(self) -> dict[str, Any]:
         return {"model_id": "mock-1", "context_window_limit": 1000, "api_key": "k"}
