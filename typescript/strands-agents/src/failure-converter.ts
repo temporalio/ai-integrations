@@ -6,6 +6,7 @@ import {
   type PayloadConverter,
   type ProtoFailure,
   type SerializationContext,
+  TemporalFailure,
 } from '@temporalio/common';
 
 export const STRANDS_INTERRUPT_TYPE = 'StrandsInterrupt';
@@ -81,18 +82,39 @@ export const failureConverter: FailureConverter = new StrandsFailureConverter();
  * so both apply. {@link StrandsPlugin} loads this through a generated module when the client or
  * worker already has a `failureConverterPath`. Decoding uses the caller's converter.
  *
- * The result inherits from the caller's converter and overrides `errorToFailure`, as
- * {@link StrandsFailureConverter} overrides the SDK's. `DefaultFailureConverter` and its subclasses
- * encode each `cause` through `this.errorToFailure`, so the rewrite applies to every error the SDK
- * walks, and the thrown errors themselves are not changed or copied.
+ * The caller's converter is called as it is, on itself, so its own fields and delegation keep
+ * working, and the thrown errors are not changed or copied. Strands' rewrite of a nested `cause`
+ * is then applied to the failure the caller returned: each `cause` failure that comes from a
+ * Strands error is replaced with the caller's encoding of the rewritten error, following the
+ * causes the SDK encodes.
  */
 export function composeFailureConverter(caller: FailureConverter): FailureConverter {
-  const composed: FailureConverter = Object.create(caller);
-  composed.errorToFailure = function (err, payloadConverter, context) {
-    return caller.errorToFailure.call(this, rewriteError(err), payloadConverter, context);
+  function withRewrittenCauses(
+    err: unknown,
+    failure: ProtoFailure,
+    payloadConverter: PayloadConverter,
+    context?: SerializationContext
+  ): ProtoFailure {
+    // The SDK encodes a failure decoded earlier as it was received, without its error's causes.
+    if (err === null || typeof err !== 'object' || (err instanceof TemporalFailure && err.failure)) return failure;
+    const cause: unknown = (err as { cause?: unknown }).cause;
+    if (!cause || !failure.cause) return failure;
+    const rewritten = rewriteError(cause);
+    const causeFailure =
+      rewritten === cause
+        ? withRewrittenCauses(cause, failure.cause, payloadConverter, context)
+        : caller.errorToFailure(rewritten, payloadConverter, context);
+    // Copy rather than assign: the caller may return a failure it keeps, such as a decoded one.
+    return causeFailure === failure.cause ? failure : { ...failure, cause: causeFailure };
+  }
+  return {
+    errorToFailure(err, payloadConverter, context) {
+      const rewritten = rewriteError(err);
+      const failure = caller.errorToFailure(rewritten, payloadConverter, context);
+      return withRewrittenCauses(rewritten, failure, payloadConverter, context);
+    },
+    failureToError(failure, payloadConverter, context) {
+      return caller.failureToError(failure, payloadConverter, context);
+    },
   };
-  composed.failureToError = function (failure, payloadConverter, context) {
-    return caller.failureToError(failure, payloadConverter, context);
-  };
-  return composed;
 }

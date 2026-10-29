@@ -1,10 +1,21 @@
 import { runInNewContext } from 'node:vm';
 import type { TestFn } from 'ava';
 import { StructuredOutputError } from '@strands-agents/sdk';
-import { ApplicationFailure, type RetryPolicy } from '@temporalio/common';
+import { Client, WorkflowFailedError } from '@temporalio/client';
+import {
+  ApplicationFailure,
+  DefaultFailureConverter,
+  defaultPayloadConverter,
+  type FailureConverter,
+  type PayloadConverter,
+  type ProtoFailure,
+  type RetryPolicy,
+  type SerializationContext,
+} from '@temporalio/common';
 import type { BaseContext } from '@temporalio/test-helpers';
 import { test as anyTest, helpers, TestWorkflowEnvironment } from '@temporalio/test-helpers';
-import { StrandsPlugin } from '..';
+import { StrandsFailureConverter, StrandsPlugin } from '..';
+import { composeFailureConverter } from '../failure-converter';
 import { startLocalWithRetry } from './helpers/environment';
 import { failFrozen, failTwice, lastFailureOfRetry } from './workflows/strands';
 
@@ -20,10 +31,11 @@ test.after.always(async (t) => {
   await t.context.env?.teardown();
 });
 
-// Errors the SDK encodes as errors although they are not `Error`s of this realm, each with a
-// StructuredOutputError cause that Strands must still rewrite. A DOMException's accessors only work
-// on the DOMException itself.
+// Activity failure causes that Strands must rewrite: a StructuredOutputError, and errors the SDK
+// encodes as errors although they are not `Error`s of this realm, each with a StructuredOutputError
+// cause. A DOMException's accessors only work on the DOMException itself.
 const activityCauses: Record<string, () => unknown> = {
+  direct: () => new StructuredOutputError('no output'),
   domException: () =>
     Object.defineProperty(new DOMException('wrapper', 'DataError'), 'cause', {
       value: new StructuredOutputError('no output'),
@@ -40,11 +52,12 @@ const activityCauses: Record<string, () => unknown> = {
 
 test("a worker's own failure converter still applies with the plugin", async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
+  const failureConverterPath = require.resolve('./encoding-failure-converter');
 
   // The worker bundles the workflows itself, so the bundle gets its failure converter.
   const worker = await createWorker({
     workflowsPath: require.resolve('./workflows/strands'),
-    dataConverter: { failureConverterPath: require.resolve('./encoding-failure-converter') },
+    dataConverter: { failureConverterPath },
     plugins: [new StrandsPlugin()],
     activities: {
       async failingActivity(message: string): Promise<never> {
@@ -56,11 +69,32 @@ test("a worker's own failure converter still applies with the plugin", async (t)
       },
     },
   });
+  const client = new Client({
+    connection: t.context.env.connection,
+    namespace: t.context.env.namespace,
+    dataConverter: { failureConverterPath },
+    plugins: [new StrandsPlugin()],
+  });
   const [history, frozenHistory, lastFailure] = await worker.runUntil(async () => {
     const handle = await startWorkflow(failTwice, {
       args: ['workflow failed', ['plain', ...Object.keys(activityCauses)]],
     });
-    await t.throwsAsync(handle.result());
+    // A client with the same converter decodes the failure and its rewritten cause.
+    const err = await t.throwsAsync(client.workflow.getHandle(handle.workflowId).result(), {
+      instanceOf: WorkflowFailedError,
+    });
+    const decodedCause = err?.cause?.cause;
+    t.deepEqual(
+      [
+        err?.cause?.message,
+        decodedCause instanceof ApplicationFailure && [
+          decodedCause.type,
+          decodedCause.nonRetryable,
+          decodedCause.message,
+        ],
+      ],
+      ['workflow failed', ['StructuredOutputError', true, 'no output']]
+    );
     // A frozen failure's `cause` cannot be assigned; Strands' rewrite of it must not fail the
     // workflow task, which would leave the run open until it times out.
     const frozen = await startWorkflow(failFrozen, {
@@ -84,16 +118,24 @@ test("a worker's own failure converter still applies with the plugin", async (t)
     [workflowFailure?.message, cause?.type, cause?.nonRetryable, lastFailure],
     ['Encoded failure', 'StructuredOutputError', true, 'decoded by the caller']
   );
-  // Each activity failure was recorded, and Strands rewrote the StructuredOutputError inside each
-  // wrapper.
+  // Each activity failure was recorded, and Strands rewrote each StructuredOutputError cause, also
+  // inside each wrapper.
   const activityFailures = (history.events ?? []).flatMap((e) => {
     const failure = e.activityTaskFailedEventAttributes?.failure;
     if (!failure) return [];
-    const inner = failure.cause?.cause?.applicationFailureInfo;
-    return [[failure.message, failure.cause?.message, inner?.type, inner?.nonRetryable]];
+    const chain = [failure];
+    for (let f = failure.cause; f; f = f.cause) chain.push(f);
+    const inner = chain.length > 1 ? chain[chain.length - 1]?.applicationFailureInfo : undefined;
+    return [[chain.length, chain.every((f) => f.message === 'Encoded failure'), inner?.type, inner?.nonRetryable]];
   });
-  const wrapped = ['Encoded failure', 'Encoded failure', 'StructuredOutputError', true];
-  t.deepEqual(activityFailures, [['Encoded failure', undefined, undefined, undefined], wrapped, wrapped, wrapped]);
+  const wrapped = [3, true, 'StructuredOutputError', true];
+  t.deepEqual(activityFailures, [
+    [1, true, undefined, undefined],
+    [2, true, 'StructuredOutputError', true],
+    wrapped,
+    wrapped,
+    wrapped,
+  ]);
   // The frozen failure was stored the same way, with its cause rewritten.
   const frozenFailure = frozenHistory.events?.find((e) => e.workflowExecutionFailedEventAttributes)
     ?.workflowExecutionFailedEventAttributes?.failure;
@@ -102,4 +144,69 @@ test("a worker's own failure converter still applies with the plugin", async (t)
     [frozenFailure?.message, frozenCause?.type, frozenCause?.nonRetryable],
     ['Encoded failure', 'StructuredOutputError', true]
   );
+});
+
+// Caller converters of other shapes, each encoding as the SDK default does.
+class PrivateFieldFailureConverter extends DefaultFailureConverter {
+  readonly #prefix = '';
+
+  override errorToFailure(err: unknown, payloadConverter: PayloadConverter, context?: SerializationContext) {
+    const failure = super.errorToFailure(err, payloadConverter, context);
+    return { ...failure, message: this.#prefix + (failure.message ?? '') };
+  }
+}
+
+function delegatingFrozen(inner: FailureConverter): FailureConverter {
+  return Object.freeze({
+    errorToFailure: (err: unknown, payloadConverter: PayloadConverter, context?: SerializationContext) =>
+      inner.errorToFailure(err, payloadConverter, context),
+    failureToError: (failure: ProtoFailure, payloadConverter: PayloadConverter, context?: SerializationContext) =>
+      inner.failureToError(failure, payloadConverter, context),
+  });
+}
+
+test("Strands' rewrite applies to every cause, whatever the caller's converter looks like", (t) => {
+  const strands = new StrandsFailureConverter();
+  const decoded = strands.failureToError(
+    strands.errorToFailure(
+      ApplicationFailure.create({ message: 'decoded', cause: new StructuredOutputError('no output') }),
+      defaultPayloadConverter
+    ),
+    defaultPayloadConverter
+  );
+  const errors: Record<string, () => unknown> = {
+    top: () => new StructuredOutputError('no output'),
+    ordinary: () => ApplicationFailure.create({ message: 'outer', cause: new StructuredOutputError('no output') }),
+    frozen: () =>
+      Object.freeze(ApplicationFailure.create({ message: 'outer', cause: new StructuredOutputError('no output') })),
+    decoded: () => decoded,
+    ...Object.fromEntries(
+      Object.entries(activityCauses).map(([name, cause]) => [
+        name,
+        () => ApplicationFailure.create({ message: 'outer', cause: cause() as Error }),
+      ])
+    ),
+  };
+  const callers: Record<string, FailureConverter> = {
+    default: new DefaultFailureConverter(),
+    privateField: new PrivateFieldFailureConverter(),
+    delegatingFrozen: delegatingFrozen(new PrivateFieldFailureConverter()),
+  };
+  const summary = (failure: ProtoFailure | null | undefined): unknown[] =>
+    failure
+      ? [
+          [failure.message, failure.applicationFailureInfo?.type, failure.applicationFailureInfo?.nonRetryable],
+          ...summary(failure.cause),
+        ]
+      : [];
+  for (const [callerName, caller] of Object.entries(callers)) {
+    const composed = composeFailureConverter(caller);
+    for (const [errorName, error] of Object.entries(errors)) {
+      t.deepEqual(
+        summary(composed.errorToFailure(error(), defaultPayloadConverter)),
+        summary(strands.errorToFailure(error(), defaultPayloadConverter)),
+        `${callerName}: ${errorName}`
+      );
+    }
+  }
 });
