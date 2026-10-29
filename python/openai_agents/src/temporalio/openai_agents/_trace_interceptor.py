@@ -29,14 +29,14 @@ HEADER_KEY = "__openai_span"
 _REFUSE_TRACING_KEY_PATCH = "openai_agents.refuse-trace-tracing-key"
 
 
-def _refuse_trace_tracing_key() -> None:
-    """Raise if the current trace has its own tracing key, which headers cannot carry.
+def _refuse_tracing_key(tracing_api_key: str | None) -> None:
+    """Raise if a trace has its own tracing key, which headers cannot carry.
 
     The header is stored in Event History, so it must not hold a credential. Without the key,
     spans made on the other side are exported with that process's default key instead.
+    Workflow code is refused where it sets the key; every header write checks again.
     """
-    current_trace = get_trace_provider().get_current_trace()
-    if current_trace is None or current_trace.tracing_api_key is None:
+    if tracing_api_key is None:
         return
     if temporalio.workflow.in_workflow() and not temporalio.workflow.patched(
         _REFUSE_TRACING_KEY_PATCH
@@ -175,7 +175,10 @@ class OpenAIAgentsContextPropagationInterceptor(
 
     def set_header_from_context(self, input: _InputWithHeaders) -> None:
         """Inserts the OpenAI Agents trace/span data in the input header."""
-        _refuse_trace_tracing_key()
+        current_trace = get_trace_provider().get_current_trace()
+        _refuse_tracing_key(
+            current_trace.tracing_api_key if current_trace is not None else None
+        )
         input.headers = {
             **input.headers,
             HEADER_KEY: temporalio.converter.PayloadConverter.default.to_payload(

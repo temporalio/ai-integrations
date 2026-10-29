@@ -932,11 +932,13 @@ SQLite storage is not suited to a distributed workflow environment.
 A trace's own tracing key, set with `RunConfig(tracing={"api_key": ...})` or
 `trace(..., tracing={"api_key": ...})`, is not supported. The plugin passes traces to Workflows and
 Activities in headers, which are stored in Event History, so it cannot pass the key, and their spans
-would be exported with another key. Starting a Workflow, or scheduling an Activity or child
-Workflow, under such a trace raises `ValueError`. Set the tracing key on every client and Worker
-process instead, with `set_tracing_export_api_key` or `OPENAI_API_KEY`. A run that started on an
-earlier version and already passed such a trace to an Activity keeps doing so, so that it replays;
-a run that does it for the first time after the upgrade gets the error.
+would be exported with another key. In Workflow code, `Runner.run`, `Runner.run_streamed` and
+`trace()` raise `ValueError` when given such a key. Starting a Workflow, or scheduling an Activity or
+child Workflow, under such a trace raises it too. Agent runs inside Activities can still use their
+own key. Set the tracing key on every client and Worker process instead, with
+`set_tracing_export_api_key` or `OPENAI_API_KEY`. A run that started on an earlier version and
+already used such a key keeps doing so, so that it replays; a run that uses one for the first time
+after the upgrade gets the error.
 
 ## OpenTelemetry Integration
 
