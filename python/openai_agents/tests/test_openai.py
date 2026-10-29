@@ -2681,16 +2681,16 @@ class McpServerStatefulWorkflow:
     @workflow.run
     async def run(
         self,
-        timeout: timedelta,
+        timeout: timedelta | None,
         factory_argument: Any | None,
         require_approval: Literal["always"] | None,
     ) -> str:
+        config = ActivityConfig(start_to_close_timeout=timedelta(seconds=30))
+        if timeout is not None:
+            config["schedule_to_start_timeout"] = timeout
         async with openai_agents.workflow.stateful_mcp_server(
             "HelloServer",
-            config=ActivityConfig(
-                schedule_to_start_timeout=timeout,
-                start_to_close_timeout=timedelta(seconds=30),
-            ),
+            config=config,
             factory_argument=factory_argument,
             require_approval=require_approval,
         ) as server:
@@ -2749,6 +2749,10 @@ def get_tracking_server(name: str, require_approval: Any = None):
             return self._name
 
         async def cleanup(self):
+            # Like servers that create their exit stack in connect(), cleanup
+            # fails before the first connect.
+            if "connect" not in self.calls:
+                raise AttributeError("cleanup() before connect()")
             self.calls.append("cleanup")
 
         async def list_tools(
@@ -2994,12 +2998,14 @@ async def test_mcp_server_factory_require_approval_is_rejected(
         ) as worker:
             with pytest.raises(WorkflowFailureError) as err:
                 if stateful:
+                    # Without a schedule-to-start timeout, the error must
+                    # still reach the workflow before its execution timeout.
                     await client.execute_workflow(
                         McpServerStatefulWorkflow.run,
-                        args=[timedelta(seconds=1), None, None],
+                        args=[None, None, None],
                         id=f"mcp-server-{uuid.uuid4()}",
                         task_queue=worker.task_queue,
-                        execution_timeout=timedelta(seconds=30),
+                        execution_timeout=timedelta(seconds=10),
                     )
                 else:
                     await client.execute_workflow(
@@ -3007,13 +3013,21 @@ async def test_mcp_server_factory_require_approval_is_rejected(
                         args=[False, None, None],
                         id=f"mcp-server-{uuid.uuid4()}",
                         task_queue=worker.task_queue,
-                        execution_timeout=timedelta(seconds=30),
+                        execution_timeout=timedelta(seconds=10),
                     )
     assert isinstance(err.value.cause, ActivityError)
     assert isinstance(err.value.cause.cause, ApplicationError)
     assert err.value.cause.cause.non_retryable
     assert "temporal_mcp_server()" in err.value.cause.cause.message
-    assert "call_tool" not in tracking_server.calls
+    # The rejected server is never connected, cleaned up or called.
+    assert tracking_server.calls == []
+    if stateful:
+        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
+        assert not [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_coro().__name__ == "heartbeat_every"  # type: ignore[union-attr]
+        ]
 
 
 async def test_stateful_mcp_server_no_worker(client: Client):

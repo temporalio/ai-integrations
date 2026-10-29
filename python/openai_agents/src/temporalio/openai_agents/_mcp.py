@@ -508,37 +508,38 @@ class StatefulMCPServerProvider:
         def _server_id():
             return self.name + "@" + (activity.info().workflow_run_id or "")
 
+        def _server() -> MCPServer:
+            server = self._servers[_server_id()]
+            _reject_worker_side_require_approval(self.name, server)
+            return server
+
         @activity.defn(name=self.name + "-list-tools")
         async def list_tools() -> list[MCPTool]:
-            return await self._servers[_server_id()].list_tools()
+            return await _server().list_tools()
 
         @activity.defn(name=self.name + "-call-tool")
         async def call_tool_deprecated(
             tool_name: str, arguments: dict[str, Any] | None
         ) -> CallToolResult:
-            return await self._servers[_server_id()].call_tool(tool_name, arguments)
+            return await _server().call_tool(tool_name, arguments)
 
         @activity.defn(name=self.name + "-call-tool-v2")
         async def call_tool(args: _StatefulCallToolsArguments) -> CallToolResult:
-            return await self._servers[_server_id()].call_tool(
-                args.tool_name, args.arguments, args.meta
-            )
+            return await _server().call_tool(args.tool_name, args.arguments, args.meta)
 
         @activity.defn(name=self.name + "-list-prompts")
         async def list_prompts() -> ListPromptsResult:
-            return await self._servers[_server_id()].list_prompts()
+            return await _server().list_prompts()
 
         @activity.defn(name=self.name + "-get-prompt")
         async def get_prompt_deprecated(
             name: str, arguments: dict[str, Any] | None
         ) -> GetPromptResult:
-            return await self._servers[_server_id()].get_prompt(name, arguments)
+            return await _server().get_prompt(name, arguments)
 
         @activity.defn(name=self.name + "-get-prompt-v2")
         async def get_prompt(args: _StatefulGetPromptArguments) -> GetPromptResult:
-            return await self._servers[_server_id()].get_prompt(
-                args.name, args.arguments
-            )
+            return await _server().get_prompt(args.name, args.arguments)
 
         async def heartbeat_every(delay: float, *details: Any) -> None:
             """Heartbeat every so often while not cancelled"""
@@ -550,19 +551,28 @@ class StatefulMCPServerProvider:
         async def connect(
             args: _StatefulServerSessionArguments | None = None,
         ) -> None:
-            heartbeat_task = asyncio.create_task(heartbeat_every(30))
-
             server_id = self.name + "@" + (activity.info().workflow_run_id or "")
             if server_id in self._servers:
                 raise ApplicationError(
                     "Cannot connect to an already running server. Use a distinct name if running multiple servers in one workflow."
                 )
             server = self._server_factory(args.factory_argument if args else None)
+            # A server with a worker-side approval policy is never connected.
+            # The dedicated worker still runs, and each of its operations fails
+            # with the policy error, so the workflow sees that error at its
+            # first MCP call whatever its schedule-to-start timeout.
+            try:
+                _reject_worker_side_require_approval(self.name, server)
+                rejected = False
+            except ApplicationError:
+                rejected = True
+
+            heartbeat_task = asyncio.create_task(heartbeat_every(30))
             try:
                 self._servers[server_id] = server
                 try:
-                    _reject_worker_side_require_approval(self.name, server)
-                    await server.connect()
+                    if not rejected:
+                        await server.connect()
 
                     worker = Worker(
                         activity.client(),
@@ -580,12 +590,15 @@ class StatefulMCPServerProvider:
 
                     await worker.run()
                 finally:
-                    await server.cleanup()
-                    heartbeat_task.cancel()
                     try:
-                        await heartbeat_task
-                    except asyncio.CancelledError:
-                        pass
+                        if not rejected:
+                            await server.cleanup()
+                    finally:
+                        heartbeat_task.cancel()
+                        try:
+                            await heartbeat_task
+                        except asyncio.CancelledError:
+                            pass
             finally:
                 del self._servers[server_id]
 
