@@ -22,6 +22,7 @@ from ._temporal_mcp_client import (
     _evict_connection,
     build_call_tool_activity,
     build_list_tools_activity,
+    drain_closing,
 )
 from ._worker_env_ref import AllowAllWorkerEnvVars
 
@@ -90,7 +91,15 @@ class StrandsPlugin(SimplePlugin):
         activities: list[Callable] = []
         if models:
             ma = ModelActivity(models, default_name=default_name)
-            activities.extend([ma.invoke_model, ma.invoke_model_streaming])
+            activities.extend(
+                [
+                    ma.invoke_model,
+                    ma.invoke_model_streaming,
+                    ma.invoke_stateful_model,
+                    ma.invoke_stateful_model_streaming,
+                    ma.get_model_config,
+                ]
+            )
 
         sandbox_activities = (
             SandboxActivities(
@@ -123,6 +132,9 @@ class StrandsPlugin(SimplePlugin):
             finally:
                 for server in mcp_clients:
                     await _evict_connection(server)
+                # Broken connections were already unpublished, so the loop above
+                # misses them; wait for their background close to finish too.
+                await drain_closing()
 
         super().__init__(
             "aws.StrandsPlugin",

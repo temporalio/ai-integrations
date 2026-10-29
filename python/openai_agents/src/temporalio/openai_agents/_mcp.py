@@ -11,6 +11,7 @@ from typing import Any, cast
 
 from agents import AgentBase, RunContextWrapper
 from agents.mcp import MCPServer
+from agents.mcp.server import RequireApprovalSetting
 from mcp import GetPromptResult, ListPromptsResult  # type:ignore
 from mcp import Tool as MCPTool  # type:ignore
 from mcp.types import CallToolResult  # type:ignore
@@ -61,6 +62,7 @@ class _StatelessMCPServerReference(MCPServer):  # type:ignore[reportUnusedClass]
         config: ActivityConfig | None,
         cache_tools_list: bool,
         factory_argument: Any | None = None,
+        require_approval: RequireApprovalSetting = None,
     ):
         self._name = server + "-stateless"
         self._config = config or ActivityConfig(
@@ -69,7 +71,7 @@ class _StatelessMCPServerReference(MCPServer):  # type:ignore[reportUnusedClass]
         self._cache_tools_list = cache_tools_list
         self._tools = None
         self._factory_argument = factory_argument
-        super().__init__()
+        super().__init__(require_approval=require_approval)
 
     @property
     def name(self) -> str:
@@ -312,6 +314,7 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
         config: ActivityConfig | None,
         server_session_config: ActivityConfig | None,
         factory_argument: Any | None,
+        require_approval: RequireApprovalSetting = None,
     ):
         self._name = server + "-stateful"
         self._config = config or ActivityConfig(
@@ -323,7 +326,7 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
         )
         self._connect_handle: ActivityHandle | None = None
         self._factory_argument = factory_argument
-        super().__init__()
+        super().__init__(require_approval=require_approval)
 
     @property
     def name(self) -> str:

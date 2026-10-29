@@ -1,10 +1,12 @@
 # Temporal Google ADK
 
-Pre-release integration between [Google ADK Java](https://github.com/google/adk-java) and
+Public Preview integration between [Google ADK Java](https://github.com/google/adk-java) and
 Temporal. Agents built with ADK's own `LlmAgent`, `Runner`, tools, and toolsets run inside a
 Temporal workflow: every model call and every MCP call executes as a Temporal Activity, the
 runner's ids and timestamps come from the workflow, and ADK's parallel fan-out runs on workflow
 threads, so a run is durable, retried on failure, and replayed deterministically.
+
+APIs and configuration may change before General Availability.
 
 The coordinate is `io.temporal:google-adk` on Maven Central. CI tests Java 17 and 25; published
 bytecode targets Java 17.
@@ -18,7 +20,7 @@ bytecode targets Java 17.
   it in; your application supplies it.
 
 ```groovy
-implementation 'io.temporal:google-adk:0.0.1'
+implementation 'io.temporal:google-adk:0.1.0'
 implementation 'io.temporal:temporal-sdk:1.40.0'
 ```
 
@@ -68,6 +70,10 @@ A model name without an explicit registration is resolved by ADK's `LlmRegistry`
 Gemini models from the environment (`GOOGLE_API_KEY`, or the Vertex AI variables). Register a
 factory with `modelFactory(...)` to change that. Disable the model SDK's own retries in your
 factory; Temporal's retry policy on the activity replaces them.
+
+Registration aliases resolve to the provider's model name unless a before-model callback overrides it.
+ADK's workflow-side capability checks still use the `TemporalModel` name, so use provider names
+when those checks apply.
 
 ## What the integration gives you
 

@@ -121,6 +121,7 @@ class ModelActivityImplTest {
                 case "failing":
                   return new FailingModel();
                 case "recording":
+                case "fast-alias":
                   return recording;
                 default:
                   return ScriptedModel.of(name, ScriptedModel.text("reply from " + name));
@@ -170,6 +171,31 @@ class ModelActivityImplTest {
         UnsupportedOperationException.class,
         () -> lookup.runAsync(args, null),
         "a restored tool runs in the workflow, never on the worker");
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void invokeModel_routesAliasesToTheProviderWithoutMutatingTheInput(boolean stream) {
+    ModelActivity activity = env.newActivityStub(ModelActivity.class);
+    LlmRequest request = REQUEST_WITH_TOOLS.toBuilder().model("fast-alias").build();
+    activity.invokeModel(new InvokeModelInput("fast-alias", request, stream));
+    LlmRequest received = recording.requests().get(0);
+    assertEquals("recording", received.model().orElseThrow());
+    assertEquals(List.of("lookup", "search"), List.copyOf(received.tools().keySet()));
+    assertEquals("fast-alias", request.model().orElseThrow());
+    assertTrue(request.tools().isEmpty());
+  }
+
+  @Test
+  void invokeModel_keepsAnExplicitOverrideAndAnAbsentRequestModel() {
+    ModelActivity activity = env.newActivityStub(ModelActivity.class);
+    LlmRequest overridden = REQUEST.toBuilder().model("callback-model").build();
+    LlmRequest absent = LlmRequest.builder().contents(REQUEST.contents()).build();
+    activity.invokeModel(new InvokeModelInput("fast-alias", overridden, false));
+    activity.invokeModel(new InvokeModelInput("fast-alias", absent, false));
+    assertEquals("callback-model", recording.requests().get(0).model().orElseThrow());
+    assertTrue(recording.requests().get(1).model().isEmpty());
+    assertEquals(1, factoryCalls.get());
   }
 
   @Test

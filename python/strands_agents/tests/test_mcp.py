@@ -96,6 +96,7 @@ async def test_mcp(client: Client):
 
     history = await handle.fetch_history()
     assert get_activities(history) == [
+        "strands_get_model_config",
         "echo-list-tools",
         "invoke_model",
         "echo-call-tool",
@@ -175,6 +176,7 @@ async def test_mcp_reuses_connection(client: Client):
 
     history = await handle.fetch_history()
     assert get_activities(history) == [
+        "strands_get_model_config",
         "echo_cached-list-tools",
         "invoke_model",
         "echo_cached-call-tool",

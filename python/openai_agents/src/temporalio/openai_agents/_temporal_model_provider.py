@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
-from agents import Agent, Model, ModelProvider, RunConfig
+from agents import Agent, Model, ModelProvider, ModelSettings, RunConfig
 from agents.run_config import CallModelData, CallModelInputFilter, ModelInputData
 
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
@@ -17,19 +17,28 @@ from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
 _current_agent: ContextVar[Agent[Any] | None] = ContextVar(
     "temporal_openai_agents_current_agent", default=None
 )
+# The run-level ``RunConfig.model_settings`` of the run in progress. Model stubs receive
+# settings already merged with these, so they are carried separately to the activity.
+_current_run_model_settings: ContextVar[ModelSettings | None] = ContextVar(
+    "temporal_openai_agents_run_model_settings", default=None
+)
 
 
 @contextmanager
-def capture_scope() -> Generator[None, None, None]:
-    """Discard agents captured inside the block when it exits, including on error.
+def capture_scope(
+    run_model_settings: ModelSettings | None = None,
+) -> Generator[None, None, None]:
+    """Scope one run: expose its run-level model settings and discard captured agents on exit.
 
     Must be entered and exited in the same task. Entering removes any agent captured by an
-    enclosing run, and exiting restores the caller's context so the variable is unset again.
+    enclosing run, and exiting restores the caller's context so the variables are unset again.
     """
     token = _current_agent.set(None)
+    settings_token = _current_run_model_settings.set(run_model_settings)
     try:
         yield
     finally:
+        _current_run_model_settings.reset(settings_token)
         _current_agent.reset(token)
 
 
@@ -69,6 +78,7 @@ class _TemporalModelProvider(ModelProvider):
             model_params=self._model_params,
             agent=None,
             current_agent=_current_agent.get,
+            current_run_model_settings=_current_run_model_settings.get,
         )
 
     def install(self, run_config: RunConfig) -> RunConfig:
