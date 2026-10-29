@@ -28,8 +28,9 @@ maximum-version job also runs race detection. Nightly checks use
 failures are tracked in a `nightly` issue for the plugin.
 
 Tests must not require provider credentials. Use deterministic local models,
-mock transports or in-process servers. Tests that need Temporal start a local
-dev server and may download the Temporal CLI on first use.
+mock transports or in-process servers. Tests that need Temporal use
+`testClient(t)` to lazily share a local dev server and its default client within
+the package's test process.
 
 Repository conventions are in
 [`AGENTS.md`](../AGENTS.md).

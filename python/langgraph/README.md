@@ -153,6 +153,19 @@ For Pydantic v2 contexts, configure `temporalio.contrib.pydantic.pydantic_data_c
 
 **Breaking change:** class-based contexts now reach Activity nodes and tasks as their declared type. Replace dictionary-based workarounds such as `runtime.context["user_id"]` with `runtime.context.user_id`. Passing a dictionary to a declared class schema does not preserve dictionary access: LangGraph converts it to the schema type. Context schema IDs also extend the serialized Activity input.
 
+### Node and Task Values
+
+Activity nodes and tasks get their arguments, and return their results, with the same types as in native LangGraph. After a value crosses the Activity boundary, the plugin rebuilds:
+
+- Pydantic models and dataclasses found in a registered graph's schemas or in a node's or task's type hints, including the types those reference and their subclasses
+- LangChain messages
+- `bytes`
+- `Command`s in a list a node returns, as `ToolNode` does when a tool returns a `Command`
+
+The configured payload converter rebuilds each value, as it would an Activity parameter of that class, so it also decides the types of the values inside. For Pydantic models, configure `pydantic_data_converter` as described for contexts above. Pydantic rebuilds a field with its declared class, so declare messages in a Pydantic state as `AnyMessage`, not `BaseMessage`, to keep each message's class. Dataclasses keep their saved `init=False` fields, but a dataclass inside another value computes them again. Values of other classes, and values the converter can't rebuild, such as a dataclass with a `Protocol` field, still arrive as decoded JSON, usually dictionaries. All Workers must register the same graphs and tasks and import the same message classes: a Worker that gets a value of a class it doesn't know fails it with a non-retryable error. In Workflow code, rebuilt values use the classes the Worker loaded outside the sandbox; import model modules with `workflow.unsafe.imports_passed_through()` to use them in `isinstance` checks or `model_validate`.
+
+**Breaking change:** code that reads these values with dictionary access, such as `state["answer"]["value"]`, must use attribute access, such as `state["answer"].value`. Code that validates values again, such as `Answer.model_validate(value)` or `convert_to_messages(messages)`, keeps working, except `model_validate` in Workflow code with a model class the sandbox loaded itself; import its module with `imports_passed_through()` as above. Activity payloads keep their format and only gain type information, so older Workers read new payloads as before, and histories recorded before the upgrade replay unchanged, apart from the task cache case below. Results recorded before the upgrade still replay as dictionaries, so deploy Workflow code that reads Activity results by attribute with Worker Versioning or after open runs finish. Task cache keys for arguments that are models, dataclasses or sets now come from their class and contents, so a run that carries a task cache across continue-as-new can fail replay with a non-determinism error on the other version, after an upgrade or a rollback. Let such runs finish before you upgrade, or upgrade with Worker Versioning. Runs started on this version may not replay on an earlier one, so roll back with Worker Versioning.
+
 ## Summaries
 
 Summaries are short, human-readable labels that show up in the Temporal UI and CLI, making it easier to see what each step of a run is doing.

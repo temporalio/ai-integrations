@@ -8,6 +8,9 @@ import opentelemetry.trace
 import pytest
 from agents import (
     Agent,
+    RunConfig,
+    RunContextWrapper,
+    RunHooks,
     Runner,
     Span,
     Trace,
@@ -38,7 +41,7 @@ from temporalio.exceptions import (
     CancelledError,
     ChildWorkflowError,
 )
-from temporalio.openai_agents import _temporal_openai_agents
+from temporalio.openai_agents import ModelActivityParameters, _temporal_openai_agents
 from temporalio.openai_agents._temporal_trace_provider import (
     TemporalTraceProvider,
 )
@@ -53,7 +56,7 @@ from temporalio.worker.workflow_sandbox import (
     SandboxedWorkflowRunner,
     SandboxRestrictions,
 )
-from tests.helpers import assert_event_subsequence, new_worker
+from tests.helpers import assert_event_subsequence, assert_eventually, new_worker
 from tests.test_openai import (
     ResearchWorkflow,
     research_mock_model,
@@ -785,6 +788,113 @@ async def test_custom_span_without_trace_context(
     assert len(spans) == 0, (
         f"Expected no spans without trace context, but found: {[s.name for s in spans]}"
     )
+
+
+@workflow.defn
+class RunTracingKeyWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        agent = Agent[None](
+            name="Assistant", instructions="You are a helpful assistant."
+        )
+        result = await Runner.run(
+            agent,
+            "Hello",
+            run_config=RunConfig(tracing={"api_key": "sk-tracing-run"}),
+        )
+        return result.final_output
+
+
+class AgentStartHooks(RunHooks[None]):
+    agent_started = False
+
+    async def on_agent_start(
+        self, context: RunContextWrapper[None], agent: Agent[None]
+    ) -> None:
+        self.agent_started = True
+
+
+@workflow.defn
+class TracingKeyEntryPointWorkflow:
+    @workflow.run
+    async def run(self, entry_point: str) -> str:
+        agent = Agent[None](
+            name="Assistant", instructions="You are a helpful assistant."
+        )
+        run_config = RunConfig(tracing={"api_key": "sk-tracing-run"})
+        hooks = AgentStartHooks()
+        try:
+            if entry_point == "run":
+                await Runner.run(agent, "Hello", run_config=run_config, hooks=hooks)
+            elif entry_point == "run_streamed":
+                Runner.run_streamed(agent, "Hello", run_config=run_config, hooks=hooks)
+            else:
+                trace("Workflow trace", tracing={"api_key": "sk-tracing-workflow"})
+        except ValueError as e:
+            return (
+                f"refused after the agent started: {e}"
+                if hooks.agent_started
+                else f"refused: {e}"
+            )
+        return "not refused"
+
+
+async def test_trace_tracing_key_refused(client: Client):
+    async with AgentEnvironment(
+        model=TestModel.returning_responses([ResponseBuilders.output_message("test")]),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            streaming_topic="events",
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(
+            client, RunTracingKeyWorkflow, TracingKeyEntryPointWorkflow
+        ) as worker:
+            # Workflow code is refused where it sets the key, before the agent starts.
+            for entry_point in ["run", "run_streamed", "trace"]:
+                result = await client.execute_workflow(
+                    TracingKeyEntryPointWorkflow.run,
+                    entry_point,
+                    id=f"tracing-key-{entry_point}-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                )
+                assert result.startswith(
+                    "refused: The OpenAI Agents plugin cannot pass a trace's own tracing key"
+                ), f"{entry_point}: {result}"
+
+            # A run's own tracing key could not reach the model Activity's spans.
+            workflow_handle = await client.start_workflow(
+                RunTracingKeyWorkflow.run,
+                id=f"run-tracing-key-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+
+            async def check():
+                async for evt in workflow_handle.fetch_history_events():
+                    if evt.HasField(
+                        "workflow_task_failed_event_attributes"
+                    ) and "cannot pass a trace's own tracing key" in (
+                        evt.workflow_task_failed_event_attributes.failure.message
+                    ):
+                        return
+                raise AssertionError("The run's tracing key was not refused")
+
+            await assert_eventually(check)
+            await workflow_handle.terminate()
+
+            # Neither could a client trace's key reach the Workflow's spans.
+            with env.openai_agents_plugin.tracing_context():
+                with trace("Client trace", tracing={"api_key": "sk-tracing-client"}):
+                    with pytest.raises(
+                        ValueError, match="cannot pass a trace's own tracing key"
+                    ):
+                        await client.start_workflow(
+                            RunTracingKeyWorkflow.run,
+                            id=f"client-tracing-key-{uuid.uuid4()}",
+                            task_queue=worker.task_queue,
+                        )
 
 
 async def test_otel_tracing_in_runner(

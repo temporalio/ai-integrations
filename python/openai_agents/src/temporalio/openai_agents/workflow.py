@@ -42,6 +42,7 @@ from temporalio.workflow import (
 
 if typing.TYPE_CHECKING:
     from agents.mcp import MCPServer
+    from agents.mcp.server import RequireApprovalSetting
 
 
 def _parse_tool_arguments(schema: FuncSchema, input: str | None) -> BaseModel:
@@ -356,6 +357,7 @@ def stateless_mcp_server(
     config: ActivityConfig | None = None,
     cache_tools_list: bool = False,
     factory_argument: Any | None = None,
+    require_approval: "RequireApprovalSetting" = None,
 ) -> "MCPServer":
     """A stateless MCP server implementation for Temporal workflows.
 
@@ -382,6 +384,10 @@ def stateless_mcp_server(
         cache_tools_list: If true, the list of tools will be cached for the duration of the server
         factory_argument: Optional argument to be provided to the factory when producing an MCPServer.
                Must not contain secrets.
+        require_approval: Optional OpenAI Agents approval policy for this server's tools, with the
+               same values as ``MCPServerStdio(require_approval=...)``. A policy set on the
+               factory's server is not used. A callable policy runs in the workflow and must be
+               deterministic.
     """
     import warnings
 
@@ -395,7 +401,11 @@ def stateless_mcp_server(
     )
 
     return _StatelessMCPServerReference(
-        name, config, cache_tools_list, factory_argument
+        name,
+        config,
+        cache_tools_list,
+        factory_argument,
+        require_approval=require_approval,
     )
 
 
@@ -404,6 +414,7 @@ def stateful_mcp_server(
     config: ActivityConfig | None = None,
     server_session_config: ActivityConfig | None = None,
     factory_argument: Any | None = None,
+    require_approval: "RequireApprovalSetting" = None,
 ) -> AbstractAsyncContextManager["MCPServer"]:
     """A stateful MCP server implementation for Temporal workflows.
 
@@ -435,6 +446,10 @@ def stateful_mcp_server(
                        Defaults to 1-hour start-to-close timeout.
         factory_argument: Optional argument to be provided to the factory when producing an MCPServer.
                Must not contain secrets.
+        require_approval: Optional OpenAI Agents approval policy for this server's tools, with the
+               same values as ``MCPServerStdio(require_approval=...)``. A policy set on the
+               factory's server is not used. A callable policy runs in the workflow and must be
+               deterministic.
     """
     import warnings
 
@@ -448,7 +463,11 @@ def stateful_mcp_server(
     )
 
     return _StatefulMCPServerReference(
-        name, config, server_session_config, factory_argument
+        name,
+        config,
+        server_session_config,
+        factory_argument,
+        require_approval=require_approval,
     )
 
 

@@ -1,11 +1,14 @@
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
+from typing import Any, cast
 
 from google.adk.models import BaseLlm, LLMRegistry
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
+from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, TypeAdapter
 
@@ -14,6 +17,38 @@ from temporalio import activity, workflow
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError
 from temporalio.workflow import ActivityConfig
+
+
+def _is_retryable_status(status: int) -> bool:
+    """The statuses the TypeScript and Java ADK plugins also retry."""
+    return status in (408, 409, 429) or status >= 500
+
+
+@contextmanager
+def _classify_model_errors() -> Generator[None, None, None]:
+    """Raise a model's HTTP error as an ``ApplicationError`` Temporal can act on.
+
+    Gemini models raise ``google.genai.errors.APIError`` with the status in
+    ``code``; other providers' SDKs carry it in ``status_code``. A permanent
+    status is non-retryable, so the workflow fails instead of re-sending a
+    request that cannot succeed. Errors without an HTTP status (connection
+    failures, timeouts) are re-raised unchanged and stay retryable.
+    """
+    try:
+        yield
+    except Exception as err:
+        status = (
+            err.code
+            if isinstance(err, genai_errors.APIError)
+            else getattr(err, "status_code", None)
+        )
+        if isinstance(status, bool) or not isinstance(status, int) or status < 400:
+            raise
+        raise ApplicationError(
+            str(err),
+            type=type(err).__name__,
+            non_retryable=not _is_retryable_status(status),
+        ) from err
 
 
 @activity.defn
@@ -36,10 +71,11 @@ async def invoke_model(llm_request: LlmRequest) -> list[LlmResponse]:
     if not llm:
         raise ValueError(f"Failed to create LLM for model: {llm_request.model}")
 
-    return [
-        response
-        async for response in llm.generate_content_async(llm_request=llm_request)
-    ]
+    with _classify_model_errors():
+        return [
+            response
+            async for response in llm.generate_content_async(llm_request=llm_request)
+        ]
 
 
 @dataclass
@@ -83,13 +119,14 @@ async def invoke_model_streaming(
         batch_interval=input.streaming_batch_interval,
     )
     events = stream.topic(input.streaming_topic, type=LlmResponse)
-    async with stream:
-        async for response in llm.generate_content_async(
-            llm_request=llm_request, stream=True
-        ):
-            activity.heartbeat()
-            responses.append(response)
-            events.publish(response)
+    with _classify_model_errors():
+        async with stream:
+            async for response in llm.generate_content_async(
+                llm_request=llm_request, stream=True
+            ):
+                activity.heartbeat()
+                responses.append(response)
+                events.publish(response)
 
     return responses
 
@@ -111,7 +148,8 @@ def _with_serializable_response_schema(llm_request: LlmRequest) -> LlmRequest:
     if isinstance(schema, type) and issubclass(schema, BaseModel):
         response_schema = schema.model_json_schema()
     else:
-        response_schema = TypeAdapter(schema).json_schema()
+        # google-genai exposes runtime schema objects without TypeForm annotations.
+        response_schema = TypeAdapter(cast(Any, schema)).json_schema()
     if (
         isinstance(schema, type)
         and issubclass(schema, Enum)

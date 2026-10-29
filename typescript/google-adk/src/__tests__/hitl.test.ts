@@ -29,6 +29,7 @@ import {
 } from '../workflow';
 import { mockMCPToolset } from '../testing';
 import {
+  adkAtLeast,
   countScheduledActivities,
   echoDef,
   findInCauseChain,
@@ -384,19 +385,25 @@ test.serial('a plain-text "yes" approves the single pending gate when plainTextT
   t.deepEqual(activities.executionsFor(workflowId), ['dangerActivity:prod']);
 });
 
-test.serial(
-  'a gate requested only at run time cannot be resumed in ADK 2.0 and fails the Workflow typed',
-  async (t) => {
-    const env = getEnv();
-    const taskQueue = uid('adk-hitl-dynamic-gate');
-    await withWorker(env, { taskQueue, plugins: [makePlugin()], activities }, async () => {
-      const handle = await env.client.workflow.start(hitlDynamicGateTool, {
-        taskQueue,
-        workflowId: uid('wf-hitl-dynamic-gate'),
-      });
-      const [pending] = await waitForPending(handle, 1);
-      t.is(pending?.kind, 'confirmation');
-      await handle.executeUpdate(respondHitlUpdate, { args: [pending!.interruptId, { confirmed: true }] });
+test.serial('a gate requested only at run time resumes after approval (ADK 2.1+) or fails typed (ADK 2.0)', async (t) => {
+  const env = getEnv();
+  const taskQueue = uid('adk-hitl-dynamic-gate');
+  await withWorker(env, { taskQueue, plugins: [makePlugin()], activities }, async () => {
+    const handle = await env.client.workflow.start(hitlDynamicGateTool, {
+      taskQueue,
+      workflowId: uid('wf-hitl-dynamic-gate'),
+    });
+    const [pending] = await waitForPending(handle, 1);
+    t.is(pending?.kind, 'confirmation');
+    t.is(pending?.toolName, 'dynamicGate');
+    await handle.executeUpdate(respondHitlUpdate, { args: [pending!.interruptId, { confirmed: true }] });
+    if (adkAtLeast(2, 1)) {
+      // ADK 2.1 resumes a gate requested at run time: the tool body runs again,
+      // now with the approval.
+      const result = await handle.result();
+      t.is(result.text, 'done:{"ran":true}');
+      t.is(result.turns, 2);
+    } else {
       // ADK 2.0.0 binds an approval only to a tool whose `checkRequireConfirmation`
       // says the call needs one; a tool that merely called `requestConfirmation()`
       // at run time is refused (`confirmation_not_required`). The plugin's tools
@@ -406,11 +413,11 @@ test.serial(
       const failure = findInCauseChain(err, ApplicationFailure);
       t.is(failure?.type, 'GoogleAdkIntentMismatchError');
       t.regex(failure?.message ?? '', /confirmation_not_required/);
-    });
-  }
-);
+    }
+  });
+});
 
-test.serial("ADK's SecurityPlugin CONFIRM outcome hits the same ADK 2.0 limit; the Activity never runs", async (t) => {
+test.serial("ADK's SecurityPlugin CONFIRM outcome holds the Activity until the approval arrives", async (t) => {
   const env = getEnv();
   const taskQueue = uid('adk-hitl-security');
   const workflowId = uid('wf-hitl-security');
@@ -420,10 +427,19 @@ test.serial("ADK's SecurityPlugin CONFIRM outcome hits the same ADK 2.0 limit; t
     t.is(pending?.kind, 'confirmation');
     t.deepEqual(activities.executionsFor(workflowId), []);
     await handle.executeUpdate(respondHitlUpdate, { args: [pending!.interruptId, { confirmed: true }] });
-    const err = await t.throwsAsync(handle.result());
-    t.is(findInCauseChain(err, ApplicationFailure)?.type, 'GoogleAdkIntentMismatchError');
+    if (adkAtLeast(2, 1)) {
+      const result = await handle.result();
+      t.is(result.text, 'done:{"result":"danger-done:prod"}');
+    } else {
+      // The same ADK 2.0.0 limit as the run-time gate above: the tool never
+      // declared a gate, so the approval is refused.
+      const err = await t.throwsAsync(handle.result());
+      t.is(findInCauseChain(err, ApplicationFailure)?.type, 'GoogleAdkIntentMismatchError');
+    }
   });
-  t.deepEqual(activities.executionsFor(workflowId), []);
+  // The ungated Activity tool ran once, after the approval — and never where
+  // ADK 2.0.0 refused the approval.
+  t.deepEqual(activities.executionsFor(workflowId), adkAtLeast(2, 1) ? ['dangerActivity:prod'] : []);
 });
 
 test.serial('a resumed dynamic node fast-forwards its completed Activity child instead of re-running it', async (t) => {

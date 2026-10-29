@@ -3,6 +3,7 @@
  * `configureWorker` output without bundling or executing a Workflow.
  */
 
+import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 
@@ -33,7 +34,7 @@ test('configureBundler stubs ADK node-only packages and disallowed builtins', (t
     '@modelcontextprotocol/sdk',
     '@google-cloud/storage',
     'express',
-    // ADK 2.0's `skills/loader.js` (on the web surface) imports the zip reader.
+    // ADK 2.0's `skills/loader.js` (on its `common` surface) imports the zip reader.
     'adm-zip',
   ]) {
     t.true(ignored.has(pkg), `expected ADK node-only package ${pkg} to be stubbed`);
@@ -129,7 +130,12 @@ test('configureBundler aliases @opentelemetry/api to the copy @google/adk resolv
   t.is(alias['user-alias'], '/user/alias');
 });
 
-test('configureBundler pins the bare @google/adk specifier to the web build', (t) => {
+/** The per-file ESM `common` surface the Workflow bundle pins `@google/adk` to. */
+function adkCommonEntry(): string {
+  return path.join(path.dirname(require.resolve('@google/adk/package.json')), 'dist', 'esm', 'common.js');
+}
+
+test('configureBundler pins the bare @google/adk specifier to the per-file common surface', (t) => {
   const plugin = new GoogleAdkPlugin();
   const { webpackConfigHook } = plugin.configureBundler({ workflowsPath: 'wf' } as BundleOptions);
   const cfg = webpackConfigHook!({ plugins: [], resolve: { alias: {} } } as never) as {
@@ -138,23 +144,34 @@ test('configureBundler pins the bare @google/adk specifier to the web build', (t
   const alias = cfg.resolve?.alias ?? {};
 
   // Which `@google/adk` build the bundle gets must not depend on the consumer's
-  // webpack target / browserslist: the sandbox always gets ADK's web surface,
-  // and subpath imports (`@google/adk/tools/mcp`) are left alone by the `$` form.
-  const expected = require.resolve('@google/adk/dist/web/index_web.js');
+  // webpack target / browserslist: the sandbox always gets ADK's `common`
+  // surface from the per-file ESM build — not the single-file web bundle ADK
+  // >= 2.1 publishes, which inlines its own `@opentelemetry/api` — and subpath
+  // imports (`@google/adk/tools/mcp`) are left alone by the `$` form.
+  const expected = adkCommonEntry();
+  t.true(existsSync(expected));
   t.is(alias['@google/adk$'], expected);
   t.false('@google/adk' in alias);
-  t.true(expected.endsWith(path.join('dist', 'web', 'index_web.js')));
+  t.true(expected.endsWith(path.join('dist', 'esm', 'common.js')));
 });
 
 test('redirects crypto requests issued from inside @google/adk to the deterministic shim', (t) => {
   const resolve = sandboxCompatResolveHook();
   const shim = require.resolve('../crypto-shim');
-  const adkIssuer = '/app/node_modules/@google/adk/dist/web/utils/env_aware_utils.js';
+  const adkIssuer = '/app/node_modules/@google/adk/dist/esm/utils/env_aware_utils.js';
   // Both request forms, from an ADK file, land on the shim.
   t.is(resolve({ request: 'node:crypto', contextInfo: { issuer: adkIssuer } }), shim);
   t.is(resolve({ request: 'crypto', contextInfo: { issuer: adkIssuer } }), shim);
   // The issuer may only be known as a directory.
-  t.is(resolve({ request: 'node:crypto', context: '/app/node_modules/@google/adk/dist/web/utils' }), shim);
+  t.is(resolve({ request: 'node:crypto', context: '/app/node_modules/@google/adk/dist/esm/utils' }), shim);
+  // The installed `uuid` package (ADK >= 2.1 imports it) is answered too, in
+  // pnpm's and npm's layouts; a user's own `uuid/` directory is not.
+  t.is(
+    resolve({ request: 'crypto', contextInfo: { issuer: '/app/node_modules/.pnpm/uuid@11.1.1/node_modules/uuid/dist/esm/rng.js' } }),
+    shim
+  );
+  t.is(resolve({ request: 'crypto', contextInfo: { issuer: '/app/node_modules/uuid/dist/esm/native.js' } }), shim);
+  t.is(resolve({ request: 'crypto', contextInfo: { issuer: '/app/src/uuid/ids.ts' } }), 'crypto');
   // Any other issuer keeps the bundler's policy: the scheme is stripped so the
   // bare-name `alias → false` applies, and nothing is redirected.
   t.is(
@@ -165,9 +182,20 @@ test('redirects crypto requests issued from inside @google/adk to the determinis
   t.is(resolve({ request: 'node:crypto' }), 'crypto');
 });
 
+test("answers ADK's undeclared uuid import with the plugin's own copy", (t) => {
+  const resolve = sandboxCompatResolveHook();
+  const expected = require.resolve('uuid');
+  t.true(expected.endsWith(path.join('dist', 'cjs', 'index.js')));
+  const adkIssuer = '/app/node_modules/@google/adk/dist/esm/plugins/reflect_retry_model_plugin.js';
+  t.is(resolve({ request: 'uuid', contextInfo: { issuer: adkIssuer } }), expected);
+  // Only the bare request from ADK; a user's own import resolves as usual.
+  t.is(resolve({ request: 'uuid', contextInfo: { issuer: '/app/src/workflows.ts' } }), 'uuid');
+  t.is(resolve({ request: 'uuid/package.json', contextInfo: { issuer: adkIssuer } }), 'uuid/package.json');
+});
+
 test("replaces ADK's own request for the broken apigee_llm.js web module", (t) => {
   const resolve = sandboxCompatResolveHook();
-  const adkIssuer = '/app/node_modules/@google/adk/dist/web/models/registry.js';
+  const adkIssuer = '/app/node_modules/@google/adk/dist/esm/models/registry.js';
   // ADK 2.0.0's `dist/web/models/apigee_llm.js` does not parse, so the request
   // is answered with the inert stand-in rather than the published file.
   t.true(resolve({ request: './apigee_llm.js', contextInfo: { issuer: adkIssuer } }).startsWith('data:'));
@@ -215,11 +243,7 @@ test('configureBundler prepends the api pin to an array-form user alias list', (
   // the object form.
   const expected = createRequire(require.resolve('@google/adk')).resolve('@opentelemetry/api');
   t.deepEqual(alias[0], { name: '@opentelemetry/api', onlyModule: true, alias: expected });
-  t.deepEqual(alias[1], {
-    name: '@google/adk',
-    onlyModule: true,
-    alias: require.resolve('@google/adk/dist/web/index_web.js'),
-  });
+  t.deepEqual(alias[1], { name: '@google/adk', onlyModule: true, alias: adkCommonEntry() });
   t.is(alias[2], userEntry);
 });
 

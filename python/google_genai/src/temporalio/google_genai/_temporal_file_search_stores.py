@@ -8,6 +8,7 @@ upload negotiation) runs on the activity worker.
 
 from __future__ import annotations
 
+import base64
 import io
 import os
 from datetime import timedelta
@@ -85,7 +86,8 @@ class TemporalAsyncFileSearchStores(AsyncFileSearchStores):
                 )
             req = _GeminiUploadToFileSearchStoreRequest(
                 file_search_store_name=file_search_store_name,
-                file_bytes=file_bytes,
+                # base64, because the JSON encoding of ``bytes`` is UTF-8 text.
+                file_base64=base64.b64encode(file_bytes).decode("ascii"),
                 config=upload_config,
             )
         elif isinstance(file, str):

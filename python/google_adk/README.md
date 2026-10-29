@@ -6,6 +6,8 @@ This package provides the integration layer between the Google ADK and Temporal.
 
 ## Install
 
+Requires Python 3.11+ and Google ADK 2.12.0+.
+
 ```bash
 uv add temporalio-google-adk
 ```
