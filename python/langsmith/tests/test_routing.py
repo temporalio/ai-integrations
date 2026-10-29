@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
 import langsmith
 import pytest
 from langsmith import Client as LangSmithClient
-from langsmith import traceable, tracing_context
+from langsmith import trace, traceable, tracing_context
 from langsmith.run_trees import RunTree, WriteReplica
 from langsmith.utils import LangSmithUserError
 
@@ -22,8 +21,6 @@ from temporalio.langsmith._interceptor import (
     HEADER_KEY,
     _extract_context,
     _inject_context,
-    _install_root_factory_override,
-    _RootReplaySafeRunTreeFactory,
 )
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer
@@ -75,6 +72,16 @@ class RoutingWorkflow:
         if source == "context":
             with tracing_context(address=ADDRESS):
                 return await _routing_step()
+        if source == "extra":
+            return await _routing_step(
+                langsmith_extra={"address": ADDRESS}  # type: ignore[call-arg]
+            )
+        if source == "trace":
+            with trace("addressed-trace", address=ADDRESS):
+                return await _routing_step()
+        if source == "async-trace":
+            async with trace("addressed-trace", address=ADDRESS):
+                return await _routing_step()
         if source.startswith("replicas"):
             replicas: list[WriteReplica] = (
                 REPLICAS
@@ -109,68 +116,6 @@ def test_address_requires_supported_langsmith(monkeypatch: pytest.MonkeyPatch) -
     with pytest.raises(ValueError, match="langsmith>=0.14.4"):
         LangSmithPlugin(client=MagicMock(), address=ADDRESS)
     LangSmithPlugin(client=MagicMock(), project_name="legacy-project")
-
-
-@pytest.mark.parametrize("source", ["decorator", "context", "extra", "env"])
-def test_native_root_destination(source: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Sync traceables retain native destination precedence through the factory."""
-    _install_root_factory_override()
-    client = make_mock_ls_client(InMemoryRunCollector())
-    if source == "env":
-        monkeypatch.setenv("LANGSMITH_AGENT_ID", "support")
-        monkeypatch.setenv("LANGSMITH_AGENT_ENVIRONMENT", "staging")
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        factory = _RootReplaySafeRunTreeFactory(ls_client=client, executor=executor)
-
-        @traceable(address=ADDRESS if source == "decorator" else None)
-        def traced() -> str:
-            return "done"
-
-        with tracing_context(
-            parent=factory,
-            client=client,
-            address=ADDRESS if source == "context" else None,
-        ):
-            assert (
-                traced(  # type: ignore[call-arg]  # LangSmith adds this argument.
-                    langsmith_extra={"address": ADDRESS} if source == "extra" else {}
-                )
-                == "done"
-            )
-    assert client.create_run.call_count == 1
-    assert client.create_run.call_args.kwargs["address"] == ADDRESS
-    assert client.create_run.call_args.kwargs.get("session_name") is None
-    assert client.create_run.call_args.kwargs.get("parent_run_id") is None
-
-
-def test_factory_explicit_address_overrides_default_project() -> None:
-    """An explicit root address must not be combined with the factory's default."""
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        factory = _RootReplaySafeRunTreeFactory(
-            ls_client=MagicMock(), executor=executor
-        )
-        child = factory.create_child(name="root", run_type="chain", address=ADDRESS)
-    assert child.address == ADDRESS
-    assert child.session_name is None
-
-
-def test_native_project_context_overrides_agent_factory() -> None:
-    """An explicit project context retains LangSmith's native precedence."""
-    _install_root_factory_override()
-    client = make_mock_ls_client(InMemoryRunCollector())
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        factory = _RootReplaySafeRunTreeFactory(
-            ls_client=client, executor=executor, destination={"address": ADDRESS}
-        )
-
-        @traceable(address=OTHER_ADDRESS)
-        def traced() -> str:
-            return "done"
-
-        with tracing_context(parent=factory, client=client, project_name="evaluation"):
-            assert traced() == "done"
-    assert client.create_run.call_args.kwargs["session_name"] == "evaluation"
-    assert client.create_run.call_args.kwargs.get("address") is None
 
 
 def _wait_for_io(plugin: LangSmithPlugin) -> None:
@@ -266,14 +211,26 @@ async def _assert_replay_is_silent(
         ("plugin", True),
         ("decorator", False),
         ("context", False),
+        ("extra", False),
+        ("trace", False),
+        ("async-trace", False),
+        ("env", False),
         ("headers", False),
         ("headers", True),
     ],
 )
 async def test_agent_destination_across_temporal(
-    client: Client, env: WorkflowEnvironment, source: str, add_temporal_runs: bool
+    client: Client,
+    env: WorkflowEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    add_temporal_runs: bool,
 ) -> None:
     """Destination and parent links survive activities, child workflows, and Nexus."""
+    if source == "env":
+        monkeypatch.delenv("LANGSMITH_PROJECT", raising=False)
+        monkeypatch.setenv("LANGSMITH_AGENT_ID", "support")
+        monkeypatch.setenv("LANGSMITH_AGENT_ENVIRONMENT", "staging")
     mock = make_mock_ls_client(InMemoryRunCollector())
     plugin = LangSmithPlugin(
         client=mock,
@@ -381,13 +338,12 @@ async def test_replica_ids_and_updates_across_temporal(
     await _assert_replay_is_silent(handle, plugin, mock, client)
 
 
-def test_replica_headers_exclude_credentials_and_keep_parent_time() -> None:
-    """A restored parent keeps stable ordering and only safe replica routing."""
+def test_replica_headers_exclude_credentials() -> None:
+    """A restored parent retains only safe replica routing."""
     client = make_mock_ls_client(InMemoryRunCollector())
     root = RunTree(
         name="root",
         ls_client=client,
-        start_time=datetime(2025, 1, 1, tzinfo=timezone.utc),
         replicas=[
             {
                 "project_name": "primary",
@@ -408,10 +364,8 @@ def test_replica_headers_exclude_credentials_and_keep_parent_time() -> None:
     assert b"must-not-be-recorded" not in headers[HEADER_KEY].data
     assert b"also-private" not in headers[HEADER_KEY].data
     assert b"private-ingestion" not in headers[HEADER_KEY].data
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        restored = _extract_context(headers, executor, client)
+    restored = _extract_context(headers, client)
     assert restored is not None
-    assert restored.start_time == root.start_time
     assert restored.replicas == [
         {
             "project_name": "primary",

@@ -167,11 +167,11 @@ The Plugin allows `@traceable` to work inside Temporal's deterministic Workflow 
 
 Temporal Workflows are deterministic and get replayed from event history on recovery. The Plugin accounts for this by injecting replay-safe data into your traceable runs:
 
-- **No duplicate traces on replay.** Run IDs are derived deterministically from the Workflow's random seed, so replayed operations produce the same IDs and LangSmith deduplicates them.
-- **No non-deterministic calls.** The Plugin injects metadata using `workflow.now()` for timestamps and `workflow.random()` for UUIDs instead of `datetime.now()` and `uuid4()`.
+- **No duplicate traces on replay.** Run IDs are deterministic, and the Plugin skips LangSmith writes while replaying history.
+- **No non-deterministic calls.** The Plugin uses `workflow.now()` for timestamps and an independent `workflow.new_random()` stream for UUIDs instead of wall-clock time and random UUIDs.
 - **Background I/O stays outside the sandbox.** LangSmith HTTP calls to the server are submitted to a background thread pool that doesn't interfere with the deterministic Workflow execution.
 
-You don't need to do anything special for this. Your `@traceable` functions behave the same whether it's a fresh execution or a replay.
+This applies to native `RunTree` instances, `@traceable` functions, and sync or async `langsmith.trace()` blocks inside Workflows. Root runs remain real roots, so LangSmith applies its own destination and replica rules. Activities and code outside Workflows retain LangSmith's normal runtime behavior.
 
 ### Example: Worker Crash Mid-Workflow
 
