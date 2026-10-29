@@ -217,6 +217,7 @@ async def test_bad_agent_env_leaves_workflow_code_untraced(
 
 
 @pytest.mark.requires_local_server
+@pytest.mark.parametrize("add_temporal_runs", [False, True])
 @pytest.mark.parametrize(
     "agent_env",
     [*_BAD_AGENT_ENVS.values(), _VALID_AGENT_ENV],
@@ -227,6 +228,7 @@ async def test_plugin_project_outranks_env_destination(
     env: WorkflowEnvironment,
     monkeypatch: pytest.MonkeyPatch,
     agent_env: dict[str, str],
+    add_temporal_runs: bool,
 ) -> None:
     if env.supports_time_skipping:
         pytest.skip("Time-skipping server doesn't persist headers.")
@@ -235,7 +237,7 @@ async def test_plugin_project_outranks_env_destination(
     mock_ls_client = await _run_workflow(
         client,
         env,
-        add_temporal_runs=False,
+        add_temporal_runs=add_temporal_runs,
         project_name="plugin-project",
     )
 
@@ -268,17 +270,19 @@ _TEMPORAL_RUNS = {
 
 @pytest.mark.requires_local_server
 @pytest.mark.parametrize("add_temporal_runs", [False, True])
+@pytest.mark.parametrize("project_name", [None, "plugin-project"])
 @pytest.mark.parametrize(
     "destination_env",
     [{}, {"LANGSMITH_PROJECT": "env-project"}, _VALID_AGENT_ENV],
     ids=["unset", "project", "agent"],
 )
-async def test_parent_project_outranks_env_destination(
+async def test_parent_project_outranks_fallback_destination(
     client: Client,
     env: WorkflowEnvironment,
     monkeypatch: pytest.MonkeyPatch,
     destination_env: dict[str, str],
     add_temporal_runs: bool,
+    project_name: str | None,
 ) -> None:
     if env.supports_time_skipping:
         pytest.skip("Time-skipping server doesn't persist headers.")
@@ -289,6 +293,7 @@ async def test_parent_project_outranks_env_destination(
         env,
         caller_project="caller-project",
         add_temporal_runs=add_temporal_runs,
+        project_name=project_name,
     )
 
     names = {call.kwargs["name"] for call in mock_ls_client.create_run.call_args_list}
@@ -360,10 +365,13 @@ async def test_bad_agent_env_runs_under_a_parent_join_it(
         add_temporal_runs=add_temporal_runs,
     )
 
-    # The plugin has no destination of its own, so it creates no runs; user
-    # runs join the caller's trace and project.
+    # A valid parent supplies the destination even when no fallback is available.
     names = {call.kwargs["name"] for call in mock_ls_client.create_run.call_args_list}
-    assert names == {"caller", *_USER_RUNS}
+    assert names == {
+        "caller",
+        *_USER_RUNS,
+        *(_TEMPORAL_RUNS if add_temporal_runs else ()),
+    }
     by_trace = _destinations_by_trace(mock_ls_client)
     assert len(by_trace) == 1
     assert all(d == ("caller-project", None) for d in next(iter(by_trace.values())))
@@ -444,7 +452,7 @@ def test_root_factory_children_inherit_an_address(
 
 @pytest.mark.parametrize("project_name", [None, "", "plugin-project"])
 @pytest.mark.parametrize("explicit_parent", [False, True])
-def test_temporal_run_inherits_parent_address_unless_project_is_explicit(
+def test_temporal_run_inherits_parent_address(
     monkeypatch: pytest.MonkeyPatch,
     project_name: str | None,
     explicit_parent: bool,
@@ -468,11 +476,7 @@ def test_temporal_run_inherits_parent_address_unless_project_is_explicit(
                 assert run is not None
                 assert run.parent_run_id == parent.id
                 assert run.trace_id == parent.trace_id
-                if project_name:
-                    assert run.session_name == project_name
-                    assert getattr(run, "address", None) is None
-                else:
-                    assert run.session_name is None
-                    assert getattr(run, "address", None) == address
+                assert run.session_name is None
+                assert getattr(run, "address", None) == address
     finally:
         interceptor._executor.shutdown(wait=True)
