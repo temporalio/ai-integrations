@@ -1,6 +1,13 @@
 import path from 'node:path';
 import type { TestFn } from 'ava';
-import { McpClient, Message, Model, StructuredOutputError, TextBlock } from '@strands-agents/sdk';
+import {
+  ContextWindowOverflowError,
+  McpClient,
+  Message,
+  Model,
+  StructuredOutputError,
+  TextBlock,
+} from '@strands-agents/sdk';
 import type { BaseModelConfig, JSONValue, ModelStreamEvent, StreamOptions, Tool } from '@strands-agents/sdk';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { WorkflowFailedError } from '@temporalio/client';
@@ -44,6 +51,7 @@ import {
   retryConfigAgent,
   streamingAgent,
   structuredOutputAgent,
+  turnsAgent,
 } from './workflows/strands';
 
 const STUB_TRANSPORT: Transport = {
@@ -79,6 +87,23 @@ class StubModel extends Model<BaseModelConfig> {
     for (const event of events) {
       yield event;
     }
+  }
+}
+
+/** A stub model whose context holds `limit` messages: a longer request overflows, as a provider's would. */
+class SmallContextModel extends StubModel {
+  constructor(
+    private readonly limit: number,
+    turns: ModelStreamEvent[][]
+  ) {
+    super(turns);
+  }
+
+  override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+    if (messages.length > this.limit) {
+      throw new ContextWindowOverflowError(`${messages.length} messages do not fit`);
+    }
+    yield* super.stream(messages, options);
   }
 }
 
@@ -922,6 +947,20 @@ test("a worker's own failure converter still applies with the plugin", async (t)
   const workflowFailure = history.events?.find((e) => e.workflowExecutionFailedEventAttributes)
     ?.workflowExecutionFailedEventAttributes?.failure;
   t.is(workflowFailure?.message, 'Encoded failure');
+});
+
+test('a context overflow in the model activity lets the agent trim the conversation', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  // Three turns fill the six messages the model holds; the fourth overflows until the agent trims.
+  const model = new SmallContextModel(6, ['one', 'two', 'three', 'four'].map(textTurn));
+  const worker = await createWorker({ plugins: [new StrandsPlugin({ models: { test: () => model } })] });
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(turnsAgent, {
+      args: [['1', '2', '3', '4']],
+      workflowExecutionTimeout: '20 seconds',
+    });
+    t.deepEqual(result, ['four', 6]);
+  });
 });
 
 test('a Strands terminal error thrown in workflow code fails the run as non-retryable', async (t) => {

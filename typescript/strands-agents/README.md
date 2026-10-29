@@ -114,6 +114,8 @@ The plugin makes Strands' terminal errors (`ContextWindowOverflowError`, `MaxTok
 
 The workflow interceptor wraps every signal and update handler, so a handler counts as finished a little later than in earlier versions. A run that started before you deploy this version can fail to replay with a nondeterminism error if its workflow code depends on that moment: for example, if it checks `allHandlersFinished()` right after a handler runs, or if an update handler releases the workflow and the workflow then schedules an activity in the same task, since the update's completion is now recorded after that activity. Let those runs finish first, or use Worker Versioning.
 
+A `ContextWindowOverflowError` from the model activity reaches the agent as Strands' own error, so its conversation manager trims the conversation and calls the model again, as it does outside Temporal. A run whose workflow code caught that overflow before you deploy this version calls the model again on replay instead, and fails with a nondeterminism error. Let those runs finish first, or use Worker Versioning.
+
 ## Snapshots
 
 `TemporalAgent.takeSnapshot()` and `TemporalAgent.loadSnapshot()` throw. Temporal's event history already persists workflow state durably at a finer granularity than Strands snapshots, so calling either inside a workflow is redundant.

@@ -226,6 +226,16 @@ export async function failActivities(messages: string[]): Promise<never> {
   throw ApplicationFailure.create({ message: 'workflow failed', nonRetryable: true, details: decoded });
 }
 
+/** Runs each prompt as a turn of one agent, then returns the last reply and how many messages the agent kept. */
+export async function turnsAgent(prompts: string[]): Promise<[string, number]> {
+  const agent = new TemporalAgent({ model: 'test', printer: false });
+  let reply = '';
+  for (const prompt of prompts) {
+    reply = (await agent.invoke(prompt)).toString();
+  }
+  return [reply, agent.messages.length];
+}
+
 export const finishSignal = defineSignal('finish');
 
 /**
