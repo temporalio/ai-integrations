@@ -33,6 +33,16 @@ class _MCPToolInfo:
     annotations: dict[str, Any] | None = None
 
 
+class MCPToolNameConflictError(ValueError):
+    """An MCP tool has the name of another tool of the same agent.
+
+    ``TemporalAgent`` raises it before a model call when a listed tool's name,
+    or the name with ``-`` and ``_`` swapped, is taken. ``StrandsPlugin`` fails
+    the Workflow when it escapes Workflow code, instead of retrying the
+    Workflow Task.
+    """
+
+
 @dataclass
 class _CallToolArgs:
     tool_name: str

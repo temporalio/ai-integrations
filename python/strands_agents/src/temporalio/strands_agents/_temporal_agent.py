@@ -6,7 +6,6 @@ from strands import Agent
 from strands.agent._concurrency import _ConcurrencyController, _InflightInvocation
 from strands.agent.conversation_manager import NullConversationManager
 from strands.hooks import BeforeModelCallEvent
-from strands.tools.registry import ToolRegistry
 from strands.types.agent import AgentInput
 from strands.types.content import Messages
 from strands.types.tools import AgentTool
@@ -15,7 +14,7 @@ from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
-from ._temporal_mcp_client import TemporalMCPClient
+from ._temporal_mcp_client import MCPToolNameConflictError, TemporalMCPClient
 from ._temporal_model import TemporalModel
 from ._temporal_sandbox import TemporalSandbox
 
@@ -32,27 +31,55 @@ def _duplicate_tool_name(
     other: str,
     provider: TemporalMCPClient,
     holder: TemporalMCPClient | None,
-) -> ValueError:
+) -> MCPToolNameConflictError:
     # Strands' words when it refuses a name, then where the two tools come from.
     if other == name:
         refused = f"Tool name '{name}' already exists."
     else:
         refused = f"Tool name '{name}' already exists as '{other}'."
-    if holder is provider:
-        source = f"MCP server '{provider.server}' lists it twice."
-    elif holder is not None:
-        source = (
-            f"MCP servers '{holder.server}' and '{provider.server}' both list it. "
-            "Set a different prefix on one server's MCPClient, or drop the tool "
-            "with tool_filters."
-        )
-    else:
+    if holder is None:
         source = (
             f"MCP server '{provider.server}' lists it, and another tool of the "
             "agent has it. Set a prefix on the server's MCPClient, or drop the "
             "tool with tool_filters."
         )
-    return ValueError(f"{refused} {source}")
+    elif holder is provider:
+        both = "it twice" if other == name else "both names"
+        source = f"MCP server '{provider.server}' lists {both}."
+    elif holder.server == provider.server:
+        source = (
+            "The agent has two TemporalMCPClient handles for MCP server "
+            f"'{provider.server}'. Pass only one."
+        )
+    else:
+        source = (
+            f"MCP servers '{holder.server}' and '{provider.server}' both list it. "
+            "Set a different prefix on one server's MCPClient, or drop the tool "
+            "with tool_filters."
+        )
+    return MCPToolNameConflictError(f"{refused} {source}")
+
+
+def _check_mcp_tools(
+    listings: dict[TemporalMCPClient, list[AgentTool]],
+    held: dict[str, str],
+    dynamic: set[str],
+) -> None:
+    # The rule ToolRegistry.register_tool() applies, for the turn's tools
+    # against each other and the agent's other tools, before the registry
+    # changes: a name may not be taken, nor differ from a taken one only by '-'
+    # or '_'.
+    seen: dict[str, tuple[str, TemporalMCPClient]] = {}
+    for provider, tools in listings.items():
+        for tool in tools:
+            name = tool.tool_name
+            key = name.replace("-", "_")
+            if key in seen:
+                other, holder = seen[key]
+                raise _duplicate_tool_name(name, other, provider, holder)
+            if key in held or name in dynamic:
+                raise _duplicate_tool_name(name, held.get(key, name), provider, None)
+            seen[key] = (name, provider)
 
 
 class _WorkflowInflightInvocation(_InflightInvocation):
@@ -156,86 +183,56 @@ class TemporalAgent(Agent):
             for provider in self.tool_registry._tool_providers
             if isinstance(provider, TemporalMCPClient)
         ]
-        registry = self.tool_registry.registry
         # Names this agent's MCP tools hold: those load_tools() registered at
-        # construction, then each turn's.
+        # construction, then each turn's. A name stays the servers' while they
+        # list it: a tool put under it meanwhile is replaced at the next listing,
+        # and removed with the name.
         self._mcp_names = {
             tool.tool_name
             for provider in self._mcp_providers
             for tool in provider._tools
-            if registry.get(tool.tool_name) is tool
-        }
-        # The sandbox's tools give way to a listed tool of the same name, as
-        # they do to a tool passed in tools=[...].
-        self._vended = {
-            tool.tool_name: tool
-            for tool in (sandbox.get_tools() if sandbox is not None else [])
-            if registry.get(tool.tool_name) is tool
         }
         if self._mcp_providers:
             self.hooks.add_callback(BeforeModelCallEvent, self._refresh_mcp_tools)
 
     async def _refresh_mcp_tools(self, event: BeforeModelCallEvent) -> None:
         # List the providers that are due in order, as one hook per provider
-        # did, then check and apply the turn's tools together, so a name can
+        # did, and check the listings so far after each one, so a refused turn
+        # lists no further. Then apply the turn's tools together, so a name can
         # move from one server to another in one turn.
+        reg = event.agent.tool_registry
+        # The agent's other tools. Strands compares a new name with the
+        # registry's names also with '-' and '_' swapped, and with dynamic tools'
+        # names (such as structured output's) exactly.
+        held = {
+            name.replace("-", "_"): name
+            for name in reg.registry
+            if name not in self._mcp_names
+        }
+        dynamic = set(reg.dynamic_tools) - self._mcp_names
         listings: dict[TemporalMCPClient, list[AgentTool]] = {}
-        listed: set[TemporalMCPClient] = set()
         for provider in self._mcp_providers:
             if not (provider._cache_tools and provider._fetched):
                 await provider._refresh()
-                listed.add(provider)
             # Read now: another agent sharing the provider may list it again
             # while this one waits for the next listing.
             listings[provider] = provider._tools
-        reg = event.agent.tool_registry
-        self._check_mcp_tools(reg, listings)
+            _check_mcp_tools(listings, held, dynamic)
         new = {tool.tool_name for tools in listings.values() for tool in tools}
         # Tools the servers dropped or renamed since the last turn. There is no
         # public unregister, so remove them from the registry directly.
         for name in self._mcp_names - new:
             reg.registry.pop(name, None)
+            reg.dynamic_tools.pop(name, None)
         # replace() swaps an existing tool in place (no hot-reload guard);
-        # register_tool() adds a newly-discovered one. Tools from a cached
-        # listing that this agent already holds stay as they are.
-        for provider, tools in listings.items():
+        # register_tool() adds a newly-discovered one.
+        for tools in listings.values():
             for tool in tools:
-                if provider not in listed and tool.tool_name in self._mcp_names:
-                    continue
                 if tool.tool_name in reg.registry:
                     reg.replace(tool)
                 else:
                     reg.register_tool(tool)
         self._mcp_names = new
-
-    def _check_mcp_tools(
-        self,
-        reg: ToolRegistry,
-        listings: dict[TemporalMCPClient, list[AgentTool]],
-    ) -> None:
-        # Strands refuses a name that is taken, or that differs from a taken
-        # one only by '-' or '_', when it builds an agent. Check the turn's
-        # tools against each other and the agent's other tools the same way,
-        # before the registry changes.
-        held = {
-            name.replace("-", "_"): name
-            for name in (*reg.registry, *reg.dynamic_tools)
-            if name not in self._mcp_names
-        }
-        seen: dict[str, tuple[str, TemporalMCPClient]] = {}
-        for provider, tools in listings.items():
-            for tool in tools:
-                name = tool.tool_name
-                key = name.replace("-", "_")
-                if key in seen:
-                    other, holder = seen[key]
-                    raise _duplicate_tool_name(name, other, provider, holder)
-                vended = self._vended.get(name)
-                if key in held and (
-                    vended is None or reg.registry.get(name) is not vended
-                ):
-                    raise _duplicate_tool_name(name, held[key], provider, None)
-                seen[key] = (name, provider)
 
     async def _convert_prompt_to_messages(self, prompt: AgentInput) -> Messages:
         """Load the worker-side model's config, then convert the prompt.

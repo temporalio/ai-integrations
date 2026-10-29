@@ -1,4 +1,5 @@
 import asyncio
+import re
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -12,8 +13,10 @@ from strands.hooks import BeforeModelCallEvent
 from strands.tools.mcp.mcp_client import MCPClient
 
 from temporalio import workflow
-from temporalio.client import Client, WorkflowHistory
+from temporalio.client import Client, WorkflowFailureError
+from temporalio.exceptions import ApplicationError
 from temporalio.strands_agents import (
+    MCPToolNameConflictError,
     StrandsPlugin,
     TemporalAgent,
     TemporalMCPClient,
@@ -23,7 +26,7 @@ from temporalio.strands_agents import (
 from temporalio.strands_agents._temporal_mcp_tool import TemporalMCPTool
 from temporalio.worker import Replayer, Worker
 from temporalio.workflow import NondeterminismError
-from tests.common import get_activities
+from tests.common import get_activities, load_history
 from tests.mock_model import MockModel
 
 
@@ -335,21 +338,25 @@ async def test_mcp_lists_tools_each_turn_when_uncached(client: Client):
     ).replay_workflow(history)
 
 
+def _two_servers_agent() -> TemporalAgent:
+    return TemporalAgent(
+        model="mock",
+        start_to_close_timeout=timedelta(seconds=30),
+        tools=[
+            TemporalMCPClient(
+                server="echo_a", start_to_close_timeout=timedelta(seconds=30)
+            ),
+            TemporalMCPClient(
+                server="echo_b", start_to_close_timeout=timedelta(seconds=30)
+            ),
+        ],
+    )
+
+
 @workflow.defn
 class MCPTwoServersWorkflow:
     def __init__(self) -> None:
-        self.agent = TemporalAgent(
-            model="mock",
-            start_to_close_timeout=timedelta(seconds=30),
-            tools=[
-                TemporalMCPClient(
-                    server="echo_a", start_to_close_timeout=timedelta(seconds=30)
-                ),
-                TemporalMCPClient(
-                    server="echo_b", start_to_close_timeout=timedelta(seconds=30)
-                ),
-            ],
-        )
+        self.agent = _two_servers_agent()
 
     @workflow.run
     async def run(self, prompt: str) -> str:
@@ -360,8 +367,18 @@ class MCPTwoServersWorkflow:
         return str(result)
 
 
+@workflow.defn
+class MCPTwoServersUncaughtWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        return str(await _two_servers_agent().invoke_async(prompt))
+
+
 async def test_mcp_duplicate_tool_names_are_refused(client: Client):
-    """Two servers that list the same tool name on one agent raise, as in Strands."""
+    """Two servers that list the same tool name on one agent raise, as in Strands.
+
+    Uncaught, the error fails the Workflow instead of retrying its Workflow Task.
+    """
     task_queue = f"test_mcp_duplicate_tool_names_are_refused-{uuid4()}"
     plugin = StrandsPlugin(
         models={"mock": lambda: MockModel(["Done!"])},
@@ -371,7 +388,7 @@ async def test_mcp_duplicate_tool_names_are_refused(client: Client):
     async with Worker(
         client,
         task_queue=task_queue,
-        workflows=[MCPTwoServersWorkflow],
+        workflows=[MCPTwoServersWorkflow, MCPTwoServersUncaughtWorkflow],
         plugins=[plugin],
         max_cached_workflows=0,
     ):
@@ -385,6 +402,17 @@ async def test_mcp_duplicate_tool_names_are_refused(client: Client):
             "refused: Tool name 'echo' already exists. "
             "MCP servers 'echo_a' and 'echo_b' both list it."
         )
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await client.execute_workflow(
+                MCPTwoServersUncaughtWorkflow.run,
+                "echo hi",
+                id=f"test_mcp_duplicate_tool_names_uncaught_{uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+    cause = exc_info.value.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "MCPToolNameConflictError"
 
     history = await handle.fetch_history()
     assert get_activities(history) == [
@@ -398,36 +426,26 @@ async def test_mcp_duplicate_tool_names_are_refused(client: Client):
     ).replay_workflow(history)
 
 
-def _legacy_history(name: str) -> WorkflowHistory:
-    """A history of MCPTwoServersWorkflow recorded before duplicates were refused.
-
-    Recorded on main at 63d7aec against a local dev server; only the worker
-    identity and task queue name were normalized. ``distinct_names``: echo_b's
-    MCPClient has ``prefix="b"``, and the model calls ``echo``, then ``b_echo``.
-    ``duplicate_names``: no prefixes, and the model calls ``echo``, which ran on
-    echo_b.
-    """
-    path = Path(__file__).parent / "histories" / f"legacy_mcp_{name}.json"
-    return WorkflowHistory.from_json(name, path.read_text())
+# MCPTwoServersWorkflow histories recorded on main at 63d7aec, before duplicates
+# were refused, against a local dev server; only the worker identity and task
+# queue name were normalized. legacy_mcp_distinct_names: echo_b's MCPClient has
+# prefix="b", and the model calls echo, then b_echo. legacy_mcp_duplicate_names:
+# no prefixes, and the model calls echo, which ran on echo_b.
 
 
 async def test_mcp_replays_history_with_distinct_names():
     """Runs whose tool names never clashed schedule the same commands as before."""
     await Replayer(
         workflows=[MCPTwoServersWorkflow], plugins=[StrandsPlugin(models={})]
-    ).replay_workflow(_legacy_history("distinct_names"))
+    ).replay_workflow(load_history("legacy_mcp_distinct_names"))
 
 
 async def test_mcp_rejects_history_with_duplicate_names():
     """A run that met a duplicate name now refuses it, so its history no longer replays."""
-    # The run now completes where it scheduled the model call.
-    with pytest.raises(
-        NondeterminismError,
-        match="Complete workflow machine does not handle this event.*ActivityTaskScheduled",
-    ):
+    with pytest.raises(NondeterminismError):
         await Replayer(
             workflows=[MCPTwoServersWorkflow], plugins=[StrandsPlugin(models={})]
-        ).replay_workflow(_legacy_history("duplicate_names"))
+        ).replay_workflow(load_history("legacy_mcp_duplicate_names"))
 
 
 def _mcp_tool(server: str, name: str) -> TemporalMCPTool:
@@ -478,10 +496,12 @@ async def test_mcp_duplicate_refused_again_after_caught(
     """Catching the duplicate-name error does not let the next turn take the name."""
     a = TemporalMCPClient("a", cache_tools=cache_tools)
     c = TemporalMCPClient("c", cache_tools=cache_tools)
-    agent = TemporalAgent(model="m", tools=[a, c])
+    d = TemporalMCPClient("d", cache_tools=cache_tools)
+    agent = TemporalAgent(model="m", tools=[a, c, d])
     log: list[str] = []
     monkeypatch.setattr(a, "_refresh", _listing(a, "echo", log=log))
     monkeypatch.setattr(c, "_refresh", _listing(c, "echo", log=log))
+    monkeypatch.setattr(d, "_refresh", _listing(d, "other", log=log))
 
     for _turn in range(2):
         with pytest.raises(
@@ -490,22 +510,42 @@ async def test_mcp_duplicate_refused_again_after_caught(
         ):
             await _before_model_call(agent)
         assert agent.tool_registry.registry == {}
-    # A cached listing is checked again, not listed again.
+    # A refused turn lists no further, and a cached listing is checked again,
+    # not listed again.
     assert log == (["a", "c"] if cache_tools else ["a", "c", "a", "c"])
 
 
+@pytest.mark.parametrize(
+    ("names", "handles", "message"),
+    [
+        (("search", "search"), 1, "MCP server 'a' lists it twice."),
+        (
+            ("foo-bar", "foo_bar"),
+            1,
+            "Tool name 'foo_bar' already exists as 'foo-bar'. "
+            "MCP server 'a' lists both names.",
+        ),
+        (
+            ("search",),
+            2,
+            "The agent has two TemporalMCPClient handles for MCP server 'a'. "
+            "Pass only one.",
+        ),
+    ],
+)
 async def test_mcp_server_listing_a_name_twice_is_refused(
     monkeypatch: pytest.MonkeyPatch,
+    names: tuple[str, ...],
+    handles: int,
+    message: str,
 ):
-    """Two tools with one name from one server are refused too."""
-    a = TemporalMCPClient("a")
-    agent = TemporalAgent(model="m", tools=[a])
-    monkeypatch.setattr(a, "_refresh", _listing(a, "search", "search"))
+    """A name one server lists twice is refused too, also through two handles."""
+    clients = [TemporalMCPClient("a", cache_tools=i > 0) for i in range(handles)]
+    agent = TemporalAgent(model="m", tools=clients)
+    for client in clients:
+        monkeypatch.setattr(client, "_refresh", _listing(client, *names))
 
-    with pytest.raises(
-        ValueError,
-        match="Tool name 'search' already exists. MCP server 'a' lists it twice.",
-    ):
+    with pytest.raises(MCPToolNameConflictError, match=re.escape(message)):
         await _before_model_call(agent)
 
 
@@ -520,6 +560,11 @@ async def test_mcp_same_client_twice_on_one_agent(monkeypatch: pytest.MonkeyPatc
         await _before_model_call(agent)
         assert _sources(agent, a) == {"echo": "a"}
     assert log == ["a"] * 4
+
+    # Built after the client listed, an agent gets its tools from load_tools(),
+    # and Strands refuses the second copy at construction.
+    with pytest.raises(ValueError, match="Tool name 'echo' already exists"):
+        TemporalAgent(model="m", tools=[a, a])
 
 
 async def test_mcp_shared_client_in_two_agents(monkeypatch: pytest.MonkeyPatch):
@@ -620,6 +665,21 @@ async def test_mcp_name_moves_between_servers(
     assert _sources(agent, a, b) == {"safe": "a", "other": "a", "echo": "b"}
 
 
+async def test_mcp_name_moves_to_a_cached_server(monkeypatch: pytest.MonkeyPatch):
+    """A name that moves to a cached server, listed by another agent, is that server's."""
+    a = TemporalMCPClient("a")
+    b = TemporalMCPClient("b", cache_tools=True)
+    monkeypatch.setattr(a, "_refresh", _listing(a, "echo"))
+    monkeypatch.setattr(b, "_refresh", _listing(b, "echo"))
+    await _before_model_call(TemporalAgent(model="m", tools=[a]))
+    agent = TemporalAgent(model="m", tools=[a, b])  # with a's echo from load_tools()
+    await _before_model_call(TemporalAgent(model="m", tools=[b]))
+    monkeypatch.setattr(a, "_refresh", _listing(a))
+
+    await _before_model_call(agent)
+    assert _sources(agent, a, b) == {"echo": "b"}
+
+
 async def test_mcp_failed_listing_changes_nothing(monkeypatch: pytest.MonkeyPatch):
     """A failed listing leaves the tools as they were; the next turn lists what is due."""
     a = TemporalMCPClient("a", cache_tools=True)
@@ -656,20 +716,30 @@ async def test_mcp_listing_replaces_a_tool_replaced_in_place(
     await _before_model_call(agent)
     assert _sources(agent, a) == {"echo": "a"}
 
-    agent.tool_registry.replace(_local_echo)
+    # A dynamic replacement, such as a tool loaded from a file, goes with the name.
+    reloaded = _mcp_tool("file", "echo")
+    reloaded.mark_dynamic()
+    agent.tool_registry.replace(reloaded)
     monkeypatch.setattr(a, "_refresh", _listing(a))
     await _before_model_call(agent)
     assert agent.tool_registry.registry == {}
+    assert agent.tool_registry.dynamic_tools == {}
 
 
-async def test_mcp_tool_takes_a_sandbox_tool_name(monkeypatch: pytest.MonkeyPatch):
-    """A listed tool takes the name of a sandbox tool, as a tool in tools=[...] does."""
+async def test_mcp_tool_named_like_a_sandbox_tool_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A listed name held by a sandbox tool is refused, as for the agent's other tools."""
     a = TemporalMCPClient("a")
     agent = TemporalAgent(model="m", tools=[a], sandbox=TemporalSandbox("sb"))
     monkeypatch.setattr(a, "_refresh", _listing(a, "sandbox_shell"))
 
-    await _before_model_call(agent)
-    assert _sources(agent, a) == {"sandbox_file_editor": "other", "sandbox_shell": "a"}
+    with pytest.raises(
+        MCPToolNameConflictError,
+        match="Tool name 'sandbox_shell' already exists. MCP server 'a' lists it, "
+        "and another tool of the agent has it.",
+    ):
+        await _before_model_call(agent)
 
 
 async def test_mcp_tool_named_like_a_dynamic_tool_is_refused(
@@ -686,3 +756,9 @@ async def test_mcp_tool_named_like_a_dynamic_tool_is_refused(
     ):
         await _before_model_call(agent)
     assert agent.tool_registry.registry == {}
+
+    # Strands compares dynamic tools' names exactly, so foo-bar may join foo_bar.
+    agent.tool_registry.register_dynamic_tool(_mcp_tool("x", "foo_bar"))
+    monkeypatch.setattr(a, "_refresh", _listing(a, "foo-bar"))
+    await _before_model_call(agent)
+    assert _sources(agent, a) == {"foo-bar": "a"}
