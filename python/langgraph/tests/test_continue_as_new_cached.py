@@ -23,6 +23,7 @@ from temporalio import workflow
 from temporalio.client import Client
 from temporalio.common import RetryPolicy
 from temporalio.langgraph import LangGraphPlugin, cache, graph
+from temporalio.langgraph._task_cache import cache_key
 from temporalio.worker import Worker
 
 # Track execution counts to verify caching
@@ -401,3 +402,16 @@ async def test_graph_continue_as_new_cached_ordinary_dict(client: Client, marker
     assert result["state"] == {_MARKER: marker}
     assert list(result["cache"].values()) == [{_MARKER: marker}]
     assert _execution_counts == {"ordinary": 1}
+
+
+@dataclass(repr=False)
+class Tags:
+    names: set[str]
+
+
+def test_cache_key_reads_values():
+    # str() of these depends on object identity and set order, which differ
+    # between processes.
+    assert cache_key("task", (Tags({"a", "b"}),), {}) == cache_key(
+        "task", (Tags({"b", "a"}),), {}
+    )

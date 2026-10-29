@@ -1,25 +1,16 @@
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Annotated, Any
+from typing import Any
 from uuid import uuid4
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, AnyMessage
 from langgraph.graph import START, StateGraph  # pyright: ignore[reportMissingTypeStubs]
 from langgraph.runtime import Runtime, get_runtime
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    PlainSerializer,
-    RootModel,
-    field_serializer,
-    model_serializer,
-)
-from typing_extensions import NotRequired, TypedDict
+from pydantic import BaseModel, Field
+from typing_extensions import TypedDict
 
 from temporalio import workflow
-from temporalio.api.history.v1 import History
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.langgraph import LangGraphPlugin, graph
@@ -45,8 +36,7 @@ class Context:
 
 @dataclass
 class ComputedContext(Context):
-    # With a default, Pydantic writes it inside a model.
-    label: str = field(init=False, default="")
+    label: str = field(init=False)
 
     def __post_init__(self) -> None:
         self.label = self.user_id.upper()
@@ -200,149 +190,35 @@ async def test_two_nodes(
     }
 
 
-class Messages(RootModel[list[BaseMessage]]):
-    pass
-
-
-def hidden_message() -> BaseMessage:
-    return AIMessage(content="not-in-history")
-
-
-def search_message() -> BaseMessage:
-    return AIMessage(
-        content="", tool_calls=[{"name": "search", "args": {}, "id": "call-1"}]
-    )
-
-
-def redact(message: BaseMessage) -> dict[str, str]:
-    return {"type": message.type, "content": "redacted"}
-
-
-class Note(BaseModel):
-    message: BaseMessage = Field(default_factory=hidden_message)
-
-    @model_serializer
-    def redact_note(self) -> dict[str, Any]:
-        return {"message": redact(self.message)}
-
-
-@dataclass
-class Computed:
-    context: ComputedContext
-    pair: tuple[int, ...] = field(init=False, default=())
-
-
-@dataclass
-class SecretContext(Context):
-    token: Annotated[str, PlainSerializer(lambda _: "redacted", when_used="json")] = (
-        "not-in-history"
-    )
-
-
-@dataclass
-class TokenContext(Context):
-    token: str = "not-in-history"
-
-
-class Encoded(BaseModel):
-    model_config = ConfigDict(
-        json_encoders={Context: lambda _: {"user_id": "redacted"}}
-    )
-
-    context: Context = Field(default_factory=lambda: TokenContext(user_id="alice"))
-
-
-class HiddenItems(TypedDict):
-    message: NotRequired[Annotated[BaseMessage, Field(exclude=True)]]
-
-
-@dataclass
-class Envelope:
-    message: Annotated[BaseMessage, Field(alias="msg")] = field(
-        default_factory=search_message
-    )
-    hidden: Annotated[BaseMessage, Field(exclude=True)] = field(
-        default_factory=hidden_message
-    )
-
-
 class ModelState(BaseModel):
-    model_config = ConfigDict(serialize_by_alias=True, validate_by_name=True)
-
     value: str
     answer: Answer | None = None
-    messages: list[BaseMessage] = []
-    union_messages: list[BaseMessage] | tuple[BaseMessage, ...] = []
-    overlap_messages: list[BaseMessage] | list[AIMessage] = []
-    root_messages: Messages = Messages([])
-    int_messages: dict[int, BaseMessage] = {}
-    envelope: Envelope = Field(default_factory=Envelope)
-    hidden: BaseMessage = Field(default_factory=hidden_message, exclude=True)
-    hidden_if: BaseMessage = Field(
-        default_factory=hidden_message, exclude_if=lambda _: True
-    )
-    redacted: BaseMessage = Field(default_factory=hidden_message)
-    redacted_hint: Annotated[BaseMessage, PlainSerializer(redact)] = Field(
-        default_factory=hidden_message
-    )
-    note: Note = Field(default_factory=Note)
-    encoded: Encoded = Field(default_factory=Encoded)
-    hidden_items: HiddenItems = Field(
-        default_factory=lambda: HiddenItems(message=hidden_message())
-    )
-    secret_context: Context = Field(
-        default_factory=lambda: SecretContext(user_id="alice")
-    )
-    computed: Computed | None = None
+    # AnyMessage keeps each message's class; BaseMessage would not.
+    messages: list[AnyMessage] = []
     state_type_a: str = ""
     state_type_b: str = ""
     answer_type_b: str = ""
-    message_b: list[str] = []
-    label_b: str = ""
-
-    @field_serializer("redacted")
-    def redact_field(self, message: BaseMessage) -> dict[str, str]:
-        return redact(message)
+    message_b: str = ""
 
 
 async def model_node_a(state: ModelState) -> dict[str, Any]:
-    message = search_message()
-    context = ComputedContext(user_id="alice")
-    context.label = "saved"
-    computed = Computed(context)
-    computed.pair = (3, 4)
+    message = AIMessage(
+        content="", tool_calls=[{"name": "search", "args": {}, "id": "call-1"}]
+    )
     return {
         "answer": Answer(value=1),
         "messages": [message],
-        "union_messages": [message],
-        "overlap_messages": [HumanMessage(content="hi"), message],
-        "root_messages": [message],
-        "int_messages": {1: message},
-        "computed": computed,
         "state_type_a": type(state).__name__,
     }
 
 
-def describe(message: BaseMessage) -> str:
+async def model_node_b(state: ModelState) -> dict[str, str]:
+    message = state.messages[-1]
     names = [call["name"] for call in getattr(message, "tool_calls", [])]
-    return f"{type(message).__name__}:{','.join(names)}"
-
-
-async def model_node_b(state: ModelState) -> dict[str, Any]:
-    messages = [
-        state.messages,
-        state.union_messages,
-        state.overlap_messages,
-        state.root_messages.root,
-        list(state.int_messages.values()),
-        [state.envelope.message],
-    ]
-    computed = state.computed
     return {
         "state_type_b": type(state).__name__,
         "answer_type_b": type(getattr(state, "answer", None)).__name__,
-        "message_b": [describe(m[-1]) for m in messages],
-        "label_b": f"{computed.context.label}:{computed.pair}" if computed else "",
+        "message_b": f"{type(message).__name__}:{','.join(names)}",
     }
 
 
@@ -375,32 +251,19 @@ async def test_two_nodes_pydantic_state(
             )
         ],
     ):
-        handle = await client.start_workflow(
+        result = await client.execute_workflow(
             TwoNodesWorkflow.run,
             "",
             id=f"test-workflow-{uuid4()}",
             task_queue=task_queue,
         )
-        result = await handle.result()
-        history = await handle.fetch_history()
 
     assert result.pop("messages")[0]["tool_calls"][0]["name"] == "search"
-    for key in (
-        "union_messages",
-        "overlap_messages",
-        "root_messages",
-        "int_messages",
-        "computed",
-    ):
-        del result[key]
     assert result == {
         "value": "",
         "answer": {"value": 1},
         "state_type_a": "ModelState",
         "state_type_b": "ModelState",
         "answer_type_b": "Answer",
-        "message_b": ["AIMessage:search"] * 6,
-        "label_b": "saved:(3, 4)",
+        "message_b": "AIMessage:search",
     }
-    # Excluded and custom-serialized fields stay out of the Activity payloads.
-    assert b"not-in-history" not in History(events=history.events).SerializeToString()

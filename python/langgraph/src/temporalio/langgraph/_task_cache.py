@@ -7,10 +7,13 @@ is a plain dict that can travel through workflow.continue_as_new().
 
 from __future__ import annotations
 
+import dataclasses
 from contextvars import ContextVar
 from hashlib import sha256
 from json import dumps
 from typing import Any
+
+from pydantic import BaseModel
 
 _task_cache: ContextVar[dict[str, Any] | None] = ContextVar(
     "_temporal_task_cache", default=None
@@ -54,6 +57,26 @@ def task_id(func: Any) -> str:
     return f"{module}.{qualname}"
 
 
+def _canonical(value: Any) -> Any:
+    """Return a JSON form of ``value`` that is the same in every process.
+
+    ``str()`` can depend on set order or object identity, so models,
+    dataclasses and sets get their contents instead.
+    """
+    try:
+        if isinstance(value, (set, frozenset)):
+            return sorted(
+                value, key=lambda item: dumps(item, sort_keys=True, default=_canonical)
+            )
+        if isinstance(value, BaseModel):
+            return value.model_dump()
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return dataclasses.asdict(value)
+    except Exception:
+        pass
+    return str(value)
+
+
 def cache_key(
     task_id: str,
     args: tuple[Any, ...],
@@ -62,7 +85,9 @@ def cache_key(
 ) -> str:
     """Build a cache key from the full task identifier, arguments, and runtime context."""
     try:
-        key_str = dumps([task_id, args, kwargs, context], sort_keys=True, default=str)
+        key_str = dumps(
+            [task_id, args, kwargs, context], sort_keys=True, default=_canonical
+        )
     except (TypeError, ValueError):
         key_str = repr([task_id, args, kwargs, context])
     return sha256(key_str.encode()).hexdigest()[:32]
