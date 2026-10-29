@@ -24,10 +24,6 @@ from temporalio import activity
 
 HEADER_KEY = "__openai_span"
 
-# Runs without this patch marker started before the plugin refused traces with their own
-# tracing key. They keep sending such traces without the key, so that they replay.
-_REFUSE_TRACING_KEY_PATCH = "openai_agents.refuse-trace-tracing-key"
-
 
 def _refuse_tracing_key(tracing_api_key: str | None) -> None:
     """Raise if a trace has its own tracing key, which headers cannot carry.
@@ -37,10 +33,6 @@ def _refuse_tracing_key(tracing_api_key: str | None) -> None:
     Workflow code is refused where it sets the key; every header write checks again.
     """
     if tracing_api_key is None:
-        return
-    if temporalio.workflow.in_workflow() and not temporalio.workflow.patched(
-        _REFUSE_TRACING_KEY_PATCH
-    ):
         return
     raise ValueError(
         "The OpenAI Agents plugin cannot pass a trace's own tracing key, set with "

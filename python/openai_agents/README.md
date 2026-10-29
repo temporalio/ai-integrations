@@ -936,9 +936,9 @@ would be exported with another key. In Workflow code, `Runner.run`, `Runner.run_
 `trace()` raise `ValueError` when given such a key. Starting a Workflow, or scheduling an Activity or
 child Workflow, under such a trace raises it too. Agent runs inside Activities can still use their
 own key. Set the tracing key on every client and Worker process instead, with
-`set_tracing_export_api_key` or `OPENAI_API_KEY`. A run that started on an earlier version and
-already used such a key keeps doing so, so that it replays; a run that uses one for the first time
-after the upgrade gets the error.
+`set_tracing_export_api_key` or `OPENAI_API_KEY`. A run that used such a key in Workflow code
+before you deploy this version gets the error when it replays: let those runs finish first, or use
+Worker Versioning.
 
 ## OpenTelemetry Integration
 
