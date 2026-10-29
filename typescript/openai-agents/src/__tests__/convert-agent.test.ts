@@ -153,7 +153,31 @@ test('installAgentToolInterception: records tools of Agent subclasses with their
   const options = { toolName: 'ask_sandboxed', toolDescription: 'Ask.' };
   const record = getAgentToolRecord(agent.asTool(options));
   t.is(record?.agent, agent);
-  t.is(record?.options, options);
+  t.deepEqual(record?.options, options);
+});
+
+test('convertAgent: rebuilt asTool() tools keep the options and name they were created with', async (t) => {
+  const nested = new Agent({ name: 'Nested', model: 'm' });
+  const options = { toolName: 'ask_gated', toolDescription: 'Gated.', needsApproval: true };
+  const gated = nested.asTool(options);
+  Object.assign(options, { toolName: 'ask_open', toolDescription: 'Open.', needsApproval: false });
+  const open = nested.asTool(options);
+  const renamed = new Agent({ name: 'Original Name', model: 'm' });
+  const byDefaultName = renamed.asTool({});
+  renamed.name = 'Updated Name';
+  const parent = new Agent({ name: 'Parent', model: 'm', tools: [gated, open, byDefaultName] });
+
+  const tools = convertAgent(parent, DEFAULT_MODEL_PARAMS).tools as FunctionTool[];
+  t.deepEqual(
+    tools.map((tool) => [tool.name, tool.description]),
+    [
+      ['ask_gated', 'Gated.'],
+      ['ask_open', 'Open.'],
+      ['Original_Name', ''],
+    ]
+  );
+  const approvals = await Promise.all(tools.map((tool) => tool.needsApproval({} as any, '{}', 'call')));
+  t.deepEqual(approvals, [true, false, false]);
 });
 
 test('convertAgent: an agent that is a handoff target and an asTool() source converts once', (t) => {

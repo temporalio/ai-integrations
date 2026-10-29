@@ -1,9 +1,9 @@
-import { type Agent, Handoff, MemorySession, type Tool } from '@openai/agents-core';
+import { type Agent, type AgentToolOptions, Handoff, MemorySession, type Tool } from '@openai/agents-core';
 import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import type { ModelActivityOptions } from '../common/model-activity-options';
 import { ActivityBackedModel } from './activity-backed-model';
-import { type AgentToolRecord, getAgentToolRecord, isUnrecordedAgentTool, rebuildAgentTool } from './agent-tools';
+import { forwardAgentToolHandlers, getAgentToolRecord, isUnrecordedAgentTool, rebuildAgentTool } from './agent-tools';
 import { validateTemporalSandboxClient } from './sandbox-client';
 
 interface Conversion {
@@ -40,6 +40,7 @@ export function convertAgent(
   for (let i = 0; i < conversion.pendingTools.length; i++) {
     const [original, convertedAgent] = conversion.pendingTools[i]!;
     convertedAgent.tools = (original.tools ?? []).map((t) => convertTool(t, original, conversion));
+    if (convertedAgent.tools.some((t, j) => t !== original.tools[j])) forwardAgentToolHandlers(convertedAgent);
   }
   return converted;
 }
@@ -132,8 +133,16 @@ function convertTool(tool: Tool<any>, owner: Agent<any, any>, conversion: Conver
     }
     return tool;
   }
-  validateAgentToolOptions(record, tool.name);
-  return rebuildAgentTool(record, convertToolAgent(record.agent, conversion));
+  // Upstream reads runConfig and runOptions when the tool runs. Copy them now, so the nested run
+  // uses the values checked here.
+  const { runConfig, runOptions } = record.options;
+  const options = {
+    ...record.options,
+    runConfig: runConfig && { ...runConfig },
+    runOptions: runOptions && { ...runOptions },
+  };
+  validateAgentToolOptions(record.agent, options, tool.name);
+  return rebuildAgentTool(record, options, convertToolAgent(record.agent, conversion));
 }
 
 function rejectModelObject(agent: Agent<any, any>): void {
@@ -151,7 +160,11 @@ function rejectModelObject(agent: Agent<any, any>): void {
 }
 
 /** Rejects `asTool()` options that would run model calls or sandbox operations in the Workflow. */
-function validateAgentToolOptions({ agent, options }: AgentToolRecord, toolName: string): void {
+function validateAgentToolOptions(
+  agent: Agent<any, any>,
+  options: AgentToolOptions<any, any, any>,
+  toolName: string
+): void {
   const where = `Agent '${agent.name}' asTool('${toolName}')`;
   const runConfig = options.runConfig;
   if (runConfig?.modelProvider !== undefined) {

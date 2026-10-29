@@ -18,6 +18,7 @@ import {
   agentToolRejectedWorkflow,
   agentToolRunConfigWorkflow,
   agentToolStreamWorkflow,
+  agentToolOptionsReuseWorkflow,
   sharedAgentApprovalWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
@@ -431,17 +432,58 @@ for (const [title, legacyFirstRun, nestedCall] of [
   });
 }
 
-test('A nested agent.asTool() run streams to its onStream option and on() handlers', async (t) => {
+for (const [title, onAfterStart] of [
+  ['A nested agent.asTool() run streams to its onStream option and on() handlers', false],
+  ['An on() handler registered after the run starts gets the nested agent.asTool() stream', true],
+] as const) {
+  test(title, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    let leadCalls = 0;
+    const provider = {
+      getModel() {
+        return {
+          async getResponse() {
+            return leadCalls++ === 0 ? toolCallResponse('ask_streamer', { input: 'q' }) : textResponse('done');
+          },
+          async *getStreamedResponse() {
+            yield* streamingTextEvents('streamed answer');
+          },
+        } as unknown as FakeModel;
+      },
+    };
+    const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider: provider })] });
+
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(agentToolStreamWorkflow, {
+        args: ['Hello', onAfterStart],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      t.deepEqual(await handle.result(), { output: 'done', onStream: ['streamed answer'], on: ['streamed answer'] });
+      const { events } = await handle.fetchHistory();
+      const activityTypes = (events ?? [])
+        .map((e) => e.activityTaskScheduledEventAttributes?.activityType?.name)
+        .filter((name) => name !== undefined);
+      t.deepEqual(activityTypes, ['invokeModelActivity', 'invokeModelStreamActivity', 'invokeModelActivity']);
+      await replay(t, handle);
+    });
+  });
+}
+
+test('agent.asTool() tools keep the options and name they were created with', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
-  let leadCalls = 0;
+  const leadTools: string[][] = [];
+  const instructions: string[] = [];
   const provider = {
     getModel() {
       return {
-        async getResponse() {
-          return leadCalls++ === 0 ? toolCallResponse('ask_streamer', { input: 'q' }) : textResponse('done');
-        },
-        async *getStreamedResponse() {
-          yield* streamingTextEvents('streamed answer');
+        async getResponse(request: any) {
+          instructions.push(request.systemInstructions);
+          if (request.systemInstructions === 'Answer as renamed.') return textResponse('renamed answer');
+          leadTools.push((request.tools ?? []).map((tool: { name: string }) => tool.name));
+          return multiToolCallResponse([
+            { name: 'ask_gated', args: { input: 'q1' } },
+            { name: 'Original_Name', args: { input: 'q2' } },
+          ]);
         },
       } as unknown as FakeModel;
     },
@@ -449,10 +491,15 @@ test('A nested agent.asTool() run streams to its onStream option and on() handle
   const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider: provider })] });
 
   await worker.runUntil(async () => {
-    const result = await (
-      await startWorkflow(agentToolStreamWorkflow, { args: ['Hello'], workflowExecutionTimeout: '30 seconds' })
-    ).result();
-    t.deepEqual(result, { output: 'done', onStream: ['streamed answer'], on: ['streamed answer'] });
+    const handle = await startWorkflow(agentToolOptionsReuseWorkflow, {
+      args: ['Hello'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    // Reusing the options object does not drop ask_gated's approval, so it pauses instead of running.
+    t.deepEqual(await handle.result(), ['ask_gated']);
+    t.deepEqual(leadTools, [['ask_gated', 'ask_open', 'Original_Name']]);
+    t.deepEqual(instructions, ['Use the tools.', 'Answer as renamed.']);
+    await replay(t, handle);
   });
 });
 

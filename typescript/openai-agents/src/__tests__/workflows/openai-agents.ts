@@ -281,8 +281,11 @@ export interface AgentToolStreamResult {
   on: string[];
 }
 
-/** A nested `asTool()` run streams to its `onStream` option and `on()` handlers. */
-export async function agentToolStreamWorkflow(prompt: string): Promise<AgentToolStreamResult> {
+/**
+ * A nested `asTool()` run streams to its `onStream` option and `on()` handlers. With `onAfterStart`,
+ * the `on()` handler is registered after the run starts, while the lead's model call is pending.
+ */
+export async function agentToolStreamWorkflow(prompt: string, onAfterStart = false): Promise<AgentToolStreamResult> {
   new WorkflowStream();
   const onStream: string[] = [];
   const on: string[] = [];
@@ -295,15 +298,43 @@ export async function agentToolStreamWorkflow(prompt: string): Promise<AgentTool
       }
     },
   });
-  askStreamer.on('raw_model_stream_event', ({ event }) => {
-    if (event.type === 'raw_model_stream_event' && event.data.type === 'output_text_delta') {
-      on.push(event.data.delta);
-    }
-  });
+  const register = () =>
+    askStreamer.on('raw_model_stream_event', ({ event }) => {
+      if (event.type === 'raw_model_stream_event' && event.data.type === 'output_text_delta') {
+        on.push(event.data.delta);
+      }
+    });
+  if (!onAfterStart) register();
   const lead = new Agent({ name: 'Lead', instructions: 'Use the tool.', model: 'lead-model', tools: [askStreamer] });
   const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
-  const result = await runner.run(lead, prompt);
+  const running = runner.run(lead, prompt);
+  if (onAfterStart) register();
+  const result = await running;
   return { output: result.finalOutput ?? '', onStream, on };
+}
+
+/**
+ * Creates `ask_gated` with approval required, then reuses its options object for `ask_open`, and
+ * renames an agent after creating its tool with the default name. Returns the pending approvals.
+ */
+export async function agentToolOptionsReuseWorkflow(prompt: string): Promise<string[]> {
+  const nested = new Agent({ name: 'Nested', instructions: 'Answer as nested.', model: 'nested-model' });
+  const options: { toolName: string; needsApproval: boolean } = { toolName: 'ask_gated', needsApproval: true };
+  const gated = nested.asTool(options);
+  options.toolName = 'ask_open';
+  options.needsApproval = false;
+  const open = nested.asTool(options);
+  const renamed = new Agent({ name: 'Original Name', instructions: 'Answer as renamed.', model: 'nested-model' });
+  const byDefaultName = renamed.asTool({});
+  renamed.name = 'Updated Name';
+  const lead = new Agent({
+    name: 'Lead',
+    instructions: 'Use the tools.',
+    model: 'lead-model',
+    tools: [gated, open, byDefaultName],
+  });
+  const result = await new TemporalOpenAIRunner().run(lead, prompt);
+  return result.interruptions.map((i) => i.name ?? '');
 }
 
 export async function statefulMcpNotConnectedWorkflow(): Promise<string> {
