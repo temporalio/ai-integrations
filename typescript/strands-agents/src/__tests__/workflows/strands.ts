@@ -11,6 +11,7 @@ import {
 } from '@strands-agents/sdk';
 import {
   ActivityFailure,
+  allHandlersFinished,
   ApplicationFailure,
   defineSignal,
   proxyActivities,
@@ -223,6 +224,26 @@ export async function failActivities(messages: string[]): Promise<never> {
   // Failing, rather than returning, also stores a workflow failure, which the bundle's failure
   // converter encodes.
   throw ApplicationFailure.create({ message: 'workflow failed', nonRetryable: true, details: decoded });
+}
+
+export const finishSignal = defineSignal('finish');
+
+/**
+ * Waits for the `finish` Signal and, one microtask later, schedules `finished` if every handler has
+ * finished by then and `unfinished` if not. The plugin's workflow interceptor wraps handlers, which
+ * makes them finish later.
+ */
+export async function handlerTiming(): Promise<void> {
+  const activities = proxyActivities<{ finished(): Promise<void>; unfinished(): Promise<void> }>({
+    startToCloseTimeout: '10 seconds',
+  });
+  let signaled = false;
+  setHandler(finishSignal, () => {
+    signaled = true;
+  });
+  await condition(() => signaled);
+  await Promise.resolve();
+  await (allHandlersFinished() ? activities.finished() : activities.unfinished());
 }
 
 export const approveSignal = defineSignal<[string]>('approve');
