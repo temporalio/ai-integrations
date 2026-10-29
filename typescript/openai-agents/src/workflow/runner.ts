@@ -27,13 +27,12 @@ import {
   type SerializableModelActivityOptions,
 } from '../common/model-activity-options';
 import { unwrapTemporalFailure } from '../common/errors';
+import { ActivityBackedModelProvider } from './activity-backed-model';
 import { convertAgent } from './convert-agent';
 import { TemporalSandboxClient } from './sandbox-client';
 import { ensureTracingProcessorRegistered } from './tracing';
 import { flushOpenSpans } from './agent-sink-processor';
 import { getCurrentPluginConfig } from './plugin-config-store';
-
-const agentAsToolSandboxConfig = Symbol.for('@temporalio/openai-agents/agentAsToolSandboxConfig');
 
 export interface TemporalRunOptions<TContext = undefined> {
   /** Run context passed to agents and tools */
@@ -181,26 +180,6 @@ function validateSandboxRunConfig(agent: Agent<any, any>, sandbox: SandboxRunCon
   }
 }
 
-function propagateAgentToolSandboxConfig(
-  agent: Agent<any, any>,
-  sandbox: SandboxRunConfig,
-  seen: Set<Agent<any, any>> = new Set()
-): void {
-  if (seen.has(agent)) return;
-  seen.add(agent);
-  agent.tools = agent.tools.map((tool) => {
-    if (tool.type !== 'function') return tool;
-    const configureSandbox = (
-      tool as typeof tool & { [agentAsToolSandboxConfig]?: (sandbox: SandboxRunConfig) => typeof tool }
-    )[agentAsToolSandboxConfig];
-    if (typeof configureSandbox !== 'function') return tool;
-    return configureSandbox(sandbox);
-  });
-  for (const handoff of agent.handoffs ?? []) {
-    propagateAgentToolSandboxConfig(handoff instanceof Handoff ? handoff.agent : handoff, sandbox, seen);
-  }
-}
-
 /**
  * A Temporal-aware agent runner that delegates model calls to Activities.
  *
@@ -272,9 +251,6 @@ export class TemporalOpenAIRunner {
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
     const converted = convertAgent(agent, this.modelParams, undefined, modelOverride);
-    if (options?.runConfig?.sandbox !== undefined) {
-      propagateAgentToolSandboxConfig(converted, options.runConfig.sandbox);
-    }
 
     let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
     if (input instanceof RunState) {
@@ -290,7 +266,13 @@ export class TemporalOpenAIRunner {
       preparedInput = input;
     }
 
-    const innerRunner = new Runner({ ...runnerConfigOverrides });
+    // Converted agents already carry their model. Nested `agent.asTool()` runs take the model,
+    // provider and settings from this config, as upstream, so their model calls are Activities too.
+    const innerRunner = new Runner({
+      ...runnerConfigOverrides,
+      model: modelOverride,
+      modelProvider: new ActivityBackedModelProvider(this.modelParams),
+    });
 
     const sharedRunOptions = {
       maxTurns: options?.maxTurns,

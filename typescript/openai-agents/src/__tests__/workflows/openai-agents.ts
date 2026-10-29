@@ -110,6 +110,23 @@ export async function summaryOverrideStringWorkflow(prompt: string): Promise<str
   return result.finalOutput ?? '';
 }
 
+export async function agentToolRunConfigWorkflow(prompt: string): Promise<string> {
+  const expert = new Agent({ name: 'Expert', instructions: 'Answer as the expert.' });
+  const specialist = new Agent({ name: 'Specialist', instructions: 'Answer as the specialist.', model: 'own-model' });
+  const lead = new Agent({
+    name: 'Lead',
+    instructions: 'Use the tools.',
+    tools: [expert.asTool({ toolName: 'ask_expert' }), specialist.asTool({ toolName: 'ask_specialist' })],
+  });
+  const runner = new TemporalOpenAIRunner({
+    defaultModelParams: { startToCloseTimeout: '17 seconds', summary: 'runner default' },
+  });
+  const result = await runner.run(lead, prompt, {
+    runConfig: { model: 'run-model', modelSettings: { temperature: 0.33, toolChoice: 'auto' } },
+  });
+  return result.finalOutput ?? '';
+}
+
 export async function statefulMcpNotConnectedWorkflow(): Promise<string> {
   const server = statefulMcpServer('testStateful');
   try {

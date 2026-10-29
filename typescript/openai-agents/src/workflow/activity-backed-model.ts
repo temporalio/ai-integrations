@@ -4,6 +4,7 @@ import {
   type Agent,
   type AgentOutputItem,
   type Model,
+  type ModelProvider,
   type ModelRequest,
   type ModelResponse,
   type StreamEvent,
@@ -167,5 +168,17 @@ export class ActivityBackedModel implements Model {
     for (const event of events) {
       yield fromSerializedStreamEvent(event);
     }
+  }
+}
+
+/**
+ * Resolves model names to `ActivityBackedModel`s. The runner gives it to its inner `Runner`, and
+ * upstream passes it on to nested `agent.asTool()` runs, so their model calls are Activities too.
+ */
+export class ActivityBackedModelProvider implements ModelProvider {
+  constructor(private readonly modelParams: ModelActivityOptions) {}
+
+  getModel(modelName?: string): Model {
+    return new ActivityBackedModel(modelName ?? '', this.modelParams);
   }
 }

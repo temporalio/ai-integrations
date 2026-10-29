@@ -391,11 +391,10 @@ const agent = new Agent({
 
 ### Nested agent tools
 
-Use `agentAsTool` to expose another `Agent` as a tool while keeping nested model calls durable:
+Use the framework's `agent.asTool()` to expose another `Agent` as a tool. The nested run happens in the Workflow, and its model calls are model Activities, like the parent's:
 
 ```ts
 import { Agent } from '@openai/agents-core';
-import { agentAsTool } from '@temporalio/openai-agents/workflow';
 
 const specialist = new Agent({
   name: 'Specialist',
@@ -408,7 +407,7 @@ const triage = new Agent({
   instructions: 'Delegate specialist questions.',
   model: 'gpt-4o-mini',
   tools: [
-    agentAsTool(specialist, {
+    specialist.asTool({
       toolName: 'ask_specialist',
       toolDescription: 'Ask the specialist agent',
     }),
@@ -416,7 +415,7 @@ const triage = new Agent({
 });
 ```
 
-Nested approval interruptions are not supported. If a nested run pauses for approval, the tool invocation fails with `ApplicationFailure` type `NestedAgentInterruption`.
+As in the framework, the nested run takes the run's `model` (for agents that set none) and `modelSettings`. Its model Activities use the same options as the runner's.
 
 ## MCP servers
 
@@ -695,7 +694,7 @@ Most applications use two import paths: `@temporalio/openai-agents` in Worker an
 
 `@temporalio/openai-agents` exports `OpenAIAgentsPlugin`, MCP provider classes, `SandboxClientProvider`, model option types, hosted tool credential types, and `DEDICATED_WORKER_FAILURE_TYPE`. `OpenAIAgentsTraceClientInterceptor` is also public for Clients that need manual interceptor wiring instead of plugin registration.
 
-`@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `agentAsTool`, `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, and `DEDICATED_WORKER_FAILURE_TYPE`.
+`@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, and `DEDICATED_WORKER_FAILURE_TYPE`.
 
 `@temporalio/openai-agents/otel` exports `createTracerProvider`, `TemporalIdGenerator`, `markReplaySafeTracerProvider`, `isReplaySafeTracerProvider`, and `TemporalOpenAIAgentsTracerProviderOptions`. Install optional peer dependency `@opentelemetry/sdk-trace-base` only when you use this OTel integration.
 
@@ -714,7 +713,7 @@ Any OpenAI Agents SDK `ModelProvider` can be passed as `modelProvider`. The prov
 | Inline function tools   | Supported                | Must be deterministic                                                                          |
 | Activity-backed tools   | Supported                | Via `activityAsTool()`                                                                         |
 | Nexus operation tools   | Supported                | Via `nexusOperationAsTool()`                                                                   |
-| Nested agent tools      | Supported                | Via `agentAsTool()`                                                                            |
+| Nested agent tools      | Supported                | Via `agent.asTool()`                                                                           |
 | Hosted tools            | Supported                | Executed server-side by the model provider                                                     |
 | Stateless MCP servers   | Supported                | Via `StatelessMCPServerProvider` and `statelessMcpServer()`                                    |
 | Stateful MCP servers    | Supported                | Via `StatefulMCPServerProvider` and `statefulMcpServer()`                                      |
