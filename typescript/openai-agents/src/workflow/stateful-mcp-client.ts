@@ -48,7 +48,8 @@ export interface StatefulMcpServerOptions {
   cacheToolsList?: boolean;
   /**
    * Builds each tool call's MCP `_meta` in the Workflow, as for a native MCP server. It gets the
-   * run context and must be deterministic.
+   * run context and must be deterministic. Older plugin versions ignore this option, so they
+   * can't replay a History in which the resolver scheduled Workflow work or failed.
    */
   toolMetaResolver?: MCPToolMetaResolver;
 }

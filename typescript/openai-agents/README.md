@@ -523,6 +523,8 @@ const server = statelessMcpServer('tickets', {
 
 The `_meta` values are recorded in the call-tool Activity input in Workflow History, so don't put secrets in them.
 
+Plugin versions before this option ignore it. A resolver that returns a value without scheduling Workflow work (Activities, timers, child Workflows) replays the same on those versions. A resolver that schedules Workflow work, throws, or returns a value that is not an object or `null` makes a History that older versions can't replay: they fail it with a nondeterminism error (`TMPRL1100`). Don't roll Workers back to an older plugin version while such Workflows are open, or keep the resolver free of Workflow work and failures.
+
 ## Sandbox agents
 
 > **Experimental** — sandbox support is subject to change prior to General Availability.
