@@ -503,6 +503,7 @@ def _maybe_run(
     parent: RunTree | None = None,
     destination: dict[str, Any] | None,
     executor: ThreadPoolExecutor,
+    inherit_parent_destination: bool = True,
 ) -> Generator[None, None, None]:
     """Create a LangSmith run, handling errors.
 
@@ -537,8 +538,10 @@ def _maybe_run(
         metadata: Extra metadata to attach to the run.
         tags: Tags to attach to the run.
         parent: Parent run for nesting.
-        destination: The run's project or address, resolved once at startup.
+        destination: The root run's project or address, resolved once at startup.
         executor: ThreadPoolExecutor for background I/O.
+        inherit_parent_destination: Whether a parent's destination overrides
+            the startup destination.
     """
     if not add_temporal_runs or not langsmith.utils.tracing_is_enabled():
         yield None
@@ -573,7 +576,15 @@ def _maybe_run(
     if rng is not None:
         run_tree_args["id"] = _uuid_from_random(rng)
         run_tree_args["start_time"] = temporalio.workflow.now()
-    run_tree_args.update(destination)
+    if parent is not None and inherit_parent_destination:
+        # RunTree(parent_run=...) inherits IDs but not the destination.
+        address = getattr(parent, "address", None)
+        if address is not None:
+            run_tree_args["address"] = address
+        else:
+            run_tree_args["project_name"] = parent.session_name
+    else:
+        run_tree_args.update(destination)
     if parent is not None:
         run_tree_args["parent_run"] = parent
     if metadata:
@@ -637,8 +648,8 @@ class LangSmithInterceptor(
         self._client = client
         # LangSmith treats an empty project name as unset, so the plugin does too.
         self._project_name = project_name or None
-        # Where the plugin's own runs, and runs with no parent, go: its
-        # project, else LangSmith's env defaults. None when neither names one.
+        # The explicit project overrides parent destinations. Otherwise the
+        # env destination is a fallback for roots. None when the env is invalid.
         self._destination = (
             {"project_name": self._project_name}
             if self._project_name is not None
@@ -676,6 +687,7 @@ class LangSmithInterceptor(
             parent=parent,
             executor=self._executor,
             destination=self._destination,
+            inherit_parent_destination=self._project_name is None,
         ) as run:
             yield run
 

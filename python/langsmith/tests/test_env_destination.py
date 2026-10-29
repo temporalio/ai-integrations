@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from langsmith import Client as LangSmithClient
-from langsmith import traceable, tracing_context
+from langsmith import get_current_run_tree, traceable, tracing_context
 from langsmith.run_trees import RunTree
 from langsmith.utils import LangSmithUserError
 
@@ -256,13 +256,58 @@ _USER_RUNS = {
     "nexus_direct_traceable",
 }
 
+_TEMPORAL_RUNS = {
+    "StartWorkflow:EnvDestinationWorkflow",
+    "RunWorkflow:EnvDestinationWorkflow",
+    "StartActivity:nested_traceable_activity",
+    "RunActivity:nested_traceable_activity",
+    "StartNexusOperation:DirectTraceableNexusService/direct_traceable_op",
+    "RunStartNexusOperationHandler:DirectTraceableNexusService/direct_traceable_op",
+}
+
 
 @pytest.mark.requires_local_server
 @pytest.mark.parametrize("add_temporal_runs", [False, True])
 @pytest.mark.parametrize(
     "destination_env",
-    [{"LANGSMITH_PROJECT": "env-project"}, _VALID_AGENT_ENV],
-    ids=["project", "agent"],
+    [{}, {"LANGSMITH_PROJECT": "env-project"}, _VALID_AGENT_ENV],
+    ids=["unset", "project", "agent"],
+)
+async def test_parent_project_outranks_env_destination(
+    client: Client,
+    env: WorkflowEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+    destination_env: dict[str, str],
+    add_temporal_runs: bool,
+) -> None:
+    if env.supports_time_skipping:
+        pytest.skip("Time-skipping server doesn't persist headers.")
+    _set_destination_env(monkeypatch, destination_env)
+
+    mock_ls_client = await _run_workflow(
+        client,
+        env,
+        caller_project="caller-project",
+        add_temporal_runs=add_temporal_runs,
+    )
+
+    names = {call.kwargs["name"] for call in mock_ls_client.create_run.call_args_list}
+    assert names == {
+        "caller",
+        *_USER_RUNS,
+        *(_TEMPORAL_RUNS if add_temporal_runs else ()),
+    }
+    by_trace = _destinations_by_trace(mock_ls_client)
+    assert len(by_trace) == 1
+    assert all(d == ("caller-project", None) for d in next(iter(by_trace.values())))
+
+
+@pytest.mark.requires_local_server
+@pytest.mark.parametrize("add_temporal_runs", [False, True])
+@pytest.mark.parametrize(
+    "destination_env",
+    [{}, {"LANGSMITH_PROJECT": "env-project"}, _VALID_AGENT_ENV],
+    ids=["unset", "project", "agent"],
 )
 async def test_env_destination_receives_every_run(
     client: Client,
@@ -275,9 +320,9 @@ async def test_env_destination_receives_every_run(
         pytest.skip("Time-skipping server doesn't persist headers.")
     _set_destination_env(monkeypatch, destination_env)
     expected = (
-        ("env-project", None)
-        if "LANGSMITH_PROJECT" in destination_env
-        else (None, _env_address())
+        (None, _env_address())
+        if "LANGSMITH_AGENT_ID" in destination_env
+        else (destination_env.get("LANGSMITH_PROJECT", "default"), None)
     )
 
     mock_ls_client = await _run_workflow(
@@ -395,3 +440,39 @@ def test_root_factory_children_inherit_an_address(
 
     assert getattr(child, "address", None) == address
     assert child.session_name is None
+
+
+@pytest.mark.parametrize("project_name", [None, "", "plugin-project"])
+@pytest.mark.parametrize("explicit_parent", [False, True])
+def test_temporal_run_inherits_parent_address_unless_project_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    project_name: str | None,
+    explicit_parent: bool,
+) -> None:
+    _set_destination_env(monkeypatch, _VALID_AGENT_ENV)
+    address = _env_address()
+    ls_client = MagicMock()
+    parent = RunTree(name="caller", address=address, ls_client=ls_client)
+    _set_destination_env(monkeypatch, {"LANGSMITH_PROJECT": "env-project"})
+    interceptor = LangSmithInterceptor(
+        client=ls_client, project_name=project_name, add_temporal_runs=True
+    )
+
+    try:
+        with tracing_context(parent=parent, enabled=True):
+            with interceptor.maybe_run(
+                "StartWorkflow:ParentAddress",
+                parent=parent if explicit_parent else None,
+            ):
+                run = get_current_run_tree()
+                assert run is not None
+                assert run.parent_run_id == parent.id
+                assert run.trace_id == parent.trace_id
+                if project_name:
+                    assert run.session_name == project_name
+                    assert getattr(run, "address", None) is None
+                else:
+                    assert run.session_name is None
+                    assert getattr(run, "address", None) == address
+    finally:
+        interceptor._executor.shutdown(wait=True)
