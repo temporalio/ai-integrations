@@ -423,11 +423,13 @@ The framework doesn't expose the agent behind an `asTool()` tool, so the plugin 
 The runner rejects nested setups that would run model calls or sandbox operations in the Workflow:
 
 - a nested agent, or an agent it hands off to, with a `Model` object instead of a model name;
-- `asTool({ runConfig: { modelProvider } })`, or a `Model` object as `runConfig.model`;
-- a `runConfig.sandbox` or `runOptions.sandbox` whose client isn't from `temporalSandboxClient(name)`;
+- `asTool({ runConfig: { modelProvider } })`, even `modelProvider: undefined`, which removes the runner's provider; or a `Model` object as `runConfig.model`;
+- a `runConfig.sandbox` or `runOptions.sandbox` whose client isn't from `temporalSandboxClient(name)`, or whose live `session` isn't from such a client;
 - a `MemorySession` as `runOptions.session`.
 
-The runner also checks each agent just before it calls its model. This covers agents the check before the run can't see: one that a custom `Handoff`'s callback returns, or one that an `agent.on(...)` listener changes. Its model must be a name, and its `asTool()` tools must pass the checks above. Each `asTool()` tool checks its options again when it's called, and after its `inputBuilder` runs, because the framework reads them only then: an `agent_tool_start` listener can change them after the model call. In the outer run, the run fails. In a nested run, the error goes back to the parent model as the tool's output, and the model isn't called. The check wraps `Agent.prototype.getSystemPrompt`, which the framework calls once per model call, so an `Agent` subclass that overrides it must call `super.getSystemPrompt()`.
+The runner also checks each agent just before it calls its model. This covers agents the check before the run can't see: one that a custom `Handoff`'s callback returns, or one that an `agent.on(...)` listener changes. Its model must be a name, and its `asTool()` tools must pass the checks above. In the outer run, the run fails. In a nested run, the error goes back to the parent model as the tool's output, and the model isn't called. The check wraps `Agent.prototype.getSystemPrompt`, which the framework calls once per model call, so an `Agent` subclass that overrides it must call `super.getSystemPrompt()`.
+
+The framework reads an `asTool()` tool's `runConfig` and `runOptions` only when the nested run starts, after the tool's `parameters` schema, its `inputBuilder` and any `agent_tool_start` listener ran. So the plugin also checks each run as it starts, by wrapping `Runner.prototype.run` in the Workflow: the run's model provider must be the runner's, its `runConfig.model` a name, its session not a `MemorySession`, and its sandbox config must pass the checks above. A nested run that fails this check doesn't start, and the error is the tool's output. The run then uses a frozen copy of its sandbox config, so a later change to your object, for example in an `agent_start` listener, doesn't reach it. Because of this check, an upstream `Runner` can't run agents in a Workflow; use `TemporalOpenAIRunner`.
 
 ## MCP servers
 

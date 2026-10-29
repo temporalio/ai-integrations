@@ -420,16 +420,27 @@ test('Agents picked or changed during the run are checked before they call their
       /^An error occurred while running the tool.*Agent 'Nested' has a Model object/,
       1,
     ],
-    // The tool checks its options again when it is invoked, after the lead's model call.
-    'tool-start-model-provider': [/^AgentsWorkflowError: .*asTool\('ask_nested'\) sets runConfig.modelProvider/, 1],
-    'tool-start-run-model-object': [
-      /^AgentsWorkflowError: .*asTool\('ask_nested'\) sets runConfig.model to a Model object/,
+    // The nested Runner's run checks the config it uses as it starts, inside the tool, so upstream
+    // returns the failure as the tool's output.
+    'tool-start-model-provider': [
+      /^An error occurred while running the tool.*agent 'Nested' has a model provider that would call models/,
       1,
     ],
-    // inputBuilder runs inside the tool, so upstream returns its failure as the tool's output.
-    'input-builder-model-provider': [
-      /^An error occurred while running the tool.*asTool\('ask_nested'\) sets runConfig.modelProvider/,
+    'tool-start-run-model-object': [
+      /^An error occurred while running the tool.*agent 'Nested' has a Model object as runConfig.model/,
       1,
+    ],
+    'input-builder-model-provider': [
+      /^An error occurred while running the tool.*agent 'Nested' has a model provider that would call models/,
+      1,
+    ],
+    'tool-start-clear-model-provider': [
+      /^An error occurred while running the tool.*agent 'Nested' has a model provider that would call models/,
+      1,
+    ],
+    'tool-option-model-provider-undefined': [
+      /^AgentsWorkflowError: .*asTool\('ask_nested'\) sets runConfig.modelProvider/,
+      0,
     ],
     'tool-start-run-model-name': [/^nested answer$/, 2],
   };

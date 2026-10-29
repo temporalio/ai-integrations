@@ -1,7 +1,10 @@
-import { Agent, Handoff, type RunContext, type Tool } from '@openai/agents-core';
+import { Agent, Handoff, MemorySession, Runner, type RunContext, type Tool } from '@openai/agents-core';
+import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import { inWorkflowContext } from '@temporalio/workflow';
+import { ActivityBackedModelProvider } from './activity-backed-model';
 import { type AgentToolRecord, checkAgentToolOptions, getAgentToolRecord, isUnrecordedAgentTool } from './agent-tools';
+import { validateTemporalSandboxClient } from './sandbox-client';
 
 /**
  * Checks an agent graph before a run, without changing it: the agents reached through handoffs and
@@ -51,8 +54,8 @@ const runningAgentCheckState = Symbol.for('@temporalio/openai-agents/runningAgen
  * `Handoff`'s callback returns, or that an `agent.on(...)` listener changes, isn't in the graph
  * `checkAgent` sees before the run. Upstream calls `getSystemPrompt` once per model call, after it
  * picks the model and before it calls it, so the wrapper rejects a `Model` object and unsafe
- * `asTool()` tools there. The agents behind those tools are checked when they run, and the tools'
- * options again when they are invoked.
+ * `asTool()` tools there. The agents behind those tools are checked when they run, and the config
+ * their nested runs use when those runs start.
  */
 export function installRunningAgentCheck(): void {
   const prototype = Agent.prototype as unknown as Record<symbol, RunningAgentCheckState | undefined>;
@@ -70,6 +73,76 @@ export function installRunningAgentCheck(): void {
 }
 
 installRunningAgentCheck();
+
+interface RunnerCheckState {
+  original: (this: Runner, agent: Agent<any, any>, input: unknown, options?: RunOptionsLike) => Promise<unknown>;
+}
+
+interface RunOptionsLike {
+  session?: unknown;
+  sandbox?: SandboxRunConfig;
+}
+
+const runnerCheckState = Symbol.for('@temporalio/openai-agents/runnerCheck');
+
+/**
+ * Checks what each `Runner` run in the Workflow uses, as it starts: the runner's own, and the one
+ * upstream builds for each `agent.asTool()` call. Upstream builds that nested config only then, after
+ * the tool's schema, its `inputBuilder` and any listener ran, and spreads the tool's `runConfig` over
+ * what it inherits, so this is the one place that sees the provider, model, session and sandbox the
+ * run uses. The model provider must be the runner's, which sends model calls to Activities. The run
+ * gets a frozen copy of its sandbox config, which upstream reads as it goes, so a later change to the
+ * caller's object, such as an `agent_start` listener's, doesn't reach it.
+ */
+export function installRunnerCheck(): void {
+  const prototype = Runner.prototype as unknown as Record<symbol, RunnerCheckState | undefined>;
+  if (prototype[runnerCheckState] !== undefined) return;
+  const state: RunnerCheckState = { original: Runner.prototype.run as RunnerCheckState['original'] };
+  async function run(this: Runner, agent: Agent<any, any>, input: unknown, options?: RunOptionsLike) {
+    if (!inWorkflowContext()) return state.original.call(this, agent, input, options);
+    const where = `The run of agent '${agent.name}'`;
+    if (!(this.config.modelProvider instanceof ActivityBackedModelProvider)) {
+      throw ApplicationFailure.create({
+        message:
+          `${where} has a model provider that would call models in the Workflow. Run agents with ` +
+          "TemporalOpenAIRunner, and don't set or clear runConfig.modelProvider in agent.asTool().",
+        type: 'AgentsWorkflowError',
+        nonRetryable: true,
+      });
+    }
+    const { model } = this.config;
+    if (model !== undefined && typeof model !== 'string') {
+      throw ApplicationFailure.create({
+        message:
+          `${where} has a Model object as runConfig.model. In Temporal workflows, all models must be ` +
+          'specified as strings.',
+        type: 'AgentsWorkflowError',
+        nonRetryable: true,
+      });
+    }
+    if (options?.session instanceof MemorySession) {
+      throw ApplicationFailure.create({
+        message:
+          `${where} has a MemorySession, which is not safe inside a Workflow. ` +
+          'Pass WorkflowSafeMemorySession from @temporalio/openai-agents/workflow.',
+        type: 'UnsafeSessionError',
+        nonRetryable: true,
+      });
+    }
+    // Upstream uses `options.sandbox ?? config.sandbox`, and passes the same to nested runs.
+    const sandbox = options?.sandbox ?? this.config.sandbox;
+    if (sandbox === undefined) return state.original.call(this, agent, input, options);
+    validateTemporalSandboxClient(
+      sandbox,
+      `${where} ${options?.sandbox !== undefined ? 'runOptions.sandbox' : 'runConfig.sandbox'}`
+    );
+    return state.original.call(this, agent, input, { ...options, sandbox: Object.freeze({ ...sandbox }) });
+  }
+  Object.defineProperty(Runner.prototype, runnerCheckState, { value: state });
+  Runner.prototype.run = run as typeof Runner.prototype.run;
+}
+
+installRunnerCheck();
 
 /**
  * Rejects a raw function, an unrecorded `asTool()` tool, and `asTool()` options that would run in the

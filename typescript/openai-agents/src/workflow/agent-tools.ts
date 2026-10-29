@@ -1,7 +1,6 @@
 import { Agent, MemorySession, type AgentTool, type AgentToolOptions, type Tool } from '@openai/agents-core';
 import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
-import { inWorkflowContext } from '@temporalio/workflow';
 import { validateTemporalSandboxClient } from './sandbox-client';
 
 type AnyAgentTool = AgentTool<any, any, any>;
@@ -33,36 +32,17 @@ function getState(): InterceptionState | undefined {
  * installs it before the Workflow module loads; loading this module, which the runner imports,
  * installs it too.
  *
- * Upstream keeps the `runConfig` and `runOptions` objects and reads them only when the tool runs,
- * so a listener or `inputBuilder` can change them after the run's checks. The tool checks them
- * again when it is invoked, and after `inputBuilder`, the last caller code before upstream reads them.
+ * Upstream keeps the `runConfig` and `runOptions` objects and reads them only when the tool runs, so
+ * a listener, `inputBuilder` or schema can change them after these checks. The nested `Runner`'s run
+ * checks what it actually uses (see `installRunnerCheck`).
  */
 export function installAgentToolInterception(): void {
   if (getState() !== undefined) return;
   const state: InterceptionState = { original: Agent.prototype.asTool as any, records: new WeakMap() };
   function asTool(this: Agent<any, any>, options: AnyAgentToolOptions): AnyAgentTool {
     // Upstream reads its options when the tool is made, so record them then too.
-    const record: AgentToolRecord = { agent: this, runConfig: options.runConfig, runOptions: options.runOptions };
-    const { inputBuilder } = options;
-    const tool = state.original.call(
-      this,
-      inputBuilder === undefined
-        ? options
-        : {
-            ...options,
-            inputBuilder: async (...args: Parameters<typeof inputBuilder>) => {
-              const input = await inputBuilder(...args);
-              checkInWorkflow(record, tool.name);
-              return input;
-            },
-          }
-    );
-    const invoke = tool.invoke;
-    tool.invoke = function (this: unknown, ...args: Parameters<typeof invoke>) {
-      checkInWorkflow(record, tool.name);
-      return invoke.apply(this, args);
-    };
-    state.records.set(tool, record);
+    const tool = state.original.call(this, options);
+    state.records.set(tool, { agent: this, runConfig: options.runConfig, runOptions: options.runOptions });
     return tool;
   }
   Object.defineProperty(Agent.prototype, interceptionState, { value: state });
@@ -87,14 +67,12 @@ export function isUnrecordedAgentTool(tool: Tool<any>): boolean {
   );
 }
 
-function checkInWorkflow(record: AgentToolRecord, toolName: string): void {
-  if (inWorkflowContext()) checkAgentToolOptions(record, toolName);
-}
-
 /** Rejects `asTool()` options that would run model calls or sandbox operations in the Workflow. */
 export function checkAgentToolOptions({ agent, runConfig, runOptions }: AgentToolRecord, toolName: string): void {
   const where = `Agent '${agent.name}' asTool('${toolName}')`;
-  if (runConfig?.modelProvider !== undefined) {
+  // Upstream spreads runConfig over the inherited config, so even `modelProvider: undefined`
+  // replaces the runner's provider.
+  if (runConfig !== undefined && Object.prototype.hasOwnProperty.call(runConfig, 'modelProvider')) {
     throw ApplicationFailure.create({
       message:
         `${where} sets runConfig.modelProvider. Nested runs must use the runner's provider, which ` +

@@ -1,10 +1,11 @@
 import test from 'ava';
-import { Agent, MemorySession, RunContext, handoff } from '@openai/agents-core';
+import { Agent, MemorySession, RunContext, Runner, handoff } from '@openai/agents-core';
 import { SandboxAgent } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import { getAgentToolRecord, installAgentToolInterception } from '../workflow/agent-tools';
-import { checkAgent, installRunningAgentCheck } from '../workflow/check-agent';
+import { checkAgent, installRunnerCheck, installRunningAgentCheck } from '../workflow/check-agent';
 import { temporalSandboxClient } from '../workflow/sandbox-client';
+import { textResponse } from './stubs/openai-agents';
 
 test('checkAgent: raw function in tools throws AgentsWorkflowError', (t) => {
   const rawFn = function someTool() {
@@ -89,6 +90,19 @@ test('installRunningAgentCheck: installing again keeps one wrapper, which checks
   t.is(await agent.getSystemPrompt(new RunContext()), 'Answer.');
 });
 
+test('installRunnerCheck: installing again keeps one wrapper, which checks nothing outside a Workflow', async (t) => {
+  const run = Runner.prototype.run;
+  installRunnerCheck();
+  t.is(Runner.prototype.run, run);
+  const fakeModel = {
+    getResponse: async () => textResponse('done'),
+    async *getStreamedResponse() {},
+  };
+  // Outside a Workflow, a Runner with another provider and a Model object runs as upstream.
+  const runner = new Runner({ modelProvider: { getModel: () => fakeModel as any }, model: fakeModel as any });
+  t.is((await runner.run(new Agent({ name: 'X' }), 'hi')).finalOutput, 'done');
+});
+
 test('checkAgent: asTool() agents and their own tools are checked, and nothing is changed', (t) => {
   const rawFn = function () {};
   const inner = new Agent({ name: 'Inner', model: 'inner-model', tools: [rawFn as any] });
@@ -117,6 +131,8 @@ test('checkAgent: asTool() options that would run in the Workflow are rejected',
   };
   t.is(rejected({ runConfig: { model: { getResponse: async () => ({}) } } }).type, 'AgentsWorkflowError');
   t.is(rejected({ runConfig: { modelProvider: { getModel: () => ({}) } } }).type, 'AgentsWorkflowError');
+  // Upstream spreads runConfig over the inherited config, so this clears the runner's provider.
+  t.is(rejected({ runConfig: { modelProvider: undefined } }).type, 'AgentsWorkflowError');
   t.is(rejected({ runConfig: { sandbox: {} } }).type, 'SandboxConfigurationError');
   t.is(rejected({ runOptions: { session: new MemorySession() } }).type, 'UnsafeSessionError');
 
