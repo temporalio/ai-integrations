@@ -127,7 +127,7 @@ def _generated_class_doc(cls: type) -> str | None:
                     cls, annotation_format=annotationlib.Format.FORWARDREF
                 )
             else:
-                signature = inspect.signature(cls)
+                signature = inspect.signature(cls)  # type: ignore[reportUnreachable]
         except (TypeError, ValueError):
             return cls.__name__
         return cls.__name__ + str(signature).replace(" -> None", "")
