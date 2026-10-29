@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Annotated, Any
+from typing import Annotated, Any, NotRequired
 
 import pytest
 
@@ -46,7 +46,9 @@ INVOKE_TOOL = "deepagents.invoke_tool"
 # the name against this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
-from langchain_core.messages import HumanMessage, ToolMessage  # noqa: E402
+from langchain.agents import AgentState  # noqa: E402
+from langchain.agents.middleware import AgentMiddleware  # noqa: E402
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage  # noqa: E402
 from langchain_core.tools import tool  # noqa: E402
 from langgraph.prebuilt import InjectedState  # noqa: E402
 from pydantic import BaseModel, ConfigDict  # noqa: E402
@@ -58,7 +60,7 @@ def pairing_weather(city: str) -> str:
 
 
 @tool
-def last_user_message(state: Annotated[dict, InjectedState]) -> str:
+async def last_user_message(state: Annotated[dict, InjectedState]) -> str:
     """Return the last user message from the conversation."""
     for message in reversed(state["messages"]):
         if isinstance(message, HumanMessage):
@@ -67,7 +69,7 @@ def last_user_message(state: Annotated[dict, InjectedState]) -> str:
 
 
 @tool
-def message_summary(state: Annotated[dict, InjectedState]) -> str:
+async def message_summary(state: Annotated[dict, InjectedState]) -> str:
     """List the conversation's message types and contents."""
     return ",".join(
         f"{type(m).__name__}:{getattr(m, 'content', '?')}" for m in state["messages"]
@@ -75,19 +77,40 @@ def message_summary(state: Annotated[dict, InjectedState]) -> str:
 
 
 @tool
-def saved_artifact(state: Annotated[dict, InjectedState]) -> str:
+async def saved_artifact(state: Annotated[dict, InjectedState]) -> str:
     """Return the first tool result's artifact."""
     for message in state["messages"]:
         if isinstance(message, ToolMessage):
             artifact = message.artifact
-            return f"{type(artifact).__name__}:{artifact['page_content']}"
+            return f"{type(artifact).__name__}:{getattr(artifact, 'page_content', '?')}"
     return "No tool results found"
 
 
 @tool
-def echo_record(record: dict) -> str:
+async def echo_record(record: dict) -> str:
     """Echo a record's tenant and marker fields."""
     return f"{record['tenant']}:{record['__deepagents_tool_arg__']}"
+
+
+class CitedMessage(AIMessage):
+    source: str
+
+
+class NotesState(AgentState):
+    notes: NotRequired[list[CitedMessage]]
+
+
+class NotesMiddleware(AgentMiddleware[NotesState]):
+    state_schema = NotesState
+
+
+@tool
+async def note_sources(state: Annotated[NotesState, InjectedState]) -> str:
+    """List the notes' types and sources."""
+    return ",".join(
+        f"{type(n).__name__}:{getattr(n, 'source', '?')}"
+        for n in state.get("notes", [])
+    )
 
 
 class Record(BaseModel):
@@ -96,7 +119,7 @@ class Record(BaseModel):
 
 
 @tool
-def echo_model(record: Record) -> str:
+async def echo_model(record: Record) -> str:
     """Echo a typed record's tenant and marker fields."""
     return f"{record.tenant}:{(record.model_extra or {})['__deepagents_tool_arg__']}"
 
@@ -230,7 +253,7 @@ class RepeatedToolCallWorkflow:
 @workflow.defn
 class InjectedStateToolWorkflow:
     @workflow.run
-    async def run(self, question: str) -> list[str]:
+    async def run(self, question: str, wrap: bool) -> list[str]:
         with workflow.unsafe.imports_passed_through():
             from langchain_core.documents import Document
             from langchain_core.messages import AIMessage, ChatMessage, FunctionMessage
@@ -241,12 +264,17 @@ class InjectedStateToolWorkflow:
             saved_artifact,
             echo_record,
             echo_model,
+            note_sources,
         )
         tools = [
             tool_as_activity(t, start_to_close_timeout=timedelta(seconds=10))
+            if wrap
+            else t
             for t in wrapped
         ]
-        agent = create_deep_agent(model="fake:model", tools=tools)
+        agent = create_deep_agent(
+            model="fake:model", tools=tools, middleware=[NotesMiddleware()]
+        )
         save_call = {"name": "save", "args": {}, "id": "save-call"}
         messages = [
             ChatMessage(role="critic", content="be brief"),
@@ -259,7 +287,8 @@ class InjectedStateToolWorkflow:
             ),
             HumanMessage(content=question),
         ]
-        result = await agent.ainvoke({"messages": messages})
+        notes = [CitedMessage(content="see notes", source="wiki")]
+        result = await agent.ainvoke({"messages": messages, "notes": notes})
         return [
             str(m.content)
             for m in result["messages"]
@@ -268,11 +297,10 @@ class InjectedStateToolWorkflow:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wrap", [False, True])
 async def test_wrapped_tool_reads_messages_from_injected_state(
-    env: WorkflowEnvironment,
+    env: WorkflowEnvironment, wrap: bool
 ) -> None:
-    from langchain_core.messages import AIMessage
-
     # Arguments that hold the marker key an earlier version of the encoding
     # used, as a dict or as a model, reach the tool unchanged.
     record = {"tenant": "keep", "__deepagents_tool_arg__": "ordinary value"}
@@ -282,6 +310,7 @@ async def test_wrapped_tool_reads_messages_from_injected_state(
         {"name": "saved_artifact", "args": {}, "id": "artifact-call"},
         {"name": "echo_record", "args": {"record": record}, "id": "record-call"},
         {"name": "echo_model", "args": {"record": record}, "id": "model-call"},
+        {"name": "note_sources", "args": {}, "id": "notes-call"},
     ]
     responses = [AIMessage(content="", tool_calls=calls), AIMessage(content="done")]
     plugin = DeepAgentsPlugin(model_provider=mock_model_provider(responses))
@@ -293,21 +322,23 @@ async def test_wrapped_tool_reads_messages_from_injected_state(
     ):
         out = await env.client.execute_workflow(
             InjectedStateToolWorkflow.run,
-            "Weather in Paris?",
+            args=["Weather in Paris?", wrap],
             id=f"da-injected-state-{uuid.uuid4()}",
             task_queue="da-injected-state",
         )
 
-    # The wrapped tools get LangChain messages, including the legacy chat and
-    # function messages, as they do without Temporal. A message's other fields,
-    # such as the tool result's Document artifact, keep their JSON form.
+    # The wrapped tools get what the same tools get without Temporal: LangChain
+    # messages, including the legacy chat and function messages, the tool
+    # result's Document artifact and a message subclass the tool's state
+    # annotation names.
     assert out == [
         "user said: Weather in Paris?",
         "ChatMessage:be brief,FunctionMessage:sunny,AIMessage:,ToolMessage:saved,"
         "HumanMessage:Weather in Paris?,AIMessage:",
-        "dict:notes",
+        "Document:notes",
         "keep:ordinary value",
         "keep:ordinary value",
+        "CitedMessage:wiki",
     ]
 
 
@@ -334,7 +365,7 @@ async def test_invoke_tool_rebuilds_only_recorded_messages(recorded: bool) -> No
         tool_name="message_summary", tool_call_id="c-1", args=args
     )
     if recorded:
-        input.arg_messages = _serde.find_tool_arg_messages(args)
+        input.arg_messages = _serde.find_tool_arg_messages(args, {})
     output = await ActivityEnvironment().run(
         DeepAgentActivities().invoke_tool, send(input)
     )
@@ -355,10 +386,10 @@ async def test_invoke_tool_rebuilds_only_recorded_messages(recorded: bool) -> No
             tool_name="message_summary",
             tool_call_id="c-2",
             args={"chunks": chunks},
-            arg_messages=_serde.find_tool_arg_messages({"chunks": chunks}),
+            arg_messages=_serde.find_tool_arg_messages({"chunks": chunks}, {}),
         )
         sent = send(input)
-        rebuilt = _serde.load_tool_arg_messages(sent.args, sent.arg_messages)
+        rebuilt = _serde.load_tool_arg_messages(sent.args, sent.arg_messages, {})
         assert rebuilt == {"chunks": chunks}
 
 

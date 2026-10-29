@@ -168,11 +168,14 @@ activity on every worker polling its task queue.
 A wrapped tool gets LangChain messages in its arguments as message objects, as
 it does without Temporal. For example, `state["messages"]` from `InjectedState`
 holds `HumanMessage` and `AIMessage` objects, not dicts. This covers the message
-classes in `langchain_core.messages` and their chunks; a subclass you define
-still arrives as a dict. Values inside a message, such as a `ToolMessage`
-artifact, keep their JSON form, so a `Document` artifact arrives as a dict.
-Update activity workers before or together with workflow workers: an older
-activity worker still passes the messages to the tool as dicts.
+classes in `langchain_core.messages`, their chunks and `Document`, also nested,
+such as a `Document` artifact in a `ToolMessage`. Other Pydantic classes, such
+as a message subclass you define, arrive as objects when the tool's argument
+annotations name them, for example
+`notes: Annotated[list[CitedMessage], InjectedState("notes")]` or a state
+schema with a `CitedMessage` field. Otherwise they arrive as dicts. Update
+activity workers before or together with workflow workers: an older activity
+worker still passes the messages to the tool as dicts.
 
 ## Durable file and shell backends
 

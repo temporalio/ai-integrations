@@ -139,9 +139,13 @@ async def call_tool(
     activity_input: _activity.ToolActivityInput,
     *,
     summary: str,
+    arg_types: Mapping[str, Any] | None = None,
     **opts: Any,
 ) -> _activity.ToolActivityOutput:
-    """Dispatch one tool call as its own Activity."""
+    """Dispatch one tool call as its own Activity.
+
+    ``arg_types`` comes from ``_serde.tool_arg_types`` for the wrapped tool.
+    """
     legacy_key, hit, cached = _legacy_lookup(
         "tool", activity_input.tool_name, activity_input.args
     )
@@ -149,7 +153,9 @@ async def call_tool(
         return _activity.ToolActivityOutput(message=cached)
     activity_input = dataclasses.replace(
         activity_input,
-        arg_messages=_serde.find_tool_arg_messages(activity_input.args),
+        arg_messages=_serde.find_tool_arg_messages(
+            activity_input.args, arg_types or {}
+        ),
     )
     output = await workflow.execute_activity(
         _activity.INVOKE_TOOL,

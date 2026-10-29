@@ -38,8 +38,10 @@ import json
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from langchain_core.messages import BaseMessage
+    from collections.abc import Mapping
+
     from langchain_core.runnables import RunnableConfig
+    from pydantic import BaseModel
 
 from temporalio.contrib.pydantic import PydanticPayloadConverter, ToJsonOptions
 from temporalio.converter import DataConverter, DefaultPayloadConverter
@@ -153,13 +155,19 @@ def load_object(data: Any) -> Any:
     return load(data)
 
 
-def _tool_arg_message_classes() -> tuple[type[BaseMessage], ...]:
-    """The message classes :func:`find_tool_arg_messages` records.
+def _qualified_name(cls: type) -> str:
+    return f"{cls.__module__}:{cls.__qualname__}"
+
+
+def _tool_arg_classes() -> tuple[type[BaseModel], ...]:
+    """The built-in classes :func:`find_tool_arg_messages` records.
 
     Every class in ``langchain_core.messages``, including ``ChatMessage``,
-    ``FunctionMessage`` and the chunks. Subclasses outside this list keep
-    today's encoding.
+    ``FunctionMessage`` and the chunks, and ``Document``. Other classes are
+    recorded only when the tool's annotations name them; see
+    :func:`tool_arg_types`.
     """
+    from langchain_core.documents import Document
     from langchain_core.messages import (
         AIMessage,
         AIMessageChunk,
@@ -190,49 +198,113 @@ def _tool_arg_message_classes() -> tuple[type[BaseMessage], ...]:
         SystemMessageChunk,
         ToolMessage,
         ToolMessageChunk,
+        Document,
     )
 
 
+def tool_arg_types(tool: Any) -> dict[str, type[BaseModel]]:
+    """The Pydantic classes a tool's argument schema checks its arguments against.
+
+    For example ``CitedMessage`` in
+    ``Annotated[list[CitedMessage], InjectedState("notes")]``, also inside a
+    state schema or another such class. They come from the schema Pydantic
+    built, so they are the classes LangChain validates the arguments with, even
+    for a tool registered from inside the workflow sandbox. Each is keyed by
+    module and qualified name, which also matches the sandbox's copy of the
+    class. The built-in classes are left out; they are always rebuilt.
+    """
+    from pydantic import BaseModel
+
+    schema = getattr(tool, "args_schema", None)
+    if not (isinstance(schema, type) and issubclass(schema, BaseModel)):
+        return {}
+    skip = (*_tool_arg_classes(), schema)
+    found: dict[str, type[BaseModel]] = {}
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            cls = node.get("cls")
+            if (
+                node.get("type") == "model"
+                and isinstance(cls, type)
+                and issubclass(cls, BaseModel)
+                and cls not in skip
+            ):
+                found[_qualified_name(cls)] = cls
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                visit(value)
+
+    visit(schema.__pydantic_core_schema__)
+    return found
+
+
+def _tool_arg_class_name(cls: type, types: Mapping[str, type[BaseModel]]) -> str | None:
+    """The name :func:`find_tool_arg_messages` records for ``cls``, if any.
+
+    A built-in class is recorded by its name, a class from ``types`` by its
+    module and qualified name.
+    """
+    if cls in _tool_arg_classes():
+        return cls.__name__
+    name = _qualified_name(cls)
+    return name if name in types else None
+
+
 def find_tool_arg_messages(
-    value: Any, path: tuple[str | int, ...] = ()
+    value: Any,
+    types: Mapping[str, type[BaseModel]],
+    path: tuple[str | int, ...] = (),
 ) -> list[tuple[list[str | int], str]]:
     """Find the LangChain messages in a wrapped tool's arguments.
 
     A tool can read the conversation from injected state, so its arguments can
     hold messages. The Pydantic converter writes each one as a plain dict, so
     the activity cannot tell it was a message. This returns the path and class
-    name of each message in nested lists, tuples and string-keyed dicts, for
-    :func:`load_tool_arg_messages` to rebuild. The arguments themselves are sent
-    unchanged.
+    name of each message, ``Document`` and ``types`` value (see
+    :func:`tool_arg_types`) in nested lists, tuples, string-keyed dicts and the
+    fields of those values, for :func:`load_tool_arg_messages` to rebuild. The
+    arguments themselves are sent unchanged.
     """
-    if type(value) in _tool_arg_message_classes():
-        return [(list(path), type(value).__name__)]
     found: list[tuple[list[str | int], str]] = []
-    if isinstance(value, (list, tuple)):
+    name = _tool_arg_class_name(type(value), types)
+    if name is not None:
+        found.append((list(path), name))
+        # The converter writes only the fields that were set, extras included.
+        fields = {**vars(value), **(value.model_extra or {})}
+        for key, item in fields.items():
+            if key in value.model_fields_set:
+                found.extend(find_tool_arg_messages(item, types, (*path, key)))
+    elif isinstance(value, (list, tuple)):
         for i, item in enumerate(value):
-            found.extend(find_tool_arg_messages(item, (*path, i)))
+            found.extend(find_tool_arg_messages(item, types, (*path, i)))
     elif isinstance(value, dict):
         for key, item in value.items():
             if isinstance(key, str):
-                found.extend(find_tool_arg_messages(item, (*path, key)))
+                found.extend(find_tool_arg_messages(item, types, (*path, key)))
     return found
 
 
 def load_tool_arg_messages(
-    args: dict[str, Any], messages: list[tuple[list[str | int], str]]
+    args: dict[str, Any],
+    messages: list[tuple[list[str | int], str]],
+    types: Mapping[str, type[BaseModel]],
 ) -> dict[str, Any]:
-    """Rebuild the messages :func:`find_tool_arg_messages` found in ``args``.
+    """Rebuild the values :func:`find_tool_arg_messages` found in ``args``.
 
-    Each recorded value is validated as its message class, so its other fields,
-    such as a ``ToolMessage`` artifact, keep the converter's form. Every other
-    value is returned unchanged.
+    Each recorded value is validated as its class, innermost first, so a
+    ``Document`` artifact is an object before its ``ToolMessage`` is rebuilt.
+    Every other value is returned unchanged.
     """
-    classes = {cls.__name__: cls for cls in _tool_arg_message_classes()}
+    classes = {cls.__name__: cls for cls in _tool_arg_classes()}
+    classes.update(types)
     args = copy.deepcopy(args)
-    for path, name in messages:
+    for path, name in sorted(messages, key=lambda m: -len(m[0])):
         cls = classes.get(name)
         if cls is None:
-            raise ValueError(f"Unknown tool argument message class {name!r}")
+            raise ValueError(f"Unknown tool argument class {name!r}")
         parent: Any = args
         for key in path[:-1]:
             parent = parent[key]
