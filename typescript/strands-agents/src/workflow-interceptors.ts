@@ -1,5 +1,5 @@
 import type { WorkflowInterceptorsFactory } from '@temporalio/workflow';
-import { rewriteTerminalError } from './failure-converter';
+import { rewriteTerminalError } from './strands-errors';
 
 async function rethrowTerminalError<T>(run: () => Promise<T>): Promise<T> {
   try {
