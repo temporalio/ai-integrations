@@ -112,6 +112,8 @@ Passing `retryStrategy` to `new TemporalAgent(...)` throws; remove the argument 
 
 The plugin makes Strands' terminal errors (`ContextWindowOverflowError`, `MaxTokensError` and `StructuredOutputError`) non-retryable. Its activity interceptor does this for a `ContextWindowOverflowError` from the model activity, and for any of the three that your own activity throws. The agent throws `MaxTokensError` and `StructuredOutputError` in workflow code, where the plugin's workflow interceptor does it: the run fails, or the update is rejected, with a failure of that type, instead of the workflow task failing on every attempt.
 
+The workflow interceptor wraps every signal and update handler, so a handler counts as finished a little later than in earlier versions. A run that started before you deploy this version and whose code depends on that moment, for example by checking `allHandlersFinished()` right after a handler runs, can take another path on replay and fail with a nondeterminism error. Let those runs finish first, or use Worker Versioning.
+
 ## Snapshots
 
 `TemporalAgent.takeSnapshot()` and `TemporalAgent.loadSnapshot()` throw. Temporal's event history already persists workflow state durably at a finer granularity than Strands snapshots, so calling either inside a workflow is redundant.
