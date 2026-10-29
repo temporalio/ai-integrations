@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from contextlib import AsyncExitStack
 from datetime import timedelta
 from typing import Any
 
@@ -14,6 +15,7 @@ from agents import (
     TracingProcessor,
     custom_span,
     function_tool,
+    set_tracing_disabled,
     trace,
 )
 from agents.tracing import get_trace_provider
@@ -53,7 +55,7 @@ from temporalio.worker.workflow_sandbox import (
     SandboxedWorkflowRunner,
     SandboxRestrictions,
 )
-from tests.helpers import assert_event_subsequence, new_worker
+from tests.helpers import assert_event_subsequence, assert_eventually, new_worker
 from tests.test_openai import (
     ResearchWorkflow,
     research_mock_model,
@@ -292,7 +294,474 @@ async def test_tracing(client: Client):
         )
 
 
-async def test_tracing_disabled_before_worker(client: Client):
+async def assert_installed_providers(count: int) -> None:
+    provider = get_trace_provider()
+    installed = 0
+    while isinstance(provider, TemporalTraceProvider):
+        installed += 1
+        provider = provider._original_provider
+    assert installed == count
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+@pytest.mark.parametrize("change", ["none", "enable", "disable"])
+async def test_tracing_disabled_before_worker(
+    client: Client, workers: int, change: str
+):
+    # "none" disables tracing before the Workers start, "enable" also turns it back on once
+    # they run, and "disable" turns it off only once they run. Every Worker installs its own
+    # provider over the previous one, so two Workers nest two providers.
+    provider = get_trace_provider()
+    processor = MemoryTracingProcessor()
+    processor.trace_events.clear()
+    processor.span_events.clear()
+    provider.set_processors([processor])
+    provider.set_disabled(change != "disable")
+    try:
+        async with AgentEnvironment(model=research_mock_model()) as env:
+            client = env.applied_on_client(client)
+            async with AsyncExitStack() as stack:
+                started = [
+                    await stack.enter_async_context(
+                        new_worker(client, ResearchWorkflow)
+                    )
+                    for _ in range(workers)
+                ]
+                # A Worker installs its provider once it runs, after it is entered.
+                await assert_eventually(lambda: assert_installed_providers(workers))
+                if change != "none":
+                    set_tracing_disabled(change == "disable")
+                await client.execute_workflow(
+                    ResearchWorkflow.run,
+                    "Caribbean vacation spots in April",
+                    id=f"research-workflow-{uuid.uuid4()}",
+                    task_queue=started[0].task_queue,
+                    execution_timeout=timedelta(seconds=120),
+                )
+        if change == "enable":
+            # Without a client trace these defaults start no spans, only the trace.
+            assert processor.trace_events
+        else:
+            assert processor.trace_events == []
+            assert processor.span_events == []
+    finally:
+        provider.set_disabled(False)
+        provider.set_processors([])
+        processor.trace_events.clear()
+        processor.span_events.clear()
+
+
+@pytest.mark.parametrize("change", ["disable", "enable"])
+@pytest.mark.usefixtures("reset_otel_tracer_provider")
+async def test_tracing_disabled_inside_open_trace(client: Client, change: str) -> None:
+    # "disable" turns tracing off inside an open trace and span, and "enable" turns it
+    # back on inside a trace started while it was off. As in the Agents SDK, a trace or
+    # span reports both its start and end if it was created while tracing was on, and
+    # neither otherwise, so the OpenTelemetry context is restored either way.
+    exporter = set_test_tracer_provider()
+    provider = get_trace_provider()
+    provider.set_disabled(change == "enable")
+    try:
+        async with AgentEnvironment(
+            model=research_mock_model(), use_otel_instrumentation=True
+        ) as env:
+            client = env.applied_on_client(client)
+            # Code outside Workflows in a Worker process, such as an Activity's, uses the
+            # Worker's provider too.
+            async with new_worker(client, SimpleWorkflow):
+                await assert_eventually(lambda: assert_installed_providers(1))
+                processor = openinference_processor()
+                previous_context = opentelemetry.context.get_current()
+                with trace("Open trace"):
+                    with custom_span("Open span"):
+                        set_tracing_disabled(change == "disable")
+                        with custom_span("Inner span"):
+                            pass
+                assert opentelemetry.context.get_current() is previous_context
+                assert not processor._root_spans
+                assert not processor._otel_spans
+                assert not processor._tokens
+    finally:
+        provider.set_disabled(False)
+    names = {span.name for span in exporter.get_finished_spans()}
+    assert names == ({"Open trace", "Open span"} if change == "disable" else set())
+
+
+@activity.defn
+async def enable_tracing_activity() -> None:
+    set_tracing_disabled(False)
+
+
+@activity.defn
+async def secret_span_activity() -> None:
+    with custom_span("Activity span", data={"prompt": "SECRET"}):
+        pass
+
+
+@workflow.defn
+class ReenabledInsideTraceWorkflow:
+    @workflow.run
+    async def run(self) -> None:
+        with trace("Workflow trace"):
+            await workflow.execute_activity(
+                enable_tracing_activity, start_to_close_timeout=timedelta(seconds=10)
+            )
+            with custom_span("Local span"):
+                await workflow.execute_activity(
+                    secret_span_activity, start_to_close_timeout=timedelta(seconds=10)
+                )
+
+
+@pytest.mark.parametrize("cached", [True, False])
+@pytest.mark.parametrize("add_temporal_spans", [True, False])
+@pytest.mark.parametrize("disabled", [True, False])
+async def test_tracing_reenabled_inside_propagated_trace(
+    client: Client, add_temporal_spans: bool, disabled: bool, cached: bool
+) -> None:
+    # With tracing disabled before the Worker starts, the Workflow trace reports nothing, and
+    # neither do its descendants after the first Activity turns tracing back on: the local
+    # span, and the Activity's spans under the context the Activity rebuilds from the headers.
+    # Without a Workflow cache, the Workflow is rebuilt from history after each Activity, with
+    # tracing back on, and makes the decisions it made before.
+    provider = get_trace_provider()
+    processor = MemoryTracingProcessor()
+    processor.trace_events.clear()
+    processor.span_events.clear()
+    provider.set_processors([processor])
+    provider.set_disabled(disabled)
+    try:
+        async with AgentEnvironment(
+            model=research_mock_model(), add_temporal_spans=add_temporal_spans
+        ) as env:
+            client = env.applied_on_client(client)
+            async with new_worker(
+                client,
+                ReenabledInsideTraceWorkflow,
+                activities=[enable_tracing_activity, secret_span_activity],
+                max_cached_workflows=1000 if cached else 0,
+            ) as worker:
+                await assert_eventually(lambda: assert_installed_providers(1))
+                handle = await client.start_workflow(
+                    ReenabledInsideTraceWorkflow.run,
+                    id=f"reenabled-workflow-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                    execution_timeout=timedelta(seconds=120),
+                )
+                await handle.result()
+                # A trace started now, with tracing back on, still reports.
+                with trace("Independent trace"):
+                    with custom_span("Independent span"):
+                        pass
+                history = await handle.fetch_history()
+        trace_names = {t.name for t, _ in processor.trace_events}
+        span_names = {
+            s.span_data.export().get("name") for s, _ in processor.span_events
+        }
+        if disabled:
+            assert trace_names == {"Independent trace"}
+            assert span_names == {"Independent span"}
+        else:
+            assert {"Workflow trace", "Independent trace"} <= trace_names
+            assert {"Local span", "Activity span", "Independent span"} <= span_names
+        # Whatever reports, reports both its start and its end, also across rebuilds.
+        trace_ids = [(t.trace_id, start) for t, start in processor.trace_events]
+        span_ids = [(s.span_id, start) for s, start in processor.span_events]
+        for events in (trace_ids, span_ids):
+            assert sorted(i for i, start in events if start) == sorted(
+                i for i, start in events if not start
+            )
+        # The Workflow trace, created with tracing disabled, leaves a patch marker in history.
+        # Its descendants follow it and need none.
+        markers = [
+            e for e in history.events if e.HasField("marker_recorded_event_attributes")
+        ]
+        assert len(markers) == (1 if disabled else 0)
+    finally:
+        provider.set_disabled(False)
+        provider.set_processors([])
+        processor.trace_events.clear()
+        processor.span_events.clear()
+
+
+@workflow.defn
+class SignaledWorkflow:
+    def __init__(self) -> None:
+        self.signals = 0
+        self.done = False
+
+    @workflow.run
+    async def run(self) -> None:
+        await workflow.wait_condition(
+            lambda: self.done and workflow.all_handlers_finished()
+        )
+
+    @workflow.signal
+    async def step(self) -> None:
+        self.signals += 1
+        with custom_span("Signal span"):
+            await workflow.wait_condition(lambda: self.done)
+            await workflow.execute_activity(
+                secret_span_activity, start_to_close_timeout=timedelta(seconds=10)
+            )
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.done = True
+
+    @workflow.query
+    def received(self) -> int:
+        return self.signals
+
+
+@pytest.mark.parametrize("cached", [True, False])
+async def test_tracing_reenabled_between_signals(client: Client, cached: bool) -> None:
+    # Two signals carry the same client trace, so the Workflow rebuilds a trace with the same
+    # ID for each. Tracing is disabled before the Worker starts and turned back on between
+    # them: what the first signal starts reports nothing, and what the second starts reports,
+    # also when the Workflow is rebuilt from history. Without temporal spans the client sends
+    # no span of its own, so the headers carry only the client trace, which reports.
+    provider = get_trace_provider()
+    processor = MemoryTracingProcessor()
+    processor.trace_events.clear()
+    processor.span_events.clear()
+    provider.set_processors([processor])
+    try:
+        with trace("Client trace"):
+            provider.set_disabled(True)
+            async with AgentEnvironment(
+                model=research_mock_model(), add_temporal_spans=False
+            ) as env:
+                client = env.applied_on_client(client)
+                async with new_worker(
+                    client,
+                    SignaledWorkflow,
+                    activities=[secret_span_activity],
+                    max_cached_workflows=1000 if cached else 0,
+                ) as worker:
+                    await assert_eventually(lambda: assert_installed_providers(1))
+                    handle = await client.start_workflow(
+                        SignaledWorkflow.run,
+                        id=f"signaled-workflow-{uuid.uuid4()}",
+                        task_queue=worker.task_queue,
+                        execution_timeout=timedelta(seconds=120),
+                    )
+                    for count in (1, 2):
+                        if count == 2:
+                            set_tracing_disabled(False)
+                        await handle.signal(SignaledWorkflow.step)
+
+                        async def received(count: int = count) -> None:
+                            assert (
+                                await handle.query(SignaledWorkflow.received) == count
+                            )
+
+                        await assert_eventually(received)
+                    await handle.signal(SignaledWorkflow.finish)
+                    await handle.result()
+        starts = sorted(
+            s.span_data.export().get("name")
+            for s, start in processor.span_events
+            if start
+            and s.span_data.export().get("name") in ("Signal span", "Activity span")
+        )
+        assert starts == ["Activity span", "Signal span"]
+        trace_ids = [(t.trace_id, start) for t, start in processor.trace_events]
+        span_ids = [(s.span_id, start) for s, start in processor.span_events]
+        for events in (trace_ids, span_ids):
+            assert sorted(i for i, start in events if start) == sorted(
+                i for i, start in events if not start
+            )
+    finally:
+        provider.set_disabled(False)
+        provider.set_processors([])
+        processor.trace_events.clear()
+        processor.span_events.clear()
+
+
+@workflow.defn
+class ReusedTraceIdWorkflow:
+    @workflow.run
+    async def run(self) -> None:
+        with trace("First trace") as first:
+            await workflow.execute_activity(
+                enable_tracing_activity, start_to_close_timeout=timedelta(seconds=10)
+            )
+        with trace("Second trace", trace_id=first.trace_id):
+            with custom_span("Second span"):
+                # Replay compares Activity IDs, so this one checks that a rebuilt Workflow
+                # gets the same OpenTelemetry context.
+                context = opentelemetry.trace.get_current_span().get_span_context()
+                await workflow.execute_activity(
+                    secret_span_activity,
+                    activity_id=f"check-{context.span_id}",
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
+
+
+@pytest.mark.parametrize("cached", [True, False])
+@pytest.mark.parametrize("otel", [True, False])
+@pytest.mark.usefixtures("reset_otel_tracer_provider")
+async def test_tracing_generated_trace_id_reused(
+    client: Client, cached: bool, otel: bool
+) -> None:
+    # Tracing is disabled before the Worker starts, and the first trace's Activity turns it
+    # back on. The second trace reuses the first one's generated ID, and reports, also when
+    # the Workflow is rebuilt from history: it does not take the first trace's decision.
+    exporter = set_test_tracer_provider()
+    provider = get_trace_provider()
+    processor = MemoryTracingProcessor()
+    processor.trace_events.clear()
+    processor.span_events.clear()
+    provider.set_processors([processor])
+    provider.set_disabled(True)
+    try:
+        async with AgentEnvironment(
+            model=research_mock_model(), use_otel_instrumentation=otel
+        ) as env:
+            client = env.applied_on_client(client)
+            async with new_worker(
+                client,
+                ReusedTraceIdWorkflow,
+                activities=[enable_tracing_activity, secret_span_activity],
+                max_cached_workflows=1000 if cached else 0,
+                workflow_runner=SandboxedWorkflowRunner(
+                    SandboxRestrictions.default.with_passthrough_modules(
+                        "opentelemetry"
+                    )
+                ),
+            ) as worker:
+                await assert_eventually(lambda: assert_installed_providers(1))
+                handle = await client.start_workflow(
+                    ReusedTraceIdWorkflow.run,
+                    id=f"reused-trace-id-workflow-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                    execution_timeout=timedelta(seconds=30),
+                )
+                await handle.result()
+                history = await handle.fetch_history()
+        # Each change of the flag that the Workflow sees leaves a marker: off for the first
+        # trace, back on for the second.
+        markers = [
+            e for e in history.events if e.HasField("marker_recorded_event_attributes")
+        ]
+        assert len(markers) == 2
+        if otel:
+            # This mode reports to OpenTelemetry instead of the processors set here.
+            names = {span.name for span in exporter.get_finished_spans()}
+            assert "First trace" not in names
+            assert {"Second trace", "Second span", "Activity span"} <= names
+            return
+        trace_starts = [t.name for t, start in processor.trace_events if start]
+        assert trace_starts == ["Second trace"]
+        span_starts = {
+            s.span_data.export().get("name")
+            for s, start in processor.span_events
+            if start
+        }
+        assert {"Second span", "Activity span"} <= span_starts
+        trace_ids = [(t.trace_id, start) for t, start in processor.trace_events]
+        span_ids = [(s.span_id, start) for s, start in processor.span_events]
+        for events in (trace_ids, span_ids):
+            assert sorted(i for i, start in events if start) == sorted(
+                i for i, start in events if not start
+            )
+    finally:
+        provider.set_disabled(False)
+        provider.set_processors([])
+        processor.trace_events.clear()
+        processor.span_events.clear()
+
+
+@activity.defn
+async def noop_activity() -> None:
+    pass
+
+
+@workflow.defn
+class ManyTracesWorkflow:
+    @workflow.run
+    async def run(self, traces: int) -> None:
+        for index in range(traces):
+            with trace(f"Trace {index}"):
+                with custom_span("Span"):
+                    await workflow.execute_activity(
+                        noop_activity, start_to_close_timeout=timedelta(seconds=10)
+                    )
+        workflow.patched("application-fix")
+
+
+@pytest.mark.parametrize(("disabled", "traces"), [(True, 40), (False, 40), (True, 0)])
+async def test_tracing_disabled_keeps_version_visibility(
+    client: Client, disabled: bool, traces: int
+) -> None:
+    # Every new patch ID enters the TemporalChangeVersion search attribute, which stops
+    # growing at 2 KiB. Traces created while tracing is disabled leave a marker only when
+    # the flag changes, so the application's own patch stays searchable after many of them.
+    provider = get_trace_provider()
+    provider.set_disabled(disabled)
+    try:
+        async with AgentEnvironment(model=research_mock_model()) as env:
+            client = env.applied_on_client(client)
+            async with new_worker(
+                client, ManyTracesWorkflow, activities=[noop_activity]
+            ) as worker:
+                await assert_eventually(lambda: assert_installed_providers(1))
+                workflow_id = f"many-traces-workflow-{uuid.uuid4()}"
+                handle = await client.start_workflow(
+                    ManyTracesWorkflow.run,
+                    traces,
+                    id=workflow_id,
+                    task_queue=worker.task_queue,
+                    execution_timeout=timedelta(seconds=60),
+                )
+                await handle.result()
+                history = await handle.fetch_history()
+
+                async def application_patch_visible() -> None:
+                    count = await client.count_workflows(
+                        f"WorkflowId = '{workflow_id}' AND "
+                        "TemporalChangeVersion = 'application-fix'"
+                    )
+                    assert count.count == 1
+
+                await assert_eventually(application_patch_visible)
+        markers = [
+            e for e in history.events if e.HasField("marker_recorded_event_attributes")
+        ]
+        assert len(markers) == (2 if disabled and traces else 1)
+    finally:
+        provider.set_disabled(False)
+
+
+@workflow.defn
+class ChangedWithinTaskWorkflow:
+    @workflow.run
+    async def run(self) -> None:
+        with trace("First trace"):
+            pass
+        # A local activity that completes at once leaves the Workflow in the same Task.
+        await workflow.execute_local_activity(
+            enable_tracing_activity, start_to_close_timeout=timedelta(seconds=10)
+        )
+        with trace("Same task trace"):
+            pass
+        await workflow.execute_activity(
+            noop_activity, start_to_close_timeout=timedelta(seconds=10)
+        )
+        with trace("Next task trace"):
+            await workflow.execute_activity(
+                noop_activity, start_to_close_timeout=timedelta(seconds=10)
+            )
+
+
+@pytest.mark.parametrize("cached", [True, False])
+async def test_tracing_flag_read_once_per_workflow_task(
+    client: Client, cached: bool
+) -> None:
+    # Replay delivers a Task's markers before its code runs, so a Workflow reads the flag at
+    # the first trace or span it creates in a Task and keeps that decision for the Task.
+    # Tracing turned back on within a Task applies from the next one, also when the Workflow
+    # is rebuilt from history.
     provider = get_trace_provider()
     processor = MemoryTracingProcessor()
     processor.trace_events.clear()
@@ -302,16 +771,32 @@ async def test_tracing_disabled_before_worker(client: Client):
     try:
         async with AgentEnvironment(model=research_mock_model()) as env:
             client = env.applied_on_client(client)
-            async with new_worker(client, ResearchWorkflow) as worker:
-                await client.execute_workflow(
-                    ResearchWorkflow.run,
-                    "Caribbean vacation spots in April",
-                    id=f"research-workflow-{uuid.uuid4()}",
+            async with new_worker(
+                client,
+                ChangedWithinTaskWorkflow,
+                activities=[enable_tracing_activity, noop_activity],
+                max_cached_workflows=1000 if cached else 0,
+            ) as worker:
+                await assert_eventually(lambda: assert_installed_providers(1))
+                handle = await client.start_workflow(
+                    ChangedWithinTaskWorkflow.run,
+                    id=f"changed-within-task-workflow-{uuid.uuid4()}",
                     task_queue=worker.task_queue,
-                    execution_timeout=timedelta(seconds=120),
+                    execution_timeout=timedelta(seconds=30),
                 )
-        assert processor.trace_events == []
-        assert processor.span_events == []
+                await handle.result()
+                history = await handle.fetch_history()
+        assert [(t.name, start) for t, start in processor.trace_events] == [
+            ("Next task trace", True),
+            ("Next task trace", False),
+        ]
+        patch_markers = [
+            e
+            for e in history.events
+            if e.HasField("marker_recorded_event_attributes")
+            and e.marker_recorded_event_attributes.marker_name == "core_patch"
+        ]
+        assert len(patch_markers) == 2
     finally:
         provider.set_disabled(False)
         provider.set_processors([])

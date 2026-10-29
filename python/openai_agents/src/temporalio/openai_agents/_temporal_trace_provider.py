@@ -1,7 +1,6 @@
 """Provides support for integration with OpenAI Agents SDK tracing across workflows"""
 
 import uuid
-from collections.abc import Callable
 from types import TracebackType
 from typing import Any, cast
 
@@ -9,11 +8,14 @@ from agents import SpanData, Trace, TracingProcessor
 from agents.tracing import (
     get_trace_provider,
 )
+from agents.tracing.config import TracingConfig
 from agents.tracing.provider import (
     DefaultTraceProvider,
     SynchronousMultiTracingProcessor,
 )
-from agents.tracing.spans import Span
+from agents.tracing.scope import Scope
+from agents.tracing.spans import Span, SpanImpl, TSpanData
+from agents.tracing.traces import TraceImpl
 
 import temporalio.workflow
 from temporalio import workflow
@@ -83,12 +85,10 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
         self,
         impl: SynchronousMultiTracingProcessor,
         start_spans_in_replay: bool,
-        tracing_disabled: Callable[[], bool],
     ):
         super().__init__()
         self._impl = impl
         self._emit_spans_in_replay = start_spans_in_replay
-        self._tracing_disabled = tracing_disabled
 
     def add_tracing_processor(self, tracing_processor: TracingProcessor):
         self._impl.add_tracing_processor(tracing_processor)
@@ -97,8 +97,6 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
         self._impl.set_processors(processors)
 
     def on_trace_start(self, trace: Trace) -> None:
-        if self._tracing_disabled():
-            return
         if not self._emit_spans_in_replay:
             if workflow.in_workflow() and workflow.unsafe.is_replaying_history_events():
                 # In replay mode, don't report
@@ -107,8 +105,6 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
         self._impl.on_trace_start(trace)
 
     def on_trace_end(self, trace: Trace) -> None:
-        if self._tracing_disabled():
-            return
         if not self._emit_spans_in_replay:
             if workflow.in_workflow() and workflow.unsafe.is_replaying_history_events():
                 # In replay mode, don't report
@@ -117,8 +113,6 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
         self._impl.on_trace_end(trace)
 
     def on_span_start(self, span: Span[Any]) -> None:
-        if self._tracing_disabled():
-            return
         if not self._emit_spans_in_replay:
             if workflow.in_workflow() and workflow.unsafe.is_replaying_history_events():
                 # In replay mode, don't report
@@ -126,8 +120,6 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
         self._impl.on_span_start(span)
 
     def on_span_end(self, span: Span[Any]) -> None:
-        if self._tracing_disabled():
-            return
         if not self._emit_spans_in_replay:
             if workflow.in_workflow() and workflow.unsafe.is_replaying_history_events():
                 # In replay mode, don't report
@@ -160,6 +152,77 @@ def _workflow_uuid() -> str:
     ).hex[:24]
 
 
+# Traces and spans created while tracing is disabled report here, so they keep their IDs
+# but reach no processor.
+_disabled_processor = SynchronousMultiTracingProcessor()
+
+
+def _tracing_disabled() -> bool:
+    # set_tracing_disabled() sets the flag on the provider installed at the time, which
+    # can be the original provider or the one of any Worker that started since. Resolve
+    # it from the installed provider down, so the latest call wins.
+    provider = get_trace_provider()
+    while isinstance(provider, TemporalTraceProvider):
+        if provider._manual_disabled is not None:
+            return provider._manual_disabled
+        provider = provider._original_provider
+    return bool(getattr(provider, "_disabled", False))
+
+
+_TRACING_PATCH_PREFIX = "openai-agents-tracing-"
+
+
+class _WorkflowTracingDecision:
+    def __init__(self) -> None:
+        # A run without markers reports, as it did before they existed.
+        self.history_length = -1
+        self.disabled = False
+
+
+def _disabled_at_creation() -> bool:
+    # A Workflow rebuilt from history recreates its traces and spans, possibly after the flag
+    # changed. A Workflow reads the flag once per Workflow Task, and a patch marker named for
+    # the Task records each change, so the rebuilt Workflow reads the marker instead and makes
+    # the same decisions. Every new patch ID also enters the TemporalChangeVersion search
+    # attribute, so only changes get one. The markers are recorded as deprecated, so builds
+    # that do not check for them skip them on replay.
+    disabled = _tracing_disabled()
+    if not workflow.in_workflow() or workflow.unsafe.is_read_only():
+        # Queries and update validators add nothing to history.
+        return disabled
+    instance = temporalio.workflow.instance()
+    decision = getattr(instance, "__temporal_openai_tracing_decision", None)
+    if decision is None:
+        decision = _WorkflowTracingDecision()
+        setattr(instance, "__temporal_openai_tracing_decision", decision)
+    history_length = workflow.info().get_current_history_length()
+    if decision.history_length != history_length:
+        # Replay delivers a Task's markers before its code runs, so a change recorded later in
+        # the Task would also apply to what came before it. The flag is read at the Task's
+        # first creation instead.
+        decision.history_length = history_length
+        patch_id = (
+            f"{_TRACING_PATCH_PREFIX}"
+            f"{'enabled' if decision.disabled else 'disabled'}-{history_length}"
+        )
+        if workflow.unsafe.is_replaying():
+            if workflow.patched(patch_id):
+                decision.disabled = not decision.disabled
+        elif disabled != decision.disabled:
+            workflow.deprecate_patch(patch_id)
+            decision.disabled = disabled
+    return decision.disabled
+
+
+def _reports_nothing(scope: Trace | Span[Any] | None) -> bool:
+    return getattr(scope, "_processor", None) is _disabled_processor
+
+
+def _report_nothing(scope: Trace | Span[Any]) -> None:
+    if isinstance(scope, (TraceImpl, SpanImpl)):
+        scope._processor = _disabled_processor
+
+
 class TemporalTraceProvider(DefaultTraceProvider):
     """A trace provider that integrates with Temporal workflows."""
 
@@ -170,16 +233,53 @@ class TemporalTraceProvider(DefaultTraceProvider):
         self._multi_processor = _TemporalTracingProcessor(
             self._original_provider._multi_processor,
             start_spans_in_replay,
-            self._original_provider_disabled,
         )
 
-    def _original_provider_disabled(self) -> bool:
-        # set_tracing_disabled() before the Worker started set the flag on the original
-        # provider. Honor it by not sending to the processors, so Workflow code still gets
-        # the same trace and span IDs. A call made while this provider is installed wins.
-        if self._manual_disabled is not None:
-            return False
-        return bool(getattr(self._original_provider, "_disabled", False))
+    def create_trace(
+        self,
+        name: str,
+        trace_id: str | None = None,
+        group_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        disabled: bool = False,
+        tracing: TracingConfig | None = None,
+    ) -> Trace:
+        """Create a trace that reports nothing if tracing is disabled."""
+        trace = super().create_trace(
+            name,
+            trace_id=trace_id,
+            group_id=group_id,
+            metadata=metadata,
+            disabled=disabled,
+            tracing=tracing,
+        )
+        # As in the Agents SDK, tracing being disabled when a trace is created decides
+        # whether it reports its start and its end, so later changes keep them paired.
+        if isinstance(trace, TraceImpl) and _disabled_at_creation():
+            _report_nothing(trace)
+        return trace
+
+    def create_span(
+        self,
+        span_data: TSpanData,
+        span_id: str | None = None,
+        parent: Trace | Span[Any] | None = None,
+        disabled: bool = False,
+    ) -> Span[TSpanData]:
+        """Create a span that reports nothing if tracing or its parent is disabled."""
+        span = super().create_span(
+            span_data, span_id=span_id, parent=parent, disabled=disabled
+        )
+        parents = (
+            [parent]
+            if parent is not None
+            else [Scope.get_current_span(), Scope.get_current_trace()]
+        )
+        if isinstance(span, SpanImpl) and (
+            any(_reports_nothing(p) for p in parents) or _disabled_at_creation()
+        ):
+            _report_nothing(span)
+        return span
 
     def time_iso(self) -> str:
         """Return the current deterministic time in ISO 8601 format."""
