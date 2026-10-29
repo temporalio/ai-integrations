@@ -174,16 +174,21 @@ def activity_as_tool(
         )
     if inspect.isclass(fn):
         # Workflow code references a callable-class activity by its class, but the worker's
-        # registered instance runs __call__, so build the tool from __call__ without `self`.
-        # A static or class __call__ has no `self` to drop.
-        if inspect.isfunction(inspect.getattr_static(fn, "__call__")):
-            call = functools.partial(fn.__call__, None)
-        else:
-            call = functools.partial(fn.__call__)
+        # registered instance runs __call__, so build the tool from __call__ as an instance binds
+        # it: without the `self` of a method or partialmethod, and with every parameter of a
+        # static or class method. The tool never calls this stand-in binding.
+        method = inspect.getattr_static(fn, "__call__")
+        if hasattr(method, "__get__"):
+            method = method.__get__(object(), fn)
+        call = functools.partial(method)
         setattr(call, "__name__", fn.__name__)
-        # A partial has no module globals, so resolve postponed annotations against __call__'s.
-        call.__annotations__ = typing.get_type_hints(fn.__call__, include_extras=True)
-        call.__doc__ = fn.__call__.__doc__ or fn.__doc__
+        # A partial has no module globals, so resolve postponed annotations against the
+        # function's own.
+        func = method
+        while isinstance(func, functools.partial):
+            func = func.func
+        call.__annotations__ = typing.get_type_hints(func, include_extras=True)
+        call.__doc__ = func.__doc__ or fn.__doc__
         fn = typing.cast(Callable, call)
     # If the provided callable has a first argument of `self`, partially apply it with the same metadata
     # The actual instance will be picked up by the activity execution, the partially applied function will never actually be executed

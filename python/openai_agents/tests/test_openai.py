@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import json
 import os
 import uuid
@@ -16,6 +17,7 @@ from agents import (
     AgentOutputSchemaBase,
     CodeInterpreterTool,
     FileSearchTool,
+    FunctionTool,
     GuardrailFunctionOutput,
     Handoff,
     HostedMCPTool,
@@ -578,6 +580,30 @@ async def test_tool_workflow(client: Client):
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
             )
+
+
+@activity.defn
+class ActivityWeatherPartialMethodCall:
+    async def get_weather(self, conditions: str, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions=conditions)
+
+    __call__ = functools.partialmethod(get_weather, "Rainy")
+
+
+def test_partialmethod_call_tool_drops_only_self():
+    # On Python 3.10 the SDK runs an async partialmethod as sync, so test_tool_workflow can't
+    # run this form; the tool's schema is the part this plugin builds.
+    tool = openai_agents.workflow.activity_as_tool(
+        ActivityWeatherPartialMethodCall, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.params_json_schema["properties"] == {
+        "city": {"title": "City", "type": "string"}
+    }
+    assert tool.description == "Get the weather for a given city."
 
 
 @activity.defn
