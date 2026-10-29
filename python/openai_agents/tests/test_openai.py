@@ -2751,12 +2751,12 @@ class McpServerStatefulWorkflow:
         factory_argument: Any | None,
         require_approval: Literal["always"] | None,
     ) -> str:
+        config = ActivityConfig(start_to_close_timeout=timedelta(seconds=30))
+        if timeout is not None:
+            config["schedule_to_start_timeout"] = timeout
         async with openai_agents.workflow.stateful_mcp_server(
             "HelloServer",
-            config=ActivityConfig(
-                schedule_to_start_timeout=timeout,
-                start_to_close_timeout=timedelta(seconds=30),
-            ),
+            config=config,
             factory_argument=factory_argument,
             require_approval=require_approval,
         ) as server:
@@ -2817,6 +2817,10 @@ def get_tracking_server(
             return self._name
 
         async def cleanup(self):
+            # Like servers that create their exit stack in connect(), cleanup
+            # fails before the first connect.
+            if "connect" not in self.calls:
+                raise AttributeError("cleanup() before connect()")
             self.calls.append("cleanup")
             # SDK servers tolerate cleanup() before connect(); raise here so a
             # cleanup() call on a rejected server is detectable.
@@ -3119,7 +3123,7 @@ async def test_mcp_server_factory_require_approval_is_rejected(
                         args=[None, None, None],
                         id=f"mcp-server-{uuid.uuid4()}",
                         task_queue=worker.task_queue,
-                        execution_timeout=timedelta(seconds=30),
+                        execution_timeout=timedelta(seconds=10),
                     )
                 else:
                     await client.execute_workflow(
@@ -3127,7 +3131,7 @@ async def test_mcp_server_factory_require_approval_is_rejected(
                         args=[False, None, None],
                         id=f"mcp-server-{uuid.uuid4()}",
                         task_queue=worker.task_queue,
-                        execution_timeout=timedelta(seconds=30),
+                        execution_timeout=timedelta(seconds=10),
                     )
     assert isinstance(err.value.cause, ActivityError)
     assert isinstance(err.value.cause.cause, ApplicationError)
