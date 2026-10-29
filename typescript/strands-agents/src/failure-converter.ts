@@ -1,6 +1,7 @@
 import { ContextWindowOverflowError, MaxTokensError, StructuredOutputError } from '@strands-agents/sdk';
 import {
   ApplicationFailure,
+  ApplicationFailureCategory,
   DefaultFailureConverter,
   type FailureConverter,
   type PayloadConverter,
@@ -31,32 +32,40 @@ const TERMINAL_ERROR_TYPES = [
 ];
 
 /**
- * Rewrite a Strands interrupt or terminal model error as a typed, non-retryable
- * {@link ApplicationFailure}. Any other value is returned as it is.
+ * Rewrite a Strands terminal model error as a typed, non-retryable
+ * {@link ApplicationFailure} that keeps its message, stack and cause. Any other
+ * value is returned as it is.
  */
-export function rewriteError(err: unknown): unknown {
-  if (isInterruptError(err)) {
-    const details = err.interrupts.map((i) => i.toJSON());
-    const names = err.interrupts.map((i) => i.toJSON().name).join(',');
-    return ApplicationFailure.create({
-      message: `interrupt:${names}`,
-      type: STRANDS_INTERRUPT_TYPE,
-      nonRetryable: true,
-      details,
-    });
-  }
+export function rewriteTerminalError(err: unknown): unknown {
   if (err instanceof Error) {
     for (const { ctor, name } of TERMINAL_ERROR_TYPES) {
-      if (err instanceof ctor) {
-        return ApplicationFailure.create({
-          message: err.message,
-          type: name,
-          nonRetryable: true,
-        });
+      // Match the name too, in case another copy of `@strands-agents/sdk` threw it.
+      if (err instanceof ctor || err.name === name) {
+        return ApplicationFailure.fromError(err, { type: name, nonRetryable: true });
       }
     }
   }
   return err;
+}
+
+/**
+ * Rewrite a Strands interrupt or terminal model error as a typed, non-retryable
+ * {@link ApplicationFailure} that keeps its stack and cause. An interrupt is a
+ * benign failure, so the worker does not log it as an activity failure. Any
+ * other value is returned as it is.
+ */
+export function rewriteError(err: unknown): unknown {
+  if (isInterruptError(err)) {
+    const details = err.interrupts.map((i) => i.toJSON());
+    return ApplicationFailure.fromError(err, {
+      message: `interrupt:${details.map((d) => d.name).join(',')}`,
+      type: STRANDS_INTERRUPT_TYPE,
+      nonRetryable: true,
+      details,
+      category: ApplicationFailureCategory.BENIGN,
+    });
+  }
+  return rewriteTerminalError(err);
 }
 
 /**

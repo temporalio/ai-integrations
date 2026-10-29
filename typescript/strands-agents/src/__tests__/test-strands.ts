@@ -1,9 +1,11 @@
 import path from 'node:path';
 import type { TestFn } from 'ava';
-import { McpClient, Message, Model, TextBlock } from '@strands-agents/sdk';
+import { McpClient, Message, Model, StructuredOutputError, TextBlock } from '@strands-agents/sdk';
 import type { BaseModelConfig, JSONValue, ModelStreamEvent, StreamOptions, Tool } from '@strands-agents/sdk';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { WorkflowFailedError } from '@temporalio/client';
 import { ApplicationFailure } from '@temporalio/common';
+import type { temporal } from '@temporalio/proto';
 import type { BaseContext } from '@temporalio/test-helpers';
 import {
   test as anyTest,
@@ -12,14 +14,23 @@ import {
   loadHistory,
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
-import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
+import { bundleWorkflowCode, DefaultLogger, Worker, type WorkflowBundle } from '@temporalio/worker';
 import { DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { StrandsPlugin } from '..';
 import { startLocalWithRetry } from './helpers/environment';
-import { auditLog, auditTool, deleteState, deleteThing, getWeather, getWeatherCalls } from './activities/strands';
+import {
+  auditLog,
+  auditTool,
+  deleteState,
+  deleteThing,
+  getWeather,
+  getWeatherCalls,
+  interruptError,
+} from './activities/strands';
 import {
   activityToolAgent,
+  failActivities,
   approveSignal,
   compressionAgent,
   defaultModelAgent,
@@ -82,6 +93,15 @@ function textTurn(text: string): ModelStreamEvent[] {
   ];
 }
 
+/** Each failed activity's message, type and non-retryable flag in a run's history. */
+function activityFailures(history: temporal.api.history.v1.IHistory): unknown[] {
+  return (history.events ?? []).flatMap((e) => {
+    const failure = e.activityTaskFailedEventAttributes?.failure;
+    const info = failure?.applicationFailureInfo;
+    return failure ? [[failure.message, info?.type, info?.nonRetryable]] : [];
+  });
+}
+
 /** Convenience: tool-call turn that the agent loop will dispatch. */
 function toolCallTurn(toolName: string, toolUseId: string, input: object): ModelStreamEvent[] {
   return [
@@ -142,7 +162,14 @@ class StubMcpClient extends McpClient {
   }
 }
 
-const test = anyTest as TestFn<BaseContext>;
+interface Context extends BaseContext {
+  /** The workflows bundled with a caller's own failure converter. */
+  callerConverterBundle: WorkflowBundle;
+}
+
+const test = anyTest as TestFn<Context>;
+
+const CALLER_FAILURE_CONVERTER = require.resolve('./encoding-failure-converter');
 
 test.before(async (t) => {
   const env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
@@ -150,13 +177,18 @@ test.before(async (t) => {
   // `@strands-agents/sdk/mcp-config.js`'s dynamic `node:*`/MCP-transport
   // imports and inline async chunks.
   const bundlerPlugin = new StrandsPlugin({ models: { test: () => new StubModel([]) } });
-  const workflowBundle = await bundleWorkflowCode({
+  const bundleOptions = {
     ...createBaseBundlerOptions(),
     workflowsPath: require.resolve('./workflows/strands'),
     logger: new DefaultLogger('WARN'),
     plugins: [bundlerPlugin],
+  };
+  const workflowBundle = await bundleWorkflowCode(bundleOptions);
+  const callerConverterBundle = await bundleWorkflowCode({
+    ...bundleOptions,
+    failureConverterPath: CALLER_FAILURE_CONVERTER,
   });
-  t.context = { env, workflowBundle };
+  t.context = { env, workflowBundle, callerConverterBundle };
 });
 
 test.after.always(async (t) => {
@@ -828,13 +860,69 @@ test('activity-tool interrupt pauses the agent and resumes', async (t) => {
   t.is(deleteState.calls, 2);
   // The interrupt failed the first activity without a retry, and the resumed agent scheduled a
   // second one; a retried activity would have run both calls in one.
-  const events = history.events ?? [];
-  const failure = events.find((e) => e.activityTaskFailedEventAttributes)?.activityTaskFailedEventAttributes?.failure;
-  t.deepEqual(
-    [failure?.applicationFailureInfo?.type, failure?.applicationFailureInfo?.nonRetryable],
-    ['StrandsInterrupt', true]
+  t.deepEqual(activityFailures(history), [['interrupt:approval', 'StrandsInterrupt', true]]);
+  // The failure keeps the stack of the error the activity threw.
+  const failure = history.events?.find((e) => e.activityTaskFailedEventAttributes)?.activityTaskFailedEventAttributes
+    ?.failure;
+  t.regex(failure?.stackTrace ?? '', /interruptError/);
+  const scheduled = history.events?.filter(
+    (e) => e.activityTaskScheduledEventAttributes?.activityType?.name === 'deleteThing'
   );
-  t.is(events.filter((e) => e.activityTaskScheduledEventAttributes?.activityType?.name === 'deleteThing').length, 2);
+  t.is(scheduled?.length, 2);
+});
+
+test("a worker's own failure converter still applies with the plugin", async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    workflowBundle: t.context.callerConverterBundle,
+    dataConverter: { failureConverterPath: CALLER_FAILURE_CONVERTER },
+    plugins: [new StrandsPlugin()],
+    activities: {
+      async failingActivity(message: string): Promise<never> {
+        throw message === 'interrupt' ? interruptError('foo') : new StructuredOutputError('no output');
+      },
+    },
+  });
+  const history = await worker.runUntil(async () => {
+    const handle = await startWorkflow(failActivities, { args: [['interrupt', 'terminal']] });
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    // Workflow code decoded each activity failure as `TemporalActivityTool` expects.
+    t.deepEqual(err?.cause instanceof ApplicationFailure && err.cause.details, [
+      ['StrandsInterrupt', true, [{ id: 'delete:foo', name: 'approval', reason: 'delete foo?', source: 'tool' }]],
+      ['StructuredOutputError', true, []],
+    ]);
+    return handle.fetchHistory();
+  });
+  // The caller's converter encoded every failure, and the plugin made the Strands errors
+  // non-retryable.
+  t.deepEqual(activityFailures(history), [
+    ['Encoded failure', 'StrandsInterrupt', true],
+    ['Encoded failure', 'StructuredOutputError', true],
+  ]);
+  const workflowFailure = history.events?.find((e) => e.workflowExecutionFailedEventAttributes)
+    ?.workflowExecutionFailedEventAttributes?.failure;
+  t.is(workflowFailure?.message, 'Encoded failure');
+});
+
+test('a Strands terminal error thrown in workflow code fails the run as non-retryable', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  // The model stops at its token limit, so Strands throws `MaxTokensError` in workflow code.
+  const maxTokensTurn: ModelStreamEvent[] = [
+    ...textTurn('cut off').slice(0, -1),
+    { type: 'modelMessageStopEvent', stopReason: 'maxTokens' },
+  ];
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin({ models: { test: () => new StubModel([maxTokensTurn]) } })],
+  });
+  await worker.runUntil(async () => {
+    // Without the rewrite the workflow task fails on every attempt until this timeout.
+    const handle = await startWorkflow(helloAgent, { args: ['hello'], workflowExecutionTimeout: '10 seconds' });
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    t.deepEqual(err?.cause instanceof ApplicationFailure && [err.cause.type, err.cause.nonRetryable], [
+      'MaxTokensError',
+      true,
+    ]);
+  });
 });
 
 test('streamingTopic publishes model events to a WorkflowStream subscriber', async (t) => {

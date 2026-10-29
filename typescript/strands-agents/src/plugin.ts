@@ -2,7 +2,7 @@ import type { McpClient } from '@strands-agents/sdk';
 import { BedrockModel, type Model } from '@strands-agents/sdk';
 import type { Duration } from '@temporalio/common';
 import { msOptionalToNumber } from '@temporalio/common/lib/time';
-import type { ActivityInboundCallsInterceptor, BundleOptions, WorkerOptions } from '@temporalio/worker';
+import type { ActivityInboundCallsInterceptor, BundleOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
 import { rewriteError } from './failure-converter';
 import { ModelActivity } from './model-activity';
@@ -118,19 +118,12 @@ export class StrandsPlugin extends SimplePlugin {
       name: 'StrandsPlugin',
       activities,
       runContext,
-      workerInterceptors: {
-        activity: [() => ({ inbound: strandsActivityInbound })],
-      },
+      // A function, so that the worker's other interceptors, such as `activityInbound`, are kept.
+      workerInterceptors: (existing) => ({
+        ...existing,
+        activity: [...(existing?.activity ?? []), () => ({ inbound: strandsActivityInbound })],
+      }),
     });
-  }
-
-  override configureWorker(options: WorkerOptions): WorkerOptions {
-    // `SimplePlugin` rebuilds the worker's `interceptors` when it adds the plugin's activity
-    // interceptor, which drops the caller's `activityInbound` interceptors. Put them back.
-    const configured = super.configureWorker(options);
-    const activityInbound = options.interceptors?.activityInbound;
-    if (activityInbound === undefined) return configured;
-    return { ...configured, interceptors: { ...configured.interceptors, activityInbound } };
   }
 
   /**
@@ -162,6 +155,10 @@ export class StrandsPlugin extends SimplePlugin {
    * - Inline async chunks so the bundle stays a single file — webpack's
    *   default JSONP chunk loader references `self`/`document`, neither of
    *   which exists in the workflow VM.
+   *
+   * - Add the plugin's workflow interceptors, which turn Strands terminal
+   *   errors thrown in workflow code into non-retryable failures. The worker
+   *   calls this when it bundles workflow code itself, too.
    */
   override configureBundler(options: BundleOptions): BundleOptions {
     const base = super.configureBundler(options);
@@ -184,6 +181,10 @@ export class StrandsPlugin extends SimplePlugin {
     return {
       ...base,
       ignoreModules,
+      workflowInterceptorModules: [
+        ...(base.workflowInterceptorModules ?? []),
+        require.resolve('./workflow-interceptors'),
+      ],
       webpackConfigHook: (config) => {
         (config.output ??= {}).asyncChunks = false;
         (config.optimization ??= {}).splitChunks = false;

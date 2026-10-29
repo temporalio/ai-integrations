@@ -110,6 +110,8 @@ new TemporalAgent({
 
 Passing `retryStrategy` to `new TemporalAgent(...)` throws; remove the argument and put the retry config on the activity options instead.
 
+The plugin makes Strands' terminal errors (`ContextWindowOverflowError`, `MaxTokensError` and `StructuredOutputError`) non-retryable. Its activity interceptor does this for a `ContextWindowOverflowError` from the model activity, and for any of the three that your own activity throws. The agent throws `MaxTokensError` and `StructuredOutputError` in workflow code, where the plugin's workflow interceptor does it: the run fails, or the update is rejected, with a failure of that type, instead of the workflow task failing on every attempt.
+
 ## Snapshots
 
 `TemporalAgent.takeSnapshot()` and `TemporalAgent.loadSnapshot()` throw. Temporal's event history already persists workflow state durably at a finer granularity than Strands snapshots, so calling either inside a workflow is redundant.
@@ -224,9 +226,11 @@ agent.addHook(AfterToolCallEvent, auditCallback);
 
 Strands supports interrupts via `toolContext.interrupt(...)` and `event.interrupt(...)`. Both work with the plugin: `agent.invoke()` returns `AgentResult` with `stopReason: 'interrupt'` and `interrupts: [...]`. Pair this with a signal handler that supplies responses, then resume by calling `agent.invoke(responses)`.
 
-Interrupts also survive the activity boundary when raised from an `activityAsTool`-wrapped activity. An activity interceptor the plugin adds to the worker packages the interrupt as a typed, non-retryable `ApplicationFailure`, and `TemporalActivityTool` re-raises it through the agent's interrupt machinery on the workflow side, so `AgentResult.interrupts` is populated just like the in-workflow case. The same interceptor makes Strands' `ContextWindowOverflowError`, `MaxTokensError` and `StructuredOutputError` non-retryable when an activity throws them.
+Interrupts also survive the activity boundary when raised from an `activityAsTool`-wrapped activity. An activity interceptor the plugin adds to the worker packages the interrupt as a typed, non-retryable `ApplicationFailure`, and `TemporalActivityTool` re-raises it through the agent's interrupt machinery on the workflow side, so `AgentResult.interrupts` is populated just like the in-workflow case.
 
-The plugin keeps the failure converter your client and worker set with `dataConverter.failureConverterPath`, for example to [encode failure messages](https://docs.temporal.io/failure-converter). For activity-tool interrupts to work, your converter must decode a failure of type `StrandsInterrupt` to an `ApplicationFailure` with that type and its details, as the SDK's default converter does. Earlier versions replaced your converter with the plugin's, so workflow code now decodes the failures of runs that started before the upgrade with your converter. If your converter decodes them into other errors than the SDK's default converter and that changes which commands a workflow issues, those runs fail to replay with a nondeterminism error. If it only changes a value the workflow keeps or returns, the runs replay without error and continue with the new value, so replay tests do not catch them. Let those runs finish before you upgrade, or use Worker Versioning.
+The plugin keeps the failure converter your client and worker set with `dataConverter.failureConverterPath`, for example to [encode failure messages](https://docs.temporal.io/failure-converter). For activity-tool interrupts to work, your converter must decode a failure of type `StrandsInterrupt` to an `ApplicationFailure` with that type and its details, as the SDK's default converter does.
+
+**Upgrading from an earlier version:** earlier versions replaced your converter with the plugin's, so workflow code now decodes the failures of runs that started before the upgrade with your converter. If your converter decodes them into other errors than the SDK's default converter and that changes which commands a workflow issues, those runs fail to replay with a nondeterminism error. If it only changes a value the workflow keeps or returns, the runs replay without error and continue with the new value, so replay tests do not catch them. Let those runs finish before you upgrade, or use Worker Versioning.
 
 ## Continue-as-new
 

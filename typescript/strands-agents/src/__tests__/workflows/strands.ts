@@ -220,6 +220,8 @@ export async function failActivities(messages: string[]): Promise<never> {
       decoded.push(cause instanceof ApplicationFailure ? [cause.type, cause.nonRetryable, cause.details] : null);
     });
   }
+  // Failing, rather than returning, also stores a workflow failure, which the bundle's failure
+  // converter encodes.
   throw ApplicationFailure.create({ message: 'workflow failed', nonRetryable: true, details: decoded });
 }
 
