@@ -11,6 +11,7 @@ import {
   type InterruptResponseContentData,
 } from '@strands-agents/sdk';
 import {
+  ActivityFailure,
   ApplicationFailure,
   defineSignal,
   proxyActivities,
@@ -214,10 +215,23 @@ export async function failTwice(message: string, activityMessages: string[] = [m
     startToCloseTimeout: '10 seconds',
     retry: { maximumAttempts: 1 },
   });
+  // How workflow code decoded each activity failure's causes, returned in the failure's details.
+  const decoded: Record<string, unknown[]> = {};
   for (const activityMessage of activityMessages) {
-    await failingActivity(activityMessage).catch(() => undefined);
+    await failingActivity(activityMessage).catch((err: unknown) => {
+      const causes: unknown[] = [];
+      for (let cause = err instanceof ActivityFailure ? err.cause : undefined; cause; cause = cause.cause as Error) {
+        causes.push(cause instanceof ApplicationFailure ? [cause.type, cause.message, cause.details] : cause.message);
+      }
+      decoded[activityMessage] = causes;
+    });
   }
-  throw ApplicationFailure.create({ message, nonRetryable: true, cause: new StructuredOutputError('no output') });
+  throw ApplicationFailure.create({
+    message,
+    nonRetryable: true,
+    cause: new StructuredOutputError('no output'),
+    details: [decoded],
+  });
 }
 
 /** Fails with a frozen failure whose cause is a Strands error, so its `cause` is read-only. */

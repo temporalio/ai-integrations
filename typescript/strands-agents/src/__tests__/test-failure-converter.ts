@@ -16,6 +16,7 @@ import type { BaseContext } from '@temporalio/test-helpers';
 import { test as anyTest, helpers, TestWorkflowEnvironment } from '@temporalio/test-helpers';
 import { StrandsFailureConverter, StrandsPlugin } from '..';
 import { composeFailureConverter } from '../failure-converter';
+import { failureConverter as envelopingConverter } from './encoding-failure-converter';
 import { startLocalWithRetry } from './helpers/environment';
 import { failFrozen, failTwice, lastFailureOfRetry } from './workflows/strands';
 
@@ -50,6 +51,17 @@ const activityCauses: Record<string, () => unknown> = {
     Object.assign(runInNewContext('new Error("wrapper")') as Error, { cause: new StructuredOutputError('no output') }),
 };
 
+// A failure the caller's converter in `encoding-failure-converter` wraps in a failure of its own, with
+// a Strands cause.
+const businessError = (): ApplicationFailure =>
+  ApplicationFailure.create({
+    message: 'business outer',
+    type: 'Business',
+    nonRetryable: true,
+    details: ['business detail'],
+    cause: new StructuredOutputError('no output'),
+  });
+
 test("a worker's own failure converter still applies with the plugin", async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
   const failureConverterPath = require.resolve('./encoding-failure-converter');
@@ -61,6 +73,7 @@ test("a worker's own failure converter still applies with the plugin", async (t)
     plugins: [new StrandsPlugin()],
     activities: {
       async failingActivity(message: string): Promise<never> {
+        if (message === 'business') throw businessError();
         throw ApplicationFailure.create({
           message: `activity failed: ${message}`,
           nonRetryable: true,
@@ -77,7 +90,7 @@ test("a worker's own failure converter still applies with the plugin", async (t)
   });
   const [history, frozenHistory, lastFailure] = await worker.runUntil(async () => {
     const handle = await startWorkflow(failTwice, {
-      args: ['workflow failed', ['plain', ...Object.keys(activityCauses)]],
+      args: ['workflow failed', ['plain', ...Object.keys(activityCauses), 'business']],
     });
     // A client with the same converter decodes the failure and its rewritten cause.
     const err = await t.throwsAsync(client.workflow.getHandle(handle.workflowId).result(), {
@@ -95,6 +108,14 @@ test("a worker's own failure converter still applies with the plugin", async (t)
       ],
       ['workflow failed', ['StructuredOutputError', true, 'no output']]
     );
+    // Workflow code decoded the caller's wrapped failure as the caller's converter alone does.
+    const decodedInWorkflow = (err?.cause as ApplicationFailure | undefined)?.details?.[0] as
+      Record<string, unknown> | undefined;
+    t.deepEqual(decodedInWorkflow?.business, [
+      ['Envelope', 'envelope', []],
+      ['Business', 'business outer', ['business detail']],
+      'no output',
+    ]);
     // A frozen failure's `cause` cannot be assigned; Strands' rewrite of it must not fail the
     // workflow task, which would leave the run open until it times out.
     const frozen = await startWorkflow(failFrozen, {
@@ -135,7 +156,21 @@ test("a worker's own failure converter still applies with the plugin", async (t)
     wrapped,
     wrapped,
     wrapped,
+    [3, true, undefined, undefined],
   ]);
+  // The caller wrapped that last failure in an envelope; Strands kept the envelope and the failure it
+  // wraps, with its type and details, and did not rewrite its cause.
+  const business = history.events
+    ?.map((e) => e.activityTaskFailedEventAttributes?.failure)
+    .find((f) => f?.applicationFailureInfo?.type === 'Envelope');
+  t.deepEqual(
+    [
+      business?.cause?.applicationFailureInfo?.type,
+      defaultPayloadConverter.fromPayload(business?.cause?.applicationFailureInfo?.details?.payloads?.[0] ?? {}),
+      business?.cause?.cause?.applicationFailureInfo ?? undefined,
+    ],
+    ['Business', 'business detail', undefined]
+  );
   // The frozen failure was stored the same way, with its cause rewritten.
   const frozenFailure = frozenHistory.events?.find((e) => e.workflowExecutionFailedEventAttributes)
     ?.workflowExecutionFailedEventAttributes?.failure;
@@ -180,6 +215,7 @@ test("Strands' rewrite applies to every cause, whatever the caller's converter l
     frozen: () =>
       Object.freeze(ApplicationFailure.create({ message: 'outer', cause: new StructuredOutputError('no output') })),
     decoded: () => decoded,
+    business: businessError,
     ...Object.fromEntries(
       Object.entries(activityCauses).map(([name, cause]) => [
         name,
@@ -208,5 +244,24 @@ test("Strands' rewrite applies to every cause, whatever the caller's converter l
         `${callerName}: ${errorName}`
       );
     }
+  }
+});
+
+test("Strands keeps failures a caller's converter adds around a cause", (t) => {
+  const composed = composeFailureConverter(envelopingConverter);
+  for (const error of [businessError, () => ApplicationFailure.create({ message: 'outer', cause: businessError() })]) {
+    const callerFailure = envelopingConverter.errorToFailure(error(), defaultPayloadConverter);
+    const composedFailure = composed.errorToFailure(error(), defaultPayloadConverter);
+    // The same failure as the caller's alone, apart from stack traces, which differ per error.
+    const levels = (failure: ProtoFailure | null | undefined): unknown[] =>
+      failure ? [{ ...failure, cause: undefined, encodedAttributes: undefined }, ...levels(failure.cause)] : [];
+    t.deepEqual(levels(composedFailure), levels(callerFailure));
+    const decoded = composed.failureToError(composedFailure, defaultPayloadConverter);
+    const business = decoded instanceof ApplicationFailure && decoded.type === 'Business' ? decoded : decoded.cause;
+    t.deepEqual(business instanceof ApplicationFailure && [business.type, business.message, business.details], [
+      'Business',
+      'business outer',
+      ['business detail'],
+    ]);
   }
 });
