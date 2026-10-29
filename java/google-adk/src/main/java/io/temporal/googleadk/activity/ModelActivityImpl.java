@@ -134,6 +134,16 @@ public final class ModelActivityImpl implements ModelActivity {
               + " artifacts; use the unshaded SDK for live streaming",
           FailureTypes.STREAM_ERROR,
           e);
+    } catch (RuntimeException e) {
+      throw ApplicationFailure.newFailureWithCause(
+          "Live delivery of model "
+              + input.model()
+              + " output to topic '"
+              + input.streamingTopic()
+              + "' could not start: "
+              + e.getMessage(),
+          FailureTypes.STREAM_ERROR,
+          e);
     }
   }
 

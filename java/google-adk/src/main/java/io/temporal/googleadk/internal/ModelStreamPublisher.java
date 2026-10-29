@@ -76,8 +76,8 @@ public final class ModelStreamPublisher implements AutoCloseable {
 
   /**
    * Clones the Worker's client with a gRPC deadline on every publish Signal. The SDK retries a
-   * Signal for up to a minute unless the calling context carries a deadline, and it re-applies the
-   * service stubs' plugins to a client built from those stubs, so the clone borrows the stubs
+   * Signal for up to a minute unless the calling context carries a deadline, and it applies a
+   * service stub's plugins again to any client built from it, so the clone borrows the stubs
    * without their plugins.
    */
   private static WorkflowClient boundedClient(WorkflowClient source, Duration timeout) {
@@ -122,15 +122,22 @@ public final class ModelStreamPublisher implements AutoCloseable {
   }
 
   /**
-   * Publishes one terminal record behind the buffered responses and waits for their delivery. Later
+   * Publishes one terminal record behind the buffered responses and waits for delivery. Later
    * output of an abandoned provider call is dropped.
    */
-  public synchronized void terminal(ModelStreamEvent.Kind kind) {
-    if (closed) {
-      return;
+  public void terminal(ModelStreamEvent.Kind kind) {
+    // Deliver the responses before claiming completion, so that a failed delivery leaves no
+    // COMPLETE record queued for a later drain. The provider has finished, so nothing races accept.
+    if (kind == ModelStreamEvent.Kind.COMPLETE) {
+      transport(client::flush);
     }
-    closed = true;
-    publish(kind, null);
+    synchronized (this) {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      publish(kind, null);
+    }
     transport(client::flush);
   }
 

@@ -324,7 +324,7 @@ class LiveStreamingWorkflowTest {
                         .streamingMode(RunConfig.StreamingMode.SSE)
                         .build()));
       } catch (CanceledFailure e) {
-        result = "cancelled";
+        result = "canceled";
       } catch (ActivityFailure e) {
         result =
             e.getCause() instanceof ApplicationFailure failure

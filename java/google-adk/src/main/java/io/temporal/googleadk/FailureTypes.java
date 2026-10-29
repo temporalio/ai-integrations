@@ -12,7 +12,10 @@ public final class FailureTypes {
   /** An MCP toolset operation failed; unknown toolsets and tools are non-retryable. */
   public static final String MCP_ERROR = "googleadk.McpError";
 
-  /** Live delivery of model output to a Workflow Stream failed; the Activity is retried. */
+  /**
+   * Live delivery of model output to a Workflow Stream failed. A blank topic or a missing Workflow
+   * Streams artifact is non-retryable; transport failures are retried.
+   */
   public static final String STREAM_ERROR = "googleadk.StreamError";
 
   private FailureTypes() {}

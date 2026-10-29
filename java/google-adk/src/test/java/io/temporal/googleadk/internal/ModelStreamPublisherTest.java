@@ -97,7 +97,15 @@ class ModelStreamPublisherTest {
       assertTrue(
           Duration.ofNanos(System.nanoTime() - start).compareTo(Duration.ofSeconds(2)) < 0,
           "a blackholed signal RPC must not use the client's much longer default retry timeout");
-      assertThrows(ModelStreamPublisher.PublishFailure.class, publisher::close);
+      long closing = System.nanoTime();
+      try {
+        publisher.close();
+      } catch (ModelStreamPublisher.PublishFailure repeated) {
+        // Nothing is left to deliver; a repeated transport error is acceptable.
+      }
+      assertTrue(
+          Duration.ofNanos(System.nanoTime() - closing).compareTo(Duration.ofSeconds(2)) < 0,
+          "closing after a failed delivery must not block");
       assertEquals(0, source.getOptions().getInterceptors().length);
       assertEquals(
           1,

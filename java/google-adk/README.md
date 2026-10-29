@@ -112,11 +112,11 @@ shaded one.
 implementation 'io.temporal:temporal-workflowstreams:1.40.0'
 ```
 
-Host a `WorkflowStream` in the Workflow and set the model's `streamingTopic`. Responses are
-published in 100 ms batches and still returned as the Activity result, so the agent sees them
-after the Activity completes. Subscribers read the stream through an Update, which a closed
-Workflow cannot serve, so publish a completion marker and give clients a bounded window to
-acknowledge it; the Workflow finishes either way.
+Host a `WorkflowStream` in the Workflow and set the model's `streamingTopic`; calls without SSE
+streaming do not publish. Responses are published in 100 ms batches and still returned as the
+Activity result, so the agent sees them after the Activity completes. Subscribers read the stream
+through an Update, which a closed Workflow cannot serve, so publish a completion marker and give
+clients a bounded window to acknowledge it; the Workflow finishes either way.
 
 ```java
 public class LiveChatWorkflowImpl implements LiveChatWorkflow {
@@ -128,7 +128,8 @@ public class LiveChatWorkflowImpl implements LiveChatWorkflow {
     LlmAgent agent =
         LlmAgent.builder()
             .name("assistant")
-            .model(TemporalModel.newBuilder("gemini-2.5-flash").streamingTopic("model-output").build())
+            .model(
+                TemporalModel.newBuilder("gemini-2.5-flash").streamingTopic("model-output").build())
             .build();
     Runner runner = TemporalAdk.runnerBuilder().appName("live-chat").agent(agent).build();
     List<Event> events =
@@ -157,9 +158,10 @@ Items are codec-free ADK JSON (the client's codec applies once, to the publish S
 them with `GoogleAdkPayloadConverter`:
 
 ```java
-WorkflowClient.start(workflow::chat, "Say hello.");
+WorkflowExecution execution = WorkflowClient.start(workflow::chat, "Say hello.");
 PayloadConverter converter = new GoogleAdkPayloadConverter();
-try (WorkflowStreamClient stream = WorkflowStreamClient.newInstance(client, workflowId);
+try (WorkflowStreamClient stream =
+        WorkflowStreamClient.newInstance(client, execution.getWorkflowId());
     WorkflowStreamSubscription subscription =
         stream.subscribe(
             SubscribeOptions.newBuilder()
@@ -369,17 +371,17 @@ text, exactly as outside Temporal. MCP failures use `googleadk.McpError`: an unk
 is non-retryable, a failing server call is retried, while a call the tool rejects outright (for
 example because of a null argument value) is not. Live-output publishing failures use
 `googleadk.StreamError`: a missing or mismatched Workflow Streams artifact is non-retryable, and
-transport failures are retried. Model and MCP calls run on a background thread,
-including the work a model does before it returns a flow (ADK's Claude model and its non-streaming
-LangChain4j model block there), a toolset factory, and the session start `McpToolset` performs on
-subscription, so with a heartbeat timeout on the activity options the activities heartbeat while
-they run and return as soon as the server cancels them. The background call is left to finish on
-its own and its result is dropped: an interrupt would not stop the request of any ADK model
-(Gemini's completes on its HTTP client's own thread), and ADK's MCP classes answer one by retrying
-on a new session, which would run a cancelled tool call twice. An MCP toolset is released only after
-its last background call has finished, and a stdio server's process with it; each toolset is
-released on its own, so a server that never answers keeps only its own toolset alive. Errors thrown
-by tools that run on the workflow thread follow ADK's contract and go back to the model.
+transport failures are retried. Model and MCP calls run on a background thread, including the work a
+model does before it returns a flow (ADK's Claude model and its non-streaming LangChain4j model
+block there), a toolset factory, and the session start `McpToolset` performs on subscription, so
+with a heartbeat timeout on the activity options the activities heartbeat while they run and return
+as soon as the server cancels them. The background call is left to finish on its own and its result
+is dropped: an interrupt would not stop the request of any ADK model (Gemini's completes on its HTTP
+client's own thread), and ADK's MCP classes answer one by retrying on a new session, which would run
+a cancelled tool call twice. An MCP toolset is released only after its last background call has
+finished, and a stdio server's process with it; each toolset is released on its own, so a server
+that never answers keeps only its own toolset alive. Errors thrown by tools that run on the workflow
+thread follow ADK's contract and go back to the model.
 
 Exceptions ADK itself raises on the workflow thread (for example `LlmCallsLimitExceededException`
 when `RunConfig.maxLlmCalls` is exceeded, or a `SessionException`) propagate out of
