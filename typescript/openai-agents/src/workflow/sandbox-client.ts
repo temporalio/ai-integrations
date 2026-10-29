@@ -3,6 +3,7 @@ import type {
   SandboxClientCreateArgs,
   SandboxClientOptions,
   SandboxClientResumeOptions,
+  SandboxRunConfig,
   SandboxSessionLike,
   SandboxSessionSerializationOptions,
 } from '@openai/agents-core/sandbox';
@@ -189,4 +190,29 @@ export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions
  */
 export function temporalSandboxClient(name: string, config?: ActivityOptions): TemporalSandboxClient {
   return new TemporalSandboxClient(name, config);
+}
+
+/**
+ * `sandbox.client` must be a `TemporalSandboxClient` so every sandbox operation is dispatched as an
+ * Activity rather than run inline in the Workflow. `where` names the config in the error.
+ */
+export function validateTemporalSandboxClient(sandbox: SandboxRunConfig, where: string): void {
+  if (sandbox.client == null) {
+    throw ApplicationFailure.create({
+      message:
+        `${where}.client must be set to a Temporal sandbox client. ` +
+        'Use temporalSandboxClient(name) from @temporalio/openai-agents/workflow.',
+      type: 'SandboxConfigurationError',
+      nonRetryable: true,
+    });
+  }
+  if (!(sandbox.client instanceof TemporalSandboxClient)) {
+    throw ApplicationFailure.create({
+      message:
+        `${where}.client must be created via temporalSandboxClient(name) ` +
+        'from @temporalio/openai-agents/workflow. Do not pass a raw sandbox client directly.',
+      type: 'SandboxConfigurationError',
+      nonRetryable: true,
+    });
+  }
 }

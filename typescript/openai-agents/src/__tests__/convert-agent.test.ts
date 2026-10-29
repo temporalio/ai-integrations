@@ -1,8 +1,11 @@
 import test from 'ava';
-import { Agent, Handoff, handoff } from '@openai/agents-core';
+import { Agent, Handoff, MemorySession, handoff, type FunctionTool } from '@openai/agents-core';
+import { SandboxAgent } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import { ActivityBackedModel } from '../workflow/activity-backed-model';
+import { getAgentToolRecord, installAgentToolInterception } from '../workflow/agent-tools';
 import { convertAgent } from '../workflow/convert-agent';
+import { temporalSandboxClient } from '../workflow/sandbox-client';
 
 const DEFAULT_MODEL_PARAMS = { startToCloseTimeout: '60s' as const };
 
@@ -134,4 +137,77 @@ test('convertAgent: wrappedOnInvoke calls original onInvokeHandoff and returns c
   t.is(returnedAgent.name, 'S');
   t.true((returnedAgent as any).model instanceof ActivityBackedModel);
   t.not(returnedAgent, specialist);
+});
+
+test('installAgentToolInterception: installing again keeps one wrapper and its records', (t) => {
+  const asTool = Agent.prototype.asTool;
+  const agent = new Agent({ name: 'Nested', model: 'm' });
+  const tool = agent.asTool({ toolName: 'ask_nested' });
+  installAgentToolInterception();
+  t.is(Agent.prototype.asTool, asTool);
+  t.is(getAgentToolRecord(tool)?.agent, agent);
+});
+
+test('installAgentToolInterception: records tools of Agent subclasses with their options', (t) => {
+  const agent = new SandboxAgent({ name: 'Sandboxed', model: 'm' });
+  const options = { toolName: 'ask_sandboxed', toolDescription: 'Ask.' };
+  const record = getAgentToolRecord(agent.asTool(options));
+  t.is(record?.agent, agent);
+  t.is(record?.options, options);
+});
+
+test('convertAgent: an agent that is a handoff target and an asTool() source converts once', (t) => {
+  const nested = new Agent({ name: 'Nested', model: 'own-model' });
+  const tool = nested.asTool({ toolName: 'ask_nested', toolDescription: 'Ask nested.' });
+  const parent = new Agent({ name: 'Parent', model: 'm', handoffs: [nested], tools: [tool] });
+
+  const converted = convertAgent(parent, DEFAULT_MODEL_PARAMS, undefined, 'run-model');
+  const convertedNested = converted.handoffs[0] as Agent<any, any>;
+  const rebuilt = converted.tools[0] as FunctionTool;
+  t.is((convertedNested as any).model.modelName, 'run-model');
+  t.not(rebuilt, tool, 'the tool is rebuilt on the converted agent');
+  t.is(rebuilt.name, 'ask_nested');
+  t.is(rebuilt.description, 'Ask nested.');
+  t.deepEqual(rebuilt.parameters, tool.parameters);
+  t.is(parent.tools[0], tool, 'the declared agent keeps its tool');
+});
+
+test('convertAgent: asTool() agents keep their string model and their own tools are checked', (t) => {
+  const rawFn = function () {};
+  const inner = new Agent({ name: 'Inner', model: 'inner-model', tools: [rawFn as any] });
+  const nested = new Agent({ name: 'Nested', model: 'own-model', tools: [inner.asTool({ toolName: 'ask_inner' })] });
+  const parent = new Agent({ name: 'Parent', model: 'm', tools: [nested.asTool({ toolName: 'ask_nested' })] });
+  const err = t.throws(() => convertAgent(parent, DEFAULT_MODEL_PARAMS)) as ApplicationFailure;
+  t.is(err.type, 'AgentsWorkflowError');
+  t.regex(err.message, /Agent 'Inner': Provided tool is a raw function/);
+
+  inner.tools = [];
+  const converted = convertAgent(parent, DEFAULT_MODEL_PARAMS);
+  t.true(converted.tools[0] !== parent.tools[0]);
+  t.is(nested.model, 'own-model', 'the declared agent is not changed');
+});
+
+test('convertAgent: asTool() options that would run in the Workflow are rejected', (t) => {
+  const nested = new Agent({ name: 'Nested', model: 'm' });
+  const rejected = (options: Record<string, unknown>) => {
+    const parent = new Agent({
+      name: 'Parent',
+      model: 'm',
+      tools: [nested.asTool({ toolName: 'ask_nested', ...options })],
+    });
+    return t.throws(() => convertAgent(parent, DEFAULT_MODEL_PARAMS)) as ApplicationFailure;
+  };
+  t.is(rejected({ runConfig: { model: { getResponse: async () => ({}) } } }).type, 'AgentsWorkflowError');
+  t.is(rejected({ runConfig: { sandbox: {} } }).type, 'SandboxConfigurationError');
+  t.is(rejected({ runOptions: { session: new MemorySession() } }).type, 'UnsafeSessionError');
+
+  const sandbox = { client: temporalSandboxClient('sandbox') };
+  const parent = new Agent({
+    name: 'Parent',
+    model: 'm',
+    tools: [
+      nested.asTool({ toolName: 'ask_nested', runConfig: { model: 'tool-model', sandbox }, runOptions: { sandbox } }),
+    ],
+  });
+  t.notThrows(() => convertAgent(parent, DEFAULT_MODEL_PARAMS));
 });

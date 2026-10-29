@@ -29,7 +29,7 @@ import {
 import { unwrapTemporalFailure } from '../common/errors';
 import { ActivityBackedModelProvider } from './activity-backed-model';
 import { convertAgent } from './convert-agent';
-import { TemporalSandboxClient } from './sandbox-client';
+import { validateTemporalSandboxClient } from './sandbox-client';
 import { ensureTracingProcessorRegistered } from './tracing';
 import { flushOpenSpans } from './agent-sink-processor';
 import { getCurrentPluginConfig } from './plugin-config-store';
@@ -144,10 +144,7 @@ function hasSandboxAgent(agent: Agent<any, any>, seen: Set<Agent<any, any>> = ne
   return false;
 }
 
-/**
- * `runConfig.sandbox.client` must be a `TemporalSandboxClient` so every sandbox
- * operation is dispatched as an Activity rather than run inline in the Workflow.
- */
+/** A reachable `SandboxAgent` needs `runConfig.sandbox`, with a Temporal sandbox client. */
 function validateSandboxRunConfig(agent: Agent<any, any>, sandbox: SandboxRunConfig | undefined): void {
   if (!hasSandboxAgent(agent) && sandbox === undefined) return;
   if (sandbox === undefined) {
@@ -160,24 +157,7 @@ function validateSandboxRunConfig(agent: Agent<any, any>, sandbox: SandboxRunCon
       nonRetryable: true,
     });
   }
-  if (sandbox.client == null) {
-    throw ApplicationFailure.create({
-      message:
-        'runConfig.sandbox.client must be set to a Temporal sandbox client. ' +
-        'Use temporalSandboxClient(name) from @temporalio/openai-agents/workflow.',
-      type: 'SandboxConfigurationError',
-      nonRetryable: true,
-    });
-  }
-  if (!(sandbox.client instanceof TemporalSandboxClient)) {
-    throw ApplicationFailure.create({
-      message:
-        'runConfig.sandbox.client must be created via temporalSandboxClient(name) ' +
-        'from @temporalio/openai-agents/workflow. Do not pass a raw sandbox client directly.',
-      type: 'SandboxConfigurationError',
-      nonRetryable: true,
-    });
-  }
+  validateTemporalSandboxClient(sandbox, 'runConfig.sandbox');
 }
 
 /**
@@ -266,8 +246,8 @@ export class TemporalOpenAIRunner {
       preparedInput = input;
     }
 
-    // Converted agents already carry their model. Nested `agent.asTool()` runs take the model,
-    // provider and settings from this config, as upstream, so their model calls are Activities too.
+    // Handoff agents carry their model. Nested `agent.asTool()` runs take the model, provider and
+    // settings from this config, as upstream, so their model calls are Activities too.
     const innerRunner = new Runner({
       ...runnerConfigOverrides,
       model: modelOverride,

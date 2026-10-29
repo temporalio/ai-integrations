@@ -415,7 +415,17 @@ const triage = new Agent({
 });
 ```
 
-As in the framework, the nested run takes the run's `model` (for agents that set none) and `modelSettings`. Its model Activities use the same options as the runner's.
+As in the framework, the nested run takes the run's `model` (for agents that set none) and `modelSettings`. Its model Activities use the same options as the runner's. An agent that is also a handoff target is the same agent in both places, so it takes the run's `model` like other handoff agents.
+
+The framework doesn't expose the agent behind an `asTool()` tool, so the plugin records it: in the Workflow, before your Workflow module loads, it wraps `Agent.prototype.asTool`. The runner uses that record to check the nested agent and to build the tool again on the agent it converted. Create these tools in Workflow code with `agent.asTool()` and pass them as they are; the runner rejects a tool it can't trace back to its agent, such as a copy, or one created outside a Worker with the plugin before `@temporalio/openai-agents/workflow` was imported.
+
+The runner rejects nested setups that would run model calls or sandbox operations in the Workflow:
+
+- a nested agent, or an agent it hands off to, with a `Model` object instead of a model name;
+- `asTool({ runConfig: { modelProvider } })`, or a `Model` object as `runConfig.model`;
+- a `runConfig.sandbox` or `runOptions.sandbox` whose client isn't from `temporalSandboxClient(name)`;
+- a `MemorySession` as `runOptions.session`;
+- a nested agent with the same name as a different handoff agent, which saved run state could confuse.
 
 ## MCP servers
 
