@@ -695,7 +695,8 @@ Cautions:
   last one without a warning. Rename the other Activity or MCP server, or put
   every model provider and toolset in one `GoogleAdkPlugin`. The same instance
   on the `NativeConnection` and the Worker, or two instances built from the
-  same options object, still work. `modelProvider` is read once, when the
+  same options object, still work, unless `setActivityOptions` gave their
+  Activities different metadata objects. `modelProvider` is read once, when the
   plugin is constructed, and is called as a method of the options object.
 - Model calls use Temporal retries. The plugin disables nested GenAI SDK retries
   for model requests and honors `retry-after` where available.

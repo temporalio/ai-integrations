@@ -8,6 +8,7 @@ import path from 'node:path';
 
 import test from 'ava';
 import type { LlmResponse } from '@google/adk';
+import { setActivityOptions } from '@temporalio/activity';
 import { MockActivityEnvironment } from '@temporalio/testing';
 import type { BundleOptions, WorkerOptions } from '@temporalio/worker';
 
@@ -301,6 +302,27 @@ test('configureWorker refuses to replace a different Activity with the same name
   const shared: GoogleAdkPluginOptions = { modelProvider: provider, mcpToolsets: { weather } };
   t.notThrows(() => new GoogleAdkPlugin(shared).configureWorker(new GoogleAdkPlugin(shared).configureWorker(base)));
   t.notThrows(() => new GoogleAdkPlugin(methodOpts).configureWorker(new GoogleAdkPlugin(methodOpts).configureWorker(base)));
+  // The Worker decodes arguments and encodes results with the metadata
+  // `setActivityOptions` attaches, so same-source Activities must also carry the
+  // same metadata object, in either order, for the model and MCP Activities.
+  const annotate = (plugin: GoogleAdkPlugin, name: string, metadata = { typeInfo: { inputTypes: [] } }) => {
+    // configureWorker returns the plugin's own Activity functions.
+    const activities = plugin.configureWorker(base).activities as Record<string, () => Promise<unknown>>;
+    setActivityOptions(metadata, activities[name]!);
+    return plugin;
+  };
+  const sharedPlugin = () => new GoogleAdkPlugin(shared);
+  const annotatedFirst = (name: string) => annotate(sharedPlugin(), name).configureWorker(base);
+  t.throws(() => sharedPlugin().configureWorker(annotatedFirst('adk-invokeModel')), duplicate('adk-invokeModel'));
+  t.throws(() => sharedPlugin().configureWorker(annotatedFirst('weather-callTool')), duplicate('weather-callTool'));
+  const annotatedLast = annotate(sharedPlugin(), 'adk-invokeModel');
+  t.throws(() => annotatedLast.configureWorker(sharedPlugin().configureWorker(base)), duplicate('adk-invokeModel'));
+  const otherMetadata = annotate(sharedPlugin(), 'adk-invokeModel');
+  t.throws(() => otherMetadata.configureWorker(annotatedFirst('adk-invokeModel')), duplicate('adk-invokeModel'));
+  const metadata = { typeInfo: { inputTypes: [] } };
+  const sameMetadata = annotate(sharedPlugin(), 'adk-invokeModel', metadata);
+  const firstWithMetadata = annotate(sharedPlugin(), 'adk-invokeModel', metadata).configureWorker(base);
+  t.notThrows(() => sameMetadata.configureWorker(firstWithMetadata));
   // Different toolset names from two instances are both kept.
   const both = new GoogleAdkPlugin({ mcpToolsets: { news: mockMCPToolset([]) } })
     .configureWorker(withToolset)
