@@ -2727,7 +2727,7 @@ def tracking_mcp_mock_model():
     )
 
 
-def get_tracking_server(name: str):
+def get_tracking_server(name: str, require_approval: Any = None):
     from agents.mcp import MCPServer  # type: ignore
     from mcp import GetPromptResult, ListPromptsResult  # type: ignore
     from mcp import Tool as MCPTool  # type: ignore
@@ -2739,7 +2739,7 @@ def get_tracking_server(name: str):
         def __init__(self, name: str):
             self._name = name
             self.calls = []
-            super().__init__()
+            super().__init__(require_approval=require_approval)
 
         async def connect(self):
             self.calls.append("connect")
@@ -2967,6 +2967,53 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
                     task_queue=worker.task_queue,
                     execution_timeout=timedelta(seconds=30),
                 )
+
+
+@pytest.mark.parametrize("stateful", [True, False])
+async def test_mcp_server_factory_require_approval_is_rejected(
+    client: Client, stateful: bool
+):
+    tracking_server = get_tracking_server("HelloServer", require_approval="always")
+    server: StatefulMCPServerProvider | StatelessMCPServerProvider = (
+        StatefulMCPServerProvider("HelloServer", lambda _: tracking_server)
+        if stateful
+        else StatelessMCPServerProvider("HelloServer", lambda _: tracking_server)
+    )
+
+    async with AgentEnvironment(
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120)
+        ),
+        model=tracking_mcp_mock_model(),
+        mcp_server_providers=[server],
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(
+            client, McpServerStatefulWorkflow, McpServerWorkflow
+        ) as worker:
+            with pytest.raises(WorkflowFailureError) as err:
+                if stateful:
+                    await client.execute_workflow(
+                        McpServerStatefulWorkflow.run,
+                        args=[timedelta(seconds=1), None, None],
+                        id=f"mcp-server-{uuid.uuid4()}",
+                        task_queue=worker.task_queue,
+                        execution_timeout=timedelta(seconds=30),
+                    )
+                else:
+                    await client.execute_workflow(
+                        McpServerWorkflow.run,
+                        args=[False, None, None],
+                        id=f"mcp-server-{uuid.uuid4()}",
+                        task_queue=worker.task_queue,
+                        execution_timeout=timedelta(seconds=30),
+                    )
+    assert isinstance(err.value.cause, ActivityError)
+    assert isinstance(err.value.cause.cause, ApplicationError)
+    assert err.value.cause.cause.non_retryable
+    assert "temporal_mcp_server()" in err.value.cause.cause.message
+    assert "call_tool" not in tracking_server.calls
 
 
 async def test_stateful_mcp_server_no_worker(client: Client):

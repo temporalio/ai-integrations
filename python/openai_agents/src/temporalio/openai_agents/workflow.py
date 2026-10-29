@@ -386,7 +386,7 @@ def stateless_mcp_server(
                Must not contain secrets.
         require_approval: Optional OpenAI Agents approval policy for this server's tools, with the
                same values as ``MCPServerStdio(require_approval=...)``. A policy set on the
-               factory's server is not used. A callable policy runs in the workflow and must be
+               factory's server is rejected. A callable policy runs in the workflow and must be
                deterministic.
     """
     import warnings
@@ -448,7 +448,7 @@ def stateful_mcp_server(
                Must not contain secrets.
         require_approval: Optional OpenAI Agents approval policy for this server's tools, with the
                same values as ``MCPServerStdio(require_approval=...)``. A policy set on the
-               factory's server is not used. A callable policy runs in the workflow and must be
+               factory's server is rejected. A callable policy runs in the workflow and must be
                deterministic.
     """
     import warnings

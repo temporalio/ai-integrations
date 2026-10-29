@@ -26,6 +26,7 @@ from temporalio.mcp._backend import (
     _FactoryInvoker,
     _MCPBackendFactory,
 )
+from temporalio.openai_agents._mcp import _reject_worker_side_require_approval
 
 _MCPServerFactory = Callable[[], MCPServer] | Callable[[Any], MCPServer]
 
@@ -175,6 +176,7 @@ def _mcp_server_backend_factory(
     def create(argument: Any = _NOT_SUPPLIED) -> _OpenAIMCPServerBackend:
         server = cast(MCPServer, invoke(argument))
         _reject_dynamic_tool_filter(name, server)
+        _reject_worker_side_require_approval(name, server)
         return _OpenAIMCPServerBackend(server)
 
     return create

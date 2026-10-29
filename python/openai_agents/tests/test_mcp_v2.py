@@ -242,6 +242,41 @@ def test_static_worker_side_tool_filter_is_allowed() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "require_approval",
+    [
+        "always",
+        {"say_hello": "always"},
+        {"always": {"tool_names": ["say_hello"]}},
+        lambda context, agent, tool: False,
+    ],
+)
+def test_worker_side_require_approval_is_rejected(require_approval: Any) -> None:
+    def factory() -> AgentsMCPServer:
+        return MCPServerStdio(
+            params={"command": "unused"}, require_approval=require_approval
+        )
+
+    with pytest.raises(ApplicationError) as err:
+        cast(Callable[[], Any], _mcp_server_backend_factory("hello", factory))()
+    assert err.value.non_retryable
+    assert "temporal_mcp_server()" in str(err.value)
+
+
+@pytest.mark.parametrize("require_approval", ["never", {"say_hello": "never"}])
+def test_worker_side_require_approval_never_is_allowed(require_approval: Any) -> None:
+    def factory() -> AgentsMCPServer:
+        return MCPServerStdio(
+            params={"command": "unused"}, require_approval=require_approval
+        )
+
+    backend = cast(
+        Callable[[], _OpenAIMCPServerBackend],
+        _mcp_server_backend_factory("hello", factory),
+    )()
+    assert isinstance(backend, _OpenAIMCPServerBackend)
+
+
 def test_cached_tools_applies_static_filter() -> None:
     class CachedClient:
         name = "hello"

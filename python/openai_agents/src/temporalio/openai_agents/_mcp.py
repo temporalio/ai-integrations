@@ -30,6 +30,30 @@ from temporalio.worker import PollerBehaviorSimpleMaximum, Worker
 from temporalio.workflow import ActivityConfig, ActivityHandle
 
 
+def _reject_worker_side_require_approval(name: str, server: MCPServer) -> None:
+    """Fail fast on a worker-side approval policy that would be ignored.
+
+    The agent reads the approval policy from the server it holds, which in a
+    workflow is the plugin's workflow-side server, so a policy on the factory's
+    server is never read and its tools would run without approval. A policy
+    that never asks for approval, such as ``"never"``, has the same effect as
+    no policy, so it is allowed.
+    """
+    # The Agents SDK keeps the normalized policy only in this private field:
+    # a bool, a dict of tool names to bools, or a callable.
+    policy = getattr(server, "_needs_approval_policy", False)
+    if isinstance(policy, dict):
+        policy = any(policy.values())
+    if callable(policy) or policy:
+        raise ApplicationError(
+            f"MCP server {name!r} sets require_approval on its worker-side "
+            "MCPServer, where the agent never reads it, so its tools would run "
+            "without approval; pass require_approval to temporal_mcp_server() "
+            "instead, or to stateless_mcp_server() or stateful_mcp_server()",
+            non_retryable=True,
+        )
+
+
 @dataclasses.dataclass
 class _StatelessListToolsArguments:
     factory_argument: Any | None
@@ -180,11 +204,13 @@ class StatelessMCPServerProvider:
 
     def _create_server(self, factory_argument: Any | None) -> MCPServer:
         if self._server_accepts_arguments:
-            return cast(Callable[[Any | None], MCPServer], self._server_factory)(
+            server = cast(Callable[[Any | None], MCPServer], self._server_factory)(
                 factory_argument
             )
         else:
-            return cast(Callable[[], MCPServer], self._server_factory)()
+            server = cast(Callable[[], MCPServer], self._server_factory)()
+        _reject_worker_side_require_approval(self.name, server)
+        return server
 
     @property
     def name(self) -> str:
@@ -535,6 +561,7 @@ class StatefulMCPServerProvider:
             try:
                 self._servers[server_id] = server
                 try:
+                    _reject_worker_side_require_approval(self.name, server)
                     await server.connect()
 
                     worker = Worker(
