@@ -5,17 +5,21 @@ from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
-from strands import Agent
+import pytest
+from strands import Agent, tool
 from strands.agent.conversation_manager import SlidingWindowConversationManager
+from strands.multiagent import Swarm
 from strands.types.content import Messages
 from strands.types.streaming import StreamEvent
 
 from temporalio import workflow
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.exceptions import ApplicationError
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
 from temporalio.strands_agents._model_activity import ModelActivity
+from temporalio.strands_agents._sync_calls import refuse_sync_calls_in_workflows
 from temporalio.worker import Replayer, Worker
 from tests.common import get_activities
 from tests.mock_model import MockModel
@@ -63,21 +67,42 @@ async def test_model(client: Client):
     ).replay_workflow(history)
 
 
+@tool
+def echo_tool(text: str) -> str:
+    """Return the text."""
+    return text
+
+
 @workflow.defn
 class SyncCallWorkflow:
     @workflow.run
-    async def run(self) -> str:
-        # A plain Strands agent with its own model, called with the sync form.
-        agent = Agent(model=MockModel(["sync answer"]), callback_handler=None)
-        try:
-            return str(agent("Hello")).strip()
-        except RuntimeError as err:
-            return f"refused: {err}"
+    async def run(self, call: str) -> str:
+        # Plain Strands objects with their own model; building them must work.
+        agent = Agent(
+            model=MockModel(["sync answer"]), tools=[echo_tool], callback_handler=None
+        )
+        swarm = Swarm(
+            [
+                Agent(
+                    model=MockModel(["swarm answer"]),
+                    name="node",
+                    callback_handler=None,
+                )
+            ]
+        )
+        if call == "agent":
+            agent("Hello")
+        elif call == "tool":
+            agent.tool.echo_tool(text="Hello")
+        elif call == "swarm":
+            swarm("Hello")
+        return "built"
 
 
-async def test_sync_agent_call_is_refused(client: Client):
-    """The sync form would run the model on a thread outside the sandbox, unrecorded."""
-    task_queue = f"test_sync_agent_call_is_refused-{uuid4()}"
+@pytest.mark.parametrize("call", ["agent", "tool", "swarm"])
+async def test_sync_call_is_refused(client: Client, call: str):
+    """The sync form would run on a thread outside the sandbox, unrecorded."""
+    task_queue = f"test_sync_call_is_refused-{uuid4()}"
     plugin = StrandsPlugin(models={"mock": lambda: MockModel([])})
 
     async with Worker(
@@ -86,57 +111,65 @@ async def test_sync_agent_call_is_refused(client: Client):
         workflows=[SyncCallWorkflow],
         plugins=[plugin],
         max_cached_workflows=0,
+        workflow_failure_exception_types=[RuntimeError],
     ):
         handle = await client.start_workflow(
             SyncCallWorkflow.run,
-            id=f"test_sync_agent_call_is_refused_{uuid4()}",
+            call,
+            id=f"test_sync_call_is_refused_{uuid4()}",
             task_queue=task_queue,
         )
-        assert (await handle.result()).startswith(
-            "refused: Agent.__call__() runs the call on a new thread"
-        )
+        with pytest.raises(WorkflowFailureError) as err:
+            await handle.result()
+    cause = err.value.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "RuntimeError"
+    assert cause.message.startswith("Strands runs this sync call on a new thread")
 
     await Replayer(
         workflows=[SyncCallWorkflow],
         plugins=[plugin],
+        workflow_failure_exception_types=[RuntimeError],
     ).replay_workflow(await handle.fetch_history())
 
 
-async def test_sync_agent_call_in_sandbox_import_is_refused(client: Client):
-    """The sandbox imports Workflow modules before the Workflow runtime is attached."""
-    task_queue = f"test_sync_agent_call_in_sandbox_import_is_refused-{uuid4()}"
-    plugin = StrandsPlugin(models={"mock": lambda: MockModel([])})
-
-    # Imported after the plugin installs its guard: an ordinary import still
-    # makes the sync call.
-    from tests import sync_import_workflow
-
-    assert sync_import_workflow.import_result == "import answer"
-    workflow_cls = sync_import_workflow.SyncImportWorkflow
-
+async def test_sync_call_workflow_builds_without_calls(client: Client):
+    """Building agents and swarms in Workflow code still works."""
+    task_queue = f"test_sync_call_workflow_builds_without_calls-{uuid4()}"
     async with Worker(
         client,
         task_queue=task_queue,
-        workflows=[workflow_cls],
-        plugins=[plugin],
-        max_cached_workflows=0,
+        workflows=[SyncCallWorkflow],
+        plugins=[StrandsPlugin(models={"mock": lambda: MockModel([])})],
     ):
-        handle = await client.start_workflow(
-            workflow_cls.run,
-            id=f"test_sync_agent_call_in_sandbox_import_is_refused_{uuid4()}",
+        result = await client.execute_workflow(
+            SyncCallWorkflow.run,
+            "none",
+            id=f"test_sync_call_workflow_builds_without_calls_{uuid4()}",
             task_queue=task_queue,
         )
-        assert (await handle.result()).startswith(
-            "refused: Agent.__call__() runs the call on a new thread"
+    assert result == "built"
+
+
+async def test_sync_call_in_sandbox_import_is_refused(client: Client):
+    """The sandbox imports Workflow modules before the Workflow runtime is attached."""
+    # Outside Workflow code the guard lets the sync call run, so an ordinary
+    # import of the module still works.
+    refuse_sync_calls_in_workflows()
+    from tests import sync_import_workflow
+
+    assert sync_import_workflow.import_result == "import answer"
+
+    with pytest.raises(RuntimeError, match="Failed validating workflow") as err:
+        Worker(
+            client,
+            task_queue=f"test_sync_call_in_sandbox_import_is_refused-{uuid4()}",
+            workflows=[sync_import_workflow.SyncImportWorkflow],
+            plugins=[StrandsPlugin(models={"mock": lambda: MockModel([])})],
         )
-
-    history = await handle.fetch_history()
-    assert get_activities(history) == []
-
-    await Replayer(
-        workflows=[workflow_cls],
-        plugins=[plugin],
-    ).replay_workflow(history)
+    assert str(err.value.__cause__).startswith(
+        "Strands runs this sync call on a new thread"
+    )
 
 
 class ConfiguredMockModel(MockModel):

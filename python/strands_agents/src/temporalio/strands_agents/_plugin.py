@@ -85,7 +85,6 @@ class StrandsPlugin(SimplePlugin):
         A sandbox factory may return an async context manager when its adapter
         needs cleanup after the Activity finishes.
         """
-        refuse_sync_calls_in_workflows()
         default_name: str | None = None
         if models is None:
             models = {"bedrock": _default_bedrock_model}
@@ -151,6 +150,8 @@ class StrandsPlugin(SimplePlugin):
 
 
 def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
+    # Strands runs sync calls on its own thread, which no runner restricts.
+    refuse_sync_calls_in_workflows()
     if not runner:
         raise ValueError("No WorkflowRunner provided to the Strands plugin.")
     if isinstance(runner, SandboxedWorkflowRunner):
