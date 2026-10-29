@@ -37,6 +37,7 @@ from temporalio.openai_agents._temporal_model_provider import (
     install_model_provider,
 )
 from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
+from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
@@ -285,6 +286,10 @@ class TemporalOpenAIRunner(AgentRunner):
                     "set a MultiProvider with a prefix map there and choose a provider "
                     "by model name."
                 )
+
+        # Model calls run in an Activity, which cannot get the run's own tracing key.
+        if run_config.tracing is not None:
+            _refuse_tracing_key(run_config.tracing.get("api_key"))
 
         run_config = install_model_provider(self.model_params, run_config)
 

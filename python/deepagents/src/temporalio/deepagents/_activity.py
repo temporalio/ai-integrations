@@ -87,6 +87,12 @@ class ToolActivityInput:
     tool_call_id: str
     args: dict[str, Any]
     config: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # The path and class name of each LangChain message in ``args``, from
+    # ``_serde.find_tool_arg_messages``. Input from older workflow code lacks it
+    # and passes through unchanged.
+    arg_messages: list[tuple[list[str | int], str]] = dataclasses.field(
+        default_factory=list
+    )
 
 
 @dataclasses.dataclass
@@ -256,6 +262,12 @@ class _BackendFactory:
         return self._factory()
 
 
+# Binding options that a provider's ``bind_tools`` converts to its own format
+# (Anthropic turns ``"any"`` into ``{"type": "any"}``, OpenAI into
+# ``"required"``). Passing them to ``.bind()`` instead skips that conversion.
+_TOOL_BIND_KWARGS = ("tool_choice", "parallel_tool_calls")
+
+
 def _default_model_provider(model_name: str) -> Any:
     """Build a chat model from a name string with LLM-SDK retries disabled.
 
@@ -295,10 +307,14 @@ class DeepAgentActivities:
 
     def _build_bound_model(self, input: ModelActivityInput) -> Any:
         model = self._model_provider(input.model_name)
+        bind_kwargs = dict(input.bind_kwargs)
         if input.tool_schemas:
-            model = model.bind_tools(input.tool_schemas)
-        if input.bind_kwargs:
-            model = model.bind(**input.bind_kwargs)
+            tool_kwargs = {
+                k: bind_kwargs.pop(k) for k in _TOOL_BIND_KWARGS if k in bind_kwargs
+            }
+            model = model.bind_tools(input.tool_schemas, **tool_kwargs)
+        if bind_kwargs:
+            model = model.bind(**bind_kwargs)
         return model
 
     @activity.defn(name=INVOKE_MODEL)
@@ -381,7 +397,7 @@ class DeepAgentActivities:
         config = _serde.rebuild_runnable_config(input.config)
         tool_call = {
             "name": input.tool_name,
-            "args": input.args,
+            "args": _serde.load_tool_arg_messages(input.args, input.arg_messages),
             "id": input.tool_call_id,
             "type": "tool_call",
         }
