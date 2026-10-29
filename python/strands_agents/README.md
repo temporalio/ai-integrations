@@ -638,7 +638,11 @@ Worker(
 
 Each factory returns a fully configured `MCPClient`, so you can pass options like `tool_filters`, `prefix`, `elicitation_callback`, or `tasks_config` to it.
 
-Tool names must be unique on one agent: when two tools have the same name, for example two servers that both list `search`, the agent's first model call raises `ValueError`, as Strands does when it builds the agent. Give one server a `prefix`, or drop the tool with `tool_filters`. Earlier versions let the later server's tool replace the earlier one, so a run that started before you deploy this version with such a duplicate can fail to replay on it: let those runs finish first, or use Worker Versioning.
+Tool names must be unique on one agent, as in Strands. Two tools may not have the same name, or names that differ only by `-` or `_`: for example two servers that both list `search`, or a server tool named like a tool in `tools=[...]`. Strands refuses such a duplicate when it builds the agent. `TemporalAgent` learns its MCP tools only when it lists them, so the model call after that listing raises `ValueError` instead: the first one, or, with `cache_tools=False`, a later one if a server starts listing such a name. Give one server a `prefix`, or drop the tool with `tool_filters`. A listed tool may take the name of a `TemporalSandbox` tool, as a tool in `tools=[...]` does.
+
+The error comes after Strands adds the prompt to `agent.messages`, as any error during an agent call does. If Workflow code catches it and calls the agent again, remove that prompt first. A run that met the error keeps the listing in its history, so a new `prefix` or filter does not fix it on replay: reset the Workflow to a point before that listing.
+
+Earlier versions let the later server's tool replace the earlier one. A run that started before you deploy this version and met such a duplicate fails to replay on it: let those runs finish first, or use Worker Versioning.
 
 By default, `TemporalMCPClient` re-lists the server's tools (via `{name}-list-tools`) on every agent turn, so an MCP server that is restarted mid-workflow — with tools added, removed, or renamed — is picked up. To list the tools just once at the beginning of the workflow and reuse that schema for the workflow's lifetime (one fewer activity per turn), set `cache_tools=True`:
 

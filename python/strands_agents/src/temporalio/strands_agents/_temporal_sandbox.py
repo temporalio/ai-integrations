@@ -63,6 +63,12 @@ class TemporalSandbox(Sandbox):
             "summary": summary,
             "priority": priority,
         }
+        # The same tools on every call, so an agent can tell them from a tool of
+        # the same name passed in tools=[...].
+        self._tools: list[AgentTool] = [
+            make_file_editor(sandbox=self, name="sandbox_file_editor"),
+            make_shell(sandbox=self, name="sandbox_shell"),
+        ]
 
     async def execute_streaming(
         self,
@@ -143,10 +149,7 @@ class TemporalSandbox(Sandbox):
 
     def get_tools(self) -> list[AgentTool]:
         """Vend Strands' standard shell and file-editor sandbox tools."""
-        return [
-            make_file_editor(sandbox=self, name="sandbox_file_editor"),
-            make_shell(sandbox=self, name="sandbox_shell"),
-        ]
+        return list(self._tools)
 
     async def _execute(
         self, operation: str, input: Any, *, result_type: type | None = None
