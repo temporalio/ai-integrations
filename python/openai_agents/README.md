@@ -462,10 +462,14 @@ rejected, because it cannot be evaluated on the worker.
 
 These checks run in every MCP Activity. A run that already holds its cached tool
 list, the default, first meets them when it calls a tool: the agent gets the
-error as the tool's output, and the run can complete without the tool. To fail
-such a run instead, pass `failure_error_function=None` to
-`temporal_mcp_server(...)`, or let open runs finish before you upgrade or add a
-setting to the factory's server.
+error as the tool's output, and the run can complete without the tool. Let open
+runs finish before you upgrade or add such a setting to the factory's server.
+Passing `failure_error_function=None` to `temporal_mcp_server(...)` makes such a
+run fail instead. It is a workflow change: every tool failure on that server
+then fails the run, and an open run whose history already contains a failed
+call-tool Activity for that server fails replay with a nondeterminism error.
+Deploy it with the upgrade, and only where open runs have no earlier tool
+failure on that server.
 
 Every MCP operation is a Temporal Activity. The workflow-side tool list is
 cached by default; pass `cache_tools_list=False` to refresh it on every Agents
