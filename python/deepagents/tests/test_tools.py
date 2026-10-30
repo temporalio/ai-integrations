@@ -7,11 +7,12 @@ expected activity.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import uuid
 from collections.abc import Sequence
 from datetime import timedelta
-from types import SimpleNamespace
+from types import FrameType, SimpleNamespace
 from typing import Annotated, Any
 
 import pytest
@@ -34,6 +35,10 @@ with workflow.unsafe.imports_passed_through():
         activity_as_tool,
         run_deep_agent,
         tool_as_activity,
+    )
+    from temporalio.deepagents._plugin import (  # noqa: E402
+        _called_by_langchain,
+        _run_inline_when_called_by,
     )
     from temporalio.deepagents._tools import warn_unwrapped_tools  # noqa: E402
     from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
@@ -534,3 +539,39 @@ async def test_repeated_tool_calls_with_same_args_both_run(
 
     counts = await count_scheduled_activities(handle)
     assert counts[INVOKE_TOOL] == 2, counts
+
+
+def run_in_executor_from_other_framework(loop: asyncio.AbstractEventLoop) -> Any:
+    return loop.run_in_executor(None, lambda: "other")
+
+
+def called_by_other_framework(frame: FrameType) -> bool:
+    return frame.f_code is run_in_executor_from_other_framework.__code__
+
+
+@pytest.mark.parametrize("langchain_first", [True, False])
+def test_langchain_dispatch_composes_with_other_framework(
+    langchain_first: bool,
+) -> None:
+    # Another plugin, such as Strands, adds its caller to the same loop.
+    from langchain_core.runnables.config import run_in_executor
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        def no_threads(*_args: Any) -> Any:
+            raise NotImplementedError
+
+        setattr(loop, "run_in_executor", no_threads)
+        callers = [_called_by_langchain, called_by_other_framework]
+        for called_by in callers if langchain_first else reversed(callers):
+            _run_inline_when_called_by(loop, called_by)
+
+        other = run_in_executor_from_other_framework(loop)
+        assert loop.run_until_complete(other) == "other"
+        # LangChain's helper still runs inline after the other framework's call.
+        assert loop.run_until_complete(run_in_executor(None, lambda: 42)) == 42
+        with pytest.raises(NotImplementedError):
+            loop.run_in_executor(None, lambda: "unrelated")
+    finally:
+        loop.close()

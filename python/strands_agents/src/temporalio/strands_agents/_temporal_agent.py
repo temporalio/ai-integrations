@@ -4,6 +4,7 @@ import contextvars
 import sys
 from collections.abc import AsyncGenerator, Callable, Generator
 from datetime import timedelta
+from types import FrameType
 from typing import Any
 
 from strands import Agent
@@ -50,22 +51,28 @@ class _WorkflowConcurrencyController(_ConcurrencyController):
 # Strands runs a sync tool function with asyncio.to_thread in these modules.
 _SYNC_TOOL_MODULES = ("strands.tools.decorator", "strands.tools.tools")
 
-# True while a TemporalAgent runs its event loop, which calls its tools.
+# True while a TemporalAgent's event loop, which calls its tools, takes a step.
 _in_agent_loop: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_in_agent_loop", default=False
 )
 
+# The callers whose run_in_executor calls the Workflow loop runs inline. The
+# Deep Agents plugin adds its caller to the same list on the same loop, so with
+# both plugins one wrapper checks the original caller against both.
+_INLINE_CALLERS = "_temporal_inline_executor_callers"
+
 
 @contextlib.contextmanager
-def _inline_sync_tools() -> Generator[None, None, None]:
-    """Run the sync tools called in this scope directly in the Workflow.
+def _agent_loop_step() -> Generator[None, None, None]:
+    """Run the sync tools called in this step directly in the Workflow.
 
     Strands runs a sync tool function with ``asyncio.to_thread``. The Workflow
     event loop has no threads, so the tool failed before its body ran and the
     model got ``Error: NotImplementedError - ``. Tools are not changed, only how
-    the loop runs that call.
+    the loop runs that call. A step never spans an ``await`` of the caller, so
+    it sets and resets the flag in one task even when a stream moves between
+    tasks.
     """
-    _run_sync_tool_calls_inline(asyncio.get_running_loop())
     token = _in_agent_loop.set(True)
     try:
         yield
@@ -73,32 +80,41 @@ def _inline_sync_tools() -> Generator[None, None, None]:
         _in_agent_loop.reset(token)
 
 
-def _run_sync_tool_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
-    """Make the Workflow loop run a sync tool's thread call inline."""
-    if getattr(loop, "_runs_sync_tools_inline", False):
-        return
-    run_in_executor = loop.run_in_executor
+def _run_inline_when_called_by(
+    loop: asyncio.AbstractEventLoop, is_caller: Callable[[FrameType], bool]
+) -> None:
+    """Make the Workflow loop run ``run_in_executor`` inline for this caller."""
+    callers: list[Callable[[FrameType], bool]] | None = getattr(
+        loop, _INLINE_CALLERS, None
+    )
+    if callers is None:
+        callers = []
+        run_in_executor = loop.run_in_executor
 
-    def inline_run_in_executor(
-        executor: Any, func: Callable[..., Any], *args: Any
-    ) -> asyncio.Future[Any]:
-        if not (_in_agent_loop.get() and _called_by_sync_tool(sys._getframe(1))):
-            return run_in_executor(executor, func, *args)
-        future = loop.create_future()
-        future.set_result(func(*args))
-        return future
+        def inline_run_in_executor(
+            executor: Any, func: Callable[..., Any], *args: Any
+        ) -> asyncio.Future[Any]:
+            caller = sys._getframe(1)
+            if not any(called_by(caller) for called_by in callers):
+                return run_in_executor(executor, func, *args)
+            future = loop.create_future()
+            future.set_result(func(*args))
+            return future
 
-    setattr(loop, "run_in_executor", inline_run_in_executor)
-    setattr(loop, "_runs_sync_tools_inline", True)
+        setattr(loop, "run_in_executor", inline_run_in_executor)
+        setattr(loop, _INLINE_CALLERS, callers)
+    if is_caller not in callers:
+        callers.append(is_caller)
 
 
-def _called_by_sync_tool(frame: Any) -> bool:
+def _called_by_sync_tool(frame: FrameType) -> bool:
     """Whether this is ``asyncio.to_thread`` called by Strands to run a sync tool.
 
     Those are the only ``asyncio.to_thread`` calls in ``_SYNC_TOOL_MODULES``.
     """
     return (
-        frame.f_code is asyncio.to_thread.__code__
+        _in_agent_loop.get()
+        and frame.f_code is asyncio.to_thread.__code__
         and frame.f_back is not None
         and frame.f_back.f_globals.get("__name__") in _SYNC_TOOL_MODULES
     )
@@ -242,12 +258,21 @@ class TemporalAgent(Agent):
         Every invocation runs its tools in this loop, also when the agent is a
         ``Graph`` or ``Swarm`` node or another agent's tool.
         """
-        with _inline_sync_tools():
-            async with contextlib.aclosing(
-                super()._run_loop(*args, **kwargs)
-            ) as events:
-                async for event in events:
-                    yield event
+        _run_inline_when_called_by(asyncio.get_running_loop(), _called_by_sync_tool)
+        events = super()._run_loop(*args, **kwargs)
+        # The caller can take each event in a different task, so each step
+        # sets the flag only while it runs.
+        try:
+            while True:
+                with _agent_loop_step():
+                    try:
+                        event = await events.__anext__()
+                    except StopAsyncIteration:
+                        return
+                yield event
+        finally:
+            with _agent_loop_step():
+                await events.aclose()
 
     def _use_server_side_state(self) -> None:
         # What Strands' Agent does at construction for a stateful model, which

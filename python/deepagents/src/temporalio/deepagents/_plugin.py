@@ -337,21 +337,40 @@ def _run_langchain_sync_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
     ``NotImplementedError``, so a sync tool never ran. Only calls from that
     helper run inline; any other ``run_in_executor`` call fails as before.
     """
-    if getattr(loop, "_runs_langchain_sync_calls_inline", False):
-        return
-    run_in_executor = loop.run_in_executor
+    _run_inline_when_called_by(loop, _called_by_langchain)
 
-    def inline_run_in_executor(
-        executor: Any, func: Callable[..., Any], *args: Any
-    ) -> asyncio.Future[Any]:
-        if not _called_by_langchain(sys._getframe(1)):
-            return run_in_executor(executor, func, *args)
-        future = loop.create_future()
-        future.set_result(func(*args))
-        return future
 
-    setattr(loop, "run_in_executor", inline_run_in_executor)
-    setattr(loop, "_runs_langchain_sync_calls_inline", True)
+# The callers whose run_in_executor calls the workflow loop runs inline. The
+# Strands plugin adds its caller to the same list on the same loop, so with
+# both plugins one wrapper checks the original caller against both.
+_INLINE_CALLERS = "_temporal_inline_executor_callers"
+
+
+def _run_inline_when_called_by(
+    loop: asyncio.AbstractEventLoop, is_caller: Callable[[FrameType], bool]
+) -> None:
+    """Make the workflow loop run ``run_in_executor`` inline for this caller."""
+    callers: list[Callable[[FrameType], bool]] | None = getattr(
+        loop, _INLINE_CALLERS, None
+    )
+    if callers is None:
+        callers = []
+        run_in_executor = loop.run_in_executor
+
+        def inline_run_in_executor(
+            executor: Any, func: Callable[..., Any], *args: Any
+        ) -> asyncio.Future[Any]:
+            caller = sys._getframe(1)
+            if not any(called_by(caller) for called_by in callers):
+                return run_in_executor(executor, func, *args)
+            future = loop.create_future()
+            future.set_result(func(*args))
+            return future
+
+        setattr(loop, "run_in_executor", inline_run_in_executor)
+        setattr(loop, _INLINE_CALLERS, callers)
+    if is_caller not in callers:
+        callers.append(is_caller)
 
 
 def _called_by_langchain(frame: FrameType) -> bool:
