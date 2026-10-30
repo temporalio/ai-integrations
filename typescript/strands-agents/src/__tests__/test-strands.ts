@@ -360,8 +360,9 @@ test('a stateful model call waits for a worker with stateful support', async (t)
   const plugin = new StrandsPlugin({
     models: { stateful: () => new StatefulStub([textTurn('one'), textTurn('two')], calls) },
   });
-  // During a rolling upgrade, the config can come from an upgraded worker while a worker without
-  // stateful support still polls the queue: it has the config and the stateless model activities only.
+  // An activity worker that registers only the stateless model activities, behind this version's
+  // workflow and config. This is not a mixed-version rollout: an earlier workflow or config activity
+  // breaks the run, as the README says.
   const legacy = new ModelActivity({ stateful: () => new StatefulStub([], calls) });
   const modelsQueue = `${taskQueue}-models`;
 
