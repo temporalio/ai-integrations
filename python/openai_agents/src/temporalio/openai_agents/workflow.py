@@ -31,6 +31,7 @@ from temporalio.exceptions import ApplicationError, TemporalError
 from temporalio.openai_agents._errors import (
     AgentsWorkflowError as AgentsWorkflowError,
 )
+from temporalio.openai_agents._openai_runner import _track_tool_operation
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
@@ -299,11 +300,16 @@ def nexus_operation_as_tool(
         args, _ = schema.to_call_args(params)
         assert len(args) == 1, "Nexus operations must have exactly one argument"
         [arg] = args
-        result = await nexus_client.execute_operation(
-            operation,
-            arg,
-            schedule_to_close_timeout=schedule_to_close_timeout,
-        )
+        # If the agent run is cancelled, its runner waits for this operation, so Temporal
+        # delivers the operation's cancel request before the Workflow closes. Tracking starts
+        # before the start request: a cancelled task keeps waiting for the start to resolve.
+        with _track_tool_operation():
+            handle = await nexus_client.start_operation(
+                operation,
+                arg,
+                schedule_to_close_timeout=schedule_to_close_timeout,
+            )
+            result = await handle
         try:
             return str(result)
         except Exception as e:
