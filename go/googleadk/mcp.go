@@ -65,21 +65,29 @@ func (m *mcpToolset) Name() string { return m.name }
 // same model step. After that, ProcessRequest lists, and Tools returns the
 // latest list without an Activity. See ProcessRequest.
 //
-// ToolFilter runs on each call, not when the list is taken, so a list kept
-// from an earlier step or turn returns only the tools the filter allows now.
-// ADK resumes a confirmed tool call from this list before any ProcessRequest
-// of the resuming agent run.
+// ToolFilter runs on the first call of each agent run, not when the list is
+// taken, so a list kept from an earlier turn returns only the tools the filter
+// allows now. ADK resumes a confirmed tool call from this list before any
+// ProcessRequest of the resuming run. Later calls in the run, which ADK v2.6.0
+// and later make before every model step, return the list the filter last
+// allowed without running it again: a filter that issues Workflow commands
+// then issues them at the same points on every ADK release.
 func (m *mcpToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	l := listingsFrom(ctx)
-	if tools, ok := l.cached(m, ctx); ok {
-		return m.allowed(ctx, tools), nil
+	if tools, ok := l.filteredBefore(m, ctx); ok {
+		return tools, nil
 	}
-	tools, err := m.list(ctx)
-	if err != nil {
-		return nil, err
+	tools, ok := l.cached(m, ctx)
+	if !ok {
+		var err error
+		if tools, err = m.list(ctx); err != nil {
+			return nil, err
+		}
+		l.listed(m, ctx, tools, true)
 	}
-	l.listed(m, ctx, tools, true)
-	return m.allowed(ctx, tools), nil
+	tools = m.allowed(ctx, tools)
+	l.filtered(m, ctx, tools, true)
+	return tools, nil
 }
 
 // allowed returns the tools the toolset's ToolFilter allows for ctx.
@@ -138,7 +146,9 @@ func (m *mcpToolset) ProcessRequest(ctx agent.Context, req *model.LLMRequest) er
 		}
 		l.listed(m, ctx, tools, false)
 	}
-	for _, t := range m.allowed(ctx, tools) {
+	tools = m.allowed(ctx, tools)
+	l.filtered(m, ctx, tools, false)
+	for _, t := range tools {
 		if err := packTool(req, t.(*mcpProxyTool)); err != nil {
 			return err
 		}
@@ -174,6 +184,22 @@ type mcpListingState struct {
 	// ProcessRequest call that follows in the same model step. Concurrent
 	// invocations of one agent each keep their own.
 	pending map[string][]tool.Tool
+	// allowed holds, per agent run whose first Tools call ran ToolFilter, the
+	// list the filter last allowed there. Tools returns it on the later calls
+	// of the run.
+	allowed map[mcpRunKey][]tool.Tool
+}
+
+// mcpRunKey identifies an agent run. A run that resumes a paused one keeps
+// its invocation ID, so the key adds the user content that started the run:
+// ADK passes the same content to every step of a run.
+type mcpRunKey struct {
+	invocation string
+	content    *genai.Content
+}
+
+func runKey(ctx agent.ReadonlyContext) mcpRunKey {
+	return mcpRunKey{ctx.InvocationID(), ctx.UserContent()}
 }
 
 // listingsFrom returns the mcpListings NewContext installed, or nil.
@@ -189,7 +215,7 @@ func (l *mcpListings) entry(m *mcpToolset, ctx agent.ReadonlyContext) *mcpListin
 	k := mcpListingKey{m, ctx.AgentName()}
 	s, ok := l.state[k]
 	if !ok {
-		s = &mcpListingState{pending: map[string][]tool.Tool{}}
+		s = &mcpListingState{pending: map[string][]tool.Tool{}, allowed: map[mcpRunKey][]tool.Tool{}}
 		l.state[k] = s
 	}
 	return s
@@ -224,6 +250,33 @@ func (l *mcpListings) listed(m *mcpToolset, ctx agent.ReadonlyContext, tools []t
 	s.latest = tools
 	if pending {
 		s.pending[ctx.InvocationID()] = tools
+	}
+}
+
+// filteredBefore returns the list ToolFilter last allowed when Tools already
+// ran it in this agent run.
+func (l *mcpListings) filteredBefore(m *mcpToolset, ctx agent.ReadonlyContext) ([]tool.Tool, bool) {
+	if l == nil {
+		return nil, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	tools, ok := l.entry(m, ctx).allowed[runKey(ctx)]
+	return tools, ok
+}
+
+// filtered records a list ToolFilter allowed in the agent run. Tools records
+// the first; ProcessRequest replaces it once Tools has.
+func (l *mcpListings) filtered(m *mcpToolset, ctx agent.ReadonlyContext, tools []tool.Tool, inTools bool) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	s := l.entry(m, ctx)
+	k := runKey(ctx)
+	if _, ok := s.allowed[k]; ok || inTools {
+		s.allowed[k] = tools
 	}
 }
 

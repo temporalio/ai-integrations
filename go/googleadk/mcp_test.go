@@ -298,35 +298,46 @@ func (l *commandLog) count(s string) int {
 	return n
 }
 
-// watchCommands records env's Activity starts and timers in order. It replaces
-// the activityCounter listener newEnv installs.
+// watchCommands records env's Activity starts and timers in order, each timer
+// as "Timer <duration>". It replaces the activityCounter listener newEnv
+// installs.
 func watchCommands(env *testsuite.TestWorkflowEnvironment) *commandLog {
 	l := &commandLog{}
 	env.SetOnActivityStartedListener(func(info *activity.Info, _ context.Context, _ converter.EncodedValues) {
 		l.add(info.ActivityType.Name)
 	})
-	env.SetOnTimerScheduledListener(func(string, time.Duration) { l.add("Timer") })
+	env.SetOnTimerScheduledListener(func(_ string, d time.Duration) { l.add("Timer " + d.String()) })
 	return l
 }
 
 // sleepingInstructionWorkflow runs two turns of an MCP agent whose
-// InstructionProvider sleeps on a workflow timer before each model call, the
-// way an instruction that reads workflow state through a command would.
-func sleepingInstructionWorkflow(ctx workflow.Context) error {
+// InstructionProvider sleeps on a 1s workflow timer before each model call, the
+// way an instruction that reads workflow state through a command would. With
+// filterSleeps, the toolset's ToolFilter also sleeps, on a 2s timer.
+func sleepingInstructionWorkflow(ctx workflow.Context, filterSleeps bool) error {
+	sleep := func(rctx agent.ReadonlyContext, d time.Duration) error {
+		wfCtx, ok := googleadk.WorkflowContext(rctx)
+		if !ok {
+			return errors.New("no workflow context")
+		}
+		return workflow.Sleep(wfCtx, d)
+	}
+	opts := googleadk.MCPToolsetOptions{Name: "search-server"}
+	if filterSleeps {
+		opts.ToolFilter = func(rctx agent.ReadonlyContext, _ tool.Tool) bool {
+			return sleep(rctx, 2*time.Second) == nil
+		}
+	}
 	root, err := llmagent.New(llmagent.Config{
 		Name:  "assistant",
 		Model: googleadk.NewModel("fake-model"),
 		InstructionProvider: func(rctx agent.ReadonlyContext) (string, error) {
-			wfCtx, ok := googleadk.WorkflowContext(rctx)
-			if !ok {
-				return "", errors.New("no workflow context")
-			}
-			if err := workflow.Sleep(wfCtx, time.Second); err != nil {
+			if err := sleep(rctx, time.Second); err != nil {
 				return "", err
 			}
 			return "be helpful", nil
 		},
-		Toolsets: []tool.Toolset{googleadk.NewMCPToolset(googleadk.MCPToolsetOptions{Name: "search-server"})},
+		Toolsets: []tool.Toolset{googleadk.NewMCPToolset(opts)},
 	})
 	if err != nil {
 		return err
@@ -353,42 +364,63 @@ func sleepingInstructionWorkflow(ctx workflow.Context) error {
 // ADK v2.6.0 also calls Tools before the request processors of every step; a
 // listing there would put ListMcpTools before the instruction's timer, where
 // ADK v2.5.0 and earlier put it after, and Histories would not replay across
-// releases.
+// releases. ToolFilter runs at the same points too: in the first Tools call of
+// each turn and in each ProcessRequest, never in the later Tools calls only
+// ADK v2.6.0 makes.
 func TestMcpListsAtTheSamePointInEveryStep(t *testing.T) {
-	m := &ruleModel{name: "fake-model", rule: func(req *model.LLMRequest) *model.LLMResponse {
-		if lastUserText(req) == "search" && !lastIsFunctionResponse(req) {
-			return googleadk.FunctionCallResponse("c1", "search", map[string]any{"query": "temporal"})
-		}
-		return googleadk.TextResponse("done")
-	}}
-	server := googleadk.NewFakeMCPServer("search-server").AddTool(
-		"search", "search the web", searchSchema(),
-		func(map[string]any) (map[string]any, error) { return map[string]any{"hits": 1}, nil },
-	)
-
-	var s testsuite.WorkflowTestSuite
-	env, _ := newEnv(t, &s, googleadk.Config{
-		Models:      map[string]googleadk.ModelFactory{"fake-model": m.factory()},
-		MCPToolsets: map[string]googleadk.MCPFactory{"search-server": server.Factory()},
-	})
-	commands := watchCommands(env)
-	env.RegisterWorkflow(sleepingInstructionWorkflow)
-	env.ExecuteWorkflow(sleepingInstructionWorkflow)
-
-	require.True(t, env.IsWorkflowCompleted())
-	require.NoError(t, env.GetWorkflowError())
-
 	list, invoke, call := googleadk.ListMcpToolsActivityName, googleadk.InvokeModelActivityName, googleadk.CallMcpToolActivityName
-	assert.Equal(t, []string{
-		// Turn 1, step 1: listed through Tools, before the instruction.
-		list, "Timer", invoke, call,
-		// Turn 1, step 2: listed in ProcessRequest, after the instruction.
-		"Timer", list, invoke,
-		// Turn 2: listed in ProcessRequest.
-		"Timer", list, invoke,
-	}, commands.get())
-	for i, names := range m.declared() {
-		assert.Equal(t, []string{"search"}, names, "model request %d", i)
+	instr, filter := "Timer 1s", "Timer 2s"
+	for _, tc := range []struct {
+		filterSleeps bool
+		want         []string
+	}{
+		{false, []string{
+			// Turn 1, step 1: listed through Tools, before the instruction.
+			list, instr, invoke, call,
+			// Turn 1, step 2: listed in ProcessRequest, after the instruction.
+			instr, list, invoke,
+			// Turn 2: listed in ProcessRequest.
+			instr, list, invoke,
+		}},
+		{true, []string{
+			// Turn 1, step 1: Tools lists and filters, ProcessRequest filters.
+			list, filter, instr, filter, invoke, call,
+			// Turn 1, step 2: ProcessRequest lists and filters.
+			instr, list, filter, invoke,
+			// Turn 2: Tools filters the kept list, ProcessRequest lists and
+			// filters.
+			filter, instr, list, filter, invoke,
+		}},
+	} {
+		t.Run(fmt.Sprintf("filterSleeps=%v", tc.filterSleeps), func(t *testing.T) {
+			m := &ruleModel{name: "fake-model", rule: func(req *model.LLMRequest) *model.LLMResponse {
+				if lastUserText(req) == "search" && !lastIsFunctionResponse(req) {
+					return googleadk.FunctionCallResponse("c1", "search", map[string]any{"query": "temporal"})
+				}
+				return googleadk.TextResponse("done")
+			}}
+			server := googleadk.NewFakeMCPServer("search-server").AddTool(
+				"search", "search the web", searchSchema(),
+				func(map[string]any) (map[string]any, error) { return map[string]any{"hits": 1}, nil },
+			)
+
+			var s testsuite.WorkflowTestSuite
+			env, _ := newEnv(t, &s, googleadk.Config{
+				Models:      map[string]googleadk.ModelFactory{"fake-model": m.factory()},
+				MCPToolsets: map[string]googleadk.MCPFactory{"search-server": server.Factory()},
+			})
+			commands := watchCommands(env)
+			env.RegisterWorkflow(sleepingInstructionWorkflow)
+			env.ExecuteWorkflow(sleepingInstructionWorkflow, tc.filterSleeps)
+
+			require.True(t, env.IsWorkflowCompleted())
+			require.NoError(t, env.GetWorkflowError())
+
+			assert.Equal(t, tc.want, commands.get())
+			for i, names := range m.declared() {
+				assert.Equal(t, []string{"search"}, names, "model request %d", i)
+			}
+		})
 	}
 }
 
