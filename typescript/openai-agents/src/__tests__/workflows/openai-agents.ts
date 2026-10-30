@@ -431,8 +431,13 @@ export interface AgentToolStreamResult {
 /**
  * A nested `asTool()` run streams to its `onStream` option and `on()` handlers. With `onAfterStart`,
  * the `on()` handler is registered after the run starts, while the lead's model call is pending.
+ * With `useLocalActivity`, model calls are local Activities, which can't stream.
  */
-export async function agentToolStreamWorkflow(prompt: string, onAfterStart = false): Promise<AgentToolStreamResult> {
+export async function agentToolStreamWorkflow(
+  prompt: string,
+  onAfterStart = false,
+  useLocalActivity = false
+): Promise<AgentToolStreamResult> {
   new WorkflowStream();
   const onStream: string[] = [];
   const on: string[] = [];
@@ -453,7 +458,7 @@ export async function agentToolStreamWorkflow(prompt: string, onAfterStart = fal
     });
   if (!onAfterStart) register();
   const lead = new Agent({ name: 'Lead', instructions: 'Use the tool.', model: 'lead-model', tools: [askStreamer] });
-  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
+  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events', useLocalActivity } });
   const running = runner.run(lead, prompt);
   if (onAfterStart) register();
   const result = await running;

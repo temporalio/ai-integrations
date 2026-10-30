@@ -683,6 +683,40 @@ for (const [title, onAfterStart] of [
   });
 }
 
+test('A nested agent.asTool() run fails to stream when model calls are local Activities', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const leadInputs: any[] = [];
+  let streamed = false;
+  const provider = {
+    getModel() {
+      return {
+        async getResponse(request: any) {
+          leadInputs.push(request.input);
+          return leadInputs.length === 1 ? toolCallResponse('ask_streamer', { input: 'q' }) : textResponse('done');
+        },
+        async *getStreamedResponse() {
+          streamed = true;
+          yield* streamingTextEvents('streamed answer');
+        },
+      } as unknown as FakeModel;
+    },
+  };
+  const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(agentToolStreamWorkflow, {
+      args: ['Hello', false, true],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    t.deepEqual(await handle.result(), { output: 'done', onStream: [], on: [] });
+    t.false(streamed, 'the nested model is not called');
+    // A nested run's failure is the tool's output, as upstream.
+    const toolOutput = leadInputs[1].find((item: any) => item.type === 'function_call_result')?.output;
+    t.regex(JSON.stringify(toolOutput), /Streaming is incompatible with useLocalActivity/);
+    await replay(t, handle);
+  });
+});
+
 test('agent.asTool() tools keep the options and name they were created with', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
   const leadTools: string[][] = [];

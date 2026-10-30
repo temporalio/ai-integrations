@@ -20,6 +20,7 @@ import {
 } from '@temporalio/workflow';
 import { ApplicationFailure } from '@temporalio/common';
 import {
+  STREAMING_LOCAL_ACTIVITY_UNSUPPORTED,
   STREAMING_TOPIC_NOT_CONFIGURED,
   type ModelActivityOptions,
   type ModelSummaryProvider,
@@ -135,6 +136,14 @@ export class ActivityBackedModel implements Model {
       throw ApplicationFailure.create({
         message: STREAMING_TOPIC_NOT_CONFIGURED.message,
         type: STREAMING_TOPIC_NOT_CONFIGURED.type,
+        nonRetryable: true,
+      });
+    }
+    // The runner checks its own streamed runs; this also covers nested `agent.asTool()` runs.
+    if (this.modelParams.useLocalActivity === true) {
+      throw ApplicationFailure.create({
+        message: STREAMING_LOCAL_ACTIVITY_UNSUPPORTED.message,
+        type: STREAMING_LOCAL_ACTIVITY_UNSUPPORTED.type,
         nonRetryable: true,
       });
     }
