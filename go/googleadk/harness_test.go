@@ -82,6 +82,19 @@ type a2aServer struct {
 	// StreamErrorAfter, when positive, ends every stream with an error after
 	// that many events.
 	StreamErrorAfter int
+	// REST makes the card name the REST transport instead of JSON-RPC.
+	REST bool
+	// Path is the path of the A2A interface the card names; "/" by default.
+	Path string
+	// Front, when set, sees every A2A request first and answers it itself
+	// when it returns true. The card is not passed to it.
+	Front func(w http.ResponseWriter, r *http.Request) bool
+	// AlsoRESTPath, when set, makes the card also name a REST interface at
+	// that path, after the first one.
+	AlsoRESTPath string
+	// NoStreaming makes the card say the agent does not stream, so the
+	// client sends message:send and an A2A error comes as an HTTP error.
+	NoStreaming bool
 }
 
 // streamErrorHandler ends every stream with an error after its first n events.
@@ -122,16 +135,31 @@ func startA2AServer(t *testing.T, cfg a2aServer) (string, *atomic.Int32) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		if cfg.Front != nil && r.URL.Path != a2asrv.WellKnownAgentCardPath && cfg.Front(w, r) {
+			return
+		}
 		mux.ServeHTTP(w, r)
 	}))
 	t.Cleanup(srv.Close)
+	path, binding := cfg.Path, a2a.TransportProtocolJSONRPC
+	if path == "" {
+		path = "/"
+	}
+	if cfg.REST {
+		binding = a2a.TransportProtocolHTTPJSON
+	}
 	card := &a2a.AgentCard{
 		Name: "remote", Description: "Answers questions.", Version: "1.0.0",
 		SupportedInterfaces: []*a2a.AgentInterface{{
-			URL: srv.URL + "/", ProtocolBinding: a2a.TransportProtocolJSONRPC, ProtocolVersion: a2a.Version,
+			URL: srv.URL + path, ProtocolBinding: binding, ProtocolVersion: a2a.Version,
 		}},
 		DefaultInputModes: []string{"text/plain"}, DefaultOutputModes: []string{"text/plain"},
-		Capabilities: a2a.AgentCapabilities{Streaming: true},
+		Capabilities: a2a.AgentCapabilities{Streaming: !cfg.NoStreaming},
+	}
+	if cfg.AlsoRESTPath != "" {
+		card.SupportedInterfaces = append(card.SupportedInterfaces, &a2a.AgentInterface{
+			URL: srv.URL + cfg.AlsoRESTPath, ProtocolBinding: a2a.TransportProtocolHTTPJSON, ProtocolVersion: a2a.Version,
+		})
 	}
 	executor := a2asrv.AgentExecutorFunc(func(_ context.Context, ec *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
 		return func(yield func(a2a.Event, error) bool) { cfg.Reply(ec, yield) }
@@ -141,7 +169,11 @@ func startA2AServer(t *testing.T, cfg a2aServer) (string, *atomic.Int32) {
 	if cfg.StreamErrorAfter > 0 {
 		handler = streamErrorHandler{RequestHandler: handler, n: cfg.StreamErrorAfter}
 	}
-	mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
+	if cfg.REST {
+		mux.Handle("/", a2asrv.NewRESTHandler(handler))
+	} else {
+		mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
+	}
 	return srv.URL, &requests
 }
 

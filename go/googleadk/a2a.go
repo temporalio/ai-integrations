@@ -1,12 +1,15 @@
 package googleadk
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"time"
@@ -14,6 +17,7 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/a2aproject/a2a-go/v2/a2aclient"
 	"github.com/a2aproject/a2a-go/v2/a2aclient/agentcard"
+	"github.com/a2aproject/a2a-go/v2/errordetails"
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
@@ -264,9 +268,7 @@ func withA2AClient[T any](ctx context.Context, a *Activities, card *a2a.AgentCar
 	}
 	client, err := factory.CreateFromCard(ctx, card)
 	if err != nil {
-		// The card names no transport the factory supports, which a retry
-		// cannot change.
-		return zero, newApplicationError(ErrorTypeA2A, false, err, "create A2A client: %v", err)
+		return zero, a2aClientError(err)
 	}
 	defer func() {
 		if err := client.Destroy(); err != nil {
@@ -278,6 +280,31 @@ func withA2AClient[T any](ctx context.Context, a *Activities, card *a2a.AgentCar
 		return zero, a2aError(op, err)
 	}
 	return res, nil
+}
+
+// a2aClientError tags a failure to create an A2A client. A failure a2a-go
+// does not wrap comes from the card or the factory, such as a card that names
+// no transport the factory supports, which a retry cannot change. Otherwise
+// a2a-go joins the errors of every transport it tried to open, and the call is
+// retried when any of them can pass, as a2aRetryable decides, such as a
+// caller's transport that could not dial or load its credentials. An interface
+// URL that does not parse comes from the card and cannot pass.
+func a2aClientError(err error) error {
+	retryable := false
+	if errors.Unwrap(err) != nil {
+		failures := []error{err}
+		var joined interface{ Unwrap() []error }
+		if errors.As(err, &joined) {
+			failures = joined.Unwrap()
+		}
+		for _, f := range failures {
+			var urlErr *url.Error
+			if !(errors.As(f, &urlErr) && urlErr.Op == "parse") && a2aRetryable(f) {
+				retryable = true
+			}
+		}
+	}
+	return newApplicationError(ErrorTypeA2A, retryable, err, "create A2A client: %v", err)
 }
 
 // appendA2AEvent appends a streamed event to events. A chunk that continues
@@ -329,6 +356,11 @@ func appendA2APart(parts a2a.ContentParts, p *a2a.Part) a2a.ContentParts {
 //   - anything else, such as a network error or a card file missing on this
 //     worker, is.
 func a2aError(op string, err error) error {
+	return newApplicationError(ErrorTypeA2A, a2aRetryable(err), err, "%s: %v", op, err)
+}
+
+// a2aRetryable reports whether a2aError retries err.
+func a2aRetryable(err error) bool {
 	retryable := true
 	var status *a2aHTTPStatusError
 	var cardStatus *agentcard.ErrStatusNotOK
@@ -344,7 +376,7 @@ func a2aError(op string, err error) error {
 		errors.As(err, &syntaxErr), errors.As(err, &typeErr):
 		retryable = false
 	}
-	return newApplicationError(ErrorTypeA2A, retryable, err, "%s: %v", op, err)
+	return retryable
 }
 
 // defaultA2AClientFactory builds the A2A clients when Config.A2AClientFactory
@@ -353,28 +385,78 @@ func a2aError(op string, err error) error {
 // own default client stops every call at 3 minutes.
 var defaultA2AClientFactory = a2aclient.NewFactory(
 	a2aclient.WithJSONRPCTransport(&http.Client{Transport: a2aStatusTransport{}}),
-	a2aclient.WithRESTTransport(&http.Client{Transport: a2aStatusTransport{keepJSONErrors: true}}),
+	a2aclient.WithRESTTransport(&http.Client{Transport: a2aStatusTransport{keepA2AErrors: true}}),
 )
 
 // a2aStatusTransport turns an HTTP error status into an a2aHTTPStatusError, so
 // a2aError can decide retries from the status. a2a-go's JSON-RPC transport
-// reports the status only as text, and its REST transport drops it when the
-// body is not JSON. With keepJSONErrors, a JSON error body is left to a2a-go,
-// which turns it into an A2A error.
+// reports the status only as text, and its REST transport turns any error body
+// into an A2A error: a JSON one with no A2A reason becomes an internal error,
+// which is not retried, and any other one a server error. A redirect is left
+// to the http.Client, which follows it. With keepA2AErrors, an error body that
+// names an A2A error, as a2a-go's REST server writes it, is left to a2a-go.
 type a2aStatusTransport struct {
-	keepJSONErrors bool
+	keepA2AErrors bool
 }
 
 func (t a2aStatusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := http.DefaultTransport.RoundTrip(req)
-	if err != nil || resp.StatusCode == http.StatusOK {
+	if err != nil || resp.StatusCode == http.StatusOK || isFollowedRedirect(resp) {
 		return resp, err
 	}
-	if t.keepJSONErrors && strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
-		return resp, nil
+	var body []byte
+	if t.keepA2AErrors && strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+		// The whole body, as a2a-go would decode it: a prefix of an A2A
+		// error does not parse, and would be taken for a gateway's.
+		body, err = io.ReadAll(resp.Body)
 	}
 	_ = resp.Body.Close()
+	if err == nil && isA2AErrorBody(body) {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		return resp, nil
+	}
 	return nil, &a2aHTTPStatusError{code: resp.StatusCode, status: resp.Status}
+}
+
+// isFollowedRedirect reports whether http.Client follows resp to its Location.
+func isFollowedRedirect(resp *http.Response) bool {
+	switch resp.StatusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return resp.Header.Get("Location") != ""
+	}
+	return false
+}
+
+// isA2AErrorBody reports whether body is a google.rpc.Status error with an
+// ErrorInfo detail in the A2A domain, which a2a-go's REST server adds to every
+// error it writes. A gateway's JSON error has none. Like a2a-go, it reads a
+// detail's fields only once its type says it is an ErrorInfo: an agent's own
+// details can hold any JSON.
+func isA2AErrorBody(body []byte) bool {
+	var status struct {
+		Error struct {
+			Details []json.RawMessage `json:"details"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &status) != nil {
+		return false
+	}
+	for _, raw := range status.Error.Details {
+		var hint struct {
+			Type string `json:"@type"`
+		}
+		if json.Unmarshal(raw, &hint) != nil || hint.Type != errordetails.ErrorInfoType {
+			continue
+		}
+		var info struct {
+			Domain string `json:"domain"`
+		}
+		if json.Unmarshal(raw, &info) == nil && info.Domain == a2a.ProtocolDomain {
+			return true
+		}
+	}
+	return false
 }
 
 // a2aHTTPStatusError is an HTTP error status from a remote A2A agent.
