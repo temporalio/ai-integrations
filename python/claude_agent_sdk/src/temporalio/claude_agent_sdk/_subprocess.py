@@ -67,15 +67,19 @@ class _SubprocessConnection(SubprocessCLITransport):
         try:
             async for message in self.read_messages():
                 self._output.put_nowait(message)
-            self._output.put_nowait(_Exit(None))
+            ended = _Exit(None)
         except ClaudeSDKError as error:
-            self._output.put_nowait(_Exit(error))
+            ended = _Exit(error)
         except Exception as error:
             # Such as invalid UTF-8, which the Claude Agent SDK lets through.
-            unreadable = CLIConnectionError(
-                f"Failed to read Claude Code's output: {error}"
+            ended = _Exit(
+                CLIConnectionError(f"Failed to read Claude Code's output: {error}")
             )
-            self._output.put_nowait(_Exit(unreadable))
+
+        # Stdout can close before the last stderr lines are read.
+        if self._stderr_task is not None:
+            await self._stderr_task.wait()
+        self._output.put_nowait(ended)
 
     async def read(self) -> list[Output]:
         output: list[Output] = []
