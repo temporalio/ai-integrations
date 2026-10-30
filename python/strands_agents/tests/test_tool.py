@@ -16,7 +16,7 @@ from temporalio.client import Client, WorkflowHistory
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
 from temporalio.strands_agents.workflow import activity_as_tool
 from temporalio.worker import Replayer, Worker
-from tests.common import get_activities
+from tests.common import get_activities, get_tool_results
 from tests.mock_model import MockModel
 from tests.postponed_activities import LoadParcels
 
@@ -241,6 +241,9 @@ async def test_tool(client: Client, tmp_path: Path):
         "locate_parcel",
         "invoke_model",
     ]
+    # The model got the result of letter_counter, the third tool, a sync tool
+    # run in the workflow.
+    assert get_tool_results(history)[2] == [{"text": "3"}]
     assert _activity_calls(client, history, "parcel") == [
         (["P-1"], "parcel P-1 via acme-post"),
         (["P-2"], "quote for P-2 via acme-post"),

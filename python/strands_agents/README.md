@@ -448,6 +448,10 @@ error result can fail replay on this version. Keep those runs on their original
 workers with Worker Versioning. To recover a run stuck during tool cancellation,
 reset it to before the affected tool call and run it on upgraded workers.
 
+Other tools run directly in the workflow, so they must be deterministic, like
+workflow code. Sync tools run there too, not in a separate thread as they do
+outside Temporal.
+
 ## Hooks
 
 Strands' [hook system](https://strandsagents.com/) (`strands.hooks`) lets you subscribe callbacks to events in the agent lifecycle — invocation start/end, model call before/after, tool call before/after, message added. Pass `hooks=[MyHookProvider()]` to `TemporalAgent`: every single-agent hook event fires in workflow context, so deterministic callbacks just work.

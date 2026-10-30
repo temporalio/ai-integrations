@@ -1,5 +1,8 @@
 import asyncio
-from collections.abc import AsyncGenerator
+import contextlib
+import contextvars
+import sys
+from collections.abc import AsyncGenerator, Callable, Generator
 from datetime import timedelta
 from typing import Any
 
@@ -130,6 +133,63 @@ class _WorkflowConcurrencyController(_ConcurrencyController):
         return waiting_on, registered_token
 
 
+# Strands runs a sync tool function with asyncio.to_thread in these modules.
+_SYNC_TOOL_MODULES = ("strands.tools.decorator", "strands.tools.tools")
+
+# True while a TemporalAgent runs its event loop, which calls its tools.
+_in_agent_loop: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_in_agent_loop", default=False
+)
+
+
+@contextlib.contextmanager
+def _inline_sync_tools() -> Generator[None, None, None]:
+    """Run the sync tools called in this scope directly in the Workflow.
+
+    Strands runs a sync tool function with ``asyncio.to_thread``. The Workflow
+    event loop has no threads, so the tool failed before its body ran and the
+    model got ``Error: NotImplementedError - ``. Tools are not changed, only how
+    the loop runs that call.
+    """
+    _run_sync_tool_calls_inline(asyncio.get_running_loop())
+    token = _in_agent_loop.set(True)
+    try:
+        yield
+    finally:
+        _in_agent_loop.reset(token)
+
+
+def _run_sync_tool_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
+    """Make the Workflow loop run a sync tool's thread call inline."""
+    if getattr(loop, "_runs_sync_tools_inline", False):
+        return
+    run_in_executor = loop.run_in_executor
+
+    def inline_run_in_executor(
+        executor: Any, func: Callable[..., Any], *args: Any
+    ) -> asyncio.Future[Any]:
+        if not (_in_agent_loop.get() and _called_by_sync_tool(sys._getframe(1))):
+            return run_in_executor(executor, func, *args)
+        future = loop.create_future()
+        future.set_result(func(*args))
+        return future
+
+    setattr(loop, "run_in_executor", inline_run_in_executor)
+    setattr(loop, "_runs_sync_tools_inline", True)
+
+
+def _called_by_sync_tool(frame: Any) -> bool:
+    """Whether this is ``asyncio.to_thread`` called by Strands to run a sync tool.
+
+    Those are the only ``asyncio.to_thread`` calls in ``_SYNC_TOOL_MODULES``.
+    """
+    return (
+        frame.f_code is asyncio.to_thread.__code__
+        and frame.f_back is not None
+        and frame.f_back.f_globals.get("__name__") in _SYNC_TOOL_MODULES
+    )
+
+
 class TemporalAgent(Agent):
     """A Strands ``Agent`` that routes model calls through a Temporal activity.
 
@@ -254,23 +314,29 @@ class TemporalAgent(Agent):
         self._mcp_names = new
 
     async def _run_loop(self, *args: Any, **kwargs: Any) -> AsyncGenerator[Any, None]:
+        """Run Strands' event loop, with sync tools run directly in the Workflow.
+
+        Every invocation runs its tools in this loop, also when the agent is a
+        ``Graph`` or ``Swarm`` node or another agent's tool.
+        """
         # After a tool call, Strands runs the next model call inside the last
         # cycle and wraps most errors from it in EventLoopException. Raise a
         # tool name conflict as itself, so Workflow code can catch it and it
         # fails the Workflow as a non-retryable ApplicationError.
-        events = super()._run_loop(*args, **kwargs)
-        try:
-            async for event in events:
-                yield event
-        except EventLoopException as err:
-            if isinstance(err.__cause__, MCPToolNameConflictError):
-                raise err.__cause__ from None
-            raise
-        finally:
-            # Close Strands' loop as stream_async closes this one, so its
-            # cleanup, such as AfterInvocationEvent hooks, finishes before a
-            # closed stream returns.
-            await events.aclose()
+        with _inline_sync_tools():
+            events = super()._run_loop(*args, **kwargs)
+            try:
+                async for event in events:
+                    yield event
+            except EventLoopException as err:
+                if isinstance(err.__cause__, MCPToolNameConflictError):
+                    raise err.__cause__ from None
+                raise
+            finally:
+                # Close Strands' loop as stream_async closes this one, so its
+                # cleanup, such as AfterInvocationEvent hooks, finishes before a
+                # closed stream returns.
+                await events.aclose()
 
     async def _convert_prompt_to_messages(self, prompt: AgentInput) -> Messages:
         """Load the worker-side model's config, then convert the prompt.
