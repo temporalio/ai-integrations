@@ -20,12 +20,13 @@ import {
   MCP_LIST_TOOLS_SUFFIX,
   MCP_SERVER_SESSION_SUFFIX,
   MCP_STATEFUL_SUFFIX,
+  type McpServerHandleOptions,
   type StatefulMcpServerSessionArgs,
   type StatefulTemporalMCPServer,
 } from '../common/mcp-types';
 import { getCurrentPluginConfig } from './plugin-config-store';
 
-export interface StatefulMcpServerOptions {
+export interface StatefulMcpServerOptions extends McpServerHandleOptions {
   /** Activity options for tool operation Activities on the dedicated Worker. */
   config?: {
     startToCloseTimeout?: Duration;
@@ -46,13 +47,6 @@ export interface StatefulMcpServerOptions {
    * mid-run.
    */
   cacheToolsList?: boolean;
-  /**
-   * Builds each tool call's MCP `_meta` in the Workflow, as for a native MCP server. It gets the
-   * run context and must be deterministic. Older plugin versions ignore this option and may not
-   * replay a History in which it ran, because running it can change the Workflow's commands or
-   * their order.
-   */
-  toolMetaResolver?: MCPToolMetaResolver;
 }
 
 const DEDICATED_WORKER_SCHEDULE_FAILURE_MESSAGE =

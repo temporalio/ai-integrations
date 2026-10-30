@@ -1,22 +1,20 @@
-import type { MCPServer, MCPToolMetaResolver } from '@openai/agents-core';
+import type { MCPServer } from '@openai/agents-core';
 import type { Duration, RetryPolicy } from '@temporalio/common';
 import { proxyActivities } from '@temporalio/workflow';
-import { MCP_CALL_TOOL_SUFFIX, MCP_LIST_TOOLS_SUFFIX, MCP_STATELESS_SUFFIX } from '../common/mcp-types';
+import {
+  MCP_CALL_TOOL_SUFFIX,
+  MCP_LIST_TOOLS_SUFFIX,
+  MCP_STATELESS_SUFFIX,
+  type McpServerHandleOptions,
+} from '../common/mcp-types';
 
-export interface StatelessMcpServerOptions {
+export interface StatelessMcpServerOptions extends McpServerHandleOptions {
   cacheToolsList?: boolean;
   startToCloseTimeout?: Duration;
   heartbeatTimeout?: Duration;
   taskQueue?: string;
   retryPolicy?: RetryPolicy;
   factoryArgument?: unknown;
-  /**
-   * Builds each tool call's MCP `_meta` in the Workflow, as for a native MCP server. It gets the
-   * run context and must be deterministic. Older plugin versions ignore this option and may not
-   * replay a History in which it ran, because running it can change the Workflow's commands or
-   * their order.
-   */
-  toolMetaResolver?: MCPToolMetaResolver;
 }
 
 export function statelessMcpServer(name: string, options?: StatelessMcpServerOptions): MCPServer {
