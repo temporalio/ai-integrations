@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 import uuid
+import warnings
 from collections.abc import Sequence
 from datetime import timedelta
 from typing import Any
@@ -185,6 +186,46 @@ async def test_model_call_is_activity(env: WorkflowEnvironment) -> None:
     assert "Paris" in out
     counts = await count_scheduled_activities(handle)
     assert counts[INVOKE_MODEL] == 1, counts
+
+
+@pytest.mark.asyncio
+async def test_model_call_warns_nothing_about_allowed_objects(
+    env: WorkflowEnvironment,
+) -> None:
+    """Neither side of the seam relies on ``load``'s default ``allowed_objects``.
+
+    One model call loads its input messages in the activity and its reply in
+    the workflow; ``langchain_core.load.load`` warns on each such call that
+    relies on the default (scheduled to narrow, which would change what the
+    plugin's own payloads revive). Assert neither warning fires.
+    """
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(["The capital of France is Paris."]),
+        model_activity_options={"start_to_close_timeout": timedelta(seconds=30)},
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        async with Worker(
+            env.client,
+            task_queue="da-model-warn",
+            workflows=[ModelWorkflow],
+            plugins=[plugin],
+        ):
+            handle = await env.client.start_workflow(
+                ModelWorkflow.run,
+                "What is the capital of France?",
+                id=f"da-model-warn-{uuid.uuid4()}",
+                task_queue="da-model-warn",
+            )
+            out = await handle.result()
+    assert "Paris" in out
+    offenders = [
+        w
+        for w in caught
+        if issubclass(w.category, PendingDeprecationWarning)
+        and "allowed_objects" in str(w.message)
+    ]
+    assert not offenders, [f"{w.filename}: {w.message}" for w in offenders]
 
 
 @pytest.mark.asyncio
