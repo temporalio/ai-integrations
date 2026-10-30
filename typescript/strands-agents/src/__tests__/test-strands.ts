@@ -22,7 +22,7 @@ import {
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
 import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
-import { DeterminismViolationError } from '@temporalio/workflow';
+import { ActivityCancellationType, DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { STRANDS_MALFORMED_INTERRUPT_TYPE, StrandsPlugin } from '..';
 import { startLocalWithRetry } from './helpers/environment';
@@ -41,6 +41,7 @@ import {
   activityToolAgent,
   failActivities,
   approveSignal,
+  cancellableAgent,
   cancellableModelCall,
   compressionAgent,
   defaultModelAgent,
@@ -661,6 +662,52 @@ for (const streaming of [false, true]) {
       t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');
     });
     t.true(receivedSignal instanceof AbortSignal && receivedSignal.aborted, 'expected the model signal to abort');
+  });
+}
+
+for (const cancellationType of [
+  ActivityCancellationType.TRY_CANCEL,
+  ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+]) {
+  test(`cancelling a TemporalAgent workflow with ${cancellationType} aborts the model call and cancels the workflow`, async (t) => {
+    t.timeout(60_000);
+    const { createWorker, startWorkflow } = helpers(t);
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => (markStarted = resolve));
+    let markAborted!: () => void;
+    const aborted = new Promise<void>((resolve) => (markAborted = resolve));
+    // Waits for its cancel signal, then fails as OpenAI's client does: an error named `Error`.
+    class AbortingStub extends StubModel {
+      // eslint-disable-next-line require-yield
+      override async *stream(_messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+        await new Promise<void>((resolve) => {
+          options?.cancelSignal?.addEventListener('abort', () => resolve());
+          markStarted();
+        });
+        markAborted();
+        throw new Error('Request was aborted.');
+      }
+    }
+
+    const worker = await createWorker({
+      plugins: [new StrandsPlugin({ models: { test: () => new AbortingStub([]) } })],
+    });
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(cancellableAgent, { args: [cancellationType] });
+      await started;
+      await handle.cancel();
+      const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+      t.true(err!.cause instanceof CancelledFailure, `expected a CancelledFailure, got ${err!.cause}`);
+      // The model's signal aborts while the worker runs, not because it shuts down.
+      await aborted;
+      const { events } = await handle.fetchHistory();
+      t.true(events!.some((e) => e.activityTaskCancelRequestedEventAttributes), 'expected ActivityTaskCancelRequested');
+      t.false(events!.some((e) => e.workflowTaskFailedEventAttributes), 'expected no WorkflowTaskFailed');
+      t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');
+      if (cancellationType === ActivityCancellationType.WAIT_CANCELLATION_COMPLETED) {
+        t.true(events!.some((e) => e.activityTaskCanceledEventAttributes), 'expected ActivityTaskCanceled');
+      }
+    });
   });
 }
 

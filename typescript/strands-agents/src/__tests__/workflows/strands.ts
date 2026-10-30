@@ -41,6 +41,20 @@ export async function helloAgent(prompt: string): Promise<string> {
 }
 
 /**
+ * Runs one agent turn whose model activity heartbeats, with the given cancellation type, so a
+ * workflow cancel during the model call reaches the model.
+ */
+export async function cancellableAgent(cancellationType: ActivityCancellationType): Promise<string> {
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    activityOptions: { startToCloseTimeout: '30 seconds', heartbeatTimeout: '5 seconds', cancellationType },
+  });
+  const result = await agent.invoke('hello');
+  return result.toString();
+}
+
+/**
  * Runs each prompt as a turn of one agent with Strands' proactive compression, then returns the
  * config the agent's model reports in workflow code.
  */
