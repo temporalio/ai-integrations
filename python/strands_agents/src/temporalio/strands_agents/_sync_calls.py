@@ -12,10 +12,11 @@ and is not covered here.
 """
 
 import functools
+import inspect
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, TypeVar
+from typing import Any
 
 from strands import Agent
 from strands.multiagent.graph import Graph
@@ -24,8 +25,6 @@ from strands.multiagent.swarm import Swarm
 from temporalio import workflow
 from temporalio.worker.workflow_sandbox import RestrictedWorkflowAccessError
 
-_T = TypeVar("_T")
-
 _MESSAGE = (
     "Strands runs this sync call on a new thread, which cannot use the Workflow "
     "event loop and is not recorded in Workflow History. In Workflow code, use "
@@ -33,6 +32,12 @@ _MESSAGE = (
     "TemporalAgent or TemporalAgent nodes, or move the call into an Activity. "
     "If Strands made the call itself, as a SummarizingConversationManager or "
     "SnapshotSessionManager does, that feature does not work in Workflow code."
+)
+
+_UNSUPPORTED = (
+    "The Strands plugin could not find strands._async.run_async using a "
+    "ThreadPoolExecutor, which it guards so that Strands' sync calls fail in "
+    "Workflow code. This strands-agents version is not supported."
 )
 
 
@@ -79,37 +84,26 @@ def refuse_sync_calls_in_workflows() -> None:
         try:
             import strands._async
 
-            run_async = strands._async.run_async
             thread_pool_executor = getattr(strands._async, "ThreadPoolExecutor")
+            run_async_code = getattr(
+                inspect.unwrap(strands._async.run_async), "__code__"
+            )
         except (ImportError, AttributeError) as err:
-            raise RuntimeError(
-                "The Strands plugin could not find strands._async.run_async or the "
-                "ThreadPoolExecutor it uses, which it guards so that Strands' sync "
-                "calls fail in Workflow code. This strands-agents version is not "
-                "supported."
-            ) from err
+            raise RuntimeError(_UNSUPPORTED) from err
+        if "ThreadPoolExecutor" not in run_async_code.co_names:
+            raise RuntimeError(_UNSUPPORTED)
 
-        def refuse_in_workflow_code() -> None:
+        def guarded_executor(*args: Any, **kwargs: Any) -> ThreadPoolExecutor:
             if _in_workflow_code():
                 raise RestrictedWorkflowAccessError(
                     "strands._async.run_async", override_message=_MESSAGE
                 )
-
-        def guarded_executor(*args: Any, **kwargs: Any) -> ThreadPoolExecutor:
-            refuse_in_workflow_code()
             return thread_pool_executor(*args, **kwargs)
 
-        def guarded(async_func: Callable[[], Awaitable[_T]]) -> _T:
-            refuse_in_workflow_code()
-            return run_async(async_func)
-
-        functools.update_wrapper(guarded, run_async)
         # run_async looks up ThreadPoolExecutor on every call, so this guards every
-        # reference to run_async, also ones bound before this install.
+        # reference to run_async, also ones bound before this install. Repeating
+        # any of these steps is harmless.
         setattr(strands._async, "ThreadPoolExecutor", guarded_executor)
-        # Guard run_async where it is defined too, in case a later Strands stops
-        # using the executor. Repeating any of these steps is harmless.
-        setattr(strands._async, "run_async", guarded)
         for cls in (Agent, Graph, Swarm):
             cls.__init__ = _allow_during(cls.__init__)  # type: ignore[method-assign]
         _installed = True

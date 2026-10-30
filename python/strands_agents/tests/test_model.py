@@ -1,5 +1,7 @@
 import asyncio
+import concurrent.futures
 import importlib
+import inspect
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -7,9 +9,11 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+import strands._async
 from strands import Agent, tool
 from strands.agent.conversation_manager import SlidingWindowConversationManager
 from strands.multiagent import Swarm
+from strands.multiagent.graph import Graph
 from strands.types.content import Messages
 from strands.types.streaming import StreamEvent
 
@@ -18,7 +22,7 @@ from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.exceptions import ApplicationError
-from temporalio.strands_agents import StrandsPlugin, TemporalAgent
+from temporalio.strands_agents import StrandsPlugin, TemporalAgent, _sync_calls
 from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.strands_agents._sync_calls import _MESSAGE
 from temporalio.worker import Replayer, Worker
@@ -27,8 +31,10 @@ from temporalio.workflow import NondeterminismError
 from tests.common import get_activities
 from tests.mock_model import MockModel
 
+# The dotted name passes through the sandbox, so the Workflow gets the binding
+# made at collection, before any Worker installed the guard.
 with workflow.unsafe.imports_passed_through():
-    from tests import prebound_run_async
+    from tests.prebound_run_async import run_async as prebound_run_async
 
 
 @workflow.defn
@@ -94,7 +100,7 @@ class SyncCallWorkflow:
             swarm("Hello")
         elif call == "prebound":
             # run_async bound by a module imported before the guard was installed.
-            prebound_run_async.run_async(lambda: agent.invoke_async("Hello"))
+            prebound_run_async(lambda: agent.invoke_async("Hello"))
         elif call == "unrestricted":
             # The SDK's escape hatch: the call runs on Strands' thread, unrecorded.
             with workflow.unsafe.sandbox_unrestricted():
@@ -146,6 +152,7 @@ async def test_sync_call_workflow_builds_without_calls(client: Client):
         task_queue=task_queue,
         workflows=[SyncCallWorkflow],
         plugins=[StrandsPlugin(models={"mock": lambda: MockModel([])})],
+        workflow_failure_exception_types=[NondeterminismError],
     ):
         result = await client.execute_workflow(
             SyncCallWorkflow.run,
@@ -163,8 +170,18 @@ async def test_sync_call_workflow_builds_without_calls(client: Client):
     assert unrestricted == "answer"
 
 
-async def test_sync_call_in_sandbox_import_is_refused(client: Client):
+async def test_sync_call_in_sandbox_import_is_refused(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
     """The sandbox imports Workflow modules before the Workflow runtime is attached."""
+    # Undo an install by an earlier test in this process, so this Worker must
+    # install the guard itself; monkeypatch restores the earlier state.
+    monkeypatch.setattr(_sync_calls, "_installed", False)
+    monkeypatch.setattr(
+        strands._async, "ThreadPoolExecutor", concurrent.futures.ThreadPoolExecutor
+    )
+    for cls in (Agent, Graph, Swarm):
+        monkeypatch.setattr(cls, "__init__", inspect.unwrap(cls.__init__))
     from tests import sync_import_workflow
 
     # Building the Worker installs the guard before it validates the Workflow.
