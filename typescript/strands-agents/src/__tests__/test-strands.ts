@@ -21,12 +21,10 @@ import {
   loadHistory,
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
-import { MockActivityEnvironment } from '@temporalio/testing';
 import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
 import { DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { STRANDS_MALFORMED_INTERRUPT_TYPE, StrandsPlugin } from '..';
-import { ModelActivity } from '../model-activity';
 import { startLocalWithRetry } from './helpers/environment';
 import {
   auditLog,
@@ -43,6 +41,7 @@ import {
   activityToolAgent,
   failActivities,
   approveSignal,
+  cancellableModelCall,
   compressionAgent,
   defaultModelAgent,
   doneSignal,
@@ -626,34 +625,44 @@ test('invokeModel gives the model Message instances and an AbortSignal', async (
   t.true(receivedSignal instanceof AbortSignal, 'expected cancelSignal to be an AbortSignal');
 });
 
-test('cancelling the model activity aborts the model call', async (t) => {
-  let aborted = false;
-  let markStarted!: () => void;
-  const started = new Promise<void>((resolve) => (markStarted = resolve));
-  // Waits on its cancel signal, as a model client does while a request is in flight.
-  class WaitingStub extends StubModel {
-    override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
-      await new Promise<void>((resolve) => {
-        options?.cancelSignal?.addEventListener('abort', () => {
-          aborted = true;
-          resolve();
+for (const streaming of [false, true]) {
+  const path = streaming ? 'invokeModelStreaming' : 'invokeModel';
+  test(`cancelling the workflow aborts the model call in ${path} and cancels the workflow`, async (t) => {
+    t.timeout(60_000);
+    const { createWorker, startWorkflow } = helpers(t);
+    let receivedSignal: unknown;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => (markStarted = resolve));
+    // Waits for its cancel signal, then fails as OpenAI's client does: an error named `Error`.
+    class AbortingStub extends StubModel {
+      override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+        receivedSignal = options?.cancelSignal;
+        const aborted = await new Promise<boolean>((resolve) => {
+          options?.cancelSignal?.addEventListener('abort', () => resolve(true));
+          markStarted();
         });
-        markStarted();
-      });
-      yield* super.stream(messages, options);
+        if (aborted) throw new Error('Request was aborted.');
+        yield* super.stream(messages, options);
+      }
     }
-  }
 
-  const activity = new ModelActivity({ test: () => new WaitingStub([textTurn('late')]) });
-  const env = new MockActivityEnvironment();
-  // What the activity receives: the agent's AbortSignal after the payload converter.
-  const options = { cancelSignal: {} } as unknown as StreamOptions;
-  const run = env.run(activity.invokeModel, { modelName: 'test', messages: [], options }).catch(() => undefined);
-  await Promise.race([started, run]);
-  env.cancel();
-  await run;
-  t.true(aborted, 'expected the model call to see the activity cancellation');
-});
+    const worker = await createWorker({
+      plugins: [new StrandsPlugin({ models: { test: () => new AbortingStub([]) } })],
+    });
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(cancellableModelCall, { args: [streaming] });
+      await started;
+      await handle.cancel();
+      const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+      t.true(err!.cause instanceof CancelledFailure, `expected a CancelledFailure, got ${err!.cause}`);
+      const { events } = await handle.fetchHistory();
+      t.true(events!.some((e) => e.activityTaskCanceledEventAttributes), 'expected ActivityTaskCanceled');
+      t.false(events!.some((e) => e.activityTaskFailedEventAttributes), 'expected no ActivityTaskFailed');
+      t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');
+    });
+    t.true(receivedSignal instanceof AbortSignal && receivedSignal.aborted, 'expected the model signal to abort');
+  });
+}
 
 test('activityAsTool dispatches a registered activity from the agent loop', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);

@@ -126,6 +126,21 @@ Workflow code that catches these errors around `invoke()` by class sees the `App
 
 If your worker lists one of these errors in `workflowFailureErrorTypes`, the run used to fail with a retryable failure, so a workflow retry policy started another run. The plugin's failure is non-retryable, so that run is no longer retried.
 
+## Cancellation
+
+The model gets the model activity's cancellation signal as `cancelSignal`. Cancelling the activity, through a cancellation scope or a workflow cancel, aborts the model call and ends the activity as cancelled. The worker learns of the cancellation through the activity's heartbeats, which the model activities send only when `activityOptions.heartbeatTimeout` is set:
+
+```ts
+new TemporalAgent({
+  activityOptions: {
+    startToCloseTimeout: '60 seconds',
+    heartbeatTimeout: '10 seconds',
+  },
+});
+```
+
+Without a `heartbeatTimeout`, the model call runs to completion after its activity is cancelled. `agent.cancel()` in workflow code does not cancel the model activity.
+
 ## Snapshots
 
 `TemporalAgent.takeSnapshot()` and `TemporalAgent.loadSnapshot()` throw. Temporal's event history already persists workflow state durably at a finer granularity than Strands snapshots, so calling either inside a workflow is redundant.

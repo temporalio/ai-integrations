@@ -55,6 +55,10 @@ export interface TemporalAgentOptions extends Omit<AgentConfig, 'model' | 'retry
  * Strands' `retryStrategy` is disabled; configure retries via
  * `activityOptions.retry` here and on the activity options accepted by
  * {@link activityAsTool}, {@link activityAsHook}, and {@link TemporalMCPClient}.
+ *
+ * Cancelling a model activity aborts the model call only when
+ * `activityOptions.heartbeatTimeout` is set: the worker learns of the
+ * cancellation through the activity's heartbeats.
  */
 export class TemporalAgent extends Agent {
   private readonly managerGiven: boolean;

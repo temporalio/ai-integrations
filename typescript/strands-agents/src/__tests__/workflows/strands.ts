@@ -12,6 +12,7 @@ import {
   type Message,
 } from '@strands-agents/sdk';
 import {
+  ActivityCancellationType,
   ActivityFailure,
   allHandlersFinished,
   ApplicationFailure,
@@ -25,7 +26,13 @@ import {
   type ActivityOptions,
 } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
-import { TemporalAgent, TemporalMCPClient, type TemporalAgentOptions, workflow as strandsWorkflow } from '../..';
+import {
+  TemporalAgent,
+  TemporalMCPClient,
+  TemporalModel,
+  type TemporalAgentOptions,
+  workflow as strandsWorkflow,
+} from '../..';
 
 export async function helloAgent(prompt: string): Promise<string> {
   const agent = new TemporalAgent({ model: 'test', printer: false });
@@ -399,4 +406,26 @@ export async function streamingAgent(prompt: string): Promise<string> {
   });
   const result = await agent.invoke(prompt);
   return result.toString();
+}
+
+/**
+ * Streams one model call whose activity heartbeats and waits for its cancellation to complete, so
+ * a workflow cancel reaches the model call and the workflow ends with the activity's result.
+ */
+export async function cancellableModelCall(streaming: boolean): Promise<string[]> {
+  if (streaming) void new WorkflowStream();
+  const model = new TemporalModel({
+    modelName: 'test',
+    streamingTopic: streaming ? 'model' : undefined,
+    activityOptions: {
+      startToCloseTimeout: '30 seconds',
+      heartbeatTimeout: '5 seconds',
+      cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+    },
+  });
+  const types: string[] = [];
+  for await (const event of model.stream([])) {
+    types.push(event.type);
+  }
+  return types;
 }
