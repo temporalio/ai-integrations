@@ -411,18 +411,22 @@ def test_java_latest_dependencies_are_selected_and_locked_before_testing() -> No
 
 
 @pytest.mark.parametrize("repetitions,fail_at,expected_calls", [
-    ("3", "0", 3), ("3", "2", 2), ("0", "0", 0), ("21", "0", 0), ("1.5", "0", 0),
+    ("1", "0", 1), ("3", "0", 3), ("3", "2", 2), ("0", "0", 0), ("21", "0", 0), ("1.5", "0", 0),
 ])
 def test_python_windows_repetitions_are_bounded_and_stop_on_failure(
     tmp_path: Path, repetitions: str, fail_at: str, expected_calls: int,
 ) -> None:
     workflow = yaml.safe_load((REPO / ".github/workflows/_python-plugin.yml").read_text())
     step = next(step for step in workflow["jobs"]["test"]["steps"] if step.get("name") == "Test")
-    assert step["env"]["REPETITIONS"] == "${{ runner.os == 'Windows' && inputs.windows-test-repetitions || '1' }}"
+    assert step["env"]["REPETITIONS"] == "${{ runner.os == 'Windows' && (inputs.windows-test-plugin == '' || inputs.windows-test-plugin == inputs.plugin) && inputs.windows-test-repetitions || '1' }}"
     call_input = workflow[True]["workflow_call"]["inputs"]["windows-test-repetitions"]
     assert call_input == {"description": "Number of fresh Windows test-suite executions (1–20)", "type": "string", "default": "1"}
     ci = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     assert ci[True]["workflow_dispatch"]["inputs"]["windows-test-repetitions"]["type"] == call_input["type"]
+    selector = workflow[True]["workflow_call"]["inputs"]["windows-test-plugin"]
+    assert selector["default"] == "" and selector["type"] == "string"
+    assert ci[True]["workflow_dispatch"]["inputs"]["windows-test-plugin"] == selector
+    assert "inputs.windows-test-plugin" in ci["jobs"]["python"]["with"]["windows-test-plugin"]
     calls = tmp_path / "calls"
     fake_make = tmp_path / "make"
     fake_make.write_text(
@@ -434,14 +438,15 @@ def test_python_windows_repetitions_are_bounded_and_stop_on_failure(
     result = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
         env={**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
-             "PLUGIN_DIR": str(tmp_path), "REPETITIONS": repetitions,
+             "PLUGIN_DIR": str(tmp_path), "REPETITIONS": repetitions, "RUNNER_OS": "Windows",
              "TEST_CALLS": str(calls), "TEST_FAIL_AT": fail_at},
         capture_output=True, text=True,
     )
     invoked = calls.read_text().splitlines() if calls.exists() else []
     assert len(invoked) == expected_calls
-    assert (result.returncode == 0) == (repetitions == "3" and fail_at == "0")
-    assert invoked == [f"test PYTEST_ARGS=-s --junit-xml=junit/test-{i}.xml" for i in range(1, expected_calls + 1)]
+    assert (result.returncode == 0) == (repetitions in ("1", "3") and fail_at == "0")
+    workers = " -n 4" if expected_calls and int(repetitions) > 1 else ""
+    assert invoked == [f"test PYTEST_ARGS=-s --junit-xml=junit/test-{i}.xml{workers}" for i in range(1, expected_calls + 1)]
 
 
 def test_java_release_reuses_tested_bytes_and_recovers_deployments() -> None:

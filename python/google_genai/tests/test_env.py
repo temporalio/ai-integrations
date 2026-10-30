@@ -5,11 +5,12 @@ import json
 import os
 import subprocess
 import sys
-import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
+import psutil
 import pytest
 
 from temporalio.testing import WorkflowEnvironment
@@ -233,13 +234,20 @@ def test_native_child_output_and_exit_are_retained(tmp_path: Path) -> None:
                 ]
             )
         try:
-            assert child.wait(timeout=10) == 7
-            deadline = time.monotonic() + 5
-            while not any(
-                event["event"] == "process_exited" for event in _events(tmp_path)
-            ):
-                assert time.monotonic() < deadline, "Child exit was not observed"
-                time.sleep(0.05)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                # Exercise Windows exit-code retention explicitly. Discovery
+                # must ignore this Python child, including in an enclosing
+                # session fixture's server diagnostics.
+                observed = (
+                    executor.submit(
+                        diagnostics._wait_windows, psutil.Process(child.pid)
+                    )
+                    if sys.platform == "win32"
+                    else None
+                )
+                assert child.wait(timeout=10) == 7
+                if observed is not None:
+                    observed.result(timeout=10)
         finally:
             if child.poll() is None:
                 child.kill()
@@ -249,16 +257,14 @@ def test_native_child_output_and_exit_are_retained(tmp_path: Path) -> None:
     assert (tmp_path / "stdout.log").read_bytes() == b"child stdout\n"
     assert (tmp_path / "stderr.log").read_bytes() == b"child stderr\n"
     events = _events(tmp_path)
-    assert (
-        next(event for event in events if event["event"] == "process_started")["pid"]
-        == child.pid
-    )
-    exited = next(event for event in events if event["event"] == "process_exited")
-    assert exited["pid"] == child.pid
+    assert not any(event["event"] == "process_started" for event in events)
+    exited = [event for event in events if event["event"] == "process_exited"]
     if sys.platform == "win32":
-        assert exited["exit_code"] == 7
+        assert len(exited) == 1
+        assert exited[0]["pid"] == child.pid
+        assert exited[0]["exit_code"] == 7
     else:
-        assert exited["exit_code"] is None
+        assert exited == []
 
 
 async def test_cancellation_during_retry_delay_is_not_retried() -> None:

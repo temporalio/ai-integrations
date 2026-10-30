@@ -156,10 +156,10 @@ class _ServerDiagnostics:
                 continue
             try:
                 command = process.cmdline()
-                if not any(
-                    command[i : i + 2] == ["server", "start-dev"]
-                    for i in range(len(command) - 1)
-                ):
+                # The SDK invokes the CLI with these as its first arguments.
+                # A Python test child can contain the same strings later in
+                # its command without being a Temporal server.
+                if command[1:3] != ["server", "start-dev"]:
                     continue
                 self._processes[process.pid] = process
                 self.record("process_started", pid=process.pid, command=command)

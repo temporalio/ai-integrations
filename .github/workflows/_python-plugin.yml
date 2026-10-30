@@ -23,6 +23,10 @@ on:
         description: Number of fresh Windows test-suite executions (1–20)
         type: string
         default: "1"
+      windows-test-plugin:
+        description: Only repeat this Python plugin (empty repeats all)
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -101,7 +105,7 @@ jobs:
         run: cd "$PLUGIN_DIR" && make lint
       - name: Test
         env:
-          REPETITIONS: ${{ runner.os == 'Windows' && inputs.windows-test-repetitions || '1' }}
+          REPETITIONS: ${{ runner.os == 'Windows' && (inputs.windows-test-plugin == '' || inputs.windows-test-plugin == inputs.plugin) && inputs.windows-test-repetitions || '1' }}
         run: |
           cd "$PLUGIN_DIR"
           if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || (( REPETITIONS < 1 || REPETITIONS > 20 )); then
@@ -110,7 +114,11 @@ jobs:
           fi
           for (( attempt=1; attempt<=REPETITIONS; attempt++ )); do
             echo "Test suite execution $attempt/$REPETITIONS"
-            make test PYTEST_ARGS="-s --junit-xml=junit/test-$attempt.xml"
+            pytest_args="-s --junit-xml=junit/test-$attempt.xml"
+            if [[ "$RUNNER_OS" == 'Windows' ]] && (( REPETITIONS > 1 )); then
+              pytest_args="$pytest_args -n 4"
+            fi
+            make test PYTEST_ARGS="$pytest_args"
           done
       - name: Build, verify, and smoke-test distributions
         # Only on the designated dist cell: the release pipeline publishes the ubuntu-built artifacts.
