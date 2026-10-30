@@ -13,7 +13,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Generator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, ClassVar, NoReturn, Protocol
 
 import langsmith
@@ -280,14 +280,16 @@ class _LangChainRuns:
     the IDs LangChain generates come from ``new_id``, a workflow-seeded
     generator (see ``_install_langchain_run_id_hook``), so callbacks and
     LangSmith see the same ID.  A run ID the caller chose, such as
-    ``config["run_id"]``, is kept.  Every run's start time becomes
-    ``workflow.now()``.  The generator is separate from
+    ``config["run_id"]``, is kept.  Every run's start time comes from
+    ``workflow.now()``, at least 1 microsecond after the run before it, so
+    runs keep the order they started in.  The generator is separate from
     ``_get_workflow_random`` so the plugin's own run IDs do not change.
     """
 
     def __init__(self) -> None:
         self._rng = random.Random()
         self._ids: dict[str, tuple[uuid.UUID, datetime]] = {}
+        self._last_start: datetime | None = None
         # Writes held back during replay, for runs that are still open.
         self.pending: dict[uuid.UUID, list[_HeldWrite]] = {}
 
@@ -317,9 +319,18 @@ class _LangChainRuns:
         entry = self._ids.get(str(run_id))
         if entry is None:
             stable = uuid.UUID(str(run_id)) if keep_id else _uuid_from_random(self._rng)
-            entry = (stable, temporalio.workflow.now())
+            entry = (stable, self._next_start())
             self._ids[str(run_id)] = entry
         return entry[0]
+
+    def _next_start(self) -> datetime:
+        # The runs of one workflow task would all start at workflow.now(),
+        # and LangSmith orders sibling runs by start time.
+        start = temporalio.workflow.now()
+        if self._last_start is not None and start <= self._last_start:
+            start = self._last_start + timedelta(microseconds=1)
+        self._last_start = start
+        return start
 
     def stable_id(self, run_id: Any) -> Any:
         """Get a run's stable ID, or ``run_id`` for a run this class does not know."""
@@ -338,6 +349,9 @@ class _LangChainRuns:
 
     def relink(self, run: RunTree) -> None:
         """Point a run at the stable IDs of the runs above it."""
+        if str(run.parent_run_id) in self._ids:
+            # Start after the parent, like the parent's other children.
+            run.start_time = self._ids[str(self.add(run.id, keep_id=True))][1]
         run.parent_run_id = self.stable_id(run.parent_run_id)
         run.trace_id = self.stable_id(run.trace_id)
         run.dotted_order = self.dotted_order(run.dotted_order)
