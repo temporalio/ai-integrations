@@ -383,12 +383,70 @@ class OptionalAnnotatedContextActivity:
         return query
 
 
+# Optional[Alias] nests the alias's own Optional inside Annotated.
+LiveContextAlias = Annotated[Optional[ToolContext], "metadata"]  # pyright: ignore[reportDeprecated]
+SnapshotAlias = Annotated[Optional[ToolContextSnapshot], "metadata"]  # pyright: ignore[reportDeprecated]
+
+
+@activity.defn
+async def nested_alias_context_tool(
+    query: str,
+    ctx: Optional[LiveContextAlias] = None,  # pyright: ignore[reportUnusedParameter, reportDeprecated]
+) -> str:
+    return query
+
+
+@activity.defn
+class NestedAliasContextActivity:
+    async def __call__(
+        self,
+        query: str,
+        ctx: Optional[LiveContextAlias] = None,  # pyright: ignore[reportUnusedParameter, reportDeprecated]
+    ) -> str:
+        return query
+
+
+@activity.defn
+async def nested_alias_snapshot_tool(
+    query: str,
+    tool_context: Optional[SnapshotAlias] = None,  # pyright: ignore[reportUnusedParameter, reportDeprecated]
+) -> str:
+    return query
+
+
+@activity.defn
+class NestedAliasSnapshotActivity:
+    async def __call__(
+        self,
+        query: str,
+        tool_context: Optional[SnapshotAlias] = None,  # pyright: ignore[reportUnusedParameter, reportDeprecated]
+    ) -> str:
+        return query
+
+
+@pytest.mark.parametrize(
+    "activity_def",
+    [nested_alias_snapshot_tool, NestedAliasSnapshotActivity],
+    ids=["function", "class"],
+)
+def test_activity_as_tool_accepts_nested_snapshot_alias(activity_def: Any):
+    """A snapshot inside nested Annotated and Optional is accepted and excluded."""
+    tool = FunctionTool(
+        func=activity_as_tool(
+            activity_def, start_to_close_timeout=timedelta(seconds=30)
+        )
+    )
+    assert set(_declared_properties(tool)) == {"query"}
+
+
 @pytest.mark.parametrize(
     "activity_def",
     [
         annotated_context_tool,
         AnnotatedContextActivity,
         OptionalAnnotatedContextActivity,
+        nested_alias_context_tool,
+        NestedAliasContextActivity,
     ],
 )
 def test_activity_as_tool_rejects_annotated_adk_context(activity_def: Any):

@@ -79,12 +79,16 @@ def _strip_annotated(annotation: Any) -> Any:
 def _annotation_members(annotation: Any) -> tuple[Any, ...]:
     """Returns a union annotation's members, or the annotation itself.
 
-    ``Annotated`` metadata is dropped, at the top and in each member.
+    ``Annotated`` metadata is dropped and nested unions are flattened, at any
+    depth, as ``typing.get_type_hints`` does for a function's hints.
     """
     annotation = _strip_annotated(annotation)
     origin = typing.get_origin(annotation)
     if origin is typing.Union or origin is types.UnionType:  # pyright: ignore[reportDeprecated]
-        return tuple(map(_strip_annotated, typing.get_args(annotation)))
+        members: list[Any] = []
+        for arg in typing.get_args(annotation):
+            members += [m for m in _annotation_members(arg) if m not in members]
+        return tuple(members)
     return (annotation,)
 
 
@@ -203,6 +207,38 @@ def _docstring(fn: Any) -> str | None:
     return doc if doc and doc.strip() else None
 
 
+def _is_method(fn: Callable) -> bool:
+    """Returns whether a function taken from a class is a method it binds.
+
+    A module-level or nested function, or a staticmethod, is called with every
+    parameter. A function defined in a class body is found in that class to
+    tell a method from a staticmethod; a class that can't be found raises
+    ``ValueError``.
+    """
+    qualname = fn.__qualname__.split(".")
+    if len(qualname) < 2 or qualname[-2] == "<locals>":
+        return False
+    owner: Any = None
+    if "<locals>" not in qualname:
+        owner = fn.__globals__.get(qualname[0])
+        for name in qualname[1:-1]:
+            owner = getattr(owner, name, None)
+    name = qualname[-1]
+    if inspect.isclass(owner) and name.startswith("__") and not name.endswith("__"):
+        name = f"_{owner.__name__.lstrip('_')}{name}"
+    try:
+        attr = inspect.getattr_static(owner, name)
+    except AttributeError:
+        attr = None
+    if not inspect.isclass(owner) or attr is None:
+        raise ValueError(
+            f"Cannot tell whether '{fn.__qualname__}' is a method or a"
+            " staticmethod: its class can't be found from its module. Define the"
+            " class at module level, or pass a bound method."
+        )
+    return not isinstance(attr, staticmethod)
+
+
 def _tool_signature(
     activity_def: Callable,
 ) -> tuple[inspect.Signature, dict[str, Any], str | None]:
@@ -256,20 +292,16 @@ def _tool_signature(
     params = list(signature.parameters.values())
     # Drop the receiver of a method passed as Class.method the way the SDK does:
     # a first parameter named `self` that is unannotated or annotated
-    # `typing.Self`. The worker's registered instance supplies it. Only a
-    # function defined in a class body is such a method: a module-level or
-    # nested function's `self` is an input the model must fill.
-    qualname = getattr(activity_def, "__qualname__", "").split(".")
+    # `typing.Self`. The worker's registered instance supplies it.
     if (
         inspect.isfunction(activity_def)
-        and len(qualname) > 1
-        and qualname[-2] != "<locals>"
         and params
         and params[0].name == "self"
         and (
             params[0].annotation is inspect.Parameter.empty
             or str(params[0].annotation) == "typing.Self"
         )
+        and _is_method(activity_def)
     ):
         signature = signature.replace(parameters=params[1:])
     try:
@@ -308,7 +340,9 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     ``self``, and from ``__call__`` for a class. A class whose ``__call__`` is
     not a function, staticmethod, classmethod or ``functools.partialmethod``,
     can't be read, or takes keyword-only arguments or ``**kwargs`` raises
-    ``ValueError``.
+    ``ValueError``. So does a method taking ``self`` whose class can't be found
+    from its module, such as a class defined in a function: its ``self`` could
+    be a staticmethod's input.
 
     If the activity declares a parameter named ``tool_context``, it must be
     annotated with :class:`ToolContextSnapshot` (or ``ToolContextSnapshot |

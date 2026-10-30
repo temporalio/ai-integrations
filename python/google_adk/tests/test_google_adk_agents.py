@@ -839,6 +839,13 @@ class ComplexActivityMethodHolder:
         complex_activity_inputs_seen["count_passengers"] = passengers
         return f"{self.prefix}:{passengers}"
 
+    @staticmethod
+    @activity.defn
+    async def echo_static(self) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType, reportSelfClsParameterName]
+        """Staticmethod: its `self` is an input the model fills."""
+        complex_activity_inputs_seen["echo_static"] = self
+        return f"static:{self}"
+
 
 @activity.defn
 class QuoteTrip:
@@ -907,6 +914,10 @@ class ComplexActivityInputAgent:
                 ),
                 temporalio.google_adk.workflow.activity_as_tool(
                     echo_self, start_to_close_timeout=timedelta(seconds=60)
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    ComplexActivityMethodHolder.echo_static,
+                    start_to_close_timeout=timedelta(seconds=60),
                 ),
             ],
         )
@@ -1044,6 +1055,18 @@ class ComplexActivityInputModel(TestModel):
             LlmResponse(
                 content=Content(
                     role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="echo_static", args={"self": "def"}
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
                     parts=[Part(text="completed complex input tool calls")],
                 )
             ),
@@ -1073,6 +1096,7 @@ async def test_activity_as_tool_supports_complex_inputs_via_adk(client: Client):
             QuoteTrip("USD"),
             TrackParcel("worker"),
             echo_self,
+            method_holder.echo_static,
         ],
         workflows=[ComplexActivityInputAgent],
         max_cached_workflows=0,
@@ -1102,6 +1126,7 @@ async def test_activity_as_tool_supports_complex_inputs_via_adk(client: Client):
             "QuoteTrip": ("USD", "SFO->LAX", 3),
             "TrackParcel": ("worker", "abc"),
             "echo_self": "abc",
+            "echo_static": "def",
         }
 
 
@@ -1315,6 +1340,27 @@ def test_activity_as_tool_preserves_metadata() -> None:
         echo_self, start_to_close_timeout=timedelta(seconds=30)
     )
     assert list(inspect.signature(function_tool).parameters) == ["self"]
+
+    # So is a staticmethod's, though it is defined in a class body.
+    static_tool = temporalio.google_adk.workflow.activity_as_tool(
+        ComplexActivityMethodHolder.echo_static,
+        start_to_close_timeout=timedelta(seconds=30),
+    )
+    assert list(inspect.signature(static_tool).parameters) == ["self"]
+
+
+def test_activity_as_tool_rejects_method_of_unreachable_class() -> None:
+    """A method whose class can't be found can't be told from a staticmethod."""
+
+    class LocalHolder:
+        @activity.defn
+        async def method(self, trip: str) -> str:
+            return trip
+
+    with pytest.raises(ValueError, match="method or a staticmethod"):
+        temporalio.google_adk.workflow.activity_as_tool(
+            LocalHolder.method, start_to_close_timeout=timedelta(seconds=30)
+        )
 
 
 @activity.defn
