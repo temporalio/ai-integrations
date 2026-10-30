@@ -198,6 +198,11 @@ _CONNECTIONS: dict[str, _ConnectionRecord] = {}
 # (which holds tasks only weakly) cannot drop one part way through.
 _CLOSING: set[asyncio.Task[None]] = set()
 
+# Server name -> records whose owner task has not finished, cached or not. A
+# record leaves _CONNECTIONS before its owner closes the transport (startup
+# timeout, cancelled eviction), so Worker shutdown waits on these instead.
+_OPEN_RECORDS: dict[str, set[_ConnectionRecord]] = {}
+
 
 class _ConnectionRecord:
     """A single MCP session held open by a dedicated owner task.
@@ -232,6 +237,8 @@ class _ConnectionRecord:
         self._inflight = 0
         self._broken = False
         self._owner = asyncio.create_task(self._run(client_factory))
+        _OPEN_RECORDS.setdefault(server, set()).add(self)
+        self._owner.add_done_callback(lambda _: self._forget())
 
     async def _run(self, client_factory: Callable[[], MCPClient]) -> None:
         client = client_factory()
@@ -275,6 +282,13 @@ class _ConnectionRecord:
             self._ready.set_exception(failure)
         self._uncache()
         self._owner.cancel()
+
+    def _forget(self) -> None:
+        records = _OPEN_RECORDS.get(self._server)
+        if records is not None:
+            records.discard(self)
+            if not records:
+                del _OPEN_RECORDS[self._server]
 
     def _uncache(self) -> None:
         if _CONNECTIONS.get(self._server) is self:
@@ -386,6 +400,13 @@ async def drain_closing() -> None:
     """Wait for the broken connections still being closed in the background."""
     while pending := [task for task in _CLOSING if not task.done()]:
         await asyncio.wait(pending)
+
+
+async def close_connections(server: str) -> None:
+    """Close the cached connection and wait for every retiring owner to finish."""
+    await _evict_connection(server)
+    for record in list(_OPEN_RECORDS.get(server, ())):
+        await record.aclose()
 
 
 def build_call_tool_activity(

@@ -475,8 +475,15 @@ async def test_mcp_startup_deadline_survives_cancelled_caller():
         await _temporal_mcp_client._evict_connection("echo_cancelled_fast")
 
 
-async def test_mcp_worker_shutdown_during_slow_startup(client: Client):
-    """Worker shutdown waits for the startup deadline, not the server's late reply."""
+@pytest.mark.parametrize("after_deadline", [False, True])
+async def test_mcp_worker_shutdown_during_slow_startup(
+    client: Client, after_deadline: bool
+):
+    """Worker shutdown waits for the startup deadline, not the server's late reply.
+
+    After the deadline, the timed-out record has left the cache but its owner
+    is still closing the transport; shutdown must still wait for it.
+    """
     task_queue = f"test_mcp_worker_shutdown_during_slow_startup-{uuid4()}"
     plugin = StrandsPlugin(
         models={"mock": lambda: MockModel(["Done!"])},
@@ -502,6 +509,11 @@ async def test_mcp_worker_shutdown_during_slow_startup(client: Client):
     while "echo_slow" not in _temporal_mcp_client._CONNECTIONS:
         await asyncio.sleep(0.01)
     record = _temporal_mcp_client._CONNECTIONS["echo_slow"]
+    if after_deadline:
+        while _temporal_mcp_client._CONNECTIONS.get("echo_slow") is record:
+            await asyncio.sleep(0.01)
+        # Cancelling stdio_client waits for the sleeping server to exit.
+        assert not record._owner.done()
     started = time.monotonic()
     await worker.shutdown()
     # Shutdown cancels the waiting list-tools activity; the cleanup then waits
@@ -511,4 +523,5 @@ async def test_mcp_worker_shutdown_during_slow_startup(client: Client):
     assert time.monotonic() - started < 10
     assert record._owner.done()
     assert "echo_slow" not in _temporal_mcp_client._CONNECTIONS
+    assert "echo_slow" not in _temporal_mcp_client._OPEN_RECORDS
     await handle.terminate()
