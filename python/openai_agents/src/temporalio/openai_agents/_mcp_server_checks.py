@@ -1,3 +1,5 @@
+# pyright: reportUnusedFunction=false
+
 """Checks on the MCPServer that a worker's factory returns.
 
 The agent reads workflow-facing settings from the workflow-side server it
