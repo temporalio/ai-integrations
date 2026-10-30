@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 from strands import Agent
+from strands.agent.conversation_manager import SummarizingConversationManager
 from strands.models import Model
 from strands.types.exceptions import (
     ContextWindowOverflowException,
@@ -84,6 +85,19 @@ class RaisingModel(Model):
         yield {"messageStart": {"role": "assistant"}}
 
 
+def _manager(kind: str, summarizer: Callable[[], Agent]) -> dict[str, Any]:
+    """Agent arguments for the default manager or a summarizing one."""
+    if kind == "sliding_window":
+        return {}
+    return {
+        "conversation_manager": SummarizingConversationManager(
+            summary_ratio=0.5,
+            preserve_recent_messages=1,
+            summarization_agent=summarizer() if kind == "summarization_agent" else None,
+        )
+    }
+
+
 def _client_with(client: Client, plugin: StrandsPlugin) -> Client:
     # The failure converter that tags ContextWindowOverflowException comes from the
     # plugin's data converter, which the activity worker reads from the client config.
@@ -95,30 +109,44 @@ def _client_with(client: Client, plugin: StrandsPlugin) -> Client:
 @workflow.defn
 class OverflowAgentWorkflow:
     @workflow.run
-    async def run(self, prompt: str) -> str:
+    async def run(self, prompt: str, manager: str = "sliding_window") -> str:
+        def summarizer() -> Agent:
+            return TemporalAgent(
+                model="small", start_to_close_timeout=timedelta(seconds=15)
+            )
+
         agent = TemporalAgent(
             model="small",
             messages=_history(),  # type: ignore[arg-type]
             start_to_close_timeout=timedelta(seconds=15),
+            **_manager(manager, summarizer),
         )
         return str(await agent.invoke_async(prompt))
 
 
-async def test_overflow_is_recovered_by_conversation_manager(client: Client):
-    # A plain Agent reduces the context and retries when the model overflows.
+@pytest.mark.parametrize(
+    "manager", ["sliding_window", "summarizing", "summarization_agent"]
+)
+async def test_overflow_is_recovered_by_conversation_manager(
+    client: Client, manager: str
+):
+    # A plain Agent reduces the context and retries when the model overflows. A
+    # summarizing manager first asks the model, or its summarization agent, for a
+    # summary.
     control_model = SmallContextModel()
     control = await Agent(
         model=control_model,
         messages=_history(),  # type: ignore[arg-type]
         callback_handler=None,
+        **_manager(manager, lambda: Agent(model=control_model, callback_handler=None)),
     ).invoke_async("q3")
     assert str(control) == "ok\n"
-    assert len(control_model.seen) == 2
+    assert len(control_model.seen) >= 2
     assert control_model.seen[0] == ["q1", "a1", "q2", "a2", "q3"]
-    assert len(control_model.seen[1]) <= CONTEXT_WINDOW
+    assert len(control_model.seen[-1]) <= CONTEXT_WINDOW
 
     # TemporalAgent must behave the same: the overflow fails the first activity
-    # attempt, Strands reduces the conversation, and the second call succeeds.
+    # attempt, Strands reduces the conversation, and the next calls succeed.
     model = SmallContextModel()
     task_queue = f"test_overflow_recovered-{uuid4()}"
     plugin = StrandsPlugin(models={"small": lambda: model})
@@ -132,19 +160,16 @@ async def test_overflow_is_recovered_by_conversation_manager(client: Client):
     ):
         handle = await client.start_workflow(
             OverflowAgentWorkflow.run,
-            "q3",
+            args=["q3", manager],
             id=f"test_overflow_recovered_{uuid4()}",
             task_queue=task_queue,
+            execution_timeout=timedelta(seconds=20),
         )
         assert await handle.result() == "ok\n"
 
     assert model.seen == control_model.seen
     history = await handle.fetch_history()
-    assert get_activities(history) == [
-        "strands_get_model_config",
-        "invoke_model",
-        "invoke_model",
-    ]
+    assert get_activities(history).count("invoke_model") == len(model.seen)
     assert [
         event
         for event in history.events

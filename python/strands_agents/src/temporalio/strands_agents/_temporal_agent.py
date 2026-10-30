@@ -1,18 +1,26 @@
 import asyncio
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from strands import Agent
 from strands.agent._concurrency import _ConcurrencyController, _InflightInvocation
 from strands.agent.conversation_manager import NullConversationManager
-from strands.hooks import BeforeModelCallEvent, HookCallback
+from strands.hooks import (
+    AfterModelCallEvent,
+    BeforeModelCallEvent,
+    HookCallback,
+    HookOrder,
+)
 from strands.types.agent import AgentInput
 from strands.types.content import Messages
+from strands.types.exceptions import ContextWindowOverflowException
 
 from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
+from ._summary import prepare_summary
 from ._temporal_mcp_client import TemporalMCPClient
 from ._temporal_model import TemporalModel
 from ._temporal_sandbox import TemporalSandbox
@@ -41,6 +49,26 @@ class _WorkflowConcurrencyController(_ConcurrencyController):
         if registered_token is not None:
             self._inflight = _WorkflowInflightInvocation()
         return waiting_on, registered_token
+
+
+async def _prepare_proactive_summary(event: BeforeModelCallEvent) -> None:
+    def reduce(manager: Any, agent: Any) -> None:
+        manager._on_before_model_call_threshold(
+            SimpleNamespace(
+                agent=agent, projected_input_tokens=event.projected_input_tokens
+            )
+        )
+
+    await prepare_summary(event.agent, reduce)
+
+
+async def _prepare_overflow_summary(event: AfterModelCallEvent) -> None:
+    overflow = event.exception
+    if not isinstance(overflow, ContextWindowOverflowException) or event.retry:
+        return
+    await prepare_summary(
+        event.agent, lambda manager, agent: manager.reduce_context(agent, e=overflow)
+    )
 
 
 class TemporalAgent(Agent):
@@ -114,6 +142,22 @@ class TemporalAgent(Agent):
         # last response id across Continue-As-New.
         if model_state:
             self._model_state = dict(model_state)
+
+        # Strands' summarizing conversation manager gets its summaries in
+        # synchronous code, on a thread where TemporalModel cannot run. Await them
+        # on the workflow loop just before Strands asks: ahead of the manager's
+        # proactive compression hook, and after a model call fails with a context
+        # overflow, before Strands reduces the history.
+        self.hooks.add_callback(
+            BeforeModelCallEvent,
+            _prepare_proactive_summary,
+            order=HookOrder.SDK_FIRST,
+        )
+        self.hooks.add_callback(
+            AfterModelCallEvent,
+            _prepare_overflow_summary,
+            order=HookOrder.SDK_LAST,
+        )
 
         # Strands invokes ToolProvider.load_tools() once at construction on a
         # separate run_async thread that has no workflow runtime, so a

@@ -5,14 +5,19 @@ from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
-from strands.agent.conversation_manager import SlidingWindowConversationManager
+import pytest
+from strands.agent.conversation_manager import (
+    SlidingWindowConversationManager,
+    SummarizingConversationManager,
+)
 from strands.types.content import Messages
 from strands.types.streaming import StreamEvent
 
 from temporalio import workflow
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.exceptions import CancelledError
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
 from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.worker import Replayer, Worker
@@ -420,22 +425,44 @@ class UsageMockModel(ConfiguredMockModel):
 @workflow.defn
 class CompressionWorkflow:
     @workflow.run
-    async def run(self, prompts: list[str]) -> None:
+    async def run(self, prompts: list[str], summarize: bool = False) -> None:
         agent = TemporalAgent(
             model="usage",
             start_to_close_timeout=timedelta(seconds=15),
-            conversation_manager=SlidingWindowConversationManager(
-                proactive_compression=True
-            ),
+            conversation_manager=SummarizingConversationManager(
+                summary_ratio=0.5,
+                preserve_recent_messages=1,
+                proactive_compression=True,
+            )
+            if summarize
+            else SlidingWindowConversationManager(proactive_compression=True),
         )
         for prompt in prompts:
             await agent.invoke_async(prompt)
 
 
-async def test_proactive_compression_uses_model_context_window(client: Client):
-    """Compression drops the first turn before the second model call, as it does natively."""
+@pytest.mark.parametrize(
+    ("summarize", "responses", "user_turns"),
+    [
+        (False, ["first", "second"], [["turn 1"], ["turn 2"]]),
+        # The summary of the first turn replaces it, from a model call of its own.
+        (
+            True,
+            ["first", "summary", "second"],
+            [
+                ["turn 1"],
+                ["turn 1", "Please summarize this conversation."],
+                ["summary", "turn 2"],
+            ],
+        ),
+    ],
+)
+async def test_proactive_compression_uses_model_context_window(
+    client: Client, summarize: bool, responses: list[str], user_turns: list[list[str]]
+):
+    """Compression shrinks the first turn before the second model call, as it does natively."""
     task_queue = f"test_proactive_compression-{uuid4()}"
-    model = UsageMockModel(["first", "second"])
+    model = UsageMockModel(list(responses))
 
     async with Worker(
         client,
@@ -445,9 +472,60 @@ async def test_proactive_compression_uses_model_context_window(client: Client):
     ):
         await client.execute_workflow(
             CompressionWorkflow.run,
-            ["turn 1", "turn 2"],
+            args=[["turn 1", "turn 2"], summarize],
             id=f"test_proactive_compression_{uuid4()}",
             task_queue=task_queue,
         )
 
-    assert model.user_turns == [["turn 1"], ["turn 2"]]
+    assert model.user_turns == user_turns
+
+
+class BlockingSummaryModel(UsageMockModel):
+    """Holds the summary call until ``release`` is set."""
+
+    def __init__(self, responses: list[str | dict[str, Any]]) -> None:
+        super().__init__(responses)
+        self.summarizing = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(
+        self, messages: Any, *args: Any, **kwargs: Any
+    ) -> AsyncIterable[StreamEvent]:  # type: ignore[override]
+        if len(self.user_turns) == 1:
+            self.summarizing.set()
+            await self.release.wait()
+        async for event in super().stream(messages, *args, **kwargs):
+            yield event
+
+
+async def test_cancel_during_summary_cancels_the_run(client: Client):
+    """A cancel while the summary runs ends the run instead of failing the summary."""
+    task_queue = f"test_cancel_during_summary-{uuid4()}"
+    model = BlockingSummaryModel(["first", "summary", "second"])
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[CompressionWorkflow],
+        plugins=[StrandsPlugin(models={"usage": lambda: model})],
+    ):
+        handle = await client.start_workflow(
+            CompressionWorkflow.run,
+            args=[["turn 1", "turn 2"], True],
+            id=f"test_cancel_during_summary_{uuid4()}",
+            task_queue=task_queue,
+        )
+        await asyncio.wait_for(model.summarizing.wait(), timeout=10)
+        await handle.cancel()
+        try:
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await handle.result()
+        finally:
+            model.release.set()
+
+    assert isinstance(exc_info.value.cause, CancelledError)
+    # No model call for the second turn followed the cancelled summary.
+    assert model.user_turns == [
+        ["turn 1"],
+        ["turn 1", "Please summarize this conversation."],
+    ]
