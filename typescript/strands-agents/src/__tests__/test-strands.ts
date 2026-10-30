@@ -416,39 +416,69 @@ test('a stateful model call waits for a worker with stateful support', async (t)
   t.deepEqual(calls, CHAINED_CALLS);
 });
 
-test('a stateful model call fails at once in a run whose config has no stateful flag', async (t) => {
+test("a model call fails at once when the worker model's stateful flag differs from the run's config", async (t) => {
   t.timeout(60_000);
   const { createWorker, startWorkflow, taskQueue } = helpers(t);
   const calls: StatefulCall[] = [];
   const plugin = new StrandsPlugin({ models: { stateful: () => new StatefulStub([], calls) } });
-  const upgraded = new ModelActivity({ stateful: () => new StatefulStub([textTurn('one')], calls) });
+  // The worker model now in one mode, as after a model change or an upgrade.
+  class SwitchedStub extends StatefulStub {
+    constructor(private readonly isStateful: boolean) {
+      super([textTurn('one')], calls);
+    }
+    override get stateful(): boolean {
+      return this.isStateful;
+    }
+  }
 
-  const worker = await createWorker({ plugins: [plugin] });
-  const history = await worker.runUntil(async () => {
-    const handle = await startWorkflow(statefulAgent, { args: ['models-queue'] });
-    // The config comes from an earlier version, without the flag, so the run takes the stateless
-    // path, and its model call reaches this version's stateless activity.
-    const modelsWorker = await createWorker({
-      taskQueue: `${taskQueue}-models`,
-      activities: {
-        strandsGetModelConfig: async () => ({}),
-        invokeModel: upgraded.invokeModel,
-        invokeModelStreaming: upgraded.invokeModelStreaming,
-      },
+  for (const c of [
+    // The run's config is stateless (here an earlier version's, with no flag; a model that became
+    // stateful later gives the same path), so its call to the stateful model reaches the stateless
+    // activity.
+    {
+      config: {},
+      stateful: true,
+      activity: 'invokeModel',
+      type: 'StatefulModelOnStatelessPath',
+      message: /is stateful, .* became stateful after the run read its config/,
+    },
+    // The config says stateful, but the model became stateless.
+    {
+      config: { stateful: true },
+      stateful: false,
+      activity: 'strandsInvokeStatefulModel',
+      type: 'StatelessModelOnStatefulPath',
+      message: /is not stateful, .* became stateless after the run read its config/,
+    },
+  ]) {
+    const current = new ModelActivity({ stateful: () => new SwitchedStub(c.stateful) });
+    const worker = await createWorker({ plugins: [plugin] });
+    const history = await worker.runUntil(async () => {
+      const handle = await startWorkflow(statefulAgent, { args: ['models-queue'] });
+      const modelsWorker = await createWorker({
+        taskQueue: `${taskQueue}-models`,
+        activities: {
+          strandsGetModelConfig: async () => c.config,
+          invokeModel: current.invokeModel,
+          invokeModelStreaming: current.invokeModelStreaming,
+          strandsInvokeStatefulModel: current.invokeStatefulModel,
+          strandsInvokeStatefulModelStreaming: current.invokeStatefulModelStreaming,
+        },
+      });
+      await modelsWorker.runUntil(handle.result());
+      return handle.fetchHistory();
     });
-    await modelsWorker.runUntil(handle.result());
-    return handle.fetchHistory();
-  });
 
-  t.deepEqual(scheduledActivities(history), ['strandsGetModelConfig', 'invokeModel']);
-  const events = history.events ?? [];
-  const attempts = events.flatMap((e) => e.activityTaskStartedEventAttributes?.attempt ?? []);
-  const failures = events.flatMap((e) => e.activityTaskFailedEventAttributes?.failure ?? []);
-  t.deepEqual(attempts, [1, 1]);
-  t.is(failures.length, 1);
-  t.like(failures[0], { applicationFailureInfo: { type: 'StatefulModelOnStatelessPath', nonRetryable: true } });
-  t.regex(failures[0]!.message ?? '', /is stateful, but the workflow called it without its model state/);
-  t.deepEqual(calls, []);
+    t.deepEqual(scheduledActivities(history), ['strandsGetModelConfig', c.activity], c.type);
+    const events = history.events ?? [];
+    const attempts = events.flatMap((e) => e.activityTaskStartedEventAttributes?.attempt ?? []);
+    const failures = events.flatMap((e) => e.activityTaskFailedEventAttributes?.failure ?? []);
+    t.deepEqual(attempts, [1, 1], c.type);
+    t.is(failures.length, 1, c.type);
+    t.like(failures[0], { applicationFailureInfo: { type: c.type, nonRetryable: true } });
+    t.regex(failures[0]?.message ?? '', c.message);
+    t.deepEqual(calls, [], c.type);
+  }
 });
 
 test("the README's continue-as-new handoff carries a stateful model's state", async (t) => {

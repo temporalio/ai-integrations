@@ -151,8 +151,9 @@ export class ModelActivity {
   /**
    * The model for a stateless call. A stateful model cannot run here without the agent's model
    * state, and retrying does not bring it: the workflow chose this activity because its config
-   * read had no stateful flag, from a worker without stateful support, or because `TemporalModel`
-   * runs without `TemporalAgent` and never read the config.
+   * read had no stateful flag, from a worker without stateful support or from a model that became
+   * stateful later, or because `TemporalModel` runs without `TemporalAgent` and never read the
+   * config.
    */
   private getStatelessModel(name?: string): Model {
     const model = this.getModel(name);
@@ -163,8 +164,29 @@ export class ModelActivity {
         message:
           `The worker model ${JSON.stringify(name ?? this.defaultName)} is stateful, but the workflow ` +
           `called it without its model state. Its config was read from a worker without stateful ` +
-          `support, or TemporalModel runs without TemporalAgent and did not read it. Reset or ` +
-          `terminate the run.`,
+          `support, the worker model became stateful after the run read its config, or ` +
+          `TemporalModel runs without TemporalAgent and did not read it. Reset or terminate the run.`,
+      });
+    }
+    return model;
+  }
+
+  /**
+   * The model for a stateful call. A model that is no longer stateful ignores the model state, and
+   * the agent, which read a stateful config, clears its messages after each turn, so the model
+   * would see only each turn's new message: the worker model became stateless after the run read
+   * its config.
+   */
+  private getStatefulModel(name?: string): Model {
+    const model = this.getModel(name);
+    if (!model.stateful) {
+      throw ApplicationFailure.create({
+        type: 'StatelessModelOnStatefulPath',
+        nonRetryable: true,
+        message:
+          `The worker model ${JSON.stringify(name ?? this.defaultName)} is not stateful, but the run ` +
+          `read a stateful config, so its agent does not keep the messages this model needs. The ` +
+          `worker model became stateless after the run read its config. Reset or terminate the run.`,
       });
     }
     return model;
@@ -205,7 +227,7 @@ export class ModelActivity {
   /** Run a stateful model with the agent's model state; return its events and the updated state. */
   async invokeStatefulModel(input: InvokeStatefulModelInput): Promise<InvokeStatefulModelResult> {
     const modelState = new StateStore(input.modelState);
-    const model = this.getModel(input.modelName);
+    const model = this.getStatefulModel(input.modelName);
     const events = await this.runModel(model, { ...input, options: { ...input.options, modelState } });
     return { events, modelState: modelState.getAll() };
   }
@@ -213,7 +235,7 @@ export class ModelActivity {
   /** As {@link invokeStatefulModel}, publishing each event as {@link invokeModelStreaming} does. */
   async invokeStatefulModelStreaming(input: InvokeStatefulModelStreamingInput): Promise<InvokeStatefulModelResult> {
     const modelState = new StateStore(input.modelState);
-    const model = this.getModel(input.modelName);
+    const model = this.getStatefulModel(input.modelName);
     const events = await this.runModelStreaming(model, { ...input, options: { ...input.options, modelState } });
     return { events, modelState: modelState.getAll() };
   }
