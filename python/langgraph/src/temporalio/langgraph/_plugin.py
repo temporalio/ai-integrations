@@ -55,6 +55,39 @@ def _constant_summary_fn(
     return lambda args, kwargs: value
 
 
+def _task_cache_id(func: Callable, activity_name: str) -> str:
+    """Return the continue-as-new cache id for an activity-bound node or task.
+
+    Node factories return closures, and ``task_id`` rejects those: every
+    closure from one factory shares a qualname, so it cannot identify a
+    node. A Graph API node's Temporal identity is its ``<graph>.<node>``
+    activity name regardless of its function, so that name — prefixed to
+    keep it out of the ``module.qualname`` id space — identifies the
+    node's cached results just as well. Only closures and local functions
+    fall back; every other ``task_id`` rejection (``__main__`` functions,
+    callables without a qualname) still propagates. Functions with a
+    stable ``module.qualname`` keep it, so caches written by earlier
+    versions (and the histories carrying them) stay valid.
+
+    Args:
+        func: Activity-bound node or task function.
+        activity_name: Activity name whose results are cached when ``func``
+            is a closure or local function.
+
+    Returns:
+        The id the continue-as-new result cache keys ``func``'s entries by.
+    """
+    try:
+        return task_id(func)
+    except ValueError:
+        qualname = (
+            getattr(func, "__qualname__", None) or getattr(func, "__name__", None) or ""
+        )
+        if "<locals>" not in qualname:
+            raise
+        return f"graph-node:{activity_name}"
+
+
 def _merge_activity_opts(
     defaults: dict[str, Any] | None, specific: dict[str, Any]
 ) -> dict[str, Any]:
@@ -363,7 +396,7 @@ class LangGraphPlugin(SimplePlugin):
             self.activities.append(a)
             return wrap_execute_activity(
                 a,
-                task_id=task_id(func),
+                task_id=_task_cache_id(func, activity_name),
                 summary_fn=summary_fn,
                 context_schemas=self._context_schemas,
                 value_types=self._value_types,
