@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"weak"
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
@@ -183,11 +184,14 @@ type mcpAgentKey struct {
 // mcpRunState is the state of a toolset in one agent run: one agent in one
 // execution of a runner.Run iterator.
 type mcpRunState struct {
-	// run is the InvocationContext ADK creates for the agent in each execution
-	// of a runner.Run iterator, a resume, a retry or another pass over a kept
-	// iterator included, and passes to every Tools call of that agent run. It
-	// tells apart the runs of one agent in one invocation.
-	run agent.InvocationContext
+	// run points weakly to the InvocationContext ADK creates for the agent in
+	// each execution of a runner.Run iterator, a resume, a retry or another
+	// pass over a kept iterator included, and passes to every Tools call of
+	// that agent run. It tells apart the runs of one agent in one invocation.
+	// The pointer is weak so that the store does not keep a finished run's
+	// InvocationContext, and the session events it holds, alive; once the
+	// garbage collector reclaims it, startRun drops the state.
+	run weak.Pointer[byte]
 	// pending is the list Tools took for the ProcessRequest call that follows
 	// in the same model step, when hasPending is set.
 	pending    []tool.Tool
@@ -206,24 +210,32 @@ func listingsFrom(ctx context.Context) *mcpListings {
 	return l
 }
 
-// agentRunOf returns the InvocationContext of the agent run ctx belongs to, or
-// nil. ADK passes Tools a ReadonlyContext that holds it in the exported
-// InvocationContext field. It is not the RunConfig: ADK reuses one RunConfig
-// when a runner.Run iterator without an LLM agent at its root runs again.
-func agentRunOf(ctx agent.ReadonlyContext) agent.InvocationContext {
+// agentRunOf returns a weak pointer to the InvocationContext of the agent run
+// ctx belongs to, and whether ctx holds one. ADK passes Tools a ReadonlyContext
+// that holds it in the exported InvocationContext field. It is not the
+// RunConfig: ADK reuses one RunConfig when a runner.Run iterator without an LLM
+// agent at its root runs again.
+//
+// Weak pointers made from the same InvocationContext are equal, and stay
+// distinct from those made from any other, even after it is reclaimed.
+func agentRunOf(ctx agent.ReadonlyContext) (weak.Pointer[byte], bool) {
 	v := reflect.ValueOf(ctx)
 	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
-		return nil
+		return weak.Pointer[byte]{}, false
 	}
 	f := v.Elem().FieldByName("InvocationContext")
 	if !f.IsValid() || !f.CanInterface() {
-		return nil
+		return weak.Pointer[byte]{}, false
 	}
 	ic, ok := f.Interface().(agent.InvocationContext)
-	if !ok || reflect.ValueOf(ic).Kind() != reflect.Pointer {
-		return nil
+	if !ok {
+		return weak.Pointer[byte]{}, false
 	}
-	return ic
+	p := reflect.ValueOf(ic)
+	if p.Kind() != reflect.Pointer || p.IsNil() {
+		return weak.Pointer[byte]{}, false
+	}
+	return weak.Make((*byte)(p.UnsafePointer())), true
 }
 
 // startRun returns the state of the toolset in ctx's agent run, for Tools. It
@@ -233,26 +245,36 @@ func agentRunOf(ctx agent.ReadonlyContext) agent.InvocationContext {
 //
 // Without a state, the toolset lists and filters on every Tools and
 // ProcessRequest call, and its proxy tools pack themselves.
+//
+// When it starts a state, it also drops the states of finished agent runs,
+// whose InvocationContext the garbage collector has reclaimed. No later call
+// can belong to such a run, so a long conversation on one NewContext keeps
+// only the states of runs that may still call the toolset.
 func (l *mcpListings) startRun(m *mcpToolset, ctx agent.ReadonlyContext) *mcpRunState {
 	if l == nil {
 		return nil
 	}
-	run := agentRunOf(ctx)
+	run, ok := agentRunOf(ctx)
 	k := mcpAgentKey{m, ctx.InvocationID(), ctx.AgentName()}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if run == nil {
+	if !ok {
 		delete(l.runs, k)
 		return nil
+	}
+	if s, ok := l.runs[k]; ok && s.run == run {
+		return s
+	}
+	for key, s := range l.runs {
+		if s.run.Value() == nil {
+			delete(l.runs, key)
+		}
 	}
 	if l.runs == nil {
 		l.runs = map[mcpAgentKey]*mcpRunState{}
 	}
-	s, ok := l.runs[k]
-	if !ok || s.run != run {
-		s = &mcpRunState{run: run}
-		l.runs[k] = s
-	}
+	s := &mcpRunState{run: run}
+	l.runs[k] = s
 	return s
 }
 
