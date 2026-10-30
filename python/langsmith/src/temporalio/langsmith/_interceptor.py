@@ -8,6 +8,7 @@ import logging
 import random
 import threading
 import uuid
+import weakref
 from collections.abc import Callable, Generator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
@@ -433,6 +434,28 @@ def _stable_child_ids(create_child: Callable[..., Any]) -> Callable[..., Any]:
     return create_child_with_stable_id
 
 
+def _replay_safe_tracer(start_trace: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``LangChainTracer._start_trace`` to write through a ``_ReplaySafeClient``.
+
+    LangChain builds its tracer with the plugin's client only when the
+    callbacks have none; a tracer the caller passes keeps its own client.  Its
+    runs get stable IDs in workflow code like any other, so without the
+    wrapper a replay would write them again under the same IDs.  The tracer
+    sets its client on each run after this.
+    """
+
+    def _start_trace(self: Any, run: Any) -> None:
+        if (
+            not isinstance(self.client, _ReplaySafeClient)
+            and isinstance(get_tracing_context().get("client"), _ReplaySafeClient)
+            and _get_langchain_runs() is not None
+        ):
+            self.client = _replay_safe_client(self.client)
+        start_trace(self, run)
+
+    return _start_trace
+
+
 def _install_langchain_run_id_hook() -> None:
     """Make the run IDs LangChain generates in workflow code stable.
 
@@ -450,8 +473,14 @@ def _install_langchain_run_id_hook() -> None:
     setattr(RunTree, "create_child", _stable_child_ids(RunTree.create_child))
     try:
         import langchain_core.callbacks.manager as manager
+        from langchain_core.tracers.langchain import LangChainTracer
     except ImportError:
         return
+    setattr(
+        LangChainTracer,
+        "_start_trace",
+        _replay_safe_tracer(getattr(LangChainTracer, "_start_trace")),
+    )
     # The names the manager calls; neither is in its __all__.
     if hasattr(manager, "uuid7"):
         # langchain-core 0.3.83 to 0.3.86, and 1.1.1 on
@@ -568,11 +597,33 @@ def _prepare_write(
     return holding.held
 
 
-class _ReplaySafeClient:
-    """Wraps the plugin's LangSmith client for use in workflow code.
+_replay_safe_clients: weakref.WeakValueDictionary[int, _ReplaySafeClient] = (
+    weakref.WeakValueDictionary()
+)
+_replay_safe_clients_lock = threading.Lock()
 
-    LangChain's tracer writes its runs through this client, not through
-    ``_ReplaySafeRunTree``.  In workflow code, this gives those runs stable
+
+def _replay_safe_client(client: Any) -> _ReplaySafeClient:
+    """Get the ``_ReplaySafeClient`` of a LangSmith client.
+
+    There is one per client, so every tracer that writes through a client
+    shares its record of the runs it posted.
+    """
+    if isinstance(client, _ReplaySafeClient):
+        return client
+    with _replay_safe_clients_lock:
+        wrapper = _replay_safe_clients.get(id(client))
+        if wrapper is None:
+            wrapper = _ReplaySafeClient(client)
+            _replay_safe_clients[id(client)] = wrapper
+        return wrapper
+
+
+class _ReplaySafeClient:
+    """Wraps a LangSmith client for use in workflow code.
+
+    LangChain's tracers write their runs through this client, not through
+    ``_ReplaySafeRunTree`` (see ``_replay_safe_tracer``).  In workflow code, this gives those runs stable
     IDs (see ``_LangChainRuns``) and holds back their writes while history
     replays.  A replayed callback still runs the client's own steps before
     its write, synchronously, so errors those steps raise, such as from a
@@ -1040,7 +1091,7 @@ class LangSmithInterceptor(
             client = langsmith.Client()
         self._client = client
         # Workflow code uses this wherever it would use a langsmith.Client.
-        self._workflow_client: Any = _ReplaySafeClient(client)
+        self._workflow_client: Any = _replay_safe_client(client)
         # LangSmith treats an empty project name as unset, so the plugin does too.
         self._project_name = project_name or None
         # The plugin project or env destination is a fallback for roots.
