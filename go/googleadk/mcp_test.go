@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -195,6 +197,20 @@ type ruleModel struct {
 func (m *ruleModel) Name() string { return m.name }
 
 func (m *ruleModel) GenerateContent(_ context.Context, req *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+	names := declaredNames(req)
+	m.mu.Lock()
+	m.decls = append(m.decls, names)
+	m.mu.Unlock()
+	resp := m.rule(req)
+	return func(yield func(*model.LLMResponse, error) bool) { yield(resp, nil) }
+}
+
+func (m *ruleModel) factory() googleadk.ModelFactory {
+	return func(context.Context, string) (model.LLM, error) { return m, nil }
+}
+
+// declaredNames returns the names of the tools a model request declares.
+func declaredNames(req *model.LLMRequest) []string {
 	var names []string
 	if req.Config != nil {
 		for _, gt := range req.Config.Tools {
@@ -205,15 +221,7 @@ func (m *ruleModel) GenerateContent(_ context.Context, req *model.LLMRequest, _ 
 			}
 		}
 	}
-	m.mu.Lock()
-	m.decls = append(m.decls, names)
-	m.mu.Unlock()
-	resp := m.rule(req)
-	return func(yield func(*model.LLMResponse, error) bool) { yield(resp, nil) }
-}
-
-func (m *ruleModel) factory() googleadk.ModelFactory {
-	return func(context.Context, string) (model.LLM, error) { return m, nil }
+	return names
 }
 
 // declared returns the tool names each model request declared, in order.
@@ -482,6 +490,115 @@ func TestMcpDroppedToolIsNeitherDeclaredNorCalled(t *testing.T) {
 	assert.Equal(t, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}, m.declared())
 	assert.Equal(t, 3, counter.get(googleadk.ListMcpToolsActivityName))
 	assert.Equal(t, 1, counter.get(googleadk.CallMcpToolActivityName), "the dropped tool ran again")
+}
+
+// wrappedToolsLog records, for TestMcpWrappedToolsetListsOnEveryToolsCall, the
+// tools each Tools call of the wrapped MCP toolset returns and the tools each
+// model request declares, in order.
+var wrappedToolsLog *commandLog
+
+// loggingToolset records in wrappedToolsLog the tools each Tools call returns.
+// Like the ADK wrappers, it has no ProcessRequest.
+type loggingToolset struct {
+	tool.Toolset
+}
+
+func (l loggingToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
+	tools, err := l.Toolset.Tools(ctx)
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Name())
+	}
+	wrappedToolsLog.add(fmt.Sprintf("tools %v", names))
+	return tools, err
+}
+
+// wrappedMCPWorkflow runs an agent whose MCP toolset is wrapped in the named
+// ADK wrapper, which does not forward the toolset's ProcessRequest.
+func wrappedMCPWorkflow(ctx workflow.Context, wrapper string) (runResult, error) {
+	ts := googleadk.NewMCPToolset(googleadk.MCPToolsetOptions{Name: "search-server"})
+	switch wrapper {
+	case "FilterToolset":
+		ts = tool.FilterToolset(ts, func(agent.ReadonlyContext, tool.Tool) bool { return true })
+	case "WithConfirmation":
+		ts = tool.WithConfirmation(ts, false, nil)
+	default:
+		return runResult{}, fmt.Errorf("unknown wrapper %q", wrapper)
+	}
+	return runAgent(ctx, agentBuild{
+		modelName:   "fake-model",
+		userMessage: "search twice",
+		toolsets:    []tool.Toolset{loggingToolset{ts}},
+	})
+}
+
+// TestMcpWrappedToolsetListsOnEveryToolsCall proves that an MCP toolset whose
+// ProcessRequest ADK never calls, because a wrapper hides it, lists on every
+// Tools call, as before the toolset listed once per model step: once per agent
+// run with ADK v2.5.0 and earlier, and once per model step with v2.6.0. Each
+// model request declares what the latest Tools call returned, so with v2.6.0 a
+// tool the server dropped is neither declared nor called again.
+func TestMcpWrappedToolsetListsOnEveryToolsCall(t *testing.T) {
+	for _, wrapper := range []string{"FilterToolset", "WithConfirmation"} {
+		t.Run(wrapper, func(t *testing.T) {
+			wrappedToolsLog = &commandLog{}
+			var hide atomic.Bool
+			server := googleadk.NewFakeMCPServer("search-server").
+				AddTool("search", "search the web", searchSchema(),
+					func(map[string]any) (map[string]any, error) {
+						hide.Store(true)
+						return map[string]any{"hits": 1}, nil
+					}).
+				AddTool("fetch", "fetch a page", searchSchema(),
+					func(map[string]any) (map[string]any, error) { return map[string]any{}, nil })
+			m := &ruleModel{name: "fake-model", rule: func(req *model.LLMRequest) *model.LLMResponse {
+				wrappedToolsLog.add(fmt.Sprintf("model %v", declaredNames(req)))
+				if n := functionResponses(req); n < 2 {
+					return googleadk.FunctionCallResponse(fmt.Sprintf("c%d", n+1), "search", map[string]any{"query": "temporal"})
+				}
+				return googleadk.TextResponse("done")
+			}}
+
+			var s testsuite.WorkflowTestSuite
+			env, counter := newEnv(t, &s, googleadk.Config{
+				Models: map[string]googleadk.ModelFactory{"fake-model": m.factory()},
+				MCPToolsets: map[string]googleadk.MCPFactory{"search-server": func(context.Context) (tool.Toolset, error) {
+					return hidingToolset{Toolset: server, hide: &hide}, nil
+				}},
+			})
+			env.RegisterWorkflow(wrappedMCPWorkflow)
+			env.ExecuteWorkflow(wrappedMCPWorkflow, wrapper)
+
+			require.True(t, env.IsWorkflowCompleted())
+			require.NoError(t, env.GetWorkflowError())
+
+			toolsCalls, latest := 0, ""
+			for _, e := range wrappedToolsLog.get() {
+				if after, ok := strings.CutPrefix(e, "tools "); ok {
+					toolsCalls++
+					latest = after
+					continue
+				}
+				assert.Equal(t, "model "+latest, e, "a model request declares the latest Tools list")
+			}
+			require.Positive(t, toolsCalls)
+			assert.Equal(t, toolsCalls, counter.get(googleadk.ListMcpToolsActivityName), "one listing per Tools call")
+
+			declared := m.declared()
+			require.Len(t, declared, 3)
+			wantCalls := 0
+			for _, names := range declared[:2] {
+				if slices.Contains(names, "search") {
+					wantCalls++
+				}
+			}
+			assert.Equal(t, wantCalls, counter.get(googleadk.CallMcpToolActivityName),
+				"a search call runs CallMcpTool only when the request declared search")
+			if toolsCalls == len(declared) {
+				assert.Equal(t, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}, declared)
+			}
+		})
+	}
 }
 
 // parallelHelperWorkflow has the root agent call one helper agent twice in

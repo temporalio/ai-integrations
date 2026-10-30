@@ -2,6 +2,8 @@ package googleadk
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -72,6 +74,10 @@ func (m *mcpToolset) Name() string { return m.name }
 // and later make before every model step, return the list the filter last
 // allowed without running it again: a filter that issues Workflow commands
 // then issues them at the same points on every ADK release.
+//
+// A toolset wrapped in a toolset without ProcessRequest, such as
+// tool.FilterToolset, lists and filters on every call, because nothing else
+// refreshes its list.
 func (m *mcpToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	l := listingsFrom(ctx)
 	if tools, ok := l.filteredBefore(m, ctx); ok {
@@ -184,22 +190,26 @@ type mcpListingState struct {
 	// ProcessRequest call that follows in the same model step. Concurrent
 	// invocations of one agent each keep their own.
 	pending map[string][]tool.Tool
-	// allowed holds, per agent run whose first Tools call ran ToolFilter, the
-	// list the filter last allowed there. Tools returns it on the later calls
-	// of the run.
+	// allowed holds, per agent run since processed, the list ToolFilter last
+	// allowed there. Tools returns it on the later calls of the run.
 	allowed map[mcpRunKey][]tool.Tool
 }
 
 // mcpRunKey identifies an agent run. A run that resumes a paused one keeps
 // its invocation ID, so the key adds the user content that started the run:
-// ADK passes the same content to every step of a run.
+// ADK passes the same content to every step of a run. The content is compared
+// by value too, because a caller may resume with the same *genai.Content,
+// overwritten with the approval.
 type mcpRunKey struct {
 	invocation string
 	content    *genai.Content
+	digest     [sha256.Size]byte
 }
 
 func runKey(ctx agent.ReadonlyContext) mcpRunKey {
-	return mcpRunKey{ctx.InvocationID(), ctx.UserContent()}
+	c := ctx.UserContent()
+	b, _ := json.Marshal(c)
+	return mcpRunKey{ctx.InvocationID(), c, sha256.Sum256(b)}
 }
 
 // listingsFrom returns the mcpListings NewContext installed, or nil.
@@ -253,20 +263,25 @@ func (l *mcpListings) listed(m *mcpToolset, ctx agent.ReadonlyContext, tools []t
 	}
 }
 
-// filteredBefore returns the list ToolFilter last allowed when Tools already
-// ran it in this agent run.
+// filteredBefore returns the list ToolFilter last allowed in this agent run,
+// once the toolset's ProcessRequest has run for the agent. Until then, nothing
+// but Tools refreshes the list.
 func (l *mcpListings) filteredBefore(m *mcpToolset, ctx agent.ReadonlyContext) ([]tool.Tool, bool) {
 	if l == nil {
 		return nil, false
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	tools, ok := l.entry(m, ctx).allowed[runKey(ctx)]
+	s := l.entry(m, ctx)
+	if !s.processed {
+		return nil, false
+	}
+	tools, ok := s.allowed[runKey(ctx)]
 	return tools, ok
 }
 
-// filtered records a list ToolFilter allowed in the agent run. Tools records
-// the first; ProcessRequest replaces it once Tools has.
+// filtered records a list ToolFilter allowed in the agent run. ProcessRequest
+// always records it; Tools only once ProcessRequest has run for the agent.
 func (l *mcpListings) filtered(m *mcpToolset, ctx agent.ReadonlyContext, tools []tool.Tool, inTools bool) {
 	if l == nil {
 		return
@@ -274,10 +289,10 @@ func (l *mcpListings) filtered(m *mcpToolset, ctx agent.ReadonlyContext, tools [
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	s := l.entry(m, ctx)
-	k := runKey(ctx)
-	if _, ok := s.allowed[k]; ok || inTools {
-		s.allowed[k] = tools
+	if inTools && !s.processed {
+		return
 	}
+	s.allowed[runKey(ctx)] = tools
 }
 
 // take marks the toolset processed for the agent and returns the list Tools
