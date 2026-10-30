@@ -1,8 +1,9 @@
-import { Model } from '@strands-agents/sdk';
+import { ContextWindowOverflowError, Model } from '@strands-agents/sdk';
 import type { BaseModelConfig, Message, ModelStreamEvent, StreamOptions } from '@strands-agents/sdk';
 import * as workflow from '@temporalio/workflow';
 import type { ActivityOptions } from '@temporalio/workflow';
 import type { Duration } from '@temporalio/common/lib/time';
+import { applicationFailureType, CONTEXT_WINDOW_OVERFLOW_TYPE } from './strands-errors';
 import type {
   GetModelConfigInput,
   InvokeModelInput,
@@ -126,11 +127,29 @@ export class TemporalModel extends Model<BaseModelConfig> {
       : undefined;
 
     if (!this.isStateful) {
-      yield* streaming
-        ? await proxiedActivities.invokeModelStreaming({ ...input, ...streaming })
-        : await proxiedActivities.invokeModel(input);
+      let events: ModelStreamEvent[];
+      try {
+        events = streaming
+          ? await proxiedActivities.invokeModelStreaming({ ...input, ...streaming })
+          : await proxiedActivities.invokeModel(input);
+      } catch (err) {
+        // Give the agent Strands' own error for a context overflow, so its conversation manager can
+        // trim the conversation and call the model again. Keep the activity failure as its cause.
+        if (
+          err instanceof workflow.ActivityFailure &&
+          applicationFailureType(err.cause) === CONTEXT_WINDOW_OVERFLOW_TYPE
+        ) {
+          throw Object.assign(new ContextWindowOverflowError(err.cause?.message ?? ''), { cause: err });
+        }
+        throw err;
+      }
+      yield* events;
       return;
     }
+
+    // A stateful model's overflow is not rethrown as Strands' error: its conversation is on the
+    // server, and the default manager the agent keeps would trim and retry where Strands, which
+    // gives a stateful agent no manager, fails the turn.
 
     // The agent's model state is a live store; send a copy of its values, and copy the updated
     // values back, as the model would have written them natively.

@@ -13,6 +13,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -82,22 +83,30 @@ func TestStreamingIntegration(t *testing.T) {
 	assert.GreaterOrEqual(t, offset, int64(len(cm.chunks)), "every streamed chunk must be published to the topic")
 }
 
-// TestReplaySingleAndMultiAgent runs real single-agent, multi-agent, and
-// multi-decision HITL workflows against the dev server, then replays each
-// recorded history with worker.WorkflowReplayer — the canonical determinism
-// guarantee. A replay failure here is exactly the non-determinism the plugin's
-// NewContext (time/uuid/task providers) exists to prevent.
+// TestReplaySingleAndMultiAgent runs real single-agent, multi-agent, remote
+// A2A sub-agent (plain and streamed), and multi-decision HITL workflows against
+// the dev server, then replays each recorded history with
+// worker.WorkflowReplayer — the canonical determinism guarantee. A replay
+// failure here is exactly the non-determinism the plugin's NewContext
+// (time/uuid/task providers) exists to prevent. The replay must also send no
+// A2A request: the remote agent's card and messages come from History.
 func TestReplaySingleAndMultiAgent(t *testing.T) {
 	c := testClient(t)
 	taskQueue := testTaskQueue(t)
+
+	a2aURL, a2aRequests := startA2AServer(t, a2aServer{
+		Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil),
+	})
 
 	models := map[string]googleadk.ModelFactory{
 		"root-model": scriptedModelFactory(
 			googleadk.FunctionCallResponse("c1", "transfer_to_agent", map[string]any{"agent_name": "specialist"}),
 			googleadk.TextResponse("(root fallback)"),
 		),
-		"specialist-model": scriptedModelFactory(googleadk.TextResponse("specialist answer")),
-		"solo-model":       scriptedModelFactory(googleadk.TextResponse("hello from solo")),
+		"specialist-model":         scriptedModelFactory(googleadk.TextResponse("specialist answer")),
+		"solo-model":               scriptedModelFactory(googleadk.TextResponse("hello from solo")),
+		"remote-root-model":        transferToRemoteModel(),
+		"remote-stream-root-model": transferToRemoteModel(),
 	}
 	for name, factory := range multiConfirmModels() {
 		models[name] = factory
@@ -119,16 +128,35 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 				ModelName:   "specialist-model",
 			}},
 		},
+		taskQueue + "-remote": {
+			ModelName:   "remote-root-model",
+			UserMessage: "ask the remote agent",
+			SubAgents:   []subAgentSpec{remoteSubAgent(a2aURL)},
+		},
+		taskQueue + "-remote-stream": {
+			ModelName:   "remote-stream-root-model",
+			UserMessage: "ask the remote agent",
+			SubAgents:   []subAgentSpec{remoteSubAgent(a2aURL)},
+			SSE:         true,
+		},
 	}
 
 	type execution struct{ id, runID string }
 	var executions []execution
+	runs := map[string]client.WorkflowRun{}
 	for id, in := range inputs {
-		run := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{ID: id, TaskQueue: taskQueue}, agentRunWorkflow, in)
+		runs[id] = startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{ID: id, TaskQueue: taskQueue}, agentRunWorkflow, in)
+	}
+	for id, run := range runs {
 		var res runResult
 		require.NoError(t, run.Get(ctx, &res))
+		if len(inputs[id].SubAgents) == 1 && inputs[id].SubAgents[0].RemoteCardURL != "" {
+			require.Contains(t, res.Texts, "remote answer")
+		}
 		executions = append(executions, execution{run.GetID(), run.GetRunID()})
 	}
+	liveA2ARequests := a2aRequests.Load()
+	require.Positive(t, liveA2ARequests, "the live run must reach the A2A server")
 
 	// The multi-decision confirmation resume: one turn pauses on three guarded
 	// ActivityAsTool tools and a single batched ConfirmationResponse — with the
@@ -162,4 +190,5 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 		})
 		require.NoError(t, err, "recorded history for %s must replay deterministically", e.id)
 	}
+	assert.Equal(t, liveA2ARequests, a2aRequests.Load(), "replay must not send A2A requests again")
 }

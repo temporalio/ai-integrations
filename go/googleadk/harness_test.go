@@ -2,11 +2,17 @@ package googleadk_test
 
 import (
 	"context"
+	"errors"
+	"iter"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/stretchr/testify/require"
 
@@ -19,7 +25,10 @@ import (
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
+	remoteagent "google.golang.org/adk/v2/agent/remoteagent/v2"
+	"google.golang.org/adk/v2/agent/workflowagents/sequentialagent"
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/plugin"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
@@ -42,6 +51,127 @@ type subAgentSpec struct {
 	Name        string
 	Description string
 	ModelName   string
+	// RemoteCardURL, when set, makes the child ADK's remote A2A agent, with its
+	// agent card at this URL, instead of an LLM agent. It uses the plugin's
+	// card and client providers.
+	RemoteCardURL string
+	// WorkflowSideA2A makes that remote agent use ADK's own providers instead,
+	// which fetch the card and send messages from Workflow code.
+	WorkflowSideA2A bool
+}
+
+// remoteSubAgent is a remote A2A sub-agent named "remote" with its card at url.
+func remoteSubAgent(url string) subAgentSpec {
+	return subAgentSpec{Name: "remote", Description: "remote A2A agent", RemoteCardURL: url}
+}
+
+// transferToRemoteModel is a root model that transfers to the "remote" agent.
+func transferToRemoteModel() googleadk.ModelFactory {
+	return scriptedModelFactory(
+		googleadk.FunctionCallResponse("c1", "transfer_to_agent", map[string]any{"agent_name": "remote"}),
+	)
+}
+
+// a2aServer configures startA2AServer.
+type a2aServer struct {
+	// Reply answers each message by yielding events or an error.
+	Reply func(ec *a2asrv.ExecutorContext, yield func(a2a.Event, error) bool)
+	// Token, when set, makes the server answer A2A calls that lack
+	// "Authorization: Bearer <Token>" with HTTP 401. The card stays public.
+	Token string
+	// StreamErrorAfter, when positive, ends every stream with an error after
+	// that many events.
+	StreamErrorAfter int
+	// REST makes the card name the REST transport instead of JSON-RPC.
+	REST bool
+	// Path is the path of the A2A interface the card names; "/" by default.
+	Path string
+	// Front, when set, sees every A2A request first and answers it itself
+	// when it returns true. The card is not passed to it.
+	Front func(w http.ResponseWriter, r *http.Request) bool
+	// AlsoRESTPath, when set, makes the card also name a REST interface at
+	// that path, after the first one.
+	AlsoRESTPath string
+}
+
+// streamErrorHandler ends every stream with an error after its first n events.
+type streamErrorHandler struct {
+	a2asrv.RequestHandler
+	n int
+}
+
+func (h streamErrorHandler) SendStreamingMessage(ctx context.Context, req *a2a.SendMessageRequest) iter.Seq2[a2a.Event, error] {
+	return func(yield func(a2a.Event, error) bool) {
+		sent := 0
+		for ev, err := range h.RequestHandler.SendStreamingMessage(ctx, req) {
+			if !yield(ev, err) || err != nil {
+				return
+			}
+			if sent++; sent == h.n {
+				yield(nil, errors.New("stream broke"))
+				return
+			}
+		}
+	}
+}
+
+// a2aReply answers every message with ev and err.
+func a2aReply(ev a2a.Event, err error) func(*a2asrv.ExecutorContext, func(a2a.Event, error) bool) {
+	return func(_ *a2asrv.ExecutorContext, yield func(a2a.Event, error) bool) { yield(ev, err) }
+}
+
+// startA2AServer starts an in-process A2A server and returns its URL and a
+// count of the requests it received.
+func startA2AServer(t *testing.T, cfg a2aServer) (string, *atomic.Int32) {
+	t.Helper()
+	var requests atomic.Int32
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if cfg.Token != "" && r.URL.Path != a2asrv.WellKnownAgentCardPath && r.Header.Get("Authorization") != "Bearer "+cfg.Token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if cfg.Front != nil && r.URL.Path != a2asrv.WellKnownAgentCardPath && cfg.Front(w, r) {
+			return
+		}
+		mux.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	path, binding := cfg.Path, a2a.TransportProtocolJSONRPC
+	if path == "" {
+		path = "/"
+	}
+	if cfg.REST {
+		binding = a2a.TransportProtocolHTTPJSON
+	}
+	card := &a2a.AgentCard{
+		Name: "remote", Description: "Answers questions.", Version: "1.0.0",
+		SupportedInterfaces: []*a2a.AgentInterface{{
+			URL: srv.URL + path, ProtocolBinding: binding, ProtocolVersion: a2a.Version,
+		}},
+		DefaultInputModes: []string{"text/plain"}, DefaultOutputModes: []string{"text/plain"},
+		Capabilities: a2a.AgentCapabilities{Streaming: true},
+	}
+	if cfg.AlsoRESTPath != "" {
+		card.SupportedInterfaces = append(card.SupportedInterfaces, &a2a.AgentInterface{
+			URL: srv.URL + cfg.AlsoRESTPath, ProtocolBinding: a2a.TransportProtocolHTTPJSON, ProtocolVersion: a2a.Version,
+		})
+	}
+	executor := a2asrv.AgentExecutorFunc(func(_ context.Context, ec *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
+		return func(yield func(a2a.Event, error) bool) { cfg.Reply(ec, yield) }
+	})
+	mux.Handle(a2asrv.WellKnownAgentCardPath, a2asrv.NewStaticAgentCardHandler(card))
+	handler := a2asrv.NewHandler(executor)
+	if cfg.StreamErrorAfter > 0 {
+		handler = streamErrorHandler{RequestHandler: handler, n: cfg.StreamErrorAfter}
+	}
+	if cfg.REST {
+		mux.Handle("/", a2asrv.NewRESTHandler(handler))
+	} else {
+		mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
+	}
+	return srv.URL, &requests
 }
 
 // runInput is the serializable input to agentRunWorkflow.
@@ -55,6 +185,16 @@ type runInput struct {
 	StreamingTopic   string
 	PerModelTimeouts map[string]time.Duration
 	UseCustomSummary bool
+	// SSE runs ADK in streaming mode without a model streaming topic: model
+	// calls still return one response, and a remote A2A agent streams. Without
+	// it, the run uses agent.StreamingModeNone, the only mode in which ADK
+	// does not stream to a remote A2A agent.
+	SSE bool
+	// SequentialRoot makes the root a sequential agent of the sub-agents
+	// instead of an LLM agent.
+	SequentialRoot bool
+	// RunnerPlugin adds googleadk.NewRunnerPlugin to the runner.
+	RunnerPlugin bool
 }
 
 // runResult is the serializable output of agentRunWorkflow.
@@ -64,6 +204,8 @@ type runResult struct {
 	ToolResponses        []string
 	ToolResponsePayloads map[string]map[string]any
 	Authors              []string
+	// Errors holds the error messages of the run's events.
+	Errors []string
 	// StateFlag carries a session-state value a test workflow read back after the
 	// run (used by the in-workflow state-mutation regression test). Empty when
 	// unused.
@@ -88,6 +230,9 @@ type agentBuild struct {
 	modelName      string
 	modelOpts      []googleadk.ModelOption
 	streamingTopic string
+	sse            bool
+	sequentialRoot bool
+	runnerPlugin   bool
 	userMessage    string
 	tools          []tool.Tool
 	toolsets       []tool.Toolset
@@ -109,15 +254,23 @@ type agentBuild struct {
 // InvokeModel Activity; ordinary function tools run in-workflow; ActivityAsTool
 // and MCP tools dispatch their own Activities.
 func runAgent(ctx workflow.Context, b agentBuild) (runResult, error) {
-	root, err := llmagent.New(llmagent.Config{
-		Name:        "assistant",
-		Description: "root assistant",
-		Model:       googleadk.NewModel(b.modelName, b.modelOpts...),
-		Instruction: "be helpful",
-		Tools:       b.tools,
-		Toolsets:    b.toolsets,
-		SubAgents:   b.subAgents,
-	})
+	var root agent.Agent
+	var err error
+	if b.sequentialRoot {
+		root, err = sequentialagent.New(sequentialagent.Config{
+			AgentConfig: agent.Config{Name: "assistant", Description: "root sequence", SubAgents: b.subAgents},
+		})
+	} else {
+		root, err = llmagent.New(llmagent.Config{
+			Name:        "assistant",
+			Description: "root assistant",
+			Model:       googleadk.NewModel(b.modelName, b.modelOpts...),
+			Instruction: "be helpful",
+			Tools:       b.tools,
+			Toolsets:    b.toolsets,
+			SubAgents:   b.subAgents,
+		})
+	}
 	if err != nil {
 		return runResult{}, err
 	}
@@ -138,17 +291,29 @@ func runAgent(ctx workflow.Context, b agentBuild) (runResult, error) {
 	if sessionID == "" {
 		sessionID = "session-1"
 	}
+	var plugins []*plugin.Plugin
+	if b.runnerPlugin {
+		p, perr := googleadk.NewRunnerPlugin(root)
+		if perr != nil {
+			return runResult{}, perr
+		}
+		plugins = append(plugins, p)
+	}
 	r, err := runner.New(runner.Config{
 		AppName:           appName,
 		Agent:             root,
 		SessionService:    svc,
 		AutoCreateSession: true,
+		PluginConfig:      runner.PluginConfig{Plugins: plugins},
 	})
 	if err != nil {
 		return runResult{}, err
 	}
 
-	runCfg := agent.RunConfig{}
+	runCfg := agent.RunConfig{StreamingMode: agent.StreamingModeNone}
+	if b.sse {
+		runCfg.StreamingMode = agent.StreamingModeSSE
+	}
 	if b.streamingTopic != "" {
 		runCfg.StreamingMode = agent.StreamingModeSSE
 		// Streaming to external consumers requires the workflow-side stream server
@@ -177,6 +342,9 @@ func collectEvent(res *runResult, ev *session.Event) {
 		return
 	}
 	res.Authors = append(res.Authors, ev.Author)
+	if ev.ErrorMessage != "" {
+		res.Errors = append(res.Errors, ev.ErrorMessage)
+	}
 	if ev.Content == nil {
 		return
 	}
@@ -237,6 +405,24 @@ func agentRunWorkflow(ctx workflow.Context, in runInput) (runResult, error) {
 
 	var subAgents []agent.Agent
 	for _, sa := range in.SubAgents {
+		if sa.RemoteCardURL != "" {
+			cfg := remoteagent.A2AConfig{
+				Name:              sa.Name,
+				Description:       sa.Description,
+				AgentCardProvider: googleadk.NewA2AAgentCardProvider(sa.RemoteCardURL, workflow.ActivityOptions{}),
+				ClientProvider:    googleadk.NewA2AClientProvider(workflow.ActivityOptions{}),
+			}
+			if sa.WorkflowSideA2A {
+				cfg.AgentCardProvider = remoteagent.NewAgentCardProvider(sa.RemoteCardURL)
+				cfg.ClientProvider = nil
+			}
+			remote, rerr := remoteagent.NewA2A(cfg)
+			if rerr != nil {
+				return runResult{}, rerr
+			}
+			subAgents = append(subAgents, remote)
+			continue
+		}
 		child, cerr := llmagent.New(llmagent.Config{
 			Name:        sa.Name,
 			Description: sa.Description,
@@ -259,6 +445,9 @@ func agentRunWorkflow(ctx workflow.Context, in runInput) (runResult, error) {
 		modelName:      in.ModelName,
 		modelOpts:      modelOpts,
 		streamingTopic: in.StreamingTopic,
+		sse:            in.SSE,
+		sequentialRoot: in.SequentialRoot,
+		runnerPlugin:   in.RunnerPlugin,
 		userMessage:    in.UserMessage,
 		tools:          tools,
 		toolsets:       toolsets,

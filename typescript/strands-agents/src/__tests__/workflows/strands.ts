@@ -12,12 +12,16 @@ import {
   type Message,
 } from '@strands-agents/sdk';
 import {
+  ActivityFailure,
+  allHandlersFinished,
+  ApplicationFailure,
+  continueAsNew,
   defineSignal,
+  defineUpdate,
+  proxyActivities,
   setHandler,
   condition,
-  continueAsNew,
   workflowInfo,
-  type ActivityFailure,
   type ActivityOptions,
 } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
@@ -277,19 +281,89 @@ export async function structuredOutputAgent(prompt: string): Promise<unknown> {
   return result.structuredOutput;
 }
 
+/**
+ * Calls an activity that fails once per message, then fails with how workflow code decoded each
+ * activity failure, so a test can check how the failures are stored and decoded.
+ */
+export async function failActivities(messages: string[]): Promise<never> {
+  const { failingActivity } = proxyActivities<{ failingActivity(message: string): Promise<void> }>({
+    startToCloseTimeout: '10 seconds',
+    retry: { maximumAttempts: 1 },
+  });
+  const decoded: unknown[] = [];
+  for (const message of messages) {
+    await failingActivity(message).catch((err: unknown) => {
+      const cause = err instanceof ActivityFailure ? err.cause : undefined;
+      decoded.push(
+        cause instanceof ApplicationFailure
+          ? { type: cause.type, nonRetryable: cause.nonRetryable, details: cause.details }
+          : null
+      );
+    });
+  }
+  // Failing, rather than returning, also stores a workflow failure, which the bundle's failure
+  // converter encodes.
+  throw ApplicationFailure.create({ message: 'workflow failed', nonRetryable: true, details: decoded });
+}
+
+/** Runs each prompt as a turn of one agent, then returns the last reply and how many messages the agent kept. */
+export async function turnsAgent(prompts: string[]): Promise<[string, number]> {
+  const agent = new TemporalAgent({ model: 'test', printer: false });
+  let reply = '';
+  for (const prompt of prompts) {
+    reply = (await agent.invoke(prompt)).toString();
+  }
+  return [reply, agent.messages.length];
+}
+
+export const finishSignal = defineSignal('finish');
+
+/**
+ * Waits for the `finish` Signal and, one microtask later, schedules `finished` if every handler has
+ * finished by then and `unfinished` if not, so its history depends on when the handler finishes.
+ */
+export async function handlerTiming(): Promise<void> {
+  const activities = proxyActivities<{ finished(): Promise<void>; unfinished(): Promise<void> }>({
+    startToCloseTimeout: '10 seconds',
+  });
+  let signaled = false;
+  setHandler(finishSignal, () => {
+    signaled = true;
+  });
+  await condition(() => signaled);
+  await Promise.resolve();
+  await (allHandlersFinished() ? activities.finished() : activities.unfinished());
+}
+
+export const turnUpdate = defineUpdate<string, [string]>('turn');
+export const doneSignal = defineSignal('done');
+
+/** Runs each `turn` update as a turn of one agent, until the `done` signal. */
+export async function updateTurnsAgent(): Promise<string> {
+  const agent = new TemporalAgent({ model: 'test', printer: false });
+  let done = false;
+  setHandler(turnUpdate, async (prompt) => (await agent.invoke(prompt)).toString());
+  setHandler(doneSignal, () => {
+    done = true;
+  });
+  await condition(() => done);
+  return 'finished';
+}
+
 export const approveSignal = defineSignal<[string]>('approve');
 
-export async function interruptAgent(prompt: string): Promise<string> {
-  let approval: string | null = null;
+export async function interruptAgent(prompt: string, activityName = 'deleteThing'): Promise<string> {
+  // One approval per pause, in the order they arrive.
+  const approvals: string[] = [];
   setHandler(approveSignal, (response: string) => {
-    approval = response;
+    approvals.push(response);
   });
 
   const agent = new TemporalAgent({
     model: 'test',
     printer: false,
     tools: [
-      strandsWorkflow.activityAsTool('deleteThing', {
+      strandsWorkflow.activityAsTool(activityName, {
         description: 'Delete a thing',
         inputSchema: {
           type: 'object',
@@ -303,9 +377,8 @@ export async function interruptAgent(prompt: string): Promise<string> {
 
   let result = await agent.invoke(prompt);
   while (result.stopReason === 'interrupt') {
-    await condition(() => approval !== null);
-    const response = approval;
-    approval = null;
+    await condition(() => approvals.length > 0);
+    const response = approvals.shift() as string;
     const responses: InterruptResponseContentData[] = (result.interrupts ?? []).map((i) => ({
       type: 'interruptResponse',
       interruptResponse: { interruptId: i.id, response },
