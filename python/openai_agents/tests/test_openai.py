@@ -520,15 +520,15 @@ async def test_nexus_tool_workflow(client: Client, env: WorkflowEnvironment):
     ) as agent_env:
         client = agent_env.applied_on_client(client)
 
-        async with new_worker(
+        worker = new_worker(
             client,
             NexusToolsWorkflow,
             nexus_service_handlers=[WeatherServiceHandler()],
-        ) as worker:
-            await env.create_nexus_endpoint(
-                make_nexus_endpoint_name(worker.task_queue), worker.task_queue
-            )
-
+        )
+        await env.create_nexus_endpoint(
+            make_nexus_endpoint_name(worker.task_queue), worker.task_queue
+        )
+        async with worker:
             workflow_handle = await client.start_workflow(
                 NexusToolsWorkflow.run,
                 "What is the weather in Tokio?",

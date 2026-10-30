@@ -86,7 +86,7 @@ class TestPluginIntegration:
         with tracing_context(client=mock_ls_client, enabled=True):
             handle = await user_pipeline()
 
-            async with new_worker(
+            worker = new_worker(
                 temporal_client,
                 ComprehensiveWorkflow,
                 TraceableActivityWorkflow,
@@ -94,11 +94,12 @@ class TestPluginIntegration:
                 nexus_service_handlers=[NexusService()],
                 task_queue=task_queue,
                 max_cached_workflows=0,
-            ) as worker:
-                await env.create_nexus_endpoint(
-                    make_nexus_endpoint_name(worker.task_queue),
-                    worker.task_queue,
-                )
+            )
+            await env.create_nexus_endpoint(
+                make_nexus_endpoint_name(worker.task_queue),
+                worker.task_queue,
+            )
+            async with worker:
                 # Updates and the signal are handled at the next workflow task
                 # wherever the run is; the queries then hit the completed
                 # workflow, which has no workflow task in flight by definition.

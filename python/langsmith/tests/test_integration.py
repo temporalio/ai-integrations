@@ -663,7 +663,7 @@ class TestComprehensiveTracing:
             # Phase 1: the worker runs the workflow to completion. Updates and
             # the signal are handled at the next workflow task wherever the run
             # is, so nothing here needs to know how far it has progressed.
-            async with new_worker(
+            worker = new_worker(
                 temporal_client_1,
                 ComprehensiveWorkflow,
                 TraceableActivityWorkflow,
@@ -671,11 +671,12 @@ class TestComprehensiveTracing:
                 nexus_service_handlers=[NexusService()],
                 task_queue=task_queue,
                 max_cached_workflows=0,
-            ) as worker:
-                await env.create_nexus_endpoint(
-                    make_nexus_endpoint_name(worker.task_queue),
-                    worker.task_queue,
-                )
+            )
+            await env.create_nexus_endpoint(
+                make_nexus_endpoint_name(worker.task_queue),
+                worker.task_queue,
+            )
+            async with worker:
                 await handle.execute_update(
                     ComprehensiveWorkflow.my_unvalidated_update, "test"
                 )
@@ -864,7 +865,7 @@ class TestComprehensiveTracing:
             # Phase 1: the worker runs the workflow to completion. Updates and
             # the signal are handled at the next workflow task wherever the run
             # is, so nothing here needs to know how far it has progressed.
-            async with new_worker(
+            worker = new_worker(
                 temporal_client_1,
                 ComprehensiveWorkflow,
                 TraceableActivityWorkflow,
@@ -872,11 +873,12 @@ class TestComprehensiveTracing:
                 nexus_service_handlers=[NexusService()],
                 task_queue=task_queue,
                 max_cached_workflows=0,
-            ) as worker:
-                await env.create_nexus_endpoint(
-                    make_nexus_endpoint_name(worker.task_queue),
-                    worker.task_queue,
-                )
+            )
+            await env.create_nexus_endpoint(
+                make_nexus_endpoint_name(worker.task_queue),
+                worker.task_queue,
+            )
+            async with worker:
                 await handle.execute_update(
                     ComprehensiveWorkflow.my_unvalidated_update, "test"
                 )
@@ -1224,17 +1226,18 @@ class TestNexusInboundTracing:
         )
 
         # Worker starts OUTSIDE tracing_context — nexus handler tasks get clean context
-        async with new_worker(
+        worker = new_worker(
             temporal_client,
             NexusDirectTraceableWorkflow,
             nexus_service_handlers=[DirectTraceableNexusService()],
             task_queue=task_queue,
             max_cached_workflows=0,
-        ) as worker:
-            await env.create_nexus_endpoint(
-                make_nexus_endpoint_name(worker.task_queue),
-                worker.task_queue,
-            )
+        )
+        await env.create_nexus_endpoint(
+            make_nexus_endpoint_name(worker.task_queue),
+            worker.task_queue,
+        )
+        async with worker:
             # Only the client call gets tracing context, not the worker
             with tracing_context(client=mock_ls, enabled=True):
                 handle = await temporal_client.start_workflow(

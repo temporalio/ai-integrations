@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from datetime import timedelta
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langsmith import Client as LangSmithClient
@@ -26,6 +26,7 @@ from temporalio.langsmith._interceptor import (
     _env_destination,
     _RootReplaySafeRunTreeFactory,
 )
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.testing import WorkflowEnvironment
 from tests.helpers import new_worker
 from tests.helpers.nexus import make_nexus_endpoint_name
@@ -119,16 +120,17 @@ async def _run_workflow(
     temporal_client, _, mock_ls_client = _make_client_and_collector(
         client, **plugin_kwargs
     )
-    async with new_worker(
+    worker = new_worker(
         temporal_client,
         EnvDestinationWorkflow,
         activities=[nested_traceable_activity],
         nexus_service_handlers=[DirectTraceableNexusService()],
         max_cached_workflows=0,
-    ) as worker:
-        await env.create_nexus_endpoint(
-            make_nexus_endpoint_name(worker.task_queue), worker.task_queue
-        )
+    )
+    await env.create_nexus_endpoint(
+        make_nexus_endpoint_name(worker.task_queue), worker.task_queue
+    )
+    async with worker:
 
         async def execute() -> str:
             return await temporal_client.execute_workflow(
@@ -146,6 +148,28 @@ async def _run_workflow(
                 )()
     assert result == "response to: nexus-input"
     return mock_ls_client
+
+
+async def test_endpoint_failure_does_not_start_worker() -> None:
+    """Preserve provisioning errors before Worker cleanup can obscure them."""
+    error = RPCError("tcp connect error", RPCStatusCode.UNAVAILABLE, b"")
+    env = AsyncMock(spec=WorkflowEnvironment)
+    env.create_nexus_endpoint.side_effect = error
+    worker = AsyncMock()
+    worker.task_queue = "endpoint-setup-failure"
+    with (
+        patch(
+            "tests.test_env_destination._make_client_and_collector",
+            return_value=(MagicMock(), MagicMock(), MagicMock()),
+        ),
+        patch("tests.test_env_destination.new_worker", return_value=worker),
+        pytest.raises(RPCError) as raised,
+    ):
+        await _run_workflow(MagicMock(spec=Client), env)
+
+    assert raised.value is error
+    worker.__aenter__.assert_not_awaited()
+    worker.__aexit__.assert_not_awaited()
 
 
 def _destinations_by_trace(

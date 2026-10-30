@@ -17,7 +17,7 @@ from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 from temporalio.typesafe._workflow import _questions_payload
 from tests import DEV_SERVER_DOWNLOAD_VERSION
-from tests.helpers.environment import start_local_with_retry
+from tests.helpers.environment import diagnosed_local_server
 from tests.helpers.plugin_meta import load_plugin_meta
 from tests.helpers.provenance import ProvenanceError, check_provenance
 
@@ -80,14 +80,18 @@ async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     else:
         options: dict[str, Any] = {
             "dev_server_download_version": DEV_SERVER_DOWNLOAD_VERSION,
+            "dev_server_log_level": "info",
             "dev_server_existing_path": os.environ.get("TEMPORAL_DEV_SERVER_PATH"),
         }
         ip = os.environ.get("TEMPORAL_TEST_IP")
         if ip:
             options["ip"] = ip
-        environment = await start_local_with_retry(
-            partial(WorkflowEnvironment.start_local, **options)
-        )
+        async with diagnosed_local_server(
+            partial(WorkflowEnvironment.start_local, **options),
+            server_version=DEV_SERVER_DOWNLOAD_VERSION,
+        ) as environment:
+            yield environment
+        return
     yield environment
     await environment.shutdown()
 

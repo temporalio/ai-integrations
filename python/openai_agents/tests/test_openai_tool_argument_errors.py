@@ -200,11 +200,12 @@ async def _run_workflow(
         ),
     ) as agent_env:
         client = agent_env.applied_on_client(client)
-        async with new_worker(client, wf, **worker_kwargs) as worker:
-            if env is not None:
-                await env.create_nexus_endpoint(
-                    make_nexus_endpoint_name(worker.task_queue), worker.task_queue
-                )
+        worker = new_worker(client, wf, **worker_kwargs)
+        if env is not None:
+            await env.create_nexus_endpoint(
+                make_nexus_endpoint_name(worker.task_queue), worker.task_queue
+            )
+        async with worker:
             handle = await client.start_workflow(
                 wf.run,
                 *args,
@@ -666,16 +667,17 @@ async def _run_mode(
         ),
     ) as agent_env:
         client = agent_env.applied_on_client(client)
-        async with new_worker(
+        worker = new_worker(
             client,
             ToolArgumentModesWorkflow,
             activities=ACTIVITIES,
             nexus_service_handlers=[ForecastServiceHandler()],
-        ) as worker:
-            if kind == "nexus":
-                await env.create_nexus_endpoint(
-                    make_nexus_endpoint_name(worker.task_queue), worker.task_queue
-                )
+        )
+        if kind == "nexus":
+            await env.create_nexus_endpoint(
+                make_nexus_endpoint_name(worker.task_queue), worker.task_queue
+            )
+        async with worker:
             handle = await client.start_workflow(
                 ToolArgumentModesWorkflow.run,
                 args=[kind, mode],

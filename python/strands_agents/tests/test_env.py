@@ -1,13 +1,24 @@
 """Local server setup retries only known SDK provisioning failures."""
 
 import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
 from functools import partial
+from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
 from temporalio.testing import WorkflowEnvironment
-from tests.helpers.environment import start_local_with_retry
+from tests.helpers.environment import (
+    _capture_server_output,
+    _ServerDiagnostics,
+    diagnosed_local_server,
+    start_local_with_retry,
+)
 
 STARTUP_PREFIX = "Failed starting Temporal dev server: "
 STARTUP_TIMEOUT = (
@@ -146,6 +157,108 @@ async def test_unexpected_error_after_retry_propagates_immediately() -> None:
     assert raised.value is error
     assert start.await_count == 2
     sleep.assert_awaited_once_with(1)
+
+
+def _events(directory: Path) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in (directory / "lifecycle.jsonl").read_text().splitlines()
+    ]
+
+
+async def test_diagnostics_keep_startup_error_and_restore_streams(
+    tmp_path: Path,
+) -> None:
+    error = RuntimeError("Failed client connect: connection refused")
+    start = AsyncMock(side_effect=error)
+    with pytest.raises(RuntimeError) as raised:
+        async with diagnosed_local_server(
+            start, server_version="pinned", log_root=tmp_path
+        ):
+            pytest.fail("A failed startup must not yield an environment")
+    assert raised.value is error
+    start.assert_awaited_once()
+    events = _events(next(tmp_path.iterdir()))
+    assert [event["event"] for event in events] == [
+        "session",
+        "startup_requested",
+        "startup_failed",
+    ]
+    assert events[0]["server_version"] == "pinned"
+    # A failed startup must not leave pytest writing to the server's files.
+    os.write(1, b"stdout restored\n")
+    os.write(2, b"stderr restored\n")
+    assert b"restored" not in (next(tmp_path.iterdir()) / "stdout.log").read_bytes()
+    assert b"restored" not in (next(tmp_path.iterdir()) / "stderr.log").read_bytes()
+
+
+async def test_diagnostics_always_shutdown_after_body_failure(tmp_path: Path) -> None:
+    environment = AsyncMock(spec=WorkflowEnvironment)
+    environment.client.service_client.config.target_host = "127.0.0.1:7233"
+    error = ValueError("test body failed")
+    with pytest.raises(ValueError) as raised:
+        async with diagnosed_local_server(
+            AsyncMock(return_value=environment),
+            server_version="pinned",
+            log_root=tmp_path,
+        ):
+            raise error
+    assert raised.value is error
+    environment.shutdown.assert_awaited_once()
+    events = _events(next(tmp_path.iterdir()))
+    assert (
+        next(event for event in events if event["event"] == "ready")["address"]
+        == "127.0.0.1:7233"
+    )
+    assert [event["event"] for event in events][-2:] == [
+        "shutdown_requested",
+        "shutdown_completed",
+    ]
+
+
+def test_native_child_output_and_exit_are_retained(tmp_path: Path) -> None:
+    """Native children keep their log handles after the parent's are restored."""
+    diagnostics = _ServerDiagnostics(tmp_path, "pinned")
+    diagnostics.start()
+    try:
+        with _capture_server_output(tmp_path):
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os, time; time.sleep(0.5); os.write(1, b'child stdout\\n'); "
+                    "os.write(2, b'child stderr\\n'); time.sleep(0.5); raise SystemExit(7)",
+                    "server",
+                    "start-dev",
+                ]
+            )
+        try:
+            assert child.wait(timeout=10) == 7
+            deadline = time.monotonic() + 5
+            while not any(
+                event["event"] == "process_exited" for event in _events(tmp_path)
+            ):
+                assert time.monotonic() < deadline, "Child exit was not observed"
+                time.sleep(0.05)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+    finally:
+        diagnostics.close()
+    assert (tmp_path / "stdout.log").read_bytes() == b"child stdout\n"
+    assert (tmp_path / "stderr.log").read_bytes() == b"child stderr\n"
+    events = _events(tmp_path)
+    assert (
+        next(event for event in events if event["event"] == "process_started")["pid"]
+        == child.pid
+    )
+    exited = next(event for event in events if event["event"] == "process_exited")
+    assert exited["pid"] == child.pid
+    if sys.platform == "win32":
+        assert exited["exit_code"] == 7
+    else:
+        assert exited["exit_code"] is None
 
 
 async def test_cancellation_during_retry_delay_is_not_retried() -> None:

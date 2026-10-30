@@ -19,6 +19,10 @@ on:
         description: Release version to inject from a validated tag; empty during ordinary CI
         type: string
         default: ""
+      windows-test-repetitions:
+        description: Number of fresh Windows test-suite executions (1–20)
+        type: number
+        default: 1
 
 permissions: {}
 
@@ -96,19 +100,30 @@ jobs:
       - name: Lint and type-check
         run: cd "$PLUGIN_DIR" && make lint
       - name: Test
-        run: cd "$PLUGIN_DIR" && make test PYTEST_ARGS="-s --junit-xml=junit/test.xml"
+        env:
+          REPETITIONS: ${{ runner.os == 'Windows' && inputs.windows-test-repetitions || 1 }}
+        run: |
+          cd "$PLUGIN_DIR"
+          if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || (( REPETITIONS < 1 || REPETITIONS > 20 )); then
+            echo "::error::Test repetitions must be an integer from 1 to 20"
+            exit 1
+          fi
+          for (( attempt=1; attempt<=REPETITIONS; attempt++ )); do
+            echo "Test suite execution $attempt/$REPETITIONS"
+            make test PYTEST_ARGS="-s --junit-xml=junit/test-$attempt.xml"
+          done
       - name: Build, verify, and smoke-test distributions
         # Only on the designated dist cell: the release pipeline publishes the ubuntu-built artifacts.
         if: matrix.dist
         uses: ./.github/actions/python-build-check
         with:
           plugin-dir: python/${{ inputs.plugin }}
-      - name: Upload test reports
+      - name: Upload test reports and server diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: junit-${{ inputs.plugin }}-${{ inputs.deps }}-${{ matrix.os }}-py${{ matrix.runtime }}
-          path: python/${{ inputs.plugin }}/junit
+          path: python/${{ inputs.plugin }}/junit # includes per-worker servers/ logs and lifecycle.jsonl
           if-no-files-found: ignore
       - name: Upload distributions
         if: matrix.dist

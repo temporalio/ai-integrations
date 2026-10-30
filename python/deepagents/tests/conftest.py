@@ -14,7 +14,7 @@ import pytest_asyncio
 from temporalio.client import Client
 from temporalio.testing import WorkflowEnvironment
 from tests import DEV_SERVER_DOWNLOAD_VERSION
-from tests.helpers.environment import start_local_with_retry
+from tests.helpers.environment import diagnosed_local_server
 from tests.helpers.plugin_meta import load_plugin_meta
 from tests.helpers.provenance import ProvenanceError, check_provenance
 
@@ -55,14 +55,15 @@ def event_loop():
 @pytest_asyncio.fixture(scope="session")  # type: ignore[reportUntypedFunctionDecorator]
 async def env() -> AsyncGenerator[WorkflowEnvironment, None]:
     """Start the pinned local Temporal development server."""
-    environment = await start_local_with_retry(
+    async with diagnosed_local_server(
         partial(
             WorkflowEnvironment.start_local,
             dev_server_download_version=DEV_SERVER_DOWNLOAD_VERSION,
-        )
-    )
-    yield environment
-    await environment.shutdown()
+            dev_server_log_level="info",
+        ),
+        server_version=DEV_SERVER_DOWNLOAD_VERSION,
+    ) as environment:
+        yield environment
 
 
 @pytest_asyncio.fixture  # type: ignore[reportUntypedFunctionDecorator]

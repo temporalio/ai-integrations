@@ -410,6 +410,37 @@ def test_java_latest_dependencies_are_selected_and_locked_before_testing() -> No
     assert steps.index(resolve) < steps.index(test) < steps.index(build)
 
 
+@pytest.mark.parametrize("repetitions,fail_at,expected_calls", [
+    ("3", "0", 3), ("3", "2", 2), ("0", "0", 0), ("21", "0", 0), ("1.5", "0", 0),
+])
+def test_python_windows_repetitions_are_bounded_and_stop_on_failure(
+    tmp_path: Path, repetitions: str, fail_at: str, expected_calls: int,
+) -> None:
+    workflow = yaml.safe_load((REPO / ".github/workflows/_python-plugin.yml").read_text())
+    step = next(step for step in workflow["jobs"]["test"]["steps"] if step.get("name") == "Test")
+    assert step["env"]["REPETITIONS"] == "${{ runner.os == 'Windows' && inputs.windows-test-repetitions || 1 }}"
+    assert workflow[True]["workflow_call"]["inputs"]["windows-test-repetitions"]["default"] == 1
+    calls = tmp_path / "calls"
+    fake_make = tmp_path / "make"
+    fake_make.write_text(
+        "#!/bin/sh\n"
+        'echo "$*" >> "$TEST_CALLS"\n'
+        '[ "$(wc -l < "$TEST_CALLS")" -ne "$TEST_FAIL_AT" ]\n'
+    )
+    fake_make.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        env={**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+             "PLUGIN_DIR": str(tmp_path), "REPETITIONS": repetitions,
+             "TEST_CALLS": str(calls), "TEST_FAIL_AT": fail_at},
+        capture_output=True, text=True,
+    )
+    invoked = calls.read_text().splitlines() if calls.exists() else []
+    assert len(invoked) == expected_calls
+    assert (result.returncode == 0) == (repetitions == "3" and fail_at == "0")
+    assert invoked == [f"test PYTEST_ARGS=-s --junit-xml=junit/test-{i}.xml" for i in range(1, expected_calls + 1)]
+
+
 def test_java_release_reuses_tested_bytes_and_recovers_deployments() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-java.yml").read_text())
     jobs = doc["jobs"]

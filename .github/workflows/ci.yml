@@ -28,6 +28,10 @@ on:
         description: Re-resolve the newest supported dependencies before testing
         type: boolean
         default: false
+      windows-test-repetitions:
+        description: Repeat each Python Windows test suite to investigate flakes (1–20)
+        type: number
+        default: 1
 
 permissions: {}
 
@@ -97,6 +101,7 @@ jobs:
     with:
       plugin: ${{ matrix.plugin }}
       deps: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.latest-deps)) && 'latest' || 'locked' }}
+      windows-test-repetitions: ${{ github.event_name == 'workflow_dispatch' && inputs.windows-test-repetitions || 1 }}
 
   java:
     name: Java

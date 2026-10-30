@@ -181,17 +181,18 @@ class TestTracingEnvOverride:
         )
 
         task_queue = f"env-override-nexus-{uuid.uuid4()}"
-        async with new_worker(
+        worker = new_worker(
             temporal_client,
             NexusDirectTraceableWorkflow,
             nexus_service_handlers=[DirectTraceableNexusService()],
             task_queue=task_queue,
             max_cached_workflows=0,
-        ) as worker:
-            await env.create_nexus_endpoint(
-                make_nexus_endpoint_name(worker.task_queue),
-                worker.task_queue,
-            )
+        )
+        await env.create_nexus_endpoint(
+            make_nexus_endpoint_name(worker.task_queue),
+            worker.task_queue,
+        )
+        async with worker:
             handle = await temporal_client.start_workflow(
                 NexusDirectTraceableWorkflow.run,
                 id=f"env-override-nexus-{uuid.uuid4()}",
