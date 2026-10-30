@@ -62,6 +62,7 @@ import {
   startNexusOperationRunName,
   validateUpdateRunName,
 } from './run-tree';
+import { destination, type ReplicaRouting } from './routing';
 
 /**
  * Configuration the worker injects into the workflow bundle via the bundler's
@@ -72,11 +73,10 @@ import {
  */
 export interface WorkflowLangSmithConfig {
   addTemporalRuns: boolean;
+  replicas?: ReplicaRouting[];
   /**
-   * The plugin's `projectName`, else the destination LangSmith's env defaults name, resolved outside the isolate when
-   * the bundle is built. Runs the isolate starts go here, and so do the plugin's own runs and the user runs below them.
-   * A user run below a propagated parent, with no plugin run between them, keeps the parent's. Absent when neither
-   * names one.
+   * The plugin's project or address, else LangSmith's env defaults, resolved outside the isolate when the bundle is
+   * built. New roots use this destination; propagated parents retain their own. Absent when neither names one.
    */
   destination?: Destination;
   tags?: string[];
@@ -153,9 +153,11 @@ function asReplaySafeParent(
       id: parent.id,
       trace_id: parent.trace_id,
       dotted_order: parent.dotted_order,
+      start_time: parent.start_time,
       parent_run_id: parent.parent_run_id,
-      project_name: parent.project_name,
-      address: parent.address,
+      ...destination(parent),
+      replicas: parent.replicas,
+      distributedParentId: parent.distributedParentId,
     },
     generateNewUuid4
   );
@@ -174,7 +176,7 @@ function placeholderRoot(
   generateNewUuid4?: () => string
 ): _RootReplaySafeRunTreeFactory {
   return new _RootReplaySafeRunTreeFactory(
-    { name: workflowInfo().workflowType, run_type: RUN_TYPE.CHAIN, ...config.destination },
+    { name: workflowInfo().workflowType, run_type: RUN_TYPE.CHAIN, ...config.destination, replicas: config.replicas },
     generateNewUuid4,
     config.destination === undefined
   );
@@ -227,7 +229,8 @@ function buildReplaySafeRunTree(
       name: params.name,
       run_type: params.runType,
       parent_run: params.parent,
-      ...config.destination,
+      ...destination(params.parent, config.destination),
+      replicas: params.parent?.replicas ?? config.replicas,
       tags: config.tags,
       extra: { metadata: scrubSensitive(config.metadata) ?? {} },
       inputs: params.inputs,
