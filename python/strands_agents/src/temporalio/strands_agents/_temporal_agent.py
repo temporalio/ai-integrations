@@ -239,14 +239,19 @@ class TemporalAgent(Agent):
         # After a tool call, Strands runs the next model call inside the last
         # cycle and wraps most errors from it in EventLoopException. Raise a
         # tool name conflict as itself, so Workflow code can catch it and
-        # StrandsPlugin fails the Workflow with it.
+        # StrandsPlugin fails the Workflow with it. Close Strands' generator
+        # here too: its cleanup runs the AfterInvocationEvent hooks, which may
+        # await when the stream is closed early.
+        events = super()._run_loop(*args, **kwargs)
         try:
-            async for event in super()._run_loop(*args, **kwargs):
+            async for event in events:
                 yield event
         except EventLoopException as err:
             if isinstance(err.__cause__, MCPToolNameConflictError):
                 raise err.__cause__ from None
             raise
+        finally:
+            await events.aclose()
 
     async def _convert_prompt_to_messages(self, prompt: AgentInput) -> Messages:
         """Load the worker-side model's config, then convert the prompt.

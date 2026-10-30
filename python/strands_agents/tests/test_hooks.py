@@ -1,9 +1,12 @@
+import asyncio
+from collections.abc import AsyncGenerator
 from datetime import timedelta
+from typing import Any, cast
 from uuid import uuid4
 
 from strands import tool
 from strands.hooks import HookProvider, HookRegistry
-from strands.hooks.events import AfterToolCallEvent
+from strands.hooks.events import AfterInvocationEvent, AfterToolCallEvent
 
 from temporalio import activity, workflow
 from temporalio.client import Client
@@ -104,3 +107,47 @@ async def test_hooks(client: Client):
         workflows=[HooksWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+@workflow.defn
+class ClosedStreamWorkflow:
+    @workflow.run
+    async def run(self) -> list[str]:
+        log: list[str] = []
+
+        async def after_invocation(
+            event: AfterInvocationEvent,  # pyright: ignore[reportUnusedParameter]
+        ) -> None:
+            log.append("start")
+            await asyncio.sleep(0)
+            log.append("end")
+
+        agent = TemporalAgent(
+            model="mock", start_to_close_timeout=timedelta(seconds=15)
+        )
+        agent.hooks.add_callback(AfterInvocationEvent, after_invocation)
+        stream = cast(AsyncGenerator[Any, None], agent.stream_async("hi"))
+        async for _event in stream:
+            break
+        await stream.aclose()
+        return log
+
+
+async def test_after_invocation_hook_finishes_when_stream_closed_early(client: Client):
+    """Closing the stream early still lets an AfterInvocationEvent hook await."""
+    task_queue = f"test_after_invocation_hook_finishes-{uuid4()}"
+    plugin = StrandsPlugin(models={"mock": lambda: MockModel(["Done!"])})
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[ClosedStreamWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        assert await client.execute_workflow(
+            ClosedStreamWorkflow.run,
+            id=f"test_after_invocation_hook_finishes_{uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
+        ) == ["start", "end"]

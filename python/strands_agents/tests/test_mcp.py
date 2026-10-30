@@ -443,7 +443,8 @@ async def test_mcp_replays_history_with_distinct_names():
 
 async def test_mcp_rejects_history_with_duplicate_names():
     """A run that met a duplicate name now refuses it, so its history no longer replays."""
-    with pytest.raises(NondeterminismError):
+    # The run now completes where it scheduled the model call.
+    with pytest.raises(NondeterminismError, match="ActivityTaskScheduled"):
         await Replayer(
             workflows=[MCPTwoServersWorkflow], plugins=[StrandsPlugin(models={})]
         ).replay_workflow(load_history("legacy_mcp_duplicate_names"))
@@ -492,15 +493,26 @@ class MCPMovingToolWorkflow:
 # two, mv_a lists safe and other, mv_b echo. Main lost echo that turn, so the
 # model's call to it found no tool.
 @pytest.mark.parametrize(
-    ("workflow_class", "name"),
+    ("workflow_class", "name", "swap"),
     [
-        (MCPSharedClientWorkflow, "legacy_mcp_shared_client_drop"),
-        (MCPMovingToolWorkflow, "legacy_mcp_tool_moves"),
+        (
+            MCPSharedClientWorkflow,
+            "legacy_mcp_shared_client_drop",
+            "'shifting-call-tool'.*'shifting-list-tools'",
+        ),
+        (
+            MCPMovingToolWorkflow,
+            "legacy_mcp_tool_moves",
+            "'mv_b-list-tools'.*'mv_b-call-tool'",
+        ),
     ],
 )
-async def test_mcp_rejects_history_with_changed_tools(workflow_class: type, name: str):
+async def test_mcp_rejects_history_with_changed_tools(
+    workflow_class: type, name: str, swap: str
+):
     """Runs whose servers changed their tools now keep the right ones, so they differ."""
-    with pytest.raises(NondeterminismError):
+    # The recorded Activity and the one the run now schedules.
+    with pytest.raises(NondeterminismError, match=swap):
         await Replayer(
             workflows=[workflow_class], plugins=[StrandsPlugin(models={})]
         ).replay_workflow(load_history(name))
