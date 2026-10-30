@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
@@ -59,8 +60,20 @@ type mcpToolset struct {
 func (m *mcpToolset) Name() string { return m.name }
 
 // Tools lists the remote MCP tools via the ListMcpTools Activity and wraps each
-// as a declaration-only proxy tool.
+// as a declaration-only proxy tool. It keeps the list for the ProcessRequest
+// call that follows in the same model step.
 func (m *mcpToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
+	tools, err := m.list(ctx)
+	if err != nil {
+		return nil, err
+	}
+	listingsFrom(ctx).put(m, ctx, tools)
+	return tools, nil
+}
+
+// list runs the ListMcpTools Activity and wraps each declaration as a proxy
+// tool.
+func (m *mcpToolset) list(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	wfCtx, ok := workflowContext(ctx)
 	if !ok {
 		return nil, errMissingContext
@@ -81,11 +94,18 @@ func (m *mcpToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 }
 
 // ProcessRequest packs every advertised proxy tool's declaration into the model
-// request. ADK calls this during toolset preprocessing.
+// request. ADK calls it before each model call. ADK v2.5.0 and earlier call
+// Tools once per agent run; v2.6.0 and later call it before each model call
+// too. So ProcessRequest reuses the list Tools took in the same step and lists
+// only when there is none. Each model step then lists the toolset once on every
+// ADK release, and a History recorded with one release replays with another.
 func (m *mcpToolset) ProcessRequest(ctx agent.Context, req *model.LLMRequest) error {
-	tools, err := m.Tools(ctx)
-	if err != nil {
-		return err
+	tools, ok := listingsFrom(ctx).take(m, ctx)
+	if !ok {
+		var err error
+		if tools, err = m.list(ctx); err != nil {
+			return err
+		}
 	}
 	for _, t := range tools {
 		if err := packTool(req, t.(*mcpProxyTool)); err != nil {
@@ -93,6 +113,59 @@ func (m *mcpToolset) ProcessRequest(ctx agent.Context, req *model.LLMRequest) er
 		}
 	}
 	return nil
+}
+
+// mcpListingsKey is the private context key for the mcpListings NewContext
+// installs.
+type mcpListingsKey struct{}
+
+// mcpListings hands the tools an MCP toolset's Tools call listed to the
+// ProcessRequest call that follows in the same model step.
+type mcpListings struct {
+	mu      sync.Mutex
+	pending map[mcpListingKey]mcpListing
+}
+
+type mcpListingKey struct {
+	toolset *mcpToolset
+	agent   string
+}
+
+type mcpListing struct {
+	invocation string
+	tools      []tool.Tool
+}
+
+// listingsFrom returns the mcpListings NewContext installed, or nil.
+func listingsFrom(ctx context.Context) *mcpListings {
+	l, _ := ctx.Value(mcpListingsKey{}).(*mcpListings)
+	return l
+}
+
+func (l *mcpListings) put(m *mcpToolset, ctx agent.ReadonlyContext, tools []tool.Tool) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.pending == nil {
+		l.pending = map[mcpListingKey]mcpListing{}
+	}
+	l.pending[mcpListingKey{m, ctx.AgentName()}] = mcpListing{ctx.InvocationID(), tools}
+}
+
+// take returns and forgets the list Tools kept for this toolset, agent and
+// invocation.
+func (l *mcpListings) take(m *mcpToolset, ctx agent.ReadonlyContext) ([]tool.Tool, bool) {
+	if l == nil {
+		return nil, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	k := mcpListingKey{m, ctx.AgentName()}
+	p, ok := l.pending[k]
+	delete(l.pending, k)
+	return p.tools, ok && p.invocation == ctx.InvocationID()
 }
 
 // mcpProxyTool is a declaration-only stand-in for a remote MCP tool. The model

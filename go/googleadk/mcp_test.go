@@ -111,8 +111,12 @@ func TestMcpListToolsCarriesParameters(t *testing.T) {
 	require.NotNil(t, decl.Parameters, "MCP tool declaration carried no parameters")
 	assert.Contains(t, decl.Parameters.Properties, "query")
 
-	// The tools were listed (>=1, packed each turn) and called once.
-	assert.GreaterOrEqual(t, counter.get(googleadk.ListMcpToolsActivityName), 1)
+	// The tools were listed once per model step, on every ADK release, and
+	// called once. ADK v2.6.0 asks the toolset for its tools twice per step;
+	// a second listing would add an Activity, and Histories recorded with
+	// another ADK release would fail replay.
+	assert.Equal(t, 2, counter.get(googleadk.InvokeModelActivityName))
+	assert.Equal(t, 2, counter.get(googleadk.ListMcpToolsActivityName), "one listing per model step")
 	assert.Equal(t, 1, counter.get(googleadk.CallMcpToolActivityName))
 }
 
