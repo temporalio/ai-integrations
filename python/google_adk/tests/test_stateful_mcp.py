@@ -16,22 +16,30 @@
 ``temporalio.google_adk._mcp``.
 
 These drive the real ``connect`` -> dedicated-worker -> ``get_tools`` path
-through a Temporal workflow, but against an in-memory fake ``McpToolset`` (no
-subprocess, no real MCP server) so they run in CI. They prove the properties
+through a Temporal workflow, mostly against an in-memory fake ``McpToolset``
+(no subprocess, no real MCP server) so they run in CI. They prove the properties
 the reviewer asked for: one toolset is built per workflow run, ``factory_argument``
 is consumed exactly once per run, distinct runs never share a toolset, and the
-toolset is torn down when the workflow completes.
+toolset is torn down when the workflow completes. The worker replacement test
+runs a real MCP server over stdio.
 """
 
+import sys
 import uuid
 from datetime import timedelta
 from typing import Any, cast
 
+import pytest
 from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
 
 from temporalio import workflow
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowFailureError
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.worker import Worker
+from temporalio.workflow import ActivityConfig
 
 with workflow.unsafe.imports_passed_through():
     from temporalio.google_adk import (
@@ -192,3 +200,122 @@ async def test_stateful_no_cross_run_sharing(client: Client):
     assert {t.factory_argument for t in CREATED} == {"tenant-a", "tenant-b"}
     assert all(t.closed for t in CREATED)
     assert provider._toolsets == {}
+
+
+_MCP_SERVER = """
+from mcp.server.fastmcp import FastMCP
+
+server = FastMCP("echo")
+
+
+@server.tool()
+def echo(text: str) -> str:
+    return text
+
+
+server.run()
+"""
+
+
+@workflow.defn
+class StatefulMcpWorkerReplacedWorkflow:
+    def __init__(self) -> None:
+        self._listed: list[str] | None = None
+        self._resume = False
+
+    @workflow.run
+    async def run(self) -> list[str]:
+        async with TemporalStatefulMcpToolSet(
+            "stateful_server",
+            config=ActivityConfig(
+                start_to_close_timeout=timedelta(seconds=20),
+                schedule_to_start_timeout=timedelta(seconds=5),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            ),
+        ) as toolset:
+            try:
+                self._listed = [t.name for t in await toolset.get_tools()]
+            except ActivityError:
+                self._listed = []
+            await workflow.wait_condition(lambda: self._resume)
+            return [t.name for t in await toolset.get_tools()]
+
+    @workflow.update
+    async def wait_listed(self) -> list[str]:
+        await workflow.wait_condition(lambda: self._listed is not None)
+        return self._listed or []
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+
+@pytest.mark.parametrize("first_connection_fails", [False, True])
+async def test_stateful_session_after_worker_replaced(
+    client: Client, first_connection_fails: bool
+):
+    factory_calls = 0
+
+    def factory(_: Any) -> McpToolset:
+        nonlocal factory_calls
+        factory_calls += 1
+        server = (
+            "pass" if first_connection_fails and factory_calls == 1 else _MCP_SERVER
+        )
+        return McpToolset(
+            connection_params=StdioConnectionParams(
+                server_params=StdioServerParameters(
+                    command=sys.executable, args=["-c", server]
+                ),
+                timeout=30,
+            )
+        )
+
+    provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
+    client = _make_client(client, provider)
+    task_queue = f"adk-stateful-mcp-replaced-{uuid.uuid4()}"
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StatefulMcpWorkerReplacedWorkflow],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            StatefulMcpWorkerReplacedWorkflow.run,
+            id=f"stateful-mcp-replaced-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=50),
+        )
+        listed = await handle.execute_update(
+            StatefulMcpWorkerReplacedWorkflow.wait_listed
+        )
+        assert listed == ([] if first_connection_fails else ["echo"])
+
+    # The first worker shut down gracefully, as in a deployment, and Temporal
+    # retries the session activity on the next one.
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StatefulMcpWorkerReplacedWorkflow],
+        max_cached_workflows=0,
+    ):
+        await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
+        if first_connection_fails:
+            # No session was opened, so the retry builds the toolset again.
+            assert await handle.result() == ["echo"]
+            assert factory_calls == 2
+            return
+        with pytest.raises(WorkflowFailureError) as err:
+            await handle.result()
+
+    # A new toolset would open a new MCP session without the old one's state.
+    assert factory_calls == 1
+    cause: BaseException | None = err.value.cause
+    while isinstance(cause, ActivityError):
+        cause = cause.cause
+    # Refused by the retried session activity, not only by the next
+    # get_tools timing out.
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "DedicatedWorkerFailure"
+    assert cause.non_retryable
