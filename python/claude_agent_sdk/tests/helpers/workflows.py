@@ -54,6 +54,8 @@ class Chat:
     """Serve ``mcp__app__echo`` from a Claude Agent SDK MCP server in the Workflow."""
     follow_ups: int = 0
     """How many turns more to read after the prompts', which Claude Code starts on its own."""
+    close_after: float = 0
+    """Seconds to wait after the last turn before closing, so the next read is running."""
 
 
 @workflow.defn
@@ -92,6 +94,8 @@ class ChatWorkflow:
                 await self.receive(client)
             for _ in range(chat.follow_ups):
                 await self.receive(client)
+            if chat.close_after:
+                await workflow.sleep(chat.close_after)
         return self.messages
 
     async def receive(self, client: sdk.ClaudeSDKClient) -> None:

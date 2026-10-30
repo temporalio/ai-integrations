@@ -247,10 +247,13 @@ class TemporalTransport(Transport):
     def _sdk_error(self, error: ActivityError) -> BaseException:
         """The Claude Agent SDK's error for a failed Activity, noting whether the connection to Claude Code is lost.
 
-        A cancellation stays as it is.
+        A cancellation is ``asyncio.CancelledError``, as the Claude Agent SDK
+        expects when it cancels a task, such as its read on close.
         """
         if is_cancelled_exception(error):
-            return error
+            cancelled = asyncio.CancelledError()
+            cancelled.__cause__ = error
+            return cancelled
         sdk = sdk_error(error)
         if isinstance(sdk, CLIConnectionError) and str(sdk) == CONNECTION_LOST:
             self._connection_lost = True
