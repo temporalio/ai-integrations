@@ -12,7 +12,10 @@ inside a ``@workflow.defn`` with no other changes:
 * wraps the worker run in a ``run_context`` that patches Deep Agents' model
   resolution seam (``deepagents.graph.resolve_model``) to auto-route bare
   ``model=`` strings through activities — regardless of how the user imported
-  ``create_deep_agent``;
+  ``create_deep_agent`` — and LangGraph's checkpoint-id mint
+  (``langgraph.checkpoint.base.id.uuid6``) to a replay-stable drop-in, so ids
+  derived from checkpoints (task ids, ``checkpoint_ns``, ``Interrupt.id``)
+  survive replay;
 * registers :class:`DeepAgentsWorkflowError` as a workflow-failure type;
 * pushes the model / tool dispatch defaults down to the seams that read them.
 
@@ -36,6 +39,7 @@ from temporalio import activity as activity_mod
 from temporalio.converter import DataConverter
 from temporalio.deepagents import _serde, _tools
 from temporalio.deepagents._activity import DeepAgentActivities
+from temporalio.deepagents._checkpoint_ids import CheckpointIdInterceptor
 from temporalio.deepagents.workflow import DeepAgentsWorkflowError
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
@@ -144,6 +148,7 @@ class DeepAgentsPlugin(SimplePlugin):
             "langchain.DeepAgentsPlugin",
             activities=activities,
             data_converter=self._configure_data_converter,
+            interceptors=[CheckpointIdInterceptor()],
             workflow_runner=self._make_workflow_runner(),
             workflow_failure_exception_types=[DeepAgentsWorkflowError],
             run_context=self._run_context,
@@ -184,10 +189,14 @@ class DeepAgentsPlugin(SimplePlugin):
         The patch (on ``deepagents.graph.resolve_model``, the seam
         ``create_deep_agent`` uses for the agent and every sub-agent) only
         rewrites ``model=`` strings when running inside a workflow, so it is inert
-        on plain clients / activity workers. Determinism itself
+        on plain clients / activity workers. Determinism otherwise
         rides on the same mechanism ``temporalio.langgraph`` uses — the loop is
-        in-workflow and every nondeterministic call is an activity — so no
-        speculative time/uuid shims are installed here.
+        in-workflow and every nondeterministic call is an activity — with one
+        exception that cannot be an activity: LangGraph mints checkpoint ids
+        from wall-clock time and ``random`` inside the loop, and everything
+        derived from them (task ids, ``checkpoint_ns``, ``Interrupt.id``)
+        changes on every replay. ``_checkpoint_ids`` swaps that mint for a
+        replay-stable drop-in, likewise inert outside workflows.
 
         One shim *is* required: LangChain's ``create_agent`` factory wraps every
         model node with LangSmith's ``@traceable``, whose async path hops onto a
@@ -206,34 +215,54 @@ class DeepAgentsPlugin(SimplePlugin):
         # worker must still start — it simply runs without the auto-wrap patch.
         patched = False
         try:
-            from temporalio.deepagents import _model, _tools
+            try:
+                from temporalio.deepagents import _checkpoint_ids, _model, _tools
 
-            _model.install_model_patch()
-            _tools.install_backend_async_patch()
-            patched = True
-        except ImportError as exc:  # LangChain / deepagents absent on this worker
-            # Deliberately ImportError only: a *missing* optional dependency
-            # must not stop the worker, but a genuine patch-installation bug
-            # (e.g. upstream renaming the seam raises AttributeError) must
-            # surface at startup, not degrade into silent in-workflow calls.
-            warnings.warn(
-                f"DeepAgentsPlugin could not patch create_deep_agent ({exc}); "
-                "use explicit TemporalModel(...) instances to route model calls "
-                "through activities.",
-                stacklevel=2,
-            )
-        # Installed for the life of the process, never uninstalled — see
-        # _install_langsmith_temporal_override for why.
-        _install_langsmith_temporal_override()
-        try:
+                for seam, install in (
+                    ("create_deep_agent model resolution", _model.install_model_patch),
+                    ("tool backend", _tools.install_backend_async_patch),
+                    (
+                        "LangGraph checkpoint ids",
+                        _checkpoint_ids.install_checkpoint_id_patch,
+                    ),
+                ):
+                    try:
+                        install()
+                    except ImportError as exc:
+                        # Name the seam that failed; only ImportError keeps
+                        # the warn-and-start path below.
+                        raise ImportError(f"{seam}: {exc}") from exc
+                    # Set as soon as the first patch is in: the finally below
+                    # must uninstall everything this loop installed — after a
+                    # later seam fails and when the worker shuts down. Every
+                    # uninstall is a no-op when its patch was never installed.
+                    patched = True
+            except ImportError as exc:  # LangChain / deepagents absent on this worker
+                # Deliberately ImportError only: a *missing* optional dependency
+                # must not stop the worker, but a genuine patch-installation bug
+                # (e.g. upstream renaming the seam raises AttributeError) must
+                # surface at startup, not degrade into silent in-workflow calls.
+                # Any such non-ImportError failure unwinds via the finally
+                # below and re-raises; nothing installed leaks.
+                warnings.warn(
+                    f"DeepAgentsPlugin could not install a patch ({exc}); "
+                    "use explicit TemporalModel(...) instances to route model calls "
+                    "through activities, and expect LangGraph interrupt ids to "
+                    "change on replay without the checkpoint-id patch.",
+                    stacklevel=2,
+                )
+            # Installed for the life of the process, never uninstalled — see
+            # _install_langsmith_temporal_override for why.
+            _install_langsmith_temporal_override()
             yield
         finally:
             if patched:
                 # Import is cached: patched=True implies the import above succeeded.
-                from temporalio.deepagents import _model, _tools
+                from temporalio.deepagents import _checkpoint_ids, _model, _tools
 
                 _model.uninstall_model_patch()
                 _tools.uninstall_backend_async_patch()
+                _checkpoint_ids.uninstall_checkpoint_id_patch()
 
     # -- worker config -------------------------------------------------------
 
