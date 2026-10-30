@@ -74,16 +74,17 @@ class StrandsFailureConverter(DefaultFailureConverter):
         super().to_failure(exception, payload_converter, failure)
 
 
-class StrandsFailureConverterWithEncodedAttributes(StrandsFailureConverter):
+# StrandsFailureConverter has no __init__, so the one from
+# DefaultFailureConverterWithEncodedAttributes runs and turns on the encoding.
+class StrandsFailureConverterWithEncodedAttributes(  # pyright: ignore[reportUnsafeMultipleInheritance]
+    StrandsFailureConverter, DefaultFailureConverterWithEncodedAttributes
+):
     """``StrandsFailureConverter`` that moves message and stack trace to encoded attributes.
 
-    It encodes like ``DefaultFailureConverterWithEncodedAttributes`` and decodes like
-    ``StrandsFailureConverter``.
+    Both Strands converters decode with ``DefaultFailureConverter.from_failure``, which
+    reads encoded and plain attributes, so a Replayer with ``StrandsFailureConverter``
+    still reads the failures this class writes.
     """
-
-    def __init__(self) -> None:
-        """Create the converter with encoded attributes."""
-        super().__init__(encode_common_attributes=True)
 
 
 def strands_failure_converter_class(
@@ -91,14 +92,15 @@ def strands_failure_converter_class(
 ) -> type[StrandsFailureConverter]:
     """Return the Strands failure converter class to use in place of ``base``.
 
-    Only ``DefaultFailureConverterWithEncodedAttributes`` is kept, as
-    ``StrandsFailureConverterWithEncodedAttributes``. Every other class is replaced
-    with ``StrandsFailureConverter``, so the failures that Workflow code reads stay
-    the same.
+    A subclass of ``DefaultFailureConverterWithEncodedAttributes`` becomes
+    ``StrandsFailureConverterWithEncodedAttributes``, so failure messages and stack
+    traces stay encoded. Every other class is replaced with
+    ``StrandsFailureConverter``, including one that sets ``encode_common_attributes``
+    in its own ``__init__``. Neither keeps the caller's ``from_failure``, so the
+    failures that Workflow code reads stay the same.
     """
-    if base in (
-        DefaultFailureConverterWithEncodedAttributes,
-        StrandsFailureConverterWithEncodedAttributes,
+    if isinstance(base, type) and issubclass(
+        base, DefaultFailureConverterWithEncodedAttributes
     ):
         return StrandsFailureConverterWithEncodedAttributes
     return StrandsFailureConverter

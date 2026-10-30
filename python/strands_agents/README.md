@@ -537,7 +537,7 @@ class MyWorkflow:
         )
 ```
 
-This relies on the plugin's failure converter, which is installed via the client's data converter. **Attach `StrandsPlugin` to the client** (not just the worker) for activity-tool interrupts to work — workers built from that client pick up the plugin automatically. If your data converter uses the default payload converter with `DefaultFailureConverterWithEncodedAttributes`, the plugin's failure converter also encodes failure messages and stack traces with your codec.
+This relies on the plugin's failure converter, which is installed via the client's data converter. **Attach `StrandsPlugin` to the client** (not just the worker) for activity-tool interrupts to work — workers built from that client pick up the plugin automatically. If your data converter uses the default payload converter with `DefaultFailureConverterWithEncodedAttributes` or a subclass of it, the plugin's failure converter also encodes failure messages and stack traces with your codec.
 
 ```python
 client = await Client.connect("localhost:7233", plugins=[StrandsPlugin(models=MODELS)])

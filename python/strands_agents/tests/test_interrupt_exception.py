@@ -1,16 +1,19 @@
+from dataclasses import replace
 from datetime import timedelta
 from uuid import uuid4
 
+import pytest
 from strands import tool
 from strands.interrupt import Interrupt, InterruptException
 from strands.types.interrupt import InterruptResponseContent
 
 from temporalio import activity, workflow
 from temporalio.client import Client
+from temporalio.converter import DefaultFailureConverterWithEncodedAttributes
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
 from temporalio.strands_agents.workflow import activity_as_tool
 from temporalio.worker import Replayer, Worker
-from tests.common import get_activities
+from tests.common import CompressionCodec, get_activities
 from tests.mock_model import MockModel
 
 
@@ -137,7 +140,8 @@ async def test_in_workflow_tool_interrupt(client: Client):
     ).replay_workflow(history)
 
 
-async def test_activity_tool_interrupt(client: Client):
+@pytest.mark.parametrize("encoded", [False, True])
+async def test_activity_tool_interrupt(client: Client, encoded: bool):
     global _activity_delete_calls
     _activity_delete_calls = 0
     task_queue = f"test_activity_tool_interrupt-{uuid4()}"
@@ -157,6 +161,13 @@ async def test_activity_tool_interrupt(client: Client):
     # Re-create the client with the plugin attached so that converter takes effect.
     config = client.config()
     config["plugins"] = [*config["plugins"], plugin]
+    if encoded:
+        # The codec also applies to the failure's encoded attributes and details.
+        config["data_converter"] = replace(
+            config["data_converter"],
+            failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
+            payload_codec=CompressionCodec(),
+        )
     client = Client(**config)
 
     async with Worker(
@@ -184,8 +195,17 @@ async def test_activity_tool_interrupt(client: Client):
         "activity_delete",
         "invoke_model",
     ]
+    failures = [
+        event.activity_task_failed_event_attributes.failure
+        for event in history.events
+        if event.HasField("activity_task_failed_event_attributes")
+    ]
+    assert [failure.message for failure in failures] == [
+        "Encoded failure" if encoded else "interrupt:approval"
+    ]
 
     await Replayer(
         workflows=[ActivityToolInterruptWorkflow],
         plugins=[plugin],
+        data_converter=config["data_converter"],
     ).replay_workflow(history)

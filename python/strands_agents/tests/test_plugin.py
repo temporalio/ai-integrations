@@ -1,6 +1,4 @@
 import typing
-import zlib
-from collections.abc import Sequence
 from dataclasses import replace
 
 import pytest
@@ -10,7 +8,6 @@ from strands.models import Model
 from strands.models.bedrock import DEFAULT_READ_TIMEOUT
 
 import temporalio.strands_agents._plugin as plugin_module
-from temporalio.api.common.v1 import Payload
 from temporalio.api.failure.v1 import Failure
 from temporalio.client import ClientConfig
 from temporalio.contrib.pydantic import PydanticPayloadConverter
@@ -18,7 +15,6 @@ from temporalio.converter import (
     DataConverter,
     DefaultFailureConverter,
     DefaultFailureConverterWithEncodedAttributes,
-    PayloadCodec,
     PayloadConverter,
 )
 from temporalio.exceptions import ApplicationError
@@ -29,6 +25,7 @@ from temporalio.strands_agents._failure_converter import (
 )
 from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
+from tests.common import CompressionCodec
 from tests.mock_model import MockModel
 
 
@@ -56,22 +53,6 @@ def test_default_bedrock_model_disables_botocore_retries(
     assert len(captured_configs) == 1
     assert getattr(captured_configs[0], "read_timeout") == DEFAULT_READ_TIMEOUT
     assert getattr(captured_configs[0], "retries") == {"max_attempts": 0}
-
-
-class CompressionCodec(PayloadCodec):
-    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
-        return [
-            Payload(
-                metadata={"encoding": b"binary/zlib"},
-                data=zlib.compress(payload.SerializeToString()),
-            )
-            for payload in payloads
-        ]
-
-    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
-        return [
-            Payload.FromString(zlib.decompress(payload.data)) for payload in payloads
-        ]
 
 
 def _client_config(converter: DataConverter | None = None) -> ClientConfig:
@@ -140,24 +121,36 @@ class DomainFailureConverter(DefaultFailureConverter):
         return super().from_failure(failure, payload_converter)
 
 
+class CallerEncodedFailureConverter(DefaultFailureConverterWithEncodedAttributes):
+    pass
+
+
 def _configure(target: str, supplied: DataConverter) -> DataConverter:
     plugin = StrandsPlugin(models={})
     configured: DataConverter | None
     if target == "client":
         configured = plugin.configure_client(_client_config(supplied))["data_converter"]
-    else:
+    elif target == "replayer":
         configured = plugin.configure_replayer(
             {"data_converter": supplied, "workflow_runner": SandboxedWorkflowRunner()}
         ).get("data_converter")
+    else:
+        raise AssertionError(target)
     assert configured is not None
     return configured
 
 
 @pytest.mark.parametrize("target", ["client", "replayer"])
-def test_caller_encoded_failure_converter_is_kept(target: str) -> None:
+@pytest.mark.parametrize(
+    "failure_converter_class",
+    [DefaultFailureConverterWithEncodedAttributes, CallerEncodedFailureConverter],
+)
+def test_caller_encoded_failure_converter_is_kept(
+    target: str,
+    failure_converter_class: type[DefaultFailureConverterWithEncodedAttributes],
+) -> None:
     supplied = replace(
-        DataConverter.default,
-        failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
+        DataConverter.default, failure_converter_class=failure_converter_class
     )
     configured = _configure(target, supplied)
 
@@ -188,7 +181,7 @@ def test_caller_encoded_failure_converter_is_kept(target: str) -> None:
         configured.failure_converter_class
         is StrandsFailureConverterWithEncodedAttributes
     )
-    # A second plugin pass, as a Worker built from the Client makes, keeps it.
+    # Running the plugin again on its own output keeps it.
     assert _configure(target, configured).failure_converter_class is (
         StrandsFailureConverterWithEncodedAttributes
     )
