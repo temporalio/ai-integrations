@@ -56,12 +56,29 @@ const DEDICATED_WORKER_SCHEDULE_FAILURE_MESSAGE =
 const DEDICATED_WORKER_HEARTBEAT_FAILURE_MESSAGE =
   'MCP Stateful Server Worker failed to heartbeat. Check that a worker is polling the dedicated task queue for this MCP run.';
 
-async function handleWorkerFailure<T>(fn: () => Promise<T>): Promise<T> {
+function isToolMetaResolverRefusal(err: unknown): err is ActivityFailure {
+  return (
+    err instanceof ActivityFailure &&
+    err.cause instanceof ApplicationFailure &&
+    err.cause.type === TOOL_META_RESOLVER_UNSUPPORTED_TYPE
+  );
+}
+
+/**
+ * Translates dedicated-Worker timeouts. `sessionRefusal` returns the session's failure if the Worker refused a
+ * `toolMetaResolver` on the factory's server: then the dedicated Worker never started, so that failure is the
+ * cause of a schedule-to-start timeout.
+ */
+async function handleWorkerFailure<T>(fn: () => Promise<T>, sessionRefusal: () => unknown): Promise<T> {
   try {
     return await fn();
   } catch (err: unknown) {
     if (err instanceof ActivityFailure && err.cause instanceof TimeoutFailure) {
       if (err.cause.timeoutType === TimeoutType.SCHEDULE_TO_START) {
+        const refusal = sessionRefusal();
+        if (refusal) {
+          throw refusal;
+        }
         throw ApplicationFailure.create({
           message: DEDICATED_WORKER_SCHEDULE_FAILURE_MESSAGE,
           type: DEDICATED_WORKER_FAILURE_TYPE,
@@ -94,6 +111,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
   private _sessionScope: CancellationScope | undefined;
   private _sessionPromise: Promise<void> | undefined;
   private _connected = false;
+  private _sessionRefusal: ActivityFailure | undefined;
   toolMetaResolver?: MCPToolMetaResolver;
 
   constructor(name: string, options?: StatefulMcpServerOptions) {
@@ -141,12 +159,17 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
       activityInterceptorOptions: pluginConfig ? { addTemporalSpans: pluginConfig.addTemporalSpans } : undefined,
     };
 
+    this._sessionRefusal = undefined;
     this._sessionScope = new CancellationScope();
     this._sessionPromise = this._sessionScope.run(() =>
       scheduleActivity<void>(sessionActivityName, [args], this._sessionConfig)
     );
-    // Errors are observed during cleanup, not here.
-    this._sessionPromise.catch(() => {});
+    // Errors are observed during cleanup, not here, except a refused toolMetaResolver, which operations throw.
+    this._sessionPromise.catch((err: unknown) => {
+      if (isToolMetaResolverRefusal(err)) {
+        this._sessionRefusal = err;
+      }
+    });
     this._connected = true;
   }
 
@@ -163,6 +186,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
       }
       this._sessionScope = undefined;
       this._sessionPromise = undefined;
+      this._sessionRefusal = undefined;
       this._connected = false;
     }
   }
@@ -180,32 +204,19 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     }
   }
 
-  /**
-   * Runs a tool operation Activity. If the session Activity fails because the Worker refused a
-   * `toolMetaResolver` on the factory's server, the dedicated Worker never starts, so this cancels
-   * the operation and throws that failure instead of waiting for the schedule-to-start timeout.
-   */
-  private async runOperation<T>(fn: () => Promise<T>): Promise<T> {
-    const scope = new CancellationScope();
-    const operation = scope.run(() => handleWorkerFailure(fn));
-    const refused = new Promise<never>((_resolve, reject) => {
-      this._sessionPromise?.catch((err: unknown) => {
-        if (
-          err instanceof ActivityFailure &&
-          err.cause instanceof ApplicationFailure &&
-          err.cause.type === TOOL_META_RESOLVER_UNSUPPORTED_TYPE
-        ) {
-          scope.cancel();
-          reject(err);
-        }
-      });
-    });
-    return Promise.race([operation, refused]);
+  private assertNotRefused(): void {
+    if (this._sessionRefusal) {
+      throw this._sessionRefusal;
+    }
   }
 
   async listTools(): Promise<any[]> {
     this.assertConnected();
-    return this.runOperation(() => scheduleActivity(this._name + MCP_LIST_TOOLS_SUFFIX, [], this._operationConfig));
+    this.assertNotRefused();
+    return handleWorkerFailure(
+      () => scheduleActivity(this._name + MCP_LIST_TOOLS_SUFFIX, [], this._operationConfig),
+      () => this._sessionRefusal
+    );
   }
 
   async callTool(
@@ -214,12 +225,15 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     meta?: Record<string, unknown> | null
   ): Promise<any> {
     this.assertConnected();
-    return this.runOperation(() =>
-      scheduleActivity(
-        this._name + MCP_CALL_TOOL_SUFFIX,
-        [{ toolName, args, ...(meta != null ? { meta } : {}) }],
-        this._operationConfig
-      )
+    this.assertNotRefused();
+    return handleWorkerFailure(
+      () =>
+        scheduleActivity(
+          this._name + MCP_CALL_TOOL_SUFFIX,
+          [{ toolName, args, ...(meta != null ? { meta } : {}) }],
+          this._operationConfig
+        ),
+      () => this._sessionRefusal
     );
   }
 
