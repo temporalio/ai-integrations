@@ -21,6 +21,7 @@ import {
   OpenAIAgentsTraceActivityInboundInterceptor,
   OpenAIAgentsTraceNexusInboundInterceptor,
   type OpenAIAgentsTraceInterceptorOptions,
+  type TracingApiKeyResolver,
 } from './trace-interceptor';
 
 export type MCPServerProvider = StatelessMCPServerProvider | StatefulMCPServerProvider;
@@ -105,6 +106,12 @@ export interface OpenAIAgentsPluginOptions {
    * `__openai_agents_config` header and applied to Activities directly.
    */
   interceptorOptions?: OpenAIAgentsPluginInterceptorOptions;
+  /**
+   * Resolves the tracing export API key for spans that cross a Temporal
+   * boundary, on the Worker, so the key stays out of Workflow history. Use it
+   * when runs export traces with different keys. See {@link TracingApiKeyResolver}.
+   */
+  tracingApiKey?: TracingApiKeyResolver;
 }
 
 /**
@@ -115,6 +122,8 @@ export interface OpenAIAgentsPluginOptions {
  * @experimental The OpenAI Agents plugin is an experimental feature; APIs may change without notice.
  */
 export class OpenAIAgentsPlugin extends SimplePlugin {
+  private readonly tracingApiKey?: TracingApiKeyResolver;
+
   constructor(options: OpenAIAgentsPluginOptions) {
     const modelActivities = createModelActivity(options.modelProvider, options.hostedToolCredentials);
 
@@ -143,6 +152,7 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
 
     const activityInterceptorOptions: OpenAIAgentsTraceInterceptorOptions = {
       addTemporalSpans: interceptorOpts?.addTemporalSpans,
+      tracingApiKey: options.tracingApiKey,
     };
 
     if (interceptorOpts?.useOtelInstrumentation) {
@@ -177,9 +187,12 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
         activity: [
           (ctx) => ({ inbound: new OpenAIAgentsTraceActivityInboundInterceptor(ctx, activityInterceptorOptions) }),
         ],
-        nexus: [() => ({ inbound: new OpenAIAgentsTraceNexusInboundInterceptor() })],
+        nexus: [
+          () => ({ inbound: new OpenAIAgentsTraceNexusInboundInterceptor({ tracingApiKey: options.tracingApiKey }) }),
+        ],
       },
     });
+    this.tracingApiKey = options.tracingApiKey;
   }
 
   override configureWorker(options: WorkerOptions): WorkerOptions {
@@ -220,7 +233,7 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
     // Registered unconditionally; per-Workflow useOtelInstrumentation flag drives suppression
     // at the bridge layer via the SUPPRESS_OTEL_BRIDGE marker.
     const sinks: InjectedSinks<AgentTracingSinks> = {
-      [AGENT_TRACING_SINK_NAME]: makeAgentTracingSink(),
+      [AGENT_TRACING_SINK_NAME]: makeAgentTracingSink(this.tracingApiKey),
     };
     return {
       ...options,

@@ -118,10 +118,15 @@ export class StatefulMCPServerProvider {
           // Wire the Activity interceptor identically to the main Worker so
           // tool Activities still restore trace context and emit
           // `temporal:executeActivity:*` spans. Options are forwarded per-run
-          // via input. Lazy import to avoid pulling the Worker package
-          // unnecessarily.
-          const { OpenAIAgentsTraceActivityInboundInterceptor } = await import('./trace-interceptor');
-          const interceptorOpts = input?.activityInterceptorOptions;
+          // via input; the tracing key resolver comes from the Worker running
+          // this session, so it stays out of Activity arguments. Lazy import to
+          // avoid pulling the Worker package unnecessarily.
+          const { OpenAIAgentsTraceActivityInboundInterceptor, tracingApiKeyResolverFor } =
+            await import('./trace-interceptor');
+          const interceptorOpts = {
+            ...input?.activityInterceptorOptions,
+            tracingApiKey: tracingApiKeyResolverFor(Context.current()),
+          };
           const dedicatedWorker = await Worker.create({
             connection: this._nativeConnection,
             taskQueue: dedicatedTaskQueue,

@@ -18,6 +18,8 @@ import io.temporal.googleadk.FailureTypes;
 import io.temporal.googleadk.internal.BackgroundCall;
 import io.temporal.googleadk.internal.Failures;
 import io.temporal.googleadk.internal.Heartbeats;
+import io.temporal.googleadk.internal.ModelStreamPublisher;
+import io.temporal.googleadk.model.ModelStreamEvent;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -65,23 +67,83 @@ public final class ModelActivityImpl implements ModelActivity {
     // returns a flow, so that abandoning it releases the activity thread at once; the call itself
     // finishes on its own there, and its result is dropped.
     PublishProcessor<Object> abandon = PublishProcessor.create();
-    try (Heartbeats heartbeats = Heartbeats.start(context, abandon::onComplete)) {
-      List<LlmResponse> responses =
-          BackgroundCall.collect(
-              () -> model.generateContent(request, input.stream()), abandon, () -> {});
-      ActivityCompletionException completion = heartbeats.completion();
-      if (completion != null) {
-        throw completion;
+    try (Heartbeats heartbeats = Heartbeats.start(context, abandon::onComplete);
+        ModelStreamPublisher publisher = publisher(context, input)) {
+      try {
+        List<LlmResponse> responses =
+            BackgroundCall.collect(
+                () -> {
+                  var flow = model.generateContent(request, input.stream());
+                  return publisher == null ? flow : flow.doOnNext(publisher::accept);
+                },
+                abandon,
+                () -> {});
+        ActivityCompletionException completion = heartbeats.completion();
+        if (completion != null) {
+          throw completion;
+        }
+        if (responses.isEmpty()) {
+          throw ApplicationFailure.newFailure(
+              "Model " + input.model() + " returned no response", FailureTypes.MODEL_ERROR);
+        }
+        if (publisher != null) {
+          publisher.terminal(ModelStreamEvent.Kind.COMPLETE);
+        }
+        return new InvokeModelOutput(responses);
+      } catch (RuntimeException | Error e) {
+        if (publisher != null) {
+          publisher.failed(
+              e instanceof ActivityCompletionException
+                  ? ModelStreamEvent.Kind.CANCELED
+                  : ModelStreamEvent.Kind.FAILED,
+              e);
+        }
+        throw e;
       }
-      if (responses.isEmpty()) {
-        throw ApplicationFailure.newFailure(
-            "Model " + input.model() + " returned no response", FailureTypes.MODEL_ERROR);
-      }
-      return new InvokeModelOutput(responses);
     } catch (ApplicationFailure | ActivityCompletionException e) {
       throw e;
+    } catch (ModelStreamPublisher.PublishFailure e) {
+      throw ApplicationFailure.newFailureWithCause(
+          "Live delivery of model "
+              + input.model()
+              + " output to topic '"
+              + input.streamingTopic()
+              + "' failed: "
+              + e.getMessage(),
+          FailureTypes.STREAM_ERROR,
+          e.getCause());
     } catch (RuntimeException e) {
       throw Failures.modelFailure(input.model(), e);
+    }
+  }
+
+  private static ModelStreamPublisher publisher(
+      ActivityExecutionContext context, InvokeModelInput input) {
+    if (!input.stream() || input.streamingTopic() == null) {
+      return null;
+    }
+    if (input.streamingTopic().isBlank()) {
+      throw ApplicationFailure.newNonRetryableFailure(
+          "streamingTopic must not be blank", FailureTypes.STREAM_ERROR);
+    }
+    try {
+      return new ModelStreamPublisher(context, input.model(), input.streamingTopic());
+    } catch (LinkageError e) {
+      throw ApplicationFailure.newNonRetryableFailureWithCause(
+          "Live streaming requires matching io.temporal:temporal-sdk and temporal-workflowstreams"
+              + " artifacts; use the unshaded SDK for live streaming",
+          FailureTypes.STREAM_ERROR,
+          e);
+    } catch (RuntimeException e) {
+      throw ApplicationFailure.newFailureWithCause(
+          "Live delivery of model "
+              + input.model()
+              + " output to topic '"
+              + input.streamingTopic()
+              + "' could not start: "
+              + e.getMessage(),
+          FailureTypes.STREAM_ERROR,
+          e);
     }
   }
 
