@@ -98,6 +98,10 @@ export class TemporalAgent extends Agent {
    * fails the workflow task: a terminal model error becomes a typed, non-retryable failure, and a
    * model activity that failed or was cancelled ends the turn with that activity's failure. So the
    * run, or the update that runs the turn, fails or is cancelled. `invoke()` uses this too.
+   *
+   * Its awaits add microtasks to each agent event, and those are part of replay: when two turns run
+   * at once in one workflow, they can change the order in which the turns schedule activities. So
+   * removing this override, or wrapping the stream in another layer, can break replay of such runs.
    */
   override async *stream(
     args: InvokeArgs,

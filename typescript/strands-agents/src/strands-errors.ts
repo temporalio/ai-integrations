@@ -74,7 +74,7 @@ export function rewriteError(err: unknown, options: { benignOverflow?: boolean }
     const details = interruptDetails(err.interrupts);
     if (details === undefined) {
       return retype(err, {
-        message: `malformed interrupt (${String((err as { message?: unknown }).message)}): each entry needs a toJSON() that returns an object with a string name, and JSON-encodable values`,
+        message: `malformed interrupt (${String((err as { message?: unknown }).message)}): each entry needs a toJSON() that returns an object with a unique string name, and JSON-encodable values`,
         type: STRANDS_MALFORMED_INTERRUPT_TYPE,
         nonRetryable: true,
       });
@@ -126,16 +126,19 @@ export function applicationFailureType(failure: unknown): string | undefined {
   return undefined;
 }
 
-// The details of each interrupt, or undefined when an entry has no toJSON(), returns no object
-// with a string name, or holds a value JSON cannot encode. The JSON check applies whatever payload
-// converter the worker uses.
+// The details of each interrupt, or undefined when an entry is missing or has no toJSON(), returns
+// no object with a string name, repeats another entry's name, or holds a value JSON cannot encode.
+// `Array.from` visits the holes in a sparse array, which `map` and `every` skip and the worker cannot
+// encode as details. Strands keys a tool's interrupts by name, so a repeated name would get the first
+// entry's response. The JSON check applies whatever payload converter the worker uses.
 function interruptDetails(interrupts: unknown[]): InterruptDetails[] | undefined {
   try {
-    const details = interrupts.map((i) => (i as InterruptLike).toJSON());
+    const details = Array.from(interrupts, (i) => (i as InterruptLike).toJSON());
     const named = details.every(
       (d) => d !== null && typeof d === 'object' && typeof (d as { name?: unknown }).name === 'string'
     );
     if (!named) return undefined;
+    if (new Set(details.map((d) => (d as InterruptDetails).name)).size !== details.length) return undefined;
     JSON.stringify(details);
     return details as InterruptDetails[];
   } catch {

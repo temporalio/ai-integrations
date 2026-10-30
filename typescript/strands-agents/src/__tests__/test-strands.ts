@@ -12,7 +12,7 @@ import type { BaseModelConfig, JSONValue, ModelStreamEvent, StreamOptions, Tool 
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { WorkflowFailedError, WorkflowUpdateFailedError } from '@temporalio/client';
 import { ActivityFailure, ApplicationFailure, CancelledFailure } from '@temporalio/common';
-import type { temporal } from '@temporalio/proto';
+import { temporal } from '@temporalio/proto';
 import type { BaseContext } from '@temporalio/test-helpers';
 import {
   test as anyTest,
@@ -206,6 +206,8 @@ class StubMcpClient extends McpClient {
 const test = anyTest as TestFn<BaseContext>;
 
 const CALLER_FAILURE_CONVERTER = require.resolve('./encoding-failure-converter');
+
+const BENIGN = temporal.api.enums.v1.ApplicationErrorCategory.APPLICATION_ERROR_CATEGORY_BENIGN;
 
 test.before(async (t) => {
   const env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
@@ -912,11 +914,13 @@ test('activity-tool interrupt pauses the agent and resumes', async (t) => {
   t.deepEqual(activityFailures(history), [
     { message: 'interrupt:approval', type: 'StrandsInterrupt', nonRetryable: true },
   ]);
-  // That failure came from the activity's first attempt, and keeps the stack of the error it threw.
+  // That failure came from the activity's first attempt, is benign, and keeps the stack of the error
+  // it threw.
   const failed = history.events?.find((e) => e.activityTaskFailedEventAttributes)?.activityTaskFailedEventAttributes;
   const startedId = failed?.startedEventId?.toString();
   const started = history.events?.find((e) => e.eventId?.toString() === startedId);
   t.is(started?.activityTaskStartedEventAttributes?.attempt, 1);
+  t.is(failed?.failure?.applicationFailureInfo?.category, BENIGN);
   t.regex(failed?.failure?.stackTrace ?? '', /interruptError/);
 });
 
@@ -1003,47 +1007,69 @@ test("a worker's own failure converter still applies with the plugin", async (t)
 
 test('a malformed activity interrupt fails without retries', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
+  const malformedInterrupts: Record<string, unknown[]> = {
+    'no toJSON': [{ toJSON: () => ({ name: 'approval' }) }, {}],
+    'plain entry': [{ name: 'approval', reason: 'delete foo?' }],
+    'repeated name': [{ toJSON: () => ({ name: 'approval' }) }, { toJSON: () => ({ name: 'approval' }) }],
+    'BigInt reason': [{ toJSON: () => ({ name: 'approval', reason: BigInt(1) }) }],
+    'hole only': new Array<unknown>(1),
+    // eslint-disable-next-line no-sparse-arrays
+    'hole between': [{ toJSON: () => ({ name: 'approval' }) }, , { toJSON: () => ({ name: 'confirmation' }) }],
+  };
   const worker = await createWorker({
     plugins: [new StrandsPlugin()],
     activities: {
       async failingActivity(message: string): Promise<never> {
-        // An entry with no toJSON(), a plain entry, and a reason JSON cannot encode.
-        const interrupts =
-          message === 'no toJSON'
-            ? [{ toJSON: () => ({ name: 'approval' }) }, {}]
-            : message === 'plain entry'
-              ? [{ name: 'approval', reason: 'delete foo?' }]
-              : [{ toJSON: () => ({ name: 'approval', reason: BigInt(1) }) }];
-        throw Object.assign(new Error('interrupt'), { interrupts });
+        throw Object.assign(new Error('interrupt'), { interrupts: malformedInterrupts[message] });
       },
     },
   });
   const history = await worker.runUntil(async () => {
-    const handle = await startWorkflow(failActivities, { args: [['no toJSON', 'plain entry', 'BigInt reason']] });
+    const handle = await startWorkflow(failActivities, { args: [Object.keys(malformedInterrupts)] });
     await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
     return handle.fetchHistory();
   });
   const malformed = {
     message:
-      'malformed interrupt (interrupt): each entry needs a toJSON() that returns an object with a string name, and JSON-encodable values',
+      'malformed interrupt (interrupt): each entry needs a toJSON() that returns an object with a unique string name, and JSON-encodable values',
     type: STRANDS_MALFORMED_INTERRUPT_TYPE,
     nonRetryable: true,
   };
-  t.deepEqual(activityFailures(history), [malformed, malformed, malformed]);
+  t.deepEqual(
+    activityFailures(history),
+    Object.keys(malformedInterrupts).map(() => malformed)
+  );
 });
 
 test('a context overflow in the model activity lets the agent trim the conversation', async (t) => {
-  const { createWorker, executeWorkflow } = helpers(t);
-  // Three turns fill the six messages the model holds; the fourth overflows until the agent trims.
-  const model = new SmallContextModel(6, ['one', 'two', 'three', 'four'].map(textTurn));
-  const worker = await createWorker({ plugins: [new StrandsPlugin({ models: { test: () => model } })] });
-  await worker.runUntil(async () => {
-    const result = await executeWorkflow(turnsAgent, {
-      args: [['1', '2', '3', '4']],
-      workflowExecutionTimeout: '30 seconds',
+  const { createWorker, startWorkflow } = helpers(t);
+  // Also with a caller's converter that decodes the overflow to a `TemporalFailure` that is not an
+  // `ApplicationFailure`. The worker bundles the workflows itself so the bundle uses that converter.
+  const otherFailureClass = {
+    workflowBundle: undefined,
+    workflowsPath: require.resolve('./workflows/strands'),
+    bundlerOptions: createBaseBundlerOptions(),
+    dataConverter: { failureConverterPath: require.resolve('./domain-failure-converter') },
+  };
+  for (const options of [{}, otherFailureClass]) {
+    // Three turns fill the six messages the model holds; the fourth overflows until the agent trims.
+    const model = new SmallContextModel(6, ['one', 'two', 'three', 'four'].map(textTurn));
+    const worker = await createWorker({ ...options, plugins: [new StrandsPlugin({ models: { test: () => model } })] });
+    const history = await worker.runUntil(async () => {
+      const handle = await startWorkflow(turnsAgent, {
+        args: [['1', '2', '3', '4']],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      t.deepEqual(await handle.result(), ['four', 6]);
+      return handle.fetchHistory();
     });
-    t.deepEqual(result, ['four', 6]);
-  });
+    // The overflow failed the model activity once, as a benign failure.
+    const failures = (history.events ?? []).flatMap((e) => {
+      const info = e.activityTaskFailedEventAttributes?.failure?.applicationFailureInfo;
+      return info ? [[info.type, info.category]] : [];
+    });
+    t.deepEqual(failures, [['ContextWindowOverflowError', BENIGN]]);
+  }
 });
 
 test('a context overflow the agent cannot trim fails the run as non-retryable', async (t) => {
