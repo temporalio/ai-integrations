@@ -150,7 +150,9 @@ class StrandsPlugin(SimplePlugin):
 
 
 def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
-    # Strands runs sync calls on its own thread, which no runner restricts.
+    # Strands' sync calls start a thread from the passed-through (host) strands
+    # modules, so the sandbox's thread restrictions never see it. Refuse them here,
+    # for every runner.
     refuse_sync_calls_in_workflows()
     if not runner:
         raise ValueError("No WorkflowRunner provided to the Strands plugin.")

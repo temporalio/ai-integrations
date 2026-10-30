@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -19,11 +20,15 @@ from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.exceptions import ApplicationError
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
 from temporalio.strands_agents._model_activity import ModelActivity
-from temporalio.strands_agents._sync_calls import refuse_sync_calls_in_workflows
+from temporalio.strands_agents._sync_calls import _MESSAGE
 from temporalio.worker import Replayer, Worker
+from temporalio.worker.workflow_sandbox import RestrictedWorkflowAccessError
 from temporalio.workflow import NondeterminismError
 from tests.common import get_activities
 from tests.mock_model import MockModel
+
+with workflow.unsafe.imports_passed_through():
+    from tests import prebound_run_async
 
 
 @workflow.defn
@@ -87,10 +92,18 @@ class SyncCallWorkflow:
             agent.tool.echo_tool(text="Hello")
         elif call == "swarm":
             swarm("Hello")
+        elif call == "prebound":
+            # run_async bound by a module imported before the guard was installed.
+            prebound_run_async.run_async(lambda: agent.invoke_async("Hello"))
+        elif call == "unrestricted":
+            # The SDK's escape hatch: the call runs on Strands' thread, unrecorded.
+            with workflow.unsafe.sandbox_unrestricted():
+                answer = Agent(model=MockModel(["answer"]), callback_handler=None)
+                return str(answer("Hello")).strip()
         return "built"
 
 
-@pytest.mark.parametrize("call", ["agent", "tool", "swarm"])
+@pytest.mark.parametrize("call", ["agent", "tool", "swarm", "prebound"])
 async def test_sync_call_is_refused(client: Client, call: str):
     """The sync form would run on a thread outside the sandbox, unrecorded."""
     task_queue = f"test_sync_call_is_refused-{uuid4()}"
@@ -113,8 +126,8 @@ async def test_sync_call_is_refused(client: Client, call: str):
             await handle.result()
     cause = err.value.cause
     assert isinstance(cause, ApplicationError)
-    assert cause.type == "RestrictedWorkflowAccessError"
-    assert cause.message.startswith("Strands runs this sync call on a new thread")
+    assert cause.type == RestrictedWorkflowAccessError.__name__
+    assert cause.message == _MESSAGE
 
     if call == "agent":  # One replay is enough: every case hits the same guard.
         await Replayer(
@@ -125,7 +138,8 @@ async def test_sync_call_is_refused(client: Client, call: str):
 
 
 async def test_sync_call_workflow_builds_without_calls(client: Client):
-    """Building agents and swarms in Workflow code still works."""
+    """Building agents and swarms in Workflow code still works, and so does a sync
+    call the Workflow makes inside ``workflow.unsafe.sandbox_unrestricted()``."""
     task_queue = f"test_sync_call_workflow_builds_without_calls-{uuid4()}"
     async with Worker(
         client,
@@ -139,18 +153,21 @@ async def test_sync_call_workflow_builds_without_calls(client: Client):
             id=f"test_sync_call_workflow_builds_without_calls_{uuid4()}",
             task_queue=task_queue,
         )
+        unrestricted = await client.execute_workflow(
+            SyncCallWorkflow.run,
+            "unrestricted",
+            id=f"test_sync_call_workflow_builds_without_calls_{uuid4()}",
+            task_queue=task_queue,
+        )
     assert result == "built"
+    assert unrestricted == "answer"
 
 
 async def test_sync_call_in_sandbox_import_is_refused(client: Client):
     """The sandbox imports Workflow modules before the Workflow runtime is attached."""
-    # Outside Workflow code the guard lets the sync call run, so an ordinary
-    # import of the module still works.
-    refuse_sync_calls_in_workflows()
     from tests import sync_import_workflow
 
-    assert sync_import_workflow.import_result == "import answer"
-
+    # Building the Worker installs the guard before it validates the Workflow.
     with pytest.raises(RuntimeError, match="Failed validating workflow") as err:
         Worker(
             client,
@@ -158,9 +175,12 @@ async def test_sync_call_in_sandbox_import_is_refused(client: Client):
             workflows=[sync_import_workflow.SyncImportWorkflow],
             plugins=[StrandsPlugin(models={"mock": lambda: MockModel([])})],
         )
-    assert str(err.value.__cause__).startswith(
-        "Strands runs this sync call on a new thread"
-    )
+    assert isinstance(err.value.__cause__, RestrictedWorkflowAccessError)
+    assert str(err.value.__cause__) == _MESSAGE
+
+    # Outside Workflow code the guard lets the sync call run.
+    importlib.reload(sync_import_workflow)
+    assert sync_import_workflow.import_result == "import answer"
 
 
 class ConfiguredMockModel(MockModel):
