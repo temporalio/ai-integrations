@@ -1,4 +1,4 @@
-import { Agent } from '@openai/agents-core';
+import { Agent, RunState, tool } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
@@ -175,4 +175,121 @@ export async function statefulMcpSlowConnectHeartbeatWorkflow(): Promise<string>
   } finally {
     await server.cleanup();
   }
+}
+
+interface ResumeContext {
+  original: string;
+  after?: string;
+  writes: string[];
+}
+
+export interface ApprovalResumeContextResult {
+  callerAfter: string | undefined;
+  resumedUsesCallerObject: boolean;
+  writes: string[];
+  approvalRounds: number;
+  failedResumeThrew: boolean;
+  approvalOwners: number;
+  approvedCallIds: number;
+  sharedContextWrites: string[];
+  sharedContextInterruptions: number;
+}
+
+/** Serialized approval record, as the `RunContext` internal below returns it. */
+interface ApprovalRecord {
+  approved: boolean | string[];
+}
+
+/** Counts the agents that own function approvals in `context`, and the call IDs they approve. */
+function countApprovalOwners(context: unknown): { approvalOwners: number; approvedCallIds: number } {
+  let approvalOwners = 0;
+  // _toJSONForRunState is internal to @openai/agents-core; it looks up each owner in the map it's given.
+  const json = (
+    context as {
+      _toJSONForRunState(keys: { get(agent: unknown): string }): {
+        functionApprovals?: Array<{ approvals: Record<string, ApprovalRecord> }>;
+      };
+    }
+  )._toJSONForRunState({ get: () => `owner-${++approvalOwners}` });
+  let approvedCallIds = 0;
+  for (const { approvals } of json.functionApprovals ?? []) {
+    for (const record of Object.values(approvals)) {
+      approvedCallIds += Array.isArray(record.approved) ? record.approved.length : 0;
+    }
+  }
+  return { approvalOwners, approvedCallIds };
+}
+
+/**
+ * Approves a tool that writes the run context and resumes the same `RunState` until the run
+ * finishes, then reads the caller's context object. The first resume uses an agent the state
+ * doesn't match, which must fail without losing the approval. Then two paused states share one
+ * `RunContext`, both are approved, and resuming the first must keep the second's approval.
+ */
+export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
+  const setAfter = tool({
+    name: 'set_after',
+    description: 'Set a value after approval.',
+    parameters: {
+      type: 'object' as const,
+      properties: { value: { type: 'string' } },
+      required: ['value'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    execute: async (args, runContext) => {
+      const context = runContext!.context as ResumeContext;
+      context.after = (args as { value: string }).value;
+      context.writes.push(context.after);
+      return 'ok';
+    },
+  });
+  const agent = new Agent<ResumeContext>({
+    name: 'ResumeContextAgent',
+    instructions: 'Set the value.',
+    model: 'gpt-4o-mini',
+    tools: [setAfter],
+  });
+  const otherAgent = new Agent<ResumeContext>({ name: 'OtherAgent', model: 'gpt-4o-mini', tools: [setAfter] });
+  const runner = new TemporalOpenAIRunner();
+  const ctx: ResumeContext = { original: 'orig', writes: [] };
+  let result = await runner.run(agent, 'go', { context: ctx });
+  let approvalRounds = 0;
+  let failedResumeThrew = false;
+  while (result.interruptions.length > 0 && approvalRounds < 10) {
+    result.state.approve(result.interruptions[0]!);
+    if (approvalRounds++ === 0) {
+      try {
+        await runner.run(otherAgent, result.state);
+      } catch {
+        failedResumeThrew = true;
+      }
+    }
+    result = await runner.run(agent, result.state);
+  }
+  const owners = countApprovalOwners(result.runContext);
+
+  const sharedAgentA = new Agent<ResumeContext>({ name: 'SharedAgentA', model: 'gpt-4o-mini', tools: [setAfter] });
+  const sharedAgentB = new Agent<ResumeContext>({ name: 'SharedAgentB', model: 'gpt-4o-mini', tools: [setAfter] });
+  const sharedCtx: ResumeContext = { original: 'shared', writes: [] };
+  const pausedA = await runner.run(sharedAgentA, 'go', { context: sharedCtx });
+  const pausedB = await runner.run(sharedAgentB, 'go', { context: sharedCtx });
+  // State A keeps the converted graph its run produced; state B is rehydrated onto A's context.
+  const stateA = pausedA.state;
+  const stateB = await RunState.fromStringWithContext(sharedAgentB, pausedB.state.toString(), stateA._context);
+  stateA.approve(stateA.getInterruptions()[0]!);
+  stateB.approve(stateB.getInterruptions()[0]!);
+  const resumedA = await runner.run(sharedAgentA, stateA);
+  const resumedB = await runner.run(sharedAgentB, stateB);
+
+  return {
+    callerAfter: ctx.after,
+    resumedUsesCallerObject: result.runContext.context === ctx,
+    writes: ctx.writes,
+    approvalRounds,
+    failedResumeThrew,
+    ...owners,
+    sharedContextWrites: sharedCtx.writes,
+    sharedContextInterruptions: resumedA.interruptions.length + resumedB.interruptions.length,
+  };
 }

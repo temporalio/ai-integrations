@@ -5,6 +5,7 @@ import {
   MemorySession,
   Runner,
   RunState,
+  type RunContext,
   type AgentOutputType,
   type CallModelInputFilter,
   type HandoffInputData,
@@ -34,6 +35,63 @@ import { flushOpenSpans } from './agent-sink-processor';
 import { getCurrentPluginConfig } from './plugin-config-store';
 
 const agentAsToolSandboxConfig = Symbol.for('@temporalio/openai-agents/agentAsToolSandboxConfig');
+
+/** Each converted agent, mapped to every agent its `convertAgent` call produced. */
+const convertedGraphs = new WeakMap<Agent<any, any>, ReadonlySet<Agent<any, any>>>();
+
+interface SerializedFunctionApprovals {
+  agentIdentity: string;
+  approvals: Record<string, unknown>;
+}
+
+/** `RunContext` approval methods that `@openai/agents-core` marks internal and omits from its types. */
+interface RunContextApprovalInternals {
+  _toJSONForRunState(agentIdentityKeys: { get(agent: Agent<any, any>): string | undefined }): {
+    functionApprovals?: SerializedFunctionApprovals[];
+  };
+  _rebuildFunctionApprovals(
+    approvals: SerializedFunctionApprovals[],
+    agentsByIdentity: Map<string, Agent<any, any>>
+  ): void;
+}
+
+/**
+ * Rebuilds `state` over `converted` while keeping the state's own `RunContext`.
+ *
+ * Function-tool approvals are keyed by agent object, and the merge keys the state's approvals
+ * under the new converted agents. The approvals owned by the state's previous converted graph
+ * are dropped first, or every resume would keep that graph with a full copy of its approvals.
+ * The serialized state carries them, so the resumed run keeps them. Approvals owned by other
+ * agents, such as those of another state sharing this context, stay where they are.
+ */
+async function restoreWithOwnContext(
+  converted: Agent<any, any>,
+  state: RunState<any, any>
+): Promise<RunState<any, any>> {
+  const serialized = state.toString();
+  const context = state._context as RunContext<any> & RunContextApprovalInternals;
+  const superseded = convertedGraphs.get(state._currentAgent as Agent<any, any>) ?? new Set();
+  // The internal serializer asks for each owner's identity, which lists every owner.
+  const owners = new Map<string, Agent<any, any>>();
+  const approvals =
+    context._toJSONForRunState({
+      get: (agent) => {
+        const identity = String(owners.size);
+        owners.set(identity, agent);
+        return identity;
+      },
+    }).functionApprovals ?? [];
+  const kept = approvals.filter(({ agentIdentity }) => !superseded.has(owners.get(agentIdentity)!));
+  // Copy the kept records, so the merge below can't change those the restore puts back.
+  context._rebuildFunctionApprovals(JSON.parse(JSON.stringify(kept)), owners);
+  try {
+    return await RunState.fromStringWithContext(converted, serialized, context);
+  } catch (error) {
+    // Leave the caller's context as it was, so a later resume of the same state keeps its approvals.
+    context._rebuildFunctionApprovals(approvals, owners);
+    throw error;
+  }
+}
 
 export interface TemporalRunOptions<TContext = undefined> {
   /** Run context passed to agents and tools */
@@ -271,7 +329,10 @@ export class TemporalOpenAIRunner {
 
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
-    const converted = convertAgent(agent, this.modelParams, undefined, modelOverride);
+    const convertedBySource = new Map<Agent<any, any>, Agent<any, any>>();
+    const converted = convertAgent(agent, this.modelParams, convertedBySource, modelOverride);
+    const convertedGraph = new Set(convertedBySource.values());
+    for (const convertedAgent of convertedGraph) convertedGraphs.set(convertedAgent, convertedGraph);
     if (options?.runConfig?.sandbox !== undefined) {
       propagateAgentToolSandboxConfig(converted, options.runConfig.sandbox);
     }
@@ -282,7 +343,9 @@ export class TemporalOpenAIRunner {
       // agent (with ActivityBackedModel); setCurrentAgent only swaps the top-level ref, not nested ones.
       // It also drops upstream's live-session identity, which would otherwise resolve manifest
       // environment references on the Workflow thread rather than in the resume Activity.
-      const restored = (await RunState.fromString(converted, input.toString())) as RunState<TContext, TAgent>;
+      // Pass the state's own context, as the upstream Runner uses it, so resumed tools write the
+      // caller's object rather than a JSON copy.
+      const restored = (await restoreWithOwnContext(converted, input)) as RunState<TContext, TAgent>;
       // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
       restored.clearTrace();
       preparedInput = restored;

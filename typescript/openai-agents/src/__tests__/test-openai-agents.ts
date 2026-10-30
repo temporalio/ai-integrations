@@ -14,6 +14,7 @@ import {
   StatelessMCPServerProvider,
 } from '..';
 import {
+  approvalResumeContextWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   summaryOverrideStringWorkflow,
@@ -569,5 +570,43 @@ test('Streaming: useLocalActivity fails fast before scheduling an Activity', asy
 
     const result = await handle.result();
     t.is(result, 'StreamingLocalActivityUnsupported');
+  });
+});
+
+test('Approval resume keeps the caller context object', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([
+          toolCallResponse('set_after', { value: 'S-1' }, 'call_set_after_1'),
+          toolCallResponse('set_after', { value: 'S-2' }, 'call_set_after_2'),
+          toolCallResponse('set_after', { value: 'S-after' }, 'call_set_after_3'),
+          textResponse('done'),
+          toolCallResponse('set_after', { value: 'A' }, 'call_shared_a'),
+          toolCallResponse('set_after', { value: 'B' }, 'call_shared_b'),
+          textResponse('done A'),
+          textResponse('done B'),
+        ]),
+      }),
+    ],
+  });
+
+  const result = await worker.runUntil(
+    executeWorkflow(approvalResumeContextWorkflow, { workflowExecutionTimeout: '30 seconds' })
+  );
+
+  // Each resume keys the approvals under a new converted agent graph; only the last one keeps them.
+  // Resuming state A drops only A's previous graph, so state B still runs its approved call.
+  t.deepEqual(result, {
+    callerAfter: 'S-after',
+    resumedUsesCallerObject: true,
+    writes: ['S-1', 'S-2', 'S-after'],
+    approvalRounds: 3,
+    failedResumeThrew: true,
+    approvalOwners: 1,
+    approvedCallIds: 3,
+    sharedContextWrites: ['A', 'B'],
+    sharedContextInterruptions: 0,
   });
 });
