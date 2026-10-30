@@ -12,7 +12,7 @@ planning/todo state, the filesystem middleware, human-in-the-loop interrupts, an
 `agent.ainvoke(...)` all keep working. You get crash-durability, resumable
 human-in-the-loop, and bounded history on top.
 
-> Release stage: [Pre-release](https://docs.temporal.io/develop/python/integrations/deepagents).
+> Release stage: [Public Preview](https://docs.temporal.io/develop/python/integrations/deepagents).
 
 ## Install
 

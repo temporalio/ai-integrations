@@ -26,7 +26,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | Folder | Coordinate | First version here | Maturity | Root API |
 |---|---|---|---|---|
 | `python/mcp` | `temporalio-mcp` | 0.1.0 | Pre-release | `temporalio.mcp` |
-| `python/deepagents` | `temporalio-deepagents` | 0.0.1 | Pre-release | `temporalio.deepagents` |
+| `python/deepagents` | `temporalio-deepagents` | 0.0.1 | Public Preview | `temporalio.deepagents` |
 | `python/google_adk` | `temporalio-google-adk` | 0.0.1 | Generally Available | `temporalio.google_adk` |
 | `python/google_genai` | `temporalio-google-genai` | 0.1.0 | Generally Available | `temporalio.google_genai` |
 | `python/langgraph` | `temporalio-langgraph` | 0.1.0 | Generally Available | `temporalio.langgraph` |
