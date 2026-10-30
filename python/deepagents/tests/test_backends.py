@@ -15,6 +15,7 @@ from __future__ import annotations
 import gc
 import inspect
 import sys
+import time
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -39,7 +40,11 @@ from temporalio.deepagents._tools import (
     registered_backends,
 )
 from temporalio.worker import Worker
-from tests.helpers.deepagents import count_scheduled_activities
+from tests.helpers.deepagents import (
+    all_scheduled_attributes,
+    count_scheduled_activities,
+    scheduled_attributes,
+)
 
 BACKEND_OP = "deepagents.backend_op"
 
@@ -153,6 +158,102 @@ async def test_temporal_backend_op_activity(env: WorkflowEnvironment) -> None:
     # One activity per op — the sync read, the async aread, and the optional
     # adelete all cross.
     assert counts[BACKEND_OP] == 3, counts
+    # backend_op carries the default heartbeat timeout, capped by the
+    # schedule's own start_to_close (10 s here).
+    attrs = await scheduled_attributes(handle, BACKEND_OP)
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=10)
+    assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
+
+
+@workflow.defn
+class BackendHeartbeatOptionsWorkflow:
+    @workflow.run
+    async def run(self, path: str) -> str:
+        overridden = TemporalBackend(
+            RecordingBackend(),
+            activity_options={"heartbeat_timeout": timedelta(seconds=7)},
+        )
+        opted_out = TemporalBackend(
+            RecordingBackend(),
+            activity_options={"heartbeat_timeout": None},
+        )
+        return f"{await overridden.read(path)}|{await opted_out.read(path)}"
+
+
+class BlockingReadBackend:
+    """A backend whose SYNC ``read`` blocks its thread — the shape of
+    ``LocalShellBackend.execute`` (``subprocess.run``) — so heartbeats keep
+    flowing during it only if ``backend_op`` dispatches it off the event
+    loop."""
+
+    def read(self, file_path: str) -> str:
+        time.sleep(3)
+        return f"slow contents of {file_path}"
+
+
+@workflow.defn
+class BlockingReadWorkflow:
+    @workflow.run
+    async def run(self, path: str) -> str:
+        backend = TemporalBackend(
+            BlockingReadBackend(),
+            activity_options={
+                "start_to_close_timeout": timedelta(seconds=30),
+                "heartbeat_timeout": timedelta(seconds=2),
+                "retry_policy": RetryPolicy(maximum_attempts=1),
+            },
+        )
+        return await backend.read(path)
+
+
+@pytest.mark.asyncio
+async def test_backend_activity_heartbeat_options_win(
+    env: WorkflowEnvironment,
+) -> None:
+    """``TemporalBackend(activity_options=...)`` heartbeat values replace the
+    default, ``heartbeat_timeout=None`` included."""
+    async with Worker(
+        env.client,
+        task_queue="da-backend-hb-opts",
+        workflows=[BackendHeartbeatOptionsWorkflow],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        handle = await env.client.start_workflow(
+            BackendHeartbeatOptionsWorkflow.run,
+            "notes.txt",
+            id=f"da-backend-hb-opts-{uuid.uuid4()}",
+            task_queue="da-backend-hb-opts",
+        )
+        assert "contents of notes.txt|contents of notes.txt" in await handle.result()
+
+    heartbeats = [
+        attrs.heartbeat_timeout.ToTimedelta()
+        for attrs in await all_scheduled_attributes(handle, BACKEND_OP)
+    ]
+    assert heartbeats == [timedelta(seconds=7), timedelta(0)]
+
+
+@pytest.mark.asyncio
+async def test_blocking_backend_op_survives_heartbeat_timeout(
+    env: WorkflowEnvironment,
+) -> None:
+    """A synchronous backend method that outlasts the heartbeat timeout still
+    completes: ``backend_op`` runs it off the event loop, so the
+    auto-heartbeater keeps beating while it blocks. Run inline, the same call
+    starves the heartbeater and the activity heartbeat-times out."""
+    async with Worker(
+        env.client,
+        task_queue="da-backend-blocking",
+        workflows=[BlockingReadWorkflow],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        out = await env.client.execute_workflow(
+            BlockingReadWorkflow.run,
+            "notes.txt",
+            id=f"da-backend-blocking-{uuid.uuid4()}",
+            task_queue="da-backend-blocking",
+        )
+    assert out == "slow contents of notes.txt"
 
 
 TEXT_FILE = ("/notes.txt", b"hello\n")

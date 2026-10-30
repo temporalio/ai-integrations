@@ -18,7 +18,8 @@ Every method:
 * translates the LLM SDK's HTTP error into Temporal's retry contract so a 429
   honors the upstream ``retry-after`` instead of hammering it;
 * heartbeats on a background task so a slow (thinking-mode / long-context) call
-  is not mistaken for a stuck worker.
+  is not mistaken for a stuck worker — and so cancellation can reach it, since
+  a Python activity observes cancellation only through a heartbeat response.
 """
 
 from __future__ import annotations
@@ -45,6 +46,47 @@ BACKEND_OP = "deepagents.backend_op"
 
 CONTEXT_OVERFLOW_ERROR_TYPE = "deepagents.ContextOverflowError"
 """``ApplicationError.type`` of a model call the provider rejected as too long."""
+
+
+# Default heartbeat timeout for the activities this module defines, applied by
+# the dispatch seams via :func:`apply_default_heartbeat_timeout` (user-supplied
+# options always win, including an explicit ``heartbeat_timeout=None`` opt-out).
+# Every activity body keeps the event loop free — model and tool calls go
+# through LangChain, which runs sync implementations on worker threads, and
+# ``backend_op`` dispatches backend methods off-loop — so the heartbeat task
+# below keeps beating however slow the underlying call is. (User code that
+# blocks the loop itself — a CPU-bound async model, a blocking sync tool —
+# starves any heartbeat timeout, this default included.) Without a timeout the
+# server cannot tell a crashed worker from a slow call until start-to-close
+# (five minutes for a model call), and cancellation never reaches the call at
+# all, because a Python activity observes cancellation solely through a
+# heartbeat response.
+DEFAULT_HEARTBEAT_TIMEOUT = timedelta(seconds=30)
+
+
+def apply_default_heartbeat_timeout(opts: dict[str, Any]) -> None:
+    """Set ``heartbeat_timeout`` unless already configured, capped by the
+    schedule's own close timeouts.
+
+    The plugin, not server-side normalization, defines the relationship: the
+    heartbeat timeout never outlives ``start_to_close_timeout`` or
+    ``schedule_to_close_timeout`` (whichever are set), so a short activity gets
+    a proportionally short heartbeat timeout rather than a value the platform
+    would have to clamp. Call this after those defaults are resolved.
+    """
+    if "heartbeat_timeout" in opts:
+        return
+    caps = [
+        timeout
+        for timeout in (
+            opts.get("start_to_close_timeout"),
+            opts.get("schedule_to_close_timeout"),
+        )
+        if timeout is not None
+    ]
+    opts["heartbeat_timeout"] = (
+        min(DEFAULT_HEARTBEAT_TIMEOUT, *caps) if caps else DEFAULT_HEARTBEAT_TIMEOUT
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +543,13 @@ class DeepAgentActivities:
                 type="DeepAgentsUnknownBackendOp",
                 non_retryable=True,
             )
-        result = method(
+        # Sync backend methods (``subprocess.run`` in LocalShellBackend.execute,
+        # filesystem reads) must not block the event loop the heartbeat task
+        # needs; like the factory call above, they run on a worker thread. An
+        # async method called in a thread only creates its coroutine, which is
+        # awaited below on the loop.
+        result = await asyncio.to_thread(
+            method,
             *_serde.load_backend_result(input.args),
             **_serde.load_backend_result(input.kwargs),
         )
