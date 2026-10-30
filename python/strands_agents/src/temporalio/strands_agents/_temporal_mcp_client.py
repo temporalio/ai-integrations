@@ -112,15 +112,15 @@ class TemporalMCPClient(ToolProvider):
         return self._server
 
     async def load_tools(self, **_kwargs: Any) -> Sequence[AgentTool]:
-        """Return the tools fetched by the most recent ``_refresh``.
+        """Return no tools; ``TemporalAgent`` adds them before each model call.
 
-        This must stay free of any ``workflow`` API: Strands invokes it once at
-        ``Agent`` construction on a separate ``run_async`` thread that has no
-        workflow runtime. ``TemporalAgent`` populates the tools by calling
-        ``_refresh`` from a ``BeforeModelCallEvent`` hook before the registry is
-        first read.
+        Strands invokes this once at ``Agent`` construction on a separate
+        ``run_async`` thread that has no workflow runtime, so the tools cannot
+        be listed here. ``TemporalAgent`` adds them from a
+        ``BeforeModelCallEvent`` hook, which lists them by calling ``_refresh``
+        and checks their names, for an agent built before or after a listing.
         """
-        return list(self._tools)
+        return []
 
     async def _refresh(self) -> None:
         """List the server's tools via the ``{server}-list-tools`` activity.

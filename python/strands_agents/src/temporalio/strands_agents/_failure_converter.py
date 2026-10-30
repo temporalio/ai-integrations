@@ -12,6 +12,8 @@ import temporalio.api.failure.v1
 from temporalio.converter import DefaultFailureConverter, PayloadConverter
 from temporalio.exceptions import ApplicationError
 
+from ._temporal_mcp_client import MCPToolNameConflictError
+
 # Activity-side: when a Strands ``InterruptException`` would otherwise be
 # serialized by the default converter, the ``Interrupt`` payload on
 # ``exc.interrupt`` is dropped (it lives on the instance, not in the
@@ -25,12 +27,14 @@ STRANDS_INTERRUPT_TYPE = "StrandsInterrupt"
 # won't succeed on retry, so they cross the boundary as non-retryable typed
 # ApplicationErrors. Only ContextWindowOverflowException is rebuilt on the workflow
 # side (TemporalModel.stream), because Strands recovers from it by reducing the
-# conversation; the others reach the workflow as an ActivityError.
+# conversation; the others reach the workflow as an ActivityError. A tool name
+# conflict fails the Workflow the same way, since a retry lists the same names.
 _TERMINAL_EXCEPTIONS: tuple[type[BaseException], ...] = (
     MaxTokensReachedException,
     ContextWindowOverflowException,
     StructuredOutputException,
     SessionException,
+    MCPToolNameConflictError,
 )
 
 

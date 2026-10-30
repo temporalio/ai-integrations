@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import AsyncGenerator
 from datetime import timedelta
 from typing import Any
 
@@ -6,8 +7,10 @@ from strands import Agent
 from strands.agent._concurrency import _ConcurrencyController, _InflightInvocation
 from strands.agent.conversation_manager import NullConversationManager
 from strands.hooks import BeforeModelCallEvent
+from strands.types._events import TypedEvent
 from strands.types.agent import AgentInput
 from strands.types.content import Messages
+from strands.types.exceptions import EventLoopException
 from strands.types.tools import AgentTool
 
 from temporalio import workflow
@@ -183,15 +186,11 @@ class TemporalAgent(Agent):
             for provider in self.tool_registry._tool_providers
             if isinstance(provider, TemporalMCPClient)
         ]
-        # Names this agent's MCP tools hold: those load_tools() registered at
-        # construction, then each turn's. A name stays the servers' while they
-        # list it: a tool put under it meanwhile is replaced at the next listing,
-        # and removed with the name.
-        self._mcp_names = {
-            tool.tool_name
-            for provider in self._mcp_providers
-            for tool in provider._tools
-        }
+        # Names this agent's MCP tools hold, from the last turn; load_tools()
+        # gives none at construction. A name stays the servers' while they list
+        # it: a tool put under it meanwhile is replaced at the next turn, and
+        # removed with the name.
+        self._mcp_names: set[str] = set()
         if self._mcp_providers:
             self.hooks.add_callback(BeforeModelCallEvent, self._refresh_mcp_tools)
 
@@ -233,6 +232,21 @@ class TemporalAgent(Agent):
                 else:
                     reg.register_tool(tool)
         self._mcp_names = new
+
+    async def _run_loop(
+        self, *args: Any, **kwargs: Any
+    ) -> AsyncGenerator[TypedEvent, None]:
+        # After a tool call, Strands runs the next model call inside the last
+        # cycle and wraps most errors from it in EventLoopException. Raise a
+        # tool name conflict as itself, so Workflow code can catch it and
+        # StrandsPlugin fails the Workflow with it.
+        try:
+            async for event in super()._run_loop(*args, **kwargs):
+                yield event
+        except EventLoopException as err:
+            if isinstance(err.__cause__, MCPToolNameConflictError):
+                raise err.__cause__ from None
+            raise
 
     async def _convert_prompt_to_messages(self, prompt: AgentInput) -> Messages:
         """Load the worker-side model's config, then convert the prompt.
