@@ -25,8 +25,12 @@ pytestmark = pytest.mark.skipif(
 pytest.importorskip("langchain_core")
 
 from temporalio import activity, workflow  # noqa: E402
-from temporalio.worker import Worker  # noqa: E402
-from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
+from temporalio.worker import Replayer, Worker  # noqa: E402
+from temporalio.workflow import ActivityConfig  # noqa: E402
+from tests.helpers.deepagents import (  # noqa: E402
+    count_scheduled_activities,
+    scheduled_activity_attrs,
+)
 
 with workflow.unsafe.imports_passed_through():
     from temporalio.deepagents import (  # noqa: E402
@@ -39,6 +43,8 @@ with workflow.unsafe.imports_passed_through():
     from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
 
 INVOKE_TOOL = "deepagents.invoke_tool"
+# Dedicated queue for tool activities, so tests can prove task-queue routing.
+TOOL_TASK_QUEUE = "da-tool-queue"
 
 # Bind deepagents symbols off the module importorskip returns: a static
 # `from deepagents import ...` cannot resolve on Python 3.10 (deepagents
@@ -180,6 +186,125 @@ async def test_activity_as_tool(env: WorkflowEnvironment) -> None:
     assert out == "echo:hi"
     counts = await count_scheduled_activities(handle)
     assert counts["echo_activity"] == 1, counts
+    # Without activity_options the scheduled attributes keep exactly the shape
+    # this helper always produced — the workflow's own task queue, a zero
+    # heartbeat timeout, the required start-to-close (retry_policy is forwarded
+    # verbatim, None included, so it records the SDK default as before) — so
+    # call sites that predate the argument record (and replay, below)
+    # unchanged.
+    attrs = await scheduled_activity_attrs(handle, "echo_activity")
+    assert attrs is not None
+    assert attrs.task_queue.name == "da-act-tool"
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(0)
+    assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
+    await Replayer(
+        workflows=[ActivityAsToolWorkflow], plugins=[DeepAgentsPlugin()]
+    ).replay_workflow(await handle.fetch_history())
+
+
+def test_activity_as_tool_accepts_activity_options() -> None:
+    """The helper takes activity_options for the tool seam's other options.
+    Constructed outside a workflow so that, on code without the argument, the
+    failure is the TypeError itself rather than a failing workflow task; the
+    end-to-end scheduling is covered below.
+    """
+    tool = activity_as_tool(
+        echo_activity,
+        start_to_close_timeout=timedelta(seconds=10),
+        activity_options={"task_queue": TOOL_TASK_QUEUE},
+    )
+    assert tool.name == "echo_activity"
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["start_to_close_timeout", "retry_policy", "summary", "activity_id", "arg", "args"],
+)
+def test_activity_as_tool_rejects_owned_activity_options(option: str) -> None:
+    """Options the helper owns are rejected at construction: silently dropping
+    a caller's start_to_close_timeout / retry_policy / summary hides the
+    mistake in history, arg/args would collide with the arguments built from
+    the model's call, and one static activity_id cannot serve every invocation
+    of the tool.
+    """
+    with pytest.raises(ValueError, match=option):
+        activity_as_tool(
+            echo_activity,
+            start_to_close_timeout=timedelta(seconds=10),
+            activity_options={option: "reserved"},
+        )
+
+
+@workflow.defn
+class ActivityAsToolOptionsWorkflow:
+    @workflow.run
+    async def run(self, text: str) -> list[str]:
+        options = ActivityConfig(
+            heartbeat_timeout=timedelta(seconds=3),
+            task_queue=TOOL_TASK_QUEUE,
+        )
+        tool = activity_as_tool(
+            echo_activity,
+            start_to_close_timeout=timedelta(seconds=10),
+            activity_options=options,
+        )
+        # A multi-parameter activity with a defaulted parameter: the options
+        # compose with the per-parameter argument mapping.
+        forecast = activity_as_tool(
+            forecast_activity,
+            start_to_close_timeout=timedelta(seconds=10),
+            activity_options=options,
+        )
+        return [
+            await tool.ainvoke({"text": text}),
+            await forecast.ainvoke({"city": "Paris", "days": 3}),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_activity_as_tool_activity_options(env: WorkflowEnvironment) -> None:
+    """activity_options carries the full ActivityConfig, not just the timeout:
+    the tool activity lands on the routed task queue with the heartbeat timeout
+    recorded, alongside the explicit start_to_close_timeout. Without it a
+    heartbeating activity tool cannot be routed off the workflow's task queue,
+    and a lost worker is only noticed at start-to-close. Only the workflow's
+    own worker runs the plugin here — the routed activity worker is
+    plugin-free, so the scheduling must work without any plugin-side
+    cooperation.
+    """
+    plugin = DeepAgentsPlugin()
+    async with (
+        Worker(
+            env.client,
+            task_queue="da-act-tool-opts",
+            workflows=[ActivityAsToolOptionsWorkflow],
+            plugins=[plugin],
+        ),
+        Worker(
+            env.client,
+            task_queue=TOOL_TASK_QUEUE,
+            activities=[echo_activity, forecast_activity],
+        ),
+    ):
+        handle = await env.client.start_workflow(
+            ActivityAsToolOptionsWorkflow.run,
+            "hi",
+            id=f"da-act-tool-opts-{uuid.uuid4()}",
+            task_queue="da-act-tool-opts",
+        )
+        out = await handle.result()
+
+    assert out == ["echo:hi", "Paris:3:C"]
+    for name in ("echo_activity", "forecast_activity"):
+        attrs = await scheduled_activity_attrs(handle, name)
+        assert attrs is not None, name
+        assert attrs.task_queue.name == TOOL_TASK_QUEUE
+        assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=3)
+        # Explicit argument and activity_options compose.
+        assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
+    await Replayer(
+        workflows=[ActivityAsToolOptionsWorkflow], plugins=[DeepAgentsPlugin()]
+    ).replay_workflow(await handle.fetch_history())
 
 
 @pytest.mark.asyncio

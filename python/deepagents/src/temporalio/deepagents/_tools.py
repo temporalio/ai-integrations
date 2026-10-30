@@ -211,6 +211,14 @@ def lookup_backend(ref: str) -> Any | None:
 # ---------------------------------------------------------------------------
 
 
+# Options activity_as_tool owns: the three set from its own arguments, the
+# activity arguments it builds from the model's call (``arg``/``args``), and
+# activity_id — one static id cannot serve every invocation of the tool.
+_OWNED_ACTIVITY_OPTIONS = frozenset(
+    {"start_to_close_timeout", "retry_policy", "summary", "activity_id", "arg", "args"}
+)
+
+
 def activity_as_tool(
     activity: Callable,
     *,
@@ -219,6 +227,7 @@ def activity_as_tool(
     description: str | None = None,
     retry_policy: Any = None,
     summary: str | None = None,
+    activity_options: Mapping[str, Any] | None = None,
 ) -> BaseTool:
     """Expose an existing Temporal activity as a Deep Agents tool.
 
@@ -235,6 +244,15 @@ def activity_as_tool(
             (defaults to the activity docstring).
         retry_policy: Optional Temporal retry policy for the activity.
         summary: Optional ``summary=`` recorded on each activity invocation.
+        activity_options: Any other ``workflow.execute_activity`` options —
+            ``task_queue`` routing, ``heartbeat_timeout``,
+            ``schedule_to_close_timeout``, ``cancellation_type``, ``priority``,
+            ... — so a long-running tool can run on its own workers and a
+            heartbeating one can have a lost worker noticed at the heartbeat
+            rather than at start-to-close. Any ``ActivityConfig`` works. The
+            keys owned by this helper (``start_to_close_timeout``,
+            ``retry_policy``, ``summary``, ``activity_id``, ``arg``,
+            ``args``) are rejected.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import StructuredTool
@@ -253,6 +271,22 @@ def activity_as_tool(
         )
     tool_desc = description or (activity.__doc__ or f"Temporal activity {tool_name}.")
     act_summary = summary or f"tool:{tool_name}"
+    owned = _OWNED_ACTIVITY_OPTIONS & set(activity_options or ())
+    if owned:
+        raise ValueError(
+            f"activity_options must not contain {', '.join(sorted(owned))}: "
+            "start_to_close_timeout, retry_policy and summary come from "
+            "activity_as_tool's own arguments, arg/args are built from the "
+            "model's tool call, and activity_id would be reused by every "
+            "invocation of the tool."
+        )
+    # A call without activity_options dispatches with exactly the three options
+    # this helper always sent, so histories recorded before the argument
+    # existed are unchanged.
+    opts: dict[str, Any] = dict(activity_options or {})
+    opts["start_to_close_timeout"] = start_to_close_timeout
+    opts["retry_policy"] = retry_policy
+    opts["summary"] = act_summary
 
     # Temporal activities take positional arguments only. StructuredTool infers
     # the model-facing schema from ``_run``'s signature, so we mirror the activity's
@@ -281,9 +315,7 @@ def activity_as_tool(
         return await workflow.execute_activity(
             activity,
             args=values,
-            start_to_close_timeout=start_to_close_timeout,
-            retry_policy=retry_policy,
-            summary=act_summary,
+            **opts,
         )
 
     _ROUTED_TOOL_NAMES.add(tool_name)
