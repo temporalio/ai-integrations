@@ -8,7 +8,8 @@ A ``TemporalModel`` cannot run on that thread: it needs the workflow event loop.
 ``TemporalAgent`` calls :func:`prepare_summary` just before Strands reduces the
 history. It runs the manager's own reduction on copies to learn which messages the
 manager will summarize, awaits that summary here, and hands it to the manager's
-synchronous call.
+synchronous call. If the history changed while the summary ran, it summarizes the
+messages the manager will now summarize instead.
 """
 
 import asyncio
@@ -57,18 +58,23 @@ async def prepare_summary(
     if not isinstance(manager, SummarizingConversationManager):
         return
     messages = _requested_messages(manager, agent, reduce)
-    if messages is None:
-        return
-    try:
-        result: Message | Exception = await _summarize(manager, agent, messages)
-    except Exception as error:
-        if _is_cancelled(error):
-            # Strands handles a failed summary as an ordinary error, so the run
-            # would not end cancelled.
-            raise asyncio.CancelledError() from error
-        # Strands raises or ignores a failed summary; hand it over to do that.
-        result = error
-    _hand_over(manager, messages, result)
+    while messages is not None:
+        try:
+            result: Message | Exception = await _summarize(manager, agent, messages)
+        except Exception as error:
+            if _is_cancelled(error):
+                # Strands handles a failed summary as an ordinary error, so the run
+                # would not end cancelled.
+                raise asyncio.CancelledError() from error
+            # Strands raises or ignores a failed summary; hand it over to do that.
+            result = error
+        # A signal or update handler may have changed the history while the summary
+        # ran. Summarize what the manager will ask for now instead.
+        requested = _requested_messages(manager, agent, reduce)
+        if requested == messages:
+            _hand_over(manager, messages, result)
+            return
+        messages = requested
 
 
 def _requested_messages(

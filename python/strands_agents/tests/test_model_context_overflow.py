@@ -1,3 +1,4 @@
+import asyncio
 import copy
 from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
@@ -170,6 +171,15 @@ def _client_with(client: Client, plugin: StrandsPlugin) -> Client:
 
 @workflow.defn
 class OverflowAgentWorkflow:
+    def __init__(self) -> None:
+        self.agent: TemporalAgent | None = None
+
+    @workflow.update
+    def redact(self) -> None:
+        """Rewrites the first prompt from outside the agent's run."""
+        assert self.agent is not None
+        self.agent.messages[0] = {"role": "user", "content": [{"text": "[redacted]"}]}
+
     @workflow.run
     async def run(self, prompt: str, manager: str = "sliding_window") -> str:
         def summarizer() -> Agent:
@@ -180,7 +190,7 @@ class OverflowAgentWorkflow:
                 start_to_close_timeout=timedelta(seconds=15),
             )
 
-        agent = TemporalAgent(
+        agent = self.agent = TemporalAgent(
             model="small",
             messages=_history(),  # type: ignore[arg-type]
             start_to_close_timeout=timedelta(seconds=15),
@@ -273,6 +283,86 @@ async def test_overflow_is_recovered_by_conversation_manager(
         workflows=[OverflowAgentWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+SUMMARY_PROMPT = "Please summarize this conversation."
+
+
+class BlockingSummaryContextModel(SmallContextModel):
+    """Holds the first summary call until ``release`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.summarizing = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(
+        self, messages: Any, *args: Any, **kwargs: Any
+    ) -> AsyncIterable[StreamEvent]:  # type: ignore[override]
+        if _texts(messages)[-1] == SUMMARY_PROMPT and not self.summarizing.is_set():
+            self.summarizing.set()
+            await self.release.wait()
+        async for event in super().stream(messages, *args, **kwargs):
+            yield event
+
+
+@pytest.mark.parametrize("manager", ["summarizing", "summarization_agent"])
+async def test_overflow_summarizes_history_changed_during_summary(
+    client: Client, manager: str
+):
+    # An update that changes the history while the overflow's summary runs gets a
+    # summary of the changed history, as a change before the summary does natively.
+    control_model = SmallContextModel()
+    control_agent = Agent(
+        model=control_model,
+        messages=_history(),  # type: ignore[arg-type]
+        callback_handler=None,
+        **_manager(manager, lambda: Agent(model=control_model, callback_handler=None)),
+    )
+
+    def redact_once(**kwargs: Any) -> None:
+        if kwargs.get("force_stop") and not control_model.seen[1:]:
+            control_agent.messages[0] = {
+                "role": "user",
+                "content": [{"text": "[redacted]"}],
+            }
+
+    control_agent.callback_handler = redact_once
+    assert str(await control_agent.invoke_async("q3")) == "ok\n"
+    assert control_model.seen[1][0] == "[redacted]"
+
+    model = BlockingSummaryContextModel()
+    task_queue = f"test_overflow_history_changed-{uuid4()}"
+    plugin = StrandsPlugin(models={"small": lambda: model})
+    client = _client_with(client, plugin)
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[OverflowAgentWorkflow],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            OverflowAgentWorkflow.run,
+            args=["q3", manager],
+            id=f"test_overflow_history_changed_{uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=20),
+        )
+        await asyncio.wait_for(model.summarizing.wait(), timeout=10)
+        try:
+            await handle.execute_update(OverflowAgentWorkflow.redact)
+        finally:
+            model.release.set()
+        assert await handle.result() == "ok\n"
+
+    # The summary of the unchanged history is dropped; the rest matches the control.
+    assert model.seen[1] == ["q1", "a1", SUMMARY_PROMPT]
+    assert [model.requests[0], *model.requests[2:]] == control_model.requests
+    await Replayer(
+        workflows=[OverflowAgentWorkflow],
+        plugins=[plugin],
+    ).replay_workflow(await handle.fetch_history())
 
 
 @pytest.mark.parametrize(

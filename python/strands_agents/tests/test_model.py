@@ -423,21 +423,34 @@ class UsageMockModel(ConfiguredMockModel):
             }
 
 
-def _redact_turn_1(event: BeforeModelCallEvent) -> None:
-    """Rewrites the first prompt once a later turn follows it, as a redaction hook would."""
-    for message in event.agent.messages[:-1]:
+def _redact_turn_1_in(messages: Messages) -> None:
+    for message in messages:
         for block in message["content"]:
             if block.get("text") == "turn 1":
                 block["text"] = "[redacted]"
 
 
+def _redact_turn_1(event: BeforeModelCallEvent) -> None:
+    """Rewrites the first prompt once a later turn follows it, as a redaction hook would."""
+    _redact_turn_1_in(event.agent.messages[:-1])
+
+
 @workflow.defn
 class CompressionWorkflow:
+    def __init__(self) -> None:
+        self.agent: TemporalAgent | None = None
+
+    @workflow.update
+    def redact(self) -> None:
+        """Rewrites the first prompt from outside the agent's run."""
+        assert self.agent is not None
+        _redact_turn_1_in(self.agent.messages)
+
     @workflow.run
     async def run(
         self, prompts: list[str], summarize: bool = False, redact: bool = False
     ) -> None:
-        agent = TemporalAgent(
+        agent = self.agent = TemporalAgent(
             model="usage",
             start_to_close_timeout=timedelta(seconds=15),
             conversation_manager=SummarizingConversationManager(
@@ -566,3 +579,41 @@ async def test_cancel_during_summary_cancels_the_run(client: Client):
         ["turn 1"],
         ["turn 1", "Please summarize this conversation."],
     ]
+
+
+async def test_history_changed_during_summary_is_summarized(client: Client):
+    """An update that changes the history while the summary runs gets a new summary."""
+    task_queue = f"test_history_changed_during_summary-{uuid4()}"
+    model = BlockingSummaryModel(["first", "stale summary", "summary", "second"])
+    plugin = StrandsPlugin(models={"usage": lambda: model})
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[CompressionWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            CompressionWorkflow.run,
+            args=[["turn 1", "turn 2"], True],
+            id=f"test_history_changed_during_summary_{uuid4()}",
+            task_queue=task_queue,
+        )
+        await asyncio.wait_for(model.summarizing.wait(), timeout=10)
+        try:
+            await handle.execute_update(CompressionWorkflow.redact)
+        finally:
+            model.release.set()
+        await handle.result()
+
+    # The stale summary is dropped; the manager gets the redacted turn's summary.
+    assert model.user_turns == [
+        ["turn 1"],
+        ["turn 1", "Please summarize this conversation."],
+        ["[redacted]", "Please summarize this conversation."],
+        ["summary", "turn 2"],
+    ]
+    await Replayer(workflows=[CompressionWorkflow], plugins=[plugin]).replay_workflow(
+        await handle.fetch_history()
+    )
