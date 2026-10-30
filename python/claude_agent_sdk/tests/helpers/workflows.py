@@ -217,7 +217,7 @@ CONTINUE = "Continue from where you left off."
 
 @workflow.defn
 class ResumingWorkflow:
-    """Sends the prompt, asks a person about each tool call, and redoes the turn from the prompt if Claude Code goes away, as the README shows."""
+    """Sends the prompt, asks a person about each tool call, and redoes the turn from the prompt if Claude Code goes away, as the samples do."""
 
     def __init__(self) -> None:
         self.pending: list[str] = []

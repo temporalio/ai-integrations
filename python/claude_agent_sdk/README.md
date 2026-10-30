@@ -105,10 +105,8 @@ SDK's own `SubprocessCLITransport` in the Worker process:
 - As in the Claude Agent SDK, it finds Claude Code, checks its version, and runs it as the Worker's
   user, with the Worker's environment, in the Worker's files. Paths in `ClaudeAgentOptions`, such
   as `cwd` and `cli_path`, are on the Worker.
-- Claude Code stops when the Worker shuts down. If the Worker is killed or crashes, Claude Code
-  fails any pending tool approval, finishes its turn, then exits. Either way, the transport raises
-  `CLIConnectionError`. To finish the turn, redo it from the prompt, as [When Claude Code
-  Stops](#when-claude-code-stops) shows.
+- When the Worker stops, the transport raises `CLIConnectionError`. See [When Claude Code
+  Stops](#when-claude-code-stops).
 - The plugin routes every Activity after the launch to the Worker process that runs Claude Code.
 
 `TemporalTransport` takes options for each of its Activities, anything `workflow.execute_activity`
@@ -186,83 +184,25 @@ As in the Claude Agent SDK, the transport raises when Claude Code stops: `Proces
 exited with an error, and `CLIConnectionError` if it's gone, such as when the Worker connected to
 it went away. The transport never starts another Claude Code by itself.
 
-To finish the turn, redo it from the prompt. With `replay-user-messages`, Claude Code sends the
-prompt back with its ID once it saved it. On `CLIConnectionError`, start a new client that resumes
-the session at that prompt with `options.resume_session_at`, and tell Claude Code to continue. Claude
-Code runs the turn again, so it asks about each tool call again, however the old Claude Code
-stopped:
+To finish a turn the Worker cut off, catch `CLIConnectionError` and resume the session at the
+turn's prompt with `options.resume_session_at`. Claude Code redoes the turn and asks about each
+tool call again, so make tool calls and callbacks idempotent. Every [sample](https://github.com/temporalio/samples-python/tree/main/claude_agent_sdk_plugin#worker-restarts)
+does this, and [human_in_the_loop](https://github.com/temporalio/samples-python/tree/main/claude_agent_sdk_plugin/human_in_the_loop)
+shows it with a pending approval.
 
-```python
-from claude_agent_sdk import CLIConnectionError, ResultMessage, SystemMessage, UserMessage
+Resuming needs the session where it runs. Mount Claude Code's config directory on a volume every
+Worker shares, or use a connector that keeps sessions in a store.
 
-# The text Claude Code sends itself to continue an interrupted turn.
-CONTINUE = "Continue from where you left off."
-
-session_id = None  # Claude Code's, once it started
-prompt_id = None  # The prompt's, once Claude Code saved it
-
-while True:
-    try:
-        options = ClaudeAgentOptions(
-            # Required to receive the prompt's UUID in the response stream.
-            extra_args={"replay-user-messages": None},
-            resume=session_id if prompt_id else None,
-            resume_session_at=prompt_id,
-        )
-        async with ClaudeSDKClient(options=options, transport=TemporalTransport(options)) as client:
-            await client.query(CONTINUE if prompt_id else prompt)
-
-            async for message in client.receive_response():
-                if isinstance(message, SystemMessage) and message.subtype == "init":
-                    session_id = message.data["session_id"]
-                elif isinstance(message, UserMessage) and message.uuid and not prompt_id:
-                    prompt_id = message.uuid
-                elif isinstance(message, ResultMessage):
-                    return message.result
-
-    except CLIConnectionError:
-        # Redo the turn from the prompt if Claude Code saved it, or start again.
-        pass
-```
-
-Tool calls and callbacks from before the Worker stopped run again, so make them safe to repeat.
-
-Resuming needs the session where it runs. Mount Claude Code's
-config directory on a volume every Worker shares, or use a connector that keeps sessions in a
-store.
-
-If the Worker goes away between reads, or crashes, the Workflow notices after 30 s, the
-`schedule_to_start_timeout` of the Activities on that Worker's task queue. To notice sooner, lower
-it with `activity_options`. Too low, and a busy Worker can be mistaken for a gone one, which starts
-a second Claude Code on the same session:
-
-```python
-gone = {"schedule_to_start_timeout": timedelta(seconds=10)}
-transport = TemporalTransport(
-    options,
-    activity_options={"write": gone, "end_input": gone, "read": gone, "close": gone},
-)
-```
-
-When a Worker shuts down, the plugin closes each Claude Code that Worker is connected to, and a
-read in progress raises `CLIConnectionError` in the Workflow, so it can redo the turn. Process
-managers stop a Worker with SIGTERM, but Python exits on SIGTERM without shutting the Worker down,
-so turn it into a shutdown. Leaving
-`async with Worker(...)` waits for the plugin to stop Claude Code:
-
-```python
-async with Worker(client, task_queue="my-task-queue", workflows=[MyWorkflow], plugins=[ClaudeAgentSDKPlugin()]):
-    stop = asyncio.Event()
-    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
-    await stop.wait()
-```
+The Workflow notices a lost Worker after 30 s, the `schedule_to_start_timeout` of the Activities on
+that Worker's task queue. Lower it with `activity_options` to notice sooner, but not so low that a
+busy Worker looks gone.
 
 ### Long Conversations
 
 Claude Code's output reaches the Workflow as Activity results, so every turn adds to Workflow
 history. A long conversation eventually fills it. When `workflow.info().is_continue_as_new_suggested()`
 is true, finish the current turn, disconnect, and continue as new with the session ID. The next run
-resumes the session, as above:
+resumes the session:
 
 ```python
 await workflow.wait_condition(
