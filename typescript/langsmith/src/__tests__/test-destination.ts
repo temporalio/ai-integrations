@@ -1,8 +1,8 @@
 /**
  * Destination end-to-end. With no plugin project, runs go where LangSmith's env defaults send them unless a client-side
  * or workflow-body `traceable` names its own project or address. A misconfigured agent env traces nothing that starts
- * without a parent, while runs below a parent that names a destination still join it, ahead of a plugin project.
- * The plugin's client is a real LangSmith `Client` over a
+ * without a parent, while user runs below a parent that names a destination still join it. A plugin project outranks a
+ * parent's address on runs built outside the workflow isolate. The plugin's client is a real LangSmith `Client` over a
  * capturing `fetch`, so LangSmith's own destination rules run. Some tests load LangSmith's ESM build for the app side,
  * as an ESM app does, beside the plugin's CommonJS build.
  *
@@ -289,9 +289,12 @@ test.serial(
 );
 
 test.serial(
-  'client traceable with an address and a plugin projectName: every run inherits the parent address',
+  'client traceable with an address and a plugin projectName: runs built outside the isolate go to the plugin project',
   async (t) => {
-    for (const addTemporalRuns of [true, false]) {
+    for (const [addTemporalRuns, pluginProjectRuns] of [
+      [true, ['StartWorkflow:DestinationWorkflow']],
+      [false, ['comprehensive_activity', 'comprehensive_activity_inner', 'nexus_inner_call']],
+    ] as const) {
       const { result, runs } = await runWithEnv(
         { LANGSMITH_PROJECT: 'env-project' },
         addTemporalRuns,
@@ -302,7 +305,13 @@ test.serial(
         'plugin-project'
       );
       t.is(result, 'wf:d');
-      t.deepEqual([...new Set(runs.map((run) => run.destination))], [AGENT_ADDRESS]);
+      const destinationsOf = (name: string): (string | undefined)[] => [
+        ...new Set(runs.filter((run) => run.name === name).map((run) => run.destination)),
+      ];
+      t.deepEqual(destinationsOf('user_pipeline'), [AGENT_ADDRESS]);
+      for (const name of pluginProjectRuns) {
+        t.deepEqual(destinationsOf(name), ['plugin-project'], name);
+      }
     }
   }
 );

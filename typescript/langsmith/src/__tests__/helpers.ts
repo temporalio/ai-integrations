@@ -34,7 +34,6 @@ export interface CollectedRun {
   parent_run_id?: string;
   trace_id?: string;
   dotted_order?: string;
-  start_time?: number | string;
   inputs?: Record<string, unknown>;
   outputs?: Record<string, unknown>;
   end_time?: number | string;
@@ -42,8 +41,6 @@ export interface CollectedRun {
   tags?: string[];
   extra?: Record<string, unknown>;
   project_name?: string;
-  session_name?: string;
-  address?: string;
   events?: unknown[];
 }
 
@@ -62,12 +59,7 @@ export class InMemoryRunCollector {
       this.createOrder.push(id);
       this.byId.set(id, { id, name: String(run.name) });
     }
-    this.byId.set(id, {
-      ...this.byId.get(id)!,
-      ...(run as Partial<CollectedRun>),
-      project_name: (run.project_name ?? run.session_name) as string | undefined,
-      id,
-    });
+    this.byId.set(id, { ...this.byId.get(id)!, ...(run as Partial<CollectedRun>), id });
   };
 
   updateRun = async (id: string, update: Record<string, unknown>): Promise<void> => {

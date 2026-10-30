@@ -152,8 +152,7 @@ user_pipeline
 | ----------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | `client`          | `new Client()`    | The LangSmith client runs are emitted to. Lives only in the worker/client process — it is never serialized or sent across a Temporal boundary. |
 | `addTemporalRuns` | `false`           | Emit first-class runs for Temporal operations (`StartWorkflow:`, `RunActivity:`, `HandleSignal:`, …) in addition to your `traceable` runs.     |
-| `projectName`     | LangSmith default | Default LangSmith project for new root traces. An inherited destination takes precedence.                                                       |
-| `address`         | —                 | Agent/environment destination, mutually exclusive with `projectName`. Requires LangSmith's workspace-enabled beta feature.                    |
+| `projectName`     | LangSmith default | Target LangSmith project for emitted runs.                                                                                                     |
 | `tags`            | —                 | Tags attached to every run the plugin emits.                                                                                                   |
 | `metadata`        | —                 | Metadata merged into every run the plugin emits. Credential-looking keys are scrubbed before emission.                                         |
 
@@ -161,56 +160,6 @@ The LangSmith API key is never accepted as a plugin option and never crosses a
 Temporal boundary. Supply a pre-constructed `Client` (which reads
 `LANGSMITH_API_KEY` from the process environment) or let the plugin build a
 default client from the environment.
-
-## Agent and environment destinations
-
-With LangSmith 0.10.8 or later, send traces to an agent's environment:
-
-```typescript
-import { address } from 'langsmith';
-import { LangSmithPlugin } from '@temporalio/langsmith';
-
-const plugin = new LangSmithPlugin({
-  address: address.agent('support', 'staging'),
-});
-```
-
-Register the plugin on the Client and Worker as in the quick start. `address`
-and `projectName` are mutually exclusive. Agent addressing is a LangSmith beta
-feature that must be enabled for the workspace.
-
-Native `traceable(fn, { address: ... })` and runtime traceable configuration
-also select destinations inside Workflows, including on a child run. An
-inherited destination takes precedence over plugin defaults; explicit
-`traceable` destination options retain LangSmith's native behavior.
-Destinations follow the trace through Activities, child Workflows, and Nexus,
-including with `addTemporalRuns: false`.
-
-## Write replicas
-
-LangSmith write replicas configured on `traceable` or through
-`LANGSMITH_RUNS_ENDPOINTS` follow the trace across Temporal boundaries:
-
-```typescript
-const pipeline = traceable(runWorkflow, {
-  replicas: [
-    { projectName: 'primary', primary: true },
-    { projectName: 'audit' },
-    { address: address.agent('support', 'production') },
-  ],
-});
-```
-
-A primary replica retains the original run IDs. Secondary replicas use
-LangSmith's deterministic destination-specific IDs, with corresponding parent
-links and completion updates. Replaying Workflow history publishes no extra
-copies.
-
-Only destination identifiers, routing flags, and sanitized replica updates
-cross Temporal boundaries. Each client/worker configures its own credentials;
-matching project destinations in its local `LANGSMITH_RUNS_ENDPOINTS` supply
-their own connection settings. API keys, ingestion URLs, and client objects
-stay outside persisted trace headers.
 
 ## Where `traceable` works
 

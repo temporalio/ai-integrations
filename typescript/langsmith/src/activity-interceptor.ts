@@ -18,14 +18,13 @@ import {
   asOutputs,
   describeError,
   buildRunTree,
+  inheritedDestination,
   runActivityRunName,
   runCancelNexusHandlerRunName,
   runStartNexusHandlerRunName,
   runTreeFromContext,
-  rootRunTree,
 } from './run-tree';
 import type { EmitterConfig } from './sinks';
-import { bindReplicaCredentials, destination } from './routing';
 
 /**
  * Reconstruct the propagated parent run from a LangSmith trace context, wired to
@@ -44,11 +43,8 @@ function reconstructParentRun(config: EmitterConfig, ctx: LangSmithTraceContext 
     id: parsed.id,
     trace_id: parsed.trace_id,
     dotted_order: parsed.dotted_order,
-    start_time: parsed.start_time,
     parent_run_id: parsed.parent_run_id,
-    ...destination(parsed, { project_name: config.projectName, address: config.address }),
-    replicas: bindReplicaCredentials(parsed.replicas, config.replicas),
-    distributedParentId: parsed.distributedParentId,
+    ...inheritedDestination(config, parsed),
     client: config.client,
     // Force-enable so nested body `traceable` runs emit; tracing gate is `isTracingEnabled()`.
     tracingEnabled: true,
@@ -92,8 +88,8 @@ export function createActivityInboundInterceptor(config: EmitterConfig): Activit
       if (!config.addTemporalRuns) {
         // Propagation only: nest the user's body `traceable` runs under the
         // reconstructed parent without emitting a Temporal-operation run.
-        // Without a parent, an invisible factory supplies defaults to independent root traceables.
-        return withRunTree(parent ?? rootRunTree(config), () => next(input));
+        // No propagated parent: run the body with no ambient run by design (nothing to attach to).
+        return parent ? withRunTree(parent, () => next(input)) : next(input);
       }
       const activityType = ctx.info.activityType;
       const run = buildRunTree(config, {
@@ -127,7 +123,7 @@ export function createNexusInboundInterceptor(config: EmitterConfig): NexusInbou
     }
     const parent = reconstructParentRun(config, nexusContext(input.ctx.headers));
     if (!config.addTemporalRuns) {
-      return withRunTree(parent ?? rootRunTree(config), () => next(input));
+      return parent ? withRunTree(parent, () => next(input)) : next(input);
     }
     const run = buildRunTree(config, {
       name: nameOf(input.ctx.service, input.ctx.operation),
