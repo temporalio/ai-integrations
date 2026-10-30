@@ -49,9 +49,14 @@ func WithSequentialToolFanout() ContextOption {
 //     timestamp is deterministic and replay-stable.
 //   - uuid:  platform.NewUUID resolves to a deterministic generator seeded
 //     from the workflow's random stream (workflow.GetRandomStream), so IDs are
-//     replay-stable without emitting one history event per ID. Each model call
-//     starts a new generator, so adding or removing a tool does not move the
-//     IDs of later events, function calls and confirmations.
+//     replay-stable without emitting one history event per ID. Each
+//     TemporalModel call starts a new generator, so adding or removing a tool
+//     does not move the IDs of the events, function calls and confirmations
+//     drawn after it. This does not cover a response supplied by an ADK plugin
+//     or BeforeModelCallbacks entry, which skips the model call, or runs that
+//     share the returned context across coroutines (agent tools fanned out in
+//     parallel, say) while a toolset blocks during request preparation; there
+//     a tool change can still move those IDs.
 //   - tasks: platform.RunTasks resolves to a workflow.Go-based fan-out (or
 //     sequential execution when WithSequentialToolFanout is set), so ADK's tool
 //     fan-out never spawns real goroutines inside the workflow.
@@ -131,6 +136,15 @@ type uuidSourceKey struct{}
 // new generator at the model call leaves those draws behind, so the IDs ADK
 // draws for the response, its function calls and confirmations do not depend on
 // the tool list.
+//
+// The restart happens only in TemporalModel.GenerateContent, and one uuidSource
+// serves every coroutine that shares the NewContext context. So the tool list
+// can still move these IDs when an ADK plugin or BeforeModelCallbacks entry
+// supplies the response (no model call follows the tool draws), or when
+// concurrent runners share the context and one prepares its tools, drawing from
+// the shared generator, after another has restarted it and before that one's
+// response IDs are drawn. Removing the request-time draws needs a change in
+// ADK's toolPreprocess and toolsetPreprocess.
 //
 // Read-only contexts (query handlers, update validators, side-effect functions)
 // are live, once-per-request operations and get ordinary random UUIDs.
