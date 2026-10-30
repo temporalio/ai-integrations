@@ -411,18 +411,43 @@ class _UuidModule:
         return getattr(uuid, name)
 
 
+def _stable_child_ids(create_child: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``RunTree.create_child`` to use ``_LangChainRuns.new_id``.
+
+    Inside a LangChain step, LangChain's run is the current run tree, so
+    ``@traceable`` and ``trace`` make their runs with its ``create_child``,
+    which picks a clock-based ID.  In workflow code, a child that writes
+    through a ``_ReplaySafeClient`` and was given no ``run_id`` gets a
+    workflow-seeded ID instead, like LangChain's own runs.
+    """
+
+    def create_child_with_stable_id(
+        self: RunTree, *args: Any, run_id: Any = None, **kwargs: Any
+    ) -> RunTree:
+        if run_id is None and isinstance(self.ls_client, _ReplaySafeClient):
+            runs = _get_langchain_runs()
+            if runs is not None:
+                run_id = runs.new_id(7)
+        return create_child(self, *args, run_id=run_id, **kwargs)
+
+    return create_child_with_stable_id
+
+
 def _install_langchain_run_id_hook() -> None:
     """Make the run IDs LangChain generates in workflow code stable.
 
     LangChain's callback manager generates an ID for each run the caller
     gave none.  In workflow code these come from ``_LangChainRuns.new_id``
     instead, so the IDs LangChain's callbacks get are the IDs LangSmith
-    stores, and a replay generates them again.  A caller's own ``run_id``
-    is kept.  Safe to call more than once.
+    stores, and a replay generates them again.  The same goes for runs made
+    inside a LangChain step, such as by ``@traceable``.  A caller's own
+    ``run_id`` is kept.  Safe to call more than once.
     """
     global _langchain_run_id_hook_installed  # noqa: PLW0603
     if _langchain_run_id_hook_installed:
         return
+    _langchain_run_id_hook_installed = True
+    setattr(RunTree, "create_child", _stable_child_ids(RunTree.create_child))
     try:
         import langchain_core.callbacks.manager as manager
     except ImportError:
@@ -440,7 +465,6 @@ def _install_langchain_run_id_hook() -> None:
             "does not know; LangChain runs in workflows may be posted again on "
             "replay"
         )
-    _langchain_run_id_hook_installed = True
 
 
 def _run_headers(run_tree: RunTree) -> dict[str, str]:
