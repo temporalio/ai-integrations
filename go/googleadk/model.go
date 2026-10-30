@@ -110,6 +110,10 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 			yield(nil, err)
 			return
 		}
+		// ADK has just drawn one ID for each tool and toolset it prepared. Start
+		// a new ID generator so the IDs it draws for this response do not depend
+		// on the tool list.
+		restartUUIDs(ctx)
 		ao := m.activityOptions
 		if ao.StartToCloseTimeout == 0 {
 			ao.StartToCloseTimeout = defaultModelTimeout
