@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
 
@@ -46,10 +46,59 @@ INVOKE_TOOL = "deepagents.invoke_tool"
 # the name against this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
+from langchain_core.messages import HumanMessage, ToolMessage  # noqa: E402
+from langchain_core.tools import tool  # noqa: E402
+from langgraph.prebuilt import InjectedState  # noqa: E402
+from pydantic import BaseModel, ConfigDict  # noqa: E402
+
 
 def pairing_weather(city: str) -> str:
     """Return the weather for a city."""
     return f"weather:{city}"
+
+
+@tool
+def last_user_message(state: Annotated[dict, InjectedState]) -> str:
+    """Return the last user message from the conversation."""
+    for message in reversed(state["messages"]):
+        if isinstance(message, HumanMessage):
+            return f"user said: {message.content}"
+    return "No user messages found"
+
+
+@tool
+def message_summary(state: Annotated[dict, InjectedState]) -> str:
+    """List the conversation's message types and contents."""
+    return ",".join(
+        f"{type(m).__name__}:{getattr(m, 'content', '?')}" for m in state["messages"]
+    )
+
+
+@tool
+def saved_artifact(state: Annotated[dict, InjectedState]) -> str:
+    """Return the first tool result's artifact."""
+    for message in state["messages"]:
+        if isinstance(message, ToolMessage):
+            artifact = message.artifact
+            return f"{type(artifact).__name__}:{artifact['page_content']}"
+    return "No tool results found"
+
+
+@tool
+def echo_record(record: dict) -> str:
+    """Echo a record's tenant and marker fields."""
+    return f"{record['tenant']}:{record['__deepagents_tool_arg__']}"
+
+
+class Record(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    tenant: str
+
+
+@tool
+def echo_model(record: Record) -> str:
+    """Echo a typed record's tenant and marker fields."""
+    return f"{record.tenant}:{(record.model_extra or {})['__deepagents_tool_arg__']}"
 
 
 @activity.defn
@@ -176,6 +225,141 @@ class RepeatedToolCallWorkflow:
             state_snapshot=state_snapshot,
         )
         return str(result["messages"][-1].content)
+
+
+@workflow.defn
+class InjectedStateToolWorkflow:
+    @workflow.run
+    async def run(self, question: str) -> list[str]:
+        with workflow.unsafe.imports_passed_through():
+            from langchain_core.documents import Document
+            from langchain_core.messages import AIMessage, ChatMessage, FunctionMessage
+
+        wrapped = (
+            last_user_message,
+            message_summary,
+            saved_artifact,
+            echo_record,
+            echo_model,
+        )
+        tools = [
+            tool_as_activity(t, start_to_close_timeout=timedelta(seconds=10))
+            for t in wrapped
+        ]
+        agent = create_deep_agent(model="fake:model", tools=tools)
+        save_call = {"name": "save", "args": {}, "id": "save-call"}
+        messages = [
+            ChatMessage(role="critic", content="be brief"),
+            FunctionMessage(name="lookup", content="sunny"),
+            AIMessage(content="", tool_calls=[save_call]),
+            ToolMessage(
+                content="saved",
+                tool_call_id="save-call",
+                artifact=Document(page_content="notes", metadata={"page": 1}),
+            ),
+            HumanMessage(content=question),
+        ]
+        result = await agent.ainvoke({"messages": messages})
+        return [
+            str(m.content)
+            for m in result["messages"]
+            if m.type == "tool" and m.tool_call_id != "save-call"
+        ]
+
+
+@pytest.mark.asyncio
+async def test_wrapped_tool_reads_messages_from_injected_state(
+    env: WorkflowEnvironment,
+) -> None:
+    from langchain_core.messages import AIMessage
+
+    # Arguments that hold the marker key an earlier version of the encoding
+    # used, as a dict or as a model, reach the tool unchanged.
+    record = {"tenant": "keep", "__deepagents_tool_arg__": "ordinary value"}
+    calls = [
+        {"name": "last_user_message", "args": {}, "id": "state-call"},
+        {"name": "message_summary", "args": {}, "id": "summary-call"},
+        {"name": "saved_artifact", "args": {}, "id": "artifact-call"},
+        {"name": "echo_record", "args": {"record": record}, "id": "record-call"},
+        {"name": "echo_model", "args": {"record": record}, "id": "model-call"},
+    ]
+    responses = [AIMessage(content="", tool_calls=calls), AIMessage(content="done")]
+    plugin = DeepAgentsPlugin(model_provider=mock_model_provider(responses))
+    async with Worker(
+        env.client,
+        task_queue="da-injected-state",
+        workflows=[InjectedStateToolWorkflow],
+        plugins=[plugin],
+    ):
+        out = await env.client.execute_workflow(
+            InjectedStateToolWorkflow.run,
+            "Weather in Paris?",
+            id=f"da-injected-state-{uuid.uuid4()}",
+            task_queue="da-injected-state",
+        )
+
+    # The wrapped tools get LangChain messages, including the legacy chat and
+    # function messages, as they do without Temporal. A message's other fields,
+    # such as the tool result's Document artifact, keep their JSON form.
+    assert out == [
+        "user said: Weather in Paris?",
+        "ChatMessage:be brief,FunctionMessage:sunny,AIMessage:,ToolMessage:saved,"
+        "HumanMessage:Weather in Paris?,AIMessage:",
+        "dict:notes",
+        "keep:ordinary value",
+        "keep:ordinary value",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded", [False, True])
+async def test_invoke_tool_rebuilds_only_recorded_messages(recorded: bool) -> None:
+    from langchain_core import messages as lc_messages
+
+    from temporalio.deepagents import _serde
+    from temporalio.deepagents._activity import DeepAgentActivities, ToolActivityInput
+    from temporalio.deepagents._tools import register_tool
+    from temporalio.testing import ActivityEnvironment
+
+    converter = _serde.data_converter.payload_converter
+
+    def send(input: ToolActivityInput) -> ToolActivityInput:
+        payloads = converter.to_payloads([input])
+        return converter.from_payloads(payloads, [ToolActivityInput])[0]
+
+    register_tool(message_summary)
+    # Input from older workflow code records no messages and passes through.
+    args: dict[str, Any] = {"state": {"messages": [HumanMessage(content="hi")]}}
+    input = ToolActivityInput(
+        tool_name="message_summary", tool_call_id="c-1", args=args
+    )
+    if recorded:
+        input.arg_messages = _serde.find_tool_arg_messages(args)
+    output = await ActivityEnvironment().run(
+        DeepAgentActivities().invoke_tool, send(input)
+    )
+    expected = "HumanMessage:hi" if recorded else "dict:?"
+    assert _serde.load_object(output.message).content == expected
+
+    if recorded:
+        # Every recorded message class, chunks included, comes back.
+        chunks = [
+            lc_messages.AIMessageChunk(content="a"),
+            lc_messages.ChatMessageChunk(content="c", role="critic"),
+            lc_messages.FunctionMessageChunk(content="f", name="fn"),
+            lc_messages.HumanMessageChunk(content="h"),
+            lc_messages.SystemMessageChunk(content="s"),
+            lc_messages.ToolMessageChunk(content="t", tool_call_id="1"),
+        ]
+        input = ToolActivityInput(
+            tool_name="message_summary",
+            tool_call_id="c-2",
+            args={"chunks": chunks},
+            arg_messages=_serde.find_tool_arg_messages({"chunks": chunks}),
+        )
+        sent = send(input)
+        rebuilt = _serde.load_tool_arg_messages(sent.args, sent.arg_messages)
+        assert rebuilt == {"chunks": chunks}
 
 
 @pytest.mark.asyncio
