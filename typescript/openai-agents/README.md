@@ -513,7 +513,7 @@ Dedicated Worker startup and heartbeat failures surface as `ApplicationFailure` 
 
 ### MCP request metadata
 
-A `toolMetaResolver` builds each tool call's MCP `_meta` from the run context, which exists only in the Workflow. Pass it as the `toolMetaResolver` option of `statelessMcpServer()` or `statefulMcpServer()`; it runs in Workflow code and must be deterministic. The call-tool Activity passes its result to the server's `callTool`. The Worker skips a `toolMetaResolver` on the factory's server and logs a warning.
+A `toolMetaResolver` builds each tool call's MCP `_meta` from the run context, which exists only in the Workflow. Pass it as the `toolMetaResolver` option of `statelessMcpServer()` or `statefulMcpServer()`; it runs in Workflow code and must be deterministic. The call-tool Activity passes its result to the server's `callTool`. The Worker can't run a `toolMetaResolver` on the factory's server, so it refuses one: every MCP Activity for that server fails with a non-retryable `ApplicationFailure` of type `MCPToolMetaResolverUnsupported`.
 
 ```ts
 const server = statelessMcpServer('tickets', {
