@@ -95,7 +95,9 @@ Before its first model call, each `TemporalAgent` reads the model's `modelId` an
 
 The read is a new activity, so a run whose agent ran before you deploy this version fails to replay on it with a nondeterminism error. Let those runs finish first, or use Worker Versioning.
 
-A worker model that keeps the conversation server-side, such as `OpenAIModel` with `stateful: true`, works as it does natively: each model call gets the agent's `modelState`, such as the last response id, and the agent clears its messages after each turn. As in Strands, such an agent cannot use a `conversationManager` or `contextManager`; because `TemporalAgent` learns that the model is stateful when it reads the config, it throws at the agent's first invocation instead of at construction.
+A worker model that keeps the conversation server-side, such as `OpenAIModel` with `stateful: true`, gets the agent's `modelState`, such as the last response id, on each model call, and the agent clears its messages after each turn, as natively. As in Strands, such an agent cannot use a `conversationManager` or `contextManager`; because `TemporalAgent` learns that the model is stateful when it reads the config, it throws at the agent's first invocation instead of at construction.
+
+`OpenAIModel` calls through `TemporalAgent`, stateful or not, currently work only with `@strands-agents/sdk` releases before 1.15.0. From 1.15.0, Strands passes an `AbortSignal` in the model's stream options, the signal reaches the model activity as a plain object, and the OpenAI client fails with `signal.addEventListener is not a function` before it sends a request. Temporal retries that activity until its retry policy or timeout runs out.
 
 Stateful model calls run as their own activities, `strandsInvokeStatefulModel` and `strandsInvokeStatefulModelStreaming`. While you roll out this version, a worker running an earlier version does not register them, so it fails such a call and Temporal retries it until an upgraded worker takes it. Upgrade every worker on the task queue before a retry policy with a low `maximumAttempts` runs out, or route upgraded workflows to upgraded workers with Worker Versioning.
 
