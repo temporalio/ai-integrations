@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from strands.tools import ToolProvider
 from strands.tools.mcp import ToolFilters
@@ -37,12 +38,21 @@ class TemporalMCPClient(ToolProvider):
     (the default) the tools are re-listed on every agent turn, so an MCP server
     restarted mid-workflow (with tools added, removed, or renamed) is picked up.
     When ``True`` the tools are listed once at the beginning of the workflow and
-    reused for its lifetime.
+    reused for its lifetime. Each listing records the server's full tool list
+    in the workflow history, before ``tool_filters`` apply, so for a server
+    with many tools prefer ``cache_tools=True``.
 
     ``prefix`` and ``tool_filters`` work as on Strands' ``MCPClient``: the agent
     sees ``{prefix}_{name}``, and filters match the server's tool name. A
-    callable filter receives the workflow-side tool and runs in the workflow,
-    so it must be deterministic.
+    callable filter receives the workflow-side ``TemporalMCPTool``, a Strands
+    ``MCPAgentTool`` whose ``mcp_client`` is the durable client, and runs in the
+    workflow, so it must be deterministic.
+
+    The activity options apply to every MCP activity. With neither
+    ``start_to_close_timeout`` nor ``schedule_to_close_timeout``, a one-minute
+    ``start_to_close_timeout`` applies. The default retry policy retries a
+    failed activity, such as one whose MCP server is down, without limit; set
+    ``retry_policy`` or ``schedule_to_close_timeout`` to bound it.
 
     Construct once at module level and pass to ``TemporalAgent(tools=[...])``
     inside the workflow. Multiple handles may reference the same server name
@@ -95,7 +105,8 @@ class TemporalMCPClient(ToolProvider):
                 summary=summary,
                 priority=priority,
             ),
-            cache_tools_list=cache_tools,
+            # TemporalAgent stops calling _refresh once a cached listing is fetched.
+            cache_tools_list=False,
         )
 
     @property
@@ -146,14 +157,16 @@ def _included(tool: TemporalMCPTool, filters: ToolFilters | None) -> bool:
 
 
 def _matches(tool: TemporalMCPTool, patterns: Sequence[Any]) -> bool:
+    # Same order as Strands; like Strands, it ignores other entries.
     name = tool.mcp_tool.name
     for pattern in patterns:
-        if isinstance(pattern, str):
-            if pattern == name:
-                return True
-        elif callable(pattern):
+        if callable(pattern):
             if pattern(tool):
                 return True
-        elif pattern.match(name):
-            return True
+        elif isinstance(pattern, re.Pattern):
+            if cast("re.Pattern[str]", pattern).match(name):
+                return True
+        elif isinstance(pattern, str):
+            if pattern == name:
+                return True
     return False

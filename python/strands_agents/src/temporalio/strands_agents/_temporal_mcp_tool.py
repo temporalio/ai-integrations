@@ -1,26 +1,31 @@
 from __future__ import annotations
 
 import base64
-from typing import TYPE_CHECKING, Any
+import json
+from typing import TYPE_CHECKING, Any, cast
 
+from mcp.types import (
+    URL_ELICITATION_REQUIRED,
+    BlobResourceContents,
+    CallToolResult,
+    ElicitationRequiredErrorData,
+    EmbeddedResource,
+    ImageContent,
+    TextContent,
+    TextResourceContents,
+    Tool,
+)
+from strands.tools.mcp import MCPAgentTool
 from strands.tools.mcp.mcp_client import MIME_TO_FORMAT
 from strands.tools.mcp.mcp_types import MCPToolResult
 from strands.types._events import ToolResultEvent
-from strands.types.tools import (
-    AgentTool,
-    ToolGenerator,
-    ToolResultContent,
-    ToolSpec,
-    ToolUse,
-)
+from strands.types.tools import ToolGenerator, ToolResultContent, ToolUse
 
-from temporalio.exceptions import ActivityError
+from temporalio.exceptions import ActivityError, ApplicationError
 
 from ._temporal_activity_tool import _activity_error_event
 
 if TYPE_CHECKING:
-    from mcp.types import CallToolResult, Tool
-
     from temporalio.mcp import TemporalMCPClient as DurableMCPClient
 
 # Blob MIME types that Strands' MCPClient hands to the model as text.
@@ -33,46 +38,24 @@ _TEXT_MIME_TYPES = (
 )
 
 
-class TemporalMCPTool(AgentTool):
-    """Workflow-side stub for a single MCP tool; calls it through an activity."""
+class TemporalMCPTool(MCPAgentTool):
+    """Workflow-side stub for a single MCP tool; calls it through an activity.
+
+    It is a Strands ``MCPAgentTool`` whose ``mcp_client`` is the durable
+    ``temporalio.mcp.TemporalMCPClient``, so its name, spec and filters work as
+    in Strands.
+    """
 
     def __init__(
         self, client: DurableMCPClient, tool: Tool, prefix: str | None = None
     ) -> None:
         """Bind this tool to its server's durable client and listed MCP tool."""
-        super().__init__()
+        super().__init__(
+            tool,
+            cast(Any, client),
+            name_override=f"{prefix}_{tool.name}" if prefix else None,
+        )
         self._client = client
-        self._tool = tool
-        self._name = f"{prefix}_{tool.name}" if prefix else tool.name
-
-    @property
-    def mcp_tool(self) -> Tool:
-        """The MCP tool as the server listed it, as on Strands' ``MCPAgentTool``."""
-        return self._tool
-
-    @property
-    def tool_name(self) -> str:
-        """Name the agent sees: the MCP tool name with any client prefix."""
-        return self._name
-
-    @property
-    def tool_spec(self) -> ToolSpec:
-        """Strands ToolSpec built from the listed MCP tool, as ``MCPAgentTool`` does."""
-        spec: ToolSpec = {
-            "name": self.tool_name,
-            "description": self._tool.description
-            or f"Tool which performs {self._tool.name}",
-            "inputSchema": {"json": self._tool.input_schema},
-        }
-        if self._tool.output_schema:
-            spec["outputSchema"] = {"json": self._tool.output_schema}
-        if self._tool.annotations:
-            annotations = self._tool.annotations.model_dump(
-                by_alias=True, exclude_none=True
-            )
-            if annotations:
-                spec["annotations"] = annotations
-        return spec
 
     @property
     def tool_type(self) -> str:
@@ -86,12 +69,70 @@ class TemporalMCPTool(AgentTool):
         **kwargs: Any,
     ) -> ToolGenerator:
         """Execute the tool through the server's call-tool activity."""
-        try:
-            result = await self._client.call_tool(self._tool.name, tool_use["input"])
-        except ActivityError as error:
-            yield _activity_error_event(tool_use["toolUseId"], error)
+        tool_use_id = tool_use["toolUseId"]
+        arguments = tool_use["input"]
+        if not isinstance(arguments, dict):
+            # The MCP client would reject it only after taking the server's
+            # shared connection, and then close that connection.
+            yield ToolResultEvent(
+                _error_result(tool_use_id, "tool input must be a JSON object")
+            )
             return
-        yield ToolResultEvent(_tool_result(tool_use["toolUseId"], result))
+        try:
+            result = await self._client.call_tool(self.mcp_tool.name, arguments)
+        except ActivityError as error:
+            yield _elicitation_event(tool_use_id, error) or _activity_error_event(
+                tool_use_id, error
+            )
+            return
+        try:
+            tool_result = _tool_result(tool_use_id, result)
+        except Exception as error:
+            # Strands' MCPClient reports a result it cannot map as a failed call.
+            tool_result = _error_result(tool_use_id, str(error))
+        yield ToolResultEvent(tool_result)
+
+
+def _error_result(tool_use_id: str, message: str) -> MCPToolResult:
+    return MCPToolResult(
+        status="error",
+        toolUseId=tool_use_id,
+        content=[{"text": f"Tool execution failed: {message}"}],
+    )
+
+
+def _elicitation_event(
+    tool_use_id: str, error: ActivityError
+) -> ToolResultEvent | None:
+    """Report a URL elicitation error with its data, as Strands' ``MCPClient`` does."""
+    cause = error.__cause__
+    if not (
+        isinstance(cause, ApplicationError)
+        and cause.type == "MCPProtocolError"
+        and len(cause.details) > 1
+        and cause.details[0] == URL_ELICITATION_REQUIRED
+    ):
+        return None
+    try:
+        data = ElicitationRequiredErrorData.model_validate(cause.details[1])
+        elicitations = json.dumps(
+            [e.model_dump(exclude_none=True) for e in data.elicitations]
+        )
+    except Exception:
+        return None
+    return ToolResultEvent(
+        MCPToolResult(
+            status="error",
+            toolUseId=tool_use_id,
+            content=[
+                {
+                    "text": f"MCP Elicitation required: [{cause.message}] "
+                    f"with data {elicitations}"
+                }
+            ],
+        ),
+        exception=cause,
+    )
 
 
 def _tool_result(tool_use_id: str, result: CallToolResult) -> MCPToolResult:
@@ -114,50 +155,41 @@ def _tool_result(tool_use_id: str, result: CallToolResult) -> MCPToolResult:
 
 
 def _tool_result_content(content: Any) -> ToolResultContent | None:
-    """Map one MCP content block; drop the ones Strands' ``MCPClient`` drops.
+    """Map one MCP content block as Strands' ``MCPClient`` does.
 
-    This runs in the workflow, so data that does not decode is dropped rather
-    than raised.
+    Like Strands, it drops the blocks it does not support and raises for an
+    image whose type is not supported or whose data does not decode.
     """
-    from mcp.types import (
-        BlobResourceContents,
-        EmbeddedResource,
-        ImageContent,
-        TextContent,
-        TextResourceContents,
-    )
-
     if isinstance(content, TextContent):
         return {"text": content.text}
     if isinstance(content, ImageContent):
-        return _image(content.mime_type, content.data)
+        return {
+            "image": {
+                "format": MIME_TO_FORMAT[content.mime_type],
+                "source": {"bytes": base64.b64decode(content.data)},
+            }
+        }
     if isinstance(content, EmbeddedResource):
         resource = content.resource
         if isinstance(resource, TextResourceContents):
             return {"text": resource.text}
         if isinstance(resource, BlobResourceContents):
+            try:
+                data = base64.b64decode(resource.blob)
+            except ValueError:
+                return None
             mime_type = resource.mime_type or ""
             if (
                 mime_type.startswith("text/")
                 or mime_type in _TEXT_MIME_TYPES
                 or mime_type.endswith(("+json", "+xml"))
             ):
-                data = _decode(resource.blob)
-                return None if data is None else {"text": data.decode(errors="replace")}
-            return _image(mime_type, resource.blob)
+                return {"text": data.decode(errors="replace")}
+            if mime_type in MIME_TO_FORMAT:
+                return {
+                    "image": {
+                        "format": MIME_TO_FORMAT[mime_type],
+                        "source": {"bytes": data},
+                    }
+                }
     return None
-
-
-def _image(mime_type: str, data: str) -> ToolResultContent | None:
-    image_format = MIME_TO_FORMAT.get(mime_type)
-    raw = _decode(data)
-    if image_format is None or raw is None:
-        return None
-    return {"image": {"format": image_format, "source": {"bytes": raw}}}
-
-
-def _decode(data: str) -> bytes | None:
-    try:
-        return base64.b64decode(data)
-    except ValueError:
-        return None

@@ -1,15 +1,20 @@
+import base64
 import sys
 from datetime import timedelta
 from pathlib import Path
+from typing import Any, cast
 from uuid import uuid4
 
+import pytest
 from mcp import Client as MCPClient
 from mcp import StdioServerParameters, stdio_client
+from mcp.types import CallToolResult, ImageContent, Tool
 
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.common import RetryPolicy
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent, TemporalMCPClient
+from temporalio.strands_agents._temporal_mcp_tool import TemporalMCPTool
 from temporalio.worker import Replayer, Worker
 from tests.common import get_activities
 from tests.mock_model import MockModel
@@ -119,3 +124,46 @@ async def test_mcp_image_tool_result(client: Client, tmp_path: Path):
         workflows=[MCPImageWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+class _ImageServer:
+    """Stands in for the durable client: returns one image from call_tool."""
+
+    def __init__(self, image: ImageContent) -> None:
+        self._image = image
+
+    async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> CallToolResult:
+        return CallToolResult(content=[self._image])
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "data", "error"),
+    [
+        ("image/svg+xml", base64.b64encode(b"<svg/>").decode(), "'image/svg+xml'"),
+        ("image/png", "abc", "Incorrect padding"),
+    ],
+)
+async def test_mcp_image_that_does_not_map_fails_the_call(
+    mime_type: str, data: str, error: str
+) -> None:
+    """As in Strands' MCPClient, the model gets a failed call, not an empty success."""
+    image = ImageContent(type="image", mime_type=mime_type, data=data)
+    tool = TemporalMCPTool(
+        cast(Any, _ImageServer(image)),
+        Tool(name="screenshot", input_schema={"type": "object"}),
+    )
+
+    events = [
+        event
+        async for event in tool.stream(
+            {"toolUseId": "t1", "name": "screenshot", "input": {}}, {}
+        )
+    ]
+
+    assert [event.tool_result for event in events] == [
+        {
+            "status": "error",
+            "toolUseId": "t1",
+            "content": [{"text": f"Tool execution failed: {error}"}],
+        }
+    ]

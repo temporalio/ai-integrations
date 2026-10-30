@@ -2,14 +2,14 @@ import re
 import sys
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
 from mcp import Client as MCPClient
 from mcp import StdioServerParameters, stdio_client
 from mcp.types import Tool, ToolAnnotations
-from strands.tools.mcp import ToolFilters
+from strands.tools.mcp import MCPAgentTool, ToolFilters
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -65,6 +65,10 @@ def test_tools_without_prefix_keep_the_server_name() -> None:
         ({"allowed": ["echo"]}, ["echo"]),
         ({"allowed": [re.compile("ot")]}, ["other"]),
         ({"rejected": [lambda tool: tool.tool_name == "gh_echo"]}, ["other"]),
+        # Callables get the tool Strands' MCPClient would give them.
+        ({"allowed": [lambda tool: isinstance(tool, MCPAgentTool)]}, ["echo", "other"]),
+        # Like Strands, entries of another type are ignored.
+        (cast(Any, {"allowed": [None, "echo"]}), ["echo"]),
     ],
 )
 def test_tool_filters_still_match_the_server_name_when_prefixed(
