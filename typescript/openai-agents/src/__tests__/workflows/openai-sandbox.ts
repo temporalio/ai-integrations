@@ -1,6 +1,7 @@
-import { Agent, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
+import { Agent, tool, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
 import {
   Capability,
+  Environment,
   Manifest,
   SandboxAgent,
   isEnvValueReference,
@@ -117,6 +118,52 @@ export async function sandboxApprovalResumeWorkflow(): Promise<string> {
   for (const interruption of result.interruptions) result.state.approve(interruption);
 
   const resumed = await runner.run(agent, result.state, { runConfig });
+  return `${resumed.finalOutput}`;
+}
+
+/**
+ * A root agent pauses for approval before it hands off to a `SandboxAgent`. Then the target's manifest
+ * environment entry or its `runAs` user changes in place, and the resume must create the sandbox with the
+ * new value.
+ */
+export async function sandboxHandoffConfigResumeWorkflow(change: 'environment' | 'runAs'): Promise<string> {
+  const target = new SandboxAgent({
+    name: 'sandbox_target',
+    model: 'gpt-4o-mini',
+    capabilities: [new TestSandboxCapability()],
+    defaultManifest: new Manifest({
+      entries: { 'data.bin': { type: 'file', content: new Uint8Array([0, 1, 2]) } },
+      environment: { VERSION: 'before' },
+    }),
+    runAs: { name: 'before' },
+  });
+  const root = new Agent({
+    name: 'root',
+    model: 'gpt-4o-mini',
+    tools: [
+      tool({
+        name: 'confirm',
+        description: 'confirm',
+        parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+        needsApproval: true,
+        execute: async () => 'confirmed',
+      }),
+    ],
+    handoffs: [target],
+  });
+  const runner = new TemporalOpenAIRunner();
+  const runConfig = { sandbox: { client: temporalSandboxClient('fake') } };
+
+  const result = await runner.run(root, 'go', { runConfig });
+  if (result.interruptions.length === 0) return 'no-interruption';
+  if (change === 'environment') {
+    target.defaultManifest!.environment.VERSION = new Environment('after');
+  } else {
+    (target.runAs as { name: string }).name = 'after';
+  }
+  for (const interruption of result.interruptions) result.state.approve(interruption);
+
+  const resumed = await runner.run(root, result.state, { runConfig });
   return `${resumed.finalOutput}`;
 }
 

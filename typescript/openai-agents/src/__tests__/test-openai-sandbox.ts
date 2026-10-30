@@ -11,6 +11,7 @@ import {
   sandboxApprovalResumeWorkflow,
   sandboxArchiveLimitsWorkflow,
   sandboxExecWorkflow,
+  sandboxHandoffConfigResumeWorkflow,
   sandboxManifestResumeWorkflow,
   sandboxValidationWorkflow,
 } from './workflows/openai-sandbox';
@@ -112,6 +113,40 @@ test.serial('a SandboxAgent whose manifest carries a workerEnvValue survives an 
   }
 
   t.true(client.resumeCalls >= 1, 'the preserved session is re-established through resume()');
+});
+
+test('a SandboxAgent manifest or runAs change before the resume reaches the sandbox', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  const client = new FakeSandboxClient();
+  const responses = () => [
+    toolCallResponse('confirm', {}),
+    toolCallResponse('transfer_to_sandbox_target', {}),
+    toolCallResponse('run_command', { cmd: 'echo hello' }),
+    textResponse('Done.'),
+  ];
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([...responses(), ...responses()]),
+        modelParams: { startToCloseTimeout: '30s' },
+        sandboxClientProviders: [new SandboxClientProvider('fake', client)],
+      }),
+    ],
+  });
+
+  const users = () => client.session.state.manifest.users.map((user) => user.name);
+  await worker.runUntil(async () => {
+    t.is(await executeWorkflow(sandboxHandoffConfigResumeWorkflow, { args: ['environment'] }), 'Done.');
+    t.is(client.createCalls.length, 1);
+    t.is(client.session.state.environment?.VERSION, 'after');
+    t.deepEqual(users(), ['before']);
+
+    t.is(await executeWorkflow(sandboxHandoffConfigResumeWorkflow, { args: ['runAs'] }), 'Done.');
+    t.is(client.createCalls.length, 2);
+    t.is(client.session.state.environment?.VERSION, 'before');
+    t.deepEqual(users(), ['after']);
+  });
 });
 
 test('setArchiveLimits is forwarded to the persistWorkspace and hydrateWorkspace Activities', async (t) => {
