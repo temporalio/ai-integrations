@@ -96,8 +96,8 @@ def strands_failure_converter_class(
     ``StrandsFailureConverterWithEncodedAttributes``, so failure messages and stack
     traces stay encoded. Every other class is replaced with
     ``StrandsFailureConverter``, including one that sets ``encode_common_attributes``
-    in its own ``__init__``. Neither keeps the caller's ``from_failure``, so the
-    failures that Workflow code reads stay the same.
+    in its own ``__init__``. The caller's own ``to_failure`` and ``from_failure``
+    never run, so the failures that Workflow code reads stay the same.
     """
     if isinstance(base, type) and issubclass(
         base, DefaultFailureConverterWithEncodedAttributes
