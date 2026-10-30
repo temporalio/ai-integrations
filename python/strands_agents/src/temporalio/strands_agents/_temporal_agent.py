@@ -1,4 +1,8 @@
 import asyncio
+import contextlib
+import contextvars
+import sys
+from collections.abc import AsyncGenerator, Callable, Generator
 from datetime import timedelta
 from typing import Any
 
@@ -41,6 +45,63 @@ class _WorkflowConcurrencyController(_ConcurrencyController):
         if registered_token is not None:
             self._inflight = _WorkflowInflightInvocation()
         return waiting_on, registered_token
+
+
+# Strands runs a sync tool function with asyncio.to_thread in these modules.
+_SYNC_TOOL_MODULES = ("strands.tools.decorator", "strands.tools.tools")
+
+# True while a TemporalAgent runs its event loop, which calls its tools.
+_in_agent_loop: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_in_agent_loop", default=False
+)
+
+
+@contextlib.contextmanager
+def _inline_sync_tools() -> Generator[None, None, None]:
+    """Run the sync tools called in this scope directly in the Workflow.
+
+    Strands runs a sync tool function with ``asyncio.to_thread``. The Workflow
+    event loop has no threads, so the tool failed before its body ran and the
+    model got ``Error: NotImplementedError - ``. Tools are not changed, only how
+    the loop runs that call.
+    """
+    _run_sync_tool_calls_inline(asyncio.get_running_loop())
+    token = _in_agent_loop.set(True)
+    try:
+        yield
+    finally:
+        _in_agent_loop.reset(token)
+
+
+def _run_sync_tool_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
+    """Make the Workflow loop run a sync tool's thread call inline."""
+    if getattr(loop, "_runs_sync_tools_inline", False):
+        return
+    run_in_executor = loop.run_in_executor
+
+    def inline_run_in_executor(
+        executor: Any, func: Callable[..., Any], *args: Any
+    ) -> asyncio.Future[Any]:
+        if not (_in_agent_loop.get() and _called_by_sync_tool(sys._getframe(1))):
+            return run_in_executor(executor, func, *args)
+        future = loop.create_future()
+        future.set_result(func(*args))
+        return future
+
+    setattr(loop, "run_in_executor", inline_run_in_executor)
+    setattr(loop, "_runs_sync_tools_inline", True)
+
+
+def _called_by_sync_tool(frame: Any) -> bool:
+    """Whether this is ``asyncio.to_thread`` called by Strands to run a sync tool.
+
+    Those are the only ``asyncio.to_thread`` calls in ``_SYNC_TOOL_MODULES``.
+    """
+    return (
+        frame.f_code is asyncio.to_thread.__code__
+        and frame.f_back is not None
+        and frame.f_back.f_globals.get("__name__") in _SYNC_TOOL_MODULES
+    )
 
 
 class TemporalAgent(Agent):
@@ -174,6 +235,19 @@ class TemporalAgent(Agent):
         if self._temporal_model.stateful:
             self._use_server_side_state()
         return await super()._convert_prompt_to_messages(prompt)
+
+    async def _run_loop(self, *args: Any, **kwargs: Any) -> AsyncGenerator[Any, None]:
+        """Run Strands' event loop, with sync tools run directly in the Workflow.
+
+        Every invocation runs its tools in this loop, also when the agent is a
+        ``Graph`` or ``Swarm`` node or another agent's tool.
+        """
+        with _inline_sync_tools():
+            async with contextlib.aclosing(
+                super()._run_loop(*args, **kwargs)
+            ) as events:
+                async for event in events:
+                    yield event
 
     def _use_server_side_state(self) -> None:
         # What Strands' Agent does at construction for a stateful model, which

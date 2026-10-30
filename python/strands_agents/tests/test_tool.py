@@ -13,7 +13,7 @@ from temporalio.client import Client
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
 from temporalio.strands_agents.workflow import activity_as_tool
 from temporalio.worker import Replayer, Worker
-from tests.common import get_activities
+from tests.common import get_activities, get_tool_results
 from tests.mock_model import MockModel
 
 
@@ -112,6 +112,8 @@ async def test_tool(client: Client, tmp_path: Path):
         # letter_counter (in-workflow)
         "invoke_model",
     ]
+    # The model got the result of letter_counter, a sync tool run in the workflow.
+    assert get_tool_results(history)[-1] == [{"text": "3"}]
 
     await Replayer(
         workflows=[ToolWorkflow],
