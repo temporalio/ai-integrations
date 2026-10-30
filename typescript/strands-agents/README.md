@@ -128,18 +128,21 @@ If your worker lists one of these errors in `workflowFailureErrorTypes`, the run
 
 ## Cancellation
 
-The model gets the model activity's cancellation signal as `cancelSignal`. Cancelling the activity, through a cancellation scope or a workflow cancel, aborts the model call and ends the activity as cancelled. The worker learns of the cancellation through the activity's heartbeats, which the model activities send only when `activityOptions.heartbeatTimeout` is set:
+The model gets the model activity's cancellation signal as `cancelSignal`. Once the worker learns that the activity was cancelled, the signal aborts the model call and the activity ends as cancelled. The worker learns of the cancellation through the activity's heartbeats, which the model activities send only when `activityOptions.heartbeatTimeout` is set. Without a `heartbeatTimeout`, the model call runs to completion after its activity is cancelled. `agent.cancel()` in workflow code does not cancel the model activity.
+
+Through `TemporalAgent`, cancelling the workflow during a model call has a known limitation. Strands wraps the activity's cancellation in a `ModelError`, which fails the workflow task, so the workflow keeps retrying that task instead of ending as cancelled. With the default `TRY_CANCEL` cancellation type, the failed task also discards the request to cancel the activity, so the model call is never aborted. To abort the model call, also set `cancellationType` to `WAIT_CANCELLATION_COMPLETED`. The cancel request is then committed before Strands sees the result, but the workflow task still fails afterward:
 
 ```ts
+import { ActivityCancellationType } from '@temporalio/workflow';
+
 new TemporalAgent({
   activityOptions: {
     startToCloseTimeout: '60 seconds',
     heartbeatTimeout: '10 seconds',
+    cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
   },
 });
 ```
-
-Without a `heartbeatTimeout`, the model call runs to completion after its activity is cancelled. `agent.cancel()` in workflow code does not cancel the model activity.
 
 ## Snapshots
 

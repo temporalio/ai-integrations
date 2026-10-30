@@ -58,7 +58,11 @@ export interface TemporalAgentOptions extends Omit<AgentConfig, 'model' | 'retry
  *
  * Cancelling a model activity aborts the model call only when
  * `activityOptions.heartbeatTimeout` is set: the worker learns of the
- * cancellation through the activity's heartbeats.
+ * cancellation through the activity's heartbeats. A workflow cancel during a
+ * model call fails the workflow task, because Strands wraps the cancellation
+ * in a `ModelError`. With the default `TRY_CANCEL` cancellation type, that
+ * failed task discards the activity-cancel request, so the model call is
+ * aborted only with `WAIT_CANCELLATION_COMPLETED`.
  */
 export class TemporalAgent extends Agent {
   private readonly managerGiven: boolean;
