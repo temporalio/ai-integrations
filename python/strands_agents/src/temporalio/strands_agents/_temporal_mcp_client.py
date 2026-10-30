@@ -15,6 +15,7 @@ from strands.types.tools import AgentTool
 
 from temporalio import activity, workflow
 from temporalio.common import Priority, RetryPolicy
+from temporalio.exceptions import ApplicationError
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from ._bytes_values import encode_tool_result
@@ -33,14 +34,24 @@ class _MCPToolInfo:
     annotations: dict[str, Any] | None = None
 
 
-class MCPToolNameConflictError(ValueError):
+class MCPToolNameConflictError(  # pyright: ignore[reportUnsafeMultipleInheritance]
+    ApplicationError, ValueError
+):
     """An MCP tool has the name of another tool of the same agent.
 
     ``TemporalAgent`` raises it before a model call when a listed tool's name,
-    or the name with ``-`` and ``_`` swapped, is taken. ``StrandsPlugin`` fails
-    the Workflow when it escapes Workflow code, instead of retrying the
-    Workflow Task.
+    or the name with ``-`` and ``_`` swapped, is taken. It is a non-retryable
+    ``ApplicationError``, so it fails the Workflow when it escapes Workflow
+    code, instead of retrying the Workflow Task, whether ``StrandsPlugin`` is
+    on the client or only on the Worker.
     """
+
+    def __init__(self, message: str) -> None:
+        """Initialize the error with Strands' message and the tools' sources."""
+        super().__init__(message, type="MCPToolNameConflictError", non_retryable=True)
+        # ApplicationError puts the type before the message in str(); keep the
+        # message as Strands words it.
+        self.args = (message,)
 
 
 @dataclass
@@ -119,6 +130,7 @@ class TemporalMCPClient(ToolProvider):
         be listed here. ``TemporalAgent`` adds them from a
         ``BeforeModelCallEvent`` hook, which lists them by calling ``_refresh``
         and checks their names, for an agent built before or after a listing.
+        Until its first model call, an agent has none of these tools.
         """
         return []
 

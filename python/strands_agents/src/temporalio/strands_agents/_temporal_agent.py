@@ -7,6 +7,7 @@ from strands import Agent
 from strands.agent._concurrency import _ConcurrencyController, _InflightInvocation
 from strands.agent.conversation_manager import NullConversationManager
 from strands.hooks import BeforeModelCallEvent
+from strands.tools.registry import ToolRegistry
 from strands.types._events import TypedEvent
 from strands.types.agent import AgentInput
 from strands.types.content import Messages
@@ -65,13 +66,19 @@ def _duplicate_tool_name(
 
 def _check_mcp_tools(
     listings: dict[TemporalMCPClient, list[AgentTool]],
-    held: dict[str, str],
-    dynamic: set[str],
+    reg: ToolRegistry,
+    mcp_names: set[str],
 ) -> None:
     # The rule ToolRegistry.register_tool() applies, for the turn's tools
     # against each other and the agent's other tools, before the registry
     # changes: a name may not be taken, nor differ from a taken one only by '-'
-    # or '_'.
+    # or '_'. The other tools are read from the registry now, since a Signal
+    # handler can add one while a listing runs. Dynamic tools' names (such as
+    # structured output's) are compared exactly, as Strands does.
+    held = {
+        name.replace("-", "_"): name for name in reg.registry if name not in mcp_names
+    }
+    dynamic = set(reg.dynamic_tools) - mcp_names
     seen: dict[str, tuple[str, TemporalMCPClient]] = {}
     for provider, tools in listings.items():
         for tool in tools:
@@ -198,17 +205,9 @@ class TemporalAgent(Agent):
         # List the providers that are due in order, as one hook per provider
         # did, and check the listings so far after each one, so a refused turn
         # lists no further. Then apply the turn's tools together, so a name can
-        # move from one server to another in one turn.
+        # move from one server to another in one turn. The last check runs
+        # after the last listing, with no await before the registry changes.
         reg = event.agent.tool_registry
-        # The agent's other tools. Strands compares a new name with the
-        # registry's names also with '-' and '_' swapped, and with dynamic tools'
-        # names (such as structured output's) exactly.
-        held = {
-            name.replace("-", "_"): name
-            for name in reg.registry
-            if name not in self._mcp_names
-        }
-        dynamic = set(reg.dynamic_tools) - self._mcp_names
         listings: dict[TemporalMCPClient, list[AgentTool]] = {}
         for provider in self._mcp_providers:
             if not (provider._cache_tools and provider._fetched):
@@ -216,7 +215,7 @@ class TemporalAgent(Agent):
             # Read now: another agent sharing the provider may list it again
             # while this one waits for the next listing.
             listings[provider] = provider._tools
-            _check_mcp_tools(listings, held, dynamic)
+            _check_mcp_tools(listings, reg, self._mcp_names)
         new = {tool.tool_name for tools in listings.values() for tool in tools}
         # Tools the servers dropped or renamed since the last turn. There is no
         # public unregister, so remove them from the registry directly.
@@ -238,10 +237,8 @@ class TemporalAgent(Agent):
     ) -> AsyncGenerator[TypedEvent, None]:
         # After a tool call, Strands runs the next model call inside the last
         # cycle and wraps most errors from it in EventLoopException. Raise a
-        # tool name conflict as itself, so Workflow code can catch it and
-        # StrandsPlugin fails the Workflow with it. Close Strands' generator
-        # here too: its cleanup runs the AfterInvocationEvent hooks, which may
-        # await when the stream is closed early.
+        # tool name conflict as itself, so Workflow code can catch it and it
+        # fails the Workflow as a non-retryable ApplicationError.
         events = super()._run_loop(*args, **kwargs)
         try:
             async for event in events:
@@ -251,6 +248,9 @@ class TemporalAgent(Agent):
                 raise err.__cause__ from None
             raise
         finally:
+            # Close Strands' loop as stream_async closes this one, so its
+            # cleanup, such as AfterInvocationEvent hooks, finishes before a
+            # closed stream returns.
             await events.aclose()
 
     async def _convert_prompt_to_messages(self, prompt: AgentInput) -> Messages:

@@ -15,6 +15,7 @@ from strands.tools.mcp.mcp_client import MCPClient
 
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowFailureError
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 from temporalio.strands_agents import (
     MCPToolNameConflictError,
@@ -378,7 +379,8 @@ class MCPTwoServersUncaughtWorkflow:
 async def test_mcp_duplicate_tool_names_are_refused(client: Client):
     """Two servers that list the same tool name on one agent raise, as in Strands.
 
-    Uncaught, the error fails the Workflow instead of retrying its Workflow Task.
+    Uncaught, the error fails the Workflow instead of retrying its Workflow Task,
+    and is non-retryable with the plugin only on the Worker.
     """
     task_queue = f"test_mcp_duplicate_tool_names_are_refused-{uuid4()}"
     plugin = StrandsPlugin(
@@ -414,6 +416,7 @@ async def test_mcp_duplicate_tool_names_are_refused(client: Client):
     cause = exc_info.value.cause
     assert isinstance(cause, ApplicationError)
     assert cause.type == "MCPToolNameConflictError"
+    assert cause.non_retryable
 
     history = await handle.fetch_history()
     assert get_activities(history) == [
@@ -562,41 +565,51 @@ class MCPConflictAfterToolWorkflow:
             return f"refused: {err}"
 
 
-async def test_mcp_conflict_after_a_tool_call(client: Client):
-    """A refusal after a tool call reaches Workflow code as itself, not wrapped by Strands."""
+@pytest.mark.parametrize("plugin_on", ["worker", "client"])
+async def test_mcp_conflict_after_a_tool_call(client: Client, plugin_on: str):
+    """A refusal after a tool call reaches Workflow code as itself, not wrapped by Strands.
+
+    Uncaught, it fails the Workflow without a retry, with the plugin on the
+    Worker only or on the client.
+    """
     task_queue = f"test_mcp_conflict_after_a_tool_call-{uuid4()}"
     plugin = StrandsPlugin(
         models={"mock": lambda: MockModel([{"name": "ping", "input": {}}] * 2)}
     )
-    # The failure converter that makes the error non-retryable comes from the
-    # plugin's data converter, which the Worker reads from the client config.
-    config = client.config()
-    config["plugins"] = [*config["plugins"], plugin]
-    client = Client(**config)
+    worker_plugins = [plugin]
+    if plugin_on == "client":
+        config = client.config()
+        config["plugins"] = [*config["plugins"], plugin]
+        client = Client(**config)
+        worker_plugins = []
 
     async with Worker(
         client,
         task_queue=task_queue,
         workflows=[MCPConflictAfterToolWorkflow],
         activities=[_late_list_tools],
+        plugins=worker_plugins,
         max_cached_workflows=0,
     ):
         for catch in (True, False):
-            run = client.execute_workflow(
+            handle = await client.start_workflow(
                 MCPConflictAfterToolWorkflow.run,
                 catch,
                 id=f"test_mcp_conflict_after_a_tool_call_{catch}_{uuid4()}",
                 task_queue=task_queue,
                 execution_timeout=timedelta(seconds=20),
+                retry_policy=RetryPolicy(maximum_attempts=2),
             )
             if catch:
-                assert (await run).startswith(
+                assert (await handle.result()).startswith(
                     "refused: Tool name 'ping' already exists. "
                     "MCP server 'late' lists it"
                 )
                 continue
             with pytest.raises(WorkflowFailureError) as exc_info:
-                await run
+                await handle.result()
+            latest = await client.get_workflow_handle(handle.id).describe()
+            assert latest.run_id == handle.first_execution_run_id
     cause = exc_info.value.cause
     assert isinstance(cause, ApplicationError)
     assert cause.type == "MCPToolNameConflictError"
@@ -952,3 +965,34 @@ async def test_mcp_tool_named_like_a_dynamic_tool_is_refused(
     monkeypatch.setattr(a, "_refresh", _listing(a, "foo-bar"))
     await _before_model_call(agent)
     assert _sources(agent, a) == {"foo-bar": "a"}
+
+
+async def test_mcp_tool_added_while_listing_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A tool added while a listing runs, as by a Signal handler, counts when the turn is checked."""
+    a = TemporalMCPClient("a")
+    b = TemporalMCPClient("b")
+    agent = TemporalAgent(model="m", tools=[a, b])
+    listing_b = _listing(b, "echo")
+
+    async def b_while_signal_adds_echo() -> None:
+        agent.tool_registry.register_tool(_local_echo)
+        await listing_b()
+
+    monkeypatch.setattr(a, "_refresh", _listing(a, "safe"))
+    monkeypatch.setattr(b, "_refresh", b_while_signal_adds_echo)
+    with pytest.raises(
+        MCPToolNameConflictError, match="MCP server 'b' lists it, and another tool"
+    ):
+        await _before_model_call(agent)
+    assert agent.tool_registry.registry == {"echo": _local_echo}
+
+    # A tool removed while a listing runs no longer holds its name.
+    async def b_while_echo_is_removed() -> None:
+        agent.tool_registry.registry.pop("echo")
+        await listing_b()
+
+    monkeypatch.setattr(b, "_refresh", b_while_echo_is_removed)
+    await _before_model_call(agent)
+    assert _sources(agent, a, b) == {"safe": "a", "echo": "b"}

@@ -19,7 +19,6 @@ from ._failure_converter import StrandsFailureConverter
 from ._model_activity import ModelActivity
 from ._sandbox_activity import SandboxActivities, SandboxFactory
 from ._temporal_mcp_client import (
-    MCPToolNameConflictError,
     _evict_connection,
     build_call_tool_activity,
     build_list_tools_activity,
@@ -142,14 +141,9 @@ class StrandsPlugin(SimplePlugin):
             workflow_runner=_workflow_runner,
             data_converter=_data_converter,
             activities=activities or None,
-            # Strands re-raises ContextWindowOverflowException when its conversation
-            # manager cannot reduce the context any further, and a duplicate tool name
-            # replays the same listing; fail the workflow instead of retrying the task
-            # forever.
-            workflow_failure_exception_types=[
-                ContextWindowOverflowException,
-                MCPToolNameConflictError,
-            ],
+            # Strands re-raises this when its conversation manager cannot reduce the
+            # context any further; fail the workflow instead of retrying the task forever.
+            workflow_failure_exception_types=[ContextWindowOverflowException],
             run_context=run_context,
         )
 
