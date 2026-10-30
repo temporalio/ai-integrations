@@ -7,8 +7,6 @@ import type { McpClientFactories } from './mcp';
 
 /**
  * Options for the AI SDK plugin
- *
- * @experimental The AI SDK plugin is an experimental feature; APIs may change without notice.
  */
 export interface AiSdkPluginOptions {
   modelProvider: ProviderV4;
@@ -36,8 +34,6 @@ export interface AiSdkPluginOptions {
  *
  * Workflow code should import from `@temporalio/vercel-ai-sdk/workflow` (not the package root) so the
  * workflow bundle doesn't pull in the worker-side activities and their disallowed imports.
- *
- * @experimental The AI SDK plugin is an experimental feature; APIs may change without notice.
  */
 export class AiSdkPlugin extends SimplePlugin {
   constructor(options: AiSdkPluginOptions) {

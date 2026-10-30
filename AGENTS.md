@@ -27,21 +27,21 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 |---|---|---|---|---|
 | `python/mcp` | `temporalio-mcp` | 0.1.0 | Pre-release | `temporalio.mcp` |
 | `python/deepagents` | `temporalio-deepagents` | 0.0.1 | Pre-release | `temporalio.deepagents` |
-| `python/google_adk` | `temporalio-google-adk` | 0.0.1 | Pre-release | `temporalio.google_adk` |
-| `python/google_genai` | `temporalio-google-genai` | 0.1.0 | Public Preview | `temporalio.google_genai` |
-| `python/langgraph` | `temporalio-langgraph` | 0.1.0 | Public Preview | `temporalio.langgraph` |
-| `python/langsmith` | `temporalio-langsmith` | 0.1.0 | Public Preview | `temporalio.langsmith` |
+| `python/google_adk` | `temporalio-google-adk` | 0.0.1 | Generally Available | `temporalio.google_adk` |
+| `python/google_genai` | `temporalio-google-genai` | 0.1.0 | Generally Available | `temporalio.google_genai` |
+| `python/langgraph` | `temporalio-langgraph` | 0.1.0 | Generally Available | `temporalio.langgraph` |
+| `python/langsmith` | `temporalio-langsmith` | 0.1.0 | Generally Available | `temporalio.langsmith` |
 | `python/openai_agents` | `temporalio-openai-agents` | 1.0.0 | Generally Available | `temporalio.openai_agents` |
-| `python/strands_agents` | `temporalio-strands-agents` | 0.1.0 | Public Preview | `temporalio.strands_agents` |
+| `python/strands_agents` | `temporalio-strands-agents` | 0.1.0 | Generally Available | `temporalio.strands_agents` |
 | `python/typesafe` | `temporalio-typesafe` | 0.0.1 | Pre-release | `temporalio.typesafe` |
 | `typescript/vercel-ai-sdk` | `@temporalio/vercel-ai-sdk` | 1.0.0 | Generally Available | `@temporalio/vercel-ai-sdk` |
-| `typescript/google-adk` | `@temporalio/google-adk` | 0.1.0 | Public Preview | `@temporalio/google-adk` |
-| `typescript/langsmith` | `@temporalio/langsmith` | continues (1.24.0 next) | Public Preview | `@temporalio/langsmith` |
+| `typescript/google-adk` | `@temporalio/google-adk` | 0.1.0 | Generally Available | `@temporalio/google-adk` |
+| `typescript/langsmith` | `@temporalio/langsmith` | continues (1.24.0 next) | Generally Available | `@temporalio/langsmith` |
 | `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
-| `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
+| `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/strands-agents` |
 | `java/spring-ai` | `io.temporal:spring-ai` | 0.1.0 | Public Preview | `io.temporal.springai` |
 | `java/google-adk` | `io.temporal:google-adk` | 0.1.0 | Public Preview | `io.temporal.googleadk` |
-| `go/googleadk` | `go.temporal.io/googleadk` | 0.1.0 (new coordinate) | Public Preview | `googleadk` |
+| `go/googleadk` | `go.temporal.io/googleadk` | 0.1.0 (new coordinate) | Generally Available | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
 version policy (below). Go plugins use `go.temporal.io/<name>` module paths and live under

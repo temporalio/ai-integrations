@@ -1,9 +1,5 @@
 """First-class Temporal integration for the Google Gemini SDK.
 
-.. warning::
-    This module is experimental and may change in future versions.
-    Use with caution in production environments.
-
 This integration lets you use the Gemini SDK's async client with full
 automatic function calling (AFC) support. Every API call becomes a
 **durable Temporal activity**. Tools default to plain workflow methods

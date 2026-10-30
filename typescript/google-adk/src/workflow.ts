@@ -2,8 +2,6 @@
  * Workflow-safe API for the Google ADK Temporal plugin — importable from
  * Workflow code running in the V8 sandbox.
  *
- * @experimental The Google ADK plugin is an experimental feature; APIs may change without notice.
- *
  * @module
  */
 

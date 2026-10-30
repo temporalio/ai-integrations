@@ -1,6 +1,6 @@
 # @temporalio/google-adk
 
-Release stage: Public Preview.
+Release stage: Generally Available.
 
 Run [Google Agent Development Kit](https://github.com/google/adk-js) (`@google/adk`)
 agents as durable [Temporal](https://temporal.io) Workflows.

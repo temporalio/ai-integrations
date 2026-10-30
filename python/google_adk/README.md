@@ -1,6 +1,6 @@
 # Google ADK Agents SDK Integration for Temporal
 
-> Release stage: [Pre-release](https://docs.temporal.io/develop/python/integrations/google-adk).
+> Release stage: [Generally Available](https://docs.temporal.io/develop/python/integrations/google-adk).
 
 This package provides the integration layer between the Google ADK and Temporal. It allows ADK Agents to run reliably within Temporal Workflows by ensuring determinism and correctly routing external calls (network I/O) through Temporal Activities.
 

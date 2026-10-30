@@ -1,6 +1,6 @@
 # Strands Agents
 
-Release stage: Pre-release.
+Release stage: Generally Available.
 
 This Temporal [Plugin](https://docs.temporal.io/develop/plugins-guide) allows you to run [Strands Agents](https://strandsagents.com/) inside Temporal Workflows, routing model invocations, tool calls, and MCP tool calls through Temporal Activities for durable execution, Temporal-managed retries, and timeouts.
 

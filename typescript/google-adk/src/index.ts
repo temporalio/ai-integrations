@@ -1,8 +1,6 @@
 /**
  * Worker-side API for the Google ADK Temporal plugin.
  *
- * @experimental The Google ADK plugin is an experimental feature; APIs may change without notice.
- *
  * @module
  */
 

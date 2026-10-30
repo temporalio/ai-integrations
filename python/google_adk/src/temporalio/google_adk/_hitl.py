@@ -40,10 +40,6 @@ _KIND_BY_FUNCTION_CALL_NAME: dict[str, Literal["input", "tool_confirmation"]] = 
 class HitlRequest:
     """A pending human-in-the-loop request extracted from an ADK event.
 
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
-
     Attributes:
         kind: ``"input"`` for a human-input node's ``RequestInput``,
             ``"tool_confirmation"`` for a tool confirmation request.
@@ -73,10 +69,6 @@ class HitlRequest:
 
 def pending_hitl_requests(event: Event) -> list[HitlRequest]:
     """Extracts pending human-in-the-loop requests from an ADK event.
-
-    .. warning::
-        This function is experimental and may change in future versions.
-        Use with caution in production environments.
 
     Call this on each event yielded by ``runner.run_async``. A non-empty
     result means the run is pausing for the returned requests; once
@@ -137,10 +129,6 @@ def pending_hitl_requests(event: Event) -> list[HitlRequest]:
 def hitl_input_response(interrupt_id: str, response: Any) -> types.Part:
     """Builds the message part answering a human-input (``RequestInput``) request.
 
-    .. warning::
-        This function is experimental and may change in future versions.
-        Use with caution in production environments.
-
     Compose one or more parts into ``types.Content(role="user", parts=[...])``
     and pass it as ``new_message`` to ``runner.run_async`` to resume the
     paused run. Non-mapping values are wrapped as ``{"result": value}`` per
@@ -167,10 +155,6 @@ def hitl_confirmation_response(
     interrupt_id: str, *, confirmed: bool, payload: Any | None = None
 ) -> types.Part:
     """Builds the message part answering a tool-confirmation request.
-
-    .. warning::
-        This function is experimental and may change in future versions.
-        Use with caution in production environments.
 
     Compose one or more parts into ``types.Content(role="user", parts=[...])``
     and pass it as ``new_message`` to ``runner.run_async`` to resume the
