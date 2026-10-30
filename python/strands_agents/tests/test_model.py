@@ -24,6 +24,8 @@ from temporalio.strands_agents import StrandsPlugin, TemporalAgent
 from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.worker import Replayer, Worker
 from tests.common import (
+    blocking_hook,
+    blocking_hooks,
     blocking_lookup,
     blocking_mcp_call_tool,
     blocking_tool,
@@ -462,12 +464,14 @@ class CompressionWorkflow:
         summarizer_tool: str | None = None,
         executor: str = "concurrent",
     ) -> None:
-        # A summarization agent with a blocking "activity" or "mcp" tool.
+        # A summarization agent with a blocking "activity" or "mcp" tool, or
+        # a blocking "hook" after its tool.
         summarizer = (
             TemporalAgent(
                 model="summarizer",
                 start_to_close_timeout=timedelta(seconds=15),
                 tools=[blocking_tool(summarizer_tool)],
+                hooks=blocking_hooks(summarizer_tool),
                 tool_executor=SequentialToolExecutor()
                 if executor == "sequential"
                 else ConcurrentToolExecutor(),
@@ -582,6 +586,8 @@ class BlockingSummaryModel(UsageMockModel):
         ("activity", "sequential"),
         ("mcp", "concurrent"),
         ("mcp", "sequential"),
+        ("hook", "concurrent"),
+        ("hook", "sequential"),
     ],
 )
 async def test_cancel_during_summary_cancels_the_run(
@@ -589,7 +595,8 @@ async def test_cancel_during_summary_cancels_the_run(
 ):
     """A cancel while the summary runs ends the run instead of failing the summary.
 
-    The summary is blocked in the agent's model or in a summarization agent's tool.
+    The summary is blocked in the agent's model, or in a summarization agent's tool
+    or the hook after it.
     """
     task_queue = f"test_cancel_during_summary-{uuid4()}"
     if summarizer_tool:
@@ -612,7 +619,7 @@ async def test_cancel_during_summary_cancels_the_run(
         client,
         task_queue=task_queue,
         workflows=[CompressionWorkflow],
-        activities=[blocking_lookup, blocking_mcp_call_tool],
+        activities=[blocking_lookup, blocking_mcp_call_tool, blocking_hook],
         plugins=[plugin],
         max_cached_workflows=0,
     ):
@@ -640,8 +647,13 @@ async def test_cancel_during_summary_cancels_the_run(
             ["turn 1"],
             ["turn 1", "Please summarize this conversation."],
         ]
+    history = await handle.fetch_history()
+    # The cancelled hook is not run again for a failed tool call.
+    assert get_activities(history).count("blocking_hook") == (
+        1 if summarizer_tool == "hook" else 0
+    )
     await Replayer(workflows=[CompressionWorkflow], plugins=[plugin]).replay_workflow(
-        await handle.fetch_history()
+        history
     )
 
 

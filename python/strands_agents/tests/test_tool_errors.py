@@ -21,10 +21,13 @@ from temporalio.strands_agents._temporal_mcp_tool import TemporalMCPTool
 from temporalio.strands_agents.workflow import activity_as_tool
 from temporalio.worker import Replayer, Worker
 from tests.common import (
+    blocking_hook,
+    blocking_hooks,
     blocking_lookup,
     blocking_mcp_call_tool,
     blocking_tool,
     blocking_tool_started,
+    get_activities,
 )
 from tests.mock_model import MockModel
 
@@ -188,6 +191,7 @@ class _BlockingToolWorkflow:
             model="mock",
             start_to_close_timeout=timedelta(seconds=15),
             tools=[blocking_tool(kind)],
+            hooks=blocking_hooks(kind),
             tool_executor=SequentialToolExecutor()
             if executor == "sequential"
             else ConcurrentToolExecutor(),
@@ -196,11 +200,14 @@ class _BlockingToolWorkflow:
 
 
 @pytest.mark.parametrize("executor", ["concurrent", "sequential"])
-@pytest.mark.parametrize("kind", ["activity", "mcp"])
+@pytest.mark.parametrize("kind", ["activity", "mcp", "hook"])
 async def test_cancelled_tool_cancels_the_run(
     client: Client, kind: str, executor: str
 ) -> None:
-    """A cancel while a tool activity runs ends the run, not just the tool call."""
+    """A cancel while a tool activity runs ends the run, not just the tool call.
+
+    With "hook", the cancel comes while an ``AfterToolCallEvent`` hook activity runs.
+    """
     _MODEL_TOOL_RESULTS.clear()
     blocking_tool_started.clear()
     task_queue = f"test_cancelled_tool-{uuid4()}"
@@ -216,7 +223,7 @@ async def test_cancelled_tool_cancels_the_run(
         client,
         task_queue=task_queue,
         workflows=[_BlockingToolWorkflow],
-        activities=[blocking_lookup, blocking_mcp_call_tool],
+        activities=[blocking_lookup, blocking_mcp_call_tool, blocking_hook],
         plugins=[plugin],
         max_cached_workflows=0,
     ):
@@ -235,6 +242,11 @@ async def test_cancelled_tool_cancels_the_run(
     assert isinstance(exc_info.value.cause, CancelledError)
     # The model never got a result for the cancelled tool call.
     assert _MODEL_TOOL_RESULTS == []
+    history = await handle.fetch_history()
+    # The cancelled hook is not run again for a failed tool call.
+    assert get_activities(history).count("blocking_hook") == (
+        1 if kind == "hook" else 0
+    )
     await Replayer(workflows=[_BlockingToolWorkflow], plugins=[plugin]).replay_workflow(
-        await handle.fetch_history()
+        history
     )
