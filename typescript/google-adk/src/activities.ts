@@ -29,7 +29,7 @@ import { ApplicationFailure, CancelledFailure } from '@temporalio/common';
 // what counts as an abort (it is a structural check, not `instanceof Error`).
 import { isAbortError } from '@temporalio/common/lib/type-helpers';
 import { Context as ActivityContext } from '@temporalio/activity';
-import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
+import { FlushTimeoutError, WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 
 import {
   MCP_ERROR_FAILURE_TYPE,
@@ -115,6 +115,8 @@ export function createModelActivities(options: ModelActivitiesOptions = {}): Mod
       const abortSignal = ActivityContext.current().cancellationSignal;
       const stopHeartbeat = startAdaptiveHeartbeat();
       let stream: ReturnType<typeof WorkflowStreamClient.fromWithinActivity> | undefined;
+      let publishFailure: ApplicationFailure | undefined;
+      const responses: LlmResponse[] = [];
       try {
         stream = WorkflowStreamClient.fromWithinActivity({
           batchInterval: args.batchInterval ?? DEFAULT_STREAM_BATCH_INTERVAL,
@@ -122,26 +124,31 @@ export function createModelActivities(options: ModelActivitiesOptions = {}): Mod
         const events = stream.topic<LlmResponse>(args.streamingTopic);
         const model = resolveModel(args.model);
         const request = fromWireRequest(args.request);
-        const responses: LlmResponse[] = [];
         for await (const response of model.generateContentAsync(request, true, abortSignal)) {
           // Heartbeat per chunk so a slow stream isn't mistaken for a stuck worker.
           ActivityContext.current().heartbeat();
           events.publish(response);
           responses.push(response);
         }
-        return responses;
       } catch (err) {
         rethrowIfCancelled(err, abortSignal);
         throw toApplicationFailure(err);
       } finally {
         try {
+          // Sends what is left; throws when a batch of the stream was not published.
           await stream?.[Symbol.asyncDispose]();
-        } catch {
-          /* a dispose failure must not mask the primary result/error */
+        } catch (err) {
+          // Thrown below, only when the model call succeeded: it must not mask the model's error.
+          publishFailure = streamPublishFailure(err, args);
         } finally {
           stopHeartbeat();
         }
       }
+      if (publishFailure) {
+        rethrowIfCancelled(publishFailure.cause, abortSignal);
+        throw publishFailure;
+      }
+      return responses;
     },
   };
 }
@@ -458,6 +465,31 @@ export function toApplicationFailure(err: unknown, baseType: string = MODEL_ERRO
     type: status !== undefined ? `${baseType}.${status}` : baseType,
     nonRetryable: !retryable,
     nextRetryDelay: parseRetryAfter(headers),
+  });
+}
+
+/** The gRPC status code `INVALID_ARGUMENT`. */
+const GRPC_INVALID_ARGUMENT = 3;
+
+/**
+ * The failure for a streamed model call that succeeded while a batch of its
+ * stream was not published (`err` is what the stream client's dispose threw).
+ * A retry calls the model again, so it is non-retryable when that retry would
+ * fail the same way: the server refused the batch as invalid (gRPC
+ * `INVALID_ARGUMENT`, as for a batch over its payload size limit), or the
+ * background flusher already retried the batch for its `maxRetryDuration` and
+ * dropped it (`FlushTimeoutError`). Anything else, such as a send during a
+ * server outage, stays retryable.
+ */
+function streamPublishFailure(err: unknown, args: InvokeModelStreamingArgs): ApplicationFailure {
+  const chain = [...causeChain(err)];
+  return ApplicationFailure.create({
+    message:
+      `Could not publish the stream of model '${args.model}' to topic '${args.streamingTopic}': ` +
+      chain.map((e) => e.message).join(': '),
+    type: MODEL_ERROR_FAILURE_TYPE,
+    nonRetryable: err instanceof FlushTimeoutError || chain.some((e) => e.code === GRPC_INVALID_ARGUMENT),
+    cause: err instanceof Error ? err : undefined,
   });
 }
 
