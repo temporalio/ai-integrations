@@ -9,6 +9,7 @@ import random
 import threading
 import uuid
 import weakref
+from collections import OrderedDict
 from collections.abc import Callable, Generator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
@@ -597,6 +598,9 @@ def _prepare_write(
     return holding.held
 
 
+# How many open runs a _ReplaySafeClient remembers posting.
+_MAX_OPEN_RUNS = 10_000
+
 _replay_safe_clients: weakref.WeakValueDictionary[int, _ReplaySafeClient] = (
     weakref.WeakValueDictionary()
 )
@@ -637,8 +641,10 @@ class _ReplaySafeClient:
     def __init__(self, client: langsmith.Client) -> None:
         """Wrap a LangSmith client."""
         self._client = client
-        # Runs this client posted from workflow code that have not ended.
-        self._open: set[uuid.UUID] = set()
+        # Runs this client posted from workflow code that have not ended,
+        # oldest first.  A run that never ends here, such as one whose
+        # workflow was terminated, is dropped after _MAX_OPEN_RUNS others.
+        self._open: OrderedDict[uuid.UUID, None] = OrderedDict()
 
     def __getattr__(self, name: str) -> Any:
         """Delegate attribute access to the wrapped client."""
@@ -661,7 +667,7 @@ class _ReplaySafeClient:
         self._post_pending(runs)
         self._client.create_run(**kwargs)
         if not ended:
-            self._open.add(run_id)
+            self._add_open(run_id)
         return None
 
     def update_run(self, *args: Any, **kwargs: Any) -> None:
@@ -679,8 +685,13 @@ class _ReplaySafeClient:
         self._post_pending(runs)
         self._client.update_run(**kwargs)
         if ended:
-            self._open.discard(run_id)
+            self._open.pop(run_id, None)
         return None
+
+    def _add_open(self, run_id: uuid.UUID) -> None:
+        self._open[run_id] = None
+        if len(self._open) > _MAX_OPEN_RUNS:
+            self._open.popitem(last=False)
 
     def _post_pending(self, runs: _LangChainRuns) -> None:
         # The held writes already went through the client's synchronous
@@ -692,7 +703,7 @@ class _ReplaySafeClient:
         for run_id, held in pending:
             if run_id in self._open:
                 continue
-            self._open.add(run_id)
+            self._add_open(run_id)
             for write in held:
                 try:
                     _write_held(self._client, write)
