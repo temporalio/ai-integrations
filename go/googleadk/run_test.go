@@ -27,6 +27,7 @@ import (
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/server/adka2a/v2"
 	"google.golang.org/adk/v2/tool"
 
 	"go.temporal.io/googleadk"
@@ -147,13 +148,14 @@ func (i bearerInterceptor) Before(ctx context.Context, req *a2aclient.Request) (
 // refuses, or a client the card cannot make, fails the SendA2AMessage Activity
 // once, without retries, and the turn ends as it would without Temporal: ADK
 // turns the error into an event.
-// The last case is the control for the HTTP 401 one: the caller's
-// A2AClientFactory adds the credentials and the remote agent answers.
+// The last case is the control for the HTTP 401 ones: the caller's
+// A2AClientFactory adds the right credentials and the remote agent answers.
 func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		server    a2aServer
 		factory   *a2aclient.Factory
+		sse       bool
 		wantError string
 		wantText  string
 	}{
@@ -174,28 +176,28 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 			server:    a2aServer{REST: true, Front: failA2ARequests(0, http.StatusBadRequest, "application/json", restA2AErrorBody(a2a.ErrInvalidParams))},
 			wantError: "invalid params",
 		},
-		{name: "REST A2A error", server: a2aServer{REST: true, Reply: a2aReply(nil, a2a.ErrInvalidParams)}, wantError: "invalid params"},
+		{name: "REST A2A error in the stream", server: a2aServer{REST: true, Reply: a2aReply(nil, a2a.ErrInvalidParams)}, sse: true, wantError: "invalid params"},
 		{
-			name:      "REST A2A error from a non-streaming agent",
-			server:    a2aServer{REST: true, NoStreaming: true, Reply: a2aReply(nil, diagnosticA2AError(1<<10))},
+			name:      "REST A2A error, 1 KiB of details",
+			server:    a2aServer{REST: true, Reply: a2aReply(nil, diagnosticA2AError(1<<10))},
 			wantError: "agent failed",
 		},
 		{
 			// The body is longer than any limit on reading it would be.
-			name:      "REST A2A error from a non-streaming agent, 2 MiB of details",
-			server:    a2aServer{REST: true, NoStreaming: true, Reply: a2aReply(nil, diagnosticA2AError(2<<20))},
+			name:      "REST A2A error, 2 MiB of details",
+			server:    a2aServer{REST: true, Reply: a2aReply(nil, diagnosticA2AError(2<<20))},
 			wantError: "agent failed",
 		},
 		{
 			// Diagnostic details whose fields are not strings, beside the
 			// A2A ErrorInfo.
-			name:      "REST A2A error from a non-streaming agent, object domain in details",
-			server:    a2aServer{REST: true, NoStreaming: true, Reply: a2aReply(nil, a2a.NewError(a2a.ErrInternalError, "remote rejected").WithDetails(map[string]any{"domain": map[string]any{"service": "remote"}}))},
+			name:      "REST A2A error, object domain in details",
+			server:    a2aServer{REST: true, Reply: a2aReply(nil, a2a.NewError(a2a.ErrInternalError, "remote rejected").WithDetails(map[string]any{"domain": map[string]any{"service": "remote"}}))},
 			wantError: "remote rejected",
 		},
 		{
-			name:      "REST A2A error from a non-streaming agent, numeric domain in details",
-			server:    a2aServer{REST: true, NoStreaming: true, Reply: a2aReply(nil, a2a.NewError(a2a.ErrInternalError, "remote rejected").WithDetails(map[string]any{"domain": 17}))},
+			name:      "REST A2A error, numeric domain in details",
+			server:    a2aServer{REST: true, Reply: a2aReply(nil, a2a.NewError(a2a.ErrInternalError, "remote rejected").WithDetails(map[string]any{"domain": 17}))},
 			wantError: "remote rejected",
 		},
 		{
@@ -229,9 +231,15 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 			wantError: "internal error",
 		},
 		{
+			name:      "wrong credentials from the A2AClientFactory",
+			server:    a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), Token: "secret"},
+			factory:   googleadk.NewA2AClientFactory(a2aclient.WithCallInterceptors(bearerInterceptor{token: "expired"})),
+			wantError: "401 Unauthorized",
+		},
+		{
 			name:     "credentials from the A2AClientFactory",
 			server:   a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), Token: "secret"},
-			factory:  a2aclient.NewFactory(a2aclient.WithCallInterceptors(bearerInterceptor{token: "secret"})),
+			factory:  googleadk.NewA2AClientFactory(a2aclient.WithCallInterceptors(bearerInterceptor{token: "secret"})),
 			wantText: "remote answer",
 		},
 	} {
@@ -247,6 +255,7 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 				ModelName:   "root-model",
 				UserMessage: "ask the remote agent",
 				SubAgents:   []subAgentSpec{remoteSubAgent(url)},
+				SSE:         tc.sse,
 			})
 
 			require.True(t, env.IsWorkflowCompleted())
@@ -437,10 +446,11 @@ func restA2AErrorBody(err error) string {
 
 // TestRemoteSubAgentStreaming proves a streamed reply reaches ADK through one
 // SendA2AMessage Activity, with the chunks of an artifact merged so the result
-// grows with the reply rather than with the number of chunks, and that an
-// error after the first events comes back with those events instead of a
-// retry that would send the message again: ADK keeps them, records the error
-// and cancels the unfinished task, as without Temporal.
+// grows with the reply rather than with the number of chunks, and an ADK
+// server's final events kept apart and its partial ones dropped. It also
+// proves an error after the first events comes back with those events instead
+// of a retry that would send the message again: ADK keeps them, records the
+// error and cancels the unfinished task, as without Temporal.
 func TestRemoteSubAgentStreaming(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -471,6 +481,32 @@ func TestRemoteSubAgentStreaming(t *testing.T) {
 			// Unmerged, ADK would also yield the partial chunks "Hello",
 			// ", world" and "!".
 			wantTexts: []string{"Hello, world!"},
+		},
+		{
+			name: "ADK server events",
+			server: a2aServer{Reply: func(ec *a2asrv.ExecutorContext, yield func(a2a.Event, error) bool) {
+				events := []a2a.Event{a2a.NewSubmittedTask(ec, ec.Message)}
+				var partialID, finalID a2a.ArtifactID
+				for _, step := range []string{"Step 1 done", "Step 2 done"} {
+					for _, chunk := range []string{step[:4], step[4:]} {
+						ev := adkArtifactEvent(ec, partialID, true, chunk)
+						partialID = ev.Artifact.ID
+						events = append(events, ev)
+					}
+					ev := adkArtifactEvent(ec, finalID, false, step)
+					finalID = ev.Artifact.ID
+					events = append(events, ev)
+				}
+				for _, ev := range append(events, a2a.NewStatusUpdateEvent(ec, a2a.TaskStateCompleted, nil)) {
+					if !yield(ev, nil) {
+						return
+					}
+				}
+			}},
+			// Merged, the final events would become "Step 1 doneStep 2 done";
+			// kept, the partial chunks would add "Step", " 1 done", "Step" and
+			// " 2 done".
+			wantTexts: []string{"Step 1 done", "Step 2 done"},
 		},
 		{
 			name: "error after events",
@@ -532,6 +568,19 @@ func TestRemoteSubAgentStreaming(t *testing.T) {
 			assert.Equal(t, tc.wantCancel, counter.get(googleadk.CancelA2ATaskActivityName), "ADK cancels a task the run leaves unfinished")
 		})
 	}
+}
+
+// adkArtifactEvent is an artifact update as an ADK server sends it in its
+// default output mode, with ADK's partial flag. The partial chunks of a run
+// replace one artifact, and its final events are appended to another.
+func adkArtifactEvent(ec *a2asrv.ExecutorContext, id a2a.ArtifactID, partial bool, text string) *a2a.TaskArtifactUpdateEvent {
+	ev := a2a.NewArtifactEvent(ec, a2a.NewTextPart(text))
+	if id != "" {
+		ev = a2a.NewArtifactUpdateEvent(ec, id, a2a.NewTextPart(text))
+		ev.Append = !partial
+	}
+	ev.Metadata = map[string]any{adka2a.ToA2AMetaKey("partial"): partial}
+	return ev
 }
 
 // errorModel is a model.LLM that always fails with a genai.APIError of the given

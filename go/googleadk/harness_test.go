@@ -92,9 +92,6 @@ type a2aServer struct {
 	// AlsoRESTPath, when set, makes the card also name a REST interface at
 	// that path, after the first one.
 	AlsoRESTPath string
-	// NoStreaming makes the card say the agent does not stream, so the
-	// client sends message:send and an A2A error comes as an HTTP error.
-	NoStreaming bool
 }
 
 // streamErrorHandler ends every stream with an error after its first n events.
@@ -154,7 +151,7 @@ func startA2AServer(t *testing.T, cfg a2aServer) (string, *atomic.Int32) {
 			URL: srv.URL + path, ProtocolBinding: binding, ProtocolVersion: a2a.Version,
 		}},
 		DefaultInputModes: []string{"text/plain"}, DefaultOutputModes: []string{"text/plain"},
-		Capabilities: a2a.AgentCapabilities{Streaming: !cfg.NoStreaming},
+		Capabilities: a2a.AgentCapabilities{Streaming: true},
 	}
 	if cfg.AlsoRESTPath != "" {
 		card.SupportedInterfaces = append(card.SupportedInterfaces, &a2a.AgentInterface{
@@ -189,7 +186,9 @@ type runInput struct {
 	PerModelTimeouts map[string]time.Duration
 	UseCustomSummary bool
 	// SSE runs ADK in streaming mode without a model streaming topic: model
-	// calls still return one response, and a remote A2A agent streams.
+	// calls still return one response, and a remote A2A agent streams. Without
+	// it, the run uses agent.StreamingModeNone, the only mode in which ADK
+	// does not stream to a remote A2A agent.
 	SSE bool
 	// SequentialRoot makes the root a sequential agent of the sub-agents
 	// instead of an LLM agent.
@@ -311,7 +310,7 @@ func runAgent(ctx workflow.Context, b agentBuild) (runResult, error) {
 		return runResult{}, err
 	}
 
-	runCfg := agent.RunConfig{}
+	runCfg := agent.RunConfig{StreamingMode: agent.StreamingModeNone}
 	if b.sse {
 		runCfg.StreamingMode = agent.StreamingModeSSE
 	}

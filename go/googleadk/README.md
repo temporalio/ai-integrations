@@ -209,23 +209,33 @@ the model SDK's own retries (see below), or override the fallbacks.
   provider, the card provider fetches the card on every run of the agent; set a
   static `AgentCard` to skip the fetch.
   - The Activities build a2a-go's JSON-RPC and REST clients with no HTTP timeout
-    of their own, so the Activity's timeouts bound each call. Set
-    `Config.A2AClientFactory` to use your own `a2aclient.Factory`, for example
-    with call interceptors that add credentials. It then uses its own HTTP
+    of their own, so the Activity's timeouts bound each call. To add options,
+    such as call interceptors that add credentials, set
+    `Config.A2AClientFactory` to `googleadk.NewA2AClientFactory(opts...)`, which
+    keeps those clients. Any other `a2aclient.Factory` uses its own HTTP
     clients: a2a-go's defaults stop every call at 3 minutes and report an HTTP
     error status only as text, which the plugin retries.
-  - A call that fails with an HTTP status follows the rule under **Typed
-    failures**. An A2A error
-    the remote agent answers with is not retried; ADK turns it into an error
-    event. A send that times out or fails on the network is retried, which sends
-    the message again, so set a `StartToCloseTimeout` longer than the remote
-    agent takes to answer.
-  - A streamed reply reaches the workflow when the stream ends, with the chunks
-    of each artifact merged. If the stream fails after its first events, the
+  - A zero `StartToCloseTimeout` falls back to one minute, and with no
+    `RetryPolicy` Temporal retries without limit. A call that fails with an HTTP
+    status follows the rule under **Typed failures**. An A2A error the remote
+    agent answers with is not retried; ADK turns it into an error event. A send
+    that times out or fails on the network is retried, which sends the message
+    again and starts another remote task, so set a `StartToCloseTimeout` longer
+    than the remote agent takes to answer. The same happens when the Worker
+    stops, or the Activity is paused or reset, during a send. A card file
+    missing on the worker is retried too.
+  - ADK streams the send unless the run's `StreamingMode` is
+    `agent.StreamingModeNone`, so the zero `RunConfig` streams too. A streamed
+    reply reaches the workflow when the stream ends, with the chunks of each
+    artifact merged. The partial events of an ADK server are dropped, since ADK
+    saves none of them. If the stream fails after its first events, the
     workflow gets those events and the error, without a retry, and ADK cancels
-    the unfinished task as it does without Temporal. A cancellation gets 5
-    seconds and one attempt, and still goes out after the workflow is
-    cancelled.
+    the unfinished task as it does without Temporal.
+  - A cancellation gets a single 5-second attempt, and still goes out after the
+    workflow is cancelled. Cancelling the workflow while a send is in flight
+    does not cancel the remote task: the send's result is dropped, and ADK
+    cancels only a task it has seen, so the remote agent finishes it on its
+    own.
   - The client sets the message ID from the workflow's random stream when it
     sends. ADK's `BeforeRequestCallbacks` run earlier and see a2a-go's random
     ID, which differs on every replay.

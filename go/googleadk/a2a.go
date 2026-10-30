@@ -29,6 +29,7 @@ import (
 	remoteagent "google.golang.org/adk/v2/agent/remoteagent/v2"
 	"google.golang.org/adk/v2/platform"
 	"google.golang.org/adk/v2/plugin"
+	"google.golang.org/adk/v2/server/adka2a/v2"
 )
 
 // a2aCancelTimeout bounds the cancellation ADK sends for a remote task a run
@@ -43,8 +44,14 @@ const a2aCancelTimeout = 5 * time.Second
 //	remote, err := remoteagent.NewA2A(remoteagent.A2AConfig{
 //		Name:              "remote",
 //		AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, workflow.ActivityOptions{}),
-//		ClientProvider:    googleadk.NewA2AClientProvider(workflow.ActivityOptions{}),
+//		ClientProvider: googleadk.NewA2AClientProvider(workflow.ActivityOptions{
+//			StartToCloseTimeout: 10 * time.Minute,
+//		}),
 //	})
+//
+// A zero StartToCloseTimeout in ao falls back to one minute, and with no
+// RetryPolicy Temporal retries a failed fetch without limit, including a card
+// file missing on the worker, which another worker or a redeploy can supply.
 func NewA2AAgentCardProvider(source string, ao workflow.ActivityOptions) remoteagent.AgentCardProvider {
 	// A method value, not a func literal, so remoteAgentSendsFromWorkflow can
 	// recognize it: a func literal gets a new code pointer when inlined.
@@ -70,8 +77,13 @@ func (p a2aCardProvider) resolve(ctx context.Context) (*a2a.AgentCard, error) {
 
 // NewA2AClientProvider returns a ClientProvider for ADK's remote A2A agent
 // (remoteagent.NewA2A) whose client sends each message in the SendA2AMessage
-// Activity and each cancellation in CancelA2ATask. A cancellation gets 5
-// seconds and one attempt, as in ADK, whatever ao says.
+// Activity and each cancellation in CancelA2ATask.
+//
+// A zero StartToCloseTimeout in ao falls back to one minute, and with no
+// RetryPolicy Temporal retries without limit. A send that times out is sent
+// again and starts another remote task, so set a StartToCloseTimeout longer
+// than the remote agent takes to answer. A cancellation gets a single
+// 5-second attempt, as in ADK; the rest of ao applies to it.
 //
 // The client sets the message ID from the workflow's random stream when it
 // sends. ADK's BeforeRequestCallbacks run earlier and see the random ID a2a-go
@@ -125,7 +137,7 @@ func (c *a2aClient) SendStreamingMessage(ctx context.Context, req *a2a.SendMessa
 			}
 		}
 		if res.Error != "" {
-			yield(nil, errors.New(res.Error))
+			yield(nil, newApplicationError(ErrorTypeA2A, false, nil, "%s", res.Error))
 		}
 	}
 }
@@ -156,7 +168,6 @@ func (c *a2aClient) CancelTask(ctx context.Context, req *a2a.CancelTaskRequest) 
 	wfCtx, _ = workflow.NewDisconnectedContext(wfCtx)
 	ao := c.activityOptions
 	ao.StartToCloseTimeout = a2aCancelTimeout
-	ao.ScheduleToCloseTimeout = a2aCancelTimeout
 	ao.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 1}
 	var task a2a.Task
 	in := a2aCancelInput{Card: c.card, Request: req}
@@ -235,14 +246,20 @@ func (a *Activities) SendA2AMessage(ctx context.Context, in a2aSendInput) (a2aSe
 			return a2aSendResult{Events: []a2a.StreamResponse{{Event: reply}}}, nil
 		}
 		var res a2aSendResult
+		answered := false
 		for ev, err := range client.SendStreamingMessage(ctx, in.Request) {
-			if err != nil && len(res.Events) == 0 {
+			// The attempt fails, and Temporal retries it, when the stream
+			// fails before the remote agent answers, or when this worker ended
+			// the call: it stopped, or the Activity was paused, reset or timed
+			// out.
+			if err != nil && (!answered || ctx.Err() != nil) {
 				return a2aSendResult{}, err
 			}
 			if err != nil {
 				res.Error = fmt.Sprintf("send A2A message: %v", err)
 				return res, nil
 			}
+			answered = true
 			res.Events = appendA2AEvent(res.Events, ev)
 		}
 		return res, nil
@@ -311,9 +328,17 @@ func a2aClientError(err error) error {
 // the artifact of the event before it is merged into that event, so the result
 // grows with the reply rather than with the number of chunks. ADK joins the
 // chunks of an artifact into one event either way.
+//
+// An ADK server marks its events with ADK's partial flag, and ADK passes them
+// on one by one, so they are not merged. The partial ones are dropped: ADK
+// saves none of them, and the server sends their content again in a final
+// event.
 func appendA2AEvent(events []a2a.StreamResponse, ev a2a.Event) []a2a.StreamResponse {
 	chunk, ok := ev.(*a2a.TaskArtifactUpdateEvent)
-	if ok && chunk.Append && chunk.Artifact != nil && len(events) > 0 {
+	if ok && adka2a.IsPartial(chunk.Metadata) {
+		return events
+	}
+	if ok && chunk.Append && chunk.Artifact != nil && len(events) > 0 && !adka2a.IsPartialFlagSet(chunk.Metadata) {
 		last, ok := events[len(events)-1].Event.(*a2a.TaskArtifactUpdateEvent)
 		if ok && !last.LastChunk && last.Artifact != nil && last.TaskID == chunk.TaskID &&
 			last.Artifact.ID == chunk.Artifact.ID &&
@@ -379,10 +404,18 @@ func a2aRetryable(err error) bool {
 	return retryable
 }
 
+// NewA2AClientFactory returns the factory the A2A Activities use by default,
+// with opts added, for Config.A2AClientFactory. Use it to add options such as
+// call interceptors that add credentials, while keeping the default
+// transports. An option that sets a transport replaces the default one for its
+// protocol.
+func NewA2AClientFactory(opts ...a2aclient.FactoryOption) *a2aclient.Factory {
+	return a2aclient.WithAdditionalOptions(defaultA2AClientFactory, opts...)
+}
+
 // defaultA2AClientFactory builds the A2A clients when Config.A2AClientFactory
 // is nil: a2a-go's JSON-RPC and REST transports over HTTP clients with no
-// timeout of their own, so the Activity's timeouts bound each call. a2a-go's
-// own default client stops every call at 3 minutes.
+// timeout of their own, so the Activity's timeouts bound each call.
 var defaultA2AClientFactory = a2aclient.NewFactory(
 	a2aclient.WithJSONRPCTransport(&http.Client{Transport: a2aStatusTransport{}}),
 	a2aclient.WithRESTTransport(&http.Client{Transport: a2aStatusTransport{keepA2AErrors: true}}),

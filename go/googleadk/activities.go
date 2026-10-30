@@ -88,10 +88,11 @@ type Config struct {
 	MCPToolsets map[string]MCPFactory
 
 	// A2AClientFactory builds the a2a-go clients the SendA2AMessage and
-	// CancelA2ATask Activities use, for example with call interceptors that
-	// add credentials. When nil, the Activities use a2a-go's JSON-RPC and REST
-	// transports over HTTP clients with no timeout of their own, so the
-	// Activity's timeouts bound each call. A factory of your own uses its own
+	// CancelA2ATask Activities use. When nil, the Activities use a2a-go's
+	// JSON-RPC and REST transports over HTTP clients with no timeout of their
+	// own, so the Activity's timeouts bound each call. Build it with
+	// NewA2AClientFactory to add options to those transports, for example call
+	// interceptors that add credentials. A factory built otherwise uses its own
 	// transports: a2a-go's default ones stop every call at 3 minutes, and an
 	// HTTP error status they report as text is retried.
 	A2AClientFactory *a2aclient.Factory
