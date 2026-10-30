@@ -69,11 +69,22 @@ class ToolContextSnapshot:
     function_call_id: str | None = None
 
 
+def _strip_annotated(annotation: Any) -> Any:
+    """Returns the type under ``Annotated[...]``, as ADK sees it."""
+    if typing.get_origin(annotation) is typing.Annotated:
+        return typing.get_args(annotation)[0]
+    return annotation
+
+
 def _annotation_members(annotation: Any) -> tuple[Any, ...]:
-    """Returns a union annotation's members, or the annotation itself."""
+    """Returns a union annotation's members, or the annotation itself.
+
+    ``Annotated`` metadata is dropped, at the top and in each member.
+    """
+    annotation = _strip_annotated(annotation)
     origin = typing.get_origin(annotation)
     if origin is typing.Union or origin is types.UnionType:  # pyright: ignore[reportDeprecated]
-        return typing.get_args(annotation)
+        return tuple(map(_strip_annotated, typing.get_args(annotation)))
     return (annotation,)
 
 
@@ -245,9 +256,15 @@ def _tool_signature(
     params = list(signature.parameters.values())
     # Drop the receiver of a method passed as Class.method the way the SDK does:
     # a first parameter named `self` that is unannotated or annotated
-    # `typing.Self`. The worker's registered instance supplies it.
+    # `typing.Self`. The worker's registered instance supplies it. Only a
+    # function defined in a class body is such a method: a module-level or
+    # nested function's `self` is an input the model must fill.
+    qualname = getattr(activity_def, "__qualname__", "").split(".")
     if (
-        params
+        inspect.isfunction(activity_def)
+        and len(qualname) > 1
+        and qualname[-2] != "<locals>"
+        and params
         and params[0].name == "self"
         and (
             params[0].annotation is inspect.Parameter.empty
@@ -304,6 +321,16 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     """
     signature, hints, doc = _tool_signature(activity_def)
     tool_context_param = _tool_context_parameter(activity_def, signature, hints)
+    # ADK passes every argument by name, and the activity gets them by
+    # position, so bind positional-only parameters by name too.
+    binding = signature.replace(
+        parameters=[
+            p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            if p.kind is inspect.Parameter.POSITIONAL_ONLY
+            else p
+            for p in signature.parameters.values()
+        ]
+    )
 
     @functools.wraps(activity_def)
     async def wrapper(*args: Any, **kw: Any):
@@ -313,7 +340,7 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
             kw[_TOOL_CONTEXT_PARAM] = _snapshot_tool_context(kw[_TOOL_CONTEXT_PARAM])
 
         # Bind arguments to the parameters the activity is called with
-        bound = signature.bind(*args, **kw)
+        bound = binding.bind(*args, **kw)
         bound.apply_defaults()
 
         # Convert to positional args for Temporal

@@ -853,6 +853,25 @@ class QuoteTrip:
         return f"{trip}:{passengers}:{self.currency}"
 
 
+@activity.defn
+class TrackParcel:
+    """Callable class whose __call__ takes a positional-only parameter."""
+
+    def __init__(self, parcel_id: str) -> None:
+        self.prefix = parcel_id
+
+    async def __call__(self, parcel_id: str, /) -> str:
+        complex_activity_inputs_seen["TrackParcel"] = (self.prefix, parcel_id)
+        return f"{self.prefix}:{parcel_id}"
+
+
+@activity.defn
+async def echo_self(self) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType]
+    """Function, not a method: its `self` is an input the model fills."""
+    complex_activity_inputs_seen["echo_self"] = self
+    return f"echo:{self}"
+
+
 @workflow.defn
 class ComplexActivityInputAgent:
     @workflow.run
@@ -882,6 +901,12 @@ class ComplexActivityInputAgent:
                 ),
                 temporalio.google_adk.workflow.activity_as_tool(
                     QuoteTrip, start_to_close_timeout=timedelta(seconds=60)
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    TrackParcel, start_to_close_timeout=timedelta(seconds=60)
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    echo_self, start_to_close_timeout=timedelta(seconds=60)
                 ),
             ],
         )
@@ -995,6 +1020,30 @@ class ComplexActivityInputModel(TestModel):
             LlmResponse(
                 content=Content(
                     role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="TrackParcel", args={"parcel_id": "abc"}
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="echo_self", args={"self": "abc"}
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
                     parts=[Part(text="completed complex input tool calls")],
                 )
             ),
@@ -1022,6 +1071,8 @@ async def test_activity_as_tool_supports_complex_inputs_via_adk(client: Client):
             method_holder.annotate_trip,
             method_holder.count_passengers,
             QuoteTrip("USD"),
+            TrackParcel("worker"),
+            echo_self,
         ],
         workflows=[ComplexActivityInputAgent],
         max_cached_workflows=0,
@@ -1049,6 +1100,8 @@ async def test_activity_as_tool_supports_complex_inputs_via_adk(client: Client):
             "annotate_trip": "SFO->LAX:3",
             "count_passengers": 3,
             "QuoteTrip": ("USD", "SFO->LAX", 3),
+            "TrackParcel": ("worker", "abc"),
+            "echo_self": "abc",
         }
 
 
@@ -1256,6 +1309,12 @@ def test_activity_as_tool_preserves_metadata() -> None:
         "passengers": int,
         "return": str,
     }
+
+    # A function's `self` is an input, not a receiver.
+    function_tool = temporalio.google_adk.workflow.activity_as_tool(
+        echo_self, start_to_close_timeout=timedelta(seconds=30)
+    )
+    assert list(inspect.signature(function_tool).parameters) == ["self"]
 
 
 @activity.defn
