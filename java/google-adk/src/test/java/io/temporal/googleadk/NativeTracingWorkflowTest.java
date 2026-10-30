@@ -112,6 +112,8 @@ class NativeTracingWorkflowTest {
     LEGACY(false, false, false),
     /** Two tracing instances and an unconfigured Worker keep separate exporters. */
     MULTIPLE(false, false, false),
+    /** The turn starts inside a timer callback, which enters through the SDK's callback thread. */
+    CALLBACK(false, false, false),
     /**
      * The Worker factory is replaced while a model Activity is pending. Needs a real Temporal
      * service ({@code -Dgoogleadk.test.target=host:port}), so CI excludes it.
@@ -448,6 +450,10 @@ class NativeTracingWorkflowTest {
           spans.size(),
           spans.stream().map(SpanData::getSpanId).distinct().count(),
           "each native operation exports once");
+      assertTrue(
+          appSpans.stream()
+              .noneMatch(s -> "gcp.vertex.agent".equals(s.getInstrumentationScopeInfo().getName())),
+          "native spans of an opted-in Worker must not reach the application provider");
       if (scenario != Scenario.OVERLAP) {
         assertEquals(1, spans.stream().map(SpanData::getTraceId).distinct().count());
       }
@@ -757,6 +763,11 @@ class NativeTracingWorkflowTest {
           Promise<String> second = Async.function(() -> turn("second", false));
           assertEquals("done", first.get());
           return second.get();
+        }
+        case "callback" -> {
+          return Workflow.newTimer(Duration.ofMillis(10))
+              .thenApply(ignored -> turn("callback", false))
+              .get();
         }
         case "parallel" -> {
           ParallelAgent parallel =

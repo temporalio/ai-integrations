@@ -20,7 +20,7 @@ import java.util.Map;
 
 /**
  * Carries W3C trace context through Temporal headers and selects the Worker's tracing instance on
- * Workflow and Activity threads.
+ * Workflow threads, including the SDK's callback threads, and on Activity threads.
  */
 final class NativeTracingPropagation extends WorkerInterceptorBase implements ContextPropagator {
   private static final String HEADER = "io.temporal.googleadk.traceparent";
@@ -155,6 +155,21 @@ final class NativeTracingPropagation extends WorkerInterceptorBase implements Co
         } finally {
           incoming.remove();
         }
+      }
+
+      /** Timer and Activity completions run on SDK callback threads, which need the context too. */
+      @Override
+      public Object newCallbackThread(Runnable runnable, String name) {
+        return super.newCallbackThread(
+            () -> {
+              try (Scope scope =
+                  incoming.get().with(GoogleAdkTracing.SELECTED, tracing).makeCurrent()) {
+                runnable.run();
+              } finally {
+                incoming.remove();
+              }
+            },
+            name);
       }
     };
   }
