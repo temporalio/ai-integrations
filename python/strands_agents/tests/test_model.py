@@ -1,11 +1,20 @@
 import asyncio
+from collections.abc import AsyncIterable
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
+from strands.agent.conversation_manager import SlidingWindowConversationManager
+from strands.types.content import Messages
+from strands.types.streaming import StreamEvent
+
 from temporalio import workflow
 from temporalio.client import Client
+from temporalio.common import RetryPolicy
+from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
+from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.worker import Replayer, Worker
 from tests.common import get_activities
 from tests.mock_model import MockModel
@@ -155,3 +164,290 @@ async def test_model_config_reaches_workflow(client: Client):
         workflows=[ModelConfigWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+class StatefulMockModel(MockModel):
+    """Keeps the conversation "server-side", as OpenAIResponsesModel(stateful=True) does."""
+
+    calls: list[dict[str, Any]] = []
+
+    @property
+    def stateful(self) -> bool:
+        return True
+
+    async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterable[StreamEvent]:
+        model_state = kwargs.get("model_state")
+        StatefulMockModel.calls.append(
+            {
+                "previous_response_id": (model_state or {}).get("response_id"),
+                "messages": len(args[0]),
+            }
+        )
+        if model_state is not None:
+            model_state["response_id"] = f"resp_{len(StatefulMockModel.calls)}"
+        async for event in super().stream(*args, **kwargs):
+            yield event
+
+
+@workflow.defn
+class StatefulModelWorkflow:
+    def __init__(self) -> None:
+        self.stream = WorkflowStream()
+
+    @workflow.run
+    async def run(self, mode: str) -> list[int] | str:
+        kwargs: dict[str, Any] = {}
+        if mode == "manager":
+            kwargs["conversation_manager"] = SlidingWindowConversationManager()
+        if mode == "streaming":
+            kwargs["streaming_topic"] = "events"
+        if mode == "models-queue":
+            kwargs["task_queue"] = workflow.info().task_queue + "-models"
+        agent = TemporalAgent(
+            model="stateful",
+            start_to_close_timeout=timedelta(seconds=15),
+            retry_policy=RetryPolicy(
+                initial_interval=timedelta(milliseconds=100), backoff_coefficient=1
+            ),
+            **kwargs,
+        )
+        messages_after_turn = []
+        try:
+            for turn in ("turn one", "turn two"):
+                await agent.invoke_async(turn)
+                messages_after_turn.append(len(agent.messages))
+        except ValueError as err:
+            return f"refused: {err}"
+        return messages_after_turn
+
+
+async def test_stateful_model_keeps_state_server_side(client: Client):
+    """A stateful worker model gets its response id back and the agent clears its messages."""
+    task_queue = f"test_stateful_model_keeps_state_server_side-{uuid4()}"
+    plugin = StrandsPlugin(
+        models={"stateful": lambda: StatefulMockModel(["one", "two", "three", "four"])}
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StatefulModelWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        for mode, activity_type in (
+            ("plain", "strands_invoke_stateful_model"),
+            ("streaming", "strands_invoke_stateful_model_streaming"),
+        ):
+            StatefulMockModel.calls = []
+            handle = await client.start_workflow(
+                StatefulModelWorkflow.run,
+                mode,
+                id=f"test_stateful_model_{mode}_{uuid4()}",
+                task_queue=task_queue,
+            )
+            assert await handle.result() == [0, 0]
+            assert StatefulMockModel.calls == [
+                {"previous_response_id": None, "messages": 1},
+                {"previous_response_id": "resp_1", "messages": 1},
+            ]
+            history = await handle.fetch_history()
+            assert get_activities(history) == [
+                "strands_get_model_config",
+                activity_type,
+                activity_type,
+            ]
+            await Replayer(
+                workflows=[StatefulModelWorkflow],
+                plugins=[plugin],
+            ).replay_workflow(history)
+
+        refused = await client.execute_workflow(
+            StatefulModelWorkflow.run,
+            "manager",
+            id=f"test_stateful_model_manager_{uuid4()}",
+            task_queue=task_queue,
+        )
+        assert refused == (
+            "refused: context_manager and conversation_manager cannot be used with "
+            "a stateful model. The model manages conversation state server-side."
+        )
+
+
+async def test_stateful_model_waits_for_a_stateful_worker(client: Client):
+    """A worker without the stateful activities cannot take a stateful call and drop its state."""
+    task_queue = f"test_stateful_model_waits_for_a_stateful_worker-{uuid4()}"
+    StatefulMockModel.calls = []
+    plugin = StrandsPlugin(
+        models={"stateful": lambda: StatefulMockModel(["one", "two", "three"])}
+    )
+    # During a rolling upgrade, the config can come from an upgraded worker
+    # while a worker without stateful support still polls the queue: it has
+    # the config and the stateless model activities only.
+    legacy = ModelActivity({"stateful": lambda: StatefulMockModel(["one", "two"])})
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StatefulModelWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            StatefulModelWorkflow.run,
+            "models-queue",
+            id=f"test_stateful_model_waits_{uuid4()}",
+            task_queue=task_queue,
+        )
+        async with Worker(
+            client,
+            task_queue=task_queue + "-models",
+            activities=[
+                legacy.get_model_config,
+                legacy.invoke_model,
+                legacy.invoke_model_streaming,
+            ],
+        ):
+            activity_type, failure = "", ""
+            for _ in range(100):
+                pending = (await handle.describe()).raw_description.pending_activities
+                if pending and pending[0].attempt > 2:
+                    activity_type = pending[0].activity_type.name
+                    failure = pending[0].last_failure.message
+                    break
+                await asyncio.sleep(0.1)
+            assert activity_type == "strands_invoke_stateful_model"
+            assert "is not registered on this worker" in failure
+            assert StatefulMockModel.calls == []
+
+        async with Worker(client, task_queue=task_queue + "-models", plugins=[plugin]):
+            assert await handle.result() == [0, 0]
+        assert StatefulMockModel.calls == [
+            {"previous_response_id": None, "messages": 1},
+            {"previous_response_id": "resp_1", "messages": 1},
+        ]
+
+
+@dataclass
+class StatefulChatInput:
+    turns: list[str]
+    messages: Messages = field(default_factory=list)
+    model_state: dict[str, Any] = field(default_factory=dict)
+
+
+@workflow.defn
+class StatefulContinueAsNewWorkflow:
+    @workflow.run
+    async def run(self, input: StatefulChatInput) -> int:
+        agent = TemporalAgent(
+            model="stateful",
+            start_to_close_timeout=timedelta(seconds=15),
+            messages=list(input.messages),
+            model_state=input.model_state,
+        )
+        await agent.invoke_async(input.turns[0])
+        if input.turns[1:]:
+            workflow.continue_as_new(
+                StatefulChatInput(
+                    turns=input.turns[1:],
+                    messages=agent.messages,
+                    model_state=agent.model_state,
+                )
+            )
+        return len(agent.messages)
+
+
+async def test_stateful_model_state_crosses_continue_as_new(client: Client):
+    """The README's Continue-As-New handoff carries the response id to the next run."""
+    task_queue = f"test_stateful_model_state_crosses_continue_as_new-{uuid4()}"
+    StatefulMockModel.calls = []
+    plugin = StrandsPlugin(
+        models={"stateful": lambda: StatefulMockModel(["one", "two"])}
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StatefulContinueAsNewWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        assert (
+            await client.execute_workflow(
+                StatefulContinueAsNewWorkflow.run,
+                StatefulChatInput(turns=["turn one", "turn two"]),
+                id=f"test_stateful_model_can_{uuid4()}",
+                task_queue=task_queue,
+            )
+            == 0
+        )
+    assert StatefulMockModel.calls == [
+        {"previous_response_id": None, "messages": 1},
+        {"previous_response_id": "resp_1", "messages": 1},
+    ]
+
+
+class UsageMockModel(ConfiguredMockModel):
+    """Records the user turns of each call; the first reply reports 800 input tokens."""
+
+    def __init__(self, responses: list[str | dict[str, Any]]) -> None:
+        super().__init__(responses)
+        self.user_turns: list[list[str]] = []
+
+    async def stream(
+        self, messages: Any, *args: Any, **kwargs: Any
+    ) -> AsyncIterable[StreamEvent]:  # type: ignore[override]
+        self.user_turns.append(
+            [m["content"][0]["text"] for m in messages if m["role"] == "user"]
+        )
+        async for event in super().stream(messages, *args, **kwargs):
+            yield event
+        if len(self.user_turns) == 1:
+            # 80% of the model's 1,000-token window, over the default compression
+            # threshold of 70%, but only 0.4% of Strands' 200,000-token fallback.
+            yield {
+                "metadata": {
+                    "usage": {
+                        "inputTokens": 800,
+                        "outputTokens": 1,
+                        "totalTokens": 801,
+                    },
+                    "metrics": {"latencyMs": 0},
+                }
+            }
+
+
+@workflow.defn
+class CompressionWorkflow:
+    @workflow.run
+    async def run(self, prompts: list[str]) -> None:
+        agent = TemporalAgent(
+            model="usage",
+            start_to_close_timeout=timedelta(seconds=15),
+            conversation_manager=SlidingWindowConversationManager(
+                proactive_compression=True
+            ),
+        )
+        for prompt in prompts:
+            await agent.invoke_async(prompt)
+
+
+async def test_proactive_compression_uses_model_context_window(client: Client):
+    """Compression drops the first turn before the second model call, as it does natively."""
+    task_queue = f"test_proactive_compression-{uuid4()}"
+    model = UsageMockModel(["first", "second"])
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[CompressionWorkflow],
+        plugins=[StrandsPlugin(models={"usage": lambda: model})],
+    ):
+        await client.execute_workflow(
+            CompressionWorkflow.run,
+            ["turn 1", "turn 2"],
+            id=f"test_proactive_compression_{uuid4()}",
+            task_queue=task_queue,
+        )
+
+    assert model.user_turns == [["turn 1"], ["turn 2"]]

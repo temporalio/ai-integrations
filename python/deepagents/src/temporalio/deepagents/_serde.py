@@ -31,12 +31,14 @@ from __future__ import annotations
 
 import base64
 import contextvars
+import copy
 import dataclasses
 import hashlib
 import json
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
+    from langchain_core.messages import BaseMessage
     from langchain_core.runnables import RunnableConfig
 
 from temporalio.contrib.pydantic import PydanticPayloadConverter, ToJsonOptions
@@ -149,6 +151,93 @@ def load_object(data: Any) -> Any:
     from langchain_core.load import load
 
     return load(data)
+
+
+def _tool_arg_message_classes() -> tuple[type[BaseMessage], ...]:
+    """The message classes :func:`find_tool_arg_messages` records.
+
+    Every class in ``langchain_core.messages``, including ``ChatMessage``,
+    ``FunctionMessage`` and the chunks. Subclasses outside this list keep
+    today's encoding.
+    """
+    from langchain_core.messages import (
+        AIMessage,
+        AIMessageChunk,
+        ChatMessage,
+        ChatMessageChunk,
+        FunctionMessage,
+        FunctionMessageChunk,
+        HumanMessage,
+        HumanMessageChunk,
+        RemoveMessage,
+        SystemMessage,
+        SystemMessageChunk,
+        ToolMessage,
+        ToolMessageChunk,
+    )
+
+    return (
+        AIMessage,
+        AIMessageChunk,
+        ChatMessage,
+        ChatMessageChunk,
+        FunctionMessage,
+        FunctionMessageChunk,
+        HumanMessage,
+        HumanMessageChunk,
+        RemoveMessage,
+        SystemMessage,
+        SystemMessageChunk,
+        ToolMessage,
+        ToolMessageChunk,
+    )
+
+
+def find_tool_arg_messages(
+    value: Any, path: tuple[str | int, ...] = ()
+) -> list[tuple[list[str | int], str]]:
+    """Find the LangChain messages in a wrapped tool's arguments.
+
+    A tool can read the conversation from injected state, so its arguments can
+    hold messages. The Pydantic converter writes each one as a plain dict, so
+    the activity cannot tell it was a message. This returns the path and class
+    name of each message in nested lists, tuples and string-keyed dicts, for
+    :func:`load_tool_arg_messages` to rebuild. The arguments themselves are sent
+    unchanged.
+    """
+    if type(value) in _tool_arg_message_classes():
+        return [(list(path), type(value).__name__)]
+    found: list[tuple[list[str | int], str]] = []
+    if isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            found.extend(find_tool_arg_messages(item, (*path, i)))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                found.extend(find_tool_arg_messages(item, (*path, key)))
+    return found
+
+
+def load_tool_arg_messages(
+    args: dict[str, Any], messages: list[tuple[list[str | int], str]]
+) -> dict[str, Any]:
+    """Rebuild the messages :func:`find_tool_arg_messages` found in ``args``.
+
+    Each recorded value is validated as its message class, so its other fields,
+    such as a ``ToolMessage`` artifact, keep the converter's form. Every other
+    value is returned unchanged.
+    """
+    classes = {cls.__name__: cls for cls in _tool_arg_message_classes()}
+    args = copy.deepcopy(args)
+    for path, name in messages:
+        cls = classes.get(name)
+        if cls is None:
+            raise ValueError(f"Unknown tool argument message class {name!r}")
+        parent: Any = args
+        for key in path[:-1]:
+            parent = parent[key]
+        parent[path[-1]] = cls.model_validate(parent[path[-1]])
+    return args
 
 
 # ---------------------------------------------------------------------------

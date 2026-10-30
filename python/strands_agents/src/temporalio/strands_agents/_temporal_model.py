@@ -19,6 +19,7 @@ from ._bytes_values import decode_event
 from ._model_activity import (
     ModelActivity,
     _InvokeModelInput,
+    _InvokeModelResult,
     _ModelConfig,
     _ModelConfigInput,
     _StreamingInvokeModelInput,
@@ -97,6 +98,7 @@ class TemporalModel(Model):
         self._config: dict[str, Any] = {}
         self._config_loaded = False
         self._config_load: asyncio.Task[None] | None = None
+        self._stateful = False
 
     def update_config(self, **_model_config: Any) -> None:
         """No-op; the real model is configured worker-side via the plugin's factories."""
@@ -114,6 +116,11 @@ class TemporalModel(Model):
     def config(self) -> dict[str, Any]:
         """The loaded config; Strands' tracing reads ``model_id`` from it."""
         return self._config
+
+    @property
+    def stateful(self) -> bool:
+        """Whether the worker-side model keeps the conversation server-side."""
+        return self._stateful
 
     async def _load_config(self) -> None:
         """Read the worker-side model's config once, as an activity.
@@ -143,6 +150,7 @@ class TemporalModel(Model):
             self._config["model_id"] = result.model_id
         if result.context_window_limit is not None:
             self._config["context_window_limit"] = result.context_window_limit
+        self._stateful = result.stateful
         self._config_loaded = True
 
     def structured_output(self, *_args: Any, **_kwargs: Any) -> Any:
@@ -166,37 +174,62 @@ class TemporalModel(Model):
     ) -> AsyncIterable[StreamEvent]:
         """Run the model via the registered Temporal activity and yield events."""
         clean_state = _filter_serializable(invocation_state) if invocation_state else {}
+        # A stateful model gets a copy of the agent's model state and returns the
+        # updated state, through activity types that only workers with stateful
+        # support register.
+        model_state: dict[str, Any] | None = kwargs.get("model_state")
+        sent_state = dict(model_state or {}) if self._stateful else None
         try:
             if self._streaming_topic is not None:
-                events = await workflow.execute_activity_method(
-                    ModelActivity.invoke_model_streaming,
-                    _StreamingInvokeModelInput(
-                        model_name=self._model_name,
-                        messages=messages,
-                        invocation_state=clean_state,
-                        tool_specs=tool_specs,
-                        system_prompt=system_prompt,
-                        tool_choice=tool_choice,
-                        system_prompt_content=system_prompt_content,
-                        streaming_topic=self._streaming_topic,
-                        streaming_batch_interval_seconds=self._streaming_batch_interval.total_seconds(),
-                    ),
-                    **self._options,
+                streaming_input = _StreamingInvokeModelInput(
+                    model_name=self._model_name,
+                    messages=messages,
+                    invocation_state=clean_state,
+                    tool_specs=tool_specs,
+                    system_prompt=system_prompt,
+                    tool_choice=tool_choice,
+                    system_prompt_content=system_prompt_content,
+                    streaming_topic=self._streaming_topic,
+                    streaming_batch_interval_seconds=self._streaming_batch_interval.total_seconds(),
+                    model_state=sent_state,
                 )
+                if sent_state is None:
+                    events = await workflow.execute_activity_method(
+                        ModelActivity.invoke_model_streaming,
+                        streaming_input,
+                        **self._options,
+                    )
+                else:
+                    result = await workflow.execute_activity_method(
+                        ModelActivity.invoke_stateful_model_streaming,
+                        streaming_input,
+                        **self._options,
+                    )
+                    events = _apply_state(result, model_state)
             else:
-                events = await workflow.execute_activity_method(
-                    ModelActivity.invoke_model,
-                    _InvokeModelInput(
-                        model_name=self._model_name,
-                        messages=messages,
-                        invocation_state=clean_state,
-                        tool_specs=tool_specs,
-                        system_prompt=system_prompt,
-                        tool_choice=tool_choice,
-                        system_prompt_content=system_prompt_content,
-                    ),
-                    **self._options,
+                invoke_input = _InvokeModelInput(
+                    model_name=self._model_name,
+                    messages=messages,
+                    invocation_state=clean_state,
+                    tool_specs=tool_specs,
+                    system_prompt=system_prompt,
+                    tool_choice=tool_choice,
+                    system_prompt_content=system_prompt_content,
+                    model_state=sent_state,
                 )
+                if sent_state is None:
+                    events = await workflow.execute_activity_method(
+                        ModelActivity.invoke_model,
+                        invoke_input,
+                        **self._options,
+                    )
+                else:
+                    result = await workflow.execute_activity_method(
+                        ModelActivity.invoke_stateful_model,
+                        invoke_input,
+                        **self._options,
+                    )
+                    events = _apply_state(result, model_state)
         except ActivityError as error:
             # Model providers raise ContextWindowOverflowException when the prompt is
             # too long, and Strands recovers by reducing the conversation and retrying.
@@ -214,3 +247,13 @@ class TemporalModel(Model):
             raise
         for event in events:
             yield decode_event(event)
+
+
+def _apply_state(
+    result: _InvokeModelResult, model_state: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Copy a stateful model's updated state into the agent's and return its events."""
+    if model_state is not None:
+        model_state.clear()
+        model_state.update(result.model_state)
+    return result.events

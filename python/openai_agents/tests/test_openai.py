@@ -44,6 +44,9 @@ from agents import (
     handoff,
     input_guardrail,
     output_guardrail,
+    set_default_openai_api,
+    set_default_openai_client,
+    set_default_openai_key,
     trace,
 )
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
@@ -54,7 +57,7 @@ from agents.items import (
     TResponseStreamEvent,
 )
 from agents.mcp import MCPServer
-from agents.models import get_default_model_settings
+from agents.models import _openai_shared, get_default_model_settings
 from agents.sandbox.capabilities.tools import SandboxApplyPatchTool
 from agents.tool import CustomTool
 from agents.tool_context import ToolContext
@@ -1578,7 +1581,12 @@ class CustomModelProvider(ModelProvider):
         return OpenAIChatCompletionsModel(model="gpt-4o", openai_client=self.client)
 
 
-async def test_chat_completions_model(client: Client):
+@pytest.mark.parametrize(
+    "client_source", ["model_provider", "default_client", "default_key"]
+)
+async def test_chat_completions_model(
+    client: Client, client_source: str, monkeypatch: pytest.MonkeyPatch
+):
     import httpx2
 
     requests: list[dict[str, Any]] = []
@@ -1643,6 +1651,7 @@ async def test_chat_completions_model(client: Client):
         assert request.method == "POST"
         assert request.url.host == "openai.invalid"
         assert request.url.path == "/v1/chat/completions"
+        assert request.headers["authorization"] == "Bearer not-a-real-key"
         requests.append(json.loads(request.content))
         return httpx2.Response(200, json=next(responses))
 
@@ -1654,11 +1663,37 @@ async def test_chat_completions_model(client: Client):
             base_url="https://openai.invalid/v1",
             http_client=http_client,
         )
+        model_provider: ModelProvider | None = CustomModelProvider(openai_client)
+        if client_source != "model_provider":
+            # The framework's documented ways to use another OpenAI-compatible endpoint
+            # or key. The plugin's default provider must use them, not the Worker's
+            # environment.
+            monkeypatch.setenv("OPENAI_API_KEY", "worker-environment-key")
+            monkeypatch.setattr(_openai_shared, "_default_openai_client", None)
+            monkeypatch.setattr(_openai_shared, "_default_openai_key", None)
+            monkeypatch.setattr(_openai_shared, "_use_responses_by_default", True)
+            set_default_openai_api("chat_completions")
+            model_provider = None
+        if client_source == "default_client":
+            monkeypatch.setenv(
+                "OPENAI_BASE_URL", "https://worker-environment.invalid/v1"
+            )
+            set_default_openai_client(openai_client, use_for_tracing=False)
+        elif client_source == "default_key":
+            # The plugin builds its own client on the environment's endpoint; send it
+            # to the mock transport.
+            monkeypatch.setenv("OPENAI_BASE_URL", "https://openai.invalid/v1")
+            monkeypatch.setattr(
+                "temporalio.openai_agents._invoke_model_activity.AsyncOpenAI",
+                lambda **kwargs: AsyncOpenAI(http_client=http_client, **kwargs),
+            )
+            set_default_openai_key("not-a-real-key", use_for_tracing=False)
 
         async with AgentEnvironment(
-            model_provider=CustomModelProvider(openai_client),
+            model_provider=model_provider,
             model_params=ModelActivityParameters(
                 start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=1),
             ),
         ) as env:
             client = env.applied_on_client(client)

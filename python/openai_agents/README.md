@@ -828,6 +828,11 @@ A run that started on an earlier version and already passed its own provider kee
 Worker's provider, so that it replays; a run that passes one for the first time after the upgrade
 gets the error.
 
+Without `model_provider`, the plugin uses an `OpenAIProvider` on the client set with the framework's
+`set_default_openai_client`, as it is: give that client `max_retries=0` to leave retries to Temporal.
+Without one, it uses the key set with `set_default_openai_key`, or else `OPENAI_API_KEY`, with the
+client's own retries turned off. Set them before you create the Worker.
+
 ### Model Response format
 
 | Model Response | Supported            |
@@ -923,6 +928,17 @@ SQLite storage is not suited to a distributed workflow environment.
 | Tracing Provider | Supported |
 | :--------------- | :-------: |
 | OpenAI platform  |    Yes    |
+
+A trace's own tracing key, set with `RunConfig(tracing={"api_key": ...})` or
+`trace(..., tracing={"api_key": ...})`, is not supported. The plugin passes traces to Workflows and
+Activities in headers, which are stored in Event History, so it cannot pass the key, and their spans
+would be exported with another key. In Workflow code, `Runner.run`, `Runner.run_streamed` and
+`trace()` raise `ValueError` when given such a key. Starting a Workflow, or scheduling an Activity or
+child Workflow, under such a trace raises it too. Agent runs inside Activities can still use their
+own key. Set the tracing key on every client and Worker process instead, with
+`set_tracing_export_api_key` or `OPENAI_API_KEY`. A run that used such a key in Workflow code
+before you deploy this version gets the error when it replays: let those runs finish first, or use
+Worker Versioning.
 
 ## OpenTelemetry Integration
 

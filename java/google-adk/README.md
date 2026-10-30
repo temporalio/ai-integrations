@@ -71,6 +71,10 @@ Gemini models from the environment (`GOOGLE_API_KEY`, or the Vertex AI variables
 factory with `modelFactory(...)` to change that. Disable the model SDK's own retries in your
 factory; Temporal's retry policy on the activity replaces them.
 
+Registration aliases resolve to the provider's model name unless a before-model callback overrides it.
+ADK's workflow-side capability checks still use the `TemporalModel` name, so use provider names
+when those checks apply.
+
 ## What the integration gives you
 
 ### Model calls as activities
@@ -93,9 +97,99 @@ AI 2.0's default.
 
 Streamed calls (`RunConfig.StreamingMode.SSE`) use the same activity: the worker collects the
 partial chunks and the final response, and the workflow replays them in order, so ADK's partial
-events keep their shape. Chunks reach the workflow only when the activity completes; the
-integration does not stream tokens out of a workflow. Live (bidirectional) connections are not
-supported.
+events keep their shape. Chunks reach the workflow only when the activity completes; see
+[Live model output](#live-model-output) to publish them while it runs. Live (bidirectional)
+connections are not supported.
+
+### Live model output
+
+The model Activity can also publish each SSE response to a Workflow Stream topic while it runs.
+Add the experimental `temporal-workflowstreams` module at the same version as your SDK. This
+path needs the unshaded `temporal-sdk` artifact; ordinary model Activities keep working with the
+shaded one.
+
+```groovy
+implementation 'io.temporal:temporal-workflowstreams:1.40.0'
+```
+
+Host a `WorkflowStream` in the Workflow and set the model's `streamingTopic`; calls without SSE
+streaming do not publish. Responses are published in 100 ms batches and still returned as the
+Activity result, so the agent sees them after the Activity completes. Subscribers read the stream
+through an Update, which a closed Workflow cannot serve, so publish a completion marker and give
+clients a bounded window to acknowledge it; the Workflow finishes either way.
+
+```java
+public class LiveChatWorkflowImpl implements LiveChatWorkflow {
+  private final WorkflowStream output = WorkflowStream.newInstance();
+  private boolean consumed;
+
+  @Override
+  public String chat(String message) {
+    LlmAgent agent =
+        LlmAgent.builder()
+            .name("assistant")
+            .model(
+                TemporalModel.newBuilder("gemini-2.5-flash").streamingTopic("model-output").build())
+            .build();
+    Runner runner = TemporalAdk.runnerBuilder().appName("live-chat").agent(agent).build();
+    List<Event> events =
+        TemporalAdk.run(
+            runner,
+            "user",
+            "session",
+            Content.fromParts(Part.fromText(message)),
+            RunConfig.builder()
+                .autoCreateSession(true)
+                .streamingMode(RunConfig.StreamingMode.SSE)
+                .build());
+    output.topic("turn-status").publish("complete");
+    Workflow.await(Duration.ofSeconds(10), () -> consumed);
+    return events.get(events.size() - 1).content().map(Content::text).orElse("");
+  }
+
+  @Override // a @SignalMethod on the Workflow interface
+  public void streamConsumed() {
+    consumed = true;
+  }
+}
+```
+
+Items are codec-free ADK JSON (the client's codec applies once, to the publish Signal); decode
+them with `GoogleAdkPayloadConverter`:
+
+```java
+WorkflowExecution execution = WorkflowClient.start(workflow::chat, "Say hello.");
+PayloadConverter converter = new GoogleAdkPayloadConverter();
+try (WorkflowStreamClient stream =
+        WorkflowStreamClient.newInstance(client, execution.getWorkflowId());
+    WorkflowStreamSubscription subscription =
+        stream.subscribe(
+            SubscribeOptions.newBuilder()
+                .setTopics("model-output", "turn-status")
+                .setFromOffset(0)
+                .build())) {
+  for (WorkflowStreamItem item : subscription) {
+    if (item.getTopic().equals("turn-status")) {
+      workflow.streamConsumed();
+      break;
+    }
+    ModelStreamEvent event =
+        converter.fromData(item.getPayload(), ModelStreamEvent.class, ModelStreamEvent.class);
+    System.out.println(event.kind() + ": " + event.response());
+  }
+}
+```
+
+A `ModelStreamEvent` carries the Workflow ID, Run ID, Activity ID, attempt, and a zero-based
+sequence; a retried Activity keeps its ID, increments the attempt, and restarts the sequence.
+`RESPONSE` wraps one ADK response. `COMPLETE`, `FAILED`, and `CANCELED` close one attempt and are
+best effort: they can be missing after a Worker or transport failure, and `COMPLETE` does not
+commit the Activity result. Treat the Workflow result or your own marker as the final outcome.
+
+Each publish Signal waits at most five seconds. A publishing failure fails the attempt with
+`googleadk.StreamError` under the Activity's retry policy, unless a provider or cancellation
+failure came first. Publication targets the current Run of the Workflow ID, so check Run IDs
+across Continue-As-New, and truncate the stream periodically for long or high-volume agents.
 
 ### Running the agent
 
@@ -275,17 +369,19 @@ raises it from a future, is classified the same way. A response the model report
 example a safety block) is not a failure: ADK emits it as a final event with an error code and no
 text, exactly as outside Temporal. MCP failures use `googleadk.McpError`: an unknown toolset or tool
 is non-retryable, a failing server call is retried, while a call the tool rejects outright (for
-example because of a null argument value) is not. Model and MCP calls run on a background thread,
-including the work a model does before it returns a flow (ADK's Claude model and its non-streaming
-LangChain4j model block there), a toolset factory, and the session start `McpToolset` performs on
-subscription, so with a heartbeat timeout on the activity options the activities heartbeat while
-they run and return as soon as the server cancels them. The background call is left to finish on
-its own and its result is dropped: an interrupt would not stop the request of any ADK model
-(Gemini's completes on its HTTP client's own thread), and ADK's MCP classes answer one by retrying
-on a new session, which would run a cancelled tool call twice. An MCP toolset is released only after
-its last background call has finished, and a stdio server's process with it; each toolset is
-released on its own, so a server that never answers keeps only its own toolset alive. Errors thrown
-by tools that run on the workflow thread follow ADK's contract and go back to the model.
+example because of a null argument value) is not. Live-output publishing failures use
+`googleadk.StreamError`: a missing or mismatched Workflow Streams artifact is non-retryable, and
+transport failures are retried. Model and MCP calls run on a background thread, including the work a
+model does before it returns a flow (ADK's Claude model and its non-streaming LangChain4j model
+block there), a toolset factory, and the session start `McpToolset` performs on subscription, so
+with a heartbeat timeout on the activity options the activities heartbeat while they run and return
+as soon as the server cancels them. The background call is left to finish on its own and its result
+is dropped: an interrupt would not stop the request of any ADK model (Gemini's completes on its HTTP
+client's own thread), and ADK's MCP classes answer one by retrying on a new session, which would run
+a cancelled tool call twice. An MCP toolset is released only after its last background call has
+finished, and a stdio server's process with it; each toolset is released on its own, so a server
+that never answers keeps only its own toolset alive. Errors thrown by tools that run on the workflow
+thread follow ADK's contract and go back to the model.
 
 Exceptions ADK itself raises on the workflow thread (for example `LlmCallsLimitExceededException`
 when `RunConfig.maxLlmCalls` is exceeded, or a `SessionException`) propagate out of
@@ -309,7 +405,8 @@ examples.
 
 ## Limitations
 
-- No token-level streaming out of the workflow and no live (bidirectional) mode.
+- Live output needs an explicit topic and a hosted Workflow Stream; live (bidirectional)
+  connections are not supported.
 - Tools that run on the workflow thread must be deterministic; ADK's code executor, memory, and
   artifact services that perform I/O are not supported inside workflows.
 - ADK's OpenTelemetry tracing is global. Spans are no-ops without an installed SDK; with one
