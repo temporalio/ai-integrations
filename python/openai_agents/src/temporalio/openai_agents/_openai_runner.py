@@ -1,8 +1,9 @@
 import dataclasses
 import weakref
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Iterable
 from typing import Any, Callable
 
+import pydantic
 from agents import (
     Agent,
     AgentsException,
@@ -198,6 +199,50 @@ def _coerce_run_config(value: object) -> RunConfig:
     return RunConfig(**value)
 
 
+# The iterator type pydantic decodes ``Iterable`` fields to. It cannot be
+# copied, and pydantic_core does not export it.
+_DecodedIterator: type[Iterable[Any]] = type(
+    pydantic.TypeAdapter(Iterable[Any]).validate_python(())
+)
+
+
+def _has_decoded_iterator(value: Any) -> bool:
+    if isinstance(value, _DecodedIterator):
+        return True
+    if isinstance(value, dict):
+        return any(_has_decoded_iterator(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_decoded_iterator(item) for item in value)
+    return False
+
+
+def _list_decoded_iterators(value: Any) -> Any:
+    """Replace decoded iterators in ``value`` with lists, in place, and return it."""
+    if isinstance(value, _DecodedIterator):
+        return [_list_decoded_iterators(item) for item in value]
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = _list_decoded_iterators(item)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _list_decoded_iterators(item)
+    return value
+
+
+def _make_input_copyable(input: object) -> None:
+    """Make input items decoded from a payload copyable.
+
+    Pydantic decodes ``Iterable`` fields of input items, such as an assistant
+    message's ``content``, as one-shot iterators. The framework deep-copies the
+    input of every run and cannot copy them, so the run raised ``TypeError``.
+    The items are rebuilt in place, so the caller's copy does not keep a used
+    iterator. Other iterators, which the framework can copy, are left as they
+    are.
+    """
+    if isinstance(input, list) and _has_decoded_iterator(input):
+        _list_decoded_iterators(input)
+
+
 class TemporalOpenAIRunner(AgentRunner):
     """Temporal Runner for OpenAI agents.
 
@@ -340,6 +385,7 @@ class TemporalOpenAIRunner(AgentRunner):
             )
 
         converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        _make_input_copyable(input)
 
         with capture_scope(run_config.model_settings):
             try:
@@ -412,6 +458,7 @@ class TemporalOpenAIRunner(AgentRunner):
             )
 
         converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        _make_input_copyable(input)
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
