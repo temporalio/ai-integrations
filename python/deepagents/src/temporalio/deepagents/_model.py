@@ -92,6 +92,32 @@ async def _call_model(
         raise
 
 
+def _replaying_history_without_legacy_cache() -> bool:
+    """Whether this activation replays history, outside the legacy cache.
+
+    This is scoped to the workflow task, not to one call. It is still enough to
+    know that a model Activity scheduled now is already in history: sdk-core
+    stops replaying at the first event that is not the result of one of the
+    workflow's own commands and comes after the last completed workflow task
+    (``WorkflowMachines`` in sdk-core). So an Activity completion that follows a
+    failed or timed-out workflow task is delivered in a non-replaying
+    activation, and every command made while replaying must match a recorded
+    event or replay fails. Its input is never persisted or dispatched to an
+    Activity (it still passes through outbound interceptors, the payload
+    converter and codec before sdk-core drops the command), so it does not
+    need to be built.
+
+    Legacy executions do need it: their result cache keys on the input (see
+    :func:`_legacy_result_cache`). ``patched`` is only asked here while
+    replaying, where it records nothing.
+    """
+    if not workflow.in_workflow() or not workflow.unsafe.is_replaying_history_events():
+        return False
+    from temporalio.deepagents.workflow import _legacy_result_cache
+
+    return not _legacy_result_cache()
+
+
 # ---------------------------------------------------------------------------
 # Activity-option resolution (worker-wide defaults live in _serde.Settings)
 # ---------------------------------------------------------------------------
@@ -198,6 +224,15 @@ class TemporalModel(BaseChatModel):
         streaming_topic: str | None,
         **kwargs: Any,
     ) -> _activity.ModelActivityInput:
+        if _replaying_history_without_legacy_cache():
+            # Answered from history: the transcript would be dumped (and passed
+            # through the payload codec) only to be dropped. Building it on
+            # every replayed call dumped and encoded calls x transcript bytes.
+            # Outbound interceptors, payload converters and codecs, and
+            # metrics see this empty input on replay.
+            return _activity.ModelActivityInput(
+                model_name=self.model, messages=[], streaming_topic=streaming_topic
+            )
         tools = kwargs.get("tools") or []
         tool_schemas = [
             t if isinstance(t, dict) else _serde.tool_to_schema(t) for t in tools

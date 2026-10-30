@@ -5,6 +5,13 @@ from collections import Counter
 from temporalio.api.enums.v1 import EventType
 from temporalio.client import WorkflowHandle
 
+FAILED_ONCE: set[str] = set()
+"""Runs whose workflow task a test already failed once.
+
+Import this module passed through, so the set outlives the workflow instance
+that a failed workflow task throws away.
+"""
+
 
 async def count_scheduled_activities(handle: WorkflowHandle) -> Counter:
     """Count ``ActivityTaskScheduled`` events by activity-type name."""
