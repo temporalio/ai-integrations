@@ -43,28 +43,48 @@ func TestSingleAgentRoutesModelToActivity(t *testing.T) {
 }
 
 // TestModelFactoryLookupByName proves the Activity reconstructs the model from
-// the worker-side registry keyed by LLMRequest.Model: two model names resolve to
-// two different scripted backends, selected by the name the agent carries.
+// the worker-side registry keyed by the TemporalModel's name: two model names
+// resolve to two different scripted backends, selected by the name the agent
+// carries. A BeforeModelCallback that changes LLMRequest.Model, or clears it,
+// does not pick another backend; the agent's model receives the request as is,
+// as ADK's own models do outside Temporal.
 func TestModelFactoryLookupByName(t *testing.T) {
-	var s testsuite.WorkflowTestSuite
-	env, _ := newEnv(t, &s, googleadk.Config{
-		Models: map[string]googleadk.ModelFactory{
-			"fast-model":     scriptedModelFactory(googleadk.TextResponse("fast answer")),
-			"thinking-model": scriptedModelFactory(googleadk.TextResponse("thoughtful answer")),
-		},
-	})
+	for _, tc := range []struct {
+		name             string
+		requestModel     *string
+		wantRequestModel string
+	}{
+		{name: "agent model", wantRequestModel: "thinking-model"},
+		{name: "callback changes request model", requestModel: new("fast-model"), wantRequestModel: "fast-model"},
+		{name: "callback clears request model", requestModel: new(""), wantRequestModel: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			thinking := newRecordingModel("thinking-model", googleadk.TextResponse("thoughtful answer"))
+			var s testsuite.WorkflowTestSuite
+			env, _ := newEnv(t, &s, googleadk.Config{
+				Models: map[string]googleadk.ModelFactory{
+					"fast-model": scriptedModelFactory(googleadk.TextResponse("fast answer")),
+					"thinking-model": func(context.Context, string) (model.LLM, error) {
+						return thinking, nil
+					},
+				},
+			})
 
-	env.ExecuteWorkflow(agentRunWorkflow, runInput{
-		ModelName:   "thinking-model",
-		UserMessage: "hi",
-	})
+			env.ExecuteWorkflow(agentRunWorkflow, runInput{
+				ModelName:    "thinking-model",
+				UserMessage:  "hi",
+				RequestModel: tc.requestModel,
+			})
 
-	require.True(t, env.IsWorkflowCompleted())
-	require.NoError(t, env.GetWorkflowError())
-	var res runResult
-	require.NoError(t, env.GetWorkflowResult(&res))
-	assert.Contains(t, res.Texts, "thoughtful answer")
-	assert.NotContains(t, res.Texts, "fast answer")
+			require.True(t, env.IsWorkflowCompleted())
+			require.NoError(t, env.GetWorkflowError())
+			var res runResult
+			require.NoError(t, env.GetWorkflowResult(&res))
+			assert.Contains(t, res.Texts, "thoughtful answer")
+			assert.NotContains(t, res.Texts, "fast answer")
+			assert.Equal(t, []string{tc.wantRequestModel}, thinking.requestModels())
+		})
+	}
 }
 
 // TestPerModelTimeoutApplied flips Options.PerModelTimeouts to a non-default

@@ -51,12 +51,34 @@ def _classify_model_errors() -> Generator[None, None, None]:
         ) from err
 
 
+def _new_llm(llm_request: LlmRequest, model_name: str | None) -> BaseLlm:
+    """Build the Worker model for the agent's ``TemporalModel`` name.
+
+    The request keeps its own model name, which a ``before_model_callback``
+    may have changed; the model sends it, as it does outside Temporal.
+    ``model_name`` is ``None`` for an Activity scheduled before
+    ``TemporalModel`` sent its name, which then uses the request's model name.
+    """
+    name = model_name if model_name is not None else llm_request.model
+    if name is None:
+        raise ValueError("No model name provided, could not create LLM.")
+
+    llm = LLMRegistry.new_llm(name)
+    if not llm:
+        raise ValueError(f"Failed to create LLM for model: {name}")
+    return llm
+
+
 @activity.defn
-async def invoke_model(llm_request: LlmRequest) -> list[LlmResponse]:
+async def invoke_model(
+    llm_request: LlmRequest, model_name: str | None = None
+) -> list[LlmResponse]:
     """Activity that invokes an LLM model.
 
     Args:
         llm_request: The LLM request containing model name and parameters.
+        model_name: The ``TemporalModel``'s model name, which selects the
+            Worker model.
 
     Returns:
         List of LLM responses from the model.
@@ -64,12 +86,11 @@ async def invoke_model(llm_request: LlmRequest) -> list[LlmResponse]:
     Raises:
         ValueError: If model name is not provided or LLM creation fails.
     """
-    if llm_request.model is None:
-        raise ValueError(f"No model name provided, could not create LLM.")
-
-    llm = LLMRegistry.new_llm(llm_request.model)
-    if not llm:
-        raise ValueError(f"Failed to create LLM for model: {llm_request.model}")
+    if isinstance(llm_request, dict):
+        # An Activity scheduled before TemporalModel sent its name has one
+        # argument, so the SDK passes the request without type hints.
+        llm_request = LlmRequest.model_validate(llm_request)
+    llm = _new_llm(llm_request, model_name)
 
     with _classify_model_errors():
         return [
@@ -85,6 +106,7 @@ class StreamingInvokeInput:
     llm_request: LlmRequest
     streaming_topic: str
     streaming_batch_interval: timedelta
+    model_name: str | None = None
 
 
 @activity.defn
@@ -106,12 +128,7 @@ async def invoke_model_streaming(
     can observe responses as they arrive.
     """
     llm_request = input.llm_request
-    if llm_request.model is None:
-        raise ValueError("No model name provided, could not create LLM.")
-
-    llm = LLMRegistry.new_llm(llm_request.model)
-    if not llm:
-        raise ValueError(f"Failed to create LLM for model: {llm_request.model}")
+    llm = _new_llm(llm_request, input.model_name)
 
     responses: list[LlmResponse] = []
 
@@ -270,13 +287,14 @@ class TemporalModel(BaseLlm):
                     llm_request=llm_request,
                     streaming_topic=self._streaming_topic,
                     streaming_batch_interval=self._streaming_batch_interval,
+                    model_name=self._model_name,
                 ),
                 **config,
             )
         else:
             responses = await workflow.execute_activity(
                 invoke_model,
-                args=[llm_request],
+                args=[llm_request, self._model_name],
                 **config,
             )
         for response in responses:

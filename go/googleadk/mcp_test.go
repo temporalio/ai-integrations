@@ -18,15 +18,17 @@ import (
 	"go.temporal.io/googleadk"
 )
 
-// recordingModel wraps a FakeModel and records the tool declarations carried in
-// each LLMRequest it receives. Because LLMRequest.Tools is json:"-" but
-// LLMRequest.Config.Tools (the genai declarations) crosses the wire, this proves
-// the MCP tool's full parameter schema reached the model via ListMcpTools.
+// recordingModel wraps a FakeModel and records the model name and tool
+// declarations carried in each LLMRequest it receives. Because
+// LLMRequest.Tools is json:"-" but LLMRequest.Config.Tools (the genai
+// declarations) crosses the wire, this proves the MCP tool's full parameter
+// schema reached the model via ListMcpTools.
 type recordingModel struct {
 	inner *googleadk.FakeModel
 
-	mu    sync.Mutex
-	decls []*genai.FunctionDeclaration
+	mu     sync.Mutex
+	models []string
+	decls  []*genai.FunctionDeclaration
 }
 
 func newRecordingModel(name string, responses ...*model.LLMResponse) *recordingModel {
@@ -37,6 +39,7 @@ func (m *recordingModel) Name() string { return m.inner.Name() }
 
 func (m *recordingModel) GenerateContent(ctx context.Context, req *model.LLMRequest, stream bool) iter.Seq2[*model.LLMResponse, error] {
 	m.mu.Lock()
+	m.models = append(m.models, req.Model)
 	if req.Config != nil {
 		for _, gt := range req.Config.Tools {
 			if gt != nil {
@@ -46,6 +49,13 @@ func (m *recordingModel) GenerateContent(ctx context.Context, req *model.LLMRequ
 	}
 	m.mu.Unlock()
 	return m.inner.GenerateContent(ctx, req, stream)
+}
+
+// requestModels returns the LLMRequest.Model of each request received.
+func (m *recordingModel) requestModels() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.models...)
 }
 
 // declFor returns the recorded declaration with the given name, if any.

@@ -28,6 +28,10 @@ from typing import Any
 import pytest
 from google.adk import Agent, Runner
 from google.adk.agents import LlmAgent
+from google.adk.agents.run_config import (
+    RunConfig,
+    StreamingMode,  # pyright: ignore[reportPrivateImportUsage]
+)
 from google.adk.events import Event
 from google.adk.models import BaseLlm, LLMRegistry
 from google.adk.models.llm_request import LlmRequest
@@ -50,6 +54,7 @@ import temporalio.google_adk.workflow
 from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.contrib.opentelemetry import OpenTelemetryPlugin, create_tracer_provider
+from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.google_adk import (
     GoogleAdkPlugin,
     TemporalMcpToolSet,
@@ -67,7 +72,7 @@ logger = logging.getLogger(__name__)
 
 
 @activity.defn
-async def get_weather(city: str) -> str:  #  type: ignore[reportUnusedParameter]
+async def get_weather(city: str) -> str:  # pyright: ignore[reportUnusedParameter]
     """Activity that gets weather for a given city."""
     return "Warm and sunny. 17 degrees."
 
@@ -714,6 +719,93 @@ def test_summary_and_summary_fn_raises():
             activity_config=ActivityConfig(summary="static"),
             summary_fn=lambda req: "dynamic",
         )
+
+
+class AgentModel(BaseLlm):
+    """Answers with its class name and the request's model name."""
+
+    @classmethod
+    def supported_models(cls) -> list[str]:
+        return ["agent_model"]
+
+    async def generate_content_async(
+        self, llm_request: LlmRequest, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        text = f"{type(self).__name__} got {llm_request.model}"
+        yield LlmResponse(content=Content(role="model", parts=[Part(text=text)]))
+
+
+class CallbackModel(AgentModel):
+    @classmethod
+    def supported_models(cls) -> list[str]:
+        return ["callback_model"]
+
+
+def set_callback_model(
+    callback_context: Any,  # pyright: ignore[reportUnusedParameter]
+    llm_request: LlmRequest,
+) -> None:
+    llm_request.model = "callback_model"
+
+
+@workflow.defn
+class CallbackModelWorkflow:
+    @workflow.init
+    def __init__(self, stream: bool) -> None:  # pyright: ignore[reportUnusedParameter]
+        self.stream = WorkflowStream()
+
+    @workflow.run
+    async def run(self, stream: bool) -> str | None:
+        agent = Agent(
+            name="callback_model_agent",
+            model=TemporalModel("agent_model", streaming_topic="events"),
+            before_model_callback=set_callback_model,
+        )
+        runner = InMemoryRunner(agent=agent, app_name="callback_model")
+        session = await runner.session_service.create_session(
+            app_name="callback_model", user_id="test"
+        )
+        mode = StreamingMode.SSE if stream else StreamingMode.NONE
+        text = None
+        async with Aclosing(
+            runner.run_async(
+                user_id="test",
+                session_id=session.id,
+                new_message=types.Content(role="user", parts=[types.Part(text="hi")]),
+                run_config=RunConfig(streaming_mode=mode),
+            )
+        ) as agen:
+            async for event in agen:
+                if event.content and event.content.parts:
+                    text = event.content.parts[0].text
+        return text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.asyncio
+async def test_callback_model_name_keeps_agent_model(client: Client, stream: bool):
+    """The agent's model sends a model name set in a callback, as outside Temporal."""
+    new_config = client.config()
+    new_config["plugins"] = [GoogleAdkPlugin()]
+    client = Client(**new_config)
+    LLMRegistry.register(AgentModel)
+    LLMRegistry.register(CallbackModel)
+
+    async with Worker(
+        client,
+        task_queue=f"adk-callback-model-{stream}",
+        workflows=[CallbackModelWorkflow],
+        max_cached_workflows=0,
+    ):
+        result = await client.execute_workflow(
+            CallbackModelWorkflow.run,
+            stream,
+            id=f"callback-model-{uuid.uuid4()}",
+            task_queue=f"adk-callback-model-{stream}",
+            execution_timeout=timedelta(seconds=60),
+        )
+
+    assert result == "AgentModel got callback_model"
 
 
 @pytest.mark.asyncio
