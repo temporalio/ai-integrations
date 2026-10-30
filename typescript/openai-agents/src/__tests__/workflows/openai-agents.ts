@@ -176,3 +176,14 @@ export async function statefulMcpSlowConnectHeartbeatWorkflow(): Promise<string>
     await server.cleanup();
   }
 }
+
+export async function tracingApiKeyWorkflow(apiKey?: string): Promise<string> {
+  const agent = new Agent({
+    name: 'TracingKeyAgent',
+    instructions: 'You are a helpful assistant.',
+    model: 'gpt-4o-mini',
+  });
+  const runner = new TemporalOpenAIRunner();
+  const result = await runner.run(agent, 'Hello', apiKey ? { tracing: { apiKey } } : undefined);
+  return result.finalOutput ?? '';
+}

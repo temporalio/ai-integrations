@@ -9,13 +9,17 @@ being "simplified" away while pre-change workflows are still in flight.
 
 Fixture provenance: recorded on sdk-python main (pre-#1806) by driving a
 scripted two-identical-tool-call agent through ``run_deep_agent`` on a local
-dev server. Delete this test and the fixture together when the patch id goes
-through ``workflow.deprecate_patch``.
+dev server. ``legacy_cache_carried_messages_across_can.json`` was recorded the
+same way on ai-integrations ``5e91c26`` with ``_legacy_result_cache`` forced
+on (no patch marker), for a wrapped tool whose arguments hold a message.
+Delete these tests and the fixtures together when the patch id goes through
+``workflow.deprecate_patch``.
 """
 
 from __future__ import annotations
 
 import sys
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -101,15 +105,14 @@ async def test_legacy_dedup_history_replays() -> None:
 
 
 with workflow.unsafe.imports_passed_through():
+    from langchain_core.messages import HumanMessage
     from langchain_core.tools import tool as _lc_tool
 
 from temporalio.deepagents import _activity
 from temporalio.deepagents._tools import register_tool
 from temporalio.deepagents.workflow import call_tool
 
-_CAN_HISTORY = (
-    Path(__file__).parent / "histories" / "legacy_cache_carried_across_can.json"
-)
+_HISTORIES = Path(__file__).parent / "histories"
 
 
 @_lc_tool("legacy_echo")
@@ -118,19 +121,22 @@ def legacy_replay_echo(x: int) -> str:
     return f"echo:{x}"
 
 
+@_lc_tool("legacy_last_message")
+def legacy_replay_last_message(messages: list) -> str:
+    """Count the messages."""
+    return f"messages:{len(messages)}"
+
+
 register_tool(legacy_replay_echo)
 
 
 class _SameCallAgent:
+    def __init__(self, call: Callable[[], Awaitable[Any]]) -> None:
+        self._call = call
+
     async def ainvoke(self, input: Any) -> dict:
         messages = list(input.get("messages", [])) if isinstance(input, dict) else []
-        await call_tool(
-            _activity.ToolActivityInput(
-                tool_name="legacy_echo", tool_call_id="tc-1", args={"x": 1}
-            ),
-            summary="tool:legacy_echo",
-            start_to_close_timeout=timedelta(seconds=10),
-        )
+        await self._call()
         done = len(messages) >= 1
         return {
             "messages": [*messages, "turn"],
@@ -145,7 +151,35 @@ class LegacyReplayCanDedupWorkflow:
         from temporalio.deepagents import run_deep_agent
 
         return await run_deep_agent(
-            _SameCallAgent(),
+            _SameCallAgent(
+                lambda: call_tool(
+                    _activity.ToolActivityInput(
+                        tool_name="legacy_echo", tool_call_id="tc-1", args={"x": 1}
+                    ),
+                    summary="tool:legacy_echo",
+                    start_to_close_timeout=timedelta(seconds=10),
+                )
+            ),
+            input,
+            continue_as_new_after=1,
+            state_snapshot=state_snapshot,
+        )
+
+
+@workflow.defn(name="LegacyCanDedupMessagesWorkflow")
+class LegacyReplayCanDedupMessagesWorkflow:
+    @workflow.run
+    async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
+        from temporalio.deepagents import run_deep_agent
+
+        # A wrapped tool whose arguments hold a message: the legacy key must
+        # hash them as recorded.
+        wrapped = tool_as_activity(
+            legacy_replay_last_message, start_to_close_timeout=timedelta(seconds=10)
+        )
+        args = {"messages": [HumanMessage(content="Weather in Paris?")]}
+        return await run_deep_agent(
+            _SameCallAgent(lambda: wrapped.ainvoke(args)),
             input,
             continue_as_new_after=1,
             state_snapshot=state_snapshot,
@@ -153,7 +187,19 @@ class LegacyReplayCanDedupWorkflow:
 
 
 @pytest.mark.asyncio
-async def test_legacy_carried_cache_history_replays() -> None:
+@pytest.mark.parametrize(
+    ("workflow_cls", "fixture"),
+    [
+        (LegacyReplayCanDedupWorkflow, "legacy_cache_carried_across_can.json"),
+        (
+            LegacyReplayCanDedupMessagesWorkflow,
+            "legacy_cache_carried_messages_across_can.json",
+        ),
+    ],
+)
+async def test_legacy_carried_cache_history_replays(
+    workflow_cls: type, fixture: str
+) -> None:
     """The legacy rehydrate-and-hit path replays: this continued-run history
     was recorded pre-change with the SAME tool call re-issued after the
     boundary and served from the CARRIED cache — it contains zero
@@ -161,7 +207,8 @@ async def test_legacy_carried_cache_history_replays() -> None:
     seeds the cache from the inbound snapshot and serves the hit."""
     import json
 
-    events = json.loads(_CAN_HISTORY.read_text())["events"]
+    text = (_HISTORIES / fixture).read_text()
+    events = json.loads(text)["events"]
     scheduled = [
         e
         for e in events
@@ -173,6 +220,6 @@ async def test_legacy_carried_cache_history_replays() -> None:
     assert scheduled == [], "fixture must contain a fully cache-served run"
 
     plugin = DeepAgentsPlugin()
-    replayer = Replayer(workflows=[LegacyReplayCanDedupWorkflow], plugins=[plugin])
-    history = WorkflowHistory.from_json("legacy-can-replay", _CAN_HISTORY.read_text())
+    replayer = Replayer(workflows=[workflow_cls], plugins=[plugin])
+    history = WorkflowHistory.from_json("legacy-can-replay", text)
     await replayer.replay_workflow(history)

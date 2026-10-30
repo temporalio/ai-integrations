@@ -514,7 +514,10 @@ workflow-history compatibility and can still run with MCP Python SDK v1 when
 the `mcp` extra is not installed. New integrations should use `mcp_servers` and
 `temporal_mcp_server()`, which require the `mcp` extra and MCP Python SDK v2.
 The legacy stateful path retains its dedicated per-workflow worker and
-persistent-session behavior.
+persistent-session behavior. To require tool approval on these servers, pass
+`require_approval` to `stateless_mcp_server()` or `stateful_mcp_server()`;
+as with `temporal_mcp_server()`, a policy set on the factory's server is not
+used.
 
 ### Hosted MCP Tool
 
@@ -801,10 +804,34 @@ Certain tools are not suitable for a distributed computing environment, so these
 
 ### Model Providers
 
-| Model Provider | Supported |
-| :------------- | :-------: |
-| OpenAI         |    Yes    |
-| LiteLLM        |    Yes    |
+| Model Provider                                              | Supported |
+| :---------------------------------------------------------- | :-------: |
+| OpenAI                                                      |    Yes    |
+| LiteLLM                                                     |    Yes    |
+| Any OpenAI-compatible API, through a custom `ModelProvider` |    Yes    |
+
+Pass a custom provider with `OpenAIAgentsPlugin(model_provider=...)`. When an agent names no
+model, the provider's `get_model(None)` chooses it. The Agents SDK gives such an agent the
+default settings for the SDK's own default model, which include a reasoning effort and
+`verbosity`; the model activity replaces them with the SDK's defaults for the model the
+provider resolved, as the SDK itself does for a named model, so an endpoint that rejects
+unknown fields never sees them. The workflow decides whether the settings were those
+implicit defaults, so an activity worker with a different `OPENAI_DEFAULT_MODEL` gets the
+same result, and `RunConfig.model_settings` is re-applied after the replacement. Settings
+the agent sets explicitly are sent unchanged.
+
+Model calls run in an Activity on the Worker, so they use the provider set on the Worker with
+`OpenAIAgentsPlugin(model_provider=...)`. To use several providers, set a `MultiProvider` with a
+prefix map there and choose a provider by model name. A Workflow cannot set its own provider:
+`Runner.run` raises `ValueError` when `RunConfig.model_provider` is anything other than the default.
+A run that started on an earlier version and already passed its own provider keeps using the
+Worker's provider, so that it replays; a run that passes one for the first time after the upgrade
+gets the error.
+
+Without `model_provider`, the plugin uses an `OpenAIProvider` on the client set with the framework's
+`set_default_openai_client`, as it is: give that client `max_retries=0` to leave retries to Temporal.
+Without one, it uses the key set with `set_default_openai_key`, or else `OPENAI_API_KEY`, with the
+client's own retries turned off. Set them before you create the Worker.
 
 ### Model Response format
 
@@ -901,6 +928,17 @@ SQLite storage is not suited to a distributed workflow environment.
 | Tracing Provider | Supported |
 | :--------------- | :-------: |
 | OpenAI platform  |    Yes    |
+
+A trace's own tracing key, set with `RunConfig(tracing={"api_key": ...})` or
+`trace(..., tracing={"api_key": ...})`, is not supported. The plugin passes traces to Workflows and
+Activities in headers, which are stored in Event History, so it cannot pass the key, and their spans
+would be exported with another key. In Workflow code, `Runner.run`, `Runner.run_streamed` and
+`trace()` raise `ValueError` when given such a key. Starting a Workflow, or scheduling an Activity or
+child Workflow, under such a trace raises it too. Agent runs inside Activities can still use their
+own key. Set the tracing key on every client and Worker process instead, with
+`set_tracing_export_api_key` or `OPENAI_API_KEY`. A run that used such a key in Workflow code
+before you deploy this version gets the error when it replays: let those runs finish first, or use
+Worker Versioning.
 
 ## OpenTelemetry Integration
 

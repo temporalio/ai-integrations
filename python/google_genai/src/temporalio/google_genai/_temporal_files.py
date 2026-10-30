@@ -8,6 +8,7 @@ activity worker.
 
 from __future__ import annotations
 
+import base64
 import io
 import os
 from datetime import timedelta
@@ -84,7 +85,11 @@ class TemporalAsyncFiles(AsyncFiles):
                     "file must be a binary stream when passing an io.IOBase; "
                     f"file.read() must return bytes (got {type(file_bytes).__name__})"
                 )
-            req = _GeminiUploadFileRequest(file_bytes=file_bytes, config=upload_config)
+            # base64, because the JSON encoding of ``bytes`` is UTF-8 text.
+            req = _GeminiUploadFileRequest(
+                file_base64=base64.b64encode(file_bytes).decode("ascii"),
+                config=upload_config,
+            )
         elif isinstance(file, str):
             req = _GeminiUploadFileRequest(file_path=file, config=upload_config)
         else:

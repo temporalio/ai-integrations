@@ -8,6 +8,8 @@ from agents import (
     AgentsException,
     FunctionTool,
     Handoff,
+    ModelProvider,
+    MultiProvider,
     RunConfig,
     RunContextWrapper,
     RunResult,
@@ -29,10 +31,13 @@ from temporalio.openai_agents._errors import (
 )
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._temporal_model_provider import (
+    _current_run_model_settings,
+    _TemporalModelProvider,
     capture_scope,
     install_model_provider,
 )
 from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
+from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
@@ -106,6 +111,7 @@ def _convert_agent(
         model_name=name,
         model_params=model_params,
         agent=agent,
+        current_run_model_settings=_current_run_model_settings.get,
     )
     new_agent.handoffs = new_handoffs
     new_agent.tools = [
@@ -135,6 +141,39 @@ def _has_sandbox_agent(agent: Agent[Any], seen: set[int] | None = None) -> bool:
         if isinstance(handoff, Agent) and _has_sandbox_agent(handoff, seen):
             return True
     return False
+
+
+# Runs without this patch marker started before the plugin refused
+# ``RunConfig.model_provider``. They keep the old behavior, the Worker's provider, so that
+# they replay.
+_REFUSE_RUN_MODEL_PROVIDER_PATCH = "openai_agents.refuse-run-model-provider"
+
+
+def _is_default_model_provider(provider: ModelProvider) -> bool:
+    """Whether ``provider`` is an unconfigured ``MultiProvider``, as ``RunConfig()`` makes."""
+    if type(provider) is not MultiProvider:
+        return False
+    return _multi_provider_settings(provider) == _multi_provider_settings(
+        MultiProvider()
+    )
+
+
+def _multi_provider_settings(provider: MultiProvider) -> dict[str, Any]:
+    # Caches filled on use are not settings.
+    caches = {"_fallback_providers", "_ws_model_cache_by_loop"}
+    settings: dict[str, Any] = {
+        name: value
+        for name, value in vars(provider).items()
+        if name not in caches and name != "openai_provider"
+    }
+    openai_settings = vars(provider.openai_provider)
+    if "_stored_api_key" in openai_settings:
+        # No client was passed, so ``_client`` caches the one built on first use.
+        caches.add("_client")
+    settings["openai_provider"] = {
+        name: value for name, value in openai_settings.items() if name not in caches
+    }
+    return settings
 
 
 def _coerce_run_config(value: object) -> RunConfig:
@@ -178,7 +217,7 @@ class TemporalOpenAIRunner(AgentRunner):
         self,
         starting_agent: Agent[TContext],
         kwargs: RunOptions[TContext],
-    ) -> Agent[Any]:
+    ) -> tuple[Agent[Any], RunConfig]:
         """Workflow-only validation and ``kwargs`` rewrite shared by ``run()`` and ``run_streamed()``."""
         for t in starting_agent.tools:
             if callable(t):
@@ -233,6 +272,25 @@ class TemporalOpenAIRunner(AgentRunner):
                 ),
             )
 
+        # Model calls run in an Activity on the Worker's provider, so a provider set on the
+        # run would be silently ignored. A nested run, such as an agent used as a tool,
+        # inherits the plugin's provider.
+        if not isinstance(
+            run_config.model_provider, _TemporalModelProvider
+        ) and not _is_default_model_provider(run_config.model_provider):
+            if workflow.patched(_REFUSE_RUN_MODEL_PROVIDER_PATCH):
+                raise ValueError(
+                    "Temporal workflows do not support RunConfig.model_provider. Model "
+                    "calls use the provider set on the Worker with "
+                    "OpenAIAgentsPlugin(model_provider=...). To use several providers, "
+                    "set a MultiProvider with a prefix map there and choose a provider "
+                    "by model name."
+                )
+
+        # Model calls run in an Activity, which cannot get the run's own tracing key.
+        if run_config.tracing is not None:
+            _refuse_tracing_key(run_config.tracing.get("api_key"))
+
         run_config = install_model_provider(self.model_params, run_config)
 
         # run_config.sandbox is global for the entire run — configure it if any agent needs it.
@@ -265,7 +323,7 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         kwargs["run_config"] = run_config
-        return _convert_agent(self.model_params, starting_agent, None)
+        return _convert_agent(self.model_params, starting_agent, None), run_config
 
     async def run(
         self,
@@ -281,9 +339,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 **kwargs,
             )
 
-        converted_agent = self._prepare_workflow_run(starting_agent, kwargs)
+        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
-        with capture_scope():
+        with capture_scope(run_config.model_settings):
             try:
                 return await self._runner.run(
                     starting_agent=converted_agent,
@@ -353,13 +411,16 @@ class TemporalOpenAIRunner(AgentRunner):
                 "heartbeats or the workflow stream signal channel)."
             )
 
-        converted_agent = self._prepare_workflow_run(starting_agent, kwargs)
+        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
-        streamed_result = self._runner.run_streamed(
-            starting_agent=converted_agent,
-            input=input,
-            **kwargs,
-        )
+        # The streaming loop runs in a task created inside run_streamed, which copies
+        # this context, so the scope only needs to cover the call itself.
+        with capture_scope(run_config.model_settings):
+            streamed_result = self._runner.run_streamed(
+                starting_agent=converted_agent,
+                input=input,
+                **kwargs,
+            )
 
         # Mirror the AgentsException -> AgentsWorkflowError rewrap done
         # in run() above. The streaming runner attaches the actual run

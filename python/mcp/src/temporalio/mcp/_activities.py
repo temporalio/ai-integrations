@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any, TypeVar
@@ -235,7 +235,7 @@ class _MCPActivities:
         return activities
 
     @asynccontextmanager
-    async def run_context(self) -> AsyncIterator[None]:
+    async def run_context(self) -> AsyncGenerator[None, None]:
         loop = asyncio.get_running_loop()
         self._run_contexts[loop] = self._run_contexts.get(loop, 0) + 1
         body_completed = False

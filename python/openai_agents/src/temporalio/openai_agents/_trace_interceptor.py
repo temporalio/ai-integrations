@@ -5,7 +5,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextvars
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from typing import Any, Protocol
 
@@ -25,6 +25,24 @@ from temporalio import activity
 HEADER_KEY = "__openai_span"
 
 
+def _refuse_tracing_key(tracing_api_key: str | None) -> None:
+    """Raise if a trace has its own tracing key, which headers cannot carry.
+
+    The header is stored in Event History, so it must not hold a credential. Without the key,
+    spans made on the other side are exported with that process's default key instead.
+    Workflow code is refused where it sets the key; every header write checks again.
+    """
+    if tracing_api_key is None:
+        return
+    raise ValueError(
+        "The OpenAI Agents plugin cannot pass a trace's own tracing key, set with "
+        "tracing={'api_key': ...} on RunConfig or trace(), to Temporal workflows and "
+        "activities, so their spans would be exported with another key. Set the tracing "
+        "key on every client and worker process instead, with set_tracing_export_api_key "
+        "or OPENAI_API_KEY."
+    )
+
+
 class _InputWithHeaders(Protocol):
     headers: Mapping[str, temporalio.api.common.v1.Payload]
 
@@ -33,7 +51,7 @@ class _InputWithHeaders(Protocol):
 def temporal_span(
     add_temporal_spans: bool,
     span_name: str,
-) -> Iterator[None]:
+) -> Generator[None, None, None]:
     """Create a temporal span context manager.
 
     Args:
@@ -149,6 +167,10 @@ class OpenAIAgentsContextPropagationInterceptor(
 
     def set_header_from_context(self, input: _InputWithHeaders) -> None:
         """Inserts the OpenAI Agents trace/span data in the input header."""
+        current_trace = get_trace_provider().get_current_trace()
+        _refuse_tracing_key(
+            current_trace.tracing_api_key if current_trace is not None else None
+        )
         input.headers = {
             **input.headers,
             HEADER_KEY: temporalio.converter.PayloadConverter.default.to_payload(
@@ -216,7 +238,7 @@ class OpenAIAgentsContextPropagationInterceptor(
     def context_from_header(
         self,
         input: _InputWithHeaders,
-    ) -> Iterator[None]:
+    ) -> Generator[None, None, None]:
         """Restore the caller's trace context for an inbound operation."""
         previous_trace: Trace | None = Scope.get_current_trace()
         previous_span: Span[Any] | None = Scope.get_current_span()
@@ -452,7 +474,9 @@ class _ContextPropagationWorkflowOutboundInterceptor(
         input: _InputWithHeaders,
         span_name: str,
         data: dict[str, Any],
-    ) -> Iterator[tuple[contextvars.Context, Callable[[asyncio.Future[Any]], None]]]:
+    ) -> Generator[
+        tuple[contextvars.Context, Callable[[asyncio.Future[Any]], None]], None, None
+    ]:
         context: contextvars.Context = contextvars.copy_context()
         span_scope: AbstractContextManager[None] = self.root().maybe_span(
             span_name=span_name, data=data

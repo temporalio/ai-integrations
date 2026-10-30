@@ -1,11 +1,19 @@
+import path from 'node:path';
 import type { TestFn } from 'ava';
 import { McpClient, Message, Model, TextBlock } from '@strands-agents/sdk';
 import type { BaseModelConfig, JSONValue, ModelStreamEvent, StreamOptions, Tool } from '@strands-agents/sdk';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { ApplicationFailure } from '@temporalio/common';
 import type { BaseContext } from '@temporalio/test-helpers';
-import { test as anyTest, createBaseBundlerOptions, helpers, TestWorkflowEnvironment } from '@temporalio/test-helpers';
+import {
+  test as anyTest,
+  createBaseBundlerOptions,
+  helpers,
+  loadHistory,
+  TestWorkflowEnvironment,
+} from '@temporalio/test-helpers';
 import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
+import { DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { StrandsPlugin } from '..';
 import { startLocalWithRetry } from './helpers/environment';
@@ -13,6 +21,7 @@ import { auditLog, auditTool, deleteState, deleteThing, getWeather, getWeatherCa
 import {
   activityToolAgent,
   approveSignal,
+  compressionAgent,
   defaultModelAgent,
   failingActivityToolAgent,
   failingMcpToolAgent,
@@ -21,6 +30,7 @@ import {
   interruptAgent,
   inWorkflowToolAgent,
   mcpAgent,
+  retryConfigAgent,
   streamingAgent,
   structuredOutputAgent,
 } from './workflows/strands';
@@ -193,6 +203,88 @@ test('TemporalAgent without `model:` resolves to the single registered factory',
     });
     t.is(result, 'reply from default');
   });
+});
+
+test('TemporalAgent gives Strands the worker model id and context window', async (t) => {
+  t.timeout(60_000);
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  const userTurns: string[][] = [];
+  class WindowStub extends StubModel {
+    // The API key must not reach the workflow, or its history.
+    override getConfig(): BaseModelConfig & { apiKey: string } {
+      return { modelId: 'window-stub', contextWindowLimit: 1000, apiKey: 'secret-api-key' };
+    }
+    override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+      userTurns.push(messages.filter((m) => m.role === 'user').map((m) => (m.content[0] as TextBlock).text));
+      yield* super.stream(messages, options);
+    }
+  }
+  // The first reply reports 800 input tokens: 80% of the model's 1,000-token window, over the
+  // default compression threshold of 70%, but only 0.4% of Strands' 200,000-token fallback.
+  const firstTurn = [
+    ...textTurn('first'),
+    { type: 'modelMetadataEvent', usage: { inputTokens: 800, outputTokens: 1, totalTokens: 801 } },
+  ];
+
+  const worker = await createWorker({
+    plugins: [
+      new StrandsPlugin({
+        models: { test: () => new WindowStub([firstTurn as ModelStreamEvent[], textTurn('second')]) },
+      }),
+    ],
+  });
+
+  const config = await worker.runUntil(
+    executeWorkflow(compressionAgent, { args: [['turn 1', 'turn 2']], workflowExecutionTimeout: '30 seconds' })
+  );
+  // Compression dropped the first turn before the second model call, as it does natively.
+  t.deepEqual(
+    { config, userTurns },
+    { config: { modelId: 'window-stub', contextWindowLimit: 1000 }, userTurns: [['turn 1'], ['turn 2']] }
+  );
+});
+
+test('TemporalAgent reads the model config again after a failed read', async (t) => {
+  t.timeout(60_000);
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  class FlakyConfigStub extends StubModel {
+    private reads = 0;
+    override getConfig(): BaseModelConfig {
+      if (++this.reads === 1) throw ApplicationFailure.nonRetryable('config unavailable');
+      return { modelId: 'flaky-stub', contextWindowLimit: 1000 };
+    }
+  }
+
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin({ models: { test: () => new FlakyConfigStub([textTurn('second')]) } })],
+  });
+
+  const result = await worker.runUntil(executeWorkflow(retryConfigAgent, { args: ['hi'] }));
+  t.deepEqual(result, {
+    turns: ['error: config unavailable', 'second'],
+    config: { modelId: 'flaky-stub', contextWindowLimit: 1000 },
+  });
+});
+
+test('a history recorded before the model config read fails to replay', async (t) => {
+  // Recorded with `helloAgent` on 73deca0, before agents read the model config: its first command
+  // is `invokeModel`, where an agent now schedules `strandsGetModelConfig`.
+  const history = await loadHistory(
+    path.resolve(__dirname, '../../src/__tests__/histories/hello-agent-before-model-config.json')
+  );
+  const err = await t.throwsAsync(
+    Worker.runReplayHistory(
+      {
+        workflowBundle: t.context.workflowBundle,
+        plugins: [new StrandsPlugin({ models: { test: () => new StubModel([]) } })],
+      },
+      history
+    ),
+    { instanceOf: DeterminismViolationError }
+  );
+  t.regex(err!.message, /\[TMPRL1100\].*'invokeModel'.*'strandsGetModelConfig'/);
 });
 
 test('invokeModel reconstructs Message instances from wire data', async (t) => {

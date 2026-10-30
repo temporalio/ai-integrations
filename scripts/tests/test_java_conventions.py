@@ -26,7 +26,7 @@ runtime-versions = ["17", "25"]
 imports = ["io.temporal.example.Public"]
 ''')
     for name in ("build.gradle", "README.md", "gradlew", "gradlew.bat",
-                 "gradle/wrapper/gradle-wrapper.jar"):
+                 "gradle/wrapper/gradle-wrapper.jar", "gradle/dependency-locks/dependencies.lockfile"):
         path = plugin / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
@@ -84,3 +84,10 @@ def test_java_plugin_requires_shared_settings(java_repo: Path) -> None:
     assert Checker(java_repo).run() == [
         "java/_shared/settings.gradle: missing shared plugin repository configuration"
     ]
+
+
+def test_java_plugin_without_boot_matrix_requires_a_dependency_lock(java_repo: Path) -> None:
+    (java_repo / "java/example/gradle/dependency-locks/dependencies.lockfile").unlink()
+    commit_all(java_repo, "drop the dependency lock")
+    failures = Checker(java_repo).run()
+    assert any("dependencies.lockfile" in failure for failure in failures), failures

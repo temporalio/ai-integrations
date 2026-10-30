@@ -20,5 +20,7 @@ export type {
   HostedToolIdentity,
 } from './worker/hosted-tool-credentials';
 
+export type { TracingApiKeyContext, TracingApiKeyResolver } from './worker/trace-interceptor';
+
 export { OpenAIAgentsTraceClientInterceptor } from './client/trace-interceptor';
 export type { OpenAIAgentsTraceClientInterceptorOptions } from './client/trace-interceptor';

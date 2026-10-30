@@ -1,0 +1,128 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-10-23T07:59:53.500605960Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+      "taskId": "1048615",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "LegacyCanDedupMessagesWorkflow"
+        },
+        "taskQueue": {
+          "name": "legacy-msgs",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "e30="
+            },
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "eyJtZXNzYWdlcyI6WyJ0dXJuIl0sIl9fdGVtcG9yYWxfY2FjaGVfXyI6eyI2Mzk0NzA4YjQ3ZGZjYjM1YzVkNWVjMTg1ZmY0MWYxYTA4YjU1MDJmNTU5NjJmMGQ0YmM1MzMzZGU1ODM0ZTA3Ijp7ImxjIjoxLCJ0eXBlIjoiY29uc3RydWN0b3IiLCJpZCI6WyJsYW5nY2hhaW4iLCJzY2hlbWEiLCJtZXNzYWdlcyIsIlRvb2xNZXNzYWdlIl0sImt3YXJncyI6eyJjb250ZW50IjoibWVzc2FnZXM6MSIsInR5cGUiOiJ0b29sIiwibmFtZSI6ImxlZ2FjeV9sYXN0X21lc3NhZ2UiLCJ0b29sX2NhbGxfaWQiOiJiYzMyZGJmY2ZkZWM0ZTU0OTMyMWU2Y2FjOWY4N2FlNSIsInN0YXR1cyI6InN1Y2Nlc3MifX19fQ=="
+            }
+          ]
+        },
+        "workflowRunTimeout": "0s",
+        "workflowTaskTimeout": "10s",
+        "continuedExecutionRunId": "01a167c6-0273-722d-b1ee-610fa017e5f3",
+        "initiator": "CONTINUE_AS_NEW_INITIATOR_WORKFLOW",
+        "originalExecutionRunId": "317579ea-6e1a-463b-8572-1261d32a7ed7",
+        "firstExecutionRunId": "01a167c6-0273-722d-b1ee-610fa017e5f3",
+        "attempt": 1,
+        "prevAutoResetPoints": {
+          "points": [
+            {
+              "runId": "01a167c6-0273-722d-b1ee-610fa017e5f3",
+              "firstWorkflowTaskCompletedId": "4",
+              "createTime": "2026-10-23T07:59:52.995000543Z",
+              "expireTime": "2026-10-24T07:59:53.500605960Z",
+              "resettable": true,
+              "buildId": "779f767933cb571146d2ef2cf0611806"
+            }
+          ]
+        },
+        "workflowId": "legacy-can-messages-4a629707-95ce-40d5-9eb9-c33c8f06127a",
+        "priority": {}
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-10-23T07:59:53.500817044Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "taskId": "1048616",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "legacy-msgs",
+          "kind": "TASK_QUEUE_KIND_NORMAL"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-10-23T07:59:53.504935877Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "taskId": "1048623",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "800@ccf4537099e6",
+        "requestId": "35db9b03-4582-47bc-8386-e834cb0a8ee4",
+        "historySizeBytes": "828",
+        "workerVersion": {
+          "buildId": "779f767933cb571146d2ef2cf0611806"
+        }
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-10-23T07:59:53.911957502Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "taskId": "1048627",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "800@ccf4537099e6",
+        "workerVersion": {
+          "buildId": "779f767933cb571146d2ef2cf0611806"
+        },
+        "sdkMetadata": {
+          "coreUsedFlags": [
+            1,
+            2,
+            3
+          ],
+          "sdkName": "temporal-python",
+          "sdkVersion": "1.34.0"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-10-23T07:59:53.912010002Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
+      "taskId": "1048628",
+      "workflowExecutionCompletedEventAttributes": {
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "eyJtZXNzYWdlcyI6WyJ0dXJuIiwidHVybiJdLCJ0b2RvcyI6W3siY29udGVudCI6InciLCJzdGF0dXMiOiJjb21wbGV0ZWQifV19"
+            }
+          ]
+        },
+        "workflowTaskCompletedEventId": "4"
+      }
+    }
+  ]
+}

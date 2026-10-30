@@ -40,6 +40,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
 | `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
 | `java/spring-ai` | `io.temporal:spring-ai` | 0.1.0 | Public Preview | `io.temporal.springai` |
+| `java/google-adk` | `io.temporal:google-adk` | 0.1.0 | Public Preview | `io.temporal.googleadk` |
 | `go/googleadk` | `go.temporal.io/googleadk` | 0.1.0 (new coordinate) | Public Preview | `googleadk` |
 
 "First version here" values are informational; the registry is the source of truth for the
@@ -90,14 +91,17 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - Provenance guard (`tests/helpers/provenance.py`, mirrored by `scripts/ci/smoke.py`) runs at every pytest session start and fails loudly if the install is editable, any file differs from the distribution's RECORD, files under the package directory are not owned by the distribution, or another distribution ships the same paths. `tests/test_installed_matches_source.py` additionally byte-compares the installed package with `src/`.
 - Dependency cooldown: `exclude-newer = "2 weeks"` (org supply-chain policy) with `exclude-newer-package = { temporalio = false }` so a new SDK release is adoptable the day it ships; a plugin that depends on another plugin adds that coordinate too (`temporalio-mcp = false` in `openai_agents`), otherwise a fresh first-party release is invisible to `uv lock` for two weeks. Declare exactly what the package imports at module level; `openinference` and similar lazy imports go in an extra.
 - Tooling: ruff, pyright, basedpyright, mypy (`mypy_path = "src"`, `explicit_package_bases`), pydocstyle (google), pytest + xdist (`-n auto --dist=worksteal`; the `os._exit(0)` hook is xdist-aware). `python/_shared/` owns the make recipes and composable Pyright/Ruff defaults; mypy and pydocstyle settings stay in each `pyproject.toml` because those tools cannot extend another config while preserving plugin overrides. All tools are invoked through `make` targets; see `make help`.
-- Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in a plugin's conftest only when one of its tests needs a server feature that is off by default. Bind those options in a startup callback passed to `tests/helpers/environment.py`'s `start_local_with_retry`. This plugin-agnostic policy allows three startup attempts with a one-second delay for the SDK's explicit startup-deadline message; other errors and cancellation propagate immediately.
+- Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in a plugin's conftest only when one of its tests needs a server feature that is off by default. Bind those options in a startup callback passed to `tests/helpers/environment.py`'s `start_local_with_retry`. This plugin-agnostic policy allows three attempts with a one-second delay only for the SDK's explicit startup timeout, executable download, and archive read/extraction errors. Other errors, including configuration, client connection and cancellation failures, propagate immediately.
 - Test scaffolding: each plugin owns its provenance guard, local dev-server fixtures and pytest hooks. New plugins copy the standard implementations from `python/_template/tests/`; the conventions check keeps `environment.py`, `plugin_meta.py`, `provenance.py`, `test_env.py`, and `test_installed_matches_source.py` byte-identical to their canonical templates. Plugin-specific fixtures stay in that plugin's conftest. Tests must not require real provider credentials; use deterministic local models, mock transports, or in-process servers to exercise provider behavior in CI.
 
 ## Java conventions
 
 - Each Java plugin owns a Gradle wrapper with distribution checksum, `build.gradle`,
-  `settings.gradle`, `plugin.toml`, and per-Spring-Boot dependency locks. Shared build
-  conventions live in `java/_shared/java.gradle`.
+  `settings.gradle`, `plugin.toml`, and committed dependency locks. Plugins with a
+  `spring-boot-versions` matrix lock once per Boot version
+  (`gradle/dependency-locks/spring-boot-<version>.lockfile`); the others keep one
+  `gradle/dependency-locks/dependencies.lockfile`. Shared build conventions live in
+  `java/_shared/java.gradle`.
 - Every Java plugin starts `settings.gradle` with a `pluginManagement` block applying
   `../_shared/settings.gradle`. The shared script checks Maven Central before the
   Gradle Plugin Portal; the conventions check enforces this entry point for every plugin.
@@ -123,19 +127,27 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   workspace or lockfile. Shared make, TypeScript and ESLint configuration lives
   in `typescript/_shared/`.
 - Coordinates and root APIs are `@temporalio/<name>`. The development version is
-  `0.0.0`. Node 22.12.0 is the minimum (provider packages require Node 22 and
-  unflagged CommonJS loading of ES modules); CI tests the latest Node 22.x and 24.x
-  using major selectors with `check-latest: true`. Use pnpm 10.27.0
-  and `make sync`, `make lint`, `make test`, `make build`.
+  `0.0.0`. Node 22.12.0 is the repository minimum (provider packages require Node 22
+  and unflagged CommonJS loading of ES modules); a plugin whose dependencies require
+  more declares its own floor in `engines` (`google-adk`: 22.17.0, which
+  `@mikro-orm/core` 7 requires through `@google/adk` 2.1 and later). CI tests the
+  latest Node 22.x and 24.x using major selectors with `check-latest: true`; a plugin
+  may name its floor's `major.minor` as the first `[ci] runtime-versions` entry so the
+  minimum cell runs that line's latest patch instead of the latest 22.x, which such a
+  plugin then does not test (`google-adk` tests 22.17 and 24). Use pnpm 10.27.0 and
+  `make sync`, `make lint`, `make test`, `make build`.
 - SDK and Workflow Streams dependencies use published npm coordinates. The
   unpublished SDK test helpers are copied into each consuming plugin's
   `tests/helpers/`, with a private development-only link. Never use a local
   SDK checkout or another plugin's checkout as a dependency.
 - Local server startup uses `startLocalWithRetry`, with three attempts and a
-  one-second delay only for the SDK's explicit startup-deadline error. Bind each
-  plugin's server configuration in the startup callback. Copy the helper and its
-  regression tests from `typescript/_template/src/__tests__/`; the conventions
-  check keeps each plugin's copies byte-identical to the templates.
+  one-second delay only for the SDK's explicit startup timeout, executable
+  download, and archive read/extraction errors. Other errors, including client
+  connection failures and `AbortError` cancellation, propagate immediately.
+  Bind each plugin's server configuration in the startup callback.
+  Copy the helper and its regression tests from
+  `typescript/_template/src/__tests__/`; the conventions check keeps each
+  plugin's copies byte-identical to the templates.
 - `make sync` preserves the committed lock. `make sync-latest` updates compatible
   ranges under the two-week pnpm release-age policy. Preserve first-party and
   exact AI SDK dependency-family cooldown exceptions inherited from the SDK.
