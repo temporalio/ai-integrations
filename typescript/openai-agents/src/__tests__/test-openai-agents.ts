@@ -532,7 +532,9 @@ test('Approval resume keeps the caller context object', async (t) => {
     plugins: [
       new OpenAIAgentsPlugin({
         modelProvider: new FakeModelProvider([
-          toolCallResponse('set_after', { value: 'S-after' }),
+          toolCallResponse('set_after', { value: 'S-1' }, 'call_set_after_1'),
+          toolCallResponse('set_after', { value: 'S-2' }, 'call_set_after_2'),
+          toolCallResponse('set_after', { value: 'S-after' }, 'call_set_after_3'),
           textResponse('done'),
         ]),
       }),
@@ -543,5 +545,14 @@ test('Approval resume keeps the caller context object', async (t) => {
     executeWorkflow(approvalResumeContextWorkflow, { workflowExecutionTimeout: '30 seconds' })
   );
 
-  t.deepEqual(result, { callerAfter: 'S-after', resumedUsesCallerObject: true });
+  // Each resume keys the approvals under a new converted agent graph; only the last one keeps them.
+  t.deepEqual(result, {
+    callerAfter: 'S-after',
+    resumedUsesCallerObject: true,
+    writes: ['S-1', 'S-2', 'S-after'],
+    approvalRounds: 3,
+    failedResumeThrew: true,
+    approvalOwners: 1,
+    approvedCallIds: 3,
+  });
 });

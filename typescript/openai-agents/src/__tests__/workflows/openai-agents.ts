@@ -180,16 +180,48 @@ export async function statefulMcpSlowConnectHeartbeatWorkflow(): Promise<string>
 interface ResumeContext {
   original: string;
   after?: string;
+  writes: string[];
 }
 
 export interface ApprovalResumeContextResult {
   callerAfter: string | undefined;
   resumedUsesCallerObject: boolean;
+  writes: string[];
+  approvalRounds: number;
+  failedResumeThrew: boolean;
+  approvalOwners: number;
+  approvedCallIds: number;
+}
+
+/** Serialized approval record, as the `RunContext` internal below returns it. */
+interface ApprovalRecord {
+  approved: boolean | string[];
+}
+
+/** Counts the agents that own function approvals in `context`, and the call IDs they approve. */
+function countApprovalOwners(context: unknown): { approvalOwners: number; approvedCallIds: number } {
+  let approvalOwners = 0;
+  // _toJSONForRunState is internal to @openai/agents-core; it looks up each owner in the map it's given.
+  const json = (
+    context as {
+      _toJSONForRunState(keys: { get(agent: unknown): string }): {
+        functionApprovals?: Array<{ approvals: Record<string, ApprovalRecord> }>;
+      };
+    }
+  )._toJSONForRunState({ get: () => `owner-${++approvalOwners}` });
+  let approvedCallIds = 0;
+  for (const { approvals } of json.functionApprovals ?? []) {
+    for (const record of Object.values(approvals)) {
+      approvedCallIds += Array.isArray(record.approved) ? record.approved.length : 0;
+    }
+  }
+  return { approvalOwners, approvedCallIds };
 }
 
 /**
- * Approves a tool that writes the run context, resumes the same `RunState`, then reads the
- * caller's context object.
+ * Approves a tool that writes the run context and resumes the same `RunState` until the run
+ * finishes, then reads the caller's context object. The first resume uses an agent the state
+ * doesn't match, which must fail without losing the approval.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -203,7 +235,9 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     },
     needsApproval: true,
     execute: async (args, runContext) => {
-      (runContext!.context as ResumeContext).after = (args as { value: string }).value;
+      const context = runContext!.context as ResumeContext;
+      context.after = (args as { value: string }).value;
+      context.writes.push(context.after);
       return 'ok';
     },
   });
@@ -213,10 +247,29 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     model: 'gpt-4o-mini',
     tools: [setAfter],
   });
+  const otherAgent = new Agent<ResumeContext>({ name: 'OtherAgent', model: 'gpt-4o-mini', tools: [setAfter] });
   const runner = new TemporalOpenAIRunner();
-  const ctx: ResumeContext = { original: 'orig' };
-  const first = await runner.run(agent, 'go', { context: ctx });
-  first.state.approve(first.interruptions[0]!);
-  const resumed = await runner.run(agent, first.state);
-  return { callerAfter: ctx.after, resumedUsesCallerObject: resumed.runContext.context === ctx };
+  const ctx: ResumeContext = { original: 'orig', writes: [] };
+  let result = await runner.run(agent, 'go', { context: ctx });
+  let approvalRounds = 0;
+  let failedResumeThrew = false;
+  while (result.interruptions.length > 0 && approvalRounds < 10) {
+    result.state.approve(result.interruptions[0]!);
+    if (approvalRounds++ === 0) {
+      try {
+        await runner.run(otherAgent, result.state);
+      } catch {
+        failedResumeThrew = true;
+      }
+    }
+    result = await runner.run(agent, result.state);
+  }
+  return {
+    callerAfter: ctx.after,
+    resumedUsesCallerObject: result.runContext.context === ctx,
+    writes: ctx.writes,
+    approvalRounds,
+    failedResumeThrew,
+    ...countApprovalOwners(result.runContext),
+  };
 }

@@ -140,13 +140,17 @@ export function textResponse(text: string): ModelResponse {
   return { output, usage: fakeUsage(text.length) };
 }
 
-export function toolCallResponse(toolName: string, args: Record<string, unknown>): ModelResponse {
+export function toolCallResponse(
+  toolName: string,
+  args: Record<string, unknown>,
+  callId = `call_fake_${toolName}`
+): ModelResponse {
   const output: AgentOutputItem[] = [
     {
       type: 'function_call',
       name: toolName,
       arguments: JSON.stringify(args),
-      callId: `call_fake_${toolName}`,
+      callId,
       status: 'completed',
     },
   ];
