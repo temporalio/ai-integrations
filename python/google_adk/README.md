@@ -69,14 +69,16 @@ Model calls are intercepted and executed as Temporal activities with configurabl
 - Automatic passthrough for `google.adk`, `google.genai`, `mcp`, and `opentelemetry` modules
 - Works with both sandboxed and unsandboxed workflow runners
 
-> **Upgrading from `temporalio.contrib.google_adk_agents` in `temporalio` 1.31 to 1.33:** with
-> `google-adk` 2.9 or later, those versions fail every agent turn with
+> **Upgrading to this plugin from `temporalio.contrib.google_adk_agents` in `temporalio` 1.31
+> through 1.33:** with `google-adk` 2.9 or later and the default Workflow sandbox, those versions
+> fail every agent turn with
 > `RestrictedWorkflowAccessError: Cannot access os.environ.get from inside a workflow`, because
 > ADK imports `opentelemetry` during the turn. This plugin passes `opentelemetry` through the
-> sandbox, so those turns now run, and runs stopped by that error continue. But a run whose
-> Workflow code caught that error and then scheduled other work fails to replay with a
-> `[TMPRL1100]` nondeterminism error. Let such runs finish on Workers that keep the old version,
-> for example with Worker Versioning, or reset them to before the failed turn.
+> sandbox, so those turns now run. But a run whose Workflow code caught that error and then did
+> anything else, such as scheduling an Activity or completing, fails to replay with a
+> `[TMPRL1100]` nondeterminism error. Reset such runs to their first Workflow Task
+> (`temporal workflow reset --type FirstWorkflowTask`), which runs their Activities again. See
+> [issue #261](https://github.com/temporalio/ai-integrations/issues/261) for details.
 
 #### 4. Advanced Serialization
 - Pydantic payload converter for ADK objects
