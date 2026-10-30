@@ -57,15 +57,46 @@ const conversions = new WeakMap<Agent<any, any>, Conversion>();
  */
 const resumeConversions = new WeakMap<object, Map<Agent<any, any>, Conversion>>();
 
+/**
+ * The `SandboxAgent` fields that `SandboxAgent.clone` copies by value (`cloneManifest`, and a new user object
+ * for `runAs`), so a change inside them doesn't reach a converted graph. `Agent.clone` and `Handoff.clone`
+ * share every other field by reference.
+ */
+const sandboxAgentFieldsCopiedByValue = new Set(['defaultManifest', 'runAs']);
+
+/** A deep copy of `value`'s contents that `sameValue` compares member by member. Functions stay by identity. */
+function contentSnapshot(value: unknown, ancestors: object[] = []): unknown {
+  if (typeof value !== 'object' || value === null) return value;
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
+    const bytes = ArrayBuffer.isView(value)
+      ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+      : new Uint8Array(value);
+    return { prototype: Object.getPrototypeOf(value), bytes: bytes.slice() };
+  }
+  const cycle = ancestors.indexOf(value);
+  if (cycle !== -1) return { cycle };
+  ancestors.push(value);
+  const entries =
+    value instanceof Map ? [...value] : value instanceof Set ? [...value].entries() : Object.entries(value);
+  const snapshot = {
+    prototype: Object.getPrototypeOf(value),
+    members: [...entries].map(([key, member]) => [contentSnapshot(key, ancestors), contentSnapshot(member, ancestors)]),
+  };
+  ancestors.pop();
+  return snapshot;
+}
+
 /** Snapshots an agent's fields, including those of each `Handoff`, which `convertAgent` clones. */
 function agentFields(agent: Agent<any, any>): [string, unknown][] {
   return Object.entries(agent).map(([key, value]) => [
     key,
-    Array.isArray(value)
-      ? value.map((member) =>
-          member instanceof Handoff ? { handoff: member, fields: Object.entries(member) } : member
-        )
-      : value,
+    agent instanceof SandboxAgent && sandboxAgentFieldsCopiedByValue.has(key)
+      ? contentSnapshot(value)
+      : Array.isArray(value)
+        ? value.map((member) =>
+            member instanceof Handoff ? { handoff: member, fields: Object.entries(member) } : member
+          )
+        : value,
   ]);
 }
 
@@ -75,9 +106,12 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
-/** Compares arrays and plain objects by their members, and any other value by identity. */
+/** Compares arrays, byte arrays and plain objects by their members, and any other value by identity. */
 function sameValue(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
+  if (a instanceof Uint8Array && b instanceof Uint8Array) {
+    return a.length === b.length && a.every((byte, index) => byte === b[index]);
+  }
   if (Array.isArray(a) && Array.isArray(b)) {
     return a.length === b.length && a.every((value, index) => sameValue(value, b[index]));
   }
