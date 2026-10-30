@@ -203,7 +203,7 @@ async def test_a_workflow_whose_worker_died_fails_with_a_way_to_resume(
 
 # The next Activity waits 30 seconds for the lost Worker, and so does stopping Claude Code.
 @pytest.mark.timeout(150)
-async def test_a_workflow_resumes_the_session_its_lost_worker_cut_off_mid_turn(
+async def test_a_workflow_redoes_the_turn_its_lost_worker_cut_off(
     harness: Harness,
 ) -> None:
     harness.answers = ANSWERS
@@ -228,7 +228,7 @@ async def test_a_workflow_resumes_the_session_its_lost_worker_cut_off_mid_turn(
         workflows=[ResumingWorkflow],
         plugins=[ClaudeAgentSDKPlugin()],
     ):
-        # The resumed Claude Code re-runs the turn, so it asks about the tool call again.
+        # The new Claude Code redoes the turn, so it asks about the tool call again.
         while await handle.query(ResumingWorkflow.launch_count) < 2 or not (
             await handle.query(ResumingWorkflow.pending_approvals)
         ):

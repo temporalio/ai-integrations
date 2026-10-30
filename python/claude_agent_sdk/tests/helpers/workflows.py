@@ -211,9 +211,13 @@ class StreamingWorkflow:
         self.finished = True
 
 
+# The text Claude Code sends itself to continue an interrupted turn.
+CONTINUE = "Continue from where you left off."
+
+
 @workflow.defn
 class ResumingWorkflow:
-    """Sends the prompt, asks a person about each tool call, and resumes the session if Claude Code goes away, as the README shows."""
+    """Sends the prompt, asks a person about each tool call, and redoes the turn from the prompt if Claude Code goes away, as the README shows."""
 
     def __init__(self) -> None:
         self.pending: list[str] = []
@@ -222,30 +226,41 @@ class ResumingWorkflow:
 
     @workflow.run
     async def run(self, prompt: str, cli_path: str) -> str:
-        session_id = str(workflow.uuid4())
-        options = sdk.ClaudeAgentOptions(
-            cli_path=cli_path,
-            can_use_tool=self.approve,
-            permission_mode="default",
-            session_id=session_id,
-            env={"CLAUDE_CODE_RESUME_INTERRUPTED_TURN": "1"},
-        )
-        result = ""
+        session_id = None  # Claude Code's, once it started
+        prompt_id = None  # The prompt's, once Claude Code saved it
         while True:
             try:
                 self.launches += 1
+                options = sdk.ClaudeAgentOptions(
+                    cli_path=cli_path,
+                    can_use_tool=self.approve,
+                    permission_mode="default",
+                    # Required to receive the prompt's UUID in the response stream.
+                    extra_args={"replay-user-messages": None},
+                    resume=session_id if prompt_id else None,
+                    resume_session_at=prompt_id,
+                )
                 transport = TemporalTransport(options)
                 async with sdk.ClaudeSDKClient(options, transport=transport) as client:
-                    if options.resume is None:
-                        await client.query(prompt)
+                    await client.query(CONTINUE if prompt_id else prompt)
                     async for message in client.receive_response():
-                        if isinstance(message, sdk.ResultMessage):
-                            result = message.result or ""
-                return result
+                        if (
+                            isinstance(message, sdk.SystemMessage)
+                            and message.subtype == "init"
+                        ):
+                            session_id = message.data["session_id"]
+                        elif (
+                            isinstance(message, sdk.UserMessage)
+                            and message.uuid
+                            and not prompt_id
+                        ):
+                            prompt_id = message.uuid
+                        elif isinstance(message, sdk.ResultMessage):
+                            return message.result or ""
+                raise RuntimeError("Claude Code ended the turn without a result")
             except sdk.CLIConnectionError:
-                options = dataclasses.replace(
-                    options, session_id=None, resume=session_id
-                )
+                # Redo the turn from the prompt if Claude Code saved it, or start again.
+                pass
 
     async def approve(
         self, tool_name: str, tool_input: dict[str, Any], context: Any

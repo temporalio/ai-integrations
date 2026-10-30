@@ -106,8 +106,9 @@ SDK's own `SubprocessCLITransport` in the Worker process:
   user, with the Worker's environment, in the Worker's files. Paths in `ClaudeAgentOptions`, such
   as `cwd` and `cli_path`, are on the Worker.
 - Claude Code stops when the Worker shuts down. If the Worker is killed or crashes, Claude Code
-  finishes its turn, then exits. Either way, the transport raises `CLIConnectionError`. To
-  continue the conversation, start a new client with `options.resume` set to the session ID.
+  fails any pending tool approval, finishes its turn, then exits. Either way, the transport raises
+  `CLIConnectionError`. To finish the turn, redo it from the prompt, as [When Claude Code
+  Stops](#when-claude-code-stops) shows.
 - The plugin routes every Activity after the launch to the Worker process that runs Claude Code.
 
 `TemporalTransport` takes options for each of its Activities, anything `workflow.execute_activity`
@@ -185,45 +186,48 @@ As in the Claude Agent SDK, the transport raises when Claude Code stops: `Proces
 exited with an error, and `CLIConnectionError` if it's gone, such as when the Worker connected to
 it went away. The transport never starts another Claude Code by itself.
 
-To continue the conversation, take the session ID from Claude Code's init message, and on
-`CLIConnectionError` start a new client with `options.resume` set to it. With
-`CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`, the new Claude Code re-runs the turn that was cut off, so
-the new client only reads its reply:
+To finish the turn, redo it from the prompt. With `replay-user-messages`, Claude Code sends the
+prompt back with its ID once it saved it. On `CLIConnectionError`, start a new client that resumes
+the session at that prompt with `options.resume_session_at`, and tell Claude Code to continue. Claude
+Code runs the turn again, so it asks about each tool call again, however the old Claude Code
+stopped:
 
 ```python
-from claude_agent_sdk import CLIConnectionError, ResultMessage, SystemMessage
+from claude_agent_sdk import CLIConnectionError, ResultMessage, SystemMessage, UserMessage
 
-session_id = None  # Claude Code's, once it has the prompt
+# The text Claude Code sends itself to continue an interrupted turn.
+CONTINUE = "Continue from where you left off."
+
+session_id = None  # Claude Code's, once it started
+prompt_id = None  # The prompt's, once Claude Code saved it
 
 while True:
     try:
         options = ClaudeAgentOptions(
-            env={"CLAUDE_CODE_RESUME_INTERRUPTED_TURN": "1"}, resume=session_id
+            # Required to receive the prompt's UUID in the response stream.
+            extra_args={"replay-user-messages": None},
+            resume=session_id if prompt_id else None,
+            resume_session_at=prompt_id,
         )
         async with ClaudeSDKClient(options=options, transport=TemporalTransport(options)) as client:
-            # Keep sending the prompt until Claude Code reports a session, which
-            # means it received it. After that, a resume finishes the turn.
-            if session_id is None:
-                await client.query(prompt)
+            await client.query(CONTINUE if prompt_id else prompt)
 
             async for message in client.receive_response():
                 if isinstance(message, SystemMessage) and message.subtype == "init":
                     session_id = message.data["session_id"]
+                elif isinstance(message, UserMessage) and message.uuid and not prompt_id:
+                    prompt_id = message.uuid
                 elif isinstance(message, ResultMessage):
                     return message.result
 
     except CLIConnectionError:
-        # Resume the session if Claude Code started it, or start again.
+        # Redo the turn from the prompt if Claude Code saved it, or start again.
         pass
 ```
 
-As with the Claude Agent SDK, output Claude Code wrote after the Worker's last read is lost when the
-Worker stops. If that was a turn's final result, the resumed session has nothing to finish, so
-check the session transcript before resuming. The [custom transport
-sample](https://github.com/temporalio/samples-python/tree/main/claude_agent_sdk_plugin/plugin_with_custom_transport)
-does this in its `find_saved_turn` Activity.
+Tool calls and callbacks from before the Worker stopped run again, so make them safe to repeat.
 
-Resuming, and checking the transcript, both need the session where they run. Mount Claude Code's
+Resuming needs the session where it runs. Mount Claude Code's
 config directory on a volume every Worker shares, or use a connector that keeps sessions in a
 store.
 
@@ -240,11 +244,10 @@ transport = TemporalTransport(
 )
 ```
 
-When a Worker shuts down, the plugin stops each Claude Code that Worker is connected to, as SIGTERM does.
-Claude Code then leaves a turn in progress, including a pending tool approval, for the resumed
-session to continue, so a person is asked again. A read in progress raises `CLIConnectionError`
-in the Workflow, so it can resume the session. Process managers stop a Worker with SIGTERM, but
-Python exits on SIGTERM without shutting the Worker down, so turn it into a shutdown. Leaving
+When a Worker shuts down, the plugin closes each Claude Code that Worker is connected to, and a
+read in progress raises `CLIConnectionError` in the Workflow, so it can redo the turn. Process
+managers stop a Worker with SIGTERM, but Python exits on SIGTERM without shutting the Worker down,
+so turn it into a shutdown. Leaving
 `async with Worker(...)` waits for the plugin to stop Claude Code:
 
 ```python
@@ -475,7 +478,7 @@ class StreamingWorkflow:
 Callers subscribe to `events` as above; each item's data is a `stream_event` message. `include_partial_messages` and `stream` go together:
 passing one without the other raises `ValueError`.
 
-If the Workflow resumes a turn that was cut off (see [When Claude Code Stops](#when-claude-code-stops)),
+If the Workflow redoes a turn that was cut off (see [When Claude Code Stops](#when-claude-code-stops)),
 the new Claude Code generates that reply again, so callers see the partial first attempt followed by
 the full retry.
 

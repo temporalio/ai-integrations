@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-import anyio
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKError, CLIConnectionError
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
@@ -102,18 +101,3 @@ class _SubprocessConnection(SubprocessCLITransport):
         await super().close()
         self._pump.cancel()
         await asyncio.gather(self._pump, return_exceptions=True)
-
-    async def terminate(self) -> None:
-        # SIGTERM, then SIGKILL, before stdin closes. On EOF Claude Code would
-        # fail a pending permission instead of leaving it for the resumed session.
-        if self._process is not None and self._process.returncode is None:
-            self._process.terminate()
-            # 5 seconds, as SubprocessCLITransport.close waits after SIGTERM.
-            with anyio.move_on_after(5):
-                await self._process.wait()
-            if self._process.returncode is None:
-                self._process.kill()
-
-        # Only to release the pipes. Claude Code has exited, so close has
-        # nothing to wrap up.
-        await self.close()

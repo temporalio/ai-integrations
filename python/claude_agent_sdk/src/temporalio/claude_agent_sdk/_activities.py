@@ -166,11 +166,11 @@ class ConnectionActivities:
             raise activity_error(error) from error
 
     async def shut_down(self) -> None:
-        """Stop every Claude Code this Worker started, leaving their sessions resumable."""
+        """Close every Claude Code this Worker started."""
         connections, self._connections = self._connections, {}
 
         results = await asyncio.gather(
-            *(connection.process.terminate() for connection in connections.values()),
+            *(connection.process.close() for connection in connections.values()),
             return_exceptions=True,
         )
 

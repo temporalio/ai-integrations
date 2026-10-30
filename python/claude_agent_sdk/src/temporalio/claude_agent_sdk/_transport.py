@@ -277,13 +277,14 @@ class TemporalTransport(Transport):
                 yield output
                 continue
 
-            # Swap the deterministic request ID back to the Claude Agent SDK's
+            # Swap the deterministic request ID back to the Claude Agent SDK's.
+            # Pass other responses as they are, such as the SDK's own answers that
+            # replay-user-messages echoes, which the SDK ignores.
             response = output["response"]
             sdk_id = self._sdk_ids.pop(response["request_id"], None)
             if sdk_id is None:
-                raise RuntimeError(
-                    f"Claude Code answered unknown request {response['request_id']}"
-                )
+                yield output
+                continue
             yield {**output, "response": {**response, "request_id": sdk_id}}
 
     def _connect_input(self) -> ConnectActivityInput:

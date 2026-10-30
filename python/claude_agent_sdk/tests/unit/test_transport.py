@@ -174,6 +174,21 @@ async def test_the_sdks_requests_go_under_ids_the_workflow_picks(
     assert messages[0]["response"]["request_id"] == "sdk_random"
 
 
+async def test_a_response_to_no_sdk_request_reaches_the_sdk_as_it_is(
+    env: WorkflowEnvironment, cli: LocalCli
+) -> None:
+    """Such as the SDK's own answer to a tool permission, which replay-user-messages echoes."""
+    echoed = {
+        "type": "control_response",
+        "response": {"subtype": "success", "request_id": "cli_1"},
+    }
+    script = f"echo '{json.dumps(echoed)}'; echo '{json.dumps(RESULT)}'"
+
+    messages = await run_transport(env, cli, script, [])
+
+    assert messages == [echoed, RESULT]
+
+
 async def test_after_the_launch_the_activities_run_on_the_workers_connector_queue(
     env: WorkflowEnvironment, cli: LocalCli
 ) -> None:

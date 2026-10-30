@@ -79,7 +79,6 @@ class ScriptedProcess:
 
     async def end_input(self) -> None: ...
     async def close(self) -> None: ...
-    async def terminate(self) -> None: ...
 
 
 def scripted(*reads: list[Output] | Exception) -> ConnectionActivities:
@@ -124,53 +123,29 @@ async def test_a_read_returns_the_next_output_until_claude_code_exits(
     assert cli.running() == []
 
 
-# Stands in for Claude Code: records whether it got SIGTERM or saw its stdin close.
-SIGTERM_OR_EOF = """
-import pathlib, signal, sys
-seen = pathlib.Path(sys.argv[1])
-def on_sigterm(signum, frame):
-    seen.write_text("SIGTERM")
-    sys.exit(0)
-signal.signal(signal.SIGTERM, on_sigterm)
-seen.with_suffix(".ready").touch()
-sys.stdin.read()
-seen.write_text("EOF")
-"""
-
-
-async def test_shutting_down_stops_claude_code_with_sigterm_before_its_stdin_closes(
-    cli: LocalCli, activities: ConnectionActivities, tmp_path: Path
+async def test_shutting_down_closes_claude_code(
+    cli: LocalCli, activities: ConnectionActivities
 ) -> None:
-    """On SIGTERM, Claude Code leaves a pending tool permission for the resumed session to ask."""
-    stand_in = tmp_path / "claude.py"
-    stand_in.write_text(SIGTERM_OR_EOF)
-    seen = tmp_path / "seen"
-    await ActivityEnvironment().run(
-        activities.connect,
-        request(cli, f'exec "{sys.executable}" "{stand_in}" "{seen}"'),
-    )
-    while not seen.with_suffix(".ready").exists():
-        await asyncio.sleep(0.05)
+    await ActivityEnvironment().run(activities.connect, request(cli))
 
     await activities.shut_down()
 
-    assert seen.read_text() == "SIGTERM"
     assert cli.running() == []
 
 
 async def test_shutting_down_stops_every_claude_code_then_raises_what_failed() -> None:
-    """Such as a remote connector whose terminate call fails, which nothing would retry."""
+    """Such as a remote connector whose close call fails, which nothing would retry."""
     stopped: list[bool] = []
 
-    class FailsToTerminate(ScriptedProcess):
-        async def terminate(self) -> None:
-            raise OSError("terminate failed")
+    class FailsToClose(ScriptedProcess):
+        async def close(self) -> None:
+            raise OSError("close failed")
 
-    class Terminates(ScriptedProcess):
-        async def terminate(self) -> None:
+    class Closes(ScriptedProcess):
+        async def close(self) -> None:
             stopped.append(True)
 
-    processes: list[ClaudeCodeProcess] = [FailsToTerminate(), Terminates()]
+    processes: list[ClaudeCodeProcess] = [FailsToClose(), Closes()]
 
     class Connector:
         async def connect(self, request: ConnectActivityInput) -> ClaudeCodeProcess:
@@ -183,7 +158,7 @@ async def test_shutting_down_stops_every_claude_code_then_raises_what_failed() -
         env.info = dataclasses.replace(env.info, activity_id=activity_id)
         await env.run(activities.connect, ConnectActivityInput([], {}))
 
-    with pytest.raises(OSError, match="terminate failed"):
+    with pytest.raises(OSError, match="close failed"):
         await activities.shut_down()
 
     assert stopped == [True]
