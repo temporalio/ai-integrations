@@ -1,4 +1,4 @@
-import { Agent, RunState, tool } from '@openai/agents-core';
+import { Agent, RunState, handoff, tool } from '@openai/agents-core';
 import { ApplicationFailure, condition } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
@@ -200,6 +200,12 @@ export interface ApprovalResumeContextResult {
   concurrentFailedResumeThrew: boolean;
   concurrentWrites: string[];
   concurrentInterruptions: number;
+  rehydratedWrites: string[];
+  rehydratedApprovalOwners: number;
+  rehydratedApprovedCallIds: number;
+  handoffTarget: string | undefined;
+  handoffFilters: string[];
+  disabledHandoffThrew: boolean;
 }
 
 /** Serialized approval record, as the `RunContext` internal below returns it. */
@@ -233,7 +239,9 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
  * doesn't match, which must fail without losing the approval. Then three paused states share one
  * `RunContext`, all are approved, and resuming one must keep the others' approvals. Last, an approved
  * tool throws once, and resuming the same state again must run it without asking again. Then a
- * resume fails while another state on its context advances and is approved again.
+ * resume fails while another state on its context advances and is approved again. Then each resume
+ * rehydrates the saved state onto the original agent and context. Last, a handoff changes between an
+ * interruption and its resume.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -371,6 +379,53 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
   gate.holdD = false;
   const finishedE = await runner.run(agentE, pausedAgainE.state);
 
+  // Each round saves the state as a string and rehydrates it onto the original agent and the caller's
+  // context. The agent has a handoff, which stays unchanged here.
+  const handoffFilters: string[] = [];
+  const firstTarget = new Agent<ResumeContext>({ name: 'FirstTarget', model: 'gpt-4o-mini' });
+  const secondTarget = new Agent<ResumeContext>({ name: 'SecondTarget', model: 'gpt-4o-mini' });
+  const routing = handoff(firstTarget, {
+    inputFilter: (data) => {
+      handoffFilters.push('first');
+      return data;
+    },
+  });
+  const routingAgent = new Agent<ResumeContext>({
+    name: 'RoutingAgent',
+    model: 'gpt-4o-mini',
+    tools: [setAfter],
+    handoffs: [routing],
+  });
+  const rehydratedCtx: ResumeContext = { original: 'rehydrated', writes: [] };
+  let rehydrated = await runner.run(routingAgent, 'go', { context: rehydratedCtx });
+  const rehydratedRunContext = rehydrated.runContext;
+  for (let round = 0; rehydrated.interruptions.length > 0 && round < 10; round++) {
+    const state = await RunState.fromStringWithContext(routingAgent, rehydrated.state.toString(), rehydratedRunContext);
+    state.approve(state.getInterruptions()[0]!);
+    rehydrated = await runner.run(routingAgent, state);
+  }
+  const rehydratedOwners = countApprovalOwners(rehydratedRunContext);
+
+  // The handoff's target and input filter change between the interruption and the resume, and then
+  // the handoff is disabled before another resume. Each resume must use the handoff as it is now.
+  const pausedRoute = await runner.run(routingAgent, 'go', { context: { original: 'route', writes: [] } });
+  pausedRoute.state.approve(pausedRoute.interruptions[0]!);
+  routing.agent = secondTarget;
+  routing.inputFilter = (data) => {
+    handoffFilters.push('second');
+    return data;
+  };
+  const routed = await runner.run(routingAgent, pausedRoute.state);
+  const pausedDisabled = await runner.run(routingAgent, 'go', { context: { original: 'disabled', writes: [] } });
+  pausedDisabled.state.approve(pausedDisabled.interruptions[0]!);
+  routing.isEnabled = async () => false;
+  let disabledHandoffThrew = false;
+  try {
+    await runner.run(routingAgent, pausedDisabled.state);
+  } catch {
+    disabledHandoffThrew = true;
+  }
+
   return {
     callerAfter: ctx.after,
     resumedUsesCallerObject: result.runContext.context === ctx,
@@ -387,5 +442,11 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     concurrentFailedResumeThrew,
     concurrentWrites: concurrentCtx.writes,
     concurrentInterruptions: finishedE.interruptions.length,
+    rehydratedWrites: rehydratedCtx.writes,
+    rehydratedApprovalOwners: rehydratedOwners.approvalOwners,
+    rehydratedApprovedCallIds: rehydratedOwners.approvedCallIds,
+    handoffTarget: routed.lastAgent?.name,
+    handoffFilters,
+    disabledHandoffThrew,
   };
 }

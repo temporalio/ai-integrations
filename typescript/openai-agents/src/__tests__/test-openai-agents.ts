@@ -26,7 +26,7 @@ import {
   streamingNoTopicWorkflow,
 } from './workflows/openai-agents';
 import { makeTestFunction } from './helpers/test-fn';
-import { FakeModelProvider, textResponse, toolCallResponse } from './stubs/openai-agents';
+import { FakeModelProvider, handoffResponse, textResponse, toolCallResponse } from './stubs/openai-agents';
 import { StreamingFakeModelProvider, streamingTextEvents } from './stubs/openai-agents-fakes';
 import EventType = temporal.api.enums.v1.EventType;
 
@@ -548,6 +548,16 @@ test('Approval resume keeps the caller context object', async (t) => {
           toolCallResponse('gated', { value: 'E1' }, 'call_gated_e1'),
           toolCallResponse('gated', { value: 'E2' }, 'call_gated_e2'),
           textResponse('done E'),
+          toolCallResponse('set_after', { value: 'R-1' }, 'call_rehydrated_1'),
+          toolCallResponse('set_after', { value: 'R-2' }, 'call_rehydrated_2'),
+          toolCallResponse('set_after', { value: 'R-3' }, 'call_rehydrated_3'),
+          textResponse('done rehydrated'),
+          toolCallResponse('set_after', { value: 'H-1' }, 'call_route_1'),
+          handoffResponse('transfer_to_FirstTarget'),
+          textResponse('done routed'),
+          toolCallResponse('set_after', { value: 'H-2' }, 'call_route_2'),
+          handoffResponse('transfer_to_FirstTarget'),
+          textResponse('done disabled'),
         ]),
       }),
     ],
@@ -576,5 +586,11 @@ test('Approval resume keeps the caller context object', async (t) => {
     concurrentFailedResumeThrew: true,
     concurrentWrites: ['E1', 'E2'],
     concurrentInterruptions: 0,
+    rehydratedWrites: ['R-1', 'R-2', 'R-3'],
+    rehydratedApprovalOwners: 2,
+    rehydratedApprovedCallIds: 6,
+    handoffTarget: 'SecondTarget',
+    handoffFilters: ['second'],
+    disabledHandoffThrew: true,
   });
 });
