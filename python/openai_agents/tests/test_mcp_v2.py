@@ -100,8 +100,8 @@ def server() -> SDKMCPServer[Any]:
 
 
 class InProcessMCPServer(AgentsMCPServer):
-    def __init__(self, server: SDKMCPServer[Any]) -> None:
-        super().__init__()
+    def __init__(self, server: SDKMCPServer[Any], **server_options: Any) -> None:
+        super().__init__(**server_options)
         self._client = MCPClient(server)
         self.session: MCPClient | None = None
 
@@ -214,6 +214,13 @@ async def test_factory_argument_uses_fresh_client_per_activity(
     assert arguments == [{"tenant": "acme"}] * 3
 
 
+def create_backend(factory: Callable[[], AgentsMCPServer]) -> _OpenAIMCPServerBackend:
+    return cast(
+        Callable[[], _OpenAIMCPServerBackend],
+        _mcp_server_backend_factory("hello", factory),
+    )()
+
+
 def test_callable_worker_side_tool_filter_is_rejected() -> None:
     def factory() -> AgentsMCPServer:
         value = InProcessMCPServer(server())
@@ -221,7 +228,7 @@ def test_callable_worker_side_tool_filter_is_rejected() -> None:
         return value
 
     with pytest.raises(ApplicationError) as err:
-        cast(Callable[[], Any], _mcp_server_backend_factory("hello", factory))()
+        create_backend(factory)
     assert err.value.non_retryable
     assert "temporal_mcp_server()" in str(err.value)
 
@@ -232,10 +239,7 @@ def test_static_worker_side_tool_filter_is_allowed() -> None:
         value.tool_filter = {"blocked_tool_names": ["say_hello"]}  # type: ignore[attr-defined]
         return value
 
-    backend = cast(
-        Callable[[], _OpenAIMCPServerBackend],
-        _mcp_server_backend_factory("hello", factory),
-    )()
+    backend = create_backend(factory)
     assert isinstance(backend, _OpenAIMCPServerBackend)
     assert backend._server.tool_filter == {  # type: ignore[attr-defined]
         "blocked_tool_names": ["say_hello"]
@@ -253,27 +257,41 @@ def test_static_worker_side_tool_filter_is_allowed() -> None:
 )
 def test_worker_side_require_approval_is_rejected(require_approval: Any) -> None:
     def factory() -> AgentsMCPServer:
-        return MCPServerStdio(
-            params={"command": "unused"}, require_approval=require_approval
-        )
+        return InProcessMCPServer(server(), require_approval=require_approval)
 
     with pytest.raises(ApplicationError) as err:
-        cast(Callable[[], Any], _mcp_server_backend_factory("hello", factory))()
+        create_backend(factory)
     assert err.value.non_retryable
-    assert "temporal_mcp_server()" in str(err.value)
+    assert "temporal_mcp_server(require_approval=...)" in str(err.value)
 
 
-@pytest.mark.parametrize("require_approval", ["never", {"say_hello": "never"}])
+def test_worker_side_approval_evaluator_override_is_rejected() -> None:
+    class AlwaysAsks(InProcessMCPServer):
+        def _get_needs_approval_for_tool(  # type: ignore[override]
+            self, tool: Any, agent: Any
+        ) -> bool:
+            return True
+
+    with pytest.raises(ApplicationError) as err:
+        create_backend(lambda: AlwaysAsks(server()))
+    assert err.value.non_retryable
+    assert "temporal_mcp_server(require_approval=...)" in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "require_approval",
+    [
+        "never",
+        False,
+        {"say_hello": "never"},
+        {"never": {"tool_names": ["say_hello"]}},
+    ],
+)
 def test_worker_side_require_approval_never_is_allowed(require_approval: Any) -> None:
     def factory() -> AgentsMCPServer:
-        return MCPServerStdio(
-            params={"command": "unused"}, require_approval=require_approval
-        )
+        return InProcessMCPServer(server(), require_approval=require_approval)
 
-    backend = cast(
-        Callable[[], _OpenAIMCPServerBackend],
-        _mcp_server_backend_factory("hello", factory),
-    )()
+    backend = create_backend(factory)
     assert isinstance(backend, _OpenAIMCPServerBackend)
 
 

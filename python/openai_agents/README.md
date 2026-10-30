@@ -439,17 +439,33 @@ agent = Agent(name="weather", mcp_servers=[server])
 
 Configure transport, connection, retry, and message-handling behavior on the
 worker-side OpenAI `MCPServer`. Configure workflow-facing behavior such as
-`tool_filter`, `require_approval`, `failure_error_function`, and metadata
-resolvers on `temporal_mcp_server(...)`, where the OpenAI agent can use it.
-Custom `MCPServer` method implementations still execute worker-side. A callable
-`tool_filter` on the worker-side server is rejected, because the run context and
-agent it receives exist only in the workflow. A callable `tool_filter` passed to
-`temporal_mcp_server(...)` therefore executes during workflow replay and must be
-deterministic: it must not perform I/O or depend on the system clock, randomness,
-mutable global state, or other external state. A `require_approval` policy on
-the worker-side server is also rejected, because the agent never reads it there,
-so its tools would run without approval. A policy that never asks for approval,
-such as `"never"`, is allowed.
+`tool_filter`, `require_approval`, `failure_error_function`,
+`use_structured_content`, metadata resolvers, `custom_data_extractor`, and, from
+openai-agents 0.22.3, tool input and output guardrails on
+`temporal_mcp_server(...)`, where the OpenAI agent can use it. On the
+worker-side server, a static `tool_filter` still filters the listed tools, a
+callable `tool_filter` and a `require_approval` policy are rejected as described
+below, and the other settings are ignored. Custom `MCPServer` method
+implementations still execute worker-side.
+
+A callable `tool_filter` on the worker-side server is rejected, because the run
+context and agent it receives exist only in the workflow. A callable
+`tool_filter` passed to `temporal_mcp_server(...)` therefore executes during
+workflow replay and must be deterministic: it must not perform I/O or depend on
+the system clock, randomness, mutable global state, or other external state.
+
+A `require_approval` policy on the worker-side server is also rejected: without
+a workflow-side policy, its tools would run without approval. Only a policy the
+Agents SDK normalizes to no approval is allowed there: `"never"`, `False`, or a
+mapping or tool list with only `"never"` entries. A callable policy is always
+rejected, because it cannot be evaluated on the worker.
+
+These checks run in every MCP Activity. A run that already holds its cached tool
+list, the default, first meets them when it calls a tool: the agent gets the
+error as the tool's output, and the run can complete without the tool. To fail
+such a run instead, pass `failure_error_function=None` to
+`temporal_mcp_server(...)`, or let open runs finish before you upgrade or add a
+setting to the factory's server.
 
 Every MCP operation is a Temporal Activity. The workflow-side tool list is
 cached by default; pass `cache_tools_list=False` to refresh it on every Agents
@@ -519,8 +535,8 @@ the `mcp` extra is not installed. New integrations should use `mcp_servers` and
 The legacy stateful path retains its dedicated per-workflow worker and
 persistent-session behavior. To require tool approval on these servers, pass
 `require_approval` to `stateless_mcp_server()` or `stateful_mcp_server()`;
-as with `temporal_mcp_server()`, a policy set on the factory's server is
-rejected.
+as with `temporal_mcp_server()`, a policy on the factory's server is rejected
+unless it never asks for approval.
 
 ### Hosted MCP Tool
 

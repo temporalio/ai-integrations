@@ -1,4 +1,3 @@
-import asyncio
 import dataclasses
 import functools
 import inspect
@@ -26,32 +25,13 @@ from temporalio.exceptions import (
     ApplicationError,
     is_cancelled_exception,
 )
+from temporalio.openai_agents._heartbeat_decorator import auto_heartbeater
+from temporalio.openai_agents._mcp_server_checks import (
+    _has_worker_side_require_approval,
+    _reject_worker_side_require_approval,
+)
 from temporalio.worker import PollerBehaviorSimpleMaximum, Worker
 from temporalio.workflow import ActivityConfig, ActivityHandle
-
-
-def _reject_worker_side_require_approval(name: str, server: MCPServer) -> None:
-    """Fail fast on a worker-side approval policy that would be ignored.
-
-    The agent reads the approval policy from the server it holds, which in a
-    workflow is the plugin's workflow-side server, so a policy on the factory's
-    server is never read and its tools would run without approval. A policy
-    that never asks for approval, such as ``"never"``, has the same effect as
-    no policy, so it is allowed.
-    """
-    # The Agents SDK keeps the normalized policy only in this private field:
-    # a bool, a dict of tool names to bools, or a callable.
-    policy = getattr(server, "_needs_approval_policy", False)
-    if isinstance(policy, dict):
-        policy = any(policy.values())
-    if callable(policy) or policy:
-        raise ApplicationError(
-            f"MCP server {name!r} sets require_approval on its worker-side "
-            "MCPServer, where the agent never reads it, so its tools would run "
-            "without approval; pass require_approval to temporal_mcp_server() "
-            "instead, or to stateless_mcp_server() or stateful_mcp_server()",
-            non_retryable=True,
-        )
 
 
 @dataclasses.dataclass
@@ -199,6 +179,7 @@ class StatelessMCPServerProvider:
         sig = inspect.signature(self._server_factory)
         self._server_accepts_arguments = len(sig.parameters) != 0
 
+        self._server_name = name
         self._name = name + "-stateless"
         super().__init__()
 
@@ -209,7 +190,9 @@ class StatelessMCPServerProvider:
             )
         else:
             server = cast(Callable[[], MCPServer], self._server_factory)()
-        _reject_worker_side_require_approval(self.name, server)
+        _reject_worker_side_require_approval(
+            self._server_name, server, "stateless_mcp_server"
+        )
         return server
 
     @property
@@ -494,6 +477,7 @@ class StatefulMCPServerProvider:
             stacklevel=2,
         )
         self._server_factory = server_factory
+        self._server_name = name
         self._name = name + "-stateful"
         self._connect_handle: ActivityHandle | None = None
         self._servers: dict[str, MCPServer] = {}
@@ -510,7 +494,9 @@ class StatefulMCPServerProvider:
 
         def _server() -> MCPServer:
             server = self._servers[_server_id()]
-            _reject_worker_side_require_approval(self.name, server)
+            _reject_worker_side_require_approval(
+                self._server_name, server, "stateful_mcp_server"
+            )
             return server
 
         @activity.defn(name=self.name + "-list-tools")
@@ -541,13 +527,8 @@ class StatefulMCPServerProvider:
         async def get_prompt(args: _StatefulGetPromptArguments) -> GetPromptResult:
             return await _server().get_prompt(args.name, args.arguments)
 
-        async def heartbeat_every(delay: float, *details: Any) -> None:
-            """Heartbeat every so often while not cancelled"""
-            while True:
-                await asyncio.sleep(delay)
-                activity.heartbeat(*details)
-
         @activity.defn(name=self.name + "-server-session")
+        @auto_heartbeater(interval=30)
         async def connect(
             args: _StatefulServerSessionArguments | None = None,
         ) -> None:
@@ -561,15 +542,9 @@ class StatefulMCPServerProvider:
             # The dedicated worker still runs, and each of its operations fails
             # with the policy error, so the workflow sees that error at its
             # first MCP call whatever its schedule-to-start timeout.
+            rejected = _has_worker_side_require_approval(server)
+            self._servers[server_id] = server
             try:
-                _reject_worker_side_require_approval(self.name, server)
-                rejected = False
-            except ApplicationError:
-                rejected = True
-
-            heartbeat_task = asyncio.create_task(heartbeat_every(30))
-            try:
-                self._servers[server_id] = server
                 try:
                     if not rejected:
                         await server.connect()
@@ -590,15 +565,8 @@ class StatefulMCPServerProvider:
 
                     await worker.run()
                 finally:
-                    try:
-                        if not rejected:
-                            await server.cleanup()
-                    finally:
-                        heartbeat_task.cancel()
-                        try:
-                            await heartbeat_task
-                        except asyncio.CancelledError:
-                            pass
+                    if not rejected:
+                        await server.cleanup()
             finally:
                 del self._servers[server_id]
 
