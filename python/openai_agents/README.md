@@ -540,7 +540,8 @@ The legacy stateful path retains its dedicated per-workflow worker and
 persistent-session behavior. To require tool approval on these servers, pass
 `require_approval` to `stateless_mcp_server()` or `stateful_mcp_server()`;
 as with `temporal_mcp_server()`, a policy on the factory's server is rejected
-unless it never asks for approval.
+unless it never asks for approval. So is a callable `tool_filter` there; a
+static filter still works.
 
 ### Hosted MCP Tool
 

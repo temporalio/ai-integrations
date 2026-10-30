@@ -3083,19 +3083,24 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
                 )
 
 
-@pytest.mark.parametrize("instance_evaluator", [False, True])
+@pytest.mark.parametrize(
+    "setting", ["require_approval", "instance_evaluator", "tool_filter"]
+)
 @pytest.mark.parametrize("stateful", [True, False])
-async def test_mcp_server_factory_require_approval_is_rejected(
-    client: Client, stateful: bool, instance_evaluator: bool
+async def test_mcp_server_factory_settings_are_rejected(
+    client: Client, stateful: bool, setting: str
 ):
-    if instance_evaluator:
+    if setting == "require_approval":
+        tracking_server = get_tracking_server("HelloServer", require_approval="always")
+    elif setting == "instance_evaluator":
         # The default policy, but an evaluator that always asks.
         tracking_server = get_tracking_server("HelloServer")
         tracking_server._get_needs_approval_for_tool = (  # type: ignore[method-assign]
             lambda tool, agent: True  # type: ignore[reportUnknownLambdaType]
         )
     else:
-        tracking_server = get_tracking_server("HelloServer", require_approval="always")
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server.tool_filter = lambda context, tool: True  # type: ignore[attr-defined]
     server: StatefulMCPServerProvider | StatelessMCPServerProvider = (
         StatefulMCPServerProvider("HelloServer", lambda _: tracking_server)
         if stateful
@@ -3136,9 +3141,14 @@ async def test_mcp_server_factory_require_approval_is_rejected(
     assert isinstance(err.value.cause, ActivityError)
     assert isinstance(err.value.cause.cause, ApplicationError)
     assert err.value.cause.cause.non_retryable
-    route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
-    assert "'HelloServer' sets require_approval" in err.value.cause.cause.message
-    assert f"{route}(require_approval=...)" in err.value.cause.cause.message
+    message = err.value.cause.cause.message
+    if setting != "tool_filter":
+        route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+        assert "'HelloServer' sets require_approval" in message
+        assert f"{route}(require_approval=...)" in message
+    else:
+        assert "'HelloServer' sets a callable tool_filter" in message
+        assert "temporal_mcp_server()" in message
     # The rejected server is never connected, cleaned up or called.
     assert tracking_server.calls == []
     if stateful:
