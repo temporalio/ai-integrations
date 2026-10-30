@@ -186,22 +186,30 @@ class TemporalAgent(Agent):
     def _make_mcp_refresh_hook(
         self, provider: TemporalMCPClient
     ) -> HookCallback[BeforeModelCallEvent]:
-        async def hook(event: BeforeModelCallEvent) -> None:
-            if provider._cache_tools and provider._fetched:
-                return
-            old_names = {tool.tool_name for tool in provider._tools}
-            await provider._refresh()
-            self._reconcile_mcp_tools(event, provider, old_names)
+        async def hook(event: BeforeModelCallEvent) -> None:  # type: ignore[reportUnusedParameter]
+            await self._refresh_mcp_tools(provider)
 
         return hook
 
+    async def _load_cached_mcp_tools(self) -> None:
+        """List the tools of each cache_tools MCP client that has not listed them."""
+        for provider in self.tool_registry._tool_providers:
+            if isinstance(provider, TemporalMCPClient) and provider._cache_tools:
+                await self._refresh_mcp_tools(provider)
+
+    async def _refresh_mcp_tools(self, provider: TemporalMCPClient) -> None:
+        if provider._cache_tools and provider._fetched:
+            return
+        old_names = {tool.tool_name for tool in provider._tools}
+        await provider._refresh()
+        self._reconcile_mcp_tools(provider, old_names)
+
     def _reconcile_mcp_tools(
         self,
-        event: BeforeModelCallEvent,
         provider: TemporalMCPClient,
         old_names: set[str],
     ) -> None:
-        reg = event.agent.tool_registry
+        reg = self.tool_registry
         new = {tool.tool_name: tool for tool in provider._tools}
         # Tools the server dropped or renamed since the last listing. There is
         # no public unregister, so remove them from the registry directly.

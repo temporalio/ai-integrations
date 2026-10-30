@@ -1,15 +1,19 @@
 import asyncio
 import copy
+import sys
 from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
 import pytest
+from mcp import StdioServerParameters, stdio_client
 from strands import Agent
 from strands.agent.conversation_manager import SummarizingConversationManager
 from strands.models import Model
+from strands.tools.mcp.mcp_client import MCPClient
 from strands.types.exceptions import (
     ContextWindowOverflowException,
     MaxTokensReachedException,
@@ -22,7 +26,7 @@ from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.exceptions import ActivityError, ApplicationError
-from temporalio.strands_agents import StrandsPlugin, TemporalAgent
+from temporalio.strands_agents import StrandsPlugin, TemporalAgent, TemporalMCPClient
 from temporalio.strands_agents._summary import _summarize_with_agent
 from temporalio.strands_agents._temporal_model import TemporalModel
 from temporalio.worker import Replayer, Worker
@@ -397,6 +401,110 @@ async def test_summarization_agent_reply_becomes_the_native_summary(
     except Exception as error:
         actual = repr(error)
     assert actual == expected
+
+
+class ToolsRecordingModel(SmallContextModel):
+    """Records the names of the tools each call is given."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tools: list[list[str]] = []
+
+    async def stream(
+        self, messages: Any, tool_specs: Any = None, *args: Any, **kwargs: Any
+    ) -> AsyncIterable[StreamEvent]:  # type: ignore[override]
+        self.tools.append(sorted(spec["name"] for spec in tool_specs or []))
+        async for event in super().stream(messages, tool_specs, *args, **kwargs):
+            yield event
+
+
+def _echo_client() -> MCPClient:
+    return MCPClient(
+        lambda: stdio_client(
+            StdioServerParameters(
+                command=sys.executable,
+                args=[str(Path(__file__).parent / "echo_mcp_server.py")],
+            )
+        )
+    )
+
+
+@workflow.defn
+class SummarizerToolsWorkflow:
+    @workflow.run
+    async def run(self, cache_tools: bool) -> None:
+        summarizer = TemporalAgent(
+            model="tools",
+            start_to_close_timeout=timedelta(seconds=15),
+            tools=[
+                TemporalMCPClient(
+                    "echo_summarizer",
+                    cache_tools=cache_tools,
+                    start_to_close_timeout=timedelta(seconds=30),
+                )
+            ],
+        )
+        for _ in range(2):
+            await _summarize_with_agent(summarizer, _history()[:2])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("cache_tools", [True, False], ids=["cached", "uncached"])
+async def test_summarization_agent_keeps_its_mcp_tools(
+    client: Client, cache_tools: bool
+):
+    # Strands lists a summarization agent's MCP tools when it is built, so every
+    # summary is offered them. A TemporalAgent lists them on the workflow loop; they
+    # must stay in its registry after a summary, so the next summary has them too.
+    control_model = ToolsRecordingModel()
+    control_agent = Agent(
+        model=control_model, tools=[_echo_client()], callback_handler=None
+    )
+    try:
+        manager = SummarizingConversationManager(summarization_agent=control_agent)
+        for _ in range(2):
+            manager._generate_summary_with_agent(_history()[:2])  # type: ignore[arg-type]
+    finally:
+        control_agent.cleanup()
+    assert control_model.tools == [["echo"], ["echo"]]
+
+    model = ToolsRecordingModel()
+    task_queue = f"test_summarizer_mcp_tools-{uuid4()}"
+    plugin = StrandsPlugin(
+        models={"tools": lambda: model},
+        mcp_clients={"echo_summarizer": _echo_client},
+    )
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[SummarizerToolsWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            SummarizerToolsWorkflow.run,
+            cache_tools,
+            id=f"test_summarizer_mcp_tools_{uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        await handle.result()
+
+    if cache_tools:
+        assert model.tools == control_model.tools
+        assert (
+            get_activities(await handle.fetch_history()).count(
+                "echo_summarizer-list-tools"
+            )
+            == 1
+        )
+    else:
+        # Listed on each call into the noop registry, as before; never lost.
+        assert all("echo" in tools for tools in model.tools)
+        assert len(model.tools) == 2
+    await Replayer(
+        workflows=[SummarizerToolsWorkflow],
+        plugins=[plugin],
+    ).replay_workflow(await handle.fetch_history())
 
 
 async def test_unrecoverable_overflow_fails_the_workflow(client: Client):

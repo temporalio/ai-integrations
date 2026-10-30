@@ -114,6 +114,15 @@ async def _summarize(
 async def _summarize_with_agent(summarizer: Agent, messages: list[Message]) -> Message:
     # The steps of SummarizingConversationManager._generate_summary_with_agent,
     # awaiting invoke_async instead of calling the agent synchronously.
+    from ._temporal_agent import TemporalAgent
+
+    if isinstance(summarizer, TemporalAgent):
+        # Strands lists a provider's tools when the agent is built, so its
+        # summarization agent never falls back to the noop tool for them. A
+        # TemporalAgent lists a cache_tools MCP client's tools on its first model
+        # call; list them now, into the agent's own registry rather than the noop
+        # one below, which is discarded.
+        await summarizer._load_cached_mcp_tools()
     system_prompt = summarizer.system_prompt
     original_messages = summarizer.messages.copy()
     tool_registry = summarizer.tool_registry
