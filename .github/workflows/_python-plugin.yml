@@ -21,8 +21,8 @@ on:
         default: ""
       windows-test-repetitions:
         description: Number of fresh Windows test-suite executions (1–20)
-        type: number
-        default: 1
+        type: string
+        default: "1"
 
 permissions: {}
 
@@ -101,7 +101,7 @@ jobs:
         run: cd "$PLUGIN_DIR" && make lint
       - name: Test
         env:
-          REPETITIONS: ${{ runner.os == 'Windows' && inputs.windows-test-repetitions || 1 }}
+          REPETITIONS: ${{ runner.os == 'Windows' && inputs.windows-test-repetitions || '1' }}
         run: |
           cd "$PLUGIN_DIR"
           if [[ ! "$REPETITIONS" =~ ^[0-9]+$ ]] || (( REPETITIONS < 1 || REPETITIONS > 20 )); then

@@ -418,8 +418,11 @@ def test_python_windows_repetitions_are_bounded_and_stop_on_failure(
 ) -> None:
     workflow = yaml.safe_load((REPO / ".github/workflows/_python-plugin.yml").read_text())
     step = next(step for step in workflow["jobs"]["test"]["steps"] if step.get("name") == "Test")
-    assert step["env"]["REPETITIONS"] == "${{ runner.os == 'Windows' && inputs.windows-test-repetitions || 1 }}"
-    assert workflow[True]["workflow_call"]["inputs"]["windows-test-repetitions"]["default"] == 1
+    assert step["env"]["REPETITIONS"] == "${{ runner.os == 'Windows' && inputs.windows-test-repetitions || '1' }}"
+    call_input = workflow[True]["workflow_call"]["inputs"]["windows-test-repetitions"]
+    assert call_input == {"description": "Number of fresh Windows test-suite executions (1–20)", "type": "string", "default": "1"}
+    ci = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
+    assert ci[True]["workflow_dispatch"]["inputs"]["windows-test-repetitions"]["type"] == call_input["type"]
     calls = tmp_path / "calls"
     fake_make = tmp_path / "make"
     fake_make.write_text(
