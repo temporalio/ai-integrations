@@ -218,7 +218,11 @@ export async function failActivities(messages: string[]): Promise<never> {
   for (const message of messages) {
     await failingActivity(message).catch((err: unknown) => {
       const cause = err instanceof ActivityFailure ? err.cause : undefined;
-      decoded.push(cause instanceof ApplicationFailure ? [cause.type, cause.nonRetryable, cause.details] : null);
+      decoded.push(
+        cause instanceof ApplicationFailure
+          ? { type: cause.type, nonRetryable: cause.nonRetryable, details: cause.details }
+          : null
+      );
     });
   }
   // Failing, rather than returning, also stores a workflow failure, which the bundle's failure

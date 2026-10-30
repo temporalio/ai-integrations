@@ -93,8 +93,6 @@ Each `TemporalAgent` carries its own activity options (timeouts, retry policy, t
 
 Before its first model call, each `TemporalAgent` reads the model's `modelId` and `contextWindowLimit` from its `getConfig()` through the `strandsGetModelConfig` activity, with the agent's activity options. Strands' traces and [proactive compression](https://strandsagents.com/docs/user-guide/sdk/agents/conversation-management/#proactive-context-compression) then use the real model's values, as they do outside Temporal. If you scaled `compressionThreshold` by the model's window divided by 200,000 to make up for the missing limit, remove that scaling.
 
-The read is a new activity, so a run whose agent ran before you deploy this version fails to replay on it with a nondeterminism error. Let those runs finish first, or use Worker Versioning.
-
 ## Retries
 
 `TemporalAgent` disables Strands' built-in `ModelRetryStrategy` so retries are handled exclusively by Temporal. Configure retries via `activityOptions.retry` on `TemporalAgent`, and on the activity options accepted by `workflow.activityAsTool`, `workflow.activityAsHook`, and `TemporalMCPClient`:
@@ -110,11 +108,15 @@ new TemporalAgent({
 
 Passing `retryStrategy` to `new TemporalAgent(...)` throws; remove the argument and put the retry config on the activity options instead.
 
-The plugin makes Strands' terminal errors (`ContextWindowOverflowError`, `MaxTokensError` and `StructuredOutputError`) non-retryable. Its activity interceptor does this for a `ContextWindowOverflowError` from the model activity, and for any of the three that your own activity throws. The agent throws `MaxTokensError` and `StructuredOutputError` in workflow code, where the plugin's workflow interceptor does it: the run fails, or the update is rejected, with a failure of that type, instead of the workflow task failing on every attempt.
+The plugin makes Strands' terminal errors (`ContextWindowOverflowError`, `MaxTokensError` and `StructuredOutputError`) non-retryable `ApplicationFailure`s whose `type` is the error's name:
 
-The workflow interceptor wraps every signal and update handler, so a handler counts as finished a little later than in earlier versions. A run that started before you deploy this version can fail to replay with a nondeterminism error if its workflow code depends on that moment: for example, if it checks `allHandlersFinished()` right after a handler runs, or if an update handler releases the workflow and the workflow then schedules an activity in the same task, since the update's completion is now recorded after that activity. Let those runs finish first, or use Worker Versioning.
+- A `ContextWindowOverflowError` from the model activity is not retried. It reaches the agent as Strands' own error, so its conversation manager trims the conversation and calls the model again, as it does outside Temporal.
+- An activity of yours that throws one of the three fails without retries.
+- The agent throws `MaxTokensError` and `StructuredOutputError` in workflow code. When one of the three escapes your workflow function or a signal or update handler, the plugin's workflow interceptor makes the run, or the update, fail with a failure of that type, instead of the workflow task failing on every attempt. Other errors Strands raises in workflow code, such as a `ModelError` for a model response it cannot parse, still fail the workflow task on every attempt.
 
-A `ContextWindowOverflowError` from the model activity reaches the agent as Strands' own error, so its conversation manager trims the conversation and calls the model again, as it does outside Temporal. A run whose workflow code caught that overflow before you deploy this version calls the model again on replay instead, and fails with a nondeterminism error. Let those runs finish first, or use Worker Versioning.
+Your own activity and workflow interceptors run outside the plugin's, so they see the `ApplicationFailure`, not the Strands error: match on its `type`. The original error, and fields such as `MaxTokensError.partialMessage`, are not reachable from them.
+
+If your worker lists one of these errors in `workflowFailureErrorTypes`, the run used to fail with a retryable failure, so a workflow retry policy started another run. The plugin's failure is non-retryable, so that run is no longer retried.
 
 ## Snapshots
 
@@ -230,11 +232,9 @@ agent.addHook(AfterToolCallEvent, auditCallback);
 
 Strands supports interrupts via `toolContext.interrupt(...)` and `event.interrupt(...)`. Both work with the plugin: `agent.invoke()` returns `AgentResult` with `stopReason: 'interrupt'` and `interrupts: [...]`. Pair this with a signal handler that supplies responses, then resume by calling `agent.invoke(responses)`.
 
-Interrupts also survive the activity boundary when raised from an `activityAsTool`-wrapped activity. An activity interceptor the plugin adds to the worker packages the interrupt as a typed, non-retryable `ApplicationFailure`, and `TemporalActivityTool` re-raises it through the agent's interrupt machinery on the workflow side, so `AgentResult.interrupts` is populated just like the in-workflow case.
+Interrupts also survive the activity boundary when raised from an `activityAsTool`-wrapped activity. An activity interceptor the plugin adds to the worker packages the interrupt as a typed, non-retryable `ApplicationFailure`, and `TemporalActivityTool` re-raises it through the agent's interrupt machinery on the workflow side, so `AgentResult.interrupts` is populated just like the in-workflow case. From an activity, throw an error with an `interrupts` array, the shape of Strands' `InterruptError`: each entry needs a `toJSON()` that returns an object with a string `name` and, optionally, a `reason`, all JSON-encodable. The plugin fails a malformed interrupt without retries.
 
 The plugin keeps the failure converter your client and worker set with `dataConverter.failureConverterPath`, for example to [encode failure messages](https://docs.temporal.io/failure-converter). For activity-tool interrupts to work, your converter must decode a failure of type `StrandsInterrupt` to an `ApplicationFailure` with that type and its details, as the SDK's default converter does.
-
-**Upgrading from an earlier version:** earlier versions replaced your converter with the plugin's, so workflow code now decodes the failures of runs that started before the upgrade with your converter. If your converter decodes them into other errors than the SDK's default converter and that changes which commands a workflow issues, those runs fail to replay with a nondeterminism error. If it only changes a value the workflow keeps or returns, the runs replay without error and continue with the new value, so replay tests do not catch them. Let those runs finish before you upgrade, or use Worker Versioning.
 
 ## Continue-as-new
 
@@ -331,7 +331,7 @@ new StrandsPlugin({
 
 ## Observability
 
-`StrandsPlugin` composes cleanly with [`OpenTelemetryPlugin`](../interceptors-opentelemetry). Register both on the client and the worker. You'll get OTel spans around the model, tool, and MCP activities the plugin schedules, plus any spans Strands itself emits inside `invoke`:
+`StrandsPlugin` composes cleanly with [`OpenTelemetryPlugin`](../interceptors-opentelemetry). Register `OpenTelemetryPlugin` on the client and the worker, and `StrandsPlugin` on the worker. You'll get OTel spans around the model, tool, and MCP activities the plugin schedules, plus any spans Strands itself emits inside `invoke`:
 
 ```ts
 import { OpenTelemetryPlugin } from '@temporalio/interceptors-opentelemetry';
@@ -357,3 +357,37 @@ const worker = await Worker.create({
 ```
 
 See the [OpenTelemetry interceptor README](../interceptors-opentelemetry) for exporter setup.
+
+## Pre-built workflow bundles
+
+If you build workflow code with `bundleWorkflowCode` instead of giving the worker `workflowsPath`, pass the plugin to the bundler as well as to the worker. Its bundler hook stubs modules that workflow code cannot load, and adds the plugin's workflow interceptor.
+
+```ts
+import { bundleWorkflowCode } from '@temporalio/worker';
+import { StrandsPlugin } from '@temporalio/strands-agents';
+
+const bundle = await bundleWorkflowCode({
+  workflowsPath: require.resolve('./workflows'),
+  plugins: [new StrandsPlugin()],
+});
+```
+
+Rebuild the bundle when you upgrade the plugin. A bundle built with an earlier version has no workflow interceptor, and nothing warns about it.
+
+## Upgrading from 1.24 and earlier
+
+This version changes what workflow code does in the cases below, with no version gate. A run that started on an earlier version can fail to replay on this one with a nondeterminism error:
+
+- **Model config read.** Before its first model call, each agent now reads the model's config through the `strandsGetModelConfig` activity, so a run whose agent ran before the upgrade fails to replay.
+- **Your failure converter.** Earlier versions replaced the failure converter your client and worker set with the plugin's, so workflow code now decodes the failures of earlier runs with yours. If yours decodes a failure into another error than the SDK's default converter and that changes which commands the workflow issues, the run fails to replay. If it only changes a value the workflow keeps or returns, the run replays without error and continues with the new value, so replay tests do not catch it.
+- **Handler timing.** The workflow interceptor wraps every signal and update handler, so a handler counts as finished a little later. A run fails to replay if its code depends on that moment: for example, if it checks `allHandlersFinished()` right after a handler runs, or if an update handler releases the workflow and the workflow then schedules an activity in the same workflow task, since the update's completion is now recorded after that activity.
+- **Context overflow.** A run whose workflow code caught a context overflow from the agent now trims and calls the model again on replay instead, and fails to replay.
+
+Let those runs finish before you upgrade, or keep them on the earlier version with Worker Versioning. The same applies to rolling back: a run that started on this version can fail to replay on an earlier one, so let it finish before you roll back.
+
+Other changes when you upgrade:
+
+- A run whose workflow task keeps failing on a Strands terminal error fails with it once this version runs, and a run stuck on a context overflow trims and continues.
+- Rebuild [pre-built workflow bundles](#pre-built-workflow-bundles) with this version.
+- `StrandsFailureConverter` is removed. Remove imports of it, and any `failureConverterPath` that points at `@temporalio/strands-agents/lib/failure-converter`.
+- The plugin no longer needs to be on the client, where it now does nothing, so you can remove it there.

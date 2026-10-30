@@ -21,7 +21,7 @@ import {
   loadHistory,
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
-import { bundleWorkflowCode, DefaultLogger, Worker, type WorkflowBundle } from '@temporalio/worker';
+import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
 import { DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { StrandsPlugin } from '..';
@@ -119,11 +119,11 @@ function textTurn(text: string): ModelStreamEvent[] {
 }
 
 /** Each failed activity's message, type and non-retryable flag in a run's history. */
-function activityFailures(history: temporal.api.history.v1.IHistory): unknown[] {
+function activityFailures(history: temporal.api.history.v1.IHistory): object[] {
   return (history.events ?? []).flatMap((e) => {
     const failure = e.activityTaskFailedEventAttributes?.failure;
     const info = failure?.applicationFailureInfo;
-    return failure ? [[failure.message, info?.type, info?.nonRetryable]] : [];
+    return failure ? [{ message: failure.message, type: info?.type, nonRetryable: info?.nonRetryable }] : [];
   });
 }
 
@@ -187,12 +187,7 @@ class StubMcpClient extends McpClient {
   }
 }
 
-interface Context extends BaseContext {
-  /** The workflows bundled with a caller's own failure converter. */
-  callerConverterBundle: WorkflowBundle;
-}
-
-const test = anyTest as TestFn<Context>;
+const test = anyTest as TestFn<BaseContext>;
 
 const CALLER_FAILURE_CONVERTER = require.resolve('./encoding-failure-converter');
 
@@ -202,18 +197,13 @@ test.before(async (t) => {
   // `@strands-agents/sdk/mcp-config.js`'s dynamic `node:*`/MCP-transport
   // imports and inline async chunks.
   const bundlerPlugin = new StrandsPlugin({ models: { test: () => new StubModel([]) } });
-  const bundleOptions = {
+  const workflowBundle = await bundleWorkflowCode({
     ...createBaseBundlerOptions(),
     workflowsPath: require.resolve('./workflows/strands'),
     logger: new DefaultLogger('WARN'),
     plugins: [bundlerPlugin],
-  };
-  const workflowBundle = await bundleWorkflowCode(bundleOptions);
-  const callerConverterBundle = await bundleWorkflowCode({
-    ...bundleOptions,
-    failureConverterPath: CALLER_FAILURE_CONVERTER,
   });
-  t.context = { env, workflowBundle, callerConverterBundle };
+  t.context = { env, workflowBundle };
 });
 
 test.after.always(async (t) => {
@@ -903,25 +893,39 @@ test('activity-tool interrupt pauses the agent and resumes', async (t) => {
   });
   // First activity invocation threw the interrupt; second succeeded after resume.
   t.is(deleteState.calls, 2);
-  // The interrupt failed the first activity without a retry, and the resumed agent scheduled a
-  // second one; a retried activity would have run both calls in one.
-  t.deepEqual(activityFailures(history), [['interrupt:approval', 'StrandsInterrupt', true]]);
+  // The interrupt failed the first activity once, with no retry; the second call came from the
+  // activity the resumed agent scheduled.
+  t.deepEqual(activityFailures(history), [
+    { message: 'interrupt:approval', type: 'StrandsInterrupt', nonRetryable: true },
+  ]);
   // The failure keeps the stack of the error the activity threw.
   const failure = history.events?.find((e) => e.activityTaskFailedEventAttributes)?.activityTaskFailedEventAttributes
     ?.failure;
   t.regex(failure?.stackTrace ?? '', /interruptError/);
-  const scheduled = history.events?.filter(
-    (e) => e.activityTaskScheduledEventAttributes?.activityType?.name === 'deleteThing'
-  );
-  t.is(scheduled?.length, 2);
 });
 
 test("a worker's own failure converter still applies with the plugin", async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
+  let inboundCalls = 0;
   const worker = await createWorker({
-    workflowBundle: t.context.callerConverterBundle,
+    // The worker bundles the workflows itself, so the bundle's failure converter comes from the
+    // worker's options and the plugins, as it does with `workflowsPath`.
+    workflowBundle: undefined,
+    workflowsPath: require.resolve('./workflows/strands'),
+    bundlerOptions: createBaseBundlerOptions(),
     dataConverter: { failureConverterPath: CALLER_FAILURE_CONVERTER },
     plugins: [new StrandsPlugin()],
+    // The worker's own interceptors still run with the plugin's.
+    interceptors: {
+      activityInbound: [
+        () => ({
+          execute: (input, next) => {
+            inboundCalls += 1;
+            return next(input);
+          },
+        }),
+      ],
+    },
     activities: {
       async failingActivity(message: string): Promise<never> {
         throw message === 'interrupt' ? interruptError('foo') : new StructuredOutputError('no output');
@@ -933,20 +937,56 @@ test("a worker's own failure converter still applies with the plugin", async (t)
     const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
     // Workflow code decoded each activity failure as `TemporalActivityTool` expects.
     t.deepEqual(err?.cause instanceof ApplicationFailure && err.cause.details, [
-      ['StrandsInterrupt', true, [{ id: 'delete:foo', name: 'approval', reason: 'delete foo?', source: 'tool' }]],
-      ['StructuredOutputError', true, []],
+      {
+        type: 'StrandsInterrupt',
+        nonRetryable: true,
+        details: [{ id: 'delete:foo', name: 'approval', reason: 'delete foo?', source: 'tool' }],
+      },
+      { type: 'StructuredOutputError', nonRetryable: true, details: [] },
     ]);
     return handle.fetchHistory();
   });
   // The caller's converter encoded every failure, and the plugin made the Strands errors
   // non-retryable.
   t.deepEqual(activityFailures(history), [
-    ['Encoded failure', 'StrandsInterrupt', true],
-    ['Encoded failure', 'StructuredOutputError', true],
+    { message: 'Encoded failure', type: 'StrandsInterrupt', nonRetryable: true },
+    { message: 'Encoded failure', type: 'StructuredOutputError', nonRetryable: true },
   ]);
   const workflowFailure = history.events?.find((e) => e.workflowExecutionFailedEventAttributes)
     ?.workflowExecutionFailedEventAttributes?.failure;
   t.is(workflowFailure?.message, 'Encoded failure');
+  t.is(inboundCalls, 2);
+});
+
+test('a malformed activity interrupt fails without retries', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin()],
+    activities: {
+      async failingActivity(message: string): Promise<never> {
+        // An entry with no toJSON(), and a reason the default payload converter cannot encode.
+        const interrupts =
+          message === 'no toJSON'
+            ? [{ toJSON: () => ({ name: 'approval' }) }, {}]
+            : [{ toJSON: () => ({ name: 'approval', reason: BigInt(1) }) }];
+        throw Object.assign(new Error('interrupt'), { interrupts });
+      },
+    },
+  });
+  const history = await worker.runUntil(async () => {
+    const handle = await startWorkflow(failActivities, { args: [['no toJSON', 'BigInt reason']] });
+    await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    return handle.fetchHistory();
+  });
+  const failures = activityFailures(history) as { message: string; type: string; nonRetryable: boolean }[];
+  t.deepEqual(
+    failures.map(({ type, nonRetryable }) => ({ type, nonRetryable })),
+    [
+      { type: 'Error', nonRetryable: true },
+      { type: 'Error', nonRetryable: true },
+    ]
+  );
+  t.true(failures.every((f) => f.message.startsWith('malformed interrupt')));
 });
 
 test('a context overflow in the model activity lets the agent trim the conversation', async (t) => {

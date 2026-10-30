@@ -118,7 +118,8 @@ export class StrandsPlugin extends SimplePlugin {
       name: 'StrandsPlugin',
       activities,
       runContext,
-      // A function, so that the worker's other interceptors, such as `activityInbound`, are kept.
+      // A function, because the object form rebuilds the worker's interceptors without the
+      // deprecated `activityInbound` key.
       workerInterceptors: (existing) => ({
         ...existing,
         activity: [...(existing?.activity ?? []), () => ({ inbound: strandsActivityInbound })],
