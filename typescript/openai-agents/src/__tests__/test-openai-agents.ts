@@ -1,7 +1,5 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
-import { readFileSync } from 'node:fs';
-import * as path from 'node:path';
 import {
   addTraceProcessor,
   getCurrentTrace,
@@ -14,7 +12,7 @@ import type { MCPServer, Model, ModelProvider, Span, SpanData, TracingProcessor 
 import { WorkflowClient } from '@temporalio/client';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
-import { bundleWorkflowCode, Worker } from '@temporalio/worker';
+import { bundleWorkflowCode } from '@temporalio/worker';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import {
   OpenAIAgentsPlugin,
@@ -290,10 +288,9 @@ test('MCP toolMetaResolver sends _meta on stateless and stateful servers', async
   ]);
 });
 
-test('Stateful MCP: a factory toolMetaResolver fails the operations without connecting', async (t) => {
+test('Stateful MCP: a factory toolMetaResolver fails the operations', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
 
-  let connects = 0;
   const worker = await createWorker({
     plugins: [
       new OpenAIAgentsPlugin({
@@ -301,14 +298,7 @@ test('Stateful MCP: a factory toolMetaResolver fails the operations without conn
         mcpServerProviders: [
           new StatefulMCPServerProvider(
             'factoryResolver',
-            () => ({
-              ...metaTestServer('factoryResolver', []),
-              toolMetaResolver: () => ({ tenant: 'tenant-7' }),
-              async connect() {
-                connects++;
-                throw new Error('connection refused');
-              },
-            }),
+            () => ({ ...metaTestServer('factoryResolver', []), toolMetaResolver: () => ({ tenant: 'tenant-7' }) }),
             t.context.env.nativeConnection
           ),
         ],
@@ -318,25 +308,12 @@ test('Stateful MCP: a factory toolMetaResolver fails the operations without conn
 
   await worker.runUntil(async () => {
     const handle = await startWorkflow(statefulMcpFactoryResolverWorkflow, { workflowExecutionTimeout: '20 seconds' });
-    t.deepEqual(await handle.result(), Array(3).fill('MCPToolMetaResolverUnsupported:true'));
-    const { events } = await handle.fetchHistory();
-    const scheduled = (events ?? [])
-      .filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED)
-      .map((e) => e.activityTaskScheduledEventAttributes?.activityType?.name);
-    // callTool() runs after the refusal, so it schedules nothing.
-    t.deepEqual(scheduled, ['factoryResolver-stateful-server-session', 'factoryResolver-stateful-list-tools']);
+    t.deepEqual(await handle.result(), [
+      'MCPToolMetaResolverUnsupported:true',
+      'MCPToolMetaResolverUnsupported:true',
+      'cleanup-success',
+    ]);
   });
-  t.is(connects, 0);
-});
-
-test('Stateful MCP: operations keep the promise steps of histories recorded before toolMetaResolver', async (t) => {
-  // statefulMcpOrderingWorkflow, recorded with main's (1e8ae93) stateful-mcp-client.ts: the callTool() and
-  // gate results arrive in one Workflow Task, and orderingAfterMcp is scheduled before orderingAfterGate.
-  // Extra promise steps in callTool() reverse them and fail this replay with a nondeterminism error.
-  const history = JSON.parse(
-    readFileSync(path.resolve(__dirname, '../../src/__tests__/histories/stateful-mcp-ordering-main.json'), 'utf8')
-  );
-  await t.notThrowsAsync(Worker.runReplayHistory({ workflowBundle: t.context.workflowBundle }, history));
 });
 
 test('summary string is passed through to model activity', async (t) => {

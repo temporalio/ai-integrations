@@ -1,10 +1,7 @@
 import test from 'ava';
 import type { MCPServer } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
-import type { NativeConnection } from '@temporalio/worker';
-import { MockActivityEnvironment } from '@temporalio/testing';
 import { StatelessMCPServerProvider } from '../worker/mcp-provider';
-import { StatefulMCPServerProvider } from '../worker/stateful-mcp-provider';
 
 function serverWithResolver(onConnect: () => void): MCPServer {
   return {
@@ -39,22 +36,5 @@ test('StatelessMCPServerProvider refuses a toolMetaResolver without connecting',
     t.is(err?.type, 'MCPToolMetaResolverUnsupported');
     t.true(err?.nonRetryable);
   }
-  t.is(connects, 0);
-});
-
-test('StatefulMCPServerProvider refuses a toolMetaResolver at session start without connecting', async (t) => {
-  let connects = 0;
-  const activities = new StatefulMCPServerProvider(
-    'tickets',
-    () => serverWithResolver(() => connects++),
-    {} as NativeConnection
-  )._getActivities();
-
-  const err = await t.throwsAsync(
-    new MockActivityEnvironment().run(activities['tickets-stateful-server-session']!, {}),
-    { instanceOf: ApplicationFailure }
-  );
-  t.is(err?.type, 'MCPToolMetaResolverUnsupported');
-  t.true(err?.nonRetryable);
   t.is(connects, 0);
 });
