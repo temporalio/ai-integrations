@@ -366,15 +366,14 @@ func sleepingInstructionWorkflow(ctx workflow.Context, filterSleeps bool) error 
 }
 
 // TestMcpListsAtTheSamePointInEveryStep proves the MCP toolset lists at a point
-// that does not depend on the ADK release: in the first model step of the
-// first turn before the request processors (ADK calls Tools there on every
-// release), and in every later step and turn after them, in ProcessRequest.
-// ADK v2.6.0 also calls Tools before the request processors of every step; a
-// listing there would put ListMcpTools before the instruction's timer, where
-// ADK v2.5.0 and earlier put it after, and Histories would not replay across
-// releases. ToolFilter runs at the same points too: in the first Tools call of
-// each turn and in each ProcessRequest, never in the later Tools calls only
-// ADK v2.6.0 makes.
+// that does not depend on the ADK release: in the first model step of each
+// turn before the request processors (ADK calls Tools there on every release),
+// and in every later step after them, in ProcessRequest. ADK v2.6.0 also calls
+// Tools before the request processors of every step; a listing there would put
+// ListMcpTools before the instruction's timer, where ADK v2.5.0 and earlier put
+// it after, and Histories would not replay across releases. ToolFilter runs at
+// the same points too: in the first Tools call of each turn and in each
+// ProcessRequest, never in the later Tools calls only ADK v2.6.0 makes.
 func TestMcpListsAtTheSamePointInEveryStep(t *testing.T) {
 	list, invoke, call := googleadk.ListMcpToolsActivityName, googleadk.InvokeModelActivityName, googleadk.CallMcpToolActivityName
 	instr, filter := "Timer 1s", "Timer 2s"
@@ -387,17 +386,16 @@ func TestMcpListsAtTheSamePointInEveryStep(t *testing.T) {
 			list, instr, invoke, call,
 			// Turn 1, step 2: listed in ProcessRequest, after the instruction.
 			instr, list, invoke,
-			// Turn 2: listed in ProcessRequest.
-			instr, list, invoke,
+			// Turn 2: listed through Tools, before the instruction.
+			list, instr, invoke,
 		}},
 		{true, []string{
 			// Turn 1, step 1: Tools lists and filters, ProcessRequest filters.
 			list, filter, instr, filter, invoke, call,
 			// Turn 1, step 2: ProcessRequest lists and filters.
 			instr, list, filter, invoke,
-			// Turn 2: Tools filters the kept list, ProcessRequest lists and
-			// filters.
-			filter, instr, list, filter, invoke,
+			// Turn 2: Tools lists and filters, ProcessRequest filters.
+			list, filter, instr, filter, invoke,
 		}},
 	} {
 		t.Run(fmt.Sprintf("filterSleeps=%v", tc.filterSleeps), func(t *testing.T) {
@@ -597,6 +595,71 @@ func TestMcpWrappedToolsetListsOnEveryToolsCall(t *testing.T) {
 			if toolsCalls == len(declared) {
 				assert.Equal(t, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}, declared)
 			}
+		})
+	}
+}
+
+// sharedProxyWorkflow runs one turn of an agent that uses an MCP toolset
+// directly, then one turn of another agent, named secondName, that uses the
+// same toolset through tool.FilterToolset. The runners share the bridged
+// context.
+func sharedProxyWorkflow(ctx workflow.Context, secondName string) error {
+	ts := googleadk.NewMCPToolset(googleadk.MCPToolsetOptions{Name: "search-server"})
+	adkCtx := googleadk.NewContext(ctx)
+	for _, a := range []struct {
+		name    string
+		toolset tool.Toolset
+	}{
+		{"assistant", ts},
+		{secondName, tool.FilterToolset(ts, func(agent.ReadonlyContext, tool.Tool) bool { return true })},
+	} {
+		ag, err := llmagent.New(llmagent.Config{
+			Name:     a.name,
+			Model:    googleadk.NewModel("fake-model"),
+			Toolsets: []tool.Toolset{a.toolset},
+		})
+		if err != nil {
+			return err
+		}
+		r, err := runner.New(runner.Config{AppName: "test-app", Agent: ag, SessionService: session.InMemoryService(), AutoCreateSession: true})
+		if err != nil {
+			return err
+		}
+		for _, rerr := range r.Run(adkCtx, "user-1", "session-1", genai.NewContentFromText("hello", genai.RoleUser), agent.RunConfig{}) {
+			if rerr != nil {
+				return rerr
+			}
+		}
+	}
+	return nil
+}
+
+// TestMcpSameNamedAgentsKeepTheirOwnListings proves that the toolset's
+// ProcessRequest running for one agent does not stand in for another agent
+// with the same name, whose wrapper hides that ProcessRequest: the second
+// agent's request still declares the toolset's tools.
+func TestMcpSameNamedAgentsKeepTheirOwnListings(t *testing.T) {
+	for _, secondName := range []string{"assistant", "other"} {
+		t.Run(secondName, func(t *testing.T) {
+			m := &ruleModel{name: "fake-model", rule: func(*model.LLMRequest) *model.LLMResponse {
+				return googleadk.TextResponse("done")
+			}}
+			server := googleadk.NewFakeMCPServer("search-server").AddTool("search", "search the web", searchSchema(),
+				func(map[string]any) (map[string]any, error) { return map[string]any{"hits": 1}, nil })
+
+			var s testsuite.WorkflowTestSuite
+			env, counter := newEnv(t, &s, googleadk.Config{
+				Models:      map[string]googleadk.ModelFactory{"fake-model": m.factory()},
+				MCPToolsets: map[string]googleadk.MCPFactory{"search-server": server.Factory()},
+			})
+			env.RegisterWorkflow(sharedProxyWorkflow)
+			env.ExecuteWorkflow(sharedProxyWorkflow, secondName)
+
+			require.True(t, env.IsWorkflowCompleted())
+			require.NoError(t, env.GetWorkflowError())
+
+			assert.Equal(t, [][]string{{"search"}, {"search"}}, m.declared())
+			assert.Equal(t, 2, counter.get(googleadk.ListMcpToolsActivityName), "one listing per agent run")
 		})
 	}
 }

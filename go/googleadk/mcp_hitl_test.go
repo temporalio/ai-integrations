@@ -2,6 +2,7 @@ package googleadk_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -53,6 +54,21 @@ func guardedMCPFactory() googleadk.MCPFactory {
 	}
 }
 
+// flakyToolset is a toolset without tools whose Tools call fails while fail is
+// set, the way a toolset fails to reach its server.
+type flakyToolset struct {
+	fail *bool
+}
+
+func (flakyToolset) Name() string { return "flaky" }
+
+func (f flakyToolset) Tools(agent.ReadonlyContext) ([]tool.Tool, error) {
+	if *f.fail {
+		return nil, errors.New("flaky toolset unavailable")
+	}
+	return nil, nil
+}
+
 // mcpHitlResult is the serializable output of mcpHitlWorkflow.
 type mcpHitlResult struct {
 	// Paused reports that the first Run pass paused on a pending confirmation.
@@ -88,9 +104,12 @@ type mcpHitlResult struct {
 // tool after pass 1, so the approved call must not run on resume. With
 // reuseMessage, pass 2 overwrites pass 1's message with the decision and
 // resumes with the same *genai.Content, the way a caller that receives each
-// message into one variable does.
-func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume, reuseMessage bool) (mcpHitlResult, error) {
-	excluded := false
+// message into one variable does. With retryResume, the first resume fails
+// because another toolset cannot list its tools, after the MCP toolset listed
+// and filtered; the filter changes only then, and the workflow retries the
+// resume with the same message.
+func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume, reuseMessage, retryResume bool) (mcpHitlResult, error) {
+	excluded, flaky := false, false
 	root, err := llmagent.New(llmagent.Config{
 		Name:        "assistant",
 		Description: "root assistant",
@@ -101,7 +120,7 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume, reuseMe
 			ToolFilter: func(_ agent.ReadonlyContext, t tool.Tool) bool {
 				return !excluded || t.Name() != "guarded"
 			},
-		})},
+		}), flakyToolset{&flaky}},
 	})
 	if err != nil {
 		return mcpHitlResult{}, err
@@ -142,7 +161,6 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume, reuseMe
 	}
 
 	// --- Pass 2: simulate the human's decision, then resume. ---
-	excluded = excludeBeforeResume
 	resume := googleadk.ConfirmationResponse(googleadk.ConfirmationDecision{
 		FunctionCallID: pending[0].FunctionCallID,
 		Confirmed:      confirm,
@@ -151,6 +169,21 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume, reuseMe
 		*msg = *resume
 		resume = msg
 	}
+	if retryResume {
+		flaky = true
+		var failed error
+		for _, rerr := range r.Run(adkCtx, "user-1", "session-1", resume, agent.RunConfig{}) {
+			if rerr != nil {
+				failed = rerr
+				break
+			}
+		}
+		if failed == nil {
+			return res, errors.New("the first resume did not fail")
+		}
+		flaky = false
+	}
+	excluded = excludeBeforeResume
 	for ev, rerr := range r.Run(adkCtx, "user-1", "session-1", resume, agent.RunConfig{}) {
 		if rerr != nil {
 			return res, rerr
@@ -203,13 +236,13 @@ func newMcpHitlEnv(t *testing.T, s *testsuite.WorkflowTestSuite) (*testsuite.Tes
 // surfaces it, with the original call attached for the human), and the approval
 // flows back through the snapshot so the tool executes exactly once.
 func TestMCPToolConfirmationPausesAndResumes(t *testing.T) {
-	for _, reuseMessage := range []bool{false, true} {
-		t.Run(fmt.Sprintf("reuseMessage=%v", reuseMessage), func(t *testing.T) {
+	for _, tc := range []struct{ reuseMessage, retryResume bool }{{false, false}, {true, false}, {true, true}} {
+		t.Run(fmt.Sprintf("reuseMessage=%v/retryResume=%v", tc.reuseMessage, tc.retryResume), func(t *testing.T) {
 			mcpGuardedRuns.Store(0)
 
 			var s testsuite.WorkflowTestSuite
 			env, counter := newMcpHitlEnv(t, &s)
-			env.ExecuteWorkflow(mcpHitlWorkflow, true, false, reuseMessage)
+			env.ExecuteWorkflow(mcpHitlWorkflow, true, false, tc.reuseMessage, tc.retryResume)
 
 			require.True(t, env.IsWorkflowCompleted())
 			require.NoError(t, env.GetWorkflowError())
@@ -237,7 +270,7 @@ func TestMCPToolConfirmationDenialBlocksTool(t *testing.T) {
 
 	var s testsuite.WorkflowTestSuite
 	env, counter := newMcpHitlEnv(t, &s)
-	env.ExecuteWorkflow(mcpHitlWorkflow, false, false, false)
+	env.ExecuteWorkflow(mcpHitlWorkflow, false, false, false, false)
 
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
@@ -258,15 +291,16 @@ func TestMCPToolConfirmationDenialBlocksTool(t *testing.T) {
 // human approves: ADK resumes the call from the toolset's current Tools list,
 // which the filter governs at that point, not when the tools were listed. The
 // resume keeps the paused run's invocation ID, and with reuseMessage also its
-// *genai.Content, so only the content's value tells the runs apart.
+// *genai.Content. With retryResume, a failed resume already listed and
+// filtered before the filter changed, and the retry passes the same message.
 func TestMCPToolConfirmationResumeHonorsCurrentToolFilter(t *testing.T) {
-	for _, reuseMessage := range []bool{false, true} {
-		t.Run(fmt.Sprintf("reuseMessage=%v", reuseMessage), func(t *testing.T) {
+	for _, tc := range []struct{ reuseMessage, retryResume bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		t.Run(fmt.Sprintf("reuseMessage=%v/retryResume=%v", tc.reuseMessage, tc.retryResume), func(t *testing.T) {
 			mcpGuardedRuns.Store(0)
 
 			var s testsuite.WorkflowTestSuite
 			env, counter := newMcpHitlEnv(t, &s)
-			env.ExecuteWorkflow(mcpHitlWorkflow, true, true, reuseMessage)
+			env.ExecuteWorkflow(mcpHitlWorkflow, true, true, tc.reuseMessage, tc.retryResume)
 
 			require.True(t, env.IsWorkflowCompleted())
 			require.NoError(t, env.GetWorkflowError())
