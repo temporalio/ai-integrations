@@ -82,13 +82,22 @@ type mcpHitlResult struct {
 //	        ADK re-dispatches the original call with the decision attached; the
 //	        snapshot carries it to the worker-side tool, which executes on
 //	        approval or rejects on denial.
-func mcpHitlWorkflow(ctx workflow.Context, confirm bool) (mcpHitlResult, error) {
+//
+// With excludeBeforeResume, the toolset's ToolFilter stops allowing the guarded
+// tool after pass 1, so the approved call must not run on resume.
+func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume bool) (mcpHitlResult, error) {
+	excluded := false
 	root, err := llmagent.New(llmagent.Config{
 		Name:        "assistant",
 		Description: "root assistant",
 		Model:       googleadk.NewModel("fake-model"),
 		Instruction: "be helpful",
-		Toolsets:    []tool.Toolset{googleadk.NewMCPToolset(googleadk.MCPToolsetOptions{Name: "guarded-server"})},
+		Toolsets: []tool.Toolset{googleadk.NewMCPToolset(googleadk.MCPToolsetOptions{
+			Name: "guarded-server",
+			ToolFilter: func(_ agent.ReadonlyContext, t tool.Tool) bool {
+				return !excluded || t.Name() != "guarded"
+			},
+		})},
 	})
 	if err != nil {
 		return mcpHitlResult{}, err
@@ -129,6 +138,7 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm bool) (mcpHitlResult, error) 
 	}
 
 	// --- Pass 2: simulate the human's decision, then resume. ---
+	excluded = excludeBeforeResume
 	resume := googleadk.ConfirmationResponse(googleadk.ConfirmationDecision{
 		FunctionCallID: pending[0].FunctionCallID,
 		Confirmed:      confirm,
@@ -189,7 +199,7 @@ func TestMCPToolConfirmationPausesAndResumes(t *testing.T) {
 
 	var s testsuite.WorkflowTestSuite
 	env, counter := newMcpHitlEnv(t, &s)
-	env.ExecuteWorkflow(mcpHitlWorkflow, true)
+	env.ExecuteWorkflow(mcpHitlWorkflow, true, false)
 
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
@@ -215,7 +225,7 @@ func TestMCPToolConfirmationDenialBlocksTool(t *testing.T) {
 
 	var s testsuite.WorkflowTestSuite
 	env, counter := newMcpHitlEnv(t, &s)
-	env.ExecuteWorkflow(mcpHitlWorkflow, false)
+	env.ExecuteWorkflow(mcpHitlWorkflow, false, false)
 
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
@@ -229,4 +239,29 @@ func TestMCPToolConfirmationDenialBlocksTool(t *testing.T) {
 		"the resumed function response must carry the rejection")
 	assert.Equal(t, 2, counter.get(googleadk.CallMcpToolActivityName),
 		"the denial is delivered to the worker-side tool, which rejects without running the handler")
+}
+
+// TestMCPToolConfirmationResumeHonorsCurrentToolFilter proves that a tool the
+// ToolFilter excludes while its confirmation is pending does not run when the
+// human approves: ADK resumes the call from the toolset's current Tools list,
+// which the filter governs at that point, not when the tools were listed.
+func TestMCPToolConfirmationResumeHonorsCurrentToolFilter(t *testing.T) {
+	mcpGuardedRuns.Store(0)
+
+	var s testsuite.WorkflowTestSuite
+	env, counter := newMcpHitlEnv(t, &s)
+	env.ExecuteWorkflow(mcpHitlWorkflow, true, true)
+
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+
+	var res mcpHitlResult
+	require.NoError(t, env.GetWorkflowResult(&res))
+
+	require.True(t, res.Paused, "agent must pause on a pending confirmation")
+	assert.EqualValues(t, 0, mcpGuardedRuns.Load(), "an excluded tool must not run after approval")
+	assert.Contains(t, res.ResumedGuardedError, "not found",
+		"ADK must not find the excluded tool when it resumes the call")
+	assert.Equal(t, 1, counter.get(googleadk.CallMcpToolActivityName),
+		"only the pending pass reaches the worker")
 }

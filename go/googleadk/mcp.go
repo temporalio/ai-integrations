@@ -64,21 +64,40 @@ func (m *mcpToolset) Name() string { return m.name }
 // agent, and keeps that list for the ProcessRequest call that follows in the
 // same model step. After that, ProcessRequest lists, and Tools returns the
 // latest list without an Activity. See ProcessRequest.
+//
+// ToolFilter runs on each call, not when the list is taken, so a list kept
+// from an earlier step or turn returns only the tools the filter allows now.
+// ADK resumes a confirmed tool call from this list before any ProcessRequest
+// of the resuming agent run.
 func (m *mcpToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	l := listingsFrom(ctx)
 	if tools, ok := l.cached(m, ctx); ok {
-		return tools, nil
+		return m.allowed(ctx, tools), nil
 	}
 	tools, err := m.list(ctx)
 	if err != nil {
 		return nil, err
 	}
 	l.listed(m, ctx, tools, true)
-	return tools, nil
+	return m.allowed(ctx, tools), nil
+}
+
+// allowed returns the tools the toolset's ToolFilter allows for ctx.
+func (m *mcpToolset) allowed(ctx agent.ReadonlyContext, tools []tool.Tool) []tool.Tool {
+	if m.filter == nil {
+		return tools
+	}
+	out := make([]tool.Tool, 0, len(tools))
+	for _, t := range tools {
+		if m.filter(ctx, t) {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // list runs the ListMcpTools Activity and wraps each declaration as a proxy
-// tool.
+// tool. It does not apply ToolFilter; see allowed.
 func (m *mcpToolset) list(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	wfCtx, ok := workflowContext(ctx)
 	if !ok {
@@ -91,10 +110,7 @@ func (m *mcpToolset) list(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	}
 	tools := make([]tool.Tool, 0, len(decls))
 	for _, d := range decls {
-		pt := &mcpProxyTool{owner: m, toolset: m.name, decl: d, activityOptions: m.activityOptions}
-		if m.filter == nil || m.filter(ctx, pt) {
-			tools = append(tools, pt)
-		}
+		tools = append(tools, &mcpProxyTool{owner: m, toolset: m.name, decl: d, activityOptions: m.activityOptions})
 	}
 	return tools, nil
 }
@@ -122,7 +138,7 @@ func (m *mcpToolset) ProcessRequest(ctx agent.Context, req *model.LLMRequest) er
 		}
 		l.listed(m, ctx, tools, false)
 	}
-	for _, t := range tools {
+	for _, t := range m.allowed(ctx, tools) {
 		if err := packTool(req, t.(*mcpProxyTool)); err != nil {
 			return err
 		}
@@ -151,7 +167,8 @@ type mcpListingState struct {
 	// processed reports that the toolset's ProcessRequest has run for the
 	// agent. From then on ProcessRequest lists, and Tools does not.
 	processed bool
-	// latest is the most recent list, which Tools returns once processed.
+	// latest is the most recent list, before ToolFilter, which Tools returns
+	// once processed.
 	latest []tool.Tool
 	// pending holds, per invocation, the list Tools took for the
 	// ProcessRequest call that follows in the same model step. Concurrent
