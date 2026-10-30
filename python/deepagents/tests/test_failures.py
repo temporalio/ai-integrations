@@ -4,11 +4,13 @@ Two dep-free paths run against a real server: the HTTP-error → Temporal retry
 translation, and that a raised :class:`DeepAgentsWorkflowError` surfaces to the
 client as a non-retryable failure with a stable ``ApplicationError.type`` (never
 a stringified peer exception). The model-instance validation error needs
-LangChain and guards on its import.
+LangChain and guards on its import. A cancelled ``run_deep_agent`` must close
+the workflow as cancelled, not wrap the cancellation in that failure type.
 """
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import uuid
 from datetime import timedelta
@@ -20,12 +22,23 @@ from temporalio.testing import WorkflowEnvironment
 pytestmark = pytest.mark.skipif(
     sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
 )
-from temporalio import workflow
-from temporalio.client import WorkflowFailureError
-from temporalio.deepagents import DeepAgentsPlugin, DeepAgentsWorkflowError
+from temporalio import activity, workflow
+from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError
+from temporalio.deepagents import (
+    DeepAgentsPlugin,
+    DeepAgentsWorkflowError,
+    activity_as_tool,
+    run_deep_agent,
+)
 from temporalio.deepagents._activity import _translate_api_error
-from temporalio.exceptions import ApplicationError
+from temporalio.deepagents.testing import mock_model_provider
+from temporalio.exceptions import ApplicationError, CancelledError
 from temporalio.worker import Worker
+from tests.helpers.deepagents import count_scheduled_activities
+
+# Bound off importorskip, as in test_tools.py, so type checkers do not resolve
+# the name against this same-named test directory.
+create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
 
 class _FakeResponse:
@@ -100,6 +113,59 @@ async def test_workflow_failure_type(env: WorkflowEnvironment) -> None:
     assert isinstance(cause, ApplicationError)
     assert cause.type == "deepagents.DeepAgentsWorkflowError"
     assert cause.non_retryable is True
+
+
+@activity.defn
+async def wait_tool(value: str) -> str:
+    while True:
+        activity.heartbeat(value)
+        await asyncio.sleep(0.1)
+
+
+@workflow.defn
+class CancelledAgentWorkflow:
+    @workflow.run
+    async def run(self, input: dict) -> str:
+        tool = activity_as_tool(wait_tool, start_to_close_timeout=timedelta(seconds=30))
+        agent = create_deep_agent(model="fake:model", tools=[tool])
+        result = await run_deep_agent(agent, input)
+        return str(result["messages"][-1].content)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_run_deep_agent_closes_cancelled(
+    env: WorkflowEnvironment,
+) -> None:
+    from langchain_core.messages import AIMessage
+
+    call = {"name": "wait_tool", "args": {"value": "go"}, "id": "wait-1"}
+    responses = [AIMessage(content="", tool_calls=[call]), AIMessage(content="done")]
+    plugin = DeepAgentsPlugin(model_provider=mock_model_provider(responses))
+    task_queue = f"da-cancel-{uuid.uuid4()}"
+    async with Worker(
+        env.client,
+        task_queue=task_queue,
+        workflows=[CancelledAgentWorkflow],
+        activities=[wait_tool],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            CancelledAgentWorkflow.run,
+            {"messages": [{"role": "user", "content": "Call wait_tool."}]},
+            id=task_queue,
+            task_queue=task_queue,
+        )
+        for _ in range(100):
+            if (await count_scheduled_activities(handle))["wait_tool"]:
+                break
+            await asyncio.sleep(0.1)
+        await handle.cancel()
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+
+    # The cancellation is not wrapped in DeepAgentsWorkflowError.
+    assert isinstance(excinfo.value.cause, CancelledError)
+    assert (await handle.describe()).status == WorkflowExecutionStatus.CANCELED
 
 
 @pytest.mark.asyncio
