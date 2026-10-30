@@ -28,12 +28,12 @@ from typing import Any
 import pytest
 from google.adk import Agent, Runner
 from google.adk.agents import LlmAgent
-from google.adk.events import Event
+from google.adk.events import Event, EventActions
 from google.adk.models import BaseLlm, LLMRegistry
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
-from google.adk.sessions import InMemorySessionService
+from google.adk.sessions import InMemorySessionService, Session
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.utils.context_utils import Aclosing
@@ -56,6 +56,7 @@ from temporalio.google_adk import (
     TemporalMcpToolSetProvider,
     TemporalModel,
 )
+from temporalio.google_adk._mcp import TemporalToolContext
 from temporalio.google_adk._model import (
     _with_serializable_response_schema,
 )
@@ -1138,6 +1139,28 @@ def test_explicitly_set_none_preserved() -> None:
 
     assert "cache_config" in serialized, "Explicitly-set None should be preserved"
     assert serialized["cache_config"] is None
+
+
+def test_fields_filled_in_place_preserved() -> None:
+    """Fields ADK fills in place are kept, although Pydantic counts them as unset."""
+    plugin = GoogleAdkPlugin()
+    converter = plugin._configure_data_converter(None)
+    session = Session(id="session", app_name="app", user_id="user")
+    session.events.append(Event(invocation_id="invocation", author="user"))
+    response = LlmResponse(content=types.ModelContent(parts=[Part(text="hello")]))
+    tool_context = TemporalToolContext(
+        tool_confirmation=None, function_call_id="call", event_actions=EventActions()
+    )
+    tool_context.request_confirmation(hint="approve?")
+    values = [session, response, tool_context]
+    payloads = converter.payload_converter.to_payloads(values)
+    decoded = converter.payload_converter.from_payloads(
+        payloads, [Session, LlmResponse, TemporalToolContext]
+    )
+
+    assert decoded[0].events == session.events
+    assert decoded[1].content.role == "model"
+    assert decoded[2].event_actions == tool_context.event_actions
 
 
 def test_activity_as_tool_preserves_metadata() -> None:

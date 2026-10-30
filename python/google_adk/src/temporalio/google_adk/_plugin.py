@@ -14,11 +14,13 @@ from typing import TYPE_CHECKING, Any
 
 import opentelemetry.metrics
 import opentelemetry.trace
+from pydantic import BaseModel, TypeAdapter
 
 from temporalio import workflow
+from temporalio.api.common.v1 import Payload
 from temporalio.contrib.pydantic import (
+    PydanticJSONPlainPayloadConverter,
     PydanticPayloadConverter,
-    ToJsonOptions,
 )
 from temporalio.converter import DataConverter, DefaultPayloadConverter
 from temporalio.google_adk._model import (
@@ -288,4 +290,52 @@ class _AdkPayloadConverter(PydanticPayloadConverter):
     """PayloadConverter for Google ADK that strips unset None fields."""
 
     def __init__(self) -> None:
-        super().__init__(ToJsonOptions(exclude_unset=True))
+        super().__init__()
+        self.converters = {
+            encoding: _AdkJSONPlainPayloadConverter()
+            if isinstance(converter, PydanticJSONPlainPayloadConverter)
+            else converter
+            for encoding, converter in self.converters.items()
+        }
+
+
+_ANY_ADAPTER = TypeAdapter[Any](Any)
+
+
+class _AdkJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
+    """Pydantic JSON converter that drops only unset fields whose value is None."""
+
+    def to_payload(self, value: Any) -> Payload | None:
+        """See base class."""
+        data = _ANY_ADAPTER.dump_json(value, exclude=_unset_none_fields(value))
+        return Payload(metadata={"encoding": self.encoding.encode()}, data=data)
+
+
+def _unset_none_fields(value: Any) -> dict[Any, Any] | None:
+    """Returns a Pydantic ``exclude`` value for the unset fields that are None.
+
+    Pydantic counts a field that ADK fills in place as unset, such as
+    ``Session.events``, ``Event.timestamp`` or a streamed reply's role, so
+    ``exclude_unset=True`` would drop data. An unset ``None`` field holds none.
+    """
+    unset: set[str] = set()
+    items: list[tuple[Any, Any]]
+    if isinstance(value, BaseModel):
+        fields = type(value).model_fields
+        unset = fields.keys() - value.model_fields_set
+        items = [(name, getattr(value, name)) for name in fields]
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        items = [(f.name, getattr(value, f.name)) for f in dataclasses.fields(value)]
+    elif isinstance(value, (list, tuple)):
+        items = list(enumerate(value))
+    elif isinstance(value, dict):
+        items = list(value.items())
+    else:
+        return None
+    exclude: dict[Any, Any] = {}
+    for key, item in items:
+        if item is None and key in unset:
+            exclude[key] = True
+        elif nested := _unset_none_fields(item):
+            exclude[key] = nested
+    return exclude or None
