@@ -222,11 +222,10 @@ search_tool = tool_as_activity(
 ```
 
 Pass both to `create_temporal_deep_agent(..., tools=[weather_tool,
-search_tool])`. An unwrapped tool runs in-workflow, so it has to be
-deterministic and `async def`. An unwrapped sync tool fails the Workflow Task
-until the code changes, because LangChain runs it on a thread and a Workflow
-has none. The plugin warns about an unwrapped tool passed in the `tools=`
-keyword. It does not check `tools` passed by position or a sub-agent's tools.
+search_tool])`. An unwrapped tool, sync or async, runs in-workflow, so it has to
+be deterministic. The plugin warns about an unwrapped tool passed in the
+`tools=` keyword. It does not check `tools` passed by position or a sub-agent's
+tools.
 Deep Agents' built-in file tools on the default state backend stay in-workflow
 by design.
 
@@ -790,7 +789,6 @@ exception type to the Worker's `workflow_failure_exception_types`.
 
 ## Limits
 
-- An unwrapped tool has to be `async def`. See the Tools section.
 - `tool_as_activity` does not support `return_direct=True`. New calls fail
   with `DeepAgentsWorkflowError` before the Activity runs. Return from the
   Workflow explicitly after calling the tool instead.
