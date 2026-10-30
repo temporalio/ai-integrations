@@ -128,7 +128,7 @@ test('a SandboxAgent manifest or runAs change before the resume reaches the sand
   const worker = await createWorker({
     plugins: [
       new OpenAIAgentsPlugin({
-        modelProvider: new FakeModelProvider([...responses(), ...responses()]),
+        modelProvider: new FakeModelProvider([...responses(), ...responses(), ...responses()]),
         modelParams: { startToCloseTimeout: '30s' },
         sandboxClientProviders: [new SandboxClientProvider('fake', client)],
       }),
@@ -146,6 +146,11 @@ test('a SandboxAgent manifest or runAs change before the resume reaches the sand
     t.is(client.createCalls.length, 2);
     t.is(client.session.state.environment?.VERSION, 'before');
     t.deepEqual(users(), ['after']);
+
+    t.is(await executeWorkflow(sandboxHandoffConfigResumeWorkflow, { args: ['reference'] }), 'Done.');
+    t.is(client.createCalls.length, 3);
+    t.is(client.session.state.environment?.VERSION, 'after');
+    t.deepEqual(users(), ['before']);
   });
 });
 

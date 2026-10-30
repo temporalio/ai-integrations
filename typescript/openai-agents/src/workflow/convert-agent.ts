@@ -7,12 +7,17 @@ import { ActivityBackedModel } from './activity-backed-model';
  * Recursively converts an agent graph: validate tools, replace each agent's
  * model with an ActivityBackedModel, and clone handoffs. Uses a seen-map to
  * handle circular handoff references.
+ *
+ * When `identities` maps a source agent to an agent an earlier conversion returned, that object is
+ * returned again, with the fields of this conversion's clone. Each agent then has the same fields as
+ * after a fresh conversion, but keeps its object identity, which approvals on a `RunContext` are keyed by.
  */
 export function convertAgent(
   agent: Agent<any, any>,
   modelParams: ModelActivityOptions,
   seen?: Map<Agent<any, any>, Agent<any, any>>,
-  modelNameOverride?: string
+  modelNameOverride?: string,
+  identities?: ReadonlyMap<Agent<any, any>, Agent<any, any>>
 ): Agent<any, any> {
   seen = seen ?? new Map();
   if (seen.has(agent)) return seen.get(agent)!;
@@ -57,17 +62,31 @@ export function convertAgent(
   // user-declared name and instructions.
   activityBackedModel.setAgent(agent);
 
-  const converted = agent.clone({ model: activityBackedModel });
+  const clone = agent.clone({ model: activityBackedModel });
+  const identity = identities?.get(agent);
+  const converted = identity === undefined ? clone : replaceFields(identity, clone);
   seen.set(agent, converted);
 
   const convertedHandoffs = (agent.handoffs ?? []).map((h) => {
     if (h instanceof Handoff) {
-      const convertedHandoffAgent = convertAgent(h.agent, modelParams, seen, modelNameOverride);
+      const convertedHandoffAgent = convertAgent(h.agent, modelParams, seen, modelNameOverride, identities);
       return h.clone({ agent: convertedHandoffAgent });
     }
-    return convertAgent(h, modelParams, seen, modelNameOverride);
+    return convertAgent(h, modelParams, seen, modelNameOverride, identities);
   });
 
   converted.handoffs = convertedHandoffs;
   return converted;
+}
+
+/** Gives `target` exactly the own properties and prototype of `source`, and returns `target`. */
+function replaceFields(target: Agent<any, any>, source: Agent<any, any>): Agent<any, any> {
+  for (const key of Reflect.ownKeys(target)) {
+    delete (target as any)[key];
+  }
+  Object.defineProperties(target, Object.getOwnPropertyDescriptors(source));
+  if (Object.getPrototypeOf(target) !== Object.getPrototypeOf(source)) {
+    Object.setPrototypeOf(target, Object.getPrototypeOf(source));
+  }
+  return target;
 }
