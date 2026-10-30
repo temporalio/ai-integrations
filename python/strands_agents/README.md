@@ -10,12 +10,6 @@ This Temporal [Plugin](https://docs.temporal.io/develop/plugins-guide) allows yo
 uv add temporalio-strands-agents
 ```
 
-### Upgrading from `temporalio.contrib.strands`
-
-`StrandsPlugin` keeps the payload codec and external storage of the `DataConverter` you pass to the Client. The `temporalio.contrib.strands` plugin in `temporalio` 1.34.0 and earlier dropped them, so the payloads it wrote are stored as plain JSON. After the upgrade, your codec also decodes those payloads: results of runs that finished before the upgrade, and the History of runs that are still open. If your codec rejects payloads it did not encode, `WorkflowHandle.result()` raises its error for those runs and their Workflow Tasks fail. Before you upgrade, change the codec's `decode` to return payloads without its encoding unchanged.
-
-Do not roll Workers back to `temporalio.contrib.strands` while runs that this plugin wrote to are open: it drops your codec and external storage, so it cannot read their payloads. If you must roll back, add a plugin after `StrandsPlugin` that sets both again from the `DataConverter` you passed to the Client, for example `SimplePlugin("restore-converter", data_converter=lambda dc: dataclasses.replace(dc, payload_codec=converter.payload_codec, external_storage=converter.external_storage))`.
-
 ## Quickstart
 
 `workflow.py` defines the workflow and runs the worker:
