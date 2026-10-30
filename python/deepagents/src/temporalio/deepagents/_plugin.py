@@ -14,6 +14,8 @@ inside a ``@workflow.defn`` with no other changes:
   ``model=`` strings through activities — regardless of how the user imported
   ``create_deep_agent``;
 * registers :class:`DeepAgentsWorkflowError` as a workflow-failure type;
+* runs LangChain's sync calls (sync tools, graph nodes, routers, output
+  parsers) directly in each workflow;
 * pushes the model / tool dispatch defaults down to the seams that read them.
 
 The plugin auto-propagates from a ``Client`` to any ``Worker`` built from it, so
@@ -24,12 +26,14 @@ no-op instead of a "More than one activity named ..." crash.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import warnings
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import timedelta
+from types import FrameType
 from typing import Any, Callable
 
 from temporalio import activity as activity_mod
@@ -38,7 +42,13 @@ from temporalio.deepagents import _serde, _tools
 from temporalio.deepagents._activity import DeepAgentActivities
 from temporalio.deepagents.workflow import DeepAgentsWorkflowError
 from temporalio.plugin import SimplePlugin
-from temporalio.worker import WorkflowRunner
+from temporalio.worker import (
+    ExecuteWorkflowInput,
+    Interceptor,
+    WorkflowInboundInterceptor,
+    WorkflowInterceptorClassInput,
+    WorkflowRunner,
+)
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 # Runtime floor for the Deep Agents control loop. Kept in a constant so
@@ -147,6 +157,7 @@ class DeepAgentsPlugin(SimplePlugin):
             workflow_runner=self._make_workflow_runner(),
             workflow_failure_exception_types=[DeepAgentsWorkflowError],
             run_context=self._run_context,
+            interceptors=[_SyncCallsInterceptor()],
         )
 
     def _configure_data_converter(
@@ -294,6 +305,61 @@ def _install_langsmith_temporal_override() -> None:
         langsmith.set_runtime_overrides(aio_to_thread=_temporal_aio_to_thread)
     except Exception:
         pass
+
+
+class _SyncCallsInterceptor(Interceptor):
+    """Run LangChain's sync calls directly in each workflow.
+
+    The plugin does not wrap a Deep Agent run (``agent.ainvoke`` is LangGraph's
+    own call), so this sets up each workflow's event loop when the workflow
+    starts.
+    """
+
+    def workflow_interceptor_class(
+        self, input: WorkflowInterceptorClassInput
+    ) -> type[WorkflowInboundInterceptor]:
+        """Return the inbound interceptor that sets up each workflow's loop."""
+        return _SyncCallsInbound
+
+
+class _SyncCallsInbound(WorkflowInboundInterceptor):
+    async def execute_workflow(self, input: ExecuteWorkflowInput) -> Any:
+        _run_langchain_sync_calls_inline(asyncio.get_running_loop())
+        return await super().execute_workflow(input)
+
+
+def _run_langchain_sync_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
+    """Make the workflow event loop run LangChain's thread calls inline.
+
+    LangChain runs a sync tool, graph node, router or output parser from async
+    code with its ``run_in_executor`` helper, which calls
+    ``loop.run_in_executor``. The workflow event loop has no threads and raised
+    ``NotImplementedError``, so a sync tool never ran. Only calls from that
+    helper run inline; any other ``run_in_executor`` call fails as before.
+    """
+    if getattr(loop, "_runs_langchain_sync_calls_inline", False):
+        return
+    run_in_executor = loop.run_in_executor
+
+    def inline_run_in_executor(
+        executor: Any, func: Callable[..., Any], *args: Any
+    ) -> asyncio.Future[Any]:
+        if not _called_by_langchain(sys._getframe(1)):
+            return run_in_executor(executor, func, *args)
+        future = loop.create_future()
+        future.set_result(func(*args))
+        return future
+
+    setattr(loop, "run_in_executor", inline_run_in_executor)
+    setattr(loop, "_runs_langchain_sync_calls_inline", True)
+
+
+def _called_by_langchain(frame: FrameType) -> bool:
+    """Whether the caller is ``langchain_core.runnables.config.run_in_executor``."""
+    return (
+        frame.f_code.co_name == "run_in_executor"
+        and frame.f_globals.get("__name__") == "langchain_core.runnables.config"
+    )
 
 
 def _dedupe_activities(activities: Sequence[Any]) -> list[Any]:

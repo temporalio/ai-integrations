@@ -155,9 +155,10 @@ search_tool = tool_as_activity(
 ```
 
 Pass both to `create_temporal_deep_agent(..., tools=[weather_tool,
-search_tool])`. An unwrapped, non-builtin tool runs in-workflow and the plugin
-warns at construction, so the choice is never silent. Deep Agents' pure
-built-ins (`write_todos`, state-backed file tools) stay in-workflow by design.
+search_tool])`. An unwrapped, non-builtin tool, sync or async, runs in-workflow
+and the plugin warns at construction, so the choice is never silent. Deep
+Agents' pure built-ins (`write_todos`, state-backed file tools) stay in-workflow
+by design.
 
 Call `tool_as_activity(...)` at module import or worker startup on **every
 activity worker** that can receive `deepagents.invoke_tool`. Registration is
