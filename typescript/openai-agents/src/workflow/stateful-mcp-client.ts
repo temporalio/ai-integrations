@@ -23,6 +23,7 @@ import {
   type McpServerHandleOptions,
   type StatefulMcpServerSessionArgs,
   type StatefulTemporalMCPServer,
+  TOOL_META_RESOLVER_UNSUPPORTED_TYPE,
 } from '../common/mcp-types';
 import { getCurrentPluginConfig } from './plugin-config-store';
 
@@ -179,9 +180,32 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     }
   }
 
+  /**
+   * Runs a tool operation Activity. If the session Activity fails because the Worker refused a
+   * `toolMetaResolver` on the factory's server, the dedicated Worker never starts, so this cancels
+   * the operation and throws that failure instead of waiting for the schedule-to-start timeout.
+   */
+  private async runOperation<T>(fn: () => Promise<T>): Promise<T> {
+    const scope = new CancellationScope();
+    const operation = scope.run(() => handleWorkerFailure(fn));
+    const refused = new Promise<never>((_resolve, reject) => {
+      this._sessionPromise?.catch((err: unknown) => {
+        if (
+          err instanceof ActivityFailure &&
+          err.cause instanceof ApplicationFailure &&
+          err.cause.type === TOOL_META_RESOLVER_UNSUPPORTED_TYPE
+        ) {
+          scope.cancel();
+          reject(err);
+        }
+      });
+    });
+    return Promise.race([operation, refused]);
+  }
+
   async listTools(): Promise<any[]> {
     this.assertConnected();
-    return handleWorkerFailure(() => scheduleActivity(this._name + MCP_LIST_TOOLS_SUFFIX, [], this._operationConfig));
+    return this.runOperation(() => scheduleActivity(this._name + MCP_LIST_TOOLS_SUFFIX, [], this._operationConfig));
   }
 
   async callTool(
@@ -190,7 +214,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     meta?: Record<string, unknown> | null
   ): Promise<any> {
     this.assertConnected();
-    return handleWorkerFailure(() =>
+    return this.runOperation(() =>
       scheduleActivity(
         this._name + MCP_CALL_TOOL_SUFFIX,
         [{ toolName, args, ...(meta != null ? { meta } : {}) }],

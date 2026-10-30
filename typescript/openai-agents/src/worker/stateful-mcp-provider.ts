@@ -74,7 +74,6 @@ export class StatefulMCPServerProvider {
           nonRetryable: true,
         });
       }
-      rejectToolMetaResolver(server);
       return server;
     };
 
@@ -105,6 +104,8 @@ export class StatefulMCPServerProvider {
         }
 
         const server = this._serverFactory(input?.factoryArgument);
+        // Refuse before connecting, so the session fails at once instead of retrying the connection.
+        rejectToolMetaResolver(server);
 
         try {
           this._servers.set(sid, server);

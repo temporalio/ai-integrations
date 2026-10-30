@@ -1,5 +1,5 @@
 import { Agent, type MCPToolMetaContext } from '@openai/agents-core';
-import { ApplicationFailure } from '@temporalio/workflow';
+import { ActivityFailure, ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
@@ -121,6 +121,33 @@ export async function mcpToolMetaWorkflow(stateful: boolean): Promise<string> {
   } finally {
     await server.close();
   }
+}
+
+function failureType(err: unknown): string {
+  const failure = err instanceof ActivityFailure ? err.cause : err;
+  return failure instanceof ApplicationFailure ? `${failure.type}:${failure.nonRetryable}` : String(err);
+}
+
+export async function statefulMcpFactoryResolverWorkflow(): Promise<string[]> {
+  // Longer than the test's execution timeout, so the operations fail only through the session failure.
+  const server = statefulMcpServer('factoryResolver', { config: { scheduleToStartTimeout: '1 minute' } });
+  await server.connect();
+  const results: string[] = [];
+  for (const operation of [() => server.listTools(), () => server.callTool('echo', {})]) {
+    try {
+      await operation();
+      results.push('unexpected-success');
+    } catch (err: unknown) {
+      results.push(failureType(err));
+    }
+  }
+  try {
+    await server.cleanup();
+    results.push('cleanup-success');
+  } catch (err: unknown) {
+    results.push(failureType(err));
+  }
+  return results;
 }
 
 export async function summaryOverrideStringWorkflow(prompt: string): Promise<string> {

@@ -1,6 +1,11 @@
 import type { MCPServer } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
-import { MCP_CALL_TOOL_SUFFIX, MCP_LIST_TOOLS_SUFFIX, MCP_STATELESS_SUFFIX } from '../common/mcp-types';
+import {
+  MCP_CALL_TOOL_SUFFIX,
+  MCP_LIST_TOOLS_SUFFIX,
+  MCP_STATELESS_SUFFIX,
+  TOOL_META_RESOLVER_UNSUPPORTED_TYPE,
+} from '../common/mcp-types';
 
 /**
  * Fails on a `toolMetaResolver` on the server the factory returns. It needs the run context, which
@@ -13,7 +18,7 @@ export function rejectToolMetaResolver(server: MCPServer): void {
         `MCP server '${server.name}' has a toolMetaResolver, which the Worker cannot run because the run ` +
         'context it gets exists only in the Workflow. Pass it as the toolMetaResolver option of ' +
         'statelessMcpServer() or statefulMcpServer() instead.',
-      type: 'MCPToolMetaResolverUnsupported',
+      type: TOOL_META_RESOLVER_UNSUPPORTED_TYPE,
       nonRetryable: true,
     });
   }

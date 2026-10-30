@@ -17,6 +17,7 @@ import {
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   mcpToolMetaWorkflow,
+  statefulMcpFactoryResolverWorkflow,
   summaryOverrideStringWorkflow,
   statefulMcpNotConnectedWorkflow,
   statefulMcpIsolationWorkflow,
@@ -276,6 +277,41 @@ test('MCP toolMetaResolver sends _meta on stateless and stateful servers', async
     { tenant: 'tenant-7', tool: 'echo_meta', server: 'metaStateless' },
     { tenant: 'tenant-7', tool: 'echo_meta', server: 'metaStateful' },
   ]);
+});
+
+test('Stateful MCP: a factory toolMetaResolver fails the operations without connecting', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  let connects = 0;
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([]),
+        mcpServerProviders: [
+          new StatefulMCPServerProvider(
+            'factoryResolver',
+            () => ({
+              ...metaTestServer('factoryResolver', []),
+              toolMetaResolver: () => ({ tenant: 'tenant-7' }),
+              async connect() {
+                connects++;
+                throw new Error('connection refused');
+              },
+            }),
+            t.context.env.nativeConnection
+          ),
+        ],
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    t.deepEqual(
+      await executeWorkflow(statefulMcpFactoryResolverWorkflow, { workflowExecutionTimeout: '20 seconds' }),
+      Array(3).fill('MCPToolMetaResolverUnsupported:true')
+    );
+  });
+  t.is(connects, 0);
 });
 
 test('summary string is passed through to model activity', async (t) => {

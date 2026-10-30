@@ -9,6 +9,9 @@ export const MCP_STATELESS_SUFFIX = '-stateless';
 /** Error type for dedicated-Worker scheduling and heartbeat failures. */
 export const DEDICATED_WORKER_FAILURE_TYPE = 'DedicatedWorkerFailure';
 
+/** Error type for a `toolMetaResolver` on the server the factory returns, which the Worker refuses. */
+export const TOOL_META_RESOLVER_UNSUPPORTED_TYPE = 'MCPToolMetaResolverUnsupported';
+
 /**
  * Stateful variant of `MCPServer`. Adds `cleanup()` — the documented
  * lifecycle method users invoke from `finally` blocks after `connect()`.
