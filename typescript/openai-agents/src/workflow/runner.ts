@@ -49,8 +49,24 @@ interface Conversion {
 /** Each converted agent, mapped to the conversion that produced it. */
 const conversions = new WeakMap<Agent<any, any>, Conversion>();
 
+/**
+ * For each `RunContext`, the conversion its latest resume used for each source agent. A state rehydrated
+ * onto the source agent doesn't point at a converted agent, so this is how its resume finds the graph that
+ * already owns the context's approvals. It's keyed by context so Workflows that share module-level agents
+ * under `reuseV8Context` never share a graph.
+ */
+const resumeConversions = new WeakMap<object, Map<Agent<any, any>, Conversion>>();
+
+/** Snapshots an agent's fields, including those of each `Handoff`, which `convertAgent` clones. */
 function agentFields(agent: Agent<any, any>): [string, unknown][] {
-  return Object.entries(agent).map(([key, value]) => [key, Array.isArray(value) ? [...value] : value]);
+  return Object.entries(agent).map(([key, value]) => [
+    key,
+    Array.isArray(value)
+      ? value.map((member) =>
+          member instanceof Handoff ? { handoff: member, fields: Object.entries(member) } : member
+        )
+      : value,
+  ]);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -95,8 +111,31 @@ function convertAgentGraph(
   return converted;
 }
 
+function convertsTheSame(
+  conversion: Conversion | undefined,
+  agent: Agent<any, any>,
+  modelParams: ModelActivityOptions,
+  modelOverride: string | undefined,
+  sandbox: SandboxRunConfig | undefined
+): conversion is Conversion {
+  if (
+    conversion === undefined ||
+    conversion.source !== agent ||
+    conversion.modelOverride !== modelOverride ||
+    !sameValue(conversion.sandbox, sandbox) ||
+    !sameValue(conversion.modelParams, modelParams)
+  ) {
+    return false;
+  }
+  for (const [source, fields] of conversion.sourceFields) {
+    if (!sameValue(fields, agentFields(source))) return false;
+  }
+  return true;
+}
+
 /**
- * Returns the converted graph that `state` runs on, if converting `agent` again would give the same graph.
+ * Returns the converted graph that `state` runs on, or else the one the latest resume on its context used,
+ * if converting `agent` again would give the same graph.
  *
  * Function-tool approvals are keyed by agent object on the state's `RunContext`, which the resume keeps.
  * Rebuilding the state over a new graph would add a copy of its approvals under every resume's graph, and
@@ -109,20 +148,22 @@ function reusableConversion(
   modelOverride: string | undefined,
   sandbox: SandboxRunConfig | undefined
 ): Agent<any, any> | undefined {
-  const conversion = conversions.get(state._currentAgent as Agent<any, any>);
-  if (
-    conversion === undefined ||
-    conversion.source !== agent ||
-    conversion.modelOverride !== modelOverride ||
-    !sameValue(conversion.sandbox, sandbox) ||
-    !sameValue(conversion.modelParams, modelParams)
-  ) {
-    return undefined;
+  const candidates = [
+    conversions.get(state._currentAgent as Agent<any, any>),
+    resumeConversions.get(state._context)?.get(agent),
+  ];
+  return candidates.find((conversion) => convertsTheSame(conversion, agent, modelParams, modelOverride, sandbox))
+    ?.converted;
+}
+
+function recordResumeConversion(state: RunState<any, any>, agent: Agent<any, any>, converted: Agent<any, any>): void {
+  const conversion = conversions.get(converted)!;
+  let byAgent = resumeConversions.get(state._context);
+  if (byAgent === undefined) {
+    byAgent = new Map();
+    resumeConversions.set(state._context, byAgent);
   }
-  for (const [source, fields] of conversion.sourceFields) {
-    if (!sameValue(fields, agentFields(source))) return undefined;
-  }
-  return conversion.converted;
+  byAgent.set(agent, conversion);
 }
 
 export interface TemporalRunOptions<TContext = undefined> {
@@ -369,6 +410,9 @@ export class TemporalOpenAIRunner {
 
     let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
     if (input instanceof RunState) {
+      // Record before restoring, since the restore merges the state's approvals under this graph even if
+      // the resume then fails.
+      recordResumeConversion(input, agent, converted);
       // Round-trip through fromString so the rehydrated state's agent graph carries our converted
       // agent (with ActivityBackedModel); setCurrentAgent only swaps the top-level ref, not nested ones.
       // It also drops upstream's live-session identity, which would otherwise resolve manifest
