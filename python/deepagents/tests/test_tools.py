@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Annotated, Any
@@ -25,6 +25,7 @@ pytestmark = pytest.mark.skipif(
 pytest.importorskip("langchain_core")
 
 from temporalio import activity, workflow  # noqa: E402
+from temporalio.common import RetryPolicy  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
 from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
 
@@ -106,14 +107,51 @@ async def echo_activity(text: str) -> str:
     return f"echo:{text}"
 
 
+@activity.defn
+async def echo_twice(text: str, /, times: int) -> str:
+    # `text` is positional-only; the model still passes it by name.
+    return ",".join([text] * times)
+
+
+class EchoActivities:
+    @activity.defn
+    async def echo_method(self, text: str) -> str:
+        return f"method:{text}"
+
+
+@activity.defn
+class EchoClass:
+    # A class-level annotation for the constructor's parameter: without it, the
+    # tool built from the constructor failed to build at all.
+    prefix: str
+
+    def __init__(self, prefix: str) -> None:
+        self.prefix = prefix
+
+    async def __call__(self, text: str) -> str:
+        """Echo text with the worker's prefix."""
+        return f"{self.prefix}:{text}"
+
+
 @workflow.defn
 class ActivityAsToolWorkflow:
     @workflow.run
-    async def run(self, text: str) -> str:
-        tool = activity_as_tool(
-            echo_activity, start_to_close_timeout=timedelta(seconds=10)
-        )
-        return await tool.ainvoke({"text": text})
+    async def run(self, text: str) -> list[str]:
+        calls: list[tuple[Callable[..., Any], dict[str, Any]]] = [
+            (echo_activity, {"text": text}),
+            (echo_twice, {"text": text, "times": 2}),
+            (EchoActivities.echo_method, {"text": text}),
+            (EchoClass, {"text": text}),
+        ]
+        results = []
+        for activity_ref, args in calls:
+            tool = activity_as_tool(
+                activity_ref,
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+            results.append(await tool.ainvoke(args))
+        return results
 
 
 @workflow.defn
@@ -139,7 +177,12 @@ async def test_activity_as_tool(env: WorkflowEnvironment) -> None:
         env.client,
         task_queue="da-act-tool",
         workflows=[ActivityAsToolWorkflow],
-        activities=[echo_activity],
+        activities=[
+            echo_activity,
+            echo_twice,
+            EchoActivities().echo_method,
+            EchoClass("worker"),
+        ],
         plugins=[plugin],
     ):
         handle = await env.client.start_workflow(
@@ -150,9 +193,70 @@ async def test_activity_as_tool(env: WorkflowEnvironment) -> None:
         )
         out = await handle.result()
 
-    assert out == "echo:hi"
+    # Each activity gets the model's arguments as its own parameters; the
+    # callable class's registered instance gets them in __call__.
+    assert out == ["echo:hi", "hi,hi", "method:hi", "worker:hi"]
     counts = await count_scheduled_activities(handle)
-    assert counts["echo_activity"] == 1, counts
+    assert counts == {
+        "echo_activity": 1,
+        "echo_twice": 1,
+        "echo_method": 1,
+        "EchoClass": 1,
+    }, counts
+
+
+@pytest.mark.parametrize(
+    "activity_ref, args, description",
+    [
+        # No `self` for a method passed as Class.method.
+        (EchoActivities.echo_method, ["text"], "Temporal activity echo_method."),
+        # A class offers __call__'s parameters and docstring, not its constructor's.
+        (EchoClass, ["text"], "Echo text with the worker's prefix."),
+    ],
+)
+def test_activity_as_tool_schema(
+    activity_ref: Any, args: list[str], description: str
+) -> None:
+    tool = activity_as_tool(activity_ref, start_to_close_timeout=timedelta(seconds=10))
+    assert list(tool.args) == args
+    assert tool.description == description
+
+
+@activity.defn
+class NoCallActivity:
+    pass
+
+
+@activity.defn
+class KeywordOnlyActivity:
+    async def __call__(self, *, text: str) -> str:
+        return text
+
+
+@activity.defn
+async def kwargs_activity(text: str, **extra: str) -> str:
+    return text + "".join(extra.values())
+
+
+class BadAnnotationActivity(EchoClass):
+    # Not decorated, so only activity_as_tool reads this annotation.
+    async def __call__(self, text: Missing) -> str:  # type: ignore
+        return text
+
+
+@pytest.mark.parametrize(
+    "activity_ref, message",
+    [
+        (NoCallActivity, "to have a __call__"),
+        (KeywordOnlyActivity, "keyword-only argument 'text'"),
+        (kwargs_activity, r"\*\*extra"),
+        (BadAnnotationActivity, "name 'Missing' is not defined"),
+        (EchoClass("workflow"), "not an instance of it"),
+    ],
+)
+def test_activity_as_tool_rejects(activity_ref: Any, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        activity_as_tool(activity_ref, start_to_close_timeout=timedelta(seconds=10))
 
 
 @pytest.mark.asyncio
