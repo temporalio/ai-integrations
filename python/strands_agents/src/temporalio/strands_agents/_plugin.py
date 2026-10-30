@@ -12,6 +12,7 @@ from strands.types.exceptions import ContextWindowOverflowException
 
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.converter import DataConverter, DefaultPayloadConverter
+from temporalio.exceptions import ApplicationError
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
@@ -131,7 +132,7 @@ class StrandsPlugin(SimplePlugin):
 
             mcp_plugin = MCPPlugin(
                 {
-                    server: _without_argument(factory)
+                    server: _client_factory(server, factory)
                     for server, factory in mcp_clients.items()
                 },
                 connection_idle_timeout=mcp_connection_idle_timeout,
@@ -151,11 +152,24 @@ class StrandsPlugin(SimplePlugin):
         )
 
 
-def _without_argument(factory: Callable[[], Client]) -> Callable[[], Client]:
+def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], Client]:
     # MCPPlugin passes a factory argument (None) to any factory with a positional
-    # parameter, even a defaulted one such as ``lambda params=params: ...``.
+    # parameter, even a defaulted one such as ``lambda params=params: ...``, so the
+    # wrapper takes none.
+    import mcp
+
     def create() -> Client:
-        return factory()
+        client = factory()
+        if not isinstance(client, mcp.Client):
+            # Retryable, so a run waits for the worker to be fixed instead of failing.
+            kind = type(client)
+            raise ApplicationError(
+                f"MCP server factory {server!r} returned "
+                f"{kind.__module__}.{kind.__qualname__}, not mcp.Client; "
+                "mcp_clients factories must return an mcp.Client "
+                "(see the upgrade notes in the plugin README)"
+            )
+        return client
 
     return create
 
