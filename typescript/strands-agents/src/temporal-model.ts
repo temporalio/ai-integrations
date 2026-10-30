@@ -43,6 +43,10 @@ export interface TemporalModelOptions {
  * The `modelName` selects which factory the plugin will invoke worker-side;
  * it must match a key in {@link StrandsPlugin}'s `models` map. A name not
  * present in `models` raises an error inside the model activity at first call.
+ *
+ * `TemporalAgent` reads the worker model's config before its first call. With a plain Strands
+ * `Agent`, call `await model.loadConfig()` before building the agent: without it, the model reports
+ * itself as stateless, and a stateful worker model fails every call.
  */
 export class TemporalModel extends Model<BaseModelConfig> {
   private readonly modelName?: string;
@@ -115,42 +119,29 @@ export class TemporalModel extends Model<BaseModelConfig> {
       ...this.activityOptions,
     });
 
-    if (this.isStateful) {
-      // The agent's model state is a live store; send a copy of its values, and copy the updated
-      // values back, as the model would have written them natively.
-      const { modelState, ...rest } = options ?? {};
-      const input = { modelName: this.modelName, messages, options: rest, modelState: modelState?.getAll() ?? {} };
-      const result = this.streamingTopic
-        ? await proxiedActivities[INVOKE_STATEFUL_MODEL_STREAMING_ACTIVITY]({
-            ...input,
-            streamingTopic: this.streamingTopic,
-            streamingBatchInterval: this.streamingBatchInterval,
-          })
-        : await proxiedActivities[INVOKE_STATEFUL_MODEL_ACTIVITY](input);
-      if (modelState) {
-        modelState.clear();
-        for (const [key, value] of Object.entries(result.modelState)) modelState.set(key, value);
-      }
-      yield* result.events;
+    const { modelState, ...rest } = options ?? {};
+    const input = { modelName: this.modelName, messages, options: this.isStateful ? rest : options };
+    const streaming = this.streamingTopic
+      ? { streamingTopic: this.streamingTopic, streamingBatchInterval: this.streamingBatchInterval }
+      : undefined;
+
+    if (!this.isStateful) {
+      yield* streaming
+        ? await proxiedActivities.invokeModelStreaming({ ...input, ...streaming })
+        : await proxiedActivities.invokeModel(input);
       return;
     }
 
-    const events = this.streamingTopic
-      ? await proxiedActivities.invokeModelStreaming({
-          modelName: this.modelName,
-          messages,
-          options,
-          streamingTopic: this.streamingTopic,
-          streamingBatchInterval: this.streamingBatchInterval,
-        })
-      : await proxiedActivities.invokeModel({
-          modelName: this.modelName,
-          messages,
-          options,
-        });
-
-    for (const event of events) {
-      yield event;
+    // The agent's model state is a live store; send a copy of its values, and copy the updated
+    // values back, as the model would have written them natively.
+    const statefulInput = { ...input, modelState: modelState?.getAll() ?? {} };
+    const result = streaming
+      ? await proxiedActivities[INVOKE_STATEFUL_MODEL_STREAMING_ACTIVITY]({ ...statefulInput, ...streaming })
+      : await proxiedActivities[INVOKE_STATEFUL_MODEL_ACTIVITY](statefulInput);
+    if (modelState) {
+      modelState.clear();
+      for (const [key, value] of Object.entries(result.modelState)) modelState.set(key, value);
     }
+    yield* result.events;
   }
 }

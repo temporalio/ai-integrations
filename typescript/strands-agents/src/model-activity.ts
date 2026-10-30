@@ -1,5 +1,6 @@
 import { Message, StateStore } from '@strands-agents/sdk';
 import type { JSONValue, Model, ModelStreamEvent, StreamOptions } from '@strands-agents/sdk';
+import { ApplicationFailure } from '@temporalio/common';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import type { Duration } from '@temporalio/common/lib/time';
 import { autoHeartbeat } from './heartbeat';
@@ -108,6 +109,8 @@ export class ModelActivity {
   ) {
     this.invokeModel = autoHeartbeat(this.invokeModel.bind(this));
     this.invokeModelStreaming = autoHeartbeat(this.invokeModelStreaming.bind(this));
+    this.invokeStatefulModel = autoHeartbeat(this.invokeStatefulModel.bind(this));
+    this.invokeStatefulModelStreaming = autoHeartbeat(this.invokeStatefulModelStreaming.bind(this));
   }
 
   private getModel(name?: string): Model {
@@ -138,7 +141,36 @@ export class ModelActivity {
   }
 
   async invokeModel(input: InvokeModelInput): Promise<ModelStreamEvent[]> {
-    const model = this.getModel(input.modelName);
+    return this.runModel(this.getStatelessModel(input.modelName), input);
+  }
+
+  async invokeModelStreaming(input: InvokeModelStreamingInput): Promise<ModelStreamEvent[]> {
+    return this.runModelStreaming(this.getStatelessModel(input.modelName), input);
+  }
+
+  /**
+   * The model for a stateless call. A stateful model cannot run here without the agent's model
+   * state, and retrying does not bring it: the workflow chose this activity because its config
+   * read had no stateful flag, from a worker without stateful support, or because `TemporalModel`
+   * runs without `TemporalAgent` and never read the config.
+   */
+  private getStatelessModel(name?: string): Model {
+    const model = this.getModel(name);
+    if (model.stateful) {
+      throw ApplicationFailure.create({
+        type: 'StatefulModelOnStatelessPath',
+        nonRetryable: true,
+        message:
+          `The worker model ${JSON.stringify(name ?? this.defaultName)} is stateful, but the workflow ` +
+          `called it without its model state. Its config was read from a worker without stateful ` +
+          `support, or TemporalModel runs without TemporalAgent and did not read it. Reset or ` +
+          `terminate the run.`,
+      });
+    }
+    return model;
+  }
+
+  private async runModel(model: Model, input: InvokeModelInput): Promise<ModelStreamEvent[]> {
     const messages = rebuildMessages(input.messages);
     const events: ModelStreamEvent[] = [];
     for await (const event of model.stream(messages, input.options)) {
@@ -147,8 +179,7 @@ export class ModelActivity {
     return events;
   }
 
-  async invokeModelStreaming(input: InvokeModelStreamingInput): Promise<ModelStreamEvent[]> {
-    const model = this.getModel(input.modelName);
+  private async runModelStreaming(model: Model, input: InvokeModelStreamingInput): Promise<ModelStreamEvent[]> {
     const messages = rebuildMessages(input.messages);
     const stream = WorkflowStreamClient.fromWithinActivity({
       batchInterval: input.streamingBatchInterval,
@@ -174,14 +205,16 @@ export class ModelActivity {
   /** Run a stateful model with the agent's model state; return its events and the updated state. */
   async invokeStatefulModel(input: InvokeStatefulModelInput): Promise<InvokeStatefulModelResult> {
     const modelState = new StateStore(input.modelState);
-    const events = await this.invokeModel({ ...input, options: { ...input.options, modelState } });
+    const model = this.getModel(input.modelName);
+    const events = await this.runModel(model, { ...input, options: { ...input.options, modelState } });
     return { events, modelState: modelState.getAll() };
   }
 
   /** As {@link invokeStatefulModel}, publishing each event as {@link invokeModelStreaming} does. */
   async invokeStatefulModelStreaming(input: InvokeStatefulModelStreamingInput): Promise<InvokeStatefulModelResult> {
     const modelState = new StateStore(input.modelState);
-    const events = await this.invokeModelStreaming({ ...input, options: { ...input.options, modelState } });
+    const model = this.getModel(input.modelName);
+    const events = await this.runModelStreaming(model, { ...input, options: { ...input.options, modelState } });
     return { events, modelState: modelState.getAll() };
   }
 }

@@ -291,6 +291,21 @@ test('a history recorded before the model config read fails to replay', async (t
   t.regex(err!.message, /\[TMPRL1100\].*'invokeModel'.*'strandsGetModelConfig'/);
 });
 
+test('a stateful run recorded before the stateful flag replays on the stateless path', async (t) => {
+  // Recorded with `statefulAgent` on 3af00d9, whose config activity returns no `stateful` flag: the
+  // run scheduled `invokeModel`, where a config with the flag schedules `strandsInvokeStatefulModel`.
+  const history = await loadHistory(path.resolve(__dirname, '../../src/__tests__/histories/stateful-before-flag.json'));
+  await t.notThrowsAsync(
+    Worker.runReplayHistory(
+      {
+        workflowBundle: t.context.workflowBundle,
+        plugins: [new StrandsPlugin({ models: { stateful: () => new StatefulStub([], []) } })],
+      },
+      history
+    )
+  );
+});
+
 /** What each call of a {@link StatefulStub} got: the response id it chained to, and its messages. */
 type StatefulCall = { previousResponseId: JSONValue | undefined; messages: number };
 
@@ -378,9 +393,16 @@ test('a stateful model call waits for a worker with stateful support', async (t)
       },
     });
     const pending = await legacyWorker.runUntil(async () => {
-      for (;;) {
-        const [activity] = (await handle.describe()).raw.pendingActivities ?? [];
+      for (let polls = 0; ; polls++) {
+        const description = await handle.describe();
+        const [activity] = description.raw.pendingActivities ?? [];
         if (activity && (activity.attempt ?? 0) > 2) return activity;
+        if (description.status.name !== 'RUNNING' || polls === 300) {
+          throw new Error(
+            `no retried model activity: run ${description.status.name}, pending ` +
+              JSON.stringify(description.raw.pendingActivities)
+          );
+        }
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
     });
@@ -392,6 +414,41 @@ test('a stateful model call waits for a worker with stateful support', async (t)
     t.deepEqual(await upgradedWorker.runUntil(handle.result()), [0, 0]);
   });
   t.deepEqual(calls, CHAINED_CALLS);
+});
+
+test('a stateful model call fails at once in a run whose config has no stateful flag', async (t) => {
+  t.timeout(60_000);
+  const { createWorker, startWorkflow, taskQueue } = helpers(t);
+  const calls: StatefulCall[] = [];
+  const plugin = new StrandsPlugin({ models: { stateful: () => new StatefulStub([], calls) } });
+  const upgraded = new ModelActivity({ stateful: () => new StatefulStub([textTurn('one')], calls) });
+
+  const worker = await createWorker({ plugins: [plugin] });
+  const history = await worker.runUntil(async () => {
+    const handle = await startWorkflow(statefulAgent, { args: ['models-queue'] });
+    // The config comes from an earlier version, without the flag, so the run takes the stateless
+    // path, and its model call reaches this version's stateless activity.
+    const modelsWorker = await createWorker({
+      taskQueue: `${taskQueue}-models`,
+      activities: {
+        strandsGetModelConfig: async () => ({}),
+        invokeModel: upgraded.invokeModel,
+        invokeModelStreaming: upgraded.invokeModelStreaming,
+      },
+    });
+    await modelsWorker.runUntil(handle.result());
+    return handle.fetchHistory();
+  });
+
+  t.deepEqual(scheduledActivities(history), ['strandsGetModelConfig', 'invokeModel']);
+  const events = history.events ?? [];
+  const attempts = events.flatMap((e) => e.activityTaskStartedEventAttributes?.attempt ?? []);
+  const failures = events.flatMap((e) => e.activityTaskFailedEventAttributes?.failure ?? []);
+  t.deepEqual(attempts, [1, 1]);
+  t.is(failures.length, 1);
+  t.like(failures[0], { applicationFailureInfo: { type: 'StatefulModelOnStatelessPath', nonRetryable: true } });
+  t.regex(failures[0]!.message ?? '', /is stateful, but the workflow called it without its model state/);
+  t.deepEqual(calls, []);
 });
 
 test("the README's continue-as-new handoff carries a stateful model's state", async (t) => {
