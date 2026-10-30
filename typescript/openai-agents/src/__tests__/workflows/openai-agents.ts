@@ -100,9 +100,10 @@ export async function mcpFactoryArgWorkflow(prompt: string): Promise<string> {
 }
 
 export async function mcpToolMetaWorkflow(stateful: boolean): Promise<string> {
-  const toolMetaResolver = ({ runContext, toolName }: MCPToolMetaContext) => ({
+  const toolMetaResolver = ({ runContext, toolName, serverName }: MCPToolMetaContext) => ({
     tenant: (runContext.context as { tenant: string }).tenant,
     tool: toolName,
+    server: serverName,
   });
   const server = stateful
     ? statefulMcpServer('metaStateful', { toolMetaResolver })

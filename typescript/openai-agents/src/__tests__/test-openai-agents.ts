@@ -178,8 +178,9 @@ test('factoryArgument is passed through to MCP activities', async (t) => {
           },
         ];
       },
-      async callTool(_toolName: string, _args: Record<string, unknown> | null) {
+      async callTool(...callArgs: unknown[]) {
         t.deepEqual(factoryArgument, { tenantId: 'tenant-42' }, 'factoryArgument should be passed to callTool');
+        t.is(callArgs.length, 2, 'callTool should get no meta argument when there is no toolMetaResolver');
         return [{ type: 'text', text: '2026-01-01' }];
       },
       async invalidateToolsCache() {},
@@ -272,8 +273,8 @@ test('MCP toolMetaResolver sends _meta on stateless and stateful servers', async
   });
 
   t.deepEqual(metas, [
-    { tenant: 'tenant-7', tool: 'echo_meta' },
-    { tenant: 'tenant-7', tool: 'echo_meta' },
+    { tenant: 'tenant-7', tool: 'echo_meta', server: 'metaStateless' },
+    { tenant: 'tenant-7', tool: 'echo_meta', server: 'metaStateful' },
   ]);
 });
 

@@ -523,6 +523,8 @@ const server = statelessMcpServer('tickets', {
 
 The `_meta` values are recorded in the call-tool Activity input in Workflow History, so don't put secrets in them.
 
+A call-tool Activity that runs on a Worker with an older plugin version drops the `_meta`, and nothing fails. Upgrade every Worker on the Task Queue before Workflows rely on `_meta`, or use Worker Versioning.
+
 Plugin versions before this option ignore it and don't run its resolver. An older version can replay a History only if it produces the same Workflow commands in the same order, and a resolver passed as this option can change them even when it is synchronous and never fails: the agent awaits it, which can reorder the Activities of parallel tool calls, and its changes to the run context can change later commands. An older version fails such a History with a nondeterminism error (`TMPRL1100`). Before you roll Workers back to an older plugin version, let the Workflows that use this option finish. Workflows with no resolver, or with a resolver set on the handle itself (`server.toolMetaResolver = ...`), run the same resolver code on older versions, so this option doesn't change their commands.
 
 ## Sandbox agents

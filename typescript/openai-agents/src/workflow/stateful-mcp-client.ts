@@ -116,7 +116,9 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     };
     this._factoryArgument = options?.factoryArgument;
     this._cacheToolsList = options?.cacheToolsList ?? true;
-    this.toolMetaResolver = options?.toolMetaResolver;
+    // Give the resolver the name the caller passed, as statelessMcpServer() does, not the suffixed one.
+    const toolMetaResolver = options?.toolMetaResolver;
+    this.toolMetaResolver = toolMetaResolver && ((context) => toolMetaResolver({ ...context, serverName: name }));
   }
 
   get name(): string {

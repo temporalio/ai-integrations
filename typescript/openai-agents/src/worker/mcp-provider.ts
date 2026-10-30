@@ -2,10 +2,12 @@ import type { MCPServer } from '@openai/agents-core';
 import { log } from '@temporalio/activity';
 import { MCP_CALL_TOOL_SUFFIX, MCP_LIST_TOOLS_SUFFIX, MCP_STATELESS_SUFFIX } from '../common/mcp-types';
 
+const warnedToolMetaResolvers = new Set<string>();
+
 /**
  * Calls a tool with the `_meta` the Workflow built, as the agent does for a native server. A
  * `toolMetaResolver` on the Worker-side server needs the run context, which only the Workflow
- * has, so it is skipped with a warning.
+ * has, so it is skipped. When the Workflow sent no `_meta`, it logs a warning once per server.
  */
 export async function callToolWithMeta(
   server: MCPServer,
@@ -13,7 +15,8 @@ export async function callToolWithMeta(
   args: Record<string, unknown> | null,
   meta: Record<string, unknown> | undefined
 ): ReturnType<MCPServer['callTool']> {
-  if (server.toolMetaResolver) {
+  if (meta === undefined && server.toolMetaResolver && !warnedToolMetaResolvers.has(server.name)) {
+    warnedToolMetaResolvers.add(server.name);
     log.warn(
       `MCP server '${server.name}' has a toolMetaResolver, which the Worker cannot run. ` +
         'Pass it as the toolMetaResolver option of statelessMcpServer() or statefulMcpServer() in the Workflow.'
