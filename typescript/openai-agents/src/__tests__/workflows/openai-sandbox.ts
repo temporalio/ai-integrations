@@ -1,9 +1,11 @@
-import { Agent, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
+import { Agent, Handoff, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
 import {
   Capability,
   Manifest,
   SandboxAgent,
   isEnvValueReference,
+  type SandboxClient,
+  type SandboxRunConfig,
   type SandboxSessionLike,
 } from '@openai/agents-core/sandbox';
 import { TemporalOpenAIRunner, workerEnvValue, temporalSandboxClient } from '../../workflow';
@@ -201,5 +203,88 @@ export async function sandboxValidationWorkflow(): Promise<string> {
     }
   }
 
+  try {
+    await runner.run(new SandboxAgent({ name: 'sandbox', model: 'gpt-4o-mini' }), 'hello', {
+      runConfig: { sandbox: { client: temporalSandboxClient('fake'), session: { state: {} } as any } },
+    });
+    return 'FAIL: raw-session should have thrown';
+  } catch (e) {
+    if (!/Do not pass a raw sandbox session directly/.test((e as Error).message)) {
+      return `FAIL: unexpected raw-session error: ${(e as Error).message}`;
+    }
+  }
+
   return 'OK';
+}
+
+/** A sandbox client that runs in the Workflow, which the plugin must never call. */
+const rawSandboxClient = {
+  backendId: 'raw',
+  async create(): Promise<never> {
+    throw new Error('the raw sandbox client ran in the Workflow');
+  },
+} as unknown as SandboxClient;
+
+/**
+ * A listener replaces a sandbox config's client with a raw one after the runner checked it: on the
+ * run's own config when `SandboxAgent` starts (`agent-start`), or on an `asTool()` tool's
+ * `runOptions.sandbox` when the lead calls the tool (`tool-start`).
+ */
+export async function sandboxClientChangedWorkflow(kind: 'agent-start' | 'tool-start'): Promise<string> {
+  const sandbox: SandboxRunConfig = { client: temporalSandboxClient('fake') };
+  const agent = new SandboxAgent({
+    name: 'sandbox-changed',
+    model: 'gpt-4o-mini',
+    capabilities: [new TestSandboxCapability()],
+  });
+  if (kind === 'agent-start') {
+    agent.on('agent_start', () => (sandbox.client = rawSandboxClient));
+    const result = await new TemporalOpenAIRunner().run(agent, 'run a command', { runConfig: { sandbox } });
+    return `${result.finalOutput}`;
+  }
+  const lead = new Agent({
+    name: 'lead',
+    model: 'gpt-4o-mini',
+    tools: [agent.asTool({ toolName: 'ask_sandbox', runOptions: { sandbox } })],
+    toolUseBehavior: 'stop_on_first_tool',
+  });
+  lead.on('agent_tool_start', () => (sandbox.client = rawSandboxClient));
+  const result = await new TemporalOpenAIRunner().run(lead, 'help');
+  return `${result.finalOutput}`;
+}
+
+/**
+ * A custom `Handoff` whose callback returns `vip`, which asks a nested `SandboxAgent` through
+ * `agent.asTool()`. With `inGraph`, `vip` is also a handoff of the router, so the runner sees it up front.
+ */
+export async function customHandoffSandboxToolWorkflow(inGraph: boolean): Promise<string> {
+  const specialist = new SandboxAgent({
+    name: 'sandbox-specialist',
+    model: 'gpt-4o-mini',
+    capabilities: [new TestSandboxCapability()],
+  });
+  const vip = new Agent({
+    name: 'vip',
+    model: 'gpt-4o-mini',
+    tools: [specialist.asTool({ toolName: 'ask_sandbox' })],
+  });
+  const standard = new Agent({ name: 'standard', model: 'gpt-4o-mini' });
+  const desk = new Handoff(standard, async () => vip);
+  desk.toolName = 'transfer_to_desk';
+  const router = new Agent({ name: 'router', model: 'gpt-4o-mini', handoffs: inGraph ? [desk, vip] : [desk] });
+  const result = await new TemporalOpenAIRunner().run(router, 'help', {
+    runConfig: { sandbox: { client: temporalSandboxClient('fake') } },
+  });
+  return `${result.lastAgent?.name}: ${result.finalOutput}`;
+}
+
+/** A custom `Handoff` whose callback returns a `SandboxAgent`, with no `runConfig.sandbox`. */
+export async function customHandoffSandboxAgentWithoutConfigWorkflow(): Promise<string> {
+  const specialist = new SandboxAgent({ name: 'sandbox-specialist', model: 'gpt-4o-mini' });
+  const standard = new Agent({ name: 'standard', model: 'gpt-4o-mini' });
+  const desk = new Handoff(standard, async () => specialist);
+  desk.toolName = 'transfer_to_desk';
+  const router = new Agent({ name: 'router', model: 'gpt-4o-mini', handoffs: [desk] });
+  await new TemporalOpenAIRunner().run(router, 'help');
+  return 'FAIL: should have thrown';
 }

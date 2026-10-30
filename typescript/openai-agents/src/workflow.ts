@@ -7,8 +7,6 @@ export { WorkflowSafeMemorySession } from './workflow/session';
 export type { WorkflowSafeMemorySessionOptions } from './workflow/session';
 export { nexusOperationAsTool } from './workflow/nexus-tools';
 export type { NexusOperationToolDefinition, NexusOperationAsToolOptions } from './workflow/nexus-tools';
-export { agentAsTool } from './workflow/agent-tools';
-export type { AgentAsToolOptions } from './workflow/agent-tools';
 export { statelessMcpServer } from './workflow/mcp-client';
 export type { StatelessMcpServerOptions } from './workflow/mcp-client';
 export type { StatefulTemporalMCPServer } from './common/mcp-types';

@@ -19,6 +19,7 @@ import {
 } from '@openai/agents-core';
 import { SandboxAgent, type SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
+import { CancellationScope } from '@temporalio/workflow';
 import {
   DEFAULT_MODEL_ACTIVITY_OPTIONS,
   STREAMING_LOCAL_ACTIVITY_UNSUPPORTED,
@@ -27,13 +28,12 @@ import {
   type SerializableModelActivityOptions,
 } from '../common/model-activity-options';
 import { unwrapTemporalFailure } from '../common/errors';
-import { convertAgent } from './convert-agent';
-import { TemporalSandboxClient } from './sandbox-client';
+import { ActivityBackedModelProvider } from './activity-backed-model';
+import { checkAgent } from './check-agent';
+import { validateTemporalSandboxClient } from './sandbox-client';
 import { ensureTracingProcessorRegistered } from './tracing';
 import { flushOpenSpans } from './agent-sink-processor';
 import { getCurrentPluginConfig } from './plugin-config-store';
-
-const agentAsToolSandboxConfig = Symbol.for('@temporalio/openai-agents/agentAsToolSandboxConfig');
 
 export interface TemporalRunOptions<TContext = undefined> {
   /** Run context passed to agents and tools */
@@ -145,10 +145,7 @@ function hasSandboxAgent(agent: Agent<any, any>, seen: Set<Agent<any, any>> = ne
   return false;
 }
 
-/**
- * `runConfig.sandbox.client` must be a `TemporalSandboxClient` so every sandbox
- * operation is dispatched as an Activity rather than run inline in the Workflow.
- */
+/** A reachable `SandboxAgent` needs `runConfig.sandbox`, with a Temporal sandbox client. */
 function validateSandboxRunConfig(agent: Agent<any, any>, sandbox: SandboxRunConfig | undefined): void {
   if (!hasSandboxAgent(agent) && sandbox === undefined) return;
   if (sandbox === undefined) {
@@ -161,44 +158,7 @@ function validateSandboxRunConfig(agent: Agent<any, any>, sandbox: SandboxRunCon
       nonRetryable: true,
     });
   }
-  if (sandbox.client == null) {
-    throw ApplicationFailure.create({
-      message:
-        'runConfig.sandbox.client must be set to a Temporal sandbox client. ' +
-        'Use temporalSandboxClient(name) from @temporalio/openai-agents/workflow.',
-      type: 'SandboxConfigurationError',
-      nonRetryable: true,
-    });
-  }
-  if (!(sandbox.client instanceof TemporalSandboxClient)) {
-    throw ApplicationFailure.create({
-      message:
-        'runConfig.sandbox.client must be created via temporalSandboxClient(name) ' +
-        'from @temporalio/openai-agents/workflow. Do not pass a raw sandbox client directly.',
-      type: 'SandboxConfigurationError',
-      nonRetryable: true,
-    });
-  }
-}
-
-function propagateAgentToolSandboxConfig(
-  agent: Agent<any, any>,
-  sandbox: SandboxRunConfig,
-  seen: Set<Agent<any, any>> = new Set()
-): void {
-  if (seen.has(agent)) return;
-  seen.add(agent);
-  agent.tools = agent.tools.map((tool) => {
-    if (tool.type !== 'function') return tool;
-    const configureSandbox = (
-      tool as typeof tool & { [agentAsToolSandboxConfig]?: (sandbox: SandboxRunConfig) => typeof tool }
-    )[agentAsToolSandboxConfig];
-    if (typeof configureSandbox !== 'function') return tool;
-    return configureSandbox(sandbox);
-  });
-  for (const handoff of agent.handoffs ?? []) {
-    propagateAgentToolSandboxConfig(handoff instanceof Handoff ? handoff.agent : handoff, sandbox, seen);
-  }
+  validateTemporalSandboxClient(sandbox, 'runConfig.sandbox');
 }
 
 /**
@@ -271,18 +231,13 @@ export class TemporalOpenAIRunner {
 
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
-    const converted = convertAgent(agent, this.modelParams, undefined, modelOverride);
-    if (options?.runConfig?.sandbox !== undefined) {
-      propagateAgentToolSandboxConfig(converted, options.runConfig.sandbox);
-    }
+    checkAgent(agent, modelOverride);
 
     let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
     if (input instanceof RunState) {
-      // Round-trip through fromString so the rehydrated state's agent graph carries our converted
-      // agent (with ActivityBackedModel); setCurrentAgent only swaps the top-level ref, not nested ones.
-      // It also drops upstream's live-session identity, which would otherwise resolve manifest
-      // environment references on the Workflow thread rather than in the resume Activity.
-      const restored = (await RunState.fromString(converted, input.toString())) as RunState<TContext, TAgent>;
+      // Round-trip through fromString to drop upstream's live-session identity, which would otherwise
+      // resolve manifest environment references on the Workflow thread rather than in the resume Activity.
+      const restored = (await RunState.fromString(agent, input.toString())) as RunState<TContext, TAgent>;
       // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
       restored.clearTrace();
       preparedInput = restored;
@@ -290,7 +245,25 @@ export class TemporalOpenAIRunner {
       preparedInput = input;
     }
 
-    const innerRunner = new Runner({ ...runnerConfigOverrides });
+    // The agent a ModelSummaryProvider gets. Model calls made during a tool call belong to a
+    // nested `agent.asTool()` run, whose agent this runner doesn't see, so they get none.
+    let runningAgent: Agent<any, any> | undefined =
+      preparedInput instanceof RunState ? preparedInput._currentAgent : agent;
+    let toolCalls = 0;
+
+    // Every agent runs as written: the provider sends each model name to the model Activity.
+    // Nested `agent.asTool()` runs take the model, provider and settings from this config, as upstream.
+    const innerRunner = new Runner({
+      ...runnerConfigOverrides,
+      model: modelOverride,
+      modelProvider: new ActivityBackedModelProvider(this.modelParams, () =>
+        toolCalls === 0 ? runningAgent : undefined
+      ),
+    });
+    innerRunner.on('agent_start', (_context, started) => (runningAgent = started));
+    innerRunner.on('agent_handoff', (_context, _from, to) => (runningAgent = to));
+    innerRunner.on('agent_tool_start', () => toolCalls++);
+    innerRunner.on('agent_tool_end', () => toolCalls--);
 
     const sharedRunOptions = {
       maxTurns: options?.maxTurns,
@@ -303,14 +276,28 @@ export class TemporalOpenAIRunner {
       tracing: options?.tracing,
     };
 
+    // A tool can turn a CancelledFailure into its output: upstream `asTool()` returns a nested run's
+    // failure to the parent model. A run that then ends on that output, for example with
+    // `toolUseBehavior: 'stop_on_first_tool'`, must not complete when its scope was cancelled.
+    const scope = CancellationScope.current();
     try {
       if (options?.stream === true) {
-        return (await innerRunner.run(converted, preparedInput as any, {
+        const streamed = (await innerRunner.run(agent, preparedInput as any, {
           ...sharedRunOptions,
           stream: true,
         })) as StreamedRunResult<TContext, TAgent>;
+        // Upstream's stream loop ends through these internal methods, which its typings omit.
+        const completion = streamed as unknown as { _done(): void; _raiseError(error: unknown): void };
+        const done = completion._done.bind(streamed);
+        completion._done = () => {
+          if (!scope.consideredCancelled) return done();
+          scope.cancelRequested.then(done, (cancellation) => completion._raiseError(cancellation));
+        };
+        return streamed;
       }
-      return (await innerRunner.run(converted, preparedInput as any, sharedRunOptions)) as RunResult<any, TAgent>;
+      const result = (await innerRunner.run(agent, preparedInput as any, sharedRunOptions)) as RunResult<any, TAgent>;
+      if (scope.consideredCancelled) await scope.cancelRequested;
+      return result;
     } catch (error) {
       throw normalizeAgentsRunError(error);
     } finally {

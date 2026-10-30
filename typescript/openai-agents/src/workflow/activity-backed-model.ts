@@ -4,6 +4,7 @@ import {
   type Agent,
   type AgentOutputItem,
   type Model,
+  type ModelProvider,
   type ModelRequest,
   type ModelResponse,
   type StreamEvent,
@@ -19,6 +20,7 @@ import {
 } from '@temporalio/workflow';
 import { ApplicationFailure } from '@temporalio/common';
 import {
+  STREAMING_LOCAL_ACTIVITY_UNSUPPORTED,
   STREAMING_TOPIC_NOT_CONFIGURED,
   type ModelActivityOptions,
   type ModelSummaryProvider,
@@ -75,7 +77,8 @@ export class ActivityBackedModel implements Model {
 
   constructor(
     private readonly modelName: string,
-    modelParams: ModelActivityOptions
+    modelParams: ModelActivityOptions,
+    private readonly runningAgent?: () => Agent<any, any> | undefined
   ) {
     this.modelParams = modelParams;
 
@@ -118,7 +121,7 @@ export class ActivityBackedModel implements Model {
       if (modelSummary && typeof modelSummary !== 'string') {
         const provider = modelSummary as ModelSummaryProvider;
         const systemInstructions = request.systemInstructions;
-        const summary = provider.provide(this.agent, systemInstructions, request.input);
+        const summary = provider.provide(this.agent ?? this.runningAgent?.(), systemInstructions, request.input);
         const wireResponse = await this.activities.invokeModelActivity.executeWithOptions({ summary }, [input]);
         return fromSerializedModelResponse(wireResponse);
       }
@@ -133,6 +136,14 @@ export class ActivityBackedModel implements Model {
       throw ApplicationFailure.create({
         message: STREAMING_TOPIC_NOT_CONFIGURED.message,
         type: STREAMING_TOPIC_NOT_CONFIGURED.type,
+        nonRetryable: true,
+      });
+    }
+    // The runner checks its own streamed runs; this also covers nested `agent.asTool()` runs.
+    if (this.modelParams.useLocalActivity === true) {
+      throw ApplicationFailure.create({
+        message: STREAMING_LOCAL_ACTIVITY_UNSUPPORTED.message,
+        type: STREAMING_LOCAL_ACTIVITY_UNSUPPORTED.type,
         nonRetryable: true,
       });
     }
@@ -155,7 +166,11 @@ export class ActivityBackedModel implements Model {
       const modelSummary = this.modelParams.summary;
       if (modelSummary && typeof modelSummary !== 'string') {
         const provider = modelSummary as ModelSummaryProvider;
-        const summary = provider.provide(this.agent, request.systemInstructions, request.input);
+        const summary = provider.provide(
+          this.agent ?? this.runningAgent?.(),
+          request.systemInstructions,
+          request.input
+        );
         return this.activities.invokeModelStreamActivity.executeWithOptions({ summary }, [input]);
       }
 
@@ -167,5 +182,21 @@ export class ActivityBackedModel implements Model {
     for (const event of events) {
       yield fromSerializedStreamEvent(event);
     }
+  }
+}
+
+/**
+ * Resolves model names to `ActivityBackedModel`s. The runner gives it to its inner `Runner`, and
+ * upstream passes it on to nested `agent.asTool()` runs, so their model calls are Activities too.
+ * `runningAgent` names the agent a `ModelSummaryProvider` gets.
+ */
+export class ActivityBackedModelProvider implements ModelProvider {
+  constructor(
+    private readonly modelParams: ModelActivityOptions,
+    private readonly runningAgent?: () => Agent<any, any> | undefined
+  ) {}
+
+  getModel(modelName?: string): Model {
+    return new ActivityBackedModel(modelName ?? '', this.modelParams, this.runningAgent);
   }
 }

@@ -44,6 +44,11 @@ import {
 import { getCurrentPluginConfig, setPluginConfig, clearPluginConfig, type PluginConfig } from './plugin-config-store';
 import { ensureTracingProcessorRegistered, runWithTracingRandom } from './tracing';
 import { clearOpenSpans, flushOpenSpans } from './agent-sink-processor';
+import { installAgentToolInterception } from './agent-tools';
+
+// The Worker loads interceptor modules before the Workflow module, so agent.asTool() tools that
+// Workflow code creates at module scope are recorded too.
+installAgentToolInterception();
 
 const TRACING_STREAM_NAME = 'package-openai-agents-tracing';
 

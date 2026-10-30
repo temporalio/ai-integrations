@@ -1,83 +1,108 @@
-import type { Agent, FunctionTool, RunContext, RunResult } from '@openai/agents-core';
+import { Agent, MemorySession, type AgentTool, type AgentToolOptions, type Tool } from '@openai/agents-core';
 import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
-import { TemporalOpenAIRunner } from './runner';
-import { ToolSerializationError } from './tools';
+import { validateTemporalSandboxClient } from './sandbox-client';
 
-export interface AgentAsToolOptions<TAgent extends Agent<any, any>> {
-  toolName: string;
-  toolDescription?: string;
-  customOutputExtractor?: (result: RunResult<any, TAgent>) => string | Promise<string>;
+type AnyAgentTool = AgentTool<any, any, any>;
+type AnyAgentToolOptions = AgentToolOptions<any, any, any>;
+
+/** The agent behind an `agent.asTool()` tool, and the run options the tool took when it was made. */
+export interface AgentToolRecord {
+  agent: Agent<any, any>;
+  runConfig: AnyAgentToolOptions['runConfig'];
+  runOptions: AnyAgentToolOptions['runOptions'];
 }
 
-const agentAsToolSandboxConfig = Symbol.for('@temporalio/openai-agents/agentAsToolSandboxConfig');
+interface InterceptionState {
+  original: (this: Agent<any, any>, options: AnyAgentToolOptions) => AnyAgentTool;
+  records: WeakMap<object, AgentToolRecord>;
+}
 
-type TemporalAgentTool = FunctionTool & {
-  [agentAsToolSandboxConfig]: (sandbox: SandboxRunConfig) => TemporalAgentTool;
-};
+// Kept on the prototype under a registry symbol, so a second copy of this module (or a second
+// install) reuses the same wrapper and records instead of wrapping `asTool` twice.
+const interceptionState = Symbol.for('@temporalio/openai-agents/agentToolInterception');
+
+function getState(): InterceptionState | undefined {
+  return (Agent.prototype as unknown as Record<symbol, InterceptionState | undefined>)[interceptionState];
+}
 
 /**
- * Nested approval interruptions are not supported: `invoke` throws
- * `ApplicationFailure` of type `NestedAgentInterruption`. Handle approvals
- * at the top-level runner instead.
+ * Wraps `Agent.prototype.asTool` to record each tool's agent. Upstream keeps that link private, and
+ * the runner needs it to check nested agents before a run. The plugin's Workflow interceptor module
+ * installs it before the Workflow module loads; loading this module, which the runner imports,
+ * installs it too.
+ *
+ * Upstream keeps the `runConfig` and `runOptions` objects and reads them only when the tool runs, so
+ * a listener, `inputBuilder` or schema can change them after these checks. The nested `Runner`'s run
+ * checks what it actually uses (see `installRunnerCheck`).
  */
-export function agentAsTool<TAgent extends Agent<any, any>>(
-  agent: TAgent,
-  options: AgentAsToolOptions<TAgent>
-): FunctionTool {
-  const createTool = (sandbox?: SandboxRunConfig): TemporalAgentTool =>
-    ({
-      type: 'function',
-      name: options.toolName,
-      description: options.toolDescription ?? '',
-      parameters: {
-        type: 'object',
-        properties: { input: { type: 'string' } },
-        required: ['input'],
-        additionalProperties: false,
-      },
-      strict: true,
-      async invoke(_runContext: RunContext<any>, input: string): Promise<string> {
-        let parsed: { input: string };
-        try {
-          parsed = JSON.parse(input);
-        } catch (e) {
-          throw new ToolSerializationError(`Failed to parse tool input for '${options.toolName}': ${e}`);
-        }
-        const runner = new TemporalOpenAIRunner();
-        const result = await runner.run(
-          agent,
-          parsed.input,
-          sandbox === undefined ? undefined : { runConfig: { sandbox } }
-        );
-        return extractToolOutput(result, agent.name, options);
-      },
-      needsApproval: async () => false,
-      isEnabled: async () => true,
-      [agentAsToolSandboxConfig]: createTool,
-    }) as TemporalAgentTool;
-
-  return createTool();
+export function installAgentToolInterception(): void {
+  if (getState() !== undefined) return;
+  const state: InterceptionState = { original: Agent.prototype.asTool as any, records: new WeakMap() };
+  function asTool(this: Agent<any, any>, options: AnyAgentToolOptions): AnyAgentTool {
+    // Upstream reads its options when the tool is made, so record them then too.
+    const tool = state.original.call(this, options);
+    state.records.set(tool, { agent: this, runConfig: options.runConfig, runOptions: options.runOptions });
+    return tool;
+  }
+  Object.defineProperty(Agent.prototype, interceptionState, { value: state });
+  Agent.prototype.asTool = asTool as typeof Agent.prototype.asTool;
 }
 
-export async function extractToolOutput<TAgent extends Agent<any, any>>(
-  result: RunResult<any, TAgent>,
-  agentName: string,
-  options: AgentAsToolOptions<TAgent>
-): Promise<string> {
-  if (result.interruptions.length > 0) {
+installAgentToolInterception();
+
+export function getAgentToolRecord(tool: Tool<any>): AgentToolRecord | undefined {
+  return getState()?.records.get(tool);
+}
+
+/**
+ * Whether `tool` has the shape of an `agent.asTool()` tool that was not recorded: created before
+ * the interception was installed, copied, or made by another copy of `@openai/agents-core`.
+ */
+export function isUnrecordedAgentTool(tool: Tool<any>): boolean {
+  return (
+    tool.type === 'function' &&
+    typeof (tool as Partial<AnyAgentTool>).on === 'function' &&
+    getAgentToolRecord(tool) === undefined
+  );
+}
+
+/** Rejects `asTool()` options that would run model calls or sandbox operations in the Workflow. */
+export function checkAgentToolOptions({ agent, runConfig, runOptions }: AgentToolRecord, toolName: string): void {
+  const where = `Agent '${agent.name}' asTool('${toolName}')`;
+  // Upstream spreads runConfig over the inherited config, so even `modelProvider: undefined`
+  // replaces the runner's provider.
+  if (runConfig !== undefined && Object.prototype.hasOwnProperty.call(runConfig, 'modelProvider')) {
     throw ApplicationFailure.create({
-      type: 'NestedAgentInterruption',
-      nonRetryable: true,
       message:
-        `Nested agent '${agentName}' invoked via agentAsTool('${options.toolName}') paused for ` +
-        `${result.interruptions.length} approval interruption(s). agentAsTool does not currently ` +
-        `bridge nested approval interruptions to the parent runner; handle approvals at the top-level runner instead.`,
+        `${where} sets runConfig.modelProvider. Nested runs must use the runner's provider, which ` +
+        'sends model calls to Activities; set a string runConfig.model instead.',
+      type: 'AgentsWorkflowError',
+      nonRetryable: true,
     });
   }
-  if (options.customOutputExtractor) {
-    return options.customOutputExtractor(result);
+  if (runConfig?.model !== undefined && typeof runConfig.model !== 'string') {
+    throw ApplicationFailure.create({
+      message:
+        `${where} sets runConfig.model to a Model object. In Temporal workflows, all models must be ` +
+        'specified as strings.',
+      type: 'AgentsWorkflowError',
+      nonRetryable: true,
+    });
   }
-  if (result.finalOutput === undefined) return '';
-  return typeof result.finalOutput === 'string' ? result.finalOutput : JSON.stringify(result.finalOutput);
+  for (const [sandbox, field] of [
+    [runConfig?.sandbox, 'runConfig.sandbox'],
+    [runOptions?.sandbox, 'runOptions.sandbox'],
+  ] as [SandboxRunConfig | undefined, string][]) {
+    if (sandbox !== undefined) validateTemporalSandboxClient(sandbox, `${where} ${field}`);
+  }
+  if (runOptions?.session instanceof MemorySession) {
+    throw ApplicationFailure.create({
+      message:
+        `${where} sets runOptions.session to a MemorySession, which is not safe inside a Workflow. ` +
+        'Pass WorkflowSafeMemorySession from @temporalio/openai-agents/workflow.',
+      type: 'UnsafeSessionError',
+      nonRetryable: true,
+    });
+  }
 }
