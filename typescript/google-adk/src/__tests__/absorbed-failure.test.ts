@@ -3,7 +3,8 @@
  * absorbed failure lets the run finish normally, every case here asserts the
  * *execution's* status, not just what the Workflow returned: a failed model call must
  * FAIL the execution, a cancel must end it CANCELLED, and a failure the caller
- * handled must leave it COMPLETED.
+ * handled must leave it COMPLETED. ADK absorbs a cancel in a tool or a model callback
+ * the same way, and that one must end the execution CANCELLED too.
  */
 
 import test from 'ava';
@@ -20,6 +21,7 @@ import {
   waitForScheduledActivities,
   withWorker,
 } from './helpers';
+import { cancellableActivity } from './test-activities';
 import {
   adkAwaitSignal,
   adkChatUpdate,
@@ -27,6 +29,7 @@ import {
   adkDoneSignal,
   adkRecoverSignal,
   adkStartSignal,
+  adkToolWaitingQuery,
   agentRunnerAwaitedSignalTurn,
   agentRunnerContinueAsNew,
   agentRunnerContinueAsNewFromUpdate,
@@ -34,6 +37,8 @@ import {
   agentRunnerFailureAfterTimeoutScope,
   agentRunnerFailureThenRecoveringSignal,
   agentRunnerFailureWithCompensation,
+  agentRunnerLongRunningToolWait,
+  agentRunnerModelCallbackActivity,
   agentRunnerOneTurn,
   agentRunnerRecoversFromCancelledModel,
   agentRunnerRecoversFromModelError,
@@ -154,6 +159,44 @@ test.serial('cancellingARunnerWhoseCallbackRecoversStillEndsCancelled', async (t
     await t.throwsAsync(handle.result());
     t.is((await handle.describe()).status.name, 'CANCELLED');
   });
+});
+
+test.serial('cancellingWhileALongRunningToolWaitsEndsCancelled', async (t) => {
+  const env = getEnv();
+  const taskQueue = uid('adk-agent-tool-wait-cancel');
+  const workflowId = uid('wf-agent-tool-wait-cancel');
+  await withWorker(env, { taskQueue, plugins: [adkPlugin()] }, async () => {
+    const handle = await env.client.workflow.start(agentRunnerLongRunningToolWait, { taskQueue, workflowId });
+    // ADK before 2.3 drops a long-running tool's error, so no model call follows to fail in
+    // the cancelled scope, and the turn ends normally.
+    while (!(await handle.query(adkToolWaitingQuery))) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    await handle.cancel();
+    await t.throwsAsync(handle.result());
+    t.is((await handle.describe()).status.name, 'CANCELLED');
+  });
+});
+
+test.serial('cancellingDuringAModelCallbackActivityEndsCancelled', async (t) => {
+  const env = getEnv();
+  for (const where of ['agent', 'plugin'] as const) {
+    const taskQueue = uid(`adk-${where}-model-callback-cancel`);
+    const workflowId = uid(`wf-${where}-model-callback-cancel`);
+    await withWorker(env, { taskQueue, plugins: [adkPlugin()], activities: { cancellableActivity } }, async () => {
+      const handle = await env.client.workflow.start(agentRunnerModelCallbackActivity, {
+        taskQueue,
+        workflowId,
+        args: [where],
+      });
+      // ADK turns the callback's cancelled Activity into an error event, a plugin's first
+      // wrapped in a plain `Error`, and ends the turn without calling the model.
+      await waitForScheduledActivities(env, workflowId, 'cancellableActivity');
+      await handle.cancel();
+      await t.throwsAsync(handle.result());
+      t.is((await handle.describe()).status.name, 'CANCELLED', where);
+    });
+  }
 });
 
 test.serial('throwingSummaryCallbackFailsTheWorkflow', async (t) => {

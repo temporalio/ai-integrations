@@ -4,6 +4,9 @@
  * and lets the run finish, so a Workflow whose model Activity failed returns
  * normally. `TemporalModel` records such a failure here, and the inbound interceptor
  * below re-raises it once the Workflow or handler frame that recorded it returns.
+ * ADK absorbs a cancellation outside a model call too, in a tool or a model callback;
+ * that one is recorded where ADK hands the error to its plugin manager (see
+ * {@link recordAbsorbedCancellation}).
  *
  * Await an agent turn in the frame that started it: a failure recorded while that frame
  * is open surfaces there, and one recorded after a handler frame returned surfaces in the
@@ -21,7 +24,8 @@
 
 import type { AsyncLocalStorage as ALS } from 'node:async_hooks';
 
-import { ApplicationFailure, TemporalFailure } from '@temporalio/common';
+import { PluginManager } from '@google/adk';
+import { ApplicationFailure, CancelledFailure, TemporalFailure } from '@temporalio/common';
 import {
   AsyncLocalStorage,
   CancellationScope,
@@ -163,6 +167,47 @@ export function recordAbsorbedFailure(err: unknown, call: ModelCall): void {
 }
 
 /**
+ * Records a cancellation that ADK absorbed outside a `TemporalModel` call. ADK hands the
+ * error a tool threw (`functions.ts`), and the error of a model step, model callbacks
+ * included (`LlmAgent.runAndHandleError`), to its plugin manager and then goes on: ADK
+ * before 2.3 drops a long-running tool's error, and a model callback's error becomes an
+ * error event that ends the turn. A plugin hook's error reaches ADK wrapped in a plain
+ * `Error` (with no `cause` before ADK 2.2.1), so a cancelled scope also counts.
+ */
+function recordAbsorbedCancellation(err: unknown): void {
+  const frame = openFrame();
+  if (frame === undefined || frame.cancellation !== undefined) return;
+  if (isCancellation(err)) {
+    frame.cancellation = err;
+  } else if (CancellationScope.current().consideredCancelled) {
+    frame.cancellation = new CancelledFailure('Workflow cancelled', [], err instanceof Error ? err : undefined);
+  }
+}
+
+/** Marks the `PluginManager` prototype once its error hand-offs record cancellations. */
+const WATCHED = Symbol.for('__temporal_googleAdkWatchedErrorHandoffs');
+
+/**
+ * Wraps the two `PluginManager` methods ADK calls with an error it is about to absorb, so
+ * {@link recordAbsorbedCancellation} sees it first. What ADK does next is unchanged. Done
+ * once per Workflow, whichever copy of this module loads first.
+ */
+function watchErrorHandoffs(): void {
+  const proto = PluginManager.prototype as unknown as Record<PropertyKey, unknown>;
+  if (proto[WATCHED] === true) return;
+  proto[WATCHED] = true;
+  for (const method of ['runOnToolErrorCallback', 'runOnModelErrorCallback']) {
+    const original = proto[method] as (this: PluginManager, params: { error: unknown }) => Promise<unknown>;
+    proto[method] = function (this: PluginManager, params: { error: unknown }): Promise<unknown> {
+      recordAbsorbedCancellation(params.error);
+      return original.call(this, params);
+    };
+  }
+}
+
+if (inWorkflowContext()) watchErrorHandoffs();
+
+/**
  * Declares that a `TemporalModel` call succeeded, which spends whatever the same agent
  * absorbed in the same ADK invocation through a call that started before this one: that is
  * ADK having retried the node (or activated it again) and got its answer, and a run
@@ -218,7 +263,7 @@ export function markModelFailureHandled(error: unknown): void {
 }
 
 function raiseAbsorbed(frame: Frame): void {
-  // Only a cancel a model call absorbed lands here, and it decides the outcome only if
+  // Only a cancel ADK absorbed lands here, and it decides the outcome only if
   // the execution itself was cancelled. An inner scope's cancel
   // (`CancellationScope.withTimeout`) is the consumer's own doing and is not raised at all.
   if (frame.cancellation !== undefined && CancellationScope.current().consideredCancelled) {

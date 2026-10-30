@@ -589,6 +589,9 @@ an agent node is waiting on, ADK absorbs the cancelled call like any model error
 and reports the node as failed (`NodeReportedError`); the plugin ends the
 execution CANCELLED with the model Activity's own cancellation instead. A
 cancelled Activity node ends it CANCELLED the same way, inside a dynamic run too.
+So does a cancel that ADK absorbs in a tool or a model callback, such as a
+`LongRunningFunctionTool` waiting for a Signal or a `beforeModelCallback` waiting
+for an Activity.
 
 A failing sibling does not cancel the execution either. When a graph node fails,
 ADK aborts the run and waits for the nodes still running before failing it. The

@@ -329,7 +329,8 @@ export class ToolCallingLlm extends BaseLlm {
 
 /**
  * A `modelProvider` that maps `boom` → {@link ThrowingLlm}, `slow-model` →
- * {@link SlowLlm}, `abort-model` → {@link AbortingLlm}, and everything else →
+ * {@link SlowLlm}, `abort-model` → {@link AbortingLlm}, `call-wait-approval-model` →
+ * a {@link ToolCallingLlm} that calls `wait_approval`, and everything else →
  * {@link FakeLlm} (optionally with canned responses).
  */
 export function defaultTestProvider(responses?: LlmResponse[]): (model: string) => BaseLlm {
@@ -337,6 +338,8 @@ export function defaultTestProvider(responses?: LlmResponse[]): (model: string) 
     if (model === 'boom') return new ThrowingLlm({ model });
     if (model === 'slow-model') return new SlowLlm({ model });
     if (model === 'abort-model') return new AbortingLlm({ model });
+    if (model === 'call-wait-approval-model')
+      return new ToolCallingLlm({ model, toolName: 'wait_approval', toolArgs: {} });
     return new FakeLlm({ model, responses });
   };
 }

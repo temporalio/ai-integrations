@@ -21,6 +21,7 @@ import {
   LongRunningFunctionTool,
   RequestInput,
   stringifyContent,
+  type LlmAgentConfig,
   type LlmRequest,
   type LlmResponse,
 } from '@google/adk';
@@ -31,6 +32,7 @@ import {
   CancellationScope,
   condition,
   continueAsNew,
+  defineQuery,
   defineSignal,
   defineUpdate,
   proxyActivities,
@@ -482,11 +484,17 @@ const SINGLE_ATTEMPT: TemporalModelOptions = { activity: { retry: { maximumAttem
  * One runner-driven agent turn through `model`, returning the turn's final text —
  * empty when the turn produced none.
  */
-async function runAgentTurn(model: TemporalModel, prompt: string, plugins?: BasePlugin[]): Promise<string> {
+async function runAgentTurn(
+  model: TemporalModel,
+  prompt: string,
+  plugins?: BasePlugin[],
+  agentOptions?: Pick<LlmAgentConfig, 'tools' | 'beforeModelCallback'>
+): Promise<string> {
   const agent = new LlmAgent({
     name: 'assistant',
     model,
     instruction: 'You are a helpful assistant.',
+    ...agentOptions,
   });
   const runner = new InMemoryRunner({ agent, plugins });
 
@@ -548,6 +556,60 @@ export async function agentRunnerRecoversOnlyTheSecondFailure(prompt: string): P
  */
 export async function agentRunnerRecoversFromCancelledModel(prompt: string): Promise<string> {
   return runAgentTurn(new TemporalModel('slow-model', SINGLE_ATTEMPT), prompt, [new RecoveringPlugin()]);
+}
+
+export const adkToolWaitingQuery = defineQuery<boolean>('adkToolWaiting');
+
+/**
+ * A runner turn whose model calls a `LongRunningFunctionTool` that waits in Workflow code
+ * for an approval that never comes, with nothing cancellable after the turn.
+ */
+export async function agentRunnerLongRunningToolWait(): Promise<string> {
+  let waiting = false;
+  setHandler(adkToolWaitingQuery, () => waiting);
+  const tool = new LongRunningFunctionTool({
+    name: 'wait_approval',
+    description: 'Wait for a person to approve.',
+    execute: async () => {
+      waiting = true;
+      await condition(() => false);
+      return { status: 'approved' };
+    },
+  });
+  return runAgentTurn(new TemporalModel('call-wait-approval-model', SINGLE_ATTEMPT), 'hi', undefined, {
+    tools: [tool],
+  });
+}
+
+interface PolicyActivities {
+  cancellableActivity(): Promise<string>;
+}
+
+/** An ADK plugin whose `beforeModelCallback` runs `check`. */
+class PolicyPlugin extends BasePlugin {
+  constructor(private readonly check: () => Promise<undefined>) {
+    super('policy');
+  }
+
+  override async beforeModelCallback(): Promise<undefined> {
+    return this.check();
+  }
+}
+
+/**
+ * A runner turn whose `beforeModelCallback`, the agent's own or an ADK plugin's, awaits a
+ * policy Activity that runs until it is cancelled.
+ */
+export async function agentRunnerModelCallbackActivity(where: 'agent' | 'plugin'): Promise<string> {
+  const { cancellableActivity } = proxyActivities<PolicyActivities>({ startToCloseTimeout: '1 minute' });
+  const check = async (): Promise<undefined> => {
+    await cancellableActivity();
+    return undefined;
+  };
+  const model = new TemporalModel('fake-model', SINGLE_ATTEMPT);
+  return where === 'plugin'
+    ? runAgentTurn(model, 'hi', [new PolicyPlugin(check)])
+    : runAgentTurn(model, 'hi', undefined, { beforeModelCallback: check });
 }
 
 /** A runner turn whose caller-supplied `summary` callback throws before the Activity. */
