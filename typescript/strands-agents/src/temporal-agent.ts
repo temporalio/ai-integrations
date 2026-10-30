@@ -1,9 +1,10 @@
 import { Agent, AfterToolsEvent } from '@strands-agents/sdk';
-import type { AgentConfig } from '@strands-agents/sdk';
+import type { AgentConfig, AgentResult, AgentStreamEvent, InvokeArgs, InvokeOptions } from '@strands-agents/sdk';
 import type { ActivityOptions } from '@temporalio/workflow';
 import type { Duration } from '@temporalio/common/lib/time';
 import { TemporalModel } from './temporal-model';
 import { TemporalMCPClient } from './temporal-mcp-client';
+import { workflowErrorFor } from './strands-errors';
 
 const SNAPSHOT_DISABLED =
   'TemporalAgent disables takeSnapshot()/loadSnapshot(). Temporal workflows ' +
@@ -90,6 +91,23 @@ export class TemporalAgent extends Agent {
   override initialize(): Promise<void> {
     const loading = this.model instanceof TemporalModel ? this.model.loadConfig() : undefined;
     return loading ? loading.then(() => super.initialize()) : super.initialize();
+  }
+
+  /**
+   * Strands' stream, ending in a Temporal failure where Strands would end in an error that only
+   * fails the workflow task: a terminal model error becomes a typed, non-retryable failure, and a
+   * model activity that failed or was cancelled ends the turn with that activity's failure. So the
+   * run, or the update that runs the turn, fails or is cancelled. `invoke()` uses this too.
+   */
+  override async *stream(
+    args: InvokeArgs,
+    options?: InvokeOptions
+  ): AsyncGenerator<AgentStreamEvent, AgentResult, undefined> {
+    try {
+      return yield* super.stream(args, options);
+    } catch (err) {
+      throw workflowErrorFor(err);
+    }
   }
 
   override takeSnapshot(): never {

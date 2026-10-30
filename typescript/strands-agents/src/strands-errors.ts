@@ -1,7 +1,18 @@
-import { ContextWindowOverflowError, MaxTokensError, StructuredOutputError } from '@strands-agents/sdk';
-import { ApplicationFailure, ApplicationFailureCategory } from '@temporalio/common';
+import { ContextWindowOverflowError, MaxTokensError, ModelError, StructuredOutputError } from '@strands-agents/sdk';
+import {
+  ApplicationFailure,
+  ApplicationFailureCategory,
+  type ApplicationFailureOptions,
+  TemporalFailure,
+} from '@temporalio/common';
 
 export const STRANDS_INTERRUPT_TYPE = 'StrandsInterrupt';
+
+/** The failure type of an interrupt an activity threw that the plugin cannot read. */
+export const STRANDS_MALFORMED_INTERRUPT_TYPE = 'StrandsMalformedInterrupt';
+
+/** The failure type of a Strands context overflow, from the model activity to `TemporalModel`. */
+export const CONTEXT_WINDOW_OVERFLOW_TYPE = 'ContextWindowOverflowError';
 
 // Strands does not re-export `InterruptError` from its public index, so detect
 // it structurally instead of via `instanceof`.
@@ -9,7 +20,8 @@ interface InterruptLike {
   toJSON(): unknown;
 }
 
-interface InterruptDetails {
+/** What each entry in a `StrandsInterrupt` failure's details holds. */
+export interface InterruptDetails {
   id?: string;
   name: string;
   reason?: unknown;
@@ -17,58 +29,57 @@ interface InterruptDetails {
   source?: string;
 }
 
-function isInterruptError(err: unknown): err is { interrupts: unknown[] } {
+// Any value with a non-empty `interrupts` array is taken as an interrupt, so a malformed one fails
+// as such instead of being retried as an ordinary error.
+function isInterruptAttempt(err: unknown): err is { interrupts: unknown[] } {
   if (err === null || typeof err !== 'object') return false;
-  const candidate = err as { interrupts?: unknown };
-  if (!Array.isArray(candidate.interrupts) || candidate.interrupts.length === 0) return false;
-  const first = candidate.interrupts[0] as { toJSON?: unknown } | undefined;
-  return typeof first?.toJSON === 'function';
+  const { interrupts } = err as { interrupts?: unknown };
+  return Array.isArray(interrupts) && interrupts.length > 0;
 }
 
 const TERMINAL_ERROR_TYPES = [
-  { ctor: ContextWindowOverflowError, name: 'ContextWindowOverflowError' },
+  { ctor: ContextWindowOverflowError, name: CONTEXT_WINDOW_OVERFLOW_TYPE },
   { ctor: MaxTokensError, name: 'MaxTokensError' },
   { ctor: StructuredOutputError, name: 'StructuredOutputError' },
 ];
 
-/**
- * Rewrite a Strands terminal model error as a typed, non-retryable
- * {@link ApplicationFailure} that keeps its message, stack and cause. Any other
- * value is returned as it is.
- */
-export function rewriteTerminalError(err: unknown): unknown {
-  if (err instanceof Error) {
-    for (const { ctor, name } of TERMINAL_ERROR_TYPES) {
-      // The name matches an error from another copy of `@strands-agents/sdk`, or any error with
-      // that name; `instanceof` also matches a subclass that sets a name of its own.
-      if (err instanceof ctor || err.name === name) {
-        return ApplicationFailure.fromError(err, { type: name, nonRetryable: true });
-      }
-    }
+// The failure type of a Strands terminal model error, or undefined for any other value. The name
+// matches an error from another copy of `@strands-agents/sdk`, or any error with that name;
+// `instanceof` also matches a subclass that sets a name of its own.
+function terminalType(err: unknown): string | undefined {
+  if (!(err instanceof Error)) return undefined;
+  return TERMINAL_ERROR_TYPES.find(({ ctor, name }) => err instanceof ctor || err.name === name)?.name;
+}
+
+// `ApplicationFailure.fromError` keeps the error's message, stack and cause, but returns an
+// `ApplicationFailure` it is given, and one decoded earlier would still be encoded from its original
+// proto, without these overrides. Start a fresh failure for that case.
+function retype(err: unknown, overrides: ApplicationFailureOptions): ApplicationFailure {
+  if (err instanceof ApplicationFailure) {
+    return ApplicationFailure.create({ message: err.message, ...overrides, cause: err });
   }
-  return err;
+  return ApplicationFailure.fromError(err, overrides);
 }
 
 /**
- * Rewrite a Strands interrupt or terminal model error as a typed, non-retryable
- * {@link ApplicationFailure} that keeps its stack and cause. An interrupt is a
- * benign failure, so the worker does not log it as an activity failure; a
- * malformed one becomes a non-retryable failure that says so. Any other value is
- * returned as it is.
+ * Rewrite an error an activity threw. A Strands interrupt becomes a typed,
+ * non-retryable failure that the worker treats as benign, and a malformed one a
+ * non-retryable failure of type {@link STRANDS_MALFORMED_INTERRUPT_TYPE}. A
+ * Strands terminal model error becomes a typed, non-retryable failure, benign
+ * for a context overflow when `benignOverflow` is set. Each keeps the error's
+ * stack and cause. Any other value is returned as it is.
  */
-export function rewriteError(err: unknown): unknown {
-  if (isInterruptError(err)) {
+export function rewriteError(err: unknown, options: { benignOverflow?: boolean } = {}): unknown {
+  if (isInterruptAttempt(err)) {
     const details = interruptDetails(err.interrupts);
     if (details === undefined) {
-      // Activities build interrupts by hand. Fail a malformed one without retries, rather than
-      // retrying it with no pause or stopping the worker when its details cannot be encoded.
-      return ApplicationFailure.fromError(err, {
-        message:
-          'malformed interrupt: each entry needs a toJSON() that returns an object with a string name, and JSON-encodable values',
+      return retype(err, {
+        message: `malformed interrupt (${String((err as { message?: unknown }).message)}): each entry needs a toJSON() that returns an object with a string name, and JSON-encodable values`,
+        type: STRANDS_MALFORMED_INTERRUPT_TYPE,
         nonRetryable: true,
       });
     }
-    return ApplicationFailure.fromError(err, {
+    return retype(err, {
       message: `interrupt:${details.map((d) => d.name).join(',')}`,
       type: STRANDS_INTERRUPT_TYPE,
       nonRetryable: true,
@@ -76,11 +87,48 @@ export function rewriteError(err: unknown): unknown {
       category: ApplicationFailureCategory.BENIGN,
     });
   }
-  return rewriteTerminalError(err);
+  const type = terminalType(err);
+  if (type === undefined) return err;
+  const benign = options.benignOverflow === true && type === CONTEXT_WINDOW_OVERFLOW_TYPE;
+  return retype(err, { type, nonRetryable: true, ...(benign ? { category: ApplicationFailureCategory.BENIGN } : {}) });
+}
+
+/**
+ * The error a `TemporalAgent` turn ends with in workflow code, in place of one
+ * that would only fail the workflow task on every attempt. A Strands terminal
+ * model error becomes a typed, non-retryable failure with the original error as
+ * its cause. A Strands `ModelError` that wraps a Temporal failure, such as a
+ * model activity that failed or was cancelled, becomes that failure, so the run
+ * fails or is cancelled. Any other value is returned as it is.
+ */
+export function workflowErrorFor(err: unknown): unknown {
+  const type = terminalType(err);
+  if (type !== undefined) {
+    return ApplicationFailure.create({
+      message: (err as Error).message,
+      type,
+      nonRetryable: true,
+      cause: err as Error,
+    });
+  }
+  if (err instanceof ModelError && err.cause instanceof TemporalFailure) return err.cause;
+  return err;
+}
+
+/**
+ * The application failure type of a decoded failure. It also reads the type from
+ * the failure's proto when the failure converter returned another kind of
+ * `TemporalFailure`.
+ */
+export function applicationFailureType(failure: unknown): string | undefined {
+  if (failure instanceof ApplicationFailure) return failure.type ?? undefined;
+  if (failure instanceof TemporalFailure) return failure.failure?.applicationFailureInfo?.type ?? undefined;
+  return undefined;
 }
 
 // The details of each interrupt, or undefined when an entry has no toJSON(), returns no object
-// with a string name, or holds a value the default payload converter cannot encode as JSON.
+// with a string name, or holds a value JSON cannot encode. The JSON check applies whatever payload
+// converter the worker uses.
 function interruptDetails(interrupts: unknown[]): InterruptDetails[] | undefined {
   try {
     const details = interrupts.map((i) => (i as InterruptLike).toJSON());

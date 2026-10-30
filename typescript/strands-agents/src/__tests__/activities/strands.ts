@@ -36,6 +36,18 @@ export function interruptError(name: string): Error {
   });
 }
 
+// Counts calls to confirmThings, which always asks for two decisions.
+export const confirmState = { calls: 0 };
+
+export async function confirmThings(input: { name: string }): Promise<string> {
+  confirmState.calls += 1;
+  throw Object.assign(new Error('interrupt'), {
+    interrupts: ['approval', 'confirmation'].map((name) => ({
+      toJSON: () => ({ id: `${name}:${input.name}`, name, reason: `${name} for ${input.name}?`, source: 'tool' }),
+    })),
+  });
+}
+
 export async function deleteThing(input: { name: string }): Promise<string> {
   deleteState.calls += 1;
   if (deleteState.calls === 1) {

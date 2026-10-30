@@ -2,6 +2,7 @@ import type { McpClient } from '@strands-agents/sdk';
 import { BedrockModel, type Model } from '@strands-agents/sdk';
 import type { Duration } from '@temporalio/common';
 import { msOptionalToNumber } from '@temporalio/common/lib/time';
+import type { Context as ActivityContext } from '@temporalio/activity';
 import type { ActivityInboundCallsInterceptor, BundleOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
 import { rewriteError } from './strands-errors';
@@ -47,20 +48,25 @@ export interface StrandsPluginOptions {
   mcpConnectionIdleTimeout?: Duration;
 }
 
+/** The plugin's model activities, whose context overflows the agent recovers from. */
+const MODEL_ACTIVITIES = new Set(['invokeModel', 'invokeModelStreaming']);
+
 /**
  * Rethrows Strands' interrupt and terminal errors from activities as typed, non-retryable
  * failures. The worker turns any other error an activity throws into a retryable
  * `ApplicationFailure` before a failure converter sees it, so this cannot be left to one.
  */
-const strandsActivityInbound: ActivityInboundCallsInterceptor = {
-  async execute(input, next) {
-    try {
-      return await next(input);
-    } catch (err) {
-      throw rewriteError(err);
-    }
-  },
-};
+function strandsActivityInbound(ctx: ActivityContext): ActivityInboundCallsInterceptor {
+  return {
+    async execute(input, next) {
+      try {
+        return await next(input);
+      } catch (err) {
+        throw rewriteError(err, { benignOverflow: MODEL_ACTIVITIES.has(ctx.info.activityType) });
+      }
+    },
+  };
+}
 
 /**
  * Temporal plugin that runs Strands Agents inside Temporal workflows. Model,
@@ -122,7 +128,7 @@ export class StrandsPlugin extends SimplePlugin {
       // deprecated `activityInbound` key.
       workerInterceptors: (existing) => ({
         ...existing,
-        activity: [...(existing?.activity ?? []), () => ({ inbound: strandsActivityInbound })],
+        activity: [...(existing?.activity ?? []), (ctx) => ({ inbound: strandsActivityInbound(ctx) })],
       }),
     });
   }
@@ -156,10 +162,6 @@ export class StrandsPlugin extends SimplePlugin {
    * - Inline async chunks so the bundle stays a single file — webpack's
    *   default JSONP chunk loader references `self`/`document`, neither of
    *   which exists in the workflow VM.
-   *
-   * - Add the plugin's workflow interceptors, which turn Strands terminal
-   *   errors thrown in workflow code into non-retryable failures. The worker
-   *   calls this when it bundles workflow code itself, too.
    */
   override configureBundler(options: BundleOptions): BundleOptions {
     const base = super.configureBundler(options);
@@ -182,10 +184,6 @@ export class StrandsPlugin extends SimplePlugin {
     return {
       ...base,
       ignoreModules,
-      workflowInterceptorModules: [
-        ...(base.workflowInterceptorModules ?? []),
-        require.resolve('./workflow-interceptors'),
-      ],
       webpackConfigHook: (config) => {
         (config.output ??= {}).asyncChunks = false;
         (config.optimization ??= {}).splitChunks = false;

@@ -13,7 +13,7 @@ import type { z } from 'zod';
 import * as workflow from '@temporalio/workflow';
 import type { ActivityOptions } from '@temporalio/workflow';
 import { ActivityFailure, ApplicationFailure } from '@temporalio/common';
-import { STRANDS_INTERRUPT_TYPE } from './strands-errors';
+import { type InterruptDetails, STRANDS_INTERRUPT_TYPE } from './strands-errors';
 import { toJsonSchema } from './json-schema';
 
 /**
@@ -39,9 +39,10 @@ export interface ActivityAsToolOptions {
  * When the activity fails with an {@link ApplicationFailure} whose `type`
  * matches {@link STRANDS_INTERRUPT_TYPE} — {@link StrandsPlugin} turns an
  * interrupt the activity throws into one —
- * `stream()` re-throws an {@link InterruptError} so the agent loop handles
- * the interrupt the same way as a hook- or tool-body interrupt. Other
- * failures are converted to an error {@link ToolResultBlock}.
+ * `stream()` raises each interrupt in its details, in order, so the agent loop
+ * handles them the same way as hook- or tool-body interrupts: the agent pauses
+ * at the first one without a response. Other failures, including a malformed
+ * interrupt, are converted to an error {@link ToolResultBlock}.
  */
 export class TemporalActivityTool extends Tool {
   readonly name: string;
@@ -90,22 +91,16 @@ export class TemporalActivityTool extends Tool {
         err.cause instanceof ApplicationFailure &&
         err.cause.type === STRANDS_INTERRUPT_TYPE
       ) {
-        const details = (err.cause.details ?? []) as Array<{
-          name: string;
-          reason?: unknown;
-          response?: unknown;
-        }>;
-        const first = details[0];
-        // Route through the agent's interrupt() helper: throws InterruptError to
-        // halt on first call, returns the user's response on resume.
-        const response = toolContext.interrupt<unknown>({
-          name: first?.name ?? 'interrupt',
-          reason: first?.reason as JSONValue,
-        });
+        const details = (err.cause.details ?? []) as InterruptDetails[];
+        // Route each interrupt through the agent's interrupt() helper, in order: the first one with
+        // no response throws InterruptError and halts; on resume the answered ones return theirs.
+        const responses = (details.length > 0 ? details : [{ name: 'interrupt' }]).map((d: Partial<InterruptDetails>) =>
+          toolContext.interrupt<unknown>({ name: d.name ?? 'interrupt', reason: d.reason as JSONValue })
+        );
         return new ToolResultBlock({
           toolUseId,
           status: 'success',
-          content: [toResultContent(response)],
+          content: [toResultContent(responses.length === 1 ? responses[0] : responses)],
         });
       }
       return activityErrorResult(toolUseId, err);

@@ -14,6 +14,7 @@ import {
   allHandlersFinished,
   ApplicationFailure,
   defineSignal,
+  defineUpdate,
   proxyActivities,
   setHandler,
   condition,
@@ -244,8 +245,7 @@ export const finishSignal = defineSignal('finish');
 
 /**
  * Waits for the `finish` Signal and, one microtask later, schedules `finished` if every handler has
- * finished by then and `unfinished` if not. The plugin's workflow interceptor wraps handlers, which
- * makes them finish later.
+ * finished by then and `unfinished` if not, so its history depends on when the handler finishes.
  */
 export async function handlerTiming(): Promise<void> {
   const activities = proxyActivities<{ finished(): Promise<void>; unfinished(): Promise<void> }>({
@@ -260,19 +260,35 @@ export async function handlerTiming(): Promise<void> {
   await (allHandlersFinished() ? activities.finished() : activities.unfinished());
 }
 
+export const turnUpdate = defineUpdate<string, [string]>('turn');
+export const doneSignal = defineSignal('done');
+
+/** Runs each `turn` update as a turn of one agent, until the `done` signal. */
+export async function updateTurnsAgent(): Promise<string> {
+  const agent = new TemporalAgent({ model: 'test', printer: false });
+  let done = false;
+  setHandler(turnUpdate, async (prompt) => (await agent.invoke(prompt)).toString());
+  setHandler(doneSignal, () => {
+    done = true;
+  });
+  await condition(() => done);
+  return 'finished';
+}
+
 export const approveSignal = defineSignal<[string]>('approve');
 
-export async function interruptAgent(prompt: string): Promise<string> {
-  let approval: string | null = null;
+export async function interruptAgent(prompt: string, activityName = 'deleteThing'): Promise<string> {
+  // One approval per pause, in the order they arrive.
+  const approvals: string[] = [];
   setHandler(approveSignal, (response: string) => {
-    approval = response;
+    approvals.push(response);
   });
 
   const agent = new TemporalAgent({
     model: 'test',
     printer: false,
     tools: [
-      strandsWorkflow.activityAsTool('deleteThing', {
+      strandsWorkflow.activityAsTool(activityName, {
         description: 'Delete a thing',
         inputSchema: {
           type: 'object',
@@ -286,9 +302,8 @@ export async function interruptAgent(prompt: string): Promise<string> {
 
   let result = await agent.invoke(prompt);
   while (result.stopReason === 'interrupt') {
-    await condition(() => approval !== null);
-    const response = approval;
-    approval = null;
+    await condition(() => approvals.length > 0);
+    const response = approvals.shift() as string;
     const responses: InterruptResponseContentData[] = (result.interrupts ?? []).map((i) => ({
       type: 'interruptResponse',
       interruptResponse: { interruptId: i.id, response },

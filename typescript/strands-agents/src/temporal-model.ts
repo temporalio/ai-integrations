@@ -3,6 +3,7 @@ import type { BaseModelConfig, Message, ModelStreamEvent, StreamOptions } from '
 import * as workflow from '@temporalio/workflow';
 import type { ActivityOptions } from '@temporalio/workflow';
 import type { Duration } from '@temporalio/common/lib/time';
+import { applicationFailureType, CONTEXT_WINDOW_OVERFLOW_TYPE } from './strands-errors';
 import type {
   GetModelConfigInput,
   InvokeModelInput,
@@ -113,13 +114,12 @@ export class TemporalModel extends Model<BaseModelConfig> {
           });
     } catch (err) {
       // Give the agent Strands' own error for a context overflow, so its conversation manager can
-      // trim the conversation and call the model again.
+      // trim the conversation and call the model again. Keep the activity failure as its cause.
       if (
         err instanceof workflow.ActivityFailure &&
-        err.cause instanceof workflow.ApplicationFailure &&
-        err.cause.type === 'ContextWindowOverflowError'
+        applicationFailureType(err.cause) === CONTEXT_WINDOW_OVERFLOW_TYPE
       ) {
-        throw new ContextWindowOverflowError(err.cause.message);
+        throw Object.assign(new ContextWindowOverflowError(err.cause?.message ?? ''), { cause: err });
       }
       throw err;
     }

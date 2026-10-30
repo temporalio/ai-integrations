@@ -10,8 +10,8 @@ import {
 } from '@strands-agents/sdk';
 import type { BaseModelConfig, JSONValue, ModelStreamEvent, StreamOptions, Tool } from '@strands-agents/sdk';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { WorkflowFailedError } from '@temporalio/client';
-import { ApplicationFailure } from '@temporalio/common';
+import { WorkflowFailedError, WorkflowUpdateFailedError } from '@temporalio/client';
+import { ActivityFailure, ApplicationFailure, CancelledFailure } from '@temporalio/common';
 import type { temporal } from '@temporalio/proto';
 import type { BaseContext } from '@temporalio/test-helpers';
 import {
@@ -24,11 +24,13 @@ import {
 import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
 import { DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
-import { StrandsPlugin } from '..';
+import { STRANDS_MALFORMED_INTERRUPT_TYPE, StrandsPlugin } from '..';
 import { startLocalWithRetry } from './helpers/environment';
 import {
   auditLog,
   auditTool,
+  confirmState,
+  confirmThings,
   deleteState,
   deleteThing,
   getWeather,
@@ -41,6 +43,7 @@ import {
   approveSignal,
   compressionAgent,
   defaultModelAgent,
+  doneSignal,
   failingActivityToolAgent,
   failingMcpToolAgent,
   helloAgent,
@@ -52,6 +55,8 @@ import {
   streamingAgent,
   structuredOutputAgent,
   turnsAgent,
+  turnUpdate,
+  updateTurnsAgent,
 } from './workflows/strands';
 
 const STUB_TRANSPORT: Transport = {
@@ -118,13 +123,24 @@ function textTurn(text: string): ModelStreamEvent[] {
   ];
 }
 
+interface ActivityFailureRecord {
+  message?: string | null;
+  type?: string | null;
+  nonRetryable?: boolean | null;
+}
+
 /** Each failed activity's message, type and non-retryable flag in a run's history. */
-function activityFailures(history: temporal.api.history.v1.IHistory): object[] {
+function activityFailures(history: temporal.api.history.v1.IHistory): ActivityFailureRecord[] {
   return (history.events ?? []).flatMap((e) => {
     const failure = e.activityTaskFailedEventAttributes?.failure;
     const info = failure?.applicationFailureInfo;
     return failure ? [{ message: failure.message, type: info?.type, nonRetryable: info?.nonRetryable }] : [];
   });
+}
+
+/** Convenience: a reply cut off at the model's token limit, so Strands throws `MaxTokensError`. */
+function maxTokensTurn(text: string): ModelStreamEvent[] {
+  return [...textTurn(text).slice(0, -1), { type: 'modelMessageStopEvent', stopReason: 'maxTokens' }];
 }
 
 /** Convenience: tool-call turn that the agent loop will dispatch. */
@@ -334,24 +350,22 @@ test('a history recorded before the model config read fails to replay', async (t
   t.regex(err!.message, /\[TMPRL1100\].*'invokeModel'.*'strandsGetModelConfig'/);
 });
 
-test('a history whose code depends on when a handler finishes can fail to replay', async (t) => {
-  // Recorded with `handlerTiming` on main at 63d7aec, before the plugin's workflow interceptor: the
-  // Signal handler had finished one microtask later, so the run scheduled `finished`. The
-  // interceptor's handler wrapper finishes it later, so replay schedules `unfinished`.
+test('a history whose code depends on when a handler finishes still replays', async (t) => {
+  // Recorded with `handlerTiming` on main at 63d7aec: one microtask after its Signal handler ran,
+  // every handler had finished, so the run scheduled `finished`. The plugin wraps no handlers, so
+  // they finish at the same moment and the history replays.
   const history = await loadHistory(
-    path.resolve(__dirname, '../../src/__tests__/histories/handler-timing-before-workflow-interceptor.json')
+    path.resolve(__dirname, '../../src/__tests__/histories/handler-timing-63d7aec.json')
   );
-  const err = await t.throwsAsync(
+  await t.notThrowsAsync(
     Worker.runReplayHistory(
       {
         workflowBundle: t.context.workflowBundle,
         plugins: [new StrandsPlugin({ models: { test: () => new StubModel([]) } })],
       },
       history
-    ),
-    { instanceOf: DeterminismViolationError }
+    )
   );
-  t.regex(err!.message, /\[TMPRL1100\].*'finished'.*'unfinished'/);
 });
 
 test('invokeModel reconstructs Message instances from wire data', async (t) => {
@@ -898,10 +912,39 @@ test('activity-tool interrupt pauses the agent and resumes', async (t) => {
   t.deepEqual(activityFailures(history), [
     { message: 'interrupt:approval', type: 'StrandsInterrupt', nonRetryable: true },
   ]);
-  // The failure keeps the stack of the error the activity threw.
-  const failure = history.events?.find((e) => e.activityTaskFailedEventAttributes)?.activityTaskFailedEventAttributes
-    ?.failure;
-  t.regex(failure?.stackTrace ?? '', /interruptError/);
+  // That failure came from the activity's first attempt, and keeps the stack of the error it threw.
+  const failed = history.events?.find((e) => e.activityTaskFailedEventAttributes)?.activityTaskFailedEventAttributes;
+  const startedId = failed?.startedEventId?.toString();
+  const started = history.events?.find((e) => e.eventId?.toString() === startedId);
+  t.is(started?.activityTaskStartedEventAttributes?.attempt, 1);
+  t.regex(failed?.failure?.stackTrace ?? '', /interruptError/);
+});
+
+test('an activity interrupt with two entries pauses the agent once for each', async (t) => {
+  confirmState.calls = 0;
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [
+      new StrandsPlugin({
+        models: {
+          test: () => new StubModel([toolCallTurn('confirmThings', 'call_1', { name: 'foo' }), textTurn('done')]),
+        },
+      }),
+    ],
+    activities: { confirmThings },
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(interruptAgent, {
+      args: ['confirm foo', 'confirmThings'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    await handle.signal(approveSignal, 'yes');
+    await handle.signal(approveSignal, 'yes');
+    t.is(await handle.result(), 'done');
+  });
+  // The first call paused at the approval, the second at the confirmation, and the third had both
+  // responses.
+  t.is(confirmState.calls, 3);
 });
 
 test("a worker's own failure converter still applies with the plugin", async (t) => {
@@ -964,29 +1007,29 @@ test('a malformed activity interrupt fails without retries', async (t) => {
     plugins: [new StrandsPlugin()],
     activities: {
       async failingActivity(message: string): Promise<never> {
-        // An entry with no toJSON(), and a reason the default payload converter cannot encode.
+        // An entry with no toJSON(), a plain entry, and a reason JSON cannot encode.
         const interrupts =
           message === 'no toJSON'
             ? [{ toJSON: () => ({ name: 'approval' }) }, {}]
-            : [{ toJSON: () => ({ name: 'approval', reason: BigInt(1) }) }];
+            : message === 'plain entry'
+              ? [{ name: 'approval', reason: 'delete foo?' }]
+              : [{ toJSON: () => ({ name: 'approval', reason: BigInt(1) }) }];
         throw Object.assign(new Error('interrupt'), { interrupts });
       },
     },
   });
   const history = await worker.runUntil(async () => {
-    const handle = await startWorkflow(failActivities, { args: [['no toJSON', 'BigInt reason']] });
+    const handle = await startWorkflow(failActivities, { args: [['no toJSON', 'plain entry', 'BigInt reason']] });
     await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
     return handle.fetchHistory();
   });
-  const failures = activityFailures(history) as { message: string; type: string; nonRetryable: boolean }[];
-  t.deepEqual(
-    failures.map(({ type, nonRetryable }) => ({ type, nonRetryable })),
-    [
-      { type: 'Error', nonRetryable: true },
-      { type: 'Error', nonRetryable: true },
-    ]
-  );
-  t.true(failures.every((f) => f.message.startsWith('malformed interrupt')));
+  const malformed = {
+    message:
+      'malformed interrupt (interrupt): each entry needs a toJSON() that returns an object with a string name, and JSON-encodable values',
+    type: STRANDS_MALFORMED_INTERRUPT_TYPE,
+    nonRetryable: true,
+  };
+  t.deepEqual(activityFailures(history), [malformed, malformed, malformed]);
 });
 
 test('a context overflow in the model activity lets the agent trim the conversation', async (t) => {
@@ -997,30 +1040,110 @@ test('a context overflow in the model activity lets the agent trim the conversat
   await worker.runUntil(async () => {
     const result = await executeWorkflow(turnsAgent, {
       args: [['1', '2', '3', '4']],
-      workflowExecutionTimeout: '20 seconds',
+      workflowExecutionTimeout: '30 seconds',
     });
     t.deepEqual(result, ['four', 6]);
   });
 });
 
-test('a Strands terminal error thrown in workflow code fails the run as non-retryable', async (t) => {
+test('a context overflow the agent cannot trim fails the run as non-retryable', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
-  // The model stops at its token limit, so Strands throws `MaxTokensError` in workflow code.
-  const maxTokensTurn: ModelStreamEvent[] = [
-    ...textTurn('cut off').slice(0, -1),
-    { type: 'modelMessageStopEvent', stopReason: 'maxTokens' },
-  ];
+  // The model holds no message, so the overflow survives every trim.
   const worker = await createWorker({
-    plugins: [new StrandsPlugin({ models: { test: () => new StubModel([maxTokensTurn]) } })],
+    plugins: [new StrandsPlugin({ models: { test: () => new SmallContextModel(0, []) } })],
   });
   await worker.runUntil(async () => {
-    // Without the rewrite the workflow task fails on every attempt until this timeout.
-    const handle = await startWorkflow(helloAgent, { args: ['hello'], workflowExecutionTimeout: '10 seconds' });
+    const handle = await startWorkflow(helloAgent, { args: ['hello'], workflowExecutionTimeout: '30 seconds' });
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    t.deepEqual(err?.cause instanceof ApplicationFailure && [err.cause.type, err.cause.nonRetryable], [
+      'ContextWindowOverflowError',
+      true,
+    ]);
+    // The model activity's failure stays in the cause chain.
+    const causes: Error[] = [];
+    for (let cause: unknown = err?.cause; cause instanceof Error; cause = cause.cause) causes.push(cause);
+    t.true(causes.some((cause) => cause instanceof ActivityFailure));
+  });
+});
+
+test('a Strands terminal error thrown in workflow code fails the run as non-retryable', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin({ models: { test: () => new StubModel([maxTokensTurn('cut off')]) } })],
+  });
+  await worker.runUntil(async () => {
+    // Before, the workflow task failed on every attempt until this timeout.
+    const handle = await startWorkflow(helloAgent, { args: ['hello'], workflowExecutionTimeout: '30 seconds' });
     const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
     t.deepEqual(err?.cause instanceof ApplicationFailure && [err.cause.type, err.cause.nonRetryable], [
       'MaxTokensError',
       true,
     ]);
+  });
+});
+
+test('a Strands terminal error in an update handler fails the update', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin({ models: { test: () => new StubModel([maxTokensTurn('cut off')]) } })],
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(updateTurnsAgent, { workflowExecutionTimeout: '30 seconds' });
+    const err = await t.throwsAsync(handle.executeUpdate(turnUpdate, { args: ['hello'] }), {
+      instanceOf: WorkflowUpdateFailedError,
+    });
+    t.deepEqual(err?.cause instanceof ApplicationFailure && [err.cause.type, err.cause.nonRetryable], [
+      'MaxTokensError',
+      true,
+    ]);
+    // The run itself goes on.
+    await handle.signal(doneSignal);
+    t.is(await handle.result(), 'finished');
+  });
+});
+
+test('a cancel during a model activity cancels the run', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  let modelStarted!: () => void;
+  const started = new Promise<void>((resolve) => (modelStarted = resolve));
+  // A model call that takes 3 seconds, so the cancel arrives while it runs.
+  class SlowModel extends StubModel {
+    override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+      modelStarted();
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      yield* super.stream(messages, options);
+    }
+  }
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin({ models: { test: () => new SlowModel([textTurn('late')]) } })],
+  });
+  await worker.runUntil(async () => {
+    // Before, the workflow task failed on every attempt and the run stayed open.
+    const handle = await startWorkflow(helloAgent, { args: ['hello'], workflowExecutionTimeout: '30 seconds' });
+    await started;
+    await handle.cancel();
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    t.true(err?.cause instanceof CancelledFailure);
+  });
+});
+
+test('a model activity that fails for good fails the run', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  class RejectingModel extends StubModel {
+    // eslint-disable-next-line require-yield
+    override async *stream(): AsyncIterable<ModelStreamEvent> {
+      throw ApplicationFailure.nonRetryable('the provider rejected the request', 'ProviderError');
+    }
+  }
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin({ models: { test: () => new RejectingModel([]) } })],
+  });
+  await worker.runUntil(async () => {
+    // Before, the workflow task failed on every attempt and the run stayed open.
+    const handle = await startWorkflow(helloAgent, { args: ['hello'], workflowExecutionTimeout: '30 seconds' });
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    t.true(err?.cause instanceof ActivityFailure);
+    t.deepEqual(err?.cause?.cause instanceof ApplicationFailure && err.cause.cause.type, 'ProviderError');
   });
 });
 
