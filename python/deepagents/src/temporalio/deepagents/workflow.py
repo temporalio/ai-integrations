@@ -14,6 +14,7 @@ still works without it.
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import importlib
 import warnings
@@ -194,6 +195,30 @@ async def call_backend_op(
 # ---------------------------------------------------------------------------
 
 
+@dataclasses.dataclass
+class _MidTurn:
+    """What ``run_deep_agent`` shares with ``ContinueAsNewMiddleware`` for one turn."""
+
+    continue_as_new_after: int | None
+    model_steps: int = 0
+    cut: bool = False
+
+
+# Set by run_deep_agent around agent.ainvoke(...). LangGraph tasks copy the
+# context they start in, so every model step of the turn sees the same holder.
+_mid_turn: contextvars.ContextVar[_MidTurn | None] = contextvars.ContextVar(
+    "_deepagents_mid_turn", default=None
+)
+
+
+def _past_limit(continue_as_new_after: int | None) -> bool:
+    if continue_as_new_after is None:
+        # Default: follow the server's judgement. The suggestion accounts for
+        # history count AND size limits, which a fixed event threshold cannot.
+        return workflow.info().is_continue_as_new_suggested()
+    return workflow.info().get_current_history_length() >= continue_as_new_after
+
+
 def _merge_snapshot(input: Any, snapshot: Mapping[str, Any]) -> Any:
     """Prepend a snapshot's carried messages onto the next turn's input.
 
@@ -244,6 +269,10 @@ async def run_deep_agent(
     limit, its messages are carried into a fresh run via
     ``workflow.continue_as_new``. Only legacy executions carry the result cache.
 
+    With :class:`~temporalio.deepagents.ContinueAsNewMiddleware` on the agent,
+    the same limit also ends a turn at its next model step, and the unfinished
+    turn is carried into the fresh run, where the agent continues it.
+
     By default (``continue_as_new_after=None``) the limit is the server's own
     recommendation — ``workflow.info().is_continue_as_new_suggested()`` — which
     accounts for both history length and size; this is the recommended mode.
@@ -273,6 +302,8 @@ async def run_deep_agent(
     else:
         _serde.set_result_cache({})
 
+    mid_turn = _MidTurn(continue_as_new_after)
+    token = _mid_turn.set(mid_turn)
     try:
         result = await agent.ainvoke(input)
     except ApplicationError:
@@ -284,16 +315,14 @@ async def run_deep_agent(
         if cause is not None and workflow.is_failure_exception(cause):
             raise DeepAgentsWorkflowError(f"Deep Agents run failed: {exc}") from cause
         raise
+    finally:
+        _mid_turn.reset(token)
 
-    if continue_as_new_after is None:
-        # Default: follow the server's judgement. The suggestion accounts for
-        # history count AND size limits, which a fixed event threshold cannot.
-        should_continue = workflow.info().is_continue_as_new_suggested()
-    else:
-        should_continue = (
-            workflow.info().get_current_history_length() >= continue_as_new_after
-        )
-    if should_continue and _has_pending_work(result):
+    # A turn that ContinueAsNewMiddleware ended early is unfinished by
+    # definition, whether or not the agent keeps todos.
+    if mid_turn.cut or (
+        _past_limit(continue_as_new_after) and _has_pending_work(result)
+    ):
         carried = _extract_messages(result)
         if not carried:
             # A turn may report pending todos with an empty/pruned transcript;
