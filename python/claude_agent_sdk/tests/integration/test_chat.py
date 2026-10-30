@@ -103,6 +103,14 @@ async def test_each_prompt_is_a_turn_of_one_conversation(harness: Harness) -> No
     assert len(harness.cli_pids()) == 1
 
 
+async def test_closing_the_client_while_a_read_runs_logs_no_error(
+    harness: Harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    await harness.run(ANSWERS, ["write it"], close_after=1)
+
+    assert "Fatal error in message reader" not in caplog.text
+
+
 class LosesTheFirstPromptWrite(Interceptor):
     """Fails the first prompt's write after Claude Code got it, as if its result was lost, so Temporal retries it."""
 
