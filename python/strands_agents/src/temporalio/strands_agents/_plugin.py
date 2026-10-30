@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import replace
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from botocore.config import Config as BotocoreConfig
 from strands.models import BedrockModel, Model
@@ -44,17 +44,24 @@ class StrandsPlugin(SimplePlugin):
     on first use, then cached for the worker's lifetime. Use the same name in
     ``TemporalAgent(model=...)`` inside the workflow.
 
-    When ``mcp_clients`` is supplied, registers the ``temporalio-mcp``
-    activities (``temporalio.mcp.{server}.list-tools``,
+    When ``mcp_clients`` is supplied, registers the activities of a
+    ``temporalio.mcp.MCPPlugin`` (``temporalio.mcp.{server}.list-tools``,
     ``temporalio.mcp.{server}.call-tool`` and the other MCP operations) for each
-    entry. Each factory returns an ``mcp.Client`` (MCP Python SDK v2) and needs
-    the ``mcp`` extra. Workflow-side ``TemporalMCPClient(server="...")``
-    discovers tools by running ``list-tools``; whether it lists once per
-    workflow or once per agent turn is controlled by its ``cache_tools`` option.
+    entry. Each factory takes no arguments, returns an ``mcp.Client`` (MCP
+    Python SDK v2) and needs the ``mcp`` extra. Workflow-side
+    ``TemporalMCPClient(server="...")`` discovers tools by running
+    ``list-tools``; whether it lists once per workflow or once per agent turn is
+    controlled by its ``cache_tools`` option. Don't register the same server
+    name through ``MCPPlugin`` or ``OpenAIAgentsPlugin`` on the same worker:
+    the activity names clash.
 
     ``mcp_connection_idle_timeout`` controls how long a worker-process MCP
     connection is kept open between activities before it is disconnected; the
-    timer resets on every reuse. Defaults to 5 minutes.
+    timer resets on every reuse. Defaults to 5 minutes. ``None`` keeps
+    connections until the worker shuts down, and zero closes them as soon as
+    they are idle. Only servers that negotiate the modern MCP protocol share a
+    connection; a server on an older protocol, such as one built with MCP
+    Python SDK 1.x, gets a new connection for every activity.
 
     When ``sandboxes`` is supplied, registers one stable set of activities that
     dispatches each operation by sandbox name. Each factory receives the
@@ -73,7 +80,7 @@ class StrandsPlugin(SimplePlugin):
         models: dict[str, Callable[[], Model]] | None = None,
         mcp_clients: dict[str, Callable[[], Client]] | None = None,
         sandboxes: dict[str, SandboxFactory] | None = None,
-        mcp_connection_idle_timeout: timedelta | None = None,
+        mcp_connection_idle_timeout: timedelta | None = timedelta(minutes=5),
         resolvable_worker_env_vars: Collection[str] | AllowAllWorkerEnvVars = (),
     ) -> None:
         """Build the plugin from optional model, MCP, and sandbox factories.
@@ -112,27 +119,25 @@ class StrandsPlugin(SimplePlugin):
         if sandbox_activities is not None:
             activities.extend(sandbox_activities.activities())
 
-        mcp_activities = None
+        mcp_plugin = None
         if mcp_clients:
             try:
-                from temporalio.mcp._activities import _MCPActivities
-                from temporalio.mcp._client import _mcp_client_backend_factory
+                from temporalio.mcp import MCPPlugin
             except ImportError as err:
                 raise RuntimeError(
                     "mcp_clients requires the 'mcp' extra and MCP Python SDK v2; "
                     "install temporalio-strands-agents[mcp]"
                 ) from err
 
-            mcp_activities = _MCPActivities(
+            mcp_plugin = MCPPlugin(
                 {
-                    server: _mcp_client_backend_factory(server, factory)
+                    server: _without_argument(factory)
                     for server, factory in mcp_clients.items()
                 },
-                idle_timeout=timedelta(minutes=5)
-                if mcp_connection_idle_timeout is None
-                else mcp_connection_idle_timeout,
+                connection_idle_timeout=mcp_connection_idle_timeout,
             )
-            activities.extend(mcp_activities.activities)
+            # MCPPlugin passes its activities as a list.
+            activities.extend(cast(Sequence[Callable], mcp_plugin.activities))
 
         super().__init__(
             "aws.StrandsPlugin",
@@ -142,8 +147,17 @@ class StrandsPlugin(SimplePlugin):
             # Strands re-raises this when its conversation manager cannot reduce the
             # context any further; fail the workflow instead of retrying the task forever.
             workflow_failure_exception_types=[ContextWindowOverflowException],
-            run_context=mcp_activities.run_context if mcp_activities else None,
+            run_context=mcp_plugin.run_context if mcp_plugin else None,
         )
+
+
+def _without_argument(factory: Callable[[], Client]) -> Callable[[], Client]:
+    # MCPPlugin passes a factory argument (None) to any factory with a positional
+    # parameter, even a defaulted one such as ``lambda params=params: ...``.
+    def create() -> Client:
+        return factory()
+
+    return create
 
 
 def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:

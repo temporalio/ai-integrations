@@ -1,6 +1,8 @@
+import asyncio
 import sys
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from mcp import Client as MCPClient
@@ -13,16 +15,14 @@ from temporalio.worker import Replayer, Worker
 from tests.common import get_activities
 from tests.mock_model import MockModel
 
+_ECHO_PARAMS = StdioServerParameters(
+    command=sys.executable,
+    args=[str(Path(__file__).parent / "echo_mcp_server.py")],
+)
+
 
 def _echo_client_factory() -> MCPClient:
-    return MCPClient(
-        stdio_client(
-            StdioServerParameters(
-                command=sys.executable,
-                args=[str(Path(__file__).parent / "echo_mcp_server.py")],
-            )
-        )
-    )
+    return MCPClient(stdio_client(_ECHO_PARAMS))
 
 
 @workflow.defn
@@ -47,6 +47,12 @@ class MCPWorkflow:
 
 async def test_mcp(client: Client):
     task_queue = f"test_mcp-{uuid4()}"
+
+    # A default that captures the server's parameters, as in a loop over
+    # servers; the plugin must still call the factory with no arguments.
+    def echo_factory(params: StdioServerParameters = _ECHO_PARAMS) -> MCPClient:
+        return MCPClient(stdio_client(params))
+
     plugin = StrandsPlugin(
         models={
             "mock": lambda: MockModel(
@@ -56,7 +62,7 @@ async def test_mcp(client: Client):
                 ]
             )
         },
-        mcp_clients={"echo": _echo_client_factory},
+        mcp_clients={"echo": echo_factory},
     )
 
     async with Worker(
@@ -112,14 +118,20 @@ class MCPReuseWorkflow:
 async def test_mcp_reuses_connection(client: Client):
     """Successive MCP tool calls reuse one cached worker-side connection."""
     task_queue = f"test_mcp_reuses_connection-{uuid4()}"
-    # Count how often the worker opens a connection. One lazily-opened
-    # connection serves the list-tools discovery and both tool calls (1);
-    # reconnecting per call would make it more.
+    # Count how often the worker opens and closes a connection. One
+    # lazily-opened connection serves the list-tools discovery and both tool
+    # calls (1); reconnecting per call would make it more.
     factory_calls = [0]
+    closed = asyncio.Event()
+
+    class ClosingClient(MCPClient):
+        async def __aexit__(self, *args: Any) -> None:
+            await super().__aexit__(*args)
+            closed.set()
 
     def counting_factory() -> MCPClient:
         factory_calls[0] += 1
-        return _echo_client_factory()
+        return ClosingClient(stdio_client(_ECHO_PARAMS))
 
     plugin = StrandsPlugin(
         models={
@@ -148,8 +160,12 @@ async def test_mcp_reuses_connection(client: Client):
             task_queue=task_queue,
         )
         assert await handle.result() == "Done!\n"
+        assert not closed.is_set()
 
     assert factory_calls[0] == 1
+    # Worker shutdown closes the cached connection. Leaving ``async with Worker``
+    # does not wait for that, so wait for it here.
+    await asyncio.wait_for(closed.wait(), timeout=10)
 
     history = await handle.fetch_history()
     assert get_activities(history) == [

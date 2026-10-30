@@ -146,11 +146,7 @@ _MCPClientFactory = Callable[[], Client] | Callable[[Any], Client]
 def _mcp_client_backend_factory(
     name: str, factory: _MCPClientFactory
 ) -> _MCPBackendFactory:
-    """Adapt a public MCP client factory to the shared Activity backend.
-
-    ``temporalio-strands-agents`` calls this; a change to it is a coordinated
-    release with that package.
-    """
+    """Adapt a public MCP client factory to the shared Activity backend."""
     invoke = _FactoryInvoker(name, factory)
 
     def create(argument: Any = _NOT_SUPPLIED) -> _MCPClientBackend:
