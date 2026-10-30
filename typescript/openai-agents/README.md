@@ -513,15 +513,17 @@ Dedicated Worker startup and heartbeat failures surface as `ApplicationFailure` 
 
 ### MCP tool filters
 
-A static `toolFilter` on the server your factory returns, such as `createMCPToolStaticFilter({ blocked: ['delete_file'] })`, applies in the list-tools Activity. The agent never sees a blocked tool.
+A static `toolFilter` on the server your factory returns, such as `createMCPToolStaticFilter({ blocked: ['delete_file'] })`, applies in the list-tools Activity, so the model is not offered a blocked tool. The filter applies only to the tool list: a run that listed tools before the Worker was upgraded keeps that list while it is cached.
 
-A callable filter gets the agent and the run context, which exist only in the Workflow. Pass it as the `toolFilter` option of `statelessMcpServer()` or `statefulMcpServer()` instead; it runs in Workflow code and must be deterministic. The Worker skips a callable filter on the factory's server and logs a warning.
+A callable filter gets the agent and the run context, which exist only in the Workflow, so the Worker refuses one on the factory's server: every MCP Activity for that server fails with a non-retryable `ApplicationFailure` of type `MCPToolFilterUnsupported`. Pass it as the `toolFilter` option of `statelessMcpServer()` or `statefulMcpServer()` instead:
 
 ```ts
 const server = statelessMcpServer('files', {
   toolFilter: async ({ agent }, tool) => tool.name !== 'delete_file' || agent.name === 'FileAdmin',
 });
 ```
+
+The agent applies this option in the Workflow each time it lists tools; the handle caches the server's full tool list, not the filtered one. A callable filter runs for each tool on every listing, gets the name the server was registered with as `serverName`, and must be deterministic. An Activity or timer it awaits adds commands that older plugin versions never schedule, so let Workflows that use the option finish before you roll the plugin back.
 
 ## Sandbox agents
 

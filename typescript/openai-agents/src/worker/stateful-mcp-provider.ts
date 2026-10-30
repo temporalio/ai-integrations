@@ -10,7 +10,7 @@ import {
   type StatefulMcpServerSessionArgs,
 } from '../common/mcp-types';
 import { startAdaptiveHeartbeat } from './heartbeat';
-import { filterListedTools } from './mcp-provider';
+import { filterListedTools, rejectCallableToolFilter } from './mcp-provider';
 
 export function registerCancelShutdown(ctx: Context, dedicatedWorker: { shutdown: () => void }): void {
   ctx.cancelled.catch(() => {
@@ -73,6 +73,7 @@ export class StatefulMCPServerProvider {
           nonRetryable: true,
         });
       }
+      rejectCallableToolFilter(server);
       return server;
     };
 

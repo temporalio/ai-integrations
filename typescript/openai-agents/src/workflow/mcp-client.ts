@@ -1,20 +1,20 @@
-import type { MCPServer, MCPToolFilterCallable, MCPToolFilterStatic } from '@openai/agents-core';
+import type { MCPServer } from '@openai/agents-core';
 import type { Duration, RetryPolicy } from '@temporalio/common';
 import { proxyActivities } from '@temporalio/workflow';
-import { MCP_CALL_TOOL_SUFFIX, MCP_LIST_TOOLS_SUFFIX, MCP_STATELESS_SUFFIX } from '../common/mcp-types';
+import {
+  MCP_CALL_TOOL_SUFFIX,
+  MCP_LIST_TOOLS_SUFFIX,
+  MCP_STATELESS_SUFFIX,
+  type McpServerHandleOptions,
+} from '../common/mcp-types';
 
-export interface StatelessMcpServerOptions {
+export interface StatelessMcpServerOptions extends McpServerHandleOptions {
   cacheToolsList?: boolean;
   startToCloseTimeout?: Duration;
   heartbeatTimeout?: Duration;
   taskQueue?: string;
   retryPolicy?: RetryPolicy;
   factoryArgument?: unknown;
-  /**
-   * Tool filter the agent applies in the Workflow, as for a native MCP server. A callable filter
-   * gets the agent and the run context, and must be deterministic.
-   */
-  toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
 }
 
 export function statelessMcpServer(name: string, options?: StatelessMcpServerOptions): MCPServer {
@@ -34,7 +34,11 @@ export function statelessMcpServer(name: string, options?: StatelessMcpServerOpt
   const factoryArg = options?.factoryArgument;
 
   return {
-    cacheToolsList: shouldCache,
+    // The agent SDK caches the filtered list, so with a filter only this handle caches, and the
+    // agent filters every listing.
+    get cacheToolsList() {
+      return shouldCache && !this.toolFilter;
+    },
     toolFilter: options?.toolFilter,
     get name() {
       return name;

@@ -2,9 +2,11 @@
 // the sibling `*.test.ts` files.
 import { createMCPToolStaticFilter, setTracingDisabled } from '@openai/agents-core';
 import type { MCPServer } from '@openai/agents-core';
-import { WorkflowClient } from '@temporalio/client';
+import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
+import type { ApplicationFailure } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
+import type { NativeConnection } from '@temporalio/worker';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import {
   OpenAIAgentsPlugin,
@@ -160,11 +162,11 @@ test('factoryArgument is passed through to MCP activities', async (t) => {
   });
 });
 
-function filterTestServer(name: string): MCPServer {
+function filterTestServer(name: string, toolFilter: MCPServer['toolFilter']): MCPServer {
   return {
     cacheToolsList: false,
     name,
-    toolFilter: createMCPToolStaticFilter({ blocked: ['danger_tool'] }),
+    toolFilter,
     async connect() {},
     async close() {},
     async listTools() {
@@ -186,40 +188,73 @@ function filterTestServer(name: string): MCPServer {
   };
 }
 
-test('MCP tool filters apply on stateless and stateful servers', async (t) => {
-  const { createWorker, executeWorkflow } = helpers(t);
+function filterTestProviders(toolFilter: MCPServer['toolFilter'], nativeConnection: NativeConnection) {
+  return [
+    new StatelessMCPServerProvider('filterStateless', () => filterTestServer('filterStateless', toolFilter)),
+    new StatefulMCPServerProvider('filterStateful', () => filterTestServer('filterStateful', toolFilter), nativeConnection),
+  ];
+}
 
-  const modelProvider = new FakeModelProvider([textResponse('stateless done'), textResponse('stateful done')]);
+test('MCP tool filters apply on stateless and stateful servers', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+
+  const modelProvider = new FakeModelProvider(Array.from({ length: 6 }, () => textResponse('done')));
   const worker = await createWorker({
     plugins: [
       new OpenAIAgentsPlugin({
         modelProvider,
-        mcpServerProviders: [
-          new StatelessMCPServerProvider('filterStateless', () => filterTestServer('filterStateless')),
-          new StatefulMCPServerProvider(
-            'filterStateful',
-            () => filterTestServer('filterStateful'),
-            t.context.env.nativeConnection
-          ),
-        ],
+        mcpServerProviders: filterTestProviders(
+          createMCPToolStaticFilter({ blocked: ['danger_tool'] }),
+          t.context.env.nativeConnection
+        ),
       }),
     ],
   });
 
   await worker.runUntil(async () => {
-    t.is(
-      await executeWorkflow(mcpToolFilterWorkflow, { args: [false], workflowExecutionTimeout: '30 seconds' }),
-      'stateless done'
-    );
-    t.is(
-      await executeWorkflow(mcpToolFilterWorkflow, { args: [true], workflowExecutionTimeout: '30 seconds' }),
-      'stateful done'
-    );
+    for (const [stateful, listToolsActivity] of [
+      [false, 'filterStateless-stateless-list-tools'],
+      [true, 'filterStateful-stateful-list-tools'],
+    ] as const) {
+      const handle = await startWorkflow(mcpToolFilterWorkflow, { args: [stateful], workflowExecutionTimeout: '30 seconds' });
+      t.deepEqual(await handle.result(), ['done', 'done', 'done']);
+      // The handle lists the server's tools once; the agent filters that list in every run.
+      const { events } = await handle.fetchHistory();
+      const listings = events?.filter(
+        (e) => e.activityTaskScheduledEventAttributes?.activityType?.name === listToolsActivity
+      );
+      t.is(listings?.length, 1);
+    }
   });
 
-  // `danger_tool` is blocked by the factory server's static filter, `extra_tool` by the Workflow's filter.
+  // `danger_tool` is blocked by the factory server's static filter. The Workflow's filter allows
+  // `extra_tool` only in the first run, whose context is admin.
   const offered = (modelProvider.getModel() as FakeModel).requests.map((r) => r.tools.map((tool) => tool.name));
-  t.deepEqual(offered, [['safe_tool'], ['safe_tool']]);
+  const perWorkflow = [['safe_tool', 'extra_tool'], ['safe_tool'], ['safe_tool']];
+  t.deepEqual(offered, [...perWorkflow, ...perWorkflow]);
+});
+
+test('a callable toolFilter on the factory server fails the run', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([]),
+        mcpServerProviders: filterTestProviders(async () => true, t.context.env.nativeConnection),
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    for (const stateful of [false, true]) {
+      const err = await t.throwsAsync(
+        executeWorkflow(mcpToolFilterWorkflow, { args: [stateful], workflowExecutionTimeout: '30 seconds' }),
+        { instanceOf: WorkflowFailedError }
+      );
+      t.is((err?.cause?.cause as ApplicationFailure | undefined)?.type, 'MCPToolFilterUnsupported');
+    }
+  });
 });
 
 test('summary string is passed through to model activity', async (t) => {
