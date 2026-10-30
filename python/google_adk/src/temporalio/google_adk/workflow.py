@@ -2,6 +2,7 @@
 
 import functools
 import inspect
+import sys
 import types
 import typing
 from dataclasses import dataclass, field
@@ -207,6 +208,14 @@ def _docstring(fn: Any) -> str | None:
     return doc if doc and doc.strip() else None
 
 
+def _mangled(owner: Any, name: str) -> str:
+    """Returns the attribute ``name`` in a class body of ``owner`` is stored as."""
+    prefix = owner.__name__.lstrip("_") if inspect.isclass(owner) else ""
+    if prefix and name.startswith("__") and not name.endswith("__"):
+        return f"_{prefix}{name}"
+    return name
+
+
 def _is_method(fn: Callable) -> bool:
     """Returns whether a function taken from a class is a method it binds.
 
@@ -220,14 +229,17 @@ def _is_method(fn: Callable) -> bool:
         return False
     owner: Any = None
     if "<locals>" not in qualname:
-        owner = fn.__globals__.get(qualname[0])
+        # Look the class up where the function was defined: a decorator's
+        # wrapper keeps the function's __qualname__ and __module__, but has its
+        # own module's globals.
+        module = sys.modules.get(fn.__module__)
+        owner = getattr(inspect.unwrap(fn), "__globals__", {}).get(
+            qualname[0], getattr(module, qualname[0], None)
+        )
         for name in qualname[1:-1]:
-            owner = getattr(owner, name, None)
-    name = qualname[-1]
-    if inspect.isclass(owner) and name.startswith("__") and not name.endswith("__"):
-        name = f"_{owner.__name__.lstrip('_')}{name}"
+            owner = getattr(owner, _mangled(owner, name), None)
     try:
-        attr = inspect.getattr_static(owner, name)
+        attr = inspect.getattr_static(owner, _mangled(owner, qualname[-1]))
     except AttributeError:
         attr = None
     if not inspect.isclass(owner) or attr is None:

@@ -61,6 +61,7 @@ from temporalio.google_adk._model import (
 )
 from temporalio.worker import Worker
 from temporalio.workflow import ActivityConfig
+from tests.helpers.decorators import passthrough
 from tests.helpers.opentelemetry import dump_spans
 
 logger = logging.getLogger(__name__)
@@ -846,6 +847,37 @@ class ComplexActivityMethodHolder:
         complex_activity_inputs_seen["echo_static"] = self
         return f"static:{self}"
 
+    @staticmethod
+    @activity.defn
+    @passthrough
+    async def echo_decorated(self) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType, reportSelfClsParameterName]
+        """Staticmethod wrapped by a decorator from another module."""
+        complex_activity_inputs_seen["echo_decorated"] = self
+        return f"decorated:{self}"
+
+    @activity.defn
+    @passthrough
+    async def count_decorated(self, passengers: int) -> str:
+        """Method wrapped by a decorator from another module."""
+        return f"{self.prefix}:{passengers}"
+
+    class __Private:
+        """Its attribute in the class is mangled: ``_ComplexActivityMethodHolder__Private``."""
+
+        @staticmethod
+        @activity.defn
+        async def echo_private(self) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType, reportSelfClsParameterName]
+            """Staticmethod of a private nested class."""
+            complex_activity_inputs_seen["echo_private"] = self
+            return f"private:{self}"
+
+        @activity.defn
+        async def count_private(self, passengers: int) -> str:
+            """Method of a private nested class."""
+            return str(passengers)
+
+    private_owner = __Private
+
 
 @activity.defn
 class QuoteTrip:
@@ -917,6 +949,14 @@ class ComplexActivityInputAgent:
                 ),
                 temporalio.google_adk.workflow.activity_as_tool(
                     ComplexActivityMethodHolder.echo_static,
+                    start_to_close_timeout=timedelta(seconds=60),
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    ComplexActivityMethodHolder.echo_decorated,
+                    start_to_close_timeout=timedelta(seconds=60),
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    ComplexActivityMethodHolder.private_owner.echo_private,
                     start_to_close_timeout=timedelta(seconds=60),
                 ),
             ],
@@ -1067,6 +1107,30 @@ class ComplexActivityInputModel(TestModel):
             LlmResponse(
                 content=Content(
                     role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="echo_decorated", args={"self": "ghi"}
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="echo_private", args={"self": "jkl"}
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
                     parts=[Part(text="completed complex input tool calls")],
                 )
             ),
@@ -1097,6 +1161,8 @@ async def test_activity_as_tool_supports_complex_inputs_via_adk(client: Client):
             TrackParcel("worker"),
             echo_self,
             method_holder.echo_static,
+            method_holder.echo_decorated,
+            ComplexActivityMethodHolder.private_owner.echo_private,
         ],
         workflows=[ComplexActivityInputAgent],
         max_cached_workflows=0,
@@ -1127,6 +1193,8 @@ async def test_activity_as_tool_supports_complex_inputs_via_adk(client: Client):
             "TrackParcel": ("worker", "abc"),
             "echo_self": "abc",
             "echo_static": "def",
+            "echo_decorated": "ghi",
+            "echo_private": "jkl",
         }
 
 
@@ -1347,6 +1415,19 @@ def test_activity_as_tool_preserves_metadata() -> None:
         start_to_close_timeout=timedelta(seconds=30),
     )
     assert list(inspect.signature(static_tool).parameters) == ["self"]
+
+    # The class is found where the function was defined, though a decorator
+    # from another module wraps it, and through a private nested class.
+    for fn, params in [
+        (ComplexActivityMethodHolder.echo_decorated, ["self"]),
+        (ComplexActivityMethodHolder.count_decorated, ["passengers"]),
+        (ComplexActivityMethodHolder.private_owner.echo_private, ["self"]),
+        (ComplexActivityMethodHolder.private_owner.count_private, ["passengers"]),
+    ]:
+        tool = temporalio.google_adk.workflow.activity_as_tool(
+            fn, start_to_close_timeout=timedelta(seconds=30)
+        )
+        assert list(inspect.signature(tool).parameters) == params, fn.__qualname__
 
 
 def test_activity_as_tool_rejects_method_of_unreachable_class() -> None:
