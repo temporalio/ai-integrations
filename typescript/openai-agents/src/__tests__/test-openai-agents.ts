@@ -857,6 +857,10 @@ test('Approval resume keeps the caller context object', async (t) => {
           toolCallResponse('set_after', { value: 'S-2' }, 'call_set_after_2'),
           toolCallResponse('set_after', { value: 'S-after' }, 'call_set_after_3'),
           textResponse('done'),
+          toolCallResponse('set_after', { value: 'A' }, 'call_shared_a'),
+          toolCallResponse('set_after', { value: 'B' }, 'call_shared_b'),
+          textResponse('done A'),
+          textResponse('done B'),
         ]),
       }),
     ],
@@ -867,6 +871,7 @@ test('Approval resume keeps the caller context object', async (t) => {
   );
 
   // Each resume keys the approvals under a new converted agent graph; only the last one keeps them.
+  // Resuming state A drops only A's previous graph, so state B still runs its approved call.
   t.deepEqual(result, {
     callerAfter: 'S-after',
     resumedUsesCallerObject: true,
@@ -875,5 +880,7 @@ test('Approval resume keeps the caller context object', async (t) => {
     failedResumeThrew: true,
     approvalOwners: 1,
     approvedCallIds: 3,
+    sharedContextWrites: ['A', 'B'],
+    sharedContextInterruptions: 0,
   });
 });

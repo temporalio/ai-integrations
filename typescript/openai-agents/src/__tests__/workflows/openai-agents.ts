@@ -1,4 +1,4 @@
-import { Agent, type MCPToolFilterContext, tool } from '@openai/agents-core';
+import { Agent, type MCPToolFilterContext, RunState, tool } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
@@ -260,6 +260,8 @@ export interface ApprovalResumeContextResult {
   failedResumeThrew: boolean;
   approvalOwners: number;
   approvedCallIds: number;
+  sharedContextWrites: string[];
+  sharedContextInterruptions: number;
 }
 
 /** Serialized approval record, as the `RunContext` internal below returns it. */
@@ -290,7 +292,8 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
 /**
  * Approves a tool that writes the run context and resumes the same `RunState` until the run
  * finishes, then reads the caller's context object. The first resume uses an agent the state
- * doesn't match, which must fail without losing the approval.
+ * doesn't match, which must fail without losing the approval. Then two paused states share one
+ * `RunContext`, both are approved, and resuming the first must keep the second's approval.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -333,12 +336,29 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     }
     result = await runner.run(agent, result.state);
   }
+  const owners = countApprovalOwners(result.runContext);
+
+  const sharedAgentA = new Agent<ResumeContext>({ name: 'SharedAgentA', model: 'gpt-4o-mini', tools: [setAfter] });
+  const sharedAgentB = new Agent<ResumeContext>({ name: 'SharedAgentB', model: 'gpt-4o-mini', tools: [setAfter] });
+  const sharedCtx: ResumeContext = { original: 'shared', writes: [] };
+  const pausedA = await runner.run(sharedAgentA, 'go', { context: sharedCtx });
+  const pausedB = await runner.run(sharedAgentB, 'go', { context: sharedCtx });
+  // State A keeps the converted graph its run produced; state B is rehydrated onto A's context.
+  const stateA = pausedA.state;
+  const stateB = await RunState.fromStringWithContext(sharedAgentB, pausedB.state.toString(), stateA._context);
+  stateA.approve(stateA.getInterruptions()[0]!);
+  stateB.approve(stateB.getInterruptions()[0]!);
+  const resumedA = await runner.run(sharedAgentA, stateA);
+  const resumedB = await runner.run(sharedAgentB, stateB);
+
   return {
     callerAfter: ctx.after,
     resumedUsesCallerObject: result.runContext.context === ctx,
     writes: ctx.writes,
     approvalRounds,
     failedResumeThrew,
-    ...countApprovalOwners(result.runContext),
+    ...owners,
+    sharedContextWrites: sharedCtx.writes,
+    sharedContextInterruptions: resumedA.interruptions.length + resumedB.interruptions.length,
   };
 }
