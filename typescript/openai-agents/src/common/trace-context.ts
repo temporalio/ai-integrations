@@ -8,7 +8,7 @@ import {
   type Span as AgentSpan,
   type SpanError,
 } from '@openai/agents-core';
-import type { AgentsSpanHeader } from './headers';
+import { markTracingApiKeyResolved, type AgentsSpanHeader } from './headers';
 import { agentTraceIdToOtelTraceId } from './tracing-bridge';
 
 export function withSpanAsCurrent<T>(span: unknown, fn: () => T): T {
@@ -57,6 +57,7 @@ export function withScopedSpan<S extends SpanWithLifecycle, T>(span: S, fn: () =
 export function withRestoredAgentsTraceContext<T>(header: AgentsSpanHeader, fn: () => T, tracingApiKey?: string): T {
   if (!header.traceId) return fn();
   const trace = new Trace({ traceId: header.traceId, name: header.traceName, tracingApiKey });
+  if (tracingApiKey != null) markTracingApiKeyResolved(trace);
   const span = header.spanId
     ? getGlobalTraceProvider().createSpan<CustomSpanData>(
         { spanId: header.spanId, data: { type: 'custom', name: '', data: {} } },

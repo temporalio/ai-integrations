@@ -27,6 +27,7 @@ import {
   type SerializableModelActivityOptions,
 } from '../common/model-activity-options';
 import { unwrapTemporalFailure } from '../common/errors';
+import { refuseTracingApiKey } from '../common/headers';
 import { convertAgent } from './convert-agent';
 import { TemporalSandboxClient } from './sandbox-client';
 import { ensureTracingProcessorRegistered } from './tracing';
@@ -239,6 +240,9 @@ export class TemporalOpenAIRunner {
     input: string | AgentInputItem[] | RunState<TContext, TAgent>,
     options?: TemporalRunOptions<TContext>
   ): Promise<RunResult<any, TAgent> | StreamedRunResult<TContext, TAgent>> {
+    // Model calls run in an Activity, which cannot get the run's own tracing key.
+    refuseTracingApiKey(options?.tracing?.apiKey);
+
     const session = options?.session;
     if (session instanceof MemorySession) {
       throw ApplicationFailure.create({

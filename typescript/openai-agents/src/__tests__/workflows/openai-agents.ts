@@ -1,4 +1,4 @@
-import { Agent, type MCPToolFilterContext } from '@openai/agents-core';
+import { Agent, type MCPToolFilterContext, withTrace } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
@@ -239,4 +239,23 @@ export async function tracingApiKeyWorkflow(apiKey?: string): Promise<string> {
   const runner = new TemporalOpenAIRunner();
   const result = await runner.run(agent, 'Hello', apiKey ? { tracing: { apiKey } } : undefined);
   return result.finalOutput ?? '';
+}
+
+export async function tracingKeyRefusedWorkflow(entryPoint: 'run' | 'withTrace'): Promise<string> {
+  const agent = new Agent({
+    name: 'TracingKeyAgent',
+    instructions: 'You are a helpful assistant.',
+    model: 'gpt-4o-mini',
+  });
+  const runner = new TemporalOpenAIRunner();
+  try {
+    if (entryPoint === 'run') {
+      await runner.run(agent, 'Hello', { tracing: { apiKey: 'sk-run' } });
+    } else {
+      await withTrace('workflow-trace', () => runner.run(agent, 'Hello'), { tracingApiKey: 'sk-workflow' });
+    }
+  } catch (e) {
+    return `refused: ${(e as Error).message}`;
+  }
+  return 'not refused';
 }

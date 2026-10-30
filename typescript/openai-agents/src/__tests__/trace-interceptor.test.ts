@@ -1,11 +1,11 @@
 import test from 'ava';
-import { getGlobalTraceProvider, withCustomSpan } from '@openai/agents-core';
+import { getGlobalTraceProvider, withCustomSpan, withTrace } from '@openai/agents-core';
 import type { NexusStartOperationInput, NexusStartOperationOutput } from '@temporalio/worker';
-import { injectAgentsTraceHeaderNexus } from '../common/headers';
+import { currentAgentsSpanHeader, injectAgentsTraceHeaderNexus } from '../common/headers';
 import { OpenAIAgentsTraceNexusInboundInterceptor } from '../worker/trace-interceptor';
 import type { TracingApiKeyContext } from '../worker/trace-interceptor';
 
-test('Nexus handler spans get the key from tracingApiKey', async (t) => {
+test("Nexus handler spans get the key from tracingApiKey, and only a trace's own key is refused", async (t) => {
   getGlobalTraceProvider().setDisabled(false);
   const contexts: TracingApiKeyContext[] = [];
   const interceptor = new OpenAIAgentsTraceNexusInboundInterceptor({
@@ -27,6 +27,11 @@ test('Nexus handler spans get the key from tracingApiKey', async (t) => {
       },
       { data: { name: 'handler-span' } }
     );
+    // The handler can still call Temporal under the restored trace: the resolved key is not the trace's own.
+    t.is(currentAgentsSpanHeader().traceId, 'trace_0123456789abcdef0123456789abcdef');
+    await withTrace('handler-trace', async () => t.throws(() => currentAgentsSpanHeader()), {
+      tracingApiKey: 'sk-own',
+    });
     return {} as NexusStartOperationOutput;
   });
 
