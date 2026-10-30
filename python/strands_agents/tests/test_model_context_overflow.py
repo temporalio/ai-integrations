@@ -145,6 +145,21 @@ def _manager(kind: str, summarizer: Callable[[], Agent]) -> dict[str, Any]:
     }
 
 
+def _redact_on_force_stop(agent: Agent, manager: str) -> Agent:
+    """Rewrites the first prompt when the overflow stops the run, before Strands reduces."""
+    if manager.endswith("redacted_on_force_stop"):
+
+        def callback_handler(**kwargs: Any) -> None:
+            if kwargs.get("force_stop"):
+                agent.messages[0] = {
+                    "role": "user",
+                    "content": [{"text": "[redacted]"}],
+                }
+
+        agent.callback_handler = callback_handler
+    return agent
+
+
 def _client_with(client: Client, plugin: StrandsPlugin) -> Client:
     # The failure converter that tags ContextWindowOverflowException comes from the
     # plugin's data converter, which the activity worker reads from the client config.
@@ -171,7 +186,7 @@ class OverflowAgentWorkflow:
             start_to_close_timeout=timedelta(seconds=15),
             **_manager(manager, summarizer),
         )
-        return str(await agent.invoke_async(prompt))
+        return str(await _redact_on_force_stop(agent, manager).invoke_async(prompt))
 
 
 def _summarizer_model(manager: str) -> SmallContextModel | None:
@@ -188,6 +203,7 @@ def _summarizer_model(manager: str) -> SmallContextModel | None:
         "summarizing",
         "summarization_agent",
         "summarization_agent_reasoning",
+        "summarizing_redacted_on_force_stop",
     ],
 )
 async def test_overflow_is_recovered_by_conversation_manager(
@@ -195,20 +211,25 @@ async def test_overflow_is_recovered_by_conversation_manager(
 ):
     # A plain Agent reduces the context and retries when the model overflows. A
     # summarizing manager first asks the model, or its summarization agent, for a
-    # summary, which it turns into a user message as the Strands version does.
+    # summary, which it turns into a user message as the Strands version does. A
+    # callback handler that changes the history on the overflow's force stop event
+    # changes what is summarized.
     control_model = SmallContextModel()
     control_summarizer = _summarizer_model(manager) or control_model
-    control = await Agent(
+    control_agent = Agent(
         model=control_model,
         messages=_history(),  # type: ignore[arg-type]
         callback_handler=None,
         **_manager(
             manager, lambda: Agent(model=control_summarizer, callback_handler=None)
         ),
-    ).invoke_async("q3")
+    )
+    control = await _redact_on_force_stop(control_agent, manager).invoke_async("q3")
     assert str(control) == "ok\n"
     assert len(control_model.seen) >= 2
     assert control_model.seen[0] == ["q1", "a1", "q2", "a2", "q3"]
+    if manager.endswith("redacted_on_force_stop"):
+        assert control_model.seen[1][0] == "[redacted]"
     assert len(control_model.seen[-1]) <= CONTEXT_WINDOW
 
     # TemporalAgent must behave the same: the overflow fails the first activity

@@ -1,6 +1,6 @@
 import asyncio
 import math
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -12,7 +12,11 @@ from strands.agent.conversation_manager import (
     SummarizingConversationManager,
 )
 from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent, HookCallback
-from strands.types.agent import AgentInput
+from strands.tools.structured_output._structured_output_context import (
+    StructuredOutputContext,
+)
+from strands.types._events import ForceStopEvent, TypedEvent
+from strands.types.agent import AgentInput, Limits
 from strands.types.content import Messages
 from strands.types.exceptions import ContextWindowOverflowException
 
@@ -68,13 +72,15 @@ def _with_proactive_summary(
     return callback
 
 
-async def _prepare_overflow_summary(event: AfterModelCallEvent) -> None:
+# Invocation state key holding a model call's context overflow that Strands will
+# reduce the history for once its force stop event has been delivered.
+_OVERFLOW = "_temporal_context_overflow"
+
+
+def _note_overflow(event: AfterModelCallEvent) -> None:
     overflow = event.exception
-    if not isinstance(overflow, ContextWindowOverflowException) or event.retry:
-        return
-    await prepare_summary(
-        event.agent, lambda manager, agent: manager.reduce_context(agent, e=overflow)
-    )
+    if isinstance(overflow, ContextWindowOverflowException) and not event.retry:
+        event.invocation_state[_OVERFLOW] = overflow
 
 
 class TemporalAgent(Agent):
@@ -153,17 +159,17 @@ class TemporalAgent(Agent):
         # synchronous code, on a thread where TemporalModel cannot run. Await them
         # on the workflow loop just before Strands asks, after any earlier callback
         # has changed the history: in place of the manager's own proactive
-        # compression callback, and after every other callback once a model call
-        # fails with a context overflow, before Strands reduces the history.
+        # compression callback, and, once a model call fails with a context
+        # overflow, after its force stop event is delivered (see
+        # _execute_event_loop_cycle). The overflow is noted after every other
+        # callback, so a callback that asks for a retry prevents it.
         manager = self.conversation_manager
         if isinstance(manager, SummarizingConversationManager):
             threshold = manager._on_before_model_call_threshold
             for entry in self.hooks._registered_callbacks.get(BeforeModelCallEvent, []):
                 if entry.callback == threshold:
                     entry.callback = _with_proactive_summary(threshold)
-        self.hooks.add_callback(
-            AfterModelCallEvent, _prepare_overflow_summary, order=math.inf
-        )
+        self.hooks.add_callback(AfterModelCallEvent, _note_overflow, order=math.inf)
 
         # Strands invokes ToolProvider.load_tools() once at construction on a
         # separate run_async thread that has no workflow runtime, so a
@@ -209,6 +215,38 @@ class TemporalAgent(Agent):
                 reg.replace(tool)
             else:
                 reg.register_tool(tool)
+
+    async def _execute_event_loop_cycle(
+        self,
+        invocation_state: dict[str, Any],
+        structured_output_context: StructuredOutputContext | None = None,
+        limits: Limits | None = None,
+    ) -> AsyncGenerator[TypedEvent, None]:
+        """Await an overflow's summary once its force stop event is delivered.
+
+        After a model call overflows, Strands yields a force stop event, which the
+        callback handler and the stream's consumer see, then raises the overflow,
+        and this method's parent catches it and reduces the history at once. The
+        parent calls this method again to retry, so an inner call's overflow passes
+        through here too; the first to see it takes it.
+        """
+        events = super()._execute_event_loop_cycle(
+            invocation_state, structured_output_context, limits
+        )
+        try:
+            async for event in events:
+                yield event
+                if isinstance(event, ForceStopEvent) and _OVERFLOW in invocation_state:
+                    overflow = invocation_state.pop(_OVERFLOW)
+                    await prepare_summary(
+                        self,
+                        lambda manager, agent: manager.reduce_context(
+                            agent, e=overflow
+                        ),
+                    )
+        finally:
+            invocation_state.pop(_OVERFLOW, None)
+            await events.aclose()
 
     async def _convert_prompt_to_messages(self, prompt: AgentInput) -> Messages:
         """Load the worker-side model's config, then convert the prompt.
