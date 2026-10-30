@@ -35,163 +35,68 @@ import { getCurrentPluginConfig } from './plugin-config-store';
 
 const agentAsToolSandboxConfig = Symbol.for('@temporalio/openai-agents/agentAsToolSandboxConfig');
 
-/** A `convertAgent` call, with the inputs that decide whether a later run would convert the same graph. */
+/** A converted agent graph. */
 interface Conversion {
   source: Agent<any, any>;
-  converted: Agent<any, any>;
-  modelParams: ModelActivityOptions;
-  modelOverride: string | undefined;
-  sandbox: SandboxRunConfig | undefined;
-  /** Each source agent in the graph, with its fields when it was converted. */
-  sourceFields: Map<Agent<any, any>, [string, unknown][]>;
+  /** Each source agent the graph has converted, mapped to its converted agent. */
+  agents: Map<Agent<any, any>, Agent<any, any>>;
+  /** Runs that are using the graph. A resume converts into the graph only while no run uses it. */
+  activeRuns: number;
 }
 
-/** Each converted agent, mapped to the conversion that produced it. */
+/** Each converted agent, mapped to the graph it belongs to. */
 const conversions = new WeakMap<Agent<any, any>, Conversion>();
 
 /**
- * For each `RunContext`, the conversion its latest resume used for each source agent. A state rehydrated
- * onto the source agent doesn't point at a converted agent, so this is how its resume finds the graph that
+ * For each `RunContext`, the graph its latest resume used for each source agent. A state rehydrated onto
+ * the source agent doesn't point at a converted agent, so this is how its resume finds the graph that
  * already owns the context's approvals. It's keyed by context so Workflows that share module-level agents
  * under `reuseV8Context` never share a graph.
  */
 const resumeConversions = new WeakMap<object, Map<Agent<any, any>, Conversion>>();
 
 /**
- * The `SandboxAgent` fields that `SandboxAgent.clone` copies by value (`cloneManifest`, and a new user object
- * for `runAs`), so a change inside them doesn't reach a converted graph. `Agent.clone` and `Handoff.clone`
- * share every other field by reference.
+ * Converts `agent`'s graph. With `into`, the conversion reuses `into`'s agent objects: each one gets the
+ * fields a fresh conversion would give it, and keeps its identity.
  */
-const sandboxAgentFieldsCopiedByValue = new Set(['defaultManifest', 'runAs']);
-
-/** A deep copy of `value`'s contents that `sameValue` compares member by member. Functions stay by identity. */
-function contentSnapshot(value: unknown, ancestors: object[] = []): unknown {
-  if (typeof value !== 'object' || value === null) return value;
-  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
-    const bytes = ArrayBuffer.isView(value)
-      ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
-      : new Uint8Array(value);
-    return { prototype: Object.getPrototypeOf(value), bytes: bytes.slice() };
-  }
-  const cycle = ancestors.indexOf(value);
-  if (cycle !== -1) return { cycle };
-  ancestors.push(value);
-  const entries =
-    value instanceof Map ? [...value] : value instanceof Set ? [...value].entries() : Object.entries(value);
-  const snapshot = {
-    prototype: Object.getPrototypeOf(value),
-    members: [...entries].map(([key, member]) => [contentSnapshot(key, ancestors), contentSnapshot(member, ancestors)]),
-  };
-  ancestors.pop();
-  return snapshot;
-}
-
-/** Snapshots an agent's fields, including those of each `Handoff`, which `convertAgent` clones. */
-function agentFields(agent: Agent<any, any>): [string, unknown][] {
-  return Object.entries(agent).map(([key, value]) => [
-    key,
-    agent instanceof SandboxAgent && sandboxAgentFieldsCopiedByValue.has(key)
-      ? contentSnapshot(value)
-      : Array.isArray(value)
-        ? value.map((member) =>
-            member instanceof Handoff ? { handoff: member, fields: Object.entries(member) } : member
-          )
-        : value,
-  ]);
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== 'object' || value === null) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-/** Compares arrays, byte arrays and plain objects by their members, and any other value by identity. */
-function sameValue(a: unknown, b: unknown): boolean {
-  if (Object.is(a, b)) return true;
-  if (a instanceof Uint8Array && b instanceof Uint8Array) {
-    return a.length === b.length && a.every((byte, index) => byte === b[index]);
-  }
-  if (Array.isArray(a) && Array.isArray(b)) {
-    return a.length === b.length && a.every((value, index) => sameValue(value, b[index]));
-  }
-  if (isPlainObject(a) && isPlainObject(b)) {
-    const keys = Object.keys(a);
-    return keys.length === Object.keys(b).length && keys.every((key) => key in b && sameValue(a[key], b[key]));
-  }
-  return false;
-}
-
 function convertAgentGraph(
   agent: Agent<any, any>,
   modelParams: ModelActivityOptions,
   modelOverride: string | undefined,
-  sandbox: SandboxRunConfig | undefined
-): Agent<any, any> {
+  sandbox: SandboxRunConfig | undefined,
+  into?: Conversion
+): Conversion {
   const convertedBySource = new Map<Agent<any, any>, Agent<any, any>>();
-  const converted = convertAgent(agent, modelParams, convertedBySource, modelOverride);
+  const converted = convertAgent(agent, modelParams, convertedBySource, modelOverride, into?.agents);
   if (sandbox !== undefined) {
     propagateAgentToolSandboxConfig(converted, sandbox);
   }
-  const conversion: Conversion = {
-    source: agent,
-    converted,
-    modelParams,
-    modelOverride,
-    sandbox,
-    sourceFields: new Map([...convertedBySource.keys()].map((source) => [source, agentFields(source)])),
-  };
-  for (const convertedAgent of convertedBySource.values()) conversions.set(convertedAgent, conversion);
-  return converted;
-}
-
-function convertsTheSame(
-  conversion: Conversion | undefined,
-  agent: Agent<any, any>,
-  modelParams: ModelActivityOptions,
-  modelOverride: string | undefined,
-  sandbox: SandboxRunConfig | undefined
-): conversion is Conversion {
-  if (
-    conversion === undefined ||
-    conversion.source !== agent ||
-    conversion.modelOverride !== modelOverride ||
-    !sameValue(conversion.sandbox, sandbox) ||
-    !sameValue(conversion.modelParams, modelParams)
-  ) {
-    return false;
+  const conversion = into ?? { source: agent, agents: new Map(), activeRuns: 0 };
+  for (const [source, convertedAgent] of convertedBySource) {
+    conversion.agents.set(source, convertedAgent);
+    conversions.set(convertedAgent, conversion);
   }
-  for (const [source, fields] of conversion.sourceFields) {
-    if (!sameValue(fields, agentFields(source))) return false;
-  }
-  return true;
+  return conversion;
 }
 
 /**
  * Returns the converted graph that `state` runs on, or else the one the latest resume on its context used,
- * if converting `agent` again would give the same graph.
+ * if it was converted from `agent` and no run is using it.
  *
  * Function-tool approvals are keyed by agent object on the state's `RunContext`, which the resume keeps.
- * Rebuilding the state over a new graph would add a copy of its approvals under every resume's graph, and
- * the earlier copies can't be dropped, because saved states that still point at those agents read them.
+ * Rebuilding the state over new agent objects would add a copy of its approvals under every resume's
+ * graph, and the earlier copies can't be dropped, because saved states that still point at those agents
+ * read them.
  */
-function reusableConversion(
-  state: RunState<any, any>,
-  agent: Agent<any, any>,
-  modelParams: ModelActivityOptions,
-  modelOverride: string | undefined,
-  sandbox: SandboxRunConfig | undefined
-): Agent<any, any> | undefined {
+function reusableConversion(state: RunState<any, any>, agent: Agent<any, any>): Conversion | undefined {
   const candidates = [
     conversions.get(state._currentAgent as Agent<any, any>),
     resumeConversions.get(state._context)?.get(agent),
   ];
-  return candidates.find((conversion) => convertsTheSame(conversion, agent, modelParams, modelOverride, sandbox))
-    ?.converted;
+  return candidates.find((conversion) => conversion?.source === agent && conversion.activeRuns === 0);
 }
 
-function recordResumeConversion(state: RunState<any, any>, agent: Agent<any, any>, converted: Agent<any, any>): void {
-  const conversion = conversions.get(converted)!;
+function recordResumeConversion(state: RunState<any, any>, agent: Agent<any, any>, conversion: Conversion): void {
   let byAgent = resumeConversions.get(state._context);
   if (byAgent === undefined) {
     byAgent = new Map();
@@ -437,58 +342,76 @@ export class TemporalOpenAIRunner {
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
     const sandbox = options?.runConfig?.sandbox;
-    const converted =
-      (input instanceof RunState
-        ? reusableConversion(input, agent, this.modelParams, modelOverride, sandbox)
-        : undefined) ?? convertAgentGraph(agent, this.modelParams, modelOverride, sandbox);
+    const conversion = convertAgentGraph(
+      agent,
+      this.modelParams,
+      modelOverride,
+      sandbox,
+      input instanceof RunState ? reusableConversion(input, agent) : undefined
+    );
+    const converted = conversion.agents.get(agent)!;
 
-    let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
-    if (input instanceof RunState) {
-      // Record before restoring, since the restore merges the state's approvals under this graph even if
-      // the resume then fails.
-      recordResumeConversion(input, agent, converted);
-      // Round-trip through fromString so the rehydrated state's agent graph carries our converted
-      // agent (with ActivityBackedModel); setCurrentAgent only swaps the top-level ref, not nested ones.
-      // It also drops upstream's live-session identity, which would otherwise resolve manifest
-      // environment references on the Workflow thread rather than in the resume Activity.
-      // Pass the state's own context, as the upstream Runner uses it, so resumed tools write the
-      // caller's object rather than a JSON copy.
-      const restored = (await RunState.fromStringWithContext(converted, input.toString(), input._context)) as RunState<
-        TContext,
-        TAgent
-      >;
-      // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
-      restored.clearTrace();
-      preparedInput = restored;
-    } else {
-      preparedInput = input;
-    }
-
-    const innerRunner = new Runner({ ...runnerConfigOverrides });
-
-    const sharedRunOptions = {
-      maxTurns: options?.maxTurns,
-      context: options?.context,
-      previousResponseId: options?.previousResponseId,
-      conversationId: options?.conversationId,
-      session: options?.session,
-      sessionInputCallback: options?.sessionInputCallback,
-      callModelInputFilter: options?.callModelInputFilter,
-      tracing: options?.tracing,
-    };
-
+    conversion.activeRuns++;
+    // A streamed run keeps using the graph after `run` returns, until its result completes.
+    let releasedOnCompletion = false;
     try {
-      if (options?.stream === true) {
-        return (await innerRunner.run(converted, preparedInput as any, {
-          ...sharedRunOptions,
-          stream: true,
-        })) as StreamedRunResult<TContext, TAgent>;
+      let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
+      if (input instanceof RunState) {
+        // Record before restoring, since the restore merges the state's approvals under this graph even if
+        // the resume then fails.
+        recordResumeConversion(input, agent, conversion);
+        // Round-trip through fromString so the rehydrated state's agent graph carries our converted
+        // agent (with ActivityBackedModel); setCurrentAgent only swaps the top-level ref, not nested ones.
+        // It also drops upstream's live-session identity, which would otherwise resolve manifest
+        // environment references on the Workflow thread rather than in the resume Activity.
+        // Pass the state's own context, as the upstream Runner uses it, so resumed tools write the
+        // caller's object rather than a JSON copy.
+        const restored = (await RunState.fromStringWithContext(
+          converted,
+          input.toString(),
+          input._context
+        )) as RunState<TContext, TAgent>;
+        // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
+        restored.clearTrace();
+        preparedInput = restored;
+      } else {
+        preparedInput = input;
       }
-      return (await innerRunner.run(converted, preparedInput as any, sharedRunOptions)) as RunResult<any, TAgent>;
-    } catch (error) {
-      throw normalizeAgentsRunError(error);
+
+      const innerRunner = new Runner({ ...runnerConfigOverrides });
+
+      const sharedRunOptions = {
+        maxTurns: options?.maxTurns,
+        context: options?.context,
+        previousResponseId: options?.previousResponseId,
+        conversationId: options?.conversationId,
+        session: options?.session,
+        sessionInputCallback: options?.sessionInputCallback,
+        callModelInputFilter: options?.callModelInputFilter,
+        tracing: options?.tracing,
+      };
+
+      try {
+        if (options?.stream === true) {
+          const result = (await innerRunner.run(converted, preparedInput as any, {
+            ...sharedRunOptions,
+            stream: true,
+          })) as StreamedRunResult<TContext, TAgent>;
+          const release = () => {
+            conversion.activeRuns--;
+          };
+          result.completed.then(release, release);
+          releasedOnCompletion = true;
+          return result;
+        }
+        return (await innerRunner.run(converted, preparedInput as any, sharedRunOptions)) as RunResult<any, TAgent>;
+      } catch (error) {
+        throw normalizeAgentsRunError(error);
+      } finally {
+        await flushOpenSpans();
+      }
     } finally {
-      await flushOpenSpans();
+      if (!releasedOnCompletion) conversion.activeRuns--;
     }
   }
 }

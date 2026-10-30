@@ -206,6 +206,8 @@ export interface ApprovalResumeContextResult {
   handoffTarget: string | undefined;
   handoffFilters: string[];
   disabledHandoffThrew: boolean;
+  sharedFieldsWrites: string[];
+  sharedFieldsTemperatures: Array<number | undefined>;
 }
 
 /** Serialized approval record, as the `RunContext` internal below returns it. */
@@ -240,8 +242,9 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
  * `RunContext`, all are approved, and resuming one must keep the others' approvals. Last, an approved
  * tool throws once, and resuming the same state again must run it without asking again. Then a
  * resume fails while another state on its context advances and is approved again. Then each resume
- * rehydrates the saved state onto the original agent and context. Last, a handoff changes between an
- * interruption and its resume.
+ * rehydrates the saved state onto the original agent and context. Then a handoff changes between an
+ * interruption and its resume. Last, an agent's tools and model settings are replaced with equal copies
+ * before a resume, and the approved tool changes them.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -426,6 +429,53 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     disabledHandoffThrew = true;
   }
 
+  // Conversion shares an agent's tools array and model settings with the converted agent. They're
+  // replaced with equal copies before the resume, and the approved tool then adds a tool and changes a
+  // setting, which the next model call must see.
+  const extra = tool({
+    name: 'extra',
+    description: 'Record a value.',
+    parameters: {
+      type: 'object' as const,
+      properties: { value: { type: 'string' } },
+      required: ['value'] as const,
+      additionalProperties: false as const,
+    },
+    execute: async (args, runContext) => {
+      (runContext!.context as ResumeContext).writes.push((args as { value: string }).value);
+      return 'ok';
+    },
+  });
+  const sharedFieldsTemperatures: Array<number | undefined> = [];
+  const sharedFieldsAgent: Agent<ResumeContext> = new Agent<ResumeContext>({
+    name: 'SharedFieldsAgent',
+    model: 'gpt-4o-mini',
+    instructions: (_runContext, current) => {
+      sharedFieldsTemperatures.push(current.modelSettings.temperature);
+      return 'Extend yourself.';
+    },
+    modelSettings: { temperature: 0.1 },
+    tools: [
+      tool({
+        name: 'extend',
+        description: 'Add a tool and change a setting after approval.',
+        parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+        needsApproval: true,
+        execute: async () => {
+          sharedFieldsAgent.tools.push(extra);
+          sharedFieldsAgent.modelSettings.temperature = 0.9;
+          return 'ok';
+        },
+      }),
+    ],
+  });
+  const sharedFieldsCtx: ResumeContext = { original: 'shared-fields', writes: [] };
+  const pausedSharedFields = await runner.run(sharedFieldsAgent, 'go', { context: sharedFieldsCtx });
+  pausedSharedFields.state.approve(pausedSharedFields.interruptions[0]!);
+  sharedFieldsAgent.tools = [...sharedFieldsAgent.tools];
+  sharedFieldsAgent.modelSettings = { ...sharedFieldsAgent.modelSettings };
+  await runner.run(sharedFieldsAgent, pausedSharedFields.state);
+
   return {
     callerAfter: ctx.after,
     resumedUsesCallerObject: result.runContext.context === ctx,
@@ -448,5 +498,7 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     handoffTarget: routed.lastAgent?.name,
     handoffFilters,
     disabledHandoffThrew,
+    sharedFieldsWrites: sharedFieldsCtx.writes,
+    sharedFieldsTemperatures,
   };
 }

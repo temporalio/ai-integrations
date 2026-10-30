@@ -8,6 +8,7 @@ import {
   type SandboxSessionLike,
 } from '@openai/agents-core/sandbox';
 import { TemporalOpenAIRunner, workerEnvValue, temporalSandboxClient } from '../../workflow';
+import { PrivateEnvValue } from '../stubs/private-env-value';
 
 class TestSandboxCapability extends Capability {
   readonly type = 'test_sandbox';
@@ -123,17 +124,19 @@ export async function sandboxApprovalResumeWorkflow(): Promise<string> {
 
 /**
  * A root agent pauses for approval before it hands off to a `SandboxAgent`. Then the target's manifest
- * environment entry or its `runAs` user changes in place, and the resume must create the sandbox with the
- * new value.
+ * environment entry, an environment reference that keeps its value private, or its `runAs` user changes in
+ * place, and the resume must create the sandbox with the new value.
  */
-export async function sandboxHandoffConfigResumeWorkflow(change: 'environment' | 'runAs'): Promise<string> {
+export async function sandboxHandoffConfigResumeWorkflow(
+  change: 'environment' | 'reference' | 'runAs'
+): Promise<string> {
   const target = new SandboxAgent({
     name: 'sandbox_target',
     model: 'gpt-4o-mini',
     capabilities: [new TestSandboxCapability()],
     defaultManifest: new Manifest({
       entries: { 'data.bin': { type: 'file', content: new Uint8Array([0, 1, 2]) } },
-      environment: { VERSION: 'before' },
+      environment: { VERSION: change === 'reference' ? new PrivateEnvValue('before') : 'before' },
     }),
     runAs: { name: 'before' },
   });
@@ -158,6 +161,8 @@ export async function sandboxHandoffConfigResumeWorkflow(change: 'environment' |
   if (result.interruptions.length === 0) return 'no-interruption';
   if (change === 'environment') {
     target.defaultManifest!.environment.VERSION = new Environment('after');
+  } else if (change === 'reference') {
+    target.defaultManifest!.environment.VERSION = new PrivateEnvValue('after');
   } else {
     (target.runAs as { name: string }).name = 'after';
   }

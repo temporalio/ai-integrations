@@ -18,6 +18,9 @@ import {
 } from '@openai/agents-core/sandbox';
 import { deserializeManifest, mergeManifestDelta, mergeManifestEntryDelta } from '@openai/agents-core/sandbox/internal';
 
+// Re-exported so the Worker can deserialize this reference in sandbox Activities.
+export { PrivateEnvValue } from './private-env-value';
+
 export class FakeSandboxSession implements SandboxSession {
   state: SandboxSessionState;
   execCalls: ExecCommandArgs[] = [];

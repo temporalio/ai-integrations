@@ -557,7 +557,9 @@ test('Approval resume keeps the caller context object', async (t) => {
           textResponse('done routed'),
           toolCallResponse('set_after', { value: 'H-2' }, 'call_route_2'),
           handoffResponse('transfer_to_FirstTarget'),
-          textResponse('done disabled'),
+          toolCallResponse('extend', {}, 'call_extend'),
+          toolCallResponse('extra', { value: 'X' }, 'call_extra'),
+          textResponse('done extended'),
         ]),
       }),
     ],
@@ -567,7 +569,7 @@ test('Approval resume keeps the caller context object', async (t) => {
     executeWorkflow(approvalResumeContextWorkflow, { workflowExecutionTimeout: '30 seconds' })
   );
 
-  // Each resume reuses the converted graph its state runs on, so the approvals keep one owner, and
+  // Each resume converts into the agent objects its state runs on, so the approvals keep one owner, and
   // no resume drops approvals that another state on the context, or a retry of the same state, needs.
   t.deepEqual(result, {
     callerAfter: 'S-after',
@@ -592,5 +594,7 @@ test('Approval resume keeps the caller context object', async (t) => {
     handoffTarget: 'SecondTarget',
     handoffFilters: ['second'],
     disabledHandoffThrew: true,
+    sharedFieldsWrites: ['X'],
+    sharedFieldsTemperatures: [0.1, 0.9, 0.9],
   });
 });
