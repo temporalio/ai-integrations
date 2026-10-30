@@ -1,6 +1,7 @@
 import test from 'ava';
 import type { MCPServer } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
+import { TOOL_META_RESOLVER_UNSUPPORTED_TYPE } from '..';
 import { StatelessMCPServerProvider } from '../worker/mcp-provider';
 
 function serverWithResolver(onConnect: () => void): MCPServer {
@@ -33,7 +34,7 @@ test('StatelessMCPServerProvider refuses a toolMetaResolver without connecting',
     const err = await t.throwsAsync(activities[name]!({ toolName: 'echo', args: {} }), {
       instanceOf: ApplicationFailure,
     });
-    t.is(err?.type, 'MCPToolMetaResolverUnsupported');
+    t.is(err?.type, TOOL_META_RESOLVER_UNSUPPORTED_TYPE);
     t.true(err?.nonRetryable);
   }
   t.is(connects, 0);

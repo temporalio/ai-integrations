@@ -12,7 +12,7 @@ export type {
   ModelSummaryProvider,
   SerializableModelActivityOptions,
 } from './common/model-activity-options';
-export { DEDICATED_WORKER_FAILURE_TYPE } from './common/mcp-types';
+export { DEDICATED_WORKER_FAILURE_TYPE, TOOL_META_RESOLVER_UNSUPPORTED_TYPE } from './common/mcp-types';
 export type {
   HostedToolCredentials,
   HostedToolCredentialsResolver,
