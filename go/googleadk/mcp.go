@@ -181,12 +181,13 @@ type mcpAgentKey struct {
 }
 
 // mcpRunState is the state of a toolset in one agent run: one agent in one
-// runner.Run call.
+// execution of a runner.Run iterator.
 type mcpRunState struct {
-	// config is the RunConfig ADK allocates for each runner.Run call, a resume
-	// or retry included, and passes to every agent the call runs. It tells
-	// apart the runs of one invocation.
-	config *agent.RunConfig
+	// run is the InvocationContext ADK creates for the agent in each execution
+	// of a runner.Run iterator, a resume, a retry or another pass over a kept
+	// iterator included, and passes to every Tools call of that agent run. It
+	// tells apart the runs of one agent in one invocation.
+	run agent.InvocationContext
 	// pending is the list Tools took for the ProcessRequest call that follows
 	// in the same model step, when hasPending is set.
 	pending    []tool.Tool
@@ -205,10 +206,11 @@ func listingsFrom(ctx context.Context) *mcpListings {
 	return l
 }
 
-// runConfigOf returns the RunConfig of the runner.Run call ctx belongs to. ADK
-// passes Tools a ReadonlyContext that holds its invocation in the exported
-// InvocationContext field.
-func runConfigOf(ctx agent.ReadonlyContext) *agent.RunConfig {
+// agentRunOf returns the InvocationContext of the agent run ctx belongs to, or
+// nil. ADK passes Tools a ReadonlyContext that holds it in the exported
+// InvocationContext field. It is not the RunConfig: ADK reuses one RunConfig
+// when a runner.Run iterator without an LLM agent at its root runs again.
+func agentRunOf(ctx agent.ReadonlyContext) agent.InvocationContext {
 	v := reflect.ValueOf(ctx)
 	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
 		return nil
@@ -218,16 +220,16 @@ func runConfigOf(ctx agent.ReadonlyContext) *agent.RunConfig {
 		return nil
 	}
 	ic, ok := f.Interface().(agent.InvocationContext)
-	if !ok {
+	if !ok || reflect.ValueOf(ic).Kind() != reflect.Pointer {
 		return nil
 	}
-	return ic.RunConfig()
+	return ic
 }
 
 // startRun returns the state of the toolset in ctx's agent run, for Tools. It
-// starts a new state when ctx belongs to another runner.Run call than the
-// state kept for the agent and invocation. When ctx does not tell its
-// runner.Run call, it drops the kept state and returns nil.
+// starts a new state when ctx belongs to another agent run than the state
+// kept for the agent and invocation. When ctx does not tell its agent run, it
+// drops the kept state and returns nil.
 //
 // Without a state, the toolset lists and filters on every Tools and
 // ProcessRequest call, and its proxy tools pack themselves.
@@ -235,11 +237,11 @@ func (l *mcpListings) startRun(m *mcpToolset, ctx agent.ReadonlyContext) *mcpRun
 	if l == nil {
 		return nil
 	}
-	cfg := runConfigOf(ctx)
+	run := agentRunOf(ctx)
 	k := mcpAgentKey{m, ctx.InvocationID(), ctx.AgentName()}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if cfg == nil {
+	if run == nil {
 		delete(l.runs, k)
 		return nil
 	}
@@ -247,8 +249,8 @@ func (l *mcpListings) startRun(m *mcpToolset, ctx agent.ReadonlyContext) *mcpRun
 		l.runs = map[mcpAgentKey]*mcpRunState{}
 	}
 	s, ok := l.runs[k]
-	if !ok || s.config != cfg {
-		s = &mcpRunState{config: cfg}
+	if !ok || s.run != run {
+		s = &mcpRunState{run: run}
 		l.runs[k] = s
 	}
 	return s

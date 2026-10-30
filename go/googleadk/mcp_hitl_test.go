@@ -17,6 +17,7 @@ import (
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
+	"google.golang.org/adk/v2/agent/workflowagents/sequentialagent"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
@@ -100,17 +101,10 @@ type mcpHitlResult struct {
 //	        snapshot carries it to the worker-side tool, which executes on
 //	        approval or rejects on denial.
 //
-// With excludeBeforeResume, the toolset's ToolFilter stops allowing the guarded
-// tool after pass 1, so the approved call must not run on resume. With
-// reuseMessage, pass 2 overwrites pass 1's message with the decision and
-// resumes with the same *genai.Content, the way a caller that receives each
-// message into one variable does. With retryResume, the first resume fails
-// because another toolset cannot list its tools, after the MCP toolset listed
-// and filtered; the filter changes only then, and the workflow retries the
-// resume with the same message.
-func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume, reuseMessage, retryResume bool) (mcpHitlResult, error) {
+// See mcpHitlCase for the variations.
+func mcpHitlWorkflow(ctx workflow.Context, c mcpHitlCase) (mcpHitlResult, error) {
 	excluded, flaky := false, false
-	root, err := llmagent.New(llmagent.Config{
+	assistant, err := llmagent.New(llmagent.Config{
 		Name:        "assistant",
 		Description: "root assistant",
 		Model:       googleadk.NewModel("fake-model"),
@@ -124,6 +118,15 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume, reuseMe
 	})
 	if err != nil {
 		return mcpHitlResult{}, err
+	}
+	root := assistant
+	if c.SequentialRoot {
+		if root, err = sequentialagent.New(sequentialagent.Config{AgentConfig: agent.Config{
+			Name:      "pipeline",
+			SubAgents: []agent.Agent{assistant},
+		}}); err != nil {
+			return mcpHitlResult{}, err
+		}
 	}
 	r, err := runner.New(runner.Config{
 		AppName:           "test-app",
@@ -140,7 +143,8 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume, reuseMe
 	// --- Pass 1: run until the agent pauses on a confirmation. ---
 	var pass1 []*session.Event
 	msg := genai.NewContentFromText("run the guarded tool", genai.RoleUser)
-	for ev, rerr := range r.Run(adkCtx, "user-1", "session-1", msg, agent.RunConfig{}) {
+	run := r.Run(adkCtx, "user-1", "session-1", msg, agent.RunConfig{})
+	for ev, rerr := range run {
 		if rerr != nil {
 			return mcpHitlResult{}, rerr
 		}
@@ -163,13 +167,13 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume, reuseMe
 	// --- Pass 2: simulate the human's decision, then resume. ---
 	resume := googleadk.ConfirmationResponse(googleadk.ConfirmationDecision{
 		FunctionCallID: pending[0].FunctionCallID,
-		Confirmed:      confirm,
+		Confirmed:      c.Confirm,
 	})
-	if reuseMessage {
+	if c.ReuseMessage || c.ReuseIterator {
 		*msg = *resume
 		resume = msg
 	}
-	if retryResume {
+	if c.RetryResume {
 		flaky = true
 		var failed error
 		for _, rerr := range r.Run(adkCtx, "user-1", "session-1", resume, agent.RunConfig{}) {
@@ -183,8 +187,11 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume, reuseMe
 		}
 		flaky = false
 	}
-	excluded = excludeBeforeResume
-	for ev, rerr := range r.Run(adkCtx, "user-1", "session-1", resume, agent.RunConfig{}) {
+	excluded = c.ExcludeBeforeResume
+	if !c.ReuseIterator {
+		run = r.Run(adkCtx, "user-1", "session-1", resume, agent.RunConfig{})
+	}
+	for ev, rerr := range run {
 		if rerr != nil {
 			return res, rerr
 		}
@@ -212,6 +219,31 @@ func mcpHitlWorkflow(ctx workflow.Context, confirm, excludeBeforeResume, reuseMe
 	return res, nil
 }
 
+// mcpHitlCase selects the variations of mcpHitlWorkflow.
+type mcpHitlCase struct {
+	// Confirm is the human's decision.
+	Confirm bool
+	// ExcludeBeforeResume makes the toolset's ToolFilter stop allowing the
+	// guarded tool after pass 1, so the approved call must not run on resume.
+	ExcludeBeforeResume bool
+	// ReuseMessage makes pass 2 overwrite pass 1's message with the decision
+	// and resume with the same *genai.Content, the way a caller that receives
+	// each message into one variable does.
+	ReuseMessage bool
+	// RetryResume makes the first resume fail because another toolset cannot
+	// list its tools, after the MCP toolset listed and filtered. The filter
+	// changes only then, and the workflow retries the resume with the same
+	// message.
+	RetryResume bool
+	// SequentialRoot runs the assistant under a sequential agent, so the
+	// runner's root is not an LLM agent.
+	SequentialRoot bool
+	// ReuseIterator makes pass 2 overwrite pass 1's message with the decision
+	// and iterate pass 1's runner.Run iterator again instead of calling
+	// runner.Run.
+	ReuseIterator bool
+}
+
 // newMcpHitlEnv builds a test environment with mcpHitlWorkflow registered and
 // the guarded MCP toolset wired.
 func newMcpHitlEnv(t *testing.T, s *testsuite.WorkflowTestSuite) (*testsuite.TestWorkflowEnvironment, *activityCounter) {
@@ -236,13 +268,19 @@ func newMcpHitlEnv(t *testing.T, s *testsuite.WorkflowTestSuite) (*testsuite.Tes
 // surfaces it, with the original call attached for the human), and the approval
 // flows back through the snapshot so the tool executes exactly once.
 func TestMCPToolConfirmationPausesAndResumes(t *testing.T) {
-	for _, tc := range []struct{ reuseMessage, retryResume bool }{{false, false}, {true, false}, {true, true}} {
-		t.Run(fmt.Sprintf("reuseMessage=%v/retryResume=%v", tc.reuseMessage, tc.retryResume), func(t *testing.T) {
+	for _, tc := range []mcpHitlCase{
+		{},
+		{ReuseMessage: true},
+		{ReuseMessage: true, RetryResume: true},
+		{SequentialRoot: true, ReuseIterator: true},
+	} {
+		tc.Confirm = true
+		t.Run(fmt.Sprintf("%+v", tc), func(t *testing.T) {
 			mcpGuardedRuns.Store(0)
 
 			var s testsuite.WorkflowTestSuite
 			env, counter := newMcpHitlEnv(t, &s)
-			env.ExecuteWorkflow(mcpHitlWorkflow, true, false, tc.reuseMessage, tc.retryResume)
+			env.ExecuteWorkflow(mcpHitlWorkflow, tc)
 
 			require.True(t, env.IsWorkflowCompleted())
 			require.NoError(t, env.GetWorkflowError())
@@ -270,7 +308,7 @@ func TestMCPToolConfirmationDenialBlocksTool(t *testing.T) {
 
 	var s testsuite.WorkflowTestSuite
 	env, counter := newMcpHitlEnv(t, &s)
-	env.ExecuteWorkflow(mcpHitlWorkflow, false, false, false, false)
+	env.ExecuteWorkflow(mcpHitlWorkflow, mcpHitlCase{})
 
 	require.True(t, env.IsWorkflowCompleted())
 	require.NoError(t, env.GetWorkflowError())
@@ -290,17 +328,27 @@ func TestMCPToolConfirmationDenialBlocksTool(t *testing.T) {
 // ToolFilter excludes while its confirmation is pending does not run when the
 // human approves: ADK resumes the call from the toolset's current Tools list,
 // which the filter governs at that point, not when the tools were listed. The
-// resume keeps the paused run's invocation ID, and with reuseMessage also its
-// *genai.Content. With retryResume, a failed resume already listed and
+// resume keeps the paused run's invocation ID, and with ReuseMessage also its
+// *genai.Content. With RetryResume, a failed resume already listed and
 // filtered before the filter changed, and the retry passes the same message.
+// With ReuseIterator under a sequential root, ADK runs the kept iterator again
+// with the same RunConfig.
 func TestMCPToolConfirmationResumeHonorsCurrentToolFilter(t *testing.T) {
-	for _, tc := range []struct{ reuseMessage, retryResume bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
-		t.Run(fmt.Sprintf("reuseMessage=%v/retryResume=%v", tc.reuseMessage, tc.retryResume), func(t *testing.T) {
+	for _, tc := range []mcpHitlCase{
+		{},
+		{ReuseMessage: true},
+		{RetryResume: true},
+		{ReuseMessage: true, RetryResume: true},
+		{SequentialRoot: true, ReuseMessage: true},
+		{SequentialRoot: true, ReuseIterator: true},
+	} {
+		tc.Confirm, tc.ExcludeBeforeResume = true, true
+		t.Run(fmt.Sprintf("%+v", tc), func(t *testing.T) {
 			mcpGuardedRuns.Store(0)
 
 			var s testsuite.WorkflowTestSuite
 			env, counter := newMcpHitlEnv(t, &s)
-			env.ExecuteWorkflow(mcpHitlWorkflow, true, true, tc.reuseMessage, tc.retryResume)
+			env.ExecuteWorkflow(mcpHitlWorkflow, tc)
 
 			require.True(t, env.IsWorkflowCompleted())
 			require.NoError(t, env.GetWorkflowError())
