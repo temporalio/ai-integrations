@@ -10,6 +10,7 @@ from strands.agent.conversation_manager import (
     SlidingWindowConversationManager,
     SummarizingConversationManager,
 )
+from strands.hooks import BeforeModelCallEvent
 from strands.types.content import Messages
 from strands.types.streaming import StreamEvent
 
@@ -422,10 +423,20 @@ class UsageMockModel(ConfiguredMockModel):
             }
 
 
+def _redact_turn_1(event: BeforeModelCallEvent) -> None:
+    """Rewrites the first prompt once a later turn follows it, as a redaction hook would."""
+    for message in event.agent.messages[:-1]:
+        for block in message["content"]:
+            if block.get("text") == "turn 1":
+                block["text"] = "[redacted]"
+
+
 @workflow.defn
 class CompressionWorkflow:
     @workflow.run
-    async def run(self, prompts: list[str], summarize: bool = False) -> None:
+    async def run(
+        self, prompts: list[str], summarize: bool = False, redact: bool = False
+    ) -> None:
         agent = TemporalAgent(
             model="usage",
             start_to_close_timeout=timedelta(seconds=15),
@@ -437,17 +448,21 @@ class CompressionWorkflow:
             if summarize
             else SlidingWindowConversationManager(proactive_compression=True),
         )
+        if redact:
+            # Ahead of the manager's proactive compression callback.
+            agent.hooks.add_callback(BeforeModelCallEvent, _redact_turn_1, order=-50)
         for prompt in prompts:
             await agent.invoke_async(prompt)
 
 
 @pytest.mark.parametrize(
-    ("summarize", "responses", "user_turns"),
+    ("summarize", "redact", "responses", "user_turns"),
     [
-        (False, ["first", "second"], [["turn 1"], ["turn 2"]]),
+        (False, False, ["first", "second"], [["turn 1"], ["turn 2"]]),
         # The summary of the first turn replaces it, from a model call of its own.
         (
             True,
+            False,
             ["first", "summary", "second"],
             [
                 ["turn 1"],
@@ -455,29 +470,51 @@ class CompressionWorkflow:
                 ["summary", "turn 2"],
             ],
         ),
+        # A callback ahead of the manager changes the history before it is
+        # summarized, as it does natively.
+        (
+            True,
+            True,
+            ["first", "summary", "second"],
+            [
+                ["turn 1"],
+                ["[redacted]", "Please summarize this conversation."],
+                ["summary", "turn 2"],
+            ],
+        ),
     ],
 )
 async def test_proactive_compression_uses_model_context_window(
-    client: Client, summarize: bool, responses: list[str], user_turns: list[list[str]]
+    client: Client,
+    summarize: bool,
+    redact: bool,
+    responses: list[str],
+    user_turns: list[list[str]],
 ):
     """Compression shrinks the first turn before the second model call, as it does natively."""
     task_queue = f"test_proactive_compression-{uuid4()}"
     model = UsageMockModel(list(responses))
+    plugin = StrandsPlugin(models={"usage": lambda: model})
 
     async with Worker(
         client,
         task_queue=task_queue,
         workflows=[CompressionWorkflow],
-        plugins=[StrandsPlugin(models={"usage": lambda: model})],
+        plugins=[plugin],
+        max_cached_workflows=0,
     ):
-        await client.execute_workflow(
+        handle = await client.start_workflow(
             CompressionWorkflow.run,
-            args=[["turn 1", "turn 2"], summarize],
+            args=[["turn 1", "turn 2"], summarize, redact],
             id=f"test_proactive_compression_{uuid4()}",
             task_queue=task_queue,
         )
+        await handle.result()
 
     assert model.user_turns == user_turns
+    await Replayer(workflows=[CompressionWorkflow], plugins=[plugin]).replay_workflow(
+        await handle.fetch_history()
+    )
 
 
 class BlockingSummaryModel(UsageMockModel):

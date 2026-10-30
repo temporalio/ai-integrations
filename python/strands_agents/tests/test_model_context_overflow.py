@@ -1,7 +1,8 @@
+import copy
 from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -21,6 +22,7 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
+from temporalio.strands_agents._summary import _summarize_with_agent
 from temporalio.strands_agents._temporal_model import TemporalModel
 from temporalio.worker import Replayer, Worker
 from tests.common import get_activities
@@ -42,23 +44,66 @@ def _history() -> list[dict[str, Any]]:
 
 
 def _texts(messages: Any) -> list[str]:
-    return [message["content"][0]["text"] for message in messages]
+    return [
+        next((block["text"] for block in message["content"] if "text" in block), "")
+        for message in messages
+    ]
+
+
+def _contents(messages: Any) -> list[dict[str, Any]]:
+    # Without the ids and metadata that differ between runs.
+    return [
+        {"role": message["role"], "content": message["content"]} for message in messages
+    ]
+
+
+REASONING: StreamEvent = {
+    "contentBlockDelta": {"delta": {"reasoningContent": {"text": "thinking"}}}
+}
+TEXT: StreamEvent = {"contentBlockDelta": {"delta": {"text": "ok"}}}
+CITATION: StreamEvent = cast(
+    Any,
+    {
+        "contentBlockDelta": {
+            "delta": {"citation": {"title": "doc", "location": {"web": {"url": "u"}}}}
+        }
+    },
+)
+STOP: StreamEvent = {"contentBlockStop": {}}
+
+
+def _reply(*blocks: list[StreamEvent]) -> list[StreamEvent]:
+    """The events of a reply made of the given content blocks."""
+    events: list[StreamEvent] = [{"messageStart": {"role": "assistant"}}]
+    for block in blocks:
+        events.extend([*block, STOP])
+    events.append({"messageStop": {"stopReason": "end_turn"}})
+    return events
 
 
 class SmallContextModel(MockModel):
     """Raises ``ContextWindowOverflowException`` when given too many messages."""
 
-    def __init__(self, *, window: int = CONTEXT_WINDOW) -> None:
+    def __init__(
+        self, *, window: int = CONTEXT_WINDOW, reply: list[StreamEvent] | None = None
+    ) -> None:
         super().__init__([])
         self._window = window
+        self._reply = reply
         self.seen: list[list[str]] = []
+        self.requests: list[Any] = []
 
     async def stream(
         self, messages: Any, *_args: Any, **_kwargs: Any
     ) -> AsyncIterable[StreamEvent]:  # type: ignore[override]
         self.seen.append(_texts(messages))
+        self.requests.append(_contents(copy.deepcopy(messages)))
         if len(messages) > self._window:
             raise ContextWindowOverflowException("prompt is too long")
+        if self._reply is not None:
+            for event in self._reply:
+                yield event
+            return
         self._responses = ["ok"]
         async for event in super().stream(messages):
             yield event
@@ -93,7 +138,9 @@ def _manager(kind: str, summarizer: Callable[[], Agent]) -> dict[str, Any]:
         "conversation_manager": SummarizingConversationManager(
             summary_ratio=0.5,
             preserve_recent_messages=1,
-            summarization_agent=summarizer() if kind == "summarization_agent" else None,
+            summarization_agent=summarizer()
+            if kind.startswith("summarization_agent")
+            else None,
         )
     }
 
@@ -112,7 +159,10 @@ class OverflowAgentWorkflow:
     async def run(self, prompt: str, manager: str = "sliding_window") -> str:
         def summarizer() -> Agent:
             return TemporalAgent(
-                model="small", start_to_close_timeout=timedelta(seconds=15)
+                model="reasoning"
+                if manager == "summarization_agent_reasoning"
+                else "small",
+                start_to_close_timeout=timedelta(seconds=15),
             )
 
         agent = TemporalAgent(
@@ -124,21 +174,37 @@ class OverflowAgentWorkflow:
         return str(await agent.invoke_async(prompt))
 
 
+def _summarizer_model(manager: str) -> SmallContextModel | None:
+    """A separate model for the summarization agent, which reasons before replying."""
+    if manager != "summarization_agent_reasoning":
+        return None
+    return SmallContextModel(reply=_reply([REASONING], [TEXT]))
+
+
 @pytest.mark.parametrize(
-    "manager", ["sliding_window", "summarizing", "summarization_agent"]
+    "manager",
+    [
+        "sliding_window",
+        "summarizing",
+        "summarization_agent",
+        "summarization_agent_reasoning",
+    ],
 )
 async def test_overflow_is_recovered_by_conversation_manager(
     client: Client, manager: str
 ):
     # A plain Agent reduces the context and retries when the model overflows. A
     # summarizing manager first asks the model, or its summarization agent, for a
-    # summary.
+    # summary, which it turns into a user message as the Strands version does.
     control_model = SmallContextModel()
+    control_summarizer = _summarizer_model(manager) or control_model
     control = await Agent(
         model=control_model,
         messages=_history(),  # type: ignore[arg-type]
         callback_handler=None,
-        **_manager(manager, lambda: Agent(model=control_model, callback_handler=None)),
+        **_manager(
+            manager, lambda: Agent(model=control_summarizer, callback_handler=None)
+        ),
     ).invoke_async("q3")
     assert str(control) == "ok\n"
     assert len(control_model.seen) >= 2
@@ -148,8 +214,11 @@ async def test_overflow_is_recovered_by_conversation_manager(
     # TemporalAgent must behave the same: the overflow fails the first activity
     # attempt, Strands reduces the conversation, and the next calls succeed.
     model = SmallContextModel()
+    summarizer = _summarizer_model(manager) or model
     task_queue = f"test_overflow_recovered-{uuid4()}"
-    plugin = StrandsPlugin(models={"small": lambda: model})
+    plugin = StrandsPlugin(
+        models={"small": lambda: model, "reasoning": lambda: summarizer}
+    )
     client = _client_with(client, plugin)
 
     async with Worker(
@@ -167,9 +236,13 @@ async def test_overflow_is_recovered_by_conversation_manager(
         )
         assert await handle.result() == "ok\n"
 
-    assert model.seen == control_model.seen
+    assert model.requests == control_model.requests
+    assert summarizer.requests == control_summarizer.requests
     history = await handle.fetch_history()
-    assert get_activities(history).count("invoke_model") == len(model.seen)
+    model_calls = len(model.seen) + (
+        len(summarizer.seen) if summarizer is not model else 0
+    )
+    assert get_activities(history).count("invoke_model") == model_calls
     assert [
         event
         for event in history.events
@@ -179,6 +252,40 @@ async def test_overflow_is_recovered_by_conversation_manager(
         workflows=[OverflowAgentWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        _reply([TEXT]),
+        _reply([REASONING], [TEXT]),
+        _reply([TEXT, CITATION]),
+        _reply([REASONING]),
+    ],
+    ids=["text", "reasoning", "cited", "no_text"],
+)
+async def test_summarization_agent_reply_becomes_the_native_summary(
+    reply: list[StreamEvent],
+):
+    # The awaited summarization agent's reply becomes the summary Strands'
+    # synchronous call makes of it, or fails as that call does.
+    def summarizer() -> Agent:
+        return Agent(model=SmallContextModel(reply=reply), callback_handler=None)
+
+    manager = SummarizingConversationManager(summarization_agent=summarizer())
+    try:
+        expected: Any = _contents(
+            [manager._generate_summary_with_agent(_history()[:2])]  # type: ignore[arg-type]
+        )
+    except Exception as error:
+        expected = repr(error)
+    try:
+        actual: Any = _contents(
+            [await _summarize_with_agent(summarizer(), _history()[:2])]  # type: ignore[arg-type]
+        )
+    except Exception as error:
+        actual = repr(error)
+    assert actual == expected
 
 
 async def test_unrecoverable_overflow_fails_the_workflow(client: Client):

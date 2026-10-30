@@ -1,17 +1,17 @@
 import asyncio
+import math
+from collections.abc import Callable
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 
 from strands import Agent
 from strands.agent._concurrency import _ConcurrencyController, _InflightInvocation
-from strands.agent.conversation_manager import NullConversationManager
-from strands.hooks import (
-    AfterModelCallEvent,
-    BeforeModelCallEvent,
-    HookCallback,
-    HookOrder,
+from strands.agent.conversation_manager import (
+    NullConversationManager,
+    SummarizingConversationManager,
 )
+from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent, HookCallback
 from strands.types.agent import AgentInput
 from strands.types.content import Messages
 from strands.types.exceptions import ContextWindowOverflowException
@@ -51,15 +51,21 @@ class _WorkflowConcurrencyController(_ConcurrencyController):
         return waiting_on, registered_token
 
 
-async def _prepare_proactive_summary(event: BeforeModelCallEvent) -> None:
-    def reduce(manager: Any, agent: Any) -> None:
-        manager._on_before_model_call_threshold(
-            SimpleNamespace(
-                agent=agent, projected_input_tokens=event.projected_input_tokens
+def _with_proactive_summary(
+    threshold: Callable[[BeforeModelCallEvent], None],
+) -> HookCallback[BeforeModelCallEvent]:
+    async def callback(event: BeforeModelCallEvent) -> None:
+        def reduce(manager: Any, agent: Any) -> None:
+            manager._on_before_model_call_threshold(
+                SimpleNamespace(
+                    agent=agent, projected_input_tokens=event.projected_input_tokens
+                )
             )
-        )
 
-    await prepare_summary(event.agent, reduce)
+        await prepare_summary(event.agent, reduce)
+        threshold(event)
+
+    return callback
 
 
 async def _prepare_overflow_summary(event: AfterModelCallEvent) -> None:
@@ -145,18 +151,18 @@ class TemporalAgent(Agent):
 
         # Strands' summarizing conversation manager gets its summaries in
         # synchronous code, on a thread where TemporalModel cannot run. Await them
-        # on the workflow loop just before Strands asks: ahead of the manager's
-        # proactive compression hook, and after a model call fails with a context
-        # overflow, before Strands reduces the history.
+        # on the workflow loop just before Strands asks, after any earlier callback
+        # has changed the history: in place of the manager's own proactive
+        # compression callback, and after every other callback once a model call
+        # fails with a context overflow, before Strands reduces the history.
+        manager = self.conversation_manager
+        if isinstance(manager, SummarizingConversationManager):
+            threshold = manager._on_before_model_call_threshold
+            for entry in self.hooks._registered_callbacks.get(BeforeModelCallEvent, []):
+                if entry.callback == threshold:
+                    entry.callback = _with_proactive_summary(threshold)
         self.hooks.add_callback(
-            BeforeModelCallEvent,
-            _prepare_proactive_summary,
-            order=HookOrder.SDK_FIRST,
-        )
-        self.hooks.add_callback(
-            AfterModelCallEvent,
-            _prepare_overflow_summary,
-            order=HookOrder.SDK_LAST,
+            AfterModelCallEvent, _prepare_overflow_summary, order=math.inf
         )
 
         # Strands invokes ToolProvider.load_tools() once at construction on a

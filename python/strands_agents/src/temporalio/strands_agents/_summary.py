@@ -19,6 +19,7 @@ from typing import Any, cast
 
 from strands import Agent
 from strands.agent.conversation_manager import SummarizingConversationManager
+from strands.agent.conversation_manager.compression import context_compression
 from strands.agent.conversation_manager.compression.context_compression import (
     generate_summary,
 )
@@ -124,15 +125,24 @@ async def _summarize_with_agent(summarizer: Agent, messages: list[Message]) -> M
         # against these messages.
         summarizer.messages = copy.deepcopy(messages)
         result = await summarizer.invoke_async("Please summarize this conversation.")
-        summary = result.message.copy()
-        summary["role"] = "user"
-        return summary
+        return _as_user_summary(result.message)
     finally:
         summarizer.system_prompt = system_prompt
         summarizer.messages = original_messages
         summarizer.tool_registry = tool_registry
         if hasattr(summarizer, "_default_structured_output_model"):
             summarizer._default_structured_output_model = structured_output_model
+
+
+def _as_user_summary(message: Message) -> Message:
+    # Strands 1.62 keeps only the reply's text and raises if there is none; earlier
+    # versions keep the whole reply as a user message.
+    as_user_summary = getattr(context_compression, "as_user_summary", None)
+    if as_user_summary is not None:
+        return as_user_summary(message)
+    summary = message.copy()
+    summary["role"] = "user"
+    return summary
 
 
 def _hand_over(
