@@ -176,6 +176,13 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 			server:    a2aServer{REST: true, Front: failA2ARequests(0, http.StatusBadRequest, "application/json", restA2AErrorBody(a2a.ErrInvalidParams))},
 			wantError: "invalid params",
 		},
+		{
+			// The media type the A2A spec recommends, with a status the
+			// HTTP rule would retry.
+			name:      "REST A2A error as application/a2a+json in an HTTP 500",
+			server:    a2aServer{REST: true, Front: failA2ARequests(0, http.StatusInternalServerError, "application/a2a+json", restA2AErrorBody(a2a.ErrInvalidParams))},
+			wantError: "invalid params",
+		},
 		{name: "REST A2A error in the stream", server: a2aServer{REST: true, Reply: a2aReply(nil, a2a.ErrInvalidParams)}, sse: true, wantError: "invalid params"},
 		{
 			name:      "REST A2A error, 1 KiB of details",
@@ -214,6 +221,12 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 		{
 			name:      "card with an interface URL that does not parse",
 			server:    a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), REST: true, Path: "/%zz"},
+			wantError: "invalid URL escape",
+		},
+		{
+			// JSON-RPC parses the URL on each call, not when the client is made.
+			name:      "card with a JSON-RPC interface URL that does not parse",
+			server:    a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), Path: "/%zz"},
 			wantError: "invalid URL escape",
 		},
 		{

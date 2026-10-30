@@ -227,10 +227,12 @@ the model SDK's own retries (see below), or override the fallbacks.
   - ADK streams the send unless the run's `StreamingMode` is
     `agent.StreamingModeNone`, so the zero `RunConfig` streams too. A streamed
     reply reaches the workflow when the stream ends, with the chunks of each
-    artifact merged. The partial events of an ADK server are dropped, since ADK
-    saves none of them. If the stream fails after its first events, the
-    workflow gets those events and the error, without a retry, and ADK cancels
-    the unfinished task as it does without Temporal.
+    artifact merged. In its default output mode, an ADK server's partial events
+    are dropped, since ADK saves none of them. In `OutputArtifactPerEvent` mode
+    they are kept, so a reply of thousands of chunks can pass the payload
+    limit. If the stream fails after its first events, the workflow gets those
+    events and the error, without a retry, and ADK cancels the unfinished task
+    as it does without Temporal.
   - A cancellation gets a single 5-second attempt, and still goes out after the
     workflow is cancelled. Cancelling the workflow while a send is in flight
     does not cancel the remote task: the send's result is dropped, and ADK

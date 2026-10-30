@@ -304,8 +304,7 @@ func withA2AClient[T any](ctx context.Context, a *Activities, card *a2a.AgentCar
 // no transport the factory supports, which a retry cannot change. Otherwise
 // a2a-go joins the errors of every transport it tried to open, and the call is
 // retried when any of them can pass, as a2aRetryable decides, such as a
-// caller's transport that could not dial or load its credentials. An interface
-// URL that does not parse comes from the card and cannot pass.
+// caller's transport that could not dial or load its credentials.
 func a2aClientError(err error) error {
 	retryable := false
 	if errors.Unwrap(err) != nil {
@@ -315,8 +314,7 @@ func a2aClientError(err error) error {
 			failures = joined.Unwrap()
 		}
 		for _, f := range failures {
-			var urlErr *url.Error
-			if !(errors.As(f, &urlErr) && urlErr.Op == "parse") && a2aRetryable(f) {
+			if a2aRetryable(f) {
 				retryable = true
 			}
 		}
@@ -329,10 +327,10 @@ func a2aClientError(err error) error {
 // grows with the reply rather than with the number of chunks. ADK joins the
 // chunks of an artifact into one event either way.
 //
-// An ADK server marks its events with ADK's partial flag, and ADK passes them
-// on one by one, so they are not merged. The partial ones are dropped: ADK
-// saves none of them, and the server sends their content again in a final
-// event.
+// In its default output mode, an ADK server marks its events with ADK's
+// partial flag, and ADK passes them on one by one, so they are not merged. The
+// partial ones are dropped: ADK saves none of them, and the server sends their
+// content again in a final event.
 func appendA2AEvent(events []a2a.StreamResponse, ev a2a.Event) []a2a.StreamResponse {
 	chunk, ok := ev.(*a2a.TaskArtifactUpdateEvent)
 	if ok && adka2a.IsPartial(chunk.Metadata) {
@@ -376,8 +374,8 @@ func appendA2APart(parts a2a.ContentParts, p *a2a.Part) a2a.ContentParts {
 //   - an A2A error the remote agent answers with is not: sending again would
 //     start another task, and ADK turns the failed call into an error event,
 //     as without Temporal;
-//   - a card source ADK cannot read, or a reply that is not valid JSON, is
-//     not;
+//   - a card source ADK cannot read, an interface URL that does not parse, or
+//     a reply that is not valid JSON, is not;
 //   - anything else, such as a network error or a card file missing on this
 //     worker, is.
 func a2aError(op string, err error) error {
@@ -392,13 +390,15 @@ func a2aRetryable(err error) bool {
 	var remote *a2a.Error
 	var syntaxErr *json.SyntaxError
 	var typeErr *json.UnmarshalTypeError
+	var urlErr *url.Error
 	switch {
 	case errors.As(err, &status):
 		retryable = retryableHTTPStatus(status.code)
 	case errors.As(err, &cardStatus):
 		retryable = retryableHTTPStatus(cardStatus.StatusCode)
 	case errors.As(err, &remote), errors.Is(err, remoteagent.ErrUnsupportedCardSource),
-		errors.As(err, &syntaxErr), errors.As(err, &typeErr):
+		errors.As(err, &syntaxErr), errors.As(err, &typeErr),
+		errors.As(err, &urlErr) && urlErr.Op == "parse":
 		retryable = false
 	}
 	return retryable
@@ -427,7 +427,9 @@ var defaultA2AClientFactory = a2aclient.NewFactory(
 // into an A2A error: a JSON one with no A2A reason becomes an internal error,
 // which is not retried, and any other one a server error. A redirect is left
 // to the http.Client, which follows it. With keepA2AErrors, an error body that
-// names an A2A error, as a2a-go's REST server writes it, is left to a2a-go.
+// names an A2A error, as a2a-go's REST server writes it, is left to a2a-go,
+// also when it comes as application/a2a+json, the media type the A2A spec
+// recommends.
 type a2aStatusTransport struct {
 	keepA2AErrors bool
 }
@@ -438,13 +440,17 @@ func (t a2aStatusTransport) RoundTrip(req *http.Request) (*http.Response, error)
 		return resp, err
 	}
 	var body []byte
-	if t.keepA2AErrors && strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
+	contentType := resp.Header.Get("Content-Type")
+	if t.keepA2AErrors && (strings.HasPrefix(contentType, "application/json") ||
+		strings.HasPrefix(contentType, "application/a2a+json")) {
 		// The whole body, as a2a-go would decode it: a prefix of an A2A
 		// error does not parse, and would be taken for a gateway's.
 		body, err = io.ReadAll(resp.Body)
 	}
 	_ = resp.Body.Close()
 	if err == nil && isA2AErrorBody(body) {
+		// a2a-go decodes an error body only as application/json.
+		resp.Header.Set("Content-Type", "application/json")
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return resp, nil
 	}
