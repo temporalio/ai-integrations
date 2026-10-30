@@ -118,6 +118,7 @@ from temporalio.openai_agents.testing import (
     TestModel,
     TestModelProvider,
 )
+from temporalio.service import RPCError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.workflow import ActivityConfig
 from tests.helpers import assert_eventually, new_worker
@@ -389,11 +390,19 @@ class HeldWorkflow:
 
 @nexusrpc.handler.service_handler(service=HeldService)
 class HeldServiceHandler:
+    """Starts the held operation, acknowledging the start once ``acknowledge`` is set."""
+
+    def __init__(self) -> None:
+        self.acknowledge = asyncio.Event()
+        self.acknowledge.set()
+
     @nexus.workflow_run_operation
     async def hold(
         self, ctx: nexus.WorkflowRunOperationContext, name: str
     ) -> nexus.WorkflowHandle[str]:
-        return await ctx.start_workflow(HeldWorkflow.run, name, id=name)
+        handle = await ctx.start_workflow(HeldWorkflow.run, name, id=name)
+        await self.acknowledge.wait()
+        return handle
 
 
 @workflow.defn
@@ -639,16 +648,21 @@ async def test_nexus_tool_workflow(client: Client, env: WorkflowEnvironment):
 
 
 @pytest.mark.requires_local_server
-@pytest.mark.parametrize("cancel_run_first", [False, True])
+@pytest.mark.parametrize("cancel", ["workflow", "run_first", "run_during_start"])
 async def test_nexus_tool_cancel_workflow(
-    client: Client, env: WorkflowEnvironment, cancel_run_first: bool
+    client: Client, env: WorkflowEnvironment, cancel: str
 ):
     if env.supports_time_skipping:
         pytest.skip("Nexus tests don't work with time-skipping server")
 
-    # With cancel_run_first, the Workflow cancels its run, and is itself cancelled while the
-    # operation delays its cancellation until released.
+    # With run_first, the Workflow cancels its run, and is itself cancelled while the
+    # operation delays its cancellation until released. With run_during_start, the Workflow
+    # cancels its run before the operation's start is acknowledged.
+    cancel_run_first = cancel == "run_first"
     held_id = f"held-{uuid.uuid4()}" + ("-slow" if cancel_run_first else "")
+    handler = HeldServiceHandler()
+    if cancel == "run_during_start":
+        handler.acknowledge.clear()
     async with AgentEnvironment(
         model=TestModel.returning_responses(
             [ResponseBuilders.tool_call(json.dumps({"input": held_id}), "hold")]
@@ -663,7 +677,7 @@ async def test_nexus_tool_cancel_workflow(
             client,
             NexusToolCancelWorkflow,
             HeldWorkflow,
-            nexus_service_handlers=[HeldServiceHandler()],
+            nexus_service_handlers=[handler],
         ) as worker:
             await env.create_nexus_endpoint(
                 make_nexus_endpoint_name(worker.task_queue), worker.task_queue
@@ -691,9 +705,45 @@ async def test_nexus_tool_cancel_workflow(
                     for e in events[started[0] :]
                 )
 
-            await assert_eventually(operation_started)
+            async def held_started() -> None:
+                try:
+                    await held_handle.describe()
+                except RPCError as err:
+                    raise AssertionError(err) from err
+
+            async def run_cancel_handled() -> list[Any]:
+                events = [e async for e in workflow_handle.fetch_history_events()]
+                signaled = [
+                    i
+                    for i, e in enumerate(events)
+                    if e.HasField("workflow_execution_signaled_event_attributes")
+                ]
+                assert signaled and any(
+                    e.HasField("workflow_task_completed_event_attributes")
+                    for e in events[signaled[0] :]
+                )
+                return events
+
             try:
-                if cancel_run_first:
+                if cancel == "run_during_start":
+                    # The handler started the operation's Workflow and withholds the start.
+                    await assert_eventually(held_started)
+                    await workflow_handle.signal(NexusToolCancelWorkflow.cancel_run)
+                    events = await assert_eventually(run_cancel_handled)
+                    assert not any(
+                        e.HasField("nexus_operation_started_event_attributes")
+                        for e in events
+                    )
+                    # The run waits for the operation's start, as a direct call does.
+                    assert (await workflow_handle.describe()).status == (
+                        WorkflowExecutionStatus.RUNNING
+                    )
+                    handler.acknowledge.set()
+                else:
+                    await assert_eventually(operation_started)
+                if cancel == "workflow":
+                    await workflow_handle.cancel()
+                elif cancel_run_first:
                     await workflow_handle.signal(NexusToolCancelWorkflow.cancel_run)
 
                     async def cancel_request_delivered() -> None:
@@ -733,8 +783,6 @@ async def test_nexus_tool_cancel_workflow(
                         WorkflowExecutionStatus.RUNNING
                     )
                     await held_handle.signal(HeldWorkflow.release)
-                else:
-                    await workflow_handle.cancel()
                 with pytest.raises(WorkflowFailureError) as err:
                     await workflow_handle.result()
                 assert isinstance(err.value.cause, CancelledError)

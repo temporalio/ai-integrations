@@ -51,7 +51,7 @@ _tool_operations: contextvars.ContextVar[tuple[set[asyncio.Future[None]], ...]] 
 
 @contextlib.contextmanager
 def _track_tool_operation() -> Generator[None, None, None]:
-    """Keep a tool's started Nexus operation pending in the runs until the block exits."""
+    """Keep a tool's Nexus operation pending in the runs until the block exits."""
     runs = _tool_operations.get()
     done: asyncio.Future[None] = asyncio.get_running_loop().create_future()
     for operations in runs:

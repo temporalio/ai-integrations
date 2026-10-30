@@ -299,14 +299,15 @@ def nexus_operation_as_tool(
         args, _ = schema.to_call_args(params)
         assert len(args) == 1, "Nexus operations must have exactly one argument"
         [arg] = args
-        handle = await nexus_client.start_operation(
-            operation,
-            arg,
-            schedule_to_close_timeout=schedule_to_close_timeout,
-        )
         # If the agent run is cancelled, its runner waits for this operation, so Temporal
-        # delivers the operation's cancel request before the Workflow closes.
+        # delivers the operation's cancel request before the Workflow closes. Tracking starts
+        # before the start request: a cancelled task keeps waiting for the start to resolve.
         with _track_tool_operation():
+            handle = await nexus_client.start_operation(
+                operation,
+                arg,
+                schedule_to_close_timeout=schedule_to_close_timeout,
+            )
             result = await handle
         try:
             return str(result)
