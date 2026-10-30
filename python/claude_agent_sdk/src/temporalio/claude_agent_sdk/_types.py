@@ -12,7 +12,11 @@ Output = dict[str, Any] | str
 
 
 class TransportActivityOptions(TypedDict, total=False):
-    """Options for each Activity a :class:`TemporalTransport` runs, overriding its own."""
+    """Options for each Activity a :class:`TemporalTransport` runs, overriding its own.
+
+    ``task_queue`` applies only to ``connect``. The other Activities always run on
+    the Worker that started Claude Code, since only it holds the process.
+    """
 
     connect: workflow.ActivityConfig
     """Starts Claude Code."""
@@ -109,11 +113,7 @@ class ClaudeCodeProcess(Protocol):
         ...
 
     async def read(self) -> list[Output]:
-        """Wait for Claude Code's next output, and return it with any more that is already there.
-
-        Keep the result under Temporal's payload limit. The plugin keeps it
-        until the Workflow confirms it got it, so a lost Activity result loses
-        no output.
+        """Wait until Claude Code writes output, then return everything it has written so far.
 
         Returns:
             At least one output, or an empty list once Claude Code exited with
@@ -134,12 +134,12 @@ class ClaudeCodeProcess(Protocol):
         ...
 
     async def terminate(self) -> None:
-        """Stop Claude Code as SIGTERM does, without waiting.
+        """Stop Claude Code at once, as SIGTERM does, forcing it if it doesn't in time.
 
         Claude Code stops where it is, instead of wrapping up as it does when
         its input ends, so a resumed session continues the turn, including a
-        pending tool permission. The plugin calls this on Worker shutdown,
-        then ``close``.
+        pending tool permission. The plugin calls this, not ``close``, on
+        Worker shutdown, so release here whatever ``close`` would.
         """
         ...
 

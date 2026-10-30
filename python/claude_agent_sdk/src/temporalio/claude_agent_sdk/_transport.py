@@ -102,7 +102,6 @@ class TemporalTransport(Transport):
         # The Worker connected to Claude Code shut down or went away. Skip any
         # Activity on its task queue rather than wait out its timeout.
         self._connection_lost = False
-        self._closed = False
 
         self._stream = stream
 
@@ -132,7 +131,7 @@ class TemporalTransport(Transport):
     async def write(self, data: str) -> None:
         """Send the Claude Agent SDK's prompts, requests, and answers to the CLI."""
         async with self._write_lock:
-            if self._connection is None or self._closed:
+            if self._connection is None:
                 raise CLIConnectionError("ProcessTransport is not ready for writing")
 
             message = json.loads(data)
@@ -143,14 +142,18 @@ class TemporalTransport(Transport):
                 request_id = str(workflow.uuid4())
                 self._sdk_ids[request_id] = message["request_id"]
                 data = f"{json.dumps({**message, 'request_id': request_id})}\n"
+            elif kind == "user" and "uuid" not in message:
+                # Claude Code skips a prompt whose uuid it already has, so a
+                # retried write doesn't run it again.
+                data = f"{json.dumps({**message, 'uuid': str(workflow.uuid4())})}\n"
 
             options: dict[str, Any] = {
                 "start_to_close_timeout": timedelta(minutes=5),
                 "heartbeat_timeout": timedelta(seconds=10),
                 "summary": f"Send {STDIN_LABELS.get(kind, kind)}",
-                "task_queue": self._connection.task_queue,
                 "schedule_to_start_timeout": WORKER_GONE_TIMEOUT,
                 **self._activity_options.get("write", {}),
+                "task_queue": self._connection.task_queue,
             }
             await self._execute(
                 WRITE, WriteActivityInput(self._connection.handle, data), options
@@ -158,7 +161,7 @@ class TemporalTransport(Transport):
 
     async def read_messages(self) -> AsyncIterator[dict[str, Any]]:
         """Yield each of the CLI's messages once until it exits, including turns Claude Code starts on its own."""
-        if self._connection is None or self._closed:
+        if self._connection is None:
             raise CLIConnectionError("Not connected")
 
         options: dict[str, Any] = {
@@ -166,9 +169,9 @@ class TemporalTransport(Transport):
             "retry_policy": RetryPolicy(backoff_coefficient=1.0),
             "heartbeat_timeout": timedelta(seconds=10),
             "summary": "Read output",
-            "task_queue": self._connection.task_queue,
             "schedule_to_start_timeout": WORKER_GONE_TIMEOUT,
             **self._activity_options.get("read", {}),
+            "task_queue": self._connection.task_queue,
         }
 
         while True:
@@ -190,16 +193,16 @@ class TemporalTransport(Transport):
     async def end_input(self) -> None:
         """End the CLI's stdin, after the writes before it."""
         async with self._write_lock:
-            if self._connection is None or self._closed:
+            if self._connection is None:
                 return
 
             options: dict[str, Any] = {
                 "start_to_close_timeout": timedelta(minutes=5),
                 "heartbeat_timeout": timedelta(seconds=10),
                 "summary": "End input",
-                "task_queue": self._connection.task_queue,
                 "schedule_to_start_timeout": WORKER_GONE_TIMEOUT,
                 **self._activity_options.get("end_input", {}),
+                "task_queue": self._connection.task_queue,
             }
 
             await self._execute(
@@ -208,29 +211,27 @@ class TemporalTransport(Transport):
 
     async def close(self) -> None:
         """Stop the CLI and everything it started."""
-        if self._closed:
-            return
-
-        self._closed = True
-
-        if self._connection is None or self._connection_lost:
+        if self._connection is None:
             return
 
         options: dict[str, Any] = {
             "start_to_close_timeout": timedelta(minutes=5),
             "heartbeat_timeout": timedelta(seconds=10),
             "summary": "Close Claude Code",
-            "task_queue": self._connection.task_queue,
             "schedule_to_start_timeout": WORKER_GONE_TIMEOUT,
             **self._activity_options.get("close", {}),
+            "task_queue": self._connection.task_queue,
         }
-        try:
-            await workflow.execute_activity(
-                CLOSE, CloseActivityInput(self._connection.handle), **options
-            )
-        except ActivityError as error:
-            if is_cancelled_exception(error):
-                raise
+        if not self._connection_lost:
+            try:
+                await workflow.execute_activity(
+                    CLOSE, CloseActivityInput(self._connection.handle), **options
+                )
+            except ActivityError as error:
+                if is_cancelled_exception(error):
+                    raise
+        # Only now, so a close that was cancelled can run again.
+        self._connection = None
 
     async def _execute(
         self, activity: str, arg: Any, options: dict[str, Any], **result: Any
@@ -257,7 +258,7 @@ class TemporalTransport(Transport):
 
     def is_ready(self) -> bool:
         """Whether Claude Code started and the transport isn't closed."""
-        return self._connection is not None and not self._closed
+        return self._connection is not None
 
     def _handle_output(self, outputs: list[Output]) -> Iterator[dict[str, Any]]:
         """Handle a batch of the CLI's output, and yield the messages in it."""

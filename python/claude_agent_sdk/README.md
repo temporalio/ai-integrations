@@ -105,8 +105,9 @@ SDK's own `SubprocessCLITransport` in the Worker process:
 - As in the Claude Agent SDK, it finds Claude Code, checks its version, and runs it as the Worker's
   user, with the Worker's environment, in the Worker's files. Paths in `ClaudeAgentOptions`, such
   as `cwd` and `cli_path`, are on the Worker.
-- Claude Code stops when the Worker process does. The transport then raises `CLIConnectionError`.
-  To continue the conversation, start a new client with `options.resume` set to the session ID.
+- Claude Code stops when the Worker shuts down. If the Worker is killed or crashes, Claude Code
+  finishes its turn, then exits. Either way, the transport raises `CLIConnectionError`. To
+  continue the conversation, start a new client with `options.resume` set to the session ID.
 - The plugin routes every Activity after the launch to the Worker process that runs Claude Code.
 
 `TemporalTransport` takes options for each of its Activities, anything `workflow.execute_activity`
@@ -217,12 +218,14 @@ while True:
 ```
 
 As with the Claude Agent SDK, output Claude Code wrote after the Worker's last read is lost when the
-Worker stops. If that was a turn's final result, the resumed session has nothing to finish. An app
-that needs it can read the turn from the session transcript with the Claude Agent SDK's
-`get_session_messages(session_id)`, called from an Activity since it reads a file.
+Worker stops. If that was a turn's final result, the resumed session has nothing to finish, so
+check the session transcript before resuming. The [custom transport
+sample](https://github.com/temporalio/samples-python/tree/main/claude_agent_sdk_plugin/plugin_with_custom_transport)
+does this in its `find_saved_turn` Activity.
 
-The new Claude Code reads the session from its config directory, so it must run where that
-directory is, such as on a volume every Worker mounts.
+Resuming, and checking the transcript, both need the session where they run. Mount Claude Code's
+config directory on a volume every Worker shares, or use a connector that keeps sessions in a
+store.
 
 If the Worker goes away between reads, or crashes, the Workflow notices after 30 s, the
 `schedule_to_start_timeout` of the Activities on that Worker's task queue. To notice sooner, lower

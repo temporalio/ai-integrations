@@ -35,12 +35,10 @@ class ClaudeAgentSDKPlugin(SimplePlugin):
                 :class:`SubprocessConnector`, which runs it in a subprocess of
                 the Worker, as the Claude Agent SDK does.
         """
-        # Only this process polls this task queue, so the Activities that reach
-        # the Claude Code it started run here.
-        self._own_queue = f"claude-agent-sdk-{uuid.uuid4()}"
-        self._connection_activities = ConnectionActivities(
-            connector or SubprocessConnector(), self._own_queue
-        )
+        self._connector = connector or SubprocessConnector()
+
+        # Each Worker's Activities, by its task queue.
+        self._workers: dict[str, ConnectionActivities] = {}
 
         def workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
             if not runner:
@@ -71,7 +69,6 @@ class ClaudeAgentSDKPlugin(SimplePlugin):
             # as it would end a program. Otherwise Temporal retries the Workflow
             # Task forever.
             workflow_failure_exception_types=[ClaudeSDKError],
-            activities=[self._connection_activities.connect],
         )
 
     def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
@@ -80,33 +77,41 @@ class ClaudeAgentSDKPlugin(SimplePlugin):
         That Worker gets this plugin from the Client, if the plugin is
         registered there. It needs nothing beyond what :meth:`run_worker` gives it.
         """
-        if config.get("task_queue") == self._own_queue:
+        task_queue = config.get("task_queue", "")
+        if task_queue in self._connector_queues():
             return config
 
+        # Only this process polls the connector queue, so the Activities that
+        # reach the Claude Code this Worker started run here.
+        activities = ConnectionActivities(
+            self._connector, f"claude-agent-sdk-{uuid.uuid4()}"
+        )
+        self._workers[task_queue] = activities
+        config["activities"] = [*config.get("activities", []), activities.connect]
         return super().configure_worker(config)
 
     async def run_worker(
         self, worker: Worker, next: Callable[[Worker], Awaitable[None]]
     ) -> None:
         """Run the Worker, and beside it a Worker for the Activities that only this process can run."""
-        if worker.task_queue == self._own_queue:
+        if worker.task_queue in self._connector_queues():
             await next(worker)
             return
 
-        own = Worker(
+        activities = self._workers[worker.task_queue]
+        connector_worker = Worker(
             worker.client,
-            task_queue=self._own_queue,
-            activities=self._connection_activities.connected_activities(),
+            task_queue=activities.connector_queue,
+            activities=activities.connected_activities(),
             interceptors=worker.config().get("interceptors", []),
         )
 
-        async with own:
-            try:
+        try:
+            async with connector_worker:
                 await super().run_worker(worker, next)
-            finally:
-                # Stop each Claude Code this Worker started, so a resumed
-                # session continues its turn. Before the own Worker shuts
-                # down, since its reads wait for Claude Code's output.
-                # Shielded, since a Worker cancels this plugin once its
-                # plugin_shutdown_timeout passes.
-                await asyncio.shield(self._connection_activities.shut_down())
+        finally:
+            # Make sure this Worker's Claude Codes are stopped, even if this plugin is cancelled.
+            await asyncio.shield(activities.shut_down())
+
+    def _connector_queues(self) -> set[str]:
+        return {activities.connector_queue for activities in self._workers.values()}

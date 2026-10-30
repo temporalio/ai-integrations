@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -34,7 +34,6 @@ from temporalio.claude_agent_sdk._types import (
     WriteActivityInput,
 )
 from temporalio.exceptions import ActivityError, ApplicationError, RetryState
-from temporalio.service import PayloadLimitsConfig
 from temporalio.testing import ActivityEnvironment
 from tests.helpers.harness import CLAUDE, LocalCli
 
@@ -43,8 +42,8 @@ pytestmark = pytest.mark.skipif(
     reason="needs sh and the Claude Agent SDK's bundled Claude Code",
 )
 
-# The plugin's own task queue for this process.
-OWN_QUEUE = "claude-agent-sdk-own"
+# The task queue only this process polls.
+CONNECTOR_QUEUE = "claude-agent-sdk-connector"
 
 
 @pytest.fixture
@@ -54,13 +53,44 @@ def cli(tmp_path: Path) -> LocalCli:
 
 @pytest.fixture
 def activities() -> ConnectionActivities:
-    return ConnectionActivities(SubprocessConnector(), OWN_QUEUE)
+    return ConnectionActivities(SubprocessConnector(), CONNECTOR_QUEUE)
 
 
 def request(cli: LocalCli, script: str = "exec cat") -> ConnectActivityInput:
     """The input to start a CLI that runs ``script``, by default echoing its stdin."""
     cli.set_cli(script)
     return ConnectActivityInput([], {}, cli_path=str(cli.cli_path))
+
+
+class ScriptedProcess:
+    """A Claude Code whose reads return ``reads`` in turn, raising each that is an error."""
+
+    def __init__(self, *reads: list[Output] | Exception) -> None:
+        self.reads = list(reads)
+
+    async def read(self) -> list[Output]:
+        result = self.reads.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def write(self, data: str) -> None:
+        del data
+
+    async def end_input(self) -> None: ...
+    async def close(self) -> None: ...
+    async def terminate(self) -> None: ...
+
+
+def scripted(*reads: list[Output] | Exception) -> ConnectionActivities:
+    """The Activities, with a :class:`ScriptedProcess` of ``reads`` as Claude Code."""
+
+    class ScriptedConnector:
+        async def connect(self, request: ConnectActivityInput) -> ClaudeCodeProcess:
+            del request
+            return ScriptedProcess(*reads)
+
+    return ConnectionActivities(ScriptedConnector(), CONNECTOR_QUEUE)
 
 
 async def test_a_read_returns_the_next_output_until_claude_code_exits(
@@ -72,8 +102,8 @@ async def test_a_read_returns_the_next_output_until_claude_code_exits(
     launched = await run(activities.connect, launch)
     # A retried launch starts nothing more.
     assert await run(activities.connect, launch) == launched
-    # Only this Worker can reach the subprocess, so the rest goes to its own queue.
-    assert launched.task_queue == OWN_QUEUE
+    # Only this Worker can reach the subprocess, so the rest goes to its connector queue.
+    assert launched.task_queue == CONNECTOR_QUEUE
     handle = launched.handle
     await run(activities.write, WriteActivityInput(handle, '{"n": 1}\n'))
     assert await run(activities.read, ReadActivityInput(handle, 0)) == ReadResult(
@@ -115,36 +145,54 @@ async def test_shutting_down_stops_claude_code_with_sigterm_before_its_stdin_clo
     stand_in = tmp_path / "claude.py"
     stand_in.write_text(SIGTERM_OR_EOF)
     seen = tmp_path / "seen"
-    launched = await ActivityEnvironment().run(
+    await ActivityEnvironment().run(
         activities.connect,
         request(cli, f'exec "{sys.executable}" "{stand_in}" "{seen}"'),
     )
     while not seen.with_suffix(".ready").exists():
         await asyncio.sleep(0.05)
-    reading = asyncio.create_task(
-        ActivityEnvironment().run(
-            activities.read, ReadActivityInput(launched.handle, 0)
-        )
-    )
-    await asyncio.sleep(0.1)
 
     await activities.shut_down()
 
     assert seen.read_text() == "SIGTERM"
     assert cli.running() == []
-    # The read fails for good, so the Workflow resumes the session now, not
-    # after its retry times out on this Worker's task queue.
-    with pytest.raises(ApplicationError) as failed:
-        await reading
-    assert failed.value.type == "CLIConnectionError"
-    assert failed.value.non_retryable
-    assert failed.value.message == CONNECTION_LOST
+
+
+async def test_shutting_down_stops_every_claude_code_then_raises_what_failed() -> None:
+    """Such as a remote connector whose terminate call fails, which nothing would retry."""
+    stopped: list[bool] = []
+
+    class FailsToTerminate(ScriptedProcess):
+        async def terminate(self) -> None:
+            raise OSError("terminate failed")
+
+    class Terminates(ScriptedProcess):
+        async def terminate(self) -> None:
+            stopped.append(True)
+
+    processes: list[ClaudeCodeProcess] = [FailsToTerminate(), Terminates()]
+
+    class Connector:
+        async def connect(self, request: ConnectActivityInput) -> ClaudeCodeProcess:
+            del request
+            return processes.pop(0)
+
+    activities = ConnectionActivities(Connector(), CONNECTOR_QUEUE)
+    for activity_id in ("1", "2"):
+        env = ActivityEnvironment()
+        env.info = dataclasses.replace(env.info, activity_id=activity_id)
+        await env.run(activities.connect, ConnectActivityInput([], {}))
+
+    with pytest.raises(OSError, match="terminate failed"):
+        await activities.shut_down()
+
+    assert stopped == [True]
 
 
 async def test_a_read_the_worker_shutdown_cancelled_fails_for_good(
     cli: LocalCli, activities: ConnectionActivities
 ) -> None:
-    """Such as when Claude Code takes a while to exit on SIGTERM."""
+    """As a Worker shutdown does at once, before the plugin stops Claude Code."""
     handle = (await ActivityEnvironment().run(activities.connect, request(cli))).handle
     env = ActivityEnvironment()
     reading = asyncio.create_task(
@@ -162,88 +210,19 @@ async def test_a_read_the_worker_shutdown_cancelled_fails_for_good(
     await activities.shut_down()
 
 
-class WritesOnSigterm:
-    """Stands in for Claude Code that writes once it gets SIGTERM."""
-
-    def __init__(self) -> None:
-        self.stopped = asyncio.Event()
-
-    async def read(self) -> list[Output]:
-        await self.stopped.wait()
-        return [{"n": 0}]
-
-    async def terminate(self) -> None:
-        self.stopped.set()
-
-    async def write(self, data: str) -> None:
-        del data
-
-    async def end_input(self) -> None: ...
-    async def close(self) -> None: ...
-
-
-async def test_a_read_that_got_output_during_a_shutdown_returns_it() -> None:
-    """Only the next read fails, so no output is dropped."""
-    process = WritesOnSigterm()
-
-    class Connector:
-        async def connect(self, request: ConnectActivityInput) -> WritesOnSigterm:
-            del request
-            return process
-
-    activities = ConnectionActivities(Connector(), OWN_QUEUE)
+async def test_a_read_returns_what_fits_the_payload_limit() -> None:
+    """At least one output, even one over the limit on its own. The next read returns the rest."""
+    big = "x" * 600_000
     run = ActivityEnvironment().run
+    activities = scripted([big, {"n": 1}, {"n": 2}, big])
     handle = (await run(activities.connect, ConnectActivityInput([], {}))).handle
-    reading = asyncio.create_task(run(activities.read, ReadActivityInput(handle, 0)))
-    await asyncio.sleep(0.1)
 
-    await activities.shut_down()
+    reads = [
+        (await run(activities.read, ReadActivityInput(handle, received))).output
+        for received in (0, 1, 3)
+    ]
 
-    assert await reading == ReadResult([{"n": 0}])
-    with pytest.raises(ApplicationError) as failed:
-        await run(activities.read, ReadActivityInput(handle, 1))
-    assert failed.value.message == CONNECTION_LOST
-
-
-async def test_a_read_returns_at_most_about_a_mebibyte(
-    cli: LocalCli, activities: ConnectionActivities
-) -> None:
-    """To stay under Temporal's payload limit: the next read returns the rest."""
-    line = """printf '{"x": "'; head -c 600000 /dev/zero | tr '\\0' x; echo '"}'"""
-    launched = await ActivityEnvironment().run(
-        activities.connect, request(cli, f"{line}; {line}; {line}")
-    )
-
-    counts: list[int] = []
-    while True:
-        read = ReadActivityInput(launched.handle, sum(counts))
-        result = await ActivityEnvironment().run(activities.read, read)
-        counts.append(len(result.output))
-        if not result.output:
-            break
-
-    assert counts == [1, 1, 1, 0]
-    await ActivityEnvironment().run(
-        activities.close, CloseActivityInput(launched.handle)
-    )
-
-
-async def test_a_read_includes_stderr_in_the_payload_limit(cli: LocalCli) -> None:
-    line = "head -c 600000 /dev/zero | tr '\\0' x >&2; echo >&2"
-    process = await SubprocessConnector().connect(
-        request(cli, f"{line}; {line}; echo '{{\"n\": 1}}'")
-    )
-
-    batches: list[list[Output]] = []
-    while output := await process.read():
-        batches.append(output)
-
-    limit = PayloadLimitsConfig().payloads_warn_size
-    assert all(
-        len(json.dumps(batch).encode()) <= limit or len(batch) == 1 for batch in batches
-    )
-    assert [item for batch in batches for item in batch][-1] == {"n": 1}
-    await process.close()
+    assert reads == [[big], [{"n": 1}, {"n": 2}], [big]]
 
 
 async def test_a_read_returns_all_the_output_already_written(cli: LocalCli) -> None:
@@ -295,29 +274,8 @@ async def test_a_read_whose_result_was_lost_returns_the_same_output_again(
 
 async def test_a_read_retries_an_error_the_connector_says_a_retry_can_fix() -> None:
     """Such as a dropped network call to a remote Claude Code."""
-    reads: list[str] = []
-
-    class FlakyProcess:
-        async def write(self, data: str) -> None:
-            del data
-
-        async def end_input(self) -> None: ...
-        async def close(self) -> None: ...
-        async def terminate(self) -> None: ...
-
-        async def read(self) -> list[Output]:
-            reads.append("read")
-            if len(reads) == 1:
-                raise ConnectionResetError("dropped")
-            return [{"n": 1}]
-
-    class FlakyConnector:
-        async def connect(self, request: ConnectActivityInput) -> ClaudeCodeProcess:
-            del request
-            return FlakyProcess()
-
     run = ActivityEnvironment().run
-    activities = ConnectionActivities(FlakyConnector(), OWN_QUEUE)
+    activities = scripted(ConnectionResetError("dropped"), [{"n": 1}])
     handle = (await run(activities.connect, ConnectActivityInput([], {}))).handle
     read = ReadActivityInput(handle, 0)
 
@@ -327,29 +285,49 @@ async def test_a_read_retries_an_error_the_connector_says_a_retry_can_fix() -> N
     assert await run(activities.read, read) == ReadResult([{"n": 1}])
 
 
-async def test_a_read_returns_stderr_before_the_output(cli: LocalCli) -> None:
+async def test_reads_return_stderr_and_output_in_the_order_they_arrive(
+    cli: LocalCli,
+) -> None:
+    """Up to Claude Code's exit, even stderr written just before it."""
     process = await SubprocessConnector().connect(
-        request(cli, """echo warning >&2; sleep 0.5; echo '{"n": 1}'""")
+        request(cli, """echo '{"n": 1}'; sleep 0.5; echo warning >&2""")
     )
 
-    assert await process.read() == ["warning", {"n": 1}]
+    output: list[Output] = []
+    while batch := await process.read():
+        output += batch
+
+    assert output == [{"n": 1}, "warning"]
+    # Every later read ends the same way.
     assert await process.read() == []
     await process.close()
 
 
-async def test_a_nonzero_exit_fails_the_read_for_good(
-    cli: LocalCli, activities: ConnectionActivities
+@pytest.mark.parametrize(
+    ("script", "error", "reason"),
+    [
+        ("exit 3", "ProcessError", "exit code 3"),
+        # Not UTF-8, which the Claude Agent SDK fails to decode.
+        ("printf '\\377\\n'", "CLIConnectionError", "can't decode byte 0xff"),
+    ],
+)
+async def test_a_nonzero_exit_or_unreadable_output_fails_every_read_for_good(
+    cli: LocalCli,
+    activities: ConnectionActivities,
+    script: str,
+    error: str,
+    reason: str,
 ) -> None:
     run = ActivityEnvironment().run
-    launched = await run(activities.connect, request(cli, "exit 3"))
+    handle = (await run(activities.connect, request(cli, script))).handle
 
-    with pytest.raises(ApplicationError) as raised:
-        await run(activities.read, ReadActivityInput(launched.handle, 0))
-
-    assert raised.value.type == "ProcessError"
-    assert raised.value.non_retryable
-    assert raised.value.details[0] == 3
-    await run(activities.close, CloseActivityInput(launched.handle))
+    for _ in range(2):
+        with pytest.raises(ApplicationError) as raised:
+            await run(activities.read, ReadActivityInput(handle, 0))
+        assert raised.value.type == error
+        assert raised.value.non_retryable
+        assert reason in raised.value.message
+    await run(activities.close, CloseActivityInput(handle))
 
 
 @pytest.mark.parametrize(
@@ -397,7 +375,7 @@ async def test_a_launch_cancelled_while_starting_closes_what_it_started(
             return process
 
     env = ActivityEnvironment()
-    activities = ConnectionActivities(SlowConnector(), OWN_QUEUE)
+    activities = ConnectionActivities(SlowConnector(), CONNECTOR_QUEUE)
     launch = asyncio.create_task(env.run(activities.connect, request(cli)))
     await starting.wait()
     env.cancel()

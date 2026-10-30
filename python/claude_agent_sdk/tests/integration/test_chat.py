@@ -14,14 +14,22 @@ from typing import Any
 
 import pytest
 
+from temporalio import activity
 from temporalio.api.common.v1 import WorkflowExecution
 from temporalio.api.enums.v1 import EventType
 from temporalio.api.workflowservice.v1 import ResetWorkflowExecutionRequest
 from temporalio.claude_agent_sdk import ClaudeAgentSDKPlugin
+from temporalio.claude_agent_sdk._constants import WRITE
 from temporalio.client import WorkflowFailureError, WorkflowHandle
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError, CancelledError
-from temporalio.worker import Replayer, Worker
+from temporalio.worker import (
+    ActivityInboundInterceptor,
+    ExecuteActivityInput,
+    Interceptor,
+    Replayer,
+    Worker,
+)
 from tests.helpers.harness import (
     ANSWERS,
     CLAUDE,
@@ -93,6 +101,44 @@ async def test_each_prompt_is_a_turn_of_one_conversation(harness: Harness) -> No
     assert harness.asked == ["write it", "tool_result:toolu_1", "bye"]
     # One CLI serves both turns.
     assert len(harness.cli_pids()) == 1
+
+
+class LosesTheFirstPromptWrite(Interceptor):
+    """Fails the first prompt's write after Claude Code got it, as if its result was lost, so Temporal retries it."""
+
+    def __init__(self) -> None:
+        self.lost = False
+
+    def intercept_activity(
+        self, next: ActivityInboundInterceptor
+    ) -> ActivityInboundInterceptor:
+        return _LosesTheFirstPromptWrite(next, self)
+
+
+class _LosesTheFirstPromptWrite(ActivityInboundInterceptor):
+    def __init__(
+        self, next: ActivityInboundInterceptor, root: LosesTheFirstPromptWrite
+    ) -> None:
+        super().__init__(next)
+        self.root = root
+
+    async def execute_activity(self, input: ExecuteActivityInput) -> Any:
+        result = await self.next.execute_activity(input)
+        is_prompt = '"type": "user"' in getattr(input.args[0], "text", "")
+        if activity.info().activity_type == WRITE and is_prompt and not self.root.lost:
+            self.root.lost = True
+            raise ApplicationError("The write's result was lost")
+        return result
+
+
+async def test_a_prompt_whose_write_is_retried_runs_once(harness: Harness) -> None:
+    harness.interceptors = [LosesTheFirstPromptWrite()]
+
+    messages = await harness.run({"hello": "Hi.", "bye": "Bye."}, ["hello", "bye"])
+
+    # A second "hello" would run before "bye".
+    assert results(messages) == [["Hi."], ["Bye."]]
+    assert harness.asked == ["hello", "bye"]
 
 
 async def test_a_denied_tool_does_not_run_and_the_model_reads_why(

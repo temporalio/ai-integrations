@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import sys
 import uuid
@@ -16,6 +18,7 @@ from temporalio.claude_agent_sdk import (
     ClaudeAgentSDKPlugin,
     ClaudeCodeProcess,
     ConnectActivityInput,
+    SubprocessConnector,
     TemporalTransport,
 )
 from temporalio.claude_agent_sdk._constants import CONNECTION_LOST
@@ -50,9 +53,18 @@ class TransportWorkflow:
         connect_queue: str | None = None,
     ) -> list[Any]:
         options = ClaudeAgentOptions(cli_path=cli_path, max_buffer_size=max_buffer_size)
-        # None runs the launch on the Workflow's task queue, as by default.
+        # None runs the launch on the Workflow's task queue, as by default. Set
+        # for every Activity, as a user might, it moves only the launch.
+        queue: workflow.ActivityConfig = {"task_queue": connect_queue}
         transport = TemporalTransport(
-            options, activity_options={"connect": {"task_queue": connect_queue}}
+            options,
+            activity_options={
+                "connect": queue,
+                "write": queue,
+                "end_input": queue,
+                "read": queue,
+                "close": queue,
+            },
         )
         await transport.connect()
         for line in lines:
@@ -132,7 +144,7 @@ async def test_once_the_connection_is_lost_no_activity_runs() -> None:
     assert isinstance(raised, CLIConnectionError)
     # Outside a Workflow, an Activity would raise.
     with pytest.raises(CLIConnectionError) as failed:
-        await transport.write('{"type": "user"}\n')
+        await transport.write('{"type": "control_response"}\n')
     assert str(failed.value) == CONNECTION_LOST
     await transport.close()
     assert not transport.is_ready()
@@ -162,7 +174,7 @@ async def test_the_sdks_requests_go_under_ids_the_workflow_picks(
     assert messages[0]["response"]["request_id"] == "sdk_random"
 
 
-async def test_after_the_launch_the_activities_run_on_the_workers_own_queue(
+async def test_after_the_launch_the_activities_run_on_the_workers_connector_queue(
     env: WorkflowEnvironment, cli: LocalCli
 ) -> None:
     """Only the Worker that started the subprocess can reach it."""
@@ -183,15 +195,15 @@ async def test_after_the_launch_the_activities_run_on_the_workers_own_queue(
         "claude-agent-sdk-read",
         "claude-agent-sdk-close",
     }
-    [own] = set(queues.values())
-    assert own != shared
-    assert own.startswith("claude-agent-sdk-")
+    [connector_queue] = set(queues.values())
+    assert connector_queue != shared
+    assert connector_queue.startswith("claude-agent-sdk-")
 
 
 async def test_claude_code_can_run_on_workers_of_its_own(
     env: WorkflowEnvironment, cli: LocalCli
 ) -> None:
-    """The launch goes to their task queue, as the README shows. The other Activities follow it there."""
+    """The launch goes to their task queue, as the README shows. The other Activities follow it there, whatever queue they're given."""
 
     class NoClaudeCode:
         async def connect(self, request: ConnectActivityInput) -> ClaudeCodeProcess:
@@ -222,7 +234,7 @@ async def test_claude_code_can_run_on_workers_of_its_own(
 async def test_the_plugin_can_be_registered_on_the_client(
     env: WorkflowEnvironment, cli: LocalCli
 ) -> None:
-    """The Worker for the plugin's own task queue gets the plugin from the Client too."""
+    """The Worker for the plugin's connector queue gets the plugin from the Client too."""
     cli.set_cli("exec cat")
     config = env.client.config()
     config["plugins"] = [ClaudeAgentSDKPlugin()]
@@ -237,6 +249,91 @@ async def test_the_plugin_can_be_registered_on_the_client(
         )
 
     assert result == [RESULT]
+
+
+async def test_a_worker_stopping_leaves_other_workers_claude_code_running(
+    env: WorkflowEnvironment, cli: LocalCli, tmp_path: Path
+) -> None:
+    """Such as two Workers that get the plugin from one Client."""
+    ready, go = tmp_path / "ready", tmp_path / "go"
+    cli.set_cli(
+        f'touch "{ready}"; while [ ! -e "{go}" ]; do sleep 0.1; done; '
+        f"echo '{json.dumps(RESULT)}'"
+    )
+    config = env.client.config()
+    config["plugins"] = [ClaudeAgentSDKPlugin()]
+    client = Client(**config)
+    task_queue = str(uuid.uuid4())
+    async with Worker(client, task_queue=task_queue, workflows=[TransportWorkflow]):
+        handle = await client.start_workflow(
+            TransportWorkflow.run,
+            args=[str(cli.cli_path), []],
+            id=task_queue,
+            task_queue=task_queue,
+        )
+        while not ready.exists():
+            await asyncio.sleep(0.05)
+
+        async with Worker(client, task_queue=str(uuid.uuid4())):
+            pass
+        go.touch()
+
+        assert await handle.result() == [RESULT]
+
+
+@workflow.defn
+class ClosesAgainWorkflow:
+    """Cancels a close while its Activity runs, then closes again, as cleanup would."""
+
+    @workflow.run
+    async def run(self, cli_path: str) -> None:
+        transport = TemporalTransport(ClaudeAgentOptions(cli_path=cli_path))
+        await transport.connect()
+        closing = asyncio.create_task(transport.close())
+        await workflow.sleep(1)
+        closing.cancel()
+        with contextlib.suppress(ActivityError):
+            await closing
+        await transport.close()
+
+
+async def test_a_cancelled_close_runs_again(
+    env: WorkflowEnvironment, cli: LocalCli
+) -> None:
+    """Such as a Workflow cancelled while Claude Code closes, whose cleanup closes again."""
+    closes: list[str] = []
+
+    class HangsOnFirstClose:
+        async def connect(self, request: ConnectActivityInput) -> ClaudeCodeProcess:
+            process = await SubprocessConnector().connect(request)
+            close = process.close
+
+            async def close_once_it_is_not_the_first() -> None:
+                closes.append("close")
+                if len(closes) == 1:
+                    await asyncio.Event().wait()
+                await close()
+
+            process.close = close_once_it_is_not_the_first  # type: ignore[method-assign]
+            return process
+
+    cli.set_cli("exec cat")
+    task_queue = str(uuid.uuid4())
+    async with Worker(
+        env.client,
+        task_queue=task_queue,
+        workflows=[ClosesAgainWorkflow],
+        plugins=[ClaudeAgentSDKPlugin(connector=HangsOnFirstClose())],
+    ):
+        await env.client.execute_workflow(
+            ClosesAgainWorkflow.run,
+            str(cli.cli_path),
+            id=task_queue,
+            task_queue=task_queue,
+        )
+        # Before the Worker's shutdown would stop it anyway.
+        assert closes == ["close", "close"]
+        assert cli.running() == []
 
 
 async def test_a_line_that_is_not_a_json_object_is_skipped(

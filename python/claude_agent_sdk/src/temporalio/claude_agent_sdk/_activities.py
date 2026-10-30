@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 from claude_agent_sdk import ClaudeSDKError, CLIConnectionError
 
 from temporalio import activity
+from temporalio.service import PayloadLimitsConfig
 
 from ._constants import CLOSE, CONNECT, CONNECTION_LOST, END_INPUT, READ, WRITE
 from ._errors import activity_error
@@ -61,22 +63,19 @@ class _Connection:
 
 
 class ConnectionActivities:
-    """The Activities, with the connector they use, the Claude Codes they started, and this process's own task queue."""
+    """One Worker's Activities, with the connector they use, the Claude Codes they started, and their connector queue."""
 
-    def __init__(self, connector: Connector, task_queue: str) -> None:
+    def __init__(self, connector: Connector, connector_queue: str) -> None:
         """Create the Activities, with no Claude Code running.
 
         Args:
             connector: Starts Claude Code and reaches it.
-            task_queue: The task queue only this process polls, where the
+            connector_queue: The task queue only this process polls, where the
                 Activities after ``connect`` must run.
         """
         self._connector = connector
-        self._task_queue = task_queue
+        self.connector_queue = connector_queue
         self._connections: dict[str, _Connection] = {}
-        # This Worker is shutting down and stops every Claude Code it's connected
-        # to, so each Activity that reaches one fails with CONNECTION_LOST.
-        self._shutting_down = False
 
     def connected_activities(self) -> list[Callable[..., Any]]:
         """The Activities that reach a Claude Code ``connect`` started, so must run in this process."""
@@ -103,9 +102,10 @@ class ConnectionActivities:
             except ClaudeSDKError as error:
                 raise activity_error(error) from error
 
-        return Connection(handle, self._task_queue)
+        return Connection(handle, self.connector_queue)
 
     @activity.defn(name=WRITE)
+    @auto_heartbeater
     async def write(self, request: WriteActivityInput) -> None:
         """Write to Claude Code's stdin."""
         try:
@@ -114,6 +114,7 @@ class ConnectionActivities:
             raise activity_error(error) from error
 
     @activity.defn(name=END_INPUT)
+    @auto_heartbeater
     async def end_input(self, request: EndInputActivityInput) -> None:
         """Close Claude Code's stdin."""
         try:
@@ -124,7 +125,7 @@ class ConnectionActivities:
     @activity.defn(name=READ)
     @auto_heartbeater
     async def read(self, request: ReadActivityInput) -> ReadResult:
-        """Wait for Claude Code's output, and return what there is.
+        """Wait for Claude Code's output, and return as much as fits Temporal's payload limit.
 
         The output stays here until a later read confirms the Workflow got it.
         The server drops the result of an attempt it timed out, so the retry
@@ -142,18 +143,11 @@ class ConnectionActivities:
                     try:
                         connection.unreceived = await connection.read_process()
                     finally:
-                        # Report a lost connection if a shutdown began during a
-                        # read that got no output, or cancelled it. Temporal
-                        # would retry a cancelled read on this Worker's task
-                        # queue, which no Worker polls once it's gone.
                         cancel = activity.cancellation_details()
-                        if not connection.unreceived and (
-                            (cancel is not None and cancel.worker_shutdown)
-                            or (self._shutting_down and not activity.is_cancelled())
-                        ):
+                        if cancel is not None and cancel.worker_shutdown:
                             raise CLIConnectionError(CONNECTION_LOST)
 
-                return ReadResult(list(connection.unreceived))
+                return ReadResult(_fit_payload(connection.unreceived))
         except ClaudeSDKError as error:
             raise activity_error(error) from error
 
@@ -172,26 +166,20 @@ class ConnectionActivities:
             raise activity_error(error) from error
 
     async def shut_down(self) -> None:
-        """Stop every Claude Code this process started, leaving their sessions resumable."""
-        self._shutting_down = True
+        """Stop every Claude Code this Worker started, leaving their sessions resumable."""
         connections, self._connections = self._connections, {}
 
-        async def stop(process: ClaudeCodeProcess) -> None:
-            await process.terminate()
-            await process.close()
-
-        await asyncio.gather(
-            *(stop(connection.process) for connection in connections.values()),
+        results = await asyncio.gather(
+            *(connection.process.terminate() for connection in connections.values()),
             return_exceptions=True,
         )
 
-    def _raise_if_shutting_down(self) -> None:
-        if self._shutting_down:
-            raise CLIConnectionError(CONNECTION_LOST)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     def _connection(self, handle: str) -> _Connection:
         """The Claude Code ``connect`` started, if this Worker still holds it."""
-        self._raise_if_shutting_down()
         connection = self._connections.get(handle)
         if connection is None:
             # Closed, or started by an earlier run, such as one a reset replaced.
@@ -200,3 +188,14 @@ class ConnectionActivities:
                 "a new client with options.resume set to the session ID."
             )
         return connection
+
+
+def _fit_payload(outputs: list[Output]) -> list[Output]:
+    """The most of ``outputs``, from the start, that fits Temporal's payload limit, and at least one."""
+    limit = PayloadLimitsConfig().payloads_warn_size
+    size = 2  # The surrounding JSON list.
+    for count, output in enumerate(outputs):
+        size += len(json.dumps(output).encode()) + (2 if count else 0)  # ", "
+        if count and size > limit:
+            return outputs[:count]
+    return list(outputs)
