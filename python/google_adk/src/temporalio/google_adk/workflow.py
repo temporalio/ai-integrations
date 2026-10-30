@@ -131,7 +131,9 @@ def _validated_tool_context_parameter(
     )
 
 
-def _tool_context_parameter(activity_def: Callable) -> inspect.Parameter | None:
+def _tool_context_parameter(
+    activity_def: Callable, signature: inspect.Signature, hints: dict[str, Any]
+) -> inspect.Parameter | None:
     """Validates context-related parameters and returns the ``tool_context`` one.
 
     ADK injects the live context into the first parameter annotated with an
@@ -144,10 +146,6 @@ def _tool_context_parameter(activity_def: Callable) -> inspect.Parameter | None:
     time, as is a misplaced ToolContextSnapshot annotation that would leak
     into the tool schema.
     """
-    try:
-        hints = typing.get_type_hints(activity_def)
-    except Exception:
-        hints = {}
     adk_context: type[Any] | None
     try:
         from google.adk.tools.tool_context import ToolContext
@@ -156,7 +154,7 @@ def _tool_context_parameter(activity_def: Callable) -> inspect.Parameter | None:
     except ImportError:
         adk_context = None
     tool_context_parameter: inspect.Parameter | None = None
-    for name, parameter in inspect.signature(activity_def).parameters.items():
+    for name, parameter in signature.parameters.items():
         members = _annotation_members(hints.get(name, parameter.annotation))
         if name == _TOOL_CONTEXT_PARAM:
             tool_context_parameter = _validated_tool_context_parameter(
@@ -175,6 +173,93 @@ def _tool_context_parameter(activity_def: Callable) -> inspect.Parameter | None:
                 " schema. Rename the parameter to 'tool_context'."
             )
     return tool_context_parameter
+
+
+def _call_function(method: Any) -> Callable | None:
+    """Returns the function under a function, staticmethod, classmethod or partialmethod."""
+    while isinstance(method, (staticmethod, classmethod, functools.partialmethod)):
+        method = (
+            method.func
+            if isinstance(method, functools.partialmethod)
+            else method.__func__
+        )
+    return method if inspect.isfunction(method) else None
+
+
+def _docstring(fn: Any) -> str | None:
+    """Returns ``fn``'s docstring, unless it is missing or blank."""
+    doc = getattr(fn, "__doc__", None) if fn is not None else None
+    return doc if doc and doc.strip() else None
+
+
+def _tool_signature(
+    activity_def: Callable,
+) -> tuple[inspect.Signature, dict[str, Any], str | None]:
+    """Returns the parameters the activity is called with, their types and its docstring."""
+    if inspect.isclass(activity_def):
+        # Workflow code references a callable-class activity by its class, but
+        # the worker's registered instance runs __call__, so take __call__'s
+        # parameters as an instance binds it: without the receiver of a method,
+        # classmethod or partialmethod, and with every parameter of a
+        # staticmethod.
+        calls = [
+            vars(c)["__call__"] for c in activity_def.__mro__ if "__call__" in vars(c)
+        ]
+        func = _call_function(calls[0]) if calls else None
+        if func is None:
+            raise ValueError(
+                f"Activity class '{activity_def.__name__}' needs a __call__ that is"
+                " a function, staticmethod, classmethod or functools.partialmethod."
+            )
+        try:
+            signature = inspect.signature(calls[0].__get__(object(), activity_def))
+            # Resolve the types in __call__'s own module: the wrapper has other
+            # globals.
+            hints = typing.get_type_hints(func, include_extras=True)
+        except Exception as e:
+            raise ValueError(
+                f"Cannot read the parameters of '{activity_def.__name__}.__call__': {e}"
+            ) from e
+        # @activity.defn checks the constructor's signature, not __call__'s, so
+        # __call__ can take keyword-only arguments or **kwargs, which the tool
+        # can't pass: activities get their arguments by position.
+        for p in signature.parameters.values():
+            if p.kind in (
+                inspect.Parameter.KEYWORD_ONLY,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                raise ValueError(
+                    f"Activity class '{activity_def.__name__}' cannot take keyword-only"
+                    f" arguments or **kwargs in __call__ ('{p.name}'): activities get"
+                    " their arguments by position."
+                )
+        # __call__'s own docstring, else the class's, else that of a __call__ it
+        # inherits.
+        doc = (
+            _docstring(_call_function(vars(activity_def).get("__call__")))
+            or _docstring(activity_def)
+            or next(filter(None, map(_docstring, map(_call_function, calls))), None)
+        )
+        return signature, hints, doc
+    signature = inspect.signature(activity_def)
+    params = list(signature.parameters.values())
+    # Drop the receiver of a method passed as Class.method the way the SDK does:
+    # a first parameter named `self` that is unannotated or annotated
+    # `typing.Self`. The worker's registered instance supplies it.
+    if (
+        params
+        and params[0].name == "self"
+        and (
+            params[0].annotation is inspect.Parameter.empty
+            or str(params[0].annotation) == "typing.Self"
+        )
+    ):
+        signature = signature.replace(parameters=params[1:])
+    try:
+        hints = typing.get_type_hints(activity_def)
+    except Exception:
+        hints = {}
+    return signature, hints, activity_def.__doc__
 
 
 def _snapshot_tool_context(tool_context: Any) -> ToolContextSnapshot:
@@ -200,6 +285,14 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     This ensures the activity's signature is preserved for ADK's tool schema generation
     while marking it as a tool that executes via 'workflow.execute_activity'.
 
+    ``activity_def`` can be an activity function, a method passed as
+    ``Class.method``, or a callable-class activity passed as its class. The
+    tool offers the parameters the activity is called with: without a method's
+    ``self``, and from ``__call__`` for a class. A class whose ``__call__`` is
+    not a function, staticmethod, classmethod or ``functools.partialmethod``,
+    can't be read, or takes keyword-only arguments or ``**kwargs`` raises
+    ``ValueError``.
+
     If the activity declares a parameter named ``tool_context``, it must be
     annotated with :class:`ToolContextSnapshot` (or ``ToolContextSnapshot |
     None``). ADK excludes the parameter from the tool schema and injects the
@@ -209,7 +302,8 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     type raises ``ValueError`` at wrap time, since ADK would inject the
     non-serializable context into it regardless of its name.
     """
-    tool_context_param = _tool_context_parameter(activity_def)
+    signature, hints, doc = _tool_signature(activity_def)
+    tool_context_param = _tool_context_parameter(activity_def, signature, hints)
 
     @functools.wraps(activity_def)
     async def wrapper(*args: Any, **kw: Any):
@@ -218,9 +312,8 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
         if tool_context_param is not None and _TOOL_CONTEXT_PARAM in kw:
             kw[_TOOL_CONTEXT_PARAM] = _snapshot_tool_context(kw[_TOOL_CONTEXT_PARAM])
 
-        # Inspect signature to bind arguments
-        sig = inspect.signature(activity_def)
-        bound = sig.bind(*args, **kw)
+        # Bind arguments to the parameters the activity is called with
+        bound = signature.bind(*args, **kw)
         bound.apply_defaults()
 
         # Convert to positional args for Temporal
@@ -249,7 +342,12 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
 
     # functools.wraps copies name/doc/module/annotations/qualname/dict.
     # Signature must be set explicitly since the wrapper uses *args/**kw.
-    setattr(wrapper, "__signature__", inspect.signature(activity_def))
+    setattr(wrapper, "__signature__", signature)
+    if inspect.isclass(activity_def):
+        # ADK reads the tool's types and description from the wrapper, so give
+        # it __call__'s instead of the class's.
+        wrapper.__annotations__ = hints
+        wrapper.__doc__ = doc
 
     return wrapper
 

@@ -833,6 +833,25 @@ class ComplexActivityMethodHolder:
         complex_activity_inputs_seen["annotate_trip"] = trip
         return f"{self.prefix}:{trip}"
 
+    @activity.defn
+    async def count_passengers(self, passengers: int) -> str:
+        """Method activity passed to activity_as_tool as Class.method."""
+        complex_activity_inputs_seen["count_passengers"] = passengers
+        return f"{self.prefix}:{passengers}"
+
+
+@activity.defn
+class QuoteTrip:
+    """Callable-class activity passed to activity_as_tool as its class."""
+
+    def __init__(self, currency: str) -> None:
+        self.currency = currency
+
+    async def __call__(self, trip: str, passengers: int) -> str:
+        """Quote a trip for some passengers."""
+        complex_activity_inputs_seen["QuoteTrip"] = (self.currency, trip, passengers)
+        return f"{trip}:{passengers}:{self.currency}"
+
 
 @workflow.defn
 class ComplexActivityInputAgent:
@@ -854,6 +873,15 @@ class ComplexActivityInputAgent:
                 temporalio.google_adk.workflow.activity_as_tool(
                     method_holder.annotate_trip,
                     start_to_close_timeout=timedelta(seconds=60),
+                ),
+                # The forms Workflow code passes to execute_activity_method and
+                # execute_activity_class; the worker's instances run them.
+                temporalio.google_adk.workflow.activity_as_tool(
+                    ComplexActivityMethodHolder.count_passengers,
+                    start_to_close_timeout=timedelta(seconds=60),
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    QuoteTrip, start_to_close_timeout=timedelta(seconds=60)
                 ),
             ],
         )
@@ -941,6 +969,32 @@ class ComplexActivityInputModel(TestModel):
             LlmResponse(
                 content=Content(
                     role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="count_passengers",
+                                args={"passengers": 3},
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="QuoteTrip",
+                                args={"trip": "SFO->LAX", "passengers": 3},
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
                     parts=[Part(text="completed complex input tool calls")],
                 )
             ),
@@ -966,6 +1020,8 @@ async def test_activity_as_tool_supports_complex_inputs_via_adk(client: Client):
             book_trip,
             summarize_payload,
             method_holder.annotate_trip,
+            method_holder.count_passengers,
+            QuoteTrip("USD"),
         ],
         workflows=[ComplexActivityInputAgent],
         max_cached_workflows=0,
@@ -991,6 +1047,8 @@ async def test_activity_as_tool_supports_complex_inputs_via_adk(client: Client):
                 {"count": 2, "owner": "team-a", "tags": ["alpha", "beta"]},
             ),
             "annotate_trip": "SFO->LAX:3",
+            "count_passengers": 3,
+            "QuoteTrip": ("USD", "SFO->LAX", 3),
         }
 
 
@@ -1176,6 +1234,70 @@ def test_activity_as_tool_preserves_metadata() -> None:
     assert params == ["city", "count"]
     assert sig.parameters["city"].annotation is str
     assert sig.parameters["count"].default == 1
+
+    # A method passed as Class.method: the worker's instance supplies `self`.
+    method_tool = temporalio.google_adk.workflow.activity_as_tool(
+        ComplexActivityMethodHolder.count_passengers,
+        start_to_close_timeout=timedelta(seconds=30),
+    )
+    assert method_tool.__name__ == "count_passengers"
+    assert list(inspect.signature(method_tool).parameters) == ["passengers"]
+
+    # A callable class passed as its class: __call__'s parameters, types and
+    # docstring, not its constructor's.
+    class_tool = temporalio.google_adk.workflow.activity_as_tool(
+        QuoteTrip, start_to_close_timeout=timedelta(seconds=30)
+    )
+    assert class_tool.__name__ == "QuoteTrip"
+    assert class_tool.__doc__ == "Quote a trip for some passengers."
+    assert list(inspect.signature(class_tool).parameters) == ["trip", "passengers"]
+    assert class_tool.__annotations__ == {
+        "trip": str,
+        "passengers": int,
+        "return": str,
+    }
+
+
+@activity.defn
+class NoCallActivity:
+    pass
+
+
+class UnresolvedCallActivity(QuoteTrip):
+    # Not decorated: @activity.defn would fail on the annotation itself.
+    async def __call__(self, trip: "MissingType", passengers: int) -> str:  # type: ignore[name-defined] # pyright: ignore[reportUndefinedVariable]
+        return str(trip)
+
+
+@activity.defn
+class KeywordOnlyCallActivity:
+    async def __call__(self, *, trip: str) -> str:
+        return trip
+
+
+@activity.defn
+class KwargsCallActivity:
+    async def __call__(self, trip: str, **extra: str) -> str:
+        return trip
+
+
+@pytest.mark.parametrize(
+    "activity_def, message",
+    [
+        (NoCallActivity, "needs a __call__"),
+        (UnresolvedCallActivity, "name 'MissingType' is not defined"),
+        (KeywordOnlyCallActivity, r"or \*\*kwargs in __call__ \('trip'\)"),
+        (KwargsCallActivity, r"or \*\*kwargs in __call__ \('extra'\)"),
+    ],
+)
+def test_activity_as_tool_rejects_unreadable_call(
+    activity_def: Any, message: str
+) -> None:
+    """A class whose __call__ the tool can't read or call fails when it is built."""
+    with pytest.raises(ValueError, match=message):
+        temporalio.google_adk.workflow.activity_as_tool(
+            activity_def, start_to_close_timeout=timedelta(seconds=30)
+        )
 
 
 class CityWeather(BaseModel):
