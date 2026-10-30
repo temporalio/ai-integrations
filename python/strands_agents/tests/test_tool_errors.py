@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterable
 from datetime import timedelta
 from typing import Any
@@ -6,18 +7,25 @@ from uuid import uuid4
 import pytest
 from strands.hooks import HookProvider, HookRegistry
 from strands.hooks.events import AfterToolCallEvent
+from strands.tools.executors import ConcurrentToolExecutor, SequentialToolExecutor
 from strands.types.content import Messages, SystemContentBlock
 from strands.types.streaming import StreamEvent
 from strands.types.tools import ToolChoice, ToolResult, ToolSpec
 
 from temporalio import activity, workflow
-from temporalio.client import Client
-from temporalio.exceptions import ApplicationError
+from temporalio.client import Client, WorkflowFailureError
+from temporalio.exceptions import ApplicationError, CancelledError
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
 from temporalio.strands_agents._temporal_mcp_client import _CallToolArgs, _MCPToolInfo
 from temporalio.strands_agents._temporal_mcp_tool import TemporalMCPTool
 from temporalio.strands_agents.workflow import activity_as_tool
 from temporalio.worker import Replayer, Worker
+from tests.common import (
+    blocking_lookup,
+    blocking_mcp_call_tool,
+    blocking_tool,
+    blocking_tool_started,
+)
 from tests.mock_model import MockModel
 
 _MODEL_TOOL_RESULTS: list[ToolResult] = []
@@ -168,5 +176,65 @@ async def test_failed_activity_tool_reports_cause(
     assert _MODEL_TOOL_RESULTS[0]["content"] == [{"text": message}]
 
     await Replayer(workflows=[_FailingToolWorkflow], plugins=[plugin]).replay_workflow(
+        await handle.fetch_history()
+    )
+
+
+@workflow.defn
+class _BlockingToolWorkflow:
+    @workflow.run
+    async def run(self, kind: str, executor: str) -> None:
+        agent = TemporalAgent(
+            model="mock",
+            start_to_close_timeout=timedelta(seconds=15),
+            tools=[blocking_tool(kind)],
+            tool_executor=SequentialToolExecutor()
+            if executor == "sequential"
+            else ConcurrentToolExecutor(),
+        )
+        await agent.invoke_async("Use the tool")
+
+
+@pytest.mark.parametrize("executor", ["concurrent", "sequential"])
+@pytest.mark.parametrize("kind", ["activity", "mcp"])
+async def test_cancelled_tool_cancels_the_run(
+    client: Client, kind: str, executor: str
+) -> None:
+    """A cancel while a tool activity runs ends the run, not just the tool call."""
+    _MODEL_TOOL_RESULTS.clear()
+    blocking_tool_started.clear()
+    task_queue = f"test_cancelled_tool-{uuid4()}"
+    plugin = StrandsPlugin(
+        models={
+            "mock": lambda: _RecordingModel(
+                [{"name": "lookup", "input": {"query": "q"}}, "Done!"]
+            )
+        }
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[_BlockingToolWorkflow],
+        activities=[blocking_lookup, blocking_mcp_call_tool],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            _BlockingToolWorkflow.run,
+            args=[kind, executor],
+            id=f"test_cancelled_tool_{uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        await asyncio.wait_for(blocking_tool_started.wait(), timeout=10)
+        await handle.cancel()
+        with pytest.raises(WorkflowFailureError) as exc_info:
+            await asyncio.wait_for(handle.result(), timeout=10)
+
+    assert isinstance(exc_info.value.cause, CancelledError)
+    # The model never got a result for the cancelled tool call.
+    assert _MODEL_TOOL_RESULTS == []
+    await Replayer(workflows=[_BlockingToolWorkflow], plugins=[plugin]).replay_workflow(
         await handle.fetch_history()
     )

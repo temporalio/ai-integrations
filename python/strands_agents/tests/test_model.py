@@ -11,6 +11,7 @@ from strands.agent.conversation_manager import (
     SummarizingConversationManager,
 )
 from strands.hooks import BeforeModelCallEvent
+from strands.tools.executors import ConcurrentToolExecutor, SequentialToolExecutor
 from strands.types.content import Messages
 from strands.types.streaming import StreamEvent
 
@@ -22,7 +23,13 @@ from temporalio.exceptions import CancelledError
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent
 from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.worker import Replayer, Worker
-from tests.common import get_activities
+from tests.common import (
+    blocking_lookup,
+    blocking_mcp_call_tool,
+    blocking_tool,
+    blocking_tool_started,
+    get_activities,
+)
 from tests.mock_model import MockModel
 
 
@@ -448,8 +455,26 @@ class CompressionWorkflow:
 
     @workflow.run
     async def run(
-        self, prompts: list[str], summarize: bool = False, redact: bool = False
+        self,
+        prompts: list[str],
+        summarize: bool = False,
+        redact: bool = False,
+        summarizer_tool: str | None = None,
+        executor: str = "concurrent",
     ) -> None:
+        # A summarization agent with a blocking "activity" or "mcp" tool.
+        summarizer = (
+            TemporalAgent(
+                model="summarizer",
+                start_to_close_timeout=timedelta(seconds=15),
+                tools=[blocking_tool(summarizer_tool)],
+                tool_executor=SequentialToolExecutor()
+                if executor == "sequential"
+                else ConcurrentToolExecutor(),
+            )
+            if summarizer_tool
+            else None
+        )
         agent = self.agent = TemporalAgent(
             model="usage",
             start_to_close_timeout=timedelta(seconds=15),
@@ -457,6 +482,7 @@ class CompressionWorkflow:
                 summary_ratio=0.5,
                 preserve_recent_messages=1,
                 proactive_compression=True,
+                summarization_agent=summarizer,
             )
             if summarize
             else SlidingWindowConversationManager(proactive_compression=True),
@@ -548,37 +574,75 @@ class BlockingSummaryModel(UsageMockModel):
             yield event
 
 
-async def test_cancel_during_summary_cancels_the_run(client: Client):
-    """A cancel while the summary runs ends the run instead of failing the summary."""
+@pytest.mark.parametrize(
+    ("summarizer_tool", "executor"),
+    [
+        (None, "concurrent"),
+        ("activity", "concurrent"),
+        ("activity", "sequential"),
+        ("mcp", "concurrent"),
+        ("mcp", "sequential"),
+    ],
+)
+async def test_cancel_during_summary_cancels_the_run(
+    client: Client, summarizer_tool: str | None, executor: str
+):
+    """A cancel while the summary runs ends the run instead of failing the summary.
+
+    The summary is blocked in the agent's model or in a summarization agent's tool.
+    """
     task_queue = f"test_cancel_during_summary-{uuid4()}"
-    model = BlockingSummaryModel(["first", "summary", "second"])
+    if summarizer_tool:
+        model = UsageMockModel(["first", "second"])
+        summarizer_model = MockModel(
+            [{"name": "lookup", "input": {"query": "q"}}, "summary"]
+        )
+        blocked = blocking_tool_started
+        blocked.clear()
+        release = asyncio.Event()
+    else:
+        model = BlockingSummaryModel(["first", "summary", "second"])
+        summarizer_model = MockModel([])
+        blocked, release = model.summarizing, model.release
+    plugin = StrandsPlugin(
+        models={"usage": lambda: model, "summarizer": lambda: summarizer_model}
+    )
 
     async with Worker(
         client,
         task_queue=task_queue,
         workflows=[CompressionWorkflow],
-        plugins=[StrandsPlugin(models={"usage": lambda: model})],
+        activities=[blocking_lookup, blocking_mcp_call_tool],
+        plugins=[plugin],
+        max_cached_workflows=0,
     ):
         handle = await client.start_workflow(
             CompressionWorkflow.run,
-            args=[["turn 1", "turn 2"], True],
+            args=[["turn 1", "turn 2"], True, False, summarizer_tool, executor],
             id=f"test_cancel_during_summary_{uuid4()}",
             task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
         )
-        await asyncio.wait_for(model.summarizing.wait(), timeout=10)
+        await asyncio.wait_for(blocked.wait(), timeout=10)
         await handle.cancel()
         try:
             with pytest.raises(WorkflowFailureError) as exc_info:
-                await handle.result()
+                await asyncio.wait_for(handle.result(), timeout=10)
         finally:
-            model.release.set()
+            release.set()
 
     assert isinstance(exc_info.value.cause, CancelledError)
     # No model call for the second turn followed the cancelled summary.
-    assert model.user_turns == [
-        ["turn 1"],
-        ["turn 1", "Please summarize this conversation."],
-    ]
+    if summarizer_tool:
+        assert model.user_turns == [["turn 1"]]
+    else:
+        assert model.user_turns == [
+            ["turn 1"],
+            ["turn 1", "Please summarize this conversation."],
+        ]
+    await Replayer(workflows=[CompressionWorkflow], plugins=[plugin]).replay_workflow(
+        await handle.fetch_history()
+    )
 
 
 async def test_history_changed_during_summary_is_summarized(client: Client):
