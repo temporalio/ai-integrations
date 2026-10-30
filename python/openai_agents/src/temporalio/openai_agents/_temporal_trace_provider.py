@@ -6,6 +6,7 @@ from typing import Any, cast
 
 from agents import SpanData, Trace, TracingProcessor
 from agents.tracing import (
+    TracingConfig,
     get_trace_provider,
 )
 from agents.tracing.provider import (
@@ -16,6 +17,7 @@ from agents.tracing.spans import Span
 
 import temporalio.workflow
 from temporalio import workflow
+from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.workflow import ReadOnlyContextError
 
 
@@ -196,6 +198,27 @@ class TemporalTraceProvider(DefaultTraceProvider):
             except ReadOnlyContextError:
                 return f"group_{uuid.uuid4().hex[:24]}"
         return super().gen_group_id()
+
+    def create_trace(
+        self,
+        name: str,
+        trace_id: str | None = None,
+        group_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        disabled: bool = False,
+        tracing: TracingConfig | None = None,
+    ) -> Trace:
+        """Create a new trace, refusing its own tracing key in workflow code."""
+        if workflow.in_workflow() and tracing is not None:
+            _refuse_tracing_key(tracing.get("api_key"))
+        return super().create_trace(
+            name,
+            trace_id=trace_id,
+            group_id=group_id,
+            metadata=metadata,
+            disabled=disabled,
+            tracing=tracing,
+        )
 
     def __enter__(self):
         """Enter the context of the Temporal trace provider."""

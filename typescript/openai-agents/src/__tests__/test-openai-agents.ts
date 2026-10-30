@@ -6,6 +6,7 @@ import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
 import type { ApplicationFailure } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
+import { bundleWorkflowCode } from '@temporalio/worker';
 import type { NativeConnection } from '@temporalio/worker';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import {
@@ -101,6 +102,52 @@ test('Local activity mode uses local activities for model calls', async (t) => {
     );
     t.is(modelActivities.length, 0, `Expected no regular invokeModelActivity, got ${modelActivities.length}`);
   });
+});
+
+test('A Workflow module with ES module imports loads with one copy of @openai/agents-core', async (t) => {
+  const { createWorker, taskQueue } = helpers(t);
+  const plugin = new OpenAIAgentsPlugin({
+    modelProvider: new FakeModelProvider([textResponse('ESM module response')]),
+  });
+  // Bundle the ES module source, as the Worker does for a `.ts` Workflow file run from source.
+  const workflowBundle = await bundleWorkflowCode({
+    workflowsPath: require.resolve('../../src/__tests__/workflows/openai-agents-esm.mjs'),
+    plugins: [plugin],
+  });
+  const esModuleBuild = new Set(workflowBundle.code.match(/@openai[\\/]agents-core[\\/]dist[\\/][^"'\s]*\.mjs/g));
+  t.deepEqual([...esModuleBuild].slice(0, 3), [], `${esModuleBuild.size} modules from the ES module build`);
+
+  const worker = await createWorker({ workflowBundle, plugins: [plugin] });
+  const result = await worker.runUntil(
+    t.context.env.client.workflow.execute('esmModuleAgentWorkflow', {
+      taskQueue,
+      workflowId: `esm-module-${Date.now()}`,
+      args: ['Hello'],
+    })
+  );
+  t.is(result, 'ESM module response');
+});
+
+test('A Workflow module with ES module imports bundles one copy of @openai/agents-core with async chunks off', async (t) => {
+  const plugin = new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) });
+  // These configs avoid the async chunk, so a bundle with both builds of @openai/agents-core would
+  // still load, and the plugin's instanceof checks would miss objects from one of them.
+  const setups: Record<string, NonNullable<Parameters<typeof bundleWorkflowCode>[0]['webpackConfigHook']>> = {
+    'output.asyncChunks: false': (config) => ({ ...config, output: { ...config.output, asyncChunks: false } }),
+    "dynamicImportMode: 'eager'": (config) => ({
+      ...config,
+      module: { ...config.module, parser: { ...config.module?.parser, javascript: { dynamicImportMode: 'eager' } } },
+    }),
+  };
+  for (const [name, webpackConfigHook] of Object.entries(setups)) {
+    const { code } = await bundleWorkflowCode({
+      workflowsPath: require.resolve('../../src/__tests__/workflows/openai-agents-esm.mjs'),
+      plugins: [plugin],
+      webpackConfigHook,
+    });
+    const esModuleBuild = new Set(code.match(/@openai[\\/]agents-core[\\/]dist[\\/][^"'\s]*\.mjs/g));
+    t.deepEqual([...esModuleBuild].slice(0, 3), [], `${name}: ${esModuleBuild.size} modules from the ES module build`);
+  }
 });
 
 function* mcpFactoryArgGenerator() {

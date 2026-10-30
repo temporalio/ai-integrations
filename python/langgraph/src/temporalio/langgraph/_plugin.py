@@ -16,7 +16,11 @@ from langgraph.graph import StateGraph
 from langgraph.pregel import Pregel
 
 from temporalio import activity, workflow
-from temporalio.langgraph._activity import wrap_activity, wrap_execute_activity
+from temporalio.langgraph._activity import (
+    ValueTypes,
+    wrap_activity,
+    wrap_execute_activity,
+)
 from temporalio.langgraph._interceptor import (
     LangGraphInterceptor,
     _workflow_entrypoints,
@@ -188,6 +192,20 @@ class LangGraphPlugin(SimplePlugin):
                 if previous is not None and previous is not schema:
                     raise ValueError(f"Conflicting context schema ID: {schema_id!r}")
                 self._context_schemas[schema_id] = schema
+        self._value_types = ValueTypes(
+            schemas=[
+                schema for graph in (graphs or {}).values() for schema in graph.schemas
+            ],
+            functions=[
+                *(
+                    getattr(node.runnable, "func", None)
+                    or getattr(node.runnable, "afunc", None)
+                    for graph in (graphs or {}).values()
+                    for node in graph.nodes.values()
+                ),
+                *(task.func for task in tasks or []),
+            ],
+        )
 
         # Graph API: Wrap graph nodes as Temporal Activities.
         if graphs:
@@ -337,6 +355,7 @@ class LangGraphPlugin(SimplePlugin):
                 func,
                 context_schema=context_schema,
                 context_schemas=self._context_schemas,
+                value_types=self._value_types,
                 streaming_topic=self._streaming_topic,
                 streaming_batch_interval=self._streaming_batch_interval,
             )
@@ -347,6 +366,7 @@ class LangGraphPlugin(SimplePlugin):
                 task_id=task_id(func),
                 summary_fn=summary_fn,
                 context_schemas=self._context_schemas,
+                value_types=self._value_types,
                 **opts,
             )
         elif execute_in == "workflow":

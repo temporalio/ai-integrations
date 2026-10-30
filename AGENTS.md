@@ -91,7 +91,7 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - Provenance guard (`tests/helpers/provenance.py`, mirrored by `scripts/ci/smoke.py`) runs at every pytest session start and fails loudly if the install is editable, any file differs from the distribution's RECORD, files under the package directory are not owned by the distribution, or another distribution ships the same paths. `tests/test_installed_matches_source.py` additionally byte-compares the installed package with `src/`.
 - Dependency cooldown: `exclude-newer = "2 weeks"` (org supply-chain policy) with `exclude-newer-package = { temporalio = false }` so a new SDK release is adoptable the day it ships; a plugin that depends on another plugin adds that coordinate too (`temporalio-mcp = false` in `openai_agents`), otherwise a fresh first-party release is invisible to `uv lock` for two weeks. Declare exactly what the package imports at module level; `openinference` and similar lazy imports go in an extra.
 - Tooling: ruff, pyright, basedpyright, mypy (`mypy_path = "src"`, `explicit_package_bases`), pydocstyle (google), pytest + xdist (`-n auto --dist=worksteal`; the `os._exit(0)` hook is xdist-aware). `python/_shared/` owns the make recipes and composable Pyright/Ruff defaults; mypy and pydocstyle settings stay in each `pyproject.toml` because those tools cannot extend another config while preserving plugin overrides. All tools are invoked through `make` targets; see `make help`.
-- Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in a plugin's conftest only when one of its tests needs a server feature that is off by default. Bind those options in a startup callback passed to `tests/helpers/environment.py`'s `start_local_with_retry`. This plugin-agnostic policy allows three startup attempts with a one-second delay for the SDK's explicit startup-deadline message; other errors and cancellation propagate immediately.
+- Tests self-provision the Temporal dev server (`WorkflowEnvironment.start_local`, version pinned in `tests/__init__.py`) with its default configuration; add a `--dynamic-config-value` flag in a plugin's conftest only when one of its tests needs a server feature that is off by default. Bind those options in a startup callback passed to `tests/helpers/environment.py`'s `start_local_with_retry`. This plugin-agnostic policy allows three attempts with a one-second delay only for the SDK's explicit startup timeout, executable download, and archive read/extraction errors. Other errors, including configuration, client connection and cancellation failures, propagate immediately.
 - Test scaffolding: each plugin owns its provenance guard, local dev-server fixtures and pytest hooks. New plugins copy the standard implementations from `python/_template/tests/`; the conventions check keeps `environment.py`, `plugin_meta.py`, `provenance.py`, `test_env.py`, and `test_installed_matches_source.py` byte-identical to their canonical templates. Plugin-specific fixtures stay in that plugin's conftest. Tests must not require real provider credentials; use deterministic local models, mock transports, or in-process servers to exercise provider behavior in CI.
 
 ## Java conventions
@@ -141,10 +141,13 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   `tests/helpers/`, with a private development-only link. Never use a local
   SDK checkout or another plugin's checkout as a dependency.
 - Local server startup uses `startLocalWithRetry`, with three attempts and a
-  one-second delay only for the SDK's explicit startup-deadline error. Bind each
-  plugin's server configuration in the startup callback. Copy the helper and its
-  regression tests from `typescript/_template/src/__tests__/`; the conventions
-  check keeps each plugin's copies byte-identical to the templates.
+  one-second delay only for the SDK's explicit startup timeout, executable
+  download, and archive read/extraction errors. Other errors, including client
+  connection failures and `AbortError` cancellation, propagate immediately.
+  Bind each plugin's server configuration in the startup callback.
+  Copy the helper and its regression tests from
+  `typescript/_template/src/__tests__/`; the conventions check keeps each
+  plugin's copies byte-identical to the templates.
 - `make sync` preserves the committed lock. `make sync-latest` updates compatible
   ranges under the two-week pnpm release-age policy. Preserve first-party and
   exact AI SDK dependency-family cooldown exceptions inherited from the SDK.
