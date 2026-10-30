@@ -1,5 +1,5 @@
 import { Agent, RunState, tool } from '@openai/agents-core';
-import { ApplicationFailure } from '@temporalio/workflow';
+import { ApplicationFailure, condition } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
@@ -193,6 +193,13 @@ export interface ApprovalResumeContextResult {
   approvedCallIds: number;
   sharedContextWrites: string[];
   sharedContextInterruptions: number;
+  retryThrew: boolean;
+  retryAttempts: number;
+  retryWrites: string[];
+  retryInterruptions: number;
+  concurrentFailedResumeThrew: boolean;
+  concurrentWrites: string[];
+  concurrentInterruptions: number;
 }
 
 /** Serialized approval record, as the `RunContext` internal below returns it. */
@@ -223,8 +230,10 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
 /**
  * Approves a tool that writes the run context and resumes the same `RunState` until the run
  * finishes, then reads the caller's context object. The first resume uses an agent the state
- * doesn't match, which must fail without losing the approval. Then two paused states share one
- * `RunContext`, both are approved, and resuming the first must keep the second's approval.
+ * doesn't match, which must fail without losing the approval. Then three paused states share one
+ * `RunContext`, all are approved, and resuming one must keep the others' approvals. Last, an approved
+ * tool throws once, and resuming the same state again must run it without asking again. Then a
+ * resume fails while another state on its context advances and is approved again.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -274,13 +283,93 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
   const sharedCtx: ResumeContext = { original: 'shared', writes: [] };
   const pausedA = await runner.run(sharedAgentA, 'go', { context: sharedCtx });
   const pausedB = await runner.run(sharedAgentB, 'go', { context: sharedCtx });
-  // State A keeps the converted graph its run produced; state B is rehydrated onto A's context.
+  const pausedC = await runner.run(sharedAgentA, 'go', { context: sharedCtx });
+  // State A keeps the converted graph its run produced. B is rehydrated onto A's context, and C onto
+  // A's context and A's converted graph, so A and C share their approval owners.
   const stateA = pausedA.state;
   const stateB = await RunState.fromStringWithContext(sharedAgentB, pausedB.state.toString(), stateA._context);
-  stateA.approve(stateA.getInterruptions()[0]!);
-  stateB.approve(stateB.getInterruptions()[0]!);
-  const resumedA = await runner.run(sharedAgentA, stateA);
-  const resumedB = await runner.run(sharedAgentB, stateB);
+  const stateC = await RunState.fromStringWithContext(pausedA.lastAgent!, pausedC.state.toString(), stateA._context);
+  for (const state of [stateA, stateB, stateC]) state.approve(state.getInterruptions()[0]!);
+  const resumed = [
+    await runner.run(sharedAgentA, stateA),
+    await runner.run(sharedAgentB, stateB),
+    await runner.run(sharedAgentA, stateC),
+  ];
+
+  const flaky = tool({
+    name: 'flaky',
+    description: 'Fail once after approval.',
+    parameters: {
+      type: 'object' as const,
+      properties: { value: { type: 'string' } },
+      required: ['value'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    errorFunction: null,
+    execute: async (args, runContext) => {
+      const context = runContext!.context as ResumeContext & { attempts: number };
+      if (context.attempts++ === 0) throw new Error('flaky failed');
+      context.writes.push((args as { value: string }).value);
+      return 'ok';
+    },
+  });
+  const retryAgent = new Agent<ResumeContext>({ name: 'RetryAgent', model: 'gpt-4o-mini', tools: [flaky] });
+  const retryCtx = { original: 'retry', writes: [] as string[], attempts: 0 };
+  const pausedRetry = await runner.run(retryAgent, 'go', { context: retryCtx });
+  pausedRetry.state.approve(pausedRetry.interruptions[0]!);
+  let retryThrew = false;
+  try {
+    await runner.run(retryAgent, pausedRetry.state);
+  } catch {
+    retryThrew = true;
+  }
+  const retried = await runner.run(retryAgent, pausedRetry.state);
+
+  // State D's resume waits in a tool's isEnabled check, then throws. Meanwhile state E, which shares
+  // D's context, resumes, interrupts on its next call, and has that call approved.
+  const gate = { holdD: false, eApproved: false };
+  const gated = tool({
+    name: 'gated',
+    description: 'Record a value after approval.',
+    parameters: {
+      type: 'object' as const,
+      properties: { value: { type: 'string' } },
+      required: ['value'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    isEnabled: async ({ agent }) => {
+      if (gate.holdD && agent.name === 'ConcurrentAgentD') {
+        await condition(() => gate.eApproved);
+        throw new Error('isEnabled failed');
+      }
+      return true;
+    },
+    execute: async (args, runContext) => {
+      (runContext!.context as ResumeContext).writes.push((args as { value: string }).value);
+      return 'ok';
+    },
+  });
+  const agentD = new Agent<ResumeContext>({ name: 'ConcurrentAgentD', model: 'gpt-4o-mini', tools: [gated] });
+  const agentE = new Agent<ResumeContext>({ name: 'ConcurrentAgentE', model: 'gpt-4o-mini', tools: [gated] });
+  const concurrentCtx: ResumeContext = { original: 'concurrent', writes: [] };
+  const pausedD = await runner.run(agentD, 'go', { context: concurrentCtx });
+  const pausedE = await runner.run(agentE, 'go', { context: concurrentCtx });
+  const stateD = pausedD.state;
+  const stateE = await RunState.fromStringWithContext(agentE, pausedE.state.toString(), stateD._context);
+  stateE.approve(stateE.getInterruptions()[0]!);
+  gate.holdD = true;
+  const failedD = runner.run(agentD, stateD).then(
+    () => false,
+    () => true
+  );
+  const pausedAgainE = await runner.run(agentE, stateE);
+  pausedAgainE.state.approve(pausedAgainE.interruptions[0]!);
+  gate.eApproved = true;
+  const concurrentFailedResumeThrew = await failedD;
+  gate.holdD = false;
+  const finishedE = await runner.run(agentE, pausedAgainE.state);
 
   return {
     callerAfter: ctx.after,
@@ -290,6 +379,13 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     failedResumeThrew,
     ...owners,
     sharedContextWrites: sharedCtx.writes,
-    sharedContextInterruptions: resumedA.interruptions.length + resumedB.interruptions.length,
+    sharedContextInterruptions: resumed.reduce((count, { interruptions }) => count + interruptions.length, 0),
+    retryThrew,
+    retryAttempts: retryCtx.attempts,
+    retryWrites: retryCtx.writes,
+    retryInterruptions: retried.interruptions.length,
+    concurrentFailedResumeThrew,
+    concurrentWrites: concurrentCtx.writes,
+    concurrentInterruptions: finishedE.interruptions.length,
   };
 }

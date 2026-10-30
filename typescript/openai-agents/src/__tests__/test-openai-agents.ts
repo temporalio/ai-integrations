@@ -538,8 +538,16 @@ test('Approval resume keeps the caller context object', async (t) => {
           textResponse('done'),
           toolCallResponse('set_after', { value: 'A' }, 'call_shared_a'),
           toolCallResponse('set_after', { value: 'B' }, 'call_shared_b'),
+          toolCallResponse('set_after', { value: 'C' }, 'call_shared_c'),
           textResponse('done A'),
           textResponse('done B'),
+          textResponse('done C'),
+          toolCallResponse('flaky', { value: 'R' }, 'call_flaky'),
+          textResponse('done R'),
+          toolCallResponse('gated', { value: 'D' }, 'call_gated_d'),
+          toolCallResponse('gated', { value: 'E1' }, 'call_gated_e1'),
+          toolCallResponse('gated', { value: 'E2' }, 'call_gated_e2'),
+          textResponse('done E'),
         ]),
       }),
     ],
@@ -549,8 +557,8 @@ test('Approval resume keeps the caller context object', async (t) => {
     executeWorkflow(approvalResumeContextWorkflow, { workflowExecutionTimeout: '30 seconds' })
   );
 
-  // Each resume keys the approvals under a new converted agent graph; only the last one keeps them.
-  // Resuming state A drops only A's previous graph, so state B still runs its approved call.
+  // Each resume reuses the converted graph its state runs on, so the approvals keep one owner, and
+  // no resume drops approvals that another state on the context, or a retry of the same state, needs.
   t.deepEqual(result, {
     callerAfter: 'S-after',
     resumedUsesCallerObject: true,
@@ -559,7 +567,14 @@ test('Approval resume keeps the caller context object', async (t) => {
     failedResumeThrew: true,
     approvalOwners: 1,
     approvedCallIds: 3,
-    sharedContextWrites: ['A', 'B'],
+    sharedContextWrites: ['A', 'B', 'C'],
     sharedContextInterruptions: 0,
+    retryThrew: true,
+    retryAttempts: 2,
+    retryWrites: ['R'],
+    retryInterruptions: 0,
+    concurrentFailedResumeThrew: true,
+    concurrentWrites: ['E1', 'E2'],
+    concurrentInterruptions: 0,
   });
 });

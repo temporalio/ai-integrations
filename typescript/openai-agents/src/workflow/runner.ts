@@ -5,7 +5,6 @@ import {
   MemorySession,
   Runner,
   RunState,
-  type RunContext,
   type AgentOutputType,
   type CallModelInputFilter,
   type HandoffInputData,
@@ -36,61 +35,94 @@ import { getCurrentPluginConfig } from './plugin-config-store';
 
 const agentAsToolSandboxConfig = Symbol.for('@temporalio/openai-agents/agentAsToolSandboxConfig');
 
-/** Each converted agent, mapped to every agent its `convertAgent` call produced. */
-const convertedGraphs = new WeakMap<Agent<any, any>, ReadonlySet<Agent<any, any>>>();
-
-interface SerializedFunctionApprovals {
-  agentIdentity: string;
-  approvals: Record<string, unknown>;
+/** A `convertAgent` call, with the inputs that decide whether a later run would convert the same graph. */
+interface Conversion {
+  source: Agent<any, any>;
+  converted: Agent<any, any>;
+  modelParams: ModelActivityOptions;
+  modelOverride: string | undefined;
+  sandbox: SandboxRunConfig | undefined;
+  /** Each source agent in the graph, with its fields when it was converted. */
+  sourceFields: Map<Agent<any, any>, [string, unknown][]>;
 }
 
-/** `RunContext` approval methods that `@openai/agents-core` marks internal and omits from its types. */
-interface RunContextApprovalInternals {
-  _toJSONForRunState(agentIdentityKeys: { get(agent: Agent<any, any>): string | undefined }): {
-    functionApprovals?: SerializedFunctionApprovals[];
+/** Each converted agent, mapped to the conversion that produced it. */
+const conversions = new WeakMap<Agent<any, any>, Conversion>();
+
+function agentFields(agent: Agent<any, any>): [string, unknown][] {
+  return Object.entries(agent).map(([key, value]) => [key, Array.isArray(value) ? [...value] : value]);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/** Compares arrays and plain objects by their members, and any other value by identity. */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((value, index) => sameValue(value, b[index]));
+  }
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length && keys.every((key) => key in b && sameValue(a[key], b[key]));
+  }
+  return false;
+}
+
+function convertAgentGraph(
+  agent: Agent<any, any>,
+  modelParams: ModelActivityOptions,
+  modelOverride: string | undefined,
+  sandbox: SandboxRunConfig | undefined
+): Agent<any, any> {
+  const convertedBySource = new Map<Agent<any, any>, Agent<any, any>>();
+  const converted = convertAgent(agent, modelParams, convertedBySource, modelOverride);
+  if (sandbox !== undefined) {
+    propagateAgentToolSandboxConfig(converted, sandbox);
+  }
+  const conversion: Conversion = {
+    source: agent,
+    converted,
+    modelParams,
+    modelOverride,
+    sandbox,
+    sourceFields: new Map([...convertedBySource.keys()].map((source) => [source, agentFields(source)])),
   };
-  _rebuildFunctionApprovals(
-    approvals: SerializedFunctionApprovals[],
-    agentsByIdentity: Map<string, Agent<any, any>>
-  ): void;
+  for (const convertedAgent of convertedBySource.values()) conversions.set(convertedAgent, conversion);
+  return converted;
 }
 
 /**
- * Rebuilds `state` over `converted` while keeping the state's own `RunContext`.
+ * Returns the converted graph that `state` runs on, if converting `agent` again would give the same graph.
  *
- * Function-tool approvals are keyed by agent object, and the merge keys the state's approvals
- * under the new converted agents. The approvals owned by the state's previous converted graph
- * are dropped first, or every resume would keep that graph with a full copy of its approvals.
- * The serialized state carries them, so the resumed run keeps them. Approvals owned by other
- * agents, such as those of another state sharing this context, stay where they are.
+ * Function-tool approvals are keyed by agent object on the state's `RunContext`, which the resume keeps.
+ * Rebuilding the state over a new graph would add a copy of its approvals under every resume's graph, and
+ * the earlier copies can't be dropped, because saved states that still point at those agents read them.
  */
-async function restoreWithOwnContext(
-  converted: Agent<any, any>,
-  state: RunState<any, any>
-): Promise<RunState<any, any>> {
-  const serialized = state.toString();
-  const context = state._context as RunContext<any> & RunContextApprovalInternals;
-  const superseded = convertedGraphs.get(state._currentAgent as Agent<any, any>) ?? new Set();
-  // The internal serializer asks for each owner's identity, which lists every owner.
-  const owners = new Map<string, Agent<any, any>>();
-  const approvals =
-    context._toJSONForRunState({
-      get: (agent) => {
-        const identity = String(owners.size);
-        owners.set(identity, agent);
-        return identity;
-      },
-    }).functionApprovals ?? [];
-  const kept = approvals.filter(({ agentIdentity }) => !superseded.has(owners.get(agentIdentity)!));
-  // Copy the kept records, so the merge below can't change those the restore puts back.
-  context._rebuildFunctionApprovals(JSON.parse(JSON.stringify(kept)), owners);
-  try {
-    return await RunState.fromStringWithContext(converted, serialized, context);
-  } catch (error) {
-    // Leave the caller's context as it was, so a later resume of the same state keeps its approvals.
-    context._rebuildFunctionApprovals(approvals, owners);
-    throw error;
+function reusableConversion(
+  state: RunState<any, any>,
+  agent: Agent<any, any>,
+  modelParams: ModelActivityOptions,
+  modelOverride: string | undefined,
+  sandbox: SandboxRunConfig | undefined
+): Agent<any, any> | undefined {
+  const conversion = conversions.get(state._currentAgent as Agent<any, any>);
+  if (
+    conversion === undefined ||
+    conversion.source !== agent ||
+    conversion.modelOverride !== modelOverride ||
+    !sameValue(conversion.sandbox, sandbox) ||
+    !sameValue(conversion.modelParams, modelParams)
+  ) {
+    return undefined;
   }
+  for (const [source, fields] of conversion.sourceFields) {
+    if (!sameValue(fields, agentFields(source))) return undefined;
+  }
+  return conversion.converted;
 }
 
 export interface TemporalRunOptions<TContext = undefined> {
@@ -329,13 +361,11 @@ export class TemporalOpenAIRunner {
 
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
-    const convertedBySource = new Map<Agent<any, any>, Agent<any, any>>();
-    const converted = convertAgent(agent, this.modelParams, convertedBySource, modelOverride);
-    const convertedGraph = new Set(convertedBySource.values());
-    for (const convertedAgent of convertedGraph) convertedGraphs.set(convertedAgent, convertedGraph);
-    if (options?.runConfig?.sandbox !== undefined) {
-      propagateAgentToolSandboxConfig(converted, options.runConfig.sandbox);
-    }
+    const sandbox = options?.runConfig?.sandbox;
+    const converted =
+      (input instanceof RunState
+        ? reusableConversion(input, agent, this.modelParams, modelOverride, sandbox)
+        : undefined) ?? convertAgentGraph(agent, this.modelParams, modelOverride, sandbox);
 
     let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
     if (input instanceof RunState) {
@@ -345,7 +375,10 @@ export class TemporalOpenAIRunner {
       // environment references on the Workflow thread rather than in the resume Activity.
       // Pass the state's own context, as the upstream Runner uses it, so resumed tools write the
       // caller's object rather than a JSON copy.
-      const restored = (await restoreWithOwnContext(converted, input)) as RunState<TContext, TAgent>;
+      const restored = (await RunState.fromStringWithContext(converted, input.toString(), input._context)) as RunState<
+        TContext,
+        TAgent
+      >;
       // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
       restored.clearTrace();
       preparedInput = restored;
