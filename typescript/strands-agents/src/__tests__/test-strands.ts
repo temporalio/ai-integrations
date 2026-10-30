@@ -21,6 +21,7 @@ import {
   loadHistory,
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
+import { MockActivityEnvironment } from '@temporalio/testing';
 import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
 import { DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
@@ -579,12 +580,14 @@ test('a history whose code depends on when a handler finishes still replays', as
   );
 });
 
-test('invokeModel reconstructs Message instances from wire data', async (t) => {
+test('invokeModel gives the model Message instances and an AbortSignal', async (t) => {
   // Strands content-block and Message classes have lossy `toJSON()` methods.
   // After Temporal's default payload converter serializes activity input,
   // the receiving side sees plain Bedrock-shape objects without the `type`
   // discriminator. ModelActivity must call `Message.fromMessageData` so the
-  // user's `Model.stream` receives real Strands types.
+  // user's `Model.stream` receives real Strands types. The agent's
+  // `cancelSignal` arrives as a plain object too, and model clients such as
+  // OpenAI's call its `addEventListener`.
   t.timeout(60_000);
   const { createWorker, executeWorkflow } = helpers(t);
 
@@ -593,8 +596,10 @@ test('invokeModel reconstructs Message instances from wire data', async (t) => {
   // reachable from the assertion below.
   let receivedFirstMessage: unknown;
   let firstBlockIsTextBlock = false;
+  let receivedSignal: unknown;
   class AssertingStub extends StubModel {
     override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+      receivedSignal = options?.cancelSignal;
       if (receivedFirstMessage === undefined) {
         receivedFirstMessage = messages[0];
         const first = messages[0];
@@ -618,6 +623,36 @@ test('invokeModel reconstructs Message instances from wire data', async (t) => {
 
   t.true(receivedFirstMessage instanceof Message, 'expected first message to be a Message instance');
   t.true(firstBlockIsTextBlock, 'expected first content block to be a TextBlock instance');
+  t.true(receivedSignal instanceof AbortSignal, 'expected cancelSignal to be an AbortSignal');
+});
+
+test('cancelling the model activity aborts the model call', async (t) => {
+  let aborted = false;
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => (markStarted = resolve));
+  // Waits on its cancel signal, as a model client does while a request is in flight.
+  class WaitingStub extends StubModel {
+    override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+      await new Promise<void>((resolve) => {
+        options?.cancelSignal?.addEventListener('abort', () => {
+          aborted = true;
+          resolve();
+        });
+        markStarted();
+      });
+      yield* super.stream(messages, options);
+    }
+  }
+
+  const activity = new ModelActivity({ test: () => new WaitingStub([textTurn('late')]) });
+  const env = new MockActivityEnvironment();
+  // What the activity receives: the agent's AbortSignal after the payload converter.
+  const options = { cancelSignal: {} } as unknown as StreamOptions;
+  const run = env.run(activity.invokeModel, { modelName: 'test', messages: [], options }).catch(() => undefined);
+  await Promise.race([started, run]);
+  env.cancel();
+  await run;
+  t.true(aborted, 'expected the model call to see the activity cancellation');
 });
 
 test('activityAsTool dispatches a registered activity from the agent loop', async (t) => {

@@ -1,5 +1,6 @@
 import { Message, StateStore } from '@strands-agents/sdk';
 import type { JSONValue, Model, ModelStreamEvent, StreamOptions } from '@strands-agents/sdk';
+import { Context } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import type { Duration } from '@temporalio/common/lib/time';
@@ -29,6 +30,15 @@ function rebuildMessages(messages: unknown): Message[] {
   return messages.map((m) =>
     m instanceof Message ? m : Message.fromMessageData(m as Parameters<typeof Message.fromMessageData>[0])
   );
+}
+
+/**
+ * The stream options the model gets in the activity. Strands passes the agent's `cancelSignal`, an
+ * `AbortSignal`, which reaches the activity as a plain object, so give the model the activity's own
+ * cancellation signal instead: cancelling the activity then aborts the model call.
+ */
+function withActivityCancellation(options?: StreamOptions): StreamOptions {
+  return { ...options, cancelSignal: Context.current().cancellationSignal };
 }
 
 /**
@@ -195,7 +205,7 @@ export class ModelActivity {
   private async runModel(model: Model, input: InvokeModelInput): Promise<ModelStreamEvent[]> {
     const messages = rebuildMessages(input.messages);
     const events: ModelStreamEvent[] = [];
-    for await (const event of model.stream(messages, input.options)) {
+    for await (const event of model.stream(messages, withActivityCancellation(input.options))) {
       events.push(event);
     }
     return events;
@@ -209,7 +219,7 @@ export class ModelActivity {
     const topic = stream.topic(input.streamingTopic);
     const events: ModelStreamEvent[] = [];
     try {
-      for await (const event of model.stream(messages, input.options)) {
+      for await (const event of model.stream(messages, withActivityCancellation(input.options))) {
         events.push(event);
         topic.publish(event);
       }
