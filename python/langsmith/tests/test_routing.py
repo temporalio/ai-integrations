@@ -152,7 +152,7 @@ async def _execute(
             task_queue=task_queue,
         )
 
-    async with new_worker(
+    worker = new_worker(
         temporal_client,
         RoutingWorkflow,
         TraceableActivityWorkflow,
@@ -162,10 +162,11 @@ async def _execute(
         task_queue=task_queue,
         max_cached_workflows=0,
         workflow_failure_exception_types=[Exception],
-    ) as worker:
-        await env.create_nexus_endpoint(
-            make_nexus_endpoint_name(worker.task_queue), worker.task_queue
-        )
+    )
+    await env.create_nexus_endpoint(
+        make_nexus_endpoint_name(worker.task_queue), worker.task_queue
+    )
+    async with worker:
         if caller_context is not None:
             with tracing_context(client=interceptor._client, **caller_context):
                 handle = await caller()
