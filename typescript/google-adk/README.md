@@ -746,17 +746,27 @@ Cautions:
   observability and governance plugins before this one.
 - The plugin registers Activities named `adk-invokeModel` and
   `adk-invokeModelStreaming`, plus `<name>-listTools`, `<name>-callTool`,
-  `<name>-listResources` and `<name>-readResource` for each MCP toolset. If the
-  Worker already has a different Activity with one of these names (your own
-  Activity, another integration's MCP Activity, or a second `GoogleAdkPlugin`
-  with a different `modelProvider` or toolset factory), `Worker.create` fails
-  with `Duplicate registration of Activity '<name>'`. Earlier versions kept the
-  last one without a warning. Rename the other Activity or MCP server, or put
-  every model provider and toolset in one `GoogleAdkPlugin`. The same instance
-  on the `NativeConnection` and the Worker, or two instances built from the
-  same options object, still work, unless `setActivityOptions` gave their
-  Activities different metadata objects. `modelProvider` is read once, when the
-  plugin is constructed, and is called as a method of the options object.
+  `<name>-listResources` and `<name>-readResource` for each MCP toolset. A
+  different Activity with one of these names now fails with
+  `Duplicate registration of Activity '<name>'`; earlier versions kept the last
+  one without a warning. If it is registered before `GoogleAdkPlugin` (in the
+  Worker's `activities` or by an earlier plugin), `Worker.create` fails. If a
+  plugin applied after `GoogleAdkPlugin` replaces one, `worker.run()` fails
+  before the Worker polls. `Worker.create` applies the Worker's `plugins` in
+  order, then the `NativeConnection`'s.
+- To fix a collision with your own Activity or another integration's MCP server
+  name, rename one of them, or run the other integration on its own Worker and
+  task queue. Two `GoogleAdkPlugin`s on one Worker must be the same instance or
+  be built from one options object; two without a `modelProvider` also work
+  when every shared toolset name uses the same factory function. Anything else
+  is refused, such as one `modelProvider` in two options objects (two equal
+  object literals, for example) or a plugin without a `modelProvider` next to
+  one with it. Use one `GoogleAdkPlugin` with every MCP toolset instead: its
+  `modelProvider` receives each model name, so one provider can serve several
+  models. Two instances built from one options object are also refused when
+  `setActivityOptions` gave their Activities different metadata objects.
+  `modelProvider` is read once, when the plugin is constructed, and is called
+  as a method of the options object.
 - Model calls use Temporal retries. The plugin disables nested GenAI SDK retries
   for model requests and honors `retry-after` where available.
 - `heartbeatTimeout` detects a dead worker, not a stalled call: when set, the model

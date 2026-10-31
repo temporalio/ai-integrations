@@ -4,10 +4,10 @@ import path from 'node:path';
 
 import type { BaseLlm } from '@google/adk';
 import { SimplePlugin } from '@temporalio/plugin';
-import type { BundleOptions, WorkerOptions } from '@temporalio/worker';
+import type { BundleOptions, Worker, WorkerOptions } from '@temporalio/worker';
 
 import { createModelActivities, createMCPActivities } from './activities';
-import { refuseReplacedActivities } from './activity-sources';
+import { refuseLaterReplacement, refuseReplacedActivities } from './activity-sources';
 import { type MCPToolsetFactory } from './mcp';
 
 /** The webpack `Configuration` object the bundler hands to `webpackConfigHook`. */
@@ -699,6 +699,18 @@ export class GoogleAdkPlugin extends SimplePlugin {
   override configureWorker(options: WorkerOptions): WorkerOptions {
     refuseReplacedActivities('GoogleAdkPlugin', options.activities, this.options.activities as object);
     return super.configureWorker(options);
+  }
+
+  /**
+   * Runs the Worker.
+   *
+   * @throws TypeError, before the Worker polls, if a plugin applied after this
+   * one replaced one of its Activities with a different one. `Worker.create`
+   * applies the Worker's plugins in order, then the `NativeConnection`'s.
+   */
+  override async runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    await refuseLaterReplacement('GoogleAdkPlugin', worker, this.options.activities as object, next);
+    return super.runWorker(worker, next);
   }
 
   /**
