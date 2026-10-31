@@ -1,4 +1,4 @@
-import { Agent } from '@openai/agents-core';
+import { Agent, type MCPToolFilterContext } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
@@ -97,6 +97,59 @@ export async function mcpFactoryArgWorkflow(prompt: string): Promise<string> {
   const runner = new TemporalOpenAIRunner();
   const result = await runner.run(agent, prompt, { maxTurns: 5 });
   return result.finalOutput ?? '';
+}
+
+export async function mcpToolFilterWorkflow(stateful: boolean): Promise<string[]> {
+  const name = stateful ? 'filterStateful' : 'filterStateless';
+  // The factory's server blocks `danger_tool` with a static filter; this filter blocks `extra_tool`
+  // unless the run's context allows it.
+  const toolFilter = async ({ runContext, serverName }: MCPToolFilterContext, tool: { name: string }) =>
+    serverName === name && (tool.name !== 'extra_tool' || (runContext.context as { admin: boolean }).admin);
+  const server = stateful ? statefulMcpServer(name, { toolFilter }) : statelessMcpServer(name, { toolFilter });
+  await server.connect();
+  try {
+    const outputs: string[] = [];
+    // Two runs of one agent with different contexts, then a second agent on the same server.
+    for (const [agentName, admin] of [
+      ['FirstAgent', true],
+      ['FirstAgent', false],
+      ['SecondAgent', false],
+    ] as const) {
+      const agent = new Agent({
+        name: agentName,
+        instructions: 'You have access to MCP tools.',
+        model: 'gpt-4o-mini',
+        mcpServers: [server],
+      });
+      const result = await new TemporalOpenAIRunner().run(agent, 'Hello', { context: { admin } });
+      outputs.push(result.finalOutput ?? '');
+    }
+    return outputs;
+  } finally {
+    await server.close();
+  }
+}
+
+class FilterSession {
+  isAdmin(): boolean {
+    return true;
+  }
+}
+
+export async function mcpToolFilterResumeWorkflow(): Promise<string> {
+  // Resuming from a RunState rebuilds the context from JSON, so `session` loses `isAdmin()`.
+  const toolFilter = async ({ runContext }: MCPToolFilterContext) =>
+    (runContext.context as { session: FilterSession }).session.isAdmin();
+  const agent = new Agent({
+    name: 'FirstAgent',
+    instructions: 'You have access to MCP tools.',
+    model: 'gpt-4o-mini',
+    mcpServers: [statelessMcpServer('filterStateless', { toolFilter })],
+  });
+  const runner = new TemporalOpenAIRunner();
+  const result = await runner.run(agent, 'Hello', { context: { session: new FilterSession() } });
+  await runner.run(agent, result.state);
+  return 'resumed';
 }
 
 export async function summaryOverrideStringWorkflow(prompt: string): Promise<string> {

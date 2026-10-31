@@ -10,6 +10,7 @@ import {
   type StatefulMcpServerSessionArgs,
 } from '../common/mcp-types';
 import { startAdaptiveHeartbeat } from './heartbeat';
+import { filterListedTools, rejectCallableToolFilter } from './mcp-provider';
 
 export function registerCancelShutdown(ctx: Context, dedicatedWorker: { shutdown: () => void }): void {
   ctx.cancelled.catch(() => {
@@ -72,11 +73,15 @@ export class StatefulMCPServerProvider {
           nonRetryable: true,
         });
       }
+      rejectCallableToolFilter(server);
       return server;
     };
 
     // Operation Activities — registered on the per-run Task Queue.
-    const listTools = async () => getServerOrThrow().listTools();
+    const listTools = async () => {
+      const server = getServerOrThrow();
+      return filterListedTools(server, await server.listTools());
+    };
 
     const callTool = async (input: CallToolArgs) => getServerOrThrow().callTool(input.toolName, input.args);
 

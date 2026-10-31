@@ -10,6 +10,8 @@ import {
 
 export class FakeModel implements Model {
   private getNext: () => ModelResponse;
+  /** Every request the model got, in order. */
+  readonly requests: ModelRequest[] = [];
 
   constructor(source: ModelResponse[] | Generator<ModelResponse>) {
     if (Array.isArray(source)) {
@@ -37,7 +39,8 @@ export class FakeModel implements Model {
     }
   }
 
-  async getResponse(_request: ModelRequest): Promise<ModelResponse> {
+  async getResponse(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
     return this.getNext();
   }
 
