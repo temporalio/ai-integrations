@@ -3013,11 +3013,19 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
                 )
 
 
+@pytest.mark.parametrize("instance_evaluator", [False, True])
 @pytest.mark.parametrize("stateful", [True, False])
 async def test_mcp_server_factory_require_approval_is_rejected(
-    client: Client, stateful: bool
+    client: Client, stateful: bool, instance_evaluator: bool
 ):
-    tracking_server = get_tracking_server("HelloServer", require_approval="always")
+    if instance_evaluator:
+        # The default policy, but an evaluator that always asks.
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server._get_needs_approval_for_tool = (  # type: ignore[method-assign]
+            lambda tool, agent: True  # type: ignore[reportUnknownLambdaType]
+        )
+    else:
+        tracking_server = get_tracking_server("HelloServer", require_approval="always")
     server: StatefulMCPServerProvider | StatelessMCPServerProvider = (
         StatefulMCPServerProvider("HelloServer", lambda _: tracking_server)
         if stateful

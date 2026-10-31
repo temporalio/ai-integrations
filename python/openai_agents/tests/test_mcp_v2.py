@@ -267,15 +267,36 @@ def test_worker_side_require_approval_is_rejected(require_approval: Any) -> None
     assert "temporal_mcp_server(require_approval=...)" in str(err.value)
 
 
-def test_worker_side_approval_evaluator_override_is_rejected() -> None:
-    class AlwaysAsks(InProcessMCPServer):
-        def _get_needs_approval_for_tool(  # type: ignore[override]
-            self, tool: Any, agent: Any
-        ) -> bool:
-            return True
+class ClassEvaluator(InProcessMCPServer):
+    def _get_needs_approval_for_tool(  # type: ignore[override]
+        self, tool: Any, agent: Any
+    ) -> bool:
+        return True
 
+
+class InstanceEvaluator(InProcessMCPServer):
+    def __init__(self, server: SDKMCPServer[Any]) -> None:
+        super().__init__(server)
+        self._get_needs_approval_for_tool = (  # type: ignore[method-assign]
+            lambda tool, agent: True  # type: ignore[reportUnknownLambdaType]
+        )
+
+
+class CustomLookup(InProcessMCPServer):
+    def __getattribute__(self, name: str) -> Any:
+        if name == "_get_needs_approval_for_tool":
+            return lambda tool, agent: True  # type: ignore[reportUnknownLambdaType]
+        return super().__getattribute__(name)
+
+
+@pytest.mark.parametrize(
+    "server_class", [ClassEvaluator, InstanceEvaluator, CustomLookup]
+)
+def test_worker_side_approval_evaluator_override_is_rejected(
+    server_class: type[InProcessMCPServer],
+) -> None:
     with pytest.raises(ApplicationError) as err:
-        create_backend(lambda: AlwaysAsks(server()))
+        create_backend(lambda: server_class(server()))
     assert err.value.non_retryable
     assert "temporal_mcp_server(require_approval=...)" in str(err.value)
 

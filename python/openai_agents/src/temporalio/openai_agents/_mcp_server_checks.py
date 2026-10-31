@@ -10,6 +10,8 @@ This module needs no ``mcp`` extra, so both the MCP v2 backend and the
 deprecated providers can use it.
 """
 
+import inspect
+
 from agents.mcp import MCPServer
 
 from temporalio.exceptions import ApplicationError
@@ -42,17 +44,22 @@ def _has_worker_side_require_approval(server: MCPServer) -> bool:
 
     Only a policy the Agents SDK normalizes to no approval is allowed:
     ``"never"``, ``False``, or a mapping or tool list with only ``"never"``
-    entries. A callable policy, or a subclass that replaces how the SDK
-    evaluates the policy, cannot be evaluated on the worker, so it counts as
-    asking.
+    entries. A callable policy, or a class or instance that replaces how the
+    SDK evaluates the policy, cannot be evaluated on the worker, so it counts
+    as asking.
     """
     # The Agents SDK keeps the normalized policy only in this private field:
     # a bool, a dict of tool names to bools, or a callable.
     policy = getattr(server, "_needs_approval_policy", False)
     if isinstance(policy, dict):
         policy = any(policy.values())
-    evaluator = getattr(type(server), "_get_needs_approval_for_tool", None)
-    overridden = evaluator is not None and evaluator is not _SDK_APPROVAL_EVALUATOR
+    # Find the evaluator the SDK's call would resolve, an instance attribute
+    # before the class's method, without running it or any descriptor. A
+    # custom __getattribute__ could resolve something else, so it counts too.
+    evaluator = inspect.getattr_static(server, "_get_needs_approval_for_tool", None)
+    overridden = (
+        evaluator is not None and evaluator is not _SDK_APPROVAL_EVALUATOR
+    ) or type(server).__getattribute__ is not object.__getattribute__
     return callable(policy) or bool(policy) or overridden
 
 
