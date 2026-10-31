@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"sync"
+	"weak"
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
@@ -58,9 +61,61 @@ type mcpToolset struct {
 
 func (m *mcpToolset) Name() string { return m.name }
 
-// Tools lists the remote MCP tools via the ListMcpTools Activity and wraps each
-// as a declaration-only proxy tool.
+// Tools returns the toolset's declaration-only proxy tools. Until the
+// toolset's ProcessRequest has run in the agent run, it lists them via the
+// ListMcpTools Activity, applies ToolFilter, and keeps the list for the
+// ProcessRequest call that follows in the same model step. After that,
+// ProcessRequest lists, and Tools returns the list it returned before, without
+// an Activity and without running the filter. See ProcessRequest.
+//
+// So the first Tools call of each agent run lists and filters. ADK resumes a
+// confirmed tool call from this list before any ProcessRequest of the run, so
+// a tool the filter no longer allows does not run. The later calls, which ADK
+// v2.6.0 and later make before every model step, issue no Workflow commands,
+// so the toolset and its filter issue them at the same points on every ADK
+// release. They return the list ADK v2.5.0 and earlier keep for the whole
+// agent run, even when the MCP server or the filter has changed it since:
+// ADK draws a UUID from the workflow's random stream for each tool it keeps
+// before every model step, so the IDs it generates, such as tool confirmation
+// IDs, stay the same on every release. The proxy tools from that list no
+// longer pack themselves, so ProcessRequest alone decides what the model
+// request declares and dispatches.
+//
+// A toolset wrapped in a toolset without ProcessRequest, such as
+// tool.FilterToolset, lists and filters on every call, because nothing else
+// refreshes its list.
 func (m *mcpToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
+	l := listingsFrom(ctx)
+	run := l.startRun(m, ctx)
+	if tools, ok := l.processedList(run); ok {
+		return tools, nil
+	}
+	tools, err := m.list(ctx)
+	if err != nil {
+		return nil, err
+	}
+	allowed := m.allowed(ctx, tools)
+	l.keepPending(run, tools, allowed)
+	return allowed, nil
+}
+
+// allowed returns the tools the toolset's ToolFilter allows for ctx.
+func (m *mcpToolset) allowed(ctx agent.ReadonlyContext, tools []tool.Tool) []tool.Tool {
+	if m.filter == nil {
+		return tools
+	}
+	out := make([]tool.Tool, 0, len(tools))
+	for _, t := range tools {
+		if m.filter(ctx, t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// list runs the ListMcpTools Activity and wraps each declaration as a proxy
+// tool. It does not apply ToolFilter; see allowed.
+func (m *mcpToolset) list(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	wfCtx, ok := workflowContext(ctx)
 	if !ok {
 		return nil, errMissingContext
@@ -72,22 +127,36 @@ func (m *mcpToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	}
 	tools := make([]tool.Tool, 0, len(decls))
 	for _, d := range decls {
-		pt := &mcpProxyTool{toolset: m.name, decl: d, activityOptions: m.activityOptions}
-		if m.filter == nil || m.filter(ctx, pt) {
-			tools = append(tools, pt)
-		}
+		tools = append(tools, &mcpProxyTool{owner: m, toolset: m.name, decl: d, activityOptions: m.activityOptions})
 	}
 	return tools, nil
 }
 
-// ProcessRequest packs every advertised proxy tool's declaration into the model
-// request. ADK calls this during toolset preprocessing.
+// ProcessRequest packs the toolset's current proxy tools into the model
+// request. ADK calls it before each model call, after the request processors
+// (instructions and the others) have run.
+//
+// ADK v2.5.0 and earlier call Tools only in the first model step of an agent
+// run, before the request processors. v2.6.0 and later call Tools before the
+// request processors in every step. To schedule the same commands in the same
+// order on every ADK release, the toolset lists in Tools only until its first
+// ProcessRequest of the agent run, and in ProcessRequest from then on. Each
+// model step lists once: the first through Tools, with ProcessRequest reusing
+// that list, and every later step here. The request carries this list alone,
+// so a tool the MCP server no longer advertises is neither declared nor
+// dispatched, whatever list ADK kept from an earlier Tools call.
 func (m *mcpToolset) ProcessRequest(ctx agent.Context, req *model.LLMRequest) error {
-	tools, err := m.Tools(ctx)
-	if err != nil {
-		return err
+	l := listingsFrom(ctx)
+	run := l.current(m, ctx)
+	tools, ok := l.takePending(run)
+	if !ok {
+		var err error
+		if tools, err = m.list(ctx); err != nil {
+			return err
+		}
 	}
-	for _, t := range tools {
+	l.processed(run)
+	for _, t := range m.allowed(ctx, tools) {
 		if err := packTool(req, t.(*mcpProxyTool)); err != nil {
 			return err
 		}
@@ -95,11 +164,226 @@ func (m *mcpToolset) ProcessRequest(ctx agent.Context, req *model.LLMRequest) er
 	return nil
 }
 
+// mcpListingsKey is the private context key for the mcpListings NewContext
+// installs.
+type mcpListingsKey struct{}
+
+// mcpListings records, for each MCP toolset and agent run, the lists the
+// toolset took, so that Tools and ProcessRequest list once per model step at
+// the same point on every ADK release.
+type mcpListings struct {
+	mu   sync.Mutex
+	runs map[mcpRunKey]*mcpRunState
+}
+
+// mcpRunKey identifies a toolset in one agent run: one agent in one execution
+// of a runner.Run iterator.
+type mcpRunKey struct {
+	toolset *mcpToolset
+	// run points weakly to the invocation ADK creates each time an agent runs:
+	// in each execution of a runner.Run iterator, a resume, a retry or another
+	// pass over a kept iterator included, and in each of the concurrent runs
+	// of one agent that share an invocation ID, such as a custom agent running
+	// it on several branches. See agentRunOf. The pointer is weak so that the
+	// store does not keep a finished run's invocation, and the session events
+	// it holds, alive; once the garbage collector reclaims it, startRun drops
+	// the state.
+	run weak.Pointer[byte]
+}
+
+// mcpRunState is the state of a toolset in one agent run.
+type mcpRunState struct {
+	// pending is the list Tools took for the ProcessRequest call that follows
+	// in the same model step, when hasPending is set.
+	pending    []tool.Tool
+	hasPending bool
+	// processed reports that the toolset's ProcessRequest has run in the agent
+	// run. From then on ProcessRequest lists, and Tools does not.
+	processed bool
+	// returned is the list Tools last returned after listing, which it returns
+	// again once processed.
+	returned []tool.Tool
+}
+
+// listingsFrom returns the mcpListings NewContext installed, or nil.
+func listingsFrom(ctx context.Context) *mcpListings {
+	l, _ := ctx.Value(mcpListingsKey{}).(*mcpListings)
+	return l
+}
+
+// agentRunOf returns a weak pointer to the invocation of the agent run ctx
+// belongs to, and whether ctx tells it. ADK runs each agent on a new
+// invocation, which it passes, wrapped, both to the toolset's Tools and to the
+// ProcessRequest calls of the toolset and its tools:
+//
+//   - Tools gets a ReadonlyContext whose exported InvocationContext field holds
+//     the agent run's context.
+//   - ProcessRequest gets a tool context, whose unexported context field holds
+//     a copy of that context.
+//
+// The agent run's context, and its copy, hold the invocation in an unexported
+// invocationContext field, or are the invocation themselves. It is not the
+// invocation ID, agent name or RunConfig: concurrent runs of one agent can
+// share all three.
+//
+// Weak pointers made from the same invocation are equal, and stay distinct
+// from those made from any other, even after it is reclaimed.
+func agentRunOf(ctx context.Context) (weak.Pointer[byte], bool) {
+	v := reflect.ValueOf(ctx)
+	for depth := range 4 {
+		if v.Kind() == reflect.Interface {
+			v = v.Elem()
+		}
+		if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+			return weak.Pointer[byte]{}, false
+		}
+		if ic, ok := interfaceField(v, "invocationContext"); ok {
+			return weakTo(ic.Elem())
+		}
+		next, ok := interfaceField(v, "InvocationContext")
+		if !ok {
+			next, ok = interfaceField(v, "context")
+		}
+		if !ok {
+			if depth == 0 {
+				return weak.Pointer[byte]{}, false
+			}
+			return weakTo(v)
+		}
+		v = next
+	}
+	return weak.Pointer[byte]{}, false
+}
+
+// weakTo returns a weak pointer to what the pointer v points to.
+func weakTo(v reflect.Value) (weak.Pointer[byte], bool) {
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return weak.Pointer[byte]{}, false
+	}
+	return weak.Make((*byte)(v.UnsafePointer())), true
+}
+
+// interfaceField returns the non-nil interface field name of the struct v
+// points to.
+func interfaceField(v reflect.Value, name string) (reflect.Value, bool) {
+	f := v.Elem().FieldByName(name)
+	if !f.IsValid() || f.Kind() != reflect.Interface || f.IsNil() {
+		return reflect.Value{}, false
+	}
+	return f, true
+}
+
+// startRun returns the state of the toolset in ctx's agent run, for Tools,
+// and starts it if needed. When ctx does not tell its agent run, it returns
+// nil.
+//
+// Without a state, the toolset lists and filters on every Tools and
+// ProcessRequest call, and its proxy tools pack themselves.
+//
+// When it starts a state, it also drops the states of finished agent runs,
+// whose invocation the garbage collector has reclaimed. No later call can
+// belong to such a run, so a long conversation on one NewContext keeps only
+// the states of runs that may still call the toolset.
+func (l *mcpListings) startRun(m *mcpToolset, ctx agent.ReadonlyContext) *mcpRunState {
+	if l == nil {
+		return nil
+	}
+	run, ok := agentRunOf(ctx)
+	if !ok {
+		return nil
+	}
+	k := mcpRunKey{m, run}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if s, ok := l.runs[k]; ok {
+		return s
+	}
+	for key := range l.runs {
+		if key.run.Value() == nil {
+			delete(l.runs, key)
+		}
+	}
+	if l.runs == nil {
+		l.runs = map[mcpRunKey]*mcpRunState{}
+	}
+	s := &mcpRunState{}
+	l.runs[k] = s
+	return s
+}
+
+// current returns the state the toolset's Tools call kept for ctx's agent run,
+// or nil. ADK calls Tools before ProcessRequest in the first model step of
+// every agent run.
+func (l *mcpListings) current(m *mcpToolset, ctx context.Context) *mcpRunState {
+	if l == nil {
+		return nil
+	}
+	run, ok := agentRunOf(ctx)
+	if !ok {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.runs[mcpRunKey{m, run}]
+}
+
+// processedList returns the list Tools returned after listing in the run,
+// once the toolset's ProcessRequest has run there.
+func (l *mcpListings) processedList(s *mcpRunState) ([]tool.Tool, bool) {
+	if s == nil {
+		return nil, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return s.returned, s.processed
+}
+
+// keepPending keeps a list Tools took for the ProcessRequest call that
+// follows, and the list Tools returns.
+func (l *mcpListings) keepPending(s *mcpRunState, tools, returned []tool.Tool) {
+	if s == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	s.pending, s.hasPending, s.returned = tools, true, returned
+}
+
+// takePending returns and drops the list Tools kept, if any.
+func (l *mcpListings) takePending(s *mcpRunState) ([]tool.Tool, bool) {
+	if s == nil {
+		return nil, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	tools, ok := s.pending, s.hasPending
+	s.pending, s.hasPending = nil, false
+	return tools, ok
+}
+
+// processed marks the toolset's ProcessRequest as run in the agent run.
+func (l *mcpListings) processed(s *mcpRunState) {
+	if s == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	s.processed = true
+}
+
+// packedByToolset reports whether the toolset's ProcessRequest has run in the
+// agent run. Its proxy tools then leave packing to it.
+func (l *mcpListings) packedByToolset(m *mcpToolset, ctx agent.ReadonlyContext) bool {
+	_, ok := l.processedList(l.current(m, ctx))
+	return ok
+}
+
 // mcpProxyTool is a declaration-only stand-in for a remote MCP tool. The model
 // sees its declaration; when the model calls it, Run (invoked in-workflow by
 // ADK) dispatches the CallMcpTool Activity so the live, stateful MCP session
 // runs worker-side, never in the workflow.
 type mcpProxyTool struct {
+	owner           *mcpToolset
 	toolset         string
 	decl            *genai.FunctionDeclaration
 	activityOptions workflow.ActivityOptions
@@ -110,7 +394,14 @@ func (t *mcpProxyTool) Description() string                     { return t.decl.
 func (t *mcpProxyTool) IsLongRunning() bool                     { return false }
 func (t *mcpProxyTool) Declaration() *genai.FunctionDeclaration { return t.decl }
 
+// ProcessRequest packs the proxy tool. ADK calls it for each tool it kept from
+// a Tools call. Once the owning toolset's ProcessRequest packs the current list
+// in the agent run, it does nothing: the tool may come from an older list, which
+// ADK v2.5.0 and earlier keep for the whole agent run.
 func (t *mcpProxyTool) ProcessRequest(ctx agent.Context, req *model.LLMRequest) error {
+	if listingsFrom(ctx).packedByToolset(t.owner, ctx) {
+		return nil
+	}
 	return packTool(req, t)
 }
 
