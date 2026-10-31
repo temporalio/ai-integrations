@@ -779,7 +779,7 @@ class StatefulMcpHostKilledWorkflow:
         self._resume = True
 
 
-@pytest.mark.timeout(90)
+@pytest.mark.timeout(120)
 @pytest.mark.parametrize("delay_worker_heartbeats", [False, True])
 async def test_stateful_session_after_host_killed(
     client: Client, tmp_path: Path, delay_worker_heartbeats: bool
@@ -813,7 +813,8 @@ async def test_stateful_session_after_host_killed(
     )
     try:
         assert host.stdout
-        async with asyncio.timeout(30):
+        # The host imports ADK first, which is slow on a loaded machine.
+        async with asyncio.timeout(60):
             assert (await host.stdout.readline()).strip() == b"ready"
         async with Worker(
             client,
