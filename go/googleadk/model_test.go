@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/testsuite"
 
 	"google.golang.org/adk/v2/model"
@@ -83,6 +84,40 @@ func TestModelFactoryLookupByName(t *testing.T) {
 			assert.Contains(t, res.Texts, "thoughtful answer")
 			assert.NotContains(t, res.Texts, "fast answer")
 			assert.Equal(t, []string{tc.wantRequestModel}, thinking.requestModels())
+		})
+	}
+}
+
+// TestInvokeModelInputWithoutModel runs InvokeModel on an input as a Workflow
+// scheduled it before TemporalModel sent its name: with no Model field, the
+// worker-side model comes from LLMRequest.Model. An empty Model, as
+// NewModel("") sends, is not such an input and fails to resolve.
+func TestInvokeModelInputWithoutModel(t *testing.T) {
+	acts, err := googleadk.NewActivities(googleadk.Config{Models: map[string]googleadk.ModelFactory{
+		"fast-model": scriptedModelFactory(googleadk.TextResponse("fast answer")),
+	}})
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name    string
+		input   map[string]any
+		wantErr string
+	}{
+		{name: "scheduled before the Model field", input: map[string]any{"Request": map[string]any{"Model": "fast-model"}}},
+		{name: "empty TemporalModel name", input: map[string]any{"Model": "", "Request": map[string]any{"Model": "fast-model"}}, wantErr: `resolve model ""`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var s testsuite.WorkflowTestSuite
+			env := s.NewTestActivityEnvironment()
+			env.RegisterActivityWithOptions(acts.InvokeModel, activity.RegisterOptions{Name: googleadk.InvokeModelActivityName})
+			val, err := env.ExecuteActivity(googleadk.InvokeModelActivityName, tc.input)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			var resp model.LLMResponse
+			require.NoError(t, val.Get(&resp))
+			assert.Equal(t, "fast answer", resp.Content.Parts[0].Text)
 		})
 	}
 }
