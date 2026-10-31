@@ -2,6 +2,8 @@ package googleadk
 
 import (
 	"context"
+	"io"
+	"math/rand/v2"
 	"time"
 
 	"github.com/google/uuid"
@@ -45,9 +47,16 @@ func WithSequentialToolFanout() ContextOption {
 //
 //   - time:  platform.Now resolves to workflow.Now(ctx), so every ADK event
 //     timestamp is deterministic and replay-stable.
-//   - uuid:  platform.NewUUID resolves to a deterministic generator that draws
+//   - uuid:  platform.NewUUID resolves to a deterministic generator seeded
 //     from the workflow's random stream (workflow.GetRandomStream), so IDs are
-//     replay-stable without emitting one history event per ID.
+//     replay-stable without emitting one history event per ID. Each
+//     TemporalModel call starts a new generator, so adding or removing a tool
+//     does not move the IDs of the events, function calls and confirmations
+//     drawn after it. This does not cover a response supplied by an ADK plugin
+//     or BeforeModelCallbacks entry, which skips the model call, or runs that
+//     share the returned context across coroutines (agent tools fanned out in
+//     parallel, say) while a toolset blocks during request preparation; there
+//     a tool change can still move those IDs.
 //   - tasks: platform.RunTasks resolves to a workflow.Go-based fan-out (or
 //     sequential execution when WithSequentialToolFanout is set), so ADK's tool
 //     fan-out never spawns real goroutines inside the workflow.
@@ -65,9 +74,11 @@ func NewContext(ctx workflow.Context, opts ...ContextOption) context.Context {
 		o(&cfg)
 	}
 
+	ids := newUUIDSource(ctx)
 	base := context.WithValue(context.Background(), wfCtxKey{}, ctx)
+	base = context.WithValue(base, uuidSourceKey{}, ids)
 	base = platform.WithTimeProvider(base, func() time.Time { return workflow.Now(ctx) })
-	base = platform.WithUUIDProvider(base, newDeterministicUUIDProvider(ctx))
+	base = platform.WithUUIDProvider(base, ids.newUUID)
 	base = platform.WithTaskRunner(base, newWorkflowTaskRunner(ctx, cfg.sequentialToolFanout))
 	return base
 }
@@ -105,26 +116,79 @@ func WorkflowContext(ctx context.Context) (workflow.Context, bool) {
 	return workflowContext(ctx)
 }
 
-// uuidRandomStream names the workflow random stream that feeds
-// newDeterministicUUIDProvider. Keep the original identifier across module
-// renames so existing workflow histories replay with the same UUIDs.
+// uuidRandomStream names the workflow random stream that seeds
+// uuidSource. Keep the original identifier across module renames.
 const uuidRandomStream = "go.temporal.io/sdk/contrib/googleadk/uuid"
 
-// newDeterministicUUIDProvider returns a platform.UUIDProvider whose output is
-// stable across workflow replays. IDs are drawn from the workflow's
-// deterministic random stream (workflow.GetRandomStream), so a replay
-// reproduces them with no per-ID history event. Read-only contexts (query
-// handlers, update validators, side-effect functions) are live,
-// once-per-request operations and get ordinary random UUIDs.
-func newDeterministicUUIDProvider(ctx workflow.Context) platform.UUIDProvider {
-	stream := workflow.GetRandomStream(ctx, uuidRandomStream)
-	return func() string {
-		if workflow.IsReadOnly(ctx) {
-			return uuid.New().String()
-		}
-		// The stream is an infinite deterministic reader; the read cannot fail.
-		id, _ := uuid.NewRandomFromReader(stream)
-		return id.String()
+// uuidSourceKey is the private context key for the uuidSource NewContext
+// installs, so TemporalModel can restart it before each model call.
+type uuidSourceKey struct{}
+
+// uuidSource is the platform.UUIDProvider NewContext installs. Its IDs are
+// stable across workflow replays: they come from a generator seeded from the
+// workflow's random stream (workflow.GetRandomStream), so a replay reproduces
+// them with no per-ID history event.
+//
+// NewContext and each model call start a new generator. Before each model call
+// ADK draws one ID for each tool and toolset it prepares. With one generator for
+// the whole run, adding or removing a tool would move every later ID, including
+// the call ID of a pending confirmation a client has already read. Starting a
+// new generator at the model call leaves those draws behind, so the IDs ADK
+// draws for the response, its function calls and confirmations do not depend on
+// the tool list.
+//
+// The restart happens only in TemporalModel.GenerateContent, and one uuidSource
+// serves every coroutine that shares the NewContext context. So the tool list
+// can still move these IDs when an ADK plugin or BeforeModelCallbacks entry
+// supplies the response (no model call follows the tool draws), or when
+// concurrent runners share the context and one prepares its tools, drawing from
+// the shared generator, after another has restarted it and before that one's
+// response IDs are drawn. Removing the request-time draws needs a change in
+// ADK's toolPreprocess and toolsetPreprocess.
+//
+// Read-only contexts (query handlers, update validators, side-effect functions)
+// are live, once-per-request operations and get ordinary random UUIDs.
+type uuidSource struct {
+	ctx   workflow.Context
+	seeds io.Reader
+	ids   *rand.ChaCha8
+}
+
+func newUUIDSource(ctx workflow.Context) *uuidSource {
+	s := &uuidSource{ctx: ctx, seeds: workflow.GetRandomStream(ctx, uuidRandomStream)}
+	s.restart()
+	return s
+}
+
+// restart starts a new generator, seeded from the next 32 bytes of the
+// workflow's random stream.
+func (s *uuidSource) restart() {
+	if workflow.IsReadOnly(s.ctx) {
+		return
+	}
+	var seed [32]byte
+	// The stream is an infinite deterministic reader; the read cannot fail.
+	_, _ = io.ReadFull(s.seeds, seed[:])
+	s.ids = rand.NewChaCha8(seed)
+}
+
+func (s *uuidSource) newUUID() string {
+	if workflow.IsReadOnly(s.ctx) {
+		return uuid.New().String()
+	}
+	if s.ids == nil {
+		// NewContext ran in read-only code.
+		s.restart()
+	}
+	// ChaCha8 reads cannot fail.
+	id, _ := uuid.NewRandomFromReader(s.ids)
+	return id.String()
+}
+
+// restartUUIDs starts a new ID generator for the uuidSource on ctx, if any.
+func restartUUIDs(ctx context.Context) {
+	if s, ok := ctx.Value(uuidSourceKey{}).(*uuidSource); ok {
+		s.restart()
 	}
 }
 
