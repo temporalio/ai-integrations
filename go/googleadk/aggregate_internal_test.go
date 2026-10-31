@@ -8,6 +8,7 @@ package googleadk
 // publish side channel is exercised by the dev-server-gated integration test.
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -102,6 +103,16 @@ func TestClassifyModelErrorRetryability(t *testing.T) {
 	empty := fmt.Errorf("empty response")
 	assert.True(t, IsNonRetryable(classifyModelError(empty)), "empty response")
 	assert.True(t, IsNonRetryable(classifyModelError(fmt.Errorf("wrapped: %w", empty))), "wrapped empty response")
+	// A model supplied through Config.Models may wrap it with other errors.
+	ctxErr := errors.New("model context")
+	assert.True(t, IsNonRetryable(classifyModelError(errors.Join(ctxErr, empty))), "joined empty response")
+	assert.True(t, IsNonRetryable(classifyModelError(fmt.Errorf("%w: %w", ctxErr, empty))), "multiple %w empty response")
+	assert.True(t, IsNonRetryable(classifyModelError(fmt.Errorf("outer: %w", errors.Join(ctxErr, empty)))), "nested joined empty response")
+	// Without it, joined status-less errors stay retryable, and an HTTP status
+	// still decides.
+	assert.False(t, IsNonRetryable(classifyModelError(errors.Join(ctxErr, assert.AnError))), "joined transient")
+	assert.False(t, IsNonRetryable(classifyModelError(errors.Join(&genai.APIError{Code: 500}, empty))), "joined 500")
+	assert.True(t, IsNonRetryable(classifyModelError(errors.Join(&genai.APIError{Code: 400}, ctxErr))), "joined 400")
 }
 
 // TestAggregateResponsesFoldsAllLateFields proves metadata a model emits only on
