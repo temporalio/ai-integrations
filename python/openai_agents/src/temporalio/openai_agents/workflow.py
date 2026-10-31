@@ -1,13 +1,18 @@
 """Workflow-specific primitives for working with the OpenAI Agents SDK in a workflow context"""
 
+import dataclasses
 import functools
 import inspect
 import json
+import sys
 import typing
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import timedelta
 from typing import Any
+
+if sys.version_info >= (3, 14):
+    import annotationlib  # type: ignore[reportUnreachable]
 
 import nexusrpc
 from agents import (
@@ -101,6 +106,84 @@ async def _tool_argument_error(
     return result
 
 
+def _invalid_tool(message: str) -> ApplicationError:
+    """Return the error for an activity that can't be made into a tool."""
+    return ApplicationError(message, type="invalid_tool")
+
+
+def _call_function(method: Any) -> Callable | None:
+    """Return the function under a function, staticmethod, classmethod or partialmethod."""
+    while isinstance(method, (staticmethod, classmethod, functools.partialmethod)):
+        method = (
+            method.func
+            if isinstance(method, functools.partialmethod)
+            else method.__func__
+        )
+    return method if inspect.isfunction(method) else None
+
+
+def _generated_class_doc(cls: type) -> str | None:
+    """Return the docstring dataclasses or namedtuple writes for a class that has none."""
+    if dataclasses.is_dataclass(cls):
+        try:
+            # Format it as dataclasses did when it made the class: 3.14 leaves forward
+            # references unevaluated, so use each field's type from that time.
+            if sys.version_info >= (3, 14):
+                signature = inspect.signature(  # type: ignore[reportUnreachable]
+                    cls, annotation_format=annotationlib.Format.FORWARDREF
+                )
+            else:
+                signature = inspect.signature(cls)  # type: ignore[reportUnreachable]
+            types = {name: f.type for name, f in cls.__dataclass_fields__.items()}
+            signature = signature.replace(
+                parameters=[
+                    p.replace(annotation=types.get(p.name, p.annotation))
+                    for p in signature.parameters.values()
+                ]
+            )
+            return cls.__name__ + str(signature).replace(" -> None", "")
+        except (TypeError, ValueError):
+            return cls.__name__
+    fields = getattr(cls, "_fields", None)
+    if issubclass(cls, tuple) and isinstance(fields, tuple):
+        names = ", ".join(fields) + ("," if len(fields) == 1 else "")
+        return f"{cls.__name__}({names})"
+    return None
+
+
+def _docstring(fn: Callable | None) -> str | None:
+    """Return ``fn``'s docstring, unless it is missing or blank."""
+    doc = fn.__doc__ if fn is not None else None
+    return doc if doc and doc.strip() else None
+
+
+def _class_doc(cls: type) -> str | None:
+    """Return a class's own docstring, unless dataclasses or namedtuple wrote it."""
+    doc = _docstring(cls)
+    if doc is None or not doc.startswith(cls.__name__):
+        return doc
+    try:
+        generated = _generated_class_doc(cls)
+    except Exception:
+        # dataclasses would have failed the same way, so it didn't write this docstring.
+        return doc
+    return None if doc == generated else doc
+
+
+def _tool_stand_in(
+    call: Callable, name: str, hints: dict[str, Any], doc: str | None
+) -> Callable:
+    """Wrap ``call`` with the name, docstring and annotations function_schema should read.
+
+    A partial has no module globals, so ``hints`` are resolved in the function's own module.
+    """
+    stand_in = functools.partial(call)
+    setattr(stand_in, "__name__", name)
+    stand_in.__annotations__ = hints
+    stand_in.__doc__ = doc
+    return stand_in
+
+
 def activity_as_tool(
     fn: Callable,
     *,
@@ -129,7 +212,10 @@ def activity_as_tool(
     For undocumented arguments, refer to :py:mod:`workflow` and :py:meth:`start_activity`
 
     Args:
-        fn: A Temporal activity function to convert to a tool.
+        fn: A Temporal activity function to convert to a tool, a method passed as
+            ``Class.method``, or a callable-class activity passed as its class. For a
+            ``__call__`` set with ``functools.partialmethod``, the SDK runs an async one as
+            sync before Python 3.13 and decodes its arguments without their types.
         strict_json_schema: Whether the tool should follow a strict schema.
             See https://openai.github.io/openai-agents-python/ref/tool/#agents.tool.FunctionTool.strict_json_schema
         failure_error_function: Formats the error text returned to the model
@@ -144,7 +230,10 @@ def activity_as_tool(
         An OpenAI agent tool that wraps the provided activity.
 
     Raises:
-        ApplicationError: If the function is not properly decorated as a Temporal activity.
+        ApplicationError: If the function is not properly decorated as a Temporal activity,
+            or is a callable-class activity passed as an instance, or whose ``__call__`` is
+            not a function, staticmethod, classmethod or ``functools.partialmethod``, can't
+            be read, or takes keyword-only arguments or ``**kwargs``.
 
     Example:
         >>> @activity.defn
@@ -162,29 +251,77 @@ def activity_as_tool(
     """
     ret = activity._Definition.from_callable(fn)
     if not ret:
-        raise ApplicationError(
-            "Bare function without tool and activity decorators is not supported",
-            "invalid_tool",
+        raise _invalid_tool(
+            "Bare function without tool and activity decorators is not supported"
         )
     if ret.name is None:
-        raise ApplicationError(
-            "Input activity must have a name to be made into a tool",
-            "invalid_tool",
+        raise _invalid_tool("Input activity must have a name to be made into a tool")
+    if not inspect.isclass(fn) and hasattr(type(fn), "__temporal_activity_definition"):
+        raise _invalid_tool(
+            f"Pass the activity class {type(fn).__name__}, not an instance of it"
         )
-    # If the provided callable has a first argument of `self`, partially apply it with the same metadata
-    # The actual instance will be picked up by the activity execution, the partially applied function will never actually be executed
-    params = list(inspect.signature(fn).parameters.keys())
-    if len(params) > 0 and params[0] == "self":
-        partial = functools.partial(fn, None)
-        setattr(partial, "__name__", fn.__name__)
-        partial.__annotations__ = getattr(fn, "__annotations__")
-        setattr(
-            partial,
-            "__temporal_activity_definition",
-            getattr(fn, "__temporal_activity_definition"),
+    if inspect.isclass(fn):
+        # Workflow code references a callable-class activity by its class, but the worker's
+        # registered instance runs __call__, so build the tool from __call__ as an instance binds
+        # it: without the receiver of a method, classmethod or partialmethod, and with every
+        # parameter of a staticmethod. The tool never calls this stand-in binding.
+        calls = [vars(c)["__call__"] for c in fn.__mro__ if "__call__" in vars(c)]
+        func = _call_function(calls[0]) if calls else None
+        if func is None:
+            raise _invalid_tool(
+                f"Activity class {fn.__name__} needs a __call__ that is a function, "
+                "staticmethod, classmethod or functools.partialmethod"
+            )
+        try:
+            call = calls[0].__get__(object(), fn)
+            hints = typing.get_type_hints(func, include_extras=True)
+            parameters = inspect.signature(call).parameters.values()
+        except Exception as e:
+            raise _invalid_tool(
+                f"Cannot build a tool from {fn.__name__}.__call__: {e}"
+            ) from e
+        # @activity.defn checks the constructor's signature, not __call__'s, so __call__ can
+        # take keyword-only arguments, which run_activity can't pass.
+        if any(p.kind is inspect.Parameter.KEYWORD_ONLY for p in parameters):
+            message = f"Activity class {fn.__name__} cannot take keyword-only arguments in __call__"
+            if isinstance(calls[0], functools.partialmethod) and calls[0].keywords:
+                message += (
+                    ": its functools.partialmethod binds an argument by keyword, which makes"
+                    " the arguments after it keyword-only"
+                )
+            raise _invalid_tool(message)
+        # __call__'s own docstring, else the class's, else that of a __call__ it inherits.
+        doc = (
+            _docstring(_call_function(vars(fn).get("__call__")))
+            or _class_doc(fn)
+            or next(filter(None, map(_docstring, map(_call_function, calls))), None)
         )
-        partial.__doc__ = fn.__doc__
-        fn = partial
+        fn = _tool_stand_in(call, fn.__name__, hints, doc)
+    else:
+        # Drop the receiver of a method passed as Class.method the way the SDK does: a first
+        # parameter named `self` that is unannotated or annotated `typing.Self`. The activity
+        # execution picks up the actual instance, so this partial is never executed.
+        first = next(iter(inspect.signature(fn).parameters.values()), None)
+        if (
+            first is not None
+            and first.name == "self"
+            and (
+                first.annotation is inspect.Parameter.empty
+                or str(first.annotation) == "typing.Self"
+            )
+        ):
+            fn = _tool_stand_in(
+                functools.partial(fn, None),
+                fn.__name__,
+                typing.get_type_hints(fn, include_extras=True),
+                fn.__doc__,
+            )
+    # run_activity passes only positional arguments, so it would drop the model's **kwargs.
+    if any(
+        p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in inspect.signature(fn).parameters.values()
+    ):
+        raise _invalid_tool(f"Activity {fn.__name__} cannot take **kwargs")
     schema = function_schema(fn)
 
     async def run_activity(ctx: RunContextWrapper[Any], input: str) -> Any:
