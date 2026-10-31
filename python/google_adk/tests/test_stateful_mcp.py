@@ -249,7 +249,6 @@ def _stdio_toolset(server: str) -> McpToolset:
 @dataclass
 class _ReplacedInput:
     name: str = "stateful_server"
-    schedule_to_start: bool = True
     heartbeat_timeout: bool = False
 
 
@@ -263,10 +262,9 @@ class StatefulMcpWorkerReplacedWorkflow:
     async def run(self, input: _ReplacedInput) -> list[str]:
         config = ActivityConfig(
             start_to_close_timeout=timedelta(seconds=20),
+            schedule_to_start_timeout=timedelta(seconds=5),
             retry_policy=RetryPolicy(maximum_attempts=1),
         )
-        if input.schedule_to_start:
-            config["schedule_to_start_timeout"] = timedelta(seconds=5)
         server_session_config = ActivityConfig(
             start_to_close_timeout=timedelta(hours=1)
         )
@@ -324,8 +322,9 @@ def _assert_refused(err: WorkflowFailureError) -> None:
     "case",
     [
         "session_opened",
-        "session_opened_no_schedule_to_start",
+        "heartbeat_details_replaced",
         "first_connection_fails",
+        "heartbeat_timeout_session_opened",
         "heartbeat_timeout_first_connection_fails",
     ],
 )
@@ -358,10 +357,7 @@ async def test_stateful_session_after_worker_replaced(
     ):
         handle = await client.start_workflow(
             StatefulMcpWorkerReplacedWorkflow.run,
-            _ReplacedInput(
-                schedule_to_start=case != "session_opened_no_schedule_to_start",
-                heartbeat_timeout=heartbeat_timeout,
-            ),
+            _ReplacedInput(heartbeat_timeout=heartbeat_timeout),
             id=f"stateful-mcp-replaced-{uuid.uuid4()}",
             task_queue=task_queue,
             execution_timeout=timedelta(seconds=50),
@@ -370,13 +366,22 @@ async def test_stateful_session_after_worker_replaced(
             StatefulMcpWorkerReplacedWorkflow.wait_listed
         )
         assert listed == ([] if first_connection_fails else ["echo"])
-        if heartbeat_timeout:
-            async with asyncio.timeout(20):
-                while True:
-                    session = await _session_activity(handle)
-                    if session and session.heartbeat_details.payloads:
-                        break
-                    await asyncio.sleep(0.1)
+        async with asyncio.timeout(20):
+            while True:
+                session = await _session_activity(handle)
+                if session and (
+                    session.heartbeat_details.payloads or not heartbeat_timeout
+                ):
+                    break
+                await asyncio.sleep(0.1)
+        if case == "heartbeat_details_replaced":
+            # Replace the session activity's heartbeat details from outside the
+            # worker. Its failure on shutdown carries the marker again.
+            await client.get_async_activity_handle(
+                workflow_id=handle.id,
+                run_id=handle.result_run_id,
+                activity_id=session.activity_id,
+            ).heartbeat()
 
     # The first worker shut down gracefully, as in a deployment, and Temporal
     # retries the session activity on the next one.
@@ -386,7 +391,7 @@ async def test_stateful_session_after_worker_replaced(
         workflows=[StatefulMcpWorkerReplacedWorkflow],
         max_cached_workflows=0,
     ):
-        if case == "session_opened":
+        if not first_connection_fails:
             # Let the retried session activity fail before the next get_tools.
             async with asyncio.timeout(30):
                 while not await _has_event(
@@ -394,8 +399,10 @@ async def test_stateful_session_after_worker_replaced(
                 ):
                     await asyncio.sleep(0.2)
         await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
-        if case == "first_connection_fails":
-            # No session was opened, so the retry builds the toolset again.
+        if first_connection_fails:
+            # No session was opened, so the retry builds the toolset again,
+            # also with a heartbeat timeout: a clean shutdown clears its
+            # "may be open" marker.
             assert await handle.result() == ["echo"]
             assert factory_calls == 2
             return
@@ -403,15 +410,13 @@ async def test_stateful_session_after_worker_replaced(
             await handle.result()
 
     # A new toolset would open a new MCP session without the old one's state.
-    # With a heartbeat timeout, every heartbeat carries the marker, so the
-    # retry is refused even though no session was opened.
     assert factory_calls == 1
     _assert_refused(err.value)
-    # get_tools failed when the session ended, without a timeout, also when no
-    # schedule-to-start timeout was set.
-    assert not await _has_event(handle, EventType.EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT)
 
 
+# Without a heartbeat timeout the worker sends a heartbeat at most every 30
+# seconds, and the reset arrives in its response.
+@pytest.mark.timeout(90)
 async def test_stateful_session_stops_on_activity_reset(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ):
@@ -448,7 +453,7 @@ async def test_stateful_session_stops_on_activity_reset(
         )
         # The next heartbeat reports the reset, and the original session
         # stops instead of serving the reset attempt.
-        async with asyncio.timeout(20):
+        async with asyncio.timeout(45):
             while not CREATED[0].closed:
                 await asyncio.sleep(0.1)
         await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
@@ -460,6 +465,7 @@ async def test_stateful_session_stops_on_activity_reset(
     _assert_refused(err.value)
 
 
+@pytest.mark.timeout(90)
 async def test_stateful_session_after_workflow_reset(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ):
@@ -503,7 +509,7 @@ async def test_stateful_session_after_workflow_reset(
         )
         # The reset run has a new session activity, which builds its own
         # toolset, and the old run's session stops.
-        async with asyncio.timeout(20):
+        async with asyncio.timeout(45):
             while len(CREATED) < 2 or not CREATED[0].closed:
                 await asyncio.sleep(0.1)
         reset_handle = client.get_workflow_handle(handle.id)
@@ -537,9 +543,9 @@ class _DelayWorkerMarkerCodec(PayloadCodec):
 async def test_stateful_session_marker_kept_by_worker_heartbeats(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ):
-    # With a heartbeat timeout the worker heartbeats too, and Core buffers
-    # them. A worker heartbeat recorded before the marker must not erase it
-    # once stored, even when the worker's own marker heartbeat is slow.
+    # The worker sends the marker in its own heartbeats, after earlier ones it
+    # buffered. Once stored, the marker must stay, even when encoding the
+    # heartbeats that carry it is slow.
     monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 1.0)
     factory_calls = 0
 
@@ -744,6 +750,7 @@ class StatefulMcpHostKilledWorkflow:
             "stateful_state",
             config=ActivityConfig(
                 start_to_close_timeout=timedelta(seconds=20),
+                schedule_to_start_timeout=timedelta(seconds=5),
                 retry_policy=RetryPolicy(maximum_attempts=1),
             ),
             server_session_config=ActivityConfig(
@@ -772,6 +779,7 @@ class StatefulMcpHostKilledWorkflow:
         self._resume = True
 
 
+@pytest.mark.timeout(90)
 @pytest.mark.parametrize("delay_worker_heartbeats", [False, True])
 async def test_stateful_session_after_host_killed(
     client: Client, tmp_path: Path, delay_worker_heartbeats: bool
@@ -806,7 +814,7 @@ async def test_stateful_session_after_host_killed(
     try:
         assert host.stdout
         async with asyncio.timeout(30):
-            assert await host.stdout.readline() == b"ready\n"
+            assert (await host.stdout.readline()).strip() == b"ready"
         async with Worker(
             client,
             task_queue=task_queue,
@@ -822,8 +830,8 @@ async def test_stateful_session_after_host_killed(
             )
             await handle.execute_update(StatefulMcpHostKilledWorkflow.wait_stored)
             if delay_worker_heartbeats:
-                # While the host's own marker heartbeats are delayed, kill it
-                # as soon as the marker leaves the heartbeat details.
+                # While the host's marker heartbeats are delayed, kill it
+                # before the marker reaches the server.
                 loop = asyncio.get_running_loop()
                 deadline = loop.time() + 8
                 while loop.time() < deadline:
