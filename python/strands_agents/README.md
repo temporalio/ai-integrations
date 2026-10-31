@@ -75,7 +75,9 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Note: Use `agent.invoke_async(message)` instead of `agent(message)`. The synchronous form spawns a worker thread, which the workflow sandbox blocks.
+Note: Use `agent.invoke_async(message)` instead of `agent(message)`. Strands runs its synchronous calls on a new thread, outside the workflow sandbox and off the workflow event loop, where their model calls and other I/O would not be recorded. So in workflow code these raise `RestrictedWorkflowAccessError`: calling an `Agent`, `A2AAgent`, `Graph` or `Swarm`, `agent.structured_output()`, direct tool calls such as `agent.tool.name()`, and Strands features that make such calls themselves, such as `SummarizingConversationManager`, `SnapshotSessionManager`, and, in recent Strands versions, leaving `with agent:` when the agent has a `memory_manager`. Building agents, graphs and swarms still works, and calls made while they are built are not checked. Call agents that do their own I/O, such as an `A2AAgent`, from an activity, for example with `activity_as_tool`.
+
+The error fails the workflow task, so the run stays open until you deploy a fix, unless the worker or workflow lists `NondeterminismError` in its failure exception types, which fails the run instead. Inside a tool, Strands catches it and gives the model an error tool result instead. Under the default sandboxed runner, a synchronous call in a workflow module's top-level code also stops the worker from starting, and fails every replay of that workflow. A run that made a synchronous call before you deploy this version no longer replays as recorded; if it caught the error, it now takes its error branch. Let those runs finish first, or use Worker Versioning.
 
 ## Models
 
@@ -551,7 +553,7 @@ class MyWorkflow:
         )
 ```
 
-This relies on the plugin's failure converter, which is installed via the client's data converter. **Attach `StrandsPlugin` to the client** (not just the worker) for activity-tool interrupts to work — workers built from that client pick up the plugin automatically.
+This relies on the plugin's failure converter, which is installed via the client's data converter. **Attach `StrandsPlugin` to the client** (not just the worker) for activity-tool interrupts to work — workers built from that client pick up the plugin automatically. If your data converter uses the default payload converter with `DefaultFailureConverterWithEncodedAttributes` or a subclass of it, the plugin replaces it with its own failure converter but keeps the encoding, so failure messages and stack traces still go through your codec. Methods your class overrides are not used.
 
 ```python
 client = await Client.connect("localhost:7233", plugins=[StrandsPlugin(models=MODELS)])

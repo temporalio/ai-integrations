@@ -200,14 +200,56 @@ the model SDK's own retries (see below), or override the fallbacks.
   closes any cached toolset that implements `Close() error` at worker stop
   automatically; with manual wiring, call `Activities.Close` yourself after
   `worker.Run` returns.
+- **Remote A2A agents.** Build ADK's remote agent (`remoteagent.NewA2A`) with
+  `AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, activityOptions)`
+  and `ClientProvider: googleadk.NewA2AClientProvider(activityOptions)`. The card
+  fetch and each message then run in the `ResolveA2AAgentCard` and
+  `SendA2AMessage` Activities (a cancellation in `CancelA2ATask`), so a replay
+  reads them from History instead of sending them again. Like ADK's own
+  provider, the card provider fetches the card on every run of the agent; set a
+  static `AgentCard` to skip the fetch.
+  - The Activities build a2a-go's JSON-RPC and REST clients with no HTTP timeout
+    of their own, so the Activity's timeouts bound each call. To add options,
+    such as call interceptors that add credentials, set
+    `Config.A2AClientFactory` to `googleadk.NewA2AClientFactory(opts...)`, which
+    keeps those clients. Any other `a2aclient.Factory` uses its own HTTP
+    clients: a2a-go's defaults stop every call at 3 minutes and report an HTTP
+    error status only as text, which the plugin retries.
+  - A zero `StartToCloseTimeout` falls back to one minute, and with no
+    `RetryPolicy` Temporal retries without limit. A call that fails with an HTTP
+    status follows the rule under **Typed failures**. An A2A error the remote
+    agent answers with is not retried; ADK turns it into an error event. A send
+    that times out or fails on the network is retried, which sends the message
+    again and starts another remote task, so set a `StartToCloseTimeout` longer
+    than the remote agent takes to answer. The same happens when the Worker
+    stops, or the Activity is paused or reset, during a send. A card file
+    missing on the worker is retried too.
+  - ADK streams the send unless the run's `StreamingMode` is
+    `agent.StreamingModeNone`, so the zero `RunConfig` streams too. A streamed
+    reply reaches the workflow when the stream ends, with the chunks of each
+    artifact merged. In its default output mode, an ADK server's partial events
+    are dropped, since ADK saves none of them. In `OutputArtifactPerEvent` mode
+    they are kept, so a reply of thousands of chunks can pass the payload
+    limit. If the stream fails after its first events, the workflow gets those
+    events and the error, without a retry, and ADK cancels the unfinished task
+    as it does without Temporal.
+  - A cancellation gets a single 5-second attempt, and still goes out after the
+    workflow is cancelled. Cancelling the workflow while a send is in flight
+    does not cancel the remote task: the send's result is dropped, and ADK
+    cancels only a task it has seen, so the remote agent finishes it on its
+    own.
+  - The client sets the message ID from the workflow's random stream when it
+    sends. ADK's `BeforeRequestCallbacks` run earlier and see a2a-go's random
+    ID, which differs on every replay.
 - **Deterministic by construction.** `NewContext` binds ADK's `platform.Now` to
   `workflow.Now`, `platform.NewUUID` to a deterministic generator drawn from the
   workflow random stream, and `platform.RunTasks` to a `workflow.Go` fan-out, so
   the agent loop replays deterministically. Concurrent tool fan-out is on by
   default; use `NewContext(ctx, googleadk.WithSequentialToolFanout())` for a
   serial fallback.
-- **Typed failures.** Model / tool / MCP failures surface as Temporal
-  `ApplicationError`s tagged `googleadk.ModelError` / `.ToolError` / `.McpError`.
+- **Typed failures.** Model / tool / MCP / A2A failures surface as Temporal
+  `ApplicationError`s tagged `googleadk.ModelError` / `.ToolError` / `.McpError`
+  / `.A2AError`.
   Classify with `IsNonRetryable(err)`; never string-match. Upstream HTTP status
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
@@ -466,9 +508,26 @@ an upgrade would newly pass through ungated.
 ## Supported & not-yet-supported
 
 - **Supported:** single- and multi-agent (`SubAgents`) trees, in-workflow function
-  tools, `ActivityAsTool`, stateless MCP, Gemini built-in tools (executed
-  server-side inside `InvokeModel`), HITL tool confirmation, continue-as-new state
-  carry, the in-memory session service, and SSE streaming.
+  tools, `ActivityAsTool`, stateless MCP, remote A2A agents built with the
+  plugin's providers, Gemini built-in tools (executed server-side inside
+  `InvokeModel`), HITL tool confirmation, continue-as-new state carry, the
+  in-memory session service, and SSE streaming.
 - **Not yet:** `RunLive` (bidirectional streaming), sub-agent-as-child-workflow,
   live memory/artifact tools that require in-workflow network I/O, and DB/Vertex
   session services. These raise or are documented rather than silently degrading.
+- **Rejected:** ADK's remote A2A agents built without
+  `NewA2AClientProvider`, or that fetch their card without
+  `NewA2AAgentCardProvider` (a static `AgentCard` is fine). This includes every
+  agent from the deprecated `agent/remoteagent` package. They fetch their agent
+  card and send messages from Workflow code, so every replay would send them
+  again. A model call from an agent with such a remote agent below it returns an
+  error and schedules no Activity. That check misses a remote agent that is not
+  below an agent making a model call: a remote root agent, one under a
+  sequential, loop or parallel agent, and one reached by transfer. To catch
+  those, add `googleadk.NewRunnerPlugin(root)` to the runner's plugins: it fails
+  every run, before any agent runs, while the tree under `root` holds such an
+  agent. Neither check sees a remote agent wrapped as a tool with `agenttool`.
+
+  An open run that made such a model call on an earlier version fails to replay
+  on this one with a non-determinism error. Let those runs finish before you
+  upgrade, or keep them on the earlier version with Worker Versioning.

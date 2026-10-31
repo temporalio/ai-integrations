@@ -1,3 +1,4 @@
+import type { MCPToolFilterCallable, MCPToolFilterStatic } from '@openai/agents-core';
 import {
   ActivityFailure,
   ApplicationFailure,
@@ -19,12 +20,13 @@ import {
   MCP_LIST_TOOLS_SUFFIX,
   MCP_SERVER_SESSION_SUFFIX,
   MCP_STATEFUL_SUFFIX,
+  type McpServerHandleOptions,
   type StatefulMcpServerSessionArgs,
   type StatefulTemporalMCPServer,
 } from '../common/mcp-types';
 import { getCurrentPluginConfig } from './plugin-config-store';
 
-export interface StatefulMcpServerOptions {
+export interface StatefulMcpServerOptions extends McpServerHandleOptions {
   /** Activity options for tool operation Activities on the dedicated Worker. */
   config?: {
     startToCloseTimeout?: Duration;
@@ -40,9 +42,9 @@ export interface StatefulMcpServerOptions {
   };
   factoryArgument?: unknown;
   /**
-   * When `true` (the default), the agent SDK caches `listTools` for the
-   * agent's lifetime. Set to `false` if the server's tool set may change
-   * mid-run.
+   * When `true` (the default), the tool list is fetched once and reused for
+   * the rest of the Workflow run. Set to `false` if the server's tool set may
+   * change mid-run.
    */
   cacheToolsList?: boolean;
 }
@@ -91,6 +93,8 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
   private _sessionScope: CancellationScope | undefined;
   private _sessionPromise: Promise<void> | undefined;
   private _connected = false;
+  private _cachedTools: any[] | undefined;
+  toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
 
   constructor(name: string, options?: StatefulMcpServerOptions) {
     this._name = `${name}${MCP_STATEFUL_SUFFIX}`;
@@ -107,14 +111,22 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     };
     this._factoryArgument = options?.factoryArgument;
     this._cacheToolsList = options?.cacheToolsList ?? true;
+    // A callable filter gets the registered name, as with statelessMcpServer(), not `this.name`.
+    const toolFilter = options?.toolFilter;
+    this.toolFilter =
+      typeof toolFilter === 'function'
+        ? (context, tool) => toolFilter({ ...context, serverName: name }, tool)
+        : toolFilter;
   }
 
   get name(): string {
     return this._name;
   }
 
+  // The agent SDK caches the filtered list, so with a filter only this handle caches, and the
+  // agent filters every listing.
   get cacheToolsList(): boolean {
-    return this._cacheToolsList;
+    return this._cacheToolsList && !this.toolFilter;
   }
 
   /** Starts the per-run server-session Activity. */
@@ -175,7 +187,17 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
 
   async listTools(): Promise<any[]> {
     this.assertConnected();
-    return handleWorkerFailure(() => scheduleActivity(this._name + MCP_LIST_TOOLS_SUFFIX, [], this._operationConfig));
+    const shouldCache = this._cacheToolsList && !!this.toolFilter;
+    if (shouldCache && this._cachedTools) {
+      return this._cachedTools;
+    }
+    const tools = await handleWorkerFailure(() =>
+      scheduleActivity<any[]>(this._name + MCP_LIST_TOOLS_SUFFIX, [], this._operationConfig)
+    );
+    if (shouldCache) {
+      this._cachedTools = tools;
+    }
+    return tools;
   }
 
   async callTool(toolName: string, args: Record<string, unknown> | null): Promise<any> {
@@ -186,8 +208,9 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
   }
 
   async invalidateToolsCache(): Promise<void> {
-    // Caching is owned by the upstream agent SDK; nothing to invalidate on the
-    // Workflow-side handle.
+    // Without a filter, caching is owned by the upstream agent SDK. With one, this cache holds the
+    // full list, and the agent SDK's invalidateServerToolsCache(name) cannot clear it.
+    this._cachedTools = undefined;
   }
 }
 

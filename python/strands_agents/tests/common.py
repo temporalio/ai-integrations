@@ -1,4 +1,6 @@
 import asyncio
+import zlib
+from collections.abc import Sequence
 from datetime import timedelta
 from typing import Any
 
@@ -7,8 +9,10 @@ from strands.hooks import AfterToolCallEvent, HookProvider, HookRegistry
 from strands.types.tools import AgentTool, ToolResult
 
 from temporalio import activity
+from temporalio.api.common.v1 import Payload
 from temporalio.api.enums.v1 import EventType
 from temporalio.client import WorkflowHistory
+from temporalio.converter import PayloadCodec
 from temporalio.strands_agents._temporal_mcp_client import _CallToolArgs, _MCPToolInfo
 from temporalio.strands_agents._temporal_mcp_tool import TemporalMCPTool
 from temporalio.strands_agents.workflow import activity_as_hook, activity_as_tool
@@ -20,6 +24,22 @@ def get_activities(history: WorkflowHistory) -> list[str]:
         for event in history.events
         if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
     ]
+
+
+class CompressionCodec(PayloadCodec):
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return [
+            Payload(
+                metadata={"encoding": b"binary/zlib"},
+                data=zlib.compress(payload.SerializeToString()),
+            )
+            for payload in payloads
+        ]
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return [
+            Payload.FromString(zlib.decompress(payload.data)) for payload in payloads
+        ]
 
 
 # Set once a blocking tool or hook activity starts; clear it before each run.

@@ -1,9 +1,19 @@
 import path from 'node:path';
 import type { TestFn } from 'ava';
-import { McpClient, Message, Model, TextBlock } from '@strands-agents/sdk';
+import {
+  ContextWindowOverflowError,
+  McpClient,
+  Message,
+  Model,
+  StructuredOutputError,
+  TextBlock,
+} from '@strands-agents/sdk';
 import type { BaseModelConfig, JSONValue, ModelStreamEvent, StreamOptions, Tool } from '@strands-agents/sdk';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { ApplicationFailure } from '@temporalio/common';
+import { WorkflowFailedError, WorkflowUpdateFailedError } from '@temporalio/client';
+import { ActivityFailure, ApplicationFailure, CancelledFailure } from '@temporalio/common';
+import { SimplePlugin } from '@temporalio/plugin';
+import { temporal } from '@temporalio/proto';
 import type { BaseContext } from '@temporalio/test-helpers';
 import {
   test as anyTest,
@@ -12,17 +22,30 @@ import {
   loadHistory,
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
-import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
+import { bundleWorkflowCode, DefaultLogger, NativeConnection, Worker, type WorkerOptions } from '@temporalio/worker';
 import { DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
-import { StrandsPlugin } from '..';
+import { STRANDS_MALFORMED_INTERRUPT_TYPE, StrandsPlugin } from '..';
+import { ModelActivity } from '../model-activity';
 import { startLocalWithRetry } from './helpers/environment';
-import { auditLog, auditTool, deleteState, deleteThing, getWeather, getWeatherCalls } from './activities/strands';
+import {
+  auditLog,
+  auditTool,
+  confirmState,
+  confirmThings,
+  deleteState,
+  deleteThing,
+  getWeather,
+  getWeatherCalls,
+  interruptError,
+} from './activities/strands';
 import {
   activityToolAgent,
+  failActivities,
   approveSignal,
   compressionAgent,
   defaultModelAgent,
+  doneSignal,
   failingActivityToolAgent,
   failingMcpToolAgent,
   helloAgent,
@@ -31,8 +54,13 @@ import {
   inWorkflowToolAgent,
   mcpAgent,
   retryConfigAgent,
+  statefulAgent,
+  statefulChatAgent,
   streamingAgent,
   structuredOutputAgent,
+  turnsAgent,
+  turnUpdate,
+  updateTurnsAgent,
 } from './workflows/strands';
 
 const STUB_TRANSPORT: Transport = {
@@ -71,6 +99,23 @@ class StubModel extends Model<BaseModelConfig> {
   }
 }
 
+/** A stub model whose context holds `limit` messages: a longer request overflows, as a provider's would. */
+class SmallContextModel extends StubModel {
+  constructor(
+    private readonly limit: number,
+    turns: ModelStreamEvent[][]
+  ) {
+    super(turns);
+  }
+
+  override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+    if (messages.length > this.limit) {
+      throw new ContextWindowOverflowError(`${messages.length} messages do not fit`);
+    }
+    yield* super.stream(messages, options);
+  }
+}
+
 /** Convenience: text reply that ends the conversation. */
 function textTurn(text: string): ModelStreamEvent[] {
   return [
@@ -80,6 +125,26 @@ function textTurn(text: string): ModelStreamEvent[] {
     { type: 'modelContentBlockStopEvent' },
     { type: 'modelMessageStopEvent', stopReason: 'endTurn' },
   ];
+}
+
+interface ActivityFailureRecord {
+  message?: string | null;
+  type?: string | null;
+  nonRetryable?: boolean | null;
+}
+
+/** Each failed activity's message, type and non-retryable flag in a run's history. */
+function activityFailures(history: temporal.api.history.v1.IHistory): ActivityFailureRecord[] {
+  return (history.events ?? []).flatMap((e) => {
+    const failure = e.activityTaskFailedEventAttributes?.failure;
+    const info = failure?.applicationFailureInfo;
+    return failure ? [{ message: failure.message, type: info?.type, nonRetryable: info?.nonRetryable }] : [];
+  });
+}
+
+/** Convenience: a reply cut off at the model's token limit, so Strands throws `MaxTokensError`. */
+function maxTokensTurn(text: string): ModelStreamEvent[] {
+  return [...textTurn(text).slice(0, -1), { type: 'modelMessageStopEvent', stopReason: 'maxTokens' }];
 }
 
 /** Convenience: tool-call turn that the agent loop will dispatch. */
@@ -143,6 +208,10 @@ class StubMcpClient extends McpClient {
 }
 
 const test = anyTest as TestFn<BaseContext>;
+
+const CALLER_FAILURE_CONVERTER = require.resolve('./encoding-failure-converter');
+
+const BENIGN = temporal.api.enums.v1.ApplicationErrorCategory.APPLICATION_ERROR_CATEGORY_BENIGN;
 
 test.before(async (t) => {
   const env = await startLocalWithRetry(() => TestWorkflowEnvironment.createLocal());
@@ -285,6 +354,299 @@ test('a history recorded before the model config read fails to replay', async (t
     { instanceOf: DeterminismViolationError }
   );
   t.regex(err!.message, /\[TMPRL1100\].*'invokeModel'.*'strandsGetModelConfig'/);
+});
+
+test('StrandsPlugin refuses to replace a different Activity with the same name', (t) => {
+  type Activities = Record<string, unknown>;
+  const claude = (): Model => new StubModel([]);
+  const beta = (): McpClient => new StubMcpClient([]);
+  const base = { taskQueue: 'q' } as WorkerOptions;
+  const duplicate = (name: string) => ({
+    instanceOf: TypeError,
+    message:
+      `Duplicate registration of Activity '${name}': StrandsPlugin would replace a different Activity with this ` +
+      'name. Rename or remove the other Activity, run the other integration on its own Worker and task queue, or ' +
+      'use one StrandsPlugin instance on this Worker.',
+  });
+  const plugin = new StrandsPlugin({ models: { claude }, mcpClients: { beta } });
+  const callerActivity = async (): Promise<string> => 'caller';
+
+  // A caller Activity is refused.
+  for (const name of ['invokeModel', 'beta-callTool']) {
+    t.throws(() => plugin.configureWorker({ ...base, activities: { [name]: callerActivity } }), duplicate(name));
+  }
+  // So is a StrandsPlugin with different options: no `models` or another `models` object (compared by
+  // identity), another factory for an MCP server, or another idle timeout for it.
+  const withModels = new StrandsPlugin({ models: { claude } }).configureWorker(base);
+  t.throws(() => new StrandsPlugin({ mcpClients: { beta } }).configureWorker(withModels), duplicate('invokeModel'));
+  t.throws(() => new StrandsPlugin({ models: { claude } }).configureWorker(withModels), duplicate('invokeModel'));
+  const withBeta = new StrandsPlugin({ mcpClients: { beta } }).configureWorker(base);
+  const otherFactory = new StrandsPlugin({ mcpClients: { beta: () => beta() } });
+  t.throws(() => otherFactory.configureWorker(withBeta), duplicate('beta-listTools'));
+  const otherTimeout = new StrandsPlugin({ mcpClients: { beta }, mcpConnectionIdleTimeout: '1 minute' });
+  t.throws(() => otherTimeout.configureWorker(withBeta), duplicate('beta-listTools'));
+
+  // Caller Activities with other names stay beside the plugin's.
+  const once = plugin.configureWorker({ ...base, activities: { lookUp: callerActivity } });
+  t.is((once.activities as Activities).lookUp, callerActivity);
+  // Worker.create runs configureWorker twice when one instance is on both the NativeConnection
+  // and the Worker.
+  const twice = plugin.configureWorker(once);
+  t.is((twice.activities as Activities).invokeModel, (once.activities as Activities).invokeModel);
+  // Instances built from one options object, two default instances, and an omitted idle timeout
+  // next to its five-minute default still start.
+  const shared = { models: { claude }, mcpClients: { beta } };
+  t.notThrows(() => new StrandsPlugin(shared).configureWorker(new StrandsPlugin(shared).configureWorker(base)));
+  t.notThrows(() => new StrandsPlugin().configureWorker(new StrandsPlugin().configureWorker(base)));
+  const fiveMinutes = new StrandsPlugin({ mcpClients: { beta }, mcpConnectionIdleTimeout: '5 minutes' });
+  t.notThrows(() => fiveMinutes.configureWorker(withBeta));
+  // Different MCP server names from two instances are both kept.
+  const both = new StrandsPlugin({ mcpClients: { gamma: beta } }).configureWorker(withBeta).activities as Activities;
+  t.is(typeof both['beta-callTool'], 'function');
+  t.is(typeof both['gamma-callTool'], 'function');
+});
+
+test('runWorker refuses an Activity that a later plugin replaced, before polling', async (t) => {
+  const connection = await NativeConnection.connect({ address: t.context.env.address });
+  // AiSdkPlugin also registers invokeModel; this plugin stands in for it.
+  const later = new SimplePlugin({ name: 'later', activities: { invokeModel: async () => 'other' } });
+  const worker = await Worker.create({
+    connection,
+    namespace: t.context.env.namespace,
+    taskQueue: 'test-strands-later-plugin',
+    plugins: [new StrandsPlugin({ models: { test: () => new StubModel([]) } }), later],
+  });
+  await t.throwsAsync(worker.run(), {
+    instanceOf: TypeError,
+    message: /^Duplicate registration of Activity 'invokeModel': a plugin applied after StrandsPlugin replaced/,
+  });
+  t.is(worker.getState(), 'STOPPED');
+  // Throws if the Worker still holds the connection.
+  await connection.close();
+});
+
+test('a stateful run recorded before the stateful flag replays on the stateless path', async (t) => {
+  // Recorded with `statefulAgent` on 3af00d9, whose config activity returns no `stateful` flag: the
+  // run scheduled `invokeModel`, where a config with the flag schedules `strandsInvokeStatefulModel`.
+  const history = await loadHistory(path.resolve(__dirname, '../../src/__tests__/histories/stateful-before-flag.json'));
+  await t.notThrowsAsync(
+    Worker.runReplayHistory(
+      {
+        workflowBundle: t.context.workflowBundle,
+        plugins: [new StrandsPlugin({ models: { stateful: () => new StatefulStub([], []) } })],
+      },
+      history
+    )
+  );
+});
+
+/** What each call of a {@link StatefulStub} got: the response id it chained to, and its messages. */
+type StatefulCall = { previousResponseId: JSONValue | undefined; messages: number };
+
+/** Keeps the conversation "server-side", as `OpenAIModel` with `stateful: true` does. */
+class StatefulStub extends StubModel {
+  constructor(
+    turns: ModelStreamEvent[][],
+    private readonly calls: StatefulCall[]
+  ) {
+    super(turns);
+  }
+
+  override get stateful(): boolean {
+    return true;
+  }
+
+  override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+    this.calls.push({ previousResponseId: options?.modelState?.get('responseId'), messages: messages.length });
+    options?.modelState?.set('responseId', `resp_${this.calls.length}`);
+    yield* super.stream(messages, options);
+  }
+}
+
+const CHAINED_CALLS = [
+  { previousResponseId: undefined, messages: 1 },
+  { previousResponseId: 'resp_1', messages: 1 },
+];
+
+function scheduledActivities(history: temporal.api.history.v1.IHistory): string[] {
+  return (history.events ?? []).flatMap((e) => e.activityTaskScheduledEventAttributes?.activityType?.name ?? []);
+}
+
+test('a stateful worker model keeps the conversation server-side', async (t) => {
+  t.timeout(60_000);
+  const { createWorker, executeWorkflow, startWorkflow } = helpers(t);
+  const calls: StatefulCall[] = [];
+  const turns = [textTurn('one'), textTurn('two'), textTurn('three'), textTurn('four')];
+  const plugin = (): StrandsPlugin => new StrandsPlugin({ models: { stateful: () => new StatefulStub(turns, calls) } });
+
+  const worker = await createWorker({ plugins: [plugin()], maxCachedWorkflows: 0 });
+  await worker.runUntil(async () => {
+    for (const [mode, activityType] of [
+      ['plain', 'strandsInvokeStatefulModel'],
+      ['streaming', 'strandsInvokeStatefulModelStreaming'],
+    ] as const) {
+      calls.length = 0;
+      const handle = await startWorkflow(statefulAgent, { args: [mode] });
+      t.deepEqual(await handle.result(), [0, 0]);
+      t.deepEqual(calls, CHAINED_CALLS);
+      const history = await handle.fetchHistory();
+      t.deepEqual(scheduledActivities(history), ['strandsGetModelConfig', activityType, activityType]);
+      await Worker.runReplayHistory({ workflowBundle: t.context.workflowBundle, plugins: [plugin()] }, history);
+    }
+
+    t.is(
+      await executeWorkflow(statefulAgent, { args: ['manager'] }),
+      'contextManager and conversationManager cannot be used with a stateful model. ' +
+        'The model manages conversation state server-side.'
+    );
+  });
+});
+
+test('a stateful model call waits for a worker with stateful support', async (t) => {
+  t.timeout(60_000);
+  const { createWorker, startWorkflow, taskQueue } = helpers(t);
+  const calls: StatefulCall[] = [];
+  const plugin = new StrandsPlugin({
+    models: { stateful: () => new StatefulStub([textTurn('one'), textTurn('two')], calls) },
+  });
+  // An activity worker that registers only the stateless model activities, behind this version's
+  // workflow and config. This is not a mixed-version rollout: an earlier workflow or config activity
+  // breaks the run, as the README says.
+  const legacy = new ModelActivity({ stateful: () => new StatefulStub([], calls) });
+  const modelsQueue = `${taskQueue}-models`;
+
+  const worker = await createWorker({ plugins: [plugin] });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(statefulAgent, { args: ['models-queue'] });
+    const legacyWorker = await createWorker({
+      taskQueue: modelsQueue,
+      activities: {
+        strandsGetModelConfig: legacy.getModelConfig.bind(legacy),
+        invokeModel: legacy.invokeModel,
+        invokeModelStreaming: legacy.invokeModelStreaming,
+      },
+    });
+    const pending = await legacyWorker.runUntil(async () => {
+      for (let polls = 0; ; polls++) {
+        const description = await handle.describe();
+        const [activity] = description.raw.pendingActivities ?? [];
+        if (activity && (activity.attempt ?? 0) > 2) return activity;
+        if (description.status.name !== 'RUNNING' || polls === 300) {
+          throw new Error(
+            `no retried model activity: run ${description.status.name}, pending ` +
+              JSON.stringify(description.raw.pendingActivities)
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    });
+    t.is(pending.activityType?.name, 'strandsInvokeStatefulModel');
+    t.regex(pending.lastFailure?.message ?? '', /not registered/);
+    t.deepEqual(calls, []);
+
+    const upgradedWorker = await createWorker({ taskQueue: modelsQueue, plugins: [plugin] });
+    t.deepEqual(await upgradedWorker.runUntil(handle.result()), [0, 0]);
+  });
+  t.deepEqual(calls, CHAINED_CALLS);
+});
+
+test("a model call fails at once when the worker model's stateful flag differs from the run's config", async (t) => {
+  t.timeout(60_000);
+  const { createWorker, startWorkflow, taskQueue } = helpers(t);
+  const calls: StatefulCall[] = [];
+  const plugin = new StrandsPlugin({ models: { stateful: () => new StatefulStub([], calls) } });
+  // The worker model now in one mode, as after a model change or an upgrade.
+  class SwitchedStub extends StatefulStub {
+    constructor(private readonly isStateful: boolean) {
+      super([textTurn('one')], calls);
+    }
+    override get stateful(): boolean {
+      return this.isStateful;
+    }
+  }
+
+  for (const c of [
+    // The run's config is stateless (here an earlier version's, with no flag; a model that became
+    // stateful later gives the same path), so its call to the stateful model reaches the stateless
+    // activity.
+    {
+      config: {},
+      stateful: true,
+      activity: 'invokeModel',
+      type: 'StatefulModelOnStatelessPath',
+      message: /is stateful, .* became stateful after the run read its config/,
+    },
+    // The config says stateful, but the model became stateless.
+    {
+      config: { stateful: true },
+      stateful: false,
+      activity: 'strandsInvokeStatefulModel',
+      type: 'StatelessModelOnStatefulPath',
+      message: /is not stateful, .* became stateless after the run read its config/,
+    },
+  ]) {
+    const current = new ModelActivity({ stateful: () => new SwitchedStub(c.stateful) });
+    const worker = await createWorker({ plugins: [plugin] });
+    const history = await worker.runUntil(async () => {
+      const handle = await startWorkflow(statefulAgent, { args: ['models-queue'] });
+      const modelsWorker = await createWorker({
+        taskQueue: `${taskQueue}-models`,
+        activities: {
+          strandsGetModelConfig: async () => c.config,
+          invokeModel: current.invokeModel,
+          invokeModelStreaming: current.invokeModelStreaming,
+          strandsInvokeStatefulModel: current.invokeStatefulModel,
+          strandsInvokeStatefulModelStreaming: current.invokeStatefulModelStreaming,
+        },
+      });
+      await modelsWorker.runUntil(handle.result());
+      return handle.fetchHistory();
+    });
+
+    t.deepEqual(scheduledActivities(history), ['strandsGetModelConfig', c.activity], c.type);
+    const events = history.events ?? [];
+    const attempts = events.flatMap((e) => e.activityTaskStartedEventAttributes?.attempt ?? []);
+    const failures = events.flatMap((e) => e.activityTaskFailedEventAttributes?.failure ?? []);
+    t.deepEqual(attempts, [1, 1], c.type);
+    t.is(failures.length, 1, c.type);
+    t.like(failures[0], { applicationFailureInfo: { type: c.type, nonRetryable: true } });
+    t.regex(failures[0]?.message ?? '', c.message);
+    t.deepEqual(calls, [], c.type);
+  }
+});
+
+test("the README's continue-as-new handoff carries a stateful model's state", async (t) => {
+  t.timeout(60_000);
+  const { createWorker, executeWorkflow } = helpers(t);
+  const calls: StatefulCall[] = [];
+  const worker = await createWorker({
+    plugins: [
+      new StrandsPlugin({ models: { stateful: () => new StatefulStub([textTurn('one'), textTurn('two')], calls) } }),
+    ],
+  });
+
+  const messages = await worker.runUntil(
+    executeWorkflow(statefulChatAgent, { args: [{ prompts: ['turn one', 'turn two'] }] })
+  );
+  t.deepEqual({ messages, calls }, { messages: 0, calls: CHAINED_CALLS });
+});
+
+test('a history whose code depends on when a handler finishes still replays', async (t) => {
+  // Recorded with `handlerTiming` on main at 63d7aec: one microtask after its Signal handler ran,
+  // every handler had finished, so the run scheduled `finished`. The plugin wraps no handlers, so
+  // they finish at the same moment and the history replays.
+  const history = await loadHistory(
+    path.resolve(__dirname, '../../src/__tests__/histories/handler-timing-63d7aec.json')
+  );
+  await t.notThrowsAsync(
+    Worker.runReplayHistory(
+      {
+        workflowBundle: t.context.workflowBundle,
+        plugins: [new StrandsPlugin({ models: { test: () => new StubModel([]) } })],
+      },
+      history
+    )
+  );
 });
 
 test('invokeModel reconstructs Message instances from wire data', async (t) => {
@@ -800,7 +1162,7 @@ test('TemporalAgent surfaces structured output via structuredOutputSchema', asyn
   });
 });
 
-test('activity-tool interrupt round-trips through failure converter and resume', async (t) => {
+test('activity-tool interrupt pauses the agent and resumes', async (t) => {
   deleteState.calls = 0;
   const { createWorker, startWorkflow } = helpers(t);
 
@@ -815,16 +1177,279 @@ test('activity-tool interrupt round-trips through failure converter and resume',
     activities: { deleteThing },
   });
 
-  await worker.runUntil(async () => {
+  const history = await worker.runUntil(async () => {
     const handle = await startWorkflow(interruptAgent, {
       args: ['delete foo'],
       workflowExecutionTimeout: '30 seconds',
     });
     await handle.signal(approveSignal, 'approve');
     t.is(await handle.result(), 'done');
+    return handle.fetchHistory();
   });
   // First activity invocation threw the interrupt; second succeeded after resume.
   t.is(deleteState.calls, 2);
+  // The interrupt failed the first activity once, with no retry; the second call came from the
+  // activity the resumed agent scheduled.
+  t.deepEqual(activityFailures(history), [
+    { message: 'interrupt:approval', type: 'StrandsInterrupt', nonRetryable: true },
+  ]);
+  // That failure came from the activity's first attempt, is benign, and keeps the stack of the error
+  // it threw.
+  const failed = history.events?.find((e) => e.activityTaskFailedEventAttributes)?.activityTaskFailedEventAttributes;
+  const startedId = failed?.startedEventId?.toString();
+  const started = history.events?.find((e) => e.eventId?.toString() === startedId);
+  t.is(started?.activityTaskStartedEventAttributes?.attempt, 1);
+  t.is(failed?.failure?.applicationFailureInfo?.category, BENIGN);
+  t.regex(failed?.failure?.stackTrace ?? '', /interruptError/);
+});
+
+test('an activity interrupt with two entries pauses the agent once for each', async (t) => {
+  confirmState.calls = 0;
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [
+      new StrandsPlugin({
+        models: {
+          test: () => new StubModel([toolCallTurn('confirmThings', 'call_1', { name: 'foo' }), textTurn('done')]),
+        },
+      }),
+    ],
+    activities: { confirmThings },
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(interruptAgent, {
+      args: ['confirm foo', 'confirmThings'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    await handle.signal(approveSignal, 'yes');
+    await handle.signal(approveSignal, 'yes');
+    t.is(await handle.result(), 'done');
+  });
+  // The first call paused at the approval, the second at the confirmation, and the third had both
+  // responses.
+  t.is(confirmState.calls, 3);
+});
+
+test("a worker's own failure converter still applies with the plugin", async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  let inboundCalls = 0;
+  const worker = await createWorker({
+    // The worker bundles the workflows itself, so the bundle's failure converter comes from the
+    // worker's options and the plugins, as it does with `workflowsPath`.
+    workflowBundle: undefined,
+    workflowsPath: require.resolve('./workflows/strands'),
+    bundlerOptions: createBaseBundlerOptions(),
+    dataConverter: { failureConverterPath: CALLER_FAILURE_CONVERTER },
+    plugins: [new StrandsPlugin()],
+    // The worker's own interceptors still run with the plugin's.
+    interceptors: {
+      activityInbound: [
+        () => ({
+          execute: (input, next) => {
+            inboundCalls += 1;
+            return next(input);
+          },
+        }),
+      ],
+    },
+    activities: {
+      async failingActivity(message: string): Promise<never> {
+        throw message === 'interrupt' ? interruptError('foo') : new StructuredOutputError('no output');
+      },
+    },
+  });
+  const history = await worker.runUntil(async () => {
+    const handle = await startWorkflow(failActivities, { args: [['interrupt', 'terminal']] });
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    // Workflow code decoded each activity failure as `TemporalActivityTool` expects.
+    t.deepEqual(err?.cause instanceof ApplicationFailure && err.cause.details, [
+      {
+        type: 'StrandsInterrupt',
+        nonRetryable: true,
+        details: [{ id: 'delete:foo', name: 'approval', reason: 'delete foo?', source: 'tool' }],
+      },
+      { type: 'StructuredOutputError', nonRetryable: true, details: [] },
+    ]);
+    return handle.fetchHistory();
+  });
+  // The caller's converter encoded every failure, and the plugin made the Strands errors
+  // non-retryable.
+  t.deepEqual(activityFailures(history), [
+    { message: 'Encoded failure', type: 'StrandsInterrupt', nonRetryable: true },
+    { message: 'Encoded failure', type: 'StructuredOutputError', nonRetryable: true },
+  ]);
+  const workflowFailure = history.events?.find((e) => e.workflowExecutionFailedEventAttributes)
+    ?.workflowExecutionFailedEventAttributes?.failure;
+  t.is(workflowFailure?.message, 'Encoded failure');
+  t.is(inboundCalls, 2);
+});
+
+test('a malformed activity interrupt fails without retries', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const malformedInterrupts: Record<string, unknown[]> = {
+    'no toJSON': [{ toJSON: () => ({ name: 'approval' }) }, {}],
+    'plain entry': [{ name: 'approval', reason: 'delete foo?' }],
+    'repeated name': [{ toJSON: () => ({ name: 'approval' }) }, { toJSON: () => ({ name: 'approval' }) }],
+    'BigInt reason': [{ toJSON: () => ({ name: 'approval', reason: BigInt(1) }) }],
+    'hole only': new Array<unknown>(1),
+    // eslint-disable-next-line no-sparse-arrays
+    'hole between': [{ toJSON: () => ({ name: 'approval' }) }, , { toJSON: () => ({ name: 'confirmation' }) }],
+  };
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin()],
+    activities: {
+      async failingActivity(message: string): Promise<never> {
+        throw Object.assign(new Error('interrupt'), { interrupts: malformedInterrupts[message] });
+      },
+    },
+  });
+  const history = await worker.runUntil(async () => {
+    const handle = await startWorkflow(failActivities, { args: [Object.keys(malformedInterrupts)] });
+    await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    return handle.fetchHistory();
+  });
+  const malformed = {
+    message:
+      'malformed interrupt (interrupt): each entry needs a toJSON() that returns an object with a unique string name, and JSON-encodable values',
+    type: STRANDS_MALFORMED_INTERRUPT_TYPE,
+    nonRetryable: true,
+  };
+  t.deepEqual(
+    activityFailures(history),
+    Object.keys(malformedInterrupts).map(() => malformed)
+  );
+});
+
+test('a context overflow in the model activity lets the agent trim the conversation', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  // Also with a caller's converter that decodes the overflow to a `TemporalFailure` that is not an
+  // `ApplicationFailure`. The worker bundles the workflows itself so the bundle uses that converter.
+  const otherFailureClass = {
+    workflowBundle: undefined,
+    workflowsPath: require.resolve('./workflows/strands'),
+    bundlerOptions: createBaseBundlerOptions(),
+    dataConverter: { failureConverterPath: require.resolve('./domain-failure-converter') },
+  };
+  for (const options of [{}, otherFailureClass]) {
+    // Three turns fill the six messages the model holds; the fourth overflows until the agent trims.
+    const model = new SmallContextModel(6, ['one', 'two', 'three', 'four'].map(textTurn));
+    const worker = await createWorker({ ...options, plugins: [new StrandsPlugin({ models: { test: () => model } })] });
+    const history = await worker.runUntil(async () => {
+      const handle = await startWorkflow(turnsAgent, {
+        args: [['1', '2', '3', '4']],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      t.deepEqual(await handle.result(), ['four', 6]);
+      return handle.fetchHistory();
+    });
+    // The overflow failed the model activity once, as a benign failure.
+    const failures = (history.events ?? []).flatMap((e) => {
+      const info = e.activityTaskFailedEventAttributes?.failure?.applicationFailureInfo;
+      return info ? [[info.type, info.category]] : [];
+    });
+    t.deepEqual(failures, [['ContextWindowOverflowError', BENIGN]]);
+  }
+});
+
+test('a context overflow the agent cannot trim fails the run as non-retryable', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  // The model holds no message, so the overflow survives every trim.
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin({ models: { test: () => new SmallContextModel(0, []) } })],
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(helloAgent, { args: ['hello'], workflowExecutionTimeout: '30 seconds' });
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    t.deepEqual(err?.cause instanceof ApplicationFailure && [err.cause.type, err.cause.nonRetryable], [
+      'ContextWindowOverflowError',
+      true,
+    ]);
+    // The model activity's failure stays in the cause chain.
+    const causes: Error[] = [];
+    for (let cause: unknown = err?.cause; cause instanceof Error; cause = cause.cause) causes.push(cause);
+    t.true(causes.some((cause) => cause instanceof ActivityFailure));
+  });
+});
+
+test('a Strands terminal error thrown in workflow code fails the run as non-retryable', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin({ models: { test: () => new StubModel([maxTokensTurn('cut off')]) } })],
+  });
+  await worker.runUntil(async () => {
+    // Before, the workflow task failed on every attempt until this timeout.
+    const handle = await startWorkflow(helloAgent, { args: ['hello'], workflowExecutionTimeout: '30 seconds' });
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    t.deepEqual(err?.cause instanceof ApplicationFailure && [err.cause.type, err.cause.nonRetryable], [
+      'MaxTokensError',
+      true,
+    ]);
+  });
+});
+
+test('a Strands terminal error in an update handler fails the update', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin({ models: { test: () => new StubModel([maxTokensTurn('cut off')]) } })],
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(updateTurnsAgent, { workflowExecutionTimeout: '30 seconds' });
+    const err = await t.throwsAsync(handle.executeUpdate(turnUpdate, { args: ['hello'] }), {
+      instanceOf: WorkflowUpdateFailedError,
+    });
+    t.deepEqual(err?.cause instanceof ApplicationFailure && [err.cause.type, err.cause.nonRetryable], [
+      'MaxTokensError',
+      true,
+    ]);
+    // The run itself goes on.
+    await handle.signal(doneSignal);
+    t.is(await handle.result(), 'finished');
+  });
+});
+
+test('a cancel during a model activity cancels the run', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  let modelStarted!: () => void;
+  const started = new Promise<void>((resolve) => (modelStarted = resolve));
+  // A model call that takes 3 seconds, so the cancel arrives while it runs.
+  class SlowModel extends StubModel {
+    override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+      modelStarted();
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      yield* super.stream(messages, options);
+    }
+  }
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin({ models: { test: () => new SlowModel([textTurn('late')]) } })],
+  });
+  await worker.runUntil(async () => {
+    // Before, the workflow task failed on every attempt and the run stayed open.
+    const handle = await startWorkflow(helloAgent, { args: ['hello'], workflowExecutionTimeout: '30 seconds' });
+    await started;
+    await handle.cancel();
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    t.true(err?.cause instanceof CancelledFailure);
+  });
+});
+
+test('a model activity that fails for good fails the run', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  class RejectingModel extends StubModel {
+    // eslint-disable-next-line require-yield
+    override async *stream(): AsyncIterable<ModelStreamEvent> {
+      throw ApplicationFailure.nonRetryable('the provider rejected the request', 'ProviderError');
+    }
+  }
+  const worker = await createWorker({
+    plugins: [new StrandsPlugin({ models: { test: () => new RejectingModel([]) } })],
+  });
+  await worker.runUntil(async () => {
+    // Before, the workflow task failed on every attempt and the run stayed open.
+    const handle = await startWorkflow(helloAgent, { args: ['hello'], workflowExecutionTimeout: '30 seconds' });
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    t.true(err?.cause instanceof ActivityFailure);
+    t.deepEqual(err?.cause?.cause instanceof ApplicationFailure && err.cause.cause.type, 'ProviderError');
+  });
 });
 
 test('streamingTopic publishes model events to a WorkflowStream subscriber', async (t) => {
