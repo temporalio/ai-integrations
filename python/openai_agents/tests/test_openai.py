@@ -89,6 +89,7 @@ from temporalio.exceptions import (
 )
 from temporalio.openai_agents import (
     ModelActivityParameters,
+    OpenAIPayloadConverter,
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
 )
@@ -1123,6 +1124,40 @@ async def test_customer_service_workflow(client: Client):
             )
 
 
+class InputRecordingModel(TestModel):
+    """Read each call's input as ``OpenAIResponsesModel`` does, and record it."""
+
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        """Return the responses in order."""
+        remaining = iter(responses)
+        super().__init__(lambda: next(remaining))
+        self.inputs: list[list[TResponseInputItem]] = []
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> ModelResponse:
+        """Record the input before producing the next response."""
+        self.inputs.append(ItemHelpers.input_to_new_input_list(input))
+        return await super().get_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            **kwargs,
+        )
+
+
 @workflow.defn
 class CarriedItemsWorkflow:
     """Runs a turn on items carried across Continue-As-New, as a chat does."""
@@ -1130,17 +1165,27 @@ class CarriedItemsWorkflow:
     @workflow.run
     async def run(self, input_items: list[TResponseInputItem]) -> str:
         try:
+            # Read the carried replies before the turn, as a chat that shows
+            # its history does.
+            items = cast(list[dict[str, Any]], input_items)
+            replies = [
+                part["text"]
+                for item in items
+                if item.get("role") == "assistant"
+                for part in item["content"]
+            ]
             result = await Runner.run(
                 Agent(name="Assistant", instructions="Answer."),
                 input_items + [{"content": "Next", "role": "user"}],
             )
-        except TypeError as e:
+        except Exception as e:
             return f"Turn failed: {e}"
-        return result.final_output
+        return f"{result.final_output}; carried replies: {replies}"
 
 
 async def test_carried_input_items(client: Client):
-    # The assistant message's content decodes as a one-shot iterator.
+    # Pydantic decodes the assistant message's content as a one-shot iterator,
+    # and the custom tool's string output as an iterator over its characters.
     input_items: list[TResponseInputItem] = [
         {"content": "Hi", "role": "user"},
         {
@@ -1150,8 +1195,16 @@ async def test_carried_input_items(client: Client):
             "status": "completed",
             "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
         },
+        {
+            "type": "custom_tool_call",
+            "call_id": "c1",
+            "name": "echo",
+            "input": "pong",
+        },
+        {"type": "custom_tool_call_output", "call_id": "c1", "output": "pong"},
     ]
-    async with AgentEnvironment(model=hello_mock_model()) as env:
+    model = InputRecordingModel([ResponseBuilders.output_message("test")])
+    async with AgentEnvironment(model=model) as env:
         client = env.applied_on_client(client)
 
         async with new_worker(client, CarriedItemsWorkflow) as worker:
@@ -1162,38 +1215,36 @@ async def test_carried_input_items(client: Client):
                 task_queue=worker.task_queue,
                 execution_timeout=timedelta(seconds=60),
             )
-            assert result == "test"
+            assert result == "test; carried replies: ['Hello!']"
+    assert model.inputs == [input_items + [{"content": "Next", "role": "user"}]]
 
 
-@workflow.defn
-class InputIteratorWorkflow:
-    """Runs a turn on input whose content the Workflow gives as an iterator."""
-
-    @workflow.run
-    async def run(self) -> str:
-        content = iter([{"type": "input_text", "text": "Hi"}])
-        item: dict[str, Any] = {"content": content, "role": "user"}
-        result = await Runner.run(
-            Agent(name="Assistant", instructions="Answer."),
-            cast(list[TResponseInputItem], [item]),
-        )
-        kept = item["content"] is content
-        return f"{result.final_output}; content kept: {kept}"
+class CarriedItemsModel(pydantic.BaseModel):
+    input_items: list[TResponseInputItem]
 
 
-async def test_input_iterator_kept(client: Client):
-    # The framework can copy this iterator, so the runner leaves it in place.
-    async with AgentEnvironment(model=hello_mock_model()) as env:
-        client = env.applied_on_client(client)
+@pydantic.dataclasses.dataclass
+class CarriedItemsState:
+    input_items: list[TResponseInputItem]
 
-        async with new_worker(client, InputIteratorWorkflow) as worker:
-            result = await client.execute_workflow(
-                InputIteratorWorkflow.run,
-                id=f"input-iterator-workflow-{uuid.uuid4()}",
-                task_queue=worker.task_queue,
-                execution_timeout=timedelta(seconds=60),
-            )
-            assert result == "test; content kept: True"
+
+@pytest.mark.parametrize("state_type", [CarriedItemsModel, CarriedItemsState])
+def test_carried_input_items_in_state_decode_as_lists(state_type: Any):
+    # Workflows often carry the items in a model or dataclass, as the
+    # documented chat does.
+    input_items: list[TResponseInputItem] = [
+        {
+            "id": "msg-carried",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
+        },
+    ]
+    converter = OpenAIPayloadConverter()
+    (payload,) = converter.to_payloads([state_type(input_items=input_items)])
+    (state,) = converter.from_payloads([payload], [state_type])
+    assert state.input_items == input_items
 
 
 class InputGuardrailModel(Model):
@@ -2295,7 +2346,7 @@ async def test_hosted_mcp_tool(client: Client):
 
 
 def custom_tool_mock_model():
-    return TestModel.returning_responses(
+    return InputRecordingModel(
         [
             ModelResponse(
                 output=[
@@ -2340,7 +2391,8 @@ class CustomToolWorkflow:
 
 
 async def test_custom_tool_workflow(client: Client):
-    async with AgentEnvironment(model=custom_tool_mock_model()) as env:
+    model = custom_tool_mock_model()
+    async with AgentEnvironment(model=model) as env:
         client = env.applied_on_client(client)
 
         async with new_worker(client, CustomToolWorkflow) as worker:
@@ -2352,6 +2404,12 @@ async def test_custom_tool_workflow(client: Client):
             )
             result = await workflow_handle.result()
             assert result == "done:ping"
+    # The model Activity decodes the tool's string output as a string.
+    assert model.inputs[1][-1] == {
+        "call_id": "c1",
+        "output": "ping",
+        "type": "custom_tool_call_output",
+    }
 
 
 class AssertDifferentModelProvider(ModelProvider):

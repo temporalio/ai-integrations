@@ -10,6 +10,7 @@ from collections.abc import (
     Callable,
     Collection,
     Generator,
+    Iterable,
     Mapping,
     Sequence,
 )
@@ -244,6 +245,38 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
     return construct_type(type_=type_, value=value)
 
 
+# The iterator type pydantic decodes ``Iterable`` fields to. It cannot be
+# copied, and pydantic_core does not export it.
+_DecodedIterator: type[Iterable[typing.Any]] = type(
+    pydantic.TypeAdapter(Iterable[typing.Any]).validate_python(())
+)
+
+
+def _list_decoded_iterators(value: typing.Any) -> typing.Any:
+    """Replace decoded iterators in ``value`` with lists, in place, and return it."""
+    if isinstance(value, _DecodedIterator):
+        return [_list_decoded_iterators(item) for item in value]
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = _list_decoded_iterators(item)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _list_decoded_iterators(item)
+    elif isinstance(value, pydantic.BaseModel):
+        for name in type(value).model_fields:
+            # Skip validate_assignment, which would decode the list again.
+            object.__setattr__(
+                value, name, _list_decoded_iterators(getattr(value, name))
+            )
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        for field in dataclasses.fields(value):
+            # Also works for frozen dataclasses.
+            object.__setattr__(
+                value, field.name, _list_decoded_iterators(getattr(value, field.name))
+            )
+    return value
+
+
 class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
     """Strict pydantic deserialization with a lenient fallback.
 
@@ -251,6 +284,11 @@ class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
     deprecated-but-required field the API has stopped sending). The SDK tolerates
     this when parsing responses, but strict ``validate_json`` on the workflow
     side does not, so fall back to lenient construction when validation fails.
+
+    Pydantic decodes ``Iterable`` fields, such as an assistant message's
+    ``content``, as one-shot iterators. The Agents SDK deep-copies run input
+    and cannot copy them, and reading one empties it, so they are decoded as
+    lists instead.
     """
 
     def from_payload(
@@ -260,7 +298,17 @@ class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
     ) -> typing.Any:
         """See base class."""
         try:
-            return super().from_payload(payload, type_hint)
+            value = super().from_payload(payload, type_hint)
+            try:
+                return _list_decoded_iterators(value)
+            except pydantic.ValidationError:
+                # In JSON mode, pydantic decodes a string for
+                # ``Union[str, Iterable[...]]``, such as a custom tool's output,
+                # as an iterator over its characters. Python mode keeps the string.
+                value = self._type_adapter(type_hint).validate_python(
+                    json.loads(payload.data)
+                )
+                return _list_decoded_iterators(value)
         except pydantic.ValidationError:
             if type_hint is None:
                 raise
