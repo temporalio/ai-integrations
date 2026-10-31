@@ -65,16 +65,21 @@ func (m *mcpToolset) Name() string { return m.name }
 // toolset's ProcessRequest has run in the agent run, it lists them via the
 // ListMcpTools Activity, applies ToolFilter, and keeps the list for the
 // ProcessRequest call that follows in the same model step. After that,
-// ProcessRequest lists, and Tools returns the list ToolFilter last allowed
-// there, without an Activity and without running the filter. See
-// ProcessRequest.
+// ProcessRequest lists, and Tools returns the list it returned before, without
+// an Activity and without running the filter. See ProcessRequest.
 //
 // So the first Tools call of each agent run lists and filters. ADK resumes a
 // confirmed tool call from this list before any ProcessRequest of the run, so
 // a tool the filter no longer allows does not run. The later calls, which ADK
 // v2.6.0 and later make before every model step, issue no Workflow commands,
 // so the toolset and its filter issue them at the same points on every ADK
-// release.
+// release. They return the list ADK v2.5.0 and earlier keep for the whole
+// agent run, even when the MCP server or the filter has changed it since:
+// ADK draws a UUID from the workflow's random stream for each tool it keeps
+// before every model step, so the IDs it generates, such as tool confirmation
+// IDs, stay the same on every release. The proxy tools from that list no
+// longer pack themselves, so ProcessRequest alone decides what the model
+// request declares and dispatches.
 //
 // A toolset wrapped in a toolset without ProcessRequest, such as
 // tool.FilterToolset, lists and filters on every call, because nothing else
@@ -89,8 +94,9 @@ func (m *mcpToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	if err != nil {
 		return nil, err
 	}
-	l.keepPending(run, tools)
-	return m.allowed(ctx, tools), nil
+	allowed := m.allowed(ctx, tools)
+	l.keepPending(run, tools, allowed)
+	return allowed, nil
 }
 
 // allowed returns the tools the toolset's ToolFilter allows for ctx.
@@ -149,9 +155,8 @@ func (m *mcpToolset) ProcessRequest(ctx agent.Context, req *model.LLMRequest) er
 			return err
 		}
 	}
-	tools = m.allowed(ctx, tools)
-	l.processed(run, tools)
-	for _, t := range tools {
+	l.processed(run)
+	for _, t := range m.allowed(ctx, tools) {
 		if err := packTool(req, t.(*mcpProxyTool)); err != nil {
 			return err
 		}
@@ -195,9 +200,9 @@ type mcpRunState struct {
 	// processed reports that the toolset's ProcessRequest has run in the agent
 	// run. From then on ProcessRequest lists, and Tools does not.
 	processed bool
-	// allowed is the list ToolFilter allowed in the last ProcessRequest, which
-	// Tools returns once processed.
-	allowed []tool.Tool
+	// returned is the list Tools last returned after listing, which it returns
+	// again once processed.
+	returned []tool.Tool
 }
 
 // listingsFrom returns the mcpListings NewContext installed, or nil.
@@ -322,25 +327,26 @@ func (l *mcpListings) current(m *mcpToolset, ctx context.Context) *mcpRunState {
 	return l.runs[mcpRunKey{m, run}]
 }
 
-// processedList returns the list ToolFilter last allowed in the run, once the
-// toolset's ProcessRequest has run there.
+// processedList returns the list Tools returned after listing in the run,
+// once the toolset's ProcessRequest has run there.
 func (l *mcpListings) processedList(s *mcpRunState) ([]tool.Tool, bool) {
 	if s == nil {
 		return nil, false
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return s.allowed, s.processed
+	return s.returned, s.processed
 }
 
-// keepPending keeps a list Tools took for the ProcessRequest call that follows.
-func (l *mcpListings) keepPending(s *mcpRunState, tools []tool.Tool) {
+// keepPending keeps a list Tools took for the ProcessRequest call that
+// follows, and the list Tools returns.
+func (l *mcpListings) keepPending(s *mcpRunState, tools, returned []tool.Tool) {
 	if s == nil {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	s.pending, s.hasPending = tools, true
+	s.pending, s.hasPending, s.returned = tools, true, returned
 }
 
 // takePending returns and drops the list Tools kept, if any.
@@ -355,15 +361,14 @@ func (l *mcpListings) takePending(s *mcpRunState) ([]tool.Tool, bool) {
 	return tools, ok
 }
 
-// processed marks the toolset's ProcessRequest as run in the agent run, and
-// records the list ToolFilter allowed there.
-func (l *mcpListings) processed(s *mcpRunState, allowed []tool.Tool) {
+// processed marks the toolset's ProcessRequest as run in the agent run.
+func (l *mcpListings) processed(s *mcpRunState) {
 	if s == nil {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	s.processed, s.allowed = true, allowed
+	s.processed = true
 }
 
 // packedByToolset reports whether the toolset's ProcessRequest has run in the

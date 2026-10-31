@@ -452,43 +452,149 @@ func (h hidingToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	return kept, nil
 }
 
+// searchDropped tells catalogChangeWorkflow's ToolFilter to drop "search".
+var searchDropped atomic.Bool
+
+// catalogChangeWorkflow runs one turn of an MCP agent and returns how many
+// UUIDs ADK drew from the context. With filterDrops, the toolset's ToolFilter
+// drops "search" once searchDropped is set.
+func catalogChangeWorkflow(ctx workflow.Context, filterDrops bool) (int, error) {
+	opts := googleadk.MCPToolsetOptions{Name: "search-server"}
+	if filterDrops {
+		opts.ToolFilter = func(_ agent.ReadonlyContext, t tool.Tool) bool {
+			return t.Name() != "search" || !searchDropped.Load()
+		}
+	}
+	root, err := llmagent.New(llmagent.Config{
+		Name:        "assistant",
+		Model:       googleadk.NewModel("fake-model"),
+		Instruction: "be helpful",
+		Toolsets:    []tool.Toolset{googleadk.NewMCPToolset(opts)},
+	})
+	if err != nil {
+		return 0, err
+	}
+	r, err := runner.New(runner.Config{AppName: "test-app", Agent: root, SessionService: session.InMemoryService(), AutoCreateSession: true})
+	if err != nil {
+		return 0, err
+	}
+	draws := 0
+	adkCtx := platform.WithUUIDProvider(googleadk.NewContext(ctx), func() string {
+		draws++
+		return fmt.Sprintf("00000000-0000-0000-0000-%012d", draws)
+	})
+	for _, rerr := range r.Run(adkCtx, "user-1", "session-1", genai.NewContentFromText("search, then fetch", genai.RoleUser), agent.RunConfig{}) {
+		if rerr != nil {
+			return 0, rerr
+		}
+	}
+	return draws, nil
+}
+
 // TestMcpDroppedToolIsNeitherDeclaredNorCalled proves each model request
 // declares and dispatches the toolset's current list. ADK v2.5.0 and earlier
 // keep the tools from the first Tools call of an agent run; if their proxies
 // still packed themselves, a tool the server dropped would stay declared and
 // a call to it would run CallMcpTool there, but not with ADK v2.6.0.
+//
+// It also proves a change in the list does not change the IDs ADK generates.
+// ADK draws a UUID for each tool it kept from Tools before every model step:
+// v2.5.0 and earlier keep the first list of the agent run, and v2.6.0 keeps
+// what each step's Tools call returns. If those calls returned the current
+// list, a dropped tool would shift the IDs drawn after it, tool confirmation
+// IDs included, on v2.6.0 only, and Histories would not replay across releases.
 func TestMcpDroppedToolIsNeitherDeclaredNorCalled(t *testing.T) {
-	var hide atomic.Bool
-	server := googleadk.NewFakeMCPServer("search-server").
-		AddTool("search", "search the web", searchSchema(),
-			func(map[string]any) (map[string]any, error) {
-				hide.Store(true)
-				return map[string]any{"hits": 1}, nil
-			}).
-		AddTool("fetch", "fetch a page", searchSchema(),
-			func(map[string]any) (map[string]any, error) { return map[string]any{}, nil })
-	m := &ruleModel{name: "fake-model", rule: func(req *model.LLMRequest) *model.LLMResponse {
-		if n := functionResponses(req); n < 2 {
-			return googleadk.FunctionCallResponse(fmt.Sprintf("c%d", n+1), "search", map[string]any{"query": "temporal"})
-		}
-		return googleadk.TextResponse("done")
-	}}
+	t.Run("not called", func(t *testing.T) {
+		var hide atomic.Bool
+		server := googleadk.NewFakeMCPServer("search-server").
+			AddTool("search", "search the web", searchSchema(),
+				func(map[string]any) (map[string]any, error) {
+					hide.Store(true)
+					return map[string]any{"hits": 1}, nil
+				}).
+			AddTool("fetch", "fetch a page", searchSchema(),
+				func(map[string]any) (map[string]any, error) { return map[string]any{}, nil })
+		m := &ruleModel{name: "fake-model", rule: func(req *model.LLMRequest) *model.LLMResponse {
+			if n := functionResponses(req); n < 2 {
+				return googleadk.FunctionCallResponse(fmt.Sprintf("c%d", n+1), "search", map[string]any{"query": "temporal"})
+			}
+			return googleadk.TextResponse("done")
+		}}
 
-	var s testsuite.WorkflowTestSuite
-	env, counter := newEnv(t, &s, googleadk.Config{
-		Models: map[string]googleadk.ModelFactory{"fake-model": m.factory()},
-		MCPToolsets: map[string]googleadk.MCPFactory{"search-server": func(context.Context) (tool.Toolset, error) {
-			return hidingToolset{Toolset: server, hide: &hide}, nil
-		}},
+		var s testsuite.WorkflowTestSuite
+		env, counter := newEnv(t, &s, googleadk.Config{
+			Models: map[string]googleadk.ModelFactory{"fake-model": m.factory()},
+			MCPToolsets: map[string]googleadk.MCPFactory{"search-server": func(context.Context) (tool.Toolset, error) {
+				return hidingToolset{Toolset: server, hide: &hide}, nil
+			}},
+		})
+		env.ExecuteWorkflow(agentRunWorkflow, runInput{ModelName: "fake-model", UserMessage: "search twice", MCPToolset: "search-server"})
+
+		require.True(t, env.IsWorkflowCompleted())
+		require.NoError(t, env.GetWorkflowError())
+
+		assert.Equal(t, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}, m.declared())
+		assert.Equal(t, 3, counter.get(googleadk.ListMcpToolsActivityName))
+		assert.Equal(t, 1, counter.get(googleadk.CallMcpToolActivityName), "the dropped tool ran again")
 	})
-	env.ExecuteWorkflow(agentRunWorkflow, runInput{ModelName: "fake-model", UserMessage: "search twice", MCPToolset: "search-server"})
 
-	require.True(t, env.IsWorkflowCompleted())
-	require.NoError(t, env.GetWorkflowError())
+	t.Run("same generated IDs", func(t *testing.T) {
+		draws := map[string]int{}
+		for _, tc := range []struct {
+			name             string
+			drop, filterDrop bool
+			want             [][]string
+		}{
+			{"unchanged", false, false, [][]string{{"search", "fetch"}, {"search", "fetch"}, {"search", "fetch"}}},
+			{"server drops search", true, false, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}},
+			{"filter drops search", true, true, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}},
+		} {
+			searchDropped.Store(false)
+			server := googleadk.NewFakeMCPServer("search-server").
+				AddTool("search", "search the web", searchSchema(),
+					func(map[string]any) (map[string]any, error) {
+						searchDropped.Store(tc.drop)
+						return map[string]any{"hits": 1}, nil
+					}).
+				AddTool("fetch", "fetch a page", searchSchema(),
+					func(map[string]any) (map[string]any, error) { return map[string]any{}, nil })
+			var ts tool.Toolset = server
+			if !tc.filterDrop {
+				ts = hidingToolset{Toolset: server, hide: &searchDropped}
+			}
+			m := &ruleModel{name: "fake-model", rule: func(req *model.LLMRequest) *model.LLMResponse {
+				switch functionResponses(req) {
+				case 0:
+					return googleadk.FunctionCallResponse("c1", "search", map[string]any{"query": "temporal"})
+				case 1:
+					return googleadk.FunctionCallResponse("c2", "fetch", map[string]any{"query": "temporal"})
+				}
+				return googleadk.TextResponse("done")
+			}}
 
-	assert.Equal(t, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}, m.declared())
-	assert.Equal(t, 3, counter.get(googleadk.ListMcpToolsActivityName))
-	assert.Equal(t, 1, counter.get(googleadk.CallMcpToolActivityName), "the dropped tool ran again")
+			var s testsuite.WorkflowTestSuite
+			env, counter := newEnv(t, &s, googleadk.Config{
+				Models: map[string]googleadk.ModelFactory{"fake-model": m.factory()},
+				MCPToolsets: map[string]googleadk.MCPFactory{"search-server": func(context.Context) (tool.Toolset, error) {
+					return ts, nil
+				}},
+			})
+			env.RegisterWorkflow(catalogChangeWorkflow)
+			env.ExecuteWorkflow(catalogChangeWorkflow, tc.filterDrop)
+
+			require.True(t, env.IsWorkflowCompleted(), tc.name)
+			require.NoError(t, env.GetWorkflowError(), tc.name)
+			var n int
+			require.NoError(t, env.GetWorkflowResult(&n), tc.name)
+			draws[tc.name] = n
+
+			assert.Equal(t, tc.want, m.declared(), tc.name)
+			assert.Equal(t, 2, counter.get(googleadk.CallMcpToolActivityName), tc.name)
+		}
+		searchDropped.Store(false)
+		assert.Equal(t, draws["unchanged"], draws["server drops search"], "UUIDs drawn: %v", draws)
+		assert.Equal(t, draws["unchanged"], draws["filter drops search"], "UUIDs drawn: %v", draws)
+	})
 }
 
 // wrappedToolsLog records, for TestMcpWrappedToolsetListsOnEveryToolsCall, the
