@@ -57,7 +57,7 @@ export function withScopedSpan<S extends SpanWithLifecycle, T>(span: S, fn: () =
 export function withRestoredAgentsTraceContext<T>(header: AgentsSpanHeader, fn: () => T, tracingApiKey?: string): T {
   if (!header.traceId) return fn();
   const trace = new Trace({ traceId: header.traceId, name: header.traceName, tracingApiKey });
-  if (tracingApiKey != null) markTracingApiKeyResolved(trace);
+  if (tracingApiKey != null) markTracingApiKeyResolved(trace, tracingApiKey);
   const span = header.spanId
     ? getGlobalTraceProvider().createSpan<CustomSpanData>(
         { spanId: header.spanId, data: { type: 'custom', name: '', data: {} } },

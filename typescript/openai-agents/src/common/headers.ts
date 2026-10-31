@@ -1,5 +1,5 @@
 import * as otel from '@opentelemetry/api';
-import { getCurrentTraceContext } from '@openai/agents-core';
+import { getCurrentTraceContext, type Trace } from '@openai/agents-core';
 import { defaultPayloadConverter, type Headers } from '@temporalio/common';
 import type { SerializableModelActivityOptions } from './model-activity-options';
 
@@ -39,13 +39,24 @@ export function extractAgentsTraceHeaderNexus(headers: Record<string, string>): 
   }
 }
 
-// Traces the plugin rebuilt on a Worker with the key its `tracingApiKey` option resolved. That key
+// The key the Worker's `tracingApiKey` option resolved for each trace the plugin rebuilt. That key
 // is Worker configuration, not the trace's own, so the plugin resolves it again past the next
-// boundary.
-const tracesWithResolvedKey = new WeakSet<object>();
+// boundary. The Agents SDK clones the current trace in span helpers and runs, so each clone
+// carries the resolved key too. A trace whose key no longer matches it has its own key.
+const resolvedTracingApiKeys = new WeakMap<Trace, string>();
 
-export function markTracingApiKeyResolved(trace: object): void {
-  tracesWithResolvedKey.add(trace);
+export function markTracingApiKeyResolved(trace: Trace, resolvedKey: string): void {
+  resolvedTracingApiKeys.set(trace, resolvedKey);
+  const clone = trace.clone;
+  trace.clone = function (this: Trace): Trace {
+    const copy = clone.call(this);
+    markTracingApiKeyResolved(copy, resolvedKey);
+    return copy;
+  };
+}
+
+function hasOwnTracingApiKey(trace: Trace): boolean {
+  return trace.tracingApiKey != null && trace.tracingApiKey !== resolvedTracingApiKeys.get(trace);
 }
 
 /**
@@ -65,7 +76,7 @@ export function refuseTracingApiKey(tracingApiKey: string | null | undefined): v
 
 export function currentAgentsSpanHeader(): AgentsSpanHeader {
   const ctx = getCurrentTraceContext();
-  if (ctx && !tracesWithResolvedKey.has(ctx.trace)) refuseTracingApiKey(ctx.trace.tracingApiKey);
+  if (ctx && hasOwnTracingApiKey(ctx.trace)) refuseTracingApiKey(ctx.trace.tracingApiKey);
   const otelSpanContext = otel.trace.getSpanContext(otel.context.active());
   return {
     traceName: ctx?.trace.name ?? 'Unknown Workflow',
