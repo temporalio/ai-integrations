@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
 import langsmith
+import langsmith.env
 import nexusrpc.handler
 import pytest
 from langchain_core.callbacks import AsyncCallbackHandler
@@ -135,6 +136,45 @@ class LangChainRunnableWorkflow:
             config["run_id"] = uuid.UUID(run_id)
         await chain.ainvoke("hello", config=config)
         return recorder.run_ids
+
+
+@traceable(name="call_traceable_activity")
+async def _call_traceable_activity() -> str:
+    """A @traceable helper around an activity."""
+    return await workflow.execute_activity(
+        traceable_activity,
+        start_to_close_timeout=timedelta(minutes=1),
+        retry_policy=common.RetryPolicy(maximum_attempts=1),
+    )
+
+
+# The client of LangChainHelperWorkflow's own tracer; the test sets it.
+_own_tracer_clients: list[Any] = []
+
+
+@workflow.defn
+class LangChainHelperWorkflow:
+    """Runs a LangChain runnable whose last step calls a @traceable helper.
+
+    With ``own_tracer``, the runnable gets a ``LangChainTracer`` built with
+    the client in ``_own_tracer_clients``, so run it unsandboxed.
+    """
+
+    @workflow.run
+    async def run(self, own_tracer: bool = False) -> str:
+        async def prepare(prompt: str) -> str:
+            return prompt
+
+        async def call_helper(_prompt: str) -> str:
+            return await _call_traceable_activity()
+
+        chain = RunnableLambda(prepare, name="prepare") | RunnableLambda(
+            call_helper, name="call_helper"
+        )
+        config: Any = {}
+        if own_tracer:
+            config["callbacks"] = [LangChainTracer(client=_own_tracer_clients[0])]
+        return await chain.ainvoke("hello", config=config)
 
 
 @workflow.defn
@@ -597,6 +637,80 @@ class TestReplay:
                 [run] = [r for r in collector.runs if r.name == name]
                 assert run.id == run_id
 
+    @pytest.mark.parametrize("own_tracer", [False, True])
+    @pytest.mark.parametrize("add_temporal_runs", [False, True])
+    async def test_each_run_written_once_on_replay(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+        add_temporal_runs: bool,
+        own_tracer: bool,
+    ) -> None:
+        """With a cache of 0, a client at default settings writes each run once."""
+        get_runtime_environment()
+        # The client's first post reads git metadata in a subprocess; read it
+        # here so it does not stall the workflow past the deadlock timeout.
+        langsmith.env.get_langchain_env_var_metadata()
+        writes: list[tuple[str, dict[str, Any]]] = []
+
+        class _RecordingClient(langsmith.Client):
+            def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("post", args[0]))
+
+            def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("patch", args[0]))
+
+        ls_client = _RecordingClient(api_url="http://localhost:1", api_key="test")
+        _own_tracer_clients[:] = [ls_client]
+        plugin = LangSmithPlugin(client=ls_client, add_temporal_runs=add_temporal_runs)
+        config = client.config()
+        config["plugins"] = [plugin]
+        temporal_client = Client(**config)
+
+        async with new_worker(
+            temporal_client,
+            LangChainHelperWorkflow,
+            activities=[traceable_activity],
+            workflow_runner=UnsandboxedWorkflowRunner(),
+            max_cached_workflows=0,
+        ) as worker:
+            await temporal_client.execute_workflow(
+                LangChainHelperWorkflow.run,
+                own_tracer,
+                id=f"replay-test-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+        _wait_for_tracing_io(plugin)
+
+        posts = [run for op, run in writes if op == "post"]
+        patches = [run for op, run in writes if op == "patch"]
+        assert {
+            "RunnableSequence",
+            "prepare",
+            "call_helper",
+            "call_traceable_activity",
+        } <= {run["name"] for run in posts}
+        # Each run is posted once and patched once, with no error.
+        names = [run["name"] for run in posts]
+        assert len(names) == len(set(names)), names
+        assert sorted(str(run["id"]) for run in patches) == sorted(
+            str(run["id"]) for run in posts
+        )
+        assert [run["error"] for run in patches if run.get("error")] == []
+        # Runs start in the order they were made, after their parents.
+        starts = {
+            str(run["id"]): run["start_time"]
+            if isinstance(run["start_time"], datetime)
+            else datetime.fromisoformat(run["start_time"].replace("Z", "+00:00"))
+            for run in posts
+        }
+        ids = {run["name"]: str(run["id"]) for run in posts}
+        assert starts[ids["prepare"]] < starts[ids["call_helper"]]
+        for run in posts:
+            parent = str(run.get("parent_run_id"))
+            if parent in starts:
+                assert starts[parent] <= starts[str(run["id"])], run["name"]
+
     async def test_tracing_error_raised_again_on_replay(
         self,
         client: Client,
@@ -666,15 +780,15 @@ class TestReplay:
                 for run in runs
             ]
 
-        ls_client = _RecordingClient(
-            api_url="http://localhost:1",
-            api_key="test",
-            auto_batch_tracing=False,
-            process_buffered_run_ops=redact,
-            run_ops_buffer_size=1,
-        )
-
         def temporal_client() -> Client:
+            # A LangSmith client of its own, as a worker in a new process has.
+            ls_client = _RecordingClient(
+                api_url="http://localhost:1",
+                api_key="test",
+                auto_batch_tracing=False,
+                process_buffered_run_ops=redact,
+                run_ops_buffer_size=1,
+            )
             config = client.config()
             config["plugins"] = [LangSmithPlugin(client=ls_client)]
             return Client(**config)
