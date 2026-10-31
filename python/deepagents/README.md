@@ -360,12 +360,20 @@ class LongResearchAgent:
 Pass `continue_as_new_after=N` instead to trigger on a fixed history-event
 count.
 
-- **Carries forward:** the accumulated messages. Repeated identical calls are
+- **Carries forward:** the accumulated messages and the agent's state files
+  (the graph's `files` state, where the default `StateBackend` keeps what
+  `write_file` writes). Both ride in the continue-as-new input, so large files
+  count toward its payload size limit; keep large files in a durable backend
+  such as `TemporalBackend`. Repeated identical calls are
   NOT deduplicated: a call the agent re-issues after the boundary runs its own
   Activity, so a genuinely new identical request is never served a stale prior
   result. Your `@workflow.run` must accept `state_snapshot=None` as shown.
-- **Does not carry forward:** anything held only in an in-memory checkpointer's
-  own structures beyond the messages/todos snapshot. The default in-workflow
+- **Does not carry forward:** todos as state. `TodoListMiddleware` marks
+  `todos` as `OmitFromInput`, so the graph drops it from input and the next
+  run starts with none; the agent's earlier `write_todos` calls are still in
+  the carried messages. Nor does anything
+  held only in an in-memory checkpointer's own structures beyond the messages
+  and files snapshot. The default in-workflow
   `InMemorySaver` is rehydrated for free by deterministic replay; a durable
   checkpointer that does its own I/O is not replay-safe from inside a workflow,
   and the plugin warns if you pass one — prefer the snapshot + continue-as-new

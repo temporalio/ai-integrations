@@ -225,6 +225,30 @@ def _merge_snapshot(input: Any, snapshot: Mapping[str, Any]) -> Any:
     return {"messages": [*prior, *_as_message_list(input)]}
 
 
+def _merge_files(input: Any, snapshot: Mapping[str, Any]) -> Any:
+    """Restore the agent's state files from a snapshot into the next input.
+
+    The default deepagents ``StateBackend`` keeps what ``write_file`` writes in
+    the graph's ``files`` state, which the graph accepts as input. When a
+    caller resumes from a snapshot with new input, a file in the new input's
+    ``files`` mapping wins over a carried file with the same path; a ``files``
+    value that is not a mapping is replaced. A bare input becomes a messages
+    input so the files have a place to go. The driver's own carry drops
+    ``files`` from the input it re-sends, so there the snapshot is the only
+    source.
+    """
+    carried: Any = snapshot.get("files")
+    if not isinstance(carried, Mapping) or not carried:
+        return input
+    if not isinstance(input, Mapping):
+        input = {"messages": _as_message_list(input)}
+    merged = dict(input)
+    raw_next: Any = input.get("files")
+    next_files: Any = raw_next if isinstance(raw_next, Mapping) else {}
+    merged["files"] = {**carried, **next_files}
+    return merged
+
+
 def _as_message_list(input: Any) -> list[Any]:
     if isinstance(input, (list, tuple)):
         return list(input)
@@ -241,8 +265,10 @@ async def run_deep_agent(
     """Drive ``agent.ainvoke(input)`` with continue-as-new state carry.
 
     Once a completed turn leaves pending todos and history has grown past the
-    limit, its messages are carried into a fresh run via
-    ``workflow.continue_as_new``. Only legacy executions carry the result cache.
+    limit, its messages and state files are carried into a fresh run via
+    ``workflow.continue_as_new``. Todos are not restored as state:
+    ``TodoListMiddleware`` marks them ``OmitFromInput``, so the graph drops
+    them from input. Only legacy executions carry the result cache.
 
     By default (``continue_as_new_after=None``) the limit is the server's own
     recommendation — ``workflow.info().is_continue_as_new_suggested()`` — which
@@ -270,6 +296,7 @@ async def run_deep_agent(
         else:
             _serde.set_result_cache({})
         input = _merge_snapshot(input, state_snapshot)
+        input = _merge_files(input, state_snapshot)
     else:
         _serde.set_result_cache({})
 
@@ -303,6 +330,12 @@ async def run_deep_agent(
             else:
                 carried = _as_message_list(input)
         snapshot: dict[str, Any] = {"messages": carried}
+        files: Any = result.get("files")
+        if isinstance(files, Mapping):
+            # The default StateBackend keeps the agent's files in graph state,
+            # not in the transcript, so they need their own place here. An
+            # empty mapping is kept too: it still replaces the input's files.
+            snapshot["files"] = dict(files)
         if _legacy_result_cache():
             snapshot[_CACHE_KEY] = _serde.result_cache_snapshot() or {}
         # ``continue_as_new`` threads positional args into the next run via
@@ -323,6 +356,10 @@ async def run_deep_agent(
                 }
             else:
                 snapshot[_INPUT_CARRIED_KEY] = original_input
+        if "files" in snapshot and isinstance(carry_input, Mapping):
+            # The snapshot holds the files as the turn left them; the original
+            # input's copy would overwrite the agent's changes in _merge_files.
+            carry_input = {k: v for k, v in carry_input.items() if k != "files"}
         workflow.continue_as_new(args=[carry_input, snapshot])
 
     return result

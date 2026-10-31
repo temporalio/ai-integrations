@@ -5,9 +5,11 @@ bloating workflow history: once the current turn finishes past the threshold and
 there is still pending work, it snapshots the accumulated messages and continues
 into a fresh run. (The legacy result cache is retired for new executions —
 see ``deepagents.retire-result-cache``; ``test_state_snapshot_roundtrip`` below
-covers the _serde plumbing that only the legacy replay branch still uses.) These tests use a plain
+covers the _serde plumbing that only the legacy replay branch still uses.) Most tests use a plain
 fake agent (no LangChain needed) so they boot a real Temporal server and exercise
-the continue-as-new machinery end to end.
+the continue-as-new machinery end to end. One drives a real Deep Agent with a
+scripted model, because its files live in graph state that a fake agent does
+not have.
 """
 
 from __future__ import annotations
@@ -453,3 +455,187 @@ async def test_identical_op_reruns_across_continue_as_new(
     )
     desc = await first.describe()
     assert desc.status == WorkflowExecutionStatus.CONTINUED_AS_NEW, desc.status
+
+
+# The tests above drive fake agents with no state beyond messages and todos. A
+# real Deep Agent's default StateBackend keeps its files in graph state.
+create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
+
+with workflow.unsafe.imports_passed_through():
+    from langchain.agents.middleware import TodoListMiddleware
+    from langchain_core.messages import AIMessage
+
+from temporalio.deepagents.testing import mock_model_provider
+
+
+def _tool_calls(*calls: tuple[str, dict[str, Any]]) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {"name": name, "args": args, "id": f"{name}-{i}"}
+            for i, (name, args) in enumerate(calls)
+        ],
+    )
+
+
+# Run 1 writes a new note, overwrites the seeded file and leaves its todo
+# pending, so the driver continues-as-new; run 2 reads both back.
+FILES_RESPONSES: list[Any] = [
+    _tool_calls(
+        ("write_file", {"file_path": "/notes.md", "content": "draft"}),
+        ("write_file", {"file_path": "/seed.md", "content": "new"}),
+        ("write_todos", {"todos": [{"content": "notes", "status": "pending"}]}),
+    ),
+    "first turn",
+    _tool_calls(
+        ("read_file", {"file_path": "/notes.md"}),
+        ("read_file", {"file_path": "/seed.md"}),
+        ("write_todos", {"todos": [{"content": "notes", "status": "completed"}]}),
+    ),
+    "done",
+]
+
+
+@workflow.defn
+class FilesCanWorkflow:
+    @workflow.run
+    async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
+        agent = create_deep_agent(model="fake:model", middleware=[TodoListMiddleware()])
+        result = await run_deep_agent(
+            agent,
+            input,
+            continue_as_new_after=1,
+            state_snapshot=state_snapshot,
+        )
+        reads = [
+            str(m.content)
+            for m in result["messages"]
+            if m.type == "tool" and m.name == "read_file"
+        ]
+        return {"reads": reads, "files": sorted(result.get("files") or {})}
+
+
+@pytest.mark.asyncio
+async def test_state_files_survive_continue_as_new(env: WorkflowEnvironment) -> None:
+    """Files as the agent left them before the boundary are readable after it.
+
+    The input seeds ``/seed.md``, which the agent overwrites in the first run,
+    so the continued run must see the agent's version, not the input's.
+    """
+    from deepagents.backends.utils import create_file_data
+
+    plugin = DeepAgentsPlugin(model_provider=mock_model_provider(FILES_RESPONSES))
+    async with Worker(
+        env.client,
+        task_queue="da-can-files",
+        workflows=[FilesCanWorkflow],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            FilesCanWorkflow.run,
+            {
+                "messages": [{"role": "user", "content": "Take notes."}],
+                "files": {"/seed.md": create_file_data("old")},
+            },
+            id=f"da-can-files-{uuid.uuid4()}",
+            task_queue="da-can-files",
+        )
+        result = await handle.result()
+        first = env.client.get_workflow_handle(
+            handle.id, run_id=handle.first_execution_run_id
+        )
+        desc = await first.describe()
+        first_history = await first.fetch_history()
+        last_history = await handle.fetch_history()
+
+    assert desc.status == WorkflowExecutionStatus.CONTINUED_AS_NEW, desc.status
+    notes, seed = result["reads"]
+    assert "draft" in notes, result
+    assert "new" in seed and "old" not in seed, result
+    assert result["files"] == ["/notes.md", "/seed.md"], result
+
+    replayer = Replayer(
+        workflows=[FilesCanWorkflow],
+        plugins=[DeepAgentsPlugin(model_provider=mock_model_provider(["unused"]))],
+    )
+    await replayer.replay_workflow(first_history)
+    await replayer.replay_workflow(last_history)
+
+
+class EmptiesFilesAgent:
+    """Reports which files it was given, then leaves its files state empty.
+
+    Two turns: the first leaves a todo pending so the driver continues as new.
+    """
+
+    async def ainvoke(self, input: Any) -> dict:
+        messages = list(input.get("messages", []))
+        seen = sorted(input.get("files") or {})
+        messages = [*messages, f"saw {seen}"]
+        done = len(messages) >= 3
+        return {
+            "messages": messages,
+            "files": {},
+            "todos": [{"content": "w", "status": "completed" if done else "pending"}],
+        }
+
+
+@workflow.defn
+class EmptiesFilesCanWorkflow:
+    @workflow.run
+    async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
+        return await run_deep_agent(
+            EmptiesFilesAgent(),
+            input,
+            continue_as_new_after=1,
+            state_snapshot=state_snapshot,
+        )
+
+
+@pytest.mark.asyncio
+async def test_emptied_files_stay_empty_across_continue_as_new(
+    env: WorkflowEnvironment,
+) -> None:
+    """Input files the agent removed do not come back with the re-sent input."""
+    async with Worker(
+        env.client,
+        task_queue="da-can-empty-files",
+        workflows=[EmptiesFilesCanWorkflow],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        result = await env.client.execute_workflow(
+            EmptiesFilesCanWorkflow.run,
+            {"messages": ["start"], "files": {"/seed.md": "x"}},
+            id=f"da-can-empty-files-{uuid.uuid4()}",
+            task_queue="da-can-empty-files",
+        )
+
+    assert result["messages"] == ["start", "saw ['/seed.md']", "saw []"], result
+
+
+def test_merge_files_composes_like_merge_snapshot() -> None:
+    """Carried files go into the next input; new input files win per path."""
+    from temporalio.deepagents.workflow import _merge_files
+
+    snapshot = {"messages": ["q"], "files": {"/a": "carried", "/b": "carried"}}
+    merged = _merge_files({"messages": ["q"], "files": {"/b": "new"}}, snapshot)
+    assert merged["files"] == {"/a": "carried", "/b": "new"}
+    assert merged["messages"] == ["q"]
+
+    # A bare input becomes a messages input so the files have somewhere to go.
+    assert _merge_files("q", snapshot) == {
+        "messages": ["q"],
+        "files": snapshot["files"],
+    }
+    assert _merge_files(["q", "r"], snapshot)["messages"] == ["q", "r"]
+
+    # New input whose files value is not a mapping: the carried files are used.
+    merged = _merge_files({"messages": ["q"], "files": ["/b"]}, snapshot)
+    assert merged["files"] == snapshot["files"]
+
+    # No files, or a value that is not a mapping: the input is left alone.
+    no_files: list[Any] = [None, {}, ["/a"]]
+    for files in no_files:
+        assert _merge_files({"messages": ["q"]}, {"files": files}) == {
+            "messages": ["q"]
+        }
