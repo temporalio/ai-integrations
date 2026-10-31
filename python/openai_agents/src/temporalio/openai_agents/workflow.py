@@ -385,9 +385,10 @@ def stateless_mcp_server(
         factory_argument: Optional argument to be provided to the factory when producing an MCPServer.
                Must not contain secrets.
         require_approval: Optional OpenAI Agents approval policy for this server's tools, with the
-               same values as ``MCPServerStdio(require_approval=...)``. A policy set on the
-               factory's server is not used. A callable policy runs in the workflow and must be
-               deterministic.
+               same values as ``MCPServerStdio(require_approval=...)``. Set it here: on the
+               factory's server, any policy other than ``"never"``, ``False``, or only ``"never"``
+               entries is rejected, callables included. A callable policy runs in the workflow and
+               must be deterministic.
     """
     import warnings
 
@@ -447,9 +448,10 @@ def stateful_mcp_server(
         factory_argument: Optional argument to be provided to the factory when producing an MCPServer.
                Must not contain secrets.
         require_approval: Optional OpenAI Agents approval policy for this server's tools, with the
-               same values as ``MCPServerStdio(require_approval=...)``. A policy set on the
-               factory's server is not used. A callable policy runs in the workflow and must be
-               deterministic.
+               same values as ``MCPServerStdio(require_approval=...)``. Set it here: on the
+               factory's server, any policy other than ``"never"``, ``False``, or only ``"never"``
+               entries is rejected, callables included. A callable policy runs in the workflow and
+               must be deterministic.
     """
     import warnings
 
@@ -505,7 +507,9 @@ def temporal_mcp_server(
             A non-None value creates a fresh server for every Activity instead
             of using the worker connection cache.
         server_options: OpenAI Agents ``MCPServer`` options such as
-            ``require_approval`` and ``failure_error_function``.
+            ``require_approval`` and ``failure_error_function``. Set them here:
+            on the factory's server, a callable ``tool_filter`` and a
+            ``require_approval`` policy that can ask for approval are rejected.
     """
     try:
         from temporalio.mcp import TemporalMCPClient

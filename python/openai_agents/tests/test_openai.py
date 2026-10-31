@@ -2747,7 +2747,7 @@ class McpServerStatefulWorkflow:
     @workflow.run
     async def run(
         self,
-        timeout: timedelta,
+        timeout: timedelta | None,
         factory_argument: Any | None,
         require_approval: Literal["always"] | None,
     ) -> str:
@@ -2793,7 +2793,9 @@ def tracking_mcp_mock_model():
     )
 
 
-def get_tracking_server(name: str):
+def get_tracking_server(
+    name: str, require_approval: Any = None, cleanup_error: bool = False
+):
     from agents.mcp import MCPServer  # type: ignore
     from mcp import GetPromptResult, ListPromptsResult  # type: ignore
     from mcp import Tool as MCPTool  # type: ignore
@@ -2805,7 +2807,7 @@ def get_tracking_server(name: str):
         def __init__(self, name: str):
             self._name = name
             self.calls = []
-            super().__init__()
+            super().__init__(require_approval=require_approval)
 
         async def connect(self):
             self.calls.append("connect")
@@ -2816,6 +2818,12 @@ def get_tracking_server(name: str):
 
         async def cleanup(self):
             self.calls.append("cleanup")
+            # SDK servers tolerate cleanup() before connect(); raise here so a
+            # cleanup() call on a rejected server is detectable.
+            if "connect" not in self.calls:
+                raise AttributeError("cleanup() before connect()")
+            if cleanup_error:
+                raise RuntimeError("cleanup failed")
 
         async def list_tools(
             self,
@@ -2889,12 +2897,14 @@ def test_legacy_mcp_apis_are_deprecated():
         "stateless-cached",
         "stateful-approval",
         "stateless-approval",
+        "stateful-cleanup-error",
     ],
 )
 async def test_mcp_server(client: Client, mode: str):
     stateful = mode.startswith("stateful")
     caching = mode == "stateless-cached"
     require_approval = "always" if mode.endswith("-approval") else None
+    cleanup_error = mode.endswith("-cleanup-error")
 
     from agents.mcp import MCPServer  # type: ignore
 
@@ -2903,7 +2913,9 @@ async def test_mcp_server(client: Client, mode: str):
         StatelessMCPServerProvider,
     )
 
-    tracking_server = get_tracking_server(name="HelloServer")
+    tracking_server = get_tracking_server(
+        name="HelloServer", cleanup_error=cleanup_error
+    )
     server: StatefulMCPServerProvider | StatelessMCPServerProvider = (
         StatefulMCPServerProvider("HelloServer", lambda _: tracking_server)
         if stateful
@@ -2939,6 +2951,14 @@ async def test_mcp_server(client: Client, mode: str):
                     execution_timeout=timedelta(seconds=30),
                 )
     print(tracking_server.calls)
+    if stateful:
+        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
+        # The session's heartbeat task stops, even when cleanup() fails.
+        assert not [
+            task
+            for task in asyncio.all_tasks()
+            if "heartbeat" in task.get_coro().__name__  # type: ignore[union-attr]
+        ]
     if require_approval:
         assert result == "Approval needed: Say-Hello"
         assert "call_tool" not in tracking_server.calls
@@ -2954,7 +2974,6 @@ async def test_mcp_server(client: Client, mode: str):
             "list_tools",
             "cleanup",
         ]
-        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
     else:
         if caching:
             assert tracking_server.calls == [
@@ -2986,6 +3005,31 @@ async def test_mcp_server(client: Client, mode: str):
                 "list_tools",
                 "cleanup",
             ]
+
+
+async def test_auto_heartbeater_interval_heartbeats_without_timeout():
+    from temporalio.openai_agents._heartbeat_decorator import auto_heartbeater
+    from temporalio.testing import ActivityEnvironment
+
+    heartbeats: list[Any] = []
+    env = ActivityEnvironment()  # no heartbeat timeout
+    env.on_heartbeat = lambda *details: heartbeats.append(details)
+
+    @auto_heartbeater(interval=0.01)
+    async def fixed_interval() -> None:
+        await asyncio.sleep(0.1)
+
+    @auto_heartbeater
+    async def from_timeout() -> None:
+        await asyncio.sleep(0.1)
+
+    # A fixed interval heartbeats whatever the timeout, as the stateful MCP
+    # session needs; the default heartbeats only with a heartbeat timeout.
+    await env.run(fixed_interval)
+    assert heartbeats
+    heartbeats.clear()
+    await env.run(from_timeout)
+    assert not heartbeats
 
 
 @pytest.mark.parametrize("stateful", [True, False])
@@ -3033,6 +3077,73 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
                     task_queue=worker.task_queue,
                     execution_timeout=timedelta(seconds=30),
                 )
+
+
+@pytest.mark.parametrize("instance_evaluator", [False, True])
+@pytest.mark.parametrize("stateful", [True, False])
+async def test_mcp_server_factory_require_approval_is_rejected(
+    client: Client, stateful: bool, instance_evaluator: bool
+):
+    if instance_evaluator:
+        # The default policy, but an evaluator that always asks.
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server._get_needs_approval_for_tool = (  # type: ignore[method-assign]
+            lambda tool, agent: True  # type: ignore[reportUnknownLambdaType]
+        )
+    else:
+        tracking_server = get_tracking_server("HelloServer", require_approval="always")
+    server: StatefulMCPServerProvider | StatelessMCPServerProvider = (
+        StatefulMCPServerProvider("HelloServer", lambda _: tracking_server)
+        if stateful
+        else StatelessMCPServerProvider("HelloServer", lambda _: tracking_server)
+    )
+
+    async with AgentEnvironment(
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120)
+        ),
+        model=tracking_mcp_mock_model(),
+        mcp_server_providers=[server],
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(
+            client, McpServerStatefulWorkflow, McpServerWorkflow
+        ) as worker:
+            with pytest.raises(WorkflowFailureError) as err:
+                if stateful:
+                    # Without a schedule-to-start timeout, the error must
+                    # still reach the workflow before its execution timeout.
+                    await client.execute_workflow(
+                        McpServerStatefulWorkflow.run,
+                        args=[None, None, None],
+                        id=f"mcp-server-{uuid.uuid4()}",
+                        task_queue=worker.task_queue,
+                        execution_timeout=timedelta(seconds=30),
+                    )
+                else:
+                    await client.execute_workflow(
+                        McpServerWorkflow.run,
+                        args=[False, None, None],
+                        id=f"mcp-server-{uuid.uuid4()}",
+                        task_queue=worker.task_queue,
+                        execution_timeout=timedelta(seconds=30),
+                    )
+    assert isinstance(err.value.cause, ActivityError)
+    assert isinstance(err.value.cause.cause, ApplicationError)
+    assert err.value.cause.cause.non_retryable
+    route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+    assert "'HelloServer' sets require_approval" in err.value.cause.cause.message
+    assert f"{route}(require_approval=...)" in err.value.cause.cause.message
+    # The rejected server is never connected, cleaned up or called.
+    assert tracking_server.calls == []
+    if stateful:
+        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
+        assert not [
+            task
+            for task in asyncio.all_tasks()
+            if "heartbeat" in task.get_coro().__name__  # type: ignore[union-attr]
+        ]
 
 
 async def test_stateful_mcp_server_no_worker(client: Client):
