@@ -1686,7 +1686,9 @@ def test_activity_as_tool_preserves_metadata() -> None:
         assert list(inspect.signature(tool).parameters) == params, fn.__qualname__
 
 
-def test_activity_as_tool_rejects_method_of_unreachable_class() -> None:
+def test_activity_as_tool_rejects_method_of_unreachable_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A method whose class can't be found can't be told from a staticmethod."""
 
     class LocalHolder:
@@ -1705,6 +1707,34 @@ def test_activity_as_tool_rejects_method_of_unreachable_class() -> None:
         temporalio.google_adk.workflow.activity_as_tool(
             UnwrappedHolder.echo, start_to_close_timeout=timedelta(seconds=30)
         )
+
+    # A reference kept after its class's name is rebound: the class now found
+    # holds another object under that name, so the reference is refused rather
+    # than given that object's binding.
+    echo_static = ComplexActivityMethodHolder.echo_static
+    count_passengers = ComplexActivityMethodHolder.count_passengers
+    monkeypatch.setitem(globals(), "ComplexActivityMethodHolder", ReboundMethodHolder)
+    with pytest.raises(ValueError, match="is another object"):
+        temporalio.google_adk.workflow.activity_as_tool(
+            echo_static, start_to_close_timeout=timedelta(seconds=30)
+        )
+    with pytest.raises(ValueError, match="is another object"):
+        temporalio.google_adk.workflow.activity_as_tool(
+            count_passengers, start_to_close_timeout=timedelta(seconds=30)
+        )
+
+
+class ReboundMethodHolder:
+    """Takes ComplexActivityMethodHolder's name, with the opposite bindings."""
+
+    @activity.defn
+    async def echo_static(self) -> str:
+        return "rebound"
+
+    @staticmethod
+    @activity.defn
+    async def count_passengers(self, passengers: int) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType, reportSelfClsParameterName]
+        return str(passengers)
 
 
 class UnwrappedHolder:
