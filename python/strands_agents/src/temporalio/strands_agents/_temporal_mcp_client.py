@@ -15,6 +15,7 @@ from strands.types.tools import AgentTool
 
 from temporalio import activity, workflow
 from temporalio.common import Priority, RetryPolicy
+from temporalio.exceptions import ApplicationError
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from ._bytes_values import encode_tool_result
@@ -31,6 +32,26 @@ class _MCPToolInfo:
     # ``None`` (an older recorded result) means ``name``.
     agent_name: str | None = None
     annotations: dict[str, Any] | None = None
+
+
+class MCPToolNameConflictError(  # pyright: ignore[reportUnsafeMultipleInheritance]
+    ApplicationError, ValueError
+):
+    """An MCP tool has the name of another tool of the same agent.
+
+    ``TemporalAgent`` raises it before a model call when a listed tool's name,
+    or the name with ``-`` and ``_`` swapped, is taken. It is a non-retryable
+    ``ApplicationError``, so it fails the Workflow when it escapes Workflow
+    code, instead of retrying the Workflow Task, whether ``StrandsPlugin`` is
+    on the client or only on the Worker.
+    """
+
+    def __init__(self, message: str) -> None:
+        """Initialize the error with Strands' message and the tools' sources."""
+        super().__init__(message, type="MCPToolNameConflictError", non_retryable=True)
+        # ApplicationError puts the type before the message in str(); keep the
+        # message as Strands words it.
+        self.args = (message,)
 
 
 @dataclass
@@ -58,7 +79,8 @@ class TemporalMCPClient(ToolProvider):
 
     Construct once at module level and pass to ``TemporalAgent(tools=[...])``
     inside the workflow. Multiple handles may reference the same server name
-    with different activity options.
+    with different activity options, on different agents: on one agent, their
+    tools have the same names and are refused.
     """
 
     def __init__(
@@ -101,15 +123,16 @@ class TemporalMCPClient(ToolProvider):
         return self._server
 
     async def load_tools(self, **_kwargs: Any) -> Sequence[AgentTool]:
-        """Return the tools fetched by the most recent ``_refresh``.
+        """Return no tools; ``TemporalAgent`` adds them before each model call.
 
-        This must stay free of any ``workflow`` API: Strands invokes it once at
-        ``Agent`` construction on a separate ``run_async`` thread that has no
-        workflow runtime. ``TemporalAgent`` populates the tools by calling
-        ``_refresh`` from a ``BeforeModelCallEvent`` hook before the registry is
-        first read.
+        Strands invokes this once at ``Agent`` construction on a separate
+        ``run_async`` thread that has no workflow runtime, so the tools cannot
+        be listed here. ``TemporalAgent`` adds them from a
+        ``BeforeModelCallEvent`` hook, which lists them by calling ``_refresh``
+        and checks their names, for an agent built before or after a listing.
+        Until its first model call, an agent has none of these tools.
         """
-        return list(self._tools)
+        return []
 
     async def _refresh(self) -> None:
         """List the server's tools via the ``{server}-list-tools`` activity.

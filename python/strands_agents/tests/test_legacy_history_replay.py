@@ -20,18 +20,15 @@ breaks their replay before the recorded model or MCP results are read.
 """
 
 from datetime import timedelta
-from pathlib import Path
 
 import pytest
 
 from temporalio import workflow
-from temporalio.client import WorkflowHistory
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent, TemporalMCPClient
 from temporalio.worker import Replayer, UnsandboxedWorkflowRunner
 from temporalio.workflow import NondeterminismError
+from tests.common import load_history
 from tests.mock_model import MockModel
-
-HISTORIES = Path(__file__).parent / "histories"
 
 # Reply that contains a ``redactedContent`` block, followed by text.
 LEGACY_REDACTED = b"ASCII-redacted"
@@ -89,12 +86,6 @@ class LegacyMCPImageWorkflow:
         return "done"
 
 
-def _legacy_history(name: str) -> WorkflowHistory:
-    return WorkflowHistory.from_json(
-        "legacy-replay", (HISTORIES / f"{name}.json").read_text()
-    )
-
-
 CONVERTERS = ["pydantic", "default_converter"]
 
 
@@ -120,7 +111,7 @@ async def test_rejects_pre_config_redacted_content_history(converter: str):
         match="scheduled event 'invoke_model'.*activity command 'strands_get_model_config'",
     ):
         await _replayer(LegacyRedactedContentWorkflow, converter).replay_workflow(
-            _legacy_history(f"legacy_redacted_content_{converter}")
+            load_history(f"legacy_redacted_content_{converter}")
         )
 
 
@@ -132,5 +123,5 @@ async def test_rejects_pre_config_mcp_image_history(converter: str):
         match="scheduled event 'image-list-tools'.*activity command 'strands_get_model_config'",
     ):
         await _replayer(LegacyMCPImageWorkflow, converter).replay_workflow(
-            _legacy_history(f"legacy_mcp_ascii_image_{converter}")
+            load_history(f"legacy_mcp_ascii_image_{converter}")
         )
