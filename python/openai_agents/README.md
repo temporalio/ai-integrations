@@ -10,7 +10,7 @@ We welcome questions and feedback in the [#python-sdk](https://temporalio.slack.
 uv add temporalio-openai-agents
 ```
 
-This integration requires Temporal 1.34 or later. The SDK extends its package
+This integration requires Temporal 1.35 or later. The SDK extends its package
 search path to support split-directory installations, including editable
 installs, separate user and system sites, layered deployments, and `--target`
 installs.
@@ -817,6 +817,29 @@ retries the same way as any other workflow_streams publisher — see
 [Delivery semantics](https://github.com/temporalio/sdk-python/blob/main/temporalio/contrib/workflow_streams/README.md) for the trade and
 the conventional `RETRY` event pattern for surfacing the transition to
 consumers.
+
+Input guardrails run in parallel with the model call by default. When one
+trips while the model is streaming, the plugin cancels the streaming
+activity, and the run raises `InputGuardrailTripwireTriggered` as
+`stream_events()` does. The cancel reaches the activity through its
+heartbeat, so set `heartbeat_timeout`: the activity then stops and
+publishes an `error` event with the code `cancelled` to the topic.
+Subscribers can still get the events the model sent before that, as a
+native `stream_events()` consumer can. If the model has already finished
+but the activity is still publishing its events when the cancel arrives,
+the `error` event comes after `response.completed`. If the activity has
+already returned, it publishes no `error` event. When the guardrail
+has already tripped, the plugin does not start the model call.
+
+The workflow must still be open when the activity publishes that
+`error` event. With the default `cancellation_type` (`TRY_CANCEL`), the
+run raises without waiting for the activity to stop, so a workflow that
+completes right after the trip can close first, and subscribers then see
+the stream end without the event. Set
+`cancellation_type=ActivityCancellationType.WAIT_CANCELLATION_COMPLETED`
+to make the run raise only after the activity has published it. Other
+kinds of cancel, such as a Worker shutdown or a heartbeat timeout,
+publish no `error` event, because the activity's retry can still answer.
 
 ## Feature Support
 
