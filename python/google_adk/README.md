@@ -74,10 +74,12 @@ Model calls are intercepted and executed as Temporal activities with configurabl
 > fail every agent turn with
 > `RestrictedWorkflowAccessError: Cannot access os.environ.get from inside a workflow`, because
 > ADK imports `opentelemetry` during the turn. This plugin passes `opentelemetry` through the
-> sandbox, so those turns now run. But a run whose Workflow code caught that error and then did
-> anything else, such as scheduling an Activity or completing, fails to replay with a
-> `[TMPRL1100]` nondeterminism error. Reset such runs to their first Workflow Task
-> (`temporal workflow reset --type FirstWorkflowTask`), which runs their Activities again. See
+> sandbox, so those turns now run. But a run whose Workflow code caught that error can fail to
+> replay with a `[TMPRL1100]` nondeterminism error, if what it recorded after the catch does
+> not match the turn that now runs. Reset open runs that fail this way to their first Workflow
+> Task, which runs their Activities again:
+> `temporal workflow reset --workflow-id <id> --type FirstWorkflowTask --reason '<reason>'`.
+> Closed runs need no reset, but Queries and replay tests over their histories fail. See
 > [issue #261](https://github.com/temporalio/ai-integrations/issues/261) for details.
 
 #### 4. Advanced Serialization
