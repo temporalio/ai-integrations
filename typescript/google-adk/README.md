@@ -595,11 +595,13 @@ execution CANCELLED with the model Activity's own cancellation instead. A
 cancelled Activity node ends it CANCELLED the same way, inside a dynamic run too.
 So does a cancel that ADK absorbs in a tool or a model callback, such as a
 `LongRunningFunctionTool` waiting for a Signal or a `beforeModelCallback` waiting
-for an Activity. A cancel absorbed in a Signal handler ends the execution when the
-main function returns, after its cleanup. Only the execution's own cancellation
-counts, followed from the operation it cancelled: a cancel that only an inner scope
-(`CancellationScope.withTimeout`) caused, or any other error, leaves the outcome to
-the Workflow, even when the Workflow's cancellation was requested meanwhile.
+for an Activity: in an agent node it ends the execution CANCELLED rather than
+failing it with `GoogleAdkNodeReportedError`. A cancel absorbed in a Signal
+handler ends the execution when the main function returns, after its cleanup.
+Only the execution's own cancellation counts, followed from the operation it
+cancelled: a cancel that only an inner scope (`CancellationScope.withTimeout`)
+caused, or any other error, leaves the outcome to the Workflow, even when the
+Workflow's cancellation was requested meanwhile.
 
 A failing sibling does not cancel the execution either. When a graph node fails,
 ADK aborts the run and waits for the nodes still running before failing it. The

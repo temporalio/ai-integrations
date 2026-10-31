@@ -193,10 +193,12 @@ async function waitForScheduledNexusOperation(handle: {
 
 test.serial('cancellingAToolOrModelCallbackWaitEndsCancelled', async (t) => {
   const env = getEnv();
-  // ADK absorbs these cancels without a model call that fails after them: before 2.3 it drops
-  // a long-running tool's error, and it turns a callback's cancelled Activity into an error
-  // event, a plugin's first wrapped in a plain `Error`, that ends the turn. The same waits on a
-  // Nexus operation that never starts fail with the operation's start, not its result.
+  // ADK absorbs these cancels without a model call that fails after them: it drops a
+  // long-running tool's error before 2.3, and from 2.3 the tool's `skipSummarization` ends
+  // the turn on the error's function response. It turns a callback's cancelled Activity
+  // into an error event, a plugin's first wrapped in a plain `Error`, that ends the turn.
+  // The same waits on a Nexus operation that never starts fail with the operation's start,
+  // not its result.
   const endpoint = uid('adk-unpolled-endpoint');
   const nexusEndpoint = await env.createNexusEndpoint(endpoint, uid('adk-unpolled'));
   t.teardown(() => env.deleteNexusEndpoint(nexusEndpoint));

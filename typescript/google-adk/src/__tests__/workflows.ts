@@ -643,7 +643,10 @@ function blockedTurn(
     const tool = new LongRunningFunctionTool({
       name: 'wait_approval',
       description: 'Wait for a person to approve.',
-      execute: async () => {
+      execute: async (_args, toolContext) => {
+        // From ADK 2.3 the tool's error goes to the model as a function response; this ends
+        // the turn on that response instead, so no model call follows on any ADK release.
+        toolContext!.actions.skipSummarization = true;
         await waitForApproval();
         return { status: 'approved' };
       },
