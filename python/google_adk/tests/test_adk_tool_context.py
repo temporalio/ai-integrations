@@ -10,7 +10,12 @@ without the parameter leaking into the LLM-facing tool schema.
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import timedelta
-from typing import Any, Optional  # pyright: ignore[reportDeprecated]
+from typing import (
+    Annotated,
+    Any,
+    ClassVar,
+    Optional,  # pyright: ignore[reportDeprecated]
+)
 
 import pytest
 from google.adk import Agent
@@ -33,6 +38,7 @@ from temporalio.google_adk.workflow import (
     activity_as_tool,
 )
 from temporalio.worker import Worker
+from tests.helpers.postponed_annotations import PostponedSnapshotActivity
 
 TASK_QUEUE = "adk-tool-context-task-queue"
 
@@ -62,6 +68,20 @@ async def lookup_weather(
     return f"{city}|{units}|{db_url}|{retries}|{region}|fc={has_function_call_id}|act={in_act}"
 
 
+@activity.defn
+class LookupWeather:
+    """Callable-class form of lookup_weather, with an Annotated snapshot."""
+
+    async def __call__(
+        self,
+        city: str,
+        tool_context: Annotated[ToolContextSnapshot, "snapshot"],
+        units: str = "celsius",
+    ) -> str:
+        """Activity that reads tool configuration from session state."""
+        return await lookup_weather(city, tool_context, units)
+
+
 def weather_agent(model_name: str) -> Agent:
     return Agent(
         name="state_agent",
@@ -69,13 +89,18 @@ def weather_agent(model_name: str) -> Agent:
         tools=[
             activity_as_tool(
                 lookup_weather, start_to_close_timeout=timedelta(seconds=30)
-            )
+            ),
+            activity_as_tool(
+                LookupWeather, start_to_close_timeout=timedelta(seconds=30)
+            ),
         ],
     )
 
 
 class StateToolModel(BaseLlm):
     """Scripted model: call lookup_weather once, then echo its response."""
+
+    tool_name: ClassVar[str] = "lookup_weather"
 
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
@@ -85,7 +110,7 @@ class StateToolModel(BaseLlm):
             for part in content.parts or []:
                 if (
                     part.function_response is not None
-                    and part.function_response.name == "lookup_weather"
+                    and part.function_response.name == self.tool_name
                 ):
                     tool_response = part.function_response
         if tool_response is None:
@@ -95,7 +120,7 @@ class StateToolModel(BaseLlm):
                     parts=[
                         Part(
                             function_call=FunctionCall(
-                                name="lookup_weather", args={"city": "NYC"}
+                                name=self.tool_name, args={"city": "NYC"}
                             )
                         )
                     ],
@@ -112,6 +137,16 @@ class StateToolModel(BaseLlm):
     @classmethod
     def supported_models(cls) -> list[str]:
         return ["state_tool_model"]
+
+
+class ClassStateToolModel(StateToolModel):
+    """Scripted model that calls the LookupWeather class tool instead."""
+
+    tool_name: ClassVar[str] = "LookupWeather"
+
+    @classmethod
+    def supported_models(cls) -> list[str]:
+        return ["class_state_tool_model"]
 
 
 async def run_state_agent(model_name: str) -> str:
@@ -146,24 +181,29 @@ class StateToolWorkflow:
 
 
 @pytest.mark.asyncio
-async def test_activity_as_tool_receives_tool_context_snapshot(client: Client):
+@pytest.mark.parametrize(
+    "model", [StateToolModel, ClassStateToolModel], ids=["function", "class"]
+)
+async def test_activity_as_tool_receives_tool_context_snapshot(
+    client: Client, model: type[StateToolModel]
+):
     new_config = client.config()
     new_config["plugins"] = [GoogleAdkPlugin()]
     client = Client(**new_config)
 
     async with Worker(
         client,
-        task_queue=TASK_QUEUE,
-        activities=[lookup_weather],
+        task_queue=f"{TASK_QUEUE}-{model.tool_name}",
+        activities=[lookup_weather, LookupWeather()],
         workflows=[StateToolWorkflow],
         max_cached_workflows=0,
     ):
-        LLMRegistry.register(StateToolModel)
+        LLMRegistry.register(model)
         result = await client.execute_workflow(
             StateToolWorkflow.run,
-            "state_tool_model",
+            model.supported_models()[0],
             id=f"tool-context-{uuid.uuid4()}",
-            task_queue=TASK_QUEUE,
+            task_queue=f"{TASK_QUEUE}-{model.tool_name}",
             execution_timeout=timedelta(seconds=30),
         )
     # The activity saw mixed-type session state (string, int, nested dict),
@@ -267,6 +307,15 @@ def test_activity_as_tool_accepts_optional_snapshot_annotation():
     properties = _declared_properties(tool)
     assert set(properties) == {"query"}
 
+    # Also for a callable-class instance whose annotations are strings: its
+    # types are read from its class's __call__.
+    tool = FunctionTool(
+        func=activity_as_tool(
+            PostponedSnapshotActivity(), start_to_close_timeout=timedelta(seconds=30)
+        )
+    )
+    assert set(_declared_properties(tool)) == {"query"}
+
 
 def test_activity_as_tool_rejects_adk_tool_context_annotation():
     """Annotating with the live ADK ToolContext gives an actionable error."""
@@ -304,6 +353,117 @@ def test_activity_as_tool_rejects_adk_context_under_any_name():
 
     with pytest.raises(ValueError, match="not serializable"):
         activity_as_tool(sneaky_tool, start_to_close_timeout=timedelta(seconds=30))
+
+
+def test_tool_schema_excludes_annotated_tool_context_of_class():
+    """A class's Annotated snapshot is accepted and excluded like a function's."""
+    tool = FunctionTool(
+        func=activity_as_tool(
+            LookupWeather, start_to_close_timeout=timedelta(seconds=30)
+        )
+    )
+    assert set(_declared_properties(tool)) == {"city", "units"}
+
+
+@activity.defn
+async def annotated_context_tool(
+    query: str,
+    ctx: Annotated[ToolContext, "metadata"],  # pyright: ignore[reportUnusedParameter]
+) -> str:
+    return query
+
+
+@activity.defn
+class AnnotatedContextActivity:
+    async def __call__(
+        self,
+        query: str,
+        ctx: Annotated[ToolContext, "metadata"],  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
+        return query
+
+
+@activity.defn
+class OptionalAnnotatedContextActivity:
+    async def __call__(
+        self,
+        query: str,
+        tool_context: Annotated[ToolContext, "metadata"] | None = None,  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
+        return query
+
+
+# Optional[Alias] nests the alias's own Optional inside Annotated.
+LiveContextAlias = Annotated[Optional[ToolContext], "metadata"]  # pyright: ignore[reportDeprecated]
+SnapshotAlias = Annotated[Optional[ToolContextSnapshot], "metadata"]  # pyright: ignore[reportDeprecated]
+
+
+@activity.defn
+async def nested_alias_context_tool(
+    query: str,
+    ctx: Optional[LiveContextAlias] = None,  # pyright: ignore[reportUnusedParameter, reportDeprecated]
+) -> str:
+    return query
+
+
+@activity.defn
+class NestedAliasContextActivity:
+    async def __call__(
+        self,
+        query: str,
+        ctx: Optional[LiveContextAlias] = None,  # pyright: ignore[reportUnusedParameter, reportDeprecated]
+    ) -> str:
+        return query
+
+
+@activity.defn
+async def nested_alias_snapshot_tool(
+    query: str,
+    tool_context: Optional[SnapshotAlias] = None,  # pyright: ignore[reportUnusedParameter, reportDeprecated]
+) -> str:
+    return query
+
+
+@activity.defn
+class NestedAliasSnapshotActivity:
+    async def __call__(
+        self,
+        query: str,
+        tool_context: Optional[SnapshotAlias] = None,  # pyright: ignore[reportUnusedParameter, reportDeprecated]
+    ) -> str:
+        return query
+
+
+@pytest.mark.parametrize(
+    "activity_def",
+    [nested_alias_snapshot_tool, NestedAliasSnapshotActivity],
+    ids=["function", "class"],
+)
+def test_activity_as_tool_accepts_nested_snapshot_alias(activity_def: Any):
+    """A snapshot inside nested Annotated and Optional is accepted and excluded."""
+    tool = FunctionTool(
+        func=activity_as_tool(
+            activity_def, start_to_close_timeout=timedelta(seconds=30)
+        )
+    )
+    assert set(_declared_properties(tool)) == {"query"}
+
+
+@pytest.mark.parametrize(
+    "activity_def",
+    [
+        annotated_context_tool,
+        AnnotatedContextActivity,
+        AnnotatedContextActivity(),
+        OptionalAnnotatedContextActivity,
+        nested_alias_context_tool,
+        NestedAliasContextActivity,
+    ],
+)
+def test_activity_as_tool_rejects_annotated_adk_context(activity_def: Any):
+    """Annotated metadata doesn't hide a live ADK context from the check."""
+    with pytest.raises(ValueError, match="not serializable"):
+        activity_as_tool(activity_def, start_to_close_timeout=timedelta(seconds=30))
 
 
 def test_activity_as_tool_rejects_snapshot_under_other_name():

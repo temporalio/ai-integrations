@@ -240,7 +240,10 @@ export class TemporalOpenAIRunner {
     if (input instanceof RunState) {
       // Round-trip through fromString to drop upstream's live-session identity, which would otherwise
       // resolve manifest environment references on the Workflow thread rather than in the resume Activity.
-      const restored = (await RunState.fromString(agent, input.toString())) as RunState<TContext, TAgent>;
+      // fromString lists tools, which runs MCP tool filters; their errors fail the run, as in the run below.
+      const restored = (await RunState.fromString(agent, input.toString()).catch((error: unknown) => {
+        throw normalizeAgentsRunError(error);
+      })) as RunState<TContext, TAgent>;
       // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
       restored.clearTrace();
       preparedInput = restored;

@@ -2,18 +2,47 @@ import type { McpClient } from '@strands-agents/sdk';
 import { BedrockModel, type Model } from '@strands-agents/sdk';
 import type { Duration } from '@temporalio/common';
 import { msOptionalToNumber } from '@temporalio/common/lib/time';
-import type { BundleOptions } from '@temporalio/worker';
+import type { Context as ActivityContext } from '@temporalio/activity';
+import type { ActivityInboundCallsInterceptor, BundleOptions, Worker, WorkerOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
+import { rewriteError } from './strands-errors';
 import { ModelActivity } from './model-activity';
-import type { GetModelConfigInput, InvokeModelInput, InvokeModelStreamingInput } from './model-activity';
-import { GET_MODEL_CONFIG_ACTIVITY } from './temporal-model';
+import type {
+  GetModelConfigInput,
+  InvokeModelInput,
+  InvokeModelStreamingInput,
+  InvokeStatefulModelInput,
+  InvokeStatefulModelStreamingInput,
+} from './model-activity';
+import {
+  GET_MODEL_CONFIG_ACTIVITY,
+  INVOKE_STATEFUL_MODEL_ACTIVITY,
+  INVOKE_STATEFUL_MODEL_STREAMING_ACTIVITY,
+} from './temporal-model';
 import {
   buildCallToolActivity,
   buildListToolsActivity,
   callToolActivityName,
   listToolsActivityName,
+  MCP_CONNECTION_IDLE_MS,
   _evictConnection,
 } from './temporal-mcp-client';
+
+// What each Activity a StrandsPlugin builds was built from: its name, then what it depends on.
+// configureWorker lets one of these replace another with the same entries: that is the same
+// instance, or one built from the same options, registered twice (e.g. on the NativeConnection
+// and the Worker).
+const activitySources = new WeakMap<object, readonly unknown[]>();
+
+function sameSources(a: object, b: object): boolean {
+  const x = activitySources.get(a);
+  const y = activitySources.get(b);
+  return x !== undefined && y !== undefined && x.length === y.length && x.every((v, i) => v === y[i]);
+}
+
+const REMEDY =
+  'Rename or remove the other Activity, run the other integration on its own Worker and task queue, ' +
+  'or use one StrandsPlugin instance on this Worker.';
 
 /**
  * Options for {@link StrandsPlugin}.
@@ -46,18 +75,35 @@ export interface StrandsPluginOptions {
   mcpConnectionIdleTimeout?: Duration;
 }
 
+/** The plugin's model activities, whose context overflows the agent recovers from. */
+const MODEL_ACTIVITIES = new Set(['invokeModel', 'invokeModelStreaming']);
+
+/**
+ * Rethrows Strands' interrupt and terminal errors from activities as typed, non-retryable
+ * failures. The worker turns any other error an activity throws into a retryable
+ * `ApplicationFailure` before a failure converter sees it, so this cannot be left to one.
+ */
+function strandsActivityInbound(ctx: ActivityContext): ActivityInboundCallsInterceptor {
+  return {
+    async execute(input, next) {
+      try {
+        return await next(input);
+      } catch (err) {
+        throw rewriteError(err, { benignOverflow: MODEL_ACTIVITIES.has(ctx.info.activityType) });
+      }
+    },
+  };
+}
+
 /**
  * Temporal plugin that runs Strands Agents inside Temporal workflows. Model,
  * MCP tool, and (via {@link workflow.activityAsTool}) custom-tool invocations
  * are routed through Temporal Activities for durable execution, retries, and
  * timeouts.
  *
- * Register on the worker (and on the client when using `activityAsTool` with
- * interrupts, so the client-side data converter picks up the failure
- * converter):
+ * Register on the worker:
  *
  * ```ts
- * const client = await Client.connect({ plugins: [new StrandsPlugin({...})] });
  * const worker = new Worker({ ..., plugins: [new StrandsPlugin({...})] });
  * ```
  */
@@ -79,14 +125,28 @@ export class StrandsPlugin extends SimplePlugin {
     const activities: Record<string, (...args: never[]) => unknown> = {
       invokeModel: (input: InvokeModelInput) => modelActivity.invokeModel(input),
       invokeModelStreaming: (input: InvokeModelStreamingInput) => modelActivity.invokeModelStreaming(input),
+      [INVOKE_STATEFUL_MODEL_ACTIVITY]: (input: InvokeStatefulModelInput) => modelActivity.invokeStatefulModel(input),
+      [INVOKE_STATEFUL_MODEL_STREAMING_ACTIVITY]: (input: InvokeStatefulModelStreamingInput) =>
+        modelActivity.invokeStatefulModelStreaming(input),
       [GET_MODEL_CONFIG_ACTIVITY]: (input: GetModelConfigInput) => modelActivity.getModelConfig(input),
     };
+    // Without `models`, every plugin builds the same default.
+    const modelSources = options.models === undefined ? [] : [options.models, defaultName];
+    for (const [name, fn] of Object.entries(activities)) {
+      activitySources.set(fn, [name, ...modelSources]);
+    }
 
     const mcpClients = options.mcpClients ?? {};
     const idleMs = msOptionalToNumber(options.mcpConnectionIdleTimeout);
     for (const [server, factory] of Object.entries(mcpClients)) {
-      activities[listToolsActivityName(server)] = buildListToolsActivity(server, factory, idleMs);
-      activities[callToolActivityName(server)] = buildCallToolActivity(server, factory, idleMs);
+      const serverActivities = {
+        [listToolsActivityName(server)]: buildListToolsActivity(server, factory, idleMs),
+        [callToolActivityName(server)]: buildCallToolActivity(server, factory, idleMs),
+      };
+      for (const [name, fn] of Object.entries(serverActivities)) {
+        activities[name] = fn;
+        activitySources.set(fn, [name, factory, idleMs ?? MCP_CONNECTION_IDLE_MS]);
+      }
     }
 
     const runContext = async (next: () => Promise<void>): Promise<void> => {
@@ -105,10 +165,57 @@ export class StrandsPlugin extends SimplePlugin {
       name: 'StrandsPlugin',
       activities,
       runContext,
-      dataConverter: {
-        failureConverterPath: require.resolve('./failure-converter'),
-      },
+      // A function, because the object form rebuilds the worker's interceptors without the
+      // deprecated `activityInbound` key.
+      workerInterceptors: (existing) => ({
+        ...existing,
+        activity: [...(existing?.activity ?? []), (ctx) => ({ inbound: strandsActivityInbound(ctx) })],
+      }),
     });
+  }
+
+  /**
+   * Adds the model and MCP Activities to the Worker.
+   *
+   * @throws TypeError if the Worker already has a different Activity with one of these names: a
+   * caller Activity, another integration's Activity, or one from a `StrandsPlugin` that doesn't share
+   * this one's `models` object, MCP client factories and idle timeout.
+   */
+  override configureWorker(options: WorkerOptions): WorkerOptions {
+    const existing = options.activities as Record<string, unknown> | undefined;
+    for (const [name, fn] of Object.entries(this.options.activities as object)) {
+      const other = existing && Object.prototype.propertyIsEnumerable.call(existing, name) ? existing[name] : undefined;
+      if (typeof other === 'function' && other !== fn && !sameSources(other, fn)) {
+        throw new TypeError(
+          `Duplicate registration of Activity '${name}': StrandsPlugin would replace a different Activity ` +
+            `with this name. ${REMEDY}`
+        );
+      }
+    }
+    return super.configureWorker(options);
+  }
+
+  /**
+   * Runs the Worker.
+   *
+   * @throws TypeError, before the Worker polls, if a plugin applied after this one replaced one of
+   * its Activities with a different one. `Worker.create` applies the Worker's plugins in order, then
+   * the `NativeConnection`'s.
+   */
+  override async runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    for (const [name, fn] of Object.entries(this.options.activities as object)) {
+      const kept = worker.options.activities.get(name);
+      if (kept === undefined || kept === fn || sameSources(kept, fn)) continue;
+      // There is no public way to stop a Worker that has not run yet. Stopping it first means it
+      // never polls; `next` then releases it as `run()` does, so `connection.close()` still works.
+      (worker as unknown as { nativeWorker: { initiateShutdown(): void } }).nativeWorker.initiateShutdown();
+      await next(worker).catch(() => undefined);
+      throw new TypeError(
+        `Duplicate registration of Activity '${name}': a plugin applied after StrandsPlugin replaced its ` +
+          `Activity with this name. ${REMEDY}`
+      );
+    }
+    return super.runWorker(worker, next);
   }
 
   /**
