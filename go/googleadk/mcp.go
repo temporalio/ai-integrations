@@ -222,11 +222,14 @@ func (a *Activities) ListMcpTools(ctx context.Context, in mcpListInput) ([]*gena
 // Activity succeeds with the pending confirmation in its output rather than
 // failing, so the workflow can pause the agent for the human.
 //
-// A tool's own error, one that wraps no other error, also goes in the output,
-// so the model sees it once, as it does without Temporal. ADK's MCP tools
-// return an isError result (and, before ADK v2.4.0, a result with no text)
-// that way. They wrap the error of a failed MCP request, which still fails the
-// Activity with a retryable McpError. So does an ApplicationError.
+// A tool's own error, one that wraps no other error and is not an
+// ApplicationError, also goes in the output, so the model sees it once, as it
+// does without Temporal. ADK's MCP tools return an isError result (and, before
+// ADK v2.4.0, a result with no text) that way. They wrap the error of a failed
+// MCP request, which still fails the Activity with a retryable McpError, as
+// does an error returned after the Activity's context is done, such as when
+// the Worker stops. An ApplicationError fails the Activity with its own type
+// and retryability.
 func (a *Activities) CallMcpTool(ctx context.Context, in mcpCallInput) (*mcpCallOutput, error) {
 	log := activity.GetLogger(ctx)
 	// No-op unless the user set a HeartbeatTimeout on the toolset's Activity
@@ -272,7 +275,9 @@ func (a *Activities) CallMcpTool(ctx context.Context, in mcpCallInput) (*mcpCall
 				return nil, newApplicationError(ErrorTypeMCP, false, runErr,
 					"tool %q failed: %v", in.Tool, runErr)
 			}
-			if isToolAnswer(runErr) {
+			// An error after ctx is done, such as ctx.Err() when the Worker
+			// stops, is not the tool's answer, whatever it wraps.
+			if ctx.Err() == nil && isToolAnswer(runErr) {
 				msg := runErr.Error()
 				return &mcpCallOutput{Result: map[string]any{"error": msg}, Error: &msg}, nil
 			}

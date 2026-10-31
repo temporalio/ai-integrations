@@ -16,6 +16,7 @@ import (
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
+	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 
 	"google.golang.org/genai"
@@ -168,4 +169,38 @@ func TestMcpToolErrorReachesModel(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMcpToolErrorAfterWorkerStops proves an error a tool returns after the
+// Activity's context is cancelled, as when the Worker stops during the call,
+// fails CallMcpTool with a retryable McpError, so the call runs again, instead
+// of reaching the model as the tool's answer. The workflow test environment
+// cannot show it: it has no Worker stop.
+func TestMcpToolErrorAfterWorkerStops(t *testing.T) {
+	bg, stop := context.WithCancel(context.Background())
+	defer stop()
+	lookup, err := funcTool("lookup", func(ctx agent.Context, _ map[string]any) (map[string]any, error) {
+		stop() // the Worker stops during the call
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	require.NoError(t, err)
+	acts, err := googleadk.NewActivities(googleadk.Config{MCPToolsets: map[string]googleadk.MCPFactory{
+		"orders": func(context.Context) (tool.Toolset, error) {
+			return staticToolset{name: "orders", tools: []tool.Tool{lookup}}, nil
+		},
+	}})
+	require.NoError(t, err)
+	var s testsuite.WorkflowTestSuite
+	env := s.NewTestActivityEnvironment()
+	env.SetWorkerOptions(worker.Options{BackgroundActivityContext: bg})
+	env.RegisterActivityWithOptions(acts.CallMcpTool, activity.RegisterOptions{Name: googleadk.CallMcpToolActivityName})
+
+	_, err = env.ExecuteActivity(googleadk.CallMcpToolActivityName,
+		map[string]any{"Toolset": "orders", "Tool": "lookup", "Args": map[string]any{}})
+
+	var appErr *temporal.ApplicationError
+	require.ErrorAs(t, err, &appErr, "CallMcpTool must fail, not return the tool's answer")
+	assert.Equal(t, googleadk.ErrorTypeMCP, appErr.Type())
+	assert.False(t, appErr.NonRetryable())
 }
