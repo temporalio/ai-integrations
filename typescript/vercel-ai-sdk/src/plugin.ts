@@ -1,9 +1,9 @@
 import type { ProviderV4 } from '@ai-sdk/provider';
 import { SimplePlugin } from '@temporalio/plugin';
-import type { BundleOptions, WorkerOptions } from '@temporalio/worker';
+import type { BundleOptions, Worker, WorkerOptions } from '@temporalio/worker';
 import type { Duration } from '@temporalio/common/lib/time';
 import { createActivities, _evictMcpConnectionsForServer } from './activities';
-import { refuseReplacedActivities } from './activity-sources';
+import { refuseLaterReplacement, refuseReplacedActivities } from './activity-sources';
 import type { McpClientFactories } from './mcp';
 
 /**
@@ -72,6 +72,18 @@ export class AiSdkPlugin extends SimplePlugin {
   override configureWorker(options: WorkerOptions): WorkerOptions {
     refuseReplacedActivities('AiSdkPlugin', options.activities, this.options.activities as object);
     return super.configureWorker(options);
+  }
+
+  /**
+   * Runs the Worker.
+   *
+   * @throws TypeError, before the Worker polls, if a plugin applied after this
+   * one replaced one of its Activities with a different one. `Worker.create`
+   * applies the Worker's plugins in order, then the `NativeConnection`'s.
+   */
+  override async runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    await refuseLaterReplacement('AiSdkPlugin', worker, this.options.activities as object, next);
+    return super.runWorker(worker, next);
   }
 
   override configureBundler(options: BundleOptions): BundleOptions {
