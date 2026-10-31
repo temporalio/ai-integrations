@@ -402,6 +402,19 @@ for interruption in state.get_interruptions():
 result = await Runner.run(agent, state)  # or Runner.run_streamed(agent, state)
 ```
 
+### Carrying input items across `continue_as_new`
+
+A workflow can also carry `result.to_input_list()` across `continue_as_new` and pass the items to
+`Runner.run` in the next run. The plugin decodes their `Iterable` fields, such as an assistant
+message's `content`, as lists.
+
+Earlier versions decoded those fields as one-shot iterators, and a turn on carried items raised
+`TypeError: cannot pickle 'pydantic_core._pydantic_core.ValidatorIterator' object`. A run that
+caught that error and went on, such as a chat whose Update reports errors to the caller, fails with
+`[TMPRL1100]` on its next Workflow Task after you deploy this version. Let those runs finish on the
+earlier version first, or keep them there with Worker Versioning. A chat that waits for its next
+message may never finish, so use Worker Versioning for it.
+
 ## MCP Support
 
 The durable MCP integration uses MCP Python SDK v2 and the optional `mcp`
