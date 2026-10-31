@@ -1,15 +1,21 @@
 import { Agent, AfterToolsEvent } from '@strands-agents/sdk';
-import type { AgentConfig } from '@strands-agents/sdk';
+import type { AgentConfig, AgentResult, AgentStreamEvent, InvokeArgs, InvokeOptions } from '@strands-agents/sdk';
 import type { ActivityOptions } from '@temporalio/workflow';
 import type { Duration } from '@temporalio/common/lib/time';
 import { TemporalModel } from './temporal-model';
 import { TemporalMCPClient } from './temporal-mcp-client';
+import { workflowErrorFor } from './strands-errors';
 
 const SNAPSHOT_DISABLED =
   'TemporalAgent disables takeSnapshot()/loadSnapshot(). Temporal workflows ' +
   'already persist agent state durably via the event history at a finer ' +
   'granularity than Strands snapshots. Remove the snapshot call and rely on ' +
   "Temporal's durable execution instead.";
+
+// Strands' own message, which its Agent throws at construction for a stateful model.
+const STATEFUL_MANAGER_REFUSED =
+  'contextManager and conversationManager cannot be used with a stateful model. ' +
+  'The model manages conversation state server-side.';
 
 const RETRY_STRATEGY_DISABLED =
   'TemporalAgent disables Strands retries; configure retries via retryPolicy ' +
@@ -51,6 +57,8 @@ export interface TemporalAgentOptions extends Omit<AgentConfig, 'model' | 'retry
  * {@link activityAsTool}, {@link activityAsHook}, and {@link TemporalMCPClient}.
  */
 export class TemporalAgent extends Agent {
+  private readonly managerGiven: boolean;
+
   constructor(options: TemporalAgentOptions = {}) {
     const { model, activityOptions, streamingTopic, streamingBatchInterval, ...rest } = options;
     if ((rest as { retryStrategy?: unknown }).retryStrategy !== undefined) {
@@ -67,6 +75,7 @@ export class TemporalAgent extends Agent {
       model: temporalModel,
       retryStrategy: null,
     });
+    this.managerGiven = Boolean(rest.conversationManager || rest.contextManager);
 
     // Strands lists each MCP client's tools once at agent initialization and
     // reuses that list for every turn. For clients with `cacheTools: false`,
@@ -81,15 +90,46 @@ export class TemporalAgent extends Agent {
   }
 
   /**
-   * Read the worker model's id and context window before Strands initializes the agent, so its
-   * traces and proactive compression use them from the first model call.
+   * Read the worker model's id, context window and stateful flag before Strands initializes the
+   * agent, so its traces, proactive compression and stateful handling use them from the first
+   * model call.
    *
    * Not `async`: once the config is read, this returns Strands' own `initialize()` promise, so it
    * adds no microtask before Strands' hooks and model call.
    */
   override initialize(): Promise<void> {
     const loading = this.model instanceof TemporalModel ? this.model.loadConfig() : undefined;
-    return loading ? loading.then(() => super.initialize()) : super.initialize();
+    return loading ? loading.then(() => this.initializeWithConfig()) : this.initializeWithConfig();
+  }
+
+  private initializeWithConfig(): Promise<void> {
+    // Strands' Agent refuses these managers for a stateful model at construction, before
+    // TemporalAgent can read the worker model's stateful flag, so refuse them here.
+    if (this.model.stateful && this.managerGiven) {
+      return Promise.reject(new Error(STATEFUL_MANAGER_REFUSED));
+    }
+    return super.initialize();
+  }
+
+  /**
+   * Strands' stream, ending in a Temporal failure where Strands would end in an error that only
+   * fails the workflow task: a terminal model error becomes a typed, non-retryable failure, and a
+   * model activity that failed or was cancelled ends the turn with that activity's failure. So the
+   * run, or the update that runs the turn, fails or is cancelled. `invoke()` uses this too.
+   *
+   * Its awaits add microtasks to each agent event, and those are part of replay: when two turns run
+   * at once in one workflow, they can change the order in which the turns schedule activities. So
+   * removing this override, or wrapping the stream in another layer, can break replay of such runs.
+   */
+  override async *stream(
+    args: InvokeArgs,
+    options?: InvokeOptions
+  ): AsyncGenerator<AgentStreamEvent, AgentResult, undefined> {
+    try {
+      return yield* super.stream(args, options);
+    } catch (err) {
+      throw workflowErrorFor(err);
+    }
   }
 
   override takeSnapshot(): never {

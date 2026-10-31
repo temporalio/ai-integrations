@@ -12,7 +12,7 @@ export type { AgentAsToolOptions } from './workflow/agent-tools';
 export { statelessMcpServer } from './workflow/mcp-client';
 export type { StatelessMcpServerOptions } from './workflow/mcp-client';
 export type { StatefulTemporalMCPServer } from './common/mcp-types';
-export { DEDICATED_WORKER_FAILURE_TYPE, TOOL_META_RESOLVER_UNSUPPORTED_TYPE } from './common/mcp-types';
+export { DEDICATED_WORKER_FAILURE_TYPE, TOOL_FILTER_UNSUPPORTED_TYPE, TOOL_META_RESOLVER_UNSUPPORTED_TYPE } from './common/mcp-types';
 export { statefulMcpServer } from './workflow/stateful-mcp-client';
 export type { StatefulMcpServerOptions } from './workflow/stateful-mcp-client';
 export { temporalSandboxClient } from './workflow/sandbox-client';

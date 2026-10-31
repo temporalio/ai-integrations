@@ -511,6 +511,24 @@ export async function statefulMcpWorkflow(prompt: string): Promise<string> {
 
 Dedicated Worker startup and heartbeat failures surface as `ApplicationFailure` type (exported as `DEDICATED_WORKER_FAILURE_TYPE`).
 
+### MCP tool filters
+
+A static `toolFilter` on the server your factory returns, such as `createMCPToolStaticFilter({ blocked: ['delete_file'] })`, applies in the list-tools Activity, so the model is not offered a blocked tool. The filter applies only to the tool list: a run that listed tools before the Worker was upgraded keeps that list while it is cached.
+
+A callable filter gets the agent and the run context, which exist only in the Workflow, so the Worker refuses one on the factory's server: every list-tools and call-tool Activity for that server fails with a non-retryable `ApplicationFailure` of type `MCPToolFilterUnsupported` (exported as `TOOL_FILTER_UNSUPPORTED_TYPE`). A new run fails at its first list-tools Activity. A `statelessMcpServer()` run that listed tools on an older Worker instead gets a tool error, which the model reads, for each call to that server, and the run keeps going. So remove the callable filter from the factory's server before you upgrade Workers. Pass it as the `toolFilter` option of `statelessMcpServer()` or `statefulMcpServer()` instead:
+
+```ts
+const server = statelessMcpServer('files', {
+  toolFilter: async ({ agent }, tool) => tool.name !== 'delete_file' || agent.name === 'FileAdmin',
+});
+```
+
+The agent applies this option in the Workflow each time it lists tools; the handle caches the server's full tool list, not the filtered one. A callable filter runs for each tool on every listing, gets the name the server was registered with as `serverName`, and must be deterministic. An Activity or timer it awaits adds commands that older plugin versions never schedule, so let Workflows that use the option finish before you roll the plugin back. A filter assigned to a stateful handle later (`server.toolFilter = ...`) gets the handle's internal name, `<name>-stateful`. A callable filter also runs when a run resumes from a `RunState`, for example after a tool approval, and then sees the context rebuilt from JSON: plain objects, without class methods. If it throws there, the run fails with an `AgentsWorkflowError`.
+
+Because the handle caches the full list, the agent SDK's `invalidateServerToolsCache(name)` does not refresh a handle that has a filter. Call the handle's `invalidateToolsCache()` as well, which also works on older plugin versions. On older versions, `invalidateServerToolsCache(name)` alone refreshed a stateful handle with a `toolFilter` property assigned. Such a run schedules one list-tools Activity fewer on this version and fails replay, so let it finish before you upgrade.
+
+Older versions also let the agent SDK cache the filtered list of a handle with a `toolFilter` property assigned, per server and agent name, so a later run with another context got the first run's tools. This version filters every listing for its own run. A run that started on an older version, whose filter depends on the run context, and that called a tool the filter now removes fails replay on this version. Let such runs finish before you upgrade.
+
 ### MCP request metadata
 
 A `toolMetaResolver` builds each tool call's MCP `_meta` from the run context, which exists only in the Workflow. Pass it as the `toolMetaResolver` option of `statelessMcpServer()` or `statefulMcpServer()`; it runs in Workflow code and must be deterministic. The call-tool Activity passes its result to the server's `callTool`. The Worker can't run a `toolMetaResolver` on the factory's server, so it refuses one: every list-tools and call-tool Activity for that server fails with a non-retryable `ApplicationFailure` of type `MCPToolMetaResolverUnsupported` (exported as `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`).

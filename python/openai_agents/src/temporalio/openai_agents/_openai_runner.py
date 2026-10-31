@@ -1,6 +1,10 @@
+import asyncio
+import contextlib
+import contextvars
 import dataclasses
+import sys
 import weakref
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Generator
 from typing import Any, Callable
 
 from agents import (
@@ -126,6 +130,61 @@ def _convert_agent(
         for tool in agent.tools
     ]
     return new_agent
+
+
+# True during an agent run, so the Workflow loop runs sync function tools inline.
+_in_agent_run: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_in_agent_run", default=False
+)
+
+
+@contextlib.contextmanager
+def _inline_sync_function_tools() -> Generator[None, None, None]:
+    """Run the sync function tools of the agent run in this scope in the Workflow.
+
+    The Agents SDK runs a sync function tool with ``asyncio.to_thread``. The Workflow
+    event loop has no threads, so the tool failed before its body ran and the model
+    got an empty error. Tools are not changed, only how the loop runs that call.
+    """
+    _run_sync_function_tool_calls_inline(asyncio.get_running_loop())
+    token = _in_agent_run.set(True)
+    try:
+        yield
+    finally:
+        _in_agent_run.reset(token)
+
+
+def _run_sync_function_tool_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
+    """Make the Workflow loop run a sync function tool's thread call inline."""
+    if getattr(loop, "_runs_sync_function_tools_inline", False):
+        return
+    run_in_executor = loop.run_in_executor
+
+    def inline_run_in_executor(
+        executor: Any, func: Callable[..., Any], *args: Any
+    ) -> asyncio.Future[Any]:
+        if not (
+            _in_agent_run.get() and _called_by_sync_function_tool(sys._getframe(1))
+        ):
+            return run_in_executor(executor, func, *args)
+        future = loop.create_future()
+        future.set_result(func(*args))
+        return future
+
+    setattr(loop, "run_in_executor", inline_run_in_executor)
+    setattr(loop, "_runs_sync_function_tools_inline", True)
+
+
+def _called_by_sync_function_tool(frame: Any) -> bool:
+    """Whether this is ``asyncio.to_thread`` called by a sync ``@function_tool``.
+
+    Those are the only ``asyncio.to_thread`` calls in ``agents.tool``.
+    """
+    return (
+        frame.f_code is asyncio.to_thread.__code__
+        and frame.f_back is not None
+        and frame.f_back.f_globals.get("__name__") == "agents.tool"
+    )
 
 
 def _has_sandbox_agent(agent: Agent[Any], seen: set[int] | None = None) -> bool:
@@ -341,7 +400,7 @@ class TemporalOpenAIRunner(AgentRunner):
 
         converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
-        with capture_scope(run_config.model_settings):
+        with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             try:
                 return await self._runner.run(
                     starting_agent=converted_agent,
@@ -415,7 +474,7 @@ class TemporalOpenAIRunner(AgentRunner):
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
-        with capture_scope(run_config.model_settings):
+        with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             streamed_result = self._runner.run_streamed(
                 starting_agent=converted_agent,
                 input=input,

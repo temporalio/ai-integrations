@@ -382,6 +382,9 @@ Use regular `@function_tool` tools only for deterministic, workflow-safe logic.
 Do not perform network, database, filesystem, or other external I/O directly from these tools.
 Use a Temporal activity with `activity_as_tool()` instead.
 Code running in the workflow can also invoke a Temporal activity directly when needed.
+Sync tools run directly in the workflow, not in a separate thread as they do outside Temporal.
+They run again on every replay, and the Workflow Task waits for them: a tool that takes more than two seconds fails the Workflow Task with a deadlock error.
+Use `activity_as_tool()` for slow work.
 
 Tools that run in the workflow can also update OpenAI Agents context, which is read-only for tools run as Temporal activities.
 
