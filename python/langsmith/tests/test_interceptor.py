@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from temporalio.langsmith._interceptor import (
     _inject_context,
     _LangSmithWorkflowInboundInterceptor,
     _maybe_run,
+    _ReplaySafeClient,
     _ReplaySafeRunTree,
 )
 from temporalio.worker import HandleQueryInput
@@ -272,6 +274,23 @@ class TestReplaySafety:
         ):
             pass
         MockRunTree.assert_called_once()
+
+    def test_client_forgets_oldest_open_run(self) -> None:
+        """Past _MAX_OPEN_RUNS, a client forgets the oldest run it posted."""
+        mock_client = MagicMock()
+        client = _ReplaySafeClient(mock_client)
+        run_ids = [uuid.uuid4() for _ in range(3)]
+        with patch(f"{_MOD}._MAX_OPEN_RUNS", 2):
+            for run_id in run_ids:
+                client._add_open(run_id)
+        assert list(client._open) == run_ids[1:]
+        # After a replay, the forgotten run is posted again; the other is not.
+        runs = MagicMock()
+        runs.pending = {
+            run_id: [("create_run", {"id": run_id}, {})] for run_id in run_ids[:2]
+        }
+        client._post_pending(runs)
+        mock_client.create_run.assert_called_once_with(id=run_ids[0])
 
 
 # ===================================================================
