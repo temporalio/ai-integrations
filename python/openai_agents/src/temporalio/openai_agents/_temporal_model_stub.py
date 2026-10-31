@@ -349,12 +349,13 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         # The activity publishes each event to the topic as the model sends it, but the
         # framework only checks the parallel input guardrails against the events it yields
         # after the activity returns. So once one of them trips, don't start the activity,
-        # or cancel it: it then publishes an error event and stops.
+        # or cancel it: it then publishes an error event and stops. The framework records
+        # the trip before it waits for the other guardrails to clean up, so act on the
+        # record without waiting for the guardrails task to finish.
         guardrails = _parallel_input_guardrails()
         if guardrails is not None:
-            result, task = guardrails
-            triggered = result._triggered_input_guardrail_result
-            if task.done() and triggered is not None:
+            triggered = guardrails[0]._triggered_input_guardrail_result
+            if triggered is not None:
                 raise InputGuardrailTripwireTriggered(triggered)
 
         handle = workflow.start_activity_method(
@@ -378,7 +379,12 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             result, task = guardrails
 
             async def cancel_on_tripwire() -> None:
-                await workflow.wait([task])
+                await workflow.wait_condition(
+                    lambda: (
+                        result._triggered_input_guardrail_result is not None
+                        or task.done()
+                    )
+                )
                 triggered = result._triggered_input_guardrail_result
                 if triggered is not None and not handle.done():
                     cancelled_for.append(triggered)

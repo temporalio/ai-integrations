@@ -519,16 +519,21 @@ class ModelActivity:
             except APIStatusError as e:
                 _raise_for_openai_status(e)
             except asyncio.CancelledError:
-                # Tell subscribers the response ends here, for example because a parallel
-                # input guardrail tripped. Leaving the context manager flushes it.
-                events_topic.publish(
-                    ResponseErrorEvent(
-                        type="error",
-                        code="cancelled",
-                        message="The model call was cancelled.",
-                        sequence_number=len(events),
+                # When the workflow cancelled the call, for example because a parallel
+                # input guardrail tripped, tell subscribers the response ends here.
+                # Leaving the context manager flushes it. Other cancels, such as a
+                # Worker shutdown or a heartbeat timeout, can be retried, so publish
+                # nothing and let the retry answer.
+                details = activity.cancellation_details()
+                if details is not None and details.cancel_requested:
+                    events_topic.publish(
+                        ResponseErrorEvent(
+                            type="error",
+                            code="cancelled",
+                            message="The model call was cancelled.",
+                            sequence_number=len(events),
+                        )
                     )
-                )
                 raise
 
         return events
