@@ -1,5 +1,6 @@
 """Workflow-specific primitives for working with the OpenAI Agents SDK in a workflow context"""
 
+import asyncio
 import functools
 import inspect
 import json
@@ -27,7 +28,12 @@ from pydantic import BaseModel, ValidationError
 from temporalio import activity
 from temporalio import workflow as temporal_workflow
 from temporalio.common import Priority, RetryPolicy
-from temporalio.exceptions import ApplicationError, TemporalError
+from temporalio.exceptions import (
+    ApplicationError,
+    CancelledError,
+    NexusOperationError,
+    TemporalError,
+)
 from temporalio.openai_agents._errors import (
     AgentsWorkflowError as AgentsWorkflowError,
 )
@@ -38,6 +44,7 @@ from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
 from temporalio.workflow import (
     ActivityCancellationType,
     ActivityConfig,
+    NexusOperationCancellationType,
     VersioningIntent,
 )
 
@@ -236,6 +243,7 @@ def nexus_operation_as_tool(
     service: type[Any],
     endpoint: str,
     schedule_to_close_timeout: timedelta | None = None,
+    cancellation_type: NexusOperationCancellationType = NexusOperationCancellationType.WAIT_COMPLETED,
     strict_json_schema: bool = True,
     failure_error_function: ToolErrorFunction | None = default_tool_error_function,
 ) -> Tool:
@@ -246,10 +254,17 @@ def nexus_operation_as_tool(
     during workflow execution. The tool will automatically handle the conversion
     of inputs and outputs between the agent and the operation.
 
+    When the agent run is cancelled, or stops because another tool failed, it
+    cancels the operation and waits as ``cancellation_type`` says before it
+    raises. With the default, ``WAIT_COMPLETED``, the Workflow closes only after
+    the operation has ended.
+
     Args:
         operation: A Nexus operation to convert into a tool.
         service: The Nexus service class that contains the operation.
         endpoint: The Nexus endpoint to use for the operation.
+        cancellation_type: How the operation is cancelled when the agent run
+            stops. See :py:class:`temporalio.workflow.NexusOperationCancellationType`.
         strict_json_schema: Whether the tool should follow a strict schema
         failure_error_function: Formats the error text returned to the model
             when its arguments are not valid JSON or do not match the
@@ -301,14 +316,23 @@ def nexus_operation_as_tool(
         [arg] = args
         # If the agent run is cancelled, its runner waits for this operation, so Temporal
         # delivers the operation's cancel request before the Workflow closes. Tracking starts
-        # before the start request: a cancelled task keeps waiting for the start to resolve.
-        with _track_tool_operation():
-            handle = await nexus_client.start_operation(
-                operation,
-                arg,
-                schedule_to_close_timeout=schedule_to_close_timeout,
-            )
-            result = await handle
+        # before the start request: a cancelled task keeps waiting for the start to resolve,
+        # unless the Workflow itself is cancelled.
+        with _track_tool_operation() as tracked:
+            try:
+                handle = await nexus_client.start_operation(
+                    operation,
+                    arg,
+                    schedule_to_close_timeout=schedule_to_close_timeout,
+                    cancellation_type=cancellation_type,
+                )
+                result = await handle
+            except NexusOperationError as e:
+                # The run stopped and the Agents SDK cancelled this call. End it as
+                # cancelled, so that asyncio and the Agents SDK do not log its error.
+                if tracked.cancelled and isinstance(e.cause, CancelledError):
+                    raise asyncio.CancelledError() from e
+                raise
         try:
             return str(result)
         except Exception as e:
