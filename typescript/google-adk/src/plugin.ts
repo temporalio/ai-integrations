@@ -665,8 +665,6 @@ export interface GoogleAdkPluginOptions {
  * out to Activities. Making that work requires the `@google/adk` barrel to
  * bundle into the Workflow sandbox; {@link GoogleAdkPlugin.configureBundler}
  * is what makes the bundle build (see the recipe documented there).
- *
- * @experimental
  */
 export class GoogleAdkPlugin extends SimplePlugin {
   private readonly autoRouteModels: boolean;

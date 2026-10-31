@@ -34,9 +34,6 @@ _DEFAULT_MCP_TIMEOUT = timedelta(seconds=60)
 class TemporalMcpClientSession(ClientSession):
     """``mcp.ClientSession`` whose tool discovery and calls run as activities.
 
-    .. warning::
-        This API is experimental and may change in future versions.
-
     Construct inside a workflow and pass it in the ``tools`` list of a
     ``generate_content`` call.  The matching server name must be registered on
     the worker via ``GoogleGenAIPlugin(mcp_servers={name: factory})``.

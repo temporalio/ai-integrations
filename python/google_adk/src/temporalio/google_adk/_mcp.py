@@ -94,10 +94,6 @@ class _CallToolArguments:
 class TemporalMcpToolSetProvider:
     """Provider for creating Temporal-aware MCP toolsets.
 
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
-
     Manages the creation of toolset activities and handles tool execution
     within Temporal workflows.
 
@@ -238,10 +234,6 @@ class _TemporalTool(BaseTool):
 class TemporalMcpToolSet(BaseToolset):
     """Temporal-aware MCP toolset implementation.
 
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
-
     Executes MCP tools as Temporal activities, providing proper isolation
     and execution guarantees within workflows.
     """
@@ -379,10 +371,6 @@ class _StatefulCallToolArguments:
 
 class TemporalStatefulMcpToolSetProvider:
     """Provider for a stateful, pooled MCP toolset backed by a dedicated worker.
-
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
 
     Unlike :class:`TemporalMcpToolSetProvider` (which builds and closes a fresh
     ``McpToolset`` per activity call), this provider maintains a single
@@ -572,10 +560,6 @@ class _TemporalStatefulTool(BaseTool):
 
 class TemporalStatefulMcpToolSet(BaseToolset):
     """Workflow-side handle for a stateful MCP toolset.
-
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
 
     Use it as an async context manager inside a workflow so the dedicated
     ``-server-session`` worker is started on ``connect`` and torn down on

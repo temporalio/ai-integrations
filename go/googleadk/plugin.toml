@@ -6,7 +6,7 @@ language = "go"
 coordinate = "go.temporal.io/googleadk"
 registry = "goproxy"
 root-api = "googleadk"
-maturity = "public-preview"
+maturity = "generally-available"
 docs = "https://github.com/temporalio/ai-integrations/blob/main/go/googleadk/README.md"
 
 [ci]

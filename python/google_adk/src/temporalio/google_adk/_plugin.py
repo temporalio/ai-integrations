@@ -111,10 +111,6 @@ def _warn_if_global_otel_providers_not_replay_safe() -> None:
 def setup_deterministic_runtime():
     """Configures ADK runtime for Temporal determinism.
 
-    .. warning::
-        This function is experimental and may change in future versions.
-        Use with caution in production environments.
-
     Installs Temporal-aware time, uuid, and random providers as the
     process-wide defaults for ADK's ``google.adk.platform`` seams. Inside a
     workflow they derive from ``workflow.now()`` / ``workflow.uuid4()`` /
@@ -167,10 +163,6 @@ def setup_deterministic_runtime():
 
 class GoogleAdkPlugin(SimplePlugin):
     """A Temporal Worker Plugin configured for ADK.
-
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
 
     This plugin configures:
     - Pydantic Payload Converter (required for ADK objects).

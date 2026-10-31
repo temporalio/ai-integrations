@@ -8,7 +8,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]   # committed copy of the repository's root LICENSE
 classifiers = [
-  "Development Status :: 4 - Beta",   # maturity; must agree with plugin.toml (see AGENTS.md for the mapping)
+  "Development Status :: 5 - Production/Stable",   # maturity; must agree with plugin.toml (see AGENTS.md for the mapping)
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
