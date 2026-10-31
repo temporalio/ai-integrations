@@ -7,8 +7,18 @@ import type { ActivityInboundCallsInterceptor, BundleOptions, WorkerOptions } fr
 import { SimplePlugin } from '@temporalio/plugin';
 import { rewriteError } from './strands-errors';
 import { ModelActivity } from './model-activity';
-import type { GetModelConfigInput, InvokeModelInput, InvokeModelStreamingInput } from './model-activity';
-import { GET_MODEL_CONFIG_ACTIVITY } from './temporal-model';
+import type {
+  GetModelConfigInput,
+  InvokeModelInput,
+  InvokeModelStreamingInput,
+  InvokeStatefulModelInput,
+  InvokeStatefulModelStreamingInput,
+} from './model-activity';
+import {
+  GET_MODEL_CONFIG_ACTIVITY,
+  INVOKE_STATEFUL_MODEL_ACTIVITY,
+  INVOKE_STATEFUL_MODEL_STREAMING_ACTIVITY,
+} from './temporal-model';
 import {
   buildCallToolActivity,
   buildListToolsActivity,
@@ -111,6 +121,9 @@ export class StrandsPlugin extends SimplePlugin {
     const activities: Record<string, (...args: never[]) => unknown> = {
       invokeModel: (input: InvokeModelInput) => modelActivity.invokeModel(input),
       invokeModelStreaming: (input: InvokeModelStreamingInput) => modelActivity.invokeModelStreaming(input),
+      [INVOKE_STATEFUL_MODEL_ACTIVITY]: (input: InvokeStatefulModelInput) => modelActivity.invokeStatefulModel(input),
+      [INVOKE_STATEFUL_MODEL_STREAMING_ACTIVITY]: (input: InvokeStatefulModelStreamingInput) =>
+        modelActivity.invokeStatefulModelStreaming(input),
       [GET_MODEL_CONFIG_ACTIVITY]: (input: GetModelConfigInput) => modelActivity.getModelConfig(input),
     };
     // Without `models`, every plugin builds the same default.
