@@ -456,6 +456,12 @@ async def test_stateful_session_stops_on_activity_reset(
         async with asyncio.timeout(45):
             while not CREATED[0].closed:
                 await asyncio.sleep(0.1)
+        # Let the reset attempt be refused before the next get_tools.
+        async with asyncio.timeout(30):
+            while not await _has_event(
+                handle, EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED
+            ):
+                await asyncio.sleep(0.2)
         await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
         with pytest.raises(WorkflowFailureError) as err:
             await handle.result()
@@ -849,6 +855,13 @@ async def test_stateful_session_after_host_killed(
             # After the heartbeat timeout, Temporal retries the session
             # activity on another host.
             async with Worker(client, task_queue=host_task_queue):
+                # Let the retried session activity fail before the next
+                # get_tools, which would otherwise time out first.
+                async with asyncio.timeout(30):
+                    while not await _has_event(
+                        handle, EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED
+                    ):
+                        await asyncio.sleep(0.2)
                 await handle.signal(StatefulMcpHostKilledWorkflow.resume)
                 with pytest.raises(WorkflowFailureError) as err:
                     await handle.result()
