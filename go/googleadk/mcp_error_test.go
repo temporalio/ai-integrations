@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
@@ -110,7 +112,9 @@ func fakeLookup(err error) func(runs *atomic.Int32) googleadk.MCPFactory {
 // TestMcpToolErrorReachesModel proves an MCP tool's own error, such as an
 // isError result, reaches the model once with the text ADK gives it without
 // Temporal, while a failed MCP request is still retried and an
-// ApplicationError still fails the Activity.
+// ApplicationError still fails the Activity. It also decodes CallMcpTool's
+// output as a workflow worker from before the fix does, reading only Result,
+// and checks that it holds the same error.
 func TestMcpToolErrorReachesModel(t *testing.T) {
 	notFound := "^" + regexp.QuoteMeta("Tool execution failed. Details: order A-1 not found") + "$"
 	for _, tc := range []struct {
@@ -118,12 +122,13 @@ func TestMcpToolErrorReachesModel(t *testing.T) {
 		factory   func(runs *atomic.Int32) googleadk.MCPFactory
 		wantCalls int    // CallMcpTool attempts
 		want      string // pattern for the "error" the model sees
+		answered  bool   // CallMcpTool succeeds with the tool's error
 	}{
-		{"isError result", adkLookup(false), 1, notFound},
-		{"failed request, then isError result", adkLookup(true), 2, notFound},
-		{"FakeMCPServer handler error", fakeLookup(errors.New("order A-1 not found")), 1, "^order A-1 not found$"},
+		{"isError result", adkLookup(false), 1, notFound, true},
+		{"failed request, then isError result", adkLookup(true), 2, notFound, true},
+		{"FakeMCPServer handler error", fakeLookup(errors.New("order A-1 not found")), 1, "^order A-1 not found$", true},
 		{"ApplicationError", fakeLookup(temporal.NewNonRetryableApplicationError("order A-1 not found", "NotFound", nil)), 1,
-			`^activity error \(type: googleadk\.CallMcpTool, .*\(type: NotFound, retryable: false\)$`},
+			`^activity error \(type: googleadk\.CallMcpTool, .*\(type: NotFound, retryable: false\)$`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var runs atomic.Int32
@@ -137,6 +142,14 @@ func TestMcpToolErrorReachesModel(t *testing.T) {
 				)},
 				MCPToolsets: map[string]googleadk.MCPFactory{"orders": tc.factory(&runs)},
 			})
+			// The fields a workflow worker from before the fix decodes.
+			var oldOut *struct{ Result map[string]any }
+			env.SetOnActivityCompletedListener(func(info *activity.Info, result converter.EncodedValue, err error) {
+				if info.ActivityType.Name == googleadk.CallMcpToolActivityName && err == nil {
+					oldOut = new(struct{ Result map[string]any })
+					require.NoError(t, result.Get(oldOut))
+				}
+			})
 
 			env.ExecuteWorkflow(mcpLookupWorkflow)
 
@@ -147,6 +160,12 @@ func TestMcpToolErrorReachesModel(t *testing.T) {
 			assert.Regexp(t, tc.want, got["error"])
 			assert.EqualValues(t, 1, runs.Load(), "tool runs")
 			assert.Equal(t, tc.wantCalls, counter.get(googleadk.CallMcpToolActivityName), "CallMcpTool attempts")
+			if tc.answered {
+				require.NotNil(t, oldOut, "CallMcpTool output")
+				assert.Equal(t, map[string]any{"error": got["error"]}, oldOut.Result, "Result read by an older workflow worker")
+			} else {
+				assert.Nil(t, oldOut, "CallMcpTool output")
+			}
 		})
 	}
 }

@@ -175,7 +175,9 @@ type mcpCallInput struct {
 // non-nil when the tool paused on ADK's tool.ErrConfirmationRequired protocol
 // instead of running; the workflow-side proxy re-records it so the runner
 // surfaces the pause exactly like an in-workflow tool. Error is the message of
-// the tool's own error, which the proxy hands to ADK; see CallMcpTool.
+// the tool's own error, which the proxy hands to ADK; see CallMcpTool. Result
+// then holds {"error": message}, the response ADK builds from a tool error, so
+// a workflow worker without the Error field gives the model the same response.
 type mcpCallOutput struct {
 	Result       map[string]any
 	Confirmation *toolconfirmation.ToolConfirmation
@@ -272,7 +274,7 @@ func (a *Activities) CallMcpTool(ctx context.Context, in mcpCallInput) (*mcpCall
 			}
 			if isToolAnswer(runErr) {
 				msg := runErr.Error()
-				return &mcpCallOutput{Error: &msg}, nil
+				return &mcpCallOutput{Result: map[string]any{"error": msg}, Error: &msg}, nil
 			}
 			return nil, classifyToolError(ErrorTypeMCP, in.Tool, runErr)
 		}
