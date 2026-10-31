@@ -401,6 +401,12 @@ def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
     ) from e
 
 
+def _cancel_requested() -> bool:
+    """Whether the workflow asked to cancel the running activity."""
+    details = activity.cancellation_details()
+    return details is not None and details.cancel_requested
+
+
 def _default_openai_client() -> AsyncOpenAI:
     """Return the framework's default client as it is, or a client on its default key.
 
@@ -519,6 +525,10 @@ class ModelActivity:
                         events_topic.publish(event)
                 except APIStatusError as e:
                     _raise_for_openai_status(e)
+            # Leaving the context manager swallows a cancel that arrives while it
+            # stops the stream's background flusher, so raise that cancel here.
+            if _cancel_requested():
+                raise asyncio.CancelledError()
         except asyncio.CancelledError:
             # When the workflow cancelled the call, for example because a parallel
             # input guardrail tripped, tell subscribers the response ends here. The
@@ -526,8 +536,7 @@ class ModelActivity:
             # manager flushes the events, so publish after both, behind the events
             # still buffered. Other cancels, such as a Worker shutdown or a heartbeat
             # timeout, can be retried, so publish nothing and let the retry answer.
-            details = activity.cancellation_details()
-            if details is not None and details.cancel_requested:
+            if _cancel_requested():
                 events_topic.publish(
                     ResponseErrorEvent(
                         type="error",

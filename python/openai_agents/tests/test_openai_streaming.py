@@ -541,12 +541,13 @@ async def test_streamed_run_runs_sync_function_tools(client: Client):
 
 class HoldingStreamingModel(StreamingTestModel):
     """Streaming test model that sends its first delta, then, on the activity's first
-    attempt, waits up to 10 s before the rest.
+    attempt, waits up to ``hold`` seconds (10 by default) before the rest.
 
     Records the attempts and whether its stream was cancelled during the wait.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, hold: float = 10) -> None:
+        self.hold = hold
         self.cancelled = False
         self.attempts: list[int] = []
 
@@ -576,7 +577,7 @@ class HoldingStreamingModel(StreamingTestModel):
         yield await anext(events)
         if attempt == 1:
             try:
-                await asyncio.sleep(10)
+                await asyncio.sleep(self.hold)
             except asyncio.CancelledError:
                 self.cancelled = True
                 raise
@@ -796,10 +797,36 @@ def delay_stream_publishing(monkeypatch: pytest.MonkeyPatch, seconds: float) -> 
     monkeypatch.setattr(WorkflowHandle, "signal", delayed_signal)
 
 
+def clean_up_first_publish_slowly(
+    monkeypatch: pytest.MonkeyPatch, seconds: float
+) -> None:
+    """Hold the first stream publish signal until it is cancelled, then take ``seconds``
+    to clean up before it raises."""
+    signal = WorkflowHandle.signal
+    first = True
+
+    async def slow_cleanup_signal(
+        self: WorkflowHandle[Any, Any], name: Any, *args: Any, **kwargs: Any
+    ) -> None:
+        nonlocal first
+        if name == "__temporal_workflow_stream_publish" and first:
+            first = False
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                await asyncio.sleep(seconds)
+                raise
+        await signal(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(WorkflowHandle, "signal", slow_cleanup_signal)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("max_cached_workflows", [1000, 0], ids=["cached", "uncached"])
 @pytest.mark.parametrize(
-    "cancelled_while", ["streaming", "publishing"], ids=["streaming", "publishing"]
+    "cancelled_while",
+    ["streaming", "publishing", "stopping-the-flusher"],
+    ids=["streaming", "publishing", "stopping-the-flusher"],
 )
 async def test_streaming_input_guardrail_trip_waits_for_the_error_event(
     client: Client,
@@ -811,15 +838,21 @@ async def test_streaming_input_guardrail_trip_waits_for_the_error_event(
     still has the error event at the end of its stream, and the Worker shuts down after
     the cancel, with or without a Workflow cache. That holds whether the cancel reaches
     the activity while the model streams or after the model finished, while the activity
-    still publishes its events."""
+    still publishes its events or stops the stream's background flusher."""
     model: StreamingTestModel
     if cancelled_while == "streaming":
         model = HoldingStreamingModel()
-    else:
+    elif cancelled_while == "publishing":
         # The model finishes at once, but the topic gets nothing for 8 s, so the cancel
         # arrives while the activity is still publishing.
         model = StreamingTestModel()
         delay_stream_publishing(monkeypatch, 8)
+    else:
+        # The background flusher's first publish hangs. The model finishes after
+        # 0.3 s, and stopping the flusher takes 8 s, so the cancel arrives while the
+        # stream's context manager waits for the flusher.
+        model = HoldingStreamingModel(hold=0.3)
+        clean_up_first_publish_slowly(monkeypatch, 8)
     async with AgentEnvironment(
         model=model,
         model_params=ModelActivityParameters(
@@ -857,13 +890,16 @@ async def test_streaming_input_guardrail_trip_waits_for_the_error_event(
     assert result == "refused"
     assert isinstance(last, ResponseErrorEvent)
     assert last.code == "cancelled"
-    if isinstance(model, HoldingStreamingModel):
+    if cancelled_while == "streaming":
         # The model held after its first delta and was cancelled, so the stream holds
         # that delta and the error event.
+        assert isinstance(model, HoldingStreamingModel)
         assert model.cancelled
         assert offset == 2
     else:
         # Two deltas, response.completed, and the error event.
+        if isinstance(model, HoldingStreamingModel):
+            assert not model.cancelled
         assert offset == 4
 
 
