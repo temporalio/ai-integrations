@@ -281,17 +281,19 @@ class _LangChainRuns:
     generator (see ``_install_langchain_run_id_hook``), so callbacks and
     LangSmith see the same ID.  A run ID the caller chose, such as
     ``config["run_id"]``, is kept.  Every run's start time comes from
-    ``workflow.now()``, at least 1 microsecond after the run before it, so
-    runs keep the order they started in.  The generator is separate from
-    ``_get_workflow_random`` so the plugin's own run IDs do not change.
+    ``workflow.now()`` when the run starts, at least 1 microsecond after the
+    run before it, so runs keep the order they started in.  The generator is
+    separate from ``_get_workflow_random`` so the plugin's own run IDs do
+    not change.
     """
 
     def __init__(self) -> None:
         self._rng = random.Random()
         self._ids: dict[str, tuple[uuid.UUID, datetime]] = {}
         self._last_start: datetime | None = None
-        # Writes held back during replay, for runs that are still open.
-        self.pending: dict[uuid.UUID, list[_HeldWrite]] = {}
+        # Writes held back during replay, for runs that are still open, with
+        # the client that would have made them.
+        self.pending: dict[uuid.UUID, tuple[_ReplaySafeClient, list[_HeldWrite]]] = {}
 
         def reseed(seed: int) -> None:
             self._rng.seed(f"temporal-langsmith-langchain-{seed}")
@@ -323,6 +325,11 @@ class _LangChainRuns:
             self._ids[str(run_id)] = entry
         return entry[0]
 
+    def start_time(self, run_id: Any) -> datetime:
+        """Get the start time of a run that keeps its ID, adding it first."""
+        self.add(run_id, keep_id=True)
+        return self._ids[str(run_id)][1]
+
     def _next_start(self) -> datetime:
         # The runs of one workflow task would all start at workflow.now(),
         # and LangSmith orders sibling runs by start time.
@@ -351,7 +358,7 @@ class _LangChainRuns:
         """Point a run at the stable IDs of the runs above it."""
         if str(run.parent_run_id) in self._ids:
             # Start after the parent, like the parent's other children.
-            run.start_time = self._ids[str(self.add(run.id, keep_id=True))][1]
+            run.start_time = self.start_time(run.id)
         run.parent_run_id = self.stable_id(run.parent_run_id)
         run.trace_id = self.stable_id(run.trace_id)
         run.dotted_order = self.dotted_order(run.dotted_order)
@@ -457,15 +464,21 @@ def _replay_safe_tracer(start_trace: Callable[..., Any]) -> Callable[..., Any]:
     runs get stable IDs in workflow code like any other, so without the
     wrapper a replay would write them again under the same IDs.  The tracer
     sets its client on each run after this.
+
+    The run also gets its stable start time here, when it starts, before
+    the tracer builds the dotted order its children copy.  A run with
+    deferred inputs, such as a ``RunnableGenerator``'s, is posted only when
+    it ends, after its children.
     """
 
     def _start_trace(self: Any, run: Any) -> None:
-        if (
-            not isinstance(self.client, _ReplaySafeClient)
-            and isinstance(get_tracing_context().get("client"), _ReplaySafeClient)
-            and _get_langchain_runs() is not None
-        ):
-            self.client = _replay_safe_client(self.client)
+        runs = None
+        if isinstance(get_tracing_context().get("client"), _ReplaySafeClient):
+            runs = _get_langchain_runs()
+        if runs is not None:
+            if not isinstance(self.client, _ReplaySafeClient):
+                self.client = _replay_safe_client(self.client)
+            run.start_time = runs.start_time(run.id)
         start_trace(self, run)
 
     return _start_trace
@@ -612,29 +625,39 @@ def _prepare_write(
     return holding.held
 
 
-# How many open runs a _ReplaySafeClient remembers posting.
+# How many open runs a LangSmith client's record holds.
 _MAX_OPEN_RUNS = 10_000
 
-_replay_safe_clients: weakref.WeakValueDictionary[int, _ReplaySafeClient] = (
-    weakref.WeakValueDictionary()
+# The runs each LangSmith client posted from workflow code that have not
+# ended, oldest first, for as long as the client lives.  A run that never
+# ends here, such as one whose workflow was terminated, is dropped after
+# _MAX_OPEN_RUNS others.
+_open_runs: weakref.WeakKeyDictionary[Any, OrderedDict[uuid.UUID, None]] = (
+    weakref.WeakKeyDictionary()
 )
-_replay_safe_clients_lock = threading.Lock()
+_open_runs_lock = threading.Lock()
 
 
 def _replay_safe_client(client: Any) -> _ReplaySafeClient:
-    """Get the ``_ReplaySafeClient`` of a LangSmith client.
-
-    There is one per client, so every tracer that writes through a client
-    shares its record of the runs it posted.
-    """
+    """Get a ``_ReplaySafeClient`` for a LangSmith client."""
     if isinstance(client, _ReplaySafeClient):
         return client
-    with _replay_safe_clients_lock:
-        wrapper = _replay_safe_clients.get(id(client))
-        if wrapper is None:
-            wrapper = _ReplaySafeClient(client)
-            _replay_safe_clients[id(client)] = wrapper
-        return wrapper
+    return _ReplaySafeClient(client)
+
+
+def _post_pending(runs: _LangChainRuns) -> None:
+    """Make the held writes of replayed runs that are still open.
+
+    Each run's writes go through the client that would have made them, and
+    only if that client has not posted the run.
+    """
+    pending = list(runs.pending.items())
+    runs.pending.clear()
+    for run_id, (client, held) in pending:
+        if run_id in client._open:
+            continue
+        client._add_open(run_id)
+        client._write(run_id, held)
 
 
 class _ReplaySafeClient:
@@ -643,12 +666,13 @@ class _ReplaySafeClient:
     LangChain's tracers write their runs through this client, not through
     ``_ReplaySafeRunTree`` (see ``_replay_safe_tracer``).  In workflow code,
     this gives those runs stable IDs (see ``_LangChainRuns``) and holds back
-    their writes while history replays.  A replayed callback still runs the
-    client's own steps before its write, synchronously, so errors those
-    steps raise, such as from a redaction callback, reach LangChain's tracer
-    as in the original run.  At the first write after a replay, it makes the
-    held writes of the replayed runs that are still open and that this
-    client has not posted, as after a worker restart.  Other calls, and
+    their writes while history replays.  A callback runs the client's own
+    steps before its write, synchronously, live or replaying, so errors
+    those steps raise, such as from a redaction callback, reach LangChain's
+    tracer each time.  Errors from the write itself are logged, since a
+    replay does not write.  At the first write after a replay, the held
+    writes of the replayed runs that are still open, and that their client
+    has not posted, are made, as after a worker restart.  Other calls, and
     writes from other threads such as ``_ReplaySafeRunTree``'s background
     I/O, go to the wrapped client as is.
     """
@@ -656,10 +680,13 @@ class _ReplaySafeClient:
     def __init__(self, client: langsmith.Client) -> None:
         """Wrap a LangSmith client."""
         self._client = client
-        # Runs this client posted from workflow code that have not ended,
-        # oldest first.  A run that never ends here, such as one whose
-        # workflow was terminated, is dropped after _MAX_OPEN_RUNS others.
-        self._open: OrderedDict[uuid.UUID, None] = OrderedDict()
+        # Every wrapper of a client shares its record.
+        with _open_runs_lock:
+            try:
+                self._open = _open_runs.setdefault(client, OrderedDict())
+            except TypeError:
+                # A client without weak references keeps a record per wrapper.
+                self._open = OrderedDict()
 
     def __getattr__(self, name: str) -> Any:
         """Delegate attribute access to the wrapped client."""
@@ -673,16 +700,18 @@ class _ReplaySafeClient:
         run_id = runs.add(kwargs["id"], keep_id=True)
         runs.remap(kwargs, "id")
         ended = kwargs.get("end_time") is not None
-        if _is_replaying():
-            held = _prepare_write(self._client, "create_run", kwargs)
-            # An empty list: the client's sampling dropped the run.
-            if not ended and held:
-                runs.pending[run_id] = held
+        held = _prepare_write(self._client, "create_run", kwargs)
+        # An empty list: the client's sampling dropped the run.
+        if not held:
             return None
-        self._post_pending(runs)
-        self._client.create_run(**kwargs)
+        if _is_replaying():
+            if not ended:
+                runs.pending[run_id] = (self, held)
+            return None
+        _post_pending(runs)
         if not ended:
             self._add_open(run_id)
+        self._write(run_id, held)
         return None
 
     def update_run(self, *args: Any, **kwargs: Any) -> None:
@@ -692,13 +721,13 @@ class _ReplaySafeClient:
         if runs is None or run_id is None:
             return self._client.update_run(*args, **kwargs)
         ended = kwargs.get("end_time") is not None
+        held = _prepare_write(self._client, "update_run", kwargs)
         if _is_replaying():
-            _prepare_write(self._client, "update_run", kwargs)
             if ended:
                 runs.pending.pop(run_id, None)
             return None
-        self._post_pending(runs)
-        self._client.update_run(**kwargs)
+        _post_pending(runs)
+        self._write(run_id, held)
         if ended:
             self._open.pop(run_id, None)
         return None
@@ -708,26 +737,19 @@ class _ReplaySafeClient:
         if len(self._open) > _MAX_OPEN_RUNS:
             self._open.popitem(last=False)
 
-    def _post_pending(self, runs: _LangChainRuns) -> None:
-        # The held writes already went through the client's synchronous
-        # steps at their replayed callbacks; only a process_buffered_run_ops
-        # callback, which runs on the client's buffer, processes them here.
-        # No error can reach workflow code from here; log it.
-        pending = list(runs.pending.items())
-        runs.pending.clear()
-        for run_id, held in pending:
-            if run_id in self._open:
-                continue
-            self._add_open(run_id)
-            for write in held:
-                try:
-                    _write_held(self._client, write)
-                except Exception:
-                    temporalio.workflow.logger.warning(
-                        "Failed to post LangSmith run %s after replay",
-                        run_id,
-                        exc_info=True,
-                    )
+    def _write(self, run_id: uuid.UUID, held: list[_HeldWrite]) -> None:
+        # The writes already went through the client's synchronous steps;
+        # only a process_buffered_run_ops callback, which runs on the
+        # client's buffer, processes them here.  A replay makes no write, so
+        # an error from one, such as an HTTP error without auto_batch_tracing,
+        # must not reach workflow code; log it.
+        for write in held:
+            try:
+                _write_held(self._client, write)
+            except Exception:
+                temporalio.workflow.logger.warning(
+                    "Failed to write LangSmith run %s", run_id, exc_info=True
+                )
 
 
 # ---------------------------------------------------------------------------

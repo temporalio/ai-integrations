@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +23,7 @@ from temporalio.langsmith._interceptor import (
     _inject_context,
     _LangSmithWorkflowInboundInterceptor,
     _maybe_run,
+    _post_pending,
     _ReplaySafeClient,
     _ReplaySafeRunTree,
 )
@@ -287,10 +289,20 @@ class TestReplaySafety:
         # After a replay, the forgotten run is posted again; the other is not.
         runs = MagicMock()
         runs.pending = {
-            run_id: [("create_run", {"id": run_id}, {})] for run_id in run_ids[:2]
+            run_id: (client, [("create_run", {"id": run_id}, {})])
+            for run_id in run_ids[:2]
         }
-        client._post_pending(runs)
+        _post_pending(runs)
         mock_client.create_run.assert_called_once_with(id=run_ids[0])
+
+    def test_client_record_outlives_its_wrapper(self) -> None:
+        """A client's record of its open runs lasts as long as the client."""
+        mock_client = MagicMock()
+        run_id = uuid.uuid4()
+        _ReplaySafeClient(mock_client)._add_open(run_id)
+        gc.collect()
+        assert list(_ReplaySafeClient(mock_client)._open) == [run_id]
+        assert list(_ReplaySafeClient(MagicMock())._open) == []
 
 
 # ===================================================================

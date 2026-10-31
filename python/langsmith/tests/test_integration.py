@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import uuid
+from collections import Counter
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
@@ -14,7 +17,7 @@ import nexusrpc.handler
 import pytest
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.env import get_runtime_environment
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import RunnableGenerator, RunnableLambda
 from langchain_core.tracers.langchain import LangChainTracer
 from langsmith import traceable, tracing_context
 from langsmith.run_helpers import get_tracing_context
@@ -148,16 +151,27 @@ async def _call_traceable_activity() -> str:
     )
 
 
-# The client of LangChainHelperWorkflow's own tracer; the test sets it.
+@traceable(name="stream_traceable_activity")
+async def _stream_traceable_activity() -> str:
+    """Another @traceable helper around an activity."""
+    return await workflow.execute_activity(
+        traceable_activity,
+        start_to_close_timeout=timedelta(minutes=1),
+        retry_policy=common.RetryPolicy(maximum_attempts=1),
+    )
+
+
+# The clients of the tracers workflows make of their own; tests set them.
 _own_tracer_clients: list[Any] = []
 
 
 @workflow.defn
 class LangChainHelperWorkflow:
-    """Runs a LangChain runnable whose last step calls a @traceable helper.
+    """Runs a LangChain runnable whose steps call @traceable helpers.
 
-    With ``own_tracer``, the runnable gets a ``LangChainTracer`` built with
-    the client in ``_own_tracer_clients``, so run it unsandboxed.
+    The ``stream`` step is a generator, whose run LangChain posts only when
+    it ends.  With ``own_tracer``, the runnable gets a ``LangChainTracer``
+    built with the client in ``_own_tracer_clients``, so run it unsandboxed.
     """
 
     @workflow.run
@@ -168,8 +182,18 @@ class LangChainHelperWorkflow:
         async def call_helper(_prompt: str) -> str:
             return await _call_traceable_activity()
 
-        chain = RunnableLambda(prepare, name="prepare") | RunnableLambda(
-            call_helper, name="call_helper"
+        async def stream(chunks: AsyncIterator[str]) -> AsyncIterator[str]:
+            async for chunk in chunks:
+                yield chunk + await _stream_traceable_activity()
+
+        async def finish(text: str) -> str:
+            return text
+
+        chain = (
+            RunnableLambda(prepare, name="prepare")
+            | RunnableLambda(call_helper, name="call_helper")
+            | RunnableGenerator(stream, name="stream")
+            | RunnableLambda(finish, name="finish")
         )
         config: Any = {}
         if own_tracer:
@@ -195,6 +219,40 @@ class LangChainSignalWorkflow:
             return text
 
         return await RunnableLambda(wait, name="wait").ainvoke("secret")
+
+
+@workflow.defn
+class LangChainTwoClientsWorkflow:
+    """Runs two LangChain runnables at once, each traced to its own client.
+
+    The step of the runnable for "a" or "b" waits for that name's signal.
+    The clients are the two in ``_own_tracer_clients``, so run it
+    unsandboxed.
+    """
+
+    def __init__(self) -> None:
+        self._released: set[str] = set()
+
+    @workflow.signal
+    def release(self, name: str) -> None:
+        self._released.add(name)
+
+    @workflow.run
+    async def run(self) -> list[str]:
+        async def wait(name: str) -> str:
+            await workflow.wait_condition(lambda: name in self._released)
+            return name
+
+        return list(
+            await asyncio.gather(
+                *(
+                    RunnableLambda(wait, name=f"wait_{name}").ainvoke(
+                        name, config={"callbacks": [LangChainTracer(client=client)]}
+                    )
+                    for name, client in zip("ab", _own_tracer_clients)
+                )
+            )
+        )
 
 
 @activity.defn
@@ -689,14 +747,33 @@ class TestReplay:
             "prepare",
             "call_helper",
             "call_traceable_activity",
+            "stream",
+            "stream_traceable_activity",
+            "finish",
         } <= {run["name"] for run in posts}
-        # Each run is posted once and patched once, with no error.
-        names = [run["name"] for run in posts]
-        assert len(names) == len(set(names)), names
+        # Each run is posted once and patched once, with no error.  The
+        # activity's runs are posted once for each of the two calls.
+        twice = {
+            "StartActivity:traceable_activity",
+            "RunActivity:traceable_activity",
+            "traceable_activity",
+            "inner_llm_call",
+        }
+        counts = Counter(run["name"] for run in posts)
+        assert {
+            name: count
+            for name, count in counts.items()
+            if count != (2 if name in twice else 1)
+        } == {}
+        # langchain-core releases that defer a generator's inputs post its
+        # run when it ends, and do not patch it.
+        [stream] = [run for run in posts if run["name"] == "stream"]
         assert sorted(str(run["id"]) for run in patches) == sorted(
-            str(run["id"]) for run in posts
+            str(run["id"])
+            for run in posts
+            if not (run is stream and stream.get("end_time"))
         )
-        assert [run["error"] for run in patches if run.get("error")] == []
+        assert [run["error"] for run in posts + patches if run.get("error")] == []
         # Runs start in the order they were made, after their parents.
         starts = {
             str(run["id"]): run["start_time"]
@@ -705,28 +782,45 @@ class TestReplay:
             for run in posts
         }
         ids = {run["name"]: str(run["id"]) for run in posts}
-        assert starts[ids["prepare"]] < starts[ids["call_helper"]]
+        steps = ["prepare", "call_helper", "stream", "finish"]
+        assert sorted(steps, key=lambda name: starts[ids[name]]) == steps
+        # A run's post and patch, and its children, agree on its dotted order.
+        orders = {str(run["id"]): run["dotted_order"] for run in posts}
+        for run in patches:
+            if run.get("dotted_order"):
+                assert run["dotted_order"] == orders[str(run["id"])], run
         for run in posts:
             parent = str(run.get("parent_run_id"))
             if parent in starts:
                 assert starts[parent] <= starts[str(run["id"])], run["name"]
+                assert run["dotted_order"].startswith(orders[parent] + "."), run
 
+    @pytest.mark.parametrize(
+        ("failing_step", "expected"), [("redaction", "fallback"), ("write", "primary")]
+    )
     async def test_tracing_error_raised_again_on_replay(
         self,
         client: Client,
         env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+        failing_step: str,
+        expected: str,
     ) -> None:
-        """A redaction error workflow code catches is raised on replay too."""
+        """A redaction error workflow code catches is raised on replay too.
+
+        An error from the write itself never reaches workflow code, since a
+        replay does not write.
+        """
         get_runtime_environment()
 
         def hide_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
-            if "secret" in str(inputs):
+            if failing_step == "redaction" and "secret" in str(inputs):
                 raise ValueError("redaction failed")
             return inputs
 
         class _NoWriteClient(langsmith.Client):
             def _create_run(self, *args: Any, **kwargs: Any) -> None:
-                pass
+                if failing_step == "write":
+                    raise ValueError("write failed")
 
             def _update_run(self, *args: Any, **kwargs: Any) -> None:
                 pass
@@ -753,7 +847,127 @@ class TestReplay:
                 task_queue=worker.task_queue,
                 run_timeout=timedelta(seconds=20),
             )
-        assert result == "fallback"
+        assert result == expected
+
+    @pytest.mark.parametrize("first", ["a", "b"])
+    async def test_held_writes_keep_their_client(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+        first: str,
+    ) -> None:
+        """Each client writes only its own runs, each once per worker."""
+        get_runtime_environment()
+        langsmith.env.get_langchain_env_var_metadata()
+        # (client, "post" or "patch", run), as written and as processed
+        writes: list[tuple[str, str, dict[str, Any]]] = []
+        processed: list[tuple[str, dict[str, Any]]] = []
+
+        class _RecordingClient(langsmith.Client):
+            label = ""
+
+            def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append((self.label, "post", args[0]))
+
+            def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append((self.label, "patch", args[0]))
+
+        def ls_client(label: str) -> Any:
+            def process(runs: Any) -> Any:
+                processed.extend((label, run) for run in runs)
+                return runs
+
+            result = _RecordingClient(
+                api_url="http://localhost:1",
+                api_key="test",
+                auto_batch_tracing=False,
+                process_buffered_run_ops=process,
+                run_ops_buffer_size=1,
+            )
+            result.label = label
+            return result
+
+        def temporal_client(label: str) -> Client:
+            config = client.config()
+            config["plugins"] = [LangSmithPlugin(client=ls_client(label))]
+            return Client(**config)
+
+        async def wait_for_tasks(handle: WorkflowHandle[Any, Any], count: int) -> None:
+            for _ in range(100):
+                history = await handle.fetch_history()
+                if (
+                    sum(
+                        e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED
+                        for e in history.events
+                    )
+                    >= count
+                ):
+                    return
+                await asyncio.sleep(0.1)
+            raise AssertionError("workflow task not completed")
+
+        second = "b" if first == "a" else "a"
+        task_queue = str(uuid.uuid4())
+        workflow_id = f"replay-test-{uuid.uuid4()}"
+        _own_tracer_clients[:] = [ls_client("a1"), ls_client("b1")]
+        # A cache of 0: each workflow task replays, so the tracers and the
+        # client wrappers of the last are gone.
+        async with new_worker(
+            temporal_client("plugin1"),
+            LangChainTwoClientsWorkflow,
+            task_queue=task_queue,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+            max_cached_workflows=0,
+        ):
+            handle = await client.start_workflow(
+                LangChainTwoClientsWorkflow.run, id=workflow_id, task_queue=task_queue
+            )
+            await wait_for_tasks(handle, 1)
+            gc.collect()
+            await handle.signal(LangChainTwoClientsWorkflow.release, first)
+            await wait_for_tasks(handle, 2)
+
+        # A new worker, with new clients, replays the run started above.
+        _own_tracer_clients[:] = [ls_client("a2"), ls_client("b2")]
+        async with new_worker(
+            temporal_client("plugin2"),
+            LangChainTwoClientsWorkflow,
+            task_queue=task_queue,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            await handle.signal(LangChainTwoClientsWorkflow.release, second)
+            assert await handle.result() == ["a", "b"]
+
+        for _ in range(100):
+            if len(writes) >= 5:
+                break
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.2)
+        names = {str(run["id"]): run["name"] for _, op, run in writes if op == "post"}
+
+        def by_client(
+            records: list[tuple[str, str, str]],
+        ) -> dict[str, list[tuple[str, str]]]:
+            result: dict[str, list[tuple[str, str]]] = {}
+            for label, op, name in records:
+                result.setdefault(label, []).append((op, name))
+            return {label: sorted(ops) for label, ops in result.items()}
+
+        expected = {
+            f"{first}1": [("patch", f"wait_{first}"), ("post", f"wait_{first}")],
+            f"{second}1": [("post", f"wait_{second}")],
+            f"{second}2": [("patch", f"wait_{second}"), ("post", f"wait_{second}")],
+        }
+        assert (
+            by_client([(c, op, names[str(run["id"])]) for c, op, run in writes])
+            == expected
+        )
+        # Each client's process_buffered_run_ops got only its own writes.
+        assert by_client(
+            [(c, "run", names[str(run["id"])]) for c, run in processed]
+        ) == {
+            label: [("run", name) for _, name in ops] for label, ops in expected.items()
+        }
 
     async def test_buffered_processing_after_worker_restart(
         self,
