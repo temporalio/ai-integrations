@@ -403,14 +403,57 @@ that has the plugin. See this module's tests for exact activity sequences, paral
 MCP, confirmation, continue-as-new, and determinism (a forced replay on a fresh worker)
 examples.
 
+## Native ADK tracing
+
+`GoogleAdkTracing` exports ADK's native `invoke_agent`, `call_llm`, and `execute_tool` spans,
+with their agent, model, tool, session, and response attributes, for agents that run inside
+Workflows. Those spans use Workflow time and deterministic span IDs derived from the Run ID, so
+they add no Workflow commands and do not consume `Workflow.newRandom()`.
+
+Create the tracing instance with a dedicated `SpanExporter` and your application's `Resource`,
+wrap the application's OpenTelemetry instance before registering it globally, and give the
+tracing instance to the plugin:
+
+```java
+GoogleAdkTracing tracing = GoogleAdkTracing.create(nativeExporter, resource);
+GlobalOpenTelemetry.set(GoogleAdkTracing.wrap(applicationTelemetry));
+
+GoogleAdkPlugin plugin =
+    GoogleAdkPlugin.newBuilder()
+        .model("gemini-2.5-flash", () -> Gemini.builder().modelName("gemini-2.5-flash").build())
+        .tracing(tracing)
+        .build();
+```
+
+`GlobalOpenTelemetry.set` must run before anything reads the global instance and before any ADK
+code runs, because ADK captures its tracer once in a static initializer; do not call the SDK's
+`buildAndRegisterGlobal()`. `applicationTelemetry` may be `OpenTelemetry.noop()`, in which case
+only native spans from Workflows are exported. Native ADK spans on the Workflow threads of
+Workers whose plugin set `tracing(...)` go to that instance; other instrumentation, ADK calls
+outside Workflows, metrics, logs, and Workers without it keep the application's configuration.
+The plugin propagates W3C trace context into model and tool Activities and across Workflow
+threads, including timer and Activity completion callbacks, and model-provider RxJava threads.
+
+Drive agents through `TemporalAdk.run` or `TemporalAdk.await`. Workflow spans stay in memory
+until the outer turn completes, fails, or is canceled, then export once; spans ended outside such
+a turn are dropped. Replay rebuilds unfinished turns with the same span IDs and exports nothing
+for completed turns; eviction discards unfinished buffers. Export is asynchronous and not
+transactional with Workflow Task completion, so a crash or a Workflow Task retry between export
+and commit can repeat spans with the same IDs. A Reset starts a new Run with new IDs; Activity
+spans exported before a mid-turn Reset lose their parent.
+
+`tracing.forceFlush().join(10, TimeUnit.SECONDS)` waits for pending exports while Workers run.
+After the Workers shut down, `tracing.close()` drains and shuts down the dedicated exporter; it
+never closes `applicationTelemetry`. Use separate exporter instances for the two providers.
+
 ## Limitations
 
 - Live output needs an explicit topic and a hosted Workflow Stream; live (bidirectional)
   connections are not supported.
 - Tools that run on the workflow thread must be deterministic; ADK's code executor, memory, and
   artifact services that perform I/O are not supported inside workflows.
-- ADK's OpenTelemetry tracing is global. Spans are no-ops without an installed SDK; with one
-  installed, they are emitted again on every replay.
+- ADK's OpenTelemetry tracer is global and captured once. Without the bootstrap under "Native
+  ADK tracing", an installed tracing SDK exports Workflow spans again on every replay.
 - `App` resumability and event compaction are ADK experimental features; they work with the
   runner builder returned here but are not covered by this integration's tests.
 - Gemini context caching is inactive through the plugin: a request's cache configuration and

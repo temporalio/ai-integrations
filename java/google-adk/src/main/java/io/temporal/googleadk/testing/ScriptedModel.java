@@ -100,10 +100,11 @@ public final class ScriptedModel extends BaseLlm {
     return Collections.unmodifiableList(new ArrayList<>(requests));
   }
 
+  /** Records the request and, like a real model, runs the script when the flow is subscribed. */
   @Override
   public Flowable<LlmResponse> generateContent(LlmRequest llmRequest, boolean stream) {
     requests.add(llmRequest);
-    return Flowable.fromIterable(script.apply(llmRequest));
+    return Flowable.defer(() -> Flowable.fromIterable(script.apply(llmRequest)));
   }
 
   @Override
