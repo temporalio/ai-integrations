@@ -37,6 +37,7 @@ import {
   MCP_TOOL_NOT_FOUND_FAILURE_TYPE,
   MODEL_ERROR_FAILURE_TYPE,
 } from './error-types';
+import { withSources } from './activity-sources';
 import type { InvokeModelArgs, InvokeModelStreamingArgs, ModelActivities, WireLlmRequest } from './model';
 import type { MCPCallToolArgs, MCPReadResourceArgs, MCPResourceContents, MCPToolsetFactory } from './mcp';
 
@@ -89,9 +90,13 @@ export interface ModelActivitiesOptions {
 
 /** @internal */
 export function createModelActivities(options: ModelActivitiesOptions = {}): ModelActivities {
-  const resolveModel = (model: string): BaseLlm => options.modelProvider?.(model) ?? LLMRegistry.newLlm(model);
+  // Read once, so the Activities use the provider recorded with them below.
+  // It is still called as a method of `options`, as before, so a provider
+  // that reads `this` keeps working.
+  const { modelProvider } = options;
+  const resolveModel = (model: string): BaseLlm => modelProvider?.call(options, model) ?? LLMRegistry.newLlm(model);
 
-  return {
+  const activities: ModelActivities = {
     async 'adk-invokeModel'(args: InvokeModelArgs): Promise<LlmResponse[]> {
       const abortSignal = ActivityContext.current().cancellationSignal;
       const stopHeartbeat = startAdaptiveHeartbeat();
@@ -144,6 +149,8 @@ export function createModelActivities(options: ModelActivitiesOptions = {}): Mod
       }
     },
   };
+  // The provider may read `this`, so its receiver is part of what they depend on.
+  return withSources(activities, modelProvider === undefined ? [] : [modelProvider, options]);
 }
 
 /**
@@ -155,7 +162,7 @@ export function createMCPActivities(
 ): Record<string, (args: never) => Promise<unknown>> {
   const activities: Record<string, (args: never) => Promise<unknown>> = {};
   for (const [name, factory] of Object.entries(toolsets)) {
-    Object.assign(activities, mcpActivitiesForName(name, factory));
+    Object.assign(activities, withSources(mcpActivitiesForName(name, factory), [factory]));
   }
   return activities;
 }

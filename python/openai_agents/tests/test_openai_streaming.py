@@ -25,14 +25,17 @@ from agents import (
     RunConfig,
     Runner,
     Tool,
+    ToolCallOutputItem,
     TResponseInputItem,
     Usage,
+    function_tool,
 )
 from agents.items import TResponseStreamEvent
 from agents.models import get_default_model_settings
 from openai.types.responses import (
     Response,
     ResponseCompletedEvent,
+    ResponseFunctionToolCall,
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseTextConfig,
@@ -436,3 +439,92 @@ async def test_streamed_run_level_model_settings_survive_the_alignment(
     ]
     assert model.settings[0].reasoning is not None
     assert model.settings[0].reasoning.effort == "low"
+
+
+class SyncToolStreamingModel(StreamingTestModel):
+    """Streams a call to the sync ``add`` tool, then the base model's reply."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        self.calls += 1
+        async for event in super().stream_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            **kwargs,
+        ):
+            if self.calls == 1 and isinstance(event, ResponseCompletedEvent):
+                tool_call = ResponseFunctionToolCall(
+                    arguments='{"a":2,"b":3}',
+                    call_id="call-add",
+                    name="add",
+                    type="function_call",
+                    id="item-add",
+                    status="completed",
+                )
+                response = event.response.model_copy(update={"output": [tool_call]})
+                event = event.model_copy(update={"response": response})
+            yield event
+
+
+def add(a: int, b: int) -> int:
+    """Add two numbers."""
+    return a + b
+
+
+@workflow.defn
+class StreamingSyncToolWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> list[Any]:
+        agent = Agent[None](
+            name="Assistant",
+            instructions="You are a test agent.",
+            tools=[function_tool(add)],
+        )
+        result = Runner.run_streamed(starting_agent=agent, input=prompt)
+        async for _ in result.stream_events():
+            pass
+        return [
+            item.output
+            for item in result.new_items
+            if isinstance(item, ToolCallOutputItem)
+        ]
+
+
+async def test_streamed_run_runs_sync_function_tools(client: Client):
+    async with AgentEnvironment(
+        model=SyncToolStreamingModel(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            streaming_topic="events",
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, StreamingSyncToolWorkflow, max_cached_workflows=0
+        ) as worker:
+            outputs = await client.execute_workflow(
+                StreamingSyncToolWorkflow.run,
+                "Add 2 and 3",
+                id=f"openai-streaming-sync-tool-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+    # The sync tool ran in the streamed run, so the model got its result.
+    assert outputs == [5]

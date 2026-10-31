@@ -3,7 +3,9 @@ package googleadk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"iter"
+	"reflect"
 	"strings"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"go.temporal.io/sdk/contrib/workflowstreams"
 	"go.temporal.io/sdk/workflow"
 
+	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )
@@ -103,6 +106,10 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 			yield(nil, errMissingContext)
 			return
 		}
+		if err := rejectRemoteAgents(ctx); err != nil {
+			yield(nil, err)
+			return
+		}
 		ao := m.activityOptions
 		if ao.StartToCloseTimeout == 0 {
 			ao.StartToCloseTimeout = defaultModelTimeout
@@ -131,6 +138,98 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 		}
 		yield(&resp, nil)
 	}
+}
+
+// rejectRemoteAgents returns an error when an agent below the agent making
+// this model call is a remote A2A agent that sends from Workflow code. History
+// does not record those requests, so a replay sends them again.
+func rejectRemoteAgents(ctx context.Context) error {
+	ic, ok := ctx.(agent.InvocationContext)
+	if !ok {
+		return nil
+	}
+	remote := findRemoteAgent(ic.Agent())
+	if remote == nil {
+		return nil
+	}
+	return remoteAgentError(remote)
+}
+
+// remoteAgentError is the error that refuses remote, a remote A2A agent that
+// sends from Workflow code.
+func remoteAgentError(remote agent.Agent) error {
+	return fmt.Errorf("googleadk: agent %q is a remote A2A agent that sends its requests from "+
+		"Workflow code, and they repeat on replay. Set its ClientProvider to "+
+		"googleadk.NewA2AClientProvider and its AgentCardProvider to "+
+		"googleadk.NewA2AAgentCardProvider (or set a static AgentCard)", remote.Name())
+}
+
+// findRemoteAgent returns the first remote A2A agent below a that sends from
+// Workflow code, or nil.
+func findRemoteAgent(a agent.Agent) agent.Agent {
+	if a == nil {
+		return nil
+	}
+	for _, sub := range a.SubAgents() {
+		if remoteAgentSendsFromWorkflow(sub) {
+			return sub
+		}
+		if found := findRemoteAgent(sub); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+// remoteAgentSendsFromWorkflow reports whether a was built by
+// remoteagent.NewA2A, which the deprecated agent/remoteagent package also
+// calls, without NewA2AClientProvider, or with a card it fetches without
+// NewA2AAgentCardProvider. ADK keeps the agent type and its A2A config in
+// internal state, so they are read with reflection.
+func remoteAgentSendsFromWorkflow(a agent.Agent) bool {
+	v := reflect.ValueOf(a)
+	t := reflectField(v, "AgentType")
+	if !t.IsValid() || t.Kind() != reflect.String || t.String() != "RemoteAgent" {
+		return false
+	}
+	cfg := reflectField(reflectField(v, "Config"), "A2A")
+	if !cfg.IsValid() || cfg.IsZero() {
+		return false // a remote agent of another kind, which this check does not know
+	}
+	if !isMethodValue(reflectField(cfg, "ClientProvider"), a2aClientProvider{}.create) {
+		return true
+	}
+	if card := reflectField(cfg, "AgentCard"); card.IsValid() && !card.IsNil() {
+		return false
+	}
+	return !isMethodValue(reflectField(cfg, "AgentCardProvider"), a2aCardProvider{}.resolve)
+}
+
+// reflectField returns the named field of the struct that v holds, following
+// pointers and interfaces, or the zero Value.
+func reflectField(v reflect.Value, name string) reflect.Value {
+	for v.Kind() == reflect.Interface || v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return reflect.Value{}
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return reflect.Value{}
+	}
+	return v.FieldByName(name)
+}
+
+// isMethodValue reports whether v holds the method value fn, for any
+// receiver. Method values of one method share a code pointer.
+func isMethodValue(v reflect.Value, fn any) bool {
+	for v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return false
+		}
+		v = v.Elem()
+	}
+	return v.Kind() == reflect.Func && !v.IsNil() && v.Pointer() == reflect.ValueOf(fn).Pointer()
 }
 
 func (m *TemporalModel) modelSummary(req *model.LLMRequest) string {
@@ -465,7 +564,7 @@ func classifyModelError(err error) error {
 	code := apiErrorCode(err)
 	retryable := true
 	if code != 0 {
-		retryable = code == 408 || code == 409 || code == 429 || (code >= 500 && code < 600)
+		retryable = retryableHTTPStatus(code)
 	}
 	return newApplicationError(ErrorTypeModel, retryable, err, "model call failed: %v", err)
 }

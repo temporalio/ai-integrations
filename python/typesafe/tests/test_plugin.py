@@ -76,16 +76,17 @@ def test_plugin_duplicate_name_with_other_class_rejects() -> None:
 
 def test_data_converter_upgrades_default() -> None:
     """Upgrading payload conversion preserves the codec and failure settings."""
-    assert type(_data_converter(None).payload_converter) is PydanticPayloadConverter
+    # The SDK may wrap the converter instance for transfer type conversion.
+    assert _data_converter(None).payload_converter_class is PydanticPayloadConverter
     codec = CompressionCodec()
     plain = DataConverter(
         payload_codec=codec,
         failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
     )
-    assert type(plain.payload_converter) is DefaultPayloadConverter
+    assert plain.payload_converter_class is DefaultPayloadConverter
     upgraded = _data_converter(plain)
     assert upgraded is not plain
-    assert isinstance(upgraded.payload_converter, PydanticPayloadConverter)
+    assert upgraded.payload_converter_class is PydanticPayloadConverter
     assert upgraded.payload_codec is codec
     assert (
         upgraded.failure_converter_class is DefaultFailureConverterWithEncodedAttributes

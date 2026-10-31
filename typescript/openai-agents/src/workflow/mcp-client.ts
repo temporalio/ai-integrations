@@ -1,9 +1,14 @@
 import type { MCPServer } from '@openai/agents-core';
 import type { Duration, RetryPolicy } from '@temporalio/common';
 import { proxyActivities } from '@temporalio/workflow';
-import { MCP_CALL_TOOL_SUFFIX, MCP_LIST_TOOLS_SUFFIX, MCP_STATELESS_SUFFIX } from '../common/mcp-types';
+import {
+  MCP_CALL_TOOL_SUFFIX,
+  MCP_LIST_TOOLS_SUFFIX,
+  MCP_STATELESS_SUFFIX,
+  type McpServerHandleOptions,
+} from '../common/mcp-types';
 
-export interface StatelessMcpServerOptions {
+export interface StatelessMcpServerOptions extends McpServerHandleOptions {
   cacheToolsList?: boolean;
   startToCloseTimeout?: Duration;
   heartbeatTimeout?: Duration;
@@ -26,10 +31,20 @@ export function statelessMcpServer(name: string, options?: StatelessMcpServerOpt
 
   let cachedTools: any[] | undefined;
   const shouldCache = options?.cacheToolsList ?? true;
+  // What the agent SDK sees. Assigning `cacheToolsList` changes only this, as it did before.
+  let sdkCache = shouldCache;
   const factoryArg = options?.factoryArgument;
 
   return {
-    cacheToolsList: shouldCache,
+    // The agent SDK caches the filtered list, so with a filter only this handle caches, and the
+    // agent filters every listing.
+    get cacheToolsList() {
+      return sdkCache && !this.toolFilter;
+    },
+    set cacheToolsList(value: boolean) {
+      sdkCache = value;
+    },
+    toolFilter: options?.toolFilter,
     get name() {
       return name;
     },
