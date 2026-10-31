@@ -13,15 +13,18 @@ import { ActivityBackedModel } from './activity-backed-model';
  * returned again, with the fields of this conversion's clone. Each agent then has the same fields as
  * after a fresh conversion, but keeps its object identity, which approvals on a `RunContext` are keyed by.
  * Those objects only change once the whole graph has converted, so a conversion that throws leaves them
- * as they were. An agent whose class overrides `clone` gets its fresh clone instead, since its clone can
- * hold state, such as private fields, that can't be moved onto another object.
+ * as they were. With `previousFields`, each changed object is mapped to a copy of its earlier fields, which
+ * `restoreFields` puts back. An agent whose class overrides `clone` gets its fresh clone instead, since its
+ * clone can hold state, such as private fields or entries keyed by the clone, that can't be moved onto
+ * another object.
  */
 export function convertAgent(
   agent: Agent<any, any>,
   modelParams: ModelActivityOptions,
   seen?: Map<Agent<any, any>, Agent<any, any>>,
   modelNameOverride?: string,
-  identities?: ReadonlyMap<Agent<any, any>, Agent<any, any>>
+  identities?: ReadonlyMap<Agent<any, any>, Agent<any, any>>,
+  previousFields?: Map<Agent<any, any>, Agent<any, any>>
 ): Agent<any, any> {
   const replacements = new Map<Agent<any, any>, Agent<any, any>>();
   const converted = cloneAgentGraph(
@@ -34,9 +37,18 @@ export function convertAgent(
     identities
   );
   for (const [target, clone] of replacements) {
+    const previous = Object.create(Object.getPrototypeOf(target), Object.getOwnPropertyDescriptors(target));
+    previousFields?.set(target, previous);
     replaceFields(target, clone);
   }
   return converted;
+}
+
+/** Gives each agent `convertAgent` changed the fields it had before, as recorded in `previousFields`. */
+export function restoreFields(previousFields: ReadonlyMap<Agent<any, any>, Agent<any, any>>): void {
+  for (const [target, previous] of previousFields) {
+    replaceFields(target, previous);
+  }
 }
 
 /**
@@ -96,7 +108,7 @@ function cloneAgentGraph(
 
   const clone = agent.clone({ model: activityBackedModel });
   const identity = identities?.get(agent);
-  const converted = identity !== undefined && canReplaceFields(identity, clone) ? identity : clone;
+  const converted = identity !== undefined && canReplaceFields(agent, identity, clone) ? identity : clone;
   seen.set(agent, converted);
   clones.set(agent, clone);
 
@@ -116,13 +128,16 @@ function cloneAgentGraph(
 }
 
 /**
- * Whether `target` can take `source`'s fields. `Agent.clone` and `SandboxAgent.clone` return instances of
- * exactly those classes, which keep all their state in own properties.
+ * Whether `target` can take the fields of `clone`, which `agent.clone` returned. `Agent.clone` and
+ * `SandboxAgent.clone` return instances of exactly those classes, which keep all their state in own
+ * properties. Any other `clone`, even one that returns such an instance, can keep state elsewhere.
  */
-function canReplaceFields(target: Agent<any, any>, source: Agent<any, any>): boolean {
+function canReplaceFields(agent: Agent<any, any>, target: Agent<any, any>, clone: Agent<any, any>): boolean {
   const plainPrototypes: readonly object[] = [Agent.prototype, SandboxAgent.prototype];
   return (
-    plainPrototypes.includes(Object.getPrototypeOf(target)) && plainPrototypes.includes(Object.getPrototypeOf(source))
+    (agent.clone === Agent.prototype.clone || agent.clone === SandboxAgent.prototype.clone) &&
+    plainPrototypes.includes(Object.getPrototypeOf(target)) &&
+    plainPrototypes.includes(Object.getPrototypeOf(clone))
   );
 }
 
