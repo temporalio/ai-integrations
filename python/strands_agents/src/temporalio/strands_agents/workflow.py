@@ -5,6 +5,7 @@ that dispatch user activities via :func:`temporalio.workflow.execute_activity`,
 so the I/O actually happens off the workflow.
 """
 
+import asyncio
 from collections.abc import Callable
 from datetime import timedelta
 from typing import Any, TypeVar
@@ -14,6 +15,7 @@ from strands.types.tools import AgentTool
 
 from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
+from temporalio.exceptions import ActivityError, is_cancelled_exception
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from ._temporal_activity_tool import TemporalActivityTool
@@ -98,6 +100,16 @@ def activity_as_hook(
     }
 
     async def callback(event: TEvent) -> None:
-        await workflow.execute_activity(activity_fn, activity_input(event), **options)
+        try:
+            await workflow.execute_activity(
+                activity_fn, activity_input(event), **options
+            )
+        except ActivityError as e:
+            if is_cancelled_exception(e):
+                # The hook's task was cancelled, such as by a workflow cancel. Strands
+                # would handle it as an ordinary error, such as a failed tool call
+                # that runs the tool's hooks again, so the run would not end cancelled.
+                raise asyncio.CancelledError() from e
+            raise
 
     return callback

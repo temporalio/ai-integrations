@@ -11,9 +11,14 @@ from uuid import uuid4
 import pytest
 import strands._async
 from strands import Agent, tool
-from strands.agent.conversation_manager import SlidingWindowConversationManager
+from strands.agent.conversation_manager import (
+    SlidingWindowConversationManager,
+    SummarizingConversationManager,
+)
+from strands.hooks import BeforeModelCallEvent
 from strands.multiagent import Swarm
 from strands.multiagent.graph import Graph
+from strands.tools.executors import ConcurrentToolExecutor, SequentialToolExecutor
 from strands.types.content import Messages
 from strands.types.streaming import StreamEvent
 
@@ -21,14 +26,22 @@ from temporalio import workflow
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, CancelledError
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent, _sync_calls
 from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.strands_agents._sync_calls import _MESSAGE
 from temporalio.worker import Replayer, Worker
 from temporalio.worker.workflow_sandbox import RestrictedWorkflowAccessError
 from temporalio.workflow import NondeterminismError
-from tests.common import get_activities
+from tests.common import (
+    blocking_hook,
+    blocking_hooks,
+    blocking_lookup,
+    blocking_mcp_call_tool,
+    blocking_tool,
+    blocking_tool_started,
+    get_activities,
+)
 from tests.mock_model import MockModel
 
 # The dotted name passes through the sandbox, so the Workflow gets the binding
@@ -555,37 +568,264 @@ class UsageMockModel(ConfiguredMockModel):
             }
 
 
+def _redact_turn_1_in(messages: Messages) -> None:
+    for message in messages:
+        for block in message["content"]:
+            if block.get("text") == "turn 1":
+                block["text"] = "[redacted]"
+
+
+def _redact_turn_1(event: BeforeModelCallEvent) -> None:
+    """Rewrites the first prompt once a later turn follows it, as a redaction hook would."""
+    _redact_turn_1_in(event.agent.messages[:-1])
+
+
 @workflow.defn
 class CompressionWorkflow:
+    def __init__(self) -> None:
+        self.agent: TemporalAgent | None = None
+
+    @workflow.update
+    def redact(self) -> None:
+        """Rewrites the first prompt from outside the agent's run."""
+        assert self.agent is not None
+        _redact_turn_1_in(self.agent.messages)
+
     @workflow.run
-    async def run(self, prompts: list[str]) -> None:
-        agent = TemporalAgent(
+    async def run(
+        self,
+        prompts: list[str],
+        summarize: bool = False,
+        redact: bool = False,
+        summarizer_tool: str | None = None,
+        executor: str = "concurrent",
+    ) -> None:
+        # A summarization agent with a blocking "activity" or "mcp" tool, or
+        # a blocking "hook" after its tool.
+        summarizer = (
+            TemporalAgent(
+                model="summarizer",
+                start_to_close_timeout=timedelta(seconds=15),
+                tools=[blocking_tool(summarizer_tool)],
+                hooks=blocking_hooks(summarizer_tool),
+                tool_executor=SequentialToolExecutor()
+                if executor == "sequential"
+                else ConcurrentToolExecutor(),
+            )
+            if summarizer_tool
+            else None
+        )
+        agent = self.agent = TemporalAgent(
             model="usage",
             start_to_close_timeout=timedelta(seconds=15),
-            conversation_manager=SlidingWindowConversationManager(
-                proactive_compression=True
-            ),
+            conversation_manager=SummarizingConversationManager(
+                summary_ratio=0.5,
+                preserve_recent_messages=1,
+                proactive_compression=True,
+                summarization_agent=summarizer,
+            )
+            if summarize
+            else SlidingWindowConversationManager(proactive_compression=True),
         )
+        if redact:
+            # Ahead of the manager's proactive compression callback.
+            agent.hooks.add_callback(BeforeModelCallEvent, _redact_turn_1, order=-50)
         for prompt in prompts:
             await agent.invoke_async(prompt)
 
 
-async def test_proactive_compression_uses_model_context_window(client: Client):
-    """Compression drops the first turn before the second model call, as it does natively."""
+@pytest.mark.parametrize(
+    ("summarize", "redact", "responses", "user_turns"),
+    [
+        (False, False, ["first", "second"], [["turn 1"], ["turn 2"]]),
+        # The summary of the first turn replaces it, from a model call of its own.
+        (
+            True,
+            False,
+            ["first", "summary", "second"],
+            [
+                ["turn 1"],
+                ["turn 1", "Please summarize this conversation."],
+                ["summary", "turn 2"],
+            ],
+        ),
+        # A callback ahead of the manager changes the history before it is
+        # summarized, as it does natively.
+        (
+            True,
+            True,
+            ["first", "summary", "second"],
+            [
+                ["turn 1"],
+                ["[redacted]", "Please summarize this conversation."],
+                ["summary", "turn 2"],
+            ],
+        ),
+    ],
+)
+async def test_proactive_compression_uses_model_context_window(
+    client: Client,
+    summarize: bool,
+    redact: bool,
+    responses: list[str],
+    user_turns: list[list[str]],
+):
+    """Compression shrinks the first turn before the second model call, as it does natively."""
     task_queue = f"test_proactive_compression-{uuid4()}"
-    model = UsageMockModel(["first", "second"])
+    model = UsageMockModel(list(responses))
+    plugin = StrandsPlugin(models={"usage": lambda: model})
 
     async with Worker(
         client,
         task_queue=task_queue,
         workflows=[CompressionWorkflow],
-        plugins=[StrandsPlugin(models={"usage": lambda: model})],
+        plugins=[plugin],
+        max_cached_workflows=0,
     ):
-        await client.execute_workflow(
+        handle = await client.start_workflow(
             CompressionWorkflow.run,
-            ["turn 1", "turn 2"],
+            args=[["turn 1", "turn 2"], summarize, redact],
             id=f"test_proactive_compression_{uuid4()}",
             task_queue=task_queue,
         )
+        await handle.result()
 
-    assert model.user_turns == [["turn 1"], ["turn 2"]]
+    assert model.user_turns == user_turns
+    await Replayer(workflows=[CompressionWorkflow], plugins=[plugin]).replay_workflow(
+        await handle.fetch_history()
+    )
+
+
+class BlockingSummaryModel(UsageMockModel):
+    """Holds the summary call until ``release`` is set."""
+
+    def __init__(self, responses: list[str | dict[str, Any]]) -> None:
+        super().__init__(responses)
+        self.summarizing = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(
+        self, messages: Any, *args: Any, **kwargs: Any
+    ) -> AsyncIterable[StreamEvent]:  # type: ignore[override]
+        if len(self.user_turns) == 1:
+            self.summarizing.set()
+            await self.release.wait()
+        async for event in super().stream(messages, *args, **kwargs):
+            yield event
+
+
+@pytest.mark.parametrize(
+    ("summarizer_tool", "executor"),
+    [
+        (None, "concurrent"),
+        ("activity", "concurrent"),
+        ("activity", "sequential"),
+        ("mcp", "concurrent"),
+        ("mcp", "sequential"),
+        ("hook", "concurrent"),
+        ("hook", "sequential"),
+    ],
+)
+async def test_cancel_during_summary_cancels_the_run(
+    client: Client, summarizer_tool: str | None, executor: str
+):
+    """A cancel while the summary runs ends the run instead of failing the summary.
+
+    The summary is blocked in the agent's model, or in a summarization agent's tool
+    or the hook after it.
+    """
+    task_queue = f"test_cancel_during_summary-{uuid4()}"
+    if summarizer_tool:
+        model = UsageMockModel(["first", "second"])
+        summarizer_model = MockModel(
+            [{"name": "lookup", "input": {"query": "q"}}, "summary"]
+        )
+        blocked = blocking_tool_started
+        blocked.clear()
+        release = asyncio.Event()
+    else:
+        model = BlockingSummaryModel(["first", "summary", "second"])
+        summarizer_model = MockModel([])
+        blocked, release = model.summarizing, model.release
+    plugin = StrandsPlugin(
+        models={"usage": lambda: model, "summarizer": lambda: summarizer_model}
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[CompressionWorkflow],
+        activities=[blocking_lookup, blocking_mcp_call_tool, blocking_hook],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            CompressionWorkflow.run,
+            args=[["turn 1", "turn 2"], True, False, summarizer_tool, executor],
+            id=f"test_cancel_during_summary_{uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        await asyncio.wait_for(blocked.wait(), timeout=10)
+        await handle.cancel()
+        try:
+            with pytest.raises(WorkflowFailureError) as exc_info:
+                await asyncio.wait_for(handle.result(), timeout=10)
+        finally:
+            release.set()
+
+    assert isinstance(exc_info.value.cause, CancelledError)
+    # No model call for the second turn followed the cancelled summary.
+    if summarizer_tool:
+        assert model.user_turns == [["turn 1"]]
+    else:
+        assert model.user_turns == [
+            ["turn 1"],
+            ["turn 1", "Please summarize this conversation."],
+        ]
+    history = await handle.fetch_history()
+    # The cancelled hook is not run again for a failed tool call.
+    assert get_activities(history).count("blocking_hook") == (
+        1 if summarizer_tool == "hook" else 0
+    )
+    await Replayer(workflows=[CompressionWorkflow], plugins=[plugin]).replay_workflow(
+        history
+    )
+
+
+async def test_history_changed_during_summary_is_summarized(client: Client):
+    """An update that changes the history while the summary runs gets a new summary."""
+    task_queue = f"test_history_changed_during_summary-{uuid4()}"
+    model = BlockingSummaryModel(["first", "stale summary", "summary", "second"])
+    plugin = StrandsPlugin(models={"usage": lambda: model})
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[CompressionWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            CompressionWorkflow.run,
+            args=[["turn 1", "turn 2"], True],
+            id=f"test_history_changed_during_summary_{uuid4()}",
+            task_queue=task_queue,
+        )
+        await asyncio.wait_for(model.summarizing.wait(), timeout=10)
+        try:
+            await handle.execute_update(CompressionWorkflow.redact)
+        finally:
+            model.release.set()
+        await handle.result()
+
+    # The stale summary is dropped; the manager gets the redacted turn's summary.
+    assert model.user_turns == [
+        ["turn 1"],
+        ["turn 1", "Please summarize this conversation."],
+        ["[redacted]", "Please summarize this conversation."],
+        ["summary", "turn 2"],
+    ]
+    await Replayer(workflows=[CompressionWorkflow], plugins=[plugin]).replay_workflow(
+        await handle.fetch_history()
+    )

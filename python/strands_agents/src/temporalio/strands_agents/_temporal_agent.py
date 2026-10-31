@@ -1,18 +1,30 @@
 import asyncio
+import math
+from collections.abc import AsyncGenerator, Callable
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from strands import Agent
 from strands.agent._concurrency import _ConcurrencyController, _InflightInvocation
-from strands.agent.conversation_manager import NullConversationManager
-from strands.hooks import BeforeModelCallEvent, HookCallback
-from strands.types.agent import AgentInput
+from strands.agent.conversation_manager import (
+    NullConversationManager,
+    SummarizingConversationManager,
+)
+from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent, HookCallback
+from strands.tools.structured_output._structured_output_context import (
+    StructuredOutputContext,
+)
+from strands.types._events import ForceStopEvent, TypedEvent
+from strands.types.agent import AgentInput, Limits
 from strands.types.content import Messages
+from strands.types.exceptions import ContextWindowOverflowException
 
 from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
+from ._summary import prepare_summary
 from ._temporal_mcp_client import TemporalMCPClient
 from ._temporal_model import TemporalModel
 from ._temporal_sandbox import TemporalSandbox
@@ -41,6 +53,34 @@ class _WorkflowConcurrencyController(_ConcurrencyController):
         if registered_token is not None:
             self._inflight = _WorkflowInflightInvocation()
         return waiting_on, registered_token
+
+
+def _with_proactive_summary(
+    threshold: Callable[[BeforeModelCallEvent], None],
+) -> HookCallback[BeforeModelCallEvent]:
+    async def callback(event: BeforeModelCallEvent) -> None:
+        def reduce(manager: Any, agent: Any) -> None:
+            manager._on_before_model_call_threshold(
+                SimpleNamespace(
+                    agent=agent, projected_input_tokens=event.projected_input_tokens
+                )
+            )
+
+        await prepare_summary(event.agent, reduce)
+        threshold(event)
+
+    return callback
+
+
+# Invocation state key holding a model call's context overflow that Strands will
+# reduce the history for once its force stop event has been delivered.
+_OVERFLOW = "_temporal_context_overflow"
+
+
+def _note_overflow(event: AfterModelCallEvent) -> None:
+    overflow = event.exception
+    if isinstance(overflow, ContextWindowOverflowException) and not event.retry:
+        event.invocation_state[_OVERFLOW] = overflow
 
 
 class TemporalAgent(Agent):
@@ -115,6 +155,22 @@ class TemporalAgent(Agent):
         if model_state:
             self._model_state = dict(model_state)
 
+        # Strands' summarizing conversation manager gets its summaries in
+        # synchronous code, on a thread where TemporalModel cannot run. Await them
+        # on the workflow loop just before Strands asks, after any earlier callback
+        # has changed the history: in place of the manager's own proactive
+        # compression callback, and, once a model call fails with a context
+        # overflow, after its force stop event is delivered (see
+        # _execute_event_loop_cycle). The overflow is noted after every other
+        # callback, so a callback that asks for a retry prevents it.
+        manager = self.conversation_manager
+        if isinstance(manager, SummarizingConversationManager):
+            threshold = manager._on_before_model_call_threshold
+            for entry in self.hooks._registered_callbacks.get(BeforeModelCallEvent, []):
+                if entry.callback == threshold:
+                    entry.callback = _with_proactive_summary(threshold)
+        self.hooks.add_callback(AfterModelCallEvent, _note_overflow, order=math.inf)
+
         # Strands invokes ToolProvider.load_tools() once at construction on a
         # separate run_async thread that has no workflow runtime, so a
         # TemporalMCPClient cannot list its tools there. Instead refresh from a
@@ -130,22 +186,30 @@ class TemporalAgent(Agent):
     def _make_mcp_refresh_hook(
         self, provider: TemporalMCPClient
     ) -> HookCallback[BeforeModelCallEvent]:
-        async def hook(event: BeforeModelCallEvent) -> None:
-            if provider._cache_tools and provider._fetched:
-                return
-            old_names = {tool.tool_name for tool in provider._tools}
-            await provider._refresh()
-            self._reconcile_mcp_tools(event, provider, old_names)
+        async def hook(event: BeforeModelCallEvent) -> None:  # type: ignore[reportUnusedParameter]
+            await self._refresh_mcp_tools(provider)
 
         return hook
 
+    async def _load_cached_mcp_tools(self) -> None:
+        """List the tools of each cache_tools MCP client that has not listed them."""
+        for provider in self.tool_registry._tool_providers:
+            if isinstance(provider, TemporalMCPClient) and provider._cache_tools:
+                await self._refresh_mcp_tools(provider)
+
+    async def _refresh_mcp_tools(self, provider: TemporalMCPClient) -> None:
+        if provider._cache_tools and provider._fetched:
+            return
+        old_names = {tool.tool_name for tool in provider._tools}
+        await provider._refresh()
+        self._reconcile_mcp_tools(provider, old_names)
+
     def _reconcile_mcp_tools(
         self,
-        event: BeforeModelCallEvent,
         provider: TemporalMCPClient,
         old_names: set[str],
     ) -> None:
-        reg = event.agent.tool_registry
+        reg = self.tool_registry
         new = {tool.tool_name: tool for tool in provider._tools}
         # Tools the server dropped or renamed since the last listing. There is
         # no public unregister, so remove them from the registry directly.
@@ -159,6 +223,38 @@ class TemporalAgent(Agent):
                 reg.replace(tool)
             else:
                 reg.register_tool(tool)
+
+    async def _execute_event_loop_cycle(
+        self,
+        invocation_state: dict[str, Any],
+        structured_output_context: StructuredOutputContext | None = None,
+        limits: Limits | None = None,
+    ) -> AsyncGenerator[TypedEvent, None]:
+        """Await an overflow's summary once its force stop event is delivered.
+
+        After a model call overflows, Strands yields a force stop event, which the
+        callback handler and the stream's consumer see, then raises the overflow,
+        and this method's parent catches it and reduces the history at once. The
+        parent calls this method again to retry, so an inner call's overflow passes
+        through here too; the first to see it takes it.
+        """
+        events = super()._execute_event_loop_cycle(
+            invocation_state, structured_output_context, limits
+        )
+        try:
+            async for event in events:
+                yield event
+                if isinstance(event, ForceStopEvent) and _OVERFLOW in invocation_state:
+                    overflow = invocation_state.pop(_OVERFLOW)
+                    await prepare_summary(
+                        self,
+                        lambda manager, agent: manager.reduce_context(
+                            agent, e=overflow
+                        ),
+                    )
+        finally:
+            invocation_state.pop(_OVERFLOW, None)
+            await events.aclose()
 
     async def _convert_prompt_to_messages(self, prompt: AgentInput) -> Messages:
         """Load the worker-side model's config, then convert the prompt.
