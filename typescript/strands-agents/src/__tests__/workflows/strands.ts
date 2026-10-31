@@ -8,16 +8,21 @@ import {
   type BaseModelConfig,
   type InterruptResponseContent,
   type InterruptResponseContentData,
+  type JSONValue,
+  type Message,
 } from '@strands-agents/sdk';
 import {
   ActivityFailure,
   allHandlersFinished,
   ApplicationFailure,
+  continueAsNew,
   defineSignal,
   defineUpdate,
   proxyActivities,
   setHandler,
   condition,
+  workflowInfo,
+  type ActivityOptions,
 } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalAgent, TemporalMCPClient, type TemporalAgentOptions, workflow as strandsWorkflow } from '../..';
@@ -59,6 +64,76 @@ export async function retryConfigAgent(prompt: string): Promise<{ turns: string[
     }
   }
   return { turns, config: agent.model.getConfig() };
+}
+
+// Retry a failed model activity quickly, and not forever.
+const STATEFUL_ACTIVITY_OPTIONS: ActivityOptions = {
+  startToCloseTimeout: '15 seconds',
+  retry: { initialInterval: '100 milliseconds', backoffCoefficient: 1, maximumAttempts: 50 },
+};
+
+/**
+ * Runs two turns on one agent with the `stateful` worker model and returns the agent's message
+ * count after each turn, or the error that ended the run. `models-queue` runs the model activities
+ * on the `-models` task queue.
+ */
+export async function statefulAgent(
+  mode: 'plain' | 'streaming' | 'manager' | 'models-queue'
+): Promise<number[] | string> {
+  void new WorkflowStream();
+  const agent = new TemporalAgent({
+    model: 'stateful',
+    printer: false,
+    activityOptions: {
+      ...STATEFUL_ACTIVITY_OPTIONS,
+      ...(mode === 'models-queue' ? { taskQueue: `${workflowInfo().taskQueue}-models` } : {}),
+    },
+    ...(mode === 'streaming' ? { streamingTopic: 'model' } : {}),
+    ...(mode === 'manager' ? { conversationManager: new SlidingWindowConversationManager() } : {}),
+  });
+  const messagesAfterTurn: number[] = [];
+  try {
+    for (const prompt of ['turn one', 'turn two']) {
+      await agent.invoke(prompt);
+      messagesAfterTurn.push(agent.messages.length);
+    }
+  } catch (err) {
+    return (err as Error).message;
+  }
+  return messagesAfterTurn;
+}
+
+export interface StatefulChatInput {
+  prompts: string[];
+  messages?: Message[];
+  modelState?: Record<string, JSONValue>;
+}
+
+/**
+ * The README's continue-as-new handoff with the `stateful` worker model: one turn per run. Returns
+ * the last run's message count, or the error that ended the turn.
+ */
+export async function statefulChatAgent(input: StatefulChatInput): Promise<number | string> {
+  const agent = new TemporalAgent({
+    model: 'stateful',
+    printer: false,
+    activityOptions: STATEFUL_ACTIVITY_OPTIONS,
+    messages: input.messages,
+    modelState: input.modelState,
+  });
+  try {
+    await agent.invoke(input.prompts[0]!);
+  } catch (err) {
+    return (err as Error).message;
+  }
+  if (input.prompts.length > 1) {
+    await continueAsNew<typeof statefulChatAgent>({
+      prompts: input.prompts.slice(1),
+      messages: agent.messages,
+      modelState: agent.modelState.getAll(),
+    });
+  }
+  return agent.messages.length;
 }
 
 /**
