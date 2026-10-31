@@ -420,3 +420,156 @@ def test_cache_key_reads_values():
         "task", ({"names": ["a"]},), {}
     )
     assert cache_key("task", ({"a"},), {}) != cache_key("task", (["a"],), {})
+
+
+class FactoryState(TypedDict):
+    value: int
+    low: int
+    high: int
+
+
+def make_scaled(field: str, factor: int):
+    """Return a closure node setting ``field`` to ``value * factor``.
+
+    Every closure built here shares the qualname
+    ``make_scaled.<locals>.scale``, so their cache entries must be keyed
+    by their distinct ``<graph>.<node>`` activity names, not the qualname.
+    """
+
+    async def scale(state: FactoryState) -> dict[str, int]:
+        _execution_counts[field] = _execution_counts.get(field, 0) + 1
+        return {field: state["value"] * factor}
+
+    return scale
+
+
+@dataclass
+class FactoryCacheInput:
+    value: int
+    cache: dict[str, Any] | None = None
+    phase: int = 1
+
+
+@workflow.defn
+class FactoryCacheWorkflow:
+    """Runs two same-qualname closure nodes in parallel, continuing-as-new once.
+
+    The parallel nodes receive identical state, so one cache entry shared
+    between them would make the second node return the first's result.
+    """
+
+    @workflow.run
+    async def run(self, input_data: FactoryCacheInput) -> dict[str, int]:
+        app = graph("cached-factory", cache=input_data.cache).compile()
+        result = await app.ainvoke({"value": input_data.value, "low": 0, "high": 0})
+
+        if input_data.phase < 2:
+            workflow.continue_as_new(
+                FactoryCacheInput(value=input_data.value, cache=cache(), phase=2)
+            )
+
+        return result
+
+
+async def test_graph_continue_as_new_cached_factory_nodes(client: Client):
+    """Same-qualname closures cache under distinct ids and stay distinct.
+
+    Both factory closures run with identical args, so an implementation
+    keying them by their shared qualname would reuse one entry: one node
+    would return the other's result and only one would execute. Each must
+    run once, and phase 2 must hit each node's own entry.
+    """
+    _reset()
+    metadata = {
+        "execute_in": "activity",
+        "start_to_close_timeout": timedelta(seconds=10),
+    }
+    g = StateGraph(FactoryState)
+    g.add_node("low", make_scaled("low", 2), metadata=metadata)
+    g.add_node("high", make_scaled("high", 10), metadata=metadata)
+    g.add_edge(START, "low")
+    g.add_edge(START, "high")
+
+    task_queue = f"graph-cached-factory-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[FactoryCacheWorkflow],
+        plugins=[LangGraphPlugin(graphs={"cached-factory": g})],
+    ):
+        result = await client.execute_workflow(
+            FactoryCacheWorkflow.run,
+            FactoryCacheInput(value=5),
+            id=f"graph-cached-factory-{uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=20),
+        )
+
+    assert result == {"value": 5, "low": 10, "high": 50}
+    assert _execution_counts == {"low": 1, "high": 1}
+
+
+@dataclass
+class LegacyKeyInput:
+    value: int
+    cache: dict[str, Any] | None = None
+    phase: int = 1
+
+
+@workflow.defn
+class LegacyKeyWorkflow:
+    """Runs the one-node graph, continuing-as-new once with the cache."""
+
+    @workflow.run
+    async def run(self, input_data: LegacyKeyInput) -> dict[str, Any]:
+        app = graph("cached-legacy-id", cache=input_data.cache).compile()
+        state = await app.ainvoke({"value": input_data.value})
+
+        if input_data.phase < 2:
+            workflow.continue_as_new(
+                LegacyKeyInput(value=input_data.value, cache=cache(), phase=2)
+            )
+
+        return {"state": state, "cache": cache()}
+
+
+async def test_graph_continue_as_new_cached_module_qualname_key(client: Client):
+    """A module-level node keeps its pre-change ``module.qualname`` cache id.
+
+    The entry is seeded exactly as an earlier version would have written
+    it — ``cache_key`` over the function's ``module.qualname``, its args,
+    and its context — so a node whose cache was populated before this
+    change is still honoured after continue-as-new. The seeded result (41)
+    differs from a real execution (20 * 2) so a cache miss is observable.
+    """
+    _reset()
+    metadata = {
+        "execute_in": "activity",
+        "start_to_close_timeout": timedelta(seconds=10),
+    }
+    g = StateGraph(State)
+    g.add_node("double", double, metadata=metadata)
+    g.add_edge(START, "double")
+
+    initial = {"value": 20}
+    legacy_id = f"{double.__module__}.{double.__qualname__}"
+    seeded = {cache_key(legacy_id, (initial,), {}, None): {"value": 41}}
+
+    task_queue = f"graph-cached-legacy-id-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[LegacyKeyWorkflow],
+        plugins=[LangGraphPlugin(graphs={"cached-legacy-id": g})],
+    ):
+        result = await client.execute_workflow(
+            LegacyKeyWorkflow.run,
+            LegacyKeyInput(value=20, cache=seeded),
+            id=f"graph-cached-legacy-id-{uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=20),
+        )
+
+    assert result["state"] == {"value": 41}
+    assert result["cache"] == seeded
+    assert _execution_counts == {}
