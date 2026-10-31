@@ -777,15 +777,49 @@ async def test_streaming_input_guardrail_known_trip_skips_the_model(
     assert model.attempts == []
 
 
+def delay_stream_publishing(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Hold every stream publish signal until ``seconds`` after the first one is sent."""
+    signal = WorkflowHandle.signal
+    deadline: float | None = None
+
+    async def delayed_signal(
+        self: WorkflowHandle[Any, Any], name: Any, *args: Any, **kwargs: Any
+    ) -> None:
+        nonlocal deadline
+        if name == "__temporal_workflow_stream_publish":
+            loop = asyncio.get_running_loop()
+            if deadline is None:
+                deadline = loop.time() + seconds
+            await asyncio.sleep(max(0.0, deadline - loop.time()))
+        await signal(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(WorkflowHandle, "signal", delayed_signal)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("max_cached_workflows", [1000, 0], ids=["cached", "uncached"])
+@pytest.mark.parametrize(
+    "cancelled_while", ["streaming", "publishing"], ids=["streaming", "publishing"]
+)
 async def test_streaming_input_guardrail_trip_waits_for_the_error_event(
-    client: Client, max_cached_workflows: int
+    client: Client,
+    monkeypatch: pytest.MonkeyPatch,
+    max_cached_workflows: int,
+    cancelled_while: str,
 ):
     """With ``WAIT_CANCELLATION_COMPLETED``, a workflow that returns right after the trip
-    still has the error event in its stream, and the Worker shuts down after the cancel,
-    with or without a Workflow cache."""
-    model = HoldingStreamingModel()
+    still has the error event at the end of its stream, and the Worker shuts down after
+    the cancel, with or without a Workflow cache. That holds whether the cancel reaches
+    the activity while the model streams or after the model finished, while the activity
+    still publishes its events."""
+    model: StreamingTestModel
+    if cancelled_while == "streaming":
+        model = HoldingStreamingModel()
+    else:
+        # The model finishes at once, but the topic gets nothing for 8 s, so the cancel
+        # arrives while the activity is still publishing.
+        model = StreamingTestModel()
+        delay_stream_publishing(monkeypatch, 8)
     async with AgentEnvironment(
         model=model,
         model_params=ModelActivityParameters(
@@ -809,13 +843,28 @@ async def test_streaming_input_guardrail_trip_waits_for_the_error_event(
                 task_queue=worker.task_queue,
                 execution_timeout=timedelta(seconds=30),
             )
-            # The model held after its first delta and was cancelled, so the stream
-            # holds that delta and the error event.
-            offset = await WorkflowStreamClient.create(client, workflow_id).get_offset()
+            stream = WorkflowStreamClient.create(client, workflow_id)
+            offset = await stream.get_offset()
+            last: TResponseStreamEvent | None = None
+            async for item in stream.subscribe(
+                ["events"],
+                from_offset=offset - 1,
+                result_type=TResponseStreamEvent,  # type: ignore[arg-type,call-overload]
+            ):
+                last = item.data
+                break
 
     assert result == "refused"
-    assert model.cancelled
-    assert offset == 2
+    assert isinstance(last, ResponseErrorEvent)
+    assert last.code == "cancelled"
+    if isinstance(model, HoldingStreamingModel):
+        # The model held after its first delta and was cancelled, so the stream holds
+        # that delta and the error event.
+        assert model.cancelled
+        assert offset == 2
+    else:
+        # Two deltas, response.completed, and the error event.
+        assert offset == 4
 
 
 @pytest.mark.asyncio

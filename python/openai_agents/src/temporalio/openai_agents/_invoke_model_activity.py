@@ -497,43 +497,46 @@ class ModelActivity:
         # typed decode can pass result_type=TResponseStreamEvent on
         # their own subscribe call.
         events_topic = stream.topic(topic)
-        async with stream:
-            try:
-                async for event in model.stream_response(
-                    system_instructions=input.get("system_instructions"),
-                    input=input["input"],
-                    model_settings=model_settings,
-                    tools=tools,
-                    output_schema=input.get("output_schema"),
-                    handoffs=handoffs,
-                    tracing=ModelTracing(input["tracing"]),
-                    previous_response_id=input.get("previous_response_id"),
-                    conversation_id=input.get("conversation_id"),
-                    prompt=input.get("prompt"),
-                ):
-                    # OpenAI models set defer_build=True, so an event's pydantic
-                    # schema may still be an unbuilt placeholder.
-                    type(event).model_rebuild()
-                    events.append(event)
-                    events_topic.publish(event)
-            except APIStatusError as e:
-                _raise_for_openai_status(e)
-            except asyncio.CancelledError:
-                # When the workflow cancelled the call, for example because a parallel
-                # input guardrail tripped, tell subscribers the response ends here.
-                # Leaving the context manager flushes it. Other cancels, such as a
-                # Worker shutdown or a heartbeat timeout, can be retried, so publish
-                # nothing and let the retry answer.
-                details = activity.cancellation_details()
-                if details is not None and details.cancel_requested:
-                    events_topic.publish(
-                        ResponseErrorEvent(
-                            type="error",
-                            code="cancelled",
-                            message="The model call was cancelled.",
-                            sequence_number=len(events),
-                        )
+        try:
+            async with stream:
+                try:
+                    async for event in model.stream_response(
+                        system_instructions=input.get("system_instructions"),
+                        input=input["input"],
+                        model_settings=model_settings,
+                        tools=tools,
+                        output_schema=input.get("output_schema"),
+                        handoffs=handoffs,
+                        tracing=ModelTracing(input["tracing"]),
+                        previous_response_id=input.get("previous_response_id"),
+                        conversation_id=input.get("conversation_id"),
+                        prompt=input.get("prompt"),
+                    ):
+                        # OpenAI models set defer_build=True, so an event's pydantic
+                        # schema may still be an unbuilt placeholder.
+                        type(event).model_rebuild()
+                        events.append(event)
+                        events_topic.publish(event)
+                except APIStatusError as e:
+                    _raise_for_openai_status(e)
+        except asyncio.CancelledError:
+            # When the workflow cancelled the call, for example because a parallel
+            # input guardrail tripped, tell subscribers the response ends here. The
+            # cancel can arrive while the model streams or while leaving the context
+            # manager flushes the events, so publish after both, behind the events
+            # still buffered. Other cancels, such as a Worker shutdown or a heartbeat
+            # timeout, can be retried, so publish nothing and let the retry answer.
+            details = activity.cancellation_details()
+            if details is not None and details.cancel_requested:
+                events_topic.publish(
+                    ResponseErrorEvent(
+                        type="error",
+                        code="cancelled",
+                        message="The model call was cancelled.",
+                        sequence_number=len(events),
                     )
-                raise
+                )
+                await stream.flush()
+            raise
 
         return events

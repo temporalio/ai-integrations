@@ -825,8 +825,10 @@ activity, and the run raises `InputGuardrailTripwireTriggered` as
 heartbeat, so set `heartbeat_timeout`: the activity then stops and
 publishes an `error` event with the code `cancelled` to the topic.
 Subscribers can still get the events the model sent before that, as a
-native `stream_events()` consumer can. When the guardrail has already
-tripped, the plugin does not start the model call.
+native `stream_events()` consumer can. If the model has already finished
+but the activity is still publishing its events when the cancel arrives,
+the `error` event comes after `response.completed`. When the guardrail
+has already tripped, the plugin does not start the model call.
 
 The workflow must still be open when the activity publishes that
 `error` event. With the default `cancellation_type` (`TRY_CANCEL`), the
