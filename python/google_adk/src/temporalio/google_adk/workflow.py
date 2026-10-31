@@ -278,8 +278,8 @@ def _is_method(fn: Callable) -> bool:
 
     A module-level or nested function, or a staticmethod, is called with every
     parameter. A function defined in a class body is found in that class to
-    tell a method from a staticmethod; a class that can't be found raises
-    ``ValueError``.
+    tell a method from a staticmethod; a class that can't be found, or whose
+    attribute isn't ``fn`` or a function ``fn`` wraps, raises ``ValueError``.
     """
     qualname = fn.__qualname__.split(".")
     if len(qualname) < 2 or qualname[-2] == "<locals>":
@@ -305,7 +305,20 @@ def _is_method(fn: Callable) -> bool:
             " (wrap decorators with functools.wraps), pass a bound method for a"
             " method, or rename a staticmethod's parameter."
         )
-    return not isinstance(attr, staticmethod)
+    static = isinstance(attr, staticmethod)
+    target = attr.__func__ if static else attr
+    # fn may wrap the attribute's function, as a functools.wraps decorator
+    # applied to Class.method does.
+    if inspect.unwrap(fn, stop=lambda f: f is target) is not target:
+        # The class's name or attribute was rebound after fn was taken from it,
+        # so the attribute's binding isn't fn's.
+        raise ValueError(
+            f"Cannot tell whether '{fn.__qualname__}' is a method or a"
+            f" staticmethod: '{'.'.join(qualname)}' reachable from the"
+            " function's globals is another object. Pass a bound method for a"
+            " method, or rename a staticmethod's parameter."
+        )
+    return not static
 
 
 def _tool_signature(
@@ -420,8 +433,9 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     staticmethod, classmethod or ``functools.partialmethod``, can't be read, or
     takes keyword-only arguments or ``**kwargs`` raises ``ValueError``. So does
     a method taking ``self`` whose class can't be reached from the function's
-    globals, such as a class defined in a function: its ``self`` could be a
-    staticmethod's input.
+    globals, such as a class defined in a function, or whose class's name or
+    attribute now holds another object: its ``self`` could be a staticmethod's
+    input.
 
     Outside a Workflow, as in local ADK runs, the tool calls ``activity_def``
     itself. A method passed as ``Class.method`` and a class passed as itself
