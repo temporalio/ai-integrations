@@ -589,6 +589,12 @@ test('Approval resume keeps the caller context object', async (t) => {
           textResponse('done persisted'),
           toolCallResponse('guarded', { value: 'G' }, 'call_guarded'),
           textResponse('done guarded'),
+          toolCallResponse('vetoed', { value: 'V-1' }, 'call_veto_persisted'),
+          textResponse('done veto persisted'),
+          toolCallResponse('vetoed', { value: 'V-2' }, 'call_veto_persisted_always'),
+          textResponse('done veto persisted always'),
+          toolCallResponse('vetoed', { value: 'V-3' }, 'call_veto_direct'),
+          textResponse('done veto direct'),
         ]),
       }),
     ],
@@ -649,5 +655,15 @@ test('Approval resume keeps the caller context object', async (t) => {
     recoveredWrites: ['G'],
     recoveredApprovalOwners: 2,
     recoveredApprovedCallIds: 2,
+    rejectionMessages: [
+      'VetoPersisted before',
+      'VetoPersisted after',
+      'VetoPersistedAlways before',
+      'VetoPersistedAlways after',
+      'VetoDirect before',
+      'VetoDirect after',
+    ],
+    revisedRejectionWrites: [],
+    revisedRejectionInterruptions: 0,
   });
 });

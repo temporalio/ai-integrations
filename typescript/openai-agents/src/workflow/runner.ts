@@ -3,6 +3,7 @@ import {
   type AgentInputItem,
   Handoff,
   MemorySession,
+  RunContext,
   Runner,
   RunState,
   type AgentOutputType,
@@ -83,8 +84,8 @@ function convertAgentGraph(
 
 /**
  * Returns the converted graph that `state` runs on, or else the one the latest resume on its context used,
- * if it was converted from `agent`, no run is using it, and it doesn't override one of the state's
- * rejections.
+ * if it was converted from `agent`, no run is using it, and restoring the state into it keeps the state's
+ * decisions and rejection messages.
  *
  * Function-tool approvals are keyed by agent object on the state's `RunContext`, which the resume keeps.
  * Rebuilding the state over new agent objects would add a copy of its approvals under every resume's
@@ -104,7 +105,7 @@ function reusableConversion(
     (conversion) =>
       conversion?.source === agent &&
       conversion.activeRuns === 0 &&
-      !overridesRejection(conversion, serializedState, state._context)
+      !losesStateDecisions(conversion, serializedState, state._context)
   );
 }
 
@@ -112,6 +113,8 @@ function reusableConversion(
 interface ApprovalRecord {
   approved: boolean | string[];
   rejected: boolean | string[];
+  messages?: Record<string, string>;
+  stickyRejectMessage?: string;
 }
 
 interface FunctionApprovals {
@@ -119,35 +122,81 @@ interface FunctionApprovals {
   approvals: Record<string, ApprovalRecord>;
 }
 
+/** The `RunContext` internals of @openai/agents-core that read and merge per-agent approvals. */
+interface ApprovalContext {
+  _toJSONForRunState(keys: ReadonlyMap<object, string>): { functionApprovals?: FunctionApprovals[] };
+  _mergeFunctionApprovals(approvals: FunctionApprovals[], agentsByIdentity: ReadonlyMap<string, object>): void;
+}
+
 /**
- * Whether one of `conversion`'s agents always approves a tool that the serialized state always rejects for
- * the agent with its name. The restore merges the state's decisions into the decisions the agent already
- * owns, and an approval for good wins that merge. So a state that always approved a tool, was resumed, and
- * then always rejected it would run it again. A fresh graph owns only the state's decisions.
+ * Whether the restore would lose one of the serialized state's decisions or rejection messages if it merged
+ * them into the decisions `conversion`'s agents already own. The merge keeps an approval for good over a
+ * rejection, and an existing rejection message over the state's. So a state that always approved a tool
+ * and then always rejected it would run it again, and a state whose rejection message changed after a
+ * failed resume would send the model the earlier message. A fresh graph owns only the state's decisions.
  */
-function overridesRejection(conversion: Conversion, serializedState: string, context: object): boolean {
+function losesStateDecisions(conversion: Conversion, serializedState: string, context: object): boolean {
   const stateApprovals: FunctionApprovals[] = JSON.parse(serializedState).context.functionApprovals ?? [];
-  const rejections = stateApprovals.flatMap(({ agentIdentity, approvals }) =>
-    Object.entries(approvals)
-      .filter(([, record]) => record.rejected === true && record.approved !== true)
-      .map(([toolName]) => ({ agentIdentity, toolName }))
-  );
-  if (rejections.length === 0) return false;
+  if (stateApprovals.length === 0) return false;
   const names = new Map<Agent<any, any>, string>();
   for (const [source, converted] of conversion.agents) names.set(converted, source.name);
-  // _toJSONForRunState is internal to @openai/agents-core; it serializes the approvals of each agent it's given.
-  const { functionApprovals = [] } = (
-    context as {
-      _toJSONForRunState(keys: ReadonlyMap<Agent<any, any>, string>): { functionApprovals?: FunctionApprovals[] };
-    }
-  )._toJSONForRunState(names);
+  const { functionApprovals: owned = [] } = (context as ApprovalContext)._toJSONForRunState(names);
   // A state's agent identity is its name, followed by `#n` if other agents in the graph share it.
-  return rejections.some(({ agentIdentity, toolName }) =>
-    functionApprovals.some(
-      ({ agentIdentity: name, approvals }) =>
-        (agentIdentity === name || agentIdentity.startsWith(`${name}#`)) && approvals[toolName]?.approved === true
+  return stateApprovals.some(({ agentIdentity, approvals }) =>
+    owned.some(
+      ({ agentIdentity: name, approvals: ownedApprovals }) =>
+        (agentIdentity === name || agentIdentity.startsWith(`${name}#`)) &&
+        Object.entries(approvals).some(
+          ([toolName, record]) =>
+            ownedApprovals[toolName] !== undefined &&
+            !keepsDecisions(record, mergeApprovalRecords(ownedApprovals[toolName], record, toolName))
+        )
     )
   );
+}
+
+/** Merges `incoming` into `current` as the restore does, in a scratch `RunContext`. */
+function mergeApprovalRecords(current: ApprovalRecord, incoming: ApprovalRecord, toolName: string): ApprovalRecord {
+  const owner = {};
+  const scratch = new RunContext() as unknown as ApprovalContext;
+  for (const record of [current, incoming]) {
+    scratch._mergeFunctionApprovals(
+      [{ agentIdentity: 'owner', approvals: { [toolName]: record } }],
+      new Map([['owner', owner]])
+    );
+  }
+  return scratch._toJSONForRunState(new Map([[owner, 'owner']])).functionApprovals![0]!.approvals[toolName]!;
+}
+
+/** Whether `merged` resolves every call that `record` decides, and its rejection messages, as `record` does. */
+function keepsDecisions(record: ApprovalRecord, merged: ApprovalRecord): boolean {
+  const callIds = new Set<string | undefined>([
+    undefined,
+    ...(Array.isArray(record.approved) ? record.approved : []),
+    ...(Array.isArray(record.rejected) ? record.rejected : []),
+    ...Object.keys(record.messages ?? {}),
+  ]);
+  return [...callIds].every((callId) => {
+    const decision = approvalDecision(record, callId);
+    if (decision === undefined) return true;
+    if (approvalDecision(merged, callId) !== decision) return false;
+    return decision || rejectionMessage(merged, callId) === rejectionMessage(record, callId);
+  });
+}
+
+/** The decision a record gives a call, or a call it doesn't name if `callId` is undefined, as agents-core resolves it. */
+function approvalDecision(record: ApprovalRecord, callId: string | undefined): boolean | undefined {
+  if (record.approved === true) return true;
+  if (record.rejected === true) return false;
+  if (callId !== undefined && Array.isArray(record.approved) && record.approved.includes(callId)) return true;
+  if (callId !== undefined && Array.isArray(record.rejected) && record.rejected.includes(callId)) return false;
+  return undefined;
+}
+
+/** The rejection message a record gives a call, as agents-core resolves it. */
+function rejectionMessage(record: ApprovalRecord, callId: string | undefined): string | undefined {
+  if (callId !== undefined && typeof record.messages?.[callId] === 'string') return record.messages[callId];
+  return record.rejected === true ? record.stickyRejectMessage : undefined;
 }
 
 function recordResumeConversion(state: RunState<any, any>, agent: Agent<any, any>, conversion: Conversion): void {

@@ -1,4 +1,4 @@
-import { Agent, type AgentOptions, RunState, handoff, tool } from '@openai/agents-core';
+import { Agent, type AgentOptions, type CallModelInputFilter, RunState, handoff, tool } from '@openai/agents-core';
 import { ApplicationFailure, condition } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
@@ -232,6 +232,9 @@ export interface ApprovalResumeContextResult {
   recoveredWrites: string[];
   recoveredApprovalOwners: number;
   recoveredApprovedCallIds: number;
+  rejectionMessages: string[];
+  revisedRejectionWrites: string[];
+  revisedRejectionInterruptions: number;
 }
 
 /** An agent whose `clone` carries a private field, which can't be copied onto another object. */
@@ -308,8 +311,9 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
  * its class overrides `clone` or the target itself was replaced. Last, a `clone` that returns a plain
  * `Agent` keeps state outside it, which changes before the resume. Then an approved call fails after
  * the resume replaced its agent's object, and is rejected through the original state, whose retry must
- * not run it. Last, the restore of a saved state fails repeatedly after merging its approvals, which must
- * not add a copy of them each time.
+ * not run it. Then the restore of a saved state fails repeatedly after merging its approvals, which must
+ * not add a copy of them each time. Last, a rejection message changes after a failed resume, and the retry
+ * must send the model the new one.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -753,6 +757,59 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
   const recovered = await runner.run(guardedAgent, guardedState);
   const recoveredOwners = countApprovalOwners(guardedState._context);
 
+  // A call is rejected with a message, and the next model call fails once after the resume. The call is
+  // then rejected again with a new message, and the model must receive the new one when the state is
+  // retried, whether the state was rehydrated onto the original agent or kept from the run.
+  const vetoed = tool({
+    name: 'vetoed',
+    description: 'Record a value after approval.',
+    parameters: {
+      type: 'object' as const,
+      properties: { value: { type: 'string' } },
+      required: ['value'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    execute: async (args, runContext) => {
+      (runContext!.context as ResumeContext).writes.push((args as { value: string }).value);
+      return 'ok';
+    },
+  });
+  const rejectionMessages: string[] = [];
+  const vetoedWrites: string[] = [];
+  const reviseRejection = async (name: string, rehydrate: boolean, alwaysReject: boolean) => {
+    const vetoAgent = new Agent<ResumeContext>({ name, model: 'gpt-4o-mini', tools: [vetoed] });
+    const vetoCtx: ResumeContext = { original: name, writes: vetoedWrites };
+    const paused = await runner.run(vetoAgent, 'go', { context: vetoCtx });
+    const state = rehydrate ? await RunState.fromString(vetoAgent, paused.state.toString()) : paused.state;
+    const interruption = state.getInterruptions()[0]!;
+    let failModel = true;
+    const callModelInputFilter: CallModelInputFilter = ({ modelData }) => {
+      for (const item of modelData.input) {
+        if (item.type === 'function_call_result') {
+          const { output } = item;
+          rejectionMessages.push(
+            typeof output === 'string' ? output : 'text' in output ? output.text : JSON.stringify(output)
+          );
+        }
+      }
+      if (failModel) {
+        failModel = false;
+        throw new Error('model failed');
+      }
+      return modelData;
+    };
+    state.reject(interruption, { alwaysReject, message: `${name} before` });
+    await runner.run(vetoAgent, state, { callModelInputFilter }).catch(() => undefined);
+    state.reject(interruption, { alwaysReject, message: `${name} after` });
+    return (await runner.run(vetoAgent, state, { callModelInputFilter })).interruptions.length;
+  };
+  const revisedInterruptions = [
+    await reviseRejection('VetoPersisted', true, false),
+    await reviseRejection('VetoPersistedAlways', true, true),
+    await reviseRejection('VetoDirect', false, false),
+  ];
+
   return {
     callerAfter: ctx.after,
     resumedUsesCallerObject: result.runContext.context === ctx,
@@ -801,5 +858,8 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     recoveredWrites: recovered.runContext.context.writes,
     recoveredApprovalOwners: recoveredOwners.approvalOwners,
     recoveredApprovedCallIds: recoveredOwners.approvedCallIds,
+    rejectionMessages,
+    revisedRejectionWrites: vetoedWrites,
+    revisedRejectionInterruptions: revisedInterruptions.reduce((count, interruptions) => count + interruptions, 0),
   };
 }
