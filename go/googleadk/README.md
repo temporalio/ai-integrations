@@ -199,7 +199,10 @@ the model SDK's own retries (see below), or override the fallbacks.
   toolset name — the toolset is cached and shared across calls — and the plugin
   closes any cached toolset that implements `Close() error` at worker stop
   automatically; with manual wiring, call `Activities.Close` yourself after
-  `worker.Run` returns.
+  `worker.Run` returns. A tool's own error, such as an MCP `isError` result,
+  reaches the model once, as it does without Temporal; `CallMcpTool` succeeds
+  and is not retried. A failed MCP request fails `CallMcpTool` with a
+  retryable `googleadk.McpError`.
 - **Remote A2A agents.** Build ADK's remote agent (`remoteagent.NewA2A`) with
   `AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, activityOptions)`
   and `ClientProvider: googleadk.NewA2AClientProvider(activityOptions)`. The card
