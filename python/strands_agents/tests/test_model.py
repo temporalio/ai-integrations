@@ -1,23 +1,40 @@
 import asyncio
+import concurrent.futures
+import importlib
+import inspect
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
+import pytest
+import strands._async
+from strands import Agent, tool
 from strands.agent.conversation_manager import SlidingWindowConversationManager
+from strands.multiagent import Swarm
+from strands.multiagent.graph import Graph
 from strands.types.content import Messages
 from strands.types.streaming import StreamEvent
 
 from temporalio import workflow
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
-from temporalio.strands_agents import StrandsPlugin, TemporalAgent
+from temporalio.exceptions import ApplicationError
+from temporalio.strands_agents import StrandsPlugin, TemporalAgent, _sync_calls
 from temporalio.strands_agents._model_activity import ModelActivity
+from temporalio.strands_agents._sync_calls import _MESSAGE
 from temporalio.worker import Replayer, Worker
+from temporalio.worker.workflow_sandbox import RestrictedWorkflowAccessError
+from temporalio.workflow import NondeterminismError
 from tests.common import get_activities
 from tests.mock_model import MockModel
+
+# The dotted name passes through the sandbox, so the Workflow gets the binding
+# made at collection, before any Worker installed the guard.
+with workflow.unsafe.imports_passed_through():
+    from tests.prebound_run_async import run_async as prebound_run_async
 
 
 @workflow.defn
@@ -60,6 +77,127 @@ async def test_model(client: Client):
         workflows=[ModelWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+@tool
+def echo_tool(text: str) -> str:
+    """Return the text."""
+    return text
+
+
+@workflow.defn
+class SyncCallWorkflow:
+    @workflow.run
+    async def run(self, call: str) -> str:
+        # Plain Strands objects with their own model; building them must work.
+        agent = Agent(model=MockModel([]), tools=[echo_tool], callback_handler=None)
+        swarm = Swarm([agent])
+        if call == "agent":
+            agent("Hello")
+        elif call == "tool":
+            agent.tool.echo_tool(text="Hello")
+        elif call == "swarm":
+            swarm("Hello")
+        elif call == "prebound":
+            # run_async bound by a module imported before the guard was installed.
+            prebound_run_async(lambda: agent.invoke_async("Hello"))
+        elif call == "unrestricted":
+            # The SDK's escape hatch: the call runs on Strands' thread, unrecorded.
+            with workflow.unsafe.sandbox_unrestricted():
+                answer = Agent(model=MockModel(["answer"]), callback_handler=None)
+                return str(answer("Hello")).strip()
+        return "built"
+
+
+@pytest.mark.parametrize("call", ["agent", "tool", "swarm", "prebound"])
+async def test_sync_call_is_refused(client: Client, call: str):
+    """The sync form would run on a thread outside the sandbox, unrecorded."""
+    task_queue = f"test_sync_call_is_refused-{uuid4()}"
+    plugin = StrandsPlugin(models={"mock": lambda: MockModel([])})
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[SyncCallWorkflow],
+        plugins=[plugin],
+        workflow_failure_exception_types=[NondeterminismError],
+    ):
+        handle = await client.start_workflow(
+            SyncCallWorkflow.run,
+            call,
+            id=f"test_sync_call_is_refused_{uuid4()}",
+            task_queue=task_queue,
+        )
+        with pytest.raises(WorkflowFailureError) as err:
+            await handle.result()
+    cause = err.value.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == RestrictedWorkflowAccessError.__name__
+    assert cause.message == _MESSAGE
+
+    if call == "agent":  # One replay is enough: every case hits the same guard.
+        await Replayer(
+            workflows=[SyncCallWorkflow],
+            plugins=[plugin],
+            workflow_failure_exception_types=[NondeterminismError],
+        ).replay_workflow(await handle.fetch_history())
+
+
+async def test_sync_call_workflow_builds_without_calls(client: Client):
+    """Building agents and swarms in Workflow code still works, and so does a sync
+    call the Workflow makes inside ``workflow.unsafe.sandbox_unrestricted()``."""
+    task_queue = f"test_sync_call_workflow_builds_without_calls-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[SyncCallWorkflow],
+        plugins=[StrandsPlugin(models={"mock": lambda: MockModel([])})],
+        workflow_failure_exception_types=[NondeterminismError],
+    ):
+        result = await client.execute_workflow(
+            SyncCallWorkflow.run,
+            "none",
+            id=f"test_sync_call_workflow_builds_without_calls_{uuid4()}",
+            task_queue=task_queue,
+        )
+        unrestricted = await client.execute_workflow(
+            SyncCallWorkflow.run,
+            "unrestricted",
+            id=f"test_sync_call_workflow_builds_without_calls_{uuid4()}",
+            task_queue=task_queue,
+        )
+    assert result == "built"
+    assert unrestricted == "answer"
+
+
+async def test_sync_call_in_sandbox_import_is_refused(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    """The sandbox imports Workflow modules before the Workflow runtime is attached."""
+    # Undo an install by an earlier test in this process, so this Worker must
+    # install the guard itself; monkeypatch restores the earlier state.
+    monkeypatch.setattr(_sync_calls, "_installed", False)
+    monkeypatch.setattr(
+        strands._async, "ThreadPoolExecutor", concurrent.futures.ThreadPoolExecutor
+    )
+    for cls in (Agent, Graph, Swarm):
+        monkeypatch.setattr(cls, "__init__", inspect.unwrap(cls.__init__))
+    from tests import sync_import_workflow
+
+    # Building the Worker installs the guard before it validates the Workflow.
+    with pytest.raises(RuntimeError, match="Failed validating workflow") as err:
+        Worker(
+            client,
+            task_queue=f"test_sync_call_in_sandbox_import_is_refused-{uuid4()}",
+            workflows=[sync_import_workflow.SyncImportWorkflow],
+            plugins=[StrandsPlugin(models={"mock": lambda: MockModel([])})],
+        )
+    assert isinstance(err.value.__cause__, RestrictedWorkflowAccessError)
+    assert str(err.value.__cause__) == _MESSAGE
+
+    # Outside Workflow code the guard lets the sync call run.
+    importlib.reload(sync_import_workflow)
+    assert sync_import_workflow.import_result == "import answer"
 
 
 class ConfiguredMockModel(MockModel):
