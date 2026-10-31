@@ -64,9 +64,12 @@ export interface TemporalRunOptions<TContext = undefined> {
 
   /** Runner-level config overrides */
   runConfig?: {
-    /** Model name override (string only — Model objects can't cross the Workflow/Activity boundary) */
+    /**
+     * Model name for agents that set no model of their own, as upstream's code does (string only —
+     * Model objects can't cross the Workflow/Activity boundary)
+     */
     model?: string;
-    /** Global model settings (temperature, topP, etc.). Non-null values override agent-specific settings. */
+    /** Global model settings (temperature, topP, etc.). An agent's own `modelSettings` override them, as upstream. */
     modelSettings?: ModelSettings;
     /** Global handoff input filter. Agent-level inputFilter takes precedence. */
     handoffInputFilter?: (input: HandoffInputData) => HandoffInputData;
@@ -231,7 +234,7 @@ export class TemporalOpenAIRunner {
 
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
-    checkAgent(agent, modelOverride);
+    checkAgent(agent);
 
     let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
     if (input instanceof RunState) {
@@ -260,8 +263,8 @@ export class TemporalOpenAIRunner {
         toolCalls === 0 ? runningAgent : undefined
       ),
     });
+    // Upstream emits `agent_start` for the first agent and for each handoff target.
     innerRunner.on('agent_start', (_context, started) => (runningAgent = started));
-    innerRunner.on('agent_handoff', (_context, _from, to) => (runningAgent = to));
     innerRunner.on('agent_tool_start', () => toolCalls++);
     innerRunner.on('agent_tool_end', () => toolCalls--);
 

@@ -1,4 +1,12 @@
-import { Agent, MemorySession, type AgentTool, type AgentToolOptions, type Tool } from '@openai/agents-core';
+import {
+  Agent,
+  MemorySession,
+  type AgentTool,
+  type AgentToolOptions,
+  type FunctionTool,
+  type RunResult,
+  type Tool,
+} from '@openai/agents-core';
 import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import { validateTemporalSandboxClient } from './sandbox-client';
@@ -15,6 +23,7 @@ export interface AgentToolRecord {
 
 interface InterceptionState {
   original: (this: Agent<any, any>, options: AnyAgentToolOptions) => AnyAgentTool;
+  // Keyed by the tool's `on` closure, which copies keep, such as the ones `toolNamespace()` makes.
   records: WeakMap<object, AgentToolRecord>;
 }
 
@@ -42,7 +51,7 @@ export function installAgentToolInterception(): void {
   function asTool(this: Agent<any, any>, options: AnyAgentToolOptions): AnyAgentTool {
     // Upstream reads its options when the tool is made, so record them then too.
     const tool = state.original.call(this, options);
-    state.records.set(tool, { agent: this, runConfig: options.runConfig, runOptions: options.runOptions });
+    state.records.set(tool.on, { agent: this, runConfig: options.runConfig, runOptions: options.runOptions });
     return tool;
   }
   Object.defineProperty(Agent.prototype, interceptionState, { value: state });
@@ -52,12 +61,13 @@ export function installAgentToolInterception(): void {
 installAgentToolInterception();
 
 export function getAgentToolRecord(tool: Tool<any>): AgentToolRecord | undefined {
-  return getState()?.records.get(tool);
+  const on = (tool as Partial<AnyAgentTool>).on;
+  return typeof on === 'function' ? getState()?.records.get(on) : undefined;
 }
 
 /**
  * Whether `tool` has the shape of an `agent.asTool()` tool that was not recorded: created before
- * the interception was installed, copied, or made by another copy of `@openai/agents-core`.
+ * the interception was installed, or made by another copy of `@openai/agents-core`.
  */
 export function isUnrecordedAgentTool(tool: Tool<any>): boolean {
   return (
@@ -105,4 +115,27 @@ export function checkAgentToolOptions({ agent, runConfig, runOptions }: AgentToo
       nonRetryable: true,
     });
   }
+}
+
+/** @deprecated Use the options of `agent.asTool()`. */
+export interface AgentAsToolOptions<TAgent extends Agent<any, any>> {
+  toolName: string;
+  toolDescription?: string;
+  customOutputExtractor?: (result: RunResult<any, TAgent>) => string | Promise<string>;
+}
+
+/**
+ * @deprecated Use `agent.asTool({ toolName, toolDescription, customOutputExtractor })`. This returns
+ * that tool, and will be removed in a later release.
+ */
+export function agentAsTool<TAgent extends Agent<any, any>>(
+  agent: TAgent,
+  // eslint-disable-next-line @typescript-eslint/no-deprecated -- the alias takes its own deprecated options
+  options: AgentAsToolOptions<TAgent>
+): FunctionTool<any, any, any> {
+  return agent.asTool({
+    toolName: options.toolName,
+    toolDescription: options.toolDescription,
+    customOutputExtractor: options.customOutputExtractor as AnyAgentToolOptions['customOutputExtractor'],
+  });
 }

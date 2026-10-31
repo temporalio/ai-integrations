@@ -214,6 +214,19 @@ export async function sandboxValidationWorkflow(): Promise<string> {
     }
   }
 
+  // As upstream, an asTool() tool returns the error of a nested SandboxAgent with no sandbox config as
+  // its output, and the run goes on.
+  const lead = new Agent({
+    name: 'lead',
+    model: 'gpt-4o-mini',
+    tools: [new SandboxAgent({ name: 'sandbox', model: 'gpt-4o-mini' }).asTool({ toolName: 'ask_sandbox' })],
+    toolUseBehavior: 'stop_on_first_tool',
+  });
+  const output = `${(await runner.run(lead, 'hello')).finalOutput}`;
+  if (!/^An error occurred while running the tool.*SandboxAgent execution requires/.test(output)) {
+    return `FAIL: unexpected nested-no-config output: ${output}`;
+  }
+
   return 'OK';
 }
 

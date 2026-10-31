@@ -1,4 +1,4 @@
-import { Agent, Handoff, tool, type Model } from '@openai/agents-core';
+import { Agent, Handoff, tool, type Model, type Tool } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
 import { TemporalOpenAIRunner } from '../../workflow';
 
@@ -8,13 +8,18 @@ import { TemporalOpenAIRunner } from '../../workflow';
 const copy = require('agents-core-copy') as typeof import('@openai/agents-core');
 
 export type AgentCopyCase =
-  'agent-start-model-object' | 'handoff-callback-model-object' | 'tool-model-object' | 'string-model';
+  | 'agent-start-model-object'
+  | 'handoff-callback-model-object'
+  | 'tool-model-object'
+  | 'as-tool'
+  | 'string-model';
 
 /**
  * Runs agents from the second copy of @openai/agents-core, whose `Agent.prototype` the plugin didn't
  * patch when it loaded. The `*-model-object` cases give such an agent a `Model` object after the check
  * before the run: an `agent_start` listener, a custom `Handoff`'s callback, or a tool between two
- * turns. `string-model` is the supported control.
+ * turns. `as-tool` passes an `asTool()` tool from that copy, which the plugin can't trace back to its
+ * agent. `string-model` is the supported control.
  * Returns the run's failure or its output.
  */
 export async function agentCopyWorkflow(kind: AgentCopyCase): Promise<string> {
@@ -53,6 +58,10 @@ export async function agentCopyWorkflow(kind: AgentCopyCase): Promise<string> {
     });
     copied.tools = [switchModel as any];
     lead = copied as unknown as Agent<any, any>;
+  } else if (kind === 'as-tool') {
+    const nested = new copy.Agent({ name: 'Nested', instructions: 'Answer.', model: 'nested-model' });
+    const askNested = nested.asTool({ toolName: 'ask_nested' }) as unknown as Tool;
+    lead = new Agent({ name: 'Lead', instructions: 'Answer.', model: 'lead-model', tools: [askNested] });
   } else {
     lead = new copy.Agent({ name: 'Lead', instructions: 'Answer.', model: 'lead-model' }) as unknown as Agent<any, any>;
   }

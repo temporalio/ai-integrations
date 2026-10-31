@@ -97,9 +97,24 @@ main();
 
 Differences from the upstream runner:
 
-- `runConfig.model` must be a model name string. The Worker's `modelProvider` resolves it inside the model Activity. As upstream, it applies to agents that set no model of their own.
+- `runConfig.model` must be a model name string. The Worker's `modelProvider` resolves it inside the model Activity. As upstream, it applies to agents that set no model of their own. Upstream's docs say it overrides every agent's model, but its code and tests let an agent's own model win, and the plugin follows the code. The Python plugin follows the Python SDK, where the run's model wins.
 - `signal` is not supported. Use Temporal cancellation APIs, such as `CancellationScope`, to cancel Workflow work.
 - If the cancellation scope `run()` started in is cancelled, `run()` throws the `CancelledFailure`, and a streamed run fails with it, even if the run ended on a tool's output. As upstream, an `agent.asTool()` tool returns a nested run's failure, including a cancelled model Activity, as its output, and with `toolUseBehavior: 'stop_on_first_tool'` the run ends on that output.
+
+### Upgrading open runs
+
+Runs started on an earlier version may not continue correctly on this one. Let them finish on the old Worker, or pin them to it with Worker Versioning, if they:
+
+- use `agentAsTool` or `agent.asTool()`;
+- set `runConfig.model` and have agents with a model of their own: those agents use their own model from their next model call;
+- set `useLocalActivity` or `cancellationType` in the runner's options: nested model calls now use the runner's Activity options;
+- have agent hooks (`agent.on(...)`), or a custom `Handoff` whose callback returns another agent: they now take effect.
+
+A passing replay test of old histories doesn't show these runs are safe. Every model call is the same Activity type, and replay doesn't compare Activity inputs, so a run that now makes a different model call can replay without an error and continue with the wrong answer.
+
+Before resuming a `RunState` saved on an earlier version, give agents unique names across handoffs and `asTool()` tools. The framework also finds `asTool()` agents by name when it restores a `RunState`, and `agentAsTool` tools weren't included, so a saved run can resume on the wrong agent.
+
+`agentAsTool(agent, { toolName, toolDescription, customOutputExtractor })` is deprecated and will be removed in a later release. It returns `agent.asTool({ toolName, toolDescription, customOutputExtractor })`; call that instead. As upstream, a nested approval now pauses the parent run, where `agentAsTool` failed the tool call with `NestedAgentInterruption`.
 
 ### Run state and approvals
 
@@ -416,9 +431,11 @@ const triage = new Agent({
 });
 ```
 
-As in the framework, the nested run takes the run's `model` (for agents that set none) and `modelSettings`. Its model Activities use the same options as the runner's.
+As in the framework, the nested run takes the run's `model` (for agents that set none) and `modelSettings`. Its model Activities use the same options as the runner's. A nested approval pauses the parent run: approve it on the parent's `result.state` and resume, as in [Run state and approvals](#run-state-and-approvals).
 
-The framework doesn't expose the agent behind an `asTool()` tool, so the plugin records it: in the Workflow, before your Workflow module loads, it wraps `Agent.prototype.asTool`. The runner uses that record to check the nested agent before the run. Create these tools in Workflow code with `agent.asTool()` and pass them as they are; the runner rejects a tool it can't trace back to its agent, such as a copy, or one created outside a Worker with the plugin before `@temporalio/openai-agents/workflow` was imported.
+As upstream, the tool returns a nested run's failure to the parent model as its output, which starts with `An error occurred while running the tool. Please try again.` This includes model Activity failures that are not retried, such as an authentication error, model Activity timeouts, the plugin's checks in the nested run below, and a nested `SandboxAgent` in a run without `runConfig.sandbox`. The parent model may call the tool again until the run reaches `maxTurns`, and that error doesn't carry the cause. A `ModelSummaryProvider` gets `agent: undefined` for nested model calls.
+
+The framework doesn't expose the agent behind an `asTool()` tool, so the plugin records it: in the Workflow, before your Workflow module loads, it wraps `Agent.prototype.asTool`. The runner uses that record to check the nested agent before the run. Create these tools in Workflow code with `agent.asTool()`. Copies, such as the ones `toolNamespace()` makes, keep the record. The runner rejects an `asTool()` tool it can't trace back to its agent: one made by an agent from another copy of `@openai/agents-core`, or one created outside a Worker with the plugin before `@temporalio/openai-agents/workflow` was imported.
 
 The runner rejects nested setups that would run model calls or sandbox operations in the Workflow:
 
@@ -427,7 +444,7 @@ The runner rejects nested setups that would run model calls or sandbox operation
 - a `runConfig.sandbox` or `runOptions.sandbox` whose client isn't from `temporalSandboxClient(name)`, or whose live `session` isn't from such a client;
 - a `MemorySession` as `runOptions.session`.
 
-The runner also checks each agent just before it calls its model. This covers agents the check before the run can't see: one that a custom `Handoff`'s callback returns, or one that an `agent.on(...)` listener changes. Its model must be a name, and its `asTool()` tools must pass the checks above. In the outer run, the run fails. In a nested run, the error goes back to the parent model as the tool's output, and the model isn't called. The check wraps `Agent.prototype.getSystemPrompt`, which the framework calls once per model call, so an `Agent` subclass that overrides it must call `super.getSystemPrompt()`. An agent from another copy of `@openai/agents-core`, such as one a dependency brings, is checked the same way: the runner wraps that copy's `Agent.prototype.getSystemPrompt` before the agent's first model call.
+The runner also checks each agent just before it calls its model. This covers agents the check before the run can't see: one that a custom `Handoff`'s callback returns, or one that an `agent.on(...)` listener changes. Its model must be a name, and its `asTool()` tools must pass the checks above. In the outer run, the run fails. In a nested run, the error goes back to the parent model as the tool's output, and the model isn't called. The check wraps `Agent.prototype.getSystemPrompt`, which the framework calls once per model call, so an `Agent` subclass that overrides it must call `super.getSystemPrompt()`. An agent from another copy of `@openai/agents-core`, such as one a dependency brings, is checked the same way: the runner wraps that copy's `Agent.prototype.getSystemPrompt` before the agent's first model call. Its `asTool()` tools are rejected, because the plugin records only its own copy's tools.
 
 The framework reads an `asTool()` tool's `runConfig` and `runOptions` only when the nested run starts, after the tool's `parameters` schema, its `inputBuilder` and any `agent_tool_start` listener ran. So the plugin also checks each run as it starts, by wrapping `Runner.prototype.run` in the Workflow: the run's model provider must be the runner's, its `runConfig.model` a name, its session not a `MemorySession`, and its sandbox config must pass the checks above. A nested run that fails this check doesn't start, and the error is the tool's output. The run then uses a frozen copy of its sandbox config, so a later change to your object, for example in an `agent_start` listener, doesn't reach it. Because of this check, an upstream `Runner` can't run agents in a Workflow; use `TemporalOpenAIRunner`.
 
@@ -721,7 +738,7 @@ Most applications use two import paths: `@temporalio/openai-agents` in Worker an
 
 `@temporalio/openai-agents` exports `OpenAIAgentsPlugin`, MCP provider classes, `SandboxClientProvider`, model option types, hosted tool credential types, and `DEDICATED_WORKER_FAILURE_TYPE`. `OpenAIAgentsTraceClientInterceptor` is also public for Clients that need manual interceptor wiring instead of plugin registration.
 
-`@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, and `DEDICATED_WORKER_FAILURE_TYPE`.
+`@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `agentAsTool` (deprecated), `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, and `DEDICATED_WORKER_FAILURE_TYPE`.
 
 `@temporalio/openai-agents/otel` exports `createTracerProvider`, `TemporalIdGenerator`, `markReplaySafeTracerProvider`, `isReplaySafeTracerProvider`, and `TemporalOpenAIAgentsTracerProviderOptions`. Install optional peer dependency `@opentelemetry/sdk-trace-base` only when you use this OTel integration.
 
@@ -754,6 +771,6 @@ Any OpenAI Agents SDK `ModelProvider` can be passed as `modelProvider`. The prov
 | `continueAsNew`         | Supported                | Plugin config propagates to the continuation                                                   |
 | Child Workflows         | Supported                | Plugin config propagates to children                                                           |
 | Local Activities        | Supported                | Set `useLocalActivity: true` in `modelParams`                                                  |
-| Model override per run  | Supported                | `runConfig.model` names the model for agents that set none                                     |
+| Run model               | Supported                | `runConfig.model` names the model for agents that set none                                     |
 | Streaming               | Supported (experimental) | `run(agent, input, { stream: true })`; requires `streamingTopic` and a hosted `WorkflowStream` |
 | Voice agents            | Not supported            |                                                                                                |

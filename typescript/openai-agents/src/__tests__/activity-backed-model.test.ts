@@ -58,13 +58,16 @@ test('getStreamedResponse: dynamic summary routes through executeWithOptions', a
       return 'dynamic summary';
     },
   };
-  const model = new ActivityBackedModel('gpt-4o', {
-    startToCloseTimeout: '60s',
-    streamingTopic: 'events',
-    summary: provider,
-  });
   const agent = new Agent({ name: 'A', model: 'gpt-4o' });
-  model.setAgent(agent);
+  const model = new ActivityBackedModel(
+    'gpt-4o',
+    {
+      startToCloseTimeout: '60s',
+      streamingTopic: 'events',
+      summary: provider,
+    },
+    () => agent
+  );
   const fake = fakeStreamActivities(events);
   (model as any).activities = fake.activities;
 

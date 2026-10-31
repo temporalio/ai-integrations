@@ -145,7 +145,8 @@ test('Sandbox configuration errors are raised inside the Workflow', async (t) =>
   const worker = await createWorker({
     plugins: [
       new OpenAIAgentsPlugin({
-        modelProvider: new FakeModelProvider([]),
+        // The lead's call in the last case, whose nested SandboxAgent fails before calling its model.
+        modelProvider: new FakeModelProvider([toolCallResponse('ask_sandbox', { input: 'hello' })]),
         sandboxClientProviders: [new SandboxClientProvider('fake', new FakeSandboxClient())],
       }),
     ],

@@ -393,7 +393,6 @@ test('agent.asTool() setups that would run a model or sandbox in the Workflow fa
       'SandboxConfigurationError',
       /asTool\('ask_nested'\) runOptions.sandbox.client must be created/,
     ],
-    unrecorded: ['AgentsWorkflowError', /tool 'ask_nested' looks like an agent.asTool\(\) tool/],
   };
 
   await worker.runUntil(async () => {
@@ -461,6 +460,7 @@ test('Agents picked or changed during the run are checked before they call their
       /^An error occurred while running the tool.*agent 'Nested' has a model provider that would call models/,
       1,
     ],
+    'tool-start-memory-session': [/^An error occurred while running the tool.*agent 'Nested' has a MemorySession/, 1],
     'tool-option-model-provider-undefined': [
       /^AgentsWorkflowError: .*asTool\('ask_nested'\) sets runConfig.modelProvider/,
       0,
@@ -527,6 +527,7 @@ test('Agents from another copy of @openai/agents-core are checked before they ca
     'agent-start-model-object': [/^AgentsWorkflowError: .*Agent 'Lead' has a Model object/, 0],
     'handoff-callback-model-object': [/^AgentsWorkflowError: .*Agent 'Picked' has a Model object/, 1],
     'tool-model-object': [/^AgentsWorkflowError: .*Agent 'Lead' has a Model object/, 1],
+    'as-tool': [/^AgentsWorkflowError: .*tool 'ask_nested' looks like an agent.asTool\(\) tool/, 0],
     'string-model': [/^copy answer$/, 1],
   };
   await worker.runUntil(async () => {
@@ -709,9 +710,12 @@ test('A nested agent.asTool() run fails to stream when model calls are local Act
   const provider = {
     getModel() {
       return {
+        // Answers from the request, not a call count, so a rerun local Activity gets the same answer.
         async getResponse(request: any) {
           leadInputs.push(request.input);
-          return leadInputs.length === 1 ? toolCallResponse('ask_streamer', { input: 'q' }) : textResponse('done');
+          const answered =
+            Array.isArray(request.input) && request.input.some((item: any) => item.type === 'function_call_result');
+          return answered ? textResponse('done') : toolCallResponse('ask_streamer', { input: 'q' });
         },
         async *getStreamedResponse() {
           streamed = true;
@@ -730,8 +734,8 @@ test('A nested agent.asTool() run fails to stream when model calls are local Act
     t.deepEqual(await handle.result(), { output: 'done', onStream: [], on: [] });
     t.false(streamed, 'the nested model is not called');
     // A nested run's failure is the tool's output, as upstream.
-    const toolOutput = leadInputs[1].find((item: any) => item.type === 'function_call_result')?.output;
-    t.regex(JSON.stringify(toolOutput), /Streaming is incompatible with useLocalActivity/);
+    const toolOutputs = leadInputs.flat().filter((item: any) => item?.type === 'function_call_result');
+    t.regex(JSON.stringify(toolOutputs), /Streaming is incompatible with useLocalActivity/);
     await replay(t, handle);
   });
 });
@@ -764,7 +768,8 @@ test('agent.asTool() tools keep the options and name they were created with', as
     });
     // Reusing the options object does not drop ask_gated's approval, so it pauses instead of running.
     t.deepEqual(await handle.result(), ['ask_gated']);
-    t.deepEqual(leadTools, [['ask_gated', 'ask_open', 'Original_Name']]);
+    // ask_early, made at module scope, is recorded, so the run isn't rejected.
+    t.deepEqual(leadTools, [['ask_gated', 'ask_open', 'Original_Name', 'ask_early']]);
     t.deepEqual(instructions, ['Use the tools.', 'Answer as renamed.']);
     await replay(t, handle);
   });

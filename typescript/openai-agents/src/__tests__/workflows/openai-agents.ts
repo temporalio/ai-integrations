@@ -1,6 +1,10 @@
+// First, so its module-scope tool is made before the plugin's Workflow module loads.
+// eslint-disable-next-line import/order
+import { moduleScopeTool } from './module-scope-agent-tool';
 import {
   Agent,
   Handoff,
+  MemorySession,
   RunState,
   setDefaultModelProvider,
   tool,
@@ -148,8 +152,7 @@ export type AgentToolRejection =
   | 'nested-handoff-model-object'
   | 'model-provider'
   | 'raw-sandbox'
-  | 'raw-sandbox-run-options'
-  | 'unrecorded';
+  | 'raw-sandbox-run-options';
 
 /** Returns the failure for an `asTool()` setup that would run a model or sandbox in the Workflow. */
 export async function agentToolRejectedWorkflow(kind: AgentToolRejection): Promise<string> {
@@ -184,7 +187,6 @@ export async function agentToolRejectedWorkflow(kind: AgentToolRejection): Promi
         toolName: 'ask_nested',
         runOptions: { sandbox: rawSandbox },
       }),
-    unrecorded: () => ({ ...nested.asTool({ toolName: 'ask_nested' }) }),
   };
   const lead = new Agent({
     name: 'Lead',
@@ -212,6 +214,7 @@ export type RunningAgentRejection =
   | 'tool-start-run-model-object'
   | 'input-builder-model-provider'
   | 'tool-start-clear-model-provider'
+  | 'tool-start-memory-session'
   | 'tool-option-model-provider-undefined'
   | 'tool-start-run-model-name';
 
@@ -222,7 +225,8 @@ export type RunningAgentRejection =
  * lead's model call, when the tool is invoked; `tool-start-run-model-name` is the supported control.
  * The `*-model-provider-undefined` and `-clear-` kinds remove the runner's provider with an explicit
  * `modelProvider: undefined`, which upstream spreads over the inherited one; a registered default
- * provider would then run the inline model.
+ * provider would then run the inline model. `tool-start-memory-session` sets a `MemorySession` in the
+ * tool's `runOptions`.
  * Returns the run's failure, or its output when a nested run's failure became the tool's output.
  */
 export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection): Promise<string> {
@@ -260,6 +264,7 @@ export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection):
     kind === 'tool-start-run-model-object' ||
     kind === 'input-builder-model-provider' ||
     kind === 'tool-start-clear-model-provider' ||
+    kind === 'tool-start-memory-session' ||
     kind === 'tool-option-model-provider-undefined' ||
     kind === 'tool-start-run-model-name'
   ) {
@@ -270,8 +275,10 @@ export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection):
       kind === 'tool-option-model-provider-undefined'
         ? { model: 'nested-run-model', modelProvider: undefined }
         : { model: 'nested-run-model' };
+    const runOptions: { session?: MemorySession } = {};
     const change = () => {
       if (kind === 'tool-start-run-model-object') runConfig.model = inlineModel;
+      else if (kind === 'tool-start-memory-session') runOptions.session = new MemorySession();
       else if (kind === 'tool-start-run-model-name') runConfig.model = 'changed-run-model';
       else if (kind === 'tool-start-clear-model-provider') runConfig.modelProvider = undefined;
       else if (kind !== 'tool-option-model-provider-undefined')
@@ -285,6 +292,7 @@ export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection):
         modelLess.asTool({
           toolName: 'ask_nested',
           runConfig,
+          runOptions,
           ...(kind === 'input-builder-model-provider'
             ? {
                 inputBuilder: ({ params }: { params: unknown }) => {
@@ -467,7 +475,8 @@ export async function agentToolStreamWorkflow(
 
 /**
  * Creates `ask_gated` with approval required, then reuses its options object for `ask_open`, and
- * renames an agent after creating its tool with the default name. Returns the pending approvals.
+ * renames an agent after creating its tool with the default name. Also passes `ask_early`, made at
+ * module scope before the plugin's Workflow module loaded. Returns the pending approvals.
  */
 export async function agentToolOptionsReuseWorkflow(prompt: string): Promise<string[]> {
   const nested = new Agent({ name: 'Nested', instructions: 'Answer as nested.', model: 'nested-model' });
@@ -483,7 +492,7 @@ export async function agentToolOptionsReuseWorkflow(prompt: string): Promise<str
     name: 'Lead',
     instructions: 'Use the tools.',
     model: 'lead-model',
-    tools: [gated, open, byDefaultName],
+    tools: [gated, open, byDefaultName, moduleScopeTool],
   });
   const result = await new TemporalOpenAIRunner().run(lead, prompt);
   return result.interruptions.map((i) => i.name ?? '');

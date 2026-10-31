@@ -73,7 +73,6 @@ interface ModelActivities {
 export class ActivityBackedModel implements Model {
   private readonly activities: ActivityInterfaceFor<ModelActivities> | LocalActivityInterfaceFor<ModelActivities>;
   private readonly modelParams: ModelActivityOptions;
-  private agent?: Agent<any, any>;
 
   constructor(
     private readonly modelName: string,
@@ -102,10 +101,6 @@ export class ActivityBackedModel implements Model {
     }
   }
 
-  setAgent(agent: Agent<any, any>): void {
-    this.agent = agent;
-  }
-
   async getResponse(request: ModelRequest): Promise<ModelResponse> {
     // Wrap in a generation span so the trace tree has agent → generation → Activity.
     return withGenerationSpan(async (span) => {
@@ -121,7 +116,7 @@ export class ActivityBackedModel implements Model {
       if (modelSummary && typeof modelSummary !== 'string') {
         const provider = modelSummary as ModelSummaryProvider;
         const systemInstructions = request.systemInstructions;
-        const summary = provider.provide(this.agent ?? this.runningAgent?.(), systemInstructions, request.input);
+        const summary = provider.provide(this.runningAgent?.(), systemInstructions, request.input);
         const wireResponse = await this.activities.invokeModelActivity.executeWithOptions({ summary }, [input]);
         return fromSerializedModelResponse(wireResponse);
       }
@@ -166,11 +161,7 @@ export class ActivityBackedModel implements Model {
       const modelSummary = this.modelParams.summary;
       if (modelSummary && typeof modelSummary !== 'string') {
         const provider = modelSummary as ModelSummaryProvider;
-        const summary = provider.provide(
-          this.agent ?? this.runningAgent?.(),
-          request.systemInstructions,
-          request.input
-        );
+        const summary = provider.provide(this.runningAgent?.(), request.systemInstructions, request.input);
         return this.activities.invokeModelStreamActivity.executeWithOptions({ summary }, [input]);
       }
 

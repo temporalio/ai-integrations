@@ -8,40 +8,22 @@ import { validateTemporalSandboxClient } from './sandbox-client';
 
 /**
  * Checks an agent graph before a run, without changing it: the agents reached through handoffs and
- * through `agent.asTool()` tools, and those tools' options. Rejects raw functions in `tools`, an agent
- * with no model when the run sets none, and setups that would run model calls or sandbox operations
- * in the Workflow. Agents then run as written: the runner's model provider sends every model name to
- * the model Activity. Uses a seen-set for circular references.
+ * through `agent.asTool()` tools, and those tools' options. Rejects raw functions in `tools` and
+ * setups that would run model calls or sandbox operations in the Workflow. Agents then run as written:
+ * the runner's model provider sends every model name to the model Activity. Uses a seen-set for
+ * circular references.
  */
-export function checkAgent(agent: Agent<any, any>, modelOverride?: string, seen = new Set<Agent<any, any>>()): void {
+export function checkAgent(agent: Agent<any, any>, seen = new Set<Agent<any, any>>()): void {
   if (seen.has(agent)) return;
   seen.add(agent);
 
   checkAgentCopy(agent);
   rejectModelObject(agent);
-  if (typeof agent.model !== 'string' && modelOverride === undefined) {
-    throw ApplicationFailure.create({
-      message:
-        `Agent '${agent.name}' has no model declared and no runConfig.model override given. ` +
-        'Declare a model on the agent or pass runConfig.model to runner.run().',
-      type: 'AgentsWorkflowError',
-      nonRetryable: true,
-    });
+  for (const tool of agent.tools ?? []) {
+    const record = checkToolOptions(tool, agent);
+    if (record !== undefined) checkAgent(record.agent, seen);
   }
-  for (const tool of agent.tools ?? []) checkTool(tool, agent, modelOverride, seen);
-  for (const h of agent.handoffs ?? []) checkAgent(h instanceof Handoff ? h.agent : h, modelOverride, seen);
-}
-
-function checkTool(
-  tool: Tool<any>,
-  owner: Agent<any, any>,
-  modelOverride: string | undefined,
-  seen: Set<Agent<any, any>>
-): void {
-  const record = checkToolOptions(tool, owner);
-  if (record === undefined) return;
-  const nestedModel = typeof record.runConfig?.model === 'string' ? record.runConfig.model : modelOverride;
-  checkAgent(record.agent, nestedModel, seen);
+  for (const h of agent.handoffs ?? []) checkAgent(h instanceof Handoff ? h.agent : h, seen);
 }
 
 interface RunningAgentCheckState {
@@ -137,7 +119,6 @@ export function installRunnerCheck(): void {
       state.watched.add(this);
       this.on('agent_start', (_context, started) => checkAgentCopy(started));
     }
-    checkAgentCopy(agent);
     const where = `The run of agent '${agent.name}'`;
     if (!(this.config.modelProvider instanceof ActivityBackedModelProvider)) {
       throw ApplicationFailure.create({
@@ -222,8 +203,7 @@ function rejectModelObject(agent: Agent<any, any>): void {
     throw ApplicationFailure.create({
       message:
         `Agent '${agent.name}' has a Model object instead of a string model name. ` +
-        'In Temporal workflows, all models must be specified as strings — use ' +
-        'runConfig.model to override, or declare a string model on the agent.',
+        'In Temporal workflows, all models must be specified as strings: give the agent a model name.',
       type: 'AgentsWorkflowError',
       nonRetryable: true,
     });

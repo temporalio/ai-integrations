@@ -1,8 +1,8 @@
 import test from 'ava';
-import { Agent, MemorySession, RunContext, Runner, handoff } from '@openai/agents-core';
+import { Agent, MemorySession, RunContext, Runner, handoff, toolNamespace } from '@openai/agents-core';
 import { SandboxAgent } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
-import { getAgentToolRecord, installAgentToolInterception } from '../workflow/agent-tools';
+import { agentAsTool, getAgentToolRecord, installAgentToolInterception } from '../workflow/agent-tools';
 import { checkAgent, installRunnerCheck, installRunningAgentCheck } from '../workflow/check-agent';
 import { temporalSandboxClient } from '../workflow/sandbox-client';
 import { textResponse } from './stubs/openai-agents';
@@ -25,15 +25,6 @@ test('checkAgent: non-string Model object throws AgentsWorkflowError', (t) => {
   const err = t.throws(() => checkAgent(agent)) as ApplicationFailure;
   t.is(err.type, 'AgentsWorkflowError');
   t.regex(err.message, /string/i);
-});
-
-test('checkAgent: no model and no override throws AgentsWorkflowError', (t) => {
-  const agent = new Agent({ name: 'NoModel' });
-  (agent as any).model = undefined;
-  const err = t.throws(() => checkAgent(agent)) as ApplicationFailure;
-  t.is(err.type, 'AgentsWorkflowError');
-  t.regex(err.message, /no model declared/);
-  t.notThrows(() => checkAgent(agent, 'run-model'));
 });
 
 test('checkAgent: cyclic handoffs terminate (seen-set prevents stack overflow)', (t) => {
@@ -62,12 +53,25 @@ test('checkAgent: raw function tool on handoff() wrapper agent is caught', (t) =
   t.regex(err.message, /Specialist/);
 });
 
-test('installAgentToolInterception: installing again keeps one wrapper and its records', (t) => {
+test('installAgentToolInterception: installing again keeps one wrapper and its records, which copies keep', (t) => {
   const asTool = Agent.prototype.asTool;
   const agent = new Agent({ name: 'Nested', model: 'm' });
   const tool = agent.asTool({ toolName: 'ask_nested' });
   installAgentToolInterception();
   t.is(Agent.prototype.asTool, asTool);
+  t.is(getAgentToolRecord(tool)?.agent, agent);
+  t.is(getAgentToolRecord({ ...tool })?.agent, agent);
+  const [namespaced] = toolNamespace({ name: 'experts', description: 'Experts.', tools: [tool] });
+  t.is(getAgentToolRecord(namespaced!)?.agent, agent);
+  t.notThrows(() => checkAgent(new Agent({ name: 'Parent', model: 'm', tools: [namespaced!] })));
+});
+
+test('agentAsTool: the deprecated alias returns the agent.asTool() tool', (t) => {
+  const agent = new Agent({ name: 'Nested', model: 'm' });
+  // eslint-disable-next-line @typescript-eslint/no-deprecated -- tests the deprecated alias
+  const tool = agentAsTool(agent, { toolName: 'ask_nested', toolDescription: 'Ask the nested agent.' });
+  t.is(tool.name, 'ask_nested');
+  t.is(tool.description, 'Ask the nested agent.');
   t.is(getAgentToolRecord(tool)?.agent, agent);
 });
 
