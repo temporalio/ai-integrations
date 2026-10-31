@@ -32,9 +32,11 @@ import {
   CancellationScope,
   condition,
   continueAsNew,
+  createNexusServiceClient,
   defineQuery,
   defineSignal,
   defineUpdate,
+  isCancellation,
   proxyActivities,
   setHandler,
   sleep,
@@ -558,31 +560,11 @@ export async function agentRunnerRecoversFromCancelledModel(prompt: string): Pro
   return runAgentTurn(new TemporalModel('slow-model', SINGLE_ATTEMPT), prompt, [new RecoveringPlugin()]);
 }
 
-export const adkToolWaitingQuery = defineQuery<boolean>('adkToolWaiting');
+export const adkStageQuery = defineQuery<string>('adkStage');
 
-/**
- * A runner turn whose model calls a `LongRunningFunctionTool` that waits in Workflow code
- * for an approval that never comes, with nothing cancellable after the turn.
- */
-export async function agentRunnerLongRunningToolWait(): Promise<string> {
-  let waiting = false;
-  setHandler(adkToolWaitingQuery, () => waiting);
-  const tool = new LongRunningFunctionTool({
-    name: 'wait_approval',
-    description: 'Wait for a person to approve.',
-    execute: async () => {
-      waiting = true;
-      await condition(() => false);
-      return { status: 'approved' };
-    },
-  });
-  return runAgentTurn(new TemporalModel('call-wait-approval-model', SINGLE_ATTEMPT), 'hi', undefined, {
-    tools: [tool],
-  });
-}
-
-interface PolicyActivities {
+interface BlockingActivities {
   cancellableActivity(): Promise<string>;
+  echoId(id: string): Promise<string>;
 }
 
 /** An ADK plugin whose `beforeModelCallback` runs `check`. */
@@ -596,20 +578,240 @@ class PolicyPlugin extends BasePlugin {
   }
 }
 
+/** Where a {@link blockedTurn} waits. */
+export type BlockedTurnKind = 'tool' | 'agent' | 'plugin' | 'model';
+
 /**
- * A runner turn whose `beforeModelCallback`, the agent's own or an ADK plugin's, awaits a
- * policy Activity that runs until it is cancelled.
+ * How the tool or callback of a {@link blockedTurn} waits: as it is (`plain`); inside
+ * `CancellationScope.nonCancellable(() => CancellationScope.withTimeout('1 second', ...))`
+ * (`shielded`); the same, then a cleanup in the non-cancellable scope that holds the
+ * timeout's error until {@link adkDoneSignal} (`shielded-cleanup`); or not at all, throwing
+ * an ordinary error instead (`throws`).
  */
-export async function agentRunnerModelCallbackActivity(where: 'agent' | 'plugin'): Promise<string> {
-  const { cancellableActivity } = proxyActivities<PolicyActivities>({ startToCloseTimeout: '1 minute' });
+export type BlockedTurnWait = 'plain' | 'shielded' | 'shielded-cleanup' | 'throws';
+
+/**
+ * A runner turn that waits until it is cancelled, with nothing cancellable after the wait:
+ * in a `LongRunningFunctionTool` waiting in Workflow code for an approval that never comes
+ * (`tool`), in a `beforeModelCallback`, the agent's own or an ADK plugin's, awaiting a policy
+ * Activity that runs until it is cancelled (`agent`, `plugin`), or in a slow model call
+ * (`model`, always `plain`). With `nexusEndpoint`, the tool or callback waits instead for a
+ * Nexus operation on that endpoint, whose task queue no Worker polls, so the operation never
+ * starts. `stage` is told when the wait starts, and when a `shielded-cleanup` wait's cleanup
+ * does.
+ */
+function blockedTurn(
+  kind: BlockedTurnKind,
+  stage: (name: string) => void,
+  wait: BlockedTurnWait = 'plain',
+  nexusEndpoint?: string
+): Promise<string> {
+  if (kind === 'model') {
+    stage('blocked');
+    return runAgentTurn(new TemporalModel('slow-model', SINGLE_ATTEMPT), 'hi');
+  }
+  let released = false;
+  if (wait === 'shielded-cleanup') {
+    setHandler(adkDoneSignal, () => {
+      released = true;
+    });
+  }
+  const shaped = (body: () => Promise<void>) => async (): Promise<void> => {
+    stage('blocked');
+    if (wait === 'throws') throw new Error('policy refused the request');
+    if (wait === 'plain') return body();
+    await CancellationScope.nonCancellable(async () => {
+      try {
+        await CancellationScope.withTimeout('1 second', body);
+      } finally {
+        if (wait === 'shielded-cleanup') {
+          stage('cleanup');
+          await condition(() => released);
+        }
+      }
+    });
+  };
+  const unstartedNexusOperation = async (): Promise<void> => {
+    const client = createNexusServiceClient({
+      endpoint: nexusEndpoint ?? '',
+      service: { name: 'blocking', operations: { wait: { name: 'wait' } } } as never,
+    });
+    await client.executeOperation('wait' as never, undefined as never, { cancellationType: 'TRY_CANCEL' });
+  };
+  if (kind === 'tool') {
+    const waitForApproval = shaped(nexusEndpoint === undefined ? () => condition(() => false) : unstartedNexusOperation);
+    const tool = new LongRunningFunctionTool({
+      name: 'wait_approval',
+      description: 'Wait for a person to approve.',
+      execute: async () => {
+        await waitForApproval();
+        return { status: 'approved' };
+      },
+    });
+    return runAgentTurn(new TemporalModel('call-wait-approval-model', SINGLE_ATTEMPT), 'hi', undefined, {
+      tools: [tool],
+    });
+  }
+  const { cancellableActivity } = proxyActivities<BlockingActivities>({ startToCloseTimeout: '1 minute' });
+  const runCheck = shaped(
+    nexusEndpoint === undefined
+      ? async () => {
+          await cancellableActivity();
+        }
+      : unstartedNexusOperation
+  );
   const check = async (): Promise<undefined> => {
-    await cancellableActivity();
+    await runCheck();
     return undefined;
   };
   const model = new TemporalModel('fake-model', SINGLE_ATTEMPT);
-  return where === 'plugin'
+  return kind === 'plugin'
     ? runAgentTurn(model, 'hi', [new PolicyPlugin(check)])
     : runAgentTurn(model, 'hi', undefined, { beforeModelCallback: check });
+}
+
+/** A {@link blockedTurn} in the main function. */
+export async function agentRunnerBlockedTurn(kind: BlockedTurnKind, nexusEndpoint?: string): Promise<string> {
+  let stage = 'start';
+  setHandler(adkStageQuery, () => stage);
+  return blockedTurn(
+    kind,
+    (name) => {
+      stage = name;
+    },
+    'plain',
+    nexusEndpoint
+  );
+}
+
+/**
+ * A Signal handler runs a {@link blockedTurn} through a `LongRunningFunctionTool`, after a
+ * failing model turn when `failFirst` is set, while the main function waits, shielded from
+ * cancellation, for the turn to end, then cleans up through two Activities with a wait for
+ * {@link adkDoneSignal} between them.
+ */
+export async function agentRunnerSignalTurnThenCleanup(failFirst = false): Promise<string> {
+  let stage = 'start';
+  let turnEnded = false;
+  let released = false;
+  setHandler(adkStageQuery, () => stage);
+  setHandler(adkStartSignal, async () => {
+    if (failFirst) await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), 'hi');
+    await blockedTurn('tool', (name) => {
+      stage = name;
+    });
+    turnEnded = true;
+  });
+  setHandler(adkDoneSignal, () => {
+    released = true;
+  });
+  const { echoId } = proxyActivities<BlockingActivities>({ startToCloseTimeout: '1 minute' });
+  await CancellationScope.nonCancellable(async () => {
+    await condition(() => turnEnded);
+    await echoId('one');
+    stage = 'held';
+    await condition(() => released);
+    await echoId('two');
+  });
+  return 'cleaned up';
+}
+
+/**
+ * A {@link blockedTurn} that its 1-second timeout scope cancels, then a wait outside ADK
+ * whose cancellation the Workflow catches and finishes on.
+ */
+export async function agentRunnerTimedOutTurnThenCaughtCancel(kind: BlockedTurnKind): Promise<string> {
+  let stage = 'start';
+  setHandler(adkStageQuery, () => stage);
+  await CancellationScope.withTimeout('1 second', () =>
+    blockedTurn(kind, (name) => {
+      stage = name;
+    })
+  );
+  stage = 'after-turn';
+  try {
+    await condition(() => false);
+  } catch (err) {
+    if (isCancellation(err)) return 'caught';
+    throw err;
+  }
+  return 'not cancelled';
+}
+
+/**
+ * A wait outside ADK whose cancellation the Workflow catches, then a {@link blockedTurn},
+ * shielded from that cancellation, that its own 1-second timeout scope cancels.
+ */
+export async function agentRunnerCaughtCancelThenTimedOutTurn(kind: BlockedTurnKind): Promise<string> {
+  let stage = 'waiting';
+  setHandler(adkStageQuery, () => stage);
+  try {
+    await condition(() => false);
+    return 'not cancelled';
+  } catch (err) {
+    if (!isCancellation(err)) throw err;
+  }
+  await CancellationScope.nonCancellable(() =>
+    CancellationScope.withTimeout('1 second', () =>
+      blockedTurn(kind, (name) => {
+        stage = name;
+      })
+    )
+  );
+  return 'caught';
+}
+
+/**
+ * A {@link blockedTurn} whose tool or callback shields its own wait, which a 1-second
+ * timeout scope then cancels (`shielded`, `shielded-cleanup`), then a wait outside ADK whose
+ * cancellation the Workflow catches and finishes on.
+ */
+export async function agentRunnerShieldedWaitThenCaughtCancel(
+  kind: BlockedTurnKind,
+  wait: BlockedTurnWait,
+  nexusEndpoint?: string
+): Promise<string> {
+  let stage = 'start';
+  setHandler(adkStageQuery, () => stage);
+  await blockedTurn(
+    kind,
+    (name) => {
+      stage = name;
+    },
+    wait,
+    nexusEndpoint
+  );
+  stage = 'after-turn';
+  try {
+    await condition(() => false);
+  } catch (err) {
+    if (isCancellation(err)) return 'caught';
+    throw err;
+  }
+  return 'not cancelled';
+}
+
+/**
+ * A wait outside ADK whose cancellation the Workflow catches, then a {@link blockedTurn}
+ * whose callback throws an ordinary error at once, before anything cancellable runs.
+ */
+export async function agentRunnerCaughtCancelThenFailingTurn(kind: BlockedTurnKind): Promise<string> {
+  let stage = 'waiting';
+  setHandler(adkStageQuery, () => stage);
+  try {
+    await condition(() => false);
+    return 'not cancelled';
+  } catch (err) {
+    if (!isCancellation(err)) throw err;
+  }
+  await blockedTurn(
+    kind,
+    (name) => {
+      stage = name;
+    },
+    'throws'
+  );
+  return 'caught';
 }
 
 /** A runner turn whose caller-supplied `summary` callback throws before the Activity. */

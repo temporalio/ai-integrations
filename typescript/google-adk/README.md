@@ -387,12 +387,16 @@ const runner = new InMemoryRunner({ agent: graph });
 - **Agent node timeouts.** A `timeout` on an `LlmAgent` node is ADK's own
   deadline, and it never reaches the agent's model call: ADK runs the agent with
   the run's abort signal rather than the node's. When the node times out, its
-  model Activity keeps running, and a `retryConfig` that retries
-  `NodeTimeoutError` starts the next attempt beside it; the calls left open are
-  only cancelled when the run itself fails or is cancelled. Once the retry has
-  answered, a failure from one of them no longer counts, whenever it arrives: the
-  plugin numbers model calls as they start, and ignores the failure of a call
-  that started before the same agent's latest answer in that run. Bound an
+  model Activity keeps running, and so does a tool or model callback it was
+  waiting on; a `retryConfig` that retries `NodeTimeoutError` starts the next
+  attempt beside it, and the work left open is only cancelled when the run
+  itself fails or is cancelled. A cancellation of that work never counts, whenever
+  it arrives: the plugin tracks each node attempt and ignores a cancellation that
+  ADK absorbs in an attempt the node's timeout abandoned, while a retry or another
+  item of a `ParallelWorker` is an attempt of its own. Once the retry has answered,
+  a model failure from that work no longer counts either: the plugin numbers
+  model calls as they start, and ignores the failure of a call that started
+  before the same agent's latest answer in that run. Bound an
   agent's model call with the model Activity's own `startToCloseTimeout` or
   `scheduleToCloseTimeout` (`TemporalModel`'s `activity` options) instead, and
   put a deadline on Activity work with `activityNode`.
@@ -591,7 +595,11 @@ execution CANCELLED with the model Activity's own cancellation instead. A
 cancelled Activity node ends it CANCELLED the same way, inside a dynamic run too.
 So does a cancel that ADK absorbs in a tool or a model callback, such as a
 `LongRunningFunctionTool` waiting for a Signal or a `beforeModelCallback` waiting
-for an Activity.
+for an Activity. A cancel absorbed in a Signal handler ends the execution when the
+main function returns, after its cleanup. Only the execution's own cancellation
+counts, followed from the operation it cancelled: a cancel that only an inner scope
+(`CancellationScope.withTimeout`) caused, or any other error, leaves the outcome to
+the Workflow, even when the Workflow's cancellation was requested meanwhile.
 
 A failing sibling does not cancel the execution either. When a graph node fails,
 ADK aborts the run and waits for the nodes still running before failing it. The
