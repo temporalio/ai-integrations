@@ -33,7 +33,7 @@ import threading
 import uuid as _uuid
 import warnings
 import weakref
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from datetime import timedelta
 from functools import wraps
 from types import SimpleNamespace
@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from temporalio import activity as activity_mod
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
+from temporalio.exceptions import ActivityError, RetryState, is_cancelled_exception
 from temporalio.workflow import ActivityConfig
 
 # LangChain is a runtime dependency of the *tool seam*, but importing this module
@@ -207,6 +208,85 @@ def lookup_backend(ref: str) -> Any | None:
 
 
 # ---------------------------------------------------------------------------
+# Terminal tool-activity failures returned to the model (opt-in)
+# ---------------------------------------------------------------------------
+
+# Prefix on the text a ``return_error_to_model`` wrapper hands the model when
+# the tool's activity failed for good, so a failure is recognizable without
+# parsing the sentence around it. The literal prefix is part of what the model
+# is shown and of recorded history, which makes it a replay contract rather
+# than a free wording choice.
+_TOOL_ERROR_PREFIX = "[tool error]"
+
+# Bound on the underlying failure's message carried into that text: it is
+# recorded in workflow history and repeated into the next model prompt, so an
+# arbitrarily long exception message must not bloat either.
+_FAILURE_DETAIL_MAX = 300
+
+
+def _failure_reason(error: ActivityError) -> str:
+    """Say why there is no result, in the words the model should act on.
+
+    An :class:`ActivityError` raised into workflow code means Temporal is done
+    with that activity, but "non-retryable" and "retries exhausted" tell a model
+    different things about whether re-asking could help.
+    """
+    if error.retry_state == RetryState.NON_RETRYABLE_FAILURE:
+        return "failed with a non-retryable error"
+    if error.retry_state == RetryState.MAXIMUM_ATTEMPTS_REACHED:
+        return "failed after exhausting its retries"
+    if error.retry_state == RetryState.TIMEOUT:
+        return "timed out"
+    return "failed and Temporal will not retry it again"
+
+
+def _tool_failure_text(tool_name: str, error: ActivityError) -> str:
+    """Render a terminal :class:`ActivityError` as text the model can act on.
+
+    The text names the tool, says why there is no result, and carries the
+    underlying failure's type and message (truncated at
+    :data:`_FAILURE_DETAIL_MAX`) — the model then decides what to do next
+    instead of the run dying. Saying "not evidence about the task" is
+    deliberate: a bare "failed" reads like an empty result, which invites the
+    model to invent one.
+    """
+    cause = error.cause or error
+    kind = getattr(cause, "type", None) or type(cause).__name__
+    message = (getattr(cause, "message", None) or str(cause) or "no detail")[
+        :_FAILURE_DETAIL_MAX
+    ]
+    return (
+        f"{_TOOL_ERROR_PREFIX} {tool_name} {_failure_reason(error)} "
+        f"({kind}: {message}). "
+        "This is a tool failure, not evidence about the task: do not invent a "
+        "result from it. Try a different tool or arguments, or report the failure."
+    )
+
+
+async def _as_tool_result(awaitable: Awaitable[Any], tool_name: str) -> Any:
+    """Await a tool dispatch, turning a terminal activity failure into text.
+
+    Returns the awaited result, or — when the activity failed for good — the
+    failure text :func:`_tool_failure_text` builds, which the caller returns as
+    the tool's content. ``awaitable`` may cover more than the dispatch itself
+    (:func:`tool_as_activity` unpacks the activity output inside it); the
+    conversion applies to the whole await. LangGraph's ToolNode re-raises every
+    error but an argument error, so an ActivityError that reaches it fails the
+    whole agent run and discards the work already recorded in the transcript.
+    Callers opt in per tool, and only for this narrow conversion:
+    cancellation is re-raised, because an activity cancelled under a workflow
+    cancellation is not a tool result, and the workflow must still end up
+    cancelled.
+    """
+    try:
+        return await awaitable
+    except ActivityError as err:
+        if is_cancelled_exception(err):
+            raise
+        return _tool_failure_text(tool_name, err)
+
+
+# ---------------------------------------------------------------------------
 # activity_as_tool
 # ---------------------------------------------------------------------------
 
@@ -219,6 +299,7 @@ def activity_as_tool(
     description: str | None = None,
     retry_policy: Any = None,
     summary: str | None = None,
+    return_error_to_model: bool = False,
 ) -> BaseTool:
     """Expose an existing Temporal activity as a Deep Agents tool.
 
@@ -235,6 +316,12 @@ def activity_as_tool(
             (defaults to the activity docstring).
         retry_policy: Optional Temporal retry policy for the activity.
         summary: Optional ``summary=`` recorded on each activity invocation.
+        return_error_to_model: Hand a terminal activity failure to the model as
+            ``[tool error]`` text instead of raising. Off by default: the
+            ActivityError then propagates and fails the agent run. The text
+            carries the underlying failure's type and message (truncated), so
+            opting in sends the activity's error text to the model. Cancellation
+            always propagates.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import StructuredTool
@@ -278,13 +365,16 @@ def activity_as_tool(
                 values.append(param.default)
             else:
                 raise TypeError(f"{tool_name} missing argument {param.name!r}")
-        return await workflow.execute_activity(
+        dispatch = workflow.execute_activity(
             activity,
             args=values,
             start_to_close_timeout=start_to_close_timeout,
             retry_policy=retry_policy,
             summary=act_summary,
         )
+        if return_error_to_model:
+            return await _as_tool_result(dispatch, tool_name)
+        return await dispatch
 
     _ROUTED_TOOL_NAMES.add(tool_name)
     return StructuredTool.from_function(
@@ -304,6 +394,7 @@ def tool_as_activity(
     *,
     start_to_close_timeout: timedelta,
     activity_options: Mapping[str, Any] | None = None,
+    return_error_to_model: bool = False,
 ) -> BaseTool:
     """Wrap a LangChain tool / callable so its execution runs as an activity.
 
@@ -315,6 +406,22 @@ def tool_as_activity(
     Call this at module import or worker startup on every process that can
     execute tool activities. Registration inside a workflow alone does not
     make the tool available in another worker process.
+
+    Args:
+        tool: A LangChain ``BaseTool`` or a plain callable (wrapped as a
+            ``StructuredTool``).
+        start_to_close_timeout: Default ``start_to_close_timeout`` for the
+            ``deepagents.invoke_tool`` activity, applied when neither
+            ``activity_options`` nor the plugin's ``tool_activity_options``
+            sets one.
+        activity_options: Extra ``execute_activity`` options (retry policy,
+            task queue routing, ...) overriding the plugin's defaults.
+        return_error_to_model: Hand a terminal activity failure to the model as
+            ``[tool error]`` text instead of raising. Off by default: the
+            ActivityError then propagates and fails the agent run. The text
+            carries the underlying failure's type and message (truncated), so
+            opting in sends the activity's error text to the model. Cancellation
+            always propagates.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import BaseTool, StructuredTool
@@ -342,23 +449,33 @@ def tool_as_activity(
             tool_call_id=tool_call_id,
             args=kwargs,
         )
-        output = await call_tool(
+        dispatch = call_tool(
             activity_input,
             summary=f"tool:{tool_name}",
             **opts,
         )
-        message = _serde.load_object(output.message)
-        # Return CONTENT, not the pre-built ToolMessage: the activity cannot
-        # know the model's real tool_call_id, so a ToolMessage assembled there
-        # carries a generated id that a real provider rejects as an unpaired
-        # tool_result. Given plain content, the tool node stamps the model's
-        # own id — exactly as it does for unwrapped tools.
-        with workflow.unsafe.imports_passed_through():
-            from langchain_core.messages import ToolMessage
 
-        if isinstance(message, ToolMessage):
-            return message.content
-        return message
+        async def _dispatched_content() -> Any:
+            output = await dispatch
+            message = _serde.load_object(output.message)
+            # Return CONTENT, not the pre-built ToolMessage: the activity cannot
+            # know the model's real tool_call_id, so a ToolMessage assembled
+            # there carries a generated id that a real provider rejects as an
+            # unpaired tool_result. Given plain content, the tool node stamps
+            # the model's own id — exactly as it does for unwrapped tools.
+            with workflow.unsafe.imports_passed_through():
+                from langchain_core.messages import ToolMessage
+
+            if isinstance(message, ToolMessage):
+                return message.content
+            return message
+
+        if return_error_to_model:
+            # Only the failure conversion bypasses the unpacking, and only by
+            # returning text: a successful call still unwraps its activity
+            # output exactly as the default path does.
+            return await _as_tool_result(_dispatched_content(), tool_name)
+        return await _dispatched_content()
 
     _ROUTED_TOOL_NAMES.add(tool_name)
     return StructuredTool(
