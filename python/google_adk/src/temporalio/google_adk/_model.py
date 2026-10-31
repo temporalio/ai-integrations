@@ -58,44 +58,73 @@ def _new_llm(llm_request: LlmRequest, model_name: str | None) -> BaseLlm:
     may have changed; the model sends it, as it does outside Temporal.
     ``model_name`` is ``None`` for an Activity scheduled before
     ``TemporalModel`` sent its name, which then uses the request's model name.
+    A name the Worker cannot build fails the Activity without retries, since
+    retrying would not build it.
     """
     name = model_name if model_name is not None else llm_request.model
     if name is None:
-        raise ValueError("No model name provided, could not create LLM.")
+        raise ApplicationError(
+            "No model name provided, could not create LLM.", non_retryable=True
+        )
+    try:
+        return LLMRegistry.new_llm(name)
+    except Exception as err:
+        raise ApplicationError(
+            f"Failed to create LLM for model {name!r}: {err}",
+            type=type(err).__name__,
+            non_retryable=True,
+        ) from err
 
-    llm = LLMRegistry.new_llm(name)
-    if not llm:
-        raise ValueError(f"Failed to create LLM for model: {name}")
-    return llm
+
+class TemporalLlmRequest(LlmRequest):
+    """An ``LlmRequest`` that also carries the ``TemporalModel``'s name.
+
+    ``LlmRequest`` ignores unknown keys, so a Worker running an earlier plugin
+    decodes this payload as a plain request, and a request scheduled by an
+    earlier plugin decodes here with ``temporal_model_name`` set to ``None``.
+    """
+
+    temporal_model_name: str | None = None
+
+    @classmethod
+    def wrap(cls, llm_request: LlmRequest, model_name: str) -> "TemporalLlmRequest":
+        """Return ``llm_request`` with ``model_name`` added."""
+        return cls.model_construct(
+            _fields_set=llm_request.model_fields_set | {"temporal_model_name"},
+            temporal_model_name=model_name,
+            **{name: getattr(llm_request, name) for name in LlmRequest.model_fields},
+        )
+
+    def unwrap(self) -> LlmRequest:
+        """Return the plain ``LlmRequest`` the model receives."""
+        return LlmRequest.model_construct(
+            _fields_set=self.model_fields_set - {"temporal_model_name"},
+            **{name: getattr(self, name) for name in LlmRequest.model_fields},
+        )
 
 
 @activity.defn
-async def invoke_model(
-    llm_request: LlmRequest, model_name: str | None = None
-) -> list[LlmResponse]:
+async def invoke_model(llm_request: TemporalLlmRequest) -> list[LlmResponse]:
     """Activity that invokes an LLM model.
 
     Args:
-        llm_request: The LLM request containing model name and parameters.
-        model_name: The ``TemporalModel``'s model name, which selects the
-            Worker model.
+        llm_request: The LLM request, with the ``TemporalModel``'s name, which
+            selects the Worker model.
 
     Returns:
         List of LLM responses from the model.
 
     Raises:
-        ValueError: If model name is not provided or LLM creation fails.
+        ApplicationError: Non-retryable, if no model name is provided or the
+            model cannot be built.
     """
-    if isinstance(llm_request, dict):
-        # An Activity scheduled before TemporalModel sent its name has one
-        # argument, so the SDK passes the request without type hints.
-        llm_request = LlmRequest.model_validate(llm_request)
-    llm = _new_llm(llm_request, model_name)
+    request = llm_request.unwrap()
+    llm = _new_llm(request, llm_request.temporal_model_name)
 
     with _classify_model_errors():
         return [
             response
-            async for response in llm.generate_content_async(llm_request=llm_request)
+            async for response in llm.generate_content_async(llm_request=request)
         ]
 
 
@@ -200,7 +229,13 @@ class TemporalModel(BaseLlm):
         flag is needed.
 
         Args:
-            model_name: The name of the model to use.
+            model_name: The name of the model to use. The Worker builds the
+                model registered for this name. A ``before_model_callback``
+                that changes ``llm_request.model`` does not pick another
+                model: this model receives the changed name, as it does
+                outside Temporal. The request carries this name as is, so a
+                registry name with a class prefix, such as
+                ``gemini:gemini-2.5-flash``, reaches the model with the prefix.
             activity_config: Configuration options for the activity execution.
             summary_fn: Optional callable that receives the LlmRequest and
                 returns a summary string (or None) for the activity. Must be
@@ -294,7 +329,7 @@ class TemporalModel(BaseLlm):
         else:
             responses = await workflow.execute_activity(
                 invoke_model,
-                args=[llm_request, self._model_name],
+                TemporalLlmRequest.wrap(llm_request, self._model_name),
                 **config,
             )
         for response in responses:

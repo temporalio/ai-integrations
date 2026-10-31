@@ -731,6 +731,7 @@ class AgentModel(BaseLlm):
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
     ) -> AsyncGenerator[LlmResponse, None]:
+        assert type(llm_request) is LlmRequest, type(llm_request)
         text = f"{type(self).__name__} got {llm_request.model}"
         yield LlmResponse(content=Content(role="model", parts=[Part(text=text)]))
 
@@ -806,6 +807,46 @@ async def test_callback_model_name_keeps_agent_model(client: Client, stream: boo
         )
 
     assert result == "AgentModel got callback_model"
+
+
+@workflow.defn
+class RequestOnlyWorkflow:
+    """Schedules ``invoke_model`` with only the request, as earlier plugins did."""
+
+    @workflow.run
+    async def run(self) -> str | None:
+        responses = await workflow.execute_activity(
+            "invoke_model",
+            LlmRequest(
+                model="callback_model",
+                contents=[types.Content(role="user", parts=[types.Part(text="hi")])],
+            ),
+            start_to_close_timeout=timedelta(seconds=10),
+            result_type=list[LlmResponse],
+        )
+        content = responses[0].content
+        return content.parts[0].text if content and content.parts else None
+
+
+@pytest.mark.asyncio
+async def test_model_call_scheduled_without_model_name(client: Client):
+    """A model call scheduled before TemporalModel sent its name uses the request's name."""
+    new_config = client.config()
+    new_config["plugins"] = [GoogleAdkPlugin()]
+    client = Client(**new_config)
+    LLMRegistry.register(CallbackModel)
+
+    async with Worker(
+        client, task_queue="adk-request-only", workflows=[RequestOnlyWorkflow]
+    ):
+        result = await client.execute_workflow(
+            RequestOnlyWorkflow.run,
+            id=f"request-only-{uuid.uuid4()}",
+            task_queue="adk-request-only",
+            execution_timeout=timedelta(seconds=60),
+        )
+
+    assert result == "CallbackModel got callback_model"
 
 
 @pytest.mark.asyncio
