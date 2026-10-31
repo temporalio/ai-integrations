@@ -213,6 +213,16 @@ export interface ApprovalResumeContextResult {
   failedConversionInterruptions: number;
   versions: string[];
   lastAgentVersion: string | undefined;
+  customChildWrites: string[];
+  customChildInterruptions: number;
+  customChildSavedApprovalOwners: number;
+  replacedChildWrites: string[];
+  replacedChildInterruptions: number;
+  failedRestoreThrew: boolean;
+  failedRestoreWrites: string[];
+  failedRestoreInterruptions: number;
+  registeredVersions: Array<string | undefined>;
+  lastAgentRegisteredVersion: string | undefined;
 }
 
 /** An agent whose `clone` carries a private field, which can't be copied onto another object. */
@@ -234,6 +244,18 @@ class VersionedAgent extends Agent<ResumeContext> {
 
   override clone(config: Partial<AgentOptions<ResumeContext>>): VersionedAgent {
     return new VersionedAgent({ ...this, ...config } as AgentOptions<ResumeContext>, this.#version);
+  }
+}
+
+/** Versions that `RegisteredVersionAgent.clone` registers for each clone. */
+const registeredVersions = new WeakMap<Agent<any, any>, string>();
+
+/** An agent whose `clone` returns a plain `Agent` and registers its version outside the clone. */
+class RegisteredVersionAgent extends Agent<ResumeContext> {
+  override clone(config: Partial<AgentOptions<ResumeContext>>): Agent<ResumeContext> {
+    const clone = super.clone(config);
+    registeredVersions.set(clone, registeredVersions.get(this)!);
+    return clone;
   }
 }
 
@@ -272,8 +294,10 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
  * rehydrates the saved state onto the original agent and context. Then a handoff changes between an
  * interruption and its resume. Then an agent's tools and model settings are replaced with equal copies
  * before a resume, and the approved tool changes them. Then a resume fails to convert a handoff target,
- * and the saved state must still carry its approval. Last, an agent class whose clone keeps a private
- * field changes that field before the resume.
+ * and the saved state must still carry its approval. Then an agent class whose clone keeps a private
+ * field changes that field before the resume. Then a resume replaces a handoff target's object, because
+ * its class overrides `clone` or the target itself was replaced. Last, a `clone` that returns a plain
+ * `Agent` keeps state outside it, which changes before the resume.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -544,6 +568,65 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
   versionedAgent.setVersion('after');
   const versioned = await runner.run(versionedAgent, pausedVersioned.state);
 
+  // The run pauses on a handoff target's call. The resume reuses the root, but gives the target a new
+  // object, because its class overrides clone. The approved call must run, and the state saved again
+  // afterwards must still carry its approval.
+  const customChild = new VersionedAgent({ name: 'CustomChild', model: 'gpt-4o-mini', tools: [setAfter] }, 'v');
+  const customRoot = new Agent<ResumeContext>({ name: 'CustomRoot', model: 'gpt-4o-mini', handoffs: [customChild] });
+  const customChildCtx: ResumeContext = { original: 'custom-child', writes: [] };
+  const pausedCustomChild = await runner.run(customRoot, 'go', { context: customChildCtx });
+  pausedCustomChild.state.approve(pausedCustomChild.interruptions[0]!);
+  const customChildResumed = await runner.run(customRoot, pausedCustomChild.state);
+  const customChildSaved = await RunState.fromString(customRoot, pausedCustomChild.state.toString());
+
+  // The handoff target is replaced by another agent with the same name before the resume.
+  const replacedChild = new Agent<ResumeContext>({ name: 'ReplacedChild', model: 'gpt-4o-mini', tools: [setAfter] });
+  const replacedRoot = new Agent<ResumeContext>({
+    name: 'ReplacedRoot',
+    model: 'gpt-4o-mini',
+    handoffs: [replacedChild],
+  });
+  const replacedChildCtx: ResumeContext = { original: 'replaced-child', writes: [] };
+  const pausedReplacedChild = await runner.run(replacedRoot, 'go', { context: replacedChildCtx });
+  pausedReplacedChild.state.approve(pausedReplacedChild.interruptions[0]!);
+  replacedRoot.handoffs = [replacedChild.clone({})];
+  const replacedChildResumed = await runner.run(replacedRoot, pausedReplacedChild.state);
+
+  // The handoff to the paused target is removed, so the restore throws after the conversion. Once the
+  // handoff is back, the state saved as a string must still carry the approval.
+  const restoreChild = new Agent<ResumeContext>({ name: 'RestoreChild', model: 'gpt-4o-mini', tools: [setAfter] });
+  const restoreRoot = new Agent<ResumeContext>({ name: 'RestoreRoot', model: 'gpt-4o-mini', handoffs: [restoreChild] });
+  const pausedRestore = await runner.run(restoreRoot, 'go', { context: { original: 'restore', writes: [] } });
+  pausedRestore.state.approve(pausedRestore.interruptions[0]!);
+  restoreRoot.handoffs = [];
+  let failedRestoreThrew = false;
+  try {
+    await runner.run(restoreRoot, pausedRestore.state);
+  } catch {
+    failedRestoreThrew = true;
+  }
+  restoreRoot.handoffs = [restoreChild];
+  const restoreRehydrated = await RunState.fromString(restoreRoot, pausedRestore.state.toString());
+  const failedRestoreResumed = await runner.run(restoreRoot, restoreRehydrated);
+
+  // The registered version changes between the interruption and the resume, and the agent the resumed run
+  // uses must have the new one, as a fresh clone does.
+  const versionsSeen: Array<string | undefined> = [];
+  const registeredAgent = new RegisteredVersionAgent({
+    name: 'RegisteredVersionAgent',
+    model: 'gpt-4o-mini',
+    instructions: (_runContext, current) => {
+      versionsSeen.push(registeredVersions.get(current));
+      return 'Set the value.';
+    },
+    tools: [setAfter],
+  });
+  registeredVersions.set(registeredAgent, 'before');
+  const pausedRegistered = await runner.run(registeredAgent, 'go', { context: { original: 'registered', writes: [] } });
+  pausedRegistered.state.approve(pausedRegistered.interruptions[0]!);
+  registeredVersions.set(registeredAgent, 'after');
+  const registered = await runner.run(registeredAgent, pausedRegistered.state);
+
   return {
     callerAfter: ctx.after,
     resumedUsesCallerObject: result.runContext.context === ctx,
@@ -573,5 +656,15 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     failedConversionInterruptions: failedConversionResumed.interruptions.length,
     versions,
     lastAgentVersion: (versioned.lastAgent as VersionedAgent | undefined)?.version,
+    customChildWrites: customChildCtx.writes,
+    customChildInterruptions: customChildResumed.interruptions.length,
+    customChildSavedApprovalOwners: countApprovalOwners(customChildSaved._context).approvalOwners,
+    replacedChildWrites: replacedChildCtx.writes,
+    replacedChildInterruptions: replacedChildResumed.interruptions.length,
+    failedRestoreThrew,
+    failedRestoreWrites: failedRestoreResumed.runContext.context.writes,
+    failedRestoreInterruptions: failedRestoreResumed.interruptions.length,
+    registeredVersions: versionsSeen,
+    lastAgentRegisteredVersion: registered.lastAgent && registeredVersions.get(registered.lastAgent),
   };
 }
