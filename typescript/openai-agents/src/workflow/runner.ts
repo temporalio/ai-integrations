@@ -174,13 +174,17 @@ function mergeApprovalRecords(current: ApprovalRecord, incoming: ApprovalRecord,
  * That includes calls only `merged` names, which a decision for good in `record` also covers.
  */
 function keepsDecisions(record: ApprovalRecord, merged: ApprovalRecord): boolean {
+  // Index each record's call IDs once, so long approval histories compare in linear time.
+  const recordDecision = approvalDecisions(record);
+  const mergedDecision = approvalDecisions(merged);
   const callIds = new Set<string | undefined>([undefined, ...namedCallIds(record), ...namedCallIds(merged)]);
-  return [...callIds].every((callId) => {
-    const decision = approvalDecision(record, callId);
-    if (decision === undefined) return true;
-    if (approvalDecision(merged, callId) !== decision) return false;
-    return decision || rejectionMessage(merged, callId) === rejectionMessage(record, callId);
-  });
+  for (const callId of callIds) {
+    const decision = recordDecision(callId);
+    if (decision === undefined) continue;
+    if (mergedDecision(callId) !== decision) return false;
+    if (!decision && rejectionMessage(merged, callId) !== rejectionMessage(record, callId)) return false;
+  }
+  return true;
 }
 
 function namedCallIds(record: ApprovalRecord): string[] {
@@ -191,13 +195,20 @@ function namedCallIds(record: ApprovalRecord): string[] {
   ];
 }
 
-/** The decision a record gives a call, or a call it doesn't name if `callId` is undefined, as agents-core resolves it. */
-function approvalDecision(record: ApprovalRecord, callId: string | undefined): boolean | undefined {
-  if (record.approved === true) return true;
-  if (record.rejected === true) return false;
-  if (callId !== undefined && Array.isArray(record.approved) && record.approved.includes(callId)) return true;
-  if (callId !== undefined && Array.isArray(record.rejected) && record.rejected.includes(callId)) return false;
-  return undefined;
+/**
+ * Resolves the decision a record gives a call, or a call it doesn't name if `callId` is undefined, as
+ * agents-core resolves it.
+ */
+function approvalDecisions(record: ApprovalRecord): (callId: string | undefined) => boolean | undefined {
+  const approved = new Set(Array.isArray(record.approved) ? record.approved : []);
+  const rejected = new Set(Array.isArray(record.rejected) ? record.rejected : []);
+  return (callId) => {
+    if (record.approved === true) return true;
+    if (record.rejected === true) return false;
+    if (callId !== undefined && approved.has(callId)) return true;
+    if (callId !== undefined && rejected.has(callId)) return false;
+    return undefined;
+  };
 }
 
 /** The rejection message a record gives a call, as agents-core resolves it. */

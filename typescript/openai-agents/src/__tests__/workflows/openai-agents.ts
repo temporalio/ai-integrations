@@ -316,6 +316,10 @@ export interface ApprovalResumeContextResult {
   batchInterruptions: number;
   sameNameWrites: string[];
   sameNameApprovalOwners: number[];
+  longHistoryThrew: boolean;
+  longHistoryWrites: string[];
+  longHistoryInterruptions: number;
+  longHistoryApprovedCallIds: number;
 }
 
 /** An agent whose `clone` carries a private field, which can't be copied onto another object. */
@@ -395,7 +399,8 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
  * not run it. Then the restore of a saved state fails repeatedly after merging its approvals, which must
  * not add a copy of them each time. Then a rejection message changes after a failed resume, and the retry
  * must send the model the new one, also for a call that a later rejection for good covers. Last, a root and
- * its handoff target share a name, and their resumes must not add a copy of the approvals each time.
+ * its handoff target share a name, and their resumes must not add a copy of the approvals each time. Last,
+ * the retry of a saved state with a long approval history must finish.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -967,6 +972,51 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
   };
   const sameNameApprovalOwners = [await resumeSameName(false), await resumeSameName(true)];
 
+  // A saved state carries a long history of earlier approvals. Its approved call throws once after the
+  // resume, and the retry, which compares that history with the one the reused graph owns, must finish.
+  const longHistoryCtx = { original: 'long-history', writes: [] as string[], attempts: 0 };
+  const longHistoryTool = tool({
+    name: 'long_history',
+    description: 'Fail once after approval.',
+    parameters: {
+      type: 'object' as const,
+      properties: { value: { type: 'string' } },
+      required: ['value'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    errorFunction: null,
+    execute: async (args, runContext) => {
+      const context = runContext!.context as ResumeContext & { attempts: number };
+      if (context.attempts++ === 0) throw new Error('long history failed');
+      context.writes.push((args as { value: string }).value);
+      return 'ok';
+    },
+  });
+  const longHistoryAgent = new Agent<ResumeContext>({
+    name: 'LongHistoryAgent',
+    model: 'gpt-4o-mini',
+    tools: [longHistoryTool],
+  });
+  const pausedLongHistory = await runner.run(longHistoryAgent, 'go', { context: longHistoryCtx });
+  pausedLongHistory.state.approve(pausedLongHistory.interruptions[0]!);
+  const longHistoryJson = JSON.parse(pausedLongHistory.state.toString());
+  for (const { approvals } of longHistoryJson.context.functionApprovals) {
+    for (const record of Object.values(approvals) as ApprovalRecord[]) {
+      if (Array.isArray(record.approved)) {
+        record.approved.push(...Array.from({ length: 50_000 }, (_, index) => `call_earlier_${index}`));
+      }
+    }
+  }
+  const longHistoryState = await RunState.fromString(longHistoryAgent, JSON.stringify(longHistoryJson));
+  let longHistoryThrew = false;
+  try {
+    await runner.run(longHistoryAgent, longHistoryState);
+  } catch {
+    longHistoryThrew = true;
+  }
+  const longHistoryRetried = await runner.run(longHistoryAgent, longHistoryState);
+
   return {
     callerAfter: ctx.after,
     resumedUsesCallerObject: result.runContext.context === ctx,
@@ -1022,5 +1072,9 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     batchInterruptions: batchInterruptions.reduce((count, interruptions) => count + interruptions, 0),
     sameNameWrites,
     sameNameApprovalOwners,
+    longHistoryThrew,
+    longHistoryWrites: longHistoryRetried.runContext.context.writes,
+    longHistoryInterruptions: longHistoryRetried.interruptions.length,
+    longHistoryApprovedCallIds: countApprovalOwners(longHistoryState._context).approvedCallIds,
   };
 }
