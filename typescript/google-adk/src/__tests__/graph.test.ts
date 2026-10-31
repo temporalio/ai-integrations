@@ -33,6 +33,7 @@ import {
   graphActivityToolWithFailingSibling,
   graphAgentNodeModelFailure,
   graphAgentNodeWithFailingSibling,
+  graphAgentStepWait,
   graphAgentTaskNode,
   graphCancellableAgentNode,
   graphDottedActivity,
@@ -46,6 +47,7 @@ import {
   graphRetry,
   graphRouting,
   graphSequential,
+  graphStageQuery,
   graphTimeout,
   graphTimedOutAgentNodeRetry,
   graphTimeoutRetry,
@@ -562,6 +564,106 @@ test.serial(
       'the orphan failed before the retry started'
     );
     t.false(events.some((e) => e.workflowTaskFailedEventAttributes != null));
+  }
+);
+
+test.serial(
+  'a model call, tool or model callback left running by an agent node timeout does not decide a cancellation the Workflow caught',
+  async (t) => {
+    const env = getEnv();
+    const taskQueue = uid('adk-graph-orphan-cancel');
+    const workflowId = uid('wf-graph-orphan-cancel');
+    await withWorker(env, { taskQueue, plugins: [makePlugin()], activities }, async () => {
+      const handle = await env.client.workflow.start(graphOrphanedAgentModelCall, {
+        taskQueue,
+        workflowId,
+        args: ['caught-cancel'],
+      });
+      const deadline = Date.now() + 20_000;
+      while (!(await history(workflowId)).some((e) => e.activityTaskCompletedEventAttributes != null)) {
+        if (Date.now() > deadline) throw new Error('timed out waiting for the retry to answer');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      await handle.cancel();
+      // The execution's cancellation cancels the first attempt's call, which ADK hands to its
+      // plugin manager, but ADK had moved past that call and the Workflow caught the cancel.
+      t.is((await handle.result()).text, 'answered-on-call-2');
+      t.is((await handle.describe()).status.name, 'COMPLETED');
+    });
+    const events = await history(workflowId);
+    const answered = indexOf(events, (e) => e.activityTaskCompletedEventAttributes != null);
+    const requested = indexOf(events, (e) => e.workflowExecutionCancelRequestedEventAttributes != null);
+    const orphanCancelled = indexOf(events, (e) => e.activityTaskCancelRequestedEventAttributes != null);
+    t.true(answered !== -1 && answered < requested && requested < orphanCancelled, 'answer, request, orphan cancel');
+    t.is(countScheduledActivities(events, 'adk-invokeModel'), 2);
+
+    // The same for a long-running tool's or a model callback's wait that the timeout left
+    // running, against the same run with nothing left running, also when the retry answers
+    // from a `beforeModelCallback` with no model call. Cancelled while that wait is still the
+    // node's own, or an item's own while another item of the same agent has answered, the run
+    // still ends CANCELLED.
+    for (const step of ['tool', 'agent', 'plugin'] as const) {
+      const outputs: Record<string, unknown> = {};
+      const modes = ['answered', 'abandoned', 'answered-cached', 'abandoned-cached', 'waiting', 'parallel'] as const;
+      for (const mode of modes) {
+        const label = `${step} ${mode}`;
+        const live = mode === 'waiting' || mode === 'parallel';
+        const stepQueue = uid(`adk-graph-${step}-${mode}`);
+        const stepWorkflowId = uid(`wf-graph-${step}-${mode}`);
+        await withWorker(env, { taskQueue: stepQueue, plugins: [makePlugin()], activities }, async () => {
+          const handle = await env.client.workflow.start(graphAgentStepWait, {
+            taskQueue: stepQueue,
+            workflowId: stepWorkflowId,
+            args: [step, mode],
+          });
+          const stage = live ? 'waiting' : 'returned';
+          const stageDeadline = Date.now() + 20_000;
+          while ((await handle.query(graphStageQuery)) !== stage) {
+            if (Date.now() > stageDeadline) throw new Error(`${label}: timed out waiting for ${stage}`);
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          if (live) {
+            // The waiting item's model calls (one for `tool`), and the answering item's (two
+            // for `tool`: the tool call and the answer).
+            const answers = mode === 'parallel' ? (step === 'tool' ? 3 : 1) : 0;
+            const liveDeadline = Date.now() + 20_000;
+            for (;;) {
+              const events = await history(stepWorkflowId);
+              const completed = events.filter((e) => e.activityTaskCompletedEventAttributes != null).length;
+              if (countScheduledActivities(events, 'cancellableActivity') > 0 && completed >= answers) break;
+              if (Date.now() > liveDeadline) throw new Error(`${label}: timed out waiting for the wait`);
+              await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+          }
+          await handle.cancel();
+          if (live) {
+            await t.throwsAsync(handle.result(), undefined, label);
+            t.is((await handle.describe()).status.name, 'CANCELLED', label);
+            return;
+          }
+          outputs[mode] = (await handle.result()).output;
+          t.is((await handle.describe()).status.name, 'COMPLETED', label);
+        });
+        if (live) continue;
+        const stepEvents = await history(stepWorkflowId);
+        const stepRequested = indexOf(stepEvents, (e) => e.workflowExecutionCancelRequestedEventAttributes != null);
+        const stepCancelled = stepEvents.findIndex((e) => e.activityTaskCancelRequestedEventAttributes != null);
+        if (mode.startsWith('answered')) {
+          t.is(stepCancelled, -1, `${label}: nothing left running`);
+          continue;
+        }
+        const lastAnswer = stepEvents.reduce(
+          (last, e, at) => (e.activityTaskCompletedEventAttributes != null ? at : last),
+          -1
+        );
+        t.true(lastAnswer < stepRequested && stepRequested < stepCancelled, `${label}: answer, request, abandoned cancel`);
+        t.is(countScheduledActivities(stepEvents, 'cancellableActivity'), 1, label);
+      }
+      t.truthy(outputs.abandoned, step);
+      t.is(outputs.abandoned, outputs.answered, `${step}: the retry's answer`);
+      t.is(outputs['abandoned-cached'], 'cached-answer', `${step}: the retry's cached answer`);
+      t.is(outputs['answered-cached'], 'cached-answer', `${step}: the cached answer`);
+    }
   }
 );
 

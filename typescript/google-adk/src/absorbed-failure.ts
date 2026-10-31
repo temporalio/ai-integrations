@@ -4,11 +4,17 @@
  * and lets the run finish, so a Workflow whose model Activity failed returns
  * normally. `TemporalModel` records such a failure here, and the inbound interceptor
  * below re-raises it once the Workflow or handler frame that recorded it returns.
+ * ADK absorbs a cancellation outside a model call too, in a tool or a model callback;
+ * that one is recorded where ADK hands the error to its plugin manager (see
+ * {@link watchErrorHandoffs}).
  *
  * Await an agent turn in the frame that started it: a failure recorded while that frame
  * is open surfaces there, and one recorded after a handler frame returned surfaces in the
  * main function's. One recorded after the main function returned never surfaces —
- * completing with unfinished handlers is a user error Temporal already warns about.
+ * completing with unfinished handlers is a user error Temporal already warns about. A
+ * cancellation a Signal handler absorbed is the exception: it surfaces in the main
+ * function's frame too, so the main function's cleanup runs before the execution ends.
+ * Only the execution's own cancellation is recorded at all (see {@link executionCancellation}).
  *
  * The same interceptor also converts the errors ADK 2.0's workflow runtime *throws* —
  * a node past its `timeout`, an output that failed its schema, an approval ADK refused
@@ -21,6 +27,7 @@
 
 import type { AsyncLocalStorage as ALS } from 'node:async_hooks';
 
+import { BaseNode, FunctionTool, PluginManager } from '@google/adk';
 import { ApplicationFailure, TemporalFailure } from '@temporalio/common';
 import {
   AsyncLocalStorage,
@@ -74,9 +81,8 @@ interface Frame {
   /** Failures no caller has marked handled or superseded, in the order they were absorbed. */
   pending: Recording[];
   /**
-   * The frame's first absorbed cancellation, held apart from `pending`: whether it is
-   * the execution's outcome is only knowable once the frame returns, and it outranks
-   * anything else the frame absorbed.
+   * The frame's first absorbed cancellation of the execution, held apart from `pending`: it
+   * outranks anything else the frame absorbed.
    */
   cancellation?: unknown;
   /** Whether the frame has returned, spending its one chance to raise; it never takes another. */
@@ -95,13 +101,35 @@ interface AbsorbedFailures {
    * frames, because a call can settle after the frame that started it has returned.
    */
   answered: WeakMap<AbortSignal, Map<string, number>>;
+  /**
+   * The reason the root scope was cancelled with, once the execution's cancellation request
+   * cancelled it. The SDK hands a scope's reason on to the scopes it cancels as the same
+   * object, so an operation that this request cancelled sees exactly this reason.
+   */
+  executionCancel?: unknown;
+  /** The failures of operations whose scope this request cancelled first (see {@link watchScope}). */
+  cancelledByExecution: WeakSet<object>;
+  /** The ADK node attempt the running code belongs to (see {@link watchNodeAttempts}). */
+  attempts: ALS<NodeAttempt>;
+  /** What a tool or a plugin hook threw, per the plain `Error` ADK threw in its place (see {@link keepWrapped}). */
+  wrapped: WeakMap<object, unknown>;
+  /** Where the running tool call keeps what its `execute` throws (see {@link watchWrappedErrors}). */
+  toolCall: ALS<Thrown>;
 }
 
 function recorded(): AbsorbedFailures {
   const global = globalThis as Record<string, unknown>;
   let state = global[ABSORBED] as AbsorbedFailures | undefined;
   if (state === undefined) {
-    state = { frames: new AsyncLocalStorage<Frame>(), calls: 0, answered: new WeakMap() };
+    state = {
+      frames: new AsyncLocalStorage<Frame>(),
+      calls: 0,
+      answered: new WeakMap(),
+      cancelledByExecution: new WeakSet(),
+      attempts: new AsyncLocalStorage<NodeAttempt>(),
+      wrapped: new WeakMap(),
+      toolCall: new AsyncLocalStorage<Thrown>(),
+    };
     global[ABSORBED] = state;
   }
   return state;
@@ -147,20 +175,297 @@ function superseded(call: ModelCall): boolean {
 /**
  * Records how a failed `TemporalModel` call ended, unless the failure is one ADK has
  * already moved past ({@link superseded}): a call left running by a timed-out attempt
- * whose retry answered first says nothing about the run, however it ends later.
+ * whose retry answered first says nothing about the run, however it ends later. A
+ * cancellation is decided by the call's own node attempt instead ({@link recordCancellation}).
  *
  * @internal
  */
 export function recordAbsorbedFailure(err: unknown, call: ModelCall): void {
-  if (superseded(call)) return;
-  const frame = openFrame();
-  if (frame === undefined) return;
   if (isCancellation(err)) {
-    frame.cancellation ??= err;
-  } else {
-    frame.pending.push({ ...call, error: err });
+    recordCancellation(err);
+    return;
+  }
+  if (superseded(call)) return;
+  openFrame()?.pending.push({ ...call, error: err });
+}
+
+/**
+ * Watches the root scope for the execution's cancellation request and keeps the reason it
+ * cancels the root scope with. Run once per execution, before Workflow code starts, so this
+ * reaction runs before any scope the request cancels in turn can react.
+ */
+function watchExecutionCancel(): void {
+  const state = recorded();
+  let root = CancellationScope.current();
+  while (root.parent !== undefined) root = root.parent;
+  root.cancelRequested.catch((reason: unknown) => {
+    state.executionCancel = reason;
+  });
+}
+
+/**
+ * Marks how the operations started in the current scope fail when the execution's
+ * cancellation request was what cancelled them: the first cancellation that reached that
+ * scope came from the root scope. Whatever scope later handles the failure (one that the
+ * operation's own code has left, ADK's hand-off) cannot tell that any more: an inner scope
+ * (`CancellationScope.withTimeout`) may have cancelled the operation inside a
+ * non-cancellable one while the root was cancelled too. A timer, a `condition` or an
+ * operation started in an already cancelled scope fails with the scope's reason itself and
+ * needs no mark. Returns the function that watches each such operation.
+ */
+function watchScope(): (operation: Promise<unknown>) => void {
+  const scope = CancellationScope.current();
+  if (!scope.cancellable) return () => undefined;
+  let reason: unknown;
+  scope.cancelRequested.catch((cancelled: unknown) => {
+    reason = cancelled;
+  });
+  return (operation) => {
+    operation.then(undefined, (err: unknown) => {
+      const state = recorded();
+      if (reason === undefined || reason !== state.executionCancel || !isCancellation(err)) return;
+      if (typeof err === 'object' && err !== null) state.cancelledByExecution.add(err);
+    });
+  };
+}
+
+/** Returns `operation`, watched as {@link watchScope} describes. */
+function watched<T>(operation: Promise<T>): Promise<T> {
+  watchScope()(operation);
+  return operation;
+}
+
+/**
+ * Returns `started`, watched as {@link watchScope} describes, and so are the operations its
+ * result holds: a Nexus operation cancelled before it starts fails `started` itself.
+ */
+function watchedEach<T>(started: Promise<T>, operations: (result: T) => Promise<unknown>[]): Promise<T> {
+  const watch = watchScope();
+  watch(started);
+  started.then(
+    (result) => operations(result).forEach(watch),
+    () => undefined
+  );
+  return started;
+}
+
+/**
+ * The failure through which the execution's cancellation request ended `err`: the root
+ * scope's reason or the failure of an operation that request cancelled (see
+ * {@link watchScope}), found on `err` itself, its `cause` chain, or what a tool or a plugin
+ * hook threw before ADK wrapped it (see {@link keepWrapped}). `undefined` when nothing
+ * there came from the request: an inner scope's cancel, or any other error, even one thrown
+ * after the Workflow caught its cancellation.
+ */
+function executionCancellation(err: unknown): unknown {
+  const state = recorded();
+  for (const current of causes(err)) {
+    if (current === state.executionCancel || state.cancelledByExecution.has(current)) return current;
+  }
+  return undefined;
+}
+
+/** `err`, its `cause` chain, and what a tool or a plugin hook threw before ADK wrapped it. */
+function* causes(err: unknown): Generator<object> {
+  const { wrapped } = recorded();
+  const seen = new Set<unknown>();
+  let current = err;
+  while (typeof current === 'object' && current !== null && !seen.has(current)) {
+    yield current;
+    seen.add(current);
+    current = wrapped.get(current) ?? (current as { cause?: unknown }).cause;
   }
 }
+
+/**
+ * Records a cancellation ADK absorbed as the open frame's, but only when it came from the
+ * execution's own cancellation request ({@link executionCancellation}). One that only an
+ * inner scope caused is left out, whether it came before or after that request: the
+ * Workflow may catch the request and finish on purpose, and an inner scope's cancel must
+ * not end that execution CANCELLED. So is one absorbed in a node attempt ADK abandoned
+ * ({@link abandoned}): ADK had moved past that work, and the run's outcome is the retry's.
+ */
+function recordCancellation(err: unknown): void {
+  if (abandoned(recorded().attempts.getStore())) return;
+  const cancellation = executionCancellation(err);
+  if (cancellation === undefined) return;
+  const frame = openFrame();
+  if (frame !== undefined) frame.cancellation ??= cancellation;
+}
+
+/** One run of an ADK node: one attempt, as ADK's node runner retries a node. */
+interface NodeAttempt {
+  /** The attempt of the node that ran this one, if any. */
+  parent: NodeAttempt | undefined;
+  /** Whether ADK abandoned the attempt: its node's `timeout` fired while it ran. */
+  abandoned: boolean;
+}
+
+/** Whether `attempt` or an attempt it ran in was abandoned (see {@link watchNodeAttempts}). */
+function abandoned(attempt: NodeAttempt | undefined): boolean {
+  for (let current = attempt; current !== undefined; current = current.parent) {
+    if (current.abandoned) return true;
+  }
+  return false;
+}
+
+/** A `NodeContext`, as far as it is read here. */
+interface AttemptContext {
+  abortSignal?: AbortSignal;
+  invocationContext?: { abortSignal?: AbortSignal };
+}
+
+/**
+ * Runs each ADK node attempt in its own {@link NodeAttempt}, so a cancellation absorbed in
+ * it can tell whether ADK has moved past it. ADK's node runner calls `BaseNode.run` once per
+ * attempt, with the attempt's own `AbortSignal` on the `NodeContext` when the node has a
+ * `timeout` (`node_runner.ts`, ADK 2.0 to 2.3). When the timeout fires, the runner aborts
+ * that signal, gives up on the attempt without cancelling what it waits on (a model call, a
+ * tool, a model callback), and retries the node or fails it. The runner also aborts it when
+ * the invocation's own signal aborts; that is not ADK moving past one attempt, so it is not
+ * counted. A retry, and another item of a `ParallelWorker`, runs as an attempt of its own,
+ * which leaves this one's state alone. What ADK does is unchanged.
+ */
+function watchNodeAttempts(): void {
+  const proto = BaseNode.prototype as unknown as Record<PropertyKey, unknown>;
+  const run = proto.run as (this: unknown, ctx: AttemptContext, input: unknown) => AsyncGenerator<unknown>;
+  proto.run = function (this: unknown, ctx: AttemptContext, input: unknown): AsyncIterableIterator<unknown> {
+    const { attempts } = recorded();
+    const attempt: NodeAttempt = { parent: attempts.getStore(), abandoned: false };
+    const own = ctx?.abortSignal;
+    const invocation = ctx?.invocationContext?.abortSignal;
+    if (own !== undefined && own !== invocation && !own.aborted) {
+      own.addEventListener(
+        'abort',
+        () => {
+          attempt.abandoned = invocation?.aborted !== true;
+        },
+        { once: true }
+      );
+    }
+    const iterator = run.call(this, ctx, input);
+    // Every step of the run happens in the attempt, whoever drives it.
+    return {
+      next: (...args) => attempts.run(attempt, () => iterator.next(...args)),
+      return: (value) => attempts.run(attempt, () => iterator.return(value)),
+      throw: (error) => attempts.run(attempt, () => iterator.throw(error)),
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  };
+}
+
+/** Marks the `PluginManager` prototype once its error hand-offs record cancellations. */
+const WATCHED = Symbol.for('__temporal_googleAdkWatchedErrorHandoffs');
+
+/** Told what code that ADK runs threw, for the plain `Error` ADK throws in its place. */
+type Thrown = (error: unknown) => void;
+
+/**
+ * Runs `call`, an ADK method that throws a plain `Error` in place of the error that code it
+ * runs threw, with no `cause`: `FunctionTool.runAsync` for a tool's `execute`, and
+ * `PluginManager.runCallbacks` for a plugin hook before ADK 2.2.1. That error is kept for
+ * the one ADK throws, so {@link executionCancellation} can follow it.
+ */
+function keepWrapped(call: (thrown: Thrown) => Promise<unknown>): Promise<unknown> {
+  let thrown: { error: unknown } | undefined;
+  const result = call((error) => {
+    thrown = { error };
+  });
+  result.then(undefined, (wrapper: unknown) => {
+    if (thrown !== undefined && thrown.error !== wrapper && typeof wrapper === 'object' && wrapper !== null) {
+      recorded().wrapped.set(wrapper, thrown.error);
+    }
+  });
+  return result;
+}
+
+/** `fn`, telling what it throws to the {@link Thrown} that `tell` returns when it is called. */
+function telling<F extends (...args: never[]) => unknown>(fn: F, tell: () => Thrown | undefined): F {
+  return function (this: unknown, ...args: Parameters<F>): unknown {
+    const thrown = tell();
+    try {
+      const result = fn.apply(this, args);
+      if (result instanceof Promise) result.then(undefined, (error: unknown) => thrown?.(error));
+      return result;
+    } catch (error) {
+      thrown?.(error);
+      throw error;
+    }
+  } as F;
+}
+
+type Execute = (...args: never[]) => unknown;
+
+/** The `execute` functions {@link watchWrappedErrors} put in place of a tool's own. */
+const TELLING_EXECUTES = new WeakSet<Execute>();
+
+/**
+ * Keeps the errors that a tool's `execute` and a plugin hook throw for the plain `Error`s
+ * ADK throws in their place (see {@link keepWrapped}). A tool's `execute` is replaced, the
+ * first time ADK runs the tool, by one that tells the call it runs in what it threw. What
+ * ADK does is unchanged.
+ */
+function watchWrappedErrors(): void {
+  const tool = FunctionTool.prototype as unknown as Record<PropertyKey, unknown>;
+  const runAsync = tool.runAsync as (this: { execute: Execute }, request: unknown) => Promise<unknown>;
+  tool.runAsync = function (this: { execute: Execute }, request: unknown): Promise<unknown> {
+    if (!TELLING_EXECUTES.has(this.execute)) {
+      this.execute = telling(this.execute, () => recorded().toolCall.getStore());
+      TELLING_EXECUTES.add(this.execute);
+    }
+    return keepWrapped((thrown) => recorded().toolCall.run(thrown, () => runAsync.call(this, request)));
+  };
+  const manager = PluginManager.prototype as unknown as Record<PropertyKey, unknown>;
+  const runCallbacks = manager.runCallbacks as (
+    this: PluginManager,
+    plugins: unknown,
+    callback: (plugin: unknown) => unknown,
+    name: string
+  ) => Promise<unknown>;
+  manager.runCallbacks = function (
+    this: PluginManager,
+    registered: unknown,
+    callback: (plugin: unknown) => unknown,
+    name: string
+  ): Promise<unknown> {
+    return keepWrapped((thrown) =>
+      runCallbacks.call(
+        this,
+        registered,
+        telling(callback, () => thrown),
+        name
+      )
+    );
+  };
+}
+
+/**
+ * Wraps the two `PluginManager` methods ADK calls with an error it is about to absorb, so
+ * that a cancellation it came from is recorded first. ADK hands the error a tool threw
+ * (`functions.ts`), and the error of a model step, model callbacks included
+ * (`LlmAgent.runAndHandleError`), to its plugin manager and then goes on: ADK before 2.3
+ * drops a long-running tool's error, and a model callback's error becomes an error event
+ * that ends the turn. What ADK does next is unchanged. Done once per Workflow, whichever
+ * copy of this module loads first, together with {@link watchNodeAttempts}.
+ */
+function watchErrorHandoffs(): void {
+  const proto = PluginManager.prototype as unknown as Record<PropertyKey, unknown>;
+  if (proto[WATCHED] === true) return;
+  proto[WATCHED] = true;
+  watchWrappedErrors();
+  watchNodeAttempts();
+  for (const method of ['runOnToolErrorCallback', 'runOnModelErrorCallback']) {
+    const original = proto[method] as (this: PluginManager, params: { error?: unknown }) => Promise<unknown>;
+    proto[method] = function (this: PluginManager, params: { error?: unknown }): Promise<unknown> {
+      recordCancellation(params.error);
+      return original.call(this, params);
+    };
+  }
+}
+
+if (inWorkflowContext()) watchErrorHandoffs();
 
 /**
  * Declares that a `TemporalModel` call succeeded, which spends whatever the same agent
@@ -218,10 +523,8 @@ export function markModelFailureHandled(error: unknown): void {
 }
 
 function raiseAbsorbed(frame: Frame): void {
-  // Only a cancel a model call absorbed lands here, and it decides the outcome only if
-  // the execution itself was cancelled. An inner scope's cancel
-  // (`CancellationScope.withTimeout`) is the consumer's own doing and is not raised at all.
-  if (frame.cancellation !== undefined && CancellationScope.current().consideredCancelled) {
+  // Only the execution's own cancellation is recorded (see `recordCancellation`).
+  if (frame.cancellation !== undefined) {
     // Re-raised as caught: CANCELLED is read off the original `ActivityFailure` /
     // `CancelledFailure` pair, which any wrapper would hide.
     throw frame.cancellation;
@@ -282,7 +585,7 @@ function toWorkflowFailure(err: unknown, frame: Frame): unknown {
   // possibly inside a dynamic run's carrier). When the execution itself was cancelled,
   // the recorded cancellation is the outcome, by the same rule `raiseAbsorbed` applies on
   // a normal return; converting ADK's report would end a cancelled execution FAILED.
-  if (frame.cancellation !== undefined && CancellationScope.current().consideredCancelled) {
+  if (frame.cancellation !== undefined) {
     return frame.cancellation;
   }
   const cause = innermostNodeFailure(err);
@@ -301,7 +604,27 @@ function toWorkflowFailure(err: unknown, frame: Frame): unknown {
   });
 }
 
-async function surfaceAbsorbedFailure<T>(frame: Frame, next: () => Promise<T>): Promise<T> {
+/**
+ * Hands a cancellation a Signal handler absorbed to the main function's frame when the
+ * handler returns, so that the main function's own cancellation handling and cleanup run
+ * before the execution ends CANCELLED. A Signal handler that raised it would end the
+ * execution at once. The cancellation outranks the failures the handler also absorbed, so
+ * it moves as the handler's whole outcome: none of them is left to raise in its place.
+ * Kept by the handler's frame once the main function has returned.
+ */
+function deferToMain(frame: Frame): void {
+  const { main } = recorded();
+  if (frame.cancellation === undefined || main === undefined || main === frame || main.surfaced) return;
+  main.cancellation ??= frame.cancellation;
+  frame.cancellation = undefined;
+  frame.pending = [];
+}
+
+async function surfaceAbsorbedFailure<T>(
+  frame: Frame,
+  next: () => Promise<T>,
+  onReturn?: (frame: Frame) => void
+): Promise<T> {
   let result: T;
   try {
     result = await recorded().frames.run(frame, next);
@@ -318,21 +641,34 @@ async function surfaceAbsorbedFailure<T>(frame: Frame, next: () => Promise<T>): 
   } finally {
     frame.surfaced = true;
   }
+  onReturn?.(frame);
   raiseAbsorbed(frame);
   return result;
 }
 
 // ts-prune-ignore-next (loaded by path from workflowInterceptorModules)
-export const interceptors: WorkflowInterceptorsFactory = () => ({
-  inbound: [
-    {
-      execute: (input, next) => {
-        const frame: Frame = { pending: [], surfaced: false };
-        recorded().main = frame;
-        return surfaceAbsorbedFailure(frame, () => next(input));
+export const interceptors: WorkflowInterceptorsFactory = () => {
+  watchExecutionCancel();
+  return {
+    inbound: [
+      {
+        execute: (input, next) => {
+          const frame: Frame = { pending: [], surfaced: false };
+          recorded().main = frame;
+          return surfaceAbsorbedFailure(frame, () => next(input));
+        },
+        handleUpdate: (input, next) => surfaceAbsorbedFailure({ pending: [], surfaced: false }, () => next(input)),
+        handleSignal: (input, next) =>
+          surfaceAbsorbedFailure({ pending: [], surfaced: false }, () => next(input), deferToMain),
       },
-      handleUpdate: (input, next) => surfaceAbsorbedFailure({ pending: [], surfaced: false }, () => next(input)),
-      handleSignal: (input, next) => surfaceAbsorbedFailure({ pending: [], surfaced: false }, () => next(input)),
-    },
-  ],
-});
+    ],
+    outbound: [
+      {
+        scheduleActivity: (input, next) => watched(next(input)),
+        scheduleLocalActivity: (input, next) => watched(next(input)),
+        startChildWorkflowExecution: (input, next) => watchedEach(next(input), (promises) => promises),
+        startNexusOperation: (input, next) => watchedEach(next(input), ({ result }) => [result]),
+      },
+    ],
+  };
+};

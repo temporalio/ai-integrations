@@ -20,7 +20,9 @@ import {
   JoinNode,
   LlmAgent,
   LLMRegistry,
+  LongRunningFunctionTool,
   node,
+  ParallelWorker,
   PolicyOutcome,
   REQUEST_INPUT_FUNCTION_CALL_NAME,
   RequestInput,
@@ -49,9 +51,12 @@ import { ApplicationFailure } from '@temporalio/common';
 import {
   ActivityCancellationType,
   type ActivityOptions,
+  CancellationScope,
   condition,
   defineQuery,
   defineUpdate,
+  isCancellation,
+  proxyActivities,
   setHandler,
   sleep,
 } from '@temporalio/workflow';
@@ -510,14 +515,20 @@ export async function graphTimedOutAgentNodeRetry(): Promise<RunOutcome> {
  * the retry has answered, and a closing six-second durable sleep keeps the Workflow open
  * past that (the dev server rounds the retry's 10ms backoff up to about a second, and a
  * slow worker adds to it). With `'before-retry'` it times out after three seconds, inside
- * the retry's four-second backoff, so it fails first.
+ * the retry's four-second backoff, so it fails first. With `'caught-cancel'` it runs for a
+ * minute, and once the graph has returned the Workflow waits until it is cancelled, which
+ * cancels that call too; the Workflow catches its cancellation, gives the call's
+ * cancellation a second to reach ADK, and returns the run's outcome.
  */
-export async function graphOrphanedAgentModelCall(orphan: 'after-retry' | 'before-retry'): Promise<RunOutcome> {
-  const late = orphan === 'after-retry';
+export async function graphOrphanedAgentModelCall(
+  orphan: 'after-retry' | 'before-retry' | 'caught-cancel'
+): Promise<RunOutcome> {
+  const late = orphan !== 'before-retry';
+  const timeout = ({ 'after-retry': '5 seconds', 'before-retry': '3 seconds', 'caught-cancel': '1 minute' } as const)[orphan];
   const agent = new LlmAgent({
     name: 'assistant',
     model: new TemporalModel('hang-first-model', {
-      activity: { startToCloseTimeout: late ? '5 seconds' : '3 seconds', retry: { maximumAttempts: 1 } },
+      activity: { startToCloseTimeout: timeout, retry: { maximumAttempts: 1 } },
     }),
     instruction: 'Help.',
   });
@@ -526,7 +537,112 @@ export async function graphOrphanedAgentModelCall(orphan: 'after-retry' | 'befor
     retryConfig: { maxAttempts: 2, initialDelay: late ? 0.01 : 4, jitter: 0, exceptions: ['NodeTimeoutError'] },
   });
   const outcome = await runOnce(new Workflow({ name: 'orphaned_agent_model_call', edges: [['START', timed]] }), 'hi');
-  if (late) await sleep('6 seconds');
+  if (orphan === 'after-retry') await sleep('6 seconds');
+  if (orphan === 'caught-cancel') {
+    try {
+      await condition(() => false);
+    } catch (err) {
+      if (!isCancellation(err)) throw err;
+      await CancellationScope.nonCancellable(() => sleep('1 second'));
+    }
+  }
+  return outcome;
+}
+
+export const graphStageQuery = defineQuery<string>('graphStage');
+
+/** An ADK plugin whose `beforeModelCallback` runs `check`. */
+class CheckingPlugin extends BasePlugin {
+  constructor(private readonly check: () => Promise<LlmResponse | undefined>) {
+    super('checking');
+  }
+
+  override async beforeModelCallback(): Promise<LlmResponse | undefined> {
+    return this.check();
+  }
+}
+
+/**
+ * An agent node whose first run of `step`, a `LongRunningFunctionTool` (`tool`) or a
+ * `beforeModelCallback`, the agent's own (`agent`) or an ADK plugin's (`plugin`), awaits an
+ * Activity that runs until it is cancelled, and whose later runs return at once. With
+ * `'abandoned'` the node runs under ADK's one-second `timeout`, retried once on
+ * `NodeTimeoutError`, so the timeout leaves that first wait running while the retry answers.
+ * With `'answered'` the first run returns at once too, and nothing is left running. The
+ * `-cached` variants answer from a `beforeModelCallback` (the agent's own for `tool`) with
+ * no model call: the retry does, or with `'answered-cached'` the first run. Either way, once
+ * the graph has returned the Workflow waits until it is cancelled, catches the cancellation,
+ * gives the abandoned wait's cancellation a second to reach ADK, and returns the run's
+ * outcome. With `'waiting'` the node has no timeout, and the Workflow is cancelled while the
+ * first wait runs. With `'parallel'` a `ParallelWorker` runs the agent, with no timeout,
+ * over two items: one waits as the first run does while the other answers, and the
+ * Workflow is cancelled then.
+ */
+export async function graphAgentStepWait(
+  step: 'tool' | 'agent' | 'plugin',
+  mode: 'abandoned' | 'answered' | 'abandoned-cached' | 'answered-cached' | 'waiting' | 'parallel'
+): Promise<RunOutcome> {
+  let stage = 'running';
+  setHandler(graphStageQuery, () => stage);
+  const { cancellableActivity } = proxyActivities<{ cancellableActivity(): Promise<string> }>({
+    startToCloseTimeout: '1 minute',
+    retry: { maximumAttempts: 1 },
+  });
+  const cached = mode === 'abandoned-cached' || mode === 'answered-cached';
+  let runs = 0;
+  const wait = async (): Promise<void> => {
+    runs += 1;
+    if (runs > 1 || mode === 'answered' || mode === 'answered-cached') return;
+    stage = 'waiting';
+    await cancellableActivity();
+  };
+  let modelSteps = 0;
+  const check = async (): Promise<LlmResponse | undefined> => {
+    modelSteps += 1;
+    if (step !== 'tool') await wait();
+    if (!cached || (modelSteps === 1 && mode !== 'answered-cached')) return undefined;
+    return { content: { role: 'model', parts: [{ text: 'cached-answer' }] } };
+  };
+  const tool = new LongRunningFunctionTool({
+    name: 'wait_approval',
+    description: 'Wait for a person to approve.',
+    execute: async () => {
+      await wait();
+      return { status: 'approved' };
+    },
+  });
+  const agent = new LlmAgent({
+    name: 'assistant',
+    model: new TemporalModel(step === 'tool' ? 'call-wait-approval-model' : 'fake-model', SINGLE_ATTEMPT),
+    instruction: 'Help.',
+    tools: step === 'tool' ? [tool] : [],
+    beforeModelCallback: step === 'agent' || (step === 'tool' && cached) ? check : undefined,
+  });
+  const items = node((_ctx: NodeContext, _input: unknown) => ['first', 'second'], { name: 'items' });
+  const chain =
+    mode === 'waiting'
+      ? [agent]
+      : mode === 'parallel'
+        ? [items, new ParallelWorker(agent)]
+        : [
+            node(agent, {
+              timeout: 1,
+              retryConfig: { maxAttempts: 2, initialDelay: 0.01, jitter: 0, exceptions: ['NodeTimeoutError'] },
+            }),
+          ];
+  const outcome = await runOnce(
+    new Workflow({ name: 'agent_step_wait', edges: [['START', ...chain]] }),
+    'hi',
+    step === 'plugin' ? [new CheckingPlugin(check)] : undefined
+  );
+  stage = 'returned';
+  if (mode === 'waiting' || mode === 'parallel') return outcome;
+  try {
+    await condition(() => false);
+  } catch (err) {
+    if (!isCancellation(err)) throw err;
+    await CancellationScope.nonCancellable(() => sleep('1 second'));
+  }
   return outcome;
 }
 
