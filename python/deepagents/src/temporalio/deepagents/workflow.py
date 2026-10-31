@@ -208,7 +208,7 @@ def _merge_snapshot(input: Any, snapshot: Mapping[str, Any]) -> Any:
     only strips input messages when the transcript is non-empty.
     """
     raw_prior: Any = snapshot.get("messages") or []
-    prior = list(raw_prior)
+    prior = _serde.load_carried_messages(raw_prior)
     if not prior:
         return input
     if isinstance(input, Mapping):
@@ -302,7 +302,9 @@ async def run_deep_agent(
                 carried = _extract_messages(input)
             else:
                 carried = _as_message_list(input)
-        snapshot: dict[str, Any] = {"messages": carried}
+        # The snapshot goes through the payload converter, which would drop
+        # each message's type; carry messages in their dumpd form instead.
+        snapshot: dict[str, Any] = {"messages": _serde.dump_carried_messages(carried)}
         if _legacy_result_cache():
             snapshot[_CACHE_KEY] = _serde.result_cache_snapshot() or {}
         # ``continue_as_new`` threads positional args into the next run via
