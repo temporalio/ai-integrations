@@ -14,6 +14,7 @@ require (
 	go.opentelemetry.io/otel/sdk/log v0.21.0
 	go.opentelemetry.io/otel/sdk/metric v1.45.0
 	go.opentelemetry.io/otel/trace v1.45.0
+	go.temporal.io/api v1.63.4
 	go.temporal.io/sdk v1.48.0
 	go.temporal.io/sdk/contrib/workflowstreams v0.1.1
 	google.golang.org/adk/v2 v2.3.0
@@ -47,7 +48,6 @@ require (
 	github.com/stretchr/objx v0.5.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.68.0 // indirect
-	go.temporal.io/api v1.63.4 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/mod v0.38.0 // indirect
 	golang.org/x/net v0.58.0 // indirect

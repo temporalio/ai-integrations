@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/contrib/workflowstreams"
 	"go.temporal.io/sdk/workflow"
@@ -352,7 +353,7 @@ func startPeriodicHeartbeats(ctx context.Context) (stop func()) {
 // the workflowstreams topic for external (UI) consumers, and returns the
 // aggregated final response into the workflow. Liveness heartbeating is handled
 // by the caller's periodic heartbeater (see InvokeModel), not per chunk.
-func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in invokeModelInput) (*model.LLMResponse, error) {
+func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in invokeModelInput) (_ *model.LLMResponse, err error) {
 	log := activity.GetLogger(ctx)
 	opts := workflowstreams.Options{}
 	if in.StreamingBatchInterval > 0 {
@@ -367,7 +368,19 @@ func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in
 	if wsc, cerr := workflowstreams.NewClientFromActivity(ctx, opts); cerr != nil {
 		log.Warn("streaming client unavailable; not publishing chunks", "error", cerr)
 	} else {
-		defer func() { _ = wsc.Close(ctx) }()
+		// Close sends the last batch. If it fails, subscribers did not get every
+		// chunk, so the call fails instead of returning as if they had. A model
+		// error stays the call's error, and a cancelled or timed-out Activity
+		// reports that instead.
+		defer func() {
+			if cerr := wsc.Close(ctx); cerr != nil && err == nil {
+				if ctx.Err() != nil {
+					err = ctx.Err()
+				} else {
+					err = streamPublishError(in, cerr)
+				}
+			}
+		}()
 		topic = wsc.Topic(in.StreamingTopic)
 	}
 
@@ -567,6 +580,20 @@ func classifyModelError(err error) error {
 		retryable = retryableHTTPStatus(code)
 	}
 	return newApplicationError(ErrorTypeModel, retryable, err, "model call failed: %v", err)
+}
+
+// streamPublishError fails a streaming call whose chunks did not all reach the
+// topic. A retry calls the model again, so the error is non-retryable when the
+// retry would fail the same way: the server refused the batch as invalid (for
+// example, over the payload size limit), or the stream client gave up on it
+// after retrying for its MaxRetryDuration. Other failures, such as a server
+// outage, stay retryable.
+func streamPublishError(in invokeModelInput, err error) error {
+	var invalid *serviceerror.InvalidArgument
+	var timeout *workflowstreams.FlushTimeoutError
+	retryable := !errors.As(err, &invalid) && !errors.As(err, &timeout)
+	return newApplicationError(ErrorTypeModel, retryable, err,
+		"model %q: publish streamed responses to topic %q: %v", in.Request.Model, in.StreamingTopic, err)
 }
 
 // apiErrorCode extracts the HTTP status from a genai.APIError, which the SDK

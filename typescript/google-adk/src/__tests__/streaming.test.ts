@@ -14,7 +14,7 @@ import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { createModelActivities } from '../activities';
 import { GoogleAdkPlugin } from '../index';
 import { fakeModelProvider } from '../testing';
-import { setupTestEnv, uid, withWorker } from './helpers';
+import { findInCauseChain, setupTestEnv, uid, withWorker } from './helpers';
 import { closeStream, streamingModelCall, streamingModelCallSubscribed } from './workflows';
 
 const chunks: LlmResponse[] = [
@@ -74,6 +74,46 @@ test.serial('publishesChunksToStreamTopic', async (t) => {
       published.map((r) => r.content?.parts?.[0]?.text),
       ['Hello ', 'streaming ', 'world']
     );
+  });
+});
+
+// E2E: the chunks arrive back to back, so they share one publish batch of about
+// 2.4 MB, over the dev server's 2 MiB payload limit, while the Activity result
+// (about 1.8 MB) fits. The server refuses the batch, so the Workflow must fail
+// with a non-retryable model error, not complete while subscribers get nothing,
+// and the model must not be called again.
+test.serial('refusedStreamPublishFailsTheModelCall', async (t) => {
+  const env = getEnv();
+  const taskQueue = uid('adk-stream-refused');
+  const third = 'x'.repeat(300_000);
+  const responses: LlmResponse[] = [
+    { content: { role: 'model', parts: [{ text: third }] }, partial: true },
+    { content: { role: 'model', parts: [{ text: third }] }, partial: true },
+    { content: { role: 'model', parts: [{ text: third }] }, partial: true },
+    { content: { role: 'model', parts: [{ text: third.repeat(3) }] }, turnComplete: true },
+  ];
+  const provider = fakeModelProvider(responses);
+  let modelCalls = 0;
+  const plugin = new GoogleAdkPlugin({
+    modelProvider: (model) => {
+      modelCalls++;
+      return provider(model);
+    },
+  });
+  await withWorker(env, { taskQueue, plugins: [plugin] }, async () => {
+    let caught: unknown;
+    try {
+      await env.client.workflow.execute(streamingModelCall, { taskQueue, workflowId: uid('wf-stream-refused') });
+    } catch (err) {
+      caught = err;
+    }
+    const appFailure = findInCauseChain(caught, ApplicationFailure);
+    t.not(appFailure, undefined);
+    t.is(appFailure?.type, 'GoogleAdkModelError');
+    t.is(appFailure?.nonRetryable, true);
+    t.regex(appFailure?.message ?? '', /'fake-model'.*'adk-test-stream'.*Blob data size exceeds limit/);
+    t.not(appFailure?.cause, undefined);
+    t.is(modelCalls, 1);
   });
 });
 

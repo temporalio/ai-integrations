@@ -11,6 +11,7 @@ package googleadk_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
@@ -19,6 +20,7 @@ import (
 
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/contrib/workflowstreams"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
@@ -54,9 +56,14 @@ func TestStreamingIntegration(t *testing.T) {
 	taskQueue := testTaskQueue(t)
 
 	cm := &chunkedModel{name: "stream-model", chunks: []string{"Hello", ", ", "world"}}
+	// Three 600,000-character chunks fit the Activity result, but their publish
+	// batch is over the server's 2 MiB limit.
+	big := strings.Repeat("x", 600_000)
+	oversized := &chunkedModel{name: "oversized-stream-model", chunks: []string{big, big, big}}
 	startWorker(t, c, taskQueue, googleadk.Config{
 		Models: map[string]googleadk.ModelFactory{
-			"stream-model": func(context.Context, string) (model.LLM, error) { return cm, nil },
+			"stream-model":           func(context.Context, string) (model.LLM, error) { return cm, nil },
+			"oversized-stream-model": func(context.Context, string) (model.LLM, error) { return oversized, nil },
 		},
 	})
 	ctx := context.Background()
@@ -81,6 +88,24 @@ func TestStreamingIntegration(t *testing.T) {
 	var offset int64
 	require.NoError(t, val.Get(&offset))
 	assert.GreaterOrEqual(t, offset, int64(len(cm.chunks)), "every streamed chunk must be published to the topic")
+
+	// A batch the server refuses fails the model call instead of returning the
+	// reply as if subscribers had every chunk. A retry would call the model again
+	// and send the same batch, so the failure is non-retryable.
+	run = startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
+		ID:        taskQueue + "-streaming-refused",
+		TaskQueue: taskQueue,
+	}, agentRunWorkflow, runInput{
+		ModelName:      "oversized-stream-model",
+		UserMessage:    "greet",
+		StreamingTopic: "run-stream",
+	})
+	err = run.Get(ctx, nil)
+	require.Error(t, err, "a refused publish batch must fail the model call")
+	var appErr *temporal.ApplicationError
+	require.ErrorAs(t, err, &appErr)
+	assert.Equal(t, googleadk.ErrorTypeModel, appErr.Type())
+	assert.True(t, appErr.NonRetryable(), "a refused batch must not be retried: %v", err)
 }
 
 // TestReplaySingleAndMultiAgent runs real single-agent, multi-agent, remote
