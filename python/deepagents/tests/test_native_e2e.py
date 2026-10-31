@@ -70,12 +70,17 @@ class ToolLoopWorkflow:
             """Return the weather for a city."""
             return f"It is sunny in {city}."
 
+        def get_time(city: str) -> str:
+            """Return the local time for a city."""
+            return f"It is noon in {city}."
+
         weather_tool = tool_as_activity(
             get_weather, start_to_close_timeout=timedelta(seconds=30)
         )
         agent = create_deep_agent(
             model="anthropic:claude-sonnet-4-5",
-            tools=[weather_tool],
+            # get_time is not wrapped, so it runs in the workflow.
+            tools=[weather_tool, get_time],
             system_prompt="Use the weather tool to answer.",
         )
         result = await agent.ainvoke(
@@ -111,11 +116,15 @@ async def test_deep_agent_runs_via_plugin(env: WorkflowEnvironment) -> None:
 
 @pytest.mark.asyncio
 async def test_agent_tool_loop_routes_to_activities(env: WorkflowEnvironment) -> None:
-    # Script the model: first turn asks for the tool, second turn answers. This
-    # forces model -> tool -> model, proving each call routes through an activity.
+    # Script the model: first turn asks for the tools, second turn answers. This
+    # forces model -> tool -> model, proving each call routes through an activity,
+    # except the unwrapped sync tool, which runs in the workflow.
     tool_call = AIMessage(
         content="",
-        tool_calls=[{"name": "get_weather", "args": {"city": "Paris"}, "id": "call-1"}],
+        tool_calls=[
+            {"name": "get_weather", "args": {"city": "Paris"}, "id": "call-1"},
+            {"name": "get_time", "args": {"city": "Paris"}, "id": "call-2"},
+        ],
     )
     final = AIMessage(content="It is sunny in Paris.")
     plugin = DeepAgentsPlugin(
@@ -132,6 +141,8 @@ async def test_agent_tool_loop_routes_to_activities(env: WorkflowEnvironment) ->
             "Paris",
             id=f"da-tool-loop-{uuid.uuid4()}",
             task_queue="da-tool-loop",
+            # A failed Workflow Task retries without end, so bound the wait.
+            execution_timeout=timedelta(seconds=30),
         )
         out = await handle.result()
 
@@ -139,3 +150,10 @@ async def test_agent_tool_loop_routes_to_activities(env: WorkflowEnvironment) ->
     counts = await count_scheduled_activities(handle)
     assert counts[INVOKE_MODEL] == 2, counts
     assert counts[INVOKE_TOOL] == 1, counts
+    # The model got the unwrapped sync tool's result.
+    model_inputs = [
+        e.activity_task_scheduled_event_attributes.input.payloads[0].data.decode()
+        async for e in handle.fetch_history_events()
+        if e.activity_task_scheduled_event_attributes.activity_type.name == INVOKE_MODEL
+    ]
+    assert "It is noon in Paris." in model_inputs[-1]
