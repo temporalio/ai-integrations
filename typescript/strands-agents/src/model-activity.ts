@@ -1,5 +1,6 @@
 import { Message, StateStore } from '@strands-agents/sdk';
 import type { JSONValue, Model, ModelStreamEvent, StreamOptions } from '@strands-agents/sdk';
+import { Context } from '@temporalio/activity';
 import { ApplicationFailure } from '@temporalio/common';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import type { Duration } from '@temporalio/common/lib/time';
@@ -29,6 +30,32 @@ function rebuildMessages(messages: unknown): Message[] {
   return messages.map((m) =>
     m instanceof Message ? m : Message.fromMessageData(m as Parameters<typeof Message.fromMessageData>[0])
   );
+}
+
+/**
+ * Run `model.stream` with the activity's own cancellation signal as `cancelSignal`. Strands passes
+ * the agent's `cancelSignal`, an `AbortSignal`, which reaches the activity as a plain object.
+ *
+ * Once the activity's cancellation reaches the worker, the signal is aborted. That stops the model
+ * call only if the model passes `cancelSignal` to its client (Strands 1.19.0's `AnthropicModel`
+ * does not); otherwise the call runs on and the activity can complete with its result. A remote
+ * activity learns of cancellation only through heartbeats, so this needs a `heartbeatTimeout` in
+ * the activity options. Model clients abort with their own errors (OpenAI's is named `Error`),
+ * which Temporal would record as a failure, so after cancellation the activity throws the signal's
+ * `CancelledFailure` instead.
+ */
+async function* streamWithActivityCancellation(
+  model: Model,
+  messages: Message[],
+  options?: StreamOptions
+): AsyncGenerator<ModelStreamEvent> {
+  const signal = Context.current().cancellationSignal;
+  try {
+    yield* model.stream(messages, { ...options, cancelSignal: signal });
+  } catch (err) {
+    if (signal.aborted) throw signal.reason;
+    throw err;
+  }
 }
 
 /**
@@ -195,7 +222,7 @@ export class ModelActivity {
   private async runModel(model: Model, input: InvokeModelInput): Promise<ModelStreamEvent[]> {
     const messages = rebuildMessages(input.messages);
     const events: ModelStreamEvent[] = [];
-    for await (const event of model.stream(messages, input.options)) {
+    for await (const event of streamWithActivityCancellation(model, messages, input.options)) {
       events.push(event);
     }
     return events;
@@ -209,7 +236,7 @@ export class ModelActivity {
     const topic = stream.topic(input.streamingTopic);
     const events: ModelStreamEvent[] = [];
     try {
-      for await (const event of model.stream(messages, input.options)) {
+      for await (const event of streamWithActivityCancellation(model, messages, input.options)) {
         events.push(event);
         topic.publish(event);
       }
