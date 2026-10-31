@@ -381,6 +381,18 @@ worker is unaffected, and the original function is restored when the worker
 stops. If you would rather be explicit, use `create_temporal_deep_agent` or
 pass `TemporalModel("provider:name")` yourself.
 
+A model call made while another model call of the same run is in flight (for
+example two sub-agents running in parallel) gets an Activity id named after the
+call it answers: the agent or sub-agent and the messages it has so far. Activity
+inputs are not compared on replay, but Activity ids are, so a change that makes
+parallel sub-agents schedule their model calls in a different order (a library
+upgrade, an `await` added in middleware) fails replay with a nondeterminism
+error instead of handing each sub-agent the other's recorded answer. Ship such a
+change with Worker Versioning. Sequential model calls keep the SDK's sequence
+ids, and so do the calls already in the history of a run started before this
+behavior. Calls with the same agent and the same messages are named by order, so
+a swap between two of them is not caught.
+
 ## Composing with other plugins
 
 This plugin carries no tracing context of its own. For observability, compose it

@@ -26,7 +26,9 @@ passes through, so the object the workflow reads is the same one the plugin set.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import json
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from datetime import timedelta
 from typing import Any
@@ -90,6 +92,30 @@ async def _call_model(
         ):
             raise ContextOverflowError(cause.message) from error
         raise
+
+
+def _without_id(dumped: Any) -> Any:
+    """Drop the message id from a ``dumpd`` message, which is not replay-stable."""
+    if isinstance(dumped, dict) and isinstance(dumped.get("kwargs"), dict):
+        kwargs = {k: v for k, v in dumped["kwargs"].items() if k != "id"}
+        return {**dumped, "kwargs": kwargs}
+    return dumped
+
+
+def _has_repr(dumped: Any) -> bool:
+    """Whether ``dumpd`` fell back to a ``repr`` somewhere in this value.
+
+    ``dumpd`` writes a value it cannot serialize as ``not_implemented`` with
+    the object's ``repr``, which often holds a memory address and so differs
+    between the original run and its replay.
+    """
+    if isinstance(dumped, dict):
+        if dumped.get("type") == "not_implemented":
+            return True
+        return any(_has_repr(v) for v in dumped.values())
+    if isinstance(dumped, list):
+        return any(_has_repr(v) for v in dumped)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +218,42 @@ class TemporalModel(BaseChatModel):
     def _summary(self) -> str:
         return f"invoke_model[{self.model}]"
 
+    @staticmethod
+    def _call_identity(messages: Sequence[BaseMessage]) -> str | None:
+        """A replay-stable name for this call: which agent loop, and its transcript.
+
+        Built only from values that replay identically: the agent's name from
+        the run config (``lc_agent_name``, which ``create_agent`` sets for each
+        sub-agent) and the non-system messages of the request in ``dumpd`` form
+        minus their ids, which LangGraph assigns with ``uuid4`` outside the
+        workflow's seeded random. System prompts, tool schemas and the model
+        name are left out, so editing them does not fail the replay of open
+        runs. Returns None when the identity cannot be built (a value JSON
+        cannot hold, one ``dumpd`` could only write as a ``repr``, or any other
+        error); the call then keeps its sequence id. Only computed for a call that
+        overlaps another one (see ``_model_activity_id`` in ``workflow``).
+        """
+        with workflow.unsafe.imports_passed_through():
+            from langchain_core.runnables.config import ensure_config
+
+        # The identity only adds a check, and the sequence id is always a safe
+        # answer, so any failure to build it keeps the sequence id.
+        try:
+            metadata = ensure_config().get("metadata") or {}
+            agent = str(metadata.get("lc_agent_name") or "")
+            history = [m for m in messages if m.type != "system"]
+            dumped = [_without_id(_serde.dump_object(m)) for m in history]
+            if _has_repr(dumped):
+                return None
+            canonical = json.dumps(
+                [agent, dumped], sort_keys=True, separators=(",", ":")
+            )
+        except Exception:
+            return None
+        digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+        turn = sum(1 for m in history if m.type == "ai")
+        return f"deepagents.model:{digest}:{turn}"
+
     def _build_input(
         self,
         messages: Sequence[BaseMessage],
@@ -245,6 +307,7 @@ class TemporalModel(BaseChatModel):
             _activity.INVOKE_MODEL,
             activity_input,
             summary=self._summary(),
+            call_identity=lambda: self._call_identity(messages),
             **opts,
         )
         message = _serde.load_object(output.message)
@@ -265,6 +328,7 @@ class TemporalModel(BaseChatModel):
                 _activity.INVOKE_MODEL_STREAMING,
                 activity_input,
                 summary=f"invoke_model_streaming[{self.model}]",
+                call_identity=lambda: self._call_identity(messages),
                 **opts,
             )
         else:
@@ -274,6 +338,7 @@ class TemporalModel(BaseChatModel):
                 _activity.INVOKE_MODEL,
                 activity_input,
                 summary=self._summary(),
+                call_identity=lambda: self._call_identity(messages),
                 **opts,
             )
         message = _serde.load_object(output.message)
