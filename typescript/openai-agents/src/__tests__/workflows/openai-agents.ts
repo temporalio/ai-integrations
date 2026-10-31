@@ -235,6 +235,10 @@ export interface ApprovalResumeContextResult {
   rejectionMessages: string[];
   revisedRejectionWrites: string[];
   revisedRejectionInterruptions: number;
+  batchMessages: string[];
+  batchInterruptions: number;
+  sameNameWrites: string[];
+  sameNameApprovalOwners: number[];
 }
 
 /** An agent whose `clone` carries a private field, which can't be copied onto another object. */
@@ -312,8 +316,9 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
  * `Agent` keeps state outside it, which changes before the resume. Then an approved call fails after
  * the resume replaced its agent's object, and is rejected through the original state, whose retry must
  * not run it. Then the restore of a saved state fails repeatedly after merging its approvals, which must
- * not add a copy of them each time. Last, a rejection message changes after a failed resume, and the retry
- * must send the model the new one.
+ * not add a copy of them each time. Then a rejection message changes after a failed resume, and the retry
+ * must send the model the new one, also for a call that a later rejection for good covers. Last, a root and
+ * its handoff target share a name, and their resumes must not add a copy of the approvals each time.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -810,6 +815,81 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     await reviseRejection('VetoDirect', false, false),
   ];
 
+  // Calls A and B pause together. A is approved and B rejected, and the next model call fails once after
+  // the resume. A is then rejected for good with a new message, which also covers B, and the model must
+  // receive the new message for both when the state is retried.
+  const batchMessages: string[] = [];
+  const rejectBatch = async (name: string, rehydrate: boolean) => {
+    const batchAgent = new Agent<ResumeContext>({ name, model: 'gpt-4o-mini', tools: [vetoed] });
+    const paused = await runner.run(batchAgent, 'go', { context: { original: name, writes: [] } });
+    const state = rehydrate ? await RunState.fromString(batchAgent, paused.state.toString()) : paused.state;
+    const [callA, callB] = state.getInterruptions();
+    let failModel = true;
+    const callModelInputFilter: CallModelInputFilter = ({ modelData }) => {
+      for (const item of modelData.input) {
+        if (item.type === 'function_call_result') {
+          const { output } = item;
+          batchMessages.push(
+            `${item.callId}: ${typeof output === 'string' ? output : 'text' in output ? output.text : JSON.stringify(output)}`
+          );
+        }
+      }
+      if (failModel) {
+        failModel = false;
+        throw new Error('model failed');
+      }
+      return modelData;
+    };
+    state.approve(callA!);
+    state.reject(callB!, { message: `${name} before` });
+    await runner.run(batchAgent, state, { callModelInputFilter }).catch(() => undefined);
+    state.reject(callA!, { alwaysReject: true, message: `${name} after` });
+    return (await runner.run(batchAgent, state, { callModelInputFilter })).interruptions.length;
+  };
+  const batchInterruptions = [await rejectBatch('BatchPersisted', true), await rejectBatch('BatchDirect', false)];
+
+  // A root and its handoff target share a name. The root's call is approved for good, and the target's
+  // calls are then rejected one at a time. The resumes must keep converting into the same agents, whether
+  // each resumes the run's state or one rehydrated onto the original agent and the run's context.
+  const sameNameTool = tool({
+    name: 'same_name',
+    description: 'Record a value after approval.',
+    parameters: {
+      type: 'object' as const,
+      properties: { value: { type: 'string' } },
+      required: ['value'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    execute: async (args, runContext) => {
+      (runContext!.context as ResumeContext).writes.push((args as { value: string }).value);
+      return 'ok';
+    },
+  });
+  const sameNameWrites: string[] = [];
+  const resumeSameName = async (rehydrate: boolean) => {
+    const target = new Agent<ResumeContext>({ name: 'Same', model: 'gpt-4o-mini', tools: [sameNameTool] });
+    const root = new Agent<ResumeContext>({
+      name: 'Same',
+      model: 'gpt-4o-mini',
+      tools: [sameNameTool],
+      handoffs: [target],
+    });
+    let paused = await runner.run(root, 'go', { context: { original: 'same-name', writes: sameNameWrites } });
+    const runContext = paused.runContext;
+    for (let round = 0; paused.interruptions.length > 0 && round < 10; round++) {
+      const state = rehydrate
+        ? await RunState.fromStringWithContext(root, paused.state.toString(), runContext)
+        : paused.state;
+      const interruption = state.getInterruptions()[0]!;
+      if (round === 0) state.approve(interruption, { alwaysApprove: true });
+      else state.reject(interruption);
+      paused = await runner.run(root, state);
+    }
+    return countApprovalOwners(runContext).approvalOwners;
+  };
+  const sameNameApprovalOwners = [await resumeSameName(false), await resumeSameName(true)];
+
   return {
     callerAfter: ctx.after,
     resumedUsesCallerObject: result.runContext.context === ctx,
@@ -861,5 +941,9 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     rejectionMessages,
     revisedRejectionWrites: vetoedWrites,
     revisedRejectionInterruptions: revisedInterruptions.reduce((count, interruptions) => count + interruptions, 0),
+    batchMessages,
+    batchInterruptions: batchInterruptions.reduce((count, interruptions) => count + interruptions, 0),
+    sameNameWrites,
+    sameNameApprovalOwners,
   };
 }

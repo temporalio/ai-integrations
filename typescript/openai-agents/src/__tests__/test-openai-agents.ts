@@ -26,7 +26,13 @@ import {
   streamingNoTopicWorkflow,
 } from './workflows/openai-agents';
 import { makeTestFunction } from './helpers/test-fn';
-import { FakeModelProvider, handoffResponse, textResponse, toolCallResponse } from './stubs/openai-agents';
+import {
+  FakeModelProvider,
+  handoffResponse,
+  multiToolCallResponse,
+  textResponse,
+  toolCallResponse,
+} from './stubs/openai-agents';
 import { StreamingFakeModelProvider, streamingTextEvents } from './stubs/openai-agents-fakes';
 import EventType = temporal.api.enums.v1.EventType;
 
@@ -595,6 +601,28 @@ test('Approval resume keeps the caller context object', async (t) => {
           textResponse('done veto persisted always'),
           toolCallResponse('vetoed', { value: 'V-3' }, 'call_veto_direct'),
           textResponse('done veto direct'),
+          multiToolCallResponse([
+            { name: 'vetoed', args: { value: 'K-A' }, callId: 'call_batch_persisted_a' },
+            { name: 'vetoed', args: { value: 'K-B' }, callId: 'call_batch_persisted_b' },
+          ]),
+          textResponse('done batch persisted'),
+          multiToolCallResponse([
+            { name: 'vetoed', args: { value: 'L-A' }, callId: 'call_batch_direct_a' },
+            { name: 'vetoed', args: { value: 'L-B' }, callId: 'call_batch_direct_b' },
+          ]),
+          textResponse('done batch direct'),
+          toolCallResponse('same_name', { value: 'N-0' }, 'call_same_direct_0'),
+          handoffResponse('transfer_to_Same'),
+          toolCallResponse('same_name', { value: 'N-1' }, 'call_same_direct_1'),
+          toolCallResponse('same_name', { value: 'N-2' }, 'call_same_direct_2'),
+          toolCallResponse('same_name', { value: 'N-3' }, 'call_same_direct_3'),
+          textResponse('done same name direct'),
+          toolCallResponse('same_name', { value: 'M-0' }, 'call_same_rehydrated_0'),
+          handoffResponse('transfer_to_Same'),
+          toolCallResponse('same_name', { value: 'M-1' }, 'call_same_rehydrated_1'),
+          toolCallResponse('same_name', { value: 'M-2' }, 'call_same_rehydrated_2'),
+          toolCallResponse('same_name', { value: 'M-3' }, 'call_same_rehydrated_3'),
+          textResponse('done same name rehydrated'),
         ]),
       }),
     ],
@@ -665,5 +693,18 @@ test('Approval resume keeps the caller context object', async (t) => {
     ],
     revisedRejectionWrites: [],
     revisedRejectionInterruptions: 0,
+    batchMessages: [
+      'call_batch_persisted_a: ok',
+      'call_batch_persisted_b: BatchPersisted before',
+      'call_batch_persisted_a: BatchPersisted after',
+      'call_batch_persisted_b: BatchPersisted after',
+      'call_batch_direct_a: ok',
+      'call_batch_direct_b: BatchDirect before',
+      'call_batch_direct_a: BatchDirect after',
+      'call_batch_direct_b: BatchDirect after',
+    ],
+    batchInterruptions: 0,
+    sameNameWrites: ['N-0', 'M-0'],
+    sameNameApprovalOwners: [2, 4],
   });
 });

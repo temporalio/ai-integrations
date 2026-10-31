@@ -161,12 +161,14 @@ export function handoffResponse(handoffToolName: string, args: Record<string, un
   return toolCallResponse(handoffToolName, args);
 }
 
-export function multiToolCallResponse(calls: Array<{ name: string; args: Record<string, unknown> }>): ModelResponse {
+export function multiToolCallResponse(
+  calls: Array<{ name: string; args: Record<string, unknown>; callId?: string }>
+): ModelResponse {
   const output: AgentOutputItem[] = calls.map((c) => ({
     type: 'function_call' as const,
     name: c.name,
     arguments: JSON.stringify(c.args),
-    callId: `call_fake_${c.name}`,
+    callId: c.callId ?? `call_fake_${c.name}`,
     status: 'completed' as const,
   }));
   return { output, usage: fakeUsage(20) };

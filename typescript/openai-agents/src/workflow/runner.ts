@@ -105,7 +105,7 @@ function reusableConversion(
     (conversion) =>
       conversion?.source === agent &&
       conversion.activeRuns === 0 &&
-      !losesStateDecisions(conversion, serializedState, state._context)
+      !losesStateDecisions(conversion.agents.get(agent)!, serializedState, state._context)
   );
 }
 
@@ -130,29 +130,30 @@ interface ApprovalContext {
 
 /**
  * Whether the restore would lose one of the serialized state's decisions or rejection messages if it merged
- * them into the decisions `conversion`'s agents already own. The merge keeps an approval for good over a
- * rejection, and an existing rejection message over the state's. So a state that always approved a tool
- * and then always rejected it would run it again, and a state whose rejection message changed after a
- * failed resume would send the model the earlier message. A fresh graph owns only the state's decisions.
+ * them into the decisions the agents of the graph rooted at `root` already own. The merge keeps an approval
+ * for good over a rejection, and an existing rejection message over the state's. So a state that always
+ * approved a tool and then always rejected it would run it again, and a state whose rejection message
+ * changed after a failed resume would send the model the earlier message. A fresh graph owns only the
+ * state's decisions.
  */
-function losesStateDecisions(conversion: Conversion, serializedState: string, context: object): boolean {
+function losesStateDecisions(root: Agent<any, any>, serializedState: string, context: RunContext<any>): boolean {
   const stateApprovals: FunctionApprovals[] = JSON.parse(serializedState).context.functionApprovals ?? [];
   if (stateApprovals.length === 0) return false;
-  const names = new Map<Agent<any, any>, string>();
-  for (const [source, converted] of conversion.agents) names.set(converted, source.name);
-  const { functionApprovals: owned = [] } = (context as ApprovalContext)._toJSONForRunState(names);
-  // A state's agent identity is its name, followed by `#n` if other agents in the graph share it.
-  return stateApprovals.some(({ agentIdentity, approvals }) =>
-    owned.some(
-      ({ agentIdentity: name, approvals: ownedApprovals }) =>
-        (agentIdentity === name || agentIdentity.startsWith(`${name}#`)) &&
-        Object.entries(approvals).some(
-          ([toolName, record]) =>
-            ownedApprovals[toolName] !== undefined &&
-            !keepsDecisions(record, mergeApprovalRecords(ownedApprovals[toolName], record, toolName))
-        )
-    )
-  );
+  // Serializing a state that starts at `root` keys the decisions the graph's agents own by the same agent
+  // identities (`name`, or `name#n` for agents that share a name) the restore resolves the state's against.
+  const owned: FunctionApprovals[] = new RunState(context, '', root, null).toJSON().context.functionApprovals ?? [];
+  const ownedByIdentity = new Map(owned.map(({ agentIdentity, approvals }) => [agentIdentity, approvals]));
+  return stateApprovals.some(({ agentIdentity, approvals }) => {
+    const ownedApprovals = ownedByIdentity.get(agentIdentity);
+    return (
+      ownedApprovals !== undefined &&
+      Object.entries(approvals).some(
+        ([toolName, record]) =>
+          ownedApprovals[toolName] !== undefined &&
+          !keepsDecisions(record, mergeApprovalRecords(ownedApprovals[toolName], record, toolName))
+      )
+    );
+  });
 }
 
 /** Merges `incoming` into `current` as the restore does, in a scratch `RunContext`. */
@@ -168,20 +169,26 @@ function mergeApprovalRecords(current: ApprovalRecord, incoming: ApprovalRecord,
   return scratch._toJSONForRunState(new Map([[owner, 'owner']])).functionApprovals![0]!.approvals[toolName]!;
 }
 
-/** Whether `merged` resolves every call that `record` decides, and its rejection messages, as `record` does. */
+/**
+ * Whether `merged` resolves every call that `record` decides, and its rejection messages, as `record` does.
+ * That includes calls only `merged` names, which a decision for good in `record` also covers.
+ */
 function keepsDecisions(record: ApprovalRecord, merged: ApprovalRecord): boolean {
-  const callIds = new Set<string | undefined>([
-    undefined,
-    ...(Array.isArray(record.approved) ? record.approved : []),
-    ...(Array.isArray(record.rejected) ? record.rejected : []),
-    ...Object.keys(record.messages ?? {}),
-  ]);
+  const callIds = new Set<string | undefined>([undefined, ...namedCallIds(record), ...namedCallIds(merged)]);
   return [...callIds].every((callId) => {
     const decision = approvalDecision(record, callId);
     if (decision === undefined) return true;
     if (approvalDecision(merged, callId) !== decision) return false;
     return decision || rejectionMessage(merged, callId) === rejectionMessage(record, callId);
   });
+}
+
+function namedCallIds(record: ApprovalRecord): string[] {
+  return [
+    ...(Array.isArray(record.approved) ? record.approved : []),
+    ...(Array.isArray(record.rejected) ? record.rejected : []),
+    ...Object.keys(record.messages ?? {}),
+  ];
 }
 
 /** The decision a record gives a call, or a call it doesn't name if `callId` is undefined, as agents-core resolves it. */
@@ -447,13 +454,16 @@ export class TemporalOpenAIRunner {
     const sandbox = options?.runConfig?.sandbox;
     // Serialize the state before converting, from the graph it was saved on, which the conversion changes.
     const serializedState = input instanceof RunState ? input.toString() : undefined;
-    const conversion = convertAgentGraph(
-      agent,
-      this.modelParams,
-      modelOverride,
-      sandbox,
-      input instanceof RunState ? reusableConversion(input, agent, serializedState!) : undefined
-    );
+    const reusable = input instanceof RunState ? reusableConversion(input, agent, serializedState!) : undefined;
+    let conversion = convertAgentGraph(agent, this.modelParams, modelOverride, sandbox, reusable);
+    // The conversion can change which agents of the graph share a name identity, so check the graph it
+    // gave again.
+    if (
+      reusable !== undefined &&
+      losesStateDecisions(conversion.agents.get(agent)!, serializedState!, (input as RunState<any, any>)._context)
+    ) {
+      conversion = convertAgentGraph(agent, this.modelParams, modelOverride, sandbox);
+    }
     const converted = conversion.agents.get(agent)!;
 
     conversion.activeRuns++;
