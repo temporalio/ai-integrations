@@ -14,6 +14,7 @@
 
 """Integration tests for ADK Temporal support."""
 
+import functools
 import inspect
 import json
 import logging
@@ -21,9 +22,10 @@ import os
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum, IntEnum
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
 from google.adk import Agent, Runner
@@ -34,6 +36,7 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
 from google.adk.sessions import InMemorySessionService
+from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from google.adk.utils.context_utils import Aclosing
@@ -44,7 +47,7 @@ from openinference.instrumentation.google_adk import GoogleADKInstrumentor
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import get_tracer_provider, set_tracer_provider
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter
 
 import temporalio.google_adk.workflow
 from temporalio import activity, workflow
@@ -61,7 +64,9 @@ from temporalio.google_adk._model import (
 )
 from temporalio.worker import Worker
 from temporalio.workflow import ActivityConfig
+from tests.helpers.decorators import passthrough, unwrapped
 from tests.helpers.opentelemetry import dump_spans
+from tests.helpers.postponed_annotations import PostponedHolder
 
 logger = logging.getLogger(__name__)
 
@@ -750,6 +755,12 @@ async def test_agent_outside_workflow():
     assert last_event.content.parts is not None
     assert last_event.content.parts[0].text == "warm and sunny"
 
+    # ADK passes arguments by name; the tool calls the activity by position.
+    tool = temporalio.google_adk.workflow.activity_as_tool(
+        locate_parcel, start_to_close_timeout=timedelta(seconds=30)
+    )
+    assert await tool(parcel_id="xyz") == "xyz"
+
 
 @pytest.mark.asyncio
 @pytest.mark.skip  # Doesn't work well in CI currently
@@ -833,6 +844,139 @@ class ComplexActivityMethodHolder:
         complex_activity_inputs_seen["annotate_trip"] = trip
         return f"{self.prefix}:{trip}"
 
+    @activity.defn
+    async def count_passengers(self, passengers: int) -> str:
+        """Method activity passed to activity_as_tool as Class.method."""
+        complex_activity_inputs_seen["count_passengers"] = passengers
+        return f"{self.prefix}:{passengers}"
+
+    @staticmethod
+    @activity.defn
+    async def echo_static(self) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType, reportSelfClsParameterName]
+        """Staticmethod: its `self` is an input the model fills."""
+        complex_activity_inputs_seen["echo_static"] = self
+        return f"static:{self}"
+
+    @staticmethod
+    @activity.defn
+    @passthrough
+    async def echo_decorated(self) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType, reportSelfClsParameterName]
+        """Staticmethod wrapped by a decorator from another module."""
+        complex_activity_inputs_seen["echo_decorated"] = self
+        return f"decorated:{self}"
+
+    @activity.defn
+    @passthrough
+    async def count_decorated(self, passengers: int) -> str:
+        """Method wrapped by a decorator from another module."""
+        return f"{self.prefix}:{passengers}"
+
+    class __Private:
+        """Its attribute in the class is mangled: ``_ComplexActivityMethodHolder__Private``."""
+
+        @staticmethod
+        @activity.defn
+        async def echo_private(self) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType, reportSelfClsParameterName]
+            """Staticmethod of a private nested class."""
+            complex_activity_inputs_seen["echo_private"] = self
+            return f"private:{self}"
+
+        @activity.defn
+        async def count_private(self, passengers: int) -> str:
+            """Method of a private nested class."""
+            return str(passengers)
+
+    private_owner = __Private
+
+    @activity.defn
+    async def __count_private(self, passengers: int) -> str:
+        """Private method: its attribute in the class is mangled."""
+        return str(passengers)
+
+    private_count = __count_private
+
+
+Passengers = Annotated[int, Field(description="Number of passengers.")]
+
+
+@activity.defn
+class QuoteTrip:
+    """Callable-class activity passed to activity_as_tool as its class."""
+
+    def __init__(self, currency: str) -> None:
+        self.currency = currency
+
+    async def __call__(self, trip: str, passengers: Passengers) -> str:
+        """Quote a trip for some passengers."""
+        complex_activity_inputs_seen["QuoteTrip"] = (self.currency, trip, passengers)
+        return f"{trip}:{passengers}:{self.currency}"
+
+
+@activity.defn
+class TrackParcel:
+    """Callable class whose __call__ takes a positional-only parameter."""
+
+    def __init__(self, parcel_id: str) -> None:
+        self.prefix = parcel_id
+
+    async def __call__(self, parcel_id: str, /) -> str:
+        complex_activity_inputs_seen["TrackParcel"] = (self.prefix, parcel_id)
+        return f"{self.prefix}:{parcel_id}"
+
+
+@activity.defn
+class StaticCallTrip:
+    @staticmethod
+    async def __call__(trip: str) -> str:
+        return trip
+
+
+@activity.defn
+class ClassCallTrip:
+    @classmethod
+    async def __call__(cls, trip: str) -> str:
+        return trip
+
+
+@activity.defn
+class PartialCallTrip:
+    async def _quote(self, trip: str, passengers: int) -> str:
+        return f"{trip}:{passengers}"
+
+    __call__ = functools.partialmethod(_quote, "SFO->LAX")
+
+
+class ShippingBase:
+    # Not decorated: @activity.defn refuses a subclass of a decorated class.
+    async def __call__(self, parcel_id: str) -> str:
+        """Quote shipping for a parcel."""
+        return parcel_id
+
+
+@activity.defn
+class DocumentedShipping(ShippingBase):
+    """Quote shipping with the class's own docstring."""
+
+
+@activity.defn
+@dataclass
+class DataclassShipping(ShippingBase):
+    carrier: str = "acme"
+
+
+@activity.defn
+async def locate_parcel(parcel_id: str, /) -> str:
+    """Function whose parameter is positional-only."""
+    complex_activity_inputs_seen["locate_parcel"] = parcel_id
+    return parcel_id
+
+
+@activity.defn
+async def echo_self(self) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType]
+    """Function, not a method: its `self` is an input the model fills."""
+    complex_activity_inputs_seen["echo_self"] = self
+    return f"echo:{self}"
+
 
 @workflow.defn
 class ComplexActivityInputAgent:
@@ -853,6 +997,36 @@ class ComplexActivityInputAgent:
                 ),
                 temporalio.google_adk.workflow.activity_as_tool(
                     method_holder.annotate_trip,
+                    start_to_close_timeout=timedelta(seconds=60),
+                ),
+                # The forms Workflow code passes to execute_activity_method and
+                # execute_activity_class; the worker's instances run them.
+                temporalio.google_adk.workflow.activity_as_tool(
+                    ComplexActivityMethodHolder.count_passengers,
+                    start_to_close_timeout=timedelta(seconds=60),
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    QuoteTrip, start_to_close_timeout=timedelta(seconds=60)
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    TrackParcel, start_to_close_timeout=timedelta(seconds=60)
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    locate_parcel, start_to_close_timeout=timedelta(seconds=60)
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    echo_self, start_to_close_timeout=timedelta(seconds=60)
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    ComplexActivityMethodHolder.echo_static,
+                    start_to_close_timeout=timedelta(seconds=60),
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    ComplexActivityMethodHolder.echo_decorated,
+                    start_to_close_timeout=timedelta(seconds=60),
+                ),
+                temporalio.google_adk.workflow.activity_as_tool(
+                    ComplexActivityMethodHolder.private_owner.echo_private,
                     start_to_close_timeout=timedelta(seconds=60),
                 ),
             ],
@@ -941,6 +1115,104 @@ class ComplexActivityInputModel(TestModel):
             LlmResponse(
                 content=Content(
                     role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="count_passengers",
+                                args={"passengers": 3},
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="QuoteTrip",
+                                args={"trip": "SFO->LAX", "passengers": 3},
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="TrackParcel", args={"parcel_id": "abc"}
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="locate_parcel", args={"parcel_id": "xyz"}
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="echo_self", args={"self": "abc"}
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="echo_static", args={"self": "def"}
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="echo_decorated", args={"self": "ghi"}
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
+                    parts=[
+                        Part(
+                            function_call=FunctionCall(
+                                name="echo_private", args={"self": "jkl"}
+                            )
+                        )
+                    ],
+                )
+            ),
+            LlmResponse(
+                content=Content(
+                    role="model",
                     parts=[Part(text="completed complex input tool calls")],
                 )
             ),
@@ -966,6 +1238,14 @@ async def test_activity_as_tool_supports_complex_inputs_via_adk(client: Client):
             book_trip,
             summarize_payload,
             method_holder.annotate_trip,
+            method_holder.count_passengers,
+            QuoteTrip("USD"),
+            TrackParcel("worker"),
+            locate_parcel,
+            echo_self,
+            method_holder.echo_static,
+            method_holder.echo_decorated,
+            ComplexActivityMethodHolder.private_owner.echo_private,
         ],
         workflows=[ComplexActivityInputAgent],
         max_cached_workflows=0,
@@ -991,6 +1271,14 @@ async def test_activity_as_tool_supports_complex_inputs_via_adk(client: Client):
                 {"count": 2, "owner": "team-a", "tags": ["alpha", "beta"]},
             ),
             "annotate_trip": "SFO->LAX:3",
+            "count_passengers": 3,
+            "QuoteTrip": ("USD", "SFO->LAX", 3),
+            "TrackParcel": ("worker", "abc"),
+            "locate_parcel": "xyz",
+            "echo_self": "abc",
+            "echo_static": "def",
+            "echo_decorated": "ghi",
+            "echo_private": "jkl",
         }
 
 
@@ -1176,6 +1464,173 @@ def test_activity_as_tool_preserves_metadata() -> None:
     assert params == ["city", "count"]
     assert sig.parameters["city"].annotation is str
     assert sig.parameters["count"].default == 1
+
+    # A method passed as Class.method: the worker's instance supplies `self`.
+    method_tool = temporalio.google_adk.workflow.activity_as_tool(
+        ComplexActivityMethodHolder.count_passengers,
+        start_to_close_timeout=timedelta(seconds=30),
+    )
+    assert method_tool.__name__ == "count_passengers"
+    assert list(inspect.signature(method_tool).parameters) == ["passengers"]
+
+    # A callable class passed as its class: __call__'s parameters, types and
+    # docstring, not its constructor's.
+    class_tool = temporalio.google_adk.workflow.activity_as_tool(
+        QuoteTrip, start_to_close_timeout=timedelta(seconds=30)
+    )
+    assert class_tool.__name__ == "QuoteTrip"
+    assert class_tool.__doc__ == "Quote a trip for some passengers."
+    assert list(inspect.signature(class_tool).parameters) == ["trip", "passengers"]
+    assert class_tool.__annotations__ == {
+        "trip": str,
+        "passengers": Passengers,
+        "return": str,
+    }
+    declaration = FunctionTool(class_tool)._get_declaration()
+    assert declaration is not None
+    assert declaration.parameters_json_schema is not None
+    assert (
+        declaration.parameters_json_schema["properties"]["passengers"]["description"]
+        == "Number of passengers."
+    )
+
+    # __call__ as an instance binds it: a staticmethod keeps every parameter;
+    # a classmethod and a partialmethod drop their receiver.
+    for cls, params in [
+        (StaticCallTrip, ["trip"]),
+        (ClassCallTrip, ["trip"]),
+        (PartialCallTrip, ["passengers"]),
+    ]:
+        tool = temporalio.google_adk.workflow.activity_as_tool(
+            cls, start_to_close_timeout=timedelta(seconds=30)
+        )
+        assert list(inspect.signature(tool).parameters) == params, cls.__name__
+
+    # The class's own docstring wins over an inherited __call__'s, but not the
+    # one dataclasses writes.
+    for shipping, doc in [
+        (DocumentedShipping, "Quote shipping with the class's own docstring."),
+        (DataclassShipping, "Quote shipping for a parcel."),
+    ]:
+        tool = temporalio.google_adk.workflow.activity_as_tool(
+            shipping, start_to_close_timeout=timedelta(seconds=30)
+        )
+        assert tool.__doc__ == doc, shipping.__name__
+
+    # A function's `self` is an input, not a receiver.
+    function_tool = temporalio.google_adk.workflow.activity_as_tool(
+        echo_self, start_to_close_timeout=timedelta(seconds=30)
+    )
+    assert list(inspect.signature(function_tool).parameters) == ["self"]
+
+    # So is a staticmethod's, though it is defined in a class body.
+    static_tool = temporalio.google_adk.workflow.activity_as_tool(
+        ComplexActivityMethodHolder.echo_static,
+        start_to_close_timeout=timedelta(seconds=30),
+    )
+    assert list(inspect.signature(static_tool).parameters) == ["self"]
+
+    @activity.defn
+    async def nested_echo(self) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType]
+        return self
+
+    # The class is found where the function was defined, though a decorator
+    # from another module wraps it, and through a private nested class or
+    # method. A method's `self` is dropped however it is annotated; a nested
+    # function keeps it.
+    for fn, params in [
+        (ComplexActivityMethodHolder.echo_decorated, ["self"]),
+        (ComplexActivityMethodHolder.count_decorated, ["passengers"]),
+        (ComplexActivityMethodHolder.private_owner.echo_private, ["self"]),
+        (ComplexActivityMethodHolder.private_owner.count_private, ["passengers"]),
+        (ComplexActivityMethodHolder.private_count, ["passengers"]),
+        (PostponedHolder.track, ["parcel_id"]),
+        (nested_echo, ["self"]),
+    ]:
+        tool = temporalio.google_adk.workflow.activity_as_tool(
+            fn, start_to_close_timeout=timedelta(seconds=30)
+        )
+        assert list(inspect.signature(tool).parameters) == params, fn.__qualname__
+
+
+def test_activity_as_tool_rejects_method_of_unreachable_class() -> None:
+    """A method whose class can't be found can't be told from a staticmethod."""
+
+    class LocalHolder:
+        @activity.defn
+        async def method(self, trip: str) -> str:
+            return trip
+
+    with pytest.raises(ValueError, match="method or a staticmethod"):
+        temporalio.google_adk.workflow.activity_as_tool(
+            LocalHolder.method, start_to_close_timeout=timedelta(seconds=30)
+        )
+
+    # A decorator that drops __wrapped__ hides the function's globals; the
+    # class isn't looked up in sys.modules, which differs in the sandbox.
+    with pytest.raises(ValueError, match="functools.wraps"):
+        temporalio.google_adk.workflow.activity_as_tool(
+            UnwrappedHolder.echo, start_to_close_timeout=timedelta(seconds=30)
+        )
+
+
+class UnwrappedHolder:
+    @staticmethod
+    @activity.defn
+    @unwrapped
+    async def echo(self) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType, reportSelfClsParameterName]
+        return self
+
+
+@activity.defn
+class NoCallActivity:
+    pass
+
+
+class UnresolvedCallActivity(QuoteTrip):
+    # Not decorated: @activity.defn would fail on the annotation itself.
+    async def __call__(self, trip: "MissingType", passengers: int) -> str:  # type: ignore[name-defined] # pyright: ignore[reportUndefinedVariable]
+        return str(trip)
+
+
+@activity.defn
+class KeywordOnlyCallActivity:
+    async def __call__(self, *, trip: str) -> str:
+        return trip
+
+
+@activity.defn
+class KwargsCallActivity:
+    async def __call__(self, trip: str, **extra: str) -> str:
+        return trip
+
+
+@activity.defn
+class KeywordPartialCallActivity:
+    async def _quote(self, trip: str, currency: str = "USD") -> str:
+        return f"{trip}:{currency}"
+
+    __call__ = functools.partialmethod(_quote, currency="EUR")
+
+
+@pytest.mark.parametrize(
+    "activity_def, message",
+    [
+        (NoCallActivity, "needs a __call__"),
+        (UnresolvedCallActivity, "name 'MissingType' is not defined"),
+        (KeywordOnlyCallActivity, r"or \*\*kwargs in __call__ \('trip'\)"),
+        (KwargsCallActivity, r"or \*\*kwargs in __call__ \('extra'\)"),
+        (KeywordPartialCallActivity, "partialmethod binds an argument by keyword"),
+    ],
+)
+def test_activity_as_tool_rejects_unreadable_call(
+    activity_def: Any, message: str
+) -> None:
+    """A class whose __call__ the tool can't read or call fails when it is built."""
+    with pytest.raises(ValueError, match=message):
+        temporalio.google_adk.workflow.activity_as_tool(
+            activity_def, start_to_close_timeout=timedelta(seconds=30)
+        )
 
 
 class CityWeather(BaseModel):
