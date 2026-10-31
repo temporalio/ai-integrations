@@ -8,6 +8,7 @@ package googleadk
 // publish side channel is exercised by the dev-server-gated integration test.
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -73,7 +74,7 @@ func TestAggregateResponsesNilNext(t *testing.T) {
 
 // TestClassifyModelErrorRetryability proves the HTTP-status → retry-contract
 // mapping used by InvokeModel: 429/5xx retryable, other 4xx non-retryable,
-// status-less errors retryable.
+// status-less errors retryable except ADK's "empty response".
 func TestClassifyModelErrorRetryability(t *testing.T) {
 	cases := []struct {
 		code      int
@@ -95,6 +96,12 @@ func TestClassifyModelErrorRetryability(t *testing.T) {
 		classified := classifyModelError(err)
 		assert.Equal(t, !tc.retryable, IsNonRetryable(classified), "code %d", tc.code)
 	}
+
+	// ADK's Gemini model returns this untyped error for a reply with no
+	// candidates, such as a blocked prompt.
+	empty := fmt.Errorf("empty response")
+	assert.True(t, IsNonRetryable(classifyModelError(empty)), "empty response")
+	assert.True(t, IsNonRetryable(classifyModelError(fmt.Errorf("wrapped: %w", empty))), "wrapped empty response")
 }
 
 // TestAggregateResponsesFoldsAllLateFields proves metadata a model emits only on

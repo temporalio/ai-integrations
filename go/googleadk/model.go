@@ -559,12 +559,22 @@ func appendText(c *genai.Content, text string) {
 // classifyModelError maps a model-call failure to Temporal's retry contract. A
 // genai.APIError is classified by HTTP status (408/409/429 and 5xx retryable,
 // other 4xx non-retryable); anything without a status is treated as a
-// retryable transient fault.
+// retryable transient fault, except ADK's "empty response".
 func classifyModelError(err error) error {
 	code := apiErrorCode(err)
 	retryable := true
 	if code != 0 {
 		retryable = retryableHTTPStatus(code)
+	} else {
+		// ADK's Gemini model returns this untyped error for a reply with no
+		// candidates, as for a blocked prompt. Natively the agent gets it
+		// once; a retry would send the same request again.
+		for e := err; e != nil; e = errors.Unwrap(e) {
+			if e.Error() == "empty response" {
+				retryable = false
+				break
+			}
+		}
 	}
 	return newApplicationError(ErrorTypeModel, retryable, err, "model call failed: %v", err)
 }
