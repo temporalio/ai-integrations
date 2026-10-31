@@ -1374,6 +1374,12 @@ def workflow_tool_mock_model():
                 call_id="call-add-note",
                 item_id="item-add-note",
             ),
+            ResponseBuilders.tool_call(
+                "{}",
+                "offload_sum",
+                call_id="call-offload-sum",
+                item_id="item-offload-sum",
+            ),
             ResponseBuilders.output_message("Workflow tool was used"),
         ]
     )
@@ -1405,7 +1411,11 @@ class WorkflowToolWorkflow:
             name="Assistant",
             instructions="You are a helpful assistant.",
             model="gpt-4o",
-            tools=[function_tool(self.run_tool), function_tool(self.add_note)],
+            tools=[
+                function_tool(self.run_tool),
+                function_tool(self.add_note),
+                function_tool(self.offload_sum),
+            ],
         )
         hooks = WorkflowToolHooks()
         await Runner.run(
@@ -1427,6 +1437,14 @@ class WorkflowToolWorkflow:
         """Add a note."""
         self.notes.append(note)
         return f"Added note: {note}"
+
+    async def offload_sum(self) -> str:
+        """Add two numbers in a thread."""
+        # Only sync function tools run inline. Other thread calls still fail.
+        try:
+            return f"to_thread returned {await asyncio.to_thread(lambda: 2 + 3)}"
+        except NotImplementedError:
+            return "to_thread raised NotImplementedError"
 
 
 async def test_workflow_method_tools(client: Client):
@@ -1450,7 +1468,7 @@ async def test_workflow_method_tools(client: Client):
         # The sync tool ran in the Workflow, and the model got its result.
         assert await workflow_handle.result() == {
             "notes": ["call back"],
-            "tool_callables": ["run_tool", "add_note"],
+            "tool_callables": ["run_tool", "add_note", "offload_sum"],
         }
         model_inputs = [
             e.activity_task_scheduled_event_attributes.input.payloads[0].data.decode()
@@ -1458,6 +1476,7 @@ async def test_workflow_method_tools(client: Client):
             if e.HasField("activity_task_scheduled_event_attributes")
         ]
         assert "Added note: call back" in model_inputs[-1]
+        assert "to_thread raised NotImplementedError" in model_inputs[-1]
 
 
 async def test_response_serialization():
