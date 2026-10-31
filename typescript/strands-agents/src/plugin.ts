@@ -2,8 +2,10 @@ import type { McpClient } from '@strands-agents/sdk';
 import { BedrockModel, type Model } from '@strands-agents/sdk';
 import type { Duration } from '@temporalio/common';
 import { msOptionalToNumber } from '@temporalio/common/lib/time';
-import type { BundleOptions } from '@temporalio/worker';
+import type { Context as ActivityContext } from '@temporalio/activity';
+import type { ActivityInboundCallsInterceptor, BundleOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
+import { rewriteError } from './strands-errors';
 import { ModelActivity } from './model-activity';
 import type { GetModelConfigInput, InvokeModelInput, InvokeModelStreamingInput } from './model-activity';
 import { GET_MODEL_CONFIG_ACTIVITY } from './temporal-model';
@@ -46,18 +48,35 @@ export interface StrandsPluginOptions {
   mcpConnectionIdleTimeout?: Duration;
 }
 
+/** The plugin's model activities, whose context overflows the agent recovers from. */
+const MODEL_ACTIVITIES = new Set(['invokeModel', 'invokeModelStreaming']);
+
+/**
+ * Rethrows Strands' interrupt and terminal errors from activities as typed, non-retryable
+ * failures. The worker turns any other error an activity throws into a retryable
+ * `ApplicationFailure` before a failure converter sees it, so this cannot be left to one.
+ */
+function strandsActivityInbound(ctx: ActivityContext): ActivityInboundCallsInterceptor {
+  return {
+    async execute(input, next) {
+      try {
+        return await next(input);
+      } catch (err) {
+        throw rewriteError(err, { benignOverflow: MODEL_ACTIVITIES.has(ctx.info.activityType) });
+      }
+    },
+  };
+}
+
 /**
  * Temporal plugin that runs Strands Agents inside Temporal workflows. Model,
  * MCP tool, and (via {@link workflow.activityAsTool}) custom-tool invocations
  * are routed through Temporal Activities for durable execution, retries, and
  * timeouts.
  *
- * Register on the worker (and on the client when using `activityAsTool` with
- * interrupts, so the client-side data converter picks up the failure
- * converter):
+ * Register on the worker:
  *
  * ```ts
- * const client = await Client.connect({ plugins: [new StrandsPlugin({...})] });
  * const worker = new Worker({ ..., plugins: [new StrandsPlugin({...})] });
  * ```
  */
@@ -105,9 +124,12 @@ export class StrandsPlugin extends SimplePlugin {
       name: 'StrandsPlugin',
       activities,
       runContext,
-      dataConverter: {
-        failureConverterPath: require.resolve('./failure-converter'),
-      },
+      // A function, because the object form rebuilds the worker's interceptors without the
+      // deprecated `activityInbound` key.
+      workerInterceptors: (existing) => ({
+        ...existing,
+        activity: [...(existing?.activity ?? []), (ctx) => ({ inbound: strandsActivityInbound(ctx) })],
+      }),
     });
   }
 

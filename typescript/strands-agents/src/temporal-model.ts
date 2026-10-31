@@ -1,8 +1,9 @@
-import { Model } from '@strands-agents/sdk';
+import { ContextWindowOverflowError, Model } from '@strands-agents/sdk';
 import type { BaseModelConfig, Message, ModelStreamEvent, StreamOptions } from '@strands-agents/sdk';
 import * as workflow from '@temporalio/workflow';
 import type { ActivityOptions } from '@temporalio/workflow';
 import type { Duration } from '@temporalio/common/lib/time';
+import { applicationFailureType, CONTEXT_WINDOW_OVERFLOW_TYPE } from './strands-errors';
 import type {
   GetModelConfigInput,
   InvokeModelInput,
@@ -96,19 +97,32 @@ export class TemporalModel extends Model<BaseModelConfig> {
       ...this.activityOptions,
     });
 
-    const events = this.streamingTopic
-      ? await proxiedActivities.invokeModelStreaming({
-          modelName: this.modelName,
-          messages,
-          options,
-          streamingTopic: this.streamingTopic,
-          streamingBatchInterval: this.streamingBatchInterval,
-        })
-      : await proxiedActivities.invokeModel({
-          modelName: this.modelName,
-          messages,
-          options,
-        });
+    let events: ModelStreamEvent[];
+    try {
+      events = this.streamingTopic
+        ? await proxiedActivities.invokeModelStreaming({
+            modelName: this.modelName,
+            messages,
+            options,
+            streamingTopic: this.streamingTopic,
+            streamingBatchInterval: this.streamingBatchInterval,
+          })
+        : await proxiedActivities.invokeModel({
+            modelName: this.modelName,
+            messages,
+            options,
+          });
+    } catch (err) {
+      // Give the agent Strands' own error for a context overflow, so its conversation manager can
+      // trim the conversation and call the model again. Keep the activity failure as its cause.
+      if (
+        err instanceof workflow.ActivityFailure &&
+        applicationFailureType(err.cause) === CONTEXT_WINDOW_OVERFLOW_TYPE
+      ) {
+        throw Object.assign(new ContextWindowOverflowError(err.cause?.message ?? ''), { cause: err });
+      }
+      throw err;
+    }
 
     for (const event of events) {
       yield event;
