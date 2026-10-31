@@ -25,6 +25,7 @@ import { bundleWorkflowCode, DefaultLogger, Worker } from '@temporalio/worker';
 import { ActivityCancellationType, DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { STRANDS_MALFORMED_INTERRUPT_TYPE, StrandsPlugin } from '..';
+import { ModelActivity } from '../model-activity';
 import { startLocalWithRetry } from './helpers/environment';
 import {
   auditLog,
