@@ -560,6 +560,11 @@ test('Approval resume keeps the caller context object', async (t) => {
           toolCallResponse('extend', {}, 'call_extend'),
           toolCallResponse('extra', { value: 'X' }, 'call_extra'),
           textResponse('done extended'),
+          handoffResponse('transfer_to_FailChild'),
+          toolCallResponse('set_after', { value: 'F' }, 'call_fail_child'),
+          textResponse('done failed conversion'),
+          toolCallResponse('set_after', { value: 'V' }, 'call_versioned'),
+          textResponse('done versioned'),
         ]),
       }),
     ],
@@ -596,5 +601,10 @@ test('Approval resume keeps the caller context object', async (t) => {
     disabledHandoffThrew: true,
     sharedFieldsWrites: ['X'],
     sharedFieldsTemperatures: [0.1, 0.9, 0.9],
+    failedConversionThrew: true,
+    failedConversionWrites: ['F'],
+    failedConversionInterruptions: 0,
+    versions: ['before', 'after'],
+    lastAgentVersion: 'after',
   });
 });

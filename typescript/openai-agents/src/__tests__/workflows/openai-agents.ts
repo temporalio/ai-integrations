@@ -1,4 +1,4 @@
-import { Agent, RunState, handoff, tool } from '@openai/agents-core';
+import { Agent, type AgentOptions, RunState, handoff, tool } from '@openai/agents-core';
 import { ApplicationFailure, condition } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
@@ -208,6 +208,33 @@ export interface ApprovalResumeContextResult {
   disabledHandoffThrew: boolean;
   sharedFieldsWrites: string[];
   sharedFieldsTemperatures: Array<number | undefined>;
+  failedConversionThrew: boolean;
+  failedConversionWrites: string[];
+  failedConversionInterruptions: number;
+  versions: string[];
+  lastAgentVersion: string | undefined;
+}
+
+/** An agent whose `clone` carries a private field, which can't be copied onto another object. */
+class VersionedAgent extends Agent<ResumeContext> {
+  #version: string;
+
+  constructor(config: AgentOptions<ResumeContext>, version: string) {
+    super(config);
+    this.#version = version;
+  }
+
+  get version(): string {
+    return this.#version;
+  }
+
+  setVersion(version: string): void {
+    this.#version = version;
+  }
+
+  override clone(config: Partial<AgentOptions<ResumeContext>>): VersionedAgent {
+    return new VersionedAgent({ ...this, ...config } as AgentOptions<ResumeContext>, this.#version);
+  }
 }
 
 /** Serialized approval record, as the `RunContext` internal below returns it. */
@@ -243,8 +270,10 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
  * tool throws once, and resuming the same state again must run it without asking again. Then a
  * resume fails while another state on its context advances and is approved again. Then each resume
  * rehydrates the saved state onto the original agent and context. Then a handoff changes between an
- * interruption and its resume. Last, an agent's tools and model settings are replaced with equal copies
- * before a resume, and the approved tool changes them.
+ * interruption and its resume. Then an agent's tools and model settings are replaced with equal copies
+ * before a resume, and the approved tool changes them. Then a resume fails to convert a handoff target,
+ * and the saved state must still carry its approval. Last, an agent class whose clone keeps a private
+ * field changes that field before the resume.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -476,6 +505,45 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
   sharedFieldsAgent.modelSettings = { ...sharedFieldsAgent.modelSettings };
   await runner.run(sharedFieldsAgent, pausedSharedFields.state);
 
+  // The run pauses on the handoff target's call. A resume while the target has a raw function tool
+  // fails to convert it. Once the tool is removed, the state saved as a string must still carry the
+  // approval: a new context rehydrated from it must run the call without asking again.
+  const failChild = new Agent<ResumeContext>({ name: 'FailChild', model: 'gpt-4o-mini', tools: [setAfter] });
+  const failRoot = new Agent<ResumeContext>({ name: 'FailRoot', model: 'gpt-4o-mini', handoffs: [failChild] });
+  const failedConversionCtx: ResumeContext = { original: 'failed-conversion', writes: [] };
+  const pausedFail = await runner.run(failRoot, 'go', { context: failedConversionCtx });
+  pausedFail.state.approve(pausedFail.interruptions[0]!);
+  failChild.tools = [setAfter, (() => 'raw') as any];
+  let failedConversionThrew = false;
+  try {
+    await runner.run(failRoot, pausedFail.state);
+  } catch {
+    failedConversionThrew = true;
+  }
+  failChild.tools = [setAfter];
+  const failRehydrated = await RunState.fromString(failRoot, pausedFail.state.toString());
+  const failedConversionResumed = await runner.run(failRoot, failRehydrated);
+
+  // The version changes between the interruption and the resume, and the agent the resumed run uses must
+  // have the new one, as a fresh clone does.
+  const versions: string[] = [];
+  const versionedAgent = new VersionedAgent(
+    {
+      name: 'VersionedAgent',
+      model: 'gpt-4o-mini',
+      instructions: (_runContext, current) => {
+        versions.push((current as VersionedAgent).version);
+        return 'Set the value.';
+      },
+      tools: [setAfter],
+    },
+    'before'
+  );
+  const pausedVersioned = await runner.run(versionedAgent, 'go', { context: { original: 'versioned', writes: [] } });
+  pausedVersioned.state.approve(pausedVersioned.interruptions[0]!);
+  versionedAgent.setVersion('after');
+  const versioned = await runner.run(versionedAgent, pausedVersioned.state);
+
   return {
     callerAfter: ctx.after,
     resumedUsesCallerObject: result.runContext.context === ctx,
@@ -500,5 +568,10 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     disabledHandoffThrew,
     sharedFieldsWrites: sharedFieldsCtx.writes,
     sharedFieldsTemperatures,
+    failedConversionThrew,
+    failedConversionWrites: failedConversionResumed.runContext.context.writes,
+    failedConversionInterruptions: failedConversionResumed.interruptions.length,
+    versions,
+    lastAgentVersion: (versioned.lastAgent as VersionedAgent | undefined)?.version,
   };
 }

@@ -1,4 +1,5 @@
-import { type Agent, Handoff } from '@openai/agents-core';
+import { Agent, Handoff } from '@openai/agents-core';
+import { SandboxAgent } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import type { ModelActivityOptions } from '../common/model-activity-options';
 import { ActivityBackedModel } from './activity-backed-model';
@@ -11,6 +12,9 @@ import { ActivityBackedModel } from './activity-backed-model';
  * When `identities` maps a source agent to an agent an earlier conversion returned, that object is
  * returned again, with the fields of this conversion's clone. Each agent then has the same fields as
  * after a fresh conversion, but keeps its object identity, which approvals on a `RunContext` are keyed by.
+ * Those objects only change once the whole graph has converted, so a conversion that throws leaves them
+ * as they were. An agent whose class overrides `clone` gets its fresh clone instead, since its clone can
+ * hold state, such as private fields, that can't be moved onto another object.
  */
 export function convertAgent(
   agent: Agent<any, any>,
@@ -19,7 +23,35 @@ export function convertAgent(
   modelNameOverride?: string,
   identities?: ReadonlyMap<Agent<any, any>, Agent<any, any>>
 ): Agent<any, any> {
-  seen = seen ?? new Map();
+  const replacements = new Map<Agent<any, any>, Agent<any, any>>();
+  const converted = cloneAgentGraph(
+    agent,
+    modelParams,
+    seen ?? new Map(),
+    new Map(),
+    replacements,
+    modelNameOverride,
+    identities
+  );
+  for (const [target, clone] of replacements) {
+    replaceFields(target, clone);
+  }
+  return converted;
+}
+
+/**
+ * Converts `agent`'s graph like `convertAgent`, without changing the objects in `identities`. Each reused
+ * object is added to `replacements`, mapped to the clone whose fields it gets.
+ */
+function cloneAgentGraph(
+  agent: Agent<any, any>,
+  modelParams: ModelActivityOptions,
+  seen: Map<Agent<any, any>, Agent<any, any>>,
+  clones: Map<Agent<any, any>, Agent<any, any>>,
+  replacements: Map<Agent<any, any>, Agent<any, any>>,
+  modelNameOverride: string | undefined,
+  identities: ReadonlyMap<Agent<any, any>, Agent<any, any>> | undefined
+): Agent<any, any> {
   if (seen.has(agent)) return seen.get(agent)!;
 
   // Reject raw functions: authoring mistake — use tool() or activityAsTool().
@@ -64,19 +96,34 @@ export function convertAgent(
 
   const clone = agent.clone({ model: activityBackedModel });
   const identity = identities?.get(agent);
-  const converted = identity === undefined ? clone : replaceFields(identity, clone);
+  const converted = identity !== undefined && canReplaceFields(identity, clone) ? identity : clone;
   seen.set(agent, converted);
+  clones.set(agent, clone);
 
-  const convertedHandoffs = (agent.handoffs ?? []).map((h) => {
+  const convertHandoffAgent = (handoffAgent: Agent<any, any>) =>
+    cloneAgentGraph(handoffAgent, modelParams, seen, clones, replacements, modelNameOverride, identities);
+  clone.handoffs = (agent.handoffs ?? []).map((h) => {
     if (h instanceof Handoff) {
-      const convertedHandoffAgent = convertAgent(h.agent, modelParams, seen, modelNameOverride, identities);
-      return h.clone({ agent: convertedHandoffAgent });
+      const convertedHandoffAgent = convertHandoffAgent(h.agent);
+      // A reused target still has its earlier fields here, so take the name from its new clone.
+      return h.clone({ agent: convertedHandoffAgent, agentName: clones.get(h.agent)!.name });
     }
-    return convertAgent(h, modelParams, seen, modelNameOverride, identities);
+    return convertHandoffAgent(h);
   });
 
-  converted.handoffs = convertedHandoffs;
+  if (converted !== clone) replacements.set(converted, clone);
   return converted;
+}
+
+/**
+ * Whether `target` can take `source`'s fields. `Agent.clone` and `SandboxAgent.clone` return instances of
+ * exactly those classes, which keep all their state in own properties.
+ */
+function canReplaceFields(target: Agent<any, any>, source: Agent<any, any>): boolean {
+  const plainPrototypes: readonly object[] = [Agent.prototype, SandboxAgent.prototype];
+  return (
+    plainPrototypes.includes(Object.getPrototypeOf(target)) && plainPrototypes.includes(Object.getPrototypeOf(source))
+  );
 }
 
 /** Gives `target` exactly the own properties and prototype of `source`, and returns `target`. */
