@@ -708,9 +708,13 @@ export class GoogleAdkPlugin extends SimplePlugin {
    * one replaced one of its Activities with a different one. `Worker.create`
    * applies the Worker's plugins in order, then the `NativeConnection`'s.
    */
-  override async runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
-    await refuseLaterReplacement('GoogleAdkPlugin', worker, this.options.activities as object, next);
-    return super.runWorker(worker, next);
+  override runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    // Not async: when the check passes, the Worker starts in this tick, as
+    // `Worker.runUntil` needs (see `refuseLaterReplacement`).
+    return (
+      refuseLaterReplacement('GoogleAdkPlugin', worker, this.options.activities as object, next) ??
+      super.runWorker(worker, next)
+    );
   }
 
   /**

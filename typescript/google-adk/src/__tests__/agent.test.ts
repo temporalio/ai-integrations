@@ -63,3 +63,34 @@ test.serial('runWorker refuses an Activity that a later plugin replaced, before 
   // Throws if the Worker still holds the connection.
   await connection.close();
 });
+
+test.serial('runWorker starts the Worker at once, so runUntil stops it after its callback', async (t) => {
+  const env = getEnv();
+  const connection = await NativeConnection.connect({ address: env.address });
+  // runUntil stops the Worker after its callback only if the Worker is already
+  // running. A callback that throws synchronously finishes before run() yields.
+  const alone = await Worker.create({
+    connection,
+    namespace: env.namespace,
+    taskQueue: uid('adk-run-until-throws'),
+    plugins: [new GoogleAdkPlugin()],
+  });
+  await t.throwsAsync(
+    alone.runUntil(() => {
+      throw new Error('boom');
+    }),
+    { message: 'boom' }
+  );
+  t.is(alone.getState(), 'STOPPED');
+  // Each plugin's check runs before the Worker starts; none may yield.
+  const options = { modelProvider: fakeModelProvider() };
+  const two = await Worker.create({
+    connection,
+    namespace: env.namespace,
+    taskQueue: uid('adk-run-until-two'),
+    plugins: [new GoogleAdkPlugin(options), new GoogleAdkPlugin(options)],
+  });
+  t.is(await two.runUntil(() => Promise.resolve('done')), 'done');
+  t.is(two.getState(), 'STOPPED');
+  await connection.close();
+});
