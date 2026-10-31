@@ -244,6 +244,12 @@ async def run_deep_agent(
     limit, its messages are carried into a fresh run via
     ``workflow.continue_as_new``. Only legacy executions carry the result cache.
 
+    Pending todos need the agent's todo tool. deepagents 0.7 no longer adds
+    ``TodoListMiddleware`` to ``create_deep_agent``, so pass
+    ``middleware=[TodoListMiddleware()]`` to make continue-as-new possible.
+    For an agent graph without ``todos`` state the driver cannot continue as
+    new, and logs a warning when history is past the limit.
+
     By default (``continue_as_new_after=None``) the limit is the server's own
     recommendation — ``workflow.info().is_continue_as_new_suggested()`` — which
     accounts for both history length and size; this is the recommended mode.
@@ -293,6 +299,15 @@ async def run_deep_agent(
         should_continue = (
             workflow.info().get_current_history_length() >= continue_as_new_after
         )
+    if should_continue and not _has_pending_work(result) and _lacks_todo_state(agent):
+        # workflow.logger, not warnings: it is not repeated when the task replays.
+        workflow.logger.warning(
+            "History is past the continue-as-new limit, but this run_deep_agent "
+            "call will not continue as new: it does so only after a turn that "
+            "leaves pending todos, and this agent has no todos state. "
+            "deepagents 0.7 no longer adds TodoListMiddleware to "
+            "create_deep_agent; pass middleware=[TodoListMiddleware()]."
+        )
     if should_continue and _has_pending_work(result):
         carried = _extract_messages(result)
         if not carried:
@@ -333,6 +348,24 @@ def _extract_messages(result: Any) -> list[Any]:
         raw: Any = result.get("messages") or []
         return list(raw)
     return []
+
+
+def _lacks_todo_state(agent: Any) -> bool:
+    """True only for a compiled LangGraph graph with no ``todos`` channel.
+
+    Without that channel the agent cannot report pending todos, so
+    :func:`_has_pending_work` is never true. The graph is checked, not the
+    turn's result: a continued run starts with no todos, so a result without
+    them does not mean the agent cannot track them. Agents that are not
+    LangGraph graphs (no ``channels`` mapping), including a wrapper around a
+    graph, are not judged.
+    """
+    try:
+        channels: Any = getattr(agent, "channels", None)
+    except Exception:
+        # Only a hint for a log message; never fail a finished turn over it.
+        return False
+    return isinstance(channels, Mapping) and "todos" not in channels
 
 
 def _has_pending_work(result: Any) -> bool:

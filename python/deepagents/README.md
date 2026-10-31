@@ -337,10 +337,14 @@ Long conversations bloat workflow history. `run_deep_agent(agent, input,
 state_snapshot=...)` snapshots state and continues into a fresh run when the
 turn ends with pending todos and the server recommends continuing
 (`workflow.info().is_continue_as_new_suggested()`, the default and recommended
-mode — it accounts for history length *and* size):
+mode — it accounts for history length *and* size). Pending todos need the
+todo tool, which deepagents 0.7 no longer adds to `create_deep_agent`, so add
+`TodoListMiddleware` to make continue-as-new possible. Without it the driver
+cannot continue as new, and logs a warning when history is past the limit:
 
 ```python
 from deepagents import create_deep_agent
+from langchain.agents.middleware import TodoListMiddleware
 from temporalio import workflow
 from temporalio.deepagents import run_deep_agent
 
@@ -349,7 +353,10 @@ from temporalio.deepagents import run_deep_agent
 class LongResearchAgent:
     @workflow.run
     async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
-        agent = create_deep_agent(model="anthropic:claude-sonnet-4-5")
+        agent = create_deep_agent(
+            model="anthropic:claude-sonnet-4-5",
+            middleware=[TodoListMiddleware()],
+        )
         return await run_deep_agent(
             agent,
             input,
