@@ -167,11 +167,11 @@ The Plugin allows `@traceable` to work inside Temporal's deterministic Workflow 
 
 Temporal Workflows are deterministic and get replayed from event history on recovery. The Plugin accounts for this by injecting replay-safe data into your traceable runs:
 
-- **No duplicate traces on replay.** Run IDs are derived deterministically from the Workflow's random seed, so replayed operations produce the same IDs and LangSmith deduplicates them.
-- **No non-deterministic calls.** The Plugin injects metadata using `workflow.now()` for timestamps and `workflow.random()` for UUIDs instead of `datetime.now()` and `uuid4()`.
+- **No duplicate traces on replay.** Run IDs are deterministic, and the Plugin skips LangSmith writes while replaying history.
+- **No non-deterministic calls.** The Plugin uses `workflow.now()` for timestamps and an independent `workflow.new_random()` stream for UUIDs instead of wall-clock time and random UUIDs.
 - **Background I/O stays outside the sandbox.** LangSmith HTTP calls to the server are submitted to a background thread pool that doesn't interfere with the deterministic Workflow execution.
 
-You don't need to do anything special for this. Your `@traceable` functions behave the same whether it's a fresh execution or a replay.
+This applies to native `RunTree` instances, `@traceable` functions, and sync or async `langsmith.trace()` blocks inside Workflows. Root runs remain real roots, so LangSmith applies its own destination and replica rules. Activities and code outside Workflows retain LangSmith's normal runtime behavior.
 
 ### Example: Worker Crash Mid-Workflow
 
@@ -214,6 +214,44 @@ my_step
     openai.responses.create
 ```
 
+## Agent and Environment Destinations
+
+With LangSmith 0.14.4 or later, an agent/environment address can select where
+traces are sent:
+
+```python
+import langsmith
+from temporalio.langsmith import LangSmithPlugin
+
+plugin = LangSmithPlugin(
+    address=langsmith.address.agent("support", "staging"),
+)
+```
+
+Register the plugin on the Client and Workers as in the quick start. `address`
+and `project_name` are mutually exclusive. LangSmith marks agent addressing as
+beta and enables it per workspace; the workspace must support the feature.
+
+Native `@langsmith.traceable(address=...)` and
+`langsmith.tracing_context(address=...)` also work when creating new traces
+inside Workflows. A child run inherits its existing parent's destination.
+The destination propagates through Activities, child Workflows, and Nexus,
+including when `add_temporal_runs=False`. Project-based tracing continues to
+work with earlier supported LangSmith versions.
+
+## Write Replicas
+
+LangSmith write replicas configured through `tracing_context(replicas=...)` or
+`LANGSMITH_RUNS_ENDPOINTS` follow the trace across Temporal boundaries. Only
+destination identifiers, the primary flag, and LangSmith's permitted replica
+updates enter Temporal headers; each Worker configures its own credentials and
+LangSmith clients.
+
+When a replica is marked primary, that destination retains the original run
+IDs. Other replicas receive LangSmith's deterministic destination-specific IDs,
+with matching parent links and completion updates. Replaying Workflow history
+does not publish additional copies.
+
 ## Context Propagation
 
 The Plugin propagates trace context across process boundaries (Client -> Workflow -> Activity -> Child Workflow -> Nexus) via Temporal headers. You don't need to pass any context manually.
@@ -237,6 +275,7 @@ Client Process              Worker Process (Workflow)        Worker Process (Act
 LangSmithPlugin(
     client=None,           # langsmith.Client instance (auto-created if None)
     project_name=None,     # LangSmith project name
+    address=None,          # Agent/environment address; mutually exclusive with project_name
     add_temporal_runs=False,  # Show Temporal operation nodes in traces
     default_metadata=None,    # Custom metadata attached to all LangSmith traces (https://docs.smith.langchain.com/observability/how_to_guides/add_metadata_tags)
     default_tags=None,        # Custom tags attached to all LangSmith traces (see link above)

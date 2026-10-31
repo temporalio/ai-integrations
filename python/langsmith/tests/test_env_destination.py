@@ -24,7 +24,6 @@ from temporalio.client import Client
 from temporalio.langsmith._interceptor import (
     LangSmithInterceptor,
     _env_destination,
-    _RootReplaySafeRunTreeFactory,
 )
 from temporalio.testing import WorkflowEnvironment
 from tests.helpers import new_worker
@@ -430,24 +429,6 @@ def test_empty_project_name_is_unset(
     assert interceptor._destination == _env_destination(ls_client)
     with interceptor.maybe_run("StartWorkflow:EmptyProjectName"):
         pass
-
-
-def test_root_factory_children_inherit_an_address(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _set_destination_env(monkeypatch, _VALID_AGENT_ENV)
-    address = _env_address()
-    _set_destination_env(monkeypatch, {"LANGSMITH_PROJECT": "env-project"})
-    factory = _RootReplaySafeRunTreeFactory(
-        ls_client=MagicMock(),
-        executor=MagicMock(),
-        destination={"address": address},
-    )
-
-    child = factory.create_child(name="traceable-fn", run_type="chain")
-
-    assert getattr(child, "address", None) == address
-    assert child.session_name is None
 
 
 @pytest.mark.parametrize("project_name", [None, "", "plugin-project"])

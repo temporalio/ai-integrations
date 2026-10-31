@@ -40,6 +40,7 @@ class LangSmithPlugin(SimplePlugin):
         *,
         client: langsmith.Client | None = None,
         project_name: str | None = None,
+        address: str | None = None,
         add_temporal_runs: bool = False,
         default_metadata: dict[str, Any] | None = None,
         default_tags: list[str] | None = None,
@@ -52,6 +53,9 @@ class LangSmithPlugin(SimplePlugin):
             project_name: Fallback LangSmith project name for traces with no
                 parent. Temporal runs inherit their parent's destination when
                 present. When unset, root runs use LangSmith's environment defaults.
+            address: Fallback LangSmith agent/environment address for traces with
+                no parent, mutually exclusive with project_name. Requires LangSmith
+                0.14.4 or later.
             add_temporal_runs: Whether to create LangSmith runs for Temporal
                 operations. Defaults to False.
             default_metadata: Default metadata to attach to all runs.
@@ -60,6 +64,7 @@ class LangSmithPlugin(SimplePlugin):
         interceptor = LangSmithInterceptor(
             client=client,
             project_name=project_name,
+            address=address,
             add_temporal_runs=add_temporal_runs,
             default_metadata=default_metadata,
             default_tags=default_tags,
