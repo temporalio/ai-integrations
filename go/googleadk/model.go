@@ -556,8 +556,8 @@ func appendText(c *genai.Content, text string) {
 	c.Parts = append(c.Parts, &genai.Part{Text: text})
 }
 
-// classifyModelError maps a model-call failure to Temporal's retry contract. A
-// genai.APIError is classified by HTTP status (408/409/429 and 5xx retryable,
+// classifyModelError maps a model-call failure to Temporal's retry contract. An
+// error with an HTTP status is classified by it (408/409/429 and 5xx retryable,
 // other 4xx non-retryable); anything without a status is treated as a
 // retryable transient fault.
 func classifyModelError(err error) error {
@@ -570,7 +570,8 @@ func classifyModelError(err error) error {
 }
 
 // apiErrorCode extracts the HTTP status from a genai.APIError, which the SDK
-// returns sometimes by value and sometimes by pointer.
+// returns sometimes by value and sometimes by pointer, or else from another
+// provider SDK's error (see statusCodeField).
 func apiErrorCode(err error) int {
 	var ptr *genai.APIError
 	if errors.As(err, &ptr) && ptr != nil {
@@ -579,6 +580,30 @@ func apiErrorCode(err error) int {
 	var val genai.APIError
 	if errors.As(err, &val) {
 		return val.Code
+	}
+	if code := statusCodeField(err); code >= 400 {
+		return code
+	}
+	return 0
+}
+
+// statusCodeField returns the int StatusCode field of the first error in err's
+// chain that has one, as openai-go's *openai.Error does (ADK's OpenAI model
+// wraps it), or 0 if none has. Reading the field by name avoids importing each
+// provider's SDK.
+func statusCodeField(err error) int {
+	for ; err != nil; err = errors.Unwrap(err) {
+		v := reflect.Indirect(reflect.ValueOf(err))
+		if v.Kind() != reflect.Struct {
+			continue
+		}
+		sf, ok := v.Type().FieldByName("StatusCode")
+		if !ok {
+			continue
+		}
+		if f, ferr := v.FieldByIndexErr(sf.Index); ferr == nil && f.CanInt() {
+			return int(f.Int())
+		}
 	}
 	return 0
 }
