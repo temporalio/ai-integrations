@@ -774,13 +774,19 @@ class TestReplay:
             if not (run is stream and stream.get("end_time"))
         )
         assert [run["error"] for run in posts + patches if run.get("error")] == []
+
         # Runs start in the order they were made, after their parents.
-        starts = {
-            str(run["id"]): run["start_time"]
-            if isinstance(run["start_time"], datetime)
-            else datetime.fromisoformat(run["start_time"].replace("Z", "+00:00"))
-            for run in posts
-        }
+        def as_datetime(value: datetime | str) -> datetime:
+            if isinstance(value, datetime):
+                return value
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        starts = {str(run["id"]): as_datetime(run["start_time"]) for run in posts}
+        # No run ends before it starts.
+        for run in posts + patches:
+            if run.get("end_time"):
+                end = as_datetime(run["end_time"])
+                assert end >= starts[str(run["id"])], run.get("name", run["id"])
         ids = {run["name"]: str(run["id"]) for run in posts}
         steps = ["prepare", "call_helper", "stream", "finish"]
         assert sorted(steps, key=lambda name: starts[ids[name]]) == steps

@@ -339,6 +339,17 @@ class _LangChainRuns:
         self._last_start = start
         return start
 
+    def end_time(self, end: datetime) -> datetime:
+        """Get an end time no earlier than any start time given out so far.
+
+        A run, or one of its children, may start up to a few microseconds
+        after ``workflow.now()``, so ending at ``workflow.now()`` would end
+        it before it started.
+        """
+        if self._last_start is not None and end.tzinfo is not None:
+            return max(end, self._last_start)
+        return end
+
     def stable_id(self, run_id: Any) -> Any:
         """Get a run's stable ID, or ``run_id`` for a run this class does not know."""
         entry = self._ids.get(str(run_id))
@@ -377,6 +388,8 @@ class _LangChainRuns:
                 kwargs[key] = self.stable_id(kwargs[key])
         if kwargs.get("start_time") is not None:
             kwargs["start_time"] = entry[1]
+        if isinstance(kwargs.get("end_time"), datetime):
+            kwargs["end_time"] = self.end_time(kwargs["end_time"])
         if kwargs.get("dotted_order"):
             kwargs["dotted_order"] = self.dotted_order(kwargs["dotted_order"])
         return entry[0]
@@ -839,12 +852,15 @@ class _ReplaySafeRunTree(RunTree):
 
         Pre-computes ``end_time`` via ``workflow.now()`` in workflow context
         so ``RunTree.end()`` doesn't call ``datetime.now()`` (non-deterministic
-        and sandbox-restricted).
+        and sandbox-restricted), and no earlier than the start times
+        ``_LangChainRuns`` gave out.
         """
         if _is_replaying():
             return
-        if temporalio.workflow.in_workflow():
-            kwargs.setdefault("end_time", temporalio.workflow.now())
+        if temporalio.workflow.in_workflow() and kwargs.get("end_time") is None:
+            end = temporalio.workflow.now()
+            runs = _get_langchain_runs()
+            kwargs["end_time"] = end if runs is None else runs.end_time(end)
         self._run.end(**kwargs)
 
     def patch(self, *, exclude_inputs: bool | None = None) -> None:

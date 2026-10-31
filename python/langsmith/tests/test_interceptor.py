@@ -7,7 +7,7 @@ import gc
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,6 +21,7 @@ from temporalio.langsmith._interceptor import (
     _end_run_on_exception,
     _extract_context,
     _inject_context,
+    _LangChainRuns,
     _LangSmithWorkflowInboundInterceptor,
     _maybe_run,
     _post_pending,
@@ -303,6 +304,37 @@ class TestReplaySafety:
         gc.collect()
         assert list(_ReplaySafeClient(mock_client)._open) == [run_id]
         assert list(_ReplaySafeClient(MagicMock())._open) == []
+
+    def test_run_does_not_end_before_it_starts(self) -> None:
+        """A run's end time is no earlier than any start time given out."""
+        now = datetime.now(timezone.utc)
+        with (
+            patch(_PATCH_WF_NOW, return_value=now),
+            patch(f"{_MOD}.temporalio.workflow.random_seed", return_value=1),
+            patch(f"{_MOD}.temporalio.workflow.register_random_seed_callback"),
+        ):
+            runs = _LangChainRuns()
+            parent, child = uuid.uuid4(), uuid.uuid4()
+            runs.add(parent, keep_id=True)
+            # The child starts 1 microsecond after workflow.now().
+            assert runs.start_time(child) == now + timedelta(microseconds=1)
+            for run_id in (child, parent):
+                kwargs = {"run_id": run_id, "end_time": now}
+                runs.remap(kwargs, "run_id")
+                assert kwargs["end_time"] == now + timedelta(microseconds=1)
+            later = now + timedelta(seconds=1)
+            kwargs = {"run_id": parent, "end_time": later}
+            runs.remap(kwargs, "run_id")
+            assert kwargs["end_time"] == later
+            # So does a plugin run ended at workflow.now().
+            run = MagicMock()
+            with (
+                patch(_PATCH_IN_WORKFLOW, return_value=True),
+                patch(_PATCH_IS_REPLAYING, return_value=False),
+                patch(f"{_MOD}._get_langchain_runs", return_value=runs),
+            ):
+                _ReplaySafeRunTree(run, executor=_make_executor()).end()
+            run.end.assert_called_once_with(end_time=now + timedelta(microseconds=1))
 
 
 # ===================================================================
