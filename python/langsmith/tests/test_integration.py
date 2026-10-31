@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock
 
+import langsmith
+import langsmith.env
 import nexusrpc.handler
 import pytest
+from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.env import get_runtime_environment
+from langchain_core.runnables import RunnableLambda
+from langchain_core.tracers.langchain import LangChainTracer
 from langsmith import traceable, tracing_context
+from langsmith.run_helpers import get_tracing_context
 
 from temporalio import activity, common, nexus, workflow
+from temporalio.api.enums.v1 import EventType
 from temporalio.client import (
     Client,
     WorkflowFailureError,
@@ -20,6 +29,7 @@ from temporalio.client import (
 from temporalio.exceptions import ApplicationError
 from temporalio.langsmith import LangSmithPlugin
 from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import UnsandboxedWorkflowRunner
 from tests.helpers import new_worker
 from tests.helpers.langsmith import (
     InMemoryRunCollector,
@@ -76,6 +86,147 @@ class TraceableActivityWorkflow:
             traceable_activity,
             start_to_close_timeout=timedelta(minutes=1),
             retry_policy=common.RetryPolicy(maximum_attempts=1),
+        )
+
+
+class _RunIdRecorder(AsyncCallbackHandler):
+    """Records the run ID LangChain gives each named run's callbacks."""
+
+    def __init__(self) -> None:
+        self.run_ids: dict[str, str] = {}
+
+    async def on_chain_start(
+        self,
+        serialized: dict[str, Any] | None,
+        inputs: Any,
+        *,
+        run_id: uuid.UUID,
+        **kwargs: Any,
+    ) -> None:
+        self.run_ids[str(kwargs.get("name"))] = str(run_id)
+
+
+@workflow.defn
+class LangChainRunnableWorkflow:
+    """Runs a LangChain runnable in workflow code; its last step calls an activity.
+
+    A nonempty input is the runnable's ``run_id``.  Returns the run IDs the
+    runnable's callbacks got, by run name.
+    """
+
+    @workflow.run
+    async def run(self, run_id: str = "") -> dict[str, str]:
+        # Async steps: a sync step would run in an executor, which workflows lack.
+        async def prepare(prompt: str) -> str:
+            return prompt
+
+        async def call_activity(_prompt: str) -> str:
+            return await workflow.execute_activity(
+                traceable_activity,
+                start_to_close_timeout=timedelta(minutes=1),
+                retry_policy=common.RetryPolicy(maximum_attempts=1),
+            )
+
+        chain = RunnableLambda(prepare, name="prepare") | RunnableLambda(
+            call_activity, name="call_activity"
+        )
+        recorder = _RunIdRecorder()
+        config: Any = {"callbacks": [recorder]}
+        if run_id:
+            config["run_id"] = uuid.UUID(run_id)
+        await chain.ainvoke("hello", config=config)
+        return recorder.run_ids
+
+
+@traceable(name="call_traceable_activity")
+async def _call_traceable_activity() -> str:
+    """A @traceable helper around an activity."""
+    return await workflow.execute_activity(
+        traceable_activity,
+        start_to_close_timeout=timedelta(minutes=1),
+        retry_policy=common.RetryPolicy(maximum_attempts=1),
+    )
+
+
+# The client of LangChainHelperWorkflow's own tracer; the test sets it.
+_own_tracer_clients: list[Any] = []
+
+
+@workflow.defn
+class LangChainHelperWorkflow:
+    """Runs a LangChain runnable whose last step calls a @traceable helper.
+
+    With ``own_tracer``, the runnable gets a ``LangChainTracer`` built with
+    the client in ``_own_tracer_clients``, so run it unsandboxed.
+    """
+
+    @workflow.run
+    async def run(self, own_tracer: bool = False) -> str:
+        async def prepare(prompt: str) -> str:
+            return prompt
+
+        async def call_helper(_prompt: str) -> str:
+            return await _call_traceable_activity()
+
+        chain = RunnableLambda(prepare, name="prepare") | RunnableLambda(
+            call_helper, name="call_helper"
+        )
+        config: Any = {}
+        if own_tracer:
+            config["callbacks"] = [LangChainTracer(client=_own_tracer_clients[0])]
+        return await chain.ainvoke("hello", config=config)
+
+
+@workflow.defn
+class LangChainSignalWorkflow:
+    """Runs a LangChain runnable whose step waits for a signal."""
+
+    def __init__(self) -> None:
+        self._released = False
+
+    @workflow.signal
+    def release(self) -> None:
+        self._released = True
+
+    @workflow.run
+    async def run(self) -> str:
+        async def wait(text: str) -> str:
+            await workflow.wait_condition(lambda: self._released)
+            return text
+
+        return await RunnableLambda(wait, name="wait").ainvoke("secret")
+
+
+@activity.defn
+async def primary_activity() -> str:
+    return "primary"
+
+
+@activity.defn
+async def fallback_activity() -> str:
+    return "fallback"
+
+
+@workflow.defn
+class LangChainTracingErrorWorkflow:
+    """Schedules a fallback activity when LangChain's tracer raises."""
+
+    @workflow.run
+    async def run(self) -> str:
+        async def step(text: str) -> str:
+            return text
+
+        tracer = LangChainTracer(client=get_tracing_context()["client"])
+        tracer.raise_error = True
+        try:
+            await RunnableLambda(step, name="step").ainvoke(
+                "secret", config={"callbacks": [tracer]}
+            )
+            activity_fn = primary_activity
+        except ValueError:
+            activity_fn = fallback_activity
+        return await workflow.execute_activity(
+            activity_fn, start_to_close_timeout=timedelta(minutes=1)
         )
 
 
@@ -394,40 +545,295 @@ class TestBasicTracing:
 
 
 class TestReplay:
+    @pytest.mark.parametrize(
+        ("workflow_cls", "arg", "expected"),
+        [
+            # Workflow→activity→@traceable flow
+            (
+                TraceableActivityWorkflow,
+                "",
+                [
+                    "StartWorkflow:TraceableActivityWorkflow",
+                    "RunWorkflow:TraceableActivityWorkflow",
+                    "  StartActivity:traceable_activity",
+                    "  RunActivity:traceable_activity",
+                    "    traceable_activity",
+                    "      inner_llm_call",
+                ],
+            ),
+            # LangChain's tracer writes these runs, not @traceable
+            (
+                LangChainRunnableWorkflow,
+                "",
+                [
+                    "StartWorkflow:LangChainRunnableWorkflow",
+                    "RunWorkflow:LangChainRunnableWorkflow",
+                    "  RunnableSequence",
+                    "    prepare",
+                    "    call_activity",
+                    "      StartActivity:traceable_activity",
+                    "      RunActivity:traceable_activity",
+                    "        traceable_activity",
+                    "          inner_llm_call",
+                ],
+            ),
+            # The same, with a run_id the caller supplied
+            (
+                LangChainRunnableWorkflow,
+                "12345678-1234-4234-8234-123456789abc",
+                [
+                    "StartWorkflow:LangChainRunnableWorkflow",
+                    "RunWorkflow:LangChainRunnableWorkflow",
+                    "  RunnableSequence",
+                    "    prepare",
+                    "    call_activity",
+                    "      StartActivity:traceable_activity",
+                    "      RunActivity:traceable_activity",
+                    "        traceable_activity",
+                    "          inner_llm_call",
+                ],
+            ),
+        ],
+    )
     async def test_no_duplicate_traces_on_replay(
         self,
         client: Client,
         env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+        workflow_cls: Any,
+        arg: str,
+        expected: list[str],
     ) -> None:
         """With max_cached_workflows=0 (forcing replay), no duplicate runs appear."""
+        # LangChain's tracer reads the runtime environment, which the workflow
+        # sandbox blocks until it is cached outside it.
+        get_runtime_environment()
         temporal_client, collector, _ = _make_client_and_collector(
             client, add_temporal_runs=True
         )
 
         async with new_worker(
             temporal_client,
-            TraceableActivityWorkflow,
+            workflow_cls,
             activities=[traceable_activity],
             max_cached_workflows=0,
         ) as worker:
             handle = await temporal_client.start_workflow(
-                TraceableActivityWorkflow.run,
+                workflow_cls.run,
+                arg,
                 id=f"replay-test-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
             )
-            await handle.result()
+            result = await handle.result()
 
-        # Workflow→activity→@traceable flow should produce exactly these runs
-        # with no duplicates from replay:
-        expected = [
-            "StartWorkflow:TraceableActivityWorkflow",
-            "RunWorkflow:TraceableActivityWorkflow",
-            "  StartActivity:traceable_activity",
-            "  RunActivity:traceable_activity",
-            "    traceable_activity",
-            "      inner_llm_call",
-        ]
         assert_trace_hierarchy(build_trace_trees(collector), expected)
+        if arg:
+            # The run keeps the ID the caller gave it.
+            [run] = [r for r in collector.runs if r.name == "RunnableSequence"]
+            assert run.id == arg
+        if workflow_cls is LangChainRunnableWorkflow:
+            # Callbacks got the IDs LangSmith stored.
+            assert set(result) == {"RunnableSequence", "prepare", "call_activity"}
+            for name, run_id in result.items():
+                [run] = [r for r in collector.runs if r.name == name]
+                assert run.id == run_id
+
+    @pytest.mark.parametrize("own_tracer", [False, True])
+    @pytest.mark.parametrize("add_temporal_runs", [False, True])
+    async def test_each_run_written_once_on_replay(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+        add_temporal_runs: bool,
+        own_tracer: bool,
+    ) -> None:
+        """With a cache of 0, a client at default settings writes each run once."""
+        get_runtime_environment()
+        # The client's first post reads git metadata in a subprocess; read it
+        # here so it does not stall the workflow past the deadlock timeout.
+        langsmith.env.get_langchain_env_var_metadata()
+        writes: list[tuple[str, dict[str, Any]]] = []
+
+        class _RecordingClient(langsmith.Client):
+            def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("post", args[0]))
+
+            def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("patch", args[0]))
+
+        ls_client = _RecordingClient(api_url="http://localhost:1", api_key="test")
+        _own_tracer_clients[:] = [ls_client]
+        plugin = LangSmithPlugin(client=ls_client, add_temporal_runs=add_temporal_runs)
+        config = client.config()
+        config["plugins"] = [plugin]
+        temporal_client = Client(**config)
+
+        async with new_worker(
+            temporal_client,
+            LangChainHelperWorkflow,
+            activities=[traceable_activity],
+            workflow_runner=UnsandboxedWorkflowRunner(),
+            max_cached_workflows=0,
+        ) as worker:
+            await temporal_client.execute_workflow(
+                LangChainHelperWorkflow.run,
+                own_tracer,
+                id=f"replay-test-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+        _wait_for_tracing_io(plugin)
+
+        posts = [run for op, run in writes if op == "post"]
+        patches = [run for op, run in writes if op == "patch"]
+        assert {
+            "RunnableSequence",
+            "prepare",
+            "call_helper",
+            "call_traceable_activity",
+        } <= {run["name"] for run in posts}
+        # Each run is posted once and patched once, with no error.
+        names = [run["name"] for run in posts]
+        assert len(names) == len(set(names)), names
+        assert sorted(str(run["id"]) for run in patches) == sorted(
+            str(run["id"]) for run in posts
+        )
+        assert [run["error"] for run in patches if run.get("error")] == []
+        # Runs start in the order they were made, after their parents.
+        starts = {
+            str(run["id"]): run["start_time"]
+            if isinstance(run["start_time"], datetime)
+            else datetime.fromisoformat(run["start_time"].replace("Z", "+00:00"))
+            for run in posts
+        }
+        ids = {run["name"]: str(run["id"]) for run in posts}
+        assert starts[ids["prepare"]] < starts[ids["call_helper"]]
+        for run in posts:
+            parent = str(run.get("parent_run_id"))
+            if parent in starts:
+                assert starts[parent] <= starts[str(run["id"])], run["name"]
+
+    async def test_tracing_error_raised_again_on_replay(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+    ) -> None:
+        """A redaction error workflow code catches is raised on replay too."""
+        get_runtime_environment()
+
+        def hide_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+            if "secret" in str(inputs):
+                raise ValueError("redaction failed")
+            return inputs
+
+        class _NoWriteClient(langsmith.Client):
+            def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+        ls_client = _NoWriteClient(
+            api_url="http://localhost:1",
+            api_key="test",
+            auto_batch_tracing=False,
+            hide_inputs=hide_inputs,
+        )
+        config = client.config()
+        config["plugins"] = [LangSmithPlugin(client=ls_client)]
+        temporal_client = Client(**config)
+
+        async with new_worker(
+            temporal_client,
+            LangChainTracingErrorWorkflow,
+            activities=[primary_activity, fallback_activity],
+            max_cached_workflows=0,
+        ) as worker:
+            result = await temporal_client.execute_workflow(
+                LangChainTracingErrorWorkflow.run,
+                id=f"replay-test-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                run_timeout=timedelta(seconds=20),
+            )
+        assert result == "fallback"
+
+    async def test_buffered_processing_after_worker_restart(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+    ) -> None:
+        """A run a new worker writes after replay goes through process_buffered_run_ops."""
+        get_runtime_environment()
+        writes: list[tuple[str, dict[str, Any]]] = []
+
+        class _RecordingClient(langsmith.Client):
+            def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("post", args[0]))
+
+            def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("patch", args[0]))
+
+        def redact(runs: Any) -> list[dict[str, Any]]:
+            return [
+                {
+                    k: "[redacted]" if k in ("inputs", "outputs") else v
+                    for k, v in run.items()
+                }
+                for run in runs
+            ]
+
+        def temporal_client() -> Client:
+            # A LangSmith client of its own, as a worker in a new process has.
+            ls_client = _RecordingClient(
+                api_url="http://localhost:1",
+                api_key="test",
+                auto_batch_tracing=False,
+                process_buffered_run_ops=redact,
+                run_ops_buffer_size=1,
+            )
+            config = client.config()
+            config["plugins"] = [LangSmithPlugin(client=ls_client)]
+            return Client(**config)
+
+        task_queue = str(uuid.uuid4())
+        workflow_id = f"replay-test-{uuid.uuid4()}"
+        async with new_worker(
+            temporal_client(),
+            LangChainSignalWorkflow,
+            task_queue=task_queue,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+            max_cached_workflows=0,
+        ):
+            handle = await temporal_client().start_workflow(
+                LangChainSignalWorkflow.run, id=workflow_id, task_queue=task_queue
+            )
+            for _ in range(100):
+                history = await handle.fetch_history()
+                if any(
+                    e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED
+                    for e in history.events
+                ):
+                    break
+                await asyncio.sleep(0.1)
+
+        # A new worker, with a new plugin, replays the run started above.
+        async with new_worker(
+            temporal_client(),
+            LangChainSignalWorkflow,
+            task_queue=task_queue,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            await handle.signal(LangChainSignalWorkflow.release)
+            assert await handle.result() == "secret"
+
+        for _ in range(100):
+            if sum(op == "patch" for op, _ in writes) >= 1:
+                break
+            await asyncio.sleep(0.05)
+        posts = [run for op, run in writes if op == "post"]
+        # The first worker's post, and the second's after replay.
+        assert [run["name"] for run in posts] == ["wait", "wait"]
+        assert len({run["id"] for run in posts}) == 1
+        assert writes
+        assert "secret" not in str(writes)
 
 
 # ---------------------------------------------------------------------------
