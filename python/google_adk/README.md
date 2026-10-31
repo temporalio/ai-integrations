@@ -244,7 +244,9 @@ The same agent definitions can also be exercised outside Temporal with
 `adk run` or `adk web`.
 
 - `TemporalModel` and `activity_as_tool(...)` work in local ADK runs without
-  additional configuration.
+  additional configuration. The exception is a tool made from a method passed
+  as `Class.method` or from a callable-class Activity passed as its class: it
+  needs the Worker's instance, so it runs only in a Workflow.
 - If the agent uses `TemporalMcpToolSet`, define a shared toolset factory,
   register it with `TemporalMcpToolSetProvider(...)` for workflow runs, and
   reuse the same function for `not_in_workflow_toolset=...` so the agent can

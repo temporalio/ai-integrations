@@ -38,6 +38,7 @@ from temporalio.google_adk.workflow import (
     activity_as_tool,
 )
 from temporalio.worker import Worker
+from tests.helpers.postponed_annotations import PostponedSnapshotActivity
 
 TASK_QUEUE = "adk-tool-context-task-queue"
 
@@ -306,6 +307,15 @@ def test_activity_as_tool_accepts_optional_snapshot_annotation():
     properties = _declared_properties(tool)
     assert set(properties) == {"query"}
 
+    # Also for a callable-class instance whose annotations are strings: its
+    # types are read from its class's __call__.
+    tool = FunctionTool(
+        func=activity_as_tool(
+            PostponedSnapshotActivity(), start_to_close_timeout=timedelta(seconds=30)
+        )
+    )
+    assert set(_declared_properties(tool)) == {"query"}
+
 
 def test_activity_as_tool_rejects_adk_tool_context_annotation():
     """Annotating with the live ADK ToolContext gives an actionable error."""
@@ -444,6 +454,7 @@ def test_activity_as_tool_accepts_nested_snapshot_alias(activity_def: Any):
     [
         annotated_context_tool,
         AnnotatedContextActivity,
+        AnnotatedContextActivity(),
         OptionalAnnotatedContextActivity,
         nested_alias_context_tool,
         NestedAliasContextActivity,

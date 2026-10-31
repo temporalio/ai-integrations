@@ -5,8 +5,11 @@ import inspect
 import sys
 import types
 import typing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass
 from typing import TYPE_CHECKING, Any, Callable, cast
+
+if sys.version_info >= (3, 14):
+    import annotationlib  # type: ignore[reportUnreachable]
 
 import temporalio.workflow
 from temporalio import workflow
@@ -101,12 +104,17 @@ def _annotation_display(members: tuple[Any, ...]) -> str:
     )
 
 
+def _activity_name(activity_def: Callable) -> str:
+    """Returns the activity's name for messages; an instance has its class's."""
+    return getattr(activity_def, "__name__", type(activity_def).__name__)
+
+
 def _adk_context_error(
     activity_def: Callable, name: str, annotation_name: str
 ) -> ValueError:
     """Builds the error for a parameter annotated with a live ADK context."""
     return ValueError(
-        f"Activity '{activity_def.__name__}' declares '{name}:"
+        f"Activity '{_activity_name(activity_def)}' declares '{name}:"
         f" {annotation_name}', but ADK context objects are not serializable"
         " and cannot be activity arguments. Declare a parameter named"
         " 'tool_context' annotated with ToolContextSnapshot instead to receive"
@@ -124,7 +132,7 @@ def _validated_tool_context_parameter(
     """
     if parameter.annotation is inspect.Parameter.empty:
         raise ValueError(
-            f"Activity '{activity_def.__name__}' has an unannotated"
+            f"Activity '{_activity_name(activity_def)}' has an unannotated"
             " 'tool_context' parameter. Annotate it with ToolContextSnapshot"
             " to receive the serializable subset of the ADK tool context"
             " (session state and function-call id)."
@@ -139,7 +147,7 @@ def _validated_tool_context_parameter(
     ):
         raise _adk_context_error(activity_def, _TOOL_CONTEXT_PARAM, annotation_name)
     raise ValueError(
-        f"Activity '{activity_def.__name__}' has a 'tool_context' parameter"
+        f"Activity '{_activity_name(activity_def)}' has a 'tool_context' parameter"
         f" annotated with {annotation_name}. The name 'tool_context' is"
         " reserved by ADK for context injection; annotate the parameter with"
         " ToolContextSnapshot to receive the serializable subset of the tool"
@@ -182,7 +190,7 @@ def _tool_context_parameter(
             raise _adk_context_error(activity_def, name, _annotation_display(members))
         elif any(member is ToolContextSnapshot for member in members):
             raise ValueError(
-                f"Activity '{activity_def.__name__}' annotates parameter"
+                f"Activity '{_activity_name(activity_def)}' annotates parameter"
                 f" '{name}' with ToolContextSnapshot, but ADK only injects the"
                 " tool context into a parameter named 'tool_context'; under"
                 " any other name it would appear in the LLM-facing tool"
@@ -208,6 +216,55 @@ def _docstring(fn: Any) -> str | None:
     return doc if doc and doc.strip() else None
 
 
+def _generated_class_doc(cls: type) -> str | None:
+    """Returns the docstring dataclasses or namedtuple writes for a class that has none."""
+    if is_dataclass(cls):
+        try:
+            # Format it as dataclasses did when it made the class.
+            if sys.version_info >= (3, 14):
+                signature = inspect.signature(  # type: ignore[reportUnreachable]
+                    cls, annotation_format=annotationlib.Format.FORWARDREF
+                )
+                # 3.14 left a forward reference in the __init__ dataclasses
+                # generated unevaluated, and the field keeps the reference from
+                # that time.
+                annotate = getattr(cls.__init__, "__annotate__", None)
+                if getattr(annotate, "__generated_by_dataclasses__", False):
+                    field_types = {
+                        n: f.type for n, f in cls.__dataclass_fields__.items()
+                    }
+                    signature = signature.replace(
+                        parameters=[
+                            p.replace(annotation=field_types.get(p.name, p.annotation))
+                            for p in signature.parameters.values()
+                        ]
+                    )
+            else:
+                signature = inspect.signature(cls)  # type: ignore[reportUnreachable]
+            return cls.__name__ + str(signature).replace(" -> None", "")
+        except (TypeError, ValueError):
+            return cls.__name__
+    fields = getattr(cls, "_fields", None)
+    if issubclass(cls, tuple) and isinstance(fields, tuple):
+        names = ", ".join(fields) + ("," if len(fields) == 1 else "")
+        return f"{cls.__name__}({names})"
+    return None
+
+
+def _class_doc(cls: type) -> str | None:
+    """Returns a class's own docstring, unless dataclasses or namedtuple wrote it."""
+    doc = _docstring(cls)
+    if doc is None or not doc.startswith(cls.__name__):
+        return doc
+    try:
+        generated = _generated_class_doc(cls)
+    except Exception:
+        # dataclasses would have failed the same way, so it didn't write this
+        # docstring.
+        return doc
+    return None if doc == generated else doc
+
+
 def _mangled(owner: Any, name: str) -> str:
     """Returns the attribute ``name`` in a class body of ``owner`` is stored as."""
     prefix = owner.__name__.lstrip("_") if inspect.isclass(owner) else ""
@@ -229,13 +286,11 @@ def _is_method(fn: Callable) -> bool:
         return False
     owner: Any = None
     if "<locals>" not in qualname:
-        # Look the class up where the function was defined: a decorator's
-        # wrapper keeps the function's __qualname__ and __module__, but has its
-        # own module's globals.
-        module = sys.modules.get(fn.__module__)
-        owner = getattr(inspect.unwrap(fn), "__globals__", {}).get(
-            qualname[0], getattr(module, qualname[0], None)
-        )
+        # Look the class up in the globals of the function's own module, not in
+        # sys.modules, which differs inside the Workflow sandbox. A
+        # functools.wraps decorator's wrapper has its own module's globals, so
+        # unwrap it first.
+        owner = getattr(inspect.unwrap(fn), "__globals__", {}).get(qualname[0])
         for name in qualname[1:-1]:
             owner = getattr(owner, _mangled(owner, name), None)
     try:
@@ -245,8 +300,10 @@ def _is_method(fn: Callable) -> bool:
     if not inspect.isclass(owner) or attr is None:
         raise ValueError(
             f"Cannot tell whether '{fn.__qualname__}' is a method or a"
-            " staticmethod: its class can't be found from its module. Define the"
-            " class at module level, or pass a bound method."
+            f" staticmethod: no class '{'.'.join(qualname[:-1])}' is reachable"
+            " from the function's globals. Define the class at module level"
+            " (wrap decorators with functools.wraps), pass a bound method for a"
+            " method, or rename a staticmethod's parameter."
         )
     return not isinstance(attr, staticmethod)
 
@@ -287,37 +344,46 @@ def _tool_signature(
                 inspect.Parameter.KEYWORD_ONLY,
                 inspect.Parameter.VAR_KEYWORD,
             ):
-                raise ValueError(
+                message = (
                     f"Activity class '{activity_def.__name__}' cannot take keyword-only"
                     f" arguments or **kwargs in __call__ ('{p.name}'): activities get"
                     " their arguments by position."
                 )
+                if isinstance(calls[0], functools.partialmethod) and calls[0].keywords:
+                    message += (
+                        " Its functools.partialmethod binds an argument by keyword,"
+                        " which makes the arguments after it keyword-only."
+                    )
+                raise ValueError(message)
         # __call__'s own docstring, else the class's, else that of a __call__ it
         # inherits.
         doc = (
             _docstring(_call_function(vars(activity_def).get("__call__")))
-            or _docstring(activity_def)
+            or _class_doc(activity_def)
             or next(filter(None, map(_docstring, map(_call_function, calls))), None)
         )
         return signature, hints, doc
     signature = inspect.signature(activity_def)
     params = list(signature.parameters.values())
-    # Drop the receiver of a method passed as Class.method the way the SDK does:
-    # a first parameter named `self` that is unannotated or annotated
-    # `typing.Self`. The worker's registered instance supplies it.
+    # Drop the receiver of a method passed as Class.method: a first parameter
+    # named `self`, however it is annotated. The worker's registered instance
+    # supplies it.
     if (
         inspect.isfunction(activity_def)
         and params
         and params[0].name == "self"
-        and (
-            params[0].annotation is inspect.Parameter.empty
-            or str(params[0].annotation) == "typing.Self"
-        )
         and _is_method(activity_def)
     ):
         signature = signature.replace(parameters=params[1:])
     try:
-        hints = typing.get_type_hints(activity_def)
+        # A callable instance's types are those of its class's __call__.
+        hints = typing.get_type_hints(
+            activity_def
+            if inspect.isroutine(activity_def)
+            else _call_function(
+                inspect.getattr_static(type(activity_def), "__call__", None)
+            )
+        )
     except Exception:
         hints = {}
     return signature, hints, activity_def.__doc__
@@ -346,15 +412,20 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     This ensures the activity's signature is preserved for ADK's tool schema generation
     while marking it as a tool that executes via 'workflow.execute_activity'.
 
-    ``activity_def`` can be an activity function, a method passed as
-    ``Class.method``, or a callable-class activity passed as its class. The
-    tool offers the parameters the activity is called with: without a method's
-    ``self``, and from ``__call__`` for a class. A class whose ``__call__`` is
-    not a function, staticmethod, classmethod or ``functools.partialmethod``,
-    can't be read, or takes keyword-only arguments or ``**kwargs`` raises
-    ``ValueError``. So does a method taking ``self`` whose class can't be found
-    from its module, such as a class defined in a function: its ``self`` could
-    be a staticmethod's input.
+    ``activity_def`` can be an activity function, a bound method, a
+    callable-class instance, a method passed as ``Class.method``, or a
+    callable-class activity passed as its class. The tool offers the parameters
+    the activity is called with: without a method's ``self``, and from
+    ``__call__`` for a class. A class whose ``__call__`` is not a function,
+    staticmethod, classmethod or ``functools.partialmethod``, can't be read, or
+    takes keyword-only arguments or ``**kwargs`` raises ``ValueError``. So does
+    a method taking ``self`` whose class can't be reached from the function's
+    globals, such as a class defined in a function: its ``self`` could be a
+    staticmethod's input.
+
+    Outside a Workflow, as in local ADK runs, the tool calls ``activity_def``
+    itself. A method passed as ``Class.method`` and a class passed as itself
+    need the Worker's instance, so their tools run only in a Workflow.
 
     If the activity declares a parameter named ``tool_context``, it must be
     annotated with :class:`ToolContextSnapshot` (or ``ToolContextSnapshot |
@@ -397,7 +468,7 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
 
         if not temporalio.workflow.in_workflow():
             # If executed outside a workflow, like when doing local adk runs, use the function directly
-            result = activity_def(*args, **kw)
+            result = activity_def(*bound.args, **bound.kwargs)
             if inspect.isawaitable(result):
                 return await result
             else:
