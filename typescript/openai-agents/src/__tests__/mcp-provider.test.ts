@@ -1,6 +1,7 @@
 import test from 'ava';
 import type { MCPServer } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
+import { TOOL_FILTER_UNSUPPORTED_TYPE } from '../common/mcp-types';
 import { StatelessMCPServerProvider, filterListedTools } from '../worker/mcp-provider';
 
 function fakeServer(toolFilter: MCPServer['toolFilter'], onConnect = () => {}): MCPServer {
@@ -52,7 +53,7 @@ test('StatelessMCPServerProvider refuses a callable toolFilter without connectin
     const err = await t.throwsAsync(activities[name]!({ toolName: 'read', args: {} }), {
       instanceOf: ApplicationFailure,
     });
-    t.is(err?.type, 'MCPToolFilterUnsupported');
+    t.is(err?.type, TOOL_FILTER_UNSUPPORTED_TYPE);
     t.true(err?.nonRetryable);
   }
   t.false(connected);

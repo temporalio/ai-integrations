@@ -22,11 +22,13 @@ import {
   OpenAIAgentsTraceClientInterceptor,
   StatefulMCPServerProvider,
   StatelessMCPServerProvider,
+  TOOL_FILTER_UNSUPPORTED_TYPE,
   type TracingApiKeyContext,
 } from '..';
 import {
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
+  mcpToolFilterResumeWorkflow,
   mcpToolFilterWorkflow,
   summaryOverrideStringWorkflow,
   statefulMcpNotConnectedWorkflow,
@@ -309,8 +311,29 @@ test('a callable toolFilter on the factory server fails the run', async (t) => {
         executeWorkflow(mcpToolFilterWorkflow, { args: [stateful], workflowExecutionTimeout: '30 seconds' }),
         { instanceOf: WorkflowFailedError }
       );
-      t.is((err?.cause?.cause as ApplicationFailure | undefined)?.type, 'MCPToolFilterUnsupported');
+      t.is((err?.cause?.cause as ApplicationFailure | undefined)?.type, TOOL_FILTER_UNSUPPORTED_TYPE);
     }
+  });
+});
+
+test('a tool filter that throws while resuming from a RunState fails the run', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([textResponse('done')]),
+        mcpServerProviders: filterTestProviders(undefined, t.context.env.nativeConnection),
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    const err = await t.throwsAsync(
+      executeWorkflow(mcpToolFilterResumeWorkflow, { workflowExecutionTimeout: '15 seconds' }),
+      { instanceOf: WorkflowFailedError }
+    );
+    t.is((err?.cause as ApplicationFailure | undefined)?.type, 'AgentsWorkflowError');
   });
 });
 

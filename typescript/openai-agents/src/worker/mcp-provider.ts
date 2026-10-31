@@ -1,6 +1,11 @@
 import type { MCPServer } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
-import { MCP_CALL_TOOL_SUFFIX, MCP_LIST_TOOLS_SUFFIX, MCP_STATELESS_SUFFIX } from '../common/mcp-types';
+import {
+  MCP_CALL_TOOL_SUFFIX,
+  MCP_LIST_TOOLS_SUFFIX,
+  MCP_STATELESS_SUFFIX,
+  TOOL_FILTER_UNSUPPORTED_TYPE,
+} from '../common/mcp-types';
 
 /**
  * Fails on a callable `toolFilter` on the server the factory returns. It needs the agent and the
@@ -13,7 +18,7 @@ export function rejectCallableToolFilter(server: MCPServer): void {
         `MCP server '${server.name}' has a callable toolFilter, which the Worker cannot run because the agent ` +
         'and run context it gets exist only in the Workflow. Pass it as the toolFilter option of ' +
         'statelessMcpServer() or statefulMcpServer() instead.',
-      type: 'MCPToolFilterUnsupported',
+      type: TOOL_FILTER_UNSUPPORTED_TYPE,
       nonRetryable: true,
     });
   }

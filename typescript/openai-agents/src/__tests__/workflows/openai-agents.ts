@@ -130,6 +130,28 @@ export async function mcpToolFilterWorkflow(stateful: boolean): Promise<string[]
   }
 }
 
+class FilterSession {
+  isAdmin(): boolean {
+    return true;
+  }
+}
+
+export async function mcpToolFilterResumeWorkflow(): Promise<string> {
+  // Resuming from a RunState rebuilds the context from JSON, so `session` loses `isAdmin()`.
+  const toolFilter = async ({ runContext }: MCPToolFilterContext) =>
+    (runContext.context as { session: FilterSession }).session.isAdmin();
+  const agent = new Agent({
+    name: 'FirstAgent',
+    instructions: 'You have access to MCP tools.',
+    model: 'gpt-4o-mini',
+    mcpServers: [statelessMcpServer('filterStateless', { toolFilter })],
+  });
+  const runner = new TemporalOpenAIRunner();
+  const result = await runner.run(agent, 'Hello', { context: { session: new FilterSession() } });
+  await runner.run(agent, result.state);
+  return 'resumed';
+}
+
 export async function summaryOverrideStringWorkflow(prompt: string): Promise<string> {
   const agent = new Agent({
     name: 'SummaryAgent',
