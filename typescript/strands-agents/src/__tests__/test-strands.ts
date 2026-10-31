@@ -364,7 +364,8 @@ test('StrandsPlugin refuses to replace a different Activity with the same name',
     instanceOf: TypeError,
     message:
       `Duplicate registration of Activity '${name}': StrandsPlugin would replace a different Activity with this ` +
-      'name. Rename or remove the other registration, or give each StrandsPlugin on this Worker the same options.',
+      'name. Rename or remove the other Activity, run the other integration on its own Worker and task queue, or ' +
+      'use one StrandsPlugin instance on this Worker.',
   });
   const plugin = new StrandsPlugin({ models: { claude }, mcpClients: { beta } });
   const callerActivity = async (): Promise<string> => 'caller';

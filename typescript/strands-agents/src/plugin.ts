@@ -174,8 +174,8 @@ export class StrandsPlugin extends SimplePlugin {
    * Adds the model and MCP Activities to the Worker.
    *
    * @throws TypeError if the Worker already has a different Activity with one of these names: a
-   * caller Activity, another integration's Activity, or one from a `StrandsPlugin` with different
-   * options.
+   * caller Activity, another integration's Activity, or one from a `StrandsPlugin` that doesn't share
+   * this one's `models` object, MCP client factories and idle timeout.
    */
   override configureWorker(options: WorkerOptions): WorkerOptions {
     const existing = options.activities as Record<string, unknown> | undefined;
@@ -184,8 +184,8 @@ export class StrandsPlugin extends SimplePlugin {
       if (typeof other === 'function' && other !== fn && !sameSources(other, fn)) {
         throw new TypeError(
           `Duplicate registration of Activity '${name}': StrandsPlugin would replace a different Activity ` +
-            'with this name. Rename or remove the other registration, or give each StrandsPlugin on this Worker ' +
-            'the same options.'
+            'with this name. Rename or remove the other Activity, run the other integration on its own Worker ' +
+            'and task queue, or use one StrandsPlugin instance on this Worker.'
         );
       }
     }
