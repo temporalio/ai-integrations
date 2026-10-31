@@ -98,7 +98,11 @@ func NewFakeMCPServer(name string) *FakeMCPServer {
 }
 
 // AddTool registers a tool on the fake server. handler is invoked when the tool
-// runs worker-side; schema describes its parameters (may be nil).
+// runs worker-side; schema describes its parameters (may be nil). An error
+// handler returns that wraps no other error and is not an ApplicationError is
+// the tool's own answer: it reaches the model and is not retried. To have a
+// failure retried, wrap its cause with %w or return a retryable
+// temporal.ApplicationError.
 func (s *FakeMCPServer) AddTool(name, description string, schema *genai.Schema, handler func(args map[string]any) (map[string]any, error)) *FakeMCPServer {
 	s.tools = append(s.tools, &fakeMCPTool{
 		decl:    &genai.FunctionDeclaration{Name: name, Description: description, Parameters: schema},

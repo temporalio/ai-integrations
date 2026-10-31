@@ -201,8 +201,13 @@ the model SDK's own retries (see below), or override the fallbacks.
   automatically; with manual wiring, call `Activities.Close` yourself after
   `worker.Run` returns. A tool's own error, such as an MCP `isError` result,
   reaches the model once, as it does without Temporal; `CallMcpTool` succeeds
-  and is not retried. A failed MCP request fails `CallMcpTool` with a
-  retryable `googleadk.McpError`.
+  and is not retried. The plugin counts an error as the tool's own when it
+  wraps no other error and is not an `ApplicationError`. ADK's MCP tools wrap
+  the error of a failed MCP request, so that error fails `CallMcpTool` with a
+  retryable `googleadk.McpError`, as does an error returned after the Worker
+  stops the call. To have a failure in your own toolset or a `FakeMCPServer`
+  handler retried, wrap its cause with `%w` or return a retryable
+  `temporal.ApplicationError`.
 - **Remote A2A agents.** Build ADK's remote agent (`remoteagent.NewA2A`) with
   `AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, activityOptions)`
   and `ClientProvider: googleadk.NewA2AClientProvider(activityOptions)`. The card
@@ -252,7 +257,9 @@ the model SDK's own retries (see below), or override the fallbacks.
   serial fallback.
 - **Typed failures.** Model / tool / MCP / A2A failures surface as Temporal
   `ApplicationError`s tagged `googleadk.ModelError` / `.ToolError` / `.McpError`
-  / `.A2AError`.
+  / `.A2AError`. An MCP tool's own error is not one of these: ADK, its
+  tool-error callbacks and the model get the tool's error, as without
+  Temporal, not a `googleadk.McpError` (see **MCP, statelessly** above).
   Classify with `IsNonRetryable(err)`; never string-match. Upstream HTTP status
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
