@@ -189,6 +189,10 @@ worker = Worker(
 
 **Do not pass secrets, credentials, or API keys through `factory_argument`.** It is an activity argument, so it is recorded in workflow history and, without a payload codec, visible in the web UI. Resolve credentials worker-side inside the toolset factory instead.
 
+**Stateful MCP toolsets:** `TemporalStatefulMcpToolSet` and `TemporalStatefulMcpToolSetProvider` keep one `McpToolset` open for an `async with` block, in a `-server-session` activity. Temporal cannot recreate that toolset's state on another worker. If the session activity is retried after its toolset opened an MCP session, for example after a graceful worker shutdown or a lost host, the retry fails with a non-retryable `ApplicationError(type="DedicatedWorkerFailure")` instead of opening a new, empty session. Tool calls then fail with the same error type, and the run fails when the `async with` block exits. A retry in which no session was opened builds the toolset again.
+
+If you set a `heartbeat_timeout` in `server_session_config`, a retry after the session activity's first heartbeat fails with `DedicatedWorkerFailure` even when no session was opened, such as when the first connection failed. This is temporary. It will be replaced once the Python SDK offers a worker heartbeat the plugin can wait for.
+
 ### Reading Session State in Activity Tools
 
 ADK's live `ToolContext` holds non-serializable objects, so it cannot be an
