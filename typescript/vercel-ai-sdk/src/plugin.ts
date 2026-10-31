@@ -1,8 +1,9 @@
 import type { ProviderV4 } from '@ai-sdk/provider';
 import { SimplePlugin } from '@temporalio/plugin';
-import type { BundleOptions } from '@temporalio/worker';
+import type { BundleOptions, Worker, WorkerOptions } from '@temporalio/worker';
 import type { Duration } from '@temporalio/common/lib/time';
 import { createActivities, _evictMcpConnectionsForServer } from './activities';
+import { refuseLaterReplacement, refuseReplacedActivities } from './activity-sources';
 import type { McpClientFactories } from './mcp';
 
 /**
@@ -58,6 +59,35 @@ export class AiSdkPlugin extends SimplePlugin {
         }
       },
     });
+  }
+
+  /**
+   * Adds the model and MCP Activities to the Worker.
+   *
+   * @throws TypeError if the Worker already has a different Activity with one
+   * of these names: a caller Activity, another integration's Activity, or an
+   * `AiSdkPlugin` with a different `modelProvider`, MCP client factory or
+   * `mcpConnectionIdleTimeout`.
+   */
+  override configureWorker(options: WorkerOptions): WorkerOptions {
+    refuseReplacedActivities('AiSdkPlugin', options.activities, this.options.activities as object);
+    return super.configureWorker(options);
+  }
+
+  /**
+   * Runs the Worker.
+   *
+   * @throws TypeError, before the Worker polls, if a plugin applied after this
+   * one replaced one of its Activities with a different one. `Worker.create`
+   * applies the Worker's plugins in order, then the `NativeConnection`'s.
+   */
+  override runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    // Not async: when the check passes, the Worker starts in this tick, as
+    // `Worker.runUntil` needs (see `refuseLaterReplacement`).
+    return (
+      refuseLaterReplacement('AiSdkPlugin', worker, this.options.activities as object, next) ??
+      super.runWorker(worker, next)
+    );
   }
 
   override configureBundler(options: BundleOptions): BundleOptions {
