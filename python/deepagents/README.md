@@ -314,6 +314,17 @@ class ApprovalAgent:
 A client polls `pending_approval`, shows it to a person, and calls the
 `resume` update with `"approve"` / `"reject"`.
 
+Interrupt ids (`result["__interrupt__"][0].id`) can be keyed on within one
+run: LangGraph normally derives them from wall-clock-time checkpoint ids,
+which change every time the same history is replayed, but under this plugin
+checkpoint ids are minted from replay-safe workflow state while a worker is
+running, so the id a reviewer was shown live is the id the workflow computes
+again on replay, worker restart, or eviction. The guarantee is per run and per
+code version: a workflow retry, reset, continue-as-new, or a code change that
+alters checkpoint ordering mints different ids. Different executions of the
+same workflow are overwhelmingly unlikely to share an id (the id carries the
+run's recorded time plus 48 hash bits of its run id), not provably distinct.
+
 ## Streaming
 
 Set `streaming_topic=` on the plugin and model dispatch switches to a streaming
@@ -380,6 +391,17 @@ auto-routed through an Activity. The wrapper only rewrites arguments when called
 worker is unaffected, and the original function is restored when the worker
 stops. If you would rather be explicit, use `create_temporal_deep_agent` or
 pass `TemporalModel("provider:name")` yourself.
+
+Over the same worker lifetime the plugin also replaces LangGraph's checkpoint-id
+generator (`langgraph.checkpoint.base.id.uuid6`, wall-clock time plus `random`)
+with a replay-stable drop-in, again only answering inside a workflow. Task ids,
+`checkpoint_ns`, and `Interrupt.id` are all derived from checkpoint ids, so this
+is what makes them identical across replay of one history. The replacement is
+process-global for the worker's lifetime: a worker that also runs
+`temporalio-langgraph` workflows gets the same replay-stable ids inside those
+workflows. An id minted before you deploy this version is not reproduced after
+it (it was already unstable across replay); re-query pending approvals after
+deploying or rolling back rather than trusting ids recorded earlier.
 
 ## Composing with other plugins
 
