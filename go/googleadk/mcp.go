@@ -168,30 +168,26 @@ type mcpListingsKey struct{}
 // the same point on every ADK release.
 type mcpListings struct {
 	mu   sync.Mutex
-	runs map[mcpAgentKey]*mcpRunState
+	runs map[mcpRunKey]*mcpRunState
 }
 
-// mcpAgentKey identifies a toolset of one agent in one invocation. Agent names
-// are unique within an agent tree, and each runner.Run call has its own
-// invocation ID, except one that resumes or retries a paused run. Concurrent
-// agent-tool calls each make their own runner.Run call.
-type mcpAgentKey struct {
-	toolset    *mcpToolset
-	invocation string
-	agent      string
-}
-
-// mcpRunState is the state of a toolset in one agent run: one agent in one
-// execution of a runner.Run iterator.
-type mcpRunState struct {
-	// run points weakly to the InvocationContext ADK creates for the agent in
-	// each execution of a runner.Run iterator, a resume, a retry or another
-	// pass over a kept iterator included, and passes to every Tools call of
-	// that agent run. It tells apart the runs of one agent in one invocation.
-	// The pointer is weak so that the store does not keep a finished run's
-	// InvocationContext, and the session events it holds, alive; once the
-	// garbage collector reclaims it, startRun drops the state.
+// mcpRunKey identifies a toolset in one agent run: one agent in one execution
+// of a runner.Run iterator.
+type mcpRunKey struct {
+	toolset *mcpToolset
+	// run points weakly to the invocation ADK creates each time an agent runs:
+	// in each execution of a runner.Run iterator, a resume, a retry or another
+	// pass over a kept iterator included, and in each of the concurrent runs
+	// of one agent that share an invocation ID, such as a custom agent running
+	// it on several branches. See agentRunOf. The pointer is weak so that the
+	// store does not keep a finished run's invocation, and the session events
+	// it holds, alive; once the garbage collector reclaims it, startRun drops
+	// the state.
 	run weak.Pointer[byte]
+}
+
+// mcpRunState is the state of a toolset in one agent run.
+type mcpRunState struct {
 	// pending is the list Tools took for the ProcessRequest call that follows
 	// in the same model step, when hasPending is set.
 	pending    []tool.Tool
@@ -210,84 +206,120 @@ func listingsFrom(ctx context.Context) *mcpListings {
 	return l
 }
 
-// agentRunOf returns a weak pointer to the InvocationContext of the agent run
-// ctx belongs to, and whether ctx holds one. ADK passes Tools a ReadonlyContext
-// that holds it in the exported InvocationContext field. It is not the
-// RunConfig: ADK reuses one RunConfig when a runner.Run iterator without an LLM
-// agent at its root runs again.
+// agentRunOf returns a weak pointer to the invocation of the agent run ctx
+// belongs to, and whether ctx tells it. ADK runs each agent on a new
+// invocation, which it passes, wrapped, both to the toolset's Tools and to the
+// ProcessRequest calls of the toolset and its tools:
 //
-// Weak pointers made from the same InvocationContext are equal, and stay
-// distinct from those made from any other, even after it is reclaimed.
-func agentRunOf(ctx agent.ReadonlyContext) (weak.Pointer[byte], bool) {
+//   - Tools gets a ReadonlyContext whose exported InvocationContext field holds
+//     the agent run's context.
+//   - ProcessRequest gets a tool context, whose unexported context field holds
+//     a copy of that context.
+//
+// The agent run's context, and its copy, hold the invocation in an unexported
+// invocationContext field, or are the invocation themselves. It is not the
+// invocation ID, agent name or RunConfig: concurrent runs of one agent can
+// share all three.
+//
+// Weak pointers made from the same invocation are equal, and stay distinct
+// from those made from any other, even after it is reclaimed.
+func agentRunOf(ctx context.Context) (weak.Pointer[byte], bool) {
 	v := reflect.ValueOf(ctx)
-	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
-		return weak.Pointer[byte]{}, false
+	for depth := range 4 {
+		if v.Kind() == reflect.Interface {
+			v = v.Elem()
+		}
+		if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+			return weak.Pointer[byte]{}, false
+		}
+		if ic, ok := interfaceField(v, "invocationContext"); ok {
+			return weakTo(ic.Elem())
+		}
+		next, ok := interfaceField(v, "InvocationContext")
+		if !ok {
+			next, ok = interfaceField(v, "context")
+		}
+		if !ok {
+			if depth == 0 {
+				return weak.Pointer[byte]{}, false
+			}
+			return weakTo(v)
+		}
+		v = next
 	}
-	f := v.Elem().FieldByName("InvocationContext")
-	if !f.IsValid() || !f.CanInterface() {
-		return weak.Pointer[byte]{}, false
-	}
-	ic, ok := f.Interface().(agent.InvocationContext)
-	if !ok {
-		return weak.Pointer[byte]{}, false
-	}
-	p := reflect.ValueOf(ic)
-	if p.Kind() != reflect.Pointer || p.IsNil() {
-		return weak.Pointer[byte]{}, false
-	}
-	return weak.Make((*byte)(p.UnsafePointer())), true
+	return weak.Pointer[byte]{}, false
 }
 
-// startRun returns the state of the toolset in ctx's agent run, for Tools. It
-// starts a new state when ctx belongs to another agent run than the state
-// kept for the agent and invocation. When ctx does not tell its agent run, it
-// drops the kept state and returns nil.
+// weakTo returns a weak pointer to what the pointer v points to.
+func weakTo(v reflect.Value) (weak.Pointer[byte], bool) {
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return weak.Pointer[byte]{}, false
+	}
+	return weak.Make((*byte)(v.UnsafePointer())), true
+}
+
+// interfaceField returns the non-nil interface field name of the struct v
+// points to.
+func interfaceField(v reflect.Value, name string) (reflect.Value, bool) {
+	f := v.Elem().FieldByName(name)
+	if !f.IsValid() || f.Kind() != reflect.Interface || f.IsNil() {
+		return reflect.Value{}, false
+	}
+	return f, true
+}
+
+// startRun returns the state of the toolset in ctx's agent run, for Tools,
+// and starts it if needed. When ctx does not tell its agent run, it returns
+// nil.
 //
 // Without a state, the toolset lists and filters on every Tools and
 // ProcessRequest call, and its proxy tools pack themselves.
 //
 // When it starts a state, it also drops the states of finished agent runs,
-// whose InvocationContext the garbage collector has reclaimed. No later call
-// can belong to such a run, so a long conversation on one NewContext keeps
-// only the states of runs that may still call the toolset.
+// whose invocation the garbage collector has reclaimed. No later call can
+// belong to such a run, so a long conversation on one NewContext keeps only
+// the states of runs that may still call the toolset.
 func (l *mcpListings) startRun(m *mcpToolset, ctx agent.ReadonlyContext) *mcpRunState {
 	if l == nil {
 		return nil
 	}
 	run, ok := agentRunOf(ctx)
-	k := mcpAgentKey{m, ctx.InvocationID(), ctx.AgentName()}
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	if !ok {
-		delete(l.runs, k)
 		return nil
 	}
-	if s, ok := l.runs[k]; ok && s.run == run {
+	k := mcpRunKey{m, run}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if s, ok := l.runs[k]; ok {
 		return s
 	}
-	for key, s := range l.runs {
-		if s.run.Value() == nil {
+	for key := range l.runs {
+		if key.run.Value() == nil {
 			delete(l.runs, key)
 		}
 	}
 	if l.runs == nil {
-		l.runs = map[mcpAgentKey]*mcpRunState{}
+		l.runs = map[mcpRunKey]*mcpRunState{}
 	}
-	s := &mcpRunState{run: run}
+	s := &mcpRunState{}
 	l.runs[k] = s
 	return s
 }
 
-// current returns the state the toolset's last Tools call for ctx's agent and
-// invocation kept, or nil. ADK calls Tools before ProcessRequest in the first
-// model step of every agent run.
-func (l *mcpListings) current(m *mcpToolset, ctx agent.ReadonlyContext) *mcpRunState {
+// current returns the state the toolset's Tools call kept for ctx's agent run,
+// or nil. ADK calls Tools before ProcessRequest in the first model step of
+// every agent run.
+func (l *mcpListings) current(m *mcpToolset, ctx context.Context) *mcpRunState {
 	if l == nil {
+		return nil
+	}
+	run, ok := agentRunOf(ctx)
+	if !ok {
 		return nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.runs[mcpAgentKey{m, ctx.InvocationID(), ctx.AgentName()}]
+	return l.runs[mcpRunKey{m, run}]
 }
 
 // processedList returns the list ToolFilter last allowed in the run, once the

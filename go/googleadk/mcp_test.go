@@ -25,6 +25,7 @@ import (
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/platform"
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
@@ -664,10 +665,9 @@ func TestMcpSameNamedAgentsKeepTheirOwnListings(t *testing.T) {
 	}
 }
 
-// parallelHelperWorkflow has the root agent call one helper agent twice in
-// parallel through an agent tool. The helper has two MCP toolsets.
-func parallelHelperWorkflow(ctx workflow.Context, sequential bool) (runResult, error) {
-	helper, err := llmagent.New(llmagent.Config{
+// searchFetchHelper returns a helper agent with two MCP toolsets.
+func searchFetchHelper() (agent.Agent, error) {
+	return llmagent.New(llmagent.Config{
 		Name:        "helper",
 		Description: "searches",
 		Model:       googleadk.NewModel("helper-model"),
@@ -677,6 +677,15 @@ func parallelHelperWorkflow(ctx workflow.Context, sequential bool) (runResult, e
 			googleadk.NewMCPToolset(googleadk.MCPToolsetOptions{Name: "fetch-server"}),
 		},
 	})
+}
+
+// parallelHelperWorkflow runs one helper agent twice, in parallel unless
+// sequential. Through an agent tool, the root agent calls it twice, and each
+// call is its own invocation. With sharedInvocation, a custom root agent runs
+// it on branches root.a and root.b through platform.RunTasks instead, so both
+// runs share the root's invocation ID and the helper's name.
+func parallelHelperWorkflow(ctx workflow.Context, sequential, sharedInvocation bool) (runResult, error) {
+	helper, err := searchFetchHelper()
 	if err != nil {
 		return runResult{}, err
 	}
@@ -684,58 +693,105 @@ func parallelHelperWorkflow(ctx workflow.Context, sequential bool) (runResult, e
 	if sequential {
 		opts = append(opts, googleadk.WithSequentialToolFanout())
 	}
-	return runAgent(ctx, agentBuild{
-		ctxOpts:     opts,
-		modelName:   "root-model",
-		userMessage: "ask the helper twice",
-		tools:       []tool.Tool{agenttool.New(helper, nil)},
+	if !sharedInvocation {
+		return runAgent(ctx, agentBuild{
+			ctxOpts:     opts,
+			modelName:   "root-model",
+			userMessage: "ask the helper twice",
+			tools:       []tool.Tool{agenttool.New(helper, nil)},
+		})
+	}
+	root, err := agent.New(agent.Config{
+		Name:      "root",
+		SubAgents: []agent.Agent{helper},
+		Run: func(ic agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(yield func(*session.Event, error) bool) {
+				stopped := false
+				var tasks []func(context.Context)
+				for _, branch := range []string{"root.a", "root.b"} {
+					tasks = append(tasks, func(c context.Context) {
+						bctx := agent.PromoteWithDelta(ic, &agent.CommonContextDelta{
+							InvocationContextDelta: &agent.InvocationContextDelta{Context: &c, Branch: &branch},
+						})
+						for ev, err := range helper.Run(bctx) {
+							if stopped || !yield(ev, err) {
+								stopped = true
+								return
+							}
+						}
+					})
+				}
+				platform.RunTasks(ic, tasks)
+			}
+		},
 	})
+	if err != nil {
+		return runResult{}, err
+	}
+	r, err := runner.New(runner.Config{AppName: "test-app", Agent: root, SessionService: session.InMemoryService(), AutoCreateSession: true})
+	if err != nil {
+		return runResult{}, err
+	}
+	for _, rerr := range r.Run(googleadk.NewContext(ctx, opts...), "user-1", "session-1", genai.NewContentFromText("ask the helper twice", genai.RoleUser), agent.RunConfig{}) {
+		if rerr != nil {
+			return runResult{}, rerr
+		}
+	}
+	return runResult{}, nil
 }
 
-// TestMcpParallelInvocationsKeepTheirOwnListings proves concurrent invocations
-// of one agent each reuse the list their own Tools call took. Two helper runs
+// TestMcpParallelInvocationsKeepTheirOwnListings proves concurrent runs of one
+// agent each reuse the list their own Tools call took, whether they are
+// separate invocations or share one invocation and agent name. Two helper runs
 // of two model steps each, with two MCP toolsets, list 8 times, in parallel as
 // in sequence.
 func TestMcpParallelInvocationsKeepTheirOwnListings(t *testing.T) {
-	for _, sequential := range []bool{false, true} {
-		t.Run(fmt.Sprintf("sequential=%v", sequential), func(t *testing.T) {
-			root := &ruleModel{name: "root-model", rule: func(req *model.LLMRequest) *model.LLMResponse {
-				if functionResponses(req) == 0 {
-					return reproFnCalls("helper", "helper")
-				}
-				return googleadk.TextResponse("root done")
-			}}
-			helper := &ruleModel{name: "helper-model", rule: func(req *model.LLMRequest) *model.LLMResponse {
-				if lastIsFunctionResponse(req) {
-					return googleadk.TextResponse("helper done")
-				}
-				return googleadk.FunctionCallResponse("h1", "search", map[string]any{"query": "temporal"})
-			}}
-			search := googleadk.NewFakeMCPServer("search-server").AddTool("search", "search the web", searchSchema(),
-				func(map[string]any) (map[string]any, error) { return map[string]any{"hits": 1}, nil })
-			fetch := googleadk.NewFakeMCPServer("fetch-server").AddTool("fetch", "fetch a page", searchSchema(),
-				func(map[string]any) (map[string]any, error) { return map[string]any{}, nil })
+	for _, sharedInvocation := range []bool{false, true} {
+		for _, sequential := range []bool{false, true} {
+			t.Run(fmt.Sprintf("sharedInvocation=%v/sequential=%v", sharedInvocation, sequential), func(t *testing.T) {
+				root := &ruleModel{name: "root-model", rule: func(req *model.LLMRequest) *model.LLMResponse {
+					if functionResponses(req) == 0 {
+						return reproFnCalls("helper", "helper")
+					}
+					return googleadk.TextResponse("root done")
+				}}
+				helper := &ruleModel{name: "helper-model", rule: func(req *model.LLMRequest) *model.LLMResponse {
+					if lastIsFunctionResponse(req) {
+						return googleadk.TextResponse("helper done")
+					}
+					return googleadk.FunctionCallResponse("h1", "search", map[string]any{"query": "temporal"})
+				}}
+				search := googleadk.NewFakeMCPServer("search-server").AddTool("search", "search the web", searchSchema(),
+					func(map[string]any) (map[string]any, error) { return map[string]any{"hits": 1}, nil })
+				fetch := googleadk.NewFakeMCPServer("fetch-server").AddTool("fetch", "fetch a page", searchSchema(),
+					func(map[string]any) (map[string]any, error) { return map[string]any{}, nil })
 
-			var s testsuite.WorkflowTestSuite
-			env, counter := newEnv(t, &s, googleadk.Config{
-				Models: map[string]googleadk.ModelFactory{"root-model": root.factory(), "helper-model": helper.factory()},
-				MCPToolsets: map[string]googleadk.MCPFactory{
-					"search-server": search.Factory(),
-					"fetch-server":  fetch.Factory(),
-				},
+				var s testsuite.WorkflowTestSuite
+				env, counter := newEnv(t, &s, googleadk.Config{
+					Models: map[string]googleadk.ModelFactory{"root-model": root.factory(), "helper-model": helper.factory()},
+					MCPToolsets: map[string]googleadk.MCPFactory{
+						"search-server": search.Factory(),
+						"fetch-server":  fetch.Factory(),
+					},
+				})
+				env.RegisterWorkflow(parallelHelperWorkflow)
+				env.ExecuteWorkflow(parallelHelperWorkflow, sequential, sharedInvocation)
+
+				require.True(t, env.IsWorkflowCompleted())
+				require.NoError(t, env.GetWorkflowError())
+
+				rootCalls := 2
+				if sharedInvocation {
+					rootCalls = 0
+				}
+				assert.Equal(t, 4+rootCalls, counter.get(googleadk.InvokeModelActivityName))
+				assert.Equal(t, 8, counter.get(googleadk.ListMcpToolsActivityName), "one listing per toolset per helper model step")
+				assert.Equal(t, 2, counter.get(googleadk.CallMcpToolActivityName))
+				assert.Len(t, helper.declared(), 4)
+				for i, names := range helper.declared() {
+					assert.ElementsMatch(t, []string{"search", "fetch"}, names, "helper request %d", i)
+				}
 			})
-			env.RegisterWorkflow(parallelHelperWorkflow)
-			env.ExecuteWorkflow(parallelHelperWorkflow, sequential)
-
-			require.True(t, env.IsWorkflowCompleted())
-			require.NoError(t, env.GetWorkflowError())
-
-			assert.Equal(t, 6, counter.get(googleadk.InvokeModelActivityName))
-			assert.Equal(t, 8, counter.get(googleadk.ListMcpToolsActivityName), "one listing per toolset per helper model step")
-			assert.Equal(t, 2, counter.get(googleadk.CallMcpToolActivityName))
-			for i, names := range helper.declared() {
-				assert.ElementsMatch(t, []string{"search", "fetch"}, names, "helper request %d", i)
-			}
-		})
+		}
 	}
 }

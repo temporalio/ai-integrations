@@ -66,8 +66,8 @@ func listingsLifetimeWorkflow(ctx workflow.Context, turns int) (listingsAfterTur
 		runtime.GC()
 		l.mu.Lock()
 		live := 0
-		for _, s := range l.runs {
-			if s.run.Value() != nil {
+		for k := range l.runs {
+			if k.run.Value() != nil {
 				live++
 			}
 		}
