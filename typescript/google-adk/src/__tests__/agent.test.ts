@@ -8,6 +8,8 @@
  */
 
 import test from 'ava';
+import { SimplePlugin } from '@temporalio/plugin';
+import { NativeConnection, Worker } from '@temporalio/worker';
 
 import { GoogleAdkPlugin } from '../index';
 import { fakeModelProvider } from '../testing';
@@ -41,4 +43,54 @@ test.serial('runsLlmAgentThroughRunnerWithDurableModelCalls', async (t) => {
   // single model turn routed through `adk-invokeModel` exactly once.
   const { events } = await env.client.workflow.getHandle(workflowId).fetchHistory();
   t.is(countScheduledActivities(events ?? [], 'adk-invokeModel'), 1);
+});
+
+test.serial('runWorker refuses an Activity that a later plugin replaced, before polling', async (t) => {
+  const env = getEnv();
+  const connection = await NativeConnection.connect({ address: env.address });
+  const later = new SimplePlugin({ name: 'later', activities: { 'adk-invokeModel': async () => 'other' } });
+  const worker = await Worker.create({
+    connection,
+    namespace: env.namespace,
+    taskQueue: uid('adk-later-plugin'),
+    plugins: [new GoogleAdkPlugin(), later],
+  });
+  await t.throwsAsync(worker.run(), {
+    instanceOf: TypeError,
+    message: /^Duplicate registration of Activity 'adk-invokeModel': a plugin applied after GoogleAdkPlugin replaced/,
+  });
+  t.is(worker.getState(), 'STOPPED');
+  // Throws if the Worker still holds the connection.
+  await connection.close();
+});
+
+test.serial('runWorker starts the Worker at once, so runUntil stops it after its callback', async (t) => {
+  const env = getEnv();
+  const connection = await NativeConnection.connect({ address: env.address });
+  // runUntil stops the Worker after its callback only if the Worker is already
+  // running. A callback that throws synchronously finishes before run() yields.
+  const alone = await Worker.create({
+    connection,
+    namespace: env.namespace,
+    taskQueue: uid('adk-run-until-throws'),
+    plugins: [new GoogleAdkPlugin()],
+  });
+  await t.throwsAsync(
+    alone.runUntil(() => {
+      throw new Error('boom');
+    }),
+    { message: 'boom' }
+  );
+  t.is(alone.getState(), 'STOPPED');
+  // Each plugin's check runs before the Worker starts; none may yield.
+  const options = { modelProvider: fakeModelProvider() };
+  const two = await Worker.create({
+    connection,
+    namespace: env.namespace,
+    taskQueue: uid('adk-run-until-two'),
+    plugins: [new GoogleAdkPlugin(options), new GoogleAdkPlugin(options)],
+  });
+  t.is(await two.runUntil(() => Promise.resolve('done')), 'done');
+  t.is(two.getState(), 'STOPPED');
+  await connection.close();
 });
