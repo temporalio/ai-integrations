@@ -52,7 +52,10 @@ from typing_extensions import Required, TypedDict
 from temporalio import activity
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError
-from temporalio.openai_agents._heartbeat_decorator import auto_heartbeater
+from temporalio.openai_agents._heartbeat_decorator import (
+    auto_heartbeater,
+    heartbeating,
+)
 from temporalio.openai_agents._temporal_worker_env_ref import (
     AllowAllWorkerEnvVars,
     _WorkerEnvRefResolver,
@@ -460,7 +463,6 @@ class ModelActivity:
             _raise_for_openai_status(e)
 
     @activity.defn
-    @auto_heartbeater
     async def invoke_model_activity_streaming(
         self, input: StreamingActivityModelInput
     ) -> list[TResponseStreamEvent]:
@@ -480,7 +482,7 @@ class ModelActivity:
         ``streaming_topic`` so external consumers (UIs, tracing,
         etc.) can observe events as they arrive.
 
-        Heartbeats run on a background task via ``auto_heartbeater`` so
+        Heartbeats run on a background task via ``heartbeating`` so
         long initial-token latency or long pauses between chunks do not
         trip ``heartbeat_timeout``.
         """
@@ -504,48 +506,51 @@ class ModelActivity:
         # their own subscribe call.
         events_topic = stream.topic(topic)
         try:
-            async with stream:
-                try:
-                    async for event in model.stream_response(
-                        system_instructions=input.get("system_instructions"),
-                        input=input["input"],
-                        model_settings=model_settings,
-                        tools=tools,
-                        output_schema=input.get("output_schema"),
-                        handoffs=handoffs,
-                        tracing=ModelTracing(input["tracing"]),
-                        previous_response_id=input.get("previous_response_id"),
-                        conversation_id=input.get("conversation_id"),
-                        prompt=input.get("prompt"),
-                    ):
-                        # OpenAI models set defer_build=True, so an event's pydantic
-                        # schema may still be an unbuilt placeholder.
-                        type(event).model_rebuild()
-                        events.append(event)
-                        events_topic.publish(event)
-                except APIStatusError as e:
-                    _raise_for_openai_status(e)
-            # Leaving the context manager swallows a cancel that arrives while it
-            # stops the stream's background flusher, so raise that cancel here.
+            async with heartbeating():
+                async with stream:
+                    try:
+                        async for event in model.stream_response(
+                            system_instructions=input.get("system_instructions"),
+                            input=input["input"],
+                            model_settings=model_settings,
+                            tools=tools,
+                            output_schema=input.get("output_schema"),
+                            handoffs=handoffs,
+                            tracing=ModelTracing(input["tracing"]),
+                            previous_response_id=input.get("previous_response_id"),
+                            conversation_id=input.get("conversation_id"),
+                            prompt=input.get("prompt"),
+                        ):
+                            # OpenAI models set defer_build=True, so an event's pydantic
+                            # schema may still be an unbuilt placeholder.
+                            type(event).model_rebuild()
+                            events.append(event)
+                            events_topic.publish(event)
+                    except APIStatusError as e:
+                        _raise_for_openai_status(e)
+            # Leaving the context managers swallows a cancel that arrives while they
+            # stop the stream's background flusher or the heartbeats, so raise that
+            # cancel here.
             if _cancel_requested():
                 raise asyncio.CancelledError()
         except asyncio.CancelledError:
             # When the workflow cancelled the call, for example because a parallel
             # input guardrail tripped, tell subscribers the response ends here. The
             # cancel can arrive while the model streams or while leaving the context
-            # manager flushes the events, so publish after both, behind the events
+            # managers flushes the events, so publish after both, behind the events
             # still buffered. Other cancels, such as a Worker shutdown or a heartbeat
             # timeout, can be retried, so publish nothing and let the retry answer.
             if _cancel_requested():
-                events_topic.publish(
-                    ResponseErrorEvent(
-                        type="error",
-                        code="cancelled",
-                        message="The model call was cancelled.",
-                        sequence_number=len(events),
+                async with heartbeating():
+                    events_topic.publish(
+                        ResponseErrorEvent(
+                            type="error",
+                            code="cancelled",
+                            message="The model call was cancelled.",
+                            sequence_number=len(events),
+                        )
                     )
-                )
-                await stream.flush()
+                    await stream.flush()
             raise
 
         return events

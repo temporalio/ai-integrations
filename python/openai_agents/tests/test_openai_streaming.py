@@ -60,7 +60,7 @@ from openai.types.shared.response_format_text import ResponseFormatText
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.contrib.workflow_streams import WorkflowStream, WorkflowStreamClient
-from temporalio.openai_agents import ModelActivityParameters
+from temporalio.openai_agents import ModelActivityParameters, _heartbeat_decorator
 from temporalio.openai_agents.testing import AgentEnvironment
 from temporalio.workflow import ActivityCancellationType
 from tests.helpers import assert_eventually, new_worker
@@ -821,12 +821,31 @@ def clean_up_first_publish_slowly(
     monkeypatch.setattr(WorkflowHandle, "signal", slow_cleanup_signal)
 
 
+def stop_heartbeats_slowly(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Make stopping the activity's heartbeats take ``seconds``, still heartbeating
+    meanwhile so that a cancel reaches the activity."""
+    heartbeat_every = _heartbeat_decorator._heartbeat_every
+
+    async def slow_to_stop(delay: float) -> None:
+        try:
+            await heartbeat_every(delay)
+        except asyncio.CancelledError:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + seconds
+            while loop.time() < deadline:
+                activity.heartbeat()
+                await asyncio.sleep(0.5)
+            raise
+
+    monkeypatch.setattr(_heartbeat_decorator, "_heartbeat_every", slow_to_stop)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("max_cached_workflows", [1000, 0], ids=["cached", "uncached"])
 @pytest.mark.parametrize(
     "cancelled_while",
-    ["streaming", "publishing", "stopping-the-flusher"],
-    ids=["streaming", "publishing", "stopping-the-flusher"],
+    ["streaming", "publishing", "stopping-the-flusher", "stopping-the-heartbeats"],
+    ids=["streaming", "publishing", "stopping-the-flusher", "stopping-the-heartbeats"],
 )
 async def test_streaming_input_guardrail_trip_waits_for_the_error_event(
     client: Client,
@@ -838,7 +857,8 @@ async def test_streaming_input_guardrail_trip_waits_for_the_error_event(
     still has the error event at the end of its stream, and the Worker shuts down after
     the cancel, with or without a Workflow cache. That holds whether the cancel reaches
     the activity while the model streams or after the model finished, while the activity
-    still publishes its events or stops the stream's background flusher."""
+    still publishes its events, stops the stream's background flusher or stops its
+    heartbeats."""
     model: StreamingTestModel
     if cancelled_while == "streaming":
         model = HoldingStreamingModel()
@@ -847,12 +867,18 @@ async def test_streaming_input_guardrail_trip_waits_for_the_error_event(
         # arrives while the activity is still publishing.
         model = StreamingTestModel()
         delay_stream_publishing(monkeypatch, 8)
-    else:
+    elif cancelled_while == "stopping-the-flusher":
         # The background flusher's first publish hangs. The model finishes after
         # 0.3 s, and stopping the flusher takes 8 s, so the cancel arrives while the
         # stream's context manager waits for the flusher.
         model = HoldingStreamingModel(hold=0.3)
         clean_up_first_publish_slowly(monkeypatch, 8)
+    else:
+        # The model finishes after 0.3 s and its events are published, but stopping
+        # the heartbeats takes 8 s, so the cancel arrives while the activity waits for
+        # its heartbeat task.
+        model = HoldingStreamingModel(hold=0.3)
+        stop_heartbeats_slowly(monkeypatch, 8)
     async with AgentEnvironment(
         model=model,
         model_params=ModelActivityParameters(

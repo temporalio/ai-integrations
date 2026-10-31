@@ -827,7 +827,8 @@ publishes an `error` event with the code `cancelled` to the topic.
 Subscribers can still get the events the model sent before that, as a
 native `stream_events()` consumer can. If the model has already finished
 but the activity is still publishing its events when the cancel arrives,
-the `error` event comes after `response.completed`. When the guardrail
+the `error` event comes after `response.completed`. If the activity has
+already returned, it publishes no `error` event. When the guardrail
 has already tripped, the plugin does not start the model call.
 
 The workflow must still be open when the activity publishes that
