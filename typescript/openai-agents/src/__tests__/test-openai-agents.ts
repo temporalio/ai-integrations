@@ -30,6 +30,8 @@ import {
   mcpFactoryArgWorkflow,
   mcpToolFilterResumeWorkflow,
   mcpToolFilterWorkflow,
+  mcpToolMetaWorkflow,
+  statefulMcpFactoryResolverWorkflow,
   summaryOverrideStringWorkflow,
   statefulMcpNotConnectedWorkflow,
   statefulMcpIsolationWorkflow,
@@ -192,8 +194,9 @@ test('factoryArgument is passed through to MCP activities', async (t) => {
           },
         ];
       },
-      async callTool(_toolName: string, _args: Record<string, unknown> | null) {
+      async callTool(...callArgs: unknown[]) {
         t.deepEqual(factoryArgument, { tenantId: 'tenant-42' }, 'factoryArgument should be passed to callTool');
+        t.is(callArgs.length, 2, 'callTool should get no meta argument when there is no toolMetaResolver');
         return [{ type: 'text', text: '2026-01-01' }];
       },
       async invalidateToolsCache() {},
@@ -334,6 +337,104 @@ test('a tool filter that throws while resuming from a RunState fails the run', a
       { instanceOf: WorkflowFailedError }
     );
     t.is((err?.cause as ApplicationFailure | undefined)?.type, 'AgentsWorkflowError');
+  });
+});
+
+function metaTestServer(name: string, metas: unknown[]): MCPServer {
+  return {
+    cacheToolsList: false,
+    name,
+    async connect() {},
+    async close() {},
+    async listTools() {
+      return [
+        {
+          name: 'echo_meta',
+          description: 'Records the request _meta',
+          inputSchema: {
+            type: 'object' as const,
+            properties: {},
+            required: [] as string[],
+            additionalProperties: false,
+          },
+        },
+      ];
+    },
+    async callTool(_toolName: string, _args: Record<string, unknown> | null, meta?: Record<string, unknown> | null) {
+      metas.push(meta);
+      return [{ type: 'text', text: 'ok' }];
+    },
+    async invalidateToolsCache() {},
+  };
+}
+
+test('MCP toolMetaResolver sends _meta on stateless and stateful servers', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  const metas: unknown[] = [];
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([
+          toolCallResponse('echo_meta', {}),
+          textResponse('stateless done'),
+          toolCallResponse('echo_meta', {}),
+          textResponse('stateful done'),
+        ]),
+        mcpServerProviders: [
+          new StatelessMCPServerProvider('metaStateless', () => metaTestServer('metaStateless', metas)),
+          new StatefulMCPServerProvider(
+            'metaStateful',
+            () => metaTestServer('metaStateful', metas),
+            t.context.env.nativeConnection
+          ),
+        ],
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    t.is(
+      await executeWorkflow(mcpToolMetaWorkflow, { args: [false], workflowExecutionTimeout: '30 seconds' }),
+      'stateless done'
+    );
+    t.is(
+      await executeWorkflow(mcpToolMetaWorkflow, { args: [true], workflowExecutionTimeout: '30 seconds' }),
+      'stateful done'
+    );
+  });
+
+  t.deepEqual(metas, [
+    { tenant: 'tenant-7', tool: 'echo_meta', server: 'metaStateless' },
+    { tenant: 'tenant-7', tool: 'echo_meta', server: 'metaStateful' },
+  ]);
+});
+
+test('Stateful MCP: a factory toolMetaResolver fails the operations', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([]),
+        mcpServerProviders: [
+          new StatefulMCPServerProvider(
+            'factoryResolver',
+            () => ({ ...metaTestServer('factoryResolver', []), toolMetaResolver: () => ({ tenant: 'tenant-7' }) }),
+            t.context.env.nativeConnection
+          ),
+        ],
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(statefulMcpFactoryResolverWorkflow, { workflowExecutionTimeout: '20 seconds' });
+    t.deepEqual(await handle.result(), [
+      'MCPToolMetaResolverUnsupported:true',
+      'MCPToolMetaResolverUnsupported:true',
+      'cleanup-success',
+    ]);
   });
 });
 

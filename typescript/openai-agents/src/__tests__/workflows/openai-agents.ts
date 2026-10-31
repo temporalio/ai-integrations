@@ -1,5 +1,5 @@
-import { Agent, type MCPToolFilterContext } from '@openai/agents-core';
-import { ApplicationFailure } from '@temporalio/workflow';
+import { Agent, type MCPToolFilterContext, type MCPToolMetaContext } from '@openai/agents-core';
+import { ActivityFailure, ApplicationFailure } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
@@ -150,6 +150,56 @@ export async function mcpToolFilterResumeWorkflow(): Promise<string> {
   const result = await runner.run(agent, 'Hello', { context: { session: new FilterSession() } });
   await runner.run(agent, result.state);
   return 'resumed';
+}
+
+export async function mcpToolMetaWorkflow(stateful: boolean): Promise<string> {
+  const toolMetaResolver = ({ runContext, toolName, serverName }: MCPToolMetaContext) => ({
+    tenant: (runContext.context as { tenant: string }).tenant,
+    tool: toolName,
+    server: serverName,
+  });
+  const server = stateful
+    ? statefulMcpServer('metaStateful', { toolMetaResolver })
+    : statelessMcpServer('metaStateless', { toolMetaResolver });
+  await server.connect();
+  try {
+    const agent = new Agent({
+      name: 'McpToolMetaAgent',
+      instructions: 'You have access to MCP tools.',
+      model: 'gpt-4o-mini',
+      mcpServers: [server],
+    });
+    const result = await new TemporalOpenAIRunner().run(agent, 'Hello', { context: { tenant: 'tenant-7' } });
+    return result.finalOutput ?? '';
+  } finally {
+    await server.close();
+  }
+}
+
+function failureType(err: unknown): string {
+  const failure = err instanceof ActivityFailure ? err.cause : err;
+  return failure instanceof ApplicationFailure ? `${failure.type}:${failure.nonRetryable}` : String(err);
+}
+
+export async function statefulMcpFactoryResolverWorkflow(): Promise<string[]> {
+  const server = statefulMcpServer('factoryResolver');
+  await server.connect();
+  const results: string[] = [];
+  for (const operation of [() => server.listTools(), () => server.callTool('echo', {})]) {
+    try {
+      await operation();
+      results.push('unexpected-success');
+    } catch (err: unknown) {
+      results.push(failureType(err));
+    }
+  }
+  try {
+    await server.cleanup();
+    results.push('cleanup-success');
+  } catch (err: unknown) {
+    results.push(failureType(err));
+  }
+  return results;
 }
 
 export async function summaryOverrideStringWorkflow(prompt: string): Promise<string> {

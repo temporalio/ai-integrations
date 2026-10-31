@@ -45,6 +45,7 @@ export function statelessMcpServer(name: string, options?: StatelessMcpServerOpt
       sdkCache = value;
     },
     toolFilter: options?.toolFilter,
+    toolMetaResolver: options?.toolMetaResolver,
     get name() {
       return name;
     },
@@ -64,10 +65,11 @@ export function statelessMcpServer(name: string, options?: StatelessMcpServerOpt
       }
       return tools;
     },
-    async callTool(toolName: string, args: Record<string, unknown> | null) {
+    async callTool(toolName: string, args: Record<string, unknown> | null, meta?: Record<string, unknown> | null) {
       return activities[callToolActivityName]!({
         toolName,
         args,
+        ...(meta != null ? { meta } : {}),
         ...(factoryArg !== undefined ? { factoryArgument: factoryArg } : {}),
       });
     },

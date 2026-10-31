@@ -10,7 +10,7 @@ import {
   type StatefulMcpServerSessionArgs,
 } from '../common/mcp-types';
 import { startAdaptiveHeartbeat } from './heartbeat';
-import { filterListedTools, rejectCallableToolFilter } from './mcp-provider';
+import { callToolWithMeta, filterListedTools, rejectCallableToolFilter, rejectToolMetaResolver } from './mcp-provider';
 
 export function registerCancelShutdown(ctx: Context, dedicatedWorker: { shutdown: () => void }): void {
   ctx.cancelled.catch(() => {
@@ -21,6 +21,7 @@ export function registerCancelShutdown(ctx: Context, dedicatedWorker: { shutdown
 interface CallToolArgs {
   toolName: string;
   args: Record<string, unknown> | null;
+  meta?: Record<string, unknown>;
 }
 
 /**
@@ -74,6 +75,7 @@ export class StatefulMCPServerProvider {
         });
       }
       rejectCallableToolFilter(server);
+      rejectToolMetaResolver(server);
       return server;
     };
 
@@ -83,7 +85,8 @@ export class StatefulMCPServerProvider {
       return filterListedTools(server, await server.listTools());
     };
 
-    const callTool = async (input: CallToolArgs) => getServerOrThrow().callTool(input.toolName, input.args);
+    const callTool = async (input: CallToolArgs) =>
+      callToolWithMeta(getServerOrThrow(), input.toolName, input.args, input.meta);
 
     // Long-running session Activity on the MAIN Worker's Task Queue. Creates
     // a server, connects it, spins up a dedicated per-run Worker, then awaits

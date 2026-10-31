@@ -529,6 +529,24 @@ Because the handle caches the full list, the agent SDK's `invalidateServerToolsC
 
 Older versions also let the agent SDK cache the filtered list of a handle with a `toolFilter` property assigned, per server and agent name, so a later run with another context got the first run's tools. This version filters every listing for its own run. A run that started on an older version, whose filter depends on the run context, and that called a tool the filter now removes fails replay on this version. Let such runs finish before you upgrade.
 
+### MCP request metadata
+
+A `toolMetaResolver` builds each tool call's MCP `_meta` from the run context, which exists only in the Workflow. Pass it as the `toolMetaResolver` option of `statelessMcpServer()` or `statefulMcpServer()`; it runs in Workflow code and must be deterministic. The call-tool Activity passes its result to the server's `callTool`. The Worker can't run a `toolMetaResolver` on the factory's server, so it refuses one: every list-tools and call-tool Activity for that server fails with a non-retryable `ApplicationFailure` of type `MCPToolMetaResolverUnsupported` (exported as `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`).
+
+```ts
+const server = statelessMcpServer('tickets', {
+  toolMetaResolver: ({ runContext }) => ({ tenant: (runContext.context as { tenant: string }).tenant }),
+});
+```
+
+A new run with a `toolMetaResolver` on the factory's server fails at its first list-tools Activity. A `statelessMcpServer()` run that listed tools on an older Worker instead gets a tool error, which the model reads, for each call to that server, and the run keeps going. So remove the `toolMetaResolver` from the factory's server before you upgrade Workers.
+
+The `_meta` values are recorded in the call-tool Activity input in Workflow History, so don't put secrets in them.
+
+A call-tool Activity that runs on a Worker with an older plugin version drops the `_meta`, and nothing fails. Upgrade every Worker on the Task Queue before Workflows rely on `_meta`, or use Worker Versioning.
+
+Plugin versions before this option ignore it and don't run its resolver. An older version can replay a History only if it produces the same Workflow commands in the same order, and a resolver passed as this option can change them even when it is synchronous and never fails: the agent awaits it, which can reorder the Activities of parallel tool calls, and its changes to the run context can change later commands. An older version fails such a History with a nondeterminism error (`TMPRL1100`). Before you roll Workers back to an older plugin version, let the Workflows that use this option finish. Workflows with no resolver, or with a resolver set on the handle itself (`server.toolMetaResolver = ...`), run the same resolver code on older versions, so this option doesn't change their commands. On a `statefulMcpServer()` handle, a resolver set this way gets the handle's internal name, `<name>-stateful`, as `serverName`; the option gets `<name>`.
+
 ## Sandbox agents
 
 > **Experimental** — sandbox support is subject to change prior to General Availability.
@@ -724,9 +742,9 @@ Most applications use two import paths: `@temporalio/openai-agents` in Worker an
 | `@temporalio/openai-agents/otel`                 | Worker or Client | Replay-safe OpenTelemetry setup                             |
 | `@temporalio/openai-agents/workflow-interceptor` | Worker bundling  | Manual `workflowInterceptorModules` wiring without a plugin |
 
-`@temporalio/openai-agents` exports `OpenAIAgentsPlugin`, MCP provider classes, `SandboxClientProvider`, model option types, hosted tool credential types, and `DEDICATED_WORKER_FAILURE_TYPE`. `OpenAIAgentsTraceClientInterceptor` is also public for Clients that need manual interceptor wiring instead of plugin registration.
+`@temporalio/openai-agents` exports `OpenAIAgentsPlugin`, MCP provider classes, `SandboxClientProvider`, model option types, hosted tool credential types, `DEDICATED_WORKER_FAILURE_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`. `OpenAIAgentsTraceClientInterceptor` is also public for Clients that need manual interceptor wiring instead of plugin registration.
 
-`@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `agentAsTool`, `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, and `DEDICATED_WORKER_FAILURE_TYPE`.
+`@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `agentAsTool`, `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, `DEDICATED_WORKER_FAILURE_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`.
 
 `@temporalio/openai-agents/otel` exports `createTracerProvider`, `TemporalIdGenerator`, `markReplaySafeTracerProvider`, `isReplaySafeTracerProvider`, and `TemporalOpenAIAgentsTracerProviderOptions`. Install optional peer dependency `@opentelemetry/sdk-trace-base` only when you use this OTel integration.
 
