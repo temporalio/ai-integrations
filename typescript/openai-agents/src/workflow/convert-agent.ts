@@ -12,59 +12,52 @@ import { ActivityBackedModel } from './activity-backed-model';
  * When `identities` maps a source agent to an agent an earlier conversion returned, that object is
  * returned again, with the fields of this conversion's clone. Each agent then has the same fields as
  * after a fresh conversion, but keeps its object identity, which approvals on a `RunContext` are keyed by.
- * Those objects only change once the whole graph has converted, so a conversion that throws leaves them
- * as they were. With `previousFields`, each changed object is mapped to a copy of its earlier fields, which
- * `restoreFields` puts back. An agent whose class overrides `clone` gets its fresh clone instead, since its
- * clone can hold state, such as private fields or entries keyed by the clone, that can't be moved onto
- * another object.
+ * An object is only reused if its handoffs lead to the same objects as before, so a state saved on the
+ * earlier graph still reaches every agent it reached, and serializes the decisions those agents own.
+ * Other agents, and agents whose class overrides `clone`, get their fresh clone. Such a clone can hold
+ * state, such as private fields or entries keyed by the clone, that can't be moved onto another object.
+ * The objects only change once the whole graph has converted, so a conversion that throws leaves them
+ * as they were.
  */
 export function convertAgent(
   agent: Agent<any, any>,
   modelParams: ModelActivityOptions,
   seen?: Map<Agent<any, any>, Agent<any, any>>,
   modelNameOverride?: string,
-  identities?: ReadonlyMap<Agent<any, any>, Agent<any, any>>,
-  previousFields?: Map<Agent<any, any>, Agent<any, any>>
+  identities?: ReadonlyMap<Agent<any, any>, Agent<any, any>>
 ): Agent<any, any> {
-  const replacements = new Map<Agent<any, any>, Agent<any, any>>();
-  const converted = cloneAgentGraph(
-    agent,
-    modelParams,
-    seen ?? new Map(),
-    new Map(),
-    replacements,
-    modelNameOverride,
-    identities
-  );
-  for (const [target, clone] of replacements) {
-    const previous = Object.create(Object.getPrototypeOf(target), Object.getOwnPropertyDescriptors(target));
-    previousFields?.set(target, previous);
-    replaceFields(target, clone);
+  seen = seen ?? new Map();
+  if (seen.has(agent)) return seen.get(agent)!;
+  const clones = new Map<Agent<any, any>, Agent<any, any>>();
+  cloneAgentGraph(agent, modelParams, seen, clones, modelNameOverride);
+  const reused = reusableIdentities(clones, identities);
+  for (const [source, clone] of clones) {
+    seen.set(source, reused.get(source) ?? clone);
   }
-  return converted;
+  for (const [source, clone] of clones) {
+    clone.handoffs = (source.handoffs ?? []).map((h) => {
+      const handoffAgent = h instanceof Handoff ? h.agent : h;
+      const converted = seen.get(handoffAgent)!;
+      if (!(h instanceof Handoff)) return converted;
+      // A reused target still has its earlier fields here, so take the name from its new clone.
+      return h.clone({ agent: converted, agentName: (clones.get(handoffAgent) ?? converted).name });
+    });
+  }
+  for (const [source, target] of reused) {
+    replaceFields(target, clones.get(source)!);
+  }
+  return seen.get(agent)!;
 }
 
-/** Gives each agent `convertAgent` changed the fields it had before, as recorded in `previousFields`. */
-export function restoreFields(previousFields: ReadonlyMap<Agent<any, any>, Agent<any, any>>): void {
-  for (const [target, previous] of previousFields) {
-    replaceFields(target, previous);
-  }
-}
-
-/**
- * Converts `agent`'s graph like `convertAgent`, without changing the objects in `identities`. Each reused
- * object is added to `replacements`, mapped to the clone whose fields it gets.
- */
+/** Validates and clones each agent in `agent`'s graph that isn't in `seen`, into `clones`. */
 function cloneAgentGraph(
   agent: Agent<any, any>,
   modelParams: ModelActivityOptions,
-  seen: Map<Agent<any, any>, Agent<any, any>>,
+  seen: ReadonlyMap<Agent<any, any>, Agent<any, any>>,
   clones: Map<Agent<any, any>, Agent<any, any>>,
-  replacements: Map<Agent<any, any>, Agent<any, any>>,
-  modelNameOverride: string | undefined,
-  identities: ReadonlyMap<Agent<any, any>, Agent<any, any>> | undefined
-): Agent<any, any> {
-  if (seen.has(agent)) return seen.get(agent)!;
+  modelNameOverride: string | undefined
+): void {
+  if (seen.has(agent) || clones.has(agent)) return;
 
   // Reject raw functions: authoring mistake — use tool() or activityAsTool().
   const tools = agent.tools ?? [];
@@ -106,25 +99,45 @@ function cloneAgentGraph(
   // user-declared name and instructions.
   activityBackedModel.setAgent(agent);
 
-  const clone = agent.clone({ model: activityBackedModel });
-  const identity = identities?.get(agent);
-  const converted = identity !== undefined && canReplaceFields(agent, identity, clone) ? identity : clone;
-  seen.set(agent, converted);
-  clones.set(agent, clone);
+  clones.set(agent, agent.clone({ model: activityBackedModel }));
+  for (const h of agent.handoffs ?? []) {
+    cloneAgentGraph(h instanceof Handoff ? h.agent : h, modelParams, seen, clones, modelNameOverride);
+  }
+}
 
-  const convertHandoffAgent = (handoffAgent: Agent<any, any>) =>
-    cloneAgentGraph(handoffAgent, modelParams, seen, clones, replacements, modelNameOverride, identities);
-  clone.handoffs = (agent.handoffs ?? []).map((h) => {
-    if (h instanceof Handoff) {
-      const convertedHandoffAgent = convertHandoffAgent(h.agent);
-      // A reused target still has its earlier fields here, so take the name from its new clone.
-      return h.clone({ agent: convertedHandoffAgent, agentName: clones.get(h.agent)!.name });
+/**
+ * The objects in `identities` this conversion reuses, keyed by source agent: those whose fields
+ * `canReplaceFields` allows replacing, and whose handoffs, once converted, lead to the same objects as
+ * before. Rewiring a reused object to a new one would hide the agent it led to from states saved on the
+ * earlier graph, which then lose that agent's approvals and rejections when serialized.
+ */
+function reusableIdentities(
+  clones: ReadonlyMap<Agent<any, any>, Agent<any, any>>,
+  identities: ReadonlyMap<Agent<any, any>, Agent<any, any>> | undefined
+): Map<Agent<any, any>, Agent<any, any>> {
+  const reused = new Map<Agent<any, any>, Agent<any, any>>();
+  for (const [source, clone] of clones) {
+    const identity = identities?.get(source);
+    if (identity !== undefined && canReplaceFields(source, identity, clone)) reused.set(source, identity);
+  }
+  // Dropping an agent can change the targets of agents that hand off to it, so repeat until none changes.
+  let dropped = true;
+  while (dropped) {
+    dropped = false;
+    for (const [source, identity] of reused) {
+      const before = new Set(handoffAgents(identity));
+      const after = new Set(handoffAgents(source).map((target) => reused.get(target)));
+      if (after.size !== before.size || [...after].some((target) => target === undefined || !before.has(target))) {
+        reused.delete(source);
+        dropped = true;
+      }
     }
-    return convertHandoffAgent(h);
-  });
+  }
+  return reused;
+}
 
-  if (converted !== clone) replacements.set(converted, clone);
-  return converted;
+function handoffAgents(agent: Agent<any, any>): Agent<any, any>[] {
+  return (agent.handoffs ?? []).map((h) => (h instanceof Handoff ? h.agent : h));
 }
 
 /**

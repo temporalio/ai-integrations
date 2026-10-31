@@ -27,7 +27,7 @@ import {
   type SerializableModelActivityOptions,
 } from '../common/model-activity-options';
 import { unwrapTemporalFailure } from '../common/errors';
-import { convertAgent, restoreFields } from './convert-agent';
+import { convertAgent } from './convert-agent';
 import { TemporalSandboxClient } from './sandbox-client';
 import { ensureTracingProcessorRegistered } from './tracing';
 import { flushOpenSpans } from './agent-sink-processor';
@@ -56,9 +56,10 @@ const conversions = new WeakMap<Agent<any, any>, Conversion>();
 const resumeConversions = new WeakMap<object, Map<Agent<any, any>, Conversion>>();
 
 /**
- * Converts `agent`'s graph. With `into`, the conversion reuses `into`'s agent objects: each one gets the
- * fields a fresh conversion would give it, and keeps its identity. The returned `undo` gives `into` back
- * the agents and fields it had before.
+ * Converts `agent`'s graph. With `into`, the conversion reuses those of `into`'s agent objects that
+ * `convertAgent` can: each one gets the fields a fresh conversion would give it, and keeps its identity.
+ * `into` then maps each source agent to its latest converted agent. It keeps them even if the resume
+ * fails, since the restore may already have merged the state's approvals under them.
  */
 function convertAgentGraph(
   agent: Agent<any, any>,
@@ -66,25 +67,18 @@ function convertAgentGraph(
   modelOverride: string | undefined,
   sandbox: SandboxRunConfig | undefined,
   into?: Conversion
-): { conversion: Conversion; undo: () => void } {
+): Conversion {
   const convertedBySource = new Map<Agent<any, any>, Agent<any, any>>();
-  const previousFields = new Map<Agent<any, any>, Agent<any, any>>();
-  const converted = convertAgent(agent, modelParams, convertedBySource, modelOverride, into?.agents, previousFields);
+  const converted = convertAgent(agent, modelParams, convertedBySource, modelOverride, into?.agents);
   if (sandbox !== undefined) {
     propagateAgentToolSandboxConfig(converted, sandbox);
   }
   const conversion = into ?? { source: agent, agents: new Map(), activeRuns: 0 };
-  const previousAgents = new Map(conversion.agents);
   for (const [source, convertedAgent] of convertedBySource) {
     conversion.agents.set(source, convertedAgent);
     conversions.set(convertedAgent, conversion);
   }
-  const undo = () => {
-    restoreFields(previousFields);
-    conversion.agents.clear();
-    for (const [source, convertedAgent] of previousAgents) conversion.agents.set(source, convertedAgent);
-  };
-  return { conversion, undo };
+  return conversion;
 }
 
 /**
@@ -350,10 +344,9 @@ export class TemporalOpenAIRunner {
     const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
     const sandbox = options?.runConfig?.sandbox;
-    // Serialize the state before converting: a reused agent can then point at new objects for its
-    // handoffs, which the state's approvals aren't keyed by, so serializing after would drop them.
+    // Serialize the state before converting, from the graph it was saved on, which the conversion changes.
     const serializedState = input instanceof RunState ? input.toString() : undefined;
-    const { conversion, undo } = convertAgentGraph(
+    const conversion = convertAgentGraph(
       agent,
       this.modelParams,
       modelOverride,
@@ -377,17 +370,11 @@ export class TemporalOpenAIRunner {
         // environment references on the Workflow thread rather than in the resume Activity.
         // Pass the state's own context, as the upstream Runner uses it, so resumed tools write the
         // caller's object rather than a JSON copy.
-        let restored: RunState<TContext, TAgent>;
-        try {
-          restored = (await RunState.fromStringWithContext(converted, serializedState!, input._context)) as RunState<
-            TContext,
-            TAgent
-          >;
-        } catch (error) {
-          // The state's approvals weren't merged under the new graph, so keep the graph that owns them.
-          undo();
-          throw error;
-        }
+        const restored = (await RunState.fromStringWithContext(
+          converted,
+          serializedState!,
+          input._context
+        )) as RunState<TContext, TAgent>;
         // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
         restored.clearTrace();
         preparedInput = restored;

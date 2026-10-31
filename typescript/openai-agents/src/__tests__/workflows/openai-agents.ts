@@ -223,6 +223,15 @@ export interface ApprovalResumeContextResult {
   failedRestoreInterruptions: number;
   registeredVersions: Array<string | undefined>;
   lastAgentRegisteredVersion: string | undefined;
+  rejectedResumesThrew: boolean[];
+  rejectedExecutions: string[];
+  rejectedInterruptions: number;
+  failedRestores: number;
+  failedRestoreApprovalOwners: number;
+  failedRestoreApprovedCallIds: number;
+  recoveredWrites: string[];
+  recoveredApprovalOwners: number;
+  recoveredApprovedCallIds: number;
 }
 
 /** An agent whose `clone` carries a private field, which can't be copied onto another object. */
@@ -297,7 +306,10 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
  * and the saved state must still carry its approval. Then an agent class whose clone keeps a private
  * field changes that field before the resume. Then a resume replaces a handoff target's object, because
  * its class overrides `clone` or the target itself was replaced. Last, a `clone` that returns a plain
- * `Agent` keeps state outside it, which changes before the resume.
+ * `Agent` keeps state outside it, which changes before the resume. Then an approved call fails after
+ * the resume replaced its agent's object, and is rejected through the original state, whose retry must
+ * not run it. Last, the restore of a saved state fails repeatedly after merging its approvals, which must
+ * not add a copy of them each time.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -627,6 +639,94 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
   registeredVersions.set(registeredAgent, 'after');
   const registered = await runner.run(registeredAgent, pausedRegistered.state);
 
+  // The run pauses on a handoff target's call, and the approved call throws once its resume has given the
+  // target a new object, because its class overrides clone or the target was replaced. The call is then
+  // always rejected through the original state, and the retry of that state must not run it again.
+  const rejectedExecutions: string[] = [];
+  const rejectable = tool({
+    name: 'rejectable',
+    description: 'Fail once after approval.',
+    parameters: {
+      type: 'object' as const,
+      properties: { value: { type: 'string' } },
+      required: ['value'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    errorFunction: null,
+    execute: async (args) => {
+      const { value } = args as { value: string };
+      const firstRun = !rejectedExecutions.includes(value);
+      rejectedExecutions.push(value);
+      if (firstRun) throw new Error('rejectable failed');
+      return 'ok';
+    },
+  });
+  const rejectAfterFailedResume = async (child: Agent<ResumeContext>, replacement?: Agent<ResumeContext>) => {
+    const root = new Agent<ResumeContext>({ name: `${child.name}Root`, model: 'gpt-4o-mini', handoffs: [child] });
+    const paused = await runner.run(root, 'go', { context: { original: child.name, writes: [] } });
+    const interruption = paused.interruptions[0]!;
+    paused.state.approve(interruption);
+    if (replacement !== undefined) root.handoffs = [replacement];
+    let threw = false;
+    try {
+      await runner.run(root, paused.state);
+    } catch {
+      threw = true;
+    }
+    paused.state.reject(interruption, { alwaysReject: true });
+    const retried = await runner.run(root, paused.state);
+    return { threw, interruptions: retried.interruptions.length };
+  };
+  const rejectChild = new Agent<ResumeContext>({ name: 'RejectChild', model: 'gpt-4o-mini', tools: [rejectable] });
+  const rejected = [
+    await rejectAfterFailedResume(
+      new VersionedAgent({ name: 'RejectCustomChild', model: 'gpt-4o-mini', tools: [rejectable] }, 'v')
+    ),
+    await rejectAfterFailedResume(rejectChild, rejectChild.clone({})),
+  ];
+
+  // A saved state is rehydrated onto the original agent. Its restore merges the approvals, then fails in a
+  // tool's isEnabled check, three times. Neither the failures nor the resume that then succeeds may add a
+  // copy of the approvals.
+  const guard = { fail: false };
+  const guarded = tool({
+    name: 'guarded',
+    description: 'Record a value after approval.',
+    parameters: {
+      type: 'object' as const,
+      properties: { value: { type: 'string' } },
+      required: ['value'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    isEnabled: async () => {
+      if (guard.fail) throw new Error('isEnabled failed');
+      return true;
+    },
+    execute: async (args, runContext) => {
+      (runContext!.context as ResumeContext).writes.push((args as { value: string }).value);
+      return 'ok';
+    },
+  });
+  const guardedAgent = new Agent<ResumeContext>({ name: 'GuardedAgent', model: 'gpt-4o-mini', tools: [guarded] });
+  const pausedGuarded = await runner.run(guardedAgent, 'go', { context: { original: 'guarded', writes: [] } });
+  pausedGuarded.state.approve(pausedGuarded.interruptions[0]!);
+  const guardedState = await RunState.fromString(guardedAgent, pausedGuarded.state.toString());
+  guard.fail = true;
+  let failedRestores = 0;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await runner.run(guardedAgent, guardedState);
+    } catch {
+      failedRestores++;
+    }
+  }
+  const failedRestoreOwners = countApprovalOwners(guardedState._context);
+  guard.fail = false;
+  const recovered = await runner.run(guardedAgent, guardedState);
+  const recoveredOwners = countApprovalOwners(guardedState._context);
+
   return {
     callerAfter: ctx.after,
     resumedUsesCallerObject: result.runContext.context === ctx,
@@ -666,5 +766,14 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     failedRestoreInterruptions: failedRestoreResumed.interruptions.length,
     registeredVersions: versionsSeen,
     lastAgentRegisteredVersion: registered.lastAgent && registeredVersions.get(registered.lastAgent),
+    rejectedResumesThrew: rejected.map(({ threw }) => threw),
+    rejectedExecutions,
+    rejectedInterruptions: rejected.reduce((count, { interruptions }) => count + interruptions, 0),
+    failedRestores,
+    failedRestoreApprovalOwners: failedRestoreOwners.approvalOwners,
+    failedRestoreApprovedCallIds: failedRestoreOwners.approvedCallIds,
+    recoveredWrites: recovered.runContext.context.writes,
+    recoveredApprovalOwners: recoveredOwners.approvalOwners,
+    recoveredApprovedCallIds: recoveredOwners.approvedCallIds,
   };
 }
