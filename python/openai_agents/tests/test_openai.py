@@ -16,6 +16,7 @@ from agents import (
     AgentOutputSchemaBase,
     CodeInterpreterTool,
     FileSearchTool,
+    FunctionTool,
     GuardrailFunctionOutput,
     Handoff,
     HostedMCPTool,
@@ -35,6 +36,7 @@ from agents import (
     OutputGuardrailTripwireTriggered,
     RunConfig,
     RunContextWrapper,
+    RunHooks,
     Runner,
     SQLiteSession,
     Tool,
@@ -1370,30 +1372,83 @@ def workflow_tool_mock_model():
     return TestModel.returning_responses(
         [
             ResponseBuilders.tool_call("{}", "run_tool"),
+            ResponseBuilders.tool_call(
+                '{"note":"call back"}',
+                "add_note",
+                call_id="call-add-note",
+                item_id="item-add-note",
+            ),
+            ResponseBuilders.tool_call(
+                "{}",
+                "offload_sum",
+                call_id="call-offload-sum",
+                item_id="item-offload-sum",
+            ),
             ResponseBuilders.output_message("Workflow tool was used"),
         ]
     )
 
 
+class WorkflowToolHooks(RunHooks):
+    def __init__(self) -> None:
+        self.tool_callables: list[str] = []
+
+    async def on_agent_start(
+        self, context: RunContextWrapper[Any], agent: Agent[Any]
+    ) -> None:
+        # Hooks get the tools as made, so each still has its Python callable.
+        self.tool_callables = [
+            tool.__wrapped__.__name__
+            for tool in agent.tools
+            if isinstance(tool, FunctionTool)
+        ]
+
+
 @workflow.defn
 class WorkflowToolWorkflow:
+    def __init__(self) -> None:
+        self.notes: list[str] = []
+
     @workflow.run
-    async def run(self) -> None:
+    async def run(self) -> dict[str, list[str]]:
         agent: Agent = Agent(
             name="Assistant",
             instructions="You are a helpful assistant.",
             model="gpt-4o",
-            tools=[function_tool(self.run_tool)],
+            tools=[
+                function_tool(self.run_tool),
+                function_tool(self.add_note),
+                function_tool(self.offload_sum),
+            ],
         )
+        hooks = WorkflowToolHooks()
         await Runner.run(
             agent,
             "My phone number is 650-123-4567. Where do you think I live?",
+            hooks=hooks,
         )
+        # Acting on what a sync tool did ties this run's commands to the tool running.
+        if self.notes:
+            await workflow.sleep(timedelta(milliseconds=1))
+        return {"notes": self.notes, "tool_callables": hooks.tool_callables}
 
     async def run_tool(self):
         print("Tool ran with self:", self)
         workflow.logger.info("Tool ran with self: %s", self)
         return None
+
+    def add_note(self, note: str) -> str:
+        """Add a note."""
+        self.notes.append(note)
+        return f"Added note: {note}"
+
+    async def offload_sum(self) -> str:
+        """Add two numbers in a thread."""
+        # Only sync function tools run inline. Other thread calls still fail.
+        try:
+            return f"to_thread returned {await asyncio.to_thread(lambda: 2 + 3)}"
+        except NotImplementedError:
+            return "to_thread raised NotImplementedError"
 
 
 async def test_workflow_method_tools(client: Client):
@@ -1414,7 +1469,18 @@ async def test_workflow_method_tools(client: Client):
             id=f"workflow-tool-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
-        await workflow_handle.result()
+        # The sync tool ran in the Workflow, and the model got its result.
+        assert await workflow_handle.result() == {
+            "notes": ["call back"],
+            "tool_callables": ["run_tool", "add_note", "offload_sum"],
+        }
+        model_inputs = [
+            e.activity_task_scheduled_event_attributes.input.payloads[0].data.decode()
+            async for e in workflow_handle.fetch_history_events()
+            if e.HasField("activity_task_scheduled_event_attributes")
+        ]
+        assert "Added note: call back" in model_inputs[-1]
+        assert "to_thread raised NotImplementedError" in model_inputs[-1]
 
 
 async def test_response_serialization():
