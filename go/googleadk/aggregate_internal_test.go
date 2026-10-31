@@ -8,8 +8,10 @@ package googleadk
 // publish side channel is exercised by the dev-server-gated integration test.
 
 import (
+	"fmt"
 	"testing"
 
+	"github.com/openai/openai-go/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -94,6 +96,12 @@ func TestClassifyModelErrorRetryability(t *testing.T) {
 		}
 		classified := classifyModelError(err)
 		assert.Equal(t, !tc.retryable, IsNonRetryable(classified), "code %d", tc.code)
+
+		// ADK's OpenAI model wraps openai-go's Error, which carries the status.
+		if tc.code != 0 {
+			err = fmt.Errorf("openai: call failed: %w", &openai.Error{StatusCode: tc.code})
+			assert.Equal(t, tc.code, apiErrorCode(err), "openai code %d", tc.code)
+		}
 	}
 }
 
