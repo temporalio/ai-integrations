@@ -106,6 +106,16 @@ async def echo_activity(text: str) -> str:
     return f"echo:{text}"
 
 
+@activity.defn
+async def forecast_activity(city: str, days: int, units: str = "C") -> str:
+    return f"{city}:{days}:{units}"
+
+
+@activity.defn
+async def quota_activity() -> str:
+    return "quota:42"
+
+
 @workflow.defn
 class ActivityAsToolWorkflow:
     @workflow.run
@@ -114,6 +124,23 @@ class ActivityAsToolWorkflow:
             echo_activity, start_to_close_timeout=timedelta(seconds=10)
         )
         return await tool.ainvoke({"text": text})
+
+
+@workflow.defn
+class ActivityParametersAsToolWorkflow:
+    @workflow.run
+    async def run(self) -> list[str]:
+        forecast = activity_as_tool(
+            forecast_activity, start_to_close_timeout=timedelta(seconds=10)
+        )
+        quota = activity_as_tool(
+            quota_activity, start_to_close_timeout=timedelta(seconds=10)
+        )
+        return [
+            await forecast.ainvoke({"city": "Paris", "days": 3}),
+            await forecast.ainvoke({"city": "Oslo", "days": 1, "units": "F"}),
+            await quota.ainvoke({}),
+        ]
 
 
 @workflow.defn
@@ -153,6 +180,26 @@ async def test_activity_as_tool(env: WorkflowEnvironment) -> None:
     assert out == "echo:hi"
     counts = await count_scheduled_activities(handle)
     assert counts["echo_activity"] == 1, counts
+
+
+@pytest.mark.asyncio
+async def test_activity_as_tool_passes_each_parameter(
+    env: WorkflowEnvironment,
+) -> None:
+    async with Worker(
+        env.client,
+        task_queue="da-act-tool-params",
+        workflows=[ActivityParametersAsToolWorkflow],
+        activities=[forecast_activity, quota_activity],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        out = await env.client.execute_workflow(
+            ActivityParametersAsToolWorkflow.run,
+            id=f"da-act-tool-params-{uuid.uuid4()}",
+            task_queue="da-act-tool-params",
+            execution_timeout=timedelta(seconds=30),
+        )
+    assert out == ["Paris:3:C", "Oslo:1:F", "quota:42"]
 
 
 @pytest.mark.asyncio

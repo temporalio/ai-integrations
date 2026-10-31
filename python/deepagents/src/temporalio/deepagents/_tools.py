@@ -254,28 +254,33 @@ def activity_as_tool(
     tool_desc = description or (activity.__doc__ or f"Temporal activity {tool_name}.")
     act_summary = summary or f"tool:{tool_name}"
 
-    # Temporal activities take a single positional argument. StructuredTool infers
+    # Temporal activities take positional arguments only. StructuredTool infers
     # the model-facing schema from ``_run``'s signature, so we mirror the activity's
-    # own parameter names onto ``_run`` (via ``@wraps``) and then collapse the
-    # keyword call the model produces back into that single positional payload.
+    # own parameter names onto ``_run`` (via ``@wraps``) and then map the keyword
+    # call the model produces onto the activity's parameters, one argument each.
     import inspect
 
     params = [
-        p for p in inspect.signature(activity).parameters if p not in ("self", "cls")
+        p
+        for p in inspect.signature(activity).parameters.values()
+        if p.name not in ("self", "cls")
     ]
 
     @wraps(activity)
     async def _run(*args: Any, **kwargs: Any) -> Any:
-        if args and not kwargs:
-            payload: Any = args[0] if len(args) == 1 else list(args)
-        elif len(params) == 1 and len(kwargs) == 1:
-            # Single-argument activity: pass the value directly, not {"arg": value}.
-            payload = next(iter(kwargs.values()))
-        else:
-            payload = kwargs
+        values = list(args)
+        for param in params[len(args) :]:
+            if param.name in kwargs:
+                values.append(kwargs[param.name])
+            elif param.default is not inspect.Parameter.empty:
+                # Pass the default too: the worker decodes arguments with the
+                # activity's type hints only when every parameter has a value.
+                values.append(param.default)
+            else:
+                raise TypeError(f"{tool_name} missing argument {param.name!r}")
         return await workflow.execute_activity(
             activity,
-            payload,
+            args=values,
             start_to_close_timeout=start_to_close_timeout,
             retry_policy=retry_policy,
             summary=act_summary,
