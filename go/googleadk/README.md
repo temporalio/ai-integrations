@@ -258,6 +258,8 @@ outside Temporal. To use another model, build the agent with
   / `.A2AError`.
   Classify with `IsNonRetryable(err)`; never string-match. Upstream HTTP status
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
+  A streamed call whose chunks could not all be published fails with
+  `googleadk.StreamError` (see [Streaming](#streaming)).
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
   under Temporal's `RetryPolicy`; leaving the model client's own retries on retries
   a transient failure twice over. Let Temporal own retries.
@@ -371,6 +373,24 @@ func StreamingAgentWorkflow(ctx workflow.Context, q string) (string, error) {
 
 External consumers read chunks with `workflowstreams.NewClient(c, workflowID, ...).Subscribe(...)`.
 The bidirectional `RunLive` path (hard-coded goroutines/channels) is **not** supported.
+
+If a batch of chunks cannot be published, the model call fails with
+`googleadk.StreamError` instead of returning as if every chunk was delivered. It
+is non-retryable when a retry would call the model again and fail the same way:
+
+- **A batch over the server's size limits**: 2 MiB per payload and 4 MiB per
+  gRPC message by default. Configure external storage on the Client so large
+  batches are stored, or keep responses smaller.
+- **A run past its Signal limit.** Each batch is one Signal, and a run accepts
+  10,000 Signals by default, counting the Workflow's other Signals. A
+  long-running streaming Workflow, such as a chat session, should
+  continue-as-new well before that, or use a longer batch interval
+  (`WithStreaming(topic, interval)`; the default is 2 seconds).
+- **A batch the stream client gave up on** after retrying it for its maximum
+  retry duration.
+
+Other failures, such as a server outage, are retried; the retry calls the model
+again and publishes its stream again.
 
 ## Composing with other plugins
 

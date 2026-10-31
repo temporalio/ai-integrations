@@ -17,6 +17,8 @@ import (
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // StreamServer installs the workflow-side stream server that streamed model
@@ -603,16 +605,24 @@ func classifyModelError(err error) error {
 
 // streamPublishError fails a streaming call whose chunks did not all reach the
 // topic. A retry calls the model again, so the error is non-retryable when the
-// retry would fail the same way: the server refused the batch as invalid (for
-// example, over the payload size limit), or the stream client gave up on it
-// after retrying for its MaxRetryDuration. Other failures, such as a server
-// outage, stay retryable.
+// retry would fail the same way: the server refused the batch as invalid (over
+// the payload size limit, or past the run's Signal limit), the batch is over
+// the server's gRPC message limit, or the stream client gave up on it after
+// retrying for its MaxRetryDuration. Other failures, such as a server outage,
+// stay retryable.
 func streamPublishError(in invokeModelInput, err error) error {
 	var invalid *serviceerror.InvalidArgument
 	var timeout *workflowstreams.FlushTimeoutError
-	retryable := !errors.As(err, &invalid) && !errors.As(err, &timeout)
-	return newApplicationError(ErrorTypeModel, retryable, err,
-		"model %q: publish streamed responses to topic %q: %v", in.Request.Model, in.StreamingTopic, err)
+	retryable := !errors.As(err, &invalid) && !errors.As(err, &timeout) && !isMessageTooLarge(err)
+	return newApplicationError(ErrorTypeStream, retryable, err,
+		"model %q: publish streamed responses to topic %q: %v", in.modelName(), in.StreamingTopic, err)
+}
+
+// isMessageTooLarge reports a request the server refused as larger than its
+// gRPC message limit, the check the Go SDK's own retry interceptor uses to stop
+// retrying. Rate limiting uses the same code with other messages.
+func isMessageTooLarge(err error) bool {
+	return status.Code(err) == codes.ResourceExhausted && strings.Contains(status.Convert(err).Message(), "larger than max")
 }
 
 // apiErrorCode extracts the HTTP status from a genai.APIError, which the SDK
