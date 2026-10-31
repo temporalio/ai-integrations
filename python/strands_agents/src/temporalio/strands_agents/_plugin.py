@@ -18,6 +18,7 @@ from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 from ._failure_converter import strands_failure_converter_class
 from ._model_activity import ModelActivity
 from ._sandbox_activity import SandboxActivities, SandboxFactory
+from ._sync_calls import refuse_sync_calls_in_workflows
 from ._temporal_mcp_client import (
     _evict_connection,
     build_call_tool_activity,
@@ -149,6 +150,10 @@ class StrandsPlugin(SimplePlugin):
 
 
 def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
+    # Strands' sync calls start a thread from the passed-through (host) strands
+    # modules, so the sandbox's thread restrictions never see it. Refuse them here,
+    # for every runner.
+    refuse_sync_calls_in_workflows()
     if not runner:
         raise ValueError("No WorkflowRunner provided to the Strands plugin.")
     if isinstance(runner, SandboxedWorkflowRunner):
