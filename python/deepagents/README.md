@@ -159,6 +159,16 @@ search_tool])`. An unwrapped, non-builtin tool runs in-workflow and the plugin
 warns at construction, so the choice is never silent. Deep Agents' pure
 built-ins (`write_todos`, state-backed file tools) stay in-workflow by design.
 
+`activity_as_tool` also takes `activity_options` — the remaining
+`execute_activity` options (`tool_as_activity` takes the same argument, and
+`ActivityConfig` is the typed spelling of the same keys). Route a slow tool to
+its own workers with `activity_options={"task_queue": "weather-tools"}` (a
+worker registered for `get_weather` must then poll that queue), or set
+`heartbeat_timeout` for an activity that heartbeats, so a lost worker is
+noticed at the heartbeat instead of at start-to-close.
+`start_to_close_timeout`, `retry_policy` and `summary` keep their dedicated
+arguments shown above.
+
 Call `tool_as_activity(...)` at module import or worker startup on **every
 activity worker** that can receive `deepagents.invoke_tool`. Registration is
 process-local; calling it only inside a workflow does not register the tool in
