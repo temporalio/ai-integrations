@@ -14,6 +14,7 @@ still works without it.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import warnings
 from collections.abc import Mapping
@@ -146,6 +147,10 @@ async def call_tool(
     )
     if hit:
         return _activity.ToolActivityOutput(message=cached)
+    activity_input = dataclasses.replace(
+        activity_input,
+        arg_messages=_serde.find_tool_arg_messages(activity_input.args),
+    )
     output = await workflow.execute_activity(
         _activity.INVOKE_TOOL,
         activity_input,

@@ -1,9 +1,15 @@
+import asyncio
 from datetime import timedelta
 from typing import Any
 
 from strands import Agent
+from strands.agent._concurrency import _ConcurrencyController, _InflightInvocation
+from strands.agent.conversation_manager import NullConversationManager
 from strands.hooks import BeforeModelCallEvent, HookCallback
+from strands.types.agent import AgentInput
+from strands.types.content import Messages
 
+from temporalio import workflow
 from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
@@ -17,6 +23,24 @@ _SNAPSHOT_DISABLED = (
     "a finer granularity than Strands snapshots. Remove the snapshot call "
     "and rely on Temporal's durable execution instead."
 )
+
+
+class _WorkflowInflightInvocation(_InflightInvocation):
+    def register_waiter(self) -> asyncio.Future:
+        # Strands uses asyncio.wrap_future to notify duplicates across threads.
+        # On Python <3.13 that calls loop methods the Workflow loop does not
+        # implement. Workflow invocations share one loop, so wait on its state.
+        return asyncio.create_task(workflow.wait_condition(lambda: self.settled))
+
+
+class _WorkflowConcurrencyController(_ConcurrencyController):
+    def _check_idempotency(
+        self, idempotency_token: Any
+    ) -> tuple[_InflightInvocation | None, Any]:
+        waiting_on, registered_token = super()._check_idempotency(idempotency_token)
+        if registered_token is not None:
+            self._inflight = _WorkflowInflightInvocation()
+        return waiting_on, registered_token
 
 
 class TemporalAgent(Agent):
@@ -51,6 +75,7 @@ class TemporalAgent(Agent):
         streaming_topic: str | None = None,
         streaming_batch_interval: timedelta = timedelta(milliseconds=100),
         sandbox: TemporalSandbox | None = None,
+        model_state: dict[str, Any] | None = None,
         **agent_kwargs: Any,
     ) -> None:
         """Build a TemporalAgent from a registered model name and activity options."""
@@ -63,6 +88,9 @@ class TemporalAgent(Agent):
                 "TemporalAgent(...) or pass retry_strategy=None."
             )
         agent_kwargs["retry_strategy"] = None
+        self._manager_given = agent_kwargs.get(
+            "conversation_manager"
+        ) is not None or agent_kwargs.get("context_manager") not in (None, False)
 
         temporal_model = TemporalModel(
             model_name=model,
@@ -80,6 +108,12 @@ class TemporalAgent(Agent):
             streaming_batch_interval=streaming_batch_interval,
         )
         super().__init__(model=temporal_model, sandbox=sandbox, **agent_kwargs)
+        self._concurrency = _WorkflowConcurrencyController(self._concurrency.mode)
+        self._temporal_model = temporal_model
+        # A model state carried from an earlier run, such as a stateful model's
+        # last response id across Continue-As-New.
+        if model_state:
+            self._model_state = dict(model_state)
 
         # Strands invokes ToolProvider.load_tools() once at construction on a
         # separate run_async thread that has no workflow runtime, so a
@@ -125,6 +159,41 @@ class TemporalAgent(Agent):
                 reg.replace(tool)
             else:
                 reg.register_tool(tool)
+
+    async def _convert_prompt_to_messages(self, prompt: AgentInput) -> Messages:
+        """Load the worker-side model's config, then convert the prompt.
+
+        Strands reads the model's context window limit for proactive
+        compression and its model id for tracing in workflow code, before the
+        first model call. ``stream_async`` awaits this method first after it
+        takes the invocation lock and registers the idempotency token, and
+        before it starts the agent span. Loading here keeps Strands' rejection,
+        deduplication and cancellation of overlapping invocations unchanged.
+        """
+        await self._temporal_model._load_config()
+        if self._temporal_model.stateful:
+            self._use_server_side_state()
+        return await super()._convert_prompt_to_messages(prompt)
+
+    def _use_server_side_state(self) -> None:
+        # What Strands' Agent does at construction for a stateful model, which
+        # TemporalAgent can only learn once the worker model's config is read.
+        if self._manager_given:
+            raise ValueError(
+                "context_manager and conversation_manager cannot be used with a "
+                "stateful model. The model manages conversation state server-side."
+            )
+        if not isinstance(self.conversation_manager, NullConversationManager):
+            self.conversation_manager = NullConversationManager()
+
+    @property
+    def model_state(self) -> dict[str, Any]:
+        """A copy of the model state, such as a stateful model's last response id.
+
+        Carry it with the messages across Continue-As-New and pass it back as
+        ``TemporalAgent(model_state=...)``.
+        """
+        return dict(self._model_state)
 
     def take_snapshot(self, *_args: Any, **_kwargs: Any) -> Any:
         """Disabled; Temporal's event history is the source of truth."""

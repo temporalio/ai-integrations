@@ -18,6 +18,7 @@ import {
   asOutputs,
   describeError,
   buildRunTree,
+  inheritedDestination,
   runActivityRunName,
   runCancelNexusHandlerRunName,
   runStartNexusHandlerRunName,
@@ -43,7 +44,7 @@ function reconstructParentRun(config: EmitterConfig, ctx: LangSmithTraceContext 
     trace_id: parsed.trace_id,
     dotted_order: parsed.dotted_order,
     parent_run_id: parsed.parent_run_id,
-    project_name: config.projectName ?? parsed.project_name,
+    ...inheritedDestination(config, parsed),
     client: config.client,
     // Force-enable so nested body `traceable` runs emit; tracing gate is `isTracingEnabled()`.
     tracingEnabled: true,
@@ -52,9 +53,13 @@ function reconstructParentRun(config: EmitterConfig, ctx: LangSmithTraceContext 
 
 /**
  * Run `fn` with `op` installed as the active LangSmith run, emitting the run
- * around the call. Shared by activity and Nexus handlers.
+ * around the call unless LangSmith turned tracing off for it (an env it can't
+ * address). Shared by activity and Nexus handlers.
  */
 async function traceOperation<T>(op: RunTree, fn: () => Promise<T>): Promise<T> {
+  if (!op.tracingEnabled) {
+    return withRunTree(op, fn);
+  }
   await op.postRun();
   try {
     const result = await withRunTree(op, fn);

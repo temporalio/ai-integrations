@@ -15,9 +15,10 @@ from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
-from ._failure_converter import StrandsFailureConverter
+from ._failure_converter import strands_failure_converter_class
 from ._model_activity import ModelActivity
 from ._sandbox_activity import SandboxActivities, SandboxFactory
+from ._sync_calls import refuse_sync_calls_in_workflows
 from ._temporal_mcp_client import (
     _evict_connection,
     build_call_tool_activity,
@@ -91,7 +92,15 @@ class StrandsPlugin(SimplePlugin):
         activities: list[Callable] = []
         if models:
             ma = ModelActivity(models, default_name=default_name)
-            activities.extend([ma.invoke_model, ma.invoke_model_streaming])
+            activities.extend(
+                [
+                    ma.invoke_model,
+                    ma.invoke_model_streaming,
+                    ma.invoke_stateful_model,
+                    ma.invoke_stateful_model_streaming,
+                    ma.get_model_config,
+                ]
+            )
 
         sandbox_activities = (
             SandboxActivities(
@@ -141,6 +150,10 @@ class StrandsPlugin(SimplePlugin):
 
 
 def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
+    # Strands' sync calls start a thread from the passed-through (host) strands
+    # modules, so the sandbox's thread restrictions never see it. Refuse them here,
+    # for every runner.
+    refuse_sync_calls_in_workflows()
     if not runner:
         raise ValueError("No WorkflowRunner provided to the Strands plugin.")
     if isinstance(runner, SandboxedWorkflowRunner):
@@ -167,5 +180,7 @@ def _data_converter(converter: DataConverter | None) -> DataConverter:
     return replace(
         converter,
         payload_converter_class=pydantic_data_converter.payload_converter_class,
-        failure_converter_class=StrandsFailureConverter,
+        failure_converter_class=strands_failure_converter_class(
+            converter.failure_converter_class
+        ),
     )

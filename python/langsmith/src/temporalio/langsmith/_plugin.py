@@ -49,7 +49,9 @@ class LangSmithPlugin(SimplePlugin):
         Args:
             client: A langsmith.Client instance. If None, one will be created
                 automatically (using LANGSMITH_API_KEY env var).
-            project_name: LangSmith project name for traces.
+            project_name: Fallback LangSmith project name for traces with no
+                parent. Temporal runs inherit their parent's destination when
+                present. When unset, root runs use LangSmith's environment defaults.
             add_temporal_runs: Whether to create LangSmith runs for Temporal
                 operations. Defaults to False.
             default_metadata: Default metadata to attach to all runs.

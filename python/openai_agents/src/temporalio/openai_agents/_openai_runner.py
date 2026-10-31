@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import contextvars
 import dataclasses
+import sys
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Generator
 from typing import Any, Callable
@@ -11,6 +12,8 @@ from agents import (
     AgentsException,
     FunctionTool,
     Handoff,
+    ModelProvider,
+    MultiProvider,
     RunConfig,
     RunContextWrapper,
     RunResult,
@@ -33,10 +36,12 @@ from temporalio.openai_agents._errors import (
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._temporal_model_provider import (
     _current_run_model_settings,
+    _TemporalModelProvider,
     capture_scope,
     install_model_provider,
 )
 from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
+from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
@@ -187,6 +192,61 @@ def _convert_agent(
     return new_agent
 
 
+# True during an agent run, so the Workflow loop runs sync function tools inline.
+_in_agent_run: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_in_agent_run", default=False
+)
+
+
+@contextlib.contextmanager
+def _inline_sync_function_tools() -> Generator[None, None, None]:
+    """Run the sync function tools of the agent run in this scope in the Workflow.
+
+    The Agents SDK runs a sync function tool with ``asyncio.to_thread``. The Workflow
+    event loop has no threads, so the tool failed before its body ran and the model
+    got an empty error. Tools are not changed, only how the loop runs that call.
+    """
+    _run_sync_function_tool_calls_inline(asyncio.get_running_loop())
+    token = _in_agent_run.set(True)
+    try:
+        yield
+    finally:
+        _in_agent_run.reset(token)
+
+
+def _run_sync_function_tool_calls_inline(loop: asyncio.AbstractEventLoop) -> None:
+    """Make the Workflow loop run a sync function tool's thread call inline."""
+    if getattr(loop, "_runs_sync_function_tools_inline", False):
+        return
+    run_in_executor = loop.run_in_executor
+
+    def inline_run_in_executor(
+        executor: Any, func: Callable[..., Any], *args: Any
+    ) -> asyncio.Future[Any]:
+        if not (
+            _in_agent_run.get() and _called_by_sync_function_tool(sys._getframe(1))
+        ):
+            return run_in_executor(executor, func, *args)
+        future = loop.create_future()
+        future.set_result(func(*args))
+        return future
+
+    setattr(loop, "run_in_executor", inline_run_in_executor)
+    setattr(loop, "_runs_sync_function_tools_inline", True)
+
+
+def _called_by_sync_function_tool(frame: Any) -> bool:
+    """Whether this is ``asyncio.to_thread`` called by a sync ``@function_tool``.
+
+    Those are the only ``asyncio.to_thread`` calls in ``agents.tool``.
+    """
+    return (
+        frame.f_code is asyncio.to_thread.__code__
+        and frame.f_back is not None
+        and frame.f_back.f_globals.get("__name__") == "agents.tool"
+    )
+
+
 def _has_sandbox_agent(agent: Agent[Any], seen: set[int] | None = None) -> bool:
     """Check if any agent in the graph (following direct Agent handoffs) is a SandboxAgent."""
     if seen is None:
@@ -200,6 +260,39 @@ def _has_sandbox_agent(agent: Agent[Any], seen: set[int] | None = None) -> bool:
         if isinstance(handoff, Agent) and _has_sandbox_agent(handoff, seen):
             return True
     return False
+
+
+# Runs without this patch marker started before the plugin refused
+# ``RunConfig.model_provider``. They keep the old behavior, the Worker's provider, so that
+# they replay.
+_REFUSE_RUN_MODEL_PROVIDER_PATCH = "openai_agents.refuse-run-model-provider"
+
+
+def _is_default_model_provider(provider: ModelProvider) -> bool:
+    """Whether ``provider`` is an unconfigured ``MultiProvider``, as ``RunConfig()`` makes."""
+    if type(provider) is not MultiProvider:
+        return False
+    return _multi_provider_settings(provider) == _multi_provider_settings(
+        MultiProvider()
+    )
+
+
+def _multi_provider_settings(provider: MultiProvider) -> dict[str, Any]:
+    # Caches filled on use are not settings.
+    caches = {"_fallback_providers", "_ws_model_cache_by_loop"}
+    settings: dict[str, Any] = {
+        name: value
+        for name, value in vars(provider).items()
+        if name not in caches and name != "openai_provider"
+    }
+    openai_settings = vars(provider.openai_provider)
+    if "_stored_api_key" in openai_settings:
+        # No client was passed, so ``_client`` caches the one built on first use.
+        caches.add("_client")
+    settings["openai_provider"] = {
+        name: value for name, value in openai_settings.items() if name not in caches
+    }
+    return settings
 
 
 def _coerce_run_config(value: object) -> RunConfig:
@@ -298,6 +391,25 @@ class TemporalOpenAIRunner(AgentRunner):
                 ),
             )
 
+        # Model calls run in an Activity on the Worker's provider, so a provider set on the
+        # run would be silently ignored. A nested run, such as an agent used as a tool,
+        # inherits the plugin's provider.
+        if not isinstance(
+            run_config.model_provider, _TemporalModelProvider
+        ) and not _is_default_model_provider(run_config.model_provider):
+            if workflow.patched(_REFUSE_RUN_MODEL_PROVIDER_PATCH):
+                raise ValueError(
+                    "Temporal workflows do not support RunConfig.model_provider. Model "
+                    "calls use the provider set on the Worker with "
+                    "OpenAIAgentsPlugin(model_provider=...). To use several providers, "
+                    "set a MultiProvider with a prefix map there and choose a provider "
+                    "by model name."
+                )
+
+        # Model calls run in an Activity, which cannot get the run's own tracing key.
+        if run_config.tracing is not None:
+            _refuse_tracing_key(run_config.tracing.get("api_key"))
+
         run_config = install_model_provider(self.model_params, run_config)
 
         # run_config.sandbox is global for the entire run — configure it if any agent needs it.
@@ -350,7 +462,7 @@ class TemporalOpenAIRunner(AgentRunner):
 
         operations: set[_ToolOperation] = set()
         token = _tool_operations.set((*_tool_operations.get(), operations))
-        with capture_scope(run_config.model_settings):
+        with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             try:
                 return await self._runner.run(
                     starting_agent=converted_agent,
@@ -431,7 +543,7 @@ class TemporalOpenAIRunner(AgentRunner):
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
-        with capture_scope(run_config.model_settings):
+        with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             streamed_result = self._runner.run_streamed(
                 starting_agent=converted_agent,
                 input=input,

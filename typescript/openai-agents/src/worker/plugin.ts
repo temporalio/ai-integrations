@@ -21,9 +21,33 @@ import {
   OpenAIAgentsTraceActivityInboundInterceptor,
   OpenAIAgentsTraceNexusInboundInterceptor,
   type OpenAIAgentsTraceInterceptorOptions,
+  type TracingApiKeyResolver,
 } from './trace-interceptor';
 
 export type MCPServerProvider = StatelessMCPServerProvider | StatefulMCPServerProvider;
+
+type WebpackConfig = Parameters<NonNullable<BundleOptions['webpackConfigHook']>>[0];
+type WebpackCompiler = Parameters<Extract<NonNullable<WebpackConfig['plugins']>[number], (...args: any[]) => void>>[0];
+
+const AGENTS_CORE_REQUEST = /^@openai\/agents-core(?:\/|$)/;
+
+/**
+ * `@openai/agents-core` has a CommonJS build and an ES module build. The plugin's own code is
+ * CommonJS, so it loads the CommonJS build. An `import` in Workflow code, such as a `.ts`
+ * Workflow file, would load the ES module build too: a second copy of the package. The plugin's
+ * `instanceof` checks miss objects from that copy, and its dynamic `import()` becomes an async
+ * chunk that cannot load in the Workflow sandbox. Resolving every request for the package as a
+ * CommonJS request keeps one copy in the bundle.
+ */
+function resolveAgentsCoreAsCommonJs(compiler: WebpackCompiler): void {
+  compiler.hooks.normalModuleFactory.tap('OpenAIAgentsPlugin', (factory) => {
+    factory.hooks.beforeResolve.tap('OpenAIAgentsPlugin', (data) => {
+      if (data.dependencyType === 'esm' && AGENTS_CORE_REQUEST.test(data.request)) {
+        data.dependencyType = 'commonjs';
+      }
+    });
+  });
+}
 
 /**
  * Options controlling trace interceptor behavior on both the Activity side
@@ -82,6 +106,12 @@ export interface OpenAIAgentsPluginOptions {
    * `__openai_agents_config` header and applied to Activities directly.
    */
   interceptorOptions?: OpenAIAgentsPluginInterceptorOptions;
+  /**
+   * Resolves the tracing export API key for spans that cross a Temporal
+   * boundary, on the Worker, so the key stays out of Workflow history. Use it
+   * when runs export traces with different keys. See {@link TracingApiKeyResolver}.
+   */
+  tracingApiKey?: TracingApiKeyResolver;
 }
 
 /**
@@ -92,6 +122,8 @@ export interface OpenAIAgentsPluginOptions {
  * @experimental The OpenAI Agents plugin is an experimental feature; APIs may change without notice.
  */
 export class OpenAIAgentsPlugin extends SimplePlugin {
+  private readonly tracingApiKey?: TracingApiKeyResolver;
+
   constructor(options: OpenAIAgentsPluginOptions) {
     const modelActivities = createModelActivity(options.modelProvider, options.hostedToolCredentials);
 
@@ -120,6 +152,7 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
 
     const activityInterceptorOptions: OpenAIAgentsTraceInterceptorOptions = {
       addTemporalSpans: interceptorOpts?.addTemporalSpans,
+      tracingApiKey: options.tracingApiKey,
     };
 
     if (interceptorOpts?.useOtelInstrumentation) {
@@ -154,9 +187,12 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
         activity: [
           (ctx) => ({ inbound: new OpenAIAgentsTraceActivityInboundInterceptor(ctx, activityInterceptorOptions) }),
         ],
-        nexus: [() => ({ inbound: new OpenAIAgentsTraceNexusInboundInterceptor() })],
+        nexus: [
+          () => ({ inbound: new OpenAIAgentsTraceNexusInboundInterceptor({ tracingApiKey: options.tracingApiKey }) }),
+        ],
       },
     });
+    this.tracingApiKey = options.tracingApiKey;
   }
 
   override configureWorker(options: WorkerOptions): WorkerOptions {
@@ -187,7 +223,8 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
           : existingEntry !== undefined
             ? [existingEntry as string]
             : [];
-        return { ...cfg, entry: [polyfillPath, ...entries] };
+        const plugins = [...(cfg.plugins ?? []), resolveAgentsCoreAsCommonJs];
+        return { ...cfg, entry: [polyfillPath, ...entries], plugins };
       },
     };
   }
@@ -196,7 +233,7 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
     // Registered unconditionally; per-Workflow useOtelInstrumentation flag drives suppression
     // at the bridge layer via the SUPPRESS_OTEL_BRIDGE marker.
     const sinks: InjectedSinks<AgentTracingSinks> = {
-      [AGENT_TRACING_SINK_NAME]: makeAgentTracingSink(),
+      [AGENT_TRACING_SINK_NAME]: makeAgentTracingSink(this.tracingApiKey),
     };
     return {
       ...options,

@@ -3,27 +3,22 @@ package googleadk_test
 // End-to-end integration tests that need a real Temporal server: the streaming
 // side channel (workflowstreams publishes chunks via a signal to the parent
 // workflow, which a unit-test mock client cannot service) and history replay.
-// They boot a local dev server via testsuite.StartDevServer, downloading the CLI
-// on first use, and FAIL when it cannot be started (no binary, no network), so a
-// run that never exercised them cannot pass. The default unit suite already
+// They share a local dev server, downloading the CLI on first use, and FAIL
+// when it cannot be started (no binary, no network), so a run that never
+// exercised them cannot pass. The default unit suite already
 // covers the durable agent loop, aggregation, determinism providers, and failure
 // classification without a server.
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"io"
-	"sync"
 	"testing"
-	"time"
 
+	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/contrib/workflowstreams"
-	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
@@ -32,69 +27,12 @@ import (
 	"go.temporal.io/googleadk"
 )
 
-const integrationTaskQueue = "google-adk-integration"
-
-// devServerState remembers the first StartDevServer outcome. The first start
-// also downloads the CLI, which can take over 30s on slow runners and is not
-// cached when it fails, so it gets a longer deadline and one retry; if both
-// fail, every dev-server test fails fast instead of re-downloading.
-var devServerState struct {
-	sync.Mutex
-	attempted bool
-	err       error
-}
-
-// devServer starts a local Temporal dev server and fails the test if one cannot
-// be started (no binary, no network).
-func devServer(t *testing.T) (client.Client, func()) {
-	t.Helper()
-	devServerState.Lock()
-	defer devServerState.Unlock()
-	if devServerState.err != nil {
-		t.Fatalf("dev server unavailable, see the first dev-server test failure: %v", devServerState.err)
-	}
-	attempts, timeout := 1, 30*time.Second
-	if !devServerState.attempted {
-		attempts, timeout = 2, 90*time.Second
-	}
-	// Redirect the dev-server process's stdio to io.Discard rather than letting it
-	// inherit the test binary's os.Stdout/os.Stderr (testsuite's default on every
-	// platform). On Windows, DevServer.Stop() shuts the server down with a console
-	// CTRL_BREAK event, which fails when the test process has no attached console
-	// (as under `go test` in CI) — Stop() then returns early without killing the
-	// process. A lingering server that inherited our stdio would hold the pipe
-	// `go test` reads, tripping its "test I/O incomplete after exiting" WaitDelay
-	// check and failing the package even though every test passed. Detaching its
-	// stdio makes that harmless (and the CI runner reaps the orphan on job exit).
-	opts := testsuite.DevServerOptions{Stdout: io.Discard, Stderr: io.Discard}
-	var srv *testsuite.DevServer
-	var err error
-	for attempt := 1; attempt <= attempts; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		var startErr error
-		srv, startErr = testsuite.StartDevServer(ctx, opts)
-		cancel()
-		if startErr == nil {
-			err = nil
-			break
-		}
-		err = errors.Join(err, fmt.Errorf("attempt %d: %w", attempt, startErr))
-	}
-	if !devServerState.attempted {
-		devServerState.attempted, devServerState.err = true, err
-	}
-	if err != nil {
-		t.Fatalf("dev server unavailable (first use downloads the Temporal CLI, which needs network): %v", err)
-	}
-	return srv.Client(), func() { _ = srv.Stop() }
-}
-
 // startWorker boots a real worker for the test workflows with the plugin
 // Activities wired from cfg, plus the guarded-trio activities the
 // multi-decision HITL workflow dispatches.
-func startWorker(t *testing.T, c client.Client, cfg googleadk.Config) worker.Worker {
+func startWorker(t *testing.T, c client.Client, taskQueue string, cfg googleadk.Config) worker.Worker {
 	t.Helper()
-	w := worker.New(c, integrationTaskQueue, worker.Options{})
+	w := worker.New(c, taskQueue, worker.Options{})
 	w.RegisterWorkflow(agentRunWorkflow)
 	w.RegisterWorkflow(multiConfirmHitlWorkflow)
 	registerGuardedTrio(w)
@@ -102,6 +40,7 @@ func startWorker(t *testing.T, c client.Client, cfg googleadk.Config) worker.Wor
 	require.NoError(t, err)
 	acts.Register(w)
 	require.NoError(t, w.Start())
+	t.Cleanup(w.Stop)
 	return w
 }
 
@@ -111,27 +50,24 @@ func startWorker(t *testing.T, c client.Client, cfg googleadk.Config) worker.Wor
 // query, which works even after completion), while the aggregated final response
 // is returned into the workflow so the agent loop stays deterministic.
 func TestStreamingIntegration(t *testing.T) {
-	c, stop := devServer(t)
-	defer stop()
+	c := testClient(t)
+	taskQueue := testTaskQueue(t)
 
 	cm := &chunkedModel{name: "stream-model", chunks: []string{"Hello", ", ", "world"}}
-	w := startWorker(t, c, googleadk.Config{
+	startWorker(t, c, taskQueue, googleadk.Config{
 		Models: map[string]googleadk.ModelFactory{
 			"stream-model": func(context.Context, string) (model.LLM, error) { return cm, nil },
 		},
 	})
-	defer w.Stop()
-
 	ctx := context.Background()
-	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:        "adk-streaming-" + time.Now().Format("150405.000"),
-		TaskQueue: integrationTaskQueue,
+	run := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
+		ID:        taskQueue + "-streaming",
+		TaskQueue: taskQueue,
 	}, agentRunWorkflow, runInput{
 		ModelName:      "stream-model",
 		UserMessage:    "greet",
 		StreamingTopic: "run-stream",
 	})
-	require.NoError(t, err)
 
 	var res runResult
 	require.NoError(t, run.Get(ctx, &res))
@@ -147,36 +83,43 @@ func TestStreamingIntegration(t *testing.T) {
 	assert.GreaterOrEqual(t, offset, int64(len(cm.chunks)), "every streamed chunk must be published to the topic")
 }
 
-// TestReplaySingleAndMultiAgent runs real single-agent, multi-agent, and
-// multi-decision HITL workflows against the dev server, then replays each
-// recorded history with worker.WorkflowReplayer — the canonical determinism
-// guarantee. A replay failure here is exactly the non-determinism the plugin's
-// NewContext (time/uuid/task providers) exists to prevent.
+// TestReplaySingleAndMultiAgent runs real single-agent, multi-agent, remote
+// A2A sub-agent (plain and streamed), and multi-decision HITL workflows against
+// the dev server, then replays each recorded history with
+// worker.WorkflowReplayer — the canonical determinism guarantee. A replay
+// failure here is exactly the non-determinism the plugin's NewContext
+// (time/uuid/task providers) exists to prevent. The replay must also send no
+// A2A request: the remote agent's card and messages come from History.
 func TestReplaySingleAndMultiAgent(t *testing.T) {
-	c, stop := devServer(t)
-	defer stop()
+	c := testClient(t)
+	taskQueue := testTaskQueue(t)
+
+	a2aURL, a2aRequests := startA2AServer(t, a2aServer{
+		Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil),
+	})
 
 	models := map[string]googleadk.ModelFactory{
 		"root-model": scriptedModelFactory(
 			googleadk.FunctionCallResponse("c1", "transfer_to_agent", map[string]any{"agent_name": "specialist"}),
 			googleadk.TextResponse("(root fallback)"),
 		),
-		"specialist-model": scriptedModelFactory(googleadk.TextResponse("specialist answer")),
-		"solo-model":       scriptedModelFactory(googleadk.TextResponse("hello from solo")),
+		"specialist-model":         scriptedModelFactory(googleadk.TextResponse("specialist answer")),
+		"solo-model":               scriptedModelFactory(googleadk.TextResponse("hello from solo")),
+		"remote-root-model":        transferToRemoteModel(),
+		"remote-stream-root-model": transferToRemoteModel(),
 	}
 	for name, factory := range multiConfirmModels() {
 		models[name] = factory
 	}
-	w := startWorker(t, c, googleadk.Config{Models: models})
-	defer w.Stop()
+	startWorker(t, c, taskQueue, googleadk.Config{Models: models})
 
 	ctx := context.Background()
 	inputs := map[string]runInput{
-		"adk-replay-solo-" + time.Now().Format("150405.000"): {
+		taskQueue + "-solo": {
 			ModelName:   "solo-model",
 			UserMessage: "hi",
 		},
-		"adk-replay-multi-" + time.Now().Format("150405.000"): {
+		taskQueue + "-multi": {
 			ModelName:   "root-model",
 			UserMessage: "handle this",
 			SubAgents: []subAgentSpec{{
@@ -185,17 +128,35 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 				ModelName:   "specialist-model",
 			}},
 		},
+		taskQueue + "-remote": {
+			ModelName:   "remote-root-model",
+			UserMessage: "ask the remote agent",
+			SubAgents:   []subAgentSpec{remoteSubAgent(a2aURL)},
+		},
+		taskQueue + "-remote-stream": {
+			ModelName:   "remote-stream-root-model",
+			UserMessage: "ask the remote agent",
+			SubAgents:   []subAgentSpec{remoteSubAgent(a2aURL)},
+			SSE:         true,
+		},
 	}
 
 	type execution struct{ id, runID string }
 	var executions []execution
+	runs := map[string]client.WorkflowRun{}
 	for id, in := range inputs {
-		run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: id, TaskQueue: integrationTaskQueue}, agentRunWorkflow, in)
-		require.NoError(t, err)
+		runs[id] = startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{ID: id, TaskQueue: taskQueue}, agentRunWorkflow, in)
+	}
+	for id, run := range runs {
 		var res runResult
 		require.NoError(t, run.Get(ctx, &res))
+		if len(inputs[id].SubAgents) == 1 && inputs[id].SubAgents[0].RemoteCardURL != "" {
+			require.Contains(t, res.Texts, "remote answer")
+		}
 		executions = append(executions, execution{run.GetID(), run.GetRunID()})
 	}
+	liveA2ARequests := a2aRequests.Load()
+	require.Positive(t, liveA2ARequests, "the live run must reach the A2A server")
 
 	// The multi-decision confirmation resume: one turn pauses on three guarded
 	// ActivityAsTool tools and a single batched ConfirmationResponse — with the
@@ -208,11 +169,10 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 	// replaying cleanly below. It drives its own two-pass workflow rather than
 	// agentRunWorkflow, so it is started directly and appended to the same
 	// replay set.
-	mcRun, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:        "adk-replay-multiconfirm-" + time.Now().Format("150405.000"),
-		TaskQueue: integrationTaskQueue,
+	mcRun := startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
+		ID:        taskQueue + "-multiconfirm",
+		TaskQueue: taskQueue,
 	}, multiConfirmHitlWorkflow)
-	require.NoError(t, err)
 	var mcRes multiConfirmResult
 	require.NoError(t, mcRun.Get(ctx, &mcRes))
 	require.Equal(t, 3, mcRes.PendingCount, "all three guarded tools must pause before the batched resume")
@@ -230,4 +190,5 @@ func TestReplaySingleAndMultiAgent(t *testing.T) {
 		})
 		require.NoError(t, err, "recorded history for %s must replay deterministically", e.id)
 	}
+	assert.Equal(t, liveA2ARequests, a2aRequests.Load(), "replay must not send A2A requests again")
 }

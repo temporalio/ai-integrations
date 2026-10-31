@@ -1,4 +1,5 @@
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
@@ -7,6 +8,7 @@ from typing import Any, cast
 from google.adk.models import BaseLlm, LLMRegistry
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
+from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, TypeAdapter
 
@@ -17,30 +19,113 @@ from temporalio.exceptions import ApplicationError
 from temporalio.workflow import ActivityConfig
 
 
+def _is_retryable_status(status: int) -> bool:
+    """The statuses the TypeScript and Java ADK plugins also retry."""
+    return status in (408, 409, 429) or status >= 500
+
+
+@contextmanager
+def _classify_model_errors() -> Generator[None, None, None]:
+    """Raise a model's HTTP error as an ``ApplicationError`` Temporal can act on.
+
+    Gemini models raise ``google.genai.errors.APIError`` with the status in
+    ``code``; other providers' SDKs carry it in ``status_code``. A permanent
+    status is non-retryable, so the workflow fails instead of re-sending a
+    request that cannot succeed. Errors without an HTTP status (connection
+    failures, timeouts) are re-raised unchanged and stay retryable.
+    """
+    try:
+        yield
+    except Exception as err:
+        status = (
+            err.code
+            if isinstance(err, genai_errors.APIError)
+            else getattr(err, "status_code", None)
+        )
+        if isinstance(status, bool) or not isinstance(status, int) or status < 400:
+            raise
+        raise ApplicationError(
+            str(err),
+            type=type(err).__name__,
+            non_retryable=not _is_retryable_status(status),
+        ) from err
+
+
+def _new_llm(llm_request: LlmRequest, model_name: str | None) -> BaseLlm:
+    """Build the Worker model for the agent's ``TemporalModel`` name.
+
+    The request keeps its own model name, which a ``before_model_callback``
+    may have changed; the model sends it, as it does outside Temporal.
+    ``model_name`` is ``None`` for an Activity scheduled before
+    ``TemporalModel`` sent its name, which then uses the request's model name.
+    A name the Worker cannot build fails the Activity without retries, since
+    retrying would not build it.
+    """
+    name = model_name if model_name is not None else llm_request.model
+    if name is None:
+        raise ApplicationError(
+            "No model name provided, could not create LLM.", non_retryable=True
+        )
+    try:
+        return LLMRegistry.new_llm(name)
+    except Exception as err:
+        raise ApplicationError(
+            f"Failed to create LLM for model {name!r}: {err}",
+            type=type(err).__name__,
+            non_retryable=True,
+        ) from err
+
+
+class TemporalLlmRequest(LlmRequest):
+    """An ``LlmRequest`` that also carries the ``TemporalModel``'s name.
+
+    ``LlmRequest`` ignores unknown keys, so a Worker running an earlier plugin
+    decodes this payload as a plain request, and a request scheduled by an
+    earlier plugin decodes here with ``temporal_model_name`` set to ``None``.
+    """
+
+    temporal_model_name: str | None = None
+
+    @classmethod
+    def wrap(cls, llm_request: LlmRequest, model_name: str) -> "TemporalLlmRequest":
+        """Return ``llm_request`` with ``model_name`` added."""
+        return cls.model_construct(
+            _fields_set=llm_request.model_fields_set | {"temporal_model_name"},
+            temporal_model_name=model_name,
+            **{name: getattr(llm_request, name) for name in LlmRequest.model_fields},
+        )
+
+    def unwrap(self) -> LlmRequest:
+        """Return the plain ``LlmRequest`` the model receives."""
+        return LlmRequest.model_construct(
+            _fields_set=self.model_fields_set - {"temporal_model_name"},
+            **{name: getattr(self, name) for name in LlmRequest.model_fields},
+        )
+
+
 @activity.defn
-async def invoke_model(llm_request: LlmRequest) -> list[LlmResponse]:
+async def invoke_model(llm_request: TemporalLlmRequest) -> list[LlmResponse]:
     """Activity that invokes an LLM model.
 
     Args:
-        llm_request: The LLM request containing model name and parameters.
+        llm_request: The LLM request, with the ``TemporalModel``'s name, which
+            selects the Worker model.
 
     Returns:
         List of LLM responses from the model.
 
     Raises:
-        ValueError: If model name is not provided or LLM creation fails.
+        ApplicationError: Non-retryable, if no model name is provided or the
+            model cannot be built.
     """
-    if llm_request.model is None:
-        raise ValueError(f"No model name provided, could not create LLM.")
+    request = llm_request.unwrap()
+    llm = _new_llm(request, llm_request.temporal_model_name)
 
-    llm = LLMRegistry.new_llm(llm_request.model)
-    if not llm:
-        raise ValueError(f"Failed to create LLM for model: {llm_request.model}")
-
-    return [
-        response
-        async for response in llm.generate_content_async(llm_request=llm_request)
-    ]
+    with _classify_model_errors():
+        return [
+            response
+            async for response in llm.generate_content_async(llm_request=request)
+        ]
 
 
 @dataclass
@@ -50,6 +135,7 @@ class StreamingInvokeInput:
     llm_request: LlmRequest
     streaming_topic: str
     streaming_batch_interval: timedelta
+    model_name: str | None = None
 
 
 @activity.defn
@@ -71,12 +157,7 @@ async def invoke_model_streaming(
     can observe responses as they arrive.
     """
     llm_request = input.llm_request
-    if llm_request.model is None:
-        raise ValueError("No model name provided, could not create LLM.")
-
-    llm = LLMRegistry.new_llm(llm_request.model)
-    if not llm:
-        raise ValueError(f"Failed to create LLM for model: {llm_request.model}")
+    llm = _new_llm(llm_request, input.model_name)
 
     responses: list[LlmResponse] = []
 
@@ -84,13 +165,14 @@ async def invoke_model_streaming(
         batch_interval=input.streaming_batch_interval,
     )
     events = stream.topic(input.streaming_topic, type=LlmResponse)
-    async with stream:
-        async for response in llm.generate_content_async(
-            llm_request=llm_request, stream=True
-        ):
-            activity.heartbeat()
-            responses.append(response)
-            events.publish(response)
+    with _classify_model_errors():
+        async with stream:
+            async for response in llm.generate_content_async(
+                llm_request=llm_request, stream=True
+            ):
+                activity.heartbeat()
+                responses.append(response)
+                events.publish(response)
 
     return responses
 
@@ -147,7 +229,13 @@ class TemporalModel(BaseLlm):
         flag is needed.
 
         Args:
-            model_name: The name of the model to use.
+            model_name: The name of the model to use. The Worker builds the
+                model registered for this name. A ``before_model_callback``
+                that changes ``llm_request.model`` does not pick another
+                model: this model receives the changed name, as it does
+                outside Temporal. The request carries this name as is, so a
+                registry name with a class prefix, such as
+                ``gemini:gemini-2.5-flash``, reaches the model with the prefix.
             activity_config: Configuration options for the activity execution.
             summary_fn: Optional callable that receives the LlmRequest and
                 returns a summary string (or None) for the activity. Must be
@@ -234,13 +322,14 @@ class TemporalModel(BaseLlm):
                     llm_request=llm_request,
                     streaming_topic=self._streaming_topic,
                     streaming_batch_interval=self._streaming_batch_interval,
+                    model_name=self._model_name,
                 ),
                 **config,
             )
         else:
             responses = await workflow.execute_activity(
                 invoke_model,
-                args=[llm_request],
+                TemporalLlmRequest.wrap(llm_request, self._model_name),
                 **config,
             )
         for response in responses:

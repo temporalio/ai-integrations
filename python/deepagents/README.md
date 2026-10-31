@@ -165,6 +165,15 @@ process-local; calling it only inside a workflow does not register the tool in
 another process. With `activity_as_tool(...)`, register the underlying Temporal
 activity on every worker polling its task queue.
 
+A wrapped tool gets LangChain messages in its arguments as message objects, as
+it does without Temporal. For example, `state["messages"]` from `InjectedState`
+holds `HumanMessage` and `AIMessage` objects, not dicts. This covers the message
+classes in `langchain_core.messages` and their chunks; a subclass you define
+still arrives as a dict. Values inside a message, such as a `ToolMessage`
+artifact, keep their JSON form, so a `Document` artifact arrives as a dict.
+Update activity workers before or together with workflow workers: an older
+activity worker still passes the messages to the tool as dicts.
+
 ## Durable file and shell backends
 
 Use `TemporalBackend("name", ...)` for a real-I/O backend
