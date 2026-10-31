@@ -36,6 +36,7 @@ import {
   MCP_RESOURCES_UNSUPPORTED_FAILURE_TYPE,
   MCP_TOOL_NOT_FOUND_FAILURE_TYPE,
   MODEL_ERROR_FAILURE_TYPE,
+  STREAM_ERROR_FAILURE_TYPE,
 } from './error-types';
 import { withSources } from './activity-sources';
 import type { InvokeModelArgs, InvokeModelStreamingArgs, ModelActivities, WireLlmRequest } from './model';
@@ -475,27 +476,35 @@ export function toApplicationFailure(err: unknown, baseType: string = MODEL_ERRO
   });
 }
 
-/** The gRPC status code `INVALID_ARGUMENT`. */
+/** The gRPC status codes `INVALID_ARGUMENT` and `RESOURCE_EXHAUSTED`. */
 const GRPC_INVALID_ARGUMENT = 3;
+const GRPC_RESOURCE_EXHAUSTED = 8;
 
 /**
  * The failure for a streamed model call that succeeded while a batch of its
  * stream was not published (`err` is what the stream client's dispose threw).
  * A retry calls the model again, so it is non-retryable when that retry would
  * fail the same way: the server refused the batch as invalid (gRPC
- * `INVALID_ARGUMENT`, as for a batch over its payload size limit), or the
- * background flusher already retried the batch for its `maxRetryDuration` and
- * dropped it (`FlushTimeoutError`). Anything else, such as a send during a
- * server outage, stays retryable.
+ * `INVALID_ARGUMENT`, as for a batch over its payload size limit or past the
+ * run's Signal limit), the batch is over the server's gRPC message limit
+ * (`RESOURCE_EXHAUSTED` "larger than max"; rate limiting uses the same code
+ * with other messages), or the background flusher already retried the batch
+ * for its `maxRetryDuration` and dropped it (`FlushTimeoutError`). Anything
+ * else, such as a send during a server outage, stays retryable.
  */
 function streamPublishFailure(err: unknown, args: InvokeModelStreamingArgs): ApplicationFailure {
   const chain = [...causeChain(err)];
+  const refused = chain.some(
+    (e) =>
+      e.code === GRPC_INVALID_ARGUMENT ||
+      (e.code === GRPC_RESOURCE_EXHAUSTED && /larger than max/.test(String(e.message)))
+  );
   return ApplicationFailure.create({
     message:
       `Could not publish the stream of model '${args.model}' to topic '${args.streamingTopic}': ` +
       chain.map((e) => e.message).join(': '),
-    type: MODEL_ERROR_FAILURE_TYPE,
-    nonRetryable: err instanceof FlushTimeoutError || chain.some((e) => e.code === GRPC_INVALID_ARGUMENT),
+    type: STREAM_ERROR_FAILURE_TYPE,
+    nonRetryable: err instanceof FlushTimeoutError || refused,
     cause: err instanceof Error ? err : undefined,
   });
 }

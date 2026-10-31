@@ -626,6 +626,27 @@ for await (const response of model.generateContentAsync(llmRequest, true)) {
 }
 ```
 
+If a batch of chunks cannot be published, the model call fails with
+`STREAM_ERROR_FAILURE_TYPE` (`GoogleAdkStreamError`, exported from
+`@temporalio/google-adk/workflow`) instead of returning as if every chunk was
+delivered. It is non-retryable when a retry would call the model again and fail
+the same way:
+
+- **A batch over the server's size limits**: 2 MiB per payload and 4 MiB per
+  gRPC message by default. Configure external storage on the Worker and the
+  subscriber's Client so large batches are stored, or keep responses smaller.
+- **A run past its Signal limit.** Each batch is one Signal, and a run accepts
+  10,000 Signals by default, counting the Workflow's other Signals. With the
+  default `streamingBatchInterval` of 100 milliseconds, a run can reach it after
+  about 17 minutes of streaming in total. A long-running streaming Workflow, such as a
+  chat session, should continue-as-new well before that, or use a longer
+  `streamingBatchInterval`.
+- **A batch Workflow Streams gave up on** after retrying it for its
+  `maxRetryDuration`.
+
+Other failures, such as a server outage, are retried; the retry calls the model
+again and publishes its stream again.
+
 ### Testing
 
 Import test doubles from the `./testing` entry point to unit-test agents

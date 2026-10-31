@@ -77,44 +77,55 @@ test.serial('publishesChunksToStreamTopic', async (t) => {
   });
 });
 
-// E2E: the chunks arrive back to back, so they share one publish batch of about
-// 2.4 MB, over the dev server's 2 MiB payload limit, while the Activity result
-// (about 1.8 MB) fits. The server refuses the batch, so the Workflow must fail
-// with a non-retryable model error, not complete while subscribers get nothing,
-// and the model must not be called again.
+// E2E: the chunks arrive back to back, so they share one publish batch. With
+// 300,000-character chunks the batch (about 2.4 MB) is over the dev server's 2 MiB
+// payload limit; with 600,000-character chunks (about 4.8 MB) it is over the 4 MiB
+// gRPC message limit. The server refuses the batch, so the Workflow must fail with a
+// non-retryable stream error, not complete while subscribers get nothing, and the
+// model must not be called again.
 test.serial('refusedStreamPublishFailsTheModelCall', async (t) => {
   const env = getEnv();
-  const taskQueue = uid('adk-stream-refused');
-  const third = 'x'.repeat(300_000);
-  const responses: LlmResponse[] = [
-    { content: { role: 'model', parts: [{ text: third }] }, partial: true },
-    { content: { role: 'model', parts: [{ text: third }] }, partial: true },
-    { content: { role: 'model', parts: [{ text: third }] }, partial: true },
-    { content: { role: 'model', parts: [{ text: third.repeat(3) }] }, turnComplete: true },
-  ];
-  const provider = fakeModelProvider(responses);
-  let modelCalls = 0;
-  const plugin = new GoogleAdkPlugin({
-    modelProvider: (model) => {
-      modelCalls++;
-      return provider(model);
-    },
-  });
-  await withWorker(env, { taskQueue, plugins: [plugin] }, async () => {
-    let caught: unknown;
-    try {
-      await env.client.workflow.execute(streamingModelCall, { taskQueue, workflowId: uid('wf-stream-refused') });
-    } catch (err) {
-      caught = err;
-    }
-    const appFailure = findInCauseChain(caught, ApplicationFailure);
-    t.not(appFailure, undefined);
-    t.is(appFailure?.type, 'GoogleAdkModelError');
-    t.is(appFailure?.nonRetryable, true);
-    t.regex(appFailure?.message ?? '', /'fake-model'.*'adk-test-stream'.*Blob data size exceeds limit/);
-    t.not(appFailure?.cause, undefined);
-    t.is(modelCalls, 1);
-  });
+  for (const [size, refusal] of [
+    [300_000, /Blob data size exceeds limit/],
+    [600_000, /larger than max/],
+  ] as const) {
+    const taskQueue = uid('adk-stream-refused');
+    const third = 'x'.repeat(size);
+    const responses: LlmResponse[] = [
+      { content: { role: 'model', parts: [{ text: third }] }, partial: true },
+      { content: { role: 'model', parts: [{ text: third }] }, partial: true },
+      { content: { role: 'model', parts: [{ text: third }] }, partial: true },
+      { content: { role: 'model', parts: [{ text: third.repeat(3) }] }, turnComplete: true },
+    ];
+    const provider = fakeModelProvider(responses);
+    let modelCalls = 0;
+    const plugin = new GoogleAdkPlugin({
+      modelProvider: (model) => {
+        modelCalls++;
+        return provider(model);
+      },
+    });
+    await withWorker(env, { taskQueue, plugins: [plugin] }, async () => {
+      let caught: unknown;
+      try {
+        await env.client.workflow.execute(streamingModelCall, {
+          taskQueue,
+          workflowId: uid('wf-stream-refused'),
+          workflowExecutionTimeout: '1 minute',
+        });
+      } catch (err) {
+        caught = err;
+      }
+      const appFailure = findInCauseChain(caught, ApplicationFailure);
+      t.not(appFailure, undefined, `chunk ${size}`);
+      t.is(appFailure?.type, 'GoogleAdkStreamError');
+      t.is(appFailure?.nonRetryable, true);
+      t.regex(appFailure?.message ?? '', /'fake-model'.*'adk-test-stream'/);
+      t.regex(appFailure?.message ?? '', refusal);
+      t.not(appFailure?.cause, undefined);
+      t.is(modelCalls, 1);
+    });
+  }
 });
 
 /** A model that yields one chunk, then raises a retryable (HTTP 503) error. */

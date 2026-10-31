@@ -47,11 +47,19 @@ export const MCP_TOOL_NOT_FOUND_FAILURE_TYPE = 'GoogleAdkMCPToolNotFound';
  * `GoogleAdkModelError.429`, so match with `startsWith`, not `===`; such a failure is
  * retryable for 408, 409, 429 and 5xx and non-retryable otherwise. One carrying no
  * status is the bare type and retryable. An `x-should-retry` response header overrides
- * either verdict. A streamed call whose stream could not be published also has the bare
- * type, and is non-retryable when the server refused the batch or Workflow Streams gave
- * up on it.
+ * either verdict.
  */
 export const MODEL_ERROR_FAILURE_TYPE = 'GoogleAdkModelError';
+
+/**
+ * Error type for a streamed model call whose responses could not all be published to
+ * its `streamingTopic`. Raised inside the model Activity, so it arrives wrapped in an
+ * `ActivityFailure`. It is non-retryable when a retry would call the model again and
+ * fail the same way: the server refused a batch (over its payload or gRPC message size
+ * limit, or past the run's Signal limit), or Workflow Streams gave up on it after its
+ * `maxRetryDuration`. Other failures, such as a send during a server outage, are retried.
+ */
+export const STREAM_ERROR_FAILURE_TYPE = 'GoogleAdkStreamError';
 
 /**
  * Error type for a failed MCP `listTools` or `callTool` call. Raised inside an
