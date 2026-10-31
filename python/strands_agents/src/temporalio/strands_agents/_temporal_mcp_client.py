@@ -11,6 +11,7 @@ from mcp.types import PaginatedRequestParams, Tool
 from strands.tools import ToolProvider
 from strands.tools.mcp import MCPAgentTool, MCPClient
 from strands.tools.mcp.mcp_types import MCPToolResult
+from strands.types.exceptions import MCPClientInitializationError
 from strands.types.tools import AgentTool
 
 from temporalio import activity, workflow
@@ -197,6 +198,11 @@ _CONNECTIONS: dict[str, _ConnectionRecord] = {}
 # (which holds tasks only weakly) cannot drop one part way through.
 _CLOSING: set[asyncio.Task[None]] = set()
 
+# Server name -> records whose owner task has not finished, cached or not. A
+# record leaves _CONNECTIONS before its owner closes the transport (startup
+# timeout, cancelled eviction), so Worker shutdown waits on these instead.
+_OPEN_RECORDS: dict[str, set[_ConnectionRecord]] = {}
+
 
 class _ConnectionRecord:
     """A single MCP session held open by a dedicated owner task.
@@ -221,14 +227,26 @@ class _ConnectionRecord:
         self._ready: asyncio.Future[tuple[MCPClient, ClientSession]] = (
             loop.create_future()
         )
+        # Every caller may have been cancelled before the connect fails; mark
+        # the failure retrieved so asyncio does not log it as unhandled.
+        self._ready.add_done_callback(
+            lambda ready: ready.cancelled() or ready.exception()
+        )
         self._idle_handle: asyncio.TimerHandle | None = None
         self._idle_task: asyncio.Task[None] | None = None
         self._inflight = 0
         self._broken = False
         self._owner = asyncio.create_task(self._run(client_factory))
+        _OPEN_RECORDS.setdefault(server, set()).add(self)
+        self._owner.add_done_callback(lambda _: self._forget())
 
     async def _run(self, client_factory: Callable[[], MCPClient]) -> None:
         client = client_factory()
+        # Apply the client's startup_timeout to opening the transport and
+        # initialize(), as MCPClient.start() does natively.
+        deadline = asyncio.get_running_loop().call_later(
+            client._startup_timeout, self._on_startup_timeout, client._startup_timeout
+        )
         try:
             async with client._transport_callable() as (read_stream, write_stream, *_):
                 async with ClientSession(
@@ -237,18 +255,44 @@ class _ConnectionRecord:
                     elicitation_callback=client._elicitation_callback,
                 ) as session:
                     await session.initialize()
+                    deadline.cancel()
                     self._ready.set_result((client, session))
                     await self._stop.wait()
         except BaseException as err:
+            deadline.cancel()
             # A failed connect should not be cached; drop it so the next call
             # retries instead of awaiting a permanently rejected future.
             if not self._ready.done():
                 self._ready.set_exception(err)
             # Only unpublish this record; a replacement may already be cached
             # under the same server name.
-            if _CONNECTIONS.get(self._server) is self:
-                del _CONNECTIONS[self._server]
+            self._uncache()
             raise
+
+    def _on_startup_timeout(self, startup_timeout: float) -> None:
+        # _run cancels this timer once initialize() returns or the owner
+        # fails, so initialization is unfinished here.
+        if not self._ready.done():
+            # Fail waiting callers now; closing the transport can take longer.
+            failure = MCPClientInitializationError(
+                "MCP server initialization did not finish within "
+                f"startup_timeout ({startup_timeout} seconds)"
+            )
+            failure.__cause__ = TimeoutError()
+            self._ready.set_exception(failure)
+        self._uncache()
+        self._owner.cancel()
+
+    def _forget(self) -> None:
+        records = _OPEN_RECORDS.get(self._server)
+        if records is not None:
+            records.discard(self)
+            if not records:
+                del _OPEN_RECORDS[self._server]
+
+    def _uncache(self) -> None:
+        if _CONNECTIONS.get(self._server) is self:
+            del _CONNECTIONS[self._server]
 
     def acquire(self) -> None:
         """Mark a call in flight; pause idle eviction while calls are active."""
@@ -301,8 +345,9 @@ class _ConnectionRecord:
     async def _maybe_evict(self) -> None:
         # A call may have acquired the connection between the timer firing and
         # this task running; only evict if it is still idle. It must also still
-        # be the cached record: a failed call may have unpublished it and a
-        # replacement taken its place, which is not ours to close.
+        # be the cached record: a record that has left the cache (startup
+        # timeout, failed call, eviction) must not evict the connection that
+        # replaced it.
         if self._inflight == 0 and _CONNECTIONS.get(self._server) is self:
             await _evict_connection(self._server)
 
@@ -319,7 +364,8 @@ class _ConnectionRecord:
 
     async def session(self) -> tuple[MCPClient, ClientSession]:
         """Return the live client and session, or raise the connect failure."""
-        return await self._ready
+        # Callers share _ready; one caller's cancellation must not cancel it.
+        return await asyncio.shield(self._ready)
 
 
 async def get_connection(
@@ -354,6 +400,13 @@ async def drain_closing() -> None:
     """Wait for the broken connections still being closed in the background."""
     while pending := [task for task in _CLOSING if not task.done()]:
         await asyncio.wait(pending)
+
+
+async def close_connections(server: str) -> None:
+    """Close the cached connection and wait for every retiring owner to finish."""
+    await _evict_connection(server)
+    for record in list(_OPEN_RECORDS.get(server, ())):
+        await record.aclose()
 
 
 def build_call_tool_activity(

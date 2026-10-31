@@ -640,6 +640,8 @@ Worker(
 
 Each factory returns a fully configured `MCPClient`, so you can pass options like `tool_filters`, `prefix`, `elicitation_callback`, or `tasks_config` to it.
 
+The plugin applies the client's `startup_timeout` (30 seconds unless you set it) to opening the connection and its `initialize` request, as Strands does. When a server takes longer, the `{name}-list-tools` activity fails with `MCPClientInitializationError` and its retry policy applies, and a `{name}-call-tool` activity returns the error as a tool error, as it does for other connection failures. Earlier versions waited with no limit; if a server needs more time, raise `startup_timeout` on its `MCPClient`.
+
 By default, `TemporalMCPClient` re-lists the server's tools (via `{name}-list-tools`) on every agent turn, so an MCP server that is restarted mid-workflow — with tools added, removed, or renamed — is picked up. To list the tools just once at the beginning of the workflow and reuse that schema for the workflow's lifetime (one fewer activity per turn), set `cache_tools=True`:
 
 ```python

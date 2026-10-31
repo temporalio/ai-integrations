@@ -20,9 +20,9 @@ from ._model_activity import ModelActivity
 from ._sandbox_activity import SandboxActivities, SandboxFactory
 from ._sync_calls import refuse_sync_calls_in_workflows
 from ._temporal_mcp_client import (
-    _evict_connection,
     build_call_tool_activity,
     build_list_tools_activity,
+    close_connections,
     drain_closing,
 )
 from ._worker_env_ref import AllowAllWorkerEnvVars
@@ -132,9 +132,9 @@ class StrandsPlugin(SimplePlugin):
                 yield
             finally:
                 for server in mcp_clients:
-                    await _evict_connection(server)
-                # Broken connections were already unpublished, so the loop above
-                # misses them; wait for their background close to finish too.
+                    await close_connections(server)
+                # Broken connections are closed by background tasks; wait for
+                # those tasks to finish too.
                 await drain_closing()
 
         super().__init__(

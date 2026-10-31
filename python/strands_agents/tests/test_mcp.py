@@ -1,14 +1,20 @@
 import asyncio
 import sys
+import time
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from mcp import StdioServerParameters, stdio_client
 from strands.tools.mcp.mcp_client import MCPClient
+from strands.types.exceptions import MCPClientInitializationError
 
 from temporalio import workflow
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowFailureError
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.strands_agents import (
     StrandsPlugin,
     TemporalAgent,
@@ -28,6 +34,19 @@ def _echo_client_factory() -> MCPClient:
                 args=[str(Path(__file__).parent / "echo_mcp_server.py")],
             )
         )
+    )
+
+
+def _slow_echo_client_factory(delay: float, startup_timeout: int) -> MCPClient:
+    return MCPClient(
+        lambda: stdio_client(
+            StdioServerParameters(
+                command=sys.executable,
+                args=[str(Path(__file__).parent / "echo_mcp_server.py")],
+                env={"ECHO_SERVER_START_DELAY": str(delay)},
+            )
+        ),
+        startup_timeout=startup_timeout,
     )
 
 
@@ -326,3 +345,183 @@ async def test_mcp_lists_tools_each_turn_when_uncached(client: Client):
         workflows=[MCPNoCacheWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+@workflow.defn
+class MCPSlowStartWorkflow:
+    def __init__(self) -> None:
+        echo = TemporalMCPClient(
+            server="echo_slow",
+            start_to_close_timeout=timedelta(seconds=30),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        self.agent = TemporalAgent(
+            model="mock",
+            start_to_close_timeout=timedelta(seconds=30),
+            tools=[echo],
+        )
+
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await self.agent.invoke_async(prompt)
+        return str(result)
+
+
+async def test_mcp_startup_timeout(client: Client):
+    """A server slower than the client's startup_timeout fails to connect, as natively."""
+    task_queue = f"test_mcp_startup_timeout-{uuid4()}"
+    plugin = StrandsPlugin(
+        models={"mock": lambda: MockModel(["Done!"])},
+        mcp_clients={"echo_slow": lambda: _slow_echo_client_factory(3, 1)},
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[MCPSlowStartWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            MCPSlowStartWorkflow.run,
+            "echo hello",
+            id=f"test_mcp_startup_timeout_{uuid4()}",
+            task_queue=task_queue,
+        )
+        try:
+            await handle.result()
+            raise AssertionError("the run completed")
+        except WorkflowFailureError as err:
+            assert isinstance(err.cause, ActivityError)
+            cause = err.cause.cause
+            assert isinstance(cause, ApplicationError)
+            assert cause.type == "MCPClientInitializationError"
+            assert "startup_timeout (1 seconds)" in cause.message
+
+
+async def _cancel_first_caller(
+    server: str,
+    list_tools: Callable[[], Awaitable[list[_temporal_mcp_client._MCPToolInfo]]],
+) -> _temporal_mcp_client._ConnectionRecord:
+    """Start a list-tools call, cancel it during the handshake, return its record."""
+    first = asyncio.ensure_future(list_tools())
+    while server not in _temporal_mcp_client._CONNECTIONS:
+        await asyncio.sleep(0.01)
+    record = _temporal_mcp_client._CONNECTIONS[server]
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    return record
+
+
+async def test_mcp_startup_deadline_survives_cancelled_caller():
+    """A cancelled caller neither stops the startup deadline nor fails other callers."""
+    connections = _temporal_mcp_client._CONNECTIONS
+
+    # Initialization outlasts the deadline: the next caller gets the deadline's
+    # error, and the owner is cancelled and retired.
+    slow = _temporal_mcp_client.build_list_tools_activity(
+        "echo_cancelled_slow", lambda: _slow_echo_client_factory(5, 1)
+    )
+    record = await _cancel_first_caller("echo_cancelled_slow", slow)
+    with pytest.raises(MCPClientInitializationError) as raised:
+        await slow()
+    assert isinstance(raised.value.__cause__, TimeoutError)
+    assert "echo_cancelled_slow" not in connections
+    await asyncio.wait([record._owner], timeout=10)
+    assert record._owner.done()
+
+    # The only caller is cancelled, so it arms the record's idle timer before
+    # the deadline retires the record. When that timer fires, it must leave the
+    # replacement, which answers at once and is busy with a call, in place.
+    starts = iter([(5, 1)])
+    idle = timedelta(seconds=3)
+
+    def first_slow_factory() -> MCPClient:
+        return _slow_echo_client_factory(*next(starts, (0, 30)))
+
+    first_slow = _temporal_mcp_client.build_list_tools_activity(
+        "echo_cancelled_idle", first_slow_factory, idle
+    )
+    record = await _cancel_first_caller("echo_cancelled_idle", first_slow)
+    assert record._idle_handle is not None
+    while connections.get("echo_cancelled_idle") is record:
+        await asyncio.sleep(0.01)
+    _, _, replacement = await _temporal_mcp_client.get_connection(
+        "echo_cancelled_idle", first_slow_factory, idle
+    )
+    try:
+        while record._idle_task is None:
+            await asyncio.sleep(0.01)
+        await record._idle_task
+        assert connections["echo_cancelled_idle"] is replacement
+        assert not replacement._owner.done()
+        assert [tool.name for tool in await first_slow()] == ["echo"]
+    finally:
+        replacement.release()
+        await _temporal_mcp_client._evict_connection("echo_cancelled_idle")
+
+    # Initialization finishes: the cancelled caller does not discard the
+    # connection, which serves the next callers.
+    fast = _temporal_mcp_client.build_list_tools_activity(
+        "echo_cancelled_fast", _echo_client_factory
+    )
+    record = await _cancel_first_caller("echo_cancelled_fast", fast)
+    try:
+        assert [tool.name for tool in await fast()] == ["echo"]
+        assert [tool.name for tool in await fast()] == ["echo"]
+        assert connections["echo_cancelled_fast"] is record
+    finally:
+        await _temporal_mcp_client._evict_connection("echo_cancelled_fast")
+
+
+@pytest.mark.parametrize("after_deadline", [False, True])
+async def test_mcp_worker_shutdown_during_slow_startup(
+    client: Client, after_deadline: bool
+):
+    """Worker shutdown waits for the startup deadline, not the server's late reply.
+
+    After the deadline, the timed-out record has left the cache but its owner
+    is still closing the transport; shutdown must still wait for it.
+    """
+    task_queue = f"test_mcp_worker_shutdown_during_slow_startup-{uuid4()}"
+    plugin = StrandsPlugin(
+        models={"mock": lambda: MockModel(["Done!"])},
+        mcp_clients={"echo_slow": lambda: _slow_echo_client_factory(15, 2)},
+    )
+
+    worker = Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[MCPSlowStartWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    )
+    # worker.run() returns only after the plugin's cleanup has closed its MCP
+    # connections; `async with Worker` would cancel that cleanup instead.
+    run = asyncio.ensure_future(worker.run())
+    handle = await client.start_workflow(
+        MCPSlowStartWorkflow.run,
+        "echo hello",
+        id=f"test_mcp_worker_shutdown_during_slow_startup_{uuid4()}",
+        task_queue=task_queue,
+    )
+    while "echo_slow" not in _temporal_mcp_client._CONNECTIONS:
+        await asyncio.sleep(0.01)
+    record = _temporal_mcp_client._CONNECTIONS["echo_slow"]
+    if after_deadline:
+        while _temporal_mcp_client._CONNECTIONS.get("echo_slow") is record:
+            await asyncio.sleep(0.01)
+        # Cancelling stdio_client waits for the sleeping server to exit.
+        assert not record._owner.done()
+    started = time.monotonic()
+    await worker.shutdown()
+    # Shutdown cancels the waiting list-tools activity; the cleanup then waits
+    # for the owner, which the 2-second deadline cancels, not for the server's
+    # reply after 15 seconds.
+    await asyncio.wait_for(run, timeout=12)
+    assert time.monotonic() - started < 10
+    assert record._owner.done()
+    assert "echo_slow" not in _temporal_mcp_client._CONNECTIONS
+    assert "echo_slow" not in _temporal_mcp_client._OPEN_RECORDS
+    await handle.terminate()
