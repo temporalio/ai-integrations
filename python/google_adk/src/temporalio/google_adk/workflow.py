@@ -279,7 +279,7 @@ def _is_method(fn: Callable) -> bool:
     A module-level or nested function, or a staticmethod, is called with every
     parameter. A function defined in a class body is found in that class to
     tell a method from a staticmethod; a class that can't be found, or whose
-    attribute isn't ``fn``, raises ``ValueError``.
+    attribute isn't ``fn`` or a function ``fn`` wraps, raises ``ValueError``.
     """
     qualname = fn.__qualname__.split(".")
     if len(qualname) < 2 or qualname[-2] == "<locals>":
@@ -306,7 +306,10 @@ def _is_method(fn: Callable) -> bool:
             " method, or rename a staticmethod's parameter."
         )
     static = isinstance(attr, staticmethod)
-    if (attr.__func__ if static else attr) is not fn:
+    target = attr.__func__ if static else attr
+    # fn may wrap the attribute's function, as a functools.wraps decorator
+    # applied to Class.method does.
+    if inspect.unwrap(fn, stop=lambda f: f is target) is not target:
         # The class's name or attribute was rebound after fn was taken from it,
         # so the attribute's binding isn't fn's.
         raise ValueError(

@@ -14,6 +14,7 @@
 
 """Integration tests for ADK Temporal support."""
 
+import asyncio
 import functools
 import inspect
 import json
@@ -1679,11 +1680,25 @@ def test_activity_as_tool_preserves_metadata() -> None:
         (ComplexActivityMethodHolder.private_count, ["passengers"]),
         (PostponedHolder.track, ["parcel_id"]),
         (nested_echo, ["self"]),
+        # A decorator applied to Class.method wraps the class's own function.
+        (passthrough(ComplexActivityMethodHolder.echo_static), ["self"]),
+        (passthrough(ComplexActivityMethodHolder.count_passengers), ["passengers"]),
+        (passthrough(ComplexActivityMethodHolder.echo_decorated), ["self"]),
     ]:
         tool = temporalio.google_adk.workflow.activity_as_tool(
             fn, start_to_close_timeout=timedelta(seconds=30)
         )
         assert list(inspect.signature(tool).parameters) == params, fn.__qualname__
+
+    wrapped_static_tool = temporalio.google_adk.workflow.activity_as_tool(
+        passthrough(ComplexActivityMethodHolder.echo_static),
+        start_to_close_timeout=timedelta(seconds=30),
+    )
+    declaration = FunctionTool(wrapped_static_tool)._get_declaration()
+    assert declaration is not None
+    assert declaration.parameters_json_schema is not None
+    assert list(declaration.parameters_json_schema["properties"]) == ["self"]
+    assert asyncio.run(wrapped_static_tool(self="model-self")) == "static:model-self"
 
 
 def test_activity_as_tool_rejects_method_of_unreachable_class(
@@ -1722,6 +1737,12 @@ def test_activity_as_tool_rejects_method_of_unreachable_class(
         temporalio.google_adk.workflow.activity_as_tool(
             count_passengers, start_to_close_timeout=timedelta(seconds=30)
         )
+    # Wrapping a kept reference doesn't make it the rebound attribute.
+    for fn in (echo_static, count_passengers):
+        with pytest.raises(ValueError, match="is another object"):
+            temporalio.google_adk.workflow.activity_as_tool(
+                passthrough(fn), start_to_close_timeout=timedelta(seconds=30)
+            )
 
 
 class ReboundMethodHolder:
