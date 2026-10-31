@@ -15,6 +15,7 @@ from temporalio import workflow
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.service import RPCError
 from temporalio.strands_agents import (
     StrandsPlugin,
     TemporalAgent,
@@ -524,4 +525,9 @@ async def test_mcp_worker_shutdown_during_slow_startup(
     assert record._owner.done()
     assert "echo_slow" not in _temporal_mcp_client._CONNECTIONS
     assert "echo_slow" not in _temporal_mcp_client._OPEN_RECORDS
-    await handle.terminate()
+    try:
+        await handle.terminate()
+    except RPCError as err:
+        # The failed list-tools activity may already have ended the workflow.
+        if err.message != "workflow execution already completed":
+            raise
