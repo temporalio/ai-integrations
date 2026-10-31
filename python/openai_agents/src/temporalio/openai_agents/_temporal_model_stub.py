@@ -49,6 +49,14 @@ from temporalio.openai_agents._invoke_model_activity import (
 )
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 
+# The SDK reads an Activity's return type with typing.get_type_hints, which drops
+# the type discriminator that TResponseStreamEvent carries in Annotated. When an
+# event fails strict validation, the converter's lenient fallback then picks a
+# union member from a process-wide openai cache that only some processes have
+# filled, so another Worker process could read response.completed as another
+# event. The converter gets the full type instead.
+_STREAM_EVENTS_TYPE: Any = list[TResponseStreamEvent]
+
 
 class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
     """A stub that allows invoking models as Temporal activities."""
@@ -318,9 +326,12 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             "streaming_batch_interval": self.model_params.streaming_batch_interval,
         }
 
-        events = await workflow.execute_activity_method(
-            ModelActivity.invoke_model_activity_streaming,
+        # Scheduled by name, so that result_type applies (a callable's declared
+        # return type would replace it).
+        events: list[TResponseStreamEvent] = await workflow.execute_activity(
+            ModelActivity.invoke_model_activity_streaming.__name__,
             streaming_input,
+            result_type=_STREAM_EVENTS_TYPE,
             summary=summary,
             task_queue=self.model_params.task_queue,
             schedule_to_close_timeout=self.model_params.schedule_to_close_timeout,
