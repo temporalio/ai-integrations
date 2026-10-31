@@ -170,6 +170,12 @@ built-in zero-config Gemini fallback (a `nil` config reads `GEMINI_API_KEY` /
 `GOOGLE_API_KEY` worker-side). Supply a factory to inject credentials, disable
 the model SDK's own retries (see below), or override the fallbacks.
 
+The Worker resolves the model by the name passed to `NewModel`. A
+`BeforeModelCallback` that changes `LLMRequest.Model` does not pick another
+Worker model: the resolved model receives the new name, as ADK's models do
+outside Temporal. To use another model, build the agent with
+`NewModel(<name>)`.
+
 ## What you get
 
 - **Every LLM turn is a durable Activity.** `NewModel(name)` returns a `model.LLM`

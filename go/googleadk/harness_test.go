@@ -195,6 +195,9 @@ type runInput struct {
 	SequentialRoot bool
 	// RunnerPlugin adds googleadk.NewRunnerPlugin to the runner.
 	RunnerPlugin bool
+	// RequestModel, when set, installs a BeforeModelCallback on the root agent
+	// that sets LLMRequest.Model to it.
+	RequestModel *string
 }
 
 // runResult is the serializable output of agentRunWorkflow.
@@ -237,6 +240,7 @@ type agentBuild struct {
 	tools          []tool.Tool
 	toolsets       []tool.Toolset
 	subAgents      []agent.Agent
+	requestModel   *string
 	// sessionService overrides the default in-memory session service. Tests that
 	// need to inspect session state/events after the run (state mutation,
 	// continue-as-new) supply their own and read it back via ExportSession.
@@ -254,6 +258,13 @@ type agentBuild struct {
 // InvokeModel Activity; ordinary function tools run in-workflow; ActivityAsTool
 // and MCP tools dispatch their own Activities.
 func runAgent(ctx workflow.Context, b agentBuild) (runResult, error) {
+	var beforeModel []llmagent.BeforeModelCallback
+	if b.requestModel != nil {
+		beforeModel = append(beforeModel, func(_ agent.Context, req *model.LLMRequest) (*model.LLMResponse, error) {
+			req.Model = *b.requestModel
+			return nil, nil
+		})
+	}
 	var root agent.Agent
 	var err error
 	if b.sequentialRoot {
@@ -262,13 +273,14 @@ func runAgent(ctx workflow.Context, b agentBuild) (runResult, error) {
 		})
 	} else {
 		root, err = llmagent.New(llmagent.Config{
-			Name:        "assistant",
-			Description: "root assistant",
-			Model:       googleadk.NewModel(b.modelName, b.modelOpts...),
-			Instruction: "be helpful",
-			Tools:       b.tools,
-			Toolsets:    b.toolsets,
-			SubAgents:   b.subAgents,
+			Name:                 "assistant",
+			Description:          "root assistant",
+			Model:                googleadk.NewModel(b.modelName, b.modelOpts...),
+			Instruction:          "be helpful",
+			Tools:                b.tools,
+			Toolsets:             b.toolsets,
+			SubAgents:            b.subAgents,
+			BeforeModelCallbacks: beforeModel,
 		})
 	}
 	if err != nil {
@@ -452,6 +464,7 @@ func agentRunWorkflow(ctx workflow.Context, in runInput) (runResult, error) {
 		tools:          tools,
 		toolsets:       toolsets,
 		subAgents:      subAgents,
+		requestModel:   in.RequestModel,
 	})
 }
 

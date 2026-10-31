@@ -35,6 +35,7 @@ from temporalio.api.failure.v1 import Failure
 from temporalio.converter import DataConverter
 from temporalio.google_adk._model import (
     StreamingInvokeInput,
+    TemporalLlmRequest,
     invoke_model,
     invoke_model_streaming,
 )
@@ -129,8 +130,8 @@ class _FailingModel(BaseLlm):
         raise self.error
 
 
-def _request(model: str) -> LlmRequest:
-    return LlmRequest(
+def _request(model: str) -> TemporalLlmRequest:
+    return TemporalLlmRequest(
         model=model,
         contents=[Content(role="user", parts=[Part(text="hi")])],
     )
@@ -214,6 +215,14 @@ async def test_status_code_attribute_is_classified(
     assert failure.application_failure_info.type == "_StatusCodeError", failure
     assert failure.application_failure_info.non_retryable == non_retryable, failure
     assert failure.cause.application_failure_info.type == "_StatusCodeError", failure
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["invoke", "streaming"])
+async def test_unknown_model_is_non_retryable(streaming: bool) -> None:
+    exc = await _run(streaming, model="no-such-model")
+    failure = _recorded(exc)
+    assert "no-such-model" in failure.message, failure
+    assert failure.application_failure_info.non_retryable, failure
 
 
 @pytest.mark.parametrize("streaming", [False, True], ids=["invoke", "streaming"])
