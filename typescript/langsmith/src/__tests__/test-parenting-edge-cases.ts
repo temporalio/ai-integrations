@@ -39,7 +39,7 @@ test('emits the basic SimpleWorkflow tree with no ambient (two roots)', async (t
   t.deepEqual(dumpTraces(collector.records), SIMPLE_TREE);
 });
 
-// No propagated parent: the placeholder root keeps LangSmith off its `crypto`-minting branch (absent in the isolate).
+// Native root construction uses deterministic defaults without calling crypto inside the isolate.
 test('root workflow-body traceable (no propagated parent) does not crash and emits just the user run', async (t) => {
   const collector = new InMemoryRunCollector();
   await withTracingWorker({

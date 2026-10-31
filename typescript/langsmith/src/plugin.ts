@@ -19,7 +19,7 @@
  * @module
  */
 
-import { Client } from 'langsmith';
+import { Client, address as addresses, type Address } from 'langsmith';
 import { RunTree } from 'langsmith/run_trees';
 
 import type * as nexus from 'nexus-rpc';
@@ -32,6 +32,7 @@ import { createLangSmithSinks } from './sinks';
 import type { EmitterConfig } from './sinks';
 import type { Destination } from './run-tree';
 import type { WorkflowLangSmithConfig } from './workflow-interceptors';
+import { replicaRouting } from './routing';
 
 // Derived: @temporalio/worker doesn't export WebpackConfiguration from its root.
 type WebpackConfiguration = Parameters<NonNullable<BundleOptions['webpackConfigHook']>>[0];
@@ -59,8 +60,10 @@ export interface LangSmithPluginOptions {
    * environment. Lives only in the worker/client process — never serialized.
    */
   client?: Client;
-  /** Target LangSmith project for every emitted run. */
+  /** Default LangSmith project for new root traces. An inherited destination takes precedence. */
   projectName?: string;
+  /** Agent/environment destination, mutually exclusive with projectName. LangSmith beta. */
+  address?: Address;
   /**
    * When `true`, emit first-class runs for Temporal operations themselves
    * (`StartWorkflow:`, `RunActivity:`, `HandleSignal:`, …) in addition to the
@@ -101,18 +104,32 @@ export class LangSmithPlugin extends SimplePlugin {
   constructor(options: LangSmithPluginOptions = {}) {
     // super() reads options.name immediately
     super({ name: 'langchain.LangSmithPlugin' });
+    if (options.projectName !== undefined && options.address !== undefined) {
+      throw new TypeError('projectName and address are mutually exclusive');
+    }
+    const address = options.address === undefined ? undefined : addresses.parse(options.address);
     this.client = options.client ?? new Client();
+    const defaults = new RunTree({
+      name: 'temporal-routing-defaults',
+      client: this.client,
+      project_name: options.projectName,
+      address,
+    });
+    const replicas = defaults.replicas;
     const addTemporalRuns = options.addTemporalRuns ?? false;
     this.emitter = {
       client: this.client,
       addTemporalRuns,
       // LangSmith treats an empty project name as unset, so the plugin does too.
       projectName: options.projectName || undefined,
+      address,
+      replicas,
       tags: options.tags,
       metadata: options.metadata,
     };
     this.workflowConfig = {
       addTemporalRuns,
+      replicas: replicaRouting(replicas),
       tags: options.tags,
       metadata: options.metadata,
     };
@@ -150,7 +167,7 @@ export class LangSmithPlugin extends SimplePlugin {
     nexusInterceptors.push((_ctx: nexus.OperationContext) => ({ inbound: nexusInbound }));
 
     // The user's own Worker sinks take precedence on any key collision.
-    const sinks = { ...createLangSmithSinks(this.client), ...(options.sinks ?? {}) };
+    const sinks = { ...createLangSmithSinks(this.client, this.emitter.replicas), ...(options.sinks ?? {}) };
 
     return {
       ...options,
@@ -177,9 +194,11 @@ export class LangSmithPlugin extends SimplePlugin {
       const workflowConfig: WorkflowLangSmithConfig = {
         ...this.workflowConfig,
         destination:
-          this.emitter.projectName !== undefined
-            ? { project_name: this.emitter.projectName }
-            : envDestination(this.client),
+          this.emitter.address !== undefined
+            ? { address: this.emitter.address }
+            : this.emitter.projectName !== undefined
+              ? { project_name: this.emitter.projectName }
+              : envDestination(this.client),
       };
       // Double-encode so the injected token is a string literal in the bundle.
       const definitions = { [CONFIG_GLOBAL]: JSON.stringify(JSON.stringify(workflowConfig)) };
