@@ -252,6 +252,8 @@ def test_static_worker_side_tool_filter_is_allowed() -> None:
         "always",
         {"say_hello": "always"},
         {"always": {"tool_names": ["say_hello"]}},
+        {"say_hello": "always", "other": "never"},
+        {"always": {"tool_names": ["say_hello"]}, "never": {"tool_names": ["other"]}},
         lambda context, agent, tool: False,
     ],
 )

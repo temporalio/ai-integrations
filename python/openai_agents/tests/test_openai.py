@@ -2885,6 +2885,14 @@ async def test_mcp_server(client: Client, mode: str):
                     execution_timeout=timedelta(seconds=30),
                 )
     print(tracking_server.calls)
+    if stateful:
+        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
+        # The session's heartbeat task stops, even when cleanup() fails.
+        assert not [
+            task
+            for task in asyncio.all_tasks()
+            if "heartbeat" in task.get_coro().__name__  # type: ignore[union-attr]
+        ]
     if require_approval:
         assert result == "Approval needed: Say-Hello"
         assert "call_tool" not in tracking_server.calls
@@ -2899,13 +2907,6 @@ async def test_mcp_server(client: Client, mode: str):
             "call_tool",
             "list_tools",
             "cleanup",
-        ]
-        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
-        # The session's heartbeat task stops, even when cleanup() fails.
-        assert not [
-            task
-            for task in asyncio.all_tasks()
-            if task.get_coro().__name__ == "_heartbeat_every"  # type: ignore[union-attr]
         ]
     else:
         if caching:
@@ -2938,6 +2939,31 @@ async def test_mcp_server(client: Client, mode: str):
                 "list_tools",
                 "cleanup",
             ]
+
+
+async def test_auto_heartbeater_interval_heartbeats_without_timeout():
+    from temporalio.openai_agents._heartbeat_decorator import auto_heartbeater
+    from temporalio.testing import ActivityEnvironment
+
+    heartbeats: list[Any] = []
+    env = ActivityEnvironment()  # no heartbeat timeout
+    env.on_heartbeat = lambda *details: heartbeats.append(details)
+
+    @auto_heartbeater(interval=0.01)
+    async def fixed_interval() -> None:
+        await asyncio.sleep(0.1)
+
+    @auto_heartbeater
+    async def from_timeout() -> None:
+        await asyncio.sleep(0.1)
+
+    # A fixed interval heartbeats whatever the timeout, as the stateful MCP
+    # session needs; the default heartbeats only with a heartbeat timeout.
+    await env.run(fixed_interval)
+    assert heartbeats
+    heartbeats.clear()
+    await env.run(from_timeout)
+    assert not heartbeats
 
 
 @pytest.mark.parametrize("stateful", [True, False])
@@ -3042,7 +3068,7 @@ async def test_mcp_server_factory_require_approval_is_rejected(
         assert not [
             task
             for task in asyncio.all_tasks()
-            if task.get_coro().__name__ == "_heartbeat_every"  # type: ignore[union-attr]
+            if "heartbeat" in task.get_coro().__name__  # type: ignore[union-attr]
         ]
 
 
