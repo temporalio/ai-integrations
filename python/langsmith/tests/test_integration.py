@@ -15,7 +15,7 @@ import langsmith
 import langsmith.env
 import nexusrpc.handler
 import pytest
-from langchain_core.callbacks import AsyncCallbackHandler
+from langchain_core.callbacks import AsyncCallbackHandler, BaseCallbackHandler
 from langchain_core.env import get_runtime_environment
 from langchain_core.runnables import RunnableGenerator, RunnableLambda
 from langchain_core.tracers.langchain import LangChainTracer
@@ -226,8 +226,9 @@ class LangChainTwoClientsWorkflow:
     """Runs two LangChain runnables at once, each traced to its own client.
 
     The step of the runnable for "a" or "b" waits for that name's signal.
-    The clients are the two in ``_own_tracer_clients``, so run it
-    unsandboxed.
+    With ``shared``, "ab" or "ba", it runs one runnable instead, traced to
+    both clients in that order, whose step waits for that signal.  The
+    clients are the two in ``_own_tracer_clients``, so run it unsandboxed.
     """
 
     def __init__(self) -> None:
@@ -238,11 +239,21 @@ class LangChainTwoClientsWorkflow:
         self._released.add(name)
 
     @workflow.run
-    async def run(self) -> list[str]:
+    async def run(self, shared: str = "") -> list[str]:
         async def wait(name: str) -> str:
             await workflow.wait_condition(lambda: name in self._released)
             return name
 
+        if shared:
+            clients = dict(zip("ab", _own_tracer_clients))
+            tracers: list[BaseCallbackHandler] = [
+                LangChainTracer(client=clients[name]) for name in shared
+            ]
+            return [
+                await RunnableLambda(wait, name=f"wait_{shared}").ainvoke(
+                    shared, config={"callbacks": tracers}
+                )
+            ]
         return list(
             await asyncio.gather(
                 *(
@@ -855,14 +866,19 @@ class TestReplay:
             )
         assert result == expected
 
-    @pytest.mark.parametrize("first", ["a", "b"])
+    @pytest.mark.parametrize("first", ["a", "b", "ab", "ba"])
     async def test_held_writes_keep_their_client(
         self,
         client: Client,
         env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
         first: str,
     ) -> None:
-        """Each client writes only its own runs, each once per worker."""
+        """Each client writes only its own runs, each once per worker.
+
+        With "a" or "b", two runs, one per client, and that run is released
+        first.  With "ab" or "ba", one run traced to both clients in that
+        order.
+        """
         get_runtime_environment()
         langsmith.env.get_langchain_env_var_metadata()
         # (client, "post" or "patch", run), as written and as processed
@@ -912,7 +928,8 @@ class TestReplay:
                 await asyncio.sleep(0.1)
             raise AssertionError("workflow task not completed")
 
-        second = "b" if first == "a" else "a"
+        shared = first if len(first) == 2 else ""
+        second = shared or ("b" if first == "a" else "a")
         task_queue = str(uuid.uuid4())
         workflow_id = f"replay-test-{uuid.uuid4()}"
         _own_tracer_clients[:] = [ls_client("a1"), ls_client("b1")]
@@ -926,12 +943,16 @@ class TestReplay:
             max_cached_workflows=0,
         ):
             handle = await client.start_workflow(
-                LangChainTwoClientsWorkflow.run, id=workflow_id, task_queue=task_queue
+                LangChainTwoClientsWorkflow.run,
+                shared,
+                id=workflow_id,
+                task_queue=task_queue,
             )
             await wait_for_tasks(handle, 1)
             gc.collect()
-            await handle.signal(LangChainTwoClientsWorkflow.release, first)
-            await wait_for_tasks(handle, 2)
+            if not shared:
+                await handle.signal(LangChainTwoClientsWorkflow.release, first)
+                await wait_for_tasks(handle, 2)
 
         # A new worker, with new clients, replays the run started above.
         _own_tracer_clients[:] = [ls_client("a2"), ls_client("b2")]
@@ -942,10 +963,10 @@ class TestReplay:
             workflow_runner=UnsandboxedWorkflowRunner(),
         ):
             await handle.signal(LangChainTwoClientsWorkflow.release, second)
-            assert await handle.result() == ["a", "b"]
+            assert await handle.result() == ([shared] if shared else ["a", "b"])
 
         for _ in range(100):
-            if len(writes) >= 5:
+            if len(writes) >= (6 if shared else 5):
                 break
             await asyncio.sleep(0.05)
         await asyncio.sleep(0.2)
@@ -959,11 +980,23 @@ class TestReplay:
                 result.setdefault(label, []).append((op, name))
             return {label: sorted(ops) for label, ops in result.items()}
 
-        expected = {
-            f"{first}1": [("patch", f"wait_{first}"), ("post", f"wait_{first}")],
-            f"{second}1": [("post", f"wait_{second}")],
-            f"{second}2": [("patch", f"wait_{second}"), ("post", f"wait_{second}")],
-        }
+        if shared:
+            # Each client of the first worker posted the open run, and each
+            # client of the second posted it again and patched it.
+            run = f"wait_{shared}"
+            expected = {
+                **{f"{c}1": [("post", run)] for c in "ab"},
+                **{f"{c}2": [("patch", run), ("post", run)] for c in "ab"},
+            }
+        else:
+            expected = {
+                f"{first}1": [("patch", f"wait_{first}"), ("post", f"wait_{first}")],
+                f"{second}1": [("post", f"wait_{second}")],
+                f"{second}2": [
+                    ("patch", f"wait_{second}"),
+                    ("post", f"wait_{second}"),
+                ],
+            }
         assert (
             by_client([(c, op, names[str(run["id"])]) for c, op, run in writes])
             == expected

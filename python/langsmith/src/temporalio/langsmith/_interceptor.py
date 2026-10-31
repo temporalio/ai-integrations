@@ -292,8 +292,12 @@ class _LangChainRuns:
         self._ids: dict[str, tuple[uuid.UUID, datetime]] = {}
         self._last_start: datetime | None = None
         # Writes held back during replay, for runs that are still open, with
-        # the client that would have made them.
-        self.pending: dict[uuid.UUID, tuple[_ReplaySafeClient, list[_HeldWrite]]] = {}
+        # the client that would have made them, by (id of that client, run
+        # ID): tracers with different clients trace the same run.  The entry
+        # keeps its client alive, so the ID stays the client's.
+        self.pending: dict[
+            tuple[int, uuid.UUID], tuple[_ReplaySafeClient, list[_HeldWrite]]
+        ] = {}
 
         def reseed(seed: int) -> None:
             self._rng.seed(f"temporal-langsmith-langchain-{seed}")
@@ -666,7 +670,7 @@ def _post_pending(runs: _LangChainRuns) -> None:
     """
     pending = list(runs.pending.items())
     runs.pending.clear()
-    for run_id, (client, held) in pending:
+    for (_, run_id), (client, held) in pending:
         if run_id in client._open:
             continue
         client._add_open(run_id)
@@ -719,7 +723,7 @@ class _ReplaySafeClient:
             return None
         if _is_replaying():
             if not ended:
-                runs.pending[run_id] = (self, held)
+                runs.pending[id(self._client), run_id] = (self, held)
             return None
         _post_pending(runs)
         if not ended:
@@ -737,7 +741,7 @@ class _ReplaySafeClient:
         held = _prepare_write(self._client, "update_run", kwargs)
         if _is_replaying():
             if ended:
-                runs.pending.pop(run_id, None)
+                runs.pending.pop((id(self._client), run_id), None)
             return None
         _post_pending(runs)
         self._write(run_id, held)

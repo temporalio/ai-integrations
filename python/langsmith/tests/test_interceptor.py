@@ -290,7 +290,7 @@ class TestReplaySafety:
         # After a replay, the forgotten run is posted again; the other is not.
         runs = MagicMock()
         runs.pending = {
-            run_id: (client, [("create_run", {"id": run_id}, {})])
+            (id(mock_client), run_id): (client, [("create_run", {"id": run_id}, {})])
             for run_id in run_ids[:2]
         }
         _post_pending(runs)
