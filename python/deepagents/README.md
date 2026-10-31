@@ -360,6 +360,21 @@ class LongResearchAgent:
 Pass `continue_as_new_after=N` instead to trigger on a fixed history-event
 count.
 
+The driver looks at history between turns. To also split one long turn (an
+agent that makes hundreds of model and tool calls before it answers), add
+`ContinueAsNewMiddleware()` to the agent's `middleware=`. Past the same limit,
+the turn ends before its next model step with every tool result in, and the
+fresh run continues the turn from the carried transcript; calls made before the
+cut are not run again, though the agent may choose to repeat one. The cut ends
+the loop like a finished turn, so other middleware's `after_agent` hooks run at
+each cut. Only messages cross the cut, as between turns: state-backed files,
+todo state and custom middleware state do not cross as state, and each run
+starts with a fresh recursion limit. The middleware does nothing under a plain
+`ainvoke(...)`. Sub-agents started by the `task` tool are not cut: a
+sub-agent's calls stay in the parent's history until its `task` call returns. Adding the middleware to an agent with runs in flight changes
+what those runs do next, so ship it with Worker Versioning or after they
+finish.
+
 - **Carries forward:** the accumulated messages. Repeated identical calls are
   NOT deduplicated: a call the agent re-issues after the boundary runs its own
   Activity, so a genuinely new identical request is never served a stale prior

@@ -12,6 +12,7 @@ the continue-as-new machinery end to end.
 
 from __future__ import annotations
 
+import importlib
 import sys
 import uuid
 from datetime import timedelta
@@ -453,3 +454,223 @@ async def test_identical_op_reruns_across_continue_as_new(
     )
     desc = await first.describe()
     assert desc.status == WorkflowExecutionStatus.CONTINUED_AS_NEW, desc.status
+
+
+# ---------------------------------------------------------------------------
+# Continue-as-new in the middle of a turn
+# ---------------------------------------------------------------------------
+
+
+def _ls_calls_then_answer(n: int) -> Any:
+    from langchain_core.messages import AIMessage
+
+    from temporalio.deepagents.testing import mock_model_provider
+
+    ls = {"name": "ls", "args": {"path": "/"}}
+    calls = [
+        AIMessage(content="", tool_calls=[{**ls, "id": f"ls-{i}"}]) for i in range(n)
+    ]
+    return mock_model_provider([*calls, "Done."])
+
+
+@workflow.defn
+class MidTurnCanWorkflow:
+    @workflow.run
+    async def run(self, input: dict, state_snapshot: dict | None = None) -> list:
+        from temporalio.deepagents import ContinueAsNewMiddleware
+
+        create_deep_agent = importlib.import_module("deepagents").create_deep_agent
+        agent = create_deep_agent(
+            model="fake:model", middleware=[ContinueAsNewMiddleware()]
+        )
+        result = await run_deep_agent(
+            agent, input, continue_as_new_after=12, state_snapshot=state_snapshot
+        )
+        return [
+            [m.type, m.content if m.type != "tool" else m.tool_call_id]
+            for m in result["messages"]
+        ]
+
+
+@pytest.mark.asyncio
+async def test_long_turn_continues_as_new_mid_turn(env: WorkflowEnvironment) -> None:
+    pytest.importorskip("deepagents")
+    async with Worker(
+        env.client,
+        task_queue="da-mid-turn",
+        workflows=[MidTurnCanWorkflow],
+        plugins=[DeepAgentsPlugin(model_provider=_ls_calls_then_answer(4))],
+    ):
+        handle = await env.client.start_workflow(
+            MidTurnCanWorkflow.run,
+            {"messages": [{"role": "user", "content": "List the files four times."}]},
+            id=f"da-mid-turn-{uuid.uuid4()}",
+            task_queue="da-mid-turn",
+        )
+        transcript = await handle.result()
+
+        first = env.client.get_workflow_handle(
+            handle.id, run_id=handle.first_execution_run_id
+        )
+        assert (await first.describe()).status == (
+            WorkflowExecutionStatus.CONTINUED_AS_NEW
+        )
+        # One turn, split across runs: the continued run picks up at the next
+        # model step, so no model or tool call runs twice.
+        assert transcript == [
+            ["human", "List the files four times."],
+            *[step for i in range(4) for step in (["ai", ""], ["tool", f"ls-{i}"])],
+            ["ai", "Done."],
+        ]
+        histories = [await first.fetch_history(), await handle.fetch_history()]
+    replayer = Replayer(
+        workflows=[MidTurnCanWorkflow],
+        plugins=[DeepAgentsPlugin(model_provider=_ls_calls_then_answer(4))],
+    )
+    for history in histories:
+        await replayer.replay_workflow(history)
+
+
+@workflow.defn
+class MidTurnPlainInvokeWorkflow:
+    @workflow.run
+    async def run(self) -> int:
+        from temporalio.deepagents import ContinueAsNewMiddleware
+
+        create_deep_agent = importlib.import_module("deepagents").create_deep_agent
+        agent = create_deep_agent(
+            model="fake:model", middleware=[ContinueAsNewMiddleware()]
+        )
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": "List the files four times."}]}
+        )
+        return len(result["messages"])
+
+
+@pytest.mark.asyncio
+async def test_mid_turn_middleware_needs_the_driver(env: WorkflowEnvironment) -> None:
+    pytest.importorskip("deepagents")
+    async with Worker(
+        env.client,
+        task_queue="da-mid-turn-plain",
+        workflows=[MidTurnPlainInvokeWorkflow],
+        plugins=[DeepAgentsPlugin(model_provider=_ls_calls_then_answer(4))],
+    ):
+        # Without run_deep_agent there is no one to continue the turn, so the
+        # middleware never cuts it, however long the history gets.
+        assert (
+            await env.client.execute_workflow(
+                MidTurnPlainInvokeWorkflow.run,
+                id=f"da-mid-turn-plain-{uuid.uuid4()}",
+                task_queue="da-mid-turn-plain",
+            )
+            == 10
+        )
+
+
+def _subagent_calls_then_answer(n: int) -> "_Scripted":
+    """Main delegates once; the sub-agent makes n ls calls, then answers."""
+    from langchain_core.messages import AIMessage
+
+    from temporalio.deepagents.testing import FakeModel
+
+    ls = {"name": "ls", "args": {"path": "/"}}
+    task = {
+        "name": "task",
+        "id": "task-1",
+        "args": {"description": "List the files.", "subagent_type": "lister"},
+    }
+    scripts: dict[str, list[Any]] = {
+        "fake:main": [AIMessage(content="", tool_calls=[task]), "Main done."],
+        "fake:sub": [
+            *[
+                AIMessage(content="", tool_calls=[{**ls, "id": f"ls-{i}"}])
+                for i in range(n)
+            ],
+            "Sub done.",
+        ],
+    }
+    return _Scripted(scripts, FakeModel)
+
+
+class _Scripted:
+    """One script per model name, counting calls; a call past a script fails."""
+
+    def __init__(self, scripts: dict[str, list[Any]], model_cls: Any) -> None:
+        self.scripts = scripts
+        self.model_cls = model_cls
+        self.calls: dict[str, int] = {}
+
+    def __call__(self, name: str) -> Any:
+        i = self.calls.get(name, 0)
+        self.calls[name] = i + 1
+        return self.model_cls([self.scripts[name][i]])
+
+
+@workflow.defn
+class MidTurnSubagentWorkflow:
+    @workflow.run
+    async def run(self, input: dict, state_snapshot: dict | None = None) -> list:
+        from temporalio.deepagents import ContinueAsNewMiddleware
+
+        create_deep_agent = importlib.import_module("deepagents").create_deep_agent
+        agent = create_deep_agent(
+            model="fake:main",
+            middleware=[ContinueAsNewMiddleware()],
+            subagents=[
+                {
+                    "name": "lister",
+                    "description": "Lists files.",
+                    "system_prompt": "List.",
+                    "model": "fake:sub",
+                    "middleware": [ContinueAsNewMiddleware()],
+                }
+            ],
+        )
+        result = await run_deep_agent(
+            agent, input, continue_as_new_after=12, state_snapshot=state_snapshot
+        )
+        return [[m.type, m.content] for m in result["messages"]]
+
+
+@pytest.mark.asyncio
+async def test_subagent_is_not_cut_mid_turn(env: WorkflowEnvironment) -> None:
+    """The limit is passed inside the sub-agent; the cut waits for its task call."""
+    pytest.importorskip("deepagents")
+    provider = _subagent_calls_then_answer(4)
+    async with Worker(
+        env.client,
+        task_queue="da-mid-turn-sub",
+        workflows=[MidTurnSubagentWorkflow],
+        plugins=[DeepAgentsPlugin(model_provider=provider)],
+    ):
+        handle = await env.client.start_workflow(
+            MidTurnSubagentWorkflow.run,
+            {"messages": [{"role": "user", "content": "Delegate."}]},
+            id=f"da-mid-turn-sub-{uuid.uuid4()}",
+            task_queue="da-mid-turn-sub",
+        )
+        transcript = await handle.result()
+        first = env.client.get_workflow_handle(
+            handle.id, run_id=handle.first_execution_run_id
+        )
+        # The turn was cut after the task call returned, at the main agent's
+        # next model step, and continued in a fresh run.
+        assert (await first.describe()).status == (
+            WorkflowExecutionStatus.CONTINUED_AS_NEW
+        )
+        histories = [await first.fetch_history(), await handle.fetch_history()]
+    # The sub-agent ran its whole loop once, and its answer reached the parent.
+    assert provider.calls == {"fake:main": 2, "fake:sub": 5}
+    # Both runs replay: the cut and the uncut sub-agent loop are deterministic.
+    replayer = Replayer(
+        workflows=[MidTurnSubagentWorkflow], plugins=[DeepAgentsPlugin()]
+    )
+    for history in histories:
+        await replayer.replay_workflow(history)
+    assert transcript == [
+        ["human", "Delegate."],
+        ["ai", ""],
+        ["tool", "Sub done."],
+        ["ai", "Main done."],
+    ]
