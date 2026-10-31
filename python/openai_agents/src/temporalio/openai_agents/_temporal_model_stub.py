@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
-from typing import Any
+from typing import Any, get_type_hints
 
 from agents import (
     Agent,
@@ -51,11 +51,13 @@ from temporalio.openai_agents._model_parameters import ModelActivityParameters
 
 # The SDK reads an Activity's return type with typing.get_type_hints, which drops
 # the type discriminator that TResponseStreamEvent carries in Annotated. When an
-# event fails strict validation, the converter's lenient fallback then picks a
-# union member from a process-wide openai cache that only some processes have
-# filled, so another Worker process could read response.completed as another
-# event. The converter gets the full type instead.
-_STREAM_EVENTS_TYPE: Any = list[TResponseStreamEvent]
+# event fails strict validation, the converter's lenient fallback then takes the
+# first union member unless this process has cached the discriminator, so another
+# Worker process could read response.completed as another event. The converter
+# gets the full type instead, read from the Activity with Annotated kept.
+_STREAM_EVENTS_TYPE: Any = get_type_hints(
+    ModelActivity.invoke_model_activity_streaming, include_extras=True
+)["return"]
 
 
 class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]

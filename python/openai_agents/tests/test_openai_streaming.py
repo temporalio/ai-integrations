@@ -440,15 +440,19 @@ async def test_streaming_publishes_raw_events(client: Client):
 async def test_streaming_drifted_event_in_fresh_process(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ):
-    """A final event that fails strict validation still decodes as itself.
+    """A final event that fails strict validation decodes as itself in every process.
 
-    The Worker process starts with an empty openai discriminator cache, as one
-    that did not run the model Activity, and the history then replays in
-    another such process.
+    The live run's process has the openai discriminator cache filled, as the
+    process whose model Activity parsed the event would. The history then
+    replays in a process with the cache empty, as another Worker process.
     """
     with pytest.raises(pydantic.ValidationError):
         InputTokensDetails.model_validate({"cached_tokens": 0})
     empty_openai_discriminator_cache(monkeypatch)
+    # openai's stream parser fills the cache when it parses such an event.
+    openai._models.construct_type(
+        type_=TResponseStreamEvent, value={"type": "response.completed"}
+    )
     async with AgentEnvironment(
         model=DriftedStreamingTestModel(),
         model_params=ModelActivityParameters(
