@@ -3,6 +3,7 @@ import type { MCPServer } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
 import { TOOL_FILTER_UNSUPPORTED_TYPE } from '../common/mcp-types';
 import { StatelessMCPServerProvider, filterListedTools } from '../worker/mcp-provider';
+import { statelessMcpServer } from '../workflow/mcp-client';
 
 function fakeServer(toolFilter: MCPServer['toolFilter'], onConnect = () => {}): MCPServer {
   return {
@@ -57,4 +58,16 @@ test('StatelessMCPServerProvider refuses a callable toolFilter without connectin
     t.true(err?.nonRetryable);
   }
   t.false(connected);
+});
+
+test('statelessMcpServer keeps cacheToolsList assignable and reports false with a filter', (t) => {
+  const server = statelessMcpServer('files');
+  t.true(server.cacheToolsList);
+  server.cacheToolsList = false;
+  t.false(server.cacheToolsList);
+
+  const filtered = statelessMcpServer('files', { toolFilter: { blockedToolNames: ['delete'] } });
+  t.false(filtered.cacheToolsList);
+  filtered.cacheToolsList = true;
+  t.false(filtered.cacheToolsList);
 });

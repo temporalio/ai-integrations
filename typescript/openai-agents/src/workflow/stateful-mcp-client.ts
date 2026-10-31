@@ -208,7 +208,8 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
   }
 
   async invalidateToolsCache(): Promise<void> {
-    // Without a filter, caching is owned by the upstream agent SDK.
+    // Without a filter, caching is owned by the upstream agent SDK. With one, this cache holds the
+    // full list, and the agent SDK's invalidateServerToolsCache(name) cannot clear it.
     this._cachedTools = undefined;
   }
 }

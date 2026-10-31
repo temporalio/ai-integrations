@@ -31,13 +31,18 @@ export function statelessMcpServer(name: string, options?: StatelessMcpServerOpt
 
   let cachedTools: any[] | undefined;
   const shouldCache = options?.cacheToolsList ?? true;
+  // What the agent SDK sees. Assigning `cacheToolsList` changes only this, as it did before.
+  let sdkCache = shouldCache;
   const factoryArg = options?.factoryArgument;
 
   return {
     // The agent SDK caches the filtered list, so with a filter only this handle caches, and the
     // agent filters every listing.
     get cacheToolsList() {
-      return shouldCache && !this.toolFilter;
+      return sdkCache && !this.toolFilter;
+    },
+    set cacheToolsList(value: boolean) {
+      sdkCache = value;
     },
     toolFilter: options?.toolFilter,
     get name() {
