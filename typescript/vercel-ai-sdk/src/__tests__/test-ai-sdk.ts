@@ -1015,6 +1015,36 @@ test('runWorker refuses an Activity that a later plugin replaced, before polling
   await connection.close();
 });
 
+test('runWorker starts the Worker at once, so runUntil stops it after its callback', async (t) => {
+  const connection = await NativeConnection.connect({ address: t.context.env.address });
+  // runUntil stops the Worker after its callback only if the Worker is already
+  // running. A callback that throws synchronously finishes before run() yields.
+  const alone = await Worker.create({
+    connection,
+    namespace: t.context.env.namespace,
+    taskQueue: 'test-ai-run-until-throws',
+    plugins: [new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) })],
+  });
+  await t.throwsAsync(
+    alone.runUntil(() => {
+      throw new Error('boom');
+    }),
+    { message: 'boom' }
+  );
+  t.is(alone.getState(), 'STOPPED');
+  // Each plugin's check runs before the Worker starts; none may yield.
+  const options = { modelProvider: new TestProvider(helloWorkflowGenerator()) };
+  const two = await Worker.create({
+    connection,
+    namespace: t.context.env.namespace,
+    taskQueue: 'test-ai-run-until-two',
+    plugins: [new AiSdkPlugin(options), new AiSdkPlugin(options)],
+  });
+  t.is(await two.runUntil(() => Promise.resolve('done')), 'done');
+  t.is(two.getState(), 'STOPPED');
+  await connection.close();
+});
+
 test('MCP tool schema survives activity serialization', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
 
