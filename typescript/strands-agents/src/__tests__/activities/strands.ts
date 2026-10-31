@@ -25,25 +25,37 @@ export async function auditTool(toolName: string): Promise<void> {
 // flag" check.
 export const deleteState = { calls: 0 };
 
+/** The interrupt-shaped error the plugin rewrites: an `Error` with an `interrupts` array. */
+export function interruptError(name: string): Error {
+  return Object.assign(new Error('interrupt'), {
+    interrupts: [
+      {
+        toJSON: () => ({ id: `delete:${name}`, name: 'approval', reason: `delete ${name}?`, source: 'tool' }),
+      },
+    ],
+  });
+}
+
+// Counts calls to confirmThings, which always asks for two decisions.
+export const confirmState = { calls: 0 };
+
+export async function confirmThings(input: { name: string }): Promise<string> {
+  confirmState.calls += 1;
+  throw Object.assign(new Error('interrupt'), {
+    interrupts: ['approval', 'confirmation'].map((name) => ({
+      toJSON: () => ({ id: `${name}:${input.name}`, name, reason: `${name} for ${input.name}?`, source: 'tool' }),
+    })),
+  });
+}
+
 export async function deleteThing(input: { name: string }): Promise<string> {
   deleteState.calls += 1;
   if (deleteState.calls === 1) {
-    // Throw an interrupt-shaped error: the strands plugin's failure converter
+    // Throw an interrupt-shaped error: the strands plugin's activity interceptor
     // detects `interrupts: InterruptLike[]` structurally and re-raises an
     // ApplicationFailure of type STRANDS_INTERRUPT_TYPE that the workflow-side
     // TemporalActivityTool routes through `toolContext.interrupt()`.
-    throw Object.assign(new Error('interrupt'), {
-      interrupts: [
-        {
-          toJSON: () => ({
-            id: `delete:${input.name}`,
-            name: 'approval',
-            reason: `delete ${input.name}?`,
-            source: 'tool',
-          }),
-        },
-      ],
-    });
+    throw interruptError(input.name);
   }
   return `deleted ${input.name}`;
 }

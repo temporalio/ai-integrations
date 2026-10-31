@@ -159,8 +159,8 @@ func TestNewPluginRejectsInvalidConfig(t *testing.T) {
 }
 
 // TestPluginRegistersActivitiesOnWorkerStart proves the plugin's StartWorker
-// hook registers exactly the three integration Activities under their stable
-// names and passes control on to next.
+// hook registers exactly the integration Activities under their stable names
+// and passes control on to next.
 func TestPluginRegistersActivitiesOnWorkerStart(t *testing.T) {
 	plugin, err := googleadk.NewPlugin(googleadk.Config{
 		Models: map[string]googleadk.ModelFactory{
@@ -176,6 +176,9 @@ func TestPluginRegistersActivitiesOnWorkerStart(t *testing.T) {
 		googleadk.InvokeModelActivityName,
 		googleadk.ListMcpToolsActivityName,
 		googleadk.CallMcpToolActivityName,
+		googleadk.ResolveA2AAgentCardActivityName,
+		googleadk.SendA2AMessageActivityName,
+		googleadk.CancelA2ATaskActivityName,
 	}, reg.activityNames)
 }
 

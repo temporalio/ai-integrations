@@ -1,24 +1,32 @@
 import typing
-import zlib
-from collections.abc import Sequence
 from dataclasses import replace
 
 import pytest
 from botocore.config import Config as BotocoreConfig
+from strands.interrupt import Interrupt, InterruptException
 from strands.models import Model
 from strands.models.bedrock import DEFAULT_READ_TIMEOUT
 from strands.tools.mcp import MCPClient as StrandsMCPClient
 
 import temporalio.strands_agents._plugin as plugin_module
-from temporalio.api.common.v1 import Payload
+from temporalio.api.failure.v1 import Failure
 from temporalio.client import ClientConfig
 from temporalio.contrib.pydantic import PydanticPayloadConverter
-from temporalio.converter import DataConverter, PayloadCodec
+from temporalio.converter import (
+    DataConverter,
+    DefaultFailureConverter,
+    DefaultFailureConverterWithEncodedAttributes,
+    PayloadConverter,
+)
 from temporalio.exceptions import ApplicationError
 from temporalio.strands_agents import StrandsPlugin
-from temporalio.strands_agents._failure_converter import StrandsFailureConverter
+from temporalio.strands_agents._failure_converter import (
+    StrandsFailureConverter,
+    StrandsFailureConverterWithEncodedAttributes,
+)
 from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
+from tests.common import CompressionCodec
 from tests.mock_model import MockModel
 
 
@@ -46,22 +54,6 @@ def test_default_bedrock_model_disables_botocore_retries(
     assert len(captured_configs) == 1
     assert getattr(captured_configs[0], "read_timeout") == DEFAULT_READ_TIMEOUT
     assert getattr(captured_configs[0], "retries") == {"max_attempts": 0}
-
-
-class CompressionCodec(PayloadCodec):
-    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
-        return [
-            Payload(
-                metadata={"encoding": b"binary/zlib"},
-                data=zlib.compress(payload.SerializeToString()),
-            )
-            for payload in payloads
-        ]
-
-    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
-        return [
-            Payload.FromString(zlib.decompress(payload.data)) for payload in payloads
-        ]
 
 
 def _client_config(converter: DataConverter | None = None) -> ClientConfig:
@@ -115,6 +107,107 @@ def test_custom_payload_converter_is_preserved() -> None:
         "data_converter"
     ]
     assert configured is supplied
+
+
+class DomainError(Exception):
+    pass
+
+
+class DomainFailureConverter(DefaultFailureConverter):
+    def from_failure(
+        self, failure: Failure, payload_converter: PayloadConverter
+    ) -> BaseException:
+        if failure.application_failure_info.type == "DomainError":
+            return DomainError(failure.message)
+        return super().from_failure(failure, payload_converter)
+
+
+class CallerEncodedFailureConverter(DefaultFailureConverterWithEncodedAttributes):
+    pass
+
+
+def _configure(target: str, supplied: DataConverter) -> DataConverter:
+    plugin = StrandsPlugin(models={})
+    configured: DataConverter | None
+    if target == "client":
+        configured = plugin.configure_client(_client_config(supplied))["data_converter"]
+    elif target == "replayer":
+        configured = plugin.configure_replayer(
+            {"data_converter": supplied, "workflow_runner": SandboxedWorkflowRunner()}
+        ).get("data_converter")
+    else:
+        raise AssertionError(target)
+    assert configured is not None
+    return configured
+
+
+@pytest.mark.parametrize("target", ["client", "replayer"])
+@pytest.mark.parametrize(
+    "failure_converter_class",
+    [DefaultFailureConverterWithEncodedAttributes, CallerEncodedFailureConverter],
+)
+def test_caller_encoded_failure_converter_is_kept(
+    target: str,
+    failure_converter_class: type[DefaultFailureConverterWithEncodedAttributes],
+) -> None:
+    supplied = replace(
+        DataConverter.default, failure_converter_class=failure_converter_class
+    )
+    configured = _configure(target, supplied)
+
+    # The caller's encoding still applies to failure messages.
+    failure = Failure()
+    configured.failure_converter.to_failure(
+        ApplicationError("secret"), configured.payload_converter, failure
+    )
+    assert failure.message == "Encoded failure"
+    decoded = configured.failure_converter.from_failure(
+        failure, configured.payload_converter
+    )
+    assert isinstance(decoded, ApplicationError)
+    assert decoded.message == "secret"
+
+    # The Strands handling is added on top of it.
+    interrupt = Failure()
+    configured.failure_converter.to_failure(
+        InterruptException(Interrupt(id="i1", name="approval", reason="ok?")),
+        configured.payload_converter,
+        interrupt,
+    )
+    assert interrupt.application_failure_info.type == "StrandsInterrupt"
+    assert interrupt.application_failure_info.non_retryable
+    assert interrupt.message == "Encoded failure"
+
+    assert (
+        configured.failure_converter_class
+        is StrandsFailureConverterWithEncodedAttributes
+    )
+    # Running the plugin again on its own output keeps it.
+    assert _configure(target, configured).failure_converter_class is (
+        StrandsFailureConverterWithEncodedAttributes
+    )
+
+
+@pytest.mark.parametrize("target", ["client", "replayer"])
+def test_other_failure_converter_is_replaced(target: str) -> None:
+    # Keeping this class would change which errors Workflow code reads, and so
+    # break the replay of existing histories.
+    supplied = replace(
+        DataConverter.default, failure_converter_class=DomainFailureConverter
+    )
+    configured = _configure(target, supplied)
+    assert configured.failure_converter_class is StrandsFailureConverter
+    failure = Failure()
+    configured.failure_converter.to_failure(
+        ApplicationError("boom", type="DomainError"),
+        configured.payload_converter,
+        failure,
+    )
+    decoded = configured.failure_converter.from_failure(
+        failure, configured.payload_converter
+    )
+    assert isinstance(decoded, ApplicationError)
+    assert decoded.type == "DomainError"
 
 
 def test_mcp_factory_that_returns_a_strands_client_fails_retryably() -> None:

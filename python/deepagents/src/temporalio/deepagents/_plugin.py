@@ -145,7 +145,7 @@ class DeepAgentsPlugin(SimplePlugin):
             activities=activities,
             data_converter=self._configure_data_converter,
             workflow_runner=self._make_workflow_runner(),
-            workflow_failure_exception_types=[DeepAgentsWorkflowError],
+            workflow_failure_exception_types=_workflow_failure_exception_types,
             run_context=self._run_context,
         )
 
@@ -244,6 +244,24 @@ class DeepAgentsPlugin(SimplePlugin):
         if activities:
             config["activities"] = _dedupe_activities(activities)
         return config
+
+
+def _workflow_failure_exception_types(
+    existing: Sequence[type[BaseException]] | None,
+) -> list[type[BaseException]]:
+    """Fail the workflow, not its task, on the plugin's terminal errors.
+
+    ``ContextOverflowError`` escapes the agent when summarization cannot bring
+    the request under the model's limit; as a workflow-task failure it would be
+    retried forever. Imported here so constructing the plugin stays
+    LangChain-free.
+    """
+    types: list[type[BaseException]] = [*(existing or []), DeepAgentsWorkflowError]
+    try:
+        from langchain_core.exceptions import ContextOverflowError
+    except ImportError:  # LangChain absent on this worker; nothing can raise it
+        return types
+    return [*types, ContextOverflowError]
 
 
 async def _temporal_aio_to_thread(
