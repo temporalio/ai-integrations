@@ -641,15 +641,16 @@ class _ReplaySafeClient:
     """Wraps a LangSmith client for use in workflow code.
 
     LangChain's tracers write their runs through this client, not through
-    ``_ReplaySafeRunTree`` (see ``_replay_safe_tracer``).  In workflow code, this gives those runs stable
-    IDs (see ``_LangChainRuns``) and holds back their writes while history
-    replays.  A replayed callback still runs the client's own steps before
-    its write, synchronously, so errors those steps raise, such as from a
-    redaction callback, reach LangChain's tracer as in the original run.  At
-    the first write after a replay, it makes the held writes of the replayed
-    runs that are still open and that this client has not posted, as after
-    a worker restart.  Other calls, and writes from other threads such as
-    ``_ReplaySafeRunTree``'s background I/O, go to the wrapped client as is.
+    ``_ReplaySafeRunTree`` (see ``_replay_safe_tracer``).  In workflow code,
+    this gives those runs stable IDs (see ``_LangChainRuns``) and holds back
+    their writes while history replays.  A replayed callback still runs the
+    client's own steps before its write, synchronously, so errors those
+    steps raise, such as from a redaction callback, reach LangChain's tracer
+    as in the original run.  At the first write after a replay, it makes the
+    held writes of the replayed runs that are still open and that this
+    client has not posted, as after a worker restart.  Other calls, and
+    writes from other threads such as ``_ReplaySafeRunTree``'s background
+    I/O, go to the wrapped client as is.
     """
 
     def __init__(self, client: langsmith.Client) -> None:
