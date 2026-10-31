@@ -3,7 +3,7 @@ import { BedrockModel, type Model } from '@strands-agents/sdk';
 import type { Duration } from '@temporalio/common';
 import { msOptionalToNumber } from '@temporalio/common/lib/time';
 import type { Context as ActivityContext } from '@temporalio/activity';
-import type { ActivityInboundCallsInterceptor, BundleOptions, WorkerOptions } from '@temporalio/worker';
+import type { ActivityInboundCallsInterceptor, BundleOptions, Worker, WorkerOptions } from '@temporalio/worker';
 import { SimplePlugin } from '@temporalio/plugin';
 import { rewriteError } from './strands-errors';
 import { ModelActivity } from './model-activity';
@@ -39,6 +39,10 @@ function sameSources(a: object, b: object): boolean {
   const y = activitySources.get(b);
   return x !== undefined && y !== undefined && x.length === y.length && x.every((v, i) => v === y[i]);
 }
+
+const REMEDY =
+  'Rename or remove the other Activity, run the other integration on its own Worker and task queue, ' +
+  'or use one StrandsPlugin instance on this Worker.';
 
 /**
  * Options for {@link StrandsPlugin}.
@@ -184,12 +188,34 @@ export class StrandsPlugin extends SimplePlugin {
       if (typeof other === 'function' && other !== fn && !sameSources(other, fn)) {
         throw new TypeError(
           `Duplicate registration of Activity '${name}': StrandsPlugin would replace a different Activity ` +
-            'with this name. Rename or remove the other Activity, run the other integration on its own Worker ' +
-            'and task queue, or use one StrandsPlugin instance on this Worker.'
+            `with this name. ${REMEDY}`
         );
       }
     }
     return super.configureWorker(options);
+  }
+
+  /**
+   * Runs the Worker.
+   *
+   * @throws TypeError, before the Worker polls, if a plugin applied after this one replaced one of
+   * its Activities with a different one. `Worker.create` applies the Worker's plugins in order, then
+   * the `NativeConnection`'s.
+   */
+  override async runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    for (const [name, fn] of Object.entries(this.options.activities as object)) {
+      const kept = worker.options.activities.get(name);
+      if (kept === undefined || kept === fn || sameSources(kept, fn)) continue;
+      // There is no public way to stop a Worker that has not run yet. Stopping it first means it
+      // never polls; `next` then releases it as `run()` does, so `connection.close()` still works.
+      (worker as unknown as { nativeWorker: { initiateShutdown(): void } }).nativeWorker.initiateShutdown();
+      await next(worker).catch(() => undefined);
+      throw new TypeError(
+        `Duplicate registration of Activity '${name}': a plugin applied after StrandsPlugin replaced its ` +
+          `Activity with this name. ${REMEDY}`
+      );
+    }
+    return super.runWorker(worker, next);
   }
 
   /**

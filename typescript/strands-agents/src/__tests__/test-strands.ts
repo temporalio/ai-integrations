@@ -12,6 +12,7 @@ import type { BaseModelConfig, JSONValue, ModelStreamEvent, StreamOptions, Tool 
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { WorkflowFailedError, WorkflowUpdateFailedError } from '@temporalio/client';
 import { ActivityFailure, ApplicationFailure, CancelledFailure } from '@temporalio/common';
+import { SimplePlugin } from '@temporalio/plugin';
 import { temporal } from '@temporalio/proto';
 import type { BaseContext } from '@temporalio/test-helpers';
 import {
@@ -21,7 +22,7 @@ import {
   loadHistory,
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
-import { bundleWorkflowCode, DefaultLogger, Worker, type WorkerOptions } from '@temporalio/worker';
+import { bundleWorkflowCode, DefaultLogger, NativeConnection, Worker, type WorkerOptions } from '@temporalio/worker';
 import { DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { STRANDS_MALFORMED_INTERRUPT_TYPE, StrandsPlugin } from '..';
@@ -403,6 +404,25 @@ test('StrandsPlugin refuses to replace a different Activity with the same name',
   const both = new StrandsPlugin({ mcpClients: { gamma: beta } }).configureWorker(withBeta).activities as Activities;
   t.is(typeof both['beta-callTool'], 'function');
   t.is(typeof both['gamma-callTool'], 'function');
+});
+
+test('runWorker refuses an Activity that a later plugin replaced, before polling', async (t) => {
+  const connection = await NativeConnection.connect({ address: t.context.env.address });
+  // AiSdkPlugin also registers invokeModel; this plugin stands in for it.
+  const later = new SimplePlugin({ name: 'later', activities: { invokeModel: async () => 'other' } });
+  const worker = await Worker.create({
+    connection,
+    namespace: t.context.env.namespace,
+    taskQueue: 'test-strands-later-plugin',
+    plugins: [new StrandsPlugin({ models: { test: () => new StubModel([]) } }), later],
+  });
+  await t.throwsAsync(worker.run(), {
+    instanceOf: TypeError,
+    message: /^Duplicate registration of Activity 'invokeModel': a plugin applied after StrandsPlugin replaced/,
+  });
+  t.is(worker.getState(), 'STOPPED');
+  // Throws if the Worker still holds the connection.
+  await connection.close();
 });
 
 test('a stateful run recorded before the stateful flag replays on the stateless path', async (t) => {
