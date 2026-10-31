@@ -13,10 +13,10 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from mcp import Client as MCPClient
 from mcp import StdioServerParameters, stdio_client
 from strands import tool
 from strands.models import Model
-from strands.tools.mcp.mcp_client import MCPClient
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -308,7 +308,7 @@ async def test_mcp_structured_content_and_metadata_that_look_like_bytes(
         models={"mock": lambda: RecordingModel(script)},
         mcp_clients={
             "marker": lambda: MCPClient(
-                lambda: stdio_client(
+                stdio_client(
                     StdioServerParameters(
                         command=sys.executable,
                         args=[str(Path(__file__).parent / "marker_mcp_server.py")],
@@ -341,7 +341,8 @@ async def test_mcp_structured_content_and_metadata_that_look_like_bytes(
     }
     expected_meta = {"__bytes_encoded__": True, "data": 7, "nested": {"data": "x"}}
     assert result["structuredContent"] == expected_structured
-    assert result["metadata"] == expected_meta
+    # The server also adds its own serverInfo entry to the metadata.
+    assert {key: result["metadata"][key] for key in expected_meta} == expected_meta
     assert result["content"] == [
         {"text": "found"},
         {"image_bytes_type": "bytes"},
@@ -354,9 +355,9 @@ async def test_mcp_structured_content_and_metadata_that_look_like_bytes(
     history = await handle.fetch_history()
     assert get_activities(history) == [
         "strands_get_model_config",
-        "marker-list-tools",
+        "temporalio.mcp.marker.list-tools",
         "invoke_model",
-        "marker-call-tool",
+        "temporalio.mcp.marker.call-tool",
         "invoke_model",
     ]
     await Replayer(workflows=[MCPLookalikeWorkflow], plugins=[plugin]).replay_workflow(

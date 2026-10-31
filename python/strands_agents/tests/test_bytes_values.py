@@ -9,10 +9,8 @@ import pytest
 from temporalio.strands_agents._bytes_values import (
     decode_event,
     decode_messages,
-    decode_tool_result,
     encode_event,
     encode_messages,
-    encode_tool_result,
 )
 
 DATA = b"\xff\x00\xfebytes"
@@ -62,25 +60,6 @@ def test_every_bytes_field_round_trips_through_tagged_form():
     assert decode_messages(encoded) == original
 
 
-def test_tool_result_round_trips_and_keeps_other_keys():
-    result = {
-        "toolUseId": "t",
-        "status": "success",
-        "content": [{"image": {"format": "png", "source": {"bytes": DATA}}}],
-        "structuredContent": {"a": [1, 2]},
-        "metadata": {"b": None},
-        "isError": False,
-    }
-
-    encoded = encode_tool_result(result)
-
-    assert encoded["content"][0]["image"]["source"]["bytes"] == TAGGED
-    assert {k: v for k, v in encoded.items() if k != "content"} == {
-        k: v for k, v in result.items() if k != "content"
-    }
-    assert decode_tool_result(encoded) == result
-
-
 def test_event_round_trips():
     event = {
         "contentBlockDelta": {"delta": {"reasoningContent": {"redactedContent": DATA}}}
@@ -112,10 +91,6 @@ def test_values_recorded_before_tagging_decode_to_bytes(recorded: Any):
     assert decoded["contentBlockDelta"]["delta"]["reasoningContent"] == {
         "redactedContent": b"ASCII-redacted"
     }
-    result = {"content": [{"image": {"format": "png", "source": {"bytes": recorded}}}]}
-    assert decode_tool_result(result)["content"][0]["image"]["source"] == {
-        "bytes": b"ASCII-redacted"
-    }
 
 
 @pytest.mark.parametrize("junk", [None, 5, [], "", "x", ["a"]])
@@ -124,4 +99,3 @@ def test_other_values_do_not_raise(junk: Any):
     assert encode_messages(junk) == junk
     assert decode_messages(junk) == junk
     assert decode_event(junk) == junk
-    assert decode_tool_result(junk) == junk
