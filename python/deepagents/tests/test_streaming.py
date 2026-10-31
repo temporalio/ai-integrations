@@ -26,7 +26,10 @@ pytest.importorskip("langchain_core")
 
 from temporalio import workflow  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
-from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
+from tests.helpers.deepagents import (  # noqa: E402
+    count_scheduled_activities,
+    scheduled_attributes,
+)
 
 with workflow.unsafe.imports_passed_through():
     from langchain_core.messages import HumanMessage
@@ -75,6 +78,12 @@ async def test_stream_chunks_published(env: WorkflowEnvironment) -> None:
     # The topic is set, so dispatch used the streaming activity, not invoke_model.
     assert counts[INVOKE_MODEL_STREAMING] == 1, counts
     assert counts[INVOKE_MODEL] == 0, counts
+    # The streaming branch of TemporalModel._astream resolves activity options
+    # separately, so the default heartbeat timeout is asserted on its schedule
+    # too (30 s start-to-close caps the 30 s default with it).
+    attrs = await scheduled_attributes(handle, INVOKE_MODEL_STREAMING)
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=30)
+    assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=30)
 
 
 @pytest.mark.asyncio
