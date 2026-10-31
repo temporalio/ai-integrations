@@ -709,6 +709,49 @@ for (const cancellationType of [
       }
     });
   });
+
+  test(`cancelling a TemporalAgent workflow with ${cancellationType} while the model ignores its signal`, async (t) => {
+    t.timeout(60_000);
+    const { createWorker, startWorkflow } = helpers(t);
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => (markStarted = resolve));
+    let markAborted!: () => void;
+    const aborted = new Promise<void>((resolve) => (markAborted = resolve));
+    // Keeps going once its cancel signal aborts, as models that ignore `cancelSignal` do.
+    class IgnoringStub extends StubModel {
+      override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+        await new Promise<void>((resolve) => {
+          options?.cancelSignal?.addEventListener('abort', () => resolve());
+          markStarted();
+        });
+        markAborted();
+        yield* super.stream(messages, options);
+      }
+    }
+
+    const worker = await createWorker({
+      plugins: [new StrandsPlugin({ models: { test: () => new IgnoringStub([textTurn('late result')]) } })],
+    });
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(cancellableAgent, { args: [cancellationType] });
+      await started;
+      await handle.cancel();
+      if (cancellationType === ActivityCancellationType.WAIT_CANCELLATION_COMPLETED) {
+        // The workflow waits for the activity, which completes, so the run completes with its result.
+        t.is((await handle.result()).trim(), 'late result');
+        const { events } = await handle.fetchHistory();
+        t.true(events!.some((e) => e.activityTaskCompletedEventAttributes), 'expected ActivityTaskCompleted');
+        t.true(events!.some((e) => e.workflowExecutionCompletedEventAttributes), 'expected WorkflowExecutionCompleted');
+        t.false(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected no WorkflowExecutionCanceled');
+      } else {
+        const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+        t.true(err!.cause instanceof CancelledFailure, `expected a CancelledFailure, got ${err!.cause}`);
+        const { events } = await handle.fetchHistory();
+        t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');
+      }
+      await aborted;
+    });
+  });
 }
 
 test('activityAsTool dispatches a registered activity from the agent loop', async (t) => {

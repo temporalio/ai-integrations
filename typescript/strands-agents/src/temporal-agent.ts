@@ -62,7 +62,9 @@ export interface TemporalAgentOptions extends Omit<AgentConfig, 'model' | 'retry
  * passes `cancelSignal` to its client (Strands' `AnthropicModel` does not). A
  * model that ignores it keeps running and its activity can still complete with
  * the model's result. A workflow cancel during a model call cancels the model
- * activity and ends the run as cancelled, with either cancellation type.
+ * activity. With `TRY_CANCEL` the run ends as cancelled at once. With
+ * `WAIT_CANCELLATION_COMPLETED` it ends as cancelled only if the activity
+ * does; if the activity completes, the turn continues with the model's result.
  */
 export class TemporalAgent extends Agent {
   private readonly managerGiven: boolean;
