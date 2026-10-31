@@ -21,6 +21,11 @@ from temporalio.exceptions import ApplicationError
 _SDK_APPROVAL_EVALUATOR = getattr(MCPServer, "_get_needs_approval_for_tool", None)
 
 
+def _has_dynamic_tool_filter(server: MCPServer) -> bool:
+    """Return whether the server has a callable ``tool_filter``."""
+    return callable(getattr(server, "tool_filter", None))
+
+
 def _reject_dynamic_tool_filter(name: str, server: MCPServer) -> None:
     """Fail fast on a worker-side filter that can never be applied.
 
@@ -29,7 +34,7 @@ def _reject_dynamic_tool_filter(name: str, server: MCPServer) -> None:
     list-tools Activity would otherwise retry forever. A static filter needs
     neither and is applied here as usual.
     """
-    if callable(getattr(server, "tool_filter", None)):
+    if _has_dynamic_tool_filter(server):
         raise ApplicationError(
             f"MCP server {name!r} sets a callable tool_filter on its worker-side "
             "MCPServer, which cannot be applied there because the run context "
