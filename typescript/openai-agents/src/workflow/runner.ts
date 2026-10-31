@@ -83,19 +83,71 @@ function convertAgentGraph(
 
 /**
  * Returns the converted graph that `state` runs on, or else the one the latest resume on its context used,
- * if it was converted from `agent` and no run is using it.
+ * if it was converted from `agent`, no run is using it, and it doesn't override one of the state's
+ * rejections.
  *
  * Function-tool approvals are keyed by agent object on the state's `RunContext`, which the resume keeps.
  * Rebuilding the state over new agent objects would add a copy of its approvals under every resume's
  * graph, and the earlier copies can't be dropped, because saved states that still point at those agents
  * read them.
  */
-function reusableConversion(state: RunState<any, any>, agent: Agent<any, any>): Conversion | undefined {
+function reusableConversion(
+  state: RunState<any, any>,
+  agent: Agent<any, any>,
+  serializedState: string
+): Conversion | undefined {
   const candidates = [
     conversions.get(state._currentAgent as Agent<any, any>),
     resumeConversions.get(state._context)?.get(agent),
   ];
-  return candidates.find((conversion) => conversion?.source === agent && conversion.activeRuns === 0);
+  return candidates.find(
+    (conversion) =>
+      conversion?.source === agent &&
+      conversion.activeRuns === 0 &&
+      !overridesRejection(conversion, serializedState, state._context)
+  );
+}
+
+/** A function-tool approval record, as a serialized `RunState` and `RunContext` store it. */
+interface ApprovalRecord {
+  approved: boolean | string[];
+  rejected: boolean | string[];
+}
+
+interface FunctionApprovals {
+  agentIdentity: string;
+  approvals: Record<string, ApprovalRecord>;
+}
+
+/**
+ * Whether one of `conversion`'s agents always approves a tool that the serialized state always rejects for
+ * the agent with its name. The restore merges the state's decisions into the decisions the agent already
+ * owns, and an approval for good wins that merge. So a state that always approved a tool, was resumed, and
+ * then always rejected it would run it again. A fresh graph owns only the state's decisions.
+ */
+function overridesRejection(conversion: Conversion, serializedState: string, context: object): boolean {
+  const stateApprovals: FunctionApprovals[] = JSON.parse(serializedState).context.functionApprovals ?? [];
+  const rejections = stateApprovals.flatMap(({ agentIdentity, approvals }) =>
+    Object.entries(approvals)
+      .filter(([, record]) => record.rejected === true && record.approved !== true)
+      .map(([toolName]) => ({ agentIdentity, toolName }))
+  );
+  if (rejections.length === 0) return false;
+  const names = new Map<Agent<any, any>, string>();
+  for (const [source, converted] of conversion.agents) names.set(converted, source.name);
+  // _toJSONForRunState is internal to @openai/agents-core; it serializes the approvals of each agent it's given.
+  const { functionApprovals = [] } = (
+    context as {
+      _toJSONForRunState(keys: ReadonlyMap<Agent<any, any>, string>): { functionApprovals?: FunctionApprovals[] };
+    }
+  )._toJSONForRunState(names);
+  // A state's agent identity is its name, followed by `#n` if other agents in the graph share it.
+  return rejections.some(({ agentIdentity, toolName }) =>
+    functionApprovals.some(
+      ({ agentIdentity: name, approvals }) =>
+        (agentIdentity === name || agentIdentity.startsWith(`${name}#`)) && approvals[toolName]?.approved === true
+    )
+  );
 }
 
 function recordResumeConversion(state: RunState<any, any>, agent: Agent<any, any>, conversion: Conversion): void {
@@ -351,7 +403,7 @@ export class TemporalOpenAIRunner {
       this.modelParams,
       modelOverride,
       sandbox,
-      input instanceof RunState ? reusableConversion(input, agent) : undefined
+      input instanceof RunState ? reusableConversion(input, agent, serializedState!) : undefined
     );
     const converted = conversion.agents.get(agent)!;
 

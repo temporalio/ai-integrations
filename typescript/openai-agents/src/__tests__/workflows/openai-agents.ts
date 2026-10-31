@@ -641,7 +641,9 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
 
   // The run pauses on a handoff target's call, and the approved call throws once its resume has given the
   // target a new object, because its class overrides clone or the target was replaced. The call is then
-  // always rejected through the original state, and the retry of that state must not run it again.
+  // always rejected through the original state, and the retry of that state must not run it again, even
+  // if the call was approved for good. A state saved as a string and rehydrated onto the original agent
+  // must not run it again either.
   const rejectedExecutions: string[] = [];
   const rejectable = tool({
     name: 'rejectable',
@@ -662,11 +664,15 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
       return 'ok';
     },
   });
-  const rejectAfterFailedResume = async (child: Agent<ResumeContext>, replacement?: Agent<ResumeContext>) => {
+  const rejectAfterFailedResume = async (
+    child: Agent<ResumeContext>,
+    replacement?: Agent<ResumeContext>,
+    alwaysApprove = false
+  ) => {
     const root = new Agent<ResumeContext>({ name: `${child.name}Root`, model: 'gpt-4o-mini', handoffs: [child] });
     const paused = await runner.run(root, 'go', { context: { original: child.name, writes: [] } });
     const interruption = paused.interruptions[0]!;
-    paused.state.approve(interruption);
+    paused.state.approve(interruption, { alwaysApprove });
     if (replacement !== undefined) root.handoffs = [replacement];
     let threw = false;
     try {
@@ -679,12 +685,32 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     return { threw, interruptions: retried.interruptions.length };
   };
   const rejectChild = new Agent<ResumeContext>({ name: 'RejectChild', model: 'gpt-4o-mini', tools: [rejectable] });
+  const alwaysChild = new Agent<ResumeContext>({ name: 'AlwaysChild', model: 'gpt-4o-mini', tools: [rejectable] });
   const rejected = [
     await rejectAfterFailedResume(
       new VersionedAgent({ name: 'RejectCustomChild', model: 'gpt-4o-mini', tools: [rejectable] }, 'v')
     ),
     await rejectAfterFailedResume(rejectChild, rejectChild.clone({})),
+    await rejectAfterFailedResume(alwaysChild, alwaysChild.clone({}), true),
   ];
+  const persistedAgent = new Agent<ResumeContext>({
+    name: 'PersistedAgent',
+    model: 'gpt-4o-mini',
+    tools: [rejectable],
+  });
+  const pausedPersisted = await runner.run(persistedAgent, 'go', { context: { original: 'persisted', writes: [] } });
+  const persistedState = await RunState.fromString(persistedAgent, pausedPersisted.state.toString());
+  const persistedInterruption = persistedState.getInterruptions()[0]!;
+  persistedState.approve(persistedInterruption, { alwaysApprove: true });
+  let persistedThrew = false;
+  try {
+    await runner.run(persistedAgent, persistedState);
+  } catch {
+    persistedThrew = true;
+  }
+  persistedState.reject(persistedInterruption, { alwaysReject: true });
+  const persistedRetried = await runner.run(persistedAgent, persistedState);
+  rejected.push({ threw: persistedThrew, interruptions: persistedRetried.interruptions.length });
 
   // A saved state is rehydrated onto the original agent. Its restore merges the approvals, then fails in a
   // tool's isEnabled check, three times. Neither the failures nor the resume that then succeeds may add a
