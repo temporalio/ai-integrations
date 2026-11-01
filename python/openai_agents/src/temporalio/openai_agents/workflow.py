@@ -126,21 +126,24 @@ def _generated_class_doc(cls: type) -> str | None:
     """Return the docstring dataclasses or namedtuple writes for a class that has none."""
     if dataclasses.is_dataclass(cls):
         try:
-            # Format it as dataclasses did when it made the class: 3.14 leaves forward
-            # references unevaluated, so use each field's type from that time.
+            # Format it as dataclasses did when it made the class.
             if sys.version_info >= (3, 14):
                 signature = inspect.signature(  # type: ignore[reportUnreachable]
                     cls, annotation_format=annotationlib.Format.FORWARDREF
                 )
+                # 3.14 left a forward reference in the __init__ dataclasses generated
+                # unevaluated, and the field keeps the reference from that time.
+                annotate = getattr(cls.__init__, "__annotate__", None)
+                if getattr(annotate, "__generated_by_dataclasses__", False):
+                    types = {n: f.type for n, f in cls.__dataclass_fields__.items()}
+                    signature = signature.replace(
+                        parameters=[
+                            p.replace(annotation=types.get(p.name, p.annotation))
+                            for p in signature.parameters.values()
+                        ]
+                    )
             else:
                 signature = inspect.signature(cls)  # type: ignore[reportUnreachable]
-            types = {name: f.type for name, f in cls.__dataclass_fields__.items()}
-            signature = signature.replace(
-                parameters=[
-                    p.replace(annotation=types.get(p.name, p.annotation))
-                    for p in signature.parameters.values()
-                ]
-            )
             return cls.__name__ + str(signature).replace(" -> None", "")
         except (TypeError, ValueError):
             return cls.__name__
@@ -233,7 +236,7 @@ def activity_as_tool(
         ApplicationError: If the function is not properly decorated as a Temporal activity,
             or is a callable-class activity passed as an instance, or whose ``__call__`` is
             not a function, staticmethod, classmethod or ``functools.partialmethod``, can't
-            be read, or takes keyword-only arguments or ``**kwargs``.
+            be read, or takes keyword-only arguments; or if the activity takes ``**kwargs``.
 
     Example:
         >>> @activity.defn
@@ -298,18 +301,12 @@ def activity_as_tool(
         )
         fn = _tool_stand_in(call, fn.__name__, hints, doc)
     else:
-        # Drop the receiver of a method passed as Class.method the way the SDK does: a first
-        # parameter named `self` that is unannotated or annotated `typing.Self`. The activity
-        # execution picks up the actual instance, so this partial is never executed.
-        first = next(iter(inspect.signature(fn).parameters.values()), None)
-        if (
-            first is not None
-            and first.name == "self"
-            and (
-                first.annotation is inspect.Parameter.empty
-                or str(first.annotation) == "typing.Self"
-            )
-        ):
+        # Drop a first argument named `self`, however it is annotated, as before: a method passed
+        # as Class.method, even one assigned from a module function, is registered bound to an
+        # instance that fills it, and the function alone can't show how it is registered.
+        # Partially apply it; the partial is never executed.
+        params = list(inspect.signature(fn).parameters.keys())
+        if len(params) > 0 and params[0] == "self":
             fn = _tool_stand_in(
                 functools.partial(fn, None),
                 fn.__name__,

@@ -3,11 +3,12 @@ import asyncio
 import functools
 import json
 import os
+import sys
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
 
 import nexusrpc
 import pydantic
@@ -615,16 +616,51 @@ class ActivityWeatherUnprintableDefault:
         return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
 
 
+# The self-type idiom from before typing.Self.
+WeatherServiceT = TypeVar("WeatherServiceT", bound="WeatherCallService")
+
+
 class WeatherCallService:
     @activity.defn
     async def __call__(self, city: str) -> Weather:
         return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
 
+    @activity.defn
+    async def get_weather(self: WeatherServiceT, city: str) -> Weather:  # type: ignore[reportInvalidTypeVarUse]
+        # The Worker registers the bound method, so the instance fills an annotated `self` too.
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
 
 @activity.defn
-async def get_weather_for(self: str) -> Weather:
-    # An annotated `self` is a parameter, as the SDK reads it, not a receiver.
-    return Weather(city=self, temperature_range="14-20C", conditions="Sunny")
+class ActivityWeatherTuple(NamedTuple):
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+@activity.defn
+async def get_weather_shared(self: Any, city: str) -> Weather:  # type: ignore[reportUnusedParameter]
+    return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+class WeatherAssignedService:
+    # Assigned from a module function, this is still registered bound to an instance.
+    get_weather = get_weather_shared
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherCustomInit:
+    count: int
+
+    def __init__(self, count: str) -> None:
+        self.count = int(count)
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
 
 
 @pytest.mark.parametrize(
@@ -655,7 +691,12 @@ async def get_weather_for(self: str) -> Weather:
         ),
         # Not object.__call__'s docstring.
         (WeatherCallService.__call__, "city", ""),
-        (get_weather_for, "self", ""),
+        (WeatherCallService.get_weather, "city", ""),
+        (WeatherAssignedService.get_weather, "city", ""),
+        # Not the docstring dataclasses writes from the handwritten __init__.
+        (ActivityWeatherCustomInit, "city", ""),
+        # Not the docstring namedtuple writes.
+        (ActivityWeatherTuple, "city", ""),
     ],
 )
 def test_callable_class_tool_schema(target: Any, parameter: str, description: str):
@@ -734,6 +775,39 @@ def test_invalid_callable_class_tool(target: Any, message: str):
             target, start_to_close_timeout=timedelta(seconds=10)
         )
     assert raised.value.type == "invalid_tool"
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 14), reason="only Python 3.14 can define these classes"
+)
+def test_callable_class_tool_on_python_314():
+    # The forward reference resolves only after dataclasses made the class and its docstring.
+    @dataclass
+    class ActivityWeatherForwardRef:
+        station: Station  # type: ignore
+
+        async def __call__(self, city: str) -> Weather:
+            return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+    class Station:  # type: ignore[reportUnusedClass]
+        pass
+
+    tool = openai_agents.workflow.activity_as_tool(
+        activity.defn(ActivityWeatherForwardRef),
+        start_to_close_timeout=timedelta(seconds=10),
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.description == ""
+
+    # From 3.14 a bare functools.partial binds like a method, so @activity.defn takes it.
+    class ActivityWeatherPartialCall:
+        __call__ = functools.partial(get_weather_no_city)
+
+    with pytest.raises(ApplicationError, match="needs a __call__ that is a function"):
+        openai_agents.workflow.activity_as_tool(
+            activity.defn(ActivityWeatherPartialCall),
+            start_to_close_timeout=timedelta(seconds=10),
+        )
 
 
 @activity.defn
