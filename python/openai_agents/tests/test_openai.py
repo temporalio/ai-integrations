@@ -1,10 +1,13 @@
 import asyncio
+import dataclasses
 import json
 import os
+import sys
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+from types import FrameType
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import nexusrpc
@@ -84,9 +87,15 @@ from pydantic import ConfigDict, Field, TypeAdapter
 
 import temporalio.openai_agents as openai_agents
 from temporalio import activity, workflow
+from temporalio.api.common.v1 import Payload
+from temporalio.api.enums.v1 import EventType
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.common import RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.converter import (
+    DefaultFailureConverterWithEncodedAttributes,
+    PayloadCodec,
+)
 from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
@@ -97,6 +106,7 @@ from temporalio.openai_agents import (
     ModelActivityParameters,
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
+    _mcp,
 )
 from temporalio.openai_agents._invoke_model_activity import (
     _build_tool,
@@ -3179,6 +3189,220 @@ async def test_stateful_mcp_server_no_worker(client: Client):
                 err.value.cause.message
                 == "MCP Stateful Server Worker failed to schedule activity."
             )
+
+
+@workflow.defn
+class McpServerStatefulRetriedWorkflow:
+    def __init__(self) -> None:
+        self._listed: list[str] | None = None
+        self._resume = False
+
+    @workflow.run
+    async def run(
+        self,
+        session_start_to_close: timedelta,
+        schedule_to_start: timedelta,
+        session_heartbeat_timeout: timedelta | None = None,
+    ) -> list[str]:
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=10),
+            schedule_to_start_timeout=schedule_to_start,
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        async with openai_agents.workflow.stateful_mcp_server(
+            "HelloServer",
+            config=config,
+            server_session_config=ActivityConfig(
+                start_to_close_timeout=session_start_to_close,
+                heartbeat_timeout=session_heartbeat_timeout,
+            ),
+        ) as server:
+            self._listed = [tool.name for tool in await server.list_tools()]
+            await workflow.wait_condition(lambda: self._resume)
+            try:
+                return [tool.name for tool in await server.list_tools()]
+            except ApplicationError:
+                # Leaving the block raises the session activity's failure.
+                pass
+        return []
+
+    @workflow.update
+    async def wait_listed(self) -> list[str]:
+        await workflow.wait_condition(lambda: self._listed is not None)
+        return self._listed or []
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+
+def _assert_session_refused(err: WorkflowFailureError) -> None:
+    cause: BaseException | None = err.cause
+    while isinstance(cause, ActivityError):
+        cause = cause.cause
+    # Refused by the retried session activity, not only by an operation timing
+    # out.
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "DedicatedWorkerFailure"
+    assert cause.non_retryable
+
+
+async def _session_failed(handle: WorkflowHandle[Any, Any]) -> bool:
+    sessions: set[int] = set()
+    async for event in handle.fetch_history_events():
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+            name = event.activity_task_scheduled_event_attributes.activity_type.name
+            if name.endswith("-server-session"):
+                sessions.add(event.event_id)
+        elif event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED:
+            failed = event.activity_task_failed_event_attributes
+            if failed.scheduled_event_id in sessions:
+                return True
+    return False
+
+
+def _encoding_in(name: str) -> bool:
+    frame: FrameType | None = sys._getframe()
+    while frame and frame.f_code.co_name != name:
+        frame = frame.f_back
+    return frame is not None
+
+
+class _DelayMayBeOpenCodec(PayloadCodec):
+    """Delays the worker's "may be open" heartbeats, and longer its activity failures.
+
+    A "may be open" heartbeat sent before the attempt clears it then finishes
+    encoding after the clearing one, but before the attempt's failure.
+    """
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_heartbeat_async"):
+            if any(_mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads):
+                await asyncio.sleep(1.5)
+        elif _encoding_in("_handle_start_activity_task") and _encoding_in(
+            "encode_failure"
+        ):
+            await asyncio.sleep(3)
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "worker_replaced",
+        "session_timed_out",
+        "first_connect_fails",
+        "first_connect_fails_delayed_heartbeats",
+        "short_heartbeat_timeout",
+    ],
+)
+async def test_stateful_mcp_server_session_retried(
+    client: Client, case: str, monkeypatch: pytest.MonkeyPatch
+):
+    first_connect_fails = case.startswith("first_connect_fails")
+    delayed_heartbeats = case.endswith("delayed_heartbeats")
+    if delayed_heartbeats:
+        monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 1.0)
+        # Each heartbeat takes longer to encode than the interval, so one is
+        # always being encoded when the first connect fails.
+        config = client.config()
+        config["data_converter"] = dataclasses.replace(
+            client.data_converter,
+            payload_codec=_DelayMayBeOpenCodec(),
+            failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
+        )
+        client = Client(**config)
+    factory_calls = 0
+
+    def factory(_: Any) -> MCPServer:
+        nonlocal factory_calls
+        factory_calls += 1
+        server = get_tracking_server("HelloServer")
+        if first_connect_fails and factory_calls == 1:
+
+            async def fail_connect() -> None:
+                if delayed_heartbeats:
+                    await asyncio.sleep(2.5)
+                raise RuntimeError("first connect failed")
+
+            server.connect = fail_connect  # type: ignore[method-assign]
+        return server
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        task_queue = str(uuid.uuid4())
+
+        async def expect_refused(handle: WorkflowHandle[Any, Any]) -> None:
+            # The fix fails the retried session activity; without it, a retry
+            # calls the factory again.
+            async with asyncio.timeout(40):
+                while not (await _session_failed(handle) or factory_calls > 1):
+                    await asyncio.sleep(0.2)
+            await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+            with pytest.raises(WorkflowFailureError) as err:
+                await handle.result()
+            # A new server would open a new MCP session without the old one's
+            # state.
+            assert factory_calls == 1
+            _assert_session_refused(err.value)
+
+        async with new_worker(
+            client,
+            McpServerStatefulRetriedWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            handle = await client.start_workflow(
+                McpServerStatefulRetriedWorkflow.run,
+                args=[
+                    timedelta(seconds=5)
+                    if case == "session_timed_out"
+                    else timedelta(hours=1),
+                    # Long enough for the retry after a failed first connect.
+                    timedelta(seconds=30 if first_connect_fails else 5),
+                    timedelta(seconds=4) if case == "short_heartbeat_timeout" else None,
+                ],
+                id=f"mcp-server-retried-{uuid.uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=80),
+            )
+            assert await handle.execute_update(
+                McpServerStatefulRetriedWorkflow.wait_listed
+            ) == ["Say-Hello"]
+            if first_connect_fails:
+                # No session was opened, so the retry connects again.
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 2
+                return
+            if case == "session_timed_out":
+                await expect_refused(handle)
+                return
+            if case == "short_heartbeat_timeout":
+                # The session heartbeats within its 4-second heartbeat timeout,
+                # so it is not retried.
+                await asyncio.sleep(10)
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 1
+                return
+
+        # The first worker shut down gracefully, as in a deployment, and
+        # Temporal retries the session activity on the next one.
+        async with new_worker(
+            client,
+            McpServerStatefulRetriedWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            await expect_refused(handle)
 
 
 async def test_model_conversion_loops():

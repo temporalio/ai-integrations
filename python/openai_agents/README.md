@@ -542,6 +542,21 @@ persistent-session behavior. To require tool approval on these servers, pass
 as with `temporal_mcp_server()`, a policy on the factory's server is rejected
 unless it never asks for approval.
 
+Temporal cannot recreate a stateful server's session on another worker. If its
+`-server-session` activity is retried after the server connected, for example
+after a graceful worker shutdown, a lost host or the session activity's
+start-to-close timeout, the retry fails with a non-retryable
+`ApplicationError(type="DedicatedWorkerFailure")` instead of connecting a new
+server with an empty session. Leaving the `async with` block then raises an
+`ActivityError` whose cause is that failure. A retry after a failed factory
+call or first `connect()` connects again. A retry after a lost host or a
+timed-out attempt fails even when the server never connected: the worker sends
+heartbeats later, and the plugin cannot wait for one, so every heartbeat says a
+session may be open until the attempt ends without one. Before it connects, the
+session activity reads its workflow's description (`DescribeWorkflowExecution`)
+until the Temporal server shows its first heartbeat, so the worker's client
+needs permission to describe the workflow.
+
 ### Hosted MCP Tool
 
 For network-accessible MCP servers, you can also use `HostedMCPTool` from the OpenAI Agents SDK, which uses an MCP client hosted by OpenAI.

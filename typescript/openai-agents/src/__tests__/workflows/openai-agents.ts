@@ -1,5 +1,5 @@
 import { Agent, type MCPToolFilterContext } from '@openai/agents-core';
-import { ApplicationFailure } from '@temporalio/workflow';
+import { ApplicationFailure, sleep } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
@@ -228,6 +228,32 @@ export async function statefulMcpSlowConnectHeartbeatWorkflow(): Promise<string>
   } finally {
     await server.cleanup();
   }
+}
+
+const text = (content: unknown): string =>
+  (content as { text?: string }[]).map((c) => c.text ?? '').join('');
+
+export async function statefulMcpRetriedWorkflow(): Promise<string[]> {
+  const server = statefulMcpServer('retried', {
+    serverSessionConfig: { heartbeatTimeout: '2 seconds' },
+    config: { scheduleToStartTimeout: '5 seconds' },
+  });
+  await server.connect();
+  const out: string[] = [];
+  try {
+    out.push(text(await server.callTool('put', { value: 'V' })));
+    // The session's host is lost here, and Temporal retries the session Activity.
+    await sleep('10 seconds');
+    try {
+      out.push(text(await server.callTool('get', {})));
+    } catch (err: unknown) {
+      // Leaving the block reports the session Activity's failure.
+      out.push(String(err));
+    }
+  } finally {
+    await server.cleanup();
+  }
+  return out;
 }
 
 export async function tracingApiKeyWorkflow(apiKey?: string): Promise<string> {

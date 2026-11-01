@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import functools
 import inspect
@@ -20,12 +21,12 @@ from temporalio.api.enums.v1.workflow_pb2 import (
     TIMEOUT_TYPE_HEARTBEAT,
     TIMEOUT_TYPE_SCHEDULE_TO_START,
 )
+from temporalio.converter import ActivitySerializationContext
 from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
     is_cancelled_exception,
 )
-from temporalio.openai_agents._heartbeat_decorator import auto_heartbeater
 from temporalio.openai_agents._mcp_server_checks import (
     _has_worker_side_require_approval,
     _reject_worker_side_require_approval,
@@ -316,6 +317,142 @@ class _StatefulServerSessionArguments:
     factory_argument: Any | None
 
 
+# Seconds between heartbeats of the ``-server-session`` activity.
+_HEARTBEAT_INTERVAL = 30.0
+
+# Heartbeat details of a ``-server-session`` attempt that connected its MCP
+# server. Heartbeat details carry over to the next attempt, which must not open
+# a new, empty session in its place.
+_SESSION_OPENED = "mcp-session-opened"
+# Heartbeat details of an attempt that has not connected yet. The worker sends
+# heartbeats later, so an attempt can be lost after connecting but before its
+# marker reaches the server.
+_SESSION_MAY_BE_OPEN = "mcp-session-may-be-open"
+
+
+class _SessionHeartbeats:
+    """Heartbeat details of one ``-server-session`` attempt.
+
+    Only the worker sends them (``activity.heartbeat()``), so cancels, pauses
+    and resets reach the attempt as before. The worker sends its latest
+    details with the attempt's failure, but it can receive heartbeats out of
+    order.
+
+    The plugin cannot wait for a heartbeat, so every heartbeat says a session
+    may be open until the attempt ends without one, and the server is not
+    connected until the Temporal server shows that. Both markers refuse a
+    retry, so only the heartbeat that clears them must not be overtaken.
+    """
+
+    def __init__(self) -> None:
+        info = activity.info()
+        self._client = activity.client()
+        self._workflow_id = info.workflow_id or ""
+        self._run_id = info.workflow_run_id
+        self._activity_id = info.activity_id
+        self._attempt = info.attempt
+        self._data_converter = self._client.data_converter.with_context(
+            ActivitySerializationContext(
+                namespace=info.namespace,
+                workflow_id=info.workflow_id,
+                workflow_type=info.workflow_type,
+                activity_type=info.activity_type,
+                activity_id=info.activity_id,
+                activity_task_queue=info.task_queue,
+                is_local=info.is_local,
+            )
+        )
+        self._may_be_open = True
+        self._opened = False
+        # The worker encodes each heartbeat in its own task, so they can reach
+        # it out of order.
+        self._sending: set[asyncio.Task[Any]] = set()
+        # The worker sends an attempt's first heartbeat at once.
+        self.beat()
+
+    def beat(self) -> None:
+        """Sends the current details."""
+        if self._opened:
+            details = [_SESSION_OPENED]
+        elif self._may_be_open:
+            details = [_SESSION_MAY_BE_OPEN]
+        else:
+            details = []
+        before = asyncio.all_tasks()
+        activity.heartbeat(*details)
+        for task in asyncio.all_tasks() - before:
+            self._sending.add(task)
+            task.add_done_callback(self._sending.discard)
+
+    async def wait_until_stored(self) -> None:
+        """Waits until the Temporal server holds this attempt's first heartbeat.
+
+        Until then, a lost attempt's retry would find no marker and open a
+        new, empty session.
+        """
+        delay = 0.1
+        handle = self._client.get_workflow_handle(
+            self._workflow_id, run_id=self._run_id
+        )
+        while True:
+            description = await handle.describe()
+            pending = next(
+                (
+                    pending
+                    for pending in description.raw_description.pending_activities
+                    if pending.activity_id == self._activity_id
+                ),
+                None,
+            )
+            if pending is None or pending.attempt != self._attempt:
+                # A later attempt or the workflow's end replaced this one, and
+                # the details on the server are not this attempt's.
+                raise ApplicationError(
+                    "This stateful MCP server session activity attempt is no "
+                    "longer the current one."
+                )
+            details = await self._data_converter.decode(
+                pending.heartbeat_details.payloads
+            )
+            if _SESSION_MAY_BE_OPEN in details or _SESSION_OPENED in details:
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 2.0)
+
+    def record_opened(self) -> None:
+        """Records that the MCP server is connected."""
+        self._opened = True
+        self.beat()
+
+    async def close(self) -> None:
+        """Ends the attempt. Its failure carries the last details to a retry."""
+        if self._may_be_open and not self._opened:
+            # This attempt connected no server, so a retry may connect again.
+            # Send that last, after every earlier heartbeat: one still being
+            # encoded would otherwise replace it. If this wait is interrupted,
+            # the marker stays and the retry is refused.
+            if self._sending:
+                await asyncio.wait(set(self._sending))
+            self._may_be_open = False
+            self.beat()
+
+
+def _earlier_attempt_failure(details: Sequence[Any]) -> ApplicationError | None:
+    """The failure for a retry whose earlier attempt opened, or may have opened, a session."""
+    if _SESSION_OPENED in details:
+        reason = "opened an MCP session"
+    elif _SESSION_MAY_BE_OPEN in details:
+        reason = "was lost after its first heartbeat and may have opened an MCP session"
+    else:
+        return None
+    return ApplicationError(
+        f"An earlier attempt of this stateful MCP server session activity {reason}, "
+        "and Temporal cannot recreate its state.",
+        type="DedicatedWorkerFailure",
+        non_retryable=True,
+    )
+
+
 class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # type:ignore[reportUnusedClass]
     def __init__(
         self,
@@ -527,16 +664,46 @@ class StatefulMCPServerProvider:
         async def get_prompt(args: _StatefulGetPromptArguments) -> GetPromptResult:
             return await _server().get_prompt(args.name, args.arguments)
 
+        async def heartbeat_every(delay: float, heartbeats: _SessionHeartbeats) -> None:
+            """Heartbeat every ``delay`` seconds until cancelled."""
+            while True:
+                await asyncio.sleep(delay)
+                heartbeats.beat()
+
         @activity.defn(name=self.name + "-server-session")
-        @auto_heartbeater(interval=30)
         async def connect(
             args: _StatefulServerSessionArguments | None = None,
         ) -> None:
             server_id = self.name + "@" + (activity.info().workflow_run_id or "")
+            failure = _earlier_attempt_failure(activity.info().heartbeat_details)
+            if failure:
+                raise failure
             if server_id in self._servers:
                 raise ApplicationError(
                     "Cannot connect to an already running server. Use a distinct name if running multiple servers in one workflow."
                 )
+            heartbeats = _SessionHeartbeats()
+            interval = _HEARTBEAT_INTERVAL
+            heartbeat_timeout = activity.info().heartbeat_timeout
+            if heartbeat_timeout:
+                # Heartbeat well within a shorter heartbeat timeout too.
+                interval = min(interval, heartbeat_timeout.total_seconds() / 2)
+            heartbeat_task = asyncio.create_task(heartbeat_every(interval, heartbeats))
+            try:
+                await _run_session(server_id, heartbeats, args)
+            finally:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                await heartbeats.close()
+
+        async def _run_session(
+            server_id: str,
+            heartbeats: _SessionHeartbeats,
+            args: _StatefulServerSessionArguments | None,
+        ) -> None:
             server = self._server_factory(args.factory_argument if args else None)
             # A server with a worker-side approval policy is never connected.
             # The dedicated worker still runs, and each of its operations fails
@@ -547,7 +714,9 @@ class StatefulMCPServerProvider:
             try:
                 try:
                     if not rejected:
+                        await heartbeats.wait_until_stored()
                         await server.connect()
+                        heartbeats.record_opened()
 
                     worker = Worker(
                         activity.client(),

@@ -1,8 +1,9 @@
 import type { MCPServer } from '@openai/agents-core';
-import { ApplicationFailure } from '@temporalio/common';
+import { ApplicationFailure, type SerializationContext } from '@temporalio/common';
 import { Context, activityInfo } from '@temporalio/activity';
 import type { NativeConnection } from '@temporalio/worker';
 import {
+  DEDICATED_WORKER_FAILURE_TYPE,
   MCP_CALL_TOOL_SUFFIX,
   MCP_LIST_TOOLS_SUFFIX,
   MCP_SERVER_SESSION_SUFFIX,
@@ -21,6 +22,120 @@ export function registerCancelShutdown(ctx: Context, dedicatedWorker: { shutdown
 interface CallToolArgs {
   toolName: string;
   args: Record<string, unknown> | null;
+}
+
+// Heartbeat details of a session Activity attempt that connected its MCP
+// server. Heartbeat details carry over to the next attempt, which must not open
+// a new, empty session in its place.
+const SESSION_OPENED = 'mcp-session-opened';
+// Heartbeat details of an attempt that has not connected yet. The Worker sends
+// heartbeats later, so an attempt can be lost after connecting but before its
+// marker reaches the server.
+const SESSION_MAY_BE_OPEN = 'mcp-session-may-be-open';
+
+/** The failure for a retry whose earlier attempt opened, or may have opened, a session. */
+function earlierAttemptFailure(details: unknown): ApplicationFailure | undefined {
+  let reason: string;
+  if (details === SESSION_OPENED) {
+    reason = 'opened an MCP session';
+  } else if (details === SESSION_MAY_BE_OPEN) {
+    reason = 'was lost after its first heartbeat and may have opened an MCP session';
+  } else {
+    return undefined;
+  }
+  return ApplicationFailure.create({
+    message: `An earlier attempt of this stateful MCP server session Activity ${reason}, and Temporal cannot recreate its state.`,
+    type: DEDICATED_WORKER_FAILURE_TYPE,
+    nonRetryable: true,
+  });
+}
+
+/**
+ * Heartbeat details of one session Activity attempt.
+ *
+ * Only the Worker sends them, one at a time and in order, and it sends the
+ * latest ones before the attempt's failure (not before a cancellation). The plugin cannot wait for a
+ * heartbeat, so every heartbeat says a session may be open until the attempt
+ * ends without one, and the server is not connected until the Temporal server
+ * shows that.
+ */
+class SessionHeartbeats {
+  private mayBeOpen = true;
+  private opened = false;
+
+  constructor(private readonly ctx: Context) {
+    // The Worker sends an attempt's first heartbeat at once.
+    this.beat();
+  }
+
+  details(): string | undefined {
+    if (this.opened) return SESSION_OPENED;
+    if (this.mayBeOpen) return SESSION_MAY_BE_OPEN;
+    return undefined;
+  }
+
+  beat(): void {
+    try {
+      this.ctx.heartbeat(this.details());
+    } catch {
+      // As in startAdaptiveHeartbeat: the Activity may already be cancelled.
+    }
+  }
+
+  /**
+   * Waits until the Temporal server holds this attempt's first heartbeat. Until
+   * then, a lost attempt's retry would find no marker and open a new, empty
+   * session.
+   */
+  async waitUntilStored(): Promise<void> {
+    const { info, client } = this.ctx;
+    const workflowId = info.workflowExecution!.workflowId;
+    const handle = client.workflow.getHandle(workflowId, info.workflowExecution!.runId);
+    const { payloadConverter, payloadCodecs } = client.options.loadedDataConverter;
+    // The context the Worker encodes this Activity's heartbeats with.
+    const context: SerializationContext = {
+      type: 'activity',
+      namespace: info.namespace,
+      activityId: info.activityId,
+      workflowId,
+      isLocal: info.isLocal,
+    };
+    let delayMs = 100;
+    for (;;) {
+      const { raw } = await handle.describe();
+      const pending = (raw.pendingActivities ?? []).find((p) => p.activityId === info.activityId);
+      if (!pending || pending.attempt !== info.attempt) {
+        // A later attempt or the Workflow's end replaced this one, and the
+        // details on the server are not this attempt's.
+        throw ApplicationFailure.create({
+          message: 'This stateful MCP server session Activity attempt is no longer the current one.',
+        });
+      }
+      let payloads = pending.heartbeatDetails?.payloads ?? [];
+      for (const codec of [...payloadCodecs].reverse()) {
+        payloads = await codec.decode(payloads, context);
+      }
+      const details = payloads.length ? payloadConverter.fromPayload(payloads[0]!, context) : undefined;
+      if (details === SESSION_MAY_BE_OPEN || details === SESSION_OPENED) return;
+      await this.ctx.sleep(delayMs);
+      delayMs = Math.min(delayMs * 2, 2_000);
+    }
+  }
+
+  /** Records that the MCP server is connected. */
+  recordOpened(): void {
+    this.opened = true;
+    this.beat();
+  }
+
+  /** Ends the attempt. The Worker sends the last details with its failure. */
+  close(): void {
+    if (this.mayBeOpen && !this.opened) {
+      // This attempt connected no server, so a retry may connect again.
+      this.mayBeOpen = false;
+      this.beat();
+    }
+  }
 }
 
 /**
@@ -89,11 +204,17 @@ export class StatefulMCPServerProvider {
     // a server, connects it, spins up a dedicated per-run Worker, then awaits
     // until cancelled.
     const serverSession = async (input?: StatefulMcpServerSessionArgs): Promise<void> => {
-      const info = activityInfo();
+      const ctx = Context.current();
+      const info = ctx.info;
       const sid = `${this._name}@${info.workflowExecution!.runId}`;
 
+      const failure = earlierAttemptFailure(info.heartbeatDetails);
+      if (failure) {
+        throw failure;
+      }
+      const heartbeats = new SessionHeartbeats(ctx);
       // Heartbeats so a slow `server.connect()` doesn't trip the timeout.
-      const stopHeartbeat = startAdaptiveHeartbeat();
+      const stopHeartbeat = startAdaptiveHeartbeat(() => heartbeats.details());
 
       try {
         if (this._servers.has(sid)) {
@@ -109,7 +230,9 @@ export class StatefulMCPServerProvider {
 
         try {
           this._servers.set(sid, server);
+          await heartbeats.waitUntilStored();
           await server.connect();
+          heartbeats.recordOpened();
 
           const { Worker } = await import('@temporalio/worker');
 
@@ -155,6 +278,7 @@ export class StatefulMCPServerProvider {
         }
       } finally {
         stopHeartbeat();
+        heartbeats.close();
       }
     };
 

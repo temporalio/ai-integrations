@@ -1,5 +1,10 @@
 // Integration tests that need a real Worker. Pure-function tests live in
 // the sibling `*.test.ts` files.
+import { spawn } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import type { MCPServer, Model, ModelProvider, Span, SpanData, TracingProcessor } from '@openai/agents-core';
 import {
   addTraceProcessor,
   createMCPToolStaticFilter,
@@ -9,9 +14,8 @@ import {
   withCustomSpan,
   withTrace,
 } from '@openai/agents-core';
-import type { MCPServer, Model, ModelProvider, Span, SpanData, TracingProcessor } from '@openai/agents-core';
 import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
-import type { ApplicationFailure } from '@temporalio/common';
+import { ActivityFailure, ApplicationFailure } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
 import { bundleWorkflowCode } from '@temporalio/worker';
@@ -24,7 +28,9 @@ import {
   StatelessMCPServerProvider,
   TOOL_FILTER_UNSUPPORTED_TYPE,
   type TracingApiKeyContext,
+  DEDICATED_WORKER_FAILURE_TYPE,
 } from '..';
+import { memoryServer } from './helpers/stateful-mcp-host';
 import {
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
@@ -35,6 +41,7 @@ import {
   statefulMcpIsolationWorkflow,
   statefulMcpHeartbeatTimeoutWorkflow,
   statefulMcpSlowConnectHeartbeatWorkflow,
+  statefulMcpRetriedWorkflow,
   streamingAgentWorkflow,
   streamingLocalActivityWorkflow,
   streamingNoTopicWorkflow,
@@ -578,6 +585,107 @@ test('Stateful MCP: slow connect heartbeat regression', async (t) => {
     const result = await handle.result();
     t.regex(result, /^connected:/, `Expected connected:N result, got: ${result}`);
     t.true(connectCallCount > 0, 'connect() should have been called');
+  });
+});
+
+test('Stateful MCP: a retried session Activity fails instead of opening a new session', async (t) => {
+  const { createWorker, startWorkflow, taskQueue } = helpers(t);
+  // Worker A runs in a child process, so the test can kill the session's host.
+  const bundleDir = mkdtempSync(path.join(os.tmpdir(), 'stateful-mcp-host-'));
+  const codePath = path.join(bundleDir, 'bundle.js');
+  writeFileSync(codePath, t.context.workflowBundle.code);
+  const host = spawn(
+    process.execPath,
+    [require.resolve('./helpers/stateful-mcp-host'), t.context.env.address, taskQueue, codePath],
+    { stdio: ['ignore', 'pipe', 'inherit'] }
+  );
+  const lines: string[] = [];
+  host.stdout.on('data', (d) => lines.push(...String(d).trim().split('\n')));
+  const waitFor = async (line: string) => {
+    for (let i = 0; i < 300 && !lines.includes(line); i++) await new Promise((r) => setTimeout(r, 100));
+    t.true(lines.includes(line), `host printed ${line}`);
+  };
+  try {
+    await waitFor('ready');
+    const handle = await startWorkflow(statefulMcpRetriedWorkflow, { workflowExecutionTimeout: '90 seconds' });
+    await waitFor('put');
+    host.kill('SIGKILL');
+
+    // Worker B takes the retried session Activity after the heartbeat timeout.
+    let factoryCalls = 0;
+    const worker = await createWorker({
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider([]),
+          mcpServerProviders: [
+            new StatefulMCPServerProvider(
+              'retried',
+              () => {
+                factoryCalls++;
+                return memoryServer('retried', 'B');
+              },
+              t.context.env.nativeConnection
+            ),
+          ],
+        }),
+      ],
+    });
+    await worker.runUntil(async () => {
+      const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+      // Refused by the retried session Activity, not only by an operation timing out.
+      let cause: unknown = err?.cause;
+      while (cause instanceof ActivityFailure) cause = cause.cause;
+      t.true(cause instanceof ApplicationFailure, String(cause));
+      t.is((cause as ApplicationFailure).type, DEDICATED_WORKER_FAILURE_TYPE);
+      t.true((cause as ApplicationFailure).nonRetryable);
+    });
+    // A new server would open a new MCP session without the old one's state.
+    t.is(factoryCalls, 0);
+  } finally {
+    host.kill('SIGKILL');
+    rmSync(bundleDir, { recursive: true, force: true });
+  }
+});
+
+test('Stateful MCP: a session Activity retried after a failed connect connects again', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  let factoryCalls = 0;
+  const mcpProvider = new StatefulMCPServerProvider(
+    'isolationTest',
+    (): MCPServer => {
+      const call = ++factoryCalls;
+      const server = memoryServer('isolationTest', `server-${call}`);
+      server.listTools = async () => [
+        {
+          name: 'get_marker',
+          description: 'Returns marker',
+          inputSchema: { type: 'object' as const, properties: {}, required: [] as string[], additionalProperties: false },
+        },
+      ];
+      if (call === 1) {
+        server.connect = async () => {
+          throw new Error('first connect failed');
+        };
+      }
+      return server;
+    },
+    t.context.env.nativeConnection
+  );
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([textResponse('unused')]),
+        mcpServerProviders: [mcpProvider],
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(statefulMcpIsolationWorkflow, { workflowExecutionTimeout: '30 seconds' });
+    // No session was opened, so the retry connects again.
+    t.regex(result, /session=server-2/);
+    t.is(factoryCalls, 2);
   });
 });
 

@@ -511,6 +511,8 @@ export async function statefulMcpWorkflow(prompt: string): Promise<string> {
 
 Dedicated Worker startup and heartbeat failures surface as `ApplicationFailure` type (exported as `DEDICATED_WORKER_FAILURE_TYPE`).
 
+Temporal cannot recreate a stateful server's session on another Worker. If its session Activity is retried after the server connected, for example after a lost host with `serverSessionConfig.heartbeatTimeout` or after the session Activity's start-to-close timeout, the retry fails with a non-retryable `ApplicationFailure` of that type instead of connecting a new server with an empty session, and `cleanup()` then throws an `ActivityFailure` whose cause is that failure. A retry after a failed factory call or first `connect()` connects again. A retry after a lost host or a timed-out attempt fails even when the server never connected: the Worker sends heartbeats later, and the plugin cannot wait for one, so every heartbeat says a session may be open until the attempt ends without one. Before it connects, the session Activity reads its Workflow's description (`DescribeWorkflowExecution`) until the Temporal Server shows its first heartbeat, so the Worker's client needs permission to describe the Workflow.
+
 ### MCP tool filters
 
 A static `toolFilter` on the server your factory returns, such as `createMCPToolStaticFilter({ blocked: ['delete_file'] })`, applies in the list-tools Activity, so the model is not offered a blocked tool. The filter applies only to the tool list: a run that listed tools before the Worker was upgraded keeps that list while it is cached.
