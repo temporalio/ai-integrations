@@ -47,7 +47,6 @@ import {
   graphRetry,
   graphRouting,
   graphSequential,
-  graphStageQuery,
   graphTimeout,
   graphTimedOutAgentNodeRetry,
   graphTimeoutRetry,
@@ -617,10 +616,8 @@ test.serial(
             args: [step, mode],
           });
           const stage = live ? 'waiting' : 'returned';
-          // A Query sometimes takes about 10 s on a Worker with no Workflow cache (see
-          // `waitForStage` in absorbed-failure.test.ts), so allow several of those.
-          const stageDeadline = Date.now() + 60_000;
-          while ((await handle.query(graphStageQuery)) !== stage) {
+          const stageDeadline = Date.now() + 20_000;
+          while ((await handle.describe()).memo?.stage !== stage) {
             if (Date.now() > stageDeadline) throw new Error(`${label}: timed out waiting for ${stage}`);
             await new Promise((resolve) => setTimeout(resolve, 100));
           }

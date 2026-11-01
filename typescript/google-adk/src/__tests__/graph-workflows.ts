@@ -59,6 +59,7 @@ import {
   proxyActivities,
   setHandler,
   sleep,
+  upsertMemo,
 } from '@temporalio/workflow';
 
 import {
@@ -549,7 +550,10 @@ export async function graphOrphanedAgentModelCall(
   return outcome;
 }
 
-export const graphStageQuery = defineQuery<string>('graphStage');
+/** Records `name` as the Workflow's `stage` memo; see `setStage` in workflows.ts. */
+function setStage(name: string): void {
+  upsertMemo({ stage: name });
+}
 
 /** An ADK plugin whose `beforeModelCallback` runs `check`. */
 class CheckingPlugin extends BasePlugin {
@@ -582,8 +586,6 @@ export async function graphAgentStepWait(
   step: 'tool' | 'agent' | 'plugin',
   mode: 'abandoned' | 'answered' | 'abandoned-cached' | 'answered-cached' | 'waiting' | 'parallel'
 ): Promise<RunOutcome> {
-  let stage = 'running';
-  setHandler(graphStageQuery, () => stage);
   const { cancellableActivity } = proxyActivities<{ cancellableActivity(): Promise<string> }>({
     startToCloseTimeout: '1 minute',
     retry: { maximumAttempts: 1 },
@@ -593,7 +595,7 @@ export async function graphAgentStepWait(
   const wait = async (): Promise<void> => {
     runs += 1;
     if (runs > 1 || mode === 'answered' || mode === 'answered-cached') return;
-    stage = 'waiting';
+    setStage('waiting');
     await cancellableActivity();
   };
   let modelSteps = 0;
@@ -635,7 +637,7 @@ export async function graphAgentStepWait(
     'hi',
     step === 'plugin' ? [new CheckingPlugin(check)] : undefined
   );
-  stage = 'returned';
+  setStage('returned');
   if (mode === 'waiting' || mode === 'parallel') return outcome;
   try {
     await condition(() => false);

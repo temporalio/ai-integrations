@@ -33,13 +33,13 @@ import {
   condition,
   continueAsNew,
   createNexusServiceClient,
-  defineQuery,
   defineSignal,
   defineUpdate,
   isCancellation,
   proxyActivities,
   setHandler,
   sleep,
+  upsertMemo,
 } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 
@@ -560,7 +560,14 @@ export async function agentRunnerRecoversFromCancelledModel(prompt: string): Pro
   return runAgentTurn(new TemporalModel('slow-model', SINGLE_ATTEMPT), prompt, [new RecoveringPlugin()]);
 }
 
-export const adkStageQuery = defineQuery<string>('adkStage');
+/**
+ * Records `name` as the Workflow's `stage` memo, which the tests read with `describe()`.
+ * Querying a Worker with no Workflow cache slows the Workflow itself, by up to a Workflow
+ * Task timeout, enough to change what a timeout in it decides.
+ */
+function setStage(name: string): void {
+  upsertMemo({ stage: name });
+}
 
 interface BlockingActivities {
   cancellableActivity(): Promise<string>;
@@ -675,16 +682,7 @@ function blockedTurn(
 
 /** A {@link blockedTurn} in the main function. */
 export async function agentRunnerBlockedTurn(kind: BlockedTurnKind, nexusEndpoint?: string): Promise<string> {
-  let stage = 'start';
-  setHandler(adkStageQuery, () => stage);
-  return blockedTurn(
-    kind,
-    (name) => {
-      stage = name;
-    },
-    'plain',
-    nexusEndpoint
-  );
+  return blockedTurn(kind, setStage, 'plain', nexusEndpoint);
 }
 
 /**
@@ -694,15 +692,11 @@ export async function agentRunnerBlockedTurn(kind: BlockedTurnKind, nexusEndpoin
  * {@link adkDoneSignal} between them.
  */
 export async function agentRunnerSignalTurnThenCleanup(failFirst = false): Promise<string> {
-  let stage = 'start';
   let turnEnded = false;
   let released = false;
-  setHandler(adkStageQuery, () => stage);
   setHandler(adkStartSignal, async () => {
     if (failFirst) await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), 'hi');
-    await blockedTurn('tool', (name) => {
-      stage = name;
-    });
+    await blockedTurn('tool', setStage);
     turnEnded = true;
   });
   setHandler(adkDoneSignal, () => {
@@ -712,7 +706,7 @@ export async function agentRunnerSignalTurnThenCleanup(failFirst = false): Promi
   await CancellationScope.nonCancellable(async () => {
     await condition(() => turnEnded);
     await echoId('one');
-    stage = 'held';
+    setStage('held');
     await condition(() => released);
     await echoId('two');
   });
@@ -724,14 +718,8 @@ export async function agentRunnerSignalTurnThenCleanup(failFirst = false): Promi
  * whose cancellation the Workflow catches and finishes on.
  */
 export async function agentRunnerTimedOutTurnThenCaughtCancel(kind: BlockedTurnKind): Promise<string> {
-  let stage = 'start';
-  setHandler(adkStageQuery, () => stage);
-  await CancellationScope.withTimeout('1 second', () =>
-    blockedTurn(kind, (name) => {
-      stage = name;
-    })
-  );
-  stage = 'after-turn';
+  await CancellationScope.withTimeout('1 second', () => blockedTurn(kind, setStage));
+  setStage('after-turn');
   try {
     await condition(() => false);
   } catch (err) {
@@ -746,8 +734,7 @@ export async function agentRunnerTimedOutTurnThenCaughtCancel(kind: BlockedTurnK
  * shielded from that cancellation, that its own 1-second timeout scope cancels.
  */
 export async function agentRunnerCaughtCancelThenTimedOutTurn(kind: BlockedTurnKind): Promise<string> {
-  let stage = 'waiting';
-  setHandler(adkStageQuery, () => stage);
+  setStage('waiting');
   try {
     await condition(() => false);
     return 'not cancelled';
@@ -755,11 +742,7 @@ export async function agentRunnerCaughtCancelThenTimedOutTurn(kind: BlockedTurnK
     if (!isCancellation(err)) throw err;
   }
   await CancellationScope.nonCancellable(() =>
-    CancellationScope.withTimeout('1 second', () =>
-      blockedTurn(kind, (name) => {
-        stage = name;
-      })
-    )
+    CancellationScope.withTimeout('1 second', () => blockedTurn(kind, setStage))
   );
   return 'caught';
 }
@@ -774,17 +757,8 @@ export async function agentRunnerShieldedWaitThenCaughtCancel(
   wait: BlockedTurnWait,
   nexusEndpoint?: string
 ): Promise<string> {
-  let stage = 'start';
-  setHandler(adkStageQuery, () => stage);
-  await blockedTurn(
-    kind,
-    (name) => {
-      stage = name;
-    },
-    wait,
-    nexusEndpoint
-  );
-  stage = 'after-turn';
+  await blockedTurn(kind, setStage, wait, nexusEndpoint);
+  setStage('after-turn');
   try {
     await condition(() => false);
   } catch (err) {
@@ -799,21 +773,14 @@ export async function agentRunnerShieldedWaitThenCaughtCancel(
  * whose callback throws an ordinary error at once, before anything cancellable runs.
  */
 export async function agentRunnerCaughtCancelThenFailingTurn(kind: BlockedTurnKind): Promise<string> {
-  let stage = 'waiting';
-  setHandler(adkStageQuery, () => stage);
+  setStage('waiting');
   try {
     await condition(() => false);
     return 'not cancelled';
   } catch (err) {
     if (!isCancellation(err)) throw err;
   }
-  await blockedTurn(
-    kind,
-    (name) => {
-      stage = name;
-    },
-    'throws'
-  );
+  await blockedTurn(kind, setStage, 'throws');
   return 'caught';
 }
 
