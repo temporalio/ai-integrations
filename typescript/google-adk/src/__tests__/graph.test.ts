@@ -617,7 +617,9 @@ test.serial(
             args: [step, mode],
           });
           const stage = live ? 'waiting' : 'returned';
-          const stageDeadline = Date.now() + 20_000;
+          // A Query sometimes takes about 10 s on a Worker with no Workflow cache (see
+          // `waitForStage` in absorbed-failure.test.ts), so allow several of those.
+          const stageDeadline = Date.now() + 60_000;
           while ((await handle.query(graphStageQuery)) !== stage) {
             if (Date.now() > stageDeadline) throw new Error(`${label}: timed out waiting for ${stage}`);
             await new Promise((resolve) => setTimeout(resolve, 100));

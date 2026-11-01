@@ -168,12 +168,16 @@ test.serial('cancellingARunnerWhoseCallbackRecoversStillEndsCancelled', async (t
   });
 });
 
-/** Resolves once the Workflow's {@link adkStageQuery} answers `stage`. */
+/**
+ * Resolves once the Workflow's {@link adkStageQuery} answers `stage`. A Query to a Worker
+ * with no Workflow cache sometimes takes about 10 s (the Workflow Task timeout), more often
+ * on busy CI runners, so the deadline allows several of those.
+ */
 async function waitForStage(
   handle: { query(query: typeof adkStageQuery): Promise<string> },
   stage: string
 ): Promise<void> {
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + 60_000;
   while ((await handle.query(adkStageQuery)) !== stage) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for stage ${stage}`);
     await new Promise((resolve) => setTimeout(resolve, 50));
