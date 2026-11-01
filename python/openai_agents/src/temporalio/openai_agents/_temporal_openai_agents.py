@@ -378,7 +378,10 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 workflow supplied none); a factory declaring more raises here. A
                 parameterless factory's modern connection is cached between
                 Activities. A factory called with a workflow ``factory_argument``
-                always creates a fresh server for that Activity.
+                always creates a fresh server for that Activity. A factory's server
+                with a callable ``tool_filter`` or a ``require_approval`` policy
+                that can ask for approval is rejected; pass those to
+                ``workflow.temporal_mcp_server()``.
             mcp_connection_idle_timeout: How long an idle modern MCP connection
                 remains cached. Defaults to five minutes. None disables idle
                 eviction, and zero disables reuse.

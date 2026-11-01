@@ -35,8 +35,8 @@ func registryHasNoMatch(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "no registered LLM matches")
 }
 
-// ModelFactory reconstructs a model.LLM worker-side from the model name carried
-// in LLMRequest.Model. API keys and other credentials are captured in the
+// ModelFactory reconstructs a model.LLM worker-side from the TemporalModel's
+// name (see NewModel). API keys and other credentials are captured in the
 // closure and therefore live only on the worker — they are never serialized
 // into Activity inputs.
 //
@@ -69,9 +69,9 @@ type MCPFactory func(ctx context.Context) (tool.Toolset, error)
 // model, tool or MCP call crosses the Activity boundary. Construct it once at
 // worker start and hand it to NewActivities.
 type Config struct {
-	// Models maps a model name (the string the user sets on their model.LLM and
-	// that ADK copies into LLMRequest.Model) to a factory that rebuilds it
-	// worker-side. The InvokeModel Activity looks the factory up by name. It is
+	// Models maps a model name (the name passed to NewModel) to a factory that
+	// rebuilds it worker-side. The InvokeModel Activity looks the factory up by
+	// that name, even when a BeforeModelCallback changes LLMRequest.Model. It is
 	// optional: when a name is absent here, InvokeModel falls back to ADK's
 	// name-based model registry (model.NewLLM) — which stays application-owned;
 	// this package never registers into it — and gemini-* names the registry
