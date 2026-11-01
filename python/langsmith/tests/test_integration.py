@@ -9,9 +9,10 @@ from collections import Counter
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import langsmith
+import langsmith._internal._uuid as ls_uuid
 import langsmith.env
 import nexusrpc.handler
 import pytest
@@ -21,6 +22,7 @@ from langchain_core.runnables import RunnableGenerator, RunnableLambda
 from langchain_core.tracers.langchain import LangChainTracer
 from langsmith import traceable, tracing_context
 from langsmith.run_helpers import get_tracing_context
+from langsmith.run_trees import WriteReplica
 
 from temporalio import activity, common, nexus, workflow
 from temporalio.api.enums.v1 import EventType
@@ -170,12 +172,20 @@ class LangChainHelperWorkflow:
     """Runs a LangChain runnable whose steps call @traceable helpers.
 
     The ``stream`` step is a generator, whose run LangChain posts only when
-    it ends.  With ``own_tracer``, the runnable gets a ``LangChainTracer``
-    built with the client in ``_own_tracer_clients``, so run it unsandboxed.
+    it ends.  ``variant`` is one of:
+
+    - ``"own_tracer"``: the runnable gets a ``LangChainTracer`` built with
+      the first client in ``_own_tracer_clients``.
+    - ``"tags"``: it runs in a ``tracing_context`` with only tags.
+    - ``"replica"``: it runs in a ``tracing_context`` whose write replica
+      has the second client in ``_own_tracer_clients``.
+    - ``"ambient_replica"``: the same, with the context's client.
+
+    Run it unsandboxed.
     """
 
     @workflow.run
-    async def run(self, own_tracer: bool = False) -> str:
+    async def run(self, variant: str = "") -> str:
         async def prepare(prompt: str) -> str:
             return prompt
 
@@ -196,9 +206,22 @@ class LangChainHelperWorkflow:
             | RunnableLambda(finish, name="finish")
         )
         config: Any = {}
-        if own_tracer:
+        context: dict[str, Any] = {}
+        if variant == "own_tracer":
             config["callbacks"] = [LangChainTracer(client=_own_tracer_clients[0])]
-        return await chain.ainvoke("hello", config=config)
+        elif variant == "tags":
+            context["tags"] = ["feature"]
+        elif variant in ("replica", "ambient_replica"):
+            replica_client = (
+                _own_tracer_clients[1]
+                if variant == "replica"
+                else get_tracing_context()["client"]
+            )
+            context["replicas"] = [{"project_name": "copy", "client": replica_client}]
+        if not context:
+            return await chain.ainvoke("hello", config=config)
+        with tracing_context(**context):
+            return await chain.ainvoke("hello", config=config)
 
 
 @workflow.defn
@@ -541,6 +564,22 @@ def _make_client_and_collector(
     return Client(**config), collector, mock_ls_client
 
 
+def _replica_ids_are_pure() -> bool:
+    """Whether LangSmith derives a replica's run IDs from the run's alone.
+
+    Earlier releases add the clock to an ID derived from one that is not a
+    UUIDv7, so a run's post and patch to a replica name different runs, with
+    or without a replay.
+    """
+    clock = MagicMock()
+    clock.time_ns.side_effect = [1_000_000_000, 2_000_000_000]
+    run_id = uuid.uuid4()
+    with patch.object(ls_uuid, "time", clock, create=True):
+        return ls_uuid.uuid7_deterministic(
+            run_id, "copy"
+        ) == ls_uuid.uuid7_deterministic(run_id, "copy")
+
+
 def _make_temporal_client(
     client: Client, mock_ls_client: MagicMock, **kwargs: Any
 ) -> Client:
@@ -706,31 +745,45 @@ class TestReplay:
                 [run] = [r for r in collector.runs if r.name == name]
                 assert run.id == run_id
 
-    @pytest.mark.parametrize("own_tracer", [False, True])
+    @pytest.mark.parametrize(
+        "variant", ["", "own_tracer", "tags", "replica", "ambient_replica"]
+    )
     @pytest.mark.parametrize("add_temporal_runs", [False, True])
     async def test_each_run_written_once_on_replay(
         self,
         client: Client,
         env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
         add_temporal_runs: bool,
-        own_tracer: bool,
+        variant: str,
     ) -> None:
-        """With a cache of 0, a client at default settings writes each run once."""
+        """With a cache of 0, a client at default settings writes each run once.
+
+        So does a write replica with a client of its own.
+        """
+        if variant == "replica" and "client" not in WriteReplica.__annotations__:
+            pytest.skip("This LangSmith has no write replicas with a client")
+        if variant.endswith("replica") and not _replica_ids_are_pure():
+            pytest.skip("This LangSmith derives replica run IDs from the clock")
         get_runtime_environment()
         # The client's first post reads git metadata in a subprocess; read it
         # here so it does not stall the workflow past the deadlock timeout.
         langsmith.env.get_langchain_env_var_metadata()
-        writes: list[tuple[str, dict[str, Any]]] = []
+        # (client, "post" or "patch", run)
+        writes: list[tuple[str, str, dict[str, Any]]] = []
 
         class _RecordingClient(langsmith.Client):
+            label = "plugin"
+
             def _create_run(self, *args: Any, **kwargs: Any) -> None:
-                writes.append(("post", args[0]))
+                writes.append((self.label, "post", args[0]))
 
             def _update_run(self, *args: Any, **kwargs: Any) -> None:
-                writes.append(("patch", args[0]))
+                writes.append((self.label, "patch", args[0]))
 
         ls_client = _RecordingClient(api_url="http://localhost:1", api_key="test")
-        _own_tracer_clients[:] = [ls_client]
+        replica_client = _RecordingClient(api_url="http://localhost:1", api_key="test")
+        replica_client.label = "replica"
+        _own_tracer_clients[:] = [ls_client, replica_client]
         plugin = LangSmithPlugin(client=ls_client, add_temporal_runs=add_temporal_runs)
         config = client.config()
         config["plugins"] = [plugin]
@@ -745,14 +798,39 @@ class TestReplay:
         ) as worker:
             await temporal_client.execute_workflow(
                 LangChainHelperWorkflow.run,
-                own_tracer,
+                variant,
                 id=f"replay-test-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
             )
         _wait_for_tracing_io(plugin)
 
+        # With a dedicated replica, LangChain's runs go to its client, and
+        # the activity's to the plugin's.
+        labels = {label for label, _, _ in writes}
+        assert labels == ({"plugin", "replica"} if variant == "replica" else {"plugin"})
+        for label in sorted(labels):
+            self._check_written_once(
+                [(op, run) for c, op, run in writes if c == label],
+                langchain=label == ("replica" if variant == "replica" else "plugin"),
+            )
+
+    @staticmethod
+    def _check_written_once(
+        writes: list[tuple[str, dict[str, Any]]], *, langchain: bool
+    ) -> None:
+        """Check one client's writes of ``LangChainHelperWorkflow``'s runs.
+
+        With ``langchain``, the client got LangChain's runs.
+        """
         posts = [run for op, run in writes if op == "post"]
         patches = [run for op, run in writes if op == "patch"]
+        assert len({str(run["id"]) for run in posts}) == len(posts)
+        assert [run["error"] for run in posts + patches if run.get("error")] == []
+        if not langchain:
+            assert sorted(str(run["id"]) for run in patches) == sorted(
+                str(run["id"]) for run in posts
+            )
+            return
         assert {
             "RunnableSequence",
             "prepare",

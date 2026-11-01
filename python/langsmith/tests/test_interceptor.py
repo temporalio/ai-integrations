@@ -315,7 +315,7 @@ class TestReplaySafety:
         ):
             runs = _LangChainRuns()
             parent, child = uuid.uuid4(), uuid.uuid4()
-            runs.add(parent, keep_id=True)
+            runs.add(parent)
             # The child starts 1 microsecond after workflow.now().
             assert runs.start_time(child) == now + timedelta(microseconds=1)
             for run_id in (child, parent):

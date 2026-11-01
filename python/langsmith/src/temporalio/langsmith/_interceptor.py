@@ -318,21 +318,31 @@ class _LangChainRuns:
         value = value & ~(0x3 << 62) | 0x2 << 62
         return uuid.UUID(int=value)
 
-    def add(self, run_id: Any, *, keep_id: bool = False) -> uuid.UUID:
-        """Give a run a stable ID and start time, once, and return the ID.
+    def add(self, run_id: Any, *, start: Any = None) -> uuid.UUID:
+        """Give a run, which keeps its ID, a stable start time, once.
 
-        With ``keep_id``, the run keeps its own ID.
+        A ``start`` the run already has, as a timezone-aware datetime, is
+        kept.  Returns the run's ID.
         """
         entry = self._ids.get(str(run_id))
         if entry is None:
-            stable = uuid.UUID(str(run_id)) if keep_id else _uuid_from_random(self._rng)
-            entry = (stable, self._next_start())
+            if isinstance(start, datetime) and start.tzinfo is not None:
+                if self._last_start is None or start > self._last_start:
+                    self._last_start = start
+            else:
+                start = self._next_start()
+            entry = (uuid.UUID(str(run_id)), start)
             self._ids[str(run_id)] = entry
         return entry[0]
 
+    def new_run(self) -> tuple[uuid.UUID, datetime]:
+        """Get a stable ID and start time for a new run, and add it."""
+        run_id = self.add(_uuid_from_random(self._rng))
+        return run_id, self._ids[str(run_id)][1]
+
     def start_time(self, run_id: Any) -> datetime:
-        """Get the start time of a run that keeps its ID, adding it first."""
-        self.add(run_id, keep_id=True)
+        """Get the start time of a run, adding it first."""
+        self.add(run_id)
         return self._ids[str(run_id)][1]
 
     def _next_start(self) -> datetime:
@@ -424,19 +434,56 @@ def _get_langchain_runs() -> _LangChainRuns | None:
 _langchain_run_id_hook_installed = False
 
 
+def _plugin_langchain_runs() -> _LangChainRuns | None:
+    """Get the workflow's ``_LangChainRuns`` in the tracing context this plugin sets.
+
+    The context's client is the one LangChain gives the tracer it makes: the
+    current run's, or with no current run, the context's.  A nested
+    ``tracing_context`` that names no client, such as one with only tags,
+    keeps the current run, so it stays in the plugin's context.  Returns
+    ``None`` outside it, such as in a workflow on a worker without the plugin.
+    """
+    context = get_tracing_context()
+    parent = context.get("parent")
+    client = (
+        context.get("client") if parent is None else getattr(parent, "ls_client", None)
+    )
+    if not isinstance(client, _ReplaySafeClient):
+        return None
+    return _get_langchain_runs()
+
+
+def _replay_safe_replicas(run: RunTree) -> None:
+    """Make the run's write replicas with a client of their own replay-safe.
+
+    ``RunTree.post`` and ``patch`` write to such a replica through its
+    client, not the run's.
+    """
+    if not run.replicas:
+        return
+    wrappers: dict[int, _ReplaySafeClient] = {}
+    replicas: list[WriteReplica] = []
+    for replica in run.replicas:
+        client = replica.get("client")
+        if client is not None and not isinstance(client, _ReplaySafeClient):
+            # One wrapper per client, so LangSmith groups the replicas as before.
+            if id(client) not in wrappers:
+                wrappers[id(client)] = _ReplaySafeClient(client)
+            replica = replica.copy()
+            replica["client"] = wrappers[id(client)]
+        replicas.append(replica)
+    run.replicas = replicas
+
+
 def _stable_run_ids(generate: Callable[..., Any], version: int) -> Callable[..., Any]:
     """Wrap a LangChain run ID generator to use ``_LangChainRuns.new_id``.
 
     It calls ``generate`` outside the tracing context this plugin sets for
-    workflow code, such as in a workflow on a worker without the plugin.
+    workflow code (see ``_plugin_langchain_runs``).
     """
 
     def generate_run_id(*args: Any, **kwargs: Any) -> Any:
-        runs = None
-        if not (args or kwargs) and isinstance(
-            get_tracing_context().get("client"), _ReplaySafeClient
-        ):
-            runs = _get_langchain_runs()
+        runs = None if args or kwargs else _plugin_langchain_runs()
         return generate(*args, **kwargs) if runs is None else runs.new_id(version)
 
     return generate_run_id
@@ -459,17 +506,28 @@ def _stable_child_ids(create_child: Callable[..., Any]) -> Callable[..., Any]:
     ``@traceable`` and ``trace`` make their runs with its ``create_child``,
     which picks a clock-based ID.  In workflow code, a child that writes
     through a ``_ReplaySafeClient`` and was given no ``run_id`` gets a
-    workflow-seeded ID instead, like LangChain's own runs.
+    workflow-seeded ID instead, like LangChain's own runs, and its write
+    replicas with a client of their own write through a ``_ReplaySafeClient``
+    too.
     """
 
     def create_child_with_stable_id(
         self: RunTree, *args: Any, run_id: Any = None, **kwargs: Any
     ) -> RunTree:
-        if run_id is None and isinstance(self.ls_client, _ReplaySafeClient):
+        runs = None
+        if isinstance(self.ls_client, _ReplaySafeClient):
             runs = _get_langchain_runs()
-            if runs is not None:
-                run_id = runs.new_id(7)
-        return create_child(self, *args, run_id=run_id, **kwargs)
+        if runs is None:
+            return create_child(self, *args, run_id=run_id, **kwargs)
+        if run_id is None:
+            run_id = runs.new_id(7)
+        # The start time is stable before the child's dotted order is built,
+        # since a replica writes the child under another ID.
+        if kwargs.get("start_time") is None:
+            kwargs["start_time"] = runs.start_time(run_id)
+        child = create_child(self, *args, run_id=run_id, **kwargs)
+        _replay_safe_replicas(child)
+        return child
 
     return create_child_with_stable_id
 
@@ -486,17 +544,17 @@ def _replay_safe_tracer(start_trace: Callable[..., Any]) -> Callable[..., Any]:
     The run also gets its stable start time here, when it starts, before
     the tracer builds the dotted order its children copy.  A run with
     deferred inputs, such as a ``RunnableGenerator``'s, is posted only when
-    it ends, after its children.
+    it ends, after its children.  The run's write replicas with a client
+    of their own are wrapped here too.
     """
 
     def _start_trace(self: Any, run: Any) -> None:
-        runs = None
-        if isinstance(get_tracing_context().get("client"), _ReplaySafeClient):
-            runs = _get_langchain_runs()
+        runs = _plugin_langchain_runs()
         if runs is not None:
             if not isinstance(self.client, _ReplaySafeClient):
                 self.client = _replay_safe_client(self.client)
             run.start_time = runs.start_time(run.id)
+            _replay_safe_replicas(run)
         start_trace(self, run)
 
     return _start_trace
@@ -681,8 +739,13 @@ def _post_pending(runs: _LangChainRuns) -> None:
         client._write(run_id, held)
 
 
-class _ReplaySafeClient:
+class _ReplaySafeClient(langsmith.Client):
     """Wraps a LangSmith client for use in workflow code.
+
+    It is a ``langsmith.Client``, so LangSmith accepts it where it checks
+    for one, such as in a ``WriteReplica``, but it never runs
+    ``langsmith.Client.__init__``: every attribute other than its own is
+    the wrapped client's.
 
     LangChain's tracers write their runs through this client, not through
     ``_ReplaySafeRunTree`` (see ``_replay_safe_tracer``).  In workflow code,
@@ -698,27 +761,43 @@ class _ReplaySafeClient:
     I/O, go to the wrapped client as is.
     """
 
-    def __init__(self, client: langsmith.Client) -> None:
+    _OWN: ClassVar[frozenset[str]] = frozenset(
+        {"_client", "_open", "create_run", "update_run", "_add_open", "_write"}
+    )
+
+    def __init__(  # pyright: ignore[reportMissingSuperCall]
+        self, client: langsmith.Client
+    ) -> None:
         """Wrap a LangSmith client."""
-        self._client = client
+        object.__setattr__(self, "_client", client)
         # Every wrapper of a client shares its record.
         with _open_runs_lock:
             try:
-                self._open = _open_runs.setdefault(client, OrderedDict())
+                record = _open_runs.setdefault(client, OrderedDict())
             except TypeError:
                 # A client without weak references keeps a record per wrapper.
-                self._open = OrderedDict()
+                record = OrderedDict()
+        object.__setattr__(self, "_open", record)
 
-    def __getattr__(self, name: str) -> Any:
-        """Delegate attribute access to the wrapped client."""
-        return getattr(self._client, name)
+    def __getattribute__(self, name: str) -> Any:
+        """Delegate attribute access, other than to its own, to the wrapped client."""
+        if name.startswith("__") or name in _ReplaySafeClient._OWN:
+            return object.__getattribute__(self, name)
+        return getattr(object.__getattribute__(self, "_client"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Delegate attribute setting to the wrapped client."""
+        setattr(self._client, name, value)
 
     def create_run(self, *args: Any, **kwargs: Any) -> None:
         """Post a run, replay-safe in workflow code."""
         runs = _get_langchain_runs()
         if runs is None or args or kwargs.get("id") is None:
             return self._client.create_run(*args, **kwargs)
-        run_id = runs.add(kwargs["id"], keep_id=True)
+        # A run this class does not know, such as a write replica's copy of
+        # one it does, under an ID derived from the stable one, keeps its
+        # start time.
+        run_id = runs.add(kwargs["id"], start=kwargs.get("start_time"))
         runs.remap(kwargs, "id")
         ended = kwargs.get("end_time") is not None
         held = _prepare_write(self._client, "create_run", kwargs)
@@ -917,19 +996,22 @@ class _RootReplaySafeRunTreeFactory(_ReplaySafeRunTree):
         replicas: Sequence[WriteReplica] | None = None,
     ) -> None:
         """Create a root factory with the given LangSmith client."""
+        # LangChain's tracer makes the factory its runs' parent, so it gets
+        # a stable ID and start time, which write replicas derive theirs from.
+        runs = _get_langchain_runs()
+        stable: dict[str, Any] = {}
+        if runs is not None:
+            stable["id"], stable["start_time"] = runs.new_run()
         # Create a minimal RunTree for the factory — it will never be posted
         factory_run = RunTree(
             name="__root_factory__",
             run_type="chain",
             ls_client=ls_client,
             **destination,
+            **stable,
         )
         if replicas is not None:
             factory_run.replicas = replicas
-        # LangChain's tracer makes the factory its runs' parent.
-        runs = _get_langchain_runs()
-        if runs is not None:
-            runs.add(factory_run.id)
         object.__setattr__(self, "_run", factory_run)
         object.__setattr__(self, "_executor", executor)
 
