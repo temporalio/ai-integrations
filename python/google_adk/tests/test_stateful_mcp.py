@@ -751,7 +751,13 @@ class StatefulMcpHostKilledWorkflow:
         self._resume = False
 
     @workflow.run
-    async def run(self, host_task_queue: str) -> str:
+    async def run(self, host_task_queue: str, heartbeat_timeout: bool) -> str:
+        session_config = ActivityConfig(
+            task_queue=host_task_queue, start_to_close_timeout=timedelta(seconds=10)
+        )
+        if heartbeat_timeout:
+            session_config["start_to_close_timeout"] = timedelta(hours=1)
+            session_config["heartbeat_timeout"] = timedelta(seconds=5)
         async with TemporalStatefulMcpToolSet(
             "stateful_state",
             config=ActivityConfig(
@@ -759,12 +765,12 @@ class StatefulMcpHostKilledWorkflow:
                 schedule_to_start_timeout=timedelta(seconds=5),
                 retry_policy=RetryPolicy(maximum_attempts=1),
             ),
-            server_session_config=ActivityConfig(
-                task_queue=host_task_queue,
-                start_to_close_timeout=timedelta(hours=1),
-                heartbeat_timeout=timedelta(seconds=5),
-            ),
+            server_session_config=session_config,
         ) as toolset:
+            if not heartbeat_timeout:
+                # Let a periodic heartbeat start the worker's 30-second
+                # throttle, so the marker heartbeat is held back.
+                await workflow.sleep(2)
             tools = {t.name: t for t in await toolset.get_tools()}
             await tools["put"].run_async(
                 args={"text": "kept"}, tool_context=_tool_context()
@@ -786,10 +792,14 @@ class StatefulMcpHostKilledWorkflow:
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("delay_worker_heartbeats", [False, True])
+@pytest.mark.parametrize(
+    "case",
+    ["heartbeat_timeout", "heartbeat_timeout_delayed_marker", "no_heartbeat_timeout"],
+)
 async def test_stateful_session_after_host_killed(
-    client: Client, tmp_path: Path, delay_worker_heartbeats: bool
+    client: Client, tmp_path: Path, case: str
 ):
+    delay_worker_heartbeats = case == "heartbeat_timeout_delayed_marker"
     (tmp_path / "host.py").write_text(_SESSION_HOST)
     (tmp_path / "codec.py").write_text(_SESSION_HOST_CODEC)
     calls_file = tmp_path / "calls"
@@ -830,7 +840,7 @@ async def test_stateful_session_after_host_killed(
         ):
             handle = await client.start_workflow(
                 StatefulMcpHostKilledWorkflow.run,
-                host_task_queue,
+                args=[host_task_queue, case != "no_heartbeat_timeout"],
                 id=f"stateful-mcp-killed-{uuid.uuid4()}",
                 task_queue=task_queue,
                 execution_timeout=timedelta(seconds=50),
@@ -852,8 +862,8 @@ async def test_stateful_session_after_host_killed(
             host.kill()
             await host.wait()
 
-            # After the heartbeat timeout, Temporal retries the session
-            # activity on another host.
+            # After the heartbeat or start-to-close timeout, Temporal retries
+            # the session activity on another host.
             async with Worker(client, task_queue=host_task_queue):
                 # Let the retried session activity fail before the next
                 # get_tools, which would otherwise time out first.

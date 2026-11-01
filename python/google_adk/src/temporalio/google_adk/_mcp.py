@@ -22,6 +22,7 @@ from temporalio.api.enums.v1.workflow_pb2 import (
     TIMEOUT_TYPE_HEARTBEAT,
     TIMEOUT_TYPE_SCHEDULE_TO_START,
 )
+from temporalio.converter import ActivitySerializationContext
 from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
@@ -378,9 +379,9 @@ _HEARTBEAT_INTERVAL = 30.0
 # session. Heartbeat details carry over to the next attempt, which must not open
 # a new, empty session in its place.
 _SESSION_OPENED = "mcp-session-opened"
-# Heartbeat details of an attempt with a heartbeat timeout that has not opened
-# a session. The worker sends heartbeats later, so such an attempt can be lost
-# after opening a session but before its marker reaches the server.
+# Heartbeat details of an attempt that has not opened a session yet. The worker
+# sends heartbeats later, so an attempt can be lost after opening a session but
+# before its marker reaches the server.
 _SESSION_MAY_BE_OPEN = "mcp-session-may-be-open"
 
 
@@ -391,21 +392,39 @@ class _SessionHeartbeats:
     and resets reach the attempt as before. The worker sends an attempt's
     heartbeats one at a time, and its latest details with the attempt's
     failure, so a heartbeat it sent earlier does not replace the marker.
+
+    The plugin cannot wait for a heartbeat, so every heartbeat says a session
+    may be open until the attempt ends without one, and no session opens until
+    the server shows that.
     """
 
     def __init__(self) -> None:
+        info = activity.info()
         # The marker is recorded from list and call activities, so keep this
         # activity's context for ``activity.heartbeat()``.
         self._context = contextvars.copy_context()
-        # A lost attempt is retried only after its heartbeat timeout. Until
-        # the attempt ends without a session, a retry treats it as having
-        # opened one.
-        self._may_be_open = bool(activity.info().heartbeat_timeout)
+        self._client = activity.client()
+        self._workflow_id = info.workflow_id or ""
+        self._run_id = info.workflow_run_id
+        self._activity_id = info.activity_id
+        self._data_converter = self._client.data_converter.with_context(
+            ActivitySerializationContext(
+                namespace=info.namespace,
+                workflow_id=info.workflow_id,
+                workflow_type=info.workflow_type,
+                activity_type=info.activity_type,
+                activity_id=info.activity_id,
+                activity_task_queue=info.task_queue,
+                is_local=info.is_local,
+            )
+        )
+        self._stored = False
+        self._store_lock = asyncio.Lock()
+        self._may_be_open = True
         self._opened = False
         self._closed = False
-        if self._may_be_open:
-            # The first heartbeat is sent at once, before a session can open.
-            self.beat()
+        # The worker sends an attempt's first heartbeat at once.
+        self.beat()
 
     def beat(self) -> None:
         """Sends the current details."""
@@ -417,15 +436,40 @@ class _SessionHeartbeats:
             details = []
         self._context.run(activity.heartbeat, *details)
 
+    async def wait_until_stored(self) -> None:
+        """Waits until the server holds this attempt's first heartbeat.
+
+        Until then, a lost attempt's retry would find no marker and open a
+        new, empty session.
+        """
+        delay = 0.1
+        async with self._store_lock:
+            while not self._stored:
+                if self._closed:
+                    raise _stopping_error()
+                handle = self._client.get_workflow_handle(
+                    self._workflow_id, run_id=self._run_id
+                )
+                description = await handle.describe()
+                for pending in description.raw_description.pending_activities:
+                    if pending.activity_id != self._activity_id:
+                        continue
+                    details = await self._data_converter.decode(
+                        pending.heartbeat_details.payloads
+                    )
+                    self._stored = (
+                        _SESSION_MAY_BE_OPEN in details or _SESSION_OPENED in details
+                    )
+                if not self._stored:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 2.0)
+
     def record_opened(self) -> None:
         """Records that the toolset opened an MCP session."""
         if self._opened:
             return
         if self._closed:
-            raise ApplicationError(
-                "The stateful MCP session activity is stopping, so it cannot "
-                "open a new MCP session."
-            )
+            raise _stopping_error()
         self._opened = True
         self.beat()
 
@@ -436,6 +480,13 @@ class _SessionHeartbeats:
             # This attempt opened no session, so a retry may build the toolset.
             self._may_be_open = False
             self.beat()
+
+
+def _stopping_error() -> ApplicationError:
+    return ApplicationError(
+        "The stateful MCP session activity is stopping, so it cannot open a new "
+        "MCP session."
+    )
 
 
 def _earlier_attempt_failure(details: Sequence[Any]) -> ApplicationError | None:
@@ -469,6 +520,7 @@ def _record_opened_sessions(
     create_session = manager.create_session
 
     async def create_session_and_record(*args: Any, **kwargs: Any) -> Any:
+        await heartbeats.wait_until_stored()
         session = await create_session(*args, **kwargs)
         heartbeats.record_opened()
         return session
@@ -483,10 +535,11 @@ class _RunningToolset:
     heartbeats: _SessionHeartbeats
     observes_sessions: bool
 
-    def get(self) -> McpToolset:
+    async def get(self) -> McpToolset:
         if not self.observes_sessions:
             # No session to observe: record the marker before the first
             # operation instead.
+            await self.heartbeats.wait_until_stored()
             self.heartbeats.record_opened()
         return self.toolset
 
@@ -555,7 +608,7 @@ class TemporalStatefulMcpToolSetProvider:
 
         @activity.defn(name=self._name + "-list-tools")
         async def get_tools() -> list[_ToolResult]:
-            toolset = self._toolsets[_server_id()].get()
+            toolset = await self._toolsets[_server_id()].get()
             tools = await toolset.get_tools()
             return [
                 _ToolResult(
@@ -570,7 +623,7 @@ class TemporalStatefulMcpToolSetProvider:
 
         @activity.defn(name=self._name + "-call-tool")
         async def call_tool(args: _StatefulCallToolArguments) -> _CallToolResult:
-            toolset = self._toolsets[_server_id()].get()
+            toolset = await self._toolsets[_server_id()].get()
             tools = await toolset.get_tools()
 
             tool_match = [tool for tool in tools if tool.name == args.name]
