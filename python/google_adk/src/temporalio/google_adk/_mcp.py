@@ -29,7 +29,11 @@ from temporalio.exceptions import (
     is_cancelled_exception,
 )
 from temporalio.worker import PollerBehaviorSimpleMaximum, Worker
-from temporalio.workflow import ActivityConfig, ActivityHandle
+from temporalio.workflow import (
+    ActivityCancellationType,
+    ActivityConfig,
+    ActivityHandle,
+)
 
 
 @dataclass
@@ -390,23 +394,26 @@ async def _execute_operation(
     if session.done():
         raise _session_ended_failure(session)
     operation = workflow.start_activity(activity, *args, **kwargs)
-    session_ended = False
-
-    def cancel_operation(_: Any) -> None:
-        nonlocal session_ended
-        if not operation.done():
-            session_ended = True
-            operation.cancel()
-
-    session.add_done_callback(cancel_operation)
     try:
+        await workflow.wait([operation, session], return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        # The operation is not awaited directly, so pass the cancellation on
+        # and wait for it as its cancellation type says.
+        operation.cancel()
         return await operation
-    except BaseException as e:
-        if session_ended and is_cancelled_exception(e):
-            raise _session_ended_failure(session)
-        raise
-    finally:
-        session.remove_done_callback(cancel_operation)
+    if operation.done():
+        return operation.result()
+    # Fail without waiting for the operation: the worker that ran it may be
+    # gone. A cancellation that waits for that worker to acknowledge it would
+    # also keep the workflow from being evicted, so such an operation is left
+    # to its timeout instead.
+    if (
+        kwargs.get("cancellation_type")
+        != ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+    ):
+        operation.cancel()
+    operation.add_done_callback(lambda op: op.cancelled() or op.exception())
+    raise _session_ended_failure(session)
 
 
 @dataclass
@@ -854,7 +861,8 @@ class TemporalStatefulMcpToolSet(BaseToolset):
                 ``schedule_to_start_timeout`` is used to detect a dead
                 dedicated worker. Operations also fail with
                 ``DedicatedWorkerFailure`` once the session activity has
-                ended.
+                ended, without waiting for a cancellation to be
+                acknowledged.
             server_session_config: Optional activity configuration for the
                 long-running ``-server-session`` activity.
             factory_argument: Optional argument passed once to the toolset

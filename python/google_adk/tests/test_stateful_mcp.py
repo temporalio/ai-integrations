@@ -43,7 +43,7 @@ from mcp import StdioServerParameters
 
 from temporalio import workflow
 from temporalio.api.common.v1 import Payload, WorkflowExecution
-from temporalio.api.enums.v1 import EventType
+from temporalio.api.enums.v1 import EventType, PendingActivityState
 from temporalio.api.workflow.v1 import PendingActivityInfo
 from temporalio.api.workflowservice.v1 import (
     ResetActivityRequest,
@@ -57,7 +57,7 @@ from temporalio.converter import (
 )
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.worker import Worker
-from temporalio.workflow import ActivityConfig
+from temporalio.workflow import ActivityCancellationType, ActivityConfig
 
 with workflow.unsafe.imports_passed_through():
     from google.adk.events import EventActions
@@ -755,6 +755,8 @@ async def test_stateful_session_marker_kept_by_worker_heartbeats(
 
 
 _STATE_MCP_SERVER = """
+import asyncio
+
 from mcp.server.fastmcp import FastMCP
 
 server = FastMCP("state")
@@ -771,6 +773,12 @@ def put(text: str) -> str:
 @server.tool()
 def get() -> str:
     return value
+
+
+@server.tool()
+async def wait() -> str:
+    await asyncio.sleep(3600)
+    return "done"
 
 
 server.run()
@@ -881,20 +889,29 @@ class StatefulMcpHostKilledWorkflow:
         self._resume = False
 
     @workflow.run
-    async def run(self, host_task_queue: str, heartbeat_timeout: bool) -> str:
+    async def run(
+        self, host_task_queue: str, heartbeat_timeout: bool, call_waiting: bool
+    ) -> str:
         session_config = ActivityConfig(
             task_queue=host_task_queue, start_to_close_timeout=timedelta(seconds=10)
         )
         if heartbeat_timeout:
             session_config["start_to_close_timeout"] = timedelta(hours=1)
             session_config["heartbeat_timeout"] = timedelta(seconds=5)
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=20),
+            schedule_to_start_timeout=timedelta(seconds=5),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        if call_waiting:
+            # Its cancellation is never acknowledged once the host is gone.
+            config["start_to_close_timeout"] = timedelta(minutes=2)
+            config["cancellation_type"] = (
+                ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+            )
         async with TemporalStatefulMcpToolSet(
             "stateful_state",
-            config=ActivityConfig(
-                start_to_close_timeout=timedelta(seconds=20),
-                schedule_to_start_timeout=timedelta(seconds=5),
-                retry_policy=RetryPolicy(maximum_attempts=1),
-            ),
+            config=config,
             server_session_config=session_config,
         ) as toolset:
             if not heartbeat_timeout:
@@ -906,6 +923,10 @@ class StatefulMcpHostKilledWorkflow:
                 args={"text": "kept"}, tool_context=_tool_context()
             )
             self._stored = True
+            if call_waiting:
+                return str(
+                    await tools["wait"].run_async(args={}, tool_context=_tool_context())
+                )
             await workflow.wait_condition(lambda: self._resume)
             tools = {t.name: t for t in await toolset.get_tools()}
             return str(
@@ -924,12 +945,18 @@ class StatefulMcpHostKilledWorkflow:
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize(
     "case",
-    ["heartbeat_timeout", "heartbeat_timeout_delayed_marker", "no_heartbeat_timeout"],
+    [
+        "heartbeat_timeout",
+        "heartbeat_timeout_delayed_marker",
+        "heartbeat_timeout_call_waiting",
+        "no_heartbeat_timeout",
+    ],
 )
 async def test_stateful_session_after_host_killed(
     client: Client, tmp_path: Path, case: str
 ):
     delay_worker_heartbeats = case == "heartbeat_timeout_delayed_marker"
+    call_waiting = case == "heartbeat_timeout_call_waiting"
     (tmp_path / "host.py").write_text(_SESSION_HOST)
     (tmp_path / "codec.py").write_text(_SESSION_HOST_CODEC)
     calls_file = tmp_path / "calls"
@@ -970,7 +997,7 @@ async def test_stateful_session_after_host_killed(
         ):
             handle = await client.start_workflow(
                 StatefulMcpHostKilledWorkflow.run,
-                args=[host_task_queue, case != "no_heartbeat_timeout"],
+                args=[host_task_queue, case != "no_heartbeat_timeout", call_waiting],
                 id=f"stateful-mcp-killed-{uuid.uuid4()}",
                 task_queue=task_queue,
                 execution_timeout=timedelta(seconds=50),
@@ -989,6 +1016,18 @@ async def test_stateful_session_after_host_killed(
                     ):
                         break
                     await asyncio.sleep(0.05)
+            if call_waiting:
+                # Kill the host while it runs the wait tool call.
+                async with asyncio.timeout(20):
+                    while not any(
+                        pending.activity_type.name.endswith("-call-tool")
+                        and pending.state
+                        == PendingActivityState.PENDING_ACTIVITY_STATE_STARTED
+                        for pending in (
+                            await handle.describe()
+                        ).raw_description.pending_activities
+                    ):
+                        await asyncio.sleep(0.1)
             host.kill()
             await host.wait()
 
@@ -1003,8 +1042,11 @@ async def test_stateful_session_after_host_killed(
                     ):
                         await asyncio.sleep(0.2)
                 await handle.signal(StatefulMcpHostKilledWorkflow.resume)
-                with pytest.raises(WorkflowFailureError) as err:
-                    await handle.result()
+                # A waiting call fails with the session, not after its
+                # start-to-close timeout.
+                async with asyncio.timeout(10):
+                    with pytest.raises(WorkflowFailureError) as err:
+                        await handle.result()
     finally:
         if host.returncode is None:
             host.kill()
