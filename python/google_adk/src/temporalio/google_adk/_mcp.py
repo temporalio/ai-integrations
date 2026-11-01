@@ -406,7 +406,8 @@ async def _execute_operation(
     # Fail without waiting for the operation: the worker that ran it may be
     # gone. A cancellation that waits for that worker to acknowledge it would
     # also keep the workflow from being evicted, so such an operation is left
-    # to its timeout instead.
+    # to its timeout instead. A later session on this task queue refuses it
+    # (see ``_RunningToolset.get``).
     if (
         kwargs.get("cancellation_type")
         != ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
@@ -591,13 +592,37 @@ def _record_opened_sessions(
     return True
 
 
+def _scheduled_before(activity_id: str, session_activity_id: str) -> bool:
+    """Whether an operation was scheduled before the session activity.
+
+    A workflow numbers its activities in the order it schedules them, and that
+    number is the default activity ID. Other IDs cannot be compared.
+    """
+    return (
+        activity_id.isdecimal()
+        and session_activity_id.isdecimal()
+        and int(activity_id) < int(session_activity_id)
+    )
+
+
 @dataclass
 class _RunningToolset:
     toolset: McpToolset
     heartbeats: _SessionHeartbeats
     observes_sessions: bool
+    session_activity_id: str
 
     async def get(self) -> McpToolset:
+        if _scheduled_before(activity.info().activity_id, self.session_activity_id):
+            # Every toolset block of a run uses the same task queue. An
+            # operation scheduled before this session belongs to an earlier
+            # block, which has ended, and must not run against this toolset.
+            raise ApplicationError(
+                "This operation belongs to an earlier stateful MCP session of "
+                "this workflow run, which has ended.",
+                type="DedicatedWorkerFailure",
+                non_retryable=True,
+            )
         if not self.observes_sessions:
             # No session to observe: record the marker before the first
             # operation instead.
@@ -742,6 +767,7 @@ class TemporalStatefulMcpToolSetProvider:
                         toolset,
                         heartbeats,
                         _record_opened_sessions(toolset, heartbeats),
+                        activity.info().activity_id,
                     )
                     try:
                         worker = Worker(

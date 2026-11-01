@@ -1056,3 +1056,127 @@ async def test_stateful_session_after_host_killed(
     assert calls_file.read_text() == "x"
     assert replacement_calls == 0
     _assert_refused(err.value)
+
+
+@workflow.defn
+class StatefulMcpReopenedWorkflow:
+    def __init__(self) -> None:
+        self._listed = False
+        self._signals = 0
+
+    @workflow.run
+    async def run(self, host_task_queue: str, wait_cancellation: bool) -> str:
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=20),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        if wait_cancellation:
+            config["cancellation_type"] = (
+                ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+            )
+        session_config = ActivityConfig(
+            task_queue=host_task_queue, start_to_close_timeout=timedelta(hours=1)
+        )
+        try:
+            async with TemporalStatefulMcpToolSet(
+                "stateful_state", config=config, server_session_config=session_config
+            ) as toolset:
+                tools = {t.name: t for t in await toolset.get_tools()}
+                self._listed = True
+                await workflow.wait_condition(lambda: self._signals >= 1)
+                await tools["put"].run_async(
+                    args={"text": "OLD-PAYLOAD"}, tool_context=_tool_context()
+                )
+        except (ActivityError, ApplicationError):
+            # The caller opens a new block, as the README suggests.
+            pass
+        async with TemporalStatefulMcpToolSet(
+            "stateful_state", config=config, server_session_config=session_config
+        ) as toolset:
+            tools = {t.name: t for t in await toolset.get_tools()}
+            await workflow.wait_condition(lambda: self._signals >= 2)
+            return str(
+                await tools["get"].run_async(args={}, tool_context=_tool_context())
+            )
+
+    @workflow.update
+    async def wait_listed(self) -> None:
+        await workflow.wait_condition(lambda: self._listed)
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._signals += 1
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("cancellation", ["wait_cancellation_completed", "try_cancel"])
+async def test_stateful_operation_of_ended_session_not_run_by_next_block(
+    client: Client, cancellation: str
+):
+    factory_calls = 0
+
+    def factory(_: Any) -> McpToolset:
+        nonlocal factory_calls
+        factory_calls += 1
+        return _stdio_toolset(_STATE_MCP_SERVER)
+
+    provider = TemporalStatefulMcpToolSetProvider("stateful_state", factory)
+    client = _make_client(client, provider)
+    task_queue = f"adk-stateful-mcp-reopened-{uuid.uuid4()}"
+    host_task_queue = f"{task_queue}-host"
+
+    async def pending_call_tool(handle: WorkflowHandle[Any, Any]) -> bool:
+        return any(
+            pending.activity_type.name.endswith("-call-tool")
+            for pending in (await handle.describe()).raw_description.pending_activities
+        )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StatefulMcpReopenedWorkflow],
+        max_cached_workflows=0,
+    ):
+        async with Worker(client, task_queue=host_task_queue):
+            handle = await client.start_workflow(
+                StatefulMcpReopenedWorkflow.run,
+                args=[host_task_queue, cancellation == "wait_cancellation_completed"],
+                id=f"stateful-mcp-reopened-{uuid.uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            await handle.execute_update(StatefulMcpReopenedWorkflow.wait_listed)
+        # The session's host shut down gracefully after it opened a session, so
+        # the put waits on the session's task queue.
+        await handle.signal(StatefulMcpReopenedWorkflow.resume)
+        async with asyncio.timeout(20):
+            while not await pending_call_tool(handle):
+                await asyncio.sleep(0.1)
+
+        # The retried session is refused, and the workflow opens a second block
+        # with the same name and task queue.
+        async with Worker(client, task_queue=host_task_queue):
+            async with asyncio.timeout(30):
+                while await pending_call_tool(handle):
+                    await asyncio.sleep(0.2)
+            await handle.signal(StatefulMcpReopenedWorkflow.resume)
+            async with asyncio.timeout(30):
+                result = await handle.result()
+
+    # The first block's put never ran against the second block's MCP session.
+    assert "'text': 'EMPTY'" in result
+    assert factory_calls == 2
+    call_tools: set[int] = set()
+    completed = 0
+    async for event in handle.fetch_history_events():
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+            scheduled = event.activity_task_scheduled_event_attributes
+            if scheduled.activity_type.name.endswith("-call-tool"):
+                call_tools.add(event.event_id)
+        elif event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED:
+            completed += (
+                event.activity_task_completed_event_attributes.scheduled_event_id
+                in call_tools
+            )
+    assert len(call_tools) == 2
+    assert completed == 1
