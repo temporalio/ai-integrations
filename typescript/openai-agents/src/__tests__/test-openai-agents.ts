@@ -42,6 +42,8 @@ import {
   statefulMcpHeartbeatTimeoutWorkflow,
   statefulMcpSlowConnectHeartbeatWorkflow,
   statefulMcpRetriedWorkflow,
+  statefulMcpSessionEndedWorkflow,
+  resumeSignal,
   streamingAgentWorkflow,
   streamingLocalActivityWorkflow,
   streamingNoTopicWorkflow,
@@ -687,6 +689,79 @@ test('Stateful MCP: a session Activity retried after a failed connect connects a
     t.regex(result, /session=server-2/);
     t.is(factoryCalls, 2);
   });
+});
+
+test('Stateful MCP: an operation without a schedule-to-start timeout fails once the session ends', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const calls: string[] = [];
+  const plugin = () =>
+    new OpenAIAgentsPlugin({
+      modelProvider: new FakeModelProvider([]),
+      mcpServerProviders: [
+        new StatefulMCPServerProvider(
+          'sessionEnded',
+          () => memoryServer('sessionEnded', 'S', calls),
+          t.context.env.nativeConnection
+        ),
+      ],
+    });
+
+  const first = await createWorker({ plugins: [plugin()] });
+  const handle = await first.runUntil(async () => {
+    const handle = await startWorkflow(statefulMcpSessionEndedWorkflow, {
+      args: [false],
+      workflowExecutionTimeout: '40 seconds',
+    });
+    for (let i = 0; i < 300 && !calls.includes('put'); i++) await new Promise((r) => setTimeout(r, 100));
+    return handle;
+  });
+  // The first Worker shut down gracefully: its session Activity completed, and
+  // nothing serves the session's Task Queue any more.
+  const second = await createWorker({ plugins: [plugin()] });
+  await second.runUntil(async () => {
+    await handle.signal(resumeSignal);
+    t.deepEqual(await handle.result(), ['put=V session=S', DEDICATED_WORKER_FAILURE_TYPE]);
+  });
+  const { events } = await handle.fetchHistory();
+  const operations = (events ?? []).filter(
+    (e) =>
+      e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED &&
+      !e.activityTaskScheduledEventAttributes?.activityType?.name?.endsWith('-server-session')
+  );
+  // No operation was scheduled after the session ended.
+  t.is(operations.length, 1);
+});
+
+test('Stateful MCP: a caller still cancels a queued operation without a schedule-to-start timeout', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const calls: string[] = [];
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([]),
+        mcpServerProviders: [
+          new StatefulMCPServerProvider(
+            'sessionEnded',
+            () => {
+              const server = memoryServer('sessionEnded', 'S', calls);
+              // The session's Worker polls only after the call is cancelled.
+              server.connect = () => new Promise((r) => setTimeout(r, 3_000));
+              return server;
+            },
+            t.context.env.nativeConnection
+          ),
+        ],
+      }),
+    ],
+  });
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(statefulMcpSessionEndedWorkflow, {
+      args: [true],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    t.deepEqual(result, ['cancelled', 'get=EMPTY session=S']);
+  });
+  t.false(calls.includes('put'));
 });
 
 test('Streaming: external subscriber and in-workflow result see the same events', async (t) => {

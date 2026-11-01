@@ -6,18 +6,21 @@ import { OpenAIAgentsPlugin, StatefulMCPServerProvider } from '../..';
 import { FakeModelProvider } from '../stubs/openai-agents';
 
 /** An MCP server whose stored value lives in this instance, like an MCP session. */
-export function memoryServer(name: string, session: string): MCPServer {
+export function memoryServer(name: string, session: string, calls: string[] = []): MCPServer {
   let value = 'EMPTY';
   return {
     name,
     cacheToolsList: false,
-    async connect() {},
+    async connect() {
+      calls.push('connect');
+    },
     async close() {},
     async listTools() {
       return [];
     },
     async callTool(tool, args) {
       if (tool === 'put') value = String(args?.value);
+      calls.push(tool);
       process.stdout.write(`${tool}\n`);
       return [{ type: 'text', text: `${tool}=${value} session=${session}` }];
     },

@@ -7,6 +7,7 @@ import {
   type Duration,
   type RetryPolicy,
 } from '@temporalio/common';
+import { msOptionalToNumber } from '@temporalio/common/lib/time';
 import {
   type ActivityOptions,
   CancellationScope,
@@ -92,6 +93,9 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
   private readonly _cacheToolsList: boolean;
   private _sessionScope: CancellationScope | undefined;
   private _sessionPromise: Promise<void> | undefined;
+  private _sessionEnded: Promise<void> | undefined;
+  private _sessionSettled = false;
+  private _sessionError: unknown;
   private _connected = false;
   private _cachedTools: any[] | undefined;
   toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
@@ -152,6 +156,17 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     );
     // Errors are observed during cleanup, not here.
     this._sessionPromise.catch(() => {});
+    this._sessionSettled = false;
+    this._sessionError = undefined;
+    this._sessionEnded = this._sessionPromise.then(
+      () => {
+        this._sessionSettled = true;
+      },
+      (err: unknown) => {
+        this._sessionSettled = true;
+        this._sessionError = err;
+      }
+    );
     this._connected = true;
   }
 
@@ -185,15 +200,54 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     }
   }
 
+  private sessionEndedFailure(): ApplicationFailure {
+    return ApplicationFailure.create({
+      message: "The stateful MCP server session Activity has ended, so no Worker serves this server's operations.",
+      type: DEDICATED_WORKER_FAILURE_TYPE,
+      cause: this._sessionError instanceof Error ? this._sessionError : undefined,
+    });
+  }
+
+  /**
+   * Runs an operation Activity on the session's Task Queue. Only the session
+   * Activity's Worker serves that queue. A schedule-to-start timeout already
+   * fails an operation once that Worker is gone. Without one, the operation
+   * would wait forever, so fail it with `DedicatedWorkerFailure` once the
+   * session Activity has ended.
+   */
+  private async executeOperation<R>(activity: string, args: unknown[]): Promise<R> {
+    if (msOptionalToNumber(this._operationConfig.scheduleToStartTimeout)) {
+      return scheduleActivity<R>(activity, args, this._operationConfig);
+    }
+    if (this._sessionSettled) {
+      throw this.sessionEndedFailure();
+    }
+    // A child of the caller's scope, so the caller's cancellation still reaches the operation.
+    const scope = new CancellationScope();
+    const operation = scope.run(() => scheduleActivity<R>(activity, args, this._operationConfig));
+    const first = await Promise.race([
+      operation.then(
+        (value) => ({ done: true as const, value }),
+        (error: unknown) => ({ done: true as const, error })
+      ),
+      this._sessionEnded!.then(() => ({ done: false as const })),
+    ]);
+    if (first.done) {
+      if ('error' in first) throw first.error;
+      return first.value;
+    }
+    operation.catch(() => {});
+    scope.cancel();
+    throw this.sessionEndedFailure();
+  }
+
   async listTools(): Promise<any[]> {
     this.assertConnected();
     const shouldCache = this._cacheToolsList && !!this.toolFilter;
     if (shouldCache && this._cachedTools) {
       return this._cachedTools;
     }
-    const tools = await handleWorkerFailure(() =>
-      scheduleActivity<any[]>(this._name + MCP_LIST_TOOLS_SUFFIX, [], this._operationConfig)
-    );
+    const tools = await handleWorkerFailure(() => this.executeOperation<any[]>(this._name + MCP_LIST_TOOLS_SUFFIX, []));
     if (shouldCache) {
       this._cachedTools = tools;
     }
@@ -203,7 +257,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
   async callTool(toolName: string, args: Record<string, unknown> | null): Promise<any> {
     this.assertConnected();
     return handleWorkerFailure(() =>
-      scheduleActivity(this._name + MCP_CALL_TOOL_SUFFIX, [{ toolName, args }], this._operationConfig)
+      this.executeOperation(this._name + MCP_CALL_TOOL_SUFFIX, [{ toolName, args }])
     );
   }
 
@@ -218,7 +272,8 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
  * Creates a stateful MCP server handle. Maintains a persistent MCP connection
  * across the Workflow via a dedicated per-run Worker.
  *
- * If the dedicated Worker fails (startup timeout or missed heartbeat),
+ * If the dedicated Worker fails (startup timeout or missed heartbeat), or the
+ * session Activity has ended and `config.scheduleToStartTimeout` is `0`,
  * operations throw `ApplicationFailure` with type `"DedicatedWorkerFailure"`.
  *
  * @param name - Server name; must match the `StatefulMCPServerProvider` registered on the Worker side.

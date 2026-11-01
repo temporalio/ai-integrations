@@ -32,7 +32,11 @@ from temporalio.openai_agents._mcp_server_checks import (
     _reject_worker_side_require_approval,
 )
 from temporalio.worker import PollerBehaviorSimpleMaximum, Worker
-from temporalio.workflow import ActivityConfig, ActivityHandle
+from temporalio.workflow import (
+    ActivityCancellationType,
+    ActivityConfig,
+    ActivityHandle,
+)
 
 
 @dataclasses.dataclass
@@ -453,6 +457,30 @@ def _earlier_attempt_failure(details: Sequence[Any]) -> ApplicationError | None:
     )
 
 
+def _session_ended_failure(session: ActivityHandle) -> ApplicationError:
+    failure = ApplicationError(
+        "The stateful MCP server session activity has ended, so no worker serves "
+        "this server's operations.",
+        type="DedicatedWorkerFailure",
+    )
+    if not session.cancelled():
+        failure.__cause__ = session.exception()
+    return failure
+
+
+def _scheduled_before(activity_id: str, session_activity_id: str) -> bool:
+    """Whether an operation was scheduled before the session activity.
+
+    A workflow numbers its activities in the order it schedules them, and that
+    number is the default activity ID. Other IDs cannot be compared.
+    """
+    return (
+        activity_id.isdecimal()
+        and session_activity_id.isdecimal()
+        and int(activity_id) < int(session_activity_id)
+    )
+
+
 class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # type:ignore[reportUnusedClass]
     def __init__(
         self,
@@ -509,6 +537,52 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
     ) -> None:
         await self.cleanup()
 
+    async def _execute_operation(
+        self, activity: str, args: list[Any], result_type: type
+    ) -> Any:
+        """Runs an operation activity on the session's task queue.
+
+        Only the session activity's worker serves that queue. A
+        schedule_to_start_timeout already fails an operation once that
+        worker is gone. Without one, the operation would wait forever, so fail
+        it with DedicatedWorkerFailure once the session activity has ended.
+        """
+        session = self._connect_handle
+        assert session
+        if self._config.get("schedule_to_start_timeout"):
+            return await workflow.execute_activity(
+                activity, args=args, result_type=result_type, **self._config
+            )
+        if session.done():
+            raise _session_ended_failure(session)
+        operation = workflow.start_activity(
+            activity, args=args, result_type=result_type, **self._config
+        )
+        try:
+            await workflow.wait(
+                [operation, session], return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            if operation.done():
+                raise
+            # The operation is not awaited directly, so pass the cancellation on
+            # and wait for it as its cancellation type says.
+            operation.cancel()
+            return await operation
+        if operation.done():
+            return operation.result()
+        # Fail without waiting for the operation: the worker that ran it may be
+        # gone. A cancellation that waits for that worker to acknowledge it would
+        # also keep the workflow from being evicted, so such an operation is left
+        # to its timeout instead. A later session on this task queue refuses it.
+        if (
+            self._config.get("cancellation_type")
+            != ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+        ):
+            operation.cancel()
+        operation.add_done_callback(lambda op: op.cancelled() or op.exception())
+        raise _session_ended_failure(session)
+
     @_handle_worker_failure
     async def list_tools(
         self,
@@ -519,11 +593,8 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
             raise ApplicationError(
                 "Stateful MCP Server not connected. Call connect first."
             )
-        return await workflow.execute_activity(
-            self.name + "-list-tools",
-            args=[],
-            result_type=list[MCPTool],
-            **self._config,
+        return await self._execute_operation(
+            self.name + "-list-tools", [], list[MCPTool]
         )
 
     @_handle_worker_failure
@@ -537,11 +608,10 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
             raise ApplicationError(
                 "Stateful MCP Server not connected. Call connect first."
             )
-        return await workflow.execute_activity(
+        return await self._execute_operation(
             self.name + "-call-tool-v2",
-            _StatefulCallToolsArguments(tool_name, arguments, meta),
-            result_type=CallToolResult,
-            **self._config,
+            [_StatefulCallToolsArguments(tool_name, arguments, meta)],
+            CallToolResult,
         )
 
     @_handle_worker_failure
@@ -550,11 +620,8 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
             raise ApplicationError(
                 "Stateful MCP Server not connected. Call connect first."
             )
-        return await workflow.execute_activity(
-            self.name + "-list-prompts",
-            args=[],
-            result_type=ListPromptsResult,
-            **self._config,
+        return await self._execute_operation(
+            self.name + "-list-prompts", [], ListPromptsResult
         )
 
     @_handle_worker_failure
@@ -565,11 +632,10 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
             raise ApplicationError(
                 "Stateful MCP Server not connected. Call connect first."
             )
-        return await workflow.execute_activity(
+        return await self._execute_operation(
             self.name + "-get-prompt-v2",
-            _StatefulGetPromptArguments(name, arguments),
-            result_type=GetPromptResult,
-            **self._config,
+            [_StatefulGetPromptArguments(name, arguments)],
+            GetPromptResult,
         )
 
 
@@ -618,6 +684,7 @@ class StatefulMCPServerProvider:
         self._name = name + "-stateful"
         self._connect_handle: ActivityHandle | None = None
         self._servers: dict[str, MCPServer] = {}
+        self._session_activity_ids: dict[str, str] = {}
         super().__init__()
 
     @property
@@ -630,7 +697,20 @@ class StatefulMCPServerProvider:
             return self.name + "@" + (activity.info().workflow_run_id or "")
 
         def _server() -> MCPServer:
-            server = self._servers[_server_id()]
+            server_id = _server_id()
+            if _scheduled_before(
+                activity.info().activity_id, self._session_activity_ids[server_id]
+            ):
+                # Every server block of a run uses the same task queue. An
+                # operation scheduled before this session belongs to an earlier
+                # block, which has ended, and must not run against this server.
+                raise ApplicationError(
+                    "This operation belongs to an earlier stateful MCP server "
+                    "session of this workflow run, which has ended.",
+                    type="DedicatedWorkerFailure",
+                    non_retryable=True,
+                )
+            server = self._servers[server_id]
             _reject_worker_side_require_approval(
                 self._server_name, server, "stateful_mcp_server"
             )
@@ -711,6 +791,7 @@ class StatefulMCPServerProvider:
             # first MCP call whatever its schedule-to-start timeout.
             rejected = _has_worker_side_require_approval(server)
             self._servers[server_id] = server
+            self._session_activity_ids[server_id] = activity.info().activity_id
             try:
                 try:
                     if not rejected:
@@ -738,5 +819,6 @@ class StatefulMCPServerProvider:
                         await server.cleanup()
             finally:
                 del self._servers[server_id]
+                del self._session_activity_ids[server_id]
 
         return (connect,)

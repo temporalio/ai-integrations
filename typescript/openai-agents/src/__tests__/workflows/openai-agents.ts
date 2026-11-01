@@ -1,5 +1,13 @@
 import { Agent, type MCPToolFilterContext } from '@openai/agents-core';
-import { ApplicationFailure, sleep } from '@temporalio/workflow';
+import {
+  ApplicationFailure,
+  CancellationScope,
+  condition,
+  defineSignal,
+  isCancellation,
+  setHandler,
+  sleep,
+} from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
@@ -249,6 +257,46 @@ export async function statefulMcpRetriedWorkflow(): Promise<string[]> {
     } catch (err: unknown) {
       // Leaving the block reports the session Activity's failure.
       out.push(String(err));
+    }
+  } finally {
+    await server.cleanup();
+  }
+  return out;
+}
+
+export const resumeSignal = defineSignal('resume');
+
+export async function statefulMcpSessionEndedWorkflow(cancelQueued: boolean): Promise<string[]> {
+  // No schedule-to-start timeout: only the session's end stops an operation
+  // waiting on the session's Task Queue.
+  const server = statefulMcpServer('sessionEnded', { config: { scheduleToStartTimeout: 0 } });
+  let resumed = false;
+  setHandler(resumeSignal, () => {
+    resumed = true;
+  });
+  await server.connect();
+  const out: string[] = [];
+  try {
+    if (cancelQueued) {
+      // Cancelled while queued, before the session's Worker polls.
+      const scope = new CancellationScope();
+      const call = scope.run(() => server.callTool('put', { value: 'cancelled' }));
+      await sleep('1 second');
+      scope.cancel();
+      try {
+        await call;
+      } catch (err: unknown) {
+        out.push(isCancellation(err) ? 'cancelled' : String(err));
+      }
+      out.push(text(await server.callTool('get', {})));
+      return out;
+    }
+    out.push(text(await server.callTool('put', { value: 'V' })));
+    await condition(() => resumed);
+    try {
+      out.push(text(await server.callTool('get', {})));
+    } catch (err: unknown) {
+      out.push(err instanceof ApplicationFailure ? `${err.type}` : String(err));
     }
   } finally {
     await server.cleanup();
