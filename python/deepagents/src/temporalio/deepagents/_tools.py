@@ -30,15 +30,20 @@ from __future__ import annotations
 import functools
 import importlib
 import inspect
+import sys
 import threading
 import typing
 import uuid as _uuid
 import warnings
 import weakref
 from collections.abc import Mapping
+from dataclasses import is_dataclass
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable
+
+if sys.version_info >= (3, 14):
+    import annotationlib  # type: ignore[reportUnreachable]
 
 from temporalio import activity as activity_mod
 from temporalio import workflow
@@ -229,6 +234,55 @@ def _docstring(fn: Any) -> str | None:
     return doc if doc and doc.strip() else None
 
 
+def _generated_class_doc(cls: type) -> str | None:
+    """Return the docstring dataclasses or namedtuple writes for a class that has none."""
+    if is_dataclass(cls):
+        try:
+            # Format it as dataclasses did when it made the class.
+            if sys.version_info >= (3, 14):
+                signature = inspect.signature(  # type: ignore[reportUnreachable]
+                    cls, annotation_format=annotationlib.Format.FORWARDREF
+                )
+                # 3.14 left a forward reference in the __init__ dataclasses
+                # generated unevaluated, and the field keeps the reference from
+                # that time.
+                annotate = getattr(cls.__init__, "__annotate__", None)
+                if getattr(annotate, "__generated_by_dataclasses__", False):
+                    field_types = {
+                        n: f.type for n, f in cls.__dataclass_fields__.items()
+                    }
+                    signature = signature.replace(
+                        parameters=[
+                            p.replace(annotation=field_types.get(p.name, p.annotation))
+                            for p in signature.parameters.values()
+                        ]
+                    )
+            else:
+                signature = inspect.signature(cls)  # type: ignore[reportUnreachable]
+            return cls.__name__ + str(signature).replace(" -> None", "")
+        except (TypeError, ValueError):
+            return cls.__name__
+    fields = getattr(cls, "_fields", None)
+    if issubclass(cls, tuple) and isinstance(fields, tuple):
+        names = ", ".join(fields) + ("," if len(fields) == 1 else "")
+        return f"{cls.__name__}({names})"
+    return None
+
+
+def _class_doc(cls: type) -> str | None:
+    """Return a class's own docstring, unless dataclasses or namedtuple wrote it."""
+    doc = _docstring(cls)
+    if doc is None or not doc.startswith(cls.__name__):
+        return doc
+    try:
+        generated = _generated_class_doc(cls)
+    except Exception:
+        # dataclasses would have failed the same way, so it didn't write this
+        # docstring.
+        return doc
+    return None if doc == generated else doc
+
+
 def _tool_signature(
     activity: Callable,
 ) -> tuple[inspect.Signature, dict[str, Any], str | None]:
@@ -256,31 +310,26 @@ def _tool_signature(
         # __call__'s own docstring, else the class's, else that of a __call__ it inherits.
         doc = (
             _docstring(_call_function(vars(activity).get("__call__")))
-            or _docstring(activity)
+            or _class_doc(activity)
             or next(filter(None, map(_docstring, map(_call_function, calls))), None)
         )
     else:
         signature = inspect.signature(activity)
         hints = typing.get_type_hints(activity, include_extras=True)
         doc = activity.__doc__
-        # Drop the receiver of a method passed as Class.method the way the SDK does:
-        # a first parameter named `self` that is unannotated or annotated
-        # `typing.Self`. The worker's registered instance supplies it.
+        # A first parameter named `self` is the receiver of a method passed as
+        # Class.method, however it is annotated: the worker registers the bound
+        # method, so its instance supplies it.
         params = list(signature.parameters.values())
-        if (
-            params
-            and params[0].name == "self"
-            and (
-                params[0].annotation is inspect.Parameter.empty
-                or str(params[0].annotation) == "typing.Self"
-            )
-        ):
+        if params and params[0].name == "self":
             signature = signature.replace(parameters=params[1:])
-    # The tool passes the model's arguments to the activity by position, so it
-    # can't pass keyword-only arguments or **kwargs. The model names every
-    # argument, positional-only ones included.
+    # The tool passes the model's arguments to the activity by position, one per
+    # parameter, so it can't pass *args, keyword-only arguments or **kwargs. The
+    # model names every argument, positional-only ones included.
     parameters = []
     for p in signature.parameters.values():
+        if p.kind is inspect.Parameter.VAR_POSITIONAL:
+            raise ValueError(f"activity_as_tool cannot pass *{p.name}.")
         if p.kind is inspect.Parameter.KEYWORD_ONLY:
             raise ValueError(
                 f"activity_as_tool cannot pass keyword-only argument {p.name!r}."
@@ -321,7 +370,8 @@ def activity_as_tool(
 
     Raises:
         ValueError: If ``activity`` is not a named activity, is an instance of a
-            callable-class activity, or takes arguments the tool can't pass:
+            callable-class activity, is a class without a ``__call__`` the tool
+            can use, or takes arguments the tool can't pass: ``*args``,
             keyword-only arguments or ``**kwargs``.
     """
     with workflow.unsafe.imports_passed_through():

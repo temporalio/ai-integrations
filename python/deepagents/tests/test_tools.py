@@ -7,12 +7,14 @@ expected activity.
 
 from __future__ import annotations
 
+import functools
 import sys
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 
 import pytest
 
@@ -108,14 +110,18 @@ async def echo_activity(text: str) -> str:
 
 
 @activity.defn
-async def echo_twice(text: str, /, times: int) -> str:
+async def echo_twice(text: str, /, times: int = 2, sep: str = ",") -> str:
     # `text` is positional-only; the model still passes it by name.
-    return ",".join([text] * times)
+    return sep.join([text] * times)
 
 
 class EchoActivities:
     @activity.defn
     async def echo_method(self, text: str) -> str:
+        return f"method:{text}"
+
+    @activity.defn
+    async def echo_self_typed(self: Self, text: str) -> str:
         return f"method:{text}"
 
 
@@ -139,7 +145,9 @@ class ActivityAsToolWorkflow:
     async def run(self, text: str) -> list[str]:
         calls: list[tuple[Callable[..., Any], dict[str, Any]]] = [
             (echo_activity, {"text": text}),
-            (echo_twice, {"text": text, "times": 2}),
+            # `times` is left out: the tool passes its default, so `sep` still
+            # reaches its own parameter.
+            (echo_twice, {"text": text, "sep": "+"}),
             (EchoActivities.echo_method, {"text": text}),
             (EchoClass, {"text": text}),
         ]
@@ -195,7 +203,7 @@ async def test_activity_as_tool(env: WorkflowEnvironment) -> None:
 
     # Each activity gets the model's arguments as its own parameters; the
     # callable class's registered instance gets them in __call__.
-    assert out == ["echo:hi", "hi,hi", "method:hi", "worker:hi"]
+    assert out == ["echo:hi", "hi+hi", "method:hi", "worker:hi"]
     counts = await count_scheduled_activities(handle)
     assert counts == {
         "echo_activity": 1,
@@ -205,13 +213,80 @@ async def test_activity_as_tool(env: WorkflowEnvironment) -> None:
     }, counts
 
 
+class EchoBase:
+    async def __call__(self, text: str) -> str:
+        """Echo text from the base class."""
+        return text
+
+
+@activity.defn
+class DocumentedEchoClass(EchoBase):
+    """Echo text from the class docstring."""
+
+    async def __call__(self, text: str) -> str:
+        return text
+
+
+@activity.defn
+class InheritedEchoClass(EchoBase):
+    async def __call__(self, text: str) -> str:
+        return text
+
+
+@activity.defn
+@dataclass
+class EchoDataclass(EchoBase):
+    # No docstring, so dataclasses writes "EchoDataclass(prefix: 'str')".
+    prefix: str
+
+
+@activity.defn
+class StaticEchoClass:
+    @staticmethod
+    async def __call__(text: str) -> str:
+        return text
+
+
+@activity.defn
+class ClassMethodEchoClass:
+    @classmethod
+    async def __call__(cls, text: str) -> str:
+        return text
+
+
+async def _echo_with(receiver: object, text: str) -> str:
+    return text
+
+
+@activity.defn
+class PartialMethodEchoClass:
+    __call__ = functools.partialmethod(_echo_with)
+
+
 @pytest.mark.parametrize(
     "activity_ref, args, description",
     [
-        # No `self` for a method passed as Class.method.
+        # No `self` for a method passed as Class.method, even annotated (a string
+        # here, under `from __future__ import annotations`).
         (EchoActivities.echo_method, ["text"], "Temporal activity echo_method."),
+        (
+            EchoActivities.echo_self_typed,
+            ["text"],
+            "Temporal activity echo_self_typed.",
+        ),
         # A class offers __call__'s parameters and docstring, not its constructor's.
         (EchoClass, ["text"], "Echo text with the worker's prefix."),
+        # Without a __call__ docstring, the class's own docstring, else that of
+        # an inherited __call__.
+        (DocumentedEchoClass, ["text"], "Echo text from the class docstring."),
+        (InheritedEchoClass, ["text"], "Echo text from the base class."),
+        # Not the docstring dataclasses writes, which names the constructor's
+        # parameters.
+        (EchoDataclass, ["text"], "Echo text from the base class."),
+        # The receiver of each __call__ form is dropped, as an instance binds it.
+        (StaticEchoClass, ["text"], "Temporal activity StaticEchoClass."),
+        (ClassMethodEchoClass, ["text"], "Temporal activity ClassMethodEchoClass."),
+        (PartialMethodEchoClass, ["text"], "Temporal activity PartialMethodEchoClass."),
     ],
 )
 def test_activity_as_tool_schema(
@@ -234,6 +309,11 @@ class KeywordOnlyActivity:
 
 
 @activity.defn
+async def varargs_activity(text: str, *more: str) -> str:
+    return text + "".join(more)
+
+
+@activity.defn
 async def kwargs_activity(text: str, **extra: str) -> str:
     return text + "".join(extra.values())
 
@@ -249,6 +329,7 @@ class BadAnnotationActivity(EchoClass):
     [
         (NoCallActivity, "to have a __call__"),
         (KeywordOnlyActivity, "keyword-only argument 'text'"),
+        (varargs_activity, r"\*more"),
         (kwargs_activity, r"\*\*extra"),
         (BadAnnotationActivity, "name 'Missing' is not defined"),
         (EchoClass("workflow"), "not an instance of it"),
