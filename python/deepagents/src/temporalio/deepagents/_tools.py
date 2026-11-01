@@ -402,6 +402,8 @@ def activity_as_tool(
 
     async def _run(*args: Any, **kwargs: Any) -> Any:
         # The model's arguments go to the activity by position, in parameter order.
+        # Defaults are passed too: the worker decodes arguments with the
+        # activity's type hints only when every parameter has a value.
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         return await workflow.execute_activity(

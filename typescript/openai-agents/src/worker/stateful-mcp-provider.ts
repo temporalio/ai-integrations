@@ -10,6 +10,7 @@ import {
   type StatefulMcpServerSessionArgs,
 } from '../common/mcp-types';
 import { startAdaptiveHeartbeat } from './heartbeat';
+import { filterListedTools, rejectCallableToolFilter } from './mcp-provider';
 
 export function registerCancelShutdown(ctx: Context, dedicatedWorker: { shutdown: () => void }): void {
   ctx.cancelled.catch(() => {
@@ -72,11 +73,15 @@ export class StatefulMCPServerProvider {
           nonRetryable: true,
         });
       }
+      rejectCallableToolFilter(server);
       return server;
     };
 
     // Operation Activities — registered on the per-run Task Queue.
-    const listTools = async () => getServerOrThrow().listTools();
+    const listTools = async () => {
+      const server = getServerOrThrow();
+      return filterListedTools(server, await server.listTools());
+    };
 
     const callTool = async (input: CallToolArgs) => getServerOrThrow().callTool(input.toolName, input.args);
 
@@ -118,10 +123,15 @@ export class StatefulMCPServerProvider {
           // Wire the Activity interceptor identically to the main Worker so
           // tool Activities still restore trace context and emit
           // `temporal:executeActivity:*` spans. Options are forwarded per-run
-          // via input. Lazy import to avoid pulling the Worker package
-          // unnecessarily.
-          const { OpenAIAgentsTraceActivityInboundInterceptor } = await import('./trace-interceptor');
-          const interceptorOpts = input?.activityInterceptorOptions;
+          // via input; the tracing key resolver comes from the Worker running
+          // this session, so it stays out of Activity arguments. Lazy import to
+          // avoid pulling the Worker package unnecessarily.
+          const { OpenAIAgentsTraceActivityInboundInterceptor, tracingApiKeyResolverFor } =
+            await import('./trace-interceptor');
+          const interceptorOpts = {
+            ...input?.activityInterceptorOptions,
+            tracingApiKey: tracingApiKeyResolverFor(Context.current()),
+          };
           const dedicatedWorker = await Worker.create({
             connection: this._nativeConnection,
             taskQueue: dedicatedTaskQueue,

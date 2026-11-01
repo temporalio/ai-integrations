@@ -511,6 +511,24 @@ export async function statefulMcpWorkflow(prompt: string): Promise<string> {
 
 Dedicated Worker startup and heartbeat failures surface as `ApplicationFailure` type (exported as `DEDICATED_WORKER_FAILURE_TYPE`).
 
+### MCP tool filters
+
+A static `toolFilter` on the server your factory returns, such as `createMCPToolStaticFilter({ blocked: ['delete_file'] })`, applies in the list-tools Activity, so the model is not offered a blocked tool. The filter applies only to the tool list: a run that listed tools before the Worker was upgraded keeps that list while it is cached.
+
+A callable filter gets the agent and the run context, which exist only in the Workflow, so the Worker refuses one on the factory's server: every list-tools and call-tool Activity for that server fails with a non-retryable `ApplicationFailure` of type `MCPToolFilterUnsupported` (exported as `TOOL_FILTER_UNSUPPORTED_TYPE`). A new run fails at its first list-tools Activity. A `statelessMcpServer()` run that listed tools on an older Worker instead gets a tool error, which the model reads, for each call to that server, and the run keeps going. So remove the callable filter from the factory's server before you upgrade Workers. Pass it as the `toolFilter` option of `statelessMcpServer()` or `statefulMcpServer()` instead:
+
+```ts
+const server = statelessMcpServer('files', {
+  toolFilter: async ({ agent }, tool) => tool.name !== 'delete_file' || agent.name === 'FileAdmin',
+});
+```
+
+The agent applies this option in the Workflow each time it lists tools; the handle caches the server's full tool list, not the filtered one. A callable filter runs for each tool on every listing, gets the name the server was registered with as `serverName`, and must be deterministic. An Activity or timer it awaits adds commands that older plugin versions never schedule, so let Workflows that use the option finish before you roll the plugin back. A filter assigned to a stateful handle later (`server.toolFilter = ...`) gets the handle's internal name, `<name>-stateful`. A callable filter also runs when a run resumes from a `RunState`, for example after a tool approval, and then sees the context rebuilt from JSON: plain objects, without class methods. If it throws there, the run fails with an `AgentsWorkflowError`.
+
+Because the handle caches the full list, the agent SDK's `invalidateServerToolsCache(name)` does not refresh a handle that has a filter. Call the handle's `invalidateToolsCache()` as well, which also works on older plugin versions. On older versions, `invalidateServerToolsCache(name)` alone refreshed a stateful handle with a `toolFilter` property assigned. Such a run schedules one list-tools Activity fewer on this version and fails replay, so let it finish before you upgrade.
+
+Older versions also let the agent SDK cache the filtered list of a handle with a `toolFilter` property assigned, per server and agent name, so a later run with another context got the first run's tools. This version filters every listing for its own run. A run that started on an older version, whose filter depends on the run context, and that called a tool the filter now removes fails replay on this version. Let such runs finish before you upgrade.
+
 ## Sandbox agents
 
 > **Experimental** — sandbox support is subject to change prior to General Availability.
@@ -611,6 +629,19 @@ addTraceProcessor(new BatchTraceProcessor(new OpenAITracingExporter()));
 **Register this processor in the Worker process, not inside Workflow code.**
 
 **Warning**: Using `setDefaultOpenAITracingExporter()` after constructing the plugin will break plugin internals. Either call it before constructing the plugin, or use `addTraceProcessor` as described above.
+
+### Tracing keys per run
+
+The exporter sends each span with its trace's key, or with its default key (`OPENAI_API_KEY` or `setTracingExportApiKey()`) when the trace has none. The plugin does not write tracing keys into Workflow history, so a trace that crosses a Temporal boundary arrives without its key. A key a run sets in Workflow code with `tracing: { apiKey }` applies to that run's Workflow spans only when the run starts its own trace. When the Workflow runs inside a trace a Client started, the run joins that trace and the Agents SDK ignores the run's key. Spans made in Activities (including stateful MCP operations) and Nexus handlers, and the Workflow spans of a trace that a Client started, with or without `tracingApiKey`, use the exporter's default key.
+
+To send those spans with another key, resolve it on the Worker with `tracingApiKey`. It gets the trace ID, and when known the trace name and the Workflow ID and type, and returns a key or `undefined` for the default:
+
+```ts
+const plugin = new OpenAIAgentsPlugin({
+  modelProvider: new OpenAIProvider(),
+  tracingApiKey: ({ workflowId }) => (workflowId?.startsWith('tenant-a-') ? tenantATracingKey : undefined),
+});
+```
 
 ### OpenTelemetry
 
