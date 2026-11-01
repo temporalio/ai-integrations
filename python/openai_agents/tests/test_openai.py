@@ -3342,9 +3342,10 @@ async def test_stateful_mcp_server_session_retried(
         async def expect_refused(handle: WorkflowHandle[Any, Any]) -> None:
             # The fix fails the retried session activity; without it, a retry
             # calls the factory again.
-            async with asyncio.timeout(40):
-                while not (await _session_failed(handle) or factory_calls > 1):
-                    await asyncio.sleep(0.2)
+            async def refused_or_retried() -> None:
+                assert await _session_failed(handle) or factory_calls > 1
+
+            await assert_eventually(refused_or_retried, timeout=timedelta(seconds=40))
             await handle.signal(McpServerStatefulRetriedWorkflow.resume)
             with pytest.raises(WorkflowFailureError) as err:
                 await handle.result()
@@ -3425,7 +3426,10 @@ class McpServerStatefulSessionEndedWorkflow:
             start_to_close_timeout=timedelta(seconds=20),
             retry_policy=RetryPolicy(maximum_attempts=1),
         )
-        if input.case == "next_block":
+        if input.case == "schedule_to_close":
+            # The timeout ends the operation, so it keeps its commands.
+            config["schedule_to_close_timeout"] = timedelta(seconds=3)
+        if input.case.startswith("next_block"):
             config["cancellation_type"] = (
                 workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
             )
@@ -3433,6 +3437,10 @@ class McpServerStatefulSessionEndedWorkflow:
             start_to_close_timeout=timedelta(hours=1),
             task_queue=input.session_task_queue,
         )
+        if input.case == "numeric_session_id":
+            server_session_config["activity_id"] = "100"
+        if input.case == "next_block_custom_ids":
+            server_session_config["activity_id"] = "session-1"
         out: list[str] = []
         try:
             async with openai_agents.workflow.stateful_mcp_server(
@@ -3440,6 +3448,11 @@ class McpServerStatefulSessionEndedWorkflow:
                 config=config,
                 server_session_config=server_session_config,
             ) as server:
+                if input.case == "numeric_session_id":
+                    # The first operations get default IDs below the session's.
+                    tools = [tool.name for tool in await server.list_tools()]
+                    await server.call_tool("Say-Hello", {"name": "First"})
+                    return tools
                 if input.case == "operation_cancelled":
                     # Cancelled while queued, before the session's worker polls.
                     call = asyncio.create_task(
@@ -3454,13 +3467,15 @@ class McpServerStatefulSessionEndedWorkflow:
                     return out + [tool.name for tool in await server.list_tools()]
                 self._listed = [tool.name for tool in await server.list_tools()]
                 await workflow.wait_condition(lambda: self._resume)
-                if input.case == "next_block":
+                if input.case.startswith("next_block"):
                     await server.call_tool("Say-Hello", {"name": "Old"})
                 else:
                     await server.list_tools()
         except (ApplicationError, ActivityError):
-            if input.case != "next_block":
+            if not input.case.startswith("next_block"):
                 raise
+        if input.case == "next_block_custom_ids":
+            server_session_config["activity_id"] = "session-2"
         # A later block with the same name uses the same task queue.
         async with openai_agents.workflow.stateful_mcp_server(
             "HelloServer", config=config, server_session_config=server_session_config
@@ -3484,7 +3499,10 @@ class McpServerStatefulSessionEndedWorkflow:
         "operation_waiting",
         "operation_after_refusal",
         "next_block",
+        "next_block_custom_ids",
         "operation_cancelled",
+        "schedule_to_close",
+        "numeric_session_id",
     ],
 )
 async def test_stateful_mcp_server_operations_after_session_ended(
@@ -3540,40 +3558,49 @@ async def test_stateful_mcp_server_operations_after_session_ended(
                     # The cancelled call never ran once the session's worker polled.
                     assert "call_tool" not in servers[0].calls
                     return
+                if case == "numeric_session_id":
+                    assert await handle.result() == ["Say-Hello"]
+                    assert "call_tool" in servers[0].calls
+                    return
                 assert await handle.execute_update(
                     McpServerStatefulSessionEndedWorkflow.wait_listed
                 ) == ["Say-Hello"]
             # The session's host shut down gracefully after the session opened.
 
-            if case in ("operation_waiting", "next_block"):
+            if case in ("operation_waiting", "next_block", "next_block_custom_ids"):
                 await handle.signal(McpServerStatefulSessionEndedWorkflow.resume)
+
                 # Wait until the operation waits beside the retried session.
-                async with asyncio.timeout(20):
-                    while (
-                        len(
-                            (await handle.describe()).raw_description.pending_activities
-                        )
-                        < 2
-                    ):
-                        await asyncio.sleep(0.1)
+                async def operation_pending() -> None:
+                    description = await handle.describe()
+                    assert len(description.raw_description.pending_activities) >= 2
+
+                await assert_eventually(
+                    operation_pending,
+                    timeout=timedelta(seconds=20),
+                    interval=timedelta(milliseconds=100),
+                )
 
             # The retried session activity is refused on the next host.
             async with new_worker(client, task_queue=host_task_queue):
-                if case == "operation_after_refusal":
-                    async with asyncio.timeout(30):
-                        while not await _session_failed(handle):
-                            await asyncio.sleep(0.2)
+                if case in ("operation_after_refusal", "schedule_to_close"):
+
+                    async def session_failed() -> None:
+                        assert await _session_failed(handle)
+
+                    await assert_eventually(
+                        session_failed, timeout=timedelta(seconds=30)
+                    )
                     await handle.signal(McpServerStatefulSessionEndedWorkflow.resume)
-                async with asyncio.timeout(30):
-                    result: list[str] | None = None
-                    failure: WorkflowFailureError | None = None
-                    try:
-                        result = await handle.result()
-                    except WorkflowFailureError as e:
-                        failure = e
+                result: list[str] | None = None
+                failure: WorkflowFailureError | None = None
+                try:
+                    result = await asyncio.wait_for(handle.result(), timeout=30)
+                except WorkflowFailureError as e:
+                    failure = e
 
     events = [event async for event in handle.fetch_history_events()]
-    if case == "next_block":
+    if case.startswith("next_block"):
         # The second block's server got its own session; the first block's call
         # did not run against it.
         assert result == ["Say-Hello"]
@@ -3584,9 +3611,10 @@ async def test_stateful_mcp_server_operations_after_session_ended(
     assert failure
     _assert_session_refused(failure)
     # The waiting operation was cancelled; none was scheduled after the session
-    # ended.
+    # ended. An operation with a schedule-to-close timeout is scheduled as before
+    # the fix, and that timeout ends it.
     assert operations() == ["HelloServer-stateful-list-tools"] * (
-        2 if case == "operation_waiting" else 1
+        2 if case in ("operation_waiting", "schedule_to_close") else 1
     )
     assert any(
         event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED

@@ -559,14 +559,14 @@ needs permission to describe the workflow.
 
 Only the session activity's worker serves the server's operations. An operation
 whose `config` has a `schedule_to_start_timeout`, as the default `config` does,
-fails with `DedicatedWorkerFailure` when that timeout expires. One without it
-fails with `DedicatedWorkerFailure` as soon as the session activity has ended,
-with the session's failure as its cause, and an operation still waiting then is
-cancelled. With `cancellation_type=WAIT_CANCELLATION_COMPLETED` that operation
-is not cancelled, because no worker may be left to acknowledge it. It stays on
-the session's task queue until one of its timeouts expires or the run ends, and
-a later `stateful_mcp_server()` block with the same name refuses it. A caller's
-own cancellation still cancels the operation.
+or a `schedule_to_close_timeout` fails when that timeout expires. One with
+neither fails with `DedicatedWorkerFailure` as soon as the session activity has
+ended, with the session's failure as its cause, and an operation still waiting
+then is cancelled. With `cancellation_type=WAIT_CANCELLATION_COMPLETED` that
+operation is not cancelled, because no worker may be left to acknowledge it. It
+stays on the session's task queue until one of its timeouts expires or the run
+ends, and a later `stateful_mcp_server()` block with the same name refuses it.
+A caller's own cancellation still cancels the operation.
 
 ### Hosted MCP Tool
 
