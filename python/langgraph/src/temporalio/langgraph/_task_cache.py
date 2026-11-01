@@ -1,8 +1,10 @@
 """Task result cache for continue-as-new support.
 
-Caches task results by (module.qualname, args, kwargs) hash so that previously
-completed tasks are not re-executed after a continue-as-new. The cache state
-is a plain dict that can travel through workflow.continue_as_new().
+Caches task results by (module.qualname, args, kwargs) hash and by how many
+identical calls came before in the run, so that previously completed calls
+are not re-executed after a continue-as-new when the run makes them again in
+the same order, while a call repeated within a run executes again. The cache
+state is a plain dict that can travel through workflow.continue_as_new().
 """
 
 from __future__ import annotations
@@ -18,11 +20,33 @@ from pydantic import BaseModel
 _task_cache: ContextVar[dict[str, Any] | None] = ContextVar(
     "_temporal_task_cache", default=None
 )
+# How many times each cache key has been used since set_task_cache(). It is
+# not part of the cache, so it does not travel through continue-as-new.
+_key_uses: ContextVar[dict[str, int] | None] = ContextVar(
+    "_temporal_task_key_uses", default=None
+)
 
 
 def set_task_cache(cache: dict[str, Any] | None) -> None:
-    """Set the task result cache for the current context."""
+    """Set the task result cache for the current context and restart call counting."""
     _task_cache.set(cache)
+    _key_uses.set({})
+
+
+def occurrence_key(key: str) -> str:
+    """Return the cache key for this occurrence of a call in the current run.
+
+    The first call with ``key`` keeps it, so caches written by earlier
+    versions still match. The n-th repeat gets ``"<key>#<n>"``, so it does not
+    find an earlier call's result and runs again, while the same calls made in
+    the same order after continue-as-new find theirs.
+    """
+    uses = _key_uses.get()
+    if uses is None:
+        return key
+    n = uses.get(key, 0)
+    uses[key] = n + 1
+    return key if n == 0 else f"{key}#{n}"
 
 
 def get_task_cache() -> dict[str, Any] | None:

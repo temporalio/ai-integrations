@@ -166,6 +166,12 @@ The configured payload converter rebuilds each value, as it would an Activity pa
 
 **Breaking change:** code that reads these values with dictionary access, such as `state["answer"]["value"]`, must use attribute access, such as `state["answer"].value`. Code that validates values again, such as `Answer.model_validate(value)` or `convert_to_messages(messages)`, keeps working, except `model_validate` in Workflow code with a model class the sandbox loaded itself; import its module with `imports_passed_through()` as above. Activity payloads keep their format and only gain type information, so older Workers read new payloads as before, and histories recorded before the upgrade replay unchanged, apart from the task cache case below. Results recorded before the upgrade still replay as dictionaries, so deploy Workflow code that reads Activity results by attribute with Worker Versioning or after open runs finish. Task cache keys for arguments that are models, dataclasses or sets now come from their class and contents, so a run that carries a task cache across continue-as-new can fail replay with a non-determinism error on the other version, after an upgrade or a rollback. Let such runs finish before you upgrade, or upgrade with Worker Versioning. Runs started on this version may not replay on an earlier one, so roll back with Worker Versioning.
 
+### Repeated Calls and Continue-as-New
+
+An Activity node or task called again with the same input in the same run runs its Activity again, as in native LangGraph, so a poll loop sees the result change. To skip finished work after continue-as-new, pass `cache()` to the next run and give it to `graph(name, cache=...)` or `entrypoint(name, cache=...)`: the calls the earlier run made get its results, matched by node or task, input and order, and any further calls run.
+
+**Breaking change:** earlier versions gave a node or task called again with the same input in the same run the first call's result, without running it. A run recorded on an earlier version that got such a result fails to replay on this version with a non-determinism error, because this version schedules an Activity there, and a run that made such a call on this version fails to replay on an earlier one. Let those runs finish before you upgrade, or upgrade with Worker Versioning.
+
 ## Summaries
 
 Summaries are short, human-readable labels that show up in the Temporal UI and CLI, making it easier to see what each step of a run is doing.

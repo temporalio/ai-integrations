@@ -385,8 +385,9 @@ def graph(
     Args:
         name: Graph name as registered with LangGraphPlugin.
         cache: Optional task result cache from a previous cache() call.
-            Restores cached results so previously-completed nodes are
-            not re-executed after continue-as-new.
+            Restores cached results so that node calls completed before
+            continue-as-new are not re-executed when the run makes them
+            again, in the same order.
     """
     set_task_cache(cache or {})
     graphs = _workflow_graphs.get(workflow.info().run_id)
@@ -407,8 +408,9 @@ def entrypoint(
     Args:
         name: Entrypoint name as registered with Plugin.
         cache: Optional task result cache from a previous cache() call.
-            Restores cached results so previously-completed tasks are
-            not re-executed after continue-as-new.
+            Restores cached results so that task calls completed before
+            continue-as-new are not re-executed when the run makes them
+            again, in the same order.
     """
     set_task_cache(cache or {})
     entrypoints = _workflow_entrypoints.get(workflow.info().run_id)
