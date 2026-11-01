@@ -78,6 +78,8 @@ plugin = LangGraphPlugin(
 )
 ```
 
+Routing functions given to `add_conditional_edges` always run in the Workflow, so they must be deterministic. They can be `def` or `async def`.
+
 ## Activity Options
 
 Options are passed through to [`workflow.execute_activity()`](https://python.temporal.io/temporalio.workflow.html#execute_activity), which supports parameters like `start_to_close_timeout`, `retry_policy`, `schedule_to_close_timeout`, `heartbeat_timeout`, and more.
