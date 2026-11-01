@@ -51,7 +51,10 @@ from temporalio.api.workflowservice.v1 import (
 )
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.common import RetryPolicy
-from temporalio.converter import PayloadCodec
+from temporalio.converter import (
+    DefaultFailureConverterWithEncodedAttributes,
+    PayloadCodec,
+)
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.worker import Worker
 from temporalio.workflow import ActivityConfig
@@ -250,6 +253,8 @@ def _stdio_toolset(server: str) -> McpToolset:
 class _ReplacedInput:
     name: str = "stateful_server"
     heartbeat_timeout: bool = False
+    schedule_to_start_timeout: bool = True
+    session_task_queue: str | None = None
 
 
 @workflow.defn
@@ -262,14 +267,17 @@ class StatefulMcpWorkerReplacedWorkflow:
     async def run(self, input: _ReplacedInput) -> list[str]:
         config = ActivityConfig(
             start_to_close_timeout=timedelta(seconds=20),
-            schedule_to_start_timeout=timedelta(seconds=5),
             retry_policy=RetryPolicy(maximum_attempts=1),
         )
+        if input.schedule_to_start_timeout:
+            config["schedule_to_start_timeout"] = timedelta(seconds=5)
         server_session_config = ActivityConfig(
             start_to_close_timeout=timedelta(hours=1)
         )
         if input.heartbeat_timeout:
             server_session_config["heartbeat_timeout"] = timedelta(seconds=5)
+        if input.session_task_queue:
+            server_session_config["task_queue"] = input.session_task_queue
         async with TemporalStatefulMcpToolSet(
             input.name, config=config, server_session_config=server_session_config
         ) as toolset:
@@ -318,12 +326,41 @@ def _assert_refused(err: WorkflowFailureError) -> None:
     assert cause.non_retryable
 
 
+def _encoding_in(name: str) -> bool:
+    frame: FrameType | None = sys._getframe()
+    while frame and frame.f_code.co_name != name:
+        frame = frame.f_back
+    return frame is not None
+
+
+class _DelayMayBeOpenCodec(PayloadCodec):
+    """Delays the worker's "may be open" heartbeats, and longer its activity failures.
+
+    A "may be open" heartbeat sent before the attempt clears it then finishes
+    encoding after the clearing one, but before the attempt's failure.
+    """
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_heartbeat_async"):
+            if any(_mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads):
+                await asyncio.sleep(1.5)
+        elif _encoding_in("_handle_start_activity_task") and _encoding_in(
+            "encode_failure"
+        ):
+            await asyncio.sleep(3)
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+
 @pytest.mark.parametrize(
     "case",
     [
         "session_opened",
         "heartbeat_details_replaced",
         "first_connection_fails",
+        "first_connection_fails_delayed_heartbeats",
         "heartbeat_timeout_session_opened",
         "heartbeat_timeout_first_connection_fails",
     ],
@@ -331,10 +368,21 @@ def _assert_refused(err: WorkflowFailureError) -> None:
 async def test_stateful_session_after_worker_replaced(
     client: Client, case: str, monkeypatch: pytest.MonkeyPatch
 ):
-    first_connection_fails = case.endswith("first_connection_fails")
+    first_connection_fails = "first_connection_fails" in case
     heartbeat_timeout = case.startswith("heartbeat_timeout")
-    if heartbeat_timeout:
+    delayed_heartbeats = case.endswith("delayed_heartbeats")
+    if heartbeat_timeout or delayed_heartbeats:
         monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 1.0)
+    if delayed_heartbeats:
+        # Each heartbeat takes longer to encode than the interval, so one is
+        # always being encoded when the worker shuts down.
+        config = client.config()
+        config["data_converter"] = dataclasses.replace(
+            client.data_converter,
+            payload_codec=_DelayMayBeOpenCodec(),
+            failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
+        )
+        client = Client(**config)
     factory_calls = 0
 
     def factory(_: Any) -> McpToolset:
@@ -412,6 +460,88 @@ async def test_stateful_session_after_worker_replaced(
     # A new toolset would open a new MCP session without the old one's state.
     assert factory_calls == 1
     _assert_refused(err.value)
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("case", ["operation_waiting", "operation_after_refusal"])
+async def test_stateful_operations_fail_after_session_refused(
+    client: Client, case: str
+):
+    # Without a schedule-to-start timeout, nothing but the session's end
+    # stops an operation waiting on the session's task queue.
+    factory_calls = 0
+
+    def factory(_: Any) -> McpToolset:
+        nonlocal factory_calls
+        factory_calls += 1
+        return _stdio_toolset(_MCP_SERVER)
+
+    provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
+    client = _make_client(client, provider)
+    task_queue = f"adk-stateful-mcp-refused-{uuid.uuid4()}"
+    host_task_queue = f"{task_queue}-host"
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StatefulMcpWorkerReplacedWorkflow],
+        max_cached_workflows=0,
+    ):
+        async with Worker(client, task_queue=host_task_queue):
+            handle = await client.start_workflow(
+                StatefulMcpWorkerReplacedWorkflow.run,
+                _ReplacedInput(
+                    schedule_to_start_timeout=False,
+                    session_task_queue=host_task_queue,
+                ),
+                id=f"stateful-mcp-refused-{uuid.uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            assert await handle.execute_update(
+                StatefulMcpWorkerReplacedWorkflow.wait_listed
+            ) == ["echo"]
+        # The session's host shut down gracefully after it opened a session.
+
+        if case == "operation_waiting":
+            await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
+            async with asyncio.timeout(20):
+                while not any(
+                    pending.activity_type.name.endswith("-list-tools")
+                    for pending in (
+                        await handle.describe()
+                    ).raw_description.pending_activities
+                ):
+                    await asyncio.sleep(0.1)
+
+        # The retried session activity is refused on the next host.
+        async with Worker(client, task_queue=host_task_queue):
+            if case == "operation_after_refusal":
+                async with asyncio.timeout(30):
+                    while not await _has_event(
+                        handle, EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED
+                    ):
+                        await asyncio.sleep(0.2)
+                await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
+            async with asyncio.timeout(30):
+                with pytest.raises(WorkflowFailureError) as err:
+                    await handle.result()
+
+    assert factory_calls == 1
+    _assert_refused(err.value)
+    # The waiting operation was cancelled; none was scheduled after the session
+    # ended.
+    scheduled = [
+        event.activity_task_scheduled_event_attributes.activity_type.name
+        async for event in handle.fetch_history_events()
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+    ]
+    assert len([n for n in scheduled if n.endswith("-list-tools")]) == (
+        2 if case == "operation_waiting" else 1
+    )
+    assert await _has_event(
+        handle, EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED
+    ) == (case == "operation_waiting")
 
 
 # Without a heartbeat timeout the worker sends a heartbeat at most every 30

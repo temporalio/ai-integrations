@@ -367,6 +367,48 @@ def _handle_worker_failure(func: Callable) -> Callable:
     return wrapper
 
 
+def _session_ended_failure(session: ActivityHandle) -> ApplicationError:
+    failure = ApplicationError(
+        "The stateful MCP session activity has ended, so no worker serves this "
+        "toolset's operations.",
+        type="DedicatedWorkerFailure",
+    )
+    if not session.cancelled():
+        failure.__cause__ = session.exception()
+    return failure
+
+
+async def _execute_operation(
+    session: ActivityHandle, activity: str, *args: Any, **kwargs: Any
+) -> Any:
+    """Runs a list or call activity on the session's task queue.
+
+    Only the session activity's worker serves that queue, so once the session
+    has ended, an operation would wait until its schedule-to-start timeout,
+    or forever without one. Fail it with ``DedicatedWorkerFailure`` instead.
+    """
+    if session.done():
+        raise _session_ended_failure(session)
+    operation = workflow.start_activity(activity, *args, **kwargs)
+    session_ended = False
+
+    def cancel_operation(_: Any) -> None:
+        nonlocal session_ended
+        if not operation.done():
+            session_ended = True
+            operation.cancel()
+
+    session.add_done_callback(cancel_operation)
+    try:
+        return await operation
+    except BaseException as e:
+        if session_ended and is_cancelled_exception(e):
+            raise _session_ended_failure(session)
+        raise
+    finally:
+        session.remove_done_callback(cancel_operation)
+
+
 @dataclass
 class _StatefulServerSessionArguments:
     factory_argument: Any | None
@@ -389,13 +431,14 @@ class _SessionHeartbeats:
     """Heartbeat details of one ``-server-session`` attempt.
 
     Only the worker sends them (``activity.heartbeat()``), so cancels, pauses
-    and resets reach the attempt as before. The worker sends an attempt's
-    heartbeats one at a time, and its latest details with the attempt's
-    failure, so a heartbeat it sent earlier does not replace the marker.
+    and resets reach the attempt as before. The worker sends its latest
+    details with the attempt's failure, but it can receive heartbeats out of
+    order.
 
     The plugin cannot wait for a heartbeat, so every heartbeat says a session
     may be open until the attempt ends without one, and no session opens until
-    the server shows that.
+    the server shows that. Both markers refuse a retry, so only the heartbeat
+    that clears them must not be overtaken.
     """
 
     def __init__(self) -> None:
@@ -423,6 +466,9 @@ class _SessionHeartbeats:
         self._may_be_open = True
         self._opened = False
         self._closed = False
+        # The worker encodes each heartbeat in its own task, so they can reach
+        # it out of order.
+        self._sending: set[asyncio.Task[Any]] = set()
         # The worker sends an attempt's first heartbeat at once.
         self.beat()
 
@@ -434,7 +480,11 @@ class _SessionHeartbeats:
             details = [_SESSION_MAY_BE_OPEN]
         else:
             details = []
+        before = asyncio.all_tasks()
         self._context.run(activity.heartbeat, *details)
+        for task in asyncio.all_tasks() - before:
+            self._sending.add(task)
+            task.add_done_callback(self._sending.discard)
 
     async def wait_until_stored(self) -> None:
         """Waits until the server holds this attempt's first heartbeat.
@@ -473,11 +523,16 @@ class _SessionHeartbeats:
         self._opened = True
         self.beat()
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """Ends the attempt. Its failure carries the last details to a retry."""
         self._closed = True
         if self._may_be_open and not self._opened:
             # This attempt opened no session, so a retry may build the toolset.
+            # Send that last, after every earlier heartbeat: one still being
+            # encoded would otherwise replace it. If this wait is interrupted,
+            # the marker stays and the retry is refused.
+            if self._sending:
+                await asyncio.wait(set(self._sending))
             self._may_be_open = False
             self.beat()
 
@@ -701,7 +756,7 @@ class TemporalStatefulMcpToolSetProvider:
                     await heartbeat_task
                 except asyncio.CancelledError:
                     pass
-                heartbeats.close()
+                await heartbeats.close()
 
         return (connect,)
 
@@ -710,6 +765,7 @@ class _TemporalStatefulTool(BaseTool):
     def __init__(
         self,
         set_name: str,
+        session: ActivityHandle,
         config: ActivityConfig,
         declaration: FunctionDeclaration | None,
         *,
@@ -725,6 +781,7 @@ class _TemporalStatefulTool(BaseTool):
             custom_metadata=custom_metadata,
         )
         self._set_name = set_name
+        self._session = session
         self._config = config
         self._declaration = declaration
 
@@ -735,7 +792,8 @@ class _TemporalStatefulTool(BaseTool):
     async def run_async(
         self, *, args: dict[str, Any], tool_context: ToolContext
     ) -> Any:
-        result: _CallToolResult = await workflow.execute_activity(
+        result: _CallToolResult = await _execute_operation(
+            self._session,
             self._set_name + "-call-tool",
             _StatefulCallToolArguments(
                 self.name,
@@ -794,7 +852,9 @@ class TemporalStatefulMcpToolSet(BaseToolset):
             config: Optional activity configuration for the per-operation
                 (``-list-tools``/``-call-tool``) activities. A
                 ``schedule_to_start_timeout`` is used to detect a dead
-                dedicated worker.
+                dedicated worker. Operations also fail with
+                ``DedicatedWorkerFailure`` once the session activity has
+                ended.
             server_session_config: Optional activity configuration for the
                 long-running ``-server-session`` activity.
             factory_argument: Optional argument passed once to the toolset
@@ -881,7 +941,8 @@ class TemporalStatefulMcpToolSet(BaseToolset):
                 "manager (async with ...) or call connect() first."
             )
 
-        tool_results: list[_ToolResult] = await workflow.execute_activity(
+        tool_results: list[_ToolResult] = await _execute_operation(
+            self._connect_handle,
             self._name + "-list-tools",
             result_type=list[_ToolResult],
             **self._config,
@@ -889,6 +950,7 @@ class TemporalStatefulMcpToolSet(BaseToolset):
         return [
             _TemporalStatefulTool(
                 set_name=self._name,
+                session=self._connect_handle,
                 config=self._config,
                 declaration=tool_result.function_declaration,
                 name=tool_result.name,
