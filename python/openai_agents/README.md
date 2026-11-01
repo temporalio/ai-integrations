@@ -532,8 +532,9 @@ def weather_server() -> MCPServerStreamableHttp:
 
 `StatelessMCPServerProvider`, `StatefulMCPServerProvider`, the plugin's
 `mcp_server_providers` option, `stateless_mcp_server()`, and
-`stateful_mcp_server()` are deprecated. They remain supported for source and
-workflow-history compatibility and can still run with MCP Python SDK v1 when
+`stateful_mcp_server()` are deprecated. They remain supported for source
+compatibility and, except for the runs described at the end of this section,
+workflow-history compatibility, and can still run with MCP Python SDK v1 when
 the `mcp` extra is not installed. New integrations should use `mcp_servers` and
 `temporal_mcp_server()`, which require the `mcp` extra and MCP Python SDK v2.
 The legacy stateful path retains its dedicated per-workflow worker and
@@ -549,7 +550,8 @@ start-to-close timeout, the retry fails with a non-retryable
 `ApplicationError(type="DedicatedWorkerFailure")` instead of connecting a new
 server with an empty session. Leaving the `async with` block then raises an
 `ActivityError` whose cause is that failure. A retry after a failed factory
-call or first `connect()` connects again. A retry after a lost host or a
+call, a failed first `connect()`, or a worker shutdown before the server
+connected connects again. A retry after a lost host or a
 timed-out attempt fails even when the server never connected: the worker sends
 heartbeats later, and the plugin cannot wait for one, so every heartbeat says a
 session may be open until the attempt ends without one. Before it connects, the
@@ -567,6 +569,20 @@ operation is not cancelled, because no worker may be left to acknowledge it. It
 stays on the session's task queue until one of its timeouts expires or the run
 ends, and a later `stateful_mcp_server()` block with the same name refuses it.
 A caller's own cancellation still cancels the operation.
+
+This changes the commands such an operation schedules, so some runs that
+started on an earlier version fail replay on this one with a nondeterminism
+error (`[TMPRL1100]`): those whose session activity ended (timed out, failed or
+completed) before the workflow left the `stateful_mcp_server()` block, and that
+then scheduled an operation whose `config` has neither a
+`schedule_to_start_timeout` nor a `schedule_to_close_timeout`. This holds
+whether that operation still waits or the caller's own deadline or
+cancellation ended it and the run moved on, and it can hold for an operation
+already running when the session ended. Runs whose operations have either
+timeout, including those with the default `config`, are not affected. Before
+you upgrade, find such open runs and reset them to before the session ended,
+or terminate them. A run that this version failed this way fails replay on an
+earlier version, so do not roll back while such runs are open.
 
 ### Hosted MCP Tool
 

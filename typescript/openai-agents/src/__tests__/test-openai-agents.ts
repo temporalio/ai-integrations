@@ -14,8 +14,9 @@ import {
   withCustomSpan,
   withTrace,
 } from '@openai/agents-core';
+import { Context } from '@temporalio/activity';
 import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
-import { ActivityFailure, ApplicationFailure } from '@temporalio/common';
+import { ActivityFailure, ApplicationFailure, type PayloadCodec } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
 import { bundleWorkflowCode } from '@temporalio/worker';
@@ -689,6 +690,66 @@ test('Stateful MCP: a session Activity retried after a failed connect connects a
     t.regex(result, /session=server-2/);
     t.is(factoryCalls, 2);
   });
+});
+
+test('Stateful MCP: a session Activity retried after a shutdown before connecting connects again', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+
+  let connectCalls = 0;
+  const plugin = () =>
+    new OpenAIAgentsPlugin({
+      modelProvider: new FakeModelProvider([textResponse('unused')]),
+      mcpServerProviders: [
+        new StatefulMCPServerProvider(
+          'slowConnectTest',
+          (): MCPServer => {
+            const server = memoryServer('slowConnectTest', 'S');
+            server.connect = async () => {
+              // The first connect lasts until the Worker's shutdown cancels it.
+              if (++connectCalls === 1) await Context.current().sleep(30_000);
+            };
+            server.listTools = async () => [
+              {
+                name: 'dummy',
+                description: 'Dummy tool',
+                inputSchema: { type: 'object' as const, properties: {}, required: [], additionalProperties: false },
+              },
+            ];
+            return server;
+          },
+          t.context.env.nativeConnection
+        ),
+      ],
+    });
+  // Slows the encoding of "may be open" heartbeats. The first one reaches the
+  // server before connect(); the clearing heartbeat then queues behind a
+  // periodic one that is still being encoded when the shutdown cancels connect().
+  const slowHeartbeats: PayloadCodec = {
+    async encode(payloads) {
+      if (payloads.some((p) => Buffer.from(p.data ?? []).toString().includes('mcp-session-may-be-open'))) {
+        await new Promise((r) => setTimeout(r, 2_000));
+      }
+      return payloads;
+    },
+    async decode(payloads) {
+      return payloads;
+    },
+  };
+
+  const first = await createWorker({ plugins: [plugin()], dataConverter: { payloadCodecs: [slowHeartbeats] } });
+  const handle = await first.runUntil(async () => {
+    const handle = await startWorkflow(statefulMcpSlowConnectHeartbeatWorkflow, { workflowExecutionTimeout: '40 seconds' });
+    for (let i = 0; i < 300 && connectCalls === 0; i++) await new Promise((r) => setTimeout(r, 50));
+    return handle;
+  });
+  t.is(connectCalls, 1);
+
+  const second = await createWorker({ plugins: [plugin()] });
+  await second.runUntil(async () => {
+    // The first attempt connected no server, so the retry connects again.
+    t.is(await handle.result(), 'connected:1');
+  });
+  t.is(connectCalls, 2);
 });
 
 test('Stateful MCP: an operation without a schedule-to-start timeout fails once the session ends', async (t) => {

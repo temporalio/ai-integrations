@@ -3297,6 +3297,7 @@ class _DelayMayBeOpenCodec(PayloadCodec):
         "session_timed_out",
         "first_connect_fails",
         "first_connect_fails_delayed_heartbeats",
+        "shutdown_before_connect_delayed_heartbeats",
         "short_heartbeat_timeout",
     ],
 )
@@ -3304,11 +3305,12 @@ async def test_stateful_mcp_server_session_retried(
     client: Client, case: str, monkeypatch: pytest.MonkeyPatch
 ):
     first_connect_fails = case.startswith("first_connect_fails")
+    shutdown_before_connect = case.startswith("shutdown_before_connect")
     delayed_heartbeats = case.endswith("delayed_heartbeats")
     if delayed_heartbeats:
         monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 1.0)
         # Each heartbeat takes longer to encode than the interval, so one is
-        # always being encoded when the first connect fails.
+        # always being encoded when the first connect fails or is cancelled.
         config = client.config()
         config["data_converter"] = dataclasses.replace(
             client.data_converter,
@@ -3317,11 +3319,21 @@ async def test_stateful_mcp_server_session_retried(
         )
         client = Client(**config)
     factory_calls = 0
+    connecting = False
 
     def factory(_: Any) -> MCPServer:
         nonlocal factory_calls
         factory_calls += 1
         server = get_tracking_server("HelloServer")
+        if shutdown_before_connect and factory_calls == 1:
+
+            async def hang_connect() -> None:
+                nonlocal connecting
+                connecting = True
+                # Until the worker's shutdown cancels it.
+                await asyncio.sleep(60)
+
+            server.connect = hang_connect  # type: ignore[method-assign]
         if first_connect_fails and factory_calls == 1:
 
             async def fail_connect() -> None:
@@ -3366,17 +3378,29 @@ async def test_stateful_mcp_server_session_retried(
                     timedelta(seconds=5)
                     if case == "session_timed_out"
                     else timedelta(hours=1),
-                    # Long enough for the retry after a failed first connect.
-                    timedelta(seconds=30 if first_connect_fails else 5),
+                    # Long enough for the retry of an attempt that never connected.
+                    timedelta(
+                        seconds=30
+                        if first_connect_fails or shutdown_before_connect
+                        else 5
+                    ),
                     timedelta(seconds=4) if case == "short_heartbeat_timeout" else None,
                 ],
                 id=f"mcp-server-retried-{uuid.uuid4()}",
                 task_queue=task_queue,
                 execution_timeout=timedelta(seconds=80),
             )
-            assert await handle.execute_update(
-                McpServerStatefulRetriedWorkflow.wait_listed
-            ) == ["Say-Hello"]
+            if shutdown_before_connect:
+
+                async def connect_started() -> None:
+                    assert connecting
+
+                # The first worker shuts down while its first connect() runs.
+                await assert_eventually(connect_started, timeout=timedelta(seconds=30))
+            else:
+                assert await handle.execute_update(
+                    McpServerStatefulRetriedWorkflow.wait_listed
+                ) == ["Say-Hello"]
             if first_connect_fails:
                 # No session was opened, so the retry connects again.
                 await handle.signal(McpServerStatefulRetriedWorkflow.resume)
@@ -3403,6 +3427,15 @@ async def test_stateful_mcp_server_session_retried(
             task_queue=task_queue,
             max_cached_workflows=0,
         ):
+            if shutdown_before_connect:
+                # No session was opened, so the retry connects again.
+                assert await handle.execute_update(
+                    McpServerStatefulRetriedWorkflow.wait_listed
+                ) == ["Say-Hello"]
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 2
+                return
             await expect_refused(handle)
 
 

@@ -1,5 +1,5 @@
 import type { MCPServer } from '@openai/agents-core';
-import { ApplicationFailure, type SerializationContext } from '@temporalio/common';
+import { ApplicationFailure, CancelledFailure, type SerializationContext } from '@temporalio/common';
 import { Context, activityInfo } from '@temporalio/activity';
 import type { NativeConnection } from '@temporalio/worker';
 import {
@@ -135,6 +135,27 @@ class SessionHeartbeats {
       this.mayBeOpen = false;
       this.beat();
     }
+  }
+
+  /**
+   * The error that ends an attempt which threw `err`. Before a cancelled
+   * result the Worker drops a heartbeat queued behind one still being encoded,
+   * which can be the one that clears the marker. A Worker shutdown cancels the
+   * attempt and is retried, so an attempt that connected no server fails
+   * instead, and the Worker sends the clearing heartbeat first.
+   */
+  endingError(err: unknown): unknown {
+    if (
+      this.opened ||
+      !this.ctx.cancellationDetails?.workerShutdown ||
+      !(err instanceof CancelledFailure || (err instanceof Error && err.name === 'AbortError'))
+    ) {
+      return err;
+    }
+    return ApplicationFailure.create({
+      message: 'The Worker shut down before this stateful MCP server session connected.',
+      cause: err,
+    });
   }
 }
 
@@ -276,6 +297,8 @@ export class StatefulMCPServerProvider {
           await server.close();
           this._servers.delete(sid);
         }
+      } catch (err) {
+        throw heartbeats.endingError(err);
       } finally {
         stopHeartbeat();
         heartbeats.close();
