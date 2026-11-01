@@ -539,7 +539,9 @@ def _replay_safe_tracer(start_trace: Callable[..., Any]) -> Callable[..., Any]:
     callbacks have none; a tracer the caller passes keeps its own client.  Its
     runs get stable IDs in workflow code like any other, so without the
     wrapper a replay would write them again under the same IDs.  The tracer
-    sets its client on each run after this.
+    keeps a client set on a run (see ``_replay_safe_persist``).  Only the
+    run gets the wrapper, not the tracer, which may be used again outside
+    the plugin's tracing context, where its runs get no stable IDs.
 
     The run also gets its stable start time here, when it starts, before
     the tracer builds the dotted order its children copy.  A run with
@@ -551,13 +553,43 @@ def _replay_safe_tracer(start_trace: Callable[..., Any]) -> Callable[..., Any]:
     def _start_trace(self: Any, run: Any) -> None:
         runs = _plugin_langchain_runs()
         if runs is not None:
-            if not isinstance(self.client, _ReplaySafeClient):
-                self.client = _replay_safe_client(self.client)
+            run.ls_client = _replay_safe_client(self.client)
             run.start_time = runs.start_time(run.id)
             _replay_safe_replicas(run)
         start_trace(self, run)
 
     return _start_trace
+
+
+class _TracerWithClient:
+    """A tracer, as one of its methods sees it, with another client."""
+
+    def __init__(self, tracer: Any, client: _ReplaySafeClient) -> None:
+        self._tracer = tracer
+        self.client = client
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._tracer, name)
+
+
+def _replay_safe_persist(persist: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap ``LangChainTracer._persist_run_single`` to keep a run's wrapper.
+
+    It sets the tracer's client on the run before posting it, which would
+    replace the ``_ReplaySafeClient`` that ``_replay_safe_tracer`` gave it.
+    """
+
+    def _persist_run_single(self: Any, run: Any) -> None:
+        client = getattr(run, "ls_client", None)
+        if (
+            isinstance(client, _ReplaySafeClient)
+            and client is not self.client
+            and client._client is self.client
+        ):
+            return persist(_TracerWithClient(self, client), run)
+        return persist(self, run)
+
+    return _persist_run_single
 
 
 def _install_langchain_run_id_hook() -> None:
@@ -587,6 +619,11 @@ def _install_langchain_run_id_hook() -> None:
         LangChainTracer,
         "_start_trace",
         _replay_safe_tracer(getattr(LangChainTracer, "_start_trace")),
+    )
+    setattr(
+        LangChainTracer,
+        "_persist_run_single",
+        _replay_safe_persist(getattr(LangChainTracer, "_persist_run_single")),
     )
     # The names the manager calls; neither is in its __all__.
     if hasattr(manager, "uuid7"):

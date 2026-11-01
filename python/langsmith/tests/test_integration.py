@@ -224,9 +224,17 @@ class LangChainHelperWorkflow:
             return await chain.ainvoke("hello", config=config)
 
 
+# A tracer workflows share; tests set it.
+_shared_tracers: list[Any] = []
+
+
 @workflow.defn
 class LangChainSignalWorkflow:
-    """Runs a LangChain runnable whose step waits for a signal."""
+    """Runs a LangChain runnable whose step waits for a signal.
+
+    With ``shared_tracer``, the runnable gets the tracer in
+    ``_shared_tracers``, so run it unsandboxed.
+    """
 
     def __init__(self) -> None:
         self._released = False
@@ -236,12 +244,13 @@ class LangChainSignalWorkflow:
         self._released = True
 
     @workflow.run
-    async def run(self) -> str:
+    async def run(self, shared_tracer: bool = False) -> str:
         async def wait(text: str) -> str:
             await workflow.wait_condition(lambda: self._released)
             return text
 
-        return await RunnableLambda(wait, name="wait").ainvoke("secret")
+        config: Any = {"callbacks": _shared_tracers[:1]} if shared_tracer else {}
+        return await RunnableLambda(wait, name="wait").ainvoke("secret", config=config)
 
 
 @workflow.defn
@@ -1165,6 +1174,77 @@ class TestReplay:
         assert len({run["id"] for run in posts}) == 1
         assert writes
         assert "secret" not in str(writes)
+
+    async def test_tracer_used_again_without_plugin(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+    ) -> None:
+        """A tracer the plugin traced through writes as before on a worker without it.
+
+        Its client stays the caller's, so outside the plugin, where runs get
+        no stable IDs, its writes are not held back on replay.
+        """
+        get_runtime_environment()
+        langsmith.env.get_langchain_env_var_metadata()
+        writes: list[tuple[str, dict[str, Any]]] = []
+
+        class _RecordingClient(langsmith.Client):
+            def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("post", args[0]))
+
+            def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("patch", args[0]))
+
+        ls_client = _RecordingClient(
+            api_url="http://localhost:1", api_key="test", auto_batch_tracing=False
+        )
+        tracer = LangChainTracer(client=ls_client)
+        _shared_tracers[:] = [tracer]
+        plugin_client, _, _ = _make_client_and_collector(client)
+
+        async def run_once(temporal_client: Client) -> None:
+            # A cache of 0: each workflow task after the first replays.
+            async with new_worker(
+                temporal_client,
+                LangChainSignalWorkflow,
+                workflow_runner=UnsandboxedWorkflowRunner(),
+                max_cached_workflows=0,
+            ) as worker:
+                handle = await temporal_client.start_workflow(
+                    LangChainSignalWorkflow.run,
+                    True,
+                    id=f"replay-test-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                )
+                for _ in range(100):
+                    history = await handle.fetch_history()
+                    if any(
+                        e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED
+                        for e in history.events
+                    ):
+                        break
+                    await asyncio.sleep(0.1)
+                await handle.signal(LangChainSignalWorkflow.release)
+                assert await handle.result() == "secret"
+
+        await run_once(plugin_client)
+        assert tracer.client is ls_client
+        # With the plugin, the run is posted once and patched once.
+        assert sorted((op, str(run["id"])) for op, run in writes) == [
+            ("patch", str(writes[0][1]["id"])),
+            ("post", str(writes[0][1]["id"])),
+        ]
+        del writes[:]
+
+        # Without it, each copy of the run is posted and patched, as LangChain
+        # does without the plugin.
+        await run_once(client)
+        assert tracer.client is ls_client
+        posts = [str(run["id"]) for op, run in writes if op == "post"]
+        patches = [str(run["id"]) for op, run in writes if op == "patch"]
+        assert posts
+        assert sorted(set(patches)) == sorted(posts)
 
 
 # ---------------------------------------------------------------------------
