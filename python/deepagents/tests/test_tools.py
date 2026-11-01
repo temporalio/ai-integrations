@@ -281,7 +281,7 @@ class ClassMethodEchoClass:
         return text
 
 
-async def _echo_with(receiver: object, text: str) -> str:
+async def _echo_with(_receiver: object, text: str) -> str:
     return text
 
 
