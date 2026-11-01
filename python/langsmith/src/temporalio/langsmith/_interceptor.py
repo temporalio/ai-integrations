@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import Any, ClassVar, NoReturn, Protocol
 
 import langsmith
+import langsmith.run_trees
 import langsmith.utils
 import nexusrpc.handler
 from langsmith import tracing_context
@@ -515,7 +516,10 @@ def _install_langchain_run_id_hook() -> None:
     if _langchain_run_id_hook_installed:
         return
     _langchain_run_id_hook_installed = True
-    setattr(RunTree, "create_child", _stable_child_ids(RunTree.create_child))
+    # langsmith's own class, even when this module's RunTree name is replaced,
+    # as tests that mock it do.
+    run_tree = langsmith.run_trees.RunTree
+    setattr(run_tree, "create_child", _stable_child_ids(run_tree.create_child))
     try:
         import langchain_core.callbacks.manager as manager
         from langchain_core.tracers.langchain import LangChainTracer
