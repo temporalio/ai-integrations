@@ -587,22 +587,30 @@ func apiErrorCode(err error) int {
 	return 0
 }
 
-// statusCodeField returns the int StatusCode field of the first error in err's
-// chain that has one, as openai-go's *openai.Error does (ADK's OpenAI model
-// wraps it), or 0 if none has. Reading the field by name avoids importing each
-// provider's SDK.
+// statusCodeField returns the first non-zero int StatusCode field in err's
+// tree, as openai-go's *openai.Error has (ADK's OpenAI model wraps it), or 0
+// if there is none. It follows both Unwrap forms (errors.Join and multiple %w
+// produce the second), depth first, as errors.As does. Reading the field by
+// name avoids importing each provider's SDK.
 func statusCodeField(err error) int {
-	for ; err != nil; err = errors.Unwrap(err) {
-		v := reflect.Indirect(reflect.ValueOf(err))
-		if v.Kind() != reflect.Struct {
-			continue
+	if err == nil {
+		return 0
+	}
+	if v := reflect.Indirect(reflect.ValueOf(err)); v.Kind() == reflect.Struct {
+		if sf, ok := v.Type().FieldByName("StatusCode"); ok {
+			if f, ferr := v.FieldByIndexErr(sf.Index); ferr == nil && f.CanInt() && f.Int() != 0 {
+				return int(f.Int())
+			}
 		}
-		sf, ok := v.Type().FieldByName("StatusCode")
-		if !ok {
-			continue
-		}
-		if f, ferr := v.FieldByIndexErr(sf.Index); ferr == nil && f.CanInt() {
-			return int(f.Int())
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return statusCodeField(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if code := statusCodeField(e); code != 0 {
+				return code
+			}
 		}
 	}
 	return 0
