@@ -247,7 +247,14 @@ export async function tracingApiKeyWorkflow(apiKey?: string): Promise<string> {
   return result.finalOutput ?? '';
 }
 
-export type TracingKeyEntryPoint = 'run' | 'stream' | 'runConfig' | 'withTrace' | 'traceContext' | 'activity';
+export type TracingKeyEntryPoint =
+  | 'run'
+  | 'stream'
+  | 'runConfig'
+  | 'withTrace'
+  | 'withTraceOnly'
+  | 'traceContext'
+  | 'activity';
 
 export async function tracingKeyRefusedWorkflow(entryPoint: TracingKeyEntryPoint): Promise<string> {
   const agent = new Agent({
@@ -279,6 +286,10 @@ export async function tracingKeyRefusedWorkflow(entryPoint: TracingKeyEntryPoint
       }
       case 'withTrace':
         await withTrace('workflow-trace', () => runner.run(agent, 'Hello'), { tracingApiKey: 'sk-workflow' });
+        break;
+      case 'withTraceOnly':
+        // No run and no Temporal call inside, so only the trace processor's check sees the key.
+        await withTrace('workflow-trace', async () => {}, { tracingApiKey: 'sk-workflow' });
         break;
       case 'traceContext':
         await withTraceContext({ trace: keyedTrace() }, () => runner.run(agent, 'Hello'));

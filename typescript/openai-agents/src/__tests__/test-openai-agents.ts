@@ -823,7 +823,15 @@ test("tracingApiKey gives spans that cross a Temporal boundary the key the Worke
     });
 
     // A trace's own key is refused in Workflow code before the model call, and at any other Temporal call.
-    for (const entryPoint of ['run', 'stream', 'runConfig', 'withTrace', 'traceContext', 'activity'] as const) {
+    for (const entryPoint of [
+      'run',
+      'stream',
+      'runConfig',
+      'withTrace',
+      'withTraceOnly',
+      'traceContext',
+      'activity',
+    ] as const) {
       const handle = await wfClient.start(tracingKeyRefusedWorkflow, {
         taskQueue,
         workflowId: `tracing-key-refused-${entryPoint}-${Date.now()}`,
