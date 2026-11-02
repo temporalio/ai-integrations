@@ -117,7 +117,7 @@ async def echo_twice(text: str, /, times: int = 2, sep: str = ",") -> str:
 
 class EchoActivities:
     @activity.defn
-    async def echo_method(self, text: str) -> str:
+    async def echo_method(self, text: Annotated[str, "The text to echo."]) -> str:
         return f"method:{text}"
 
     @activity.defn
@@ -127,6 +127,8 @@ class EchoActivities:
 
 @activity.defn
 class EchoClass:
+    """An echo activity whose prefix is set on the worker."""
+
     # A class-level annotation for the constructor's parameter: without it, the
     # tool built from the constructor failed to build at all.
     prefix: str
@@ -134,7 +136,7 @@ class EchoClass:
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
 
-    async def __call__(self, text: str) -> str:
+    async def __call__(self, text: Annotated[str, "The text to echo."]) -> str:
         """Echo text with the worker's prefix."""
         return f"{self.prefix}:{text}"
 
@@ -155,8 +157,8 @@ class ActivityAsToolWorkflow:
     async def run(self, text: str) -> list[str]:
         calls: list[tuple[Callable[..., Any], dict[str, Any]]] = [
             (echo_activity, {"text": text}),
-            # `times` is left out: the tool passes its default, so `sep` still
-            # reaches its own parameter.
+            # `times` is left out and `sep` is passed: LangChain fills in the
+            # default before it calls the tool.
             (echo_twice, {"text": text, "sep": "+"}),
             (EchoActivities.echo_method, {"text": text}),
             (EchoClass, {"text": text}),
@@ -290,37 +292,61 @@ class PartialMethodEchoClass:
     __call__ = functools.partialmethod(_echo_with)
 
 
+@activity.defn
+class PartialKeywordEchoClass:
+    # Binding `text` by keyword makes it keyword-only.
+    __call__ = functools.partialmethod(_echo_with, text="hi")
+
+
 @pytest.mark.parametrize(
     "activity_ref, args, description",
     [
         # No `self` for a method passed as Class.method, even annotated (a string
         # here, under `from __future__ import annotations`).
-        (EchoActivities.echo_method, ["text"], "Temporal activity echo_method."),
+        (
+            EchoActivities.echo_method,
+            {"text": "The text to echo."},
+            "Temporal activity echo_method.",
+        ),
         (
             EchoActivities.echo_self_typed,
-            ["text"],
+            {"text": None},
             "Temporal activity echo_self_typed.",
         ),
-        # A class offers __call__'s parameters and docstring, not its constructor's.
-        (EchoClass, ["text"], "Echo text with the worker's prefix."),
+        # A class offers __call__'s parameters and docstring, not its constructor's
+        # or its class docstring.
+        (
+            EchoClass,
+            {"text": "The text to echo."},
+            "Echo text with the worker's prefix.",
+        ),
         # Without a __call__ docstring, the class's own docstring, else that of
         # an inherited __call__.
-        (DocumentedEchoClass, ["text"], "Echo text from the class docstring."),
-        (InheritedEchoClass, ["text"], "Echo text from the base class."),
+        (DocumentedEchoClass, {"text": None}, "Echo text from the class docstring."),
+        (InheritedEchoClass, {"text": None}, "Echo text from the base class."),
         # Not the docstring dataclasses writes, which names the constructor's
         # parameters.
-        (EchoDataclass, ["text"], "Echo text from the base class."),
+        (EchoDataclass, {"text": None}, "Echo text from the base class."),
         # The receiver of each __call__ form is dropped, as an instance binds it.
-        (StaticEchoClass, ["text"], "Temporal activity StaticEchoClass."),
-        (ClassMethodEchoClass, ["text"], "Temporal activity ClassMethodEchoClass."),
-        (PartialMethodEchoClass, ["text"], "Temporal activity PartialMethodEchoClass."),
+        (StaticEchoClass, {"text": None}, "Temporal activity StaticEchoClass."),
+        (
+            ClassMethodEchoClass,
+            {"text": None},
+            "Temporal activity ClassMethodEchoClass.",
+        ),
+        (
+            PartialMethodEchoClass,
+            {"text": None},
+            "Temporal activity PartialMethodEchoClass.",
+        ),
     ],
 )
 def test_activity_as_tool_schema(
-    activity_ref: Any, args: list[str], description: str
+    activity_ref: Any, args: dict[str, str | None], description: str
 ) -> None:
+    # `args` maps each parameter the model is offered to its description.
     tool = activity_as_tool(activity_ref, start_to_close_timeout=timedelta(seconds=10))
-    assert list(tool.args) == args
+    assert {name: arg.get("description") for name, arg in tool.args.items()} == args
     assert tool.description == description
 
 
@@ -356,6 +382,7 @@ class BadAnnotationActivity(EchoClass):
     [
         (NoCallActivity, "to have a __call__"),
         (KeywordOnlyActivity, "keyword-only argument 'text'"),
+        (PartialKeywordEchoClass, "partialmethod binds an argument by keyword"),
         (varargs_activity, r"\*more"),
         (kwargs_activity, r"\*\*extra"),
         (BadAnnotationActivity, "name 'Missing' is not defined"),

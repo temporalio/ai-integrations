@@ -307,6 +307,11 @@ def _tool_signature(
             raise ValueError(
                 f"activity_as_tool cannot read {activity.__name__}.__call__: {e}"
             ) from e
+        # A functools.partialmethod that binds an argument by keyword makes the
+        # arguments after it keyword-only.
+        bound_by_keyword = isinstance(calls[0], functools.partialmethod) and bool(
+            calls[0].keywords
+        )
         # __call__'s own docstring, else the class's, else that of a __call__ it inherits.
         doc = (
             _docstring(_call_function(vars(activity).get("__call__")))
@@ -317,6 +322,7 @@ def _tool_signature(
         signature = inspect.signature(activity)
         hints = typing.get_type_hints(activity, include_extras=True)
         doc = activity.__doc__
+        bound_by_keyword = False
         # A first parameter named `self` is the receiver of a method passed as
         # Class.method, however it is annotated: the worker registers the bound
         # method, so its instance supplies it.
@@ -331,9 +337,13 @@ def _tool_signature(
         if p.kind is inspect.Parameter.VAR_POSITIONAL:
             raise ValueError(f"activity_as_tool cannot pass *{p.name}.")
         if p.kind is inspect.Parameter.KEYWORD_ONLY:
-            raise ValueError(
-                f"activity_as_tool cannot pass keyword-only argument {p.name!r}."
-            )
+            message = f"activity_as_tool cannot pass keyword-only argument {p.name!r}."
+            if bound_by_keyword:
+                message += (
+                    " Its functools.partialmethod binds an argument by keyword,"
+                    " which makes the arguments after it keyword-only."
+                )
+            raise ValueError(message)
         if p.kind is inspect.Parameter.VAR_KEYWORD:
             raise ValueError(f"activity_as_tool cannot pass **{p.name}.")
         if p.kind is inspect.Parameter.POSITIONAL_ONLY:
