@@ -1,6 +1,8 @@
 import typing
 from dataclasses import replace
+from datetime import timedelta
 
+import mcp
 import pytest
 from botocore.config import Config as BotocoreConfig
 from strands.interrupt import Interrupt, InterruptException
@@ -8,6 +10,7 @@ from strands.models import Model
 from strands.models.bedrock import DEFAULT_READ_TIMEOUT
 from strands.tools.mcp import MCPClient as StrandsMCPClient
 
+import temporalio.mcp
 import temporalio.strands_agents._plugin as plugin_module
 from temporalio.api.failure.v1 import Failure
 from temporalio.client import ClientConfig
@@ -25,6 +28,7 @@ from temporalio.strands_agents._failure_converter import (
     StrandsFailureConverterWithEncodedAttributes,
 )
 from temporalio.strands_agents._model_activity import ModelActivity
+from temporalio.testing import ActivityEnvironment
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 from tests.common import CompressionCodec
 from tests.mock_model import MockModel
@@ -210,20 +214,91 @@ def test_other_failure_converter_is_replaced(target: str) -> None:
     assert decoded.type == "DomainError"
 
 
-def test_mcp_factory_that_returns_a_strands_client_fails_retryably() -> None:
+def _old_strands_client() -> typing.Any:
     # A factory left as it was for Strands' MCPClient, the common upgrade mistake.
-    def old_factory() -> typing.Any:
-        return StrandsMCPClient(typing.cast(typing.Any, lambda: None))
+    return StrandsMCPClient(typing.cast(typing.Any, lambda: None))
 
-    create = plugin_module._client_factory("old", old_factory)
+
+def _client_on_a_function() -> mcp.Client:
+    # The same factory with only its import changed to mcp.Client.
+    return mcp.Client(typing.cast(typing.Any, lambda: None))
+
+
+@pytest.mark.parametrize(
+    ("factory", "message"),
+    [
+        (
+            _old_strands_client,
+            "MCP server factory 'old' returned strands.tools.mcp.mcp_client.MCPClient, "
+            "not mcp.Client; mcp_clients factories must return an mcp.Client "
+            "(see the upgrade notes in the plugin README)",
+        ),
+        (
+            _client_on_a_function,
+            "MCP server factory 'old' returned an mcp.Client whose server is a "
+            "function; pass the transport itself, a StdioServerParameters or a URL, "
+            "not a function that returns the transport "
+            "(see the upgrade notes in the plugin README)",
+        ),
+    ],
+)
+async def test_mcp_factory_that_returns_the_wrong_client_fails_retryably(
+    factory: typing.Callable[[], typing.Any], message: str
+) -> None:
+    plugin = StrandsPlugin(models={}, mcp_clients={"old": factory})
+    activities = typing.cast(list[typing.Any], plugin.activities)
+    list_tools = next(
+        a
+        for a in activities
+        if a.__temporal_activity_definition.name == "temporalio.mcp.old.list-tools"
+    )
 
     with pytest.raises(ApplicationError) as error:
-        create()
+        await ActivityEnvironment().run(list_tools, {"factory_argument": None})
 
-    assert error.value.message == (
-        "MCP server factory 'old' returned strands.tools.mcp.mcp_client.MCPClient, "
-        "not mcp.Client; mcp_clients factories must return an mcp.Client "
-        "(see the upgrade notes in the plugin README)"
-    )
+    assert error.value.message == message
     # Retryable: the run waits for a fixed worker instead of failing.
     assert not error.value.non_retryable
+
+
+def test_mcp_factory_that_needs_arguments_fails_when_the_plugin_is_built() -> None:
+    def tenant_factory(tenant: str) -> mcp.Client:
+        return mcp.Client(f"https://{tenant}.example.com/mcp")
+
+    with pytest.raises(
+        TypeError, match="MCP server factory 'weather' must take no arguments"
+    ):
+        StrandsPlugin(
+            models={}, mcp_clients={"weather": typing.cast(typing.Any, tenant_factory)}
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({}, timedelta(minutes=5)),
+        ({"mcp_connection_idle_timeout": None}, None),
+        ({"mcp_connection_idle_timeout": timedelta(0)}, timedelta(0)),
+    ],
+)
+def test_mcp_connection_idle_timeout_is_passed_through(
+    monkeypatch: pytest.MonkeyPatch,
+    kwargs: dict[str, typing.Any],
+    expected: timedelta | None,
+) -> None:
+    seen: list[timedelta | None] = []
+
+    class RecordingMCPPlugin(temporalio.mcp.MCPPlugin):
+        def __init__(self, clients: typing.Any, **options: typing.Any) -> None:
+            seen.append(options["connection_idle_timeout"])
+            super().__init__(clients, **options)
+
+    monkeypatch.setattr(temporalio.mcp, "MCPPlugin", RecordingMCPPlugin)
+
+    StrandsPlugin(
+        models={},
+        mcp_clients={"echo": lambda: mcp.Client("http://localhost")},
+        **kwargs,
+    )
+
+    assert seen == [expected]
