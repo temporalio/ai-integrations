@@ -35,7 +35,8 @@ export interface McpServerHandleOptions {
    * Builds each tool call's MCP `_meta` in the Workflow, as for a native MCP server. It gets the
    * run context and must be deterministic. Older plugin versions ignore this option and may not
    * replay a History in which it ran, because running it can change the Workflow's commands or
-   * their order.
+   * their order. Its result is recorded in Workflow History as part of the call-tool Activity
+   * input, so it must not hold secrets.
    */
   toolMetaResolver?: MCPToolMetaResolver;
 }
