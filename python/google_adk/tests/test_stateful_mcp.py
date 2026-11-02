@@ -49,15 +49,28 @@ from temporalio.api.workflowservice.v1 import (
     ResetActivityRequest,
     ResetWorkflowExecutionRequest,
 )
-from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
+from temporalio.client import (
+    Client,
+    DescribeWorkflowInput,
+    Interceptor,
+    OutboundInterceptor,
+    WorkflowFailureError,
+    WorkflowHandle,
+    WorkflowHistory,
+)
 from temporalio.common import RetryPolicy
 from temporalio.converter import (
     DefaultFailureConverterWithEncodedAttributes,
     PayloadCodec,
 )
 from temporalio.exceptions import ActivityError, ApplicationError
-from temporalio.worker import Worker
+from temporalio.service import RPCError, RPCStatusCode
+from temporalio.worker import Replayer, Worker
 from temporalio.workflow import ActivityCancellationType, ActivityConfig
+from tests.helpers.stateful_replay import (
+    StatefulMcpCancelWorkflow,
+    StatefulMcpGatherWorkflow,
+)
 
 with workflow.unsafe.imports_passed_through():
     from google.adk.events import EventActions
@@ -255,6 +268,7 @@ class _ReplacedInput:
     heartbeat_timeout: bool = False
     schedule_to_start_timeout: bool = True
     session_task_queue: str | None = None
+    wait_cancellation: bool = False
 
 
 @workflow.defn
@@ -271,6 +285,10 @@ class StatefulMcpWorkerReplacedWorkflow:
         )
         if input.schedule_to_start_timeout:
             config["schedule_to_start_timeout"] = timedelta(seconds=5)
+        if input.wait_cancellation:
+            config["cancellation_type"] = (
+                ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+            )
         server_session_config = ActivityConfig(
             start_to_close_timeout=timedelta(hours=1)
         )
@@ -316,14 +334,18 @@ async def _has_event(handle: WorkflowHandle[Any, Any], event_type: int) -> bool:
 
 
 def _assert_refused(err: WorkflowFailureError) -> None:
-    cause: BaseException | None = err.cause
-    while isinstance(cause, ActivityError):
-        cause = cause.cause
+    # What leaves the block is the type the docstrings name.
+    assert isinstance(err.cause, ApplicationError)
+    assert err.cause.type == "DedicatedWorkerFailure"
     # Refused by the retried session activity, not only by the next
     # operation timing out.
+    cause: BaseException | None = err.cause
+    while cause is not None and not (
+        isinstance(cause, ApplicationError) and cause.non_retryable
+    ):
+        cause = cause.__cause__
     assert isinstance(cause, ApplicationError)
     assert cause.type == "DedicatedWorkerFailure"
-    assert cause.non_retryable
 
 
 def _encoding_in(name: str) -> bool:
@@ -340,13 +362,19 @@ class _DelayMayBeOpenCodec(PayloadCodec):
     encoding after the clearing one, but before the attempt's failure.
     """
 
+    def __init__(self) -> None:
+        self.heartbeat_delays = 0
+        self.failure_delays = 0
+
     async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
         if _encoding_in("_heartbeat_async"):
             if any(_mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads):
+                self.heartbeat_delays += 1
                 await asyncio.sleep(1.5)
         elif _encoding_in("_handle_start_activity_task") and _encoding_in(
             "encode_failure"
         ):
+            self.failure_delays += 1
             await asyncio.sleep(3)
         return list(payloads)
 
@@ -373,13 +401,14 @@ async def test_stateful_session_after_worker_replaced(
     delayed_heartbeats = case.endswith("delayed_heartbeats")
     if heartbeat_timeout or delayed_heartbeats:
         monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 1.0)
+    codec = _DelayMayBeOpenCodec()
     if delayed_heartbeats:
         # Each heartbeat takes longer to encode than the interval, so one is
         # always being encoded when the worker shuts down.
         config = client.config()
         config["data_converter"] = dataclasses.replace(
             client.data_converter,
-            payload_codec=_DelayMayBeOpenCodec(),
+            payload_codec=codec,
             failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
         )
         client = Client(**config)
@@ -453,6 +482,9 @@ async def test_stateful_session_after_worker_replaced(
             # "may be open" marker.
             assert await handle.result() == ["echo"]
             assert factory_calls == 2
+            if delayed_heartbeats:
+                # The SDK functions the codec looks for still exist.
+                assert codec.heartbeat_delays and codec.failure_delays
             return
         with pytest.raises(WorkflowFailureError) as err:
             await handle.result()
@@ -463,7 +495,14 @@ async def test_stateful_session_after_worker_replaced(
 
 
 @pytest.mark.timeout(90)
-@pytest.mark.parametrize("case", ["operation_waiting", "operation_after_refusal"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "operation_waiting",
+        "operation_after_refusal",
+        "operation_after_refusal_wait_cancellation",
+    ],
+)
 async def test_stateful_operations_fail_after_session_refused(
     client: Client, case: str
 ):
@@ -493,6 +532,7 @@ async def test_stateful_operations_fail_after_session_refused(
                 _ReplacedInput(
                     schedule_to_start_timeout=False,
                     session_task_queue=host_task_queue,
+                    wait_cancellation=case.endswith("wait_cancellation"),
                 ),
                 id=f"stateful-mcp-refused-{uuid.uuid4()}",
                 task_queue=task_queue,
@@ -516,7 +556,7 @@ async def test_stateful_operations_fail_after_session_refused(
 
         # The retried session activity is refused on the next host.
         async with Worker(client, task_queue=host_task_queue):
-            if case == "operation_after_refusal":
+            if case.startswith("operation_after_refusal"):
                 async with asyncio.timeout(30):
                     while not await _has_event(
                         handle, EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED
@@ -542,6 +582,95 @@ async def test_stateful_operations_fail_after_session_refused(
     assert await _has_event(
         handle, EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED
     ) == (case == "operation_waiting")
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_session_heartbeats_within_heartbeat_timeout(client: Client):
+    # A 5-second heartbeat timeout, well under the 30-second heartbeat
+    # interval, with nothing patched: a healthy block stays open past it.
+    factory_calls = 0
+
+    def factory(_: Any) -> McpToolset:
+        nonlocal factory_calls
+        factory_calls += 1
+        return _stdio_toolset(_MCP_SERVER)
+
+    provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
+    client = _make_client(client, provider)
+    task_queue = f"adk-stateful-mcp-heartbeat-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StatefulMcpWorkerReplacedWorkflow],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            StatefulMcpWorkerReplacedWorkflow.run,
+            _ReplacedInput(heartbeat_timeout=True),
+            id=f"stateful-mcp-heartbeat-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+        assert await handle.execute_update(
+            StatefulMcpWorkerReplacedWorkflow.wait_listed
+        ) == ["echo"]
+        await asyncio.sleep(15)
+        await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
+        assert await handle.result() == ["echo"]
+    assert factory_calls == 1
+
+
+class _DenyDescribe(Interceptor):
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _DenyDescribeOutbound(next)
+
+
+class _DenyDescribeOutbound(OutboundInterceptor):
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        raise RPCError("Request unauthorized.", RPCStatusCode.PERMISSION_DENIED, b"")
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_session_without_describe_permission(client: Client):
+    # The worker's client may not describe the workflow: the session activity
+    # fails at once with an error that says so, and the run fails with it.
+    factory_calls = 0
+
+    def factory(_: Any) -> McpToolset:
+        nonlocal factory_calls
+        factory_calls += 1
+        return _stdio_toolset(_MCP_SERVER)
+
+    provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
+    config = client.config()
+    config["interceptors"] = [*config["interceptors"], _DenyDescribe()]
+    worker_client = _make_client(Client(**config), provider)
+    task_queue = f"adk-stateful-mcp-describe-{uuid.uuid4()}"
+    async with Worker(
+        worker_client,
+        task_queue=task_queue,
+        workflows=[StatefulMcpWorkerReplacedWorkflow],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            StatefulMcpWorkerReplacedWorkflow.run,
+            _ReplacedInput(),
+            id=f"stateful-mcp-describe-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+        async with asyncio.timeout(20):
+            with pytest.raises(WorkflowFailureError) as err:
+                await handle.result()
+
+    assert factory_calls == 0
+    _assert_refused(err.value)
+    messages: list[str] = []
+    cause: BaseException | None = err.value
+    while cause is not None:
+        messages.append(str(cause))
+        cause = cause.__cause__
+    assert any("permission to describe" in m for m in messages), messages
 
 
 # Without a heartbeat timeout the worker sends a heartbeat at most every 30
@@ -663,12 +792,13 @@ _SLOW_START = "import time; time.sleep(2.5)\n"
 class _DelayWorkerMarkerCodec(PayloadCodec):
     """Delays the worker's own heartbeats that carry the session marker."""
 
+    def __init__(self) -> None:
+        self.delays = 0
+
     async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
         if any(_mcp._SESSION_OPENED.encode() in p.data for p in payloads):
-            frame: FrameType | None = sys._getframe()
-            while frame and frame.f_code.co_name != "_heartbeat_async":
-                frame = frame.f_back
-            if frame:
+            if _encoding_in("_heartbeat_async"):
+                self.delays += 1
                 await asyncio.sleep(3.5)
         return list(payloads)
 
@@ -693,9 +823,10 @@ async def test_stateful_session_marker_kept_by_worker_heartbeats(
         return _stdio_toolset(_SLOW_START + _MCP_SERVER)
 
     provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
+    codec = _DelayWorkerMarkerCodec()
     config = client.config()
     config["data_converter"] = dataclasses.replace(
-        client.data_converter, payload_codec=_DelayWorkerMarkerCodec()
+        client.data_converter, payload_codec=codec
     )
     client = _make_client(Client(**config), provider)
     task_queue = f"adk-stateful-mcp-marker-{uuid.uuid4()}"
@@ -736,6 +867,7 @@ async def test_stateful_session_marker_kept_by_worker_heartbeats(
         finally:
             observer.cancel()
 
+    assert codec.delays
     assert True in observed
     # Once stored, the marker never left the heartbeat details.
     assert False not in observed[observed.index(True) :]
@@ -826,6 +958,10 @@ async def main():
         from codec import DelayWorkerMarkerCodec
 
         codec = DelayWorkerMarkerCodec()
+    elif delay == "2":
+        from codec import DelayHeartbeatsCodec
+
+        codec = DelayHeartbeatsCodec()
     client = await Client.connect(
         target,
         namespace=namespace,
@@ -861,6 +997,19 @@ class DelayWorkerMarkerCodec(PayloadCodec):
                 frame = frame.f_back
             if frame:
                 await asyncio.sleep(3.5)
+        return list(payloads)
+
+    async def decode(self, payloads):
+        return list(payloads)
+
+
+class DelayHeartbeatsCodec(PayloadCodec):
+    async def encode(self, payloads):
+        frame = sys._getframe()
+        while frame and frame.f_code.co_name != "_heartbeat_async":
+            frame = frame.f_back
+        if frame:
+            await asyncio.sleep(3)
         return list(payloads)
 
     async def decode(self, payloads):
@@ -948,6 +1097,7 @@ class StatefulMcpHostKilledWorkflow:
     [
         "heartbeat_timeout",
         "heartbeat_timeout_delayed_marker",
+        "heartbeat_timeout_slow_heartbeats",
         "heartbeat_timeout_call_waiting",
         "no_heartbeat_timeout",
     ],
@@ -956,6 +1106,10 @@ async def test_stateful_session_after_host_killed(
     client: Client, tmp_path: Path, case: str
 ):
     delay_worker_heartbeats = case == "heartbeat_timeout_delayed_marker"
+    # Every heartbeat takes 3 seconds to encode, so the session would open and
+    # be used before its first heartbeat reaches the server if the session
+    # activity did not wait for it.
+    slow_heartbeats = case == "heartbeat_timeout_slow_heartbeats"
     call_waiting = case == "heartbeat_timeout_call_waiting"
     (tmp_path / "host.py").write_text(_SESSION_HOST)
     (tmp_path / "codec.py").write_text(_SESSION_HOST_CODEC)
@@ -981,7 +1135,7 @@ async def test_stateful_session_after_host_killed(
         host_task_queue,
         str(calls_file),
         (_SLOW_START if delay_worker_heartbeats else "") + _STATE_MCP_SERVER,
-        "1" if delay_worker_heartbeats else "0",
+        "1" if delay_worker_heartbeats else "2" if slow_heartbeats else "0",
         stdout=asyncio.subprocess.PIPE,
     )
     try:
@@ -1111,9 +1265,10 @@ class StatefulMcpReopenedWorkflow:
                 await tools["put"].run_async(
                     args={"text": "OLD-PAYLOAD"}, tool_context=_tool_context()
                 )
-        except (ActivityError, ApplicationError):
+        except ApplicationError as err:
             # The caller opens a new block, as the README suggests.
-            pass
+            if err.type != "DedicatedWorkerFailure":
+                raise
         async with TemporalStatefulMcpToolSet(
             "stateful_state",
             config=config,
@@ -1233,3 +1388,17 @@ async def test_stateful_operation_of_ended_session_not_run_by_next_block(
     # Both blocks' operations use the queue that sessions of every version
     # poll, so a session recorded by an earlier version keeps serving them.
     assert operation_queues == {f"stateful_state-stateful@{handle.result_run_id}"}
+
+
+@pytest.mark.parametrize(
+    "file_name", ["stateful_mcp_gather.json", "stateful_mcp_cancel.json"]
+)
+async def test_stateful_mcp_histories_from_main_replay(file_name: str) -> None:
+    # Recorded on main at 88745dc with the workflow worker stopped, so that one
+    # activation resolves a stateful tool call together with another activity
+    # (gather) or with a workflow cancel (cancel).
+    history_json = (Path(__file__).with_name("histories") / file_name).read_text()
+    await Replayer(
+        workflows=[StatefulMcpGatherWorkflow, StatefulMcpCancelWorkflow],
+        plugins=[GoogleAdkPlugin()],
+    ).replay_workflow(WorkflowHistory.from_json("replay", history_json))
