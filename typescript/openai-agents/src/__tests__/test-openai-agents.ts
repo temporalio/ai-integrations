@@ -13,6 +13,7 @@ import {
   StatelessMCPServerProvider,
 } from '..';
 import { activityAsTool } from '../workflow';
+import type { ActivityToolDefinition } from '../workflow';
 import {
   activityToolContextWorkflow,
   localActivityAgentWorkflow,
@@ -41,12 +42,43 @@ setTracingDisabled(false);
   new OpenAIAgentsPlugin({ modelProvider: _provider, modelParams: { summary: { provide: () => 'x' } } });
   // @ts-expect-error — modelParams.summary must be string, not function/object
   new OpenAIAgentsTraceClientInterceptor({ modelParams: { summary: { provide: () => 'x' } } });
-  // @ts-expect-error — an Activity with a second parameter needs includeContext: true
-  activityAsTool<(input: { key: string }, context: unknown) => Promise<string>>({
+}
+
+// Compile-time check: an Activity with a required second parameter needs includeContext: true,
+// both inline and through an annotated ActivityToolDefinition.
+{
+  type OneArg = (input: { key: string }) => Promise<string>;
+  type OptionalSecond = (input: { key: string }, options?: { verbose: boolean }) => Promise<string>;
+  type TwoArgs = (input: { key: string }, context: unknown) => Promise<string>;
+  type ThreeArgs = (input: { key: string }, context: unknown, extra: number) => Promise<string>;
+  const base = {
     name: 'lookup',
     description: '',
     parameters: { type: 'object', properties: { key: { type: 'string' } } },
-  });
+  } as const;
+
+  // @ts-expect-error — an Activity with a second parameter needs includeContext: true
+  activityAsTool<TwoArgs>({ ...base });
+  // @ts-expect-error — an Activity with a second parameter needs includeContext: true
+  const _missing: ActivityToolDefinition<TwoArgs> = { ...base };
+  // @ts-expect-error — includeContext: false still gives the Activity one argument
+  activityAsTool<TwoArgs>({ ...base, includeContext: false });
+  // @ts-expect-error — the tool passes at most two arguments
+  activityAsTool<ThreeArgs>({ ...base, includeContext: true });
+
+  const withContext: ActivityToolDefinition<TwoArgs> = { ...base, includeContext: true };
+  activityAsTool<TwoArgs>(withContext);
+  activityAsTool(withContext);
+  activityAsTool<TwoArgs>({ ...base, includeContext: true });
+
+  const oneArg: ActivityToolDefinition<OneArg> = { ...base };
+  activityAsTool<OneArg>(oneArg);
+  activityAsTool<OneArg>({ ...base, includeContext: true });
+  // @ts-expect-error — a one-argument definition does not promise the context
+  activityAsTool<TwoArgs>(oneArg);
+  const optionalSecond: ActivityToolDefinition<OptionalSecond> = { ...base };
+  activityAsTool<OptionalSecond>(optionalSecond);
+  activityAsTool({ ...base });
 }
 
 const test = makeTestFunction({

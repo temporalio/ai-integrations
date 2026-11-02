@@ -16,28 +16,38 @@ export interface JsonObjectSchema<_T = unknown> {
   additionalProperties?: boolean;
 }
 
-type ActivityInput<TActivity extends (...args: any[]) => Promise<any>> = Parameters<TActivity>[0];
+/** An Activity that takes the tool input and, optionally, a context copy. */
+type ToolActivity = (input: any, context?: any) => Promise<any>;
+
+type ActivityInput<TActivity extends ToolActivity> = Parameters<TActivity>[0];
 
 /**
  * Definition for wrapping a Temporal Activity as an agent tool. `TActivity` is
  * the Activity function type (e.g. `typeof activities.getWeather`); its first
- * argument shape types `parameters`.
+ * argument shape types `parameters`. An Activity with a required second
+ * parameter needs `includeContext: true`.
  */
-export interface ActivityToolDefinition<TActivity extends (...args: any[]) => Promise<any>> {
+export type ActivityToolDefinition<TActivity extends ToolActivity> = {
   /** Activity name — must match the registered Activity on the Worker. */
   name: string;
   /** Tool description shown to the model. */
   description: string;
   /** Explicit JSON schema for the tool parameters (not Zod). */
   parameters: JsonObjectSchema<ActivityInput<TActivity>>;
-  /**
-   * When `true`, the Activity gets a copy of the run's context
-   * (`runContext.context`) as its second argument. The copy is part of the
-   * Activity's input, so it is stored in the Workflow's History, and changes
-   * the Activity makes to it do not reach the run.
-   */
-  includeContext?: boolean;
-}
+} & (TActivity extends (input: any) => Promise<any>
+  ? {
+      /**
+       * When `true`, the Activity gets a copy of the run's context
+       * (`runContext.context`) as its second argument. The copy is part of the
+       * Activity's input, so it is stored in the Workflow's History, and changes
+       * the Activity makes to it do not reach the run.
+       */
+      includeContext?: boolean;
+    }
+  : {
+      /** Required because the Activity has a required second parameter for the context copy. */
+      includeContext: true;
+    });
 
 export interface ActivityAsToolOptions {
   startToCloseTimeout?: Duration;
@@ -52,17 +62,12 @@ export interface ActivityAsToolOptions {
  * invokes the tool, it schedules the named Activity via `proxyActivities` and
  * returns the stringified result.
  */
-export function activityAsTool<TActivity extends (input: any) => Promise<any>>(
+export function activityAsTool<TActivity extends ToolActivity>(
   definition: ActivityToolDefinition<TActivity>,
   options?: ActivityAsToolOptions
 ): FunctionTool;
-/** With `includeContext: true`, the Activity can take the context copy as a second parameter. */
-export function activityAsTool<TActivity extends (input: any, context: any) => Promise<any>>(
-  definition: ActivityToolDefinition<TActivity> & { includeContext: true },
-  options?: ActivityAsToolOptions
-): FunctionTool;
 export function activityAsTool(
-  definition: ActivityToolDefinition<(...args: any[]) => Promise<any>>,
+  definition: ActivityToolDefinition<(input: any) => Promise<any>>,
   options?: ActivityAsToolOptions
 ): FunctionTool {
   const activities = proxyActivities<Record<string, (...args: any[]) => Promise<any>>>({
