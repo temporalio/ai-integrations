@@ -75,6 +75,27 @@ class MCPFactoryArgumentWorkflow:
         return result.final_output
 
 
+@workflow.defn
+class MCPToolMetaWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        server = openai_agents.workflow.temporal_mcp_server(
+            "hello",
+            tool_meta_resolver=lambda context: {
+                "tenant": "t-7",
+                "tool": context.tool_name,
+                "server": context.server_name,
+            },
+        )
+        agent = Agent[str](
+            name="MCP workflow",
+            instructions="Use the tools.",
+            mcp_servers=[server],
+        )
+        result = await Runner.run(agent, "Say hello to Tom and Tim.")
+        return result.final_output
+
+
 def model() -> TestModel:
     return TestModel.returning_responses(
         [
@@ -212,6 +233,39 @@ async def test_factory_argument_uses_fresh_client_per_activity(
 
     assert result == "Hi Tom and Tim!"
     assert arguments == [{"tenant": "acme"}] * 3
+
+
+async def test_temporal_mcp_server_sends_tool_meta(client: Client) -> None:
+    metas: list[Any] = []
+    mcp_server = server()
+
+    class RecordingServer(InProcessMCPServer):
+        async def call_tool(
+            self,
+            tool_name: str,
+            arguments: dict[str, Any] | None,
+            meta: dict[str, Any] | None = None,
+        ) -> CallToolResult:
+            metas.append(meta)
+            return await super().call_tool(tool_name, arguments, meta)
+
+    async with AgentEnvironment(
+        model=model(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30)
+        ),
+        mcp_servers={"hello": lambda: RecordingServer(mcp_server)},
+    ) as environment:
+        plugged_client = environment.applied_on_client(client)
+        async with new_worker(plugged_client, MCPToolMetaWorkflow) as worker:
+            result = await plugged_client.execute_workflow(
+                MCPToolMetaWorkflow.run,
+                id=f"mcp-v2-meta-{uuid4()}",
+                task_queue=worker.task_queue,
+            )
+
+    assert result == "Hi Tom and Tim!"
+    assert metas == [{"tenant": "t-7", "tool": "say_hello", "server": "hello"}] * 2
 
 
 def create_backend(factory: Callable[[], AgentsMCPServer]) -> _OpenAIMCPServerBackend:

@@ -3143,8 +3143,9 @@ async def test_mcp_server_factory_settings_are_rejected(
     assert err.value.cause.cause.non_retryable
     message = err.value.cause.cause.message
     if setting == "tool_meta_resolver":
+        route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
         assert "'HelloServer' sets tool_meta_resolver" in message
-        assert "temporal_mcp_server(tool_meta_resolver=...)" in message
+        assert f"on the server {route}() gives the workflow" in message
     elif setting != "tool_filter":
         route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
         assert "'HelloServer' sets require_approval" in message

@@ -45,6 +45,15 @@ _LEGACY_TOOL_FILTER_REMEDY = (
 )
 
 
+def _legacy_tool_meta_resolver_remedy(route: str) -> str:
+    """What the deprecated routes' tool_meta_resolver error tells the user to do."""
+    return (
+        f"set tool_meta_resolver on the server {route}() gives the workflow, or "
+        "register the factory with OpenAIAgentsPlugin(mcp_servers=...) and pass "
+        "it to temporal_mcp_server(tool_meta_resolver=...)"
+    )
+
+
 @dataclasses.dataclass
 class _StatelessListToolsArguments:
     factory_argument: Any | None
@@ -209,7 +218,11 @@ class StatelessMCPServerProvider:
         _reject_worker_side_require_approval(
             self._server_name, server, "stateless_mcp_server"
         )
-        _reject_worker_side_tool_meta_resolver(self._server_name, server)
+        _reject_worker_side_tool_meta_resolver(
+            self._server_name,
+            server,
+            _legacy_tool_meta_resolver_remedy("stateless_mcp_server"),
+        )
         return server
 
     @property
@@ -519,7 +532,11 @@ class StatefulMCPServerProvider:
             _reject_worker_side_require_approval(
                 self._server_name, server, "stateful_mcp_server"
             )
-            _reject_worker_side_tool_meta_resolver(self._server_name, server)
+            _reject_worker_side_tool_meta_resolver(
+                self._server_name,
+                server,
+                _legacy_tool_meta_resolver_remedy("stateful_mcp_server"),
+            )
             return server
 
         @activity.defn(name=self.name + "-list-tools")

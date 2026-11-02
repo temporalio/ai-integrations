@@ -473,6 +473,8 @@ These checks run in every MCP Activity. A run that already holds its cached tool
 list, the default, first meets them when it calls a tool: the agent gets the
 error as the tool's output, and the run can complete without the tool. Let open
 runs finish before you upgrade or add such a setting to the factory's server.
+A resolver there never had an effect, so removing it from the factory's server
+in the same deploy is enough.
 Moving the policy into `temporal_mcp_server(require_approval=...)` is also a
 workflow change: an open run that already called one of that server's tools
 fails replay with a nondeterminism error. Moving a resolver there is a workflow
@@ -549,7 +551,9 @@ persistent-session behavior. To require tool approval on these servers, pass
 as with `temporal_mcp_server()`, a policy on the factory's server is rejected
 unless it never asks for approval. So are a callable `tool_filter` and a
 `tool_meta_resolver` there, in every MCP operation, direct `call_tool()` and
-prompt calls included; a static filter still works. Remove such a filter or
+prompt calls included; a static filter still works. On these routes, set a
+resolver on the server that `stateless_mcp_server()` or `stateful_mcp_server()`
+gives the workflow (`server.tool_meta_resolver = ...`). Remove such a filter or
 resolver from the factory in the same deploy, or let open runs finish first.
 
 ### Hosted MCP Tool
