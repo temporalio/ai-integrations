@@ -1,8 +1,8 @@
 import os
 
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.mcpserver import Image, MCPServer
 
-mcp = FastMCP("image-server")
+mcp = MCPServer("image-server")
 
 # A PNG signature and header chunk: valid bytes, but not valid UTF-8.
 PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"

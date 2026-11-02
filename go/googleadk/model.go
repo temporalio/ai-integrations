@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/contrib/workflowstreams"
 	"go.temporal.io/sdk/workflow"
@@ -16,6 +17,8 @@ import (
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // StreamServer installs the workflow-side stream server that streamed model
@@ -89,8 +92,10 @@ func NewModel(name string, opts ...ModelOption) *TemporalModel {
 	return m
 }
 
-// Name reports the model name. ADK copies it into LLMRequest.Model, which the
-// InvokeModel Activity uses to resolve the worker-side model.
+// Name reports the model name. The InvokeModel Activity uses it to resolve the
+// worker-side model. ADK also copies it into LLMRequest.Model, which a
+// BeforeModelCallback may change; the worker-side model then receives the
+// changed name, as it would outside Temporal.
 func (m *TemporalModel) Name() string { return m.name }
 
 // GenerateContent dispatches the model call to the InvokeModel Activity and
@@ -126,6 +131,7 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 		actx := workflow.WithActivityOptions(wfCtx, ao)
 
 		in := invokeModelInput{
+			Model:                  &m.name,
 			Request:                req,
 			Stream:                 m.streamingTopic != "",
 			StreamingTopic:         m.streamingTopic,
@@ -244,8 +250,12 @@ func (m *TemporalModel) modelSummary(req *model.LLMRequest) string {
 // dropped automatically; only the model name and serialized tool declarations
 // cross the wire.
 type invokeModelInput struct {
-	// Request is the ADK LLM request. Request.Model selects the worker-side
-	// ModelFactory; Request.Config carries the tool declarations the model needs.
+	// Model is the TemporalModel's name. It selects the worker-side model. It is
+	// nil in inputs scheduled before this field existed; Request.Model is used
+	// then.
+	Model *string
+	// Request is the ADK LLM request, passed to the worker-side model as is.
+	// Request.Config carries the tool declarations the model needs.
 	Request *model.LLMRequest
 	// Stream selects streaming mode (model called with stream=true, chunks
 	// published to StreamingTopic). The aggregated final response is still
@@ -258,12 +268,23 @@ type invokeModelInput struct {
 	StreamingBatchInterval time.Duration
 }
 
+// modelName is the name that selects the worker-side model: the
+// TemporalModel's name, or Request.Model in an input scheduled before Model
+// existed.
+func (in invokeModelInput) modelName() string {
+	if in.Model != nil {
+		return *in.Model
+	}
+	return in.Request.Model
+}
+
 // InvokeModel runs a single LLM round-trip worker-side. It reconstructs the
-// model from the registered ModelFactory keyed by Request.Model, calls it, and
-// returns the (aggregated) response. The user's model.LLM is therefore never
-// invoked inside the workflow. Underlying model-SDK retries should be disabled
-// in the factory so Temporal's retry policy is the single source of truth;
-// transient failures are surfaced as retryable ApplicationErrors.
+// model from the registered ModelFactory keyed by the TemporalModel's name,
+// calls it with the request as is, and returns the (aggregated) response. The
+// user's model.LLM is therefore never invoked inside the workflow. Underlying
+// model-SDK retries should be disabled in the factory so Temporal's retry
+// policy is the single source of truth; transient failures are surfaced as
+// retryable ApplicationErrors.
 func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*model.LLMResponse, error) {
 	log := activity.GetLogger(ctx)
 	if in.Request == nil {
@@ -282,18 +303,19 @@ func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*mod
 	// disabled SDK retries, etc.) wins; otherwise the application-owned ADK model
 	// registry, then the built-in zero-config gemini-* fallback (see
 	// resolveModel). Mirrors adk-python's LLMRegistry.
-	llm, err := a.resolveModel(ctx, in.Request.Model)
+	name := in.modelName()
+	llm, err := a.resolveModel(ctx, name)
 	if err != nil {
 		return nil, newApplicationError(ErrorTypeModel, false, err,
-			"resolve model %q (add it to Config.Models or register its provider): %v", in.Request.Model, err)
+			"resolve model %q (add it to Config.Models or register its provider): %v", name, err)
 	}
 
 	if in.Stream && in.StreamingTopic != "" {
-		log.Debug("invoking model in streaming mode", "model", in.Request.Model, "topic", in.StreamingTopic)
+		log.Debug("invoking model in streaming mode", "model", name, "request_model", in.Request.Model, "topic", in.StreamingTopic)
 		return a.invokeModelStreaming(ctx, llm, in)
 	}
 
-	log.Debug("invoking model", "model", in.Request.Model)
+	log.Debug("invoking model", "model", name, "request_model", in.Request.Model)
 	var agg *model.LLMResponse
 	for resp, gerr := range llm.GenerateContent(ctx, in.Request, false) {
 		if gerr != nil {
@@ -303,7 +325,7 @@ func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*mod
 	}
 	if agg == nil {
 		return nil, newApplicationError(ErrorTypeModel, true, nil,
-			"model %q returned no response", in.Request.Model)
+			"model %q returned no response", name)
 	}
 	return agg, nil
 }
@@ -352,7 +374,7 @@ func startPeriodicHeartbeats(ctx context.Context) (stop func()) {
 // the workflowstreams topic for external (UI) consumers, and returns the
 // aggregated final response into the workflow. Liveness heartbeating is handled
 // by the caller's periodic heartbeater (see InvokeModel), not per chunk.
-func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in invokeModelInput) (*model.LLMResponse, error) {
+func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in invokeModelInput) (result *model.LLMResponse, err error) {
 	log := activity.GetLogger(ctx)
 	opts := workflowstreams.Options{}
 	if in.StreamingBatchInterval > 0 {
@@ -367,7 +389,20 @@ func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in
 	if wsc, cerr := workflowstreams.NewClientFromActivity(ctx, opts); cerr != nil {
 		log.Warn("streaming client unavailable; not publishing chunks", "error", cerr)
 	} else {
-		defer func() { _ = wsc.Close(ctx) }()
+		// Close sends the last batch. If it fails, subscribers did not get every
+		// chunk, so the call fails instead of returning as if they had. A model
+		// error stays the call's error, and a cancelled or timed-out Activity
+		// reports that instead. The result is dropped with it, so the SDK does
+		// not encode a reply it then discards.
+		defer func() {
+			if cerr := wsc.Close(ctx); cerr != nil && err == nil {
+				if ctx.Err() != nil {
+					result, err = nil, ctx.Err()
+				} else {
+					result, err = nil, streamPublishError(in, cerr)
+				}
+			}
+		}()
 		topic = wsc.Topic(in.StreamingTopic)
 	}
 
@@ -383,7 +418,7 @@ func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in
 	}
 	if agg == nil {
 		return nil, newApplicationError(ErrorTypeModel, true, nil,
-			"model %q returned no streamed response", in.Request.Model)
+			"model %q returned no streamed response", in.modelName())
 	}
 	// Mark the aggregate complete: it is the single response handed back into the
 	// workflow regardless of how many chunks were streamed to the topic.
@@ -567,6 +602,28 @@ func classifyModelError(err error) error {
 		retryable = retryableHTTPStatus(code)
 	}
 	return newApplicationError(ErrorTypeModel, retryable, err, "model call failed: %v", err)
+}
+
+// streamPublishError fails a streaming call whose chunks did not all reach the
+// topic. A retry calls the model again, so the error is non-retryable when the
+// retry would fail the same way: the server refused the batch as invalid (over
+// the payload size limit, or past the run's Signal limit), the batch is over
+// the server's gRPC message limit, or the stream client gave up on it after
+// retrying for its MaxRetryDuration. Other failures, such as a server outage,
+// stay retryable.
+func streamPublishError(in invokeModelInput, err error) error {
+	var invalid *serviceerror.InvalidArgument
+	var timeout *workflowstreams.FlushTimeoutError
+	retryable := !errors.As(err, &invalid) && !errors.As(err, &timeout) && !isMessageTooLarge(err)
+	return newApplicationError(ErrorTypeStream, retryable, err,
+		"model %q: publish streamed responses to topic %q: %v", in.modelName(), in.StreamingTopic, err)
+}
+
+// isMessageTooLarge reports a request the server refused as larger than its
+// gRPC message limit, the check the Go SDK's own retry interceptor uses to stop
+// retrying. Rate limiting uses the same code with other messages.
+func isMessageTooLarge(err error) bool {
+	return status.Code(err) == codes.ResourceExhausted && strings.Contains(status.Convert(err).Message(), "larger than max")
 }
 
 // apiErrorCode extracts the HTTP status from a genai.APIError, which the SDK
