@@ -10,7 +10,12 @@ import {
   withTrace,
 } from '@openai/agents-core';
 import type { MCPServer, Model, ModelProvider, Span, SpanData, TracingProcessor } from '@openai/agents-core';
-import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
+import {
+  WithStartWorkflowOperation,
+  WorkflowClient,
+  WorkflowFailedError,
+  WorkflowUpdateStage,
+} from '@temporalio/client';
 import type { ApplicationFailure } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
@@ -817,8 +822,8 @@ test("tracingApiKey gives spans that cross a Temporal boundary the key the Worke
       });
     });
 
-    // A trace's own key is refused in Workflow code before the model call.
-    for (const entryPoint of ['run', 'withTrace'] as const) {
+    // A trace's own key is refused in Workflow code before the model call, and at any other Temporal call.
+    for (const entryPoint of ['run', 'stream', 'runConfig', 'withTrace', 'traceContext', 'activity'] as const) {
       const handle = await wfClient.start(tracingKeyRefusedWorkflow, {
         taskQueue,
         workflowId: `tracing-key-refused-${entryPoint}-${Date.now()}`,
@@ -829,7 +834,7 @@ test("tracingApiKey gives spans that cross a Temporal boundary the key the Worke
       t.true(result.startsWith(`refused: ${refusal}`), `${entryPoint}: ${result}`);
       const { events } = await handle.fetchHistory();
       const scheduled = events?.filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED) ?? [];
-      t.is(scheduled.length, 0, `${entryPoint}: no model Activity`);
+      t.is(scheduled.length, 0, `${entryPoint}: no Activity`);
     }
     // Uncaught, the refusal fails the Workflow Task, which is retried until the code changes.
     const uncaught = await wfClient.start(tracingApiKeyWorkflow, {
@@ -847,18 +852,35 @@ test("tracingApiKey gives spans that cross a Temporal boundary the key the Worke
     }
     t.true(taskFailure?.startsWith(refusal), `an uncaught refusal fails the Workflow Task: ${taskFailure}`);
     await uncaught.terminate();
-    // The client is refused when it starts a Workflow inside a trace with its own key.
+    // The client is refused when it calls a Workflow inside a trace with its own key.
+    const keyedOptions = {
+      taskQueue,
+      workflowId: `tracing-key-client-key-${Date.now()}`,
+      workflowExecutionTimeout: '30 seconds' as const,
+    };
+    const keyedHandle = wfClient.getHandle(keyedOptions.workflowId);
+    const clientCalls = {
+      start: () => wfClient.start(tracingApiKeyWorkflow, keyedOptions),
+      signal: () => keyedHandle.signal('unused'),
+      query: () => keyedHandle.query('unused'),
+      startUpdate: () => keyedHandle.startUpdate('unused', { waitForStage: WorkflowUpdateStage.ACCEPTED }),
+      signalWithStart: () => wfClient.signalWithStart(tracingApiKeyWorkflow, { ...keyedOptions, signal: 'unused' }),
+      startUpdateWithStart: () =>
+        wfClient.startUpdateWithStart('unused', {
+          waitForStage: WorkflowUpdateStage.ACCEPTED,
+          startWorkflowOperation: new WithStartWorkflowOperation(tracingApiKeyWorkflow, {
+            ...keyedOptions,
+            workflowIdConflictPolicy: 'FAIL',
+          }),
+        }),
+    };
     await withTrace(
       'tracing-key-keyed-client-trace',
-      () =>
-        t.throwsAsync(
-          wfClient.start(tracingApiKeyWorkflow, {
-            taskQueue,
-            workflowId: `tracing-key-client-key-${Date.now()}`,
-            workflowExecutionTimeout: '30 seconds',
-          }),
-          { message: (message) => message.startsWith(refusal) }
-        ),
+      async () => {
+        for (const [name, call] of Object.entries(clientCalls)) {
+          await t.throwsAsync(call, { message: (message) => message.startsWith(refusal) }, name);
+        }
+      },
       { tracingApiKey: 'sk-client' }
     );
   });

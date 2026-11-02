@@ -13,6 +13,8 @@ import {
 import { OpenAIAgentsTraceActivityInboundInterceptor, OpenAIAgentsTraceNexusInboundInterceptor } from '../worker/trace-interceptor';
 import type { TracingApiKeyContext } from '../worker/trace-interceptor';
 
+const refusal = /^The OpenAI Agents plugin cannot pass a trace's own tracing key/;
+
 const callerTrace = {
   traceName: 'caller-trace',
   traceId: 'trace_0123456789abcdef0123456789abcdef',
@@ -35,23 +37,25 @@ test("Nexus handler spans get the key from tracingApiKey, and only a trace's own
     await withCustomSpan(
       async (span) => {
         spanKey = span.tracingApiKey;
-        // Span helpers clone the restored trace; the clone keeps the resolved key's exemption.
+        // Span helpers clone the restored trace; the clone, and a clone of it, keep the resolved key's exemption.
         t.is(currentAgentsSpanHeader().traceId, callerTrace.traceId);
-        await withCustomSpan(
-          async () => {
-            // A key that application code puts on the trace in place of the resolved one is its own.
-            getCurrentTrace()!.tracingApiKey = 'sk-application';
-            t.throws(() => currentAgentsSpanHeader(), { message: /cannot pass a trace's own tracing key/ });
-          },
-          { data: { name: 'replaced-key' } }
-        );
-        t.is(currentAgentsSpanHeader().traceId, callerTrace.traceId);
+        await withCustomSpan(async () => t.is(currentAgentsSpanHeader().traceId, callerTrace.traceId), {
+          data: { name: 'nested-span' },
+        });
       },
       { data: { name: 'handler-span' } }
     );
+    await withCustomSpan(
+      async () => {
+        // A key that application code puts on the trace in place of the resolved one is its own.
+        getCurrentTrace()!.tracingApiKey = 'sk-application';
+        t.throws(() => currentAgentsSpanHeader(), { message: refusal });
+      },
+      { data: { name: 'replaced-key' } }
+    );
     // The handler can still call Temporal under the restored trace: the resolved key is not the trace's own.
     t.is(currentAgentsSpanHeader().traceId, callerTrace.traceId);
-    await withTrace('handler-trace', async () => t.throws(() => currentAgentsSpanHeader()), {
+    await withTrace('handler-trace', async () => t.throws(() => currentAgentsSpanHeader(), { message: refusal }), {
       tracingApiKey: 'sk-own',
     });
     return {} as NexusStartOperationOutput;

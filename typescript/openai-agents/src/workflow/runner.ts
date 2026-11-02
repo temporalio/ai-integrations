@@ -1,6 +1,7 @@
 import {
   type Agent,
   type AgentInputItem,
+  getCurrentTrace,
   Handoff,
   MemorySession,
   Runner,
@@ -240,8 +241,11 @@ export class TemporalOpenAIRunner {
     input: string | AgentInputItem[] | RunState<TContext, TAgent>,
     options?: TemporalRunOptions<TContext>
   ): Promise<RunResult<any, TAgent> | StreamedRunResult<TContext, TAgent>> {
-    // Model calls run in an Activity, which cannot get the run's own tracing key.
+    // Model calls run in an Activity, which cannot get a tracing key set on the run or its trace.
+    // Refuse it here: inside the upstream runner the refusal would fail the Workflow, not its task.
     refuseTracingApiKey(options?.tracing?.apiKey);
+    refuseTracingApiKey((options?.runConfig as { tracing?: TracingConfig } | undefined)?.tracing?.apiKey);
+    refuseTracingApiKey(getCurrentTrace()?.tracingApiKey);
 
     const session = options?.session;
     if (session instanceof MemorySession) {

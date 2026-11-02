@@ -62,14 +62,14 @@ function hasOwnTracingApiKey(trace: Trace): boolean {
 /**
  * Throws if a trace has its own tracing key. Headers are stored in Event History, so they cannot
  * carry the key, and spans past the boundary would be exported with another key. Workflow code
- * is refused where it sets the key; every header write checks again.
+ * is refused when it starts a keyed trace or calls `run` with a key; every header write checks again.
  */
 export function refuseTracingApiKey(tracingApiKey: string | null | undefined): void {
   if (tracingApiKey == null) return;
   throw new Error(
-    "The OpenAI Agents plugin cannot pass a trace's own tracing key, set with tracing: { apiKey } on a run " +
-      'or tracingApiKey on a trace, to Temporal Workflows and Activities, so their spans would be exported ' +
-      'with another key. Set the tracing key on every Client and Worker process instead, with ' +
+    "The OpenAI Agents plugin cannot pass a trace's own tracing key, set with tracing: { apiKey } on a run or " +
+      'tracingApiKey on a trace, to Temporal Workflows, Activities and Nexus operations, so their spans would be ' +
+      'exported with another key. Set the tracing key on every Client and Worker process instead, with ' +
       "setTracingExportApiKey() or OPENAI_API_KEY, or resolve it on the Worker with the plugin's tracingApiKey option."
   );
 }

@@ -1,5 +1,11 @@
-import { Agent, type MCPToolFilterContext, withTrace } from '@openai/agents-core';
-import { ApplicationFailure } from '@temporalio/workflow';
+import {
+  Agent,
+  getGlobalTraceProvider,
+  type MCPToolFilterContext,
+  withTrace,
+  withTraceContext,
+} from '@openai/agents-core';
+import { ApplicationFailure, proxyActivities } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
@@ -241,18 +247,45 @@ export async function tracingApiKeyWorkflow(apiKey?: string): Promise<string> {
   return result.finalOutput ?? '';
 }
 
-export async function tracingKeyRefusedWorkflow(entryPoint: 'run' | 'withTrace'): Promise<string> {
+export type TracingKeyEntryPoint = 'run' | 'stream' | 'runConfig' | 'withTrace' | 'traceContext' | 'activity';
+
+export async function tracingKeyRefusedWorkflow(entryPoint: TracingKeyEntryPoint): Promise<string> {
   const agent = new Agent({
     name: 'TracingKeyAgent',
     instructions: 'You are a helpful assistant.',
     model: 'gpt-4o-mini',
   });
   const runner = new TemporalOpenAIRunner();
+  // A keyed trace that is never started, so only the checks in run and at each header write see its key.
+  const keyedTrace = () =>
+    getGlobalTraceProvider().createTrace({ name: 'workflow-trace', tracingApiKey: 'sk-workflow' });
+  const { notRegistered } = proxyActivities<{ notRegistered(): Promise<void> }>({
+    startToCloseTimeout: '5 seconds',
+    retry: { maximumAttempts: 1 },
+  });
   try {
-    if (entryPoint === 'run') {
-      await runner.run(agent, 'Hello', { tracing: { apiKey: 'sk-run' } });
-    } else {
-      await withTrace('workflow-trace', () => runner.run(agent, 'Hello'), { tracingApiKey: 'sk-workflow' });
+    switch (entryPoint) {
+      case 'run':
+        await runner.run(agent, 'Hello', { tracing: { apiKey: 'sk-run' } });
+        break;
+      case 'stream':
+        await runner.run(agent, 'Hello', { stream: true, tracing: { apiKey: 'sk-run' } });
+        break;
+      case 'runConfig': {
+        // runConfig has no tracing field, but a config object shared through a variable passes the type check.
+        const runConfig = { workflowName: 'support', tracing: { apiKey: 'sk-run' } };
+        await runner.run(agent, 'Hello', { runConfig });
+        break;
+      }
+      case 'withTrace':
+        await withTrace('workflow-trace', () => runner.run(agent, 'Hello'), { tracingApiKey: 'sk-workflow' });
+        break;
+      case 'traceContext':
+        await withTraceContext({ trace: keyedTrace() }, () => runner.run(agent, 'Hello'));
+        break;
+      case 'activity':
+        await withTraceContext({ trace: keyedTrace() }, () => notRegistered());
+        break;
     }
   } catch (e) {
     return `refused: ${(e as Error).message}`;

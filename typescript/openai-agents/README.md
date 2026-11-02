@@ -632,7 +632,7 @@ addTraceProcessor(new BatchTraceProcessor(new OpenAITracingExporter()));
 
 ### Tracing keys per run
 
-The exporter sends each span with its trace's key, or with its default key (`OPENAI_API_KEY` or `setTracingExportApiKey()`) when the trace has none. A trace's own tracing key, set with `tracing: { apiKey }` on a run or `tracingApiKey` on a trace, is not supported. The plugin passes traces to Workflows, Activities and Nexus handlers in headers, which are stored in Event History, so it cannot pass the key, and their spans would be exported with another key. In Workflow code, `TemporalOpenAIRunner.run` with `tracing: { apiKey }` and `withTrace(name, fn, { tracingApiKey })` throw. Starting, signaling, querying or updating a Workflow, or scheduling an Activity, child Workflow or Nexus operation, under such a trace throws too. Agent runs inside Activities can still use their own key. Set the tracing key on every Client and Worker process instead. A run that used such a key in Workflow code before you deploy this version gets the error when it replays: let those runs finish first, or use Worker Versioning.
+The exporter sends each span with its trace's key, or with its default key (`OPENAI_API_KEY` or `setTracingExportApiKey()`) when the trace has none. A trace's own tracing key, set with `tracing: { apiKey }` on a run or `tracingApiKey` on a trace, is not supported. The plugin passes traces to Workflows, Activities and Nexus handlers in headers, which are stored in Event History, so it cannot pass the key, and their spans would be exported with another key. In Workflow code, `TemporalOpenAIRunner.run` with `tracing: { apiKey }` or inside such a trace, and `withTrace(name, fn, { tracingApiKey })`, throw. Starting, signaling, querying or updating a Workflow, or scheduling an Activity, child Workflow or Nexus operation, under such a trace throws too. Set the tracing key on every Client and Worker process instead. In an Activity or Nexus handler, an agent run joins the trace the plugin restored there and ignores `tracing: { apiKey }`; use the Worker's `tracingApiKey` option instead. Only a trace that the Activity or handler starts itself, with `withTrace(name, fn, { tracingApiKey })`, keeps its own key; it is separate from the Workflow's trace, and Temporal calls under it throw. A run that used such a key in Workflow code before you deploy this version gets the error when it replays: let those runs finish first, or use Worker Versioning.
 
 To use a different key per run, resolve it on the Worker with `tracingApiKey`. The plugin calls it for Workflow spans and for spans made in Activities (including stateful MCP operations) and Nexus handlers. It gets the trace ID, and when known the trace name and the Workflow ID and type, and returns a key or `undefined` for the default:
 
@@ -642,6 +642,8 @@ const plugin = new OpenAIAgentsPlugin({
   tracingApiKey: ({ workflowId }) => (workflowId?.startsWith('tenant-a-') ? tenantATracingKey : undefined),
 });
 ```
+
+The resolver runs only on Workers. A trace that a Client starts, and the spans the Client makes in it, keep the Client's default key. To keep a run under one key, start the Workflow outside a Client trace, so that the run starts its own trace, or have the resolver return the Client's key for that trace.
 
 ### OpenTelemetry
 
