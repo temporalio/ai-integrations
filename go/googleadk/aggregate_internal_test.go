@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/openai/openai-go/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -97,12 +96,6 @@ func TestClassifyModelErrorRetryability(t *testing.T) {
 		}
 		classified := classifyModelError(err)
 		assert.Equal(t, !tc.retryable, IsNonRetryable(classified), "code %d", tc.code)
-
-		// ADK's OpenAI model wraps openai-go's Error, which carries the status.
-		if tc.code != 0 {
-			err = fmt.Errorf("openai: call failed: %w", &openai.Error{StatusCode: tc.code})
-			assert.Equal(t, tc.code, apiErrorCode(err), "openai code %d", tc.code)
-		}
 	}
 }
 
@@ -134,26 +127,30 @@ func TestAggregateResponsesFoldsAllLateFields(t *testing.T) {
 	assert.Equal(t, "blocked by safety", agg.ErrorMessage)
 }
 
-// customStatusError stands for another provider SDK's error with a StatusCode.
+// customStatusError stands for a provider SDK's error with an int StatusCode
+// field, as openai-go's *openai.Error has. TestOpenAIModelErrorIsNonRetryable
+// covers the real error that ADK's OpenAI model returns.
 type customStatusError struct{ StatusCode int }
 
 func (e customStatusError) Error() string { return fmt.Sprintf("status %d", e.StatusCode) }
 
-// TestClassifyModelErrorWrappedStatusCode proves an OpenAI status is found when
-// a model supplied through Config.Models wraps the error with other errors,
-// through either Unwrap form, and that the status rule still applies, also to
-// another error type with a StatusCode.
+// TestClassifyModelErrorWrappedStatusCode proves the status is found when the
+// error is wrapped, also by a model supplied through Config.Models that joins
+// it with other errors, through either Unwrap form, and that the status rule
+// still applies.
 func TestClassifyModelErrorWrappedStatusCode(t *testing.T) {
 	ctxErr := errors.New("model context")
 	for code, retryable := range map[int]bool{400: false, 401: false, 404: false, 408: true, 409: true, 429: true, 500: true, 503: true} {
-		oaiErr := &openai.Error{StatusCode: code}
+		statusErr := &customStatusError{code}
 		for name, err := range map[string]error{
-			"custom":        customStatusError{code},
-			"joined custom": errors.Join(ctxErr, customStatusError{code}),
-			"joined":        errors.Join(oaiErr, nil),
-			"joined last":   errors.Join(ctxErr, oaiErr),
-			"multiple %w":   fmt.Errorf("%w: %w", ctxErr, oaiErr),
-			"nested":        fmt.Errorf("outer: %w", errors.Join(ctxErr, fmt.Errorf("openai: %w", oaiErr))),
+			"value":       customStatusError{code},
+			"pointer":     statusErr,
+			"wrapped":     fmt.Errorf("openai: call failed: %w", statusErr),
+			"joined":      errors.Join(statusErr, nil),
+			"joined last": errors.Join(ctxErr, statusErr),
+			"after zero":  errors.Join(customStatusError{0}, statusErr),
+			"multiple %w": fmt.Errorf("%w: %w", ctxErr, statusErr),
+			"nested":      fmt.Errorf("outer: %w", errors.Join(ctxErr, fmt.Errorf("openai: %w", statusErr))),
 		} {
 			assert.Equal(t, code, apiErrorCode(err), "%s %d", name, code)
 			assert.Equal(t, !retryable, IsNonRetryable(classifyModelError(err)), "%s %d", name, code)
@@ -162,5 +159,5 @@ func TestClassifyModelErrorWrappedStatusCode(t *testing.T) {
 	// Joined status-less errors stay retryable, and a genai.APIError anywhere
 	// in the tree still decides first.
 	assert.False(t, IsNonRetryable(classifyModelError(errors.Join(ctxErr, assert.AnError))), "joined transient")
-	assert.False(t, IsNonRetryable(classifyModelError(errors.Join(&openai.Error{StatusCode: 404}, &genai.APIError{Code: 500}))), "joined genai 500")
+	assert.False(t, IsNonRetryable(classifyModelError(errors.Join(&customStatusError{404}, &genai.APIError{Code: 500}))), "joined genai 500")
 }
