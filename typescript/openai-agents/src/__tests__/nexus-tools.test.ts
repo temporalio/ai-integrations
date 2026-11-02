@@ -1,6 +1,7 @@
 import test from 'ava';
 import * as nexus from 'nexus-rpc';
 import type { FunctionTool, RunContext } from '@openai/agents-core';
+import type { ApplicationFailure } from '@temporalio/common';
 import { nexusOperationAsTool } from '../workflow/nexus-tools';
 import { ToolSerializationError } from '../workflow/tools';
 
@@ -94,4 +95,15 @@ test('nexusOperationAsTool: invoke outside workflow context fails after JSON par
 
   const err = await t.throwsAsync(() => tool.invoke({} as RunContext<any>, '{"location":"Seattle"}'));
   t.false(err instanceof ToolSerializationError, 'should fail after JSON parse, not during it');
+});
+
+test('nexusOperationAsTool: inputProperty not in parameters throws AgentsWorkflowError', (t) => {
+  const err = t.throws(() =>
+    nexusOperationAsTool(
+      WeatherService.operations.getWeather,
+      { name: 'getWeather', description: '', parameters: weatherSchema, inputProperty: 'city' },
+      { service: WeatherService, endpoint: 'weather-endpoint' }
+    )
+  ) as ApplicationFailure;
+  t.is(err.type, 'AgentsWorkflowError');
 });
