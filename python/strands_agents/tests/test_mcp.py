@@ -12,6 +12,7 @@ from mcp import StdioServerParameters, stdio_client
 from strands import tool
 from strands.hooks import BeforeModelCallEvent
 from strands.tools.mcp.mcp_client import MCPClient
+from strands.types.exceptions import EventLoopException
 
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowFailureError
@@ -616,6 +617,54 @@ async def test_mcp_conflict_after_a_tool_call(client: Client, plugin_on: str):
     assert cause.non_retryable
 
 
+@workflow.defn
+class HookErrorAfterToolWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        model_calls = 0
+
+        def fail_after_tool(
+            event: BeforeModelCallEvent,  # pyright: ignore[reportUnusedParameter]
+        ) -> None:
+            nonlocal model_calls
+            model_calls += 1
+            if model_calls == 2:
+                raise ValueError("hook failed")
+
+        agent = TemporalAgent(
+            model="mock", start_to_close_timeout=timedelta(seconds=30), tools=[ping]
+        )
+        agent.hooks.add_callback(BeforeModelCallEvent, fail_after_tool)
+        try:
+            await agent.invoke_async("ping")
+        except EventLoopException as err:
+            return f"wrapped {type(err.__cause__).__name__}"
+        return "not raised"
+
+
+async def test_other_errors_after_a_tool_call_stay_wrapped(client: Client):
+    """Only a tool name conflict is unwrapped: Strands still wraps a hook's ValueError."""
+    task_queue = f"test_other_errors_after_a_tool_call_stay_wrapped-{uuid4()}"
+    plugin = StrandsPlugin(
+        models={"mock": lambda: MockModel([{"name": "ping", "input": {}}])}
+    )
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[HookErrorAfterToolWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        result = await client.execute_workflow(
+            HookErrorAfterToolWorkflow.run,
+            id=f"test_other_errors_after_a_tool_call_stay_wrapped_{uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=20),
+        )
+    assert result == "wrapped ValueError"
+
+
 def _mcp_tool(server: str, name: str) -> TemporalMCPTool:
     info = _temporal_mcp_client._MCPToolInfo(
         name=name, description="", input_schema={}, agent_name=name
@@ -840,21 +889,6 @@ async def test_mcp_name_moves_between_servers(
     assert _sources(agent, a, b) == {"safe": "a", "other": "a", "echo": "b"}
 
 
-async def test_mcp_name_moves_to_a_cached_server(monkeypatch: pytest.MonkeyPatch):
-    """A name that moves to a cached server, listed by another agent, is that server's."""
-    a = TemporalMCPClient("a")
-    b = TemporalMCPClient("b", cache_tools=True)
-    monkeypatch.setattr(a, "_refresh", _listing(a, "echo"))
-    monkeypatch.setattr(b, "_refresh", _listing(b, "echo"))
-    await _before_model_call(TemporalAgent(model="m", tools=[a]))
-    agent = TemporalAgent(model="m", tools=[a, b])  # with a's echo from load_tools()
-    await _before_model_call(TemporalAgent(model="m", tools=[b]))
-    monkeypatch.setattr(a, "_refresh", _listing(a))
-
-    await _before_model_call(agent)
-    assert _sources(agent, a, b) == {"echo": "b"}
-
-
 async def test_mcp_failed_listing_changes_nothing(monkeypatch: pytest.MonkeyPatch):
     """A failed listing leaves the tools as they were; the next turn lists what is due."""
     a = TemporalMCPClient("a", cache_tools=True)
@@ -996,3 +1030,44 @@ async def test_mcp_tool_added_while_listing_is_refused(
     monkeypatch.setattr(b, "_refresh", b_while_echo_is_removed)
     await _before_model_call(agent)
     assert _sources(agent, a, b) == {"safe": "a", "echo": "b"}
+
+
+async def test_mcp_dynamic_tool_added_while_listing_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dynamic tool added while a listing runs counts when the turn is checked."""
+    a, b = TemporalMCPClient("a"), TemporalMCPClient("b")
+    agent = TemporalAgent(model="m", tools=[a, b])
+    listing_b = _listing(b, "echo")
+
+    async def b_while_signal_adds_dynamic_echo() -> None:
+        agent.tool_registry.register_dynamic_tool(_local_echo)
+        await listing_b()
+
+    monkeypatch.setattr(a, "_refresh", _listing(a, "safe"))
+    monkeypatch.setattr(b, "_refresh", b_while_signal_adds_dynamic_echo)
+    with pytest.raises(MCPToolNameConflictError, match="MCP server 'b' lists it"):
+        await _before_model_call(agent)
+    assert agent.tool_registry.registry == {}
+    assert agent.tool_registry.dynamic_tools == {"echo": _local_echo}
+
+
+async def test_mcp_listing_is_read_when_it_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later listing of a shared client by another agent does not change this turn's."""
+    p1, p2 = TemporalMCPClient("p1"), TemporalMCPClient("p2")
+    first = TemporalAgent(model="m", tools=[p1, p2])
+    second = TemporalAgent(model="m", tools=[p1])
+    monkeypatch.setattr(p1, "_refresh", _listing(p1, "x"))
+    listing_p2 = _listing(p2, "y")
+
+    async def p2_while_second_lists_p1() -> None:
+        monkeypatch.setattr(p1, "_refresh", _listing(p1, "y"))
+        await _before_model_call(second)
+        await listing_p2()
+
+    monkeypatch.setattr(p2, "_refresh", p2_while_second_lists_p1)
+    await _before_model_call(first)
+    assert set(first.tool_registry.registry) == {"x", "y"}
+    assert first.tool_registry.registry["y"] is p2._tools[0]

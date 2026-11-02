@@ -39,11 +39,12 @@ class MCPToolNameConflictError(  # pyright: ignore[reportUnsafeMultipleInheritan
 ):
     """An MCP tool has the name of another tool of the same agent.
 
-    ``TemporalAgent`` raises it before a model call when a listed tool's name,
-    or the name with ``-`` and ``_`` swapped, is taken. It is a non-retryable
-    ``ApplicationError``, so it fails the Workflow when it escapes Workflow
-    code, instead of retrying the Workflow Task, whether ``StrandsPlugin`` is
-    on the client or only on the Worker.
+    ``TemporalAgent`` raises it before a model call when a listed tool's name
+    is taken, or differs from a taken name only by ``-`` or ``_``. It is a
+    non-retryable ``ApplicationError``, so it fails the Workflow when it escapes
+    the Workflow's run method or a Signal handler, instead of retrying the
+    Workflow Task, whether ``StrandsPlugin`` is on the client or only on the
+    Worker. Escaping an Update handler, it fails only that Update.
     """
 
     def __init__(self, message: str) -> None:
