@@ -28,7 +28,9 @@ from temporalio.exceptions import (
     is_cancelled_exception,
 )
 from temporalio.openai_agents._mcp_server_checks import (
+    _has_dynamic_tool_filter,
     _has_worker_side_require_approval,
+    _reject_dynamic_tool_filter,
     _reject_worker_side_require_approval,
 )
 from temporalio.worker import PollerBehaviorSimpleMaximum, Worker
@@ -36,6 +38,13 @@ from temporalio.workflow import (
     ActivityCancellationType,
     ActivityConfig,
     ActivityHandle,
+)
+
+# What the deprecated routes' tool_filter error tells the user to do instead.
+_LEGACY_TOOL_FILTER_REMEDY = (
+    "use a static filter (create_static_tool_filter) on the factory's server, "
+    "or register the factory with OpenAIAgentsPlugin(mcp_servers=...) and pass "
+    "the filter to temporal_mcp_server(tool_filter=...)"
 )
 
 
@@ -169,7 +178,9 @@ class StatelessMCPServerProvider:
             name: The name of the MCP server.
             server_factory: A function which will produce MCPServer instances. It should return a new server each time
                 so that state is not shared between workflow runs. It may accept a single positional parameter, which
-                receives a ``factory_argument`` from the workflow.
+                receives a ``factory_argument`` from the workflow. A callable ``tool_filter`` or a ``require_approval``
+                policy that can ask for approval on the returned server is rejected in every MCP operation; a static
+                filter is applied.
         """
         warnings.warn(
             "StatelessMCPServerProvider is deprecated; use "
@@ -195,6 +206,9 @@ class StatelessMCPServerProvider:
             )
         else:
             server = cast(Callable[[], MCPServer], self._server_factory)()
+        _reject_dynamic_tool_filter(
+            self._server_name, server, _LEGACY_TOOL_FILTER_REMEDY
+        )
         _reject_worker_side_require_approval(
             self._server_name, server, "stateless_mcp_server"
         )
@@ -660,7 +674,8 @@ class StatefulMCPServerProvider:
             name: The name of the MCP server.
             server_factory: A function which will produce MCPServer instances. It should return a new server each time
                 so that state is not shared between workflow runs. It receives an optional ``factory_argument`` from the
-                workflow.
+                workflow. A callable ``tool_filter`` or a ``require_approval`` policy that can ask for approval on the
+                returned server is rejected in every MCP operation; a static filter is applied.
         """
         warnings.warn(
             "StatefulMCPServerProvider is deprecated; use "
@@ -703,6 +718,9 @@ class StatefulMCPServerProvider:
                     non_retryable=True,
                 )
             server = self._servers[server_id]
+            _reject_dynamic_tool_filter(
+                self._server_name, server, _LEGACY_TOOL_FILTER_REMEDY
+            )
             _reject_worker_side_require_approval(
                 self._server_name, server, "stateful_mcp_server"
             )
@@ -777,11 +795,13 @@ class StatefulMCPServerProvider:
             args: _StatefulServerSessionArguments | None,
         ) -> None:
             server = self._server_factory(args.factory_argument if args else None)
-            # A server with a worker-side approval policy is never connected.
-            # The dedicated worker still runs, and each of its operations fails
-            # with the policy error, so the workflow sees that error at its
-            # first MCP call whatever its schedule-to-start timeout.
-            rejected = _has_worker_side_require_approval(server)
+            # A server with a callable tool filter or a worker-side approval
+            # policy is never connected. The dedicated worker still runs, and
+            # each of its operations fails with the same error, so the workflow
+            # sees that error at its first MCP call whatever its
+            # schedule-to-start timeout.
+            has_filter = _has_dynamic_tool_filter(server)
+            rejected = has_filter or _has_worker_side_require_approval(server)
             self._servers[server_id] = server
             self._session_scheduled_times[server_id] = activity.info().scheduled_time
             try:
