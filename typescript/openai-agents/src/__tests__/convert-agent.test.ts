@@ -3,6 +3,7 @@ import { Agent, Handoff, handoff } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
 import { ActivityBackedModel } from '../workflow/activity-backed-model';
 import { convertAgent } from '../workflow/convert-agent';
+import { activityAsTool } from '../workflow/tools';
 
 const DEFAULT_MODEL_PARAMS = { startToCloseTimeout: '60s' as const };
 
@@ -16,6 +17,29 @@ test('convertAgent: raw function in tools throws AgentsWorkflowError', (t) => {
   t.is(err.type, 'AgentsWorkflowError');
   t.true(err.nonRetryable);
   t.regex(err.message, /raw function|tool\(\) or activityAsTool\(\)/);
+});
+
+test('convertAgent: activityAsTool with an unknown inputProperty throws AgentsWorkflowError', async (t) => {
+  const greet = (inputProperty: string) =>
+    activityAsTool({
+      name: 'greet',
+      description: '',
+      parameters: { type: 'object', properties: { name: { type: 'string' } } },
+      inputProperty,
+    });
+  t.notThrows(() => convertAgent(new Agent({ name: 'X', model: 'm', tools: [greet('name')] }), DEFAULT_MODEL_PARAMS));
+  for (const name of ['nmae', 'toString']) {
+    // Defining the tool does not throw, so a module-level declaration loads.
+    const tool = greet(name);
+    const agent = new Agent({ name: 'X', model: 'm', tools: [tool] });
+    const err = t.throws(() => convertAgent(agent, DEFAULT_MODEL_PARAMS)) as ApplicationFailure;
+    t.is(err.type, 'AgentsWorkflowError');
+    t.true(err.nonRetryable);
+    t.regex(err.message, new RegExp(`inputProperty '${name}'`));
+    // invoke checks too, before scheduling the Activity.
+    const invokeErr = (await t.throwsAsync(tool.invoke({} as any, '{"name":"Ada"}'))) as ApplicationFailure;
+    t.is(invokeErr.type, 'AgentsWorkflowError');
+  }
 });
 
 test('convertAgent: non-string Model object throws AgentsWorkflowError', (t) => {

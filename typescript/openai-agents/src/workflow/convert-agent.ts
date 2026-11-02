@@ -2,6 +2,7 @@ import { type Agent, Handoff } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
 import type { ModelActivityOptions } from '../common/model-activity-options';
 import { ActivityBackedModel } from './activity-backed-model';
+import { checkActivityTool } from './tools';
 
 /**
  * Recursively converts an agent graph: validate tools, replace each agent's
@@ -29,6 +30,7 @@ export function convertAgent(
         nonRetryable: true,
       });
     }
+    checkActivityTool(t);
   }
 
   const rawModel = agent.model;

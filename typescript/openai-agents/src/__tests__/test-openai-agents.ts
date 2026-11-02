@@ -2,7 +2,7 @@
 // the sibling `*.test.ts` files.
 import { setTracingDisabled } from '@openai/agents-core';
 import type { MCPServer } from '@openai/agents-core';
-import { WorkflowClient } from '@temporalio/client';
+import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
 import type { ApplicationFailure } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
@@ -13,9 +13,9 @@ import {
   StatefulMCPServerProvider,
   StatelessMCPServerProvider,
 } from '..';
-import { activityAsTool } from '../workflow';
 import {
   activityToolInputPropertyWorkflow,
+  activityToolInvalidInputPropertyWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   summaryOverrideStringWorkflow,
@@ -127,18 +127,20 @@ test('activityAsTool inputProperty gives a scalar Activity one property of the a
       workflowExecutionTimeout: '30 seconds',
     });
     t.is(await handle.result(), 'Done');
+
+    // The bundle also declares a tool with an unknown inputProperty at module
+    // level. The run above loaded; a run that uses that tool fails instead.
+    const invalid = await startWorkflow(activityToolInvalidInputPropertyWorkflow, {
+      args: ['Greet Ada.'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    const err = (await t.throwsAsync(invalid.result(), { instanceOf: WorkflowFailedError })) as WorkflowFailedError;
+    const cause = err.cause as ApplicationFailure;
+    t.is(cause.type, 'AgentsWorkflowError');
+    t.true(cause.nonRetryable);
+    t.regex(cause.message, /inputProperty 'nmae'/);
   });
   t.deepEqual(received, [['Ada']]);
-
-  const err = t.throws(() =>
-    activityAsTool({
-      name: 'greet',
-      description: '',
-      parameters: { type: 'object', properties: { name: { type: 'string' } } },
-      inputProperty: 'nmae',
-    })
-  ) as ApplicationFailure;
-  t.is(err.type, 'AgentsWorkflowError');
 });
 
 function* mcpFactoryArgGenerator() {

@@ -16,6 +16,17 @@ export interface JsonObjectSchema<_T = unknown> {
   additionalProperties?: boolean;
 }
 
+const activityToolCheck = Symbol.for('@temporalio/openai-agents/activityToolCheck');
+
+/**
+ * Throws the non-retryable `AgentsWorkflowError` for an invalid
+ * `activityAsTool` definition. Other tools pass.
+ */
+export function checkActivityTool(tool: unknown): void {
+  const check = (tool as { [activityToolCheck]?: () => void } | null)?.[activityToolCheck];
+  if (typeof check === 'function') check();
+}
+
 type ActivityInput<TActivity extends (input: any) => Promise<any>> = Parameters<TActivity>[0];
 
 /**
@@ -57,13 +68,18 @@ export function activityAsTool<TActivity extends (input: any) => Promise<any>>(
   options?: ActivityAsToolOptions
 ): FunctionTool {
   const { inputProperty } = definition;
-  if (inputProperty !== undefined && !Object.hasOwn(definition.parameters.properties, inputProperty)) {
-    throw ApplicationFailure.create({
-      message: `activityAsTool('${definition.name}'): inputProperty '${inputProperty}' is not a property in parameters.`,
-      type: 'AgentsWorkflowError',
-      nonRetryable: true,
-    });
-  }
+  // Checked when a run starts and when the tool is called, not here: tools are
+  // often declared at module level, where a throw would break loading the
+  // Workflow bundle instead of failing the Workflow.
+  const checkDefinition = (): void => {
+    if (inputProperty !== undefined && !Object.hasOwn(definition.parameters.properties, inputProperty)) {
+      throw ApplicationFailure.create({
+        message: `activityAsTool('${definition.name}'): inputProperty '${inputProperty}' is not a property in parameters.`,
+        type: 'AgentsWorkflowError',
+        nonRetryable: true,
+      });
+    }
+  };
   const activities = proxyActivities<Record<string, (input: any) => Promise<any>>>({
     startToCloseTimeout: options?.startToCloseTimeout ?? '1 minute',
     heartbeatTimeout: options?.heartbeatTimeout,
@@ -78,6 +94,7 @@ export function activityAsTool<TActivity extends (input: any) => Promise<any>>(
     parameters: definition.parameters as any,
     strict: options?.strict ?? true,
     invoke: async (_runContext: RunContext<any>, input: string): Promise<string> => {
+      checkDefinition();
       let parsedInput: any;
       try {
         parsedInput = JSON.parse(input);
@@ -92,6 +109,7 @@ export function activityAsTool<TActivity extends (input: any) => Promise<any>>(
     },
     needsApproval: async () => false,
     isEnabled: async () => true,
+    [activityToolCheck]: checkDefinition,
   } as FunctionTool;
 
   return t;

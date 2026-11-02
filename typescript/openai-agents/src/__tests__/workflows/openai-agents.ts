@@ -110,6 +110,34 @@ export async function activityToolInputPropertyWorkflow(prompt: string): Promise
   return result.finalOutput ?? '';
 }
 
+// Declared at module level, as in the README, so every Workflow in this bundle
+// shows that a bad inputProperty does not stop the bundle from loading.
+const typoGreetTool = activityAsTool<(name: string) => Promise<string>>(
+  {
+    name: 'greet',
+    description: 'Greet a person by name.',
+    parameters: {
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+      additionalProperties: false,
+    },
+    inputProperty: 'nmae',
+  },
+  { startToCloseTimeout: '10s' }
+);
+
+export async function activityToolInvalidInputPropertyWorkflow(prompt: string): Promise<string> {
+  const agent = new Agent({
+    name: 'Greeter',
+    instructions: 'Greet the person.',
+    model: 'gpt-4o-mini',
+    tools: [typoGreetTool],
+  });
+  const result = await new TemporalOpenAIRunner().run(agent, prompt);
+  return result.finalOutput ?? '';
+}
+
 export async function mcpFactoryArgWorkflow(prompt: string): Promise<string> {
   const mcpServer = statelessMcpServer('testMcp', {
     factoryArgument: { tenantId: 'tenant-42' },
