@@ -902,7 +902,7 @@ class TestReplay:
                 assert end >= starts[str(run["id"])], run.get("name", run["id"])
         ids = {run["name"]: str(run["id"]) for run in posts}
         steps = ["prepare", "call_helper", "stream", "finish"]
-        assert sorted(steps, key=lambda name: starts[ids[name]]) == steps
+        assert all(starts[ids[a]] < starts[ids[b]] for a, b in zip(steps, steps[1:]))
         # A run's post and patch, and its children, agree on its dotted order.
         orders = {str(run["id"]): run["dotted_order"] for run in posts}
         for run in patches:
