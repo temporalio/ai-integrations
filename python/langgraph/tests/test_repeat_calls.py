@@ -6,7 +6,7 @@ see the job finish under the plugin too.
 """
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
@@ -24,7 +24,7 @@ from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
 from typing_extensions import NotRequired, TypedDict
 
 from temporalio import workflow
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowHistory
 from temporalio.langgraph import LangGraphPlugin, cache, entrypoint, graph
 from temporalio.worker import Replayer, Worker
 
@@ -100,6 +100,144 @@ class WaitAcrossContinueAsNewWorkflow:
         return await entrypoint("wait-for-job", cache=input.cache).ainvoke(
             {"job_id": input.job_id, "max_polls": 5}
         )
+
+
+# Calls per job ID, counted where the Activities run.
+_calls: dict[str, int] = {}
+
+
+def next_value(job_id: str) -> str:
+    """Return a new value on every call: ``<job_id>:1``, ``<job_id>:2``, ..."""
+    _calls[job_id] = _calls.get(job_id, 0) + 1
+    return f"{job_id}:{_calls[job_id]}"
+
+
+def _repeat_plugin() -> LangGraphPlugin:
+    """Entrypoints that call ``next_value`` with the same job ID ``calls`` times.
+
+    ``repeat-in-sequence`` awaits each call before making the next one;
+    ``repeat-in-parallel`` makes all the calls first, then awaits them.
+    """
+    fetch = task(next_value)
+
+    @lg_entrypoint()
+    async def repeat_in_sequence(request: dict[str, Any]) -> list[str]:
+        return [await fetch(request["job_id"]) for _ in range(request["calls"])]
+
+    @lg_entrypoint()
+    async def repeat_in_parallel(request: dict[str, Any]) -> list[str]:
+        futures = [fetch(request["job_id"]) for _ in range(request["calls"])]
+        return [await future for future in futures]
+
+    return LangGraphPlugin(
+        entrypoints={
+            "repeat-in-sequence": repeat_in_sequence,
+            "repeat-in-parallel": repeat_in_parallel,
+        },
+        tasks=[fetch],
+        activity_options={"next_value": {"execute_in": "activity"}},
+        default_activity_options=_ACTIVITY_OPTIONS,
+    )
+
+
+@dataclass
+class RepeatAcrossContinueAsNewInput:
+    entrypoint: str
+    job_id: str
+    runs: int
+    cache: dict[str, Any] | None = None
+    seen: list[Any] = field(default_factory=list)
+
+
+@workflow.defn
+class RepeatAcrossContinueAsNewWorkflow:
+    """Run k makes k + 1 identical calls, then continues-as-new with the cache.
+
+    Returns the results of every run, in run order.
+    """
+
+    @workflow.run
+    async def run(self, input: RepeatAcrossContinueAsNewInput) -> list[Any]:
+        result = await entrypoint(input.entrypoint, cache=input.cache).ainvoke(
+            {"job_id": input.job_id, "calls": len(input.seen) + 2}
+        )
+        seen = [*input.seen, result]
+        if len(seen) < input.runs:
+            workflow.continue_as_new(
+                RepeatAcrossContinueAsNewInput(
+                    entrypoint=input.entrypoint,
+                    job_id=input.job_id,
+                    runs=input.runs,
+                    cache=cache(),
+                    seen=seen,
+                )
+            )
+        return seen
+
+
+async def _repeat_across_continue_as_new(
+    client: Client, name: str, job_id: str, runs: int
+) -> tuple[list[Any], list[WorkflowHistory]]:
+    """Run ``name`` over ``runs`` runs; return each run's results and history.
+
+    Each run's history is replayed.
+    """
+    plugin = _repeat_plugin()
+    task_queue = f"repeat-runs-{uuid4()}"
+    workflow_id = f"repeat-runs-{uuid4()}"
+
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[RepeatAcrossContinueAsNewWorkflow],
+        plugins=[plugin],
+    ):
+        handle = await client.start_workflow(
+            RepeatAcrossContinueAsNewWorkflow.run,
+            RepeatAcrossContinueAsNewInput(entrypoint=name, job_id=job_id, runs=runs),
+            id=workflow_id,
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=30),
+        )
+        seen = await handle.result()
+
+    histories: list[WorkflowHistory] = []
+    run_id = handle.first_execution_run_id
+    while run_id:
+        history = await client.get_workflow_handle(
+            workflow_id, run_id=run_id
+        ).fetch_history()
+        histories.append(history)
+        last = history.events[-1]
+        run_id = (
+            last.workflow_execution_continued_as_new_event_attributes.new_execution_run_id
+            if last.HasField("workflow_execution_continued_as_new_event_attributes")
+            else None
+        )
+    assert len(histories) == runs
+
+    replayer = Replayer(workflows=[RepeatAcrossContinueAsNewWorkflow], plugins=[plugin])
+    for history in histories:
+        await replayer.replay_workflow(history)
+    return seen, histories
+
+
+def _scheduled(history: WorkflowHistory) -> list[int]:
+    """Return the positions of the run's ActivityTaskScheduled events."""
+    return [
+        i
+        for i, event in enumerate(history.events)
+        if event.HasField("activity_task_scheduled_event_attributes")
+    ]
+
+
+def _completed(history: WorkflowHistory) -> list[int]:
+    """Return the positions of the run's ActivityTaskCompleted events."""
+    return [
+        i
+        for i, event in enumerate(history.events)
+        if event.HasField("activity_task_completed_event_attributes")
+    ]
 
 
 class PollState(TypedDict):
@@ -214,3 +352,51 @@ async def test_repeated_call_after_continue_as_new(client: Client):
     await replayer.replay_workflow(
         await client.get_workflow_handle(workflow_id).fetch_history()
     )
+
+
+@_needs_functional_api
+async def test_repeated_calls_restored_in_order_after_continue_as_new(
+    client: Client,
+):
+    """Completed repeats come back from the cache in order; only the new call runs.
+
+    Run k makes k + 1 identical calls one after another, so each run after
+    the first finds its earlier calls under the plain key and ``#1``, ``#2``,
+    ... and schedules an Activity for its last call only. Every Activity
+    returns a new value, so a result restored in the wrong place shows.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client, "repeat-in-sequence", job_id, runs=3
+    )
+
+    values = [f"{job_id}:{n}" for n in range(1, 5)]
+    assert seen == [values[:2], values[:3], values[:4]]
+    assert [len(_scheduled(h)) for h in histories] == [2, 1, 1]
+    assert _calls[job_id] == 4
+
+
+@_needs_functional_api
+async def test_parallel_repeated_calls_after_continue_as_new(client: Client):
+    """Identical calls made at once get separate results that survive continue-as-new.
+
+    Run k starts k + 1 identical calls before awaiting any of them, so they
+    take their occurrence numbers from one shared count while running as
+    separate tasks. The first run's calls are scheduled together and return
+    different values; each later run gets the earlier results back in the
+    same places and schedules an Activity for its last call only.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client, "repeat-in-parallel", job_id, runs=3
+    )
+
+    scheduled = _scheduled(histories[0])
+    assert len(scheduled) == 2
+    assert max(scheduled) < min(_completed(histories[0]))
+    assert sorted(seen[0]) == [f"{job_id}:1", f"{job_id}:2"]
+    assert seen[1][:2] == seen[0]
+    assert seen[2][:3] == seen[1]
+    assert sorted(seen[2]) == [f"{job_id}:{n}" for n in range(1, 5)]
+    assert [len(_scheduled(h)) for h in histories] == [2, 1, 1]
+    assert _calls[job_id] == 4
