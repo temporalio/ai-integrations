@@ -36,7 +36,13 @@ export interface StatefulMcpServerOptions extends McpServerHandleOptions {
     taskQueue?: string;
     retryPolicy?: RetryPolicy;
   };
-  /** Activity options for the long-running server-session Activity. */
+  /**
+   * Activity options for the long-running server-session Activity. Its
+   * `startToCloseTimeout` (one hour by default) is the longest the server can
+   * stay connected: the Activity then times out, and its retry fails with
+   * `DedicatedWorkerFailure`. Raise it for long runs, such as ones that wait
+   * for a person, and set a `heartbeatTimeout` to notice a lost Worker sooner.
+   */
   serverSessionConfig?: {
     startToCloseTimeout?: Duration;
     heartbeatTimeout?: Duration;
@@ -56,10 +62,21 @@ const DEDICATED_WORKER_SCHEDULE_FAILURE_MESSAGE =
 const DEDICATED_WORKER_HEARTBEAT_FAILURE_MESSAGE =
   'MCP Stateful Server Worker failed to heartbeat. Check that a worker is polling the dedicated task queue for this MCP run.';
 
-async function handleWorkerFailure<T>(fn: () => Promise<T>): Promise<T> {
+/**
+ * Runs `fn` and turns timeouts of the dedicated Worker into `DedicatedWorkerFailure`.
+ * `cancelledBySession` gives the failure for a cancellation that the session's end caused.
+ */
+async function handleWorkerFailure<T>(
+  fn: () => Promise<T>,
+  cancelledBySession?: () => ApplicationFailure | undefined
+): Promise<T> {
   try {
     return await fn();
   } catch (err: unknown) {
+    const sessionEnded = isCancellation(err) ? cancelledBySession?.() : undefined;
+    if (sessionEnded) {
+      throw sessionEnded;
+    }
     if (err instanceof ActivityFailure && err.cause instanceof TimeoutFailure) {
       if (err.cause.timeoutType === TimeoutType.SCHEDULE_TO_START) {
         throw ApplicationFailure.create({
@@ -170,13 +187,25 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     this._connected = true;
   }
 
-  /** Cancels the server-session Activity, tearing down the dedicated Worker. */
+  /**
+   * Cancels the server-session Activity, tearing down the dedicated Worker. If
+   * the session Activity failed with `DedicatedWorkerFailure`, throws an
+   * `ApplicationFailure` of that type with the session's `ActivityFailure` as
+   * its cause.
+   */
   async cleanup(): Promise<void> {
     if (this._sessionScope) {
       this._sessionScope.cancel();
       try {
         await this._sessionPromise;
       } catch (err: unknown) {
+        if (
+          err instanceof ActivityFailure &&
+          err.cause instanceof ApplicationFailure &&
+          err.cause.type === DEDICATED_WORKER_FAILURE_TYPE
+        ) {
+          throw this.sessionEndedFailure(err);
+        }
         if (!isCancellation(err)) {
           throw err;
         }
@@ -200,11 +229,13 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     }
   }
 
-  private sessionEndedFailure(): ApplicationFailure {
+  private sessionEndedFailure(cause: unknown = this._sessionError): ApplicationFailure {
     return ApplicationFailure.create({
-      message: "The stateful MCP server session Activity has ended, so no Worker serves this server's operations.",
+      message: isCancellation(cause)
+        ? 'The stateful MCP server session Activity was cancelled, as when the scope that connected the server is cancelled. Connect the server again to use it.'
+        : "The stateful MCP server session Activity has ended, so no Worker serves this server's operations.",
       type: DEDICATED_WORKER_FAILURE_TYPE,
-      cause: this._sessionError instanceof Error ? this._sessionError : undefined,
+      cause: cause instanceof Error ? cause : undefined,
     });
   }
 
@@ -214,31 +245,39 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
    * fails an operation once that Worker is gone. Without one, the operation
    * would wait forever, so fail it with `DedicatedWorkerFailure` once the
    * session Activity has ended.
+   *
+   * Not `async`, and the caller awaits the Activity's own promise, so the
+   * Workflow resumes in the same order as on earlier versions.
    */
-  private async executeOperation<R>(activity: string, args: unknown[]): Promise<R> {
+  private executeOperation<R>(activity: string, args: unknown[]): Promise<R> {
     if (msOptionalToNumber(this._operationConfig.scheduleToStartTimeout)) {
-      return scheduleActivity<R>(activity, args, this._operationConfig);
+      return handleWorkerFailure(() => scheduleActivity<R>(activity, args, this._operationConfig));
     }
-    if (this._sessionSettled) {
-      throw this.sessionEndedFailure();
-    }
-    // A child of the caller's scope, so the caller's cancellation still reaches the operation.
-    const scope = new CancellationScope();
-    const operation = scope.run(() => scheduleActivity<R>(activity, args, this._operationConfig));
-    const first = await Promise.race([
-      operation.then(
-        (value) => ({ done: true as const, value }),
-        (error: unknown) => ({ done: true as const, error })
-      ),
-      this._sessionEnded!.then(() => ({ done: false as const })),
-    ]);
-    if (first.done) {
-      if ('error' in first) throw first.error;
-      return first.value;
-    }
-    operation.catch(() => {});
-    scope.cancel();
-    throw this.sessionEndedFailure();
+    let cancelledBySession = false;
+    return handleWorkerFailure(
+      () => {
+        if (this._sessionSettled) {
+          throw this.sessionEndedFailure();
+        }
+        // A child of the caller's scope, so the caller's cancellation still
+        // reaches the operation, and the session's end cancels only this one.
+        const scope = new CancellationScope();
+        let operation!: Promise<R>;
+        // run() calls this at once; awaiting run()'s own promise would add steps.
+        scope
+          .run(() => {
+            operation = scheduleActivity<R>(activity, args, this._operationConfig);
+            return operation;
+          })
+          .catch(() => {});
+        void this._sessionEnded!.then(() => {
+          cancelledBySession = true;
+          scope.cancel();
+        });
+        return operation;
+      },
+      () => (cancelledBySession ? this.sessionEndedFailure() : undefined)
+    );
   }
 
   async listTools(): Promise<any[]> {
@@ -247,7 +286,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     if (shouldCache && this._cachedTools) {
       return this._cachedTools;
     }
-    const tools = await handleWorkerFailure(() => this.executeOperation<any[]>(this._name + MCP_LIST_TOOLS_SUFFIX, []));
+    const tools = await this.executeOperation<any[]>(this._name + MCP_LIST_TOOLS_SUFFIX, []);
     if (shouldCache) {
       this._cachedTools = tools;
     }
@@ -256,9 +295,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
 
   async callTool(toolName: string, args: Record<string, unknown> | null): Promise<any> {
     this.assertConnected();
-    return handleWorkerFailure(() =>
-      this.executeOperation(this._name + MCP_CALL_TOOL_SUFFIX, [{ toolName, args }])
-    );
+    return this.executeOperation(this._name + MCP_CALL_TOOL_SUFFIX, [{ toolName, args }]);
   }
 
   async invalidateToolsCache(): Promise<void> {

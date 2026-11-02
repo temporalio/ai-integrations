@@ -11,6 +11,8 @@ import {
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
+export { statefulMcpCancelWorkflow, statefulMcpGatherWorkflow } from './stateful-mcp-replay';
+
 export interface StreamingAgentResult {
   finalOutput: string;
   /** `output_text_delta` deltas observed in-workflow, in order. */

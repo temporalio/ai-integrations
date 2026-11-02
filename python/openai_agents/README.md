@@ -551,16 +551,36 @@ Temporal cannot recreate a stateful server's session on another worker. If its
 after a graceful worker shutdown, a lost host or the session activity's
 start-to-close timeout, the retry fails with a non-retryable
 `ApplicationError(type="DedicatedWorkerFailure")` instead of connecting a new
-server with an empty session. Leaving the `async with` block then raises an
-`ActivityError` whose cause is that failure. A retry after a failed factory
-call, a failed first `connect()`, or a worker shutdown before the server
-connected connects again. A retry after a lost host or a
+server with an empty session. Leaving the `async with` block then raises
+`ApplicationError(type="DedicatedWorkerFailure")`, whose cause is the session
+activity's `ActivityError`. To recover, catch it around the block and open a
+new block, which connects a new, empty server (but see the note on same-name
+blocks below). A retry after a failed factory call, a failed first `connect()`,
+or a worker shutdown before the server connected connects again. A retry after a lost host or a
 timed-out attempt fails even when the server never connected: the worker sends
 heartbeats later, and the plugin cannot wait for one, so every heartbeat says a
 session may be open until the attempt ends without one. Before it connects, the
 session activity reads its workflow's description (`DescribeWorkflowExecution`)
 until the Temporal server shows its first heartbeat, so the worker's client
-needs permission to describe the workflow.
+needs permission to describe the workflow; without it, the session activity
+fails with a non-retryable `DedicatedWorkerFailure` that says so.
+
+Some consequences:
+
+- The session activity's `start_to_close_timeout` in `server_session_config`,
+  one hour by default, is the longest a block can stay open, since the attempt
+  then times out and its retry is refused. Raise it for long blocks, such as
+  ones that wait for a person, and set a `heartbeat_timeout` to notice a lost
+  worker sooner. The session activity heartbeats every 30 seconds, or every
+  half `heartbeat_timeout` if that is shorter.
+- An activity reset or unpause with `reset_heartbeat=True` clears the marker,
+  so the next attempt connects a new, empty server.
+- Blocks with the same name in one run use the same task queue. A later block
+  refuses any operation the server scheduled for an earlier block, but until
+  the earlier block's session activity notices its cancellation, which can take
+  one heartbeat interval, it serves the later block's operations with the
+  earlier block's server. Don't rely on a new block being isolated from the
+  previous one during that time.
 
 Only the session activity's worker serves the server's operations. An operation
 whose `config` has a `schedule_to_start_timeout`, as the default `config` does,
@@ -582,10 +602,17 @@ then scheduled an operation whose `config` has neither a
 whether that operation still waits or the caller's own deadline or
 cancellation ended it and the run moved on, and it can hold for an operation
 already running when the session ended. Runs whose operations have either
-timeout, including those with the default `config`, are not affected. Before
-you upgrade, find such open runs and reset them to before the session ended,
-or terminate them. A run that this version failed this way fails replay on an
-earlier version, so do not roll back while such runs are open.
+timeout, including those with the default `config`, are not affected. Nor
+are runs in which the session did not end while the workflow used the server,
+except with `cancellation_type=WAIT_CANCELLATION_COMPLETED` and neither
+timeout: the workflow then waits for the operation or the session, whichever
+ends first, so a stateful operation and another activity that finish in the
+same workflow task resume in a different order than on earlier versions, and
+such runs fail replay too, in both directions. Before you upgrade, find such
+open runs and reset them to before the session ended (or, for the second kind,
+let them finish on the earlier version), or terminate them. A run that this
+version failed this way fails replay on an earlier version, so do not roll back
+while such runs are open.
 
 ### Hosted MCP Tool
 

@@ -1,5 +1,11 @@
 import type { MCPServer } from '@openai/agents-core';
-import { ApplicationFailure, CancelledFailure, type SerializationContext } from '@temporalio/common';
+import {
+  ApplicationFailure,
+  CancelledFailure,
+  NamespaceNotFoundError,
+  WorkflowNotFoundError,
+  type SerializationContext,
+} from '@temporalio/common';
 import { Context, activityInfo } from '@temporalio/activity';
 import type { NativeConnection } from '@temporalio/worker';
 import {
@@ -33,18 +39,41 @@ const SESSION_OPENED = 'mcp-session-opened';
 // marker reaches the server.
 const SESSION_MAY_BE_OPEN = 'mcp-session-may-be-open';
 
+// How long the session Activity waits for the server to show its first heartbeat.
+const STORE_TIMEOUT_MS = 30_000;
+
+// gRPC status codes of describe errors that retrying cannot fix.
+const DESCRIBE_REFUSALS = new Map([
+  [3, 'INVALID_ARGUMENT'],
+  [5, 'NOT_FOUND'],
+  [7, 'PERMISSION_DENIED'],
+  [12, 'UNIMPLEMENTED'],
+  [16, 'UNAUTHENTICATED'],
+]);
+
+/** Describes a describe error that retrying cannot fix, or returns undefined. */
+function describeRefusal(err: unknown): string | undefined {
+  if (err instanceof WorkflowNotFoundError || err instanceof NamespaceNotFoundError) {
+    return `NOT_FOUND: ${err.message}`;
+  }
+  // The client wraps other gRPC errors in a ServiceError.
+  const cause = (err as { cause?: { code?: unknown; details?: unknown } } | undefined)?.cause;
+  const status = typeof cause?.code === 'number' ? DESCRIBE_REFUSALS.get(cause.code) : undefined;
+  return status && `${status}: ${String(cause?.details)}`;
+}
+
 /** The failure for a retry whose earlier attempt opened, or may have opened, a session. */
 function earlierAttemptFailure(details: unknown): ApplicationFailure | undefined {
   let reason: string;
   if (details === SESSION_OPENED) {
     reason = 'opened an MCP session';
   } else if (details === SESSION_MAY_BE_OPEN) {
-    reason = 'was lost after its first heartbeat and may have opened an MCP session';
+    reason = 'ended (it lost its Worker, timed out, or was reset) without confirming that it opened no MCP session';
   } else {
     return undefined;
   }
   return ApplicationFailure.create({
-    message: `An earlier attempt of this stateful MCP server session Activity ${reason}, and Temporal cannot recreate its state.`,
+    message: `An earlier attempt of this stateful MCP server session Activity ${reason}, and Temporal cannot recreate an MCP session's state.`,
     type: DEDICATED_WORKER_FAILURE_TYPE,
     nonRetryable: true,
   });
@@ -88,6 +117,32 @@ class SessionHeartbeats {
    * session.
    */
   async waitUntilStored(): Promise<void> {
+    const deadline = Date.now() + STORE_TIMEOUT_MS;
+    let lastError: unknown;
+    const timedOut = () =>
+      ApplicationFailure.create({
+        message: `The server did not show the stateful MCP server session Activity's first heartbeat within ${STORE_TIMEOUT_MS / 1000} seconds.`,
+        cause: lastError instanceof Error ? lastError : undefined,
+      });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    // The deadline also bounds a describe that never returns, and the decoding
+    // of the details.
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(timedOut()), STORE_TIMEOUT_MS);
+    });
+    const readBack = this.readBack(deadline, timedOut, (err) => {
+      lastError = err;
+    });
+    // Nothing waits for it after the deadline.
+    readBack.catch(() => {});
+    try {
+      await Promise.race([readBack, expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async readBack(deadline: number, timedOut: () => Error, onError: (err: unknown) => void): Promise<void> {
     const { info, client } = this.ctx;
     const workflowId = info.workflowExecution!.workflowId;
     const handle = client.workflow.getHandle(workflowId, info.workflowExecution!.runId);
@@ -101,25 +156,52 @@ class SessionHeartbeats {
       isLocal: info.isLocal,
     };
     let delayMs = 100;
-    for (;;) {
-      const { raw } = await handle.describe();
-      const pending = (raw.pendingActivities ?? []).find((p) => p.activityId === info.activityId);
-      if (!pending || pending.attempt !== info.attempt) {
-        // A later attempt or the Workflow's end replaced this one, and the
-        // details on the server are not this attempt's.
-        throw ApplicationFailure.create({
-          message: 'This stateful MCP server session Activity attempt is no longer the current one.',
-        });
+    while (Date.now() < deadline) {
+      let description;
+      try {
+        description = await client.connection.withDeadline(deadline, () => handle.describe());
+      } catch (err) {
+        const refusal = describeRefusal(err);
+        if (refusal) {
+          throw ApplicationFailure.create({
+            message: `The stateful MCP server session Activity confirms its first heartbeat with DescribeWorkflowExecution, and the server refused it (${refusal}). Give the Worker's client permission to describe Workflows in this namespace.`,
+            type: DEDICATED_WORKER_FAILURE_TYPE,
+            nonRetryable: true,
+            cause: err instanceof Error ? err : undefined,
+          });
+        }
+        onError(err);
       }
-      let payloads = pending.heartbeatDetails?.payloads ?? [];
-      for (const codec of [...payloadCodecs].reverse()) {
-        payloads = await codec.decode(payloads, context);
+      if (description) {
+        const pending = (description.raw.pendingActivities ?? []).find((p) => p.activityId === info.activityId);
+        if (!pending || pending.attempt !== info.attempt) {
+          // A later attempt or the Workflow's end replaced this one, and the
+          // details on the server are not this attempt's.
+          throw ApplicationFailure.create({
+            message: 'This stateful MCP server session Activity attempt is no longer the current one.',
+          });
+        }
+        let details: unknown;
+        try {
+          let payloads = pending.heartbeatDetails?.payloads ?? [];
+          for (const codec of [...payloadCodecs].reverse()) {
+            payloads = await codec.decode(payloads, context);
+          }
+          details = payloads.length ? payloadConverter.fromPayload(payloads[0]!, context) : undefined;
+        } catch (err) {
+          throw ApplicationFailure.create({
+            message: 'The stateful MCP server session Activity could not decode its own heartbeat details.',
+            type: DEDICATED_WORKER_FAILURE_TYPE,
+            nonRetryable: true,
+            cause: err instanceof Error ? err : undefined,
+          });
+        }
+        if (details === SESSION_MAY_BE_OPEN || details === SESSION_OPENED) return;
       }
-      const details = payloads.length ? payloadConverter.fromPayload(payloads[0]!, context) : undefined;
-      if (details === SESSION_MAY_BE_OPEN || details === SESSION_OPENED) return;
       await this.ctx.sleep(delayMs);
       delayMs = Math.min(delayMs * 2, 2_000);
     }
+    throw timedOut();
   }
 
   /** Records that the MCP server is connected. */
@@ -238,6 +320,9 @@ export class StatefulMCPServerProvider {
       const stopHeartbeat = startAdaptiveHeartbeat(() => heartbeats.details());
 
       try {
+        // No server is built before the Temporal server holds the first
+        // heartbeat, which says a session may be open.
+        await heartbeats.waitUntilStored();
         if (this._servers.has(sid)) {
           throw ApplicationFailure.create({
             message:
@@ -251,7 +336,6 @@ export class StatefulMCPServerProvider {
 
         try {
           this._servers.set(sid, server);
-          await heartbeats.waitUntilStored();
           await server.connect();
           heartbeats.recordOpened();
 

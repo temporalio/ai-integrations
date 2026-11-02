@@ -33,6 +33,7 @@ from temporalio.openai_agents._mcp_server_checks import (
     _reject_dynamic_tool_filter,
     _reject_worker_side_require_approval,
 )
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import PollerBehaviorSimpleMaximum, Worker
 from temporalio.workflow import (
     ActivityCancellationType,
@@ -338,6 +339,19 @@ class _StatefulServerSessionArguments:
 # Seconds between heartbeats of the ``-server-session`` activity.
 _HEARTBEAT_INTERVAL = 30.0
 
+# Seconds the ``-server-session`` activity waits for the server to show its
+# first heartbeat.
+_STORE_TIMEOUT = 30.0
+
+# Describe errors that retrying cannot fix.
+_DESCRIBE_REFUSALS = {
+    RPCStatusCode.PERMISSION_DENIED,
+    RPCStatusCode.UNAUTHENTICATED,
+    RPCStatusCode.UNIMPLEMENTED,
+    RPCStatusCode.NOT_FOUND,
+    RPCStatusCode.INVALID_ARGUMENT,
+}
+
 # Heartbeat details of a ``-server-session`` attempt that connected its MCP
 # server. Heartbeat details carry over to the next attempt, which must not open
 # a new, empty session in its place.
@@ -408,34 +422,78 @@ class _SessionHeartbeats:
         Until then, a lost attempt's retry would find no marker and open a
         new, empty session.
         """
-        delay = 0.1
         handle = self._client.get_workflow_handle(
             self._workflow_id, run_id=self._run_id
         )
-        while True:
-            description = await handle.describe()
-            pending = next(
-                (
-                    pending
-                    for pending in description.raw_description.pending_activities
-                    if pending.activity_id == self._activity_id
-                ),
-                None,
-            )
-            if pending is None or pending.attempt != self._attempt:
-                # A later attempt or the workflow's end replaced this one, and
-                # the details on the server are not this attempt's.
-                raise ApplicationError(
-                    "This stateful MCP server session activity attempt is no "
-                    "longer the current one."
-                )
-            details = await self._data_converter.decode(
-                pending.heartbeat_details.payloads
-            )
-            if _SESSION_MAY_BE_OPEN in details or _SESSION_OPENED in details:
-                return
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 2.0)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _STORE_TIMEOUT
+        last_error: RPCError | None = None
+
+        async def _read_back() -> None:
+            nonlocal last_error
+            delay = 0.1
+            while True:
+                try:
+                    description = await handle.describe(
+                        rpc_timeout=timedelta(
+                            seconds=max(deadline - loop.time(), 0.001)
+                        )
+                    )
+                except RPCError as err:
+                    if err.status in _DESCRIBE_REFUSALS:
+                        raise ApplicationError(
+                            "The stateful MCP server session activity confirms "
+                            "its first heartbeat with DescribeWorkflowExecution, "
+                            "and the server refused it "
+                            f"({err.status.name}: {err.message}). Give the "
+                            "worker's client permission to describe workflows "
+                            "in this namespace.",
+                            type="DedicatedWorkerFailure",
+                            non_retryable=True,
+                        ) from err
+                    last_error = err
+                else:
+                    pending = next(
+                        (
+                            pending
+                            for pending in description.raw_description.pending_activities
+                            if pending.activity_id == self._activity_id
+                        ),
+                        None,
+                    )
+                    if pending is None or pending.attempt != self._attempt:
+                        # A later attempt or the workflow's end replaced this
+                        # one, and the details on the server are not this
+                        # attempt's.
+                        raise ApplicationError(
+                            "This stateful MCP server session activity attempt "
+                            "is no longer the current one."
+                        )
+                    try:
+                        details = await self._data_converter.decode(
+                            pending.heartbeat_details.payloads
+                        )
+                    except Exception as err:
+                        raise ApplicationError(
+                            "The stateful MCP server session activity could not "
+                            "decode its own heartbeat details.",
+                            type="DedicatedWorkerFailure",
+                            non_retryable=True,
+                        ) from err
+                    if _SESSION_MAY_BE_OPEN in details or _SESSION_OPENED in details:
+                        return
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 2.0)
+
+        # The deadline also bounds a describe that the client keeps retrying,
+        # and the decoding of the details.
+        try:
+            await asyncio.wait_for(_read_back(), _STORE_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise ApplicationError(
+                "The server did not show the stateful MCP server session "
+                f"activity's first heartbeat within {_STORE_TIMEOUT:g} seconds."
+            ) from last_error
 
     def record_opened(self) -> None:
         """Records that the MCP server is connected."""
@@ -460,25 +518,35 @@ def _earlier_attempt_failure(details: Sequence[Any]) -> ApplicationError | None:
     if _SESSION_OPENED in details:
         reason = "opened an MCP session"
     elif _SESSION_MAY_BE_OPEN in details:
-        reason = "was lost after its first heartbeat and may have opened an MCP session"
+        reason = (
+            "ended (it lost its worker, timed out, or was reset) without "
+            "confirming that it opened no MCP session"
+        )
     else:
         return None
     return ApplicationError(
         f"An earlier attempt of this stateful MCP server session activity {reason}, "
-        "and Temporal cannot recreate its state.",
+        "and Temporal cannot recreate an MCP session's state.",
         type="DedicatedWorkerFailure",
         non_retryable=True,
     )
 
 
 def _session_ended_failure(session: ActivityHandle) -> ApplicationError:
-    failure = ApplicationError(
-        "The stateful MCP server session activity has ended, so no worker serves "
-        "this server's operations.",
-        type="DedicatedWorkerFailure",
-    )
-    if not session.cancelled():
-        failure.__cause__ = session.exception()
+    cause = None if session.cancelled() else session.exception()
+    if session.cancelled() or (cause is not None and is_cancelled_exception(cause)):
+        message = (
+            "The stateful MCP server session activity was cancelled, as when its "
+            "async with block exits. Use the server inside an open "
+            "stateful_mcp_server() block."
+        )
+    else:
+        message = (
+            "The stateful MCP server session activity has ended, so no worker "
+            "serves this server's operations."
+        )
+    failure = ApplicationError(message, type="DedicatedWorkerFailure")
+    failure.__cause__ = cause
     return failure
 
 
@@ -516,13 +584,26 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
         )
 
     async def cleanup(self) -> None:
+        """Cancels the session activity and waits for it to end.
+
+        If the session activity failed with ``DedicatedWorkerFailure``, raises
+        ``ApplicationError(type="DedicatedWorkerFailure")`` with the session's
+        ``ActivityError`` as its cause.
+        """
         if self._connect_handle:
-            self._connect_handle.cancel()
+            session = self._connect_handle
+            session.cancel()
             try:
-                await self._connect_handle
+                await session
             except Exception as e:
                 if is_cancelled_exception(e):
                     pass
+                elif (
+                    isinstance(e, ActivityError)
+                    and isinstance(e.cause, ApplicationError)
+                    and e.cause.type == "DedicatedWorkerFailure"
+                ):
+                    raise _session_ended_failure(session) from e
                 else:
                     raise
 
@@ -562,12 +643,39 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
         operation = workflow.start_activity(
             activity, args=args, result_type=result_type, **self._config
         )
+        if (
+            self._config.get("cancellation_type")
+            != ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+        ):
+            # Await the operation itself, as ``workflow.execute_activity`` does,
+            # so the workflow resumes in the same order as on earlier versions
+            # and the SDK handles a cancellation that arrives with the result.
+            # If the session ends first, cancel the operation and fail.
+            cancelled_by_session = False
+
+            def cancel_operation(_: Any) -> None:
+                nonlocal cancelled_by_session
+                if not operation.done():
+                    cancelled_by_session = True
+                    operation.cancel()
+
+            session.add_done_callback(cancel_operation)
+            try:
+                return await operation
+            except BaseException as err:
+                if cancelled_by_session and is_cancelled_exception(err):
+                    raise _session_ended_failure(session)
+                raise
+            finally:
+                session.remove_done_callback(cancel_operation)
         try:
             await workflow.wait(
                 [operation, session], return_when=asyncio.FIRST_COMPLETED
             )
         except asyncio.CancelledError:
             if operation.done():
+                # Cancelled in the activation that completed the operation:
+                # keep the cancellation, as awaiting the operation would.
                 raise
             # The operation is not awaited directly, so pass the cancellation on
             # and wait for it as its cancellation type says.
@@ -577,13 +685,8 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
             return operation.result()
         # Fail without waiting for the operation: the worker that ran it may be
         # gone. A cancellation that waits for that worker to acknowledge it would
-        # also keep the workflow from being evicted, so such an operation is left
-        # to its timeout instead. A later session on this task queue refuses it.
-        if (
-            self._config.get("cancellation_type")
-            != ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
-        ):
-            operation.cancel()
+        # also keep the workflow from being evicted, so the operation is left to
+        # its timeout instead. A later session on this task queue refuses it.
         operation.add_done_callback(lambda op: op.cancelled() or op.exception())
         raise _session_ended_failure(session)
 
@@ -768,10 +871,6 @@ class StatefulMCPServerProvider:
             failure = _earlier_attempt_failure(activity.info().heartbeat_details)
             if failure:
                 raise failure
-            if server_id in self._servers:
-                raise ApplicationError(
-                    "Cannot connect to an already running server. Use a distinct name if running multiple servers in one workflow."
-                )
             heartbeats = _SessionHeartbeats()
             interval = _HEARTBEAT_INTERVAL
             heartbeat_timeout = activity.info().heartbeat_timeout
@@ -780,6 +879,13 @@ class StatefulMCPServerProvider:
                 interval = min(interval, heartbeat_timeout.total_seconds() / 2)
             heartbeat_task = asyncio.create_task(heartbeat_every(interval, heartbeats))
             try:
+                # No server is built before the Temporal server holds the first
+                # heartbeat, which says a session may be open.
+                await heartbeats.wait_until_stored()
+                if server_id in self._servers:
+                    raise ApplicationError(
+                        "Cannot connect to an already running server. Use a distinct name if running multiple servers in one workflow."
+                    )
                 await _run_session(server_id, heartbeats, args)
             finally:
                 heartbeat_task.cancel()
@@ -807,7 +913,6 @@ class StatefulMCPServerProvider:
             try:
                 try:
                     if not rejected:
-                        await heartbeats.wait_until_stored()
                         await server.connect()
                         heartbeats.record_opened()
 
