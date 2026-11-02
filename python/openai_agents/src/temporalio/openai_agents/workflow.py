@@ -5,6 +5,7 @@ import functools
 import inspect
 import json
 import sys
+import types
 import typing
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
@@ -22,7 +23,11 @@ from agents import (
     _debug,
     default_tool_error_function,
 )
-from agents.function_schema import FuncSchema, function_schema
+from agents.function_schema import (
+    FuncSchema,
+    function_schema,
+    generate_func_documentation,
+)
 from agents.tool import (
     FunctionTool,
     ToolErrorFunction,
@@ -106,11 +111,6 @@ async def _tool_argument_error(
     return result
 
 
-def _invalid_tool(message: str) -> ApplicationError:
-    """Return the error for an activity that can't be made into a tool."""
-    return ApplicationError(message, type="invalid_tool")
-
-
 def _call_function(method: Any) -> Callable | None:
     """Return the function under a function, staticmethod, classmethod or partialmethod."""
     while isinstance(method, (staticmethod, classmethod, functools.partialmethod)):
@@ -155,9 +155,22 @@ def _generated_class_doc(cls: type) -> str | None:
 
 
 def _docstring(fn: Callable | None) -> str | None:
-    """Return ``fn``'s docstring, unless it is missing or blank."""
+    """Return ``fn``'s docstring, unless it is missing, blank or not a string."""
     doc = fn.__doc__ if fn is not None else None
-    return doc if doc and doc.strip() else None
+    return doc if isinstance(doc, str) and doc.strip() else None
+
+
+def _type_hints(fn: Callable) -> dict[str, Any]:
+    """Return ``fn``'s annotations resolved in its own module, keeping ``Annotated`` metadata.
+
+    Unlike ``typing.get_type_hints(fn)`` on Python 3.10, this doesn't wrap a parameter with a
+    ``None`` default in ``Optional``, which would hide a context type or ``Annotated`` metadata.
+    """
+    return typing.get_type_hints(
+        types.SimpleNamespace(__annotations__=dict(fn.__annotations__)),
+        globalns=getattr(inspect.unwrap(fn), "__globals__", {}),
+        include_extras=True,
+    )
 
 
 def _class_doc(cls: type) -> str | None:
@@ -171,6 +184,13 @@ def _class_doc(cls: type) -> str | None:
         # dataclasses would have failed the same way, so it didn't write this docstring.
         return doc
     return None if doc == generated else doc
+
+
+def _doc_summary(doc: str) -> str | None:
+    """Return the summary function_schema would take from a docstring."""
+    return generate_func_documentation(
+        _tool_stand_in(lambda: None, "summary", {}, doc)
+    ).description
 
 
 def _tool_stand_in(
@@ -233,7 +253,7 @@ def activity_as_tool(
         An OpenAI agent tool that wraps the provided activity.
 
     Raises:
-        ApplicationError: If the function is not properly decorated as a Temporal activity,
+        ValueError: If the function is not properly decorated as a Temporal activity,
             or is a callable-class activity passed as an instance, or whose ``__call__`` is
             not a function, staticmethod, classmethod or ``functools.partialmethod``, can't
             be read, or takes keyword-only arguments; or if the activity takes ``**kwargs``.
@@ -254,16 +274,18 @@ def activity_as_tool(
     """
     ret = activity._Definition.from_callable(fn)
     if not ret:
-        raise _invalid_tool(
+        raise ValueError(
             "Bare function without tool and activity decorators is not supported"
         )
     if ret.name is None:
-        raise _invalid_tool("Input activity must have a name to be made into a tool")
+        raise ValueError("Input activity must have a name to be made into a tool")
     if not inspect.isclass(fn) and hasattr(type(fn), "__temporal_activity_definition"):
-        raise _invalid_tool(
+        raise ValueError(
             f"Pass the activity class {type(fn).__name__}, not an instance of it"
         )
+    owner: type | None = None
     if inspect.isclass(fn):
+        owner = fn
         # Workflow code references a callable-class activity by its class, but the worker's
         # registered instance runs __call__, so build the tool from __call__ as an instance binds
         # it: without the receiver of a method, classmethod or partialmethod, and with every
@@ -271,16 +293,16 @@ def activity_as_tool(
         calls = [vars(c)["__call__"] for c in fn.__mro__ if "__call__" in vars(c)]
         func = _call_function(calls[0]) if calls else None
         if func is None:
-            raise _invalid_tool(
+            raise ValueError(
                 f"Activity class {fn.__name__} needs a __call__ that is a function, "
                 "staticmethod, classmethod or functools.partialmethod"
             )
         try:
             call = calls[0].__get__(object(), fn)
-            hints = typing.get_type_hints(func, include_extras=True)
+            hints = _type_hints(func)
             parameters = inspect.signature(call).parameters.values()
         except Exception as e:
-            raise _invalid_tool(
+            raise ValueError(
                 f"Cannot build a tool from {fn.__name__}.__call__: {e}"
             ) from e
         # @activity.defn checks the constructor's signature, not __call__'s, so __call__ can
@@ -292,7 +314,7 @@ def activity_as_tool(
                     ": its functools.partialmethod binds an argument by keyword, which makes"
                     " the arguments after it keyword-only"
                 )
-            raise _invalid_tool(message)
+            raise ValueError(message)
         # __call__'s own docstring, else the class's, else that of a __call__ it inherits.
         doc = (
             _docstring(_call_function(vars(fn).get("__call__")))
@@ -310,7 +332,7 @@ def activity_as_tool(
             fn = _tool_stand_in(
                 functools.partial(fn, None),
                 fn.__name__,
-                typing.get_type_hints(fn, include_extras=True),
+                _type_hints(fn),
                 fn.__doc__,
             )
     # run_activity passes only positional arguments, so it would drop the model's **kwargs.
@@ -318,8 +340,15 @@ def activity_as_tool(
         p.kind is inspect.Parameter.VAR_KEYWORD
         for p in inspect.signature(fn).parameters.values()
     ):
-        raise _invalid_tool(f"Activity {fn.__name__} cannot take **kwargs")
+        raise ValueError(f"Activity {fn.__name__} cannot take **kwargs")
     schema = function_schema(fn)
+    if owner is not None and not schema.description:
+        # A __call__ docstring with only sections, such as Args:, has no summary; use the
+        # class's own.
+        class_doc = _class_doc(owner)
+        summary = _doc_summary(class_doc) if class_doc else None
+        if summary:
+            schema = function_schema(fn, description_override=summary)
 
     async def run_activity(ctx: RunContextWrapper[Any], input: str) -> Any:
         try:

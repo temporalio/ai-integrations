@@ -8,7 +8,7 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple, TypeVar, cast
 
 import nexusrpc
 import pydantic
@@ -632,6 +632,29 @@ class WeatherCallService:
 
 
 @activity.defn
+class ActivityWeatherSectionsOnlyCall:
+    """
+    Get the weather for a given city.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        :param city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherDocProperty:
+    @property
+    def __doc__(self) -> str:  # type: ignore
+        return "Per-instance weather."
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
 class ActivityWeatherTuple(NamedTuple):
     conditions: str
 
@@ -697,6 +720,8 @@ class ActivityWeatherCustomInit:
         (ActivityWeatherCustomInit, "city", ""),
         # Not the docstring namedtuple writes.
         (ActivityWeatherTuple, "city", ""),
+        # A __doc__ that isn't a string is no description.
+        (ActivityWeatherDocProperty, "city", ""),
     ],
 )
 def test_callable_class_tool_schema(target: Any, parameter: str, description: str):
@@ -708,6 +733,52 @@ def test_callable_class_tool_schema(target: Any, parameter: str, description: st
         parameter: {"title": parameter.title(), "type": "string"}
     }
     assert tool.description == description
+
+
+def test_callable_class_tool_summary_from_class_docstring():
+    # A __call__ docstring with only parameters has no summary, so the class's is used.
+    tool = openai_agents.workflow.activity_as_tool(
+        ActivityWeatherSectionsOnlyCall, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.description == "Get the weather for a given city."
+    assert tool.params_json_schema["properties"]["city"]["description"] == (
+        "Name of the city."
+    )
+
+
+class WeatherDefaultsService:
+    @activity.defn
+    async def get_weather_context(
+        self,
+        ctx: RunContextWrapper[Any] = None,  # type: ignore
+        city: str = "Tokyo",
+    ) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions=ctx.context)
+
+    @activity.defn
+    async def get_weather_alias(
+        self,
+        city: Annotated[str, pydantic.Field(alias="cityName")] = None,  # type: ignore
+    ) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "target, parameters",
+    [
+        (WeatherDefaultsService.get_weather_context, ["city"]),
+        (WeatherDefaultsService.get_weather_alias, ["cityName"]),
+    ],
+)
+def test_method_tool_with_none_defaults(target: Any, parameters: list[str]):
+    # Python 3.10's typing.get_type_hints would wrap these in Optional, hiding the context type
+    # and the alias.
+    tool = openai_agents.workflow.activity_as_tool(
+        target, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert list(tool.params_json_schema["properties"]) == parameters
 
 
 @activity.defn
@@ -770,11 +841,10 @@ class ActivityWeatherBadAnnotation(ActivityWeatherClass):
     ],
 )
 def test_invalid_callable_class_tool(target: Any, message: str):
-    with pytest.raises(ApplicationError, match=message) as raised:
+    with pytest.raises(ValueError, match=message):
         openai_agents.workflow.activity_as_tool(
             target, start_to_close_timeout=timedelta(seconds=10)
         )
-    assert raised.value.type == "invalid_tool"
 
 
 @pytest.mark.skipif(
@@ -803,7 +873,7 @@ def test_callable_class_tool_on_python_314():
     class ActivityWeatherPartialCall:
         __call__ = functools.partial(get_weather_no_city)
 
-    with pytest.raises(ApplicationError, match="needs a __call__ that is a function"):
+    with pytest.raises(ValueError, match="needs a __call__ that is a function"):
         openai_agents.workflow.activity_as_tool(
             activity.defn(ActivityWeatherPartialCall),
             start_to_close_timeout=timedelta(seconds=10),
