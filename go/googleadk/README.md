@@ -215,29 +215,47 @@ outside Temporal. To use another model, build the agent with
   handler retried, wrap its cause with `%w` or return a retryable
   `temporal.ApplicationError`.
 
-  If an agent or a runner plugin has a tool-error callback, or an after-tool
-  callback that treats errors differently from results, don't run Workers of an
-  earlier version and this one on the same Task Queue. An earlier Workflow
-  Worker hands this version's tool error to ADK as a result and skips the
-  callback, so the run fails to replay on the other version or closes as
-  `Failed`. Deploy this version on a new Task Queue, or stop every earlier
-  Worker before you start this version's. If you roll back, keep runs that ran
-  on this version on its Workers until they close.
   - The toolset lists its tools once per model step, at the same point with
-    every ADK release, so its Histories replay from ADK v2.3.0 to v2.6.0. A
-    toolset wrapped in `tool.FilterToolset` or `tool.WithConfirmation` lists
-    each time ADK asks for its tools, which ADK v2.6.0 does more often, so its
-    Histories do not replay across that release. Use
-    `MCPToolsetOptions.ToolFilter` instead of `tool.FilterToolset`, and
-    `mcptoolset`'s `RequireConfirmation` option instead of
-    `tool.WithConfirmation`.
-  - From the second model step of an agent run, each request declares only the
-    tools the server lists for that step. A model call to a tool the server no
-    longer lists gets ADK's tool-not-found error, with no `CallMcpTool`
-    Activity and no before- or after-tool callbacks.
-  - A run that used `NewMCPToolset` before you deploy this version fails replay
-    on it with `[TMPRL1100]`, and so does a run that used it on this version
-    after a rollback. Let those runs finish first, or use Worker Versioning.
+    every ADK release, so its Histories replay from ADK v2.3.0 to v2.7.0. A
+    toolset wrapped in another that does not forward `ProcessRequest`, such as
+    `tool.FilterToolset` or `tool.WithConfirmation`, lists each time ADK asks
+    for its tools: in every model step with ADK v2.6.0 and later, and only in
+    the first step of an agent run before. So a History in which an agent with
+    such a toolset took a second model step in one run does not replay across
+    ADK v2.6.0; one-step runs do. Use `MCPToolsetOptions.ToolFilter` instead of
+    `tool.FilterToolset`, and `mcptoolset`'s `RequireConfirmation` option
+    instead of `tool.WithConfirmation`.
+  - From the second model step of an agent run, a toolset in the agent's
+    `Toolsets` declares only the tools the server lists, and `ToolFilter`
+    allows, for that step. A model call to an MCP tool it no longer declares
+    gets ADK's tool-not-found error: no `CallMcpTool` Activity and no before-
+    or after-tool callbacks run, but on-tool-error callbacks do. In the first
+    step, and with a wrapped toolset on ADK v2.5.0 and earlier, such a call
+    still runs `CallMcpTool`; for a tool the server no longer lists, it fails
+    with a non-retryable `McpError`.
+  - From the second model step, your own `Tools` calls on such a toolset, for
+    example from an `InstructionProvider`, return the agent run's first list,
+    so they don't see changes the server or `ToolFilter` makes during the run.
+    To read the current list, call `Tools` on a second `NewMCPToolset` that is
+    not in the agent's `Toolsets`.
+
+  To upgrade to this version:
+  - A run that used `NewMCPToolset` directly in an agent's `Toolsets` before
+    you deploy this version fails replay on it with `[TMPRL1100]`, with or
+    without a tool call, and so does such a run on this version after a
+    rollback. Let those runs finish first, or keep them on the earlier version
+    with Worker Versioning. Runs whose MCP toolsets are all wrapped replay and
+    continue across the upgrade and a rollback, with the ADK release they ran
+    on.
+  - If an agent or a runner plugin has a tool-error callback, or an after-tool
+    callback that treats errors differently from results, don't run Workers of
+    an earlier version and this one on the same Task Queue. An earlier Workflow
+    Worker hands this version's tool error to ADK as a result and skips the
+    callback, so the run fails to replay on the other version or closes as
+    `Failed`. Deploy this version on a new Task Queue or, once the runs in the
+    item above have finished, stop every earlier Worker before you start this
+    version's. If you roll back, keep runs that ran on this version on its
+    Workers until they close.
 - **Remote A2A agents.** Build ADK's remote agent (`remoteagent.NewA2A`) with
   `AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, activityOptions)`
   and `ClientProvider: googleadk.NewA2AClientProvider(activityOptions)`. The card
