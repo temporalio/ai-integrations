@@ -22,6 +22,7 @@ cadence.
 | [`python/langgraph`](python/langgraph) | [![PyPI](https://img.shields.io/pypi/v/temporalio-langgraph.svg)](https://pypi.org/project/temporalio-langgraph/) (Public Preview) |
 | [`python/langsmith`](python/langsmith) | [![PyPI](https://img.shields.io/pypi/v/temporalio-langsmith.svg)](https://pypi.org/project/temporalio-langsmith/) (Public Preview) |
 | [`python/mcp`](python/mcp) | [![PyPI](https://img.shields.io/pypi/v/temporalio-mcp.svg)](https://pypi.org/project/temporalio-mcp/) (Public Preview) |
+| [`python/openai_codex`](python/openai_codex) | [![PyPI](https://img.shields.io/pypi/v/temporalio-openai-codex.svg)](https://pypi.org/project/temporalio-openai-codex/) (Pre-release) |
 | [`python/openai_agents`](python/openai_agents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-openai-agents.svg)](https://pypi.org/project/temporalio-openai-agents/) |
 | [`python/strands_agents`](python/strands_agents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-strands-agents.svg)](https://pypi.org/project/temporalio-strands-agents/) (Public Preview) |
 | [`python/typesafe`](python/typesafe) | [![PyPI](https://img.shields.io/pypi/v/temporalio-typesafe.svg)](https://pypi.org/project/temporalio-typesafe/) (Pre-release) |
