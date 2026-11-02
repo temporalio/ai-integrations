@@ -508,6 +508,12 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
         # it __call__'s instead of the class's.
         wrapper.__annotations__ = hints
         wrapper.__doc__ = doc
+    elif not hasattr(activity_def, "__name__"):
+        # A callable-class instance has no name for functools.wraps to copy,
+        # so the tool would be named "wrapper"; name it after the class, as
+        # ADK names a callable object.
+        wrapper.__name__ = type(activity_def).__name__
+        wrapper.__qualname__ = type(activity_def).__qualname__
 
     return wrapper
 

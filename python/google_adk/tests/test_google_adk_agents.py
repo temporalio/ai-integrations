@@ -1634,6 +1634,15 @@ def test_activity_as_tool_preserves_metadata() -> None:
         == "Number of passengers."
     )
 
+    # A callable-class instance has no __name__: its tool gets the class's, the
+    # name ADK gives the instance, so two instance tools don't share a name.
+    instance_tool = temporalio.google_adk.workflow.activity_as_tool(
+        QuoteTrip("USD"), start_to_close_timeout=timedelta(seconds=30)
+    )
+    assert instance_tool.__name__ == "QuoteTrip"
+    assert instance_tool.__qualname__ == "QuoteTrip"
+    assert FunctionTool(instance_tool).name == FunctionTool(QuoteTrip("USD")).name
+
     # __call__ as an instance binds it: a staticmethod keeps every parameter;
     # a classmethod and a partialmethod drop their receiver.
     for cls, params in [
