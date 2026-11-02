@@ -379,18 +379,20 @@ If a batch of chunks cannot be published, the model call fails with
 is non-retryable when a retry would call the model again and fail the same way:
 
 - **A batch over the server's size limits**: 2 MiB per payload and 4 MiB per
-  gRPC message by default. Configure external storage on the Client so large
-  batches are stored, or keep responses smaller.
+  gRPC message by default. Configure external storage on the Worker's Client
+  and on every subscriber's Client so large batches are stored, or keep
+  responses smaller.
 - **A run past its Signal limit.** Each batch is one Signal, and a run accepts
   10,000 Signals by default, counting the Workflow's other Signals. A
   long-running streaming Workflow, such as a chat session, should
   continue-as-new well before that, or use a longer batch interval
   (`WithStreaming(topic, interval)`; the default is 2 seconds).
-- **A batch the stream client gave up on** after retrying it for its maximum
-  retry duration.
+- **A batch Workflow Streams gave up on** after its fixed 10-minute retry limit.
+  This needs a model Activity `StartToCloseTimeout` over 10 minutes (the default
+  is 2 minutes), and then a server outage that long ends here too.
 
-Other failures, such as a server outage, are retried; the retry calls the model
-again and publishes its stream again.
+Other failures, such as a shorter server outage, are retried; the retry calls
+the model again and publishes its stream again.
 
 ## Composing with other plugins
 

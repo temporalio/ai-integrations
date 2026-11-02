@@ -26,6 +26,7 @@ import (
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/genai"
 
 	"go.temporal.io/googleadk"
 )
@@ -64,11 +65,15 @@ func TestStreamingIntegration(t *testing.T) {
 	big := strings.Repeat("x", 600_000)
 	oversized := &chunkedModel{name: "oversized-stream-model", chunks: []string{big, big, big}}
 	tooLarge := &chunkedModel{name: "too-large-stream-model", chunks: []string{big, big, big}, final: big + big + big}
+	// The same refused batch, but the model then fails: its error wins.
+	failing := &chunkedModel{name: "failing-stream-model", chunks: []string{big, big, big},
+		fail: &genai.APIError{Code: 400, Message: "bad request"}}
 	startWorker(t, c, taskQueue, googleadk.Config{
 		Models: map[string]googleadk.ModelFactory{
 			"stream-model":           func(context.Context, string) (model.LLM, error) { return cm, nil },
 			"oversized-stream-model": func(context.Context, string) (model.LLM, error) { return oversized, nil },
 			"too-large-stream-model": func(context.Context, string) (model.LLM, error) { return tooLarge, nil },
+			"failing-stream-model":   func(context.Context, string) (model.LLM, error) { return failing, nil },
 		},
 	})
 	ctx := context.Background()
@@ -96,24 +101,29 @@ func TestStreamingIntegration(t *testing.T) {
 
 	// A batch the server refuses fails the model call instead of returning the
 	// reply as if subscribers had every chunk. A retry would call the model again
-	// and send the same batch, so the failure is non-retryable.
-	for _, name := range []string{"oversized-stream-model", "too-large-stream-model"} {
+	// and send the same batch, so the failure is non-retryable. A model error
+	// stays the call's error.
+	for _, tc := range []struct{ name, errType string }{
+		{"oversized-stream-model", googleadk.ErrorTypeStream},
+		{"too-large-stream-model", googleadk.ErrorTypeStream},
+		{"failing-stream-model", googleadk.ErrorTypeModel},
+	} {
 		run = startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
-			ID:        taskQueue + "-refused-" + name,
+			ID:        taskQueue + "-refused-" + tc.name,
 			TaskQueue: taskQueue,
 		}, agentRunWorkflow, runInput{
-			ModelName:      name,
+			ModelName:      tc.name,
 			UserMessage:    "greet",
 			StreamingTopic: "run-stream",
 		})
 		getCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		err = run.Get(getCtx, nil)
 		cancel()
-		require.Error(t, err, "%s: a refused publish batch must fail the model call", name)
+		require.Error(t, err, "%s: a refused publish batch must fail the model call", tc.name)
 		var appErr *temporal.ApplicationError
-		require.ErrorAs(t, err, &appErr, name)
-		assert.Equal(t, googleadk.ErrorTypeStream, appErr.Type(), name)
-		assert.True(t, appErr.NonRetryable(), "%s: a refused batch must not be retried: %v", name, err)
+		require.ErrorAs(t, err, &appErr, tc.name)
+		assert.Equal(t, tc.errType, appErr.Type(), tc.name)
+		assert.True(t, appErr.NonRetryable(), "%s: must not be retried: %v", tc.name, err)
 	}
 }
 

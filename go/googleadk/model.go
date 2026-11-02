@@ -374,7 +374,7 @@ func startPeriodicHeartbeats(ctx context.Context) (stop func()) {
 // the workflowstreams topic for external (UI) consumers, and returns the
 // aggregated final response into the workflow. Liveness heartbeating is handled
 // by the caller's periodic heartbeater (see InvokeModel), not per chunk.
-func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in invokeModelInput) (_ *model.LLMResponse, err error) {
+func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in invokeModelInput) (result *model.LLMResponse, err error) {
 	log := activity.GetLogger(ctx)
 	opts := workflowstreams.Options{}
 	if in.StreamingBatchInterval > 0 {
@@ -392,13 +392,14 @@ func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in
 		// Close sends the last batch. If it fails, subscribers did not get every
 		// chunk, so the call fails instead of returning as if they had. A model
 		// error stays the call's error, and a cancelled or timed-out Activity
-		// reports that instead.
+		// reports that instead. The result is dropped with it, so the SDK does
+		// not encode a reply it then discards.
 		defer func() {
 			if cerr := wsc.Close(ctx); cerr != nil && err == nil {
 				if ctx.Err() != nil {
-					err = ctx.Err()
+					result, err = nil, ctx.Err()
 				} else {
-					err = streamPublishError(in, cerr)
+					result, err = nil, streamPublishError(in, cerr)
 				}
 			}
 		}()
