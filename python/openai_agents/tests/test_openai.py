@@ -1,10 +1,11 @@
 import asyncio
+import copy
 import json
 import os
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, cast
 
 import nexusrpc
@@ -64,6 +65,7 @@ from openai.types.responses import (
     ResponseFileSearchToolCall,
     ResponseFunctionToolCall,
     ResponseFunctionWebSearch,
+    ResponseOutputMessage,
 )
 from openai.types.responses.response_file_search_tool_call import Result
 from openai.types.responses.response_function_web_search import ActionSearch
@@ -78,6 +80,7 @@ from pydantic import ConfigDict, Field, TypeAdapter
 
 import temporalio.openai_agents as openai_agents
 from temporalio import activity, workflow
+from temporalio.api.common.v1 import Payload
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.common import RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -1183,25 +1186,30 @@ class CarriedItemsWorkflow:
         return f"{result.final_output}; carried replies: {replies}"
 
 
+# Pydantic decodes the assistant message's content as a one-shot iterator,
+# and the custom tool's string output as an iterator over its characters.
+CARRIED_ITEMS: list[TResponseInputItem] = [
+    {
+        "id": "msg-carried",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
+    },
+    {
+        "type": "custom_tool_call",
+        "call_id": "c1",
+        "name": "echo",
+        "input": "pong",
+    },
+    {"type": "custom_tool_call_output", "call_id": "c1", "output": "pong"},
+]
+
+
 async def test_carried_input_items(client: Client):
-    # Pydantic decodes the assistant message's content as a one-shot iterator,
-    # and the custom tool's string output as an iterator over its characters.
     input_items: list[TResponseInputItem] = [
         {"content": "Hi", "role": "user"},
-        {
-            "id": "msg-carried",
-            "type": "message",
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
-        },
-        {
-            "type": "custom_tool_call",
-            "call_id": "c1",
-            "name": "echo",
-            "input": "pong",
-        },
-        {"type": "custom_tool_call_output", "call_id": "c1", "output": "pong"},
+        *CARRIED_ITEMS,
     ]
     model = InputRecordingModel([ResponseBuilders.output_message("test")])
     async with AgentEnvironment(model=model) as env:
@@ -1219,32 +1227,190 @@ async def test_carried_input_items(client: Client):
     assert model.inputs == [input_items + [{"content": "Next", "role": "user"}]]
 
 
+CARRIED_AT = datetime(2026, 10, 31, 12, tzinfo=timezone.utc)
+
+
 class CarriedItemsModel(pydantic.BaseModel):
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+class CarriedItemsStrictModel(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
     input_items: list[TResponseInputItem]
 
 
 @pydantic.dataclasses.dataclass
 class CarriedItemsState:
+    carried_at: datetime
     input_items: list[TResponseInputItem]
 
 
-@pytest.mark.parametrize("state_type", [CarriedItemsModel, CarriedItemsState])
-def test_carried_input_items_in_state_decode_as_lists(state_type: Any):
+@pydantic.dataclasses.dataclass(config=ConfigDict(strict=True))
+class CarriedItemsStrictState:
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+class CarriedItemsExtraModel(pydantic.BaseModel):
+    # Undeclared fields hold carried items, and pydantic keeps them in model_extra.
+    model_config = ConfigDict(extra="allow")
+    # Pydantic's documented way to type extra values; BaseModel declares it as optional.
+    __pydantic_extra__: dict[str, list[TResponseInputItem]] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
+        init=False
+    )
+    carried_at: datetime
+
+
+def _dated_items(state: Any) -> Any:
+    return state.carried_at, state.input_items
+
+
+@pytest.mark.parametrize(
+    "carried,read,expected",
+    [
+        (
+            CarriedItemsModel(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsStrictModel(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsState(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsStrictState(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsExtraModel.model_validate(
+                {"carried_at": CARRIED_AT, "carried": CARRIED_ITEMS}
+            ),
+            lambda state: (state.carried_at, state.__pydantic_extra__["carried"]),
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+    ],
+    ids=["model", "strict-model", "dataclass", "strict-dataclass", "extra-model"],
+)
+def test_carried_input_items_in_state_decode_as_lists(
+    carried: Any, read: Any, expected: Any
+):
     # Workflows often carry the items in a model or dataclass, as the
     # documented chat does.
-    input_items: list[TResponseInputItem] = [
-        {
-            "id": "msg-carried",
-            "type": "message",
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
-        },
-    ]
     converter = OpenAIPayloadConverter()
-    (payload,) = converter.to_payloads([state_type(input_items=input_items)])
-    (state,) = converter.from_payloads([payload], [state_type])
-    assert state.input_items == input_items
+    (payload,) = converter.to_payloads([carried])
+    (state,) = converter.from_payloads([payload], [type(carried)])
+    assert type(state) is type(carried)
+    copy.deepcopy(state)
+    assert read(state) == expected
+
+
+@pydantic.dataclasses.dataclass
+class CarriedItemsWithResponse:
+    last_message: ResponseOutputMessage
+    input_items: list[TResponseInputItem]
+
+
+def test_carried_input_items_decode_as_lists_in_lenient_fallback():
+    # The message lacks the required status, as a response from a newer API
+    # might, so the converter falls back to lenient construction.
+    message = {key: value for key, value in CARRIED_ITEMS[0].items() if key != "status"}
+    payload = Payload(
+        metadata={"encoding": b"json/plain"},
+        data=json.dumps(
+            {"last_message": message, "input_items": CARRIED_ITEMS}
+        ).encode(),
+    )
+    converter = OpenAIPayloadConverter()
+    (state,) = converter.from_payloads([payload], [CarriedItemsWithResponse])
+    assert type(state) is CarriedItemsWithResponse
+    assert state.input_items == CARRIED_ITEMS
+    copy.deepcopy(state)
+
+
+class CarriedChatState(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+@workflow.defn
+class CarriedCustomToolChatWorkflow:
+    @workflow.run
+    async def run(self, state: CarriedChatState | None = None) -> str:
+        async def echo(ctx: ToolContext[Any], input: str) -> str:  # type: ignore[reportUnusedParameter]
+            return input
+
+        agent = Agent[str](
+            name="custom-tool-agent",
+            instructions="Use the echo tool.",
+            tools=[
+                CustomTool(
+                    name="echo",
+                    description="Echo the input string back.",
+                    on_invoke_tool=echo,
+                )
+            ],
+        )
+        if state is None:
+            result = await Runner.run(starting_agent=agent, input="say something")
+            workflow.continue_as_new(
+                CarriedChatState(
+                    carried_at=CARRIED_AT, input_items=result.to_input_list()
+                )
+            )
+        copy.deepcopy(state.input_items)
+        result = await Runner.run(
+            starting_agent=agent,
+            input=state.input_items + [{"content": "Next", "role": "user"}],
+        )
+        return f"{result.final_output}; {state.carried_at.isoformat()}"
+
+
+async def test_carried_custom_tool_output_across_continue_as_new(client: Client):
+    model = InputRecordingModel(
+        [
+            ModelResponse(
+                output=[
+                    ResponseCustomToolCall(
+                        call_id="c1",
+                        input="ping",
+                        name="echo",
+                        type="custom_tool_call",
+                    )
+                ],
+                usage=Usage(),
+                response_id=None,
+            ),
+            ResponseBuilders.output_message("done"),
+            ResponseBuilders.output_message("next done"),
+        ]
+    )
+    async with AgentEnvironment(model=model) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, CarriedCustomToolChatWorkflow) as worker:
+            result = await client.execute_workflow(
+                CarriedCustomToolChatWorkflow.run,
+                id=f"carried-custom-tool-chat-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+    assert result == "next done; 2026-10-31T12:00:00+00:00"
+    items = [dict(i) for i in model.inputs[2]]
+    (output,) = [i for i in items if i.get("type") == "custom_tool_call_output"]
+    assert output["output"] == "ping"
+    replies = [i for i in items if i.get("role") == "assistant"]
+    assert [type(r["content"]) for r in replies] == [list]
 
 
 class InputGuardrailModel(Model):

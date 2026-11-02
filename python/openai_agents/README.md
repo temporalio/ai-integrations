@@ -408,6 +408,12 @@ A workflow can also carry `result.to_input_list()` across `continue_as_new` and 
 `Runner.run` in the next run. The plugin decodes their `Iterable` fields, such as an assistant
 message's `content`, as lists.
 
+To do this, importing `temporalio.openai_agents` changes the `Iterable[X]` fields of the `openai`
+input item types to `list[X]` for the whole process. Type checkers still see `Iterable`. At runtime,
+`typing.get_type_hints()` reports `list`, your own pydantic validation of those types returns lists,
+and in strict mode it rejects a tuple or generator there. Requests the `openai` client sends are
+unchanged.
+
 Earlier versions decoded those fields as one-shot iterators, and a turn on carried items raised
 `TypeError: cannot pickle 'pydantic_core._pydantic_core.ValidatorIterator' object`. A run that
 caught that error and went on, such as a chat whose Update reports errors to the caller, fails with

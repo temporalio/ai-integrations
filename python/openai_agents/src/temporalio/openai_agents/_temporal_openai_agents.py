@@ -288,7 +288,9 @@ class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
     Pydantic decodes ``Iterable`` fields, such as an assistant message's
     ``content``, as one-shot iterators. The Agents SDK deep-copies run input
     and cannot copy them, and reading one empties it, so they are decoded as
-    lists instead.
+    lists instead. ``_openai_types`` changes the openai item types so that
+    pydantic builds lists itself; this walk covers classes built before the
+    plugin was imported.
     """
 
     def from_payload(
