@@ -91,6 +91,29 @@ func retryableHTTPStatus(code int) bool {
 	return code == 408 || code == 409 || code == 429 || (code >= 500 && code < 600)
 }
 
+// isEmptyResponse reports whether err, or any error it wraps through either
+// Unwrap form (as errors.Join and multiple %w produce), is ADK's untyped
+// "empty response".
+func isEmptyResponse(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err.Error() == "empty response" {
+		return true
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return isEmptyResponse(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if isEmptyResponse(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // newApplicationError builds a typed Temporal ApplicationError. retryable=false
 // marks the error non-retryable so Temporal stops retrying.
 func newApplicationError(errType string, retryable bool, cause error, format string, args ...any) error {

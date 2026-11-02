@@ -281,6 +281,11 @@ outside Temporal. To use another model, build the agent with
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
   A streamed call whose chunks could not all be published fails with
   `googleadk.StreamError` (see [Streaming](#streaming)).
+  A non-streamed Gemini reply with no candidates, which is how Gemini answers a
+  blocked prompt, fails at once as a non-retryable `googleadk.ModelError`, like
+  a permanent `4xx`: ADK returns it as `empty response`, with no status. With
+  `WithStreaming`, ADK returns the block as a response with an `ErrorCode`
+  instead. Other errors without a status are retried.
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
   under Temporal's `RetryPolicy`; leaving the model client's own retries on retries
   a transient failure twice over. Let Temporal own retries.
