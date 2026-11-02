@@ -252,6 +252,9 @@ the model SDK's own retries (see below), or override the fallbacks.
   / `.A2AError`.
   Classify with `IsNonRetryable(err)`; never string-match. Upstream HTTP status
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
+  The status is read from a `genai.APIError`, or else from an int `StatusCode`
+  field of 400 or more on any error the model returns or wraps, as openai-go's
+  errors have. A custom `model.LLM` can expose its status the same way.
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
   under Temporal's `RetryPolicy`; leaving the model client's own retries on retries
   a transient failure twice over. Let Temporal own retries.
