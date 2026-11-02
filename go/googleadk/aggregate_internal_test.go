@@ -15,6 +15,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
+	"go.temporal.io/sdk/contrib/workflowstreams"
+	"go.temporal.io/sdk/temporal"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"google.golang.org/genai"
 
 	"google.golang.org/adk/v2/model"
@@ -96,6 +103,33 @@ func TestClassifyModelErrorRetryability(t *testing.T) {
 		}
 		classified := classifyModelError(err)
 		assert.Equal(t, !tc.retryable, IsNonRetryable(classified), "code %d", tc.code)
+	}
+}
+
+// TestStreamPublishErrorRetryability proves the retry contract for a stream
+// that could not be published: a batch the server refused (invalid, or over
+// the gRPC message limit) or one the stream client gave up on is final; rate
+// limiting and an outage stay retryable.
+func TestStreamPublishErrorRetryability(t *testing.T) {
+	in := invokeModelInput{Request: &model.LLMRequest{Model: "m"}, StreamingTopic: "t"}
+	cases := []struct {
+		name      string
+		err       error
+		retryable bool
+	}{
+		{"over the payload limit", serviceerror.NewInvalidArgument("Blob data size exceeds limit."), false},
+		{"over the gRPC message limit", status.Error(codes.ResourceExhausted, "grpc: received message after decompression larger than max 4194304"), false},
+		{"rate limited", serviceerror.NewResourceExhausted(enumspb.RESOURCE_EXHAUSTED_CAUSE_RPS_LIMIT, "namespace rate limit exceeded"), true},
+		{"rate limited, gRPC status", status.Error(codes.ResourceExhausted, "namespace rate limit exceeded"), true},
+		{"client gave up", &workflowstreams.FlushTimeoutError{}, false},
+		{"server unavailable", serviceerror.NewUnavailable("connection refused"), true},
+	}
+	for _, tc := range cases {
+		err := streamPublishError(in, tc.err)
+		var appErr *temporal.ApplicationError
+		require.ErrorAs(t, err, &appErr, tc.name)
+		assert.Equal(t, ErrorTypeStream, appErr.Type(), tc.name)
+		assert.Equal(t, !tc.retryable, appErr.NonRetryable(), tc.name)
 	}
 }
 
