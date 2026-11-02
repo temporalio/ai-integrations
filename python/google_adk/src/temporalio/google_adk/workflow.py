@@ -316,7 +316,7 @@ def _is_method(fn: Callable) -> bool:
         raise ValueError(
             f"Cannot tell whether '{fn.__qualname__}' is a method or a"
             f" staticmethod: '{'.'.join(qualname)}' reachable from the"
-            " function's globals is another object. Take the reference again"
+            " function's globals is another object. Import the class again"
             " if its module was reloaded, pass a bound method for a method, or"
             " rename a staticmethod's parameter."
         )
