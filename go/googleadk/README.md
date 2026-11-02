@@ -208,6 +208,15 @@ the model SDK's own retries (see below), or override the fallbacks.
   stops the call. To have a failure in your own toolset or a `FakeMCPServer`
   handler retried, wrap its cause with `%w` or return a retryable
   `temporal.ApplicationError`.
+
+  If an agent or a runner plugin has a tool-error callback, or an after-tool
+  callback that treats errors differently from results, don't run Workers of an
+  earlier version and this one on the same Task Queue. An earlier Workflow
+  Worker hands this version's tool error to ADK as a result and skips the
+  callback, so the run fails to replay on the other version or closes as
+  `Failed`. Deploy this version on a new Task Queue, or stop every earlier
+  Worker before you start this version's. If you roll back, keep runs that ran
+  on this version on its Workers until they close.
 - **Remote A2A agents.** Build ADK's remote agent (`remoteagent.NewA2A`) with
   `AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, activityOptions)`
   and `ClientProvider: googleadk.NewA2AClientProvider(activityOptions)`. The card
@@ -257,11 +266,14 @@ the model SDK's own retries (see below), or override the fallbacks.
   serial fallback.
 - **Typed failures.** Model / tool / MCP / A2A failures surface as Temporal
   `ApplicationError`s tagged `googleadk.ModelError` / `.ToolError` / `.McpError`
-  / `.A2AError`. An MCP tool's own error is not one of these: ADK, its
-  tool-error callbacks and the model get the tool's error, as without
-  Temporal, not a `googleadk.McpError` (see **MCP, statelessly** above).
+  / `.A2AError`.
   Classify with `IsNonRetryable(err)`; never string-match. Upstream HTTP status
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
+  An MCP tool's own error is not one of these failures: ADK, its tool-error
+  callbacks and the model get an error with the tool's message, as without
+  Temporal, not a `googleadk.McpError`. Its Go type and identity don't cross
+  the Activity boundary, so `errors.Is` and `errors.As` don't match it; match
+  on the message (see **MCP, statelessly** above).
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
   under Temporal's `RetryPolicy`; leaving the model client's own retries on retries
   a transient failure twice over. Let Temporal own retries.

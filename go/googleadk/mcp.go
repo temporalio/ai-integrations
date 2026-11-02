@@ -147,9 +147,10 @@ func (t *mcpProxyTool) Run(ctx agent.Context, args any) (map[string]any, error) 
 		return nil, fmt.Errorf("error tool %q %w", t.Name(), tool.ErrConfirmationRequired)
 	}
 	if out.Error != nil {
-		// The tool's own error, such as an MCP isError result. Give ADK the
-		// error the tool returned, so the model sees it as it does without
-		// Temporal.
+		// The tool's own error, such as an MCP isError result. Give ADK an
+		// error with the tool's message, so callbacks and the model see it as
+		// they do without Temporal. Only the message crosses the Activity
+		// boundary, not the error's Go type.
 		return nil, errors.New(*out.Error)
 	}
 	if out.Result == nil {
@@ -228,8 +229,9 @@ func (a *Activities) ListMcpTools(ctx context.Context, in mcpListInput) ([]*gena
 // ADK v2.4.0, a result with no text) that way. They wrap the error of a failed
 // MCP request, which still fails the Activity with a retryable McpError, as
 // does an error returned after the Activity's context is done, such as when
-// the Worker stops. An ApplicationError fails the Activity with its own type
-// and retryability.
+// the Worker stops. An ApplicationError returned as is fails the Activity with
+// its own type and retryability; wrapped in another error, it fails as a
+// retryable wrapError.
 func (a *Activities) CallMcpTool(ctx context.Context, in mcpCallInput) (*mcpCallOutput, error) {
 	log := activity.GetLogger(ctx)
 	// No-op unless the user set a HeartbeatTimeout on the toolset's Activity
