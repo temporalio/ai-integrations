@@ -933,6 +933,8 @@ test('Stateful MCP dedicated-worker failure produces DedicatedWorkerFailure', as
 
 test('runWorker refuses an Activity a later plugin replaced, and starts the Worker at once', async (t) => {
   await withTestEnv(async (env) => {
+    const replaced =
+      /^Duplicate registration of Activity 'invokeModelActivity': a plugin applied after OpenAIAgentsPlugin replaced/;
     const connection = await NativeConnection.connect({ address: env.address });
     const later = new SimplePlugin({ name: 'later', activities: { invokeModelActivity: async () => 'other' } });
     const worker = await Worker.create({
@@ -942,12 +944,23 @@ test('runWorker refuses an Activity a later plugin replaced, and starts the Work
       workflowBundle: sharedWorkflowBundle,
       taskQueue: `later-plugin-${randomUUID()}`,
     });
-    await t.throwsAsync(worker.run(), {
-      instanceOf: TypeError,
-      message:
-        /^Duplicate registration of Activity 'invokeModelActivity': a plugin applied after OpenAIAgentsPlugin replaced/,
-    });
+    await t.throwsAsync(worker.run(), { instanceOf: TypeError, message: replaced });
     t.is(worker.getState(), 'STOPPED');
+
+    // One instance on the connection and the Worker, with the later plugin on the connection: both of
+    // the instance's checks run, and the Worker must still stop cleanly.
+    const plugin = new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) });
+    const shared = await NativeConnection.connect({ address: env.address, plugins: [plugin, later] });
+    const twice = await Worker.create({
+      connection: shared,
+      namespace: env.namespace,
+      plugins: [plugin],
+      workflowBundle: sharedWorkflowBundle,
+      taskQueue: `later-plugin-twice-${randomUUID()}`,
+    });
+    await t.throwsAsync(twice.run(), { instanceOf: TypeError, message: replaced });
+    t.is(twice.getState(), 'STOPPED');
+    await shared.close();
 
     // runUntil stops the Worker after its callback only if the Worker is already running, so the
     // check must not yield before it starts: not for a callback that throws at once, and not for

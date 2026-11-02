@@ -8,6 +8,7 @@ import { SimplePlugin } from '@temporalio/plugin';
 import type { BundleOptions, InjectedSinks, ReplayWorkerOptions, Worker, WorkerOptions } from '@temporalio/worker';
 import { OpenAIAgentsTraceClientInterceptor } from '../client/trace-interceptor';
 import { AGENT_TRACING_SINK_NAME, type AgentTracingSinks } from '../common/agent-sink-types';
+import { MCP_STATEFUL_SUFFIX } from '../common/mcp-types';
 import type { SerializableModelActivityOptions } from '../common/model-activity-options';
 import { isReplaySafeTracerProvider } from '../common/tracing-bridge';
 import { createModelActivity } from './activities';
@@ -16,7 +17,7 @@ import { makeAgentTracingSink } from './agent-sink-bridge';
 import type { HostedToolCredentialsResolver } from './hosted-tool-credentials';
 import type { StatelessMCPServerProvider } from './mcp-provider';
 import type { SandboxClientProvider } from './sandbox-provider';
-import type { StatefulMCPServerProvider } from './stateful-mcp-provider';
+import { StatefulMCPServerProvider } from './stateful-mcp-provider';
 import {
   OpenAIAgentsTraceActivityInboundInterceptor,
   OpenAIAgentsTraceNexusInboundInterceptor,
@@ -165,10 +166,13 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
         );
       }
       seenNames.add(provider.name);
+      // A stateful MCP server provider adds a suffix to the name the caller passed.
+      const shownName =
+        provider instanceof StatefulMCPServerProvider ? provider.name.slice(0, -MCP_STATEFUL_SUFFIX.length) : provider.name;
       const providerActivities = provider._getActivities();
       for (const [name, fn] of Object.entries(providerActivities)) {
         activitySources.set(fn, [name, provider]);
-        activityProviders.set(name, provider.name);
+        activityProviders.set(name, shownName);
       }
       allActivities = { ...allActivities, ...providerActivities };
     }

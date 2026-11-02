@@ -1,6 +1,7 @@
 import test from 'ava';
-import type { WorkerOptions } from '@temporalio/worker';
+import type { NativeConnection, WorkerOptions } from '@temporalio/worker';
 import { StatelessMCPServerProvider } from '../worker/mcp-provider';
+import { StatefulMCPServerProvider } from '../worker/stateful-mcp-provider';
 import { OpenAIAgentsPlugin } from '../worker/plugin';
 import { FakeModelProvider } from './stubs/openai-agents';
 
@@ -19,6 +20,13 @@ test('configureWorker refuses to replace a different Activity with the same name
       new StatelessMCPServerProvider('docs', () => {
         throw new Error('not called');
       }),
+      new StatefulMCPServerProvider(
+        'notes',
+        () => {
+          throw new Error('not called');
+        },
+        {} as NativeConnection
+      ),
     ],
   };
   const plugin = new OpenAIAgentsPlugin(options);
@@ -30,6 +38,10 @@ test('configureWorker refuses to replace a different Activity with the same name
     'docs-stateless-call-tool':
       "Duplicate registration of Activity 'docs-stateless-call-tool': OpenAIAgentsPlugin provider 'docs' would " +
       `replace a different Activity with this name. Rename the provider, rename ${tail}`,
+    // The name the caller passed, without the stateful provider's internal suffix.
+    'notes-stateful-server-session':
+      "Duplicate registration of Activity 'notes-stateful-server-session': OpenAIAgentsPlugin provider 'notes' " +
+      `would replace a different Activity with this name. Rename the provider, rename ${tail}`,
   };
   for (const [name, message] of Object.entries(refusals)) {
     t.throws(
