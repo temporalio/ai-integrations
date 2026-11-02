@@ -8,14 +8,13 @@ from uuid import uuid4
 import pytest
 from mcp import Client as MCPClient
 from mcp import StdioServerParameters, stdio_client
-from mcp.types import Tool, ToolAnnotations
+from mcp.types import ListToolsResult, Tool, ToolAnnotations
 from strands.tools.mcp import MCPAgentTool, ToolFilters
 
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.mcp import TemporalMCPClient as DurableMCPClient
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent, TemporalMCPClient
-from temporalio.strands_agents._temporal_mcp_client import _included
 from temporalio.strands_agents._temporal_mcp_tool import TemporalMCPTool
 from temporalio.worker import Replayer, Worker
 from tests.common import get_activities
@@ -71,12 +70,28 @@ def test_tools_without_prefix_keep_the_server_name() -> None:
         (cast(Any, {"allowed": [None, "echo"]}), ["echo"]),
     ],
 )
-def test_tool_filters_still_match_the_server_name_when_prefixed(
+async def test_tool_filters_still_match_the_server_name_when_prefixed(
     filters: ToolFilters, included: list[str]
 ) -> None:
-    tools = [_tool("echo", prefix="gh"), _tool("other", prefix="gh")]
+    class ListingServer:
+        """Stands in for the durable client: lists two tools."""
 
-    assert [t.mcp_tool.name for t in tools if _included(t, filters)] == included
+        async def list_tools(self) -> ListToolsResult:
+            return ListToolsResult(
+                tools=[
+                    Tool(name=name, input_schema=_ECHO_SCHEMA)
+                    for name in ("echo", "other")
+                ]
+            )
+
+    client = TemporalMCPClient("gh", prefix="gh", tool_filters=filters)
+    client._client = cast(Any, ListingServer())
+
+    # The listing the agent gets, as TemporalAgent's hook refreshes it.
+    await client._refresh()
+    tools = await client.load_tools()
+
+    assert [t.tool_name for t in tools] == [f"gh_{name}" for name in included]
 
 
 def test_tools_carry_annotations() -> None:

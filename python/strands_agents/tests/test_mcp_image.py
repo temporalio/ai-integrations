@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 from mcp import Client as MCPClient
 from mcp import StdioServerParameters, stdio_client
-from mcp.types import CallToolResult, ImageContent, Tool
+from mcp.types import CallToolResult, ImageContent, TextContent, Tool
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -126,30 +126,60 @@ async def test_mcp_image_tool_result(client: Client, tmp_path: Path):
     ).replay_workflow(history)
 
 
-class _ImageServer:
-    """Stands in for the durable client: returns one image from call_tool."""
+class _StubServer:
+    """Stands in for the durable client: returns one result from call_tool."""
 
-    def __init__(self, image: ImageContent) -> None:
-        self._image = image
+    def __init__(self, result: CallToolResult) -> None:
+        self._result = result
 
     async def call_tool(self, _name: str, _arguments: dict[str, Any]) -> CallToolResult:
-        return CallToolResult(content=[self._image])
+        return self._result
+
+
+def _image(mime_type: str, data: str) -> CallToolResult:
+    return CallToolResult(
+        content=[ImageContent(type="image", mime_type=mime_type, data=data)]
+    )
+
+
+def _failed_call(error: str) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "toolUseId": "t1",
+        "content": [{"text": f"Tool execution failed: {error}"}],
+    }
 
 
 @pytest.mark.parametrize(
-    ("mime_type", "data", "error"),
+    ("result", "expected"),
     [
-        ("image/svg+xml", base64.b64encode(b"<svg/>").decode(), "'image/svg+xml'"),
-        ("image/png", "abc", "Incorrect padding"),
+        # As in Strands' MCPClient, an image that does not map fails the call
+        # instead of giving the model an empty success.
+        (
+            _image("image/svg+xml", base64.b64encode(b"<svg/>").decode()),
+            _failed_call("'image/svg+xml'"),
+        ),
+        (_image("image/png", "abc"), _failed_call("Incorrect padding")),
+        # A tool that reports an error.
+        (
+            CallToolResult(
+                content=[TextContent(type="text", text="no such repo")], is_error=True
+            ),
+            {
+                "status": "error",
+                "toolUseId": "t1",
+                "content": [{"text": "no such repo"}],
+                "isError": True,
+            },
+        ),
     ],
+    ids=["unsupported-image", "undecodable-image", "tool-error"],
 )
-async def test_mcp_image_that_does_not_map_fails_the_call(
-    mime_type: str, data: str, error: str
+async def test_mcp_failed_results_reach_the_agent_as_errors(
+    result: CallToolResult, expected: dict[str, Any]
 ) -> None:
-    """As in Strands' MCPClient, the model gets a failed call, not an empty success."""
-    image = ImageContent(type="image", mime_type=mime_type, data=data)
     tool = TemporalMCPTool(
-        cast(Any, _ImageServer(image)),
+        cast(Any, _StubServer(result)),
         Tool(name="screenshot", input_schema={"type": "object"}),
     )
 
@@ -160,10 +190,4 @@ async def test_mcp_image_that_does_not_map_fails_the_call(
         )
     ]
 
-    assert [event.tool_result for event in events] == [
-        {
-            "status": "error",
-            "toolUseId": "t1",
-            "content": [{"text": f"Tool execution failed: {error}"}],
-        }
-    ]
+    assert [event.tool_result for event in events] == [expected]
