@@ -158,10 +158,9 @@ async def test_temporal_backend_op_activity(env: WorkflowEnvironment) -> None:
     # One activity per op — the sync read, the async aread, and the optional
     # adelete all cross.
     assert counts[BACKEND_OP] == 3, counts
-    # backend_op carries the default heartbeat timeout, capped by the
-    # schedule's own start_to_close (10 s here).
+    # Backend operations are opt-in for heartbeats: no default timeout.
     attrs = await scheduled_attributes(handle, BACKEND_OP)
-    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=10)
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(0)
     assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
 
 
@@ -210,8 +209,9 @@ class BlockingReadWorkflow:
 async def test_backend_activity_heartbeat_options_win(
     env: WorkflowEnvironment,
 ) -> None:
-    """``TemporalBackend(activity_options=...)`` heartbeat values replace the
-    default, ``heartbeat_timeout=None`` included."""
+    """``TemporalBackend(activity_options=...)`` heartbeat values are applied
+    as configured (backends have no default), ``heartbeat_timeout=None``
+    included."""
     async with Worker(
         env.client,
         task_queue="da-backend-hb-opts",

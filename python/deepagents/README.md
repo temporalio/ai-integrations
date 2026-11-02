@@ -119,27 +119,30 @@ plugin = DeepAgentsPlugin(
 )
 ```
 
-The plugin's own activities — `invoke_model`, `invoke_model_streaming`,
-`invoke_tool` and `backend_op` — heartbeat on a background task and are
-scheduled with a default `heartbeat_timeout` of 30 seconds, never exceeding the
-schedule's own start-to-close (or schedule-to-close) timeout. The heartbeater
-beats at half the timeout, and the activity bodies keep the event loop free
-(LangChain runs sync models and tools on worker threads; `backend_op` runs
-backend methods off-loop), so slow calls of any length keep heartbeating — the
-default changes how a dead worker or a cancellation is noticed, not how long a
-healthy call may run. It buys two things: a crashed worker's activity is timed
-out within the heartbeat timeout and retried per its retry policy instead of
-waiting out `start_to_close_timeout`, and workflow cancellation — which a
-Python activity only observes through a heartbeat — reaches a running model or
-tool call within one beat interval (15 s with the default) instead of never.
-The one caveat: code that blocks the event loop itself (a CPU-bound async
-model, a blocking sync tool) starves any heartbeat timeout, this default
-included — override or disable it with `heartbeat_timeout` (including `None`)
-in any of the maps above if you run such code.
+Model calls — `invoke_model` and `invoke_model_streaming` — heartbeat on a
+background task and are scheduled with a default `heartbeat_timeout` of 30
+seconds, never exceeding the schedule's own start-to-close (or
+schedule-to-close) timeout. The heartbeater beats at half the timeout and
+LangChain runs sync models on worker threads, so slow calls of any length keep
+heartbeating — the default changes how a dead worker or a cancellation is
+noticed, not how long a healthy call may run. It buys two things: a crashed
+worker's model call is timed out within the heartbeat timeout and retried per
+its retry policy instead of waiting out `start_to_close_timeout`, and workflow
+cancellation — which a Python activity only observes through a heartbeat —
+reaches a running model call within one beat interval (15 s with the default)
+instead of never. Override or disable it with `heartbeat_timeout` (including
+`None`) in the model activity options above.
 
-Activities you expose with `activity_as_tool(...)` are your own, so the plugin
-never adds a heartbeat timeout to their schedule: an activity that does not
-heartbeat would fail spuriously once the timeout expired.
+Tools and backend operations get no default heartbeat timeout. They run
+arbitrary application code with their own execution, progress-reporting and
+cancellation behavior, so the application decides when background heartbeats
+are appropriate: set `heartbeat_timeout` in `tool_activity_options`, a tool's
+`activity_options`, or `TemporalBackend(activity_options=...)`, and the
+plugin's `invoke_tool` and `backend_op` activities heartbeat in the background
+for you. `backend_op` runs sync backend methods off the event loop, so a
+blocking method such as a shell command keeps heartbeating once you opt in.
+Activities you expose with `activity_as_tool(...)` are your own; the plugin
+never adds a heartbeat timeout to their schedule.
 
 ## Tools: the Workflow-vs-Activity choice, made explicit
 

@@ -226,10 +226,9 @@ async def test_tool_as_activity(env: WorkflowEnvironment) -> None:
     assert "sunny in Paris" in out
     counts = await count_scheduled_activities(handle)
     assert counts[INVOKE_TOOL] == 1, counts
-    # The default heartbeat timeout never outlives the schedule's own bound:
-    # this tool's 10 s start-to-close caps the 30 s default with it.
+    # Tools are opt-in for heartbeats: no default timeout.
     attrs = await scheduled_attributes(handle, INVOKE_TOOL)
-    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=10)
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(0)
     assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
 
 
@@ -278,11 +277,10 @@ class ToolHeartbeatOptionsWorkflow:
 async def test_plugin_tool_activity_heartbeat_boundary(
     env: WorkflowEnvironment,
 ) -> None:
-    """Only the plugin's own ``invoke_tool`` activity gets the default
-    heartbeat timeout: it auto-heartbeats, so a short timeout is safe and
-    cancellation can reach a long tool call. A user activity exposed with
-    ``activity_as_tool`` may never heartbeat — defaulting a timeout for it
-    would fail the activity — so its schedule stays untouched."""
+    """Neither tool path gets a default heartbeat timeout: tools run
+    arbitrary application code, so heartbeats are opt-in. The plugin's
+    ``invoke_tool`` schedule and a user activity exposed with
+    ``activity_as_tool`` both stay untouched."""
     plugin = DeepAgentsPlugin()
     async with Worker(
         env.client,
@@ -306,10 +304,8 @@ async def test_plugin_tool_activity_heartbeat_boundary(
         )
         assert "echo:hi" in await activity_handle.result()
 
-    # The literal 30 s (not the source constant) so this test speaks against
-    # any code that resolves the schedule, main's included.
     tool_attrs = await scheduled_attributes(tool_handle, INVOKE_TOOL)
-    assert tool_attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=30)
+    assert tool_attrs.heartbeat_timeout.ToTimedelta() == timedelta(0)
     # The user's own activity keeps whatever schedule the caller asked for.
     user_attrs = await scheduled_attributes(activity_handle, "echo_activity")
     assert user_attrs.heartbeat_timeout.ToTimedelta() == timedelta(0)
@@ -319,8 +315,8 @@ async def test_plugin_tool_activity_heartbeat_boundary(
 async def test_tool_activity_heartbeat_user_options_win(
     env: WorkflowEnvironment,
 ) -> None:
-    """The plugin's ``tool_activity_options`` heartbeat replaces the default,
-    and a per-tool ``heartbeat_timeout=None`` opts back out."""
+    """A plugin-wide ``tool_activity_options`` heartbeat opts tools in, and a
+    per-tool ``heartbeat_timeout=None`` opts back out."""
     plugin = DeepAgentsPlugin(
         tool_activity_options={"heartbeat_timeout": timedelta(seconds=7)},
     )

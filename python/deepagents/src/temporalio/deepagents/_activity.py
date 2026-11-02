@@ -48,14 +48,15 @@ CONTEXT_OVERFLOW_ERROR_TYPE = "deepagents.ContextOverflowError"
 """``ApplicationError.type`` of a model call the provider rejected as too long."""
 
 
-# Default heartbeat timeout for the activities this module defines, applied by
-# the dispatch seams via :func:`apply_default_heartbeat_timeout` (user-supplied
-# options always win, including an explicit ``heartbeat_timeout=None`` opt-out).
-# Every activity body keeps the event loop free — model and tool calls go
-# through LangChain, which runs sync implementations on worker threads, and
-# ``backend_op`` dispatches backend methods off-loop — so the heartbeat task
-# below keeps beating however slow the underlying call is. (User code that
-# blocks the loop itself — a CPU-bound async model, a blocking sync tool —
+# Default heartbeat timeout for model calls (``invoke_model`` and
+# ``invoke_model_streaming``), applied by the model dispatch seam via
+# :func:`apply_default_heartbeat_timeout` (user-supplied options always win,
+# including an explicit ``heartbeat_timeout=None`` opt-out). Tools and backend
+# operations run arbitrary application code, so they get no default: their
+# activities still auto-heartbeat, but only when the caller configures
+# ``heartbeat_timeout`` explicitly. Model calls go through LangChain, which
+# runs sync implementations on worker threads, so the heartbeat task below
+# keeps beating however slow the call is. (A model that blocks the loop itself
 # starves any heartbeat timeout, this default included.) Without a timeout the
 # server cannot tell a crashed worker from a slow call until start-to-close
 # (five minutes for a model call), and cancellation never reaches the call at
