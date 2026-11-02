@@ -33,12 +33,14 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
+from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from langchain_core.callbacks import (
         AsyncCallbackManagerForLLMRun,
         CallbackManagerForLLMRun,
     )
+    from langchain_core.exceptions import ContextOverflowError
     from langchain_core.language_models import BaseChatModel
     from langchain_core.messages import AIMessageChunk, BaseMessage
     from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
@@ -54,6 +56,40 @@ def _as_message_chunk(message: Any) -> Any:
         tool_calls=getattr(message, "tool_calls", []) or [],
         usage_metadata=getattr(message, "usage_metadata", None),
     )
+
+
+# Patch id for rebuilding ContextOverflowError from a failed model Activity.
+# Never change it: it is recorded in histories as a marker.
+_CONTEXT_OVERFLOW_PATCH = "deepagents.context-overflow-recovery"
+
+
+async def _call_model(
+    activity_name: str,
+    activity_input: _activity.ModelActivityInput,
+    *,
+    summary: str,
+    **opts: Any,
+) -> _activity.ModelActivityOutput:
+    """Run the model Activity, raising a provider overflow as ``ContextOverflowError``.
+
+    Deep Agents' summarization middleware summarizes and retries only when the
+    model call raises an overflow it recognizes; an ``ActivityError`` is not one.
+    Histories recorded before this change let the ``ActivityError`` propagate,
+    and the Workflow may have handled it, so they keep that behavior.
+    """
+    from temporalio.deepagents.workflow import call_model
+
+    try:
+        return await call_model(activity_name, activity_input, summary=summary, **opts)
+    except ActivityError as error:
+        cause = error.cause
+        if (
+            isinstance(cause, ApplicationError)
+            and cause.type == _activity.CONTEXT_OVERFLOW_ERROR_TYPE
+            and workflow.patched(_CONTEXT_OVERFLOW_PATCH)
+        ):
+            raise ContextOverflowError(cause.message) from error
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -203,11 +239,9 @@ class TemporalModel(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        from temporalio.deepagents.workflow import call_model
-
         activity_input = self._build_input(messages, None, stop=stop, **kwargs)
         opts = _resolve_activity_options(self.model, self.activity_options)
-        output = await call_model(
+        output = await _call_model(
             _activity.INVOKE_MODEL,
             activity_input,
             summary=self._summary(),
@@ -223,13 +257,11 @@ class TemporalModel(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
-        from temporalio.deepagents.workflow import call_model
-
         topic = _serde.get_settings().streaming_topic
         opts = _resolve_activity_options(self.model, self.activity_options)
         if topic:
             activity_input = self._build_input(messages, topic, stop=stop, **kwargs)
-            output = await call_model(
+            output = await _call_model(
                 _activity.INVOKE_MODEL_STREAMING,
                 activity_input,
                 summary=f"invoke_model_streaming[{self.model}]",
@@ -238,7 +270,7 @@ class TemporalModel(BaseChatModel):
         else:
             # No topic configured: fall back to a single response-level chunk.
             activity_input = self._build_input(messages, None, stop=stop, **kwargs)
-            output = await call_model(
+            output = await _call_model(
                 _activity.INVOKE_MODEL,
                 activity_input,
                 summary=self._summary(),

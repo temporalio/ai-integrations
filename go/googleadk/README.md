@@ -170,6 +170,12 @@ built-in zero-config Gemini fallback (a `nil` config reads `GEMINI_API_KEY` /
 `GOOGLE_API_KEY` worker-side). Supply a factory to inject credentials, disable
 the model SDK's own retries (see below), or override the fallbacks.
 
+The Worker resolves the model by the name passed to `NewModel`. A
+`BeforeModelCallback` that changes `LLMRequest.Model` does not pick another
+Worker model: the resolved model receives the new name, as ADK's models do
+outside Temporal. To use another model, build the agent with
+`NewModel(<name>)`.
+
 ## What you get
 
 - **Every LLM turn is a durable Activity.** `NewModel(name)` returns a `model.LLM`
@@ -252,6 +258,8 @@ the model SDK's own retries (see below), or override the fallbacks.
   / `.A2AError`.
   Classify with `IsNonRetryable(err)`; never string-match. Upstream HTTP status
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
+  A streamed call whose chunks could not all be published fails with
+  `googleadk.StreamError` (see [Streaming](#streaming)).
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
   under Temporal's `RetryPolicy`; leaving the model client's own retries on retries
   a transient failure twice over. Let Temporal own retries.
@@ -365,6 +373,26 @@ func StreamingAgentWorkflow(ctx workflow.Context, q string) (string, error) {
 
 External consumers read chunks with `workflowstreams.NewClient(c, workflowID, ...).Subscribe(...)`.
 The bidirectional `RunLive` path (hard-coded goroutines/channels) is **not** supported.
+
+If a batch of chunks cannot be published, the model call fails with
+`googleadk.StreamError` instead of returning as if every chunk was delivered. It
+is non-retryable when a retry would call the model again and fail the same way:
+
+- **A batch over the server's size limits**: 2 MiB per payload and 4 MiB per
+  gRPC message by default. Configure external storage on the Worker's Client
+  and on every subscriber's Client so large batches are stored, or keep
+  responses smaller.
+- **A run past its Signal limit.** Each batch is one Signal, and a run accepts
+  10,000 Signals by default, counting the Workflow's other Signals. A
+  long-running streaming Workflow, such as a chat session, should
+  continue-as-new well before that, or use a longer batch interval
+  (`WithStreaming(topic, interval)`; the default is 2 seconds).
+- **A batch Workflow Streams gave up on** after its fixed 10-minute retry limit.
+  This needs a model Activity `StartToCloseTimeout` over 10 minutes (the default
+  is 2 minutes), and then a server outage that long ends here too.
+
+Other failures, such as a shorter server outage, are retried; the retry calls
+the model again and publishes its stream again.
 
 ## Composing with other plugins
 
