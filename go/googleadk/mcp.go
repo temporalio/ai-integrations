@@ -65,8 +65,9 @@ func (m *mcpToolset) Name() string { return m.name }
 // toolset's ProcessRequest has run in the agent run, it lists them via the
 // ListMcpTools Activity, applies ToolFilter, and keeps the list for the
 // ProcessRequest call that follows in the same model step. After that,
-// ProcessRequest lists, and Tools returns the list it returned before, without
-// an Activity and without running the filter. See ProcessRequest.
+// ProcessRequest lists, and Tools returns the list the first Tools call of the
+// agent run returned, without an Activity and without running the filter. See
+// ProcessRequest.
 //
 // So the first Tools call of each agent run lists and filters. ADK resumes a
 // confirmed tool call from this list before any ProcessRequest of the run, so
@@ -74,12 +75,19 @@ func (m *mcpToolset) Name() string { return m.name }
 // v2.6.0 and later make before every model step, issue no Workflow commands,
 // so the toolset and its filter issue them at the same points on every ADK
 // release. They return the list ADK v2.5.0 and earlier keep for the whole
-// agent run, even when the MCP server or the filter has changed it since:
-// ADK draws a UUID from the workflow's random stream for each tool it keeps
-// before every model step, so the IDs it generates, such as tool confirmation
-// IDs, stay the same on every release. The proxy tools from that list no
-// longer pack themselves, so ProcessRequest alone decides what the model
-// request declares and dispatches.
+// agent run, even when the MCP server, the filter or another Tools call, such
+// as one from an InstructionProvider, has changed it since: ADK draws a UUID
+// from the workflow's random stream for each tool it keeps before every model
+// step, so the IDs it generates, such as tool confirmation IDs, stay the same
+// on every release. The proxy tools from that list no longer pack themselves,
+// so ProcessRequest alone decides what the model request declares and
+// dispatches.
+//
+// One case still keeps different lists on different releases: an agent that
+// uses the same toolset both directly and through tool.FilterToolset, when the
+// MCP server changes its tools between the two listings of the first step.
+// ADK v2.5.0 and earlier keep both lists; with v2.6.0 the later Tools calls
+// return the first list for both.
 //
 // A toolset wrapped in a toolset without ProcessRequest, such as
 // tool.FilterToolset, lists and filters on every call, because nothing else
@@ -200,9 +208,10 @@ type mcpRunState struct {
 	// processed reports that the toolset's ProcessRequest has run in the agent
 	// run. From then on ProcessRequest lists, and Tools does not.
 	processed bool
-	// returned is the list Tools last returned after listing, which it returns
-	// again once processed.
-	returned []tool.Tool
+	// returned is the list the first Tools call of the agent run returned,
+	// when hasReturned is set. Tools returns it again once processed.
+	returned    []tool.Tool
+	hasReturned bool
 }
 
 // listingsFrom returns the mcpListings NewContext installed, or nil.
@@ -327,7 +336,7 @@ func (l *mcpListings) current(m *mcpToolset, ctx context.Context) *mcpRunState {
 	return l.runs[mcpRunKey{m, run}]
 }
 
-// processedList returns the list Tools returned after listing in the run,
+// processedList returns the list the first Tools call of the run returned,
 // once the toolset's ProcessRequest has run there.
 func (l *mcpListings) processedList(s *mcpRunState) ([]tool.Tool, bool) {
 	if s == nil {
@@ -339,14 +348,20 @@ func (l *mcpListings) processedList(s *mcpRunState) ([]tool.Tool, bool) {
 }
 
 // keepPending keeps a list Tools took for the ProcessRequest call that
-// follows, and the list Tools returns.
+// follows, and, in the first Tools call of the agent run, the list Tools
+// returns. Other Tools calls can come before that ProcessRequest, such as one
+// from an InstructionProvider; they replace the pending list but not the
+// returned one, which ADK v2.5.0 and earlier keep.
 func (l *mcpListings) keepPending(s *mcpRunState, tools, returned []tool.Tool) {
 	if s == nil {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	s.pending, s.hasPending, s.returned = tools, true, returned
+	s.pending, s.hasPending = tools, true
+	if !s.hasReturned {
+		s.returned, s.hasReturned = returned, true
+	}
 }
 
 // takePending returns and drops the list Tools kept, if any.

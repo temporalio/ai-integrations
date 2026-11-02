@@ -457,20 +457,34 @@ var searchDropped atomic.Bool
 
 // catalogChangeWorkflow runs one turn of an MCP agent and returns how many
 // UUIDs ADK drew from the context. With filterDrops, the toolset's ToolFilter
-// drops "search" once searchDropped is set.
-func catalogChangeWorkflow(ctx workflow.Context, filterDrops bool) (int, error) {
+// drops "search" once searchDropped is set. With instructionLists, the
+// agent's InstructionProvider sets searchDropped and lists the toolset, after
+// ADK's own Tools call.
+func catalogChangeWorkflow(ctx workflow.Context, filterDrops, instructionLists bool) (int, error) {
 	opts := googleadk.MCPToolsetOptions{Name: "search-server"}
 	if filterDrops {
 		opts.ToolFilter = func(_ agent.ReadonlyContext, t tool.Tool) bool {
 			return t.Name() != "search" || !searchDropped.Load()
 		}
 	}
-	root, err := llmagent.New(llmagent.Config{
+	ts := googleadk.NewMCPToolset(opts)
+	cfg := llmagent.Config{
 		Name:        "assistant",
 		Model:       googleadk.NewModel("fake-model"),
 		Instruction: "be helpful",
-		Toolsets:    []tool.Toolset{googleadk.NewMCPToolset(opts)},
-	})
+		Toolsets:    []tool.Toolset{ts},
+	}
+	if instructionLists {
+		cfg.Instruction = ""
+		cfg.InstructionProvider = func(rctx agent.ReadonlyContext) (string, error) {
+			searchDropped.Store(true)
+			if _, err := ts.Tools(rctx); err != nil {
+				return "", err
+			}
+			return "be helpful", nil
+		}
+	}
+	root, err := llmagent.New(cfg)
 	if err != nil {
 		return 0, err
 	}
@@ -501,8 +515,10 @@ func catalogChangeWorkflow(ctx workflow.Context, filterDrops bool) (int, error) 
 // ADK draws a UUID for each tool it kept from Tools before every model step:
 // v2.5.0 and earlier keep the first list of the agent run, and v2.6.0 keeps
 // what each step's Tools call returns. If those calls returned the current
-// list, a dropped tool would shift the IDs drawn after it, tool confirmation
-// IDs included, on v2.6.0 only, and Histories would not replay across releases.
+// list, or the list of a later Tools call before the first ProcessRequest,
+// such as an InstructionProvider's, a dropped tool would shift the IDs drawn
+// after it, tool confirmation IDs included, on v2.6.0 only, and Histories
+// would not replay across releases.
 func TestMcpDroppedToolIsNeitherDeclaredNorCalled(t *testing.T) {
 	t.Run("not called", func(t *testing.T) {
 		var hide atomic.Bool
@@ -541,13 +557,14 @@ func TestMcpDroppedToolIsNeitherDeclaredNorCalled(t *testing.T) {
 	t.Run("same generated IDs", func(t *testing.T) {
 		draws := map[string]int{}
 		for _, tc := range []struct {
-			name             string
-			drop, filterDrop bool
-			want             [][]string
+			name                               string
+			drop, filterDrop, instructionLists bool
+			want                               [][]string
 		}{
-			{"unchanged", false, false, [][]string{{"search", "fetch"}, {"search", "fetch"}, {"search", "fetch"}}},
-			{"server drops search", true, false, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}},
-			{"filter drops search", true, true, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}},
+			{"unchanged", false, false, false, [][]string{{"search", "fetch"}, {"search", "fetch"}, {"search", "fetch"}}},
+			{"server drops search", true, false, false, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}},
+			{"filter drops search", true, true, false, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}},
+			{"instruction lists after server drops search", true, false, true, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}},
 		} {
 			searchDropped.Store(false)
 			server := googleadk.NewFakeMCPServer("search-server").
@@ -580,7 +597,7 @@ func TestMcpDroppedToolIsNeitherDeclaredNorCalled(t *testing.T) {
 				}},
 			})
 			env.RegisterWorkflow(catalogChangeWorkflow)
-			env.ExecuteWorkflow(catalogChangeWorkflow, tc.filterDrop)
+			env.ExecuteWorkflow(catalogChangeWorkflow, tc.filterDrop, tc.instructionLists)
 
 			require.True(t, env.IsWorkflowCompleted(), tc.name)
 			require.NoError(t, env.GetWorkflowError(), tc.name)
@@ -594,6 +611,7 @@ func TestMcpDroppedToolIsNeitherDeclaredNorCalled(t *testing.T) {
 		searchDropped.Store(false)
 		assert.Equal(t, draws["unchanged"], draws["server drops search"], "UUIDs drawn: %v", draws)
 		assert.Equal(t, draws["unchanged"], draws["filter drops search"], "UUIDs drawn: %v", draws)
+		assert.Equal(t, draws["unchanged"], draws["instruction lists after server drops search"], "UUIDs drawn: %v", draws)
 	})
 }
 
