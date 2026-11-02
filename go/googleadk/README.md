@@ -205,7 +205,24 @@ outside Temporal. To use another model, build the agent with
   toolset name — the toolset is cached and shared across calls — and the plugin
   closes any cached toolset that implements `Close() error` at worker stop
   automatically; with manual wiring, call `Activities.Close` yourself after
-  `worker.Run` returns.
+  `worker.Run` returns. A tool's own error, such as an MCP `isError` result,
+  reaches the model once, as it does without Temporal; `CallMcpTool` succeeds
+  and is not retried. The plugin counts an error as the tool's own when it
+  wraps no other error and is not an `ApplicationError`. ADK's MCP tools wrap
+  the error of a failed MCP request, so that error fails `CallMcpTool` with a
+  retryable `googleadk.McpError`, as does an error returned after the Worker
+  stops the call. To have a failure in your own toolset or a `FakeMCPServer`
+  handler retried, wrap its cause with `%w` or return a retryable
+  `temporal.ApplicationError`.
+
+  If an agent or a runner plugin has a tool-error callback, or an after-tool
+  callback that treats errors differently from results, don't run Workers of an
+  earlier version and this one on the same Task Queue. An earlier Workflow
+  Worker hands this version's tool error to ADK as a result and skips the
+  callback, so the run fails to replay on the other version or closes as
+  `Failed`. Deploy this version on a new Task Queue, or stop every earlier
+  Worker before you start this version's. If you roll back, keep runs that ran
+  on this version on its Workers until they close.
 - **Remote A2A agents.** Build ADK's remote agent (`remoteagent.NewA2A`) with
   `AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, activityOptions)`
   and `ClientProvider: googleadk.NewA2AClientProvider(activityOptions)`. The card
@@ -255,9 +272,23 @@ outside Temporal. To use another model, build the agent with
   serial fallback.
 - **Typed failures.** Model / tool / MCP / A2A failures surface as Temporal
   `ApplicationError`s tagged `googleadk.ModelError` / `.ToolError` / `.McpError`
-  / `.A2AError`.
+  / `.A2AError`. An MCP tool's own error is not one of these: ADK, its
+  tool-error callbacks and the model get an error with the tool's message, as
+  without Temporal, not a `googleadk.McpError`. Its Go type and identity don't
+  cross the Activity boundary, so `errors.Is` and `errors.As` don't match it;
+  a callback can only check its message (see **MCP, statelessly** above).
   Classify with `IsNonRetryable(err)`; never string-match. Upstream HTTP status
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
+  The status is read from a `genai.APIError`, or else from an int `StatusCode`
+  field of 400 or more on any error the model returns or wraps, as openai-go's
+  errors have. A custom `model.LLM` can expose its status the same way.
+  A streamed call whose chunks could not all be published fails with
+  `googleadk.StreamError` (see [Streaming](#streaming)).
+  A non-streamed Gemini reply with no candidates, which is how Gemini answers a
+  blocked prompt, fails at once as a non-retryable `googleadk.ModelError`, like
+  a permanent `4xx`: ADK returns it as `empty response`, with no status. With
+  `WithStreaming`, ADK returns the block as a response with an `ErrorCode`
+  instead. Other errors without a status are retried.
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
   under Temporal's `RetryPolicy`; leaving the model client's own retries on retries
   a transient failure twice over. Let Temporal own retries.
@@ -371,6 +402,26 @@ func StreamingAgentWorkflow(ctx workflow.Context, q string) (string, error) {
 
 External consumers read chunks with `workflowstreams.NewClient(c, workflowID, ...).Subscribe(...)`.
 The bidirectional `RunLive` path (hard-coded goroutines/channels) is **not** supported.
+
+If a batch of chunks cannot be published, the model call fails with
+`googleadk.StreamError` instead of returning as if every chunk was delivered. It
+is non-retryable when a retry would call the model again and fail the same way:
+
+- **A batch over the server's size limits**: 2 MiB per payload and 4 MiB per
+  gRPC message by default. Configure external storage on the Worker's Client
+  and on every subscriber's Client so large batches are stored, or keep
+  responses smaller.
+- **A run past its Signal limit.** Each batch is one Signal, and a run accepts
+  10,000 Signals by default, counting the Workflow's other Signals. A
+  long-running streaming Workflow, such as a chat session, should
+  continue-as-new well before that, or use a longer batch interval
+  (`WithStreaming(topic, interval)`; the default is 2 seconds).
+- **A batch Workflow Streams gave up on** after its fixed 10-minute retry limit.
+  This needs a model Activity `StartToCloseTimeout` over 10 minutes (the default
+  is 2 minutes), and then a server outage that long ends here too.
+
+Other failures, such as a shorter server outage, are retried; the retry calls
+the model again and publishes its stream again.
 
 ## Composing with other plugins
 

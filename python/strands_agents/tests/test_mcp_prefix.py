@@ -1,18 +1,21 @@
+import re
 import sys
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
+import pytest
+from mcp import Client as MCPClient
 from mcp import StdioServerParameters, stdio_client
 from mcp.types import Tool, ToolAnnotations
-from strands.tools.mcp.mcp_client import MCPClient
+from strands.tools.mcp import MCPAgentTool, ToolFilters
 
 from temporalio import workflow
 from temporalio.client import Client
-from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.mcp import TemporalMCPClient as DurableMCPClient
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent, TemporalMCPClient
-from temporalio.strands_agents._temporal_mcp_client import _MCPToolInfo, _tool_infos
+from temporalio.strands_agents._temporal_mcp_client import _included
 from temporalio.strands_agents._temporal_mcp_tool import TemporalMCPTool
 from temporalio.worker import Replayer, Worker
 from tests.common import get_activities
@@ -24,88 +27,76 @@ _ECHO_SCHEMA: dict[str, Any] = {
 }
 
 
-def _client(**kwargs: Any) -> MCPClient:
-    # Never connected: _tool_infos only reads the client's prefix and filters.
-    return MCPClient(
-        lambda: stdio_client(StdioServerParameters(command="unused")), **kwargs
+def _tool(
+    name: str, annotations: ToolAnnotations | None = None, prefix: str | None = None
+) -> TemporalMCPTool:
+    # Never called: these tests only read the tool's name, spec and filters.
+    return TemporalMCPTool(
+        DurableMCPClient("gh"),
+        Tool(
+            name=name,
+            description=f"Run {name}",
+            input_schema=_ECHO_SCHEMA,
+            annotations=annotations,
+        ),
+        prefix,
     )
 
 
-def _tool(name: str, annotations: ToolAnnotations | None = None) -> Tool:
-    return Tool(
-        name=name,
-        description=f"Run {name}",
-        inputSchema=_ECHO_SCHEMA,
-        annotations=annotations,
-    )
+def test_tools_apply_client_prefix() -> None:
+    tool = _tool("echo", prefix="gh")
 
-
-def test_tool_infos_apply_client_prefix() -> None:
-    infos = _tool_infos(_client(prefix="gh"), [_tool("echo")])
-
-    assert [(info.name, info.agent_name) for info in infos] == [("echo", "gh_echo")]
-    tool = TemporalMCPTool("gh", infos[0], {})
+    assert tool.mcp_tool.name == "echo"
     assert tool.tool_name == "gh_echo"
     assert tool.tool_spec["name"] == "gh_echo"
 
 
-def test_tool_infos_without_prefix_keep_the_server_name() -> None:
-    infos = _tool_infos(_client(), [_tool("echo")])
+def test_tools_without_prefix_keep_the_server_name() -> None:
+    tool = _tool("echo")
 
-    assert [(info.name, info.agent_name) for info in infos] == [("echo", "echo")]
-    tool = TemporalMCPTool("gh", infos[0], {})
     assert tool.tool_name == "echo"
     assert tool.tool_spec["name"] == "echo"
     assert "annotations" not in tool.tool_spec
 
 
-def test_tool_filters_still_match_the_server_name_when_prefixed() -> None:
-    client = _client(prefix="gh", tool_filters={"allowed": ["echo"]})
+@pytest.mark.parametrize(
+    ("filters", "included"),
+    [
+        ({"allowed": ["echo"]}, ["echo"]),
+        ({"allowed": [re.compile("ot")]}, ["other"]),
+        ({"rejected": [lambda tool: tool.tool_name == "gh_echo"]}, ["other"]),
+        # Callables get the tool Strands' MCPClient would give them.
+        ({"allowed": [lambda tool: isinstance(tool, MCPAgentTool)]}, ["echo", "other"]),
+        # Like Strands, entries of another type are ignored.
+        (cast(Any, {"allowed": [None, "echo"]}), ["echo"]),
+    ],
+)
+def test_tool_filters_still_match_the_server_name_when_prefixed(
+    filters: ToolFilters, included: list[str]
+) -> None:
+    tools = [_tool("echo", prefix="gh"), _tool("other", prefix="gh")]
 
-    infos = _tool_infos(client, [_tool("echo"), _tool("other")])
-
-    assert [(info.name, info.agent_name) for info in infos] == [("echo", "gh_echo")]
+    assert [t.mcp_tool.name for t in tools if _included(t, filters)] == included
 
 
-def test_tool_infos_carry_annotations() -> None:
-    annotations = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
-    infos = _tool_infos(
-        _client(prefix="gh"), [_tool("echo", annotations), _tool("plain")]
-    )
+def test_tools_carry_annotations() -> None:
+    annotations = ToolAnnotations(read_only_hint=True, destructive_hint=False)
 
-    assert infos[0].annotations == {"readOnlyHint": True, "destructiveHint": False}
-    assert infos[1].annotations is None
-    annotated = TemporalMCPTool("gh", infos[0], {}).tool_spec
-    assert annotated.get("annotations") == {
+    assert _tool("echo", annotations, prefix="gh").tool_spec.get("annotations") == {
         "readOnlyHint": True,
         "destructiveHint": False,
     }
-    assert "annotations" not in TemporalMCPTool("gh", infos[1], {}).tool_spec
+    assert "annotations" not in _tool("plain", prefix="gh").tool_spec
 
 
-def test_tool_info_recorded_before_agent_name_still_decodes() -> None:
-    """A list-tools result recorded by an older version replays with the old name."""
-    payload = pydantic_data_converter.payload_converter.to_payload(
-        {"name": "echo", "description": "d", "input_schema": _ECHO_SCHEMA}
-    )
-
-    (info,) = pydantic_data_converter.payload_converter.from_payloads(
-        [payload], [_MCPToolInfo]
-    )
-
-    assert (info.agent_name, info.annotations) == (None, None)
-    assert TemporalMCPTool("gh", info, {}).tool_name == "echo"
-
-
-def _labeled_client_factory(label: str, prefix: str) -> Any:
+def _labeled_client_factory(label: str) -> Any:
     return lambda: MCPClient(
-        lambda: stdio_client(
+        stdio_client(
             StdioServerParameters(
                 command=sys.executable,
                 args=[str(Path(__file__).parent / "labeled_mcp_server.py"), label],
             )
-        ),
-        prefix=prefix,
+        )
     )
 
 
@@ -117,10 +108,16 @@ class MCPPrefixWorkflow:
             start_to_close_timeout=timedelta(seconds=30),
             tools=[
                 TemporalMCPClient(
-                    "gh", cache_tools=True, start_to_close_timeout=timedelta(seconds=30)
+                    "gh",
+                    prefix="gh",
+                    cache_tools=True,
+                    start_to_close_timeout=timedelta(seconds=30),
                 ),
                 TemporalMCPClient(
-                    "gl", cache_tools=True, start_to_close_timeout=timedelta(seconds=30)
+                    "gl",
+                    prefix="gl",
+                    cache_tools=True,
+                    start_to_close_timeout=timedelta(seconds=30),
                 ),
             ],
         )
@@ -154,8 +151,8 @@ async def test_mcp_prefix_and_annotations(client: Client) -> None:
             )
         },
         mcp_clients={
-            "gh": _labeled_client_factory("gh", "gh"),
-            "gl": _labeled_client_factory("gl", "gl"),
+            "gh": _labeled_client_factory("gh"),
+            "gl": _labeled_client_factory("gl"),
         },
     )
 
@@ -188,12 +185,12 @@ async def test_mcp_prefix_and_annotations(client: Client) -> None:
     history = await handle.fetch_history()
     assert get_activities(history) == [
         "strands_get_model_config",
-        "gh-list-tools",
-        "gl-list-tools",
+        "temporalio.mcp.gh.list-tools",
+        "temporalio.mcp.gl.list-tools",
         "invoke_model",
-        "gh-call-tool",
+        "temporalio.mcp.gh.call-tool",
         "invoke_model",
-        "gl-call-tool",
+        "temporalio.mcp.gl.call-tool",
         "invoke_model",
     ]
 
