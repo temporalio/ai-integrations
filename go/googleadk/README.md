@@ -266,14 +266,13 @@ the model SDK's own retries (see below), or override the fallbacks.
   serial fallback.
 - **Typed failures.** Model / tool / MCP / A2A failures surface as Temporal
   `ApplicationError`s tagged `googleadk.ModelError` / `.ToolError` / `.McpError`
-  / `.A2AError`.
+  / `.A2AError`. An MCP tool's own error is not one of these: ADK, its
+  tool-error callbacks and the model get an error with the tool's message, as
+  without Temporal, not a `googleadk.McpError`. Its Go type and identity don't
+  cross the Activity boundary, so `errors.Is` and `errors.As` don't match it;
+  a callback can only check its message (see **MCP, statelessly** above).
   Classify with `IsNonRetryable(err)`; never string-match. Upstream HTTP status
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
-  An MCP tool's own error is not one of these failures: ADK, its tool-error
-  callbacks and the model get an error with the tool's message, as without
-  Temporal, not a `googleadk.McpError`. Its Go type and identity don't cross
-  the Activity boundary, so `errors.Is` and `errors.As` don't match it; match
-  on the message (see **MCP, statelessly** above).
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
   under Temporal's `RetryPolicy`; leaving the model client's own retries on retries
   a transient failure twice over. Let Temporal own retries.
