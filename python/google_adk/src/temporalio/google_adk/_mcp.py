@@ -1,7 +1,6 @@
 import asyncio
 import contextvars
 import functools
-import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -424,8 +423,8 @@ async def _execute_operation(
             return await operation
         except BaseException as err:
             if cancelled_by_session and is_cancelled_exception(err):
-                # Keep the session's failure as the cause; the operation's own
-                # cancellation stays as the context.
+                # Keep the session's failure as the cause, as when the session
+                # ends with no operation waiting.
                 raise _session_ended_failure(session)
             raise
         finally:
@@ -551,61 +550,77 @@ class _SessionHeartbeats:
         handle = self._client.get_workflow_handle(
             self._workflow_id, run_id=self._run_id
         )
-        deadline = time.monotonic() + _STORE_TIMEOUT
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _STORE_TIMEOUT
         delay = 0.1
-        while True:
-            try:
-                description = await handle.describe()
-            except RPCError as err:
-                if err.status in _DESCRIBE_REFUSALS:
-                    raise ApplicationError(
-                        "The stateful MCP session activity confirms its first "
-                        "heartbeat with DescribeWorkflowExecution, and the "
-                        f"server refused it ({err.status.name}: {err.message}). "
-                        "Give the worker's client permission to describe "
-                        "workflows in this namespace.",
-                        type="DedicatedWorkerFailure",
-                        non_retryable=True,
-                    ) from err
-                if time.monotonic() > deadline:
-                    raise
-            else:
-                pending = next(
-                    (
-                        pending
-                        for pending in description.raw_description.pending_activities
-                        if pending.activity_id == self._activity_id
-                    ),
-                    None,
-                )
-                if pending is None or pending.attempt != self._attempt:
-                    # A later attempt or the workflow's end replaced this one,
-                    # and the details on the server are not this attempt's.
-                    raise ApplicationError(
-                        "This stateful MCP session activity attempt is no "
-                        "longer the current one."
-                    )
-                try:
-                    details = await self._data_converter.decode(
-                        pending.heartbeat_details.payloads
-                    )
-                except Exception as err:
-                    raise ApplicationError(
-                        "The stateful MCP session activity could not decode its "
-                        "own heartbeat details.",
-                        type="DedicatedWorkerFailure",
-                        non_retryable=True,
-                    ) from err
-                if _SESSION_MAY_BE_OPEN in details or _SESSION_OPENED in details:
-                    return
-                if time.monotonic() > deadline:
-                    raise ApplicationError(
-                        "The server did not show the stateful MCP session "
-                        f"activity's first heartbeat within {_STORE_TIMEOUT:g} "
-                        "seconds."
-                    )
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 2.0)
+        last_error: RPCError | None = None
+        # The deadline also bounds a describe that the client keeps retrying,
+        # and the decoding of the details.
+        scope = asyncio.timeout_at(deadline)
+        try:
+            async with scope:
+                while True:
+                    try:
+                        description = await handle.describe(
+                            rpc_timeout=timedelta(
+                                seconds=max(deadline - loop.time(), 0.001)
+                            )
+                        )
+                    except RPCError as err:
+                        if err.status in _DESCRIBE_REFUSALS:
+                            raise ApplicationError(
+                                "The stateful MCP session activity confirms its "
+                                "first heartbeat with DescribeWorkflowExecution, "
+                                "and the server refused it "
+                                f"({err.status.name}: {err.message}). Give the "
+                                "worker's client permission to describe "
+                                "workflows in this namespace.",
+                                type="DedicatedWorkerFailure",
+                                non_retryable=True,
+                            ) from err
+                        last_error = err
+                    else:
+                        pending = next(
+                            (
+                                pending
+                                for pending in description.raw_description.pending_activities
+                                if pending.activity_id == self._activity_id
+                            ),
+                            None,
+                        )
+                        if pending is None or pending.attempt != self._attempt:
+                            # A later attempt or the workflow's end replaced this
+                            # one, and the details on the server are not this
+                            # attempt's.
+                            raise ApplicationError(
+                                "This stateful MCP session activity attempt is no "
+                                "longer the current one."
+                            )
+                        try:
+                            details = await self._data_converter.decode(
+                                pending.heartbeat_details.payloads
+                            )
+                        except Exception as err:
+                            raise ApplicationError(
+                                "The stateful MCP session activity could not "
+                                "decode its own heartbeat details.",
+                                type="DedicatedWorkerFailure",
+                                non_retryable=True,
+                            ) from err
+                        if (
+                            _SESSION_MAY_BE_OPEN in details
+                            or _SESSION_OPENED in details
+                        ):
+                            return
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 2.0)
+        except TimeoutError:
+            if not scope.expired():
+                raise
+            raise ApplicationError(
+                "The server did not show the stateful MCP session activity's "
+                f"first heartbeat within {_STORE_TIMEOUT:g} seconds."
+            ) from last_error
 
     def record_opened(self) -> None:
         """Records that the toolset opened an MCP session."""

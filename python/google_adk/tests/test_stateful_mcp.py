@@ -269,6 +269,15 @@ class _ReplacedInput:
     schedule_to_start_timeout: bool = True
     session_task_queue: str | None = None
     wait_cancellation: bool = False
+    abandon: bool = False
+
+
+@dataclass
+class _RaisedError:
+    type: str
+    application_type: str | None
+    non_retryable: bool
+    message: str
 
 
 @workflow.defn
@@ -276,7 +285,7 @@ class StatefulMcpWorkerReplacedWorkflow:
     def __init__(self) -> None:
         self._listed: list[str] | None = None
         self._resume = False
-        self._failure: list[str] = []
+        self._raised: list[_RaisedError] = []
 
     @workflow.run
     async def run(self, input: _ReplacedInput) -> list[str]:
@@ -290,6 +299,8 @@ class StatefulMcpWorkerReplacedWorkflow:
             config["cancellation_type"] = (
                 ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
             )
+        if input.abandon:
+            config["cancellation_type"] = ActivityCancellationType.ABANDON
         server_session_config = ActivityConfig(
             start_to_close_timeout=timedelta(hours=1)
         )
@@ -308,21 +319,28 @@ class StatefulMcpWorkerReplacedWorkflow:
             try:
                 return [t.name for t in await toolset.get_tools()]
             except ApplicationError as err:
-                # The block's exit replaces this error, so keep its causes.
+                # What a caller sees inside the block, before cleanup.
                 cause: BaseException | None = err
                 while cause is not None:
-                    self._failure.append(str(cause))
+                    self._raised.append(
+                        _RaisedError(
+                            type(cause).__name__,
+                            getattr(cause, "type", None),
+                            getattr(cause, "non_retryable", False),
+                            str(cause),
+                        )
+                    )
                     cause = cause.__cause__
                 raise
+
+    @workflow.query
+    def raised(self) -> list[_RaisedError]:
+        return self._raised
 
     @workflow.update
     async def wait_listed(self) -> list[str]:
         await workflow.wait_condition(lambda: self._listed is not None)
         return self._listed or []
-
-    @workflow.query
-    def failure(self) -> list[str]:
-        return self._failure
 
     @workflow.signal
     def resume(self) -> None:
@@ -512,6 +530,8 @@ async def test_stateful_session_after_worker_replaced(
     "case",
     [
         "operation_waiting",
+        "operation_waiting_abandon",
+        "operation_waiting_wait_cancellation",
         "operation_after_refusal",
         "operation_after_refusal_wait_cancellation",
     ],
@@ -546,6 +566,7 @@ async def test_stateful_operations_fail_after_session_refused(
                     schedule_to_start_timeout=False,
                     session_task_queue=host_task_queue,
                     wait_cancellation=case.endswith("wait_cancellation"),
+                    abandon=case.endswith("abandon"),
                 ),
                 id=f"stateful-mcp-refused-{uuid.uuid4()}",
                 task_queue=task_queue,
@@ -556,7 +577,7 @@ async def test_stateful_operations_fail_after_session_refused(
             ) == ["echo"]
         # The session's host shut down gracefully after it opened a session.
 
-        if case == "operation_waiting":
+        if case.startswith("operation_waiting"):
             await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
             async with asyncio.timeout(20):
                 while not any(
@@ -579,13 +600,22 @@ async def test_stateful_operations_fail_after_session_refused(
             async with asyncio.timeout(30):
                 with pytest.raises(WorkflowFailureError) as err:
                     await handle.result()
-            failure = await handle.query(StatefulMcpWorkerReplacedWorkflow.failure)
+        raised = await handle.query(StatefulMcpWorkerReplacedWorkflow.raised)
 
     assert factory_calls == 1
     _assert_refused(err.value)
-    # The operation's own error names the session's refusal as its cause.
-    assert any("An earlier attempt" in message for message in failure), failure
-    # The waiting operation was cancelled; none was scheduled after the session
+    # Inside the block, the operation's error has the session's failure as its
+    # cause in every cancellation mode, not the operation's cancellation.
+    assert raised[0].type == "ApplicationError", raised
+    assert raised[0].application_type == "DedicatedWorkerFailure", raised
+    assert [e.type for e in raised[1:3]] == ["ActivityError", "ApplicationError"], (
+        raised
+    )
+    assert raised[2].application_type == "DedicatedWorkerFailure", raised
+    assert raised[2].non_retryable, raised
+    assert "An earlier attempt" in raised[2].message, raised
+    # The waiting operation was cancelled unless its cancellation type waits
+    # for the cancel to be confirmed; none was scheduled after the session
     # ended.
     scheduled = [
         event.activity_task_scheduled_event_attributes.activity_type.name
@@ -593,7 +623,7 @@ async def test_stateful_operations_fail_after_session_refused(
         if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
     ]
     assert len([n for n in scheduled if n.endswith("-list-tools")]) == (
-        2 if case == "operation_waiting" else 1
+        2 if case.startswith("operation_waiting") else 1
     )
     assert await _has_event(
         handle, EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED
@@ -646,10 +676,37 @@ class _DenyDescribeOutbound(OutboundInterceptor):
         raise RPCError("Request unauthorized.", RPCStatusCode.PERMISSION_DENIED, b"")
 
 
+class _StallDescribeOutbound(OutboundInterceptor):
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        await asyncio.Event().wait()
+
+
+class _StallDescribe(Interceptor):
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _StallDescribeOutbound(next)
+
+
+class _StallReadBackCodec(PayloadCodec):
+    """Never finishes decoding the details the session activity reads back."""
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("wait_until_stored"):
+            await asyncio.Event().wait()
+        return list(payloads)
+
+
 @pytest.mark.timeout(90)
-async def test_stateful_session_without_describe_permission(client: Client):
+@pytest.mark.parametrize("case", ["refused", "describe_stalls", "decode_stalls"])
+async def test_stateful_session_without_describe_permission(
+    client: Client, case: str, monkeypatch: pytest.MonkeyPatch
+):
     # The worker's client may not describe the workflow: the session activity
-    # fails at once with an error that says so, and the run fails with it.
+    # fails at once with an error that says so, and the run fails with it. A
+    # describe or decoding that never ends fails the attempt at the deadline.
+    monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
     factory_calls = 0
 
     def factory(_: Any) -> McpToolset:
@@ -659,7 +716,13 @@ async def test_stateful_session_without_describe_permission(client: Client):
 
     provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
     config = client.config()
-    config["interceptors"] = [*config["interceptors"], _DenyDescribe()]
+    if case == "decode_stalls":
+        config["data_converter"] = dataclasses.replace(
+            client.data_converter, payload_codec=_StallReadBackCodec()
+        )
+    else:
+        interceptor = _DenyDescribe() if case == "refused" else _StallDescribe()
+        config["interceptors"] = [*config["interceptors"], interceptor]
     worker_client = _make_client(Client(**config), provider)
     task_queue = f"adk-stateful-mcp-describe-{uuid.uuid4()}"
     async with Worker(
@@ -675,6 +738,21 @@ async def test_stateful_session_without_describe_permission(client: Client):
             task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
+        if case != "refused":
+            # The attempt fails at the 2-second deadline and is retried.
+            async with asyncio.timeout(20):
+                while True:
+                    session = await _session_activity(handle)
+                    if session and session.last_failure.message:
+                        break
+                    await asyncio.sleep(0.2)
+            await handle.terminate()
+            assert factory_calls == 0
+            assert session.last_failure.message == (
+                "The server did not show the stateful MCP session activity's "
+                "first heartbeat within 2 seconds."
+            )
+            return
         async with asyncio.timeout(20):
             with pytest.raises(WorkflowFailureError) as err:
                 await handle.result()
