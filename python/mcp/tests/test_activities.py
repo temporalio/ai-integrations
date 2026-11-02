@@ -279,25 +279,9 @@ async def test_protocol_error_is_retryable_unless_a_retry_cannot_fix_it(
     assert err.value.details == ((code,) if data is None else (code, data))
 
 
-@pytest.mark.parametrize(
-    ("not_found_body", "message"),
-    [
-        (None, "Session terminated"),
-        (
-            {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": INVALID_REQUEST, "message": "Session not found"},
-            },
-            "Session not found",
-        ),
-    ],
-)
-async def test_lost_session_over_streamable_http_is_retried_with_a_new_session(
-    not_found_body: dict[str, Any] | None, message: str
-) -> None:
+async def test_lost_session_with_an_empty_404_is_retried_with_a_new_session() -> None:
     # An older-protocol server that forgets its first session before the first
-    # call, as after a restart, and answers it with HTTP 404.
+    # call, as after a restart, and answers it with an empty HTTP 404.
     sessions: list[str] = []
     calls = 0
 
@@ -331,9 +315,7 @@ async def test_lost_session_over_streamable_http_is_retried_with_a_new_session(
         if rpc["method"] == "tools/call":
             calls += 1
             if calls == 1:
-                if not_found_body is None:
-                    return httpx2.Response(404)
-                return httpx2.Response(404, json=not_found_body)
+                return httpx2.Response(404)
             return reply({"content": [{"type": "text", "text": "ok"}]})
         error = {"code": METHOD_NOT_FOUND, "message": "Method not found"}
         return httpx2.Response(
@@ -357,7 +339,7 @@ async def test_lost_session_over_streamable_http_is_retried_with_a_new_session(
         "meta": None,
     }
     try:
-        with pytest.raises(ApplicationError, match=message) as err:
+        with pytest.raises(ApplicationError, match="Session terminated") as err:
             await call_tool(request)
         # Temporal's retry: a new connection and session.
         result = await call_tool(request)
@@ -369,6 +351,67 @@ async def test_lost_session_over_streamable_http_is_retried_with_a_new_session(
     assert err.value.details == (INVALID_REQUEST,)
     assert result["content"][0]["text"] == "ok"
     assert sessions == ["s1", "s2"]
+
+
+async def test_lost_session_from_the_sdk_session_manager_is_retried() -> None:
+    # mcp's own session manager answers a session id it never issued with
+    # HTTP 404 "Session not found".
+    server = MCPServer("lost-session")
+
+    @server.tool()
+    def lookup() -> str:  # type: ignore[reportUnusedFunction]
+        return "ok"
+
+    app = server.streamable_http_app()
+    sessions: list[str] = []
+
+    async def lose_first_session(request: httpx2.Request) -> None:
+        if request.method != "POST":
+            return
+        if json.loads(request.content).get("method") != "tools/call":
+            return
+        sessions.append(request.headers["mcp-session-id"])
+        if len(sessions) == 1:
+            request.headers["mcp-session-id"] = "unknown"
+
+    def factory() -> _MCPClientBackend:
+        http_client = httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app),
+            event_hooks={"request": [lose_first_session]},
+        )
+        # 127.0.0.1 passes the server's default host check, and "legacy"
+        # negotiates the older protocol, which has sessions.
+        return _MCPClientBackend(
+            Client(
+                streamable_http_client(
+                    "http://127.0.0.1:8000/mcp", http_client=http_client
+                ),
+                mode="legacy",
+            )
+        )
+
+    support = _MCPActivities({"test": factory}, idle_timeout=timedelta(minutes=5))
+    call_tool = _activity_by_name(support, "temporalio.mcp.test.call-tool")
+    request: dict[str, Any] = {
+        "factory_argument": None,
+        "name": "lookup",
+        "arguments": {},
+        "meta": None,
+    }
+    async with server.session_manager.run():
+        try:
+            with pytest.raises(ApplicationError, match="Session not found") as err:
+                await call_tool(request)
+            # Temporal's retry: a new connection and session.
+            result = await call_tool(request)
+        finally:
+            await support._pool.close()
+
+    assert err.value.type == "MCPProtocolError"
+    assert err.value.non_retryable is False
+    assert err.value.details == (INVALID_REQUEST,)
+    assert result["content"][0]["text"] == "ok"
+    assert len(sessions) == 2 and sessions[0] != sessions[1]
 
 
 async def test_permanent_protocol_error_fails_without_retry() -> None:
