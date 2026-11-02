@@ -1041,7 +1041,10 @@ async def test_stateful_session_after_host_killed(
                         handle, EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED
                     ):
                         await asyncio.sleep(0.2)
-                await handle.signal(StatefulMcpHostKilledWorkflow.resume)
+                if not call_waiting:
+                    # A waiting call needs no signal: the run may already
+                    # have ended.
+                    await handle.signal(StatefulMcpHostKilledWorkflow.resume)
                 # A waiting call fails with the session, not after its
                 # start-to-close timeout.
                 async with asyncio.timeout(10):
