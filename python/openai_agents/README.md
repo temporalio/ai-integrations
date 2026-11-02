@@ -414,8 +414,8 @@ message's `content`, as lists.
 To do this, importing `temporalio.openai_agents` changes the `Iterable[X]` fields of the `openai`
 input item types to `list[X]` for the whole process. Type checkers still see `Iterable`. At runtime,
 `typing.get_type_hints()` reports `list`, your own pydantic validation of those types returns lists,
-and in strict mode it rejects a tuple or generator there. Requests the `openai` client sends are
-unchanged.
+and in strict mode it rejects a tuple or generator there. The `openai` client no longer accepts an
+iterator in those fields: pass a list.
 
 The payload converter also decodes your own `Iterable` fields as lists when they are the decoded
 value itself, fields of a dataclass or pydantic model, dict values or list items, so code that
