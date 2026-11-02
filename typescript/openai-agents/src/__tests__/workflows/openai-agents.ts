@@ -320,6 +320,11 @@ export interface ApprovalResumeContextResult {
   longHistoryWrites: string[];
   longHistoryInterruptions: number;
   longHistoryApprovedCallIds: number;
+  renamedResumeThrew: boolean;
+  renamedSavedAgent: string;
+  renamedRehydratedWrites: string[];
+  renamedRetryWrites: string[];
+  renamedInterruptions: number;
 }
 
 /** An agent whose `clone` carries a private field, which can't be copied onto another object. */
@@ -400,7 +405,8 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
  * not add a copy of them each time. Then a rejection message changes after a failed resume, and the retry
  * must send the model the new one, also for a call that a later rejection for good covers. Last, a root and
  * its handoff target share a name, and their resumes must not add a copy of the approvals each time. Last,
- * the retry of a saved state with a long approval history must finish.
+ * the retry of a saved state with a long approval history must finish. Last, a resume fails because the
+ * agent was renamed, and once the name is put back, the state must still save and resume under it.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -1017,6 +1023,25 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
   }
   const longHistoryRetried = await runner.run(longHistoryAgent, longHistoryState);
 
+  // The agent is renamed between an interruption and its resume, so the restore fails after the conversion
+  // gave the state's own agent objects the new name. Once the name is put back, the state must save under
+  // the name it ran with, and both its rehydrated copy and a retry of the state itself must run the call.
+  const renamedCtx: ResumeContext = { original: 'renamed', writes: [] };
+  const renamedAgent = new Agent<ResumeContext>({ name: 'Original', model: 'gpt-4o-mini', tools: [setAfter] });
+  const pausedRenamed = await runner.run(renamedAgent, 'go', { context: renamedCtx });
+  pausedRenamed.state.approve(pausedRenamed.interruptions[0]!);
+  renamedAgent.name = 'Changed';
+  let renamedResumeThrew = false;
+  try {
+    await runner.run(renamedAgent, pausedRenamed.state);
+  } catch {
+    renamedResumeThrew = true;
+  }
+  renamedAgent.name = 'Original';
+  const renamedSaved = pausedRenamed.state.toString();
+  const renamedRehydrated = await runner.run(renamedAgent, await RunState.fromString(renamedAgent, renamedSaved));
+  const renamedRetried = await runner.run(renamedAgent, pausedRenamed.state);
+
   return {
     callerAfter: ctx.after,
     resumedUsesCallerObject: result.runContext.context === ctx,
@@ -1076,5 +1101,10 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     longHistoryWrites: longHistoryRetried.runContext.context.writes,
     longHistoryInterruptions: longHistoryRetried.interruptions.length,
     longHistoryApprovedCallIds: countApprovalOwners(longHistoryState._context).approvedCallIds,
+    renamedResumeThrew,
+    renamedSavedAgent: JSON.parse(renamedSaved).currentAgent.name,
+    renamedRehydratedWrites: renamedRehydrated.runContext.context.writes,
+    renamedRetryWrites: renamedRetried.runContext.context.writes,
+    renamedInterruptions: renamedRehydrated.interruptions.length + renamedRetried.interruptions.length,
   };
 }

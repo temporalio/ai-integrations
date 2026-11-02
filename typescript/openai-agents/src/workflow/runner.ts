@@ -60,17 +60,19 @@ const resumeConversions = new WeakMap<object, Map<Agent<any, any>, Conversion>>(
  * Converts `agent`'s graph. With `into`, the conversion reuses those of `into`'s agent objects that
  * `convertAgent` can: each one gets the fields a fresh conversion would give it, and keeps its identity.
  * `into` then maps each source agent to its latest converted agent. It keeps them even if the resume
- * fails, since the restore may already have merged the state's approvals under them.
+ * fails, since the restore may already have merged the state's approvals under them. `undo` collects
+ * functions that give the reused objects back their earlier fields.
  */
 function convertAgentGraph(
   agent: Agent<any, any>,
   modelParams: ModelActivityOptions,
   modelOverride: string | undefined,
   sandbox: SandboxRunConfig | undefined,
-  into?: Conversion
+  into?: Conversion,
+  undo?: (() => void)[]
 ): Conversion {
   const convertedBySource = new Map<Agent<any, any>, Agent<any, any>>();
-  const converted = convertAgent(agent, modelParams, convertedBySource, modelOverride, into?.agents);
+  const converted = convertAgent(agent, modelParams, convertedBySource, modelOverride, into?.agents, undo);
   if (sandbox !== undefined) {
     propagateAgentToolSandboxConfig(converted, sandbox);
   }
@@ -215,6 +217,15 @@ function approvalDecisions(record: ApprovalRecord): (callId: string | undefined)
 function rejectionMessage(record: ApprovalRecord, callId: string | undefined): string | undefined {
   if (callId !== undefined && typeof record.messages?.[callId] === 'string') return record.messages[callId];
   return record.rejected === true ? record.stickyRejectMessage : undefined;
+}
+
+/**
+ * Gives the objects a conversion reused back the fields they had before it. States saved on those objects
+ * serialize their agents by name, so a resume that fails before it runs must not leave them with a
+ * configuration, such as a new name, that the state can't be restored under once the agent is put back.
+ */
+function undoReusedFields(undo: (() => void)[]): void {
+  for (const restore of undo.splice(0).reverse()) restore();
 }
 
 function recordResumeConversion(state: RunState<any, any>, agent: Agent<any, any>, conversion: Conversion): void {
@@ -466,13 +477,15 @@ export class TemporalOpenAIRunner {
     // Serialize the state before converting, from the graph it was saved on, which the conversion changes.
     const serializedState = input instanceof RunState ? input.toString() : undefined;
     const reusable = input instanceof RunState ? reusableConversion(input, agent, serializedState!) : undefined;
-    let conversion = convertAgentGraph(agent, this.modelParams, modelOverride, sandbox, reusable);
+    const undo: (() => void)[] = [];
+    let conversion = convertAgentGraph(agent, this.modelParams, modelOverride, sandbox, reusable, undo);
     // The conversion can change which agents of the graph share a name identity, so check the graph it
     // gave again.
     if (
       reusable !== undefined &&
       losesStateDecisions(conversion.agents.get(agent)!, serializedState!, (input as RunState<any, any>)._context)
     ) {
+      undoReusedFields(undo);
       conversion = convertAgentGraph(agent, this.modelParams, modelOverride, sandbox);
     }
     const converted = conversion.agents.get(agent)!;
@@ -499,6 +512,8 @@ export class TemporalOpenAIRunner {
             TAgent
           >;
         } catch (error) {
+          // Approvals the restore merged stay with the objects, which keep their identity.
+          undoReusedFields(undo);
           // Restoring lists tools, which runs MCP tool filters; their errors fail the run, as in the run below.
           throw normalizeAgentsRunError(error);
         }

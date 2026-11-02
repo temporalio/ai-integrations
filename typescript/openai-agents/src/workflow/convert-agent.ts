@@ -17,14 +17,16 @@ import { ActivityBackedModel } from './activity-backed-model';
  * Other agents, and agents whose class overrides `clone`, get their fresh clone. Such a clone can hold
  * state, such as private fields or entries keyed by the clone, that can't be moved onto another object.
  * The objects only change once the whole graph has converted, so a conversion that throws leaves them
- * as they were.
+ * as they were. For each object it changes, the conversion adds a function to `undo` that gives the
+ * object back its earlier fields.
  */
 export function convertAgent(
   agent: Agent<any, any>,
   modelParams: ModelActivityOptions,
   seen?: Map<Agent<any, any>, Agent<any, any>>,
   modelNameOverride?: string,
-  identities?: ReadonlyMap<Agent<any, any>, Agent<any, any>>
+  identities?: ReadonlyMap<Agent<any, any>, Agent<any, any>>,
+  undo?: (() => void)[]
 ): Agent<any, any> {
   seen = seen ?? new Map();
   if (seen.has(agent)) return seen.get(agent)!;
@@ -44,7 +46,7 @@ export function convertAgent(
     });
   }
   for (const [source, target] of reused) {
-    replaceFields(target, clones.get(source)!);
+    undo?.push(replaceFields(target, clones.get(source)!));
   }
   return seen.get(agent)!;
 }
@@ -154,14 +156,23 @@ function canReplaceFields(agent: Agent<any, any>, target: Agent<any, any>, clone
   );
 }
 
-/** Gives `target` exactly the own properties and prototype of `source`, and returns `target`. */
-function replaceFields(target: Agent<any, any>, source: Agent<any, any>): Agent<any, any> {
+/**
+ * Gives `target` exactly the own properties and prototype of `source`, and returns a function that gives
+ * `target` back the ones it had before.
+ */
+function replaceFields(target: Agent<any, any>, source: Agent<any, any>): () => void {
+  const descriptors = Object.getOwnPropertyDescriptors(target);
+  const prototype = Object.getPrototypeOf(target);
+  setFields(target, Object.getOwnPropertyDescriptors(source), Object.getPrototypeOf(source));
+  return () => setFields(target, descriptors, prototype);
+}
+
+function setFields(target: Agent<any, any>, descriptors: PropertyDescriptorMap, prototype: object): void {
   for (const key of Reflect.ownKeys(target)) {
     delete (target as any)[key];
   }
-  Object.defineProperties(target, Object.getOwnPropertyDescriptors(source));
-  if (Object.getPrototypeOf(target) !== Object.getPrototypeOf(source)) {
-    Object.setPrototypeOf(target, Object.getPrototypeOf(source));
+  Object.defineProperties(target, descriptors);
+  if (Object.getPrototypeOf(target) !== prototype) {
+    Object.setPrototypeOf(target, prototype);
   }
-  return target;
 }

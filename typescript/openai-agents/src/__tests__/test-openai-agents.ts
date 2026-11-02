@@ -947,6 +947,9 @@ test('Approval resume keeps the caller context object', async (t) => {
           textResponse('done same name rehydrated'),
           toolCallResponse('long_history', { value: 'H' }, 'call_long_history'),
           textResponse('done long history'),
+          toolCallResponse('set_after', { value: 'O' }, 'call_renamed'),
+          textResponse('done renamed rehydrated'),
+          textResponse('done renamed retry'),
         ]),
       }),
     ],
@@ -1034,5 +1037,10 @@ test('Approval resume keeps the caller context object', async (t) => {
     longHistoryWrites: ['H'],
     longHistoryInterruptions: 0,
     longHistoryApprovedCallIds: 100_002,
+    renamedResumeThrew: true,
+    renamedSavedAgent: 'Original',
+    renamedRehydratedWrites: ['O'],
+    renamedRetryWrites: ['O'],
+    renamedInterruptions: 0,
   });
 });
