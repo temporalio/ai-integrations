@@ -5,7 +5,7 @@
 import { trace } from '@opentelemetry/api';
 import type { ModelProvider } from '@openai/agents-core';
 import { SimplePlugin } from '@temporalio/plugin';
-import type { BundleOptions, InjectedSinks, ReplayWorkerOptions, WorkerOptions } from '@temporalio/worker';
+import type { BundleOptions, InjectedSinks, ReplayWorkerOptions, Worker, WorkerOptions } from '@temporalio/worker';
 import { OpenAIAgentsTraceClientInterceptor } from '../client/trace-interceptor';
 import { AGENT_TRACING_SINK_NAME, type AgentTracingSinks } from '../common/agent-sink-types';
 import type { SerializableModelActivityOptions } from '../common/model-activity-options';
@@ -49,10 +49,17 @@ function resolveAgentsCoreAsCommonJs(compiler: WebpackCompiler): void {
   });
 }
 
-// Every Activity function an OpenAIAgentsPlugin builds. configureWorker lets these be replaced, so
-// one instance can be on both the NativeConnection and the Worker, and chained instances keep the
-// last one's Activities.
-const pluginActivityFunctions = new WeakSet<object>();
+// What each Activity an OpenAIAgentsPlugin builds was built from: its name, then what it depends on.
+// configureWorker lets one of these replace another with the same entries: that is the same
+// instance, or one built from the same options, registered twice (e.g. on the NativeConnection
+// and the Worker).
+const activitySources = new WeakMap<object, readonly unknown[]>();
+
+function sameSources(a: object, b: object): boolean {
+  const x = activitySources.get(a);
+  const y = activitySources.get(b);
+  return x !== undefined && y !== undefined && x.length === y.length && x.every((v, i) => v === y[i]);
+}
 
 /**
  * Options controlling trace interceptor behavior on both the Activity side
@@ -127,11 +134,15 @@ export interface OpenAIAgentsPluginOptions {
  * @experimental The OpenAI Agents plugin is an experimental feature; APIs may change without notice.
  */
 export class OpenAIAgentsPlugin extends SimplePlugin {
-  private readonly activityNames: readonly string[];
+  // The provider each provider Activity comes from, by Activity name, for the error message.
+  private readonly activityProviders: ReadonlyMap<string, string>;
   private readonly tracingApiKey?: TracingApiKeyResolver;
 
   constructor(options: OpenAIAgentsPluginOptions) {
     const modelActivities = createModelActivity(options.modelProvider, options.hostedToolCredentials);
+    for (const [name, fn] of Object.entries(modelActivities)) {
+      activitySources.set(fn, [name, options.modelProvider, options.hostedToolCredentials]);
+    }
 
     let allActivities: Record<string, (...args: any[]) => Promise<any>> = { ...modelActivities };
 
@@ -146,6 +157,7 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
       ...(options.sandboxClientProviders ?? []),
     ];
     const seenNames = new Set<string>();
+    const activityProviders = new Map<string, string>();
     for (const provider of providers) {
       if (seenNames.has(provider.name)) {
         throw new Error(
@@ -153,10 +165,12 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
         );
       }
       seenNames.add(provider.name);
-      allActivities = { ...allActivities, ...provider._getActivities() };
-    }
-    for (const fn of Object.values(allActivities)) {
-      pluginActivityFunctions.add(fn);
+      const providerActivities = provider._getActivities();
+      for (const [name, fn] of Object.entries(providerActivities)) {
+        activitySources.set(fn, [name, provider]);
+        activityProviders.set(name, provider.name);
+      }
+      allActivities = { ...allActivities, ...providerActivities };
     }
 
     const activityInterceptorOptions: OpenAIAgentsTraceInterceptorOptions = {
@@ -201,22 +215,55 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
         ],
       },
     });
-    this.activityNames = Object.keys(allActivities);
+    this.activityProviders = activityProviders;
     this.tracingApiKey = options.tracingApiKey;
   }
 
+  /**
+   * Adds the plugin's Activities, interceptors and sinks to the Worker.
+   *
+   * @throws TypeError if the Worker already has a different Activity with one of these names: a
+   * caller Activity, another integration's Activity, or one from an `OpenAIAgentsPlugin` built from
+   * a different model provider, credentials resolver, or MCP server or sandbox client provider.
+   * Activities that a plugin applied later replaces are refused by {@link runWorker}.
+   */
   override configureWorker(options: WorkerOptions): WorkerOptions {
     const existing = options.activities as Record<string, unknown> | undefined;
-    for (const name of this.activityNames) {
-      const fn = existing && Object.prototype.propertyIsEnumerable.call(existing, name) ? existing[name] : undefined;
-      if (typeof fn === 'function' && !pluginActivityFunctions.has(fn)) {
+    for (const [name, fn] of Object.entries(this.options.activities as object)) {
+      const other = existing && Object.prototype.propertyIsEnumerable.call(existing, name) ? existing[name] : undefined;
+      if (typeof other === 'function' && other !== fn && !sameSources(other, fn)) {
+        const provider = this.activityProviders.get(name);
+        const source = provider === undefined ? 'OpenAIAgentsPlugin' : `OpenAIAgentsPlugin provider '${provider}'`;
         throw new TypeError(
-          `Duplicate registration of Activity '${name}': OpenAIAgentsPlugin would replace a different Activity ` +
-            'with this name. Rename or remove the other registration.'
+          `Duplicate registration of Activity '${name}': ${source} would replace a different Activity with this ` +
+            `name. ${this.remedy(name)}`
         );
       }
     }
     return super.configureWorker(this.injectSinks(options));
+  }
+
+  /**
+   * Runs the Worker.
+   *
+   * @throws TypeError, before the Worker polls, if a plugin applied after this one replaced one of
+   * its Activities with a different one. `Worker.create` applies the Worker's plugins in order, then
+   * the `NativeConnection`'s.
+   */
+  override async runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    for (const [name, fn] of Object.entries(this.options.activities as object)) {
+      const kept = worker.options.activities.get(name);
+      if (kept === undefined || kept === fn || sameSources(kept, fn)) continue;
+      // There is no public way to stop a Worker that has not run yet. With Core shut down first, the
+      // pollers end at once and run()'s own teardown releases the connection.
+      (worker as unknown as { nativeWorker: { initiateShutdown(): void } }).nativeWorker.initiateShutdown();
+      await next(worker).catch(() => undefined);
+      throw new TypeError(
+        `Duplicate registration of Activity '${name}': a plugin applied after OpenAIAgentsPlugin replaced its ` +
+          `Activity with this name. ${this.remedy(name)}`
+      );
+    }
+    return super.runWorker(worker, next);
   }
 
   override configureReplayWorker(options: ReplayWorkerOptions): ReplayWorkerOptions {
@@ -247,6 +294,14 @@ export class OpenAIAgentsPlugin extends SimplePlugin {
         return { ...cfg, entry: [polyfillPath, ...entries], plugins };
       },
     };
+  }
+
+  private remedy(name: string): string {
+    const rename = this.activityProviders.has(name) ? 'Rename the provider, rename' : 'Rename';
+    return (
+      `${rename} or remove the other Activity, run the other integration on its own Worker and task queue, ` +
+      'or use one OpenAIAgentsPlugin instance on this Worker.'
+    );
   }
 
   private injectSinks<T extends { sinks?: InjectedSinks<any> }>(options: T): T {

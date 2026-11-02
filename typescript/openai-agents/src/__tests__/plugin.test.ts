@@ -8,25 +8,33 @@ type Activities = Record<string, unknown>;
 
 const callerActivity = async () => 'caller';
 
-test('configureWorker refuses to replace a caller Activity, but not its own', (t) => {
-  const plugin = new OpenAIAgentsPlugin({
+const tail =
+  'or remove the other Activity, run the other integration on its own Worker and task queue, or use one ' +
+  'OpenAIAgentsPlugin instance on this Worker.';
+
+test('configureWorker refuses to replace a different Activity with the same name', (t) => {
+  const options = {
     modelProvider: new FakeModelProvider([]),
     mcpServerProviders: [
       new StatelessMCPServerProvider('docs', () => {
         throw new Error('not called');
       }),
     ],
-  });
+  };
+  const plugin = new OpenAIAgentsPlugin(options);
 
-  for (const name of ['invokeModelActivity', 'docs-stateless-call-tool']) {
+  const refusals: Record<string, string> = {
+    invokeModelActivity:
+      "Duplicate registration of Activity 'invokeModelActivity': OpenAIAgentsPlugin would replace a different " +
+      `Activity with this name. Rename ${tail}`,
+    'docs-stateless-call-tool':
+      "Duplicate registration of Activity 'docs-stateless-call-tool': OpenAIAgentsPlugin provider 'docs' would " +
+      `replace a different Activity with this name. Rename the provider, rename ${tail}`,
+  };
+  for (const [name, message] of Object.entries(refusals)) {
     t.throws(
       () => plugin.configureWorker({ taskQueue: 'test', activities: { [name]: callerActivity } } as WorkerOptions),
-      {
-        instanceOf: TypeError,
-        message:
-          `Duplicate registration of Activity '${name}': OpenAIAgentsPlugin would replace a different Activity ` +
-          'with this name. Rename or remove the other registration.',
-      }
+      { instanceOf: TypeError, message }
     );
   }
 
@@ -39,8 +47,15 @@ test('configureWorker refuses to replace a caller Activity, but not its own', (t
   const twice = plugin.configureWorker(once);
   t.is((twice.activities as Activities).invokeModelActivity, (once.activities as Activities).invokeModelActivity);
 
-  // Chained instances keep the last instance's Activities, as before.
-  const chained = new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) }).configureWorker(once);
-  t.not((chained.activities as Activities).invokeModelActivity, (once.activities as Activities).invokeModelActivity);
-  t.is((chained.activities as Activities).lookUp, callerActivity);
+  // A second instance built from the same options is the same plugin.
+  const same = new OpenAIAgentsPlugin(options).configureWorker(once);
+  t.is((same.activities as Activities).lookUp, callerActivity);
+
+  // A second instance with another model provider would replace the first one's Activities.
+  t.throws(() => new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) }).configureWorker(once), {
+    instanceOf: TypeError,
+    message:
+      "Duplicate registration of Activity 'invokeModelActivity': OpenAIAgentsPlugin would replace a different " +
+      `Activity with this name. Rename ${tail}`,
+  });
 });

@@ -11,7 +11,8 @@ import { withTrace, withCustomSpan } from '@openai/agents-core';
 import { Client, WorkflowFailedError } from '@temporalio/client';
 import { ApplicationFailure } from '@temporalio/common';
 import type { WorkflowBundleWithSourceMap } from '@temporalio/worker';
-import { bundleWorkflowCode } from '@temporalio/worker';
+import { bundleWorkflowCode, NativeConnection } from '@temporalio/worker';
+import { SimplePlugin } from '@temporalio/plugin';
 import type { TestWorkflowEnvironment } from '@temporalio/test-helpers';
 import { Worker, createTestWorkflowEnvironment } from '@temporalio/test-helpers';
 import {
@@ -927,5 +928,56 @@ test('Stateful MCP dedicated-worker failure produces DedicatedWorkerFailure', as
       t.true(cause instanceof ApplicationFailure, 'cause must be ApplicationFailure');
       t.is((cause as ApplicationFailure).type, DEDICATED_WORKER_FAILURE_TYPE);
     });
+  });
+});
+
+test('runWorker refuses an Activity a later plugin replaced, and starts the Worker at once', async (t) => {
+  await withTestEnv(async (env) => {
+    const connection = await NativeConnection.connect({ address: env.address });
+    const later = new SimplePlugin({ name: 'later', activities: { invokeModelActivity: async () => 'other' } });
+    const worker = await Worker.create({
+      connection,
+      namespace: env.namespace,
+      plugins: [new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) }), later],
+      workflowBundle: sharedWorkflowBundle,
+      taskQueue: `later-plugin-${randomUUID()}`,
+    });
+    await t.throwsAsync(worker.run(), {
+      instanceOf: TypeError,
+      message:
+        /^Duplicate registration of Activity 'invokeModelActivity': a plugin applied after OpenAIAgentsPlugin replaced/,
+    });
+    t.is(worker.getState(), 'STOPPED');
+
+    // runUntil stops the Worker after its callback only if the Worker is already running, so the
+    // check must not yield before it starts: not for a callback that throws at once, and not for
+    // two instances that both check.
+    const options = { modelProvider: new FakeModelProvider([]) };
+    const alone = await Worker.create({
+      connection,
+      namespace: env.namespace,
+      plugins: [new OpenAIAgentsPlugin(options)],
+      workflowBundle: sharedWorkflowBundle,
+      taskQueue: `run-until-throws-${randomUUID()}`,
+    });
+    await t.throwsAsync(
+      alone.runUntil(() => {
+        throw new Error('boom');
+      }),
+      { message: 'boom' }
+    );
+    t.is(alone.getState(), 'STOPPED');
+    const two = await Worker.create({
+      connection,
+      namespace: env.namespace,
+      plugins: [new OpenAIAgentsPlugin(options), new OpenAIAgentsPlugin(options)],
+      workflowBundle: sharedWorkflowBundle,
+      taskQueue: `run-until-two-${randomUUID()}`,
+    });
+    t.is(await two.runUntil(() => Promise.resolve('done')), 'done');
+    t.is(two.getState(), 'STOPPED');
+
+    // Throws if a Worker still holds the connection.
+    await connection.close();
   });
 });
