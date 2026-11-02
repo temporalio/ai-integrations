@@ -49,8 +49,10 @@ them. `StrandsPlugin` (`@temporalio/strands-agents`) also registers
 `invokeModel` and `invokeModelStreaming`, and neither plugin can rename them, so
 run the two integrations on separate Workers and task queues. Two `AiSdkPlugin`
 instances count as the same only when they share the `modelProvider` object
-and, for each MCP server name, the same factory function and idle timeout, as
-when both are built from one options object. Two equal object literals are
-refused.
+and, for each MCP server name both register, the same factory function and idle
+timeout. A provider or factory created separately for each instance is refused
+even when its settings are equal, for example `createOpenAI({ apiKey })` called
+once per plugin, or an `async () => ...` factory written inline in each options
+object.
 
 Development details are in [typescript/README.md](../README.md).
