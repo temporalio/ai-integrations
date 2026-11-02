@@ -32,12 +32,18 @@ import (
 )
 
 // mcpLookupWorkflow runs an agent with the "orders" MCP toolset, two attempts
-// per MCP Activity, and returns the "lookup" tool response the model saw.
+// per MCP Activity, and returns the "lookup" tool response the model saw. Its
+// tool-error callback hands the model the error it got, with "callback": true.
 func mcpLookupWorkflow(ctx workflow.Context) (map[string]any, error) {
 	root, err := llmagent.New(llmagent.Config{
 		Name:        "assistant",
 		Model:       googleadk.NewModel("fake-model"),
 		Instruction: "look up orders",
+		OnToolErrorCallbacks: []llmagent.OnToolErrorCallback{
+			func(_ agent.Context, _ tool.Tool, _ map[string]any, err error) (map[string]any, error) {
+				return map[string]any{"error": err.Error(), "callback": true}, nil
+			},
+		},
 		Toolsets: []tool.Toolset{googleadk.NewMCPToolset(googleadk.MCPToolsetOptions{
 			Name: "orders",
 			ActivityOptions: workflow.ActivityOptions{
@@ -111,9 +117,10 @@ func fakeLookup(err error) func(runs *atomic.Int32) googleadk.MCPFactory {
 }
 
 // TestMcpToolErrorReachesModel proves an MCP tool's own error, such as an
-// isError result, reaches the model once with the text ADK gives it without
-// Temporal, while a failed MCP request is still retried and an
-// ApplicationError still fails the Activity. It also decodes CallMcpTool's
+// isError result, reaches the tool-error callback and the model once with the
+// text ADK gives it without Temporal, while a failed MCP request, or an error
+// that wraps several errors, is still retried and an ApplicationError still
+// fails the Activity. It also decodes CallMcpTool's
 // output as a workflow worker from before the fix does, reading only Result,
 // and checks that it holds the same error.
 func TestMcpToolErrorReachesModel(t *testing.T) {
@@ -122,13 +129,16 @@ func TestMcpToolErrorReachesModel(t *testing.T) {
 		name      string
 		factory   func(runs *atomic.Int32) googleadk.MCPFactory
 		wantCalls int    // CallMcpTool attempts
-		want      string // pattern for the "error" the model sees
+		wantRuns  int32  // tool runs
+		want      string // pattern for the "error" the callback gets and the model sees
 		answered  bool   // CallMcpTool succeeds with the tool's error
 	}{
-		{"isError result", adkLookup(false), 1, notFound, true},
-		{"failed request, then isError result", adkLookup(true), 2, notFound, true},
-		{"FakeMCPServer handler error", fakeLookup(errors.New("order A-1 not found")), 1, "^order A-1 not found$", true},
-		{"ApplicationError", fakeLookup(temporal.NewNonRetryableApplicationError("order A-1 not found", "NotFound", nil)), 1,
+		{"isError result", adkLookup(false), 1, 1, notFound, true},
+		{"failed request, then isError result", adkLookup(true), 2, 1, notFound, true},
+		{"FakeMCPServer handler error", fakeLookup(errors.New("order A-1 not found")), 1, 1, "^order A-1 not found$", true},
+		{"FakeMCPServer handler joined errors", fakeLookup(errors.Join(errors.New("order A-1"), errors.New("not found"))), 2, 2,
+			`(?s)^activity error \(type: googleadk\.CallMcpTool, .*\(type: googleadk\.McpError, retryable: true\)`, false},
+		{"ApplicationError", fakeLookup(temporal.NewNonRetryableApplicationError("order A-1 not found", "NotFound", nil)), 1, 1,
 			`^activity error \(type: googleadk\.CallMcpTool, .*\(type: NotFound, retryable: false\)$`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -159,7 +169,8 @@ func TestMcpToolErrorReachesModel(t *testing.T) {
 			var got map[string]any
 			require.NoError(t, env.GetWorkflowResult(&got))
 			assert.Regexp(t, tc.want, got["error"])
-			assert.EqualValues(t, 1, runs.Load(), "tool runs")
+			assert.Equal(t, true, got["callback"], "tool-error callback")
+			assert.Equal(t, tc.wantRuns, runs.Load(), "tool runs")
 			assert.Equal(t, tc.wantCalls, counter.get(googleadk.CallMcpToolActivityName), "CallMcpTool attempts")
 			if tc.answered {
 				require.NotNil(t, oldOut, "CallMcpTool output")
