@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/contrib/workflowstreams"
 	"go.temporal.io/sdk/workflow"
@@ -16,6 +17,8 @@ import (
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // StreamServer installs the workflow-side stream server that streamed model
@@ -371,7 +374,7 @@ func startPeriodicHeartbeats(ctx context.Context) (stop func()) {
 // the workflowstreams topic for external (UI) consumers, and returns the
 // aggregated final response into the workflow. Liveness heartbeating is handled
 // by the caller's periodic heartbeater (see InvokeModel), not per chunk.
-func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in invokeModelInput) (*model.LLMResponse, error) {
+func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in invokeModelInput) (result *model.LLMResponse, err error) {
 	log := activity.GetLogger(ctx)
 	opts := workflowstreams.Options{}
 	if in.StreamingBatchInterval > 0 {
@@ -386,7 +389,20 @@ func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in
 	if wsc, cerr := workflowstreams.NewClientFromActivity(ctx, opts); cerr != nil {
 		log.Warn("streaming client unavailable; not publishing chunks", "error", cerr)
 	} else {
-		defer func() { _ = wsc.Close(ctx) }()
+		// Close sends the last batch. If it fails, subscribers did not get every
+		// chunk, so the call fails instead of returning as if they had. A model
+		// error stays the call's error, and a cancelled or timed-out Activity
+		// reports that instead. The result is dropped with it, so the SDK does
+		// not encode a reply it then discards.
+		defer func() {
+			if cerr := wsc.Close(ctx); cerr != nil && err == nil {
+				if ctx.Err() != nil {
+					result, err = nil, ctx.Err()
+				} else {
+					result, err = nil, streamPublishError(in, cerr)
+				}
+			}
+		}()
 		topic = wsc.Topic(in.StreamingTopic)
 	}
 
@@ -575,21 +591,49 @@ func appendText(c *genai.Content, text string) {
 	c.Parts = append(c.Parts, &genai.Part{Text: text})
 }
 
-// classifyModelError maps a model-call failure to Temporal's retry contract. A
-// genai.APIError is classified by HTTP status (408/409/429 and 5xx retryable,
+// classifyModelError maps a model-call failure to Temporal's retry contract. An
+// error with an HTTP status is classified by it (408/409/429 and 5xx retryable,
 // other 4xx non-retryable); anything without a status is treated as a
-// retryable transient fault.
+// retryable transient fault, except ADK's "empty response".
 func classifyModelError(err error) error {
 	code := apiErrorCode(err)
 	retryable := true
 	if code != 0 {
 		retryable = retryableHTTPStatus(code)
+	} else {
+		// ADK's Gemini model returns this untyped error for a reply with no
+		// candidates, as for a blocked prompt. Natively the agent gets it
+		// once; a retry would send the same request again.
+		retryable = !isEmptyResponse(err)
 	}
 	return newApplicationError(ErrorTypeModel, retryable, err, "model call failed: %v", err)
 }
 
+// streamPublishError fails a streaming call whose chunks did not all reach the
+// topic. A retry calls the model again, so the error is non-retryable when the
+// retry would fail the same way: the server refused the batch as invalid (over
+// the payload size limit, or past the run's Signal limit), the batch is over
+// the server's gRPC message limit, or the stream client gave up on it after
+// retrying for its MaxRetryDuration. Other failures, such as a server outage,
+// stay retryable.
+func streamPublishError(in invokeModelInput, err error) error {
+	var invalid *serviceerror.InvalidArgument
+	var timeout *workflowstreams.FlushTimeoutError
+	retryable := !errors.As(err, &invalid) && !errors.As(err, &timeout) && !isMessageTooLarge(err)
+	return newApplicationError(ErrorTypeStream, retryable, err,
+		"model %q: publish streamed responses to topic %q: %v", in.modelName(), in.StreamingTopic, err)
+}
+
+// isMessageTooLarge reports a request the server refused as larger than its
+// gRPC message limit, the check the Go SDK's own retry interceptor uses to stop
+// retrying. Rate limiting uses the same code with other messages.
+func isMessageTooLarge(err error) bool {
+	return status.Code(err) == codes.ResourceExhausted && strings.Contains(status.Convert(err).Message(), "larger than max")
+}
+
 // apiErrorCode extracts the HTTP status from a genai.APIError, which the SDK
-// returns sometimes by value and sometimes by pointer.
+// returns sometimes by value and sometimes by pointer, or else from another
+// provider SDK's error (see statusCodeField).
 func apiErrorCode(err error) int {
 	var ptr *genai.APIError
 	if errors.As(err, &ptr) && ptr != nil {
@@ -598,6 +642,38 @@ func apiErrorCode(err error) int {
 	var val genai.APIError
 	if errors.As(err, &val) {
 		return val.Code
+	}
+	if code := statusCodeField(err); code >= 400 {
+		return code
+	}
+	return 0
+}
+
+// statusCodeField returns the first non-zero int StatusCode field in err's
+// tree, as openai-go's *openai.Error has (ADK's OpenAI model wraps it), or 0
+// if there is none. It follows both Unwrap forms (errors.Join and multiple %w
+// produce the second), depth first, as errors.As does. Reading the field by
+// name avoids importing each provider's SDK.
+func statusCodeField(err error) int {
+	if err == nil {
+		return 0
+	}
+	if v := reflect.Indirect(reflect.ValueOf(err)); v.Kind() == reflect.Struct {
+		if sf, ok := v.Type().FieldByName("StatusCode"); ok {
+			if f, ferr := v.FieldByIndexErr(sf.Index); ferr == nil && f.CanInt() && f.Int() != 0 {
+				return int(f.Int())
+			}
+		}
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return statusCodeField(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if code := statusCodeField(e); code != 0 {
+				return code
+			}
+		}
 	}
 	return 0
 }
