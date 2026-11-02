@@ -26,10 +26,12 @@ type MCPToolsetOptions struct {
 	// Config.MCPToolsets so the worker-side factory can be found.
 	Name string
 	// ToolFilter optionally restricts which advertised MCP tools are exposed to
-	// the model. It runs on the workflow side over declaration-only proxy tools:
-	// in the first Tools call of each agent run and in every ProcessRequest, so
-	// twice in the first model step. ADK resumes confirmed tool calls from the
-	// first result and draws its generated IDs for it.
+	// the model. It runs on the workflow side over declaration-only proxy tools,
+	// each time the toolset lists: in every Tools call before the toolset's
+	// first ProcessRequest of an agent run, and in every ProcessRequest. With
+	// only ADK's own calls, that is twice in the first model step and once in
+	// each later one. ADK resumes confirmed tool calls from the first result and
+	// draws its generated IDs for it.
 	ToolFilter tool.Predicate
 	// ActivityOptions overrides the per-call Activity options for the ListMcpTools
 	// and CallMcpTool Activities. A zero StartToCloseTimeout falls back to the
@@ -89,10 +91,14 @@ func (m *mcpToolset) Name() string { return m.name }
 // first list.
 //
 // One case still keeps different lists on different releases: an agent that
-// uses the same toolset both directly and through tool.FilterToolset, when the
-// MCP server changes its tools between the two listings of the first step.
-// ADK v2.5.0 and earlier keep both lists; with v2.6.0 the later Tools calls
-// return the first list for both.
+// reaches the same toolset more than once, for example directly and through
+// tool.FilterToolset, when the MCP server changes its tools between those
+// listings in the first step. ADK v2.5.0 and earlier keep each list; with
+// v2.6.0 the later Tools calls return the first list for all of them.
+//
+// Agent and model callbacks get contexts that wrap the agent run's context,
+// not its invocation, so their Tools calls are not part of the run: each one
+// lists and filters, on every release.
 //
 // A toolset wrapped in a toolset without ProcessRequest, such as
 // tool.FilterToolset, lists and filters on every call, because nothing else
@@ -154,9 +160,11 @@ func (m *mcpToolset) list(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 // no tools at all. v2.6.0 and later call Tools before the request processors
 // in every step. To schedule the same commands in the same order on every ADK
 // release, the toolset lists in Tools only until its first ProcessRequest of
-// the agent run, and in ProcessRequest from then on. Each model step lists
-// once: the first through Tools, with ProcessRequest reusing that list, and
-// every later step here. From the second step, the request carries this list
+// the agent run, and in ProcessRequest from then on. With only ADK's own
+// calls, each model step lists once: the first through Tools, with
+// ProcessRequest reusing that list, and every later step here. Other Tools
+// calls before the first ProcessRequest, such as an InstructionProvider's,
+// list too. From the second step, the request carries this list
 // alone, so a tool the MCP server no longer advertises is neither declared nor
 // dispatched, whatever list ADK kept from an earlier Tools call.
 func (m *mcpToolset) ProcessRequest(ctx agent.Context, req *model.LLMRequest) error {
