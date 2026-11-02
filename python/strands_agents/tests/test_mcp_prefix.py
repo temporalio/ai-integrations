@@ -187,6 +187,7 @@ async def test_mcp_prefix_and_annotations(client: Client) -> None:
 
     history = await handle.fetch_history()
     assert get_activities(history) == [
+        "strands_get_model_config",
         "gh-list-tools",
         "gl-list-tools",
         "invoke_model",

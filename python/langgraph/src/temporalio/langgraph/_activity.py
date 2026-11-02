@@ -1,17 +1,33 @@
 """Activity wrappers for executing LangGraph nodes and tasks."""
 
 import asyncio
-from collections.abc import Awaitable, Sequence
+import dataclasses
+import sys
+import warnings
+from collections.abc import Awaitable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from inspect import iscoroutinefunction, signature
-from typing import Any, Callable
+from inspect import get_annotations, iscoroutinefunction, signature
+from typing import (
+    Annotated,
+    Any,
+    Callable,
+    Literal,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
+from langchain_core.messages import BaseMessage
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command, Interrupt, Send, TimeoutPolicy
+from pydantic import BaseModel
+from typing_extensions import is_typeddict
 
-from temporalio import workflow
+from temporalio import activity, workflow
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
+from temporalio.converter import PayloadConverter
+from temporalio.exceptions import ApplicationError
 from temporalio.langgraph._langgraph_config import (
     context_schema_id,
     get_langgraph_config,
@@ -43,6 +59,7 @@ class ActivityInput:
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
     langgraph_config: dict[str, Any]
+    value_types: list[Any] | None = None
 
 
 @dataclass
@@ -52,6 +69,7 @@ class ActivityOutput:
     result: Any = None
     langgraph_command: Any = None
     langgraph_interrupts: tuple[Interrupt] | None = None
+    value_types: list[Any] | None = None
 
 
 def _command_to_payload(command: Command) -> dict[str, Any]:
@@ -89,11 +107,9 @@ def _command_from_payload(payload: dict[str, Any]) -> Command:
     def dict_to_send(item: Any) -> Any:
         if isinstance(item, dict):
             timeout = item.get("timeout")
-            return Send(
-                item["node"],
-                item["arg"],
-                timeout=TimeoutPolicy(**timeout) if timeout else None,
-            )
+            if isinstance(timeout, dict):  # Not one rebuilt as a known class
+                timeout = TimeoutPolicy(**timeout) if timeout else None
+            return Send(item["node"], item["arg"], timeout=timeout)
         return item
 
     goto = payload["goto"]
@@ -109,16 +125,243 @@ def _command_from_payload(payload: dict[str, Any]) -> Command:
     )
 
 
+_COMMAND_TYPE_ID = "langgraph.types.Command"
+# Marks the type ID of a node in the tree ValueTypes.restore builds from paths.
+_TYPE_ID = object()
+_MISSING = object()
+
+
+def _subclasses(cls: type) -> Iterator[type]:
+    for subclass in cls.__subclasses__():
+        yield subclass
+        yield from _subclasses(subclass)
+
+
+def _type_hints(obj: Any) -> list[Any]:
+    """Return the type hints of a function or class that can be resolved."""
+    try:
+        return list(get_type_hints(obj, include_extras=True).values())
+    except Exception:
+        pass
+    # Resolve the hints one at a time, so one that can't be resolved, such as
+    # a name imported only for type checking, doesn't hide the others.
+    hints: list[Any] = []
+    for owner in reversed(obj.__mro__) if isinstance(obj, type) else [obj]:
+        module = sys.modules.get(getattr(owner, "__module__", None) or "")
+        globalns = getattr(owner, "__globals__", vars(module) if module else {})
+        try:
+            annotations = get_annotations(owner)
+        except Exception:
+            continue
+        for hint in annotations.values():
+            try:
+                hints.append(eval(hint, globalns) if isinstance(hint, str) else hint)
+            except Exception:
+                pass
+    return hints
+
+
+def _importable(cls: type) -> bool:
+    """Whether ``cls`` is the class its module holds under its name."""
+    owner: Any = sys.modules.get(cls.__module__)
+    for name in cls.__qualname__.split("."):
+        owner = getattr(owner, name, None)
+    return owner is cls
+
+
+def _convert(converter: PayloadConverter, value: Any, hint: Any) -> Any:
+    """Rebuild plain JSON ``value`` as ``hint`` with ``converter``, or ``_MISSING``."""
+    try:
+        return converter.from_payload(converter.to_payload(value), hint)
+    except Exception:
+        return _MISSING
+
+
+class ValueTypes:
+    """Keep the types of node and task values across the Activity boundary.
+
+    Activity inputs and outputs hold these values as ``Any``, so the payload
+    converter decodes them as plain JSON. The sender records where values of
+    known classes sit in dicts, lists and tuples, by class ID, and the receiver
+    rebuilds them with the payload converter, as for an Activity parameter of
+    that class. Values inside a rebuilt value are what the converter makes of
+    them. Values are encoded as before, so older payloads and readers are
+    unaffected.
+
+    Known classes are ``bytes``, LangChain messages, and the Pydantic models
+    and dataclasses reachable from the given schemas and function signatures,
+    with their subclasses. Only these are rebuilt.
+    """
+
+    def __init__(
+        self, schemas: Iterable[Any] = (), functions: Iterable[Any] = ()
+    ) -> None:
+        """Collect the classes reachable from ``schemas`` and ``functions``."""
+        found: dict[str, list[type]] = {}
+        # Keyed by id() because some hints are unhashable; keeps them alive.
+        seen: dict[int, Any] = {}
+        stack = [bytes, *_subclasses(BaseMessage), *schemas]
+        for function in functions:
+            stack.extend(_type_hints(function))
+        while stack:
+            hint = stack.pop()
+            if id(hint) in seen:
+                continue
+            seen[id(hint)] = hint
+            origin = get_origin(hint)
+            if origin is Literal:
+                continue
+            if origin is not None:
+                args = get_args(hint)
+                stack.extend(args[:1] if origin is Annotated else args)
+                continue
+            if not isinstance(hint, type):
+                continue
+            if issubclass(hint, BaseModel):
+                stack.extend(field.annotation for field in hint.model_fields.values())
+                if hint is not BaseModel:
+                    stack.extend(_subclasses(hint))
+            elif dataclasses.is_dataclass(hint):
+                stack.extend(_type_hints(hint))
+                stack.extend(_subclasses(hint))
+            elif hint is not bytes:
+                if is_typeddict(hint):
+                    stack.extend(_type_hints(hint))
+                continue
+            found.setdefault(context_schema_id(hint), []).append(hint)
+        classes: dict[str, type] = {}
+        for type_id, candidates in found.items():
+            # The sandbox imports Workflow modules again, so a subclass of a
+            # passed-through class, such as a message class, can appear twice.
+            if len(candidates) > 1:
+                candidates = [cls for cls in candidates if _importable(cls)]
+            if len(candidates) == 1:
+                classes[type_id] = candidates[0]
+            else:
+                warnings.warn(
+                    f"Classes with the same ID {type_id!r} are not rebuilt "
+                    "after crossing an Activity boundary.",
+                    stacklevel=2,
+                )
+        self._classes = classes
+        self._ids = {cls: type_id for type_id, cls in classes.items()}
+
+    def _type_id(self, cls: type) -> str | None:
+        type_id = self._ids.get(cls)
+        # Workflow code can build values from the sandbox's copy of a class.
+        if type_id is None and (
+            issubclass(cls, BaseModel) or dataclasses.is_dataclass(cls)
+        ):
+            candidate = context_schema_id(cls)
+            if candidate in self._classes:
+                type_id = candidate
+        return type_id
+
+    def encode(self, value: Any, path: list[str | int], value_types: list[Any]) -> Any:
+        """Record known values in ``value`` and put its Commands in payload form."""
+        if isinstance(value, Command):
+            payload = self.encode(_command_to_payload(value), path, value_types)
+            value_types.append([path, _COMMAND_TYPE_ID])
+            return payload
+        type_id = self._type_id(type(value))
+        if type_id is not None:
+            value_types.append([path, type_id])
+            return value
+        if isinstance(value, dict):
+            items = {
+                key: self.encode(item, [*path, key], value_types)
+                if isinstance(key, (str, int)) and not isinstance(key, bool)
+                else item
+                for key, item in value.items()
+            }
+            changed = any(items[key] is not value[key] for key in value)
+            return items if changed else value
+        if isinstance(value, (list, tuple)):
+            elements = [
+                self.encode(item, [*path, index], value_types)
+                for index, item in enumerate(value)
+            ]
+            changed = any(new is not old for new, old in zip(elements, value))
+            return elements if changed else value
+        return value
+
+    def restore(
+        self, value: Any, value_types: list[Any], converter: PayloadConverter
+    ) -> Any:
+        """Rebuild the values ``encode`` recorded, leaving ``value`` unchanged."""
+        tree: dict[Any, Any] = {}
+        for path, type_id in value_types:
+            node = tree
+            for key in path:
+                node = node.setdefault(key, {})
+            node[_TYPE_ID] = type_id
+
+        def rebuild(value: Any, node: dict[Any, Any]) -> Any:
+            children = [key for key in node if key is not _TYPE_ID]
+            if children:
+                value = dict(value) if isinstance(value, dict) else list(value)
+                for key in children:
+                    # JSON writes an int key as a string.
+                    found = (
+                        str(key)
+                        if isinstance(value, dict) and key not in value
+                        else key
+                    )
+                    value[found] = rebuild(value[found], node[key])
+            if _TYPE_ID in node:
+                value = self._rebuild(node[_TYPE_ID], value, converter)
+            return value
+
+        return rebuild(value, tree)
+
+    def _rebuild(self, type_id: str, value: Any, converter: PayloadConverter) -> Any:
+        if type_id == _COMMAND_TYPE_ID:
+            return _command_from_payload(value)
+        cls = self._classes.get(type_id)
+        if cls is None:
+            raise ApplicationError(
+                f"Unknown value type ID {type_id!r}: this Worker didn't find its "
+                "class. All Workers must register the same graphs and tasks, "
+                "and import the same message classes.",
+                non_retryable=True,
+            )
+        non_init: list[str] = []
+        if dataclasses.is_dataclass(cls) and isinstance(value, dict):
+            non_init = [f.name for f in dataclasses.fields(cls) if not f.init]
+        # The default converter passes every field it finds to __init__.
+        init_values = (
+            {k: v for k, v in value.items() if k not in non_init} if non_init else value
+        )
+        # A value the converter can't rebuild, such as a dataclass with a
+        # Protocol field, keeps its plain JSON form, as before.
+        restored = _convert(converter, init_values, cls)
+        if restored is _MISSING:
+            return value
+        # Restore saved init=False fields with their declared types.
+        try:
+            hints = get_type_hints(cls) if non_init else {}
+        except Exception:
+            hints = {}
+        for name in non_init:
+            if name in value:
+                saved = _convert(converter, value[name], hints.get(name, Any))
+                saved = value[name] if saved is _MISSING else saved
+                object.__setattr__(restored, name, saved)
+        return restored
+
+
 def wrap_activity(
     func: Callable,
     *,
     context_schema: type[Any] | None = None,
     context_schemas: dict[str, type[Any]] | None = None,
+    value_types: ValueTypes | None = None,
     streaming_topic: str | None = None,
     streaming_batch_interval: timedelta = timedelta(milliseconds=100),
 ) -> Callable[[ActivityInput], Awaitable[ActivityOutput]]:
     """Wrap a function as a Temporal activity that handles LangGraph config and interrupts."""
     accepts_runtime = "runtime" in signature(func).parameters
+    known = value_types if value_types is not None else ValueTypes()
 
     async def wrapper(input: ActivityInput) -> ActivityOutput:
         async def run(stream_writer: Callable[[Any], None] | None) -> ActivityOutput:
@@ -147,18 +390,30 @@ def wrap_activity(
                 context_schema=schema,
                 stream_writer=effective_writer,
             )
-            kwargs = dict(input.kwargs)
+            values = {"args": list(input.args), "kwargs": input.kwargs}
+            if input.value_types:
+                values = known.restore(
+                    values, input.value_types, activity.payload_converter()
+                )
+            args = values["args"]
+            kwargs = dict(values["kwargs"])
             if accepts_runtime:
                 kwargs["runtime"] = runtime
 
             try:
                 if iscoroutinefunction(func):
-                    result = await func(*input.args, **kwargs)
+                    result = await func(*args, **kwargs)
                 else:
-                    result = await asyncio.to_thread(func, *input.args, **kwargs)
-                if isinstance(result, Command):
-                    return ActivityOutput(langgraph_command=_command_to_payload(result))
-                return ActivityOutput(result=result)
+                    result = await asyncio.to_thread(func, *args, **kwargs)
+                # A top-level Command keeps its own field for older Workflows.
+                output = (
+                    {"langgraph_command": _command_to_payload(result)}
+                    if isinstance(result, Command)
+                    else {"result": result}
+                )
+                result_types: list[Any] = []
+                output = known.encode(output, [], result_types)
+                return ActivityOutput(**output, value_types=result_types or None)
             except GraphInterrupt as e:
                 return ActivityOutput(langgraph_interrupts=e.args[0])
 
@@ -178,9 +433,19 @@ def wrap_execute_activity(
     task_id: str = "",
     summary_fn: Callable[[tuple[Any, ...], dict[str, Any]], str | None] | None = None,
     context_schemas: dict[str, type[Any]] | None = None,
+    value_types: ValueTypes | None = None,
     **execute_activity_kwargs: Any,
 ) -> Callable[..., Any]:
     """Wrap an activity function to be called via workflow.execute_activity with caching."""
+    known = value_types if value_types is not None else ValueTypes()
+
+    def output_value(result: Any, command: Any, result_types: list[Any] | None) -> Any:
+        output = {"result": result, "langgraph_command": command}
+        if result_types:
+            output = known.restore(output, result_types, workflow.payload_converter())
+        if output["langgraph_command"] is not None:
+            return _command_from_payload(output["langgraph_command"])
+        return output["result"]
 
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         # LangGraph may inject a RunnableConfig as the 'config' kwarg. Strip it
@@ -232,17 +497,24 @@ def wrap_execute_activity(
         # stored in its payload form under a separate "<key>:command" entry and
         # rebuilt on lookup. cache_key() returns 32 hex characters, so this
         # namespace can't collide with a plain result key, and a result dict
-        # is never mistaken for a Command.
+        # is never mistaken for a Command. Value types go under "<key>:types",
+        # so older Workflows still find the plain entry.
         if task_id:
-            found, cached = cache_lookup(f"{key}:command")
-            if found:
-                return _command_from_payload(cached)
-            found, cached = cache_lookup(key)
-            if found:
-                return cached
+            found_command, command = cache_lookup(f"{key}:command")
+            found_result, result = cache_lookup(key)
+            if found_command or found_result:
+                _, result_types = cache_lookup(f"{key}:types")
+                return output_value(
+                    None if found_command else result, command, result_types
+                )
 
+        arg_types: list[Any] = []
+        values = known.encode({"args": args, "kwargs": kwargs}, [], arg_types)
         input = ActivityInput(
-            args=args, kwargs=kwargs, langgraph_config=langgraph_config
+            args=tuple(values["args"]),
+            kwargs=values["kwargs"],
+            langgraph_config=langgraph_config,
+            value_types=arg_types or None,
         )
         # Compute a dynamic activity summary (if configured) on the schedule
         # path only; a cache hit above returns before reaching here, so no
@@ -256,19 +528,15 @@ def wrap_execute_activity(
         if output.langgraph_interrupts is not None:
             raise GraphInterrupt(output.langgraph_interrupts)
 
-        result = output.result
-        cached = result
-        if output.langgraph_command is not None:
-            result = _command_from_payload(output.langgraph_command)
-            cached = output.langgraph_command
-
         # Store in cache for future continue-as-new cycles.
         if task_id:
-            cache_put(
-                f"{key}:command" if output.langgraph_command is not None else key,
-                cached,
-            )
+            if output.langgraph_command is not None:
+                cache_put(f"{key}:command", output.langgraph_command)
+            else:
+                cache_put(key, output.result)
+            if output.value_types:
+                cache_put(f"{key}:types", output.value_types)
 
-        return result
+        return output_value(output.result, output.langgraph_command, output.value_types)
 
     return wrapper

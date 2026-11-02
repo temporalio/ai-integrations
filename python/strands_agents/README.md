@@ -75,7 +75,9 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Note: Use `agent.invoke_async(message)` instead of `agent(message)`. The synchronous form spawns a worker thread, which the workflow sandbox blocks.
+Note: Use `agent.invoke_async(message)` instead of `agent(message)`. Strands runs its synchronous calls on a new thread, outside the workflow sandbox and off the workflow event loop, where their model calls and other I/O would not be recorded. So in workflow code these raise `RestrictedWorkflowAccessError`: calling an `Agent`, `A2AAgent`, `Graph` or `Swarm`, `agent.structured_output()`, direct tool calls such as `agent.tool.name()`, and Strands features that make such calls themselves, such as `SummarizingConversationManager`, `SnapshotSessionManager`, and, in recent Strands versions, leaving `with agent:` when the agent has a `memory_manager`. Building agents, graphs and swarms still works, and calls made while they are built are not checked. Call agents that do their own I/O, such as an `A2AAgent`, from an activity, for example with `activity_as_tool`.
+
+The error fails the workflow task, so the run stays open until you deploy a fix, unless the worker or workflow lists `NondeterminismError` in its failure exception types, which fails the run instead. Inside a tool, Strands catches it and gives the model an error tool result instead. Under the default sandboxed runner, a synchronous call in a workflow module's top-level code also stops the worker from starting, and fails every replay of that workflow. A run that made a synchronous call before you deploy this version no longer replays as recorded; if it caught the error, it now takes its error branch. Let those runs finish first, or use Worker Versioning.
 
 ## Models
 
@@ -109,6 +111,16 @@ Worker(..., plugins=[StrandsPlugin(models={
 ```
 
 Each `TemporalAgent` carries its own activity options (timeouts, retry policy, task queue, streaming topic) and dispatches to the shared model activity, which resolves the model name against the registered factories at runtime. A name not present in `models` raises `ValueError` inside the activity.
+
+Before its first invocation in a workflow, each `TemporalAgent` reads the worker model's `model_id` and `context_window_limit` with the `strands_get_model_config` activity, using the agent's activity options. `agent.model.get_config()` returns them, so proactive compression, `context_manager="auto"` and Strands' tracing use the real model's window and id, as they do natively. No other part of the model's config is sent to the workflow. The read is a new activity, so a run whose agent ran before you deploy this version fails to replay on it: let those runs finish first, or use Worker Versioning.
+
+If you scaled `compression_threshold` by the model's window divided by 200,000 to work around the missing limit, remove that scaling: the threshold now applies to the model's own window.
+
+A worker model that keeps the conversation server-side, such as `OpenAIResponsesModel(stateful=True)`, works as it does natively: each model call gets the agent's model state, such as the last response id, and the agent clears its messages after each turn. As in Strands, such an agent cannot use a `conversation_manager` or `context_manager`; because `TemporalAgent` learns that the model is stateful when it reads the config, it raises `ValueError` at the agent's first invocation instead of at construction. Remove the manager from those agents.
+
+Stateful model calls run as their own activities, `strands_invoke_stateful_model` and `strands_invoke_stateful_model_streaming`. While you roll out this version, a worker running an earlier version does not register them, so it fails such a call (`NotFoundError`) and Temporal retries it until an upgraded worker takes it. Upgrade every worker on the task queue before a `retry_policy` with a low `maximum_attempts` runs out, or route upgraded workflows to upgraded workers with Worker Versioning.
+
+A run that continues as new starts with no messages when its model is stateful, so it needs the model state it carries. If that run's workers do not have this version, or its config activity runs on a worker that does not, it treats the model as stateless, ignores the carried response id and starts the model's conversation over. Keep such runs on upgraded workers, and do not roll workers back to an earlier version while they continue as new.
 
 ## Retries
 
@@ -174,6 +186,8 @@ async for item in WorkflowStreamClient.create(client, workflow_id).subscribe(
 ):
     print(item.data)
 ```
+
+Events are published as your data converter writes them, so a `StreamEvent`-typed subscriber receives `bytes` fields such as `redactedContent` as `bytes`. If the model emits `redactedContent` that is not valid UTF-8 and the data converter is the Pydantic one (the plugin's default), which cannot write it, subscribers receive the event with `redactedContent` empty (`b""`) and the model activity does not fail. The workflow itself always gets the real bytes, and the default converter carries any bytes to subscribers.
 
 ## Sandboxes
 
@@ -537,7 +551,7 @@ class MyWorkflow:
         )
 ```
 
-This relies on the plugin's failure converter, which is installed via the client's data converter. **Attach `StrandsPlugin` to the client** (not just the worker) for activity-tool interrupts to work — workers built from that client pick up the plugin automatically.
+This relies on the plugin's failure converter, which is installed via the client's data converter. **Attach `StrandsPlugin` to the client** (not just the worker) for activity-tool interrupts to work — workers built from that client pick up the plugin automatically. If your data converter uses the default payload converter with `DefaultFailureConverterWithEncodedAttributes` or a subclass of it, the plugin replaces it with its own failure converter but keeps the encoding, so failure messages and stack traces still go through your codec. Methods your class overrides are not used.
 
 ```python
 client = await Client.connect("localhost:7233", plugins=[StrandsPlugin(models=MODELS)])
@@ -546,15 +560,17 @@ Worker(client, task_queue="strands", workflows=[MyWorkflow], activities=[delete_
 
 ## Continue-as-new
 
-A chat-style workflow accumulates history with every turn and will eventually hit Temporal's per-workflow history limit. `workflow.info().is_continue_as_new_suggested()` flips true once the server decides history has grown large enough; check it after each turn and hand off to a fresh run, carrying `agent.messages` as input:
+A chat-style workflow accumulates history with every turn and will eventually hit Temporal's per-workflow history limit. `workflow.info().is_continue_as_new_suggested()` flips true once the server decides history has grown large enough; check it after each turn and hand off to a fresh run, carrying `agent.messages` and `agent.model_state` as input. A stateful model clears the messages after each turn and keeps its context in the model state, such as the last response id; a run that carries only the messages starts the model's conversation over:
 
 ```python
 from dataclasses import dataclass, field
+from typing import Any
 from strands.types.content import Messages
 
 @dataclass
 class ChatInput:
     messages: Messages = field(default_factory=list)
+    model_state: dict[str, Any] = field(default_factory=dict)
 
 @workflow.defn
 class ChatWorkflow:
@@ -575,6 +591,7 @@ class ChatWorkflow:
         agent = TemporalAgent(
             start_to_close_timeout=timedelta(seconds=60),
             messages=list(input.messages),
+            model_state=input.model_state,
         )
         while True:
             await workflow.wait_condition(lambda: self._pending or self._done)
@@ -582,7 +599,9 @@ class ChatWorkflow:
                 return
             await agent.invoke_async(self._pending.pop(0))
             if workflow.info().is_continue_as_new_suggested():
-                workflow.continue_as_new(ChatInput(messages=agent.messages))
+                workflow.continue_as_new(
+                    ChatInput(messages=agent.messages, model_state=agent.model_state)
+                )
 ```
 
 ## MCP

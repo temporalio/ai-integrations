@@ -43,6 +43,9 @@ INVOKE_MODEL_STREAMING = "deepagents.invoke_model_streaming"
 INVOKE_TOOL = "deepagents.invoke_tool"
 BACKEND_OP = "deepagents.backend_op"
 
+CONTEXT_OVERFLOW_ERROR_TYPE = "deepagents.ContextOverflowError"
+"""``ApplicationError.type`` of a model call the provider rejected as too long."""
+
 
 # ---------------------------------------------------------------------------
 # Boundary payloads
@@ -87,6 +90,12 @@ class ToolActivityInput:
     tool_call_id: str
     args: dict[str, Any]
     config: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # The path and class name of each LangChain message in ``args``, from
+    # ``_serde.find_tool_arg_messages``. Input from older workflow code lacks it
+    # and passes through unchanged.
+    arg_messages: list[tuple[list[str | int], str]] = dataclasses.field(
+        default_factory=list
+    )
 
 
 @dataclasses.dataclass
@@ -209,6 +218,57 @@ def _translate_api_error(exc: Exception) -> ApplicationError | None:
     )
 
 
+# HTTP statuses and messages that mark a provider's context overflow, as in Deep
+# Agents' summarization middleware since 0.7.14. Its check is private and older
+# 0.7 releases lack it, so the plugin keeps its own copy.
+_CONTEXT_OVERFLOW_STATUSES = frozenset({400, 413, 422})
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "contextwindowexceedederror",
+    "maximum context length",
+    "exceeds the context window",
+    "exceeds the available context size",
+    "context window exceeded",
+    "context limit exceeded",
+    "input tokens exceed the configured limit",
+    "prompt is too long",
+)
+
+
+def _is_context_overflow(exc: Exception) -> bool:
+    """Return whether the provider rejected the request as too long.
+
+    LangChain's ``ContextOverflowError`` covers the typed overflow errors, with
+    or without an HTTP status. An OpenAI-compatible server such as vLLM returns
+    an ordinary 400 instead, so an error with one of the statuses above whose
+    message names an overflow counts too.
+    """
+    from langchain_core.exceptions import ContextOverflowError
+
+    if isinstance(exc, ContextOverflowError):
+        return True
+    if getattr(exc, "status_code", None) not in _CONTEXT_OVERFLOW_STATUSES:
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS)
+
+
+def _context_overflow_error(exc: Exception) -> ApplicationError | None:
+    """Mark a provider's context-window overflow so the workflow can recover.
+
+    Deep Agents' summarization middleware summarizes older messages and retries
+    when a model call fails with ``ContextOverflowError``. The provider's
+    exception is only available here, so classify it here and give the failure
+    a type the workflow side rebuilds the overflow from. Retrying the same
+    request cannot succeed, so it is non-retryable.
+    """
+    if not _is_context_overflow(exc):
+        return None
+    return ApplicationError(
+        str(exc), type=CONTEXT_OVERFLOW_ERROR_TYPE, non_retryable=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # The activities
 # ---------------------------------------------------------------------------
@@ -256,6 +316,12 @@ class _BackendFactory:
         return self._factory()
 
 
+# Binding options that a provider's ``bind_tools`` converts to its own format
+# (Anthropic turns ``"any"`` into ``{"type": "any"}``, OpenAI into
+# ``"required"``). Passing them to ``.bind()`` instead skips that conversion.
+_TOOL_BIND_KWARGS = ("tool_choice", "parallel_tool_calls")
+
+
 def _default_model_provider(model_name: str) -> Any:
     """Build a chat model from a name string with LLM-SDK retries disabled.
 
@@ -295,10 +361,14 @@ class DeepAgentActivities:
 
     def _build_bound_model(self, input: ModelActivityInput) -> Any:
         model = self._model_provider(input.model_name)
+        bind_kwargs = dict(input.bind_kwargs)
         if input.tool_schemas:
-            model = model.bind_tools(input.tool_schemas)
-        if input.bind_kwargs:
-            model = model.bind(**input.bind_kwargs)
+            tool_kwargs = {
+                k: bind_kwargs.pop(k) for k in _TOOL_BIND_KWARGS if k in bind_kwargs
+            }
+            model = model.bind_tools(input.tool_schemas, **tool_kwargs)
+        if bind_kwargs:
+            model = model.bind(**bind_kwargs)
         return model
 
     @activity.defn(name=INVOKE_MODEL)
@@ -311,6 +381,9 @@ class DeepAgentActivities:
         try:
             message = await model.ainvoke(messages, config=config)
         except Exception as exc:
+            overflow = _context_overflow_error(exc)
+            if overflow is not None:
+                raise overflow from exc
             translated = _translate_api_error(exc)
             if translated is not None:
                 activity.logger.warning(
@@ -353,6 +426,9 @@ class DeepAgentActivities:
                         topic.publish(_serde.dump_object(chunk))
                     final = chunk if final is None else final + chunk
         except Exception as exc:
+            overflow = _context_overflow_error(exc)
+            if overflow is not None:
+                raise overflow from exc
             translated = _translate_api_error(exc)
             if translated is not None:
                 activity.logger.warning(
@@ -381,7 +457,7 @@ class DeepAgentActivities:
         config = _serde.rebuild_runnable_config(input.config)
         tool_call = {
             "name": input.tool_name,
-            "args": input.args,
+            "args": _serde.load_tool_arg_messages(input.args, input.arg_messages),
             "id": input.tool_call_id,
             "type": "tool_call",
         }

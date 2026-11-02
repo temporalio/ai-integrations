@@ -103,6 +103,7 @@ async def test_tool(client: Client, tmp_path: Path):
 
     history = await handle.fetch_history()
     assert get_activities(history) == [
+        "strands_get_model_config",
         "invoke_model",
         "read_file",
         "invoke_model",

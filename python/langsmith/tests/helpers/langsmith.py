@@ -13,17 +13,20 @@ from tests.helpers.trace import TraceNode
 
 @pytest.fixture(autouse=True)
 def clear_langsmith_env_cache() -> Any:
-    """Clear langsmith's lru_cache before and after each test.
+    """Clear langsmith's lru_caches before and after each test.
 
-    Tests manipulate LANGSMITH_TRACING / LANGCHAIN_TRACING_V2 env vars.
-    langsmith.utils.get_env_var caches results, so stale values would
-    leak across tests (or into other test modules in the same session).
+    Tests manipulate LANGSMITH_TRACING / LANGCHAIN_TRACING_V2 / LANGSMITH_PROJECT
+    env vars. langsmith.utils.get_env_var and get_tracer_project cache results,
+    so stale values would leak across tests (or into other test modules in the
+    same session).
     """
     import langsmith.utils
 
     langsmith.utils.get_env_var.cache_clear()  # type: ignore[attr-defined]
+    langsmith.utils.get_tracer_project.cache_clear()
     yield
     langsmith.utils.get_env_var.cache_clear()  # type: ignore[attr-defined]
+    langsmith.utils.get_tracer_project.cache_clear()
 
 
 @pytest.fixture(autouse=True)

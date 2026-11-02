@@ -407,6 +407,7 @@ class TestRootReplaySafeRunTreeFactory:
 
         executor = kwargs.pop("executor", _make_executor())
         mock_client = kwargs.pop("ls_client", MagicMock())
+        kwargs.setdefault("destination", {"project_name": "test-project"})
         return _RootReplaySafeRunTreeFactory(
             ls_client=mock_client, executor=executor, **kwargs
         )
@@ -462,7 +463,7 @@ class TestRootReplaySafeRunTreeFactory:
         factory = self._make_factory(
             ls_client=mock_client,
             executor=executor,
-            session_name="my-project",
+            destination={"project_name": "my-project"},
             replicas=mock_replicas,
         )
 

@@ -1,5 +1,10 @@
+import zlib
+from collections.abc import Sequence
+
+from temporalio.api.common.v1 import Payload
 from temporalio.api.enums.v1 import EventType
 from temporalio.client import WorkflowHistory
+from temporalio.converter import PayloadCodec
 
 
 def get_activities(history: WorkflowHistory) -> list[str]:
@@ -8,3 +13,19 @@ def get_activities(history: WorkflowHistory) -> list[str]:
         for event in history.events
         if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
     ]
+
+
+class CompressionCodec(PayloadCodec):
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return [
+            Payload(
+                metadata={"encoding": b"binary/zlib"},
+                data=zlib.compress(payload.SerializeToString()),
+            )
+            for payload in payloads
+        ]
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return [
+            Payload.FromString(zlib.decompress(payload.data)) for payload in payloads
+        ]

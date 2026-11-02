@@ -6,6 +6,8 @@ This package provides the integration layer between the Google ADK and Temporal.
 
 ## Install
 
+Requires Python 3.11+ and Google ADK 2.12.0+.
+
 ```bash
 uv add temporalio-google-adk
 ```
@@ -66,6 +68,19 @@ Model calls are intercepted and executed as Temporal activities with configurabl
 #### 3. Sandbox Compatibility
 - Automatic passthrough for `google.adk`, `google.genai`, `mcp`, and `opentelemetry` modules
 - Works with both sandboxed and unsandboxed workflow runners
+
+> **Upgrading to this plugin from `temporalio.contrib.google_adk_agents` in `temporalio` 1.31
+> through 1.33:** with `google-adk` 2.9 or later and the default Workflow sandbox, those versions
+> fail every agent turn with
+> `RestrictedWorkflowAccessError: Cannot access os.environ.get from inside a workflow`, because
+> ADK imports `opentelemetry` during the turn. This plugin passes `opentelemetry` through the
+> sandbox, so those turns now run. But a run whose Workflow code caught that error can fail to
+> replay with a `[TMPRL1100]` nondeterminism error, if what it recorded after the catch does
+> not match the turn that now runs. Reset open runs that fail this way to their first Workflow
+> Task, which runs their Activities again:
+> `temporal workflow reset --workflow-id <id> --type FirstWorkflowTask --reason '<reason>'`.
+> Closed runs need no reset, but Queries and replay tests over their histories fail. See
+> [issue #261](https://github.com/temporalio/ai-integrations/issues/261) for details.
 
 #### 4. Advanced Serialization
 - Pydantic payload converter for ADK objects
@@ -242,7 +257,9 @@ The same agent definitions can also be exercised outside Temporal with
 `adk run` or `adk web`.
 
 - `TemporalModel` and `activity_as_tool(...)` work in local ADK runs without
-  additional configuration.
+  additional configuration. The exception is a tool made from a method passed
+  as `Class.method` or from a callable-class Activity passed as its class: it
+  needs the Worker's instance, so it runs only in a Workflow.
 - If the agent uses `TemporalMcpToolSet`, define a shared toolset factory,
   register it with `TemporalMcpToolSetProvider(...)` for workflow runs, and
   reuse the same function for `not_in_workflow_toolset=...` so the agent can

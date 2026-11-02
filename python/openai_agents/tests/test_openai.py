@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import nexusrpc
 import pydantic
@@ -17,6 +17,7 @@ from agents import (
     AgentOutputSchemaBase,
     CodeInterpreterTool,
     FileSearchTool,
+    FunctionTool,
     GuardrailFunctionOutput,
     Handoff,
     HostedMCPTool,
@@ -31,10 +32,12 @@ from agents import (
     ModelResponse,
     ModelSettings,
     ModelTracing,
+    MultiProvider,
     OpenAIChatCompletionsModel,
     OutputGuardrailTripwireTriggered,
     RunConfig,
     RunContextWrapper,
+    RunHooks,
     Runner,
     SQLiteSession,
     Tool,
@@ -44,6 +47,9 @@ from agents import (
     handoff,
     input_guardrail,
     output_guardrail,
+    set_default_openai_api,
+    set_default_openai_client,
+    set_default_openai_key,
     trace,
 )
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
@@ -54,7 +60,7 @@ from agents.items import (
     TResponseStreamEvent,
 )
 from agents.mcp import MCPServer
-from agents.models import get_default_model_settings
+from agents.models import _openai_shared, get_default_model_settings
 from agents.sandbox.capabilities.tools import SandboxApplyPatchTool
 from agents.tool import CustomTool
 from agents.tool_context import ToolContext
@@ -1656,30 +1662,83 @@ def workflow_tool_mock_model():
     return TestModel.returning_responses(
         [
             ResponseBuilders.tool_call("{}", "run_tool"),
+            ResponseBuilders.tool_call(
+                '{"note":"call back"}',
+                "add_note",
+                call_id="call-add-note",
+                item_id="item-add-note",
+            ),
+            ResponseBuilders.tool_call(
+                "{}",
+                "offload_sum",
+                call_id="call-offload-sum",
+                item_id="item-offload-sum",
+            ),
             ResponseBuilders.output_message("Workflow tool was used"),
         ]
     )
 
 
+class WorkflowToolHooks(RunHooks):
+    def __init__(self) -> None:
+        self.tool_callables: list[str] = []
+
+    async def on_agent_start(
+        self, context: RunContextWrapper[Any], agent: Agent[Any]
+    ) -> None:
+        # Hooks get the tools as made, so each still has its Python callable.
+        self.tool_callables = [
+            tool.__wrapped__.__name__
+            for tool in agent.tools
+            if isinstance(tool, FunctionTool)
+        ]
+
+
 @workflow.defn
 class WorkflowToolWorkflow:
+    def __init__(self) -> None:
+        self.notes: list[str] = []
+
     @workflow.run
-    async def run(self) -> None:
+    async def run(self) -> dict[str, list[str]]:
         agent: Agent = Agent(
             name="Assistant",
             instructions="You are a helpful assistant.",
             model="gpt-4o",
-            tools=[function_tool(self.run_tool)],
+            tools=[
+                function_tool(self.run_tool),
+                function_tool(self.add_note),
+                function_tool(self.offload_sum),
+            ],
         )
+        hooks = WorkflowToolHooks()
         await Runner.run(
             agent,
             "My phone number is 650-123-4567. Where do you think I live?",
+            hooks=hooks,
         )
+        # Acting on what a sync tool did ties this run's commands to the tool running.
+        if self.notes:
+            await workflow.sleep(timedelta(milliseconds=1))
+        return {"notes": self.notes, "tool_callables": hooks.tool_callables}
 
     async def run_tool(self):
         print("Tool ran with self:", self)
         workflow.logger.info("Tool ran with self: %s", self)
         return None
+
+    def add_note(self, note: str) -> str:
+        """Add a note."""
+        self.notes.append(note)
+        return f"Added note: {note}"
+
+    async def offload_sum(self) -> str:
+        """Add two numbers in a thread."""
+        # Only sync function tools run inline. Other thread calls still fail.
+        try:
+            return f"to_thread returned {await asyncio.to_thread(lambda: 2 + 3)}"
+        except NotImplementedError:
+            return "to_thread raised NotImplementedError"
 
 
 async def test_workflow_method_tools(client: Client):
@@ -1700,7 +1759,18 @@ async def test_workflow_method_tools(client: Client):
             id=f"workflow-tool-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
-        await workflow_handle.result()
+        # The sync tool ran in the Workflow, and the model got its result.
+        assert await workflow_handle.result() == {
+            "notes": ["call back"],
+            "tool_callables": ["run_tool", "add_note", "offload_sum"],
+        }
+        model_inputs = [
+            e.activity_task_scheduled_event_attributes.input.payloads[0].data.decode()
+            async for e in workflow_handle.fetch_history_events()
+            if e.HasField("activity_task_scheduled_event_attributes")
+        ]
+        assert "Added note: call back" in model_inputs[-1]
+        assert "to_thread raised NotImplementedError" in model_inputs[-1]
 
 
 async def test_response_serialization():
@@ -1867,7 +1937,12 @@ class CustomModelProvider(ModelProvider):
         return OpenAIChatCompletionsModel(model="gpt-4o", openai_client=self.client)
 
 
-async def test_chat_completions_model(client: Client):
+@pytest.mark.parametrize(
+    "client_source", ["model_provider", "default_client", "default_key"]
+)
+async def test_chat_completions_model(
+    client: Client, client_source: str, monkeypatch: pytest.MonkeyPatch
+):
     import httpx2
 
     requests: list[dict[str, Any]] = []
@@ -1932,6 +2007,7 @@ async def test_chat_completions_model(client: Client):
         assert request.method == "POST"
         assert request.url.host == "openai.invalid"
         assert request.url.path == "/v1/chat/completions"
+        assert request.headers["authorization"] == "Bearer not-a-real-key"
         requests.append(json.loads(request.content))
         return httpx2.Response(200, json=next(responses))
 
@@ -1943,11 +2019,37 @@ async def test_chat_completions_model(client: Client):
             base_url="https://openai.invalid/v1",
             http_client=http_client,
         )
+        model_provider: ModelProvider | None = CustomModelProvider(openai_client)
+        if client_source != "model_provider":
+            # The framework's documented ways to use another OpenAI-compatible endpoint
+            # or key. The plugin's default provider must use them, not the Worker's
+            # environment.
+            monkeypatch.setenv("OPENAI_API_KEY", "worker-environment-key")
+            monkeypatch.setattr(_openai_shared, "_default_openai_client", None)
+            monkeypatch.setattr(_openai_shared, "_default_openai_key", None)
+            monkeypatch.setattr(_openai_shared, "_use_responses_by_default", True)
+            set_default_openai_api("chat_completions")
+            model_provider = None
+        if client_source == "default_client":
+            monkeypatch.setenv(
+                "OPENAI_BASE_URL", "https://worker-environment.invalid/v1"
+            )
+            set_default_openai_client(openai_client, use_for_tracing=False)
+        elif client_source == "default_key":
+            # The plugin builds its own client on the environment's endpoint; send it
+            # to the mock transport.
+            monkeypatch.setenv("OPENAI_BASE_URL", "https://openai.invalid/v1")
+            monkeypatch.setattr(
+                "temporalio.openai_agents._invoke_model_activity.AsyncOpenAI",
+                lambda **kwargs: AsyncOpenAI(http_client=http_client, **kwargs),
+            )
+            set_default_openai_key("not-a-real-key", use_for_tracing=False)
 
         async with AgentEnvironment(
-            model_provider=CustomModelProvider(openai_client),
+            model_provider=model_provider,
             model_params=ModelActivityParameters(
                 start_to_close_timeout=timedelta(seconds=30),
+                retry_policy=RetryPolicy(maximum_attempts=1),
             ),
         ) as env:
             client = env.applied_on_client(client)
@@ -2108,6 +2210,72 @@ async def test_session(client: Client):
                         return
 
             await assert_eventually(check)
+
+
+class RunModelProvider(ModelProvider):
+    """A provider set on the run, as the framework's custom provider example does."""
+
+    def get_model(self, model_name: str | None) -> Model:
+        raise AssertionError("the plugin never asks a run's provider for a model")
+
+
+@workflow.defn
+class RunModelProviderWorkflow:
+    @workflow.run
+    async def run(self, provider: str) -> str:
+        model_provider = (
+            RunModelProvider()
+            if provider == "custom"
+            else MultiProvider(openai_use_responses=False)
+        )
+        agent = Agent[None](
+            name="Assistant", instructions="You are a helpful assistant."
+        )
+        result = await Runner.run(
+            agent, "Hello", run_config=RunConfig(model_provider=model_provider)
+        )
+        return result.final_output
+
+
+def test_reused_default_model_provider_is_not_refused(monkeypatch: pytest.MonkeyPatch):
+    from temporalio.openai_agents._openai_runner import _is_default_model_provider
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    provider = MultiProvider()
+    # A native run fills the OpenAI provider's client cache; that is not configuration.
+    provider.get_model("gpt-4o")
+    assert _is_default_model_provider(provider)
+    assert not _is_default_model_provider(MultiProvider(openai_use_responses=False))
+
+
+@pytest.mark.parametrize("provider", ["custom", "configured"])
+async def test_run_model_provider_refused(client: Client, provider: str):
+    async with AgentEnvironment(model=hello_mock_model()) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(
+            client,
+            RunModelProviderWorkflow,
+        ) as worker:
+            workflow_handle = await client.start_workflow(
+                RunModelProviderWorkflow.run,
+                provider,
+                id=f"run-model-provider-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+
+            async def check():
+                async for evt in workflow_handle.fetch_history_events():
+                    if evt.HasField(
+                        "workflow_task_failed_event_attributes"
+                    ) and "do not support RunConfig.model_provider" in (
+                        evt.workflow_task_failed_event_attributes.failure.message
+                    ):
+                        return
+                raise AssertionError("RunConfig.model_provider was not refused")
+
+            await assert_eventually(check)
+            await workflow_handle.terminate()
 
 
 @workflow.defn
@@ -2844,11 +3012,19 @@ async def test_output_type(client: Client):
 @workflow.defn
 class McpServerWorkflow:
     @workflow.run
-    async def run(self, caching: bool, factory_argument: Any | None) -> str:
+    async def run(
+        self,
+        caching: bool,
+        factory_argument: Any | None,
+        require_approval: Literal["always"] | None,
+    ) -> str:
         from agents.mcp import MCPServer  # type: ignore[reportUnusedImport]
 
         server: MCPServer = openai_agents.workflow.stateless_mcp_server(
-            "HelloServer", cache_tools_list=caching, factory_argument=factory_argument
+            "HelloServer",
+            cache_tools_list=caching,
+            factory_argument=factory_argument,
+            require_approval=require_approval,
         )
         agent = Agent[str](
             name="MCP ServerWorkflow",
@@ -2858,13 +3034,20 @@ class McpServerWorkflow:
         result = await Runner.run(
             starting_agent=agent, input="Say hello to Tom and Tim."
         )
+        if result.interruptions:
+            return f"Approval needed: {result.interruptions[0].tool_name}"
         return result.final_output
 
 
 @workflow.defn
 class McpServerStatefulWorkflow:
     @workflow.run
-    async def run(self, timeout: timedelta, factory_argument: Any | None) -> str:
+    async def run(
+        self,
+        timeout: timedelta | None,
+        factory_argument: Any | None,
+        require_approval: Literal["always"] | None,
+    ) -> str:
         async with openai_agents.workflow.stateful_mcp_server(
             "HelloServer",
             config=ActivityConfig(
@@ -2872,6 +3055,7 @@ class McpServerStatefulWorkflow:
                 start_to_close_timeout=timedelta(seconds=30),
             ),
             factory_argument=factory_argument,
+            require_approval=require_approval,
         ) as server:
             agent = Agent[str](
                 name="MCP ServerWorkflow",
@@ -2881,6 +3065,8 @@ class McpServerStatefulWorkflow:
             result = await Runner.run(
                 starting_agent=agent, input="Say hello to Tom and Tim."
             )
+            if result.interruptions:
+                return f"Approval needed: {result.interruptions[0].tool_name}"
             return result.final_output
 
 
@@ -2904,7 +3090,9 @@ def tracking_mcp_mock_model():
     )
 
 
-def get_tracking_server(name: str):
+def get_tracking_server(
+    name: str, require_approval: Any = None, cleanup_error: bool = False
+):
     from agents.mcp import MCPServer  # type: ignore
     from mcp import GetPromptResult, ListPromptsResult  # type: ignore
     from mcp import Tool as MCPTool  # type: ignore
@@ -2916,7 +3104,7 @@ def get_tracking_server(name: str):
         def __init__(self, name: str):
             self._name = name
             self.calls = []
-            super().__init__()
+            super().__init__(require_approval=require_approval)
 
         async def connect(self):
             self.calls.append("connect")
@@ -2927,6 +3115,12 @@ def get_tracking_server(name: str):
 
         async def cleanup(self):
             self.calls.append("cleanup")
+            # SDK servers tolerate cleanup() before connect(); raise here so a
+            # cleanup() call on a rejected server is detectable.
+            if "connect" not in self.calls:
+                raise AttributeError("cleanup() before connect()")
+            if cleanup_error:
+                raise RuntimeError("cleanup failed")
 
         async def list_tools(
             self,
@@ -2994,11 +3188,20 @@ def test_legacy_mcp_apis_are_deprecated():
 
 @pytest.mark.parametrize(
     "mode",
-    ["stateful", "stateless", "stateless-cached"],
+    [
+        "stateful",
+        "stateless",
+        "stateless-cached",
+        "stateful-approval",
+        "stateless-approval",
+        "stateful-cleanup-error",
+    ],
 )
 async def test_mcp_server(client: Client, mode: str):
-    stateful = mode == "stateful"
+    stateful = mode.startswith("stateful")
     caching = mode == "stateless-cached"
+    require_approval = "always" if mode.endswith("-approval") else None
+    cleanup_error = mode.endswith("-cleanup-error")
 
     from agents.mcp import MCPServer  # type: ignore
 
@@ -3007,7 +3210,9 @@ async def test_mcp_server(client: Client, mode: str):
         StatelessMCPServerProvider,
     )
 
-    tracking_server = get_tracking_server(name="HelloServer")
+    tracking_server = get_tracking_server(
+        name="HelloServer", cleanup_error=cleanup_error
+    )
     server: StatefulMCPServerProvider | StatelessMCPServerProvider = (
         StatefulMCPServerProvider("HelloServer", lambda _: tracking_server)
         if stateful
@@ -3029,7 +3234,7 @@ async def test_mcp_server(client: Client, mode: str):
             if stateful:
                 result = await client.execute_workflow(
                     McpServerStatefulWorkflow.run,
-                    args=[timedelta(seconds=30), None],
+                    args=[timedelta(seconds=30), None, require_approval],
                     id=f"mcp-server-{uuid.uuid4()}",
                     task_queue=worker.task_queue,
                     execution_timeout=timedelta(seconds=30),
@@ -3037,13 +3242,25 @@ async def test_mcp_server(client: Client, mode: str):
             else:
                 result = await client.execute_workflow(
                     McpServerWorkflow.run,
-                    args=[caching, None],
+                    args=[caching, None, require_approval],
                     id=f"mcp-server-{uuid.uuid4()}",
                     task_queue=worker.task_queue,
                     execution_timeout=timedelta(seconds=30),
                 )
-        assert result == "Hi Tom and Tim!"
     print(tracking_server.calls)
+    if stateful:
+        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
+        # The session's heartbeat task stops, even when cleanup() fails.
+        assert not [
+            task
+            for task in asyncio.all_tasks()
+            if "heartbeat" in task.get_coro().__name__  # type: ignore[union-attr]
+        ]
+    if require_approval:
+        assert result == "Approval needed: Say-Hello"
+        assert "call_tool" not in tracking_server.calls
+        return
+    assert result == "Hi Tom and Tim!"
     if stateful:
         assert tracking_server.calls == [
             "connect",
@@ -3054,7 +3271,6 @@ async def test_mcp_server(client: Client, mode: str):
             "list_tools",
             "cleanup",
         ]
-        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
     else:
         if caching:
             assert tracking_server.calls == [
@@ -3086,6 +3302,31 @@ async def test_mcp_server(client: Client, mode: str):
                 "list_tools",
                 "cleanup",
             ]
+
+
+async def test_auto_heartbeater_interval_heartbeats_without_timeout():
+    from temporalio.openai_agents._heartbeat_decorator import auto_heartbeater
+    from temporalio.testing import ActivityEnvironment
+
+    heartbeats: list[Any] = []
+    env = ActivityEnvironment()  # no heartbeat timeout
+    env.on_heartbeat = lambda *details: heartbeats.append(details)
+
+    @auto_heartbeater(interval=0.01)
+    async def fixed_interval() -> None:
+        await asyncio.sleep(0.1)
+
+    @auto_heartbeater
+    async def from_timeout() -> None:
+        await asyncio.sleep(0.1)
+
+    # A fixed interval heartbeats whatever the timeout, as the stateful MCP
+    # session needs; the default heartbeats only with a heartbeat timeout.
+    await env.run(fixed_interval)
+    assert heartbeats
+    heartbeats.clear()
+    await env.run(from_timeout)
+    assert not heartbeats
 
 
 @pytest.mark.parametrize("stateful", [True, False])
@@ -3120,7 +3361,7 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
             if stateful:
                 await client.execute_workflow(
                     McpServerStatefulWorkflow.run,
-                    args=[timedelta(seconds=30), headers],
+                    args=[timedelta(seconds=30), headers, None],
                     id=f"mcp-server-{uuid.uuid4()}",
                     task_queue=worker.task_queue,
                     execution_timeout=timedelta(seconds=30),
@@ -3128,11 +3369,78 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
             else:
                 await client.execute_workflow(
                     McpServerWorkflow.run,
-                    args=[False, headers],
+                    args=[False, headers, None],
                     id=f"mcp-server-{uuid.uuid4()}",
                     task_queue=worker.task_queue,
                     execution_timeout=timedelta(seconds=30),
                 )
+
+
+@pytest.mark.parametrize("instance_evaluator", [False, True])
+@pytest.mark.parametrize("stateful", [True, False])
+async def test_mcp_server_factory_require_approval_is_rejected(
+    client: Client, stateful: bool, instance_evaluator: bool
+):
+    if instance_evaluator:
+        # The default policy, but an evaluator that always asks.
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server._get_needs_approval_for_tool = (  # type: ignore[method-assign]
+            lambda tool, agent: True  # type: ignore[reportUnknownLambdaType]
+        )
+    else:
+        tracking_server = get_tracking_server("HelloServer", require_approval="always")
+    server: StatefulMCPServerProvider | StatelessMCPServerProvider = (
+        StatefulMCPServerProvider("HelloServer", lambda _: tracking_server)
+        if stateful
+        else StatelessMCPServerProvider("HelloServer", lambda _: tracking_server)
+    )
+
+    async with AgentEnvironment(
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=120)
+        ),
+        model=tracking_mcp_mock_model(),
+        mcp_server_providers=[server],
+    ) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(
+            client, McpServerStatefulWorkflow, McpServerWorkflow
+        ) as worker:
+            with pytest.raises(WorkflowFailureError) as err:
+                if stateful:
+                    # Without a schedule-to-start timeout, the error must
+                    # still reach the workflow before its execution timeout.
+                    await client.execute_workflow(
+                        McpServerStatefulWorkflow.run,
+                        args=[None, None, None],
+                        id=f"mcp-server-{uuid.uuid4()}",
+                        task_queue=worker.task_queue,
+                        execution_timeout=timedelta(seconds=30),
+                    )
+                else:
+                    await client.execute_workflow(
+                        McpServerWorkflow.run,
+                        args=[False, None, None],
+                        id=f"mcp-server-{uuid.uuid4()}",
+                        task_queue=worker.task_queue,
+                        execution_timeout=timedelta(seconds=30),
+                    )
+    assert isinstance(err.value.cause, ActivityError)
+    assert isinstance(err.value.cause.cause, ApplicationError)
+    assert err.value.cause.cause.non_retryable
+    route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+    assert "'HelloServer' sets require_approval" in err.value.cause.cause.message
+    assert f"{route}(require_approval=...)" in err.value.cause.cause.message
+    # The rejected server is never connected, cleaned up or called.
+    assert tracking_server.calls == []
+    if stateful:
+        assert len(cast(StatefulMCPServerProvider, server)._servers) == 0
+        assert not [
+            task
+            for task in asyncio.all_tasks()
+            if "heartbeat" in task.get_coro().__name__  # type: ignore[union-attr]
+        ]
 
 
 async def test_stateful_mcp_server_no_worker(client: Client):
@@ -3156,7 +3464,7 @@ async def test_stateful_mcp_server_no_worker(client: Client):
         ) as worker:
             workflow_handle = await client.start_workflow(
                 McpServerStatefulWorkflow.run,
-                args=[timedelta(seconds=1), None],
+                args=[timedelta(seconds=1), None, None],
                 id=f"mcp-server-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
                 execution_timeout=timedelta(seconds=30),
