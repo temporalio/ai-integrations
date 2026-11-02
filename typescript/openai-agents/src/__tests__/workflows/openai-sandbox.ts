@@ -1,4 +1,4 @@
-import { Agent, Handoff, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
+import { Agent, Handoff, tool, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
 import {
   Capability,
   Manifest,
@@ -8,6 +8,7 @@ import {
   type SandboxRunConfig,
   type SandboxSessionLike,
 } from '@openai/agents-core/sandbox';
+import { ApplicationFailure } from '@temporalio/workflow';
 import { TemporalOpenAIRunner, workerEnvValue, temporalSandboxClient } from '../../workflow';
 
 class TestSandboxCapability extends Capability {
@@ -120,6 +121,62 @@ export async function sandboxApprovalResumeWorkflow(): Promise<string> {
 
   const resumed = await runner.run(agent, result.state, { runConfig });
   return `${resumed.finalOutput}`;
+}
+
+/**
+ * A `SandboxAgent` named `parentName` reaches `Nested` through `ask_nested`, the `asTool()` tool or a
+ * spread copy, and `Nested` pauses on an approval. Approves it and resumes, with the same agents or,
+ * if `rebuilt`, with new ones built the same way. Returns the output and the approved action's runs,
+ * or the resumed run's failure.
+ */
+export async function sandboxNestedApprovalWorkflow(
+  copied: boolean,
+  parentName = 'sandbox-parent',
+  rebuilt = false
+): Promise<string> {
+  let executions = 0;
+  const confirmAction = tool({
+    name: 'confirmAction',
+    description: 'Confirm the action.',
+    parameters: {
+      type: 'object' as const,
+      properties: { reason: { type: 'string' } },
+      required: ['reason'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    execute: async () => `confirmed:${++executions}`,
+  });
+  const buildAgent = () => {
+    const nested = new Agent({
+      name: 'Nested',
+      instructions: 'Answer as nested.',
+      model: 'nested-model',
+      tools: [confirmAction],
+    });
+    const askNested = nested.asTool({ toolName: 'ask_nested' });
+    return new SandboxAgent({
+      name: parentName,
+      instructions: 'Reach nested.',
+      model: 'gpt-4o-mini',
+      capabilities: [new TestSandboxCapability()],
+      tools: [copied ? { ...askNested } : askNested],
+    });
+  };
+  const agent = buildAgent();
+  const runner = new TemporalOpenAIRunner();
+  const runConfig = { sandbox: { client: temporalSandboxClient('fake') } };
+
+  const result = await runner.run(agent, 'go', { runConfig });
+  if (result.state._sandbox === undefined) return 'no-sandbox-state';
+  for (const interruption of result.interruptions) result.state.approve(interruption);
+  try {
+    const resumed = await runner.run(rebuilt ? buildAgent() : agent, result.state, { runConfig });
+    return `${resumed.finalOutput} executions=${executions}`;
+  } catch (err) {
+    if (err instanceof ApplicationFailure) return `${err.type}: ${err.message} executions=${executions}`;
+    throw err;
+  }
 }
 
 export async function sandboxManifestResumeWorkflow(): Promise<string> {

@@ -8,6 +8,7 @@ import {
   RunState,
   setDefaultModelProvider,
   tool,
+  toolNamespace,
   type MCPToolFilterContext,
   type Model,
   type ModelProvider,
@@ -19,6 +20,7 @@ import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import {
   TemporalOpenAIRunner,
   activityAsTool,
+  agentAsTool,
   statelessMcpServer,
   statefulMcpServer,
   temporalSandboxClient,
@@ -481,6 +483,65 @@ export async function sharedAgentApprovalWorkflow(input: SharedAgentApprovalInpu
     savedIdentity: saved.currentAgent.identity ?? saved.currentAgent.name,
     output: result.finalOutput ?? '',
     executions: executions(),
+  };
+}
+
+export type CopiedAgentToolKind = 'original' | 'alias' | 'spread' | 'namespace';
+
+export interface CopiedAgentToolApprovalResult {
+  output: string;
+  executions: number;
+  resumes: number;
+  pending: string[];
+}
+
+/**
+ * `Nested` pauses on an approval behind `ask_nested`: the `asTool()` tool, the deprecated alias's
+ * tool, a spread copy or a `toolNamespace()` copy. Approves it on `result.state` and resumes, at
+ * most three times.
+ */
+export async function copiedAgentToolApprovalWorkflow(
+  kind: CopiedAgentToolKind
+): Promise<CopiedAgentToolApprovalResult> {
+  let executions = 0;
+  const confirmAction = tool({
+    name: 'confirmAction',
+    description: 'Confirm the action.',
+    parameters: {
+      type: 'object' as const,
+      properties: { reason: { type: 'string' } },
+      required: ['reason'] as const,
+      additionalProperties: false as const,
+    },
+    needsApproval: true,
+    execute: async () => `confirmed:${++executions}`,
+  });
+  const nested = new Agent({ name: 'Nested', instructions: 'Answer as nested.', tools: [confirmAction] });
+  const askNested =
+    kind === 'alias'
+      ? // eslint-disable-next-line @typescript-eslint/no-deprecated -- tests the deprecated alias
+        agentAsTool(nested, { toolName: 'ask_nested' })
+      : nested.asTool({ toolName: 'ask_nested' });
+  const parentTool =
+    kind === 'spread'
+      ? { ...askNested }
+      : kind === 'namespace'
+        ? toolNamespace({ name: 'desk', description: 'The desk.', tools: [askNested] })[0]!
+        : askNested;
+  const parent = new Agent({ name: 'Parent', instructions: 'Reach nested.', tools: [parentTool] });
+  const runner = new TemporalOpenAIRunner();
+  let result = await runner.run(parent, 'go', { runConfig: { model: 'run-model' } });
+  let resumes = 0;
+  while (result.interruptions.length > 0 && resumes < 3) {
+    for (const interruption of result.interruptions) result.state.approve(interruption);
+    result = await runner.run(parent, result.state, { runConfig: { model: 'run-model' } });
+    resumes++;
+  }
+  return {
+    output: result.interruptions.length > 0 ? '' : (result.finalOutput ?? ''),
+    executions,
+    resumes,
+    pending: result.interruptions.map((interruption) => interruption.name ?? ''),
   };
 }
 

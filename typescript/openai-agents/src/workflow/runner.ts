@@ -29,6 +29,7 @@ import {
 } from '../common/model-activity-options';
 import { unwrapTemporalFailure } from '../common/errors';
 import { ActivityBackedModelProvider } from './activity-backed-model';
+import { getAgentToolRecord } from './agent-tools';
 import { checkAgent } from './check-agent';
 import { validateTemporalSandboxClient } from './sandbox-client';
 import { ensureTracingProcessorRegistered } from './tracing';
@@ -238,15 +239,22 @@ export class TemporalOpenAIRunner {
 
     let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
     if (input instanceof RunState) {
-      // Round-trip through fromString to drop upstream's live-session identity, which would otherwise
-      // resolve manifest environment references on the Workflow thread rather than in the resume Activity.
       // fromString lists tools, which runs MCP tool filters; their errors fail the run, as in the run below.
       const restored = (await RunState.fromString(agent, input.toString()).catch((error: unknown) => {
         throw normalizeAgentsRunError(error);
       })) as RunState<TContext, TAgent>;
+      // A state with sandbox sessions runs restored, to drop upstream's live-session identity, which would
+      // otherwise resolve manifest environment references on the Workflow thread rather than in the resume
+      // Activity. Other states run as given: restoring finds an `asTool()` agent only through the tool
+      // object `asTool()` returned, so a copy's nested approvals would go to the parent agent.
+      if (input._sandbox !== undefined) {
+        checkRestoredInterruptions(agent, input);
+        preparedInput = restored;
+      } else {
+        preparedInput = input;
+      }
       // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
-      restored.clearTrace();
-      preparedInput = restored;
+      preparedInput.clearTrace();
     } else {
       preparedInput = input;
     }
@@ -310,6 +318,50 @@ export class TemporalOpenAIRunner {
       await flushOpenSpans();
     }
   }
+}
+
+/**
+ * Fails the run if restoring `input` would move one of its approvals to another agent. Restoring finds
+ * an agent through handoffs and the tools `agent.asTool()` returned, so the approval of an agent reached
+ * only through a copy of such a tool goes to the parent or to another agent of the same name, and
+ * resumed it would stay pending. Checks agent objects, not names, from both `agent` and the state's
+ * current agent, so a state whose agents were built again for this run is checked too.
+ */
+function checkRestoredInterruptions(agent: Agent<any, any>, input: RunState<any, any>): void {
+  const roots = [agent, input._currentAgent];
+  const restorable = collectAgents(roots, false);
+  const reachable = collectAgents(roots, true);
+  for (const interruption of input.getInterruptions()) {
+    if (restorable.has(interruption.agent) || !reachable.has(interruption.agent)) continue;
+    throw ApplicationFailure.create({
+      message:
+        `The approval for '${interruption.name}' of agent '${interruption.agent.name}' can't be resumed: ` +
+        "this run's sandbox state is restored from its serialized form, which finds a nested agent only " +
+        'through the tool its agent.asTool() returned, not a copy such as a toolNamespace() one. Give the ' +
+        'parent agent the tool agent.asTool() returned.',
+      type: 'AgentsWorkflowError',
+      nonRetryable: true,
+    });
+  }
+}
+
+/**
+ * The agents reached from `roots` through handoffs and `asTool()` tools: all of them, or with
+ * `throughCopies` false, only the tools `asTool()` returned, as upstream's `RunState` does.
+ */
+function collectAgents(roots: Agent<any, any>[], throughCopies: boolean): Set<Agent<any, any>> {
+  const seen = new Set<Agent<any, any>>();
+  const queue = [...roots];
+  for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
+    if (seen.has(next)) continue;
+    seen.add(next);
+    for (const h of next.handoffs ?? []) queue.push(h instanceof Handoff ? h.agent : h);
+    for (const tool of next.tools ?? []) {
+      const record = getAgentToolRecord(tool);
+      if (record !== undefined && (throughCopies || record.tool === tool)) queue.push(record.agent);
+    }
+  }
+  return seen;
 }
 
 /**

@@ -17,6 +17,8 @@ type AnyAgentToolOptions = AgentToolOptions<any, any, any>;
 /** The agent behind an `agent.asTool()` tool, and the run options the tool took when it was made. */
 export interface AgentToolRecord {
   agent: Agent<any, any>;
+  /** The tool `asTool()` returned. Its copies share the record, but upstream's `RunState` doesn't know them. */
+  tool: AnyAgentTool;
   runConfig: AnyAgentToolOptions['runConfig'];
   runOptions: AnyAgentToolOptions['runOptions'];
 }
@@ -51,7 +53,7 @@ export function installAgentToolInterception(): void {
   function asTool(this: Agent<any, any>, options: AnyAgentToolOptions): AnyAgentTool {
     // Upstream reads its options when the tool is made, so record them then too.
     const tool = state.original.call(this, options);
-    state.records.set(tool.on, { agent: this, runConfig: options.runConfig, runOptions: options.runOptions });
+    state.records.set(tool.on, { agent: this, tool, runConfig: options.runConfig, runOptions: options.runOptions });
     return tool;
   }
   Object.defineProperty(Agent.prototype, interceptionState, { value: state });

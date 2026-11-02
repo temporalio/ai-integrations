@@ -16,6 +16,7 @@ import {
   sandboxClientChangedWorkflow,
   sandboxExecWorkflow,
   sandboxManifestResumeWorkflow,
+  sandboxNestedApprovalWorkflow,
   sandboxValidationWorkflow,
 } from './workflows/openai-sandbox';
 
@@ -117,6 +118,44 @@ test.serial('a SandboxAgent whose manifest carries a workerEnvValue survives an 
 
   t.true(client.resumeCalls >= 1, 'the preserved session is re-established through resume()');
 });
+
+for (const [copied, parentName, rebuilt] of [
+  [false, 'sandbox-parent', false],
+  [true, 'sandbox-parent', false],
+  [false, 'Nested', false],
+  [true, 'Nested', false],
+  [false, 'sandbox-parent', true],
+  [true, 'sandbox-parent', true],
+  [false, 'Nested', true],
+  [true, 'Nested', true],
+] as const) {
+  test(`A nested approval behind ${copied ? 'a copy of an' : 'an'} asTool() tool in a sandbox run whose parent is named '${parentName}' ${copied ? 'fails the resume' : 'resumes'}${rebuilt ? ' with rebuilt agents' : ''}`, async (t) => {
+    const { createWorker, executeWorkflow } = helpers(t);
+    const worker = await createWorker({
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider([
+            toolCallResponse('ask_nested', { input: 'q' }),
+            toolCallResponse('confirmAction', { reason: 'approved' }),
+            textResponse('nested done'),
+            textResponse('parent done'),
+          ]),
+          sandboxClientProviders: [new SandboxClientProvider('fake', new FakeSandboxClient())],
+        }),
+      ],
+    });
+
+    await worker.runUntil(async () => {
+      const result = await executeWorkflow(sandboxNestedApprovalWorkflow, { args: [copied, parentName, rebuilt] });
+      if (copied) {
+        t.regex(result, /^AgentsWorkflowError: The approval for 'confirmAction' of agent 'Nested' can't be resumed/);
+        t.regex(result, /executions=0$/);
+      } else {
+        t.is(result, 'parent done executions=1');
+      }
+    });
+  });
+}
 
 test('setArchiveLimits is forwarded to the persistWorkspace and hydrateWorkspace Activities', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
