@@ -3,7 +3,8 @@
 Pydantic decodes an ``Iterable[X]`` field as a one-shot iterator, which cannot be copied, and in
 JSON mode it picks the ``Iterable`` side of ``str | Iterable[X]`` for a string
 (pydantic/pydantic#11219). Importing this module swaps those annotations for ``list[X]``, so every
-class built afterwards decodes carried items as lists and strings.
+class built afterwards decodes carried items as lists and strings. Tool definitions keep their
+types, because other ``openai`` requests share them.
 """
 
 import collections.abc
@@ -14,6 +15,7 @@ import typing
 
 import typing_extensions
 from agents import TResponseInputItem
+from openai.types.responses import ToolParam
 
 
 def _as_list(hint: typing.Any) -> typing.Any:
@@ -52,4 +54,5 @@ def _swap(hint: typing.Any, seen: set[int]) -> None:
         _swap(arg, seen)
 
 
-_swap(TResponseInputItem, set())
+# Items can hold tool definitions; start with them marked as seen.
+_swap(TResponseInputItem, {id(tool) for tool in typing.get_args(ToolParam)})
