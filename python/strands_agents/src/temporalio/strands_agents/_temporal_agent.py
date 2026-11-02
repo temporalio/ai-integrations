@@ -8,7 +8,6 @@ from strands.agent._concurrency import _ConcurrencyController, _InflightInvocati
 from strands.agent.conversation_manager import NullConversationManager
 from strands.hooks import BeforeModelCallEvent
 from strands.tools.registry import ToolRegistry
-from strands.types._events import TypedEvent
 from strands.types.agent import AgentInput
 from strands.types.content import Messages
 from strands.types.exceptions import EventLoopException
@@ -19,6 +18,7 @@ from temporalio.common import Priority, RetryPolicy
 from temporalio.workflow import ActivityCancellationType, VersioningIntent
 
 from ._temporal_mcp_client import MCPToolNameConflictError, TemporalMCPClient
+from ._temporal_mcp_tool import TemporalMCPTool
 from ._temporal_model import TemporalModel
 from ._temporal_sandbox import TemporalSandbox
 
@@ -30,36 +30,55 @@ _SNAPSHOT_DISABLED = (
 )
 
 
+def _server_name(tool: AgentTool) -> str:
+    # The server's own name for an MCP tool, which tool_filters match. A prefix
+    # makes the agent's name differ from it.
+    return tool.mcp_tool.name if isinstance(tool, TemporalMCPTool) else tool.tool_name
+
+
+def _listed_as(provider: TemporalMCPClient, tool: AgentTool) -> str:
+    listed = _server_name(tool)
+    if listed == tool.tool_name:
+        return f"'{provider.server}'"
+    return f"'{provider.server}' (as '{listed}')"
+
+
 def _duplicate_tool_name(
-    name: str,
-    other: str,
+    tool: AgentTool,
     provider: TemporalMCPClient,
-    holder: TemporalMCPClient | None,
+    other: str,
+    held: tuple[AgentTool, TemporalMCPClient] | None,
 ) -> MCPToolNameConflictError:
     # Strands' words when it refuses a name, then where the two tools come from.
+    name = tool.tool_name
     if other == name:
         refused = f"Tool name '{name}' already exists."
     else:
         refused = f"Tool name '{name}' already exists as '{other}'."
-    if holder is None:
+    if held is None:
         source = (
-            f"MCP server '{provider.server}' lists it, and another tool of the "
-            "agent has it. Set a prefix on the server's TemporalMCPClient, or "
-            "drop the tool with its tool_filters."
+            f"MCP server {_listed_as(provider, tool)} lists it, and another tool "
+            "of the agent has it. Set a prefix (or a different one) on the "
+            f"server's TemporalMCPClient, or drop '{_server_name(tool)}' with its "
+            "tool_filters."
         )
-    elif holder is provider:
+        return MCPToolNameConflictError(f"{refused} {source}")
+    held_tool, holder = held
+    if holder is provider:
         both = "it twice" if other == name else "both names"
         source = f"MCP server '{provider.server}' lists {both}."
     elif holder.server == provider.server:
         source = (
             "The agent has two TemporalMCPClient handles for MCP server "
-            f"'{provider.server}'. Give one a different prefix, or pass only one."
+            f"'{provider.server}'. Give one a different prefix, narrow one's "
+            "tool_filters, or pass only one."
         )
     else:
         source = (
-            f"MCP servers '{holder.server}' and '{provider.server}' both list it. "
-            "Set a different prefix on one server's TemporalMCPClient, or drop "
-            "the tool with its tool_filters."
+            f"MCP servers {_listed_as(holder, held_tool)} and "
+            f"{_listed_as(provider, tool)} both list it. Set a prefix (or a "
+            "different one) on one server's TemporalMCPClient, or drop the tool "
+            "from one with its tool_filters."
         )
     return MCPToolNameConflictError(f"{refused} {source}")
 
@@ -79,17 +98,18 @@ def _check_mcp_tools(
         name.replace("-", "_"): name for name in reg.registry if name not in mcp_names
     }
     dynamic = set(reg.dynamic_tools) - mcp_names
-    seen: dict[str, tuple[str, TemporalMCPClient]] = {}
+    seen: dict[str, tuple[AgentTool, TemporalMCPClient]] = {}
     for provider, tools in listings.items():
         for tool in tools:
             name = tool.tool_name
             key = name.replace("-", "_")
             if key in seen:
-                other, holder = seen[key]
-                raise _duplicate_tool_name(name, other, provider, holder)
+                other = seen[key][0].tool_name
+                raise _duplicate_tool_name(tool, provider, other, seen[key])
             if key in held or name in dynamic:
-                raise _duplicate_tool_name(name, held.get(key, name), provider, None)
-            seen[key] = (name, provider)
+                other = held.get(key, name)
+                raise _duplicate_tool_name(tool, provider, other, None)
+            seen[key] = (tool, provider)
 
 
 class _WorkflowInflightInvocation(_InflightInvocation):
@@ -217,8 +237,8 @@ class TemporalAgent(Agent):
             listings[provider] = provider._tools
             _check_mcp_tools(listings, reg, self._mcp_names)
         new = {tool.tool_name for tools in listings.values() for tool in tools}
-        # Tools the servers dropped or renamed since the last turn. There is no
-        # public unregister, so remove them from the registry directly.
+        # Tools the servers dropped or renamed since the last turn.
+        # ToolRegistry.remove() needs Strands 1.63, so remove them directly.
         for name in self._mcp_names - new:
             reg.registry.pop(name, None)
             reg.dynamic_tools.pop(name, None)
@@ -232,9 +252,7 @@ class TemporalAgent(Agent):
                     reg.register_tool(tool)
         self._mcp_names = new
 
-    async def _run_loop(
-        self, *args: Any, **kwargs: Any
-    ) -> AsyncGenerator[TypedEvent, None]:
+    async def _run_loop(self, *args: Any, **kwargs: Any) -> AsyncGenerator[Any, None]:
         # After a tool call, Strands runs the next model call inside the last
         # cycle and wraps most errors from it in EventLoopException. Raise a
         # tool name conflict as itself, so Workflow code can catch it and it

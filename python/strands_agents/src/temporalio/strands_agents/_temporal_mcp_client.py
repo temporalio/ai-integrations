@@ -79,7 +79,8 @@ class TemporalMCPClient(ToolProvider):
     Construct once at module level and pass to ``TemporalAgent(tools=[...])``
     inside the workflow. Multiple handles may reference the same server name
     with different activity options or prefixes. On one agent, two handles of
-    a server with the same prefix list the same names, which are refused.
+    a server must not list the same name: give them different prefixes or
+    disjoint ``tool_filters``.
     """
 
     def __init__(

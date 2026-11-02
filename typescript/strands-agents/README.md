@@ -334,6 +334,8 @@ const echo = new TemporalMCPClient({
 });
 ```
 
+Tool names must be unique on one agent, as in Strands: two tools may not have the same name, or names that differ only by `-` or `_`. Strands refuses such a name when the agent first lists its MCP servers. When a server that is re-listed starts listing a name that another tool of the agent has, such as a tool of another server or a tool in `tools`, the listing throws Strands' `ToolValidationError` and leaves the agent's tools as they were. Like other errors thrown in workflow code, it fails the workflow task on every attempt, until the run is reset or terminated. While a server lists a name, the name is that server's: a tool you put under it is replaced at the next listing.
+
 To amortize connection setup, the `{name}-listTools` and `{name}-callTool` activities share one worker-process MCP connection and reuse it across calls. The connection is disconnected after it sits idle for `mcpConnectionIdleTimeout` (default 5 minutes); the timer resets on every reuse. `mcpConnectionIdleTimeout` accepts a millisecond number or a duration string (e.g. `'30 seconds'`), like `startToCloseTimeout`:
 
 ```ts
@@ -396,6 +398,7 @@ This version changes what workflow code does in the cases below, with no version
 - **Your failure converter.** Earlier versions replaced the failure converter your client and worker set with the plugin's, so workflow code now decodes the failures of earlier runs with yours. If yours decodes a failure into another error than the SDK's default converter and that changes which commands the workflow issues, the run fails to replay. If it only changes a value the workflow keeps or returns, the run replays without error and continues with the new value, so replay tests do not catch it.
 - **Errors from a turn.** Workflow code that catches errors from `invoke()` by class now gets an `ApplicationFailure` or `ActivityFailure` instead of the Strands error. If it acts on the difference, the run fails to replay.
 - **Context overflow.** A run whose workflow code caught a context overflow from the agent now trims and calls the model again on replay instead, and fails to replay.
+- **Duplicate MCP tool names.** When a re-listed server starts listing a name that another tool of the agent has, the listing now throws Strands' `ToolValidationError`, where earlier versions let the new tool replace the other one. A run in which that happened fails to replay at that listing.
 
 Let those runs finish before you upgrade, or keep them on the earlier version with Worker Versioning. The same applies to rolling back: a run that started on this version can fail to replay on an earlier one, so let it finish before you roll back.
 

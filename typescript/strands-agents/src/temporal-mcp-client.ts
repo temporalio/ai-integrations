@@ -1,4 +1,4 @@
-import { McpClient } from '@strands-agents/sdk';
+import { McpClient, ToolValidationError } from '@strands-agents/sdk';
 import type { JSONSchema, JSONValue } from '@strands-agents/sdk';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import * as workflow from '@temporalio/workflow';
@@ -84,6 +84,11 @@ export class TemporalMCPClient extends McpClient {
   private readonly activityOptions: ActivityOptions;
   /** Whether the agent lists this server's tools once or re-lists each turn. */
   readonly cacheTools: boolean;
+  // The names this client's tools hold in each agent's registry since its last refresh. While the
+  // server lists a name, the name is this client's.
+  private readonly held = new WeakMap<ToolRegistryView, Set<string>>();
+  // The tools this client listed, to find the ones Strands registered when the agent initialized.
+  private readonly listed = new WeakSet<object>();
 
   constructor(options: TemporalMCPClientOptions) {
     super({ transport: STUB_TRANSPORT });
@@ -116,7 +121,9 @@ export class TemporalMCPClient extends McpClient {
       ...this.activityOptions,
     });
     const infos = await activities[listToolsActivityName(this.server)]!({ server: this.server });
-    return infos.map((info) => new TemporalMCPTool(this.server, info, this.activityOptions)) as never[];
+    const tools = infos.map((info) => new TemporalMCPTool(this.server, info, this.activityOptions));
+    for (const tool of tools) this.listed.add(tool);
+    return tools as never[];
   }
 
   /**
@@ -124,20 +131,58 @@ export class TemporalMCPClient extends McpClient {
    * registry, dropping tools that no longer exist and adding new ones.
    * {@link TemporalAgent} calls this on each agent turn when `cacheTools` is
    * `false` so a mid-workflow MCP-server restart is reflected in the next call.
+   *
+   * A listed name that another tool of the agent has, or that differs from one
+   * only by `-` or `_`, throws Strands' `ToolValidationError` and leaves the
+   * registry as it was, as Strands does when the agent first lists the server.
    */
   async refreshTools(registry: ToolRegistryView): Promise<void> {
     // Imported lazily to avoid a circular module cycle with TemporalMCPTool.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { TemporalMCPTool } = require('./temporal-mcp-tool') as typeof import('./temporal-mcp-tool');
     const fresh = await this.listTools();
-    const freshNames = new Set((fresh as unknown as { name: string }[]).map((t) => t.name));
+    const names = (fresh as unknown as { name: string }[]).map((t) => t.name);
+    const held =
+      this.held.get(registry) ?? new Set(registry.list().flatMap((t) => (this.listed.has(t) ? [t.name] : [])));
+    const taken = new Map<string, { name: string }>();
     for (const tool of registry.list()) {
-      if (tool instanceof TemporalMCPTool && tool.server === this.server && !freshNames.has(tool.name)) {
-        registry.remove(tool.name);
+      if (!held.has(tool.name)) taken.set(normalized(tool.name), tool);
+    }
+    const seen = new Map<string, string>();
+    for (const name of names) {
+      const first = seen.get(normalized(name));
+      if (first !== undefined) {
+        throw duplicateToolName(name, first, `MCP server '${this.server}' lists ${first === name ? 'it twice' : 'both names'}.`);
       }
+      const other = taken.get(normalized(name));
+      if (other !== undefined) {
+        const source =
+          other instanceof TemporalMCPTool && other.server !== this.server
+            ? `MCP servers '${other.server}' and '${this.server}' both list it.`
+            : `MCP server '${this.server}' lists it, and another tool of the agent has it.`;
+        throw duplicateToolName(name, other.name, source);
+      }
+      seen.set(normalized(name), name);
+    }
+    const freshNames = new Set(names);
+    for (const name of held) {
+      if (!freshNames.has(name)) registry.remove(name);
     }
     registry.addOrReplace(fresh);
+    this.held.set(registry, freshNames);
   }
+}
+
+// Strands' ToolRegistry refuses a name that differs from a registered one only by '-' or '_'.
+function normalized(name: string): string {
+  return name.replaceAll('-', '_');
+}
+
+// Strands' words when its ToolRegistry refuses a name, then where the two tools come from.
+function duplicateToolName(name: string, other: string, source: string): ToolValidationError {
+  const refused =
+    other === name ? `Tool with name '${name}' already registered.` : `Tool name '${name}' already exists as '${other}'.`;
+  return new ToolValidationError(`${refused} ${source}`);
 }
 
 export function listToolsActivityName(server: string): string {

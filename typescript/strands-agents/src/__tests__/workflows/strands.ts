@@ -223,6 +223,23 @@ export async function mcpAgent(prompt: string, server = 'testServer', cacheTools
   return result.toString();
 }
 
+/** An agent with one `TemporalMCPClient` per server, and the `echo` tool when `local` is set. */
+export async function mcpServersAgent(prompt: string, servers: string[], local = false): Promise<string> {
+  const clients = servers.map(
+    (server) => new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } })
+  );
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    tools: local ? [echoTool, ...clients] : clients,
+  });
+  try {
+    return (await agent.invoke(prompt)).toString();
+  } catch (err) {
+    return `refused: ${(err as Error).message}`;
+  }
+}
+
 const echoTool = tool({
   name: 'echo',
   description: 'Echo back the input text',

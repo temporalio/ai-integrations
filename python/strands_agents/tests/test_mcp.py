@@ -10,7 +10,7 @@ from uuid import uuid4
 import pytest
 from mcp import Client as MCPClient
 from mcp import StdioServerParameters, stdio_client
-from mcp.types import Tool
+from mcp.types import ListToolsResult, Tool
 from strands import tool
 from strands.hooks import BeforeModelCallEvent
 from strands.types.exceptions import EventLoopException
@@ -398,9 +398,11 @@ async def test_mcp_duplicate_tool_names_are_refused(client: Client):
             id=f"test_mcp_duplicate_tool_names_are_refused_{uuid4()}",
             task_queue=task_queue,
         )
-        assert (await handle.result()).startswith(
+        assert await handle.result() == (
             "refused: Tool name 'echo' already exists. "
-            "MCP servers 'echo_a' and 'echo_b' both list it."
+            "MCP servers 'echo_a' and 'echo_b' both list it. Set a prefix (or a "
+            "different one) on one server's TemporalMCPClient, or drop the tool "
+            "from one with its tool_filters."
         )
         with pytest.raises(WorkflowFailureError) as exc_info:
             await client.execute_workflow(
@@ -661,10 +663,14 @@ async def test_other_errors_after_a_tool_call_stay_wrapped(client: Client):
     assert result == "wrapped ValueError"
 
 
+def _listed_tool(name: str) -> Tool:
+    return Tool.model_validate(
+        {"name": name, "inputSchema": {"type": "object", "properties": {}}}
+    )
+
+
 def _mcp_tool(server: str, name: str) -> TemporalMCPTool:
-    schema = {"type": "object", "properties": {}}
-    listed = Tool.model_validate({"name": name, "inputSchema": schema})
-    return TemporalMCPTool(DurableMCPClient(server), listed)
+    return TemporalMCPTool(DurableMCPClient(server), _listed_tool(name))
 
 
 async def _before_model_call(agent: TemporalAgent) -> None:
@@ -748,7 +754,8 @@ async def test_mcp_duplicate_refused_again_after_caught(
             ("search",),
             2,
             "The agent has two TemporalMCPClient handles for MCP server 'a'. "
-            "Give one a different prefix, or pass only one.",
+            "Give one a different prefix, narrow one's tool_filters, or pass only "
+            "one.",
         ),
     ],
 )
@@ -766,6 +773,60 @@ async def test_mcp_server_listing_a_name_twice_is_refused(
 
     with pytest.raises(MCPToolNameConflictError, match=re.escape(message)):
         await _before_model_call(agent)
+
+
+async def test_mcp_conflict_names_the_servers_tool(monkeypatch: pytest.MonkeyPatch):
+    """With a prefix, the error names the server's tool, which tool_filters match.
+
+    Two handles of one server are refused only when both list a name.
+    """
+
+    def server(name: str, *names: str, **kwargs: Any) -> TemporalMCPClient:
+        client = TemporalMCPClient(name, **kwargs)
+
+        async def list_tools() -> ListToolsResult:
+            return ListToolsResult(tools=[_listed_tool(n) for n in names])
+
+        monkeypatch.setattr(client._client, "list_tools", list_tools)
+        return client
+
+    a = server("a", "x", prefix="p")
+    with pytest.raises(
+        MCPToolNameConflictError,
+        match=re.escape(
+            "Tool name 'p_x' already exists. "
+            "MCP servers 'a' (as 'x') and 'b' (as 'x') both list it."
+        ),
+    ):
+        await _before_model_call(
+            TemporalAgent(model="m", tools=[a, server("b", "x", prefix="p")])
+        )
+    b = server("b", "x", prefix="p", tool_filters={"rejected": ["x"]})
+    agent = TemporalAgent(model="m", tools=[a, b])
+    await _before_model_call(agent)
+    assert set(agent.tool_registry.registry) == {"p_x"}
+
+    with pytest.raises(
+        MCPToolNameConflictError,
+        match=re.escape(
+            "MCP server 'a' (as 'x') lists it, and another tool of the agent has "
+            "it. Set a prefix (or a different one) on the server's "
+            "TemporalMCPClient, or drop 'x' with its tool_filters."
+        ),
+    ):
+        await _before_model_call(
+            TemporalAgent(model="m", tools=[_mcp_tool("local", "p_x"), a])
+        )
+
+    names = ("search", "create_pr")
+    fast = server("s", *names, tool_filters={"allowed": ["search", "create_pr"]})
+    slow = server("s", *names, tool_filters={"allowed": ["create_pr"]})
+    with pytest.raises(MCPToolNameConflictError, match="two TemporalMCPClient handles"):
+        await _before_model_call(TemporalAgent(model="m", tools=[fast, slow]))
+    fast = server("s", *names, tool_filters={"allowed": ["search"]})
+    agent = TemporalAgent(model="m", tools=[fast, slow])
+    await _before_model_call(agent)
+    assert set(agent.tool_registry.registry) == set(names)
 
 
 async def test_mcp_same_client_twice_on_one_agent(monkeypatch: pytest.MonkeyPatch):
@@ -826,30 +887,31 @@ async def test_mcp_shared_cached_client(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.parametrize("cache_tools", [False, True])
+@pytest.mark.parametrize(("first", "second"), [("foo-bar", "foo_bar"), ("x_y", "x-y")])
 async def test_mcp_refused_listing_registers_nothing(
-    monkeypatch: pytest.MonkeyPatch, cache_tools: bool
+    monkeypatch: pytest.MonkeyPatch, cache_tools: bool, first: str, second: str
 ):
     """A name that differs from another only by '-' or '_' refuses the whole turn."""
     h = TemporalMCPClient("h")
     n = TemporalMCPClient("n", cache_tools=cache_tools)
     agent = TemporalAgent(model="m", tools=[h, n])
-    monkeypatch.setattr(h, "_refresh", _listing(h, "foo-bar"))
-    monkeypatch.setattr(n, "_refresh", _listing(n, "safe", "foo_bar"))
+    monkeypatch.setattr(h, "_refresh", _listing(h, first))
+    monkeypatch.setattr(n, "_refresh", _listing(n, "safe", second))
 
     for _turn in range(2):
         with pytest.raises(
             ValueError,
-            match="Tool name 'foo_bar' already exists as 'foo-bar'. "
+            match=f"Tool name '{second}' already exists as '{first}'. "
             "MCP servers 'h' and 'n' both list it.",
         ):
             await _before_model_call(agent)
         assert agent.tool_registry.registry == {}
 
-    # h drops foo-bar; n's tools register and stay n's on the next turns.
+    # h drops its name; n's tools register and stay n's on the next turns.
     monkeypatch.setattr(h, "_refresh", _listing(h, "other"))
     for _turn in range(2):
         await _before_model_call(agent)
-        assert _sources(agent, h, n) == {"other": "h", "safe": "n", "foo_bar": "n"}
+        assert _sources(agent, h, n) == {"other": "h", "safe": "n", second: "n"}
 
 
 @pytest.mark.parametrize("order", ["ab", "ba"])
@@ -910,7 +972,10 @@ async def test_mcp_failed_listing_changes_nothing(monkeypatch: pytest.MonkeyPatc
 async def test_mcp_listing_replaces_a_tool_replaced_in_place(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """A server's tool replaced in place stays the server's: listed again, it is replaced."""
+    """A server's tool replaced in place stays the server's: listed again, it is replaced.
+
+    A name the server drops is the agent's again.
+    """
     a = TemporalMCPClient("a")
     agent = TemporalAgent(model="m", tools=[a])
     monkeypatch.setattr(a, "_refresh", _listing(a, "echo"))
@@ -935,9 +1000,25 @@ async def test_mcp_listing_replaces_a_tool_replaced_in_place(
     assert agent.tool_registry.registry == {}
     assert agent.tool_registry.dynamic_tools == {}
 
+    # A tool put under the dropped name stays, and the server listing the name
+    # again is refused.
+    agent.tool_registry.register_tool(_local_echo)
+    await _before_model_call(agent)
+    assert agent.tool_registry.registry == {"echo": _local_echo}
+    monkeypatch.setattr(a, "_refresh", _listing(a, "echo"))
+    with pytest.raises(MCPToolNameConflictError, match="MCP server 'a' lists it"):
+        await _before_model_call(agent)
+    assert agent.tool_registry.registry == {"echo": _local_echo}
+
 
 @tool(name="foo_bar")
 def _local_foo_bar() -> str:
+    """Return LOCAL."""
+    return "LOCAL"
+
+
+@tool(name="x-y")
+def _local_x_y() -> str:
     """Return LOCAL."""
     return "LOCAL"
 
@@ -948,10 +1029,11 @@ def _local_foo_bar() -> str:
         (
             "echo",
             "Tool name 'echo' already exists. MCP server 'a' lists it, and another "
-            "tool of the agent has it. Set a prefix on the server's "
-            "TemporalMCPClient, or drop the tool with its tool_filters.",
+            "tool of the agent has it. Set a prefix (or a different one) on the "
+            "server's TemporalMCPClient, or drop 'echo' with its tool_filters.",
         ),
         ("foo-bar", "Tool name 'foo-bar' already exists as 'foo_bar'."),
+        ("x_y", "Tool name 'x_y' already exists as 'x-y'."),
         ("sandbox_shell", "Tool name 'sandbox_shell' already exists."),
     ],
 )
@@ -964,7 +1046,8 @@ async def test_mcp_tool_named_like_another_tool_is_refused(
     """
     a = TemporalMCPClient("a")
     monkeypatch.setattr(a, "_refresh", _listing(a, listed))
-    for tools in ([_local_echo, _local_foo_bar, a], [a, _local_echo, _local_foo_bar]):
+    local = [_local_echo, _local_foo_bar, _local_x_y]
+    for tools in ([*local, a], [a, *local]):
         agent = TemporalAgent(model="m", tools=tools, sandbox=TemporalSandbox("sb"))
         with pytest.raises(MCPToolNameConflictError, match=re.escape(message)):
             await _before_model_call(agent)
