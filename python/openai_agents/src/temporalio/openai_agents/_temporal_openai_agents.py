@@ -252,6 +252,9 @@ _DecodedIterator: type[Iterable[typing.Any]] = type(
 )
 
 
+_UNSET = object()
+
+
 def _list_decoded_iterators(value: typing.Any) -> typing.Any:
     """Replace decoded iterators in ``value`` with lists, in place, and return it."""
     if isinstance(value, _DecodedIterator):
@@ -270,10 +273,12 @@ def _list_decoded_iterators(value: typing.Any) -> typing.Any:
             )
     elif dataclasses.is_dataclass(value) and not isinstance(value, type):
         for field in dataclasses.fields(value):
+            # Pydantic leaves an init=False field unset.
+            item = getattr(value, field.name, _UNSET)
+            if item is _UNSET:
+                continue
             # Also works for frozen dataclasses.
-            object.__setattr__(
-                value, field.name, _list_decoded_iterators(getattr(value, field.name))
-            )
+            object.__setattr__(value, field.name, _list_decoded_iterators(item))
     return value
 
 

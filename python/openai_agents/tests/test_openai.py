@@ -3,14 +3,15 @@ import copy
 import json
 import os
 import uuid
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import nexusrpc
 import pydantic
 import pytest
+import typing_extensions
 from agents import (
     Agent,
     AgentBase,
@@ -71,6 +72,7 @@ from openai.types.responses import (
     ResponseFileSearchToolCall,
     ResponseFunctionToolCall,
     ResponseFunctionWebSearch,
+    ResponseInputTextParam,
     ResponseOutputMessage,
 )
 from openai.types.responses.response_file_search_tool_call import Result
@@ -1270,6 +1272,35 @@ class CarriedItemsExtraModel(pydantic.BaseModel):
     carried_at: datetime
 
 
+class OwnValuesModel(pydantic.BaseModel):
+    # The app's own Iterable field, which only the converter's walk lists.
+    values: Iterable[int]
+
+
+class OwnCustomToolOutput(typing_extensions.TypedDict):
+    # Same union as openai's custom tool output, which the swap leaves alone here.
+    type: Literal["custom_tool_call_output"]
+    call_id: str
+    output: str | Iterable[ResponseInputTextParam]
+
+
+class OwnCustomToolOutputModel(pydantic.BaseModel):
+    item: OwnCustomToolOutput
+
+
+@dataclass
+class PricedOrder:
+    id: str
+    # Pydantic leaves an init=False field unset when it decodes the order.
+    total: float = field(init=False)
+
+
+def _priced_order() -> PricedOrder:
+    order = PricedOrder("o-1")
+    order.total = 9.5
+    return order
+
+
 def _dated_items(state: Any) -> Any:
     return state.carried_at, state.input_items
 
@@ -1304,14 +1335,35 @@ def _dated_items(state: Any) -> Any:
             lambda state: (state.carried_at, state.__pydantic_extra__["carried"]),
             (CARRIED_AT, CARRIED_ITEMS),
         ),
+        (OwnValuesModel(values=[1, 2]), lambda state: state.values, [1, 2]),
+        (
+            OwnCustomToolOutputModel(
+                item={
+                    "type": "custom_tool_call_output",
+                    "call_id": "c1",
+                    "output": "pong",
+                }
+            ),
+            lambda state: state.item["output"],
+            "pong",
+        ),
+        (_priced_order(), lambda state: state.id, "o-1"),
     ],
-    ids=["model", "strict-model", "dataclass", "strict-dataclass", "extra-model"],
+    ids=[
+        "model",
+        "strict-model",
+        "dataclass",
+        "strict-dataclass",
+        "extra-model",
+        "own-iterable-field",
+        "own-str-or-iterable",
+        "unset-init-false-field",
+    ],
 )
-def test_carried_input_items_in_state_decode_as_lists(
-    carried: Any, read: Any, expected: Any
-):
+def test_state_decodes_iterables_as_lists(carried: Any, read: Any, expected: Any):
     # Workflows often carry the items in a model or dataclass, as the
-    # documented chat does.
+    # documented chat does. The app's own Iterable fields go through the
+    # converter's walk.
     converter = OpenAIPayloadConverter()
     (payload,) = converter.to_payloads([carried])
     (state,) = converter.from_payloads([payload], [type(carried)])
