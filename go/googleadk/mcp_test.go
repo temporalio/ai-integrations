@@ -442,15 +442,22 @@ func TestMcpListsAtTheSamePointInEveryStep(t *testing.T) {
 }
 
 // hidingToolset hides the "search" tool of the wrapped MCP server once hide is
-// set, the way a server drops a tool from its list.
+// set, the way a server drops a tool from its list. With calls set, it also
+// hides it from Tools call number hideCall alone, counting from 1.
 type hidingToolset struct {
 	tool.Toolset
-	hide *atomic.Bool
+	hide     *atomic.Bool
+	calls    *atomic.Int32
+	hideCall int32
 }
 
 func (h hidingToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 	tools, err := h.Toolset.Tools(ctx)
-	if err != nil || !h.hide.Load() {
+	hide := h.hide.Load()
+	if h.calls != nil && h.calls.Add(1) == h.hideCall {
+		hide = true
+	}
+	if err != nil || !hide {
 		return tools, err
 	}
 	var kept []tool.Tool
@@ -468,8 +475,8 @@ var searchDropped atomic.Bool
 // catalogChangeWorkflow runs one turn of an MCP agent and returns how many
 // UUIDs ADK drew from the context. With filterDrops, the toolset's ToolFilter
 // drops "search" once searchDropped is set. With instructionLists, the
-// agent's InstructionProvider sets searchDropped and lists the toolset, after
-// ADK's own Tools call.
+// agent's InstructionProvider lists the toolset too, after ADK's own Tools
+// call.
 func catalogChangeWorkflow(ctx workflow.Context, filterDrops, instructionLists bool) (int, error) {
 	opts := googleadk.MCPToolsetOptions{Name: "search-server"}
 	if filterDrops {
@@ -487,7 +494,6 @@ func catalogChangeWorkflow(ctx workflow.Context, filterDrops, instructionLists b
 	if instructionLists {
 		cfg.Instruction = ""
 		cfg.InstructionProvider = func(rctx agent.ReadonlyContext) (string, error) {
-			searchDropped.Store(true)
 			if _, err := ts.Tools(rctx); err != nil {
 				return "", err
 			}
@@ -521,8 +527,10 @@ func catalogChangeWorkflow(ctx workflow.Context, filterDrops, instructionLists b
 // still packed themselves, a tool the server dropped would stay declared and
 // a call to it would run CallMcpTool there, but not with ADK v2.6.0.
 //
-// It also proves a change in the list does not change the IDs ADK generates.
-// ADK draws a UUID for each tool it kept from Tools before every model step:
+// It also proves a change in the list does not change the IDs ADK generates:
+// the turn draws the same number of UUIDs in every case, on every ADK
+// release. ADK draws a UUID for each tool it kept from Tools before every
+// model step:
 // v2.5.0 and earlier keep the first list of the agent run, and v2.6.0 keeps
 // what each step's Tools call returns. If those calls returned the current
 // list, or the list of a later Tools call before the first ProcessRequest,
@@ -565,7 +573,8 @@ func TestMcpDroppedToolIsNeitherDeclaredNorCalled(t *testing.T) {
 	})
 
 	t.Run("same generated IDs", func(t *testing.T) {
-		draws := map[string]int{}
+		// The turn draws this many UUIDs with ADK v2.3.0 to v2.7.0.
+		const wantDraws = 19
 		for _, tc := range []struct {
 			name                               string
 			drop, filterDrop, instructionLists bool
@@ -574,7 +583,7 @@ func TestMcpDroppedToolIsNeitherDeclaredNorCalled(t *testing.T) {
 			{"unchanged", false, false, false, [][]string{{"search", "fetch"}, {"search", "fetch"}, {"search", "fetch"}}},
 			{"server drops search", true, false, false, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}},
 			{"filter drops search", true, true, false, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}},
-			{"instruction lists after server drops search", true, false, true, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}},
+			{"server drops search before the instruction lists", true, false, true, [][]string{{"search", "fetch"}, {"fetch"}, {"fetch"}}},
 		} {
 			searchDropped.Store(false)
 			server := googleadk.NewFakeMCPServer("search-server").
@@ -587,7 +596,13 @@ func TestMcpDroppedToolIsNeitherDeclaredNorCalled(t *testing.T) {
 					func(map[string]any) (map[string]any, error) { return map[string]any{}, nil })
 			var ts tool.Toolset = server
 			if !tc.filterDrop {
-				ts = hidingToolset{Toolset: server, hide: &searchDropped}
+				h := hidingToolset{Toolset: server, hide: &searchDropped}
+				if tc.instructionLists {
+					// Hide "search" from the InstructionProvider's listing, the
+					// second, but not from the CallMcpTool lookup after it.
+					h.calls, h.hideCall = new(atomic.Int32), 2
+				}
+				ts = h
 			}
 			m := &ruleModel{name: "fake-model", rule: func(req *model.LLMRequest) *model.LLMResponse {
 				switch functionResponses(req) {
@@ -613,15 +628,12 @@ func TestMcpDroppedToolIsNeitherDeclaredNorCalled(t *testing.T) {
 			require.NoError(t, env.GetWorkflowError(), tc.name)
 			var n int
 			require.NoError(t, env.GetWorkflowResult(&n), tc.name)
-			draws[tc.name] = n
 
+			assert.Equal(t, wantDraws, n, "UUIDs drawn: %s", tc.name)
 			assert.Equal(t, tc.want, m.declared(), tc.name)
 			assert.Equal(t, 2, counter.get(googleadk.CallMcpToolActivityName), tc.name)
 		}
 		searchDropped.Store(false)
-		assert.Equal(t, draws["unchanged"], draws["server drops search"], "UUIDs drawn: %v", draws)
-		assert.Equal(t, draws["unchanged"], draws["filter drops search"], "UUIDs drawn: %v", draws)
-		assert.Equal(t, draws["unchanged"], draws["instruction lists after server drops search"], "UUIDs drawn: %v", draws)
 	})
 }
 
