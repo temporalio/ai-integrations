@@ -7,9 +7,9 @@
 
 import test from 'ava';
 import { BaseLlm, type BaseLlmConnection, type LlmRequest, type LlmResponse } from '@google/adk';
-import { ApplicationFailure } from '@temporalio/common';
+import { ApplicationFailure, CancelledFailure } from '@temporalio/common';
 import { MockActivityEnvironment } from '@temporalio/testing';
-import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
+import { FlushTimeoutError, WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 
 import { createModelActivities } from '../activities';
 import { GoogleAdkPlugin } from '../index';
@@ -178,6 +178,50 @@ test.serial('midStreamModelErrorIsClassifiedAndStreamDisposed', async (t) => {
     t.is((err as ApplicationFailure).type, 'GoogleAdkModelError.503');
     t.true(disposed);
     t.is(published, 1);
+  } finally {
+    WorkflowStreamClient.fromWithinActivity = original;
+  }
+});
+
+// Unit test (MockActivityEnvironment): the model call succeeds and the stream's
+// dispose rejects. Rate limiting stays retryable, a batch Workflow Streams gave up
+// on is final, and a cancel before a refused dispose is reported as a cancel.
+test.serial('streamDisposeFailureIsClassified', async (t) => {
+  const original = WorkflowStreamClient.fromWithinActivity;
+  const stubDispose = (dispose: () => Promise<void>) => {
+    WorkflowStreamClient.fromWithinActivity = (() => ({
+      topic: () => ({ publish: () => {} }),
+      [Symbol.asyncDispose]: dispose,
+    })) as unknown as typeof WorkflowStreamClient.fromWithinActivity;
+  };
+  const run = (mockEnv: MockActivityEnvironment) =>
+    t.throwsAsync(
+      mockEnv.run(createModelActivities({ modelProvider: fakeModelProvider(chunks) })['adk-invokeModelStreaming'], {
+        model: 'fake-model',
+        request: {} as never,
+        streamingTopic: 'adk-test-stream',
+      })
+    );
+  try {
+    for (const [name, disposeError, nonRetryable] of [
+      ['rate limited', Object.assign(new Error('namespace rate limit exceeded'), { code: 8 }), false],
+      ['gave up', new FlushTimeoutError('gave up'), true],
+    ] as const) {
+      stubDispose(async () => {
+        throw disposeError;
+      });
+      const err = await run(new MockActivityEnvironment());
+      t.true(err instanceof ApplicationFailure, `${name}: ${err}`);
+      t.is((err as ApplicationFailure).type, 'GoogleAdkStreamError', name);
+      t.is((err as ApplicationFailure).nonRetryable, nonRetryable, name);
+    }
+    const mockEnv = new MockActivityEnvironment();
+    stubDispose(async () => {
+      mockEnv.cancel();
+      throw Object.assign(new Error('Blob data size exceeds limit.'), { code: 3 });
+    });
+    const err = await run(mockEnv);
+    t.true(err instanceof CancelledFailure, `cancelled: ${err}`);
   } finally {
     WorkflowStreamClient.fromWithinActivity = original;
   }
