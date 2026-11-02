@@ -1196,7 +1196,7 @@ async def test_stateful_operation_of_ended_session_not_run_by_next_block(
 
         # The retried session is refused, and the workflow opens a second block
         # with the same name. With WAIT_CANCELLATION_COMPLETED the put stays on
-        # the first block's task queue.
+        # the run's task queue, and the second block's session refuses it.
         async with Worker(client, task_queue=host_task_queue):
             async with asyncio.timeout(30):
                 while not await _has_event(
@@ -1211,12 +1211,15 @@ async def test_stateful_operation_of_ended_session_not_run_by_next_block(
     assert "'text': 'EMPTY'" in result
     assert factory_calls == 2
     call_tools: set[int] = set()
+    operation_queues: set[str] = set()
     completed = 0
     async for event in handle.fetch_history_events():
         if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
             scheduled = event.activity_task_scheduled_event_attributes
             if scheduled.activity_type.name.endswith("-call-tool"):
                 call_tools.add(event.event_id)
+            if not scheduled.activity_type.name.endswith("-server-session"):
+                operation_queues.add(scheduled.task_queue.name)
         elif event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED:
             completed += (
                 event.activity_task_completed_event_attributes.scheduled_event_id
@@ -1224,3 +1227,6 @@ async def test_stateful_operation_of_ended_session_not_run_by_next_block(
             )
     assert len(call_tools) == 2
     assert completed == 1
+    # Both blocks' operations use the queue that sessions of every version
+    # poll, so a session recorded by an earlier version keeps serving them.
+    assert operation_queues == {f"stateful_state-stateful@{handle.result_run_id}"}

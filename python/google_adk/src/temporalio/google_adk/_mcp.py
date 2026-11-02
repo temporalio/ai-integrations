@@ -1,10 +1,9 @@
 import asyncio
 import contextvars
 import functools
-import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import TracebackType
 from typing import Any, Callable
 
@@ -407,8 +406,8 @@ async def _execute_operation(
     # Fail without waiting for the operation: the worker that ran it may be
     # gone. A cancellation that waits for that worker to acknowledge it would
     # also keep the workflow from being evicted, so such an operation is left
-    # to its timeout instead. It stays on this session's task queue, which a
-    # later block does not serve (see ``_session_task_queue``).
+    # to its timeout instead. A later session on this task queue refuses it
+    # (see ``_RunningToolset.get``).
     if (
         kwargs.get("cancellation_type")
         != ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
@@ -421,32 +420,6 @@ async def _execute_operation(
 @dataclass
 class _StatefulServerSessionArguments:
     factory_argument: Any | None
-    # Which ``async with`` block of the run, for this toolset name, the session
-    # serves. Earlier versions did not send it.
-    block: int = 1
-
-
-def _session_task_queue(server_id: str, block: int) -> str:
-    """The task queue of one toolset block's operations.
-
-    An operation can outlive its block's session, so each block of a run with
-    the same name serves its own queue and never runs an earlier block's
-    operations. The first block keeps the queue earlier versions used.
-    """
-    return server_id if block == 1 else f"{server_id}#{block}"
-
-
-# Toolset blocks opened by each running workflow, by toolset name. A workflow's
-# event loop lasts as long as its instance, so replay counts the same blocks.
-_blocks_opened: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, int]] = (
-    weakref.WeakKeyDictionary()
-)
-
-
-def _next_block(name: str) -> int:
-    opened = _blocks_opened.setdefault(asyncio.get_running_loop(), {})
-    opened[name] = opened.get(name, 0) + 1
-    return opened[name]
 
 
 # Seconds between heartbeats of the ``-server-session`` activity.
@@ -624,8 +597,22 @@ class _RunningToolset:
     toolset: McpToolset
     heartbeats: _SessionHeartbeats
     observes_sessions: bool
+    # When the server first scheduled the session activity.
+    session_scheduled_time: datetime
 
     async def get(self) -> McpToolset:
+        if activity.info().scheduled_time < self.session_scheduled_time:
+            # Every toolset block of a run uses the same task queue, which the
+            # workflow and a running session of any version agree on. An
+            # operation the server scheduled before this session belongs to an
+            # earlier block, which has ended, and must not run against this
+            # toolset. A retry keeps its first scheduled time.
+            raise ApplicationError(
+                "This operation belongs to an earlier stateful MCP session of "
+                "this workflow run, which has ended.",
+                type="DedicatedWorkerFailure",
+                non_retryable=True,
+            )
         if not self.observes_sessions:
             # No session to observe: record the marker before the first
             # operation instead.
@@ -770,13 +757,12 @@ class TemporalStatefulMcpToolSetProvider:
                         toolset,
                         heartbeats,
                         _record_opened_sessions(toolset, heartbeats),
+                        activity.info().scheduled_time,
                     )
                     try:
                         worker = Worker(
                             activity.client(),
-                            task_queue=_session_task_queue(
-                                server_id, args.block if args else 1
-                            ),
+                            task_queue=server_id,
                             activities=[get_tools, call_tool],
                             activity_task_poller_behavior=PollerBehaviorSimpleMaximum(
                                 1
@@ -918,13 +904,10 @@ class TemporalStatefulMcpToolSet(BaseToolset):
         """Starts the dedicated ``-server-session`` activity for this run."""
         if not workflow.in_workflow():
             return
-        block = _next_block(self._name)
-        self._config["task_queue"] = _session_task_queue(
-            self._name + "@" + workflow.info().run_id, block
-        )
+        self._config["task_queue"] = self._name + "@" + workflow.info().run_id
         self._connect_handle = workflow.start_activity(
             self._name + "-server-session",
-            _StatefulServerSessionArguments(self._factory_argument, block),
+            _StatefulServerSessionArguments(self._factory_argument),
             **self._server_session_config,
         )
 
