@@ -276,6 +276,7 @@ class StatefulMcpWorkerReplacedWorkflow:
     def __init__(self) -> None:
         self._listed: list[str] | None = None
         self._resume = False
+        self._failure: list[str] = []
 
     @workflow.run
     async def run(self, input: _ReplacedInput) -> list[str]:
@@ -304,12 +305,24 @@ class StatefulMcpWorkerReplacedWorkflow:
             except ActivityError:
                 self._listed = []
             await workflow.wait_condition(lambda: self._resume)
-            return [t.name for t in await toolset.get_tools()]
+            try:
+                return [t.name for t in await toolset.get_tools()]
+            except ApplicationError as err:
+                # The block's exit replaces this error, so keep its causes.
+                cause: BaseException | None = err
+                while cause is not None:
+                    self._failure.append(str(cause))
+                    cause = cause.__cause__
+                raise
 
     @workflow.update
     async def wait_listed(self) -> list[str]:
         await workflow.wait_condition(lambda: self._listed is not None)
         return self._listed or []
+
+    @workflow.query
+    def failure(self) -> list[str]:
+        return self._failure
 
     @workflow.signal
     def resume(self) -> None:
@@ -566,9 +579,12 @@ async def test_stateful_operations_fail_after_session_refused(
             async with asyncio.timeout(30):
                 with pytest.raises(WorkflowFailureError) as err:
                     await handle.result()
+            failure = await handle.query(StatefulMcpWorkerReplacedWorkflow.failure)
 
     assert factory_calls == 1
     _assert_refused(err.value)
+    # The operation's own error names the session's refusal as its cause.
+    assert any("An earlier attempt" in message for message in failure), failure
     # The waiting operation was cancelled; none was scheduled after the session
     # ended.
     scheduled = [

@@ -424,7 +424,9 @@ async def _execute_operation(
             return await operation
         except BaseException as err:
             if cancelled_by_session and is_cancelled_exception(err):
-                raise _session_ended_failure(session) from err
+                # Keep the session's failure as the cause; the operation's own
+                # cancellation stays as the context.
+                raise _session_ended_failure(session)
             raise
         finally:
             session.remove_done_callback(cancel_operation)
