@@ -412,13 +412,19 @@ A workflow can also carry `result.to_input_list()` across `continue_as_new` and 
 message's `content`, as lists.
 
 To do this, importing `temporalio.openai_agents` changes the `Iterable[X]` fields of the `openai`
-input item types to `list[X]` for the whole process. Type checkers still see `Iterable`. At runtime,
-`typing.get_type_hints()` reports `list`, your own pydantic validation of those types returns lists,
-and in strict mode it rejects a tuple or generator there. The `openai` client also stops turning an
-iterator in those fields into a list when it builds a request, so `client.responses.create(...)`
-with, for example, an assistant message's `content` given as `iter([...])` raises
-`TypeError: Object of type list_iterator is not JSON serializable`. Pass lists there, for example
-with `list(...)`.
+input item types (the `TypedDict`s in `TResponseInputItem`, except tool definitions such as
+`FileSearchToolParam`) to `list[X]` for the whole process. Type checkers still see `Iterable`. At
+runtime, `typing.get_type_hints()` reports `list`, your own pydantic validation of those types
+returns lists, and in strict mode it rejects a tuple or generator there. The `openai` client also
+stops turning an iterator in those fields into a list when it builds a request, so
+`client.responses.create(...)` with, for example, an assistant message's `content` given as
+`iter([...])` raises `TypeError: Object of type list_iterator is not JSON serializable`. Pass lists
+there, for example with `list(...)`.
+
+The change reaches only classes built after `temporalio.openai_agents` is imported, so import it
+before the modules that define your Workflow inputs, Activity results or other classes that hold
+input items. For a class built earlier, the payload converter still lists the iterators, but a
+strict model that holds a custom tool's output can decode as a plain `dict`.
 
 The payload converter also decodes your own `Iterable` fields as lists when they are the decoded
 value itself, fields of a dataclass or pydantic model, dict values or list items, so code that
@@ -430,7 +436,9 @@ Earlier versions decoded those fields as one-shot iterators, and a turn on carri
 caught that error and went on, such as a chat whose Update reports errors to the caller, fails with
 `[TMPRL1100]` on its next Workflow Task after you deploy this version. Let those runs finish on the
 earlier version first, or keep them there with Worker Versioning. A chat that waits for its next
-message may never finish, so use Worker Versioning for it.
+message may never finish, so use Worker Versioning for it. Do not roll a Worker back to an earlier
+version while runs that ran a turn on carried items with this version are open: they fail replay
+there.
 
 ## MCP Support
 
