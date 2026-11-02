@@ -424,6 +424,10 @@ the activity's error message, and `AfterToolCallEvent.exception` contains the
 underlying exception. This also applies when an MCP tool's call-tool activity
 fails.
 
+Other tools run directly in the workflow, so they must be deterministic, like
+workflow code. Sync tools run there too, not in a separate thread as they do
+outside Temporal.
+
 ## Hooks
 
 Strands' [hook system](https://strandsagents.com/) (`strands.hooks`) lets you subscribe callbacks to events in the agent lifecycle — invocation start/end, model call before/after, tool call before/after, message added. Pass `hooks=[MyHookProvider()]` to `TemporalAgent`: every single-agent hook event fires in workflow context, so deterministic callbacks just work.

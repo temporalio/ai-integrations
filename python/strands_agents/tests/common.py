@@ -1,5 +1,7 @@
+import json
 import zlib
 from collections.abc import Sequence
+from typing import Any
 
 from temporalio.api.common.v1 import Payload
 from temporalio.api.enums.v1 import EventType
@@ -29,3 +31,21 @@ class CompressionCodec(PayloadCodec):
         return [
             Payload.FromString(zlib.decompress(payload.data)) for payload in payloads
         ]
+
+
+def get_tool_results(history: WorkflowHistory) -> list[Any]:
+    """The content of each tool result the last model call got."""
+    model_input = json.loads(
+        [
+            event.activity_task_scheduled_event_attributes.input.payloads[0].data
+            for event in history.events
+            if event.activity_task_scheduled_event_attributes.activity_type.name
+            == "invoke_model"
+        ][-1]
+    )
+    return [
+        content["toolResult"]["content"]
+        for message in model_input["messages"]
+        for content in message["content"]
+        if "toolResult" in content
+    ]
