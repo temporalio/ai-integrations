@@ -26,7 +26,10 @@ type MCPToolsetOptions struct {
 	// Config.MCPToolsets so the worker-side factory can be found.
 	Name string
 	// ToolFilter optionally restricts which advertised MCP tools are exposed to
-	// the model. It runs on the workflow side over declaration-only proxy tools.
+	// the model. It runs on the workflow side over declaration-only proxy tools:
+	// in the first Tools call of each agent run and in every ProcessRequest, so
+	// twice in the first model step. ADK resumes confirmed tool calls from the
+	// first result and draws its generated IDs for it.
 	ToolFilter tool.Predicate
 	// ActivityOptions overrides the per-call Activity options for the ListMcpTools
 	// and CallMcpTool Activities. A zero StartToCloseTimeout falls back to the
@@ -79,9 +82,11 @@ func (m *mcpToolset) Name() string { return m.name }
 // as one from an InstructionProvider, has changed it since: ADK draws a UUID
 // from the workflow's random stream for each tool it keeps before every model
 // step, so the IDs it generates, such as tool confirmation IDs, stay the same
-// on every release. The proxy tools from that list no longer pack themselves,
-// so ProcessRequest alone decides what the model request declares and
-// dispatches.
+// on every release. From the second model step, the proxy tools from that
+// list no longer pack themselves, so ProcessRequest alone decides what the
+// model request declares and dispatches. In the first step ADK packs them
+// before ProcessRequest runs, so that request also declares the tools of the
+// first list.
 //
 // One case still keeps different lists on different releases: an agent that
 // uses the same toolset both directly and through tool.FilterToolset, when the
@@ -144,14 +149,15 @@ func (m *mcpToolset) list(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
 // request. ADK calls it before each model call, after the request processors
 // (instructions and the others) have run.
 //
-// ADK v2.5.0 and earlier call Tools only in the first model step of an agent
-// run, before the request processors. v2.6.0 and later call Tools before the
-// request processors in every step. To schedule the same commands in the same
-// order on every ADK release, the toolset lists in Tools only until its first
-// ProcessRequest of the agent run, and in ProcessRequest from then on. Each
-// model step lists once: the first through Tools, with ProcessRequest reusing
-// that list, and every later step here. The request carries this list alone,
-// so a tool the MCP server no longer advertises is neither declared nor
+// ADK v2.5.0 and earlier call Tools in the first model step of an agent run,
+// before the request processors, and in later steps only while the agent has
+// no tools at all. v2.6.0 and later call Tools before the request processors
+// in every step. To schedule the same commands in the same order on every ADK
+// release, the toolset lists in Tools only until its first ProcessRequest of
+// the agent run, and in ProcessRequest from then on. Each model step lists
+// once: the first through Tools, with ProcessRequest reusing that list, and
+// every later step here. From the second step, the request carries this list
+// alone, so a tool the MCP server no longer advertises is neither declared nor
 // dispatched, whatever list ADK kept from an earlier Tools call.
 func (m *mcpToolset) ProcessRequest(ctx agent.Context, req *model.LLMRequest) error {
 	l := listingsFrom(ctx)
@@ -654,9 +660,9 @@ func (a *Activities) mcpToolset(ctx context.Context, name string) (tool.Toolset,
 // req.Tools (json:"-", so it never crosses the wire) so ADK can later resolve it
 // to dispatch. It is idempotent: ADK runs both toolPreprocess (each expanded
 // toolset tool's ProcessRequest) and toolsetPreprocess (the toolset's own
-// ProcessRequest), so a toolset tool is packed twice with identical
-// declarations. A name already present is skipped, rather than erroring as
-// toolutils.PackTool does on a duplicate.
+// ProcessRequest), so in the first model step of an agent run a toolset tool
+// is packed twice with identical declarations. A name already present is
+// skipped, rather than erroring as toolutils.PackTool does on a duplicate.
 func packTool(req *model.LLMRequest, t toolutils.Tool) error {
 	if req.Tools != nil {
 		if _, ok := req.Tools[t.Name()]; ok {

@@ -200,6 +200,21 @@ the model SDK's own retries (see below), or override the fallbacks.
   closes any cached toolset that implements `Close() error` at worker stop
   automatically; with manual wiring, call `Activities.Close` yourself after
   `worker.Run` returns.
+  - The toolset lists its tools once per model step, at the same point with
+    every ADK release, so its Histories replay from ADK v2.3.0 to v2.6.0. A
+    toolset wrapped in `tool.FilterToolset` or `tool.WithConfirmation` lists
+    each time ADK asks for its tools, which ADK v2.6.0 does more often, so its
+    Histories do not replay across that release. Use
+    `MCPToolsetOptions.ToolFilter` instead of `tool.FilterToolset`, and
+    `mcptoolset`'s `RequireConfirmation` option instead of
+    `tool.WithConfirmation`.
+  - From the second model step of an agent run, each request declares only the
+    tools the server lists for that step. A model call to a tool the server no
+    longer lists gets ADK's tool-not-found error, with no `CallMcpTool`
+    Activity and no before- or after-tool callbacks.
+  - A run that used `NewMCPToolset` before you deploy this version fails replay
+    on it with `[TMPRL1100]`, and so does a run that used it on this version
+    after a rollback. Let those runs finish first, or use Worker Versioning.
 - **Deterministic by construction.** `NewContext` binds ADK's `platform.Now` to
   `workflow.Now`, `platform.NewUUID` to a deterministic generator drawn from the
   workflow random stream, and `platform.RunTasks` to a `workflow.Go` fan-out, so
