@@ -64,6 +64,25 @@ test.serial('runWorker refuses an Activity that a later plugin replaced, before 
   await connection.close();
 });
 
+test.serial('runWorker refuses a later replacement with one instance on the connection and the Worker', async (t) => {
+  const env = getEnv();
+  const adk = new GoogleAdkPlugin();
+  const later = new SimplePlugin({ name: 'later', activities: { 'adk-invokeModel': async () => 'other' } });
+  const connection = await NativeConnection.connect({ address: env.address, plugins: [adk, later] });
+  const worker = await Worker.create({
+    connection,
+    namespace: env.namespace,
+    taskQueue: uid('adk-later-twice'),
+    plugins: [adk],
+  });
+  await t.throwsAsync(worker.run(), {
+    instanceOf: TypeError,
+    message: /^Duplicate registration of Activity 'adk-invokeModel': a plugin applied after GoogleAdkPlugin replaced/,
+  });
+  t.is(worker.getState(), 'STOPPED');
+  await connection.close();
+});
+
 test.serial('runWorker starts the Worker at once, so runUntil stops it after its callback', async (t) => {
   const env = getEnv();
   const connection = await NativeConnection.connect({ address: env.address });

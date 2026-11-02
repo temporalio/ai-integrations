@@ -753,7 +753,9 @@ Cautions:
   Worker's `activities` or by an earlier plugin), `Worker.create` fails. If a
   plugin applied after `GoogleAdkPlugin` replaces one, `worker.run()` fails
   before the Worker polls. `Worker.create` applies the Worker's `plugins` in
-  order, then the `NativeConnection`'s.
+  order, then the `NativeConnection`'s. A plugin applied after `GoogleAdkPlugin`
+  that wraps these Activities counts as replacing them; wrap Activity execution
+  with an Activity interceptor (`interceptors.activity`) instead.
 - To fix a collision with your own Activity or another integration's MCP server
   name, rename one of them, or run the other integration on its own Worker and
   task queue. Two `GoogleAdkPlugin`s on one Worker must be the same instance or
