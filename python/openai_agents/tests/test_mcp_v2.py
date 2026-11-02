@@ -233,6 +233,18 @@ def test_callable_worker_side_tool_filter_is_rejected() -> None:
     assert "temporal_mcp_server()" in str(err.value)
 
 
+def test_worker_side_tool_meta_resolver_is_rejected() -> None:
+    def factory() -> AgentsMCPServer:
+        value = InProcessMCPServer(server())
+        value.tool_meta_resolver = lambda context: {"tenant": "t-1"}  # type: ignore[attr-defined]
+        return value
+
+    with pytest.raises(ApplicationError) as err:
+        create_backend(factory)
+    assert err.value.non_retryable
+    assert "temporal_mcp_server(tool_meta_resolver=...)" in str(err.value)
+
+
 def test_static_worker_side_tool_filter_is_allowed() -> None:
     def factory() -> AgentsMCPServer:
         value = InProcessMCPServer(server())
