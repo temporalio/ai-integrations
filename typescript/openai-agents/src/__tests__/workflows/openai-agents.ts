@@ -2,6 +2,7 @@ import {
   Agent,
   type AgentOptions,
   type CallModelInputFilter,
+  Handoff,
   type MCPToolFilterContext,
   RunState,
   handoff,
@@ -325,6 +326,12 @@ export interface ApprovalResumeContextResult {
   renamedRehydratedWrites: string[];
   renamedRetryWrites: string[];
   renamedInterruptions: number;
+  handoffCloneInstructions: string[];
+  handoffCloneTargetInstructions: string | undefined;
+  handoffCloneThrew: boolean;
+  handoffCloneSavedAgent: string;
+  handoffCloneWrites: string[];
+  handoffCloneInterruptions: number;
 }
 
 /** An agent whose `clone` carries a private field, which can't be copied onto another object. */
@@ -406,7 +413,9 @@ function countApprovalOwners(context: unknown): { approvalOwners: number; approv
  * must send the model the new one, also for a call that a later rejection for good covers. Last, a root and
  * its handoff target share a name, and their resumes must not add a copy of the approvals each time. Last,
  * the retry of a saved state with a long approval history must finish. Last, a resume fails because the
- * agent was renamed, and once the name is put back, the state must still save and resume under it.
+ * agent was renamed, and once the name is put back, the state must still save and resume under it. Last,
+ * a `Handoff.clone` must see its target's current fields, and a resume where it throws must leave the
+ * state usable.
  */
 export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeContextResult> {
   const setAfter = tool({
@@ -1042,6 +1051,60 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
   const renamedRehydrated = await runner.run(renamedAgent, await RunState.fromString(renamedAgent, renamedSaved));
   const renamedRetried = await runner.run(renamedAgent, pausedRenamed.state);
 
+  // A `Handoff` whose clone captures its target's instructions in its input filter. The target's
+  // instructions change between the root's interruption and its resume, and the filter must see the new
+  // ones. Then a resume fails because the handoff's clone throws after the root was renamed. Once the name
+  // is put back, the state must still save and resume under it.
+  const handoffCloneInstructions: string[] = [];
+  let handoffCloneFails = false;
+  class InstructionsHandoff extends Handoff<ResumeContext> {
+    override clone(overrides?: Parameters<Handoff<ResumeContext>['clone']>[0]): Handoff<ResumeContext> {
+      if (handoffCloneFails) throw new Error('handoff clone failed');
+      const cloned = super.clone(overrides);
+      const instructions = String(cloned.agent.instructions);
+      cloned.inputFilter = (data) => {
+        handoffCloneInstructions.push(instructions);
+        return data;
+      };
+      return cloned;
+    }
+  }
+  const handoffCloneTarget = new Agent<ResumeContext>({
+    name: 'HandoffCloneTarget',
+    instructions: 'before',
+    model: 'gpt-4o-mini',
+  });
+  const handoffCloneRoot = new Agent<ResumeContext>({
+    name: 'HandoffCloneRoot',
+    model: 'gpt-4o-mini',
+    tools: [setAfter],
+    handoffs: [new InstructionsHandoff(handoffCloneTarget, () => handoffCloneTarget)],
+  });
+  const pausedHandoffClone = await runner.run(handoffCloneRoot, 'go', {
+    context: { original: 'handoff-clone', writes: [] },
+  });
+  pausedHandoffClone.state.approve(pausedHandoffClone.interruptions[0]!);
+  handoffCloneTarget.instructions = 'after';
+  const handoffCloned = await runner.run(handoffCloneRoot, pausedHandoffClone.state);
+  const handoffCloneFailedCtx: ResumeContext = { original: 'handoff-clone-failed', writes: [] };
+  const pausedHandoffCloneFailed = await runner.run(handoffCloneRoot, 'go', { context: handoffCloneFailedCtx });
+  pausedHandoffCloneFailed.state.approve(pausedHandoffCloneFailed.interruptions[0]!);
+  handoffCloneRoot.name = 'HandoffCloneRenamed';
+  handoffCloneFails = true;
+  let handoffCloneThrew = false;
+  try {
+    await runner.run(handoffCloneRoot, pausedHandoffCloneFailed.state);
+  } catch {
+    handoffCloneThrew = true;
+  }
+  handoffCloneFails = false;
+  handoffCloneRoot.name = 'HandoffCloneRoot';
+  const handoffCloneSaved = pausedHandoffCloneFailed.state.toString();
+  const handoffCloneRecovered = await runner.run(
+    handoffCloneRoot,
+    await RunState.fromString(handoffCloneRoot, handoffCloneSaved)
+  );
+
   return {
     callerAfter: ctx.after,
     resumedUsesCallerObject: result.runContext.context === ctx,
@@ -1106,5 +1169,11 @@ export async function approvalResumeContextWorkflow(): Promise<ApprovalResumeCon
     renamedRehydratedWrites: renamedRehydrated.runContext.context.writes,
     renamedRetryWrites: renamedRetried.runContext.context.writes,
     renamedInterruptions: renamedRehydrated.interruptions.length + renamedRetried.interruptions.length,
+    handoffCloneInstructions,
+    handoffCloneTargetInstructions: handoffCloned.lastAgent?.instructions as string | undefined,
+    handoffCloneThrew,
+    handoffCloneSavedAgent: JSON.parse(handoffCloneSaved).currentAgent.name,
+    handoffCloneWrites: handoffCloneRecovered.runContext.context.writes,
+    handoffCloneInterruptions: handoffCloneRecovered.interruptions.length,
   };
 }

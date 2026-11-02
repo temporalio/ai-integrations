@@ -950,6 +950,11 @@ test('Approval resume keeps the caller context object', async (t) => {
           toolCallResponse('set_after', { value: 'O' }, 'call_renamed'),
           textResponse('done renamed rehydrated'),
           textResponse('done renamed retry'),
+          toolCallResponse('set_after', { value: 'P-1' }, 'call_handoff_clone_1'),
+          handoffResponse('transfer_to_HandoffCloneTarget'),
+          textResponse('done handoff clone'),
+          toolCallResponse('set_after', { value: 'P-2' }, 'call_handoff_clone_2'),
+          textResponse('done handoff clone recovered'),
         ]),
       }),
     ],
@@ -1042,5 +1047,11 @@ test('Approval resume keeps the caller context object', async (t) => {
     renamedRehydratedWrites: ['O'],
     renamedRetryWrites: ['O'],
     renamedInterruptions: 0,
+    handoffCloneInstructions: ['after'],
+    handoffCloneTargetInstructions: 'after',
+    handoffCloneThrew: true,
+    handoffCloneSavedAgent: 'HandoffCloneRoot',
+    handoffCloneWrites: ['P-2'],
+    handoffCloneInterruptions: 0,
   });
 });

@@ -16,9 +16,9 @@ import { ActivityBackedModel } from './activity-backed-model';
  * earlier graph still reaches every agent it reached, and serializes the decisions those agents own.
  * Other agents, and agents whose class overrides `clone`, get their fresh clone. Such a clone can hold
  * state, such as private fields or entries keyed by the clone, that can't be moved onto another object.
- * The objects only change once the whole graph has converted, so a conversion that throws leaves them
- * as they were. For each object it changes, the conversion adds a function to `undo` that gives the
- * object back its earlier fields.
+ * The objects only change once every agent has cloned, and get their earlier fields back if a
+ * `Handoff.clone` then throws, so a conversion that throws leaves them as they were. For each object it
+ * changes, the conversion adds a function to `undo` that gives the object back its earlier fields.
  */
 export function convertAgent(
   agent: Agent<any, any>,
@@ -36,19 +36,39 @@ export function convertAgent(
   for (const [source, clone] of clones) {
     seen.set(source, reused.get(source) ?? clone);
   }
-  for (const [source, clone] of clones) {
-    clone.handoffs = (source.handoffs ?? []).map((h) => {
-      const handoffAgent = h instanceof Handoff ? h.agent : h;
-      const converted = seen.get(handoffAgent)!;
-      if (!(h instanceof Handoff)) return converted;
-      // A reused target still has its earlier fields here, so take the name from its new clone.
-      return h.clone({ agent: converted, agentName: (clones.get(handoffAgent) ?? converted).name });
-    });
-  }
+  // Give the reused objects their new fields before any `Handoff.clone` sees them, as a fresh conversion does.
+  const undoFields: (() => void)[] = [];
   for (const [source, target] of reused) {
-    undo?.push(replaceFields(target, clones.get(source)!));
+    undoFields.push(replaceFields(target, clones.get(source)!));
   }
+  try {
+    connectHandoffs(agent, seen, clones, new Set());
+  } catch (error) {
+    for (const restore of undoFields.reverse()) restore();
+    throw error;
+  }
+  undo?.push(...undoFields);
   return seen.get(agent)!;
+}
+
+/**
+ * Sets the handoffs of the converted agent of each source agent in `clones` reachable from `agent`. Each
+ * handoff target is connected before its `Handoff.clone` runs, so the clone sees the converted target.
+ */
+function connectHandoffs(
+  agent: Agent<any, any>,
+  seen: ReadonlyMap<Agent<any, any>, Agent<any, any>>,
+  clones: ReadonlyMap<Agent<any, any>, Agent<any, any>>,
+  connected: Set<Agent<any, any>>
+): void {
+  if (!clones.has(agent) || connected.has(agent)) return;
+  connected.add(agent);
+  seen.get(agent)!.handoffs = (agent.handoffs ?? []).map((h) => {
+    const handoffAgent = h instanceof Handoff ? h.agent : h;
+    connectHandoffs(handoffAgent, seen, clones, connected);
+    const converted = seen.get(handoffAgent)!;
+    return h instanceof Handoff ? h.clone({ agent: converted }) : converted;
+  });
 }
 
 /** Validates and clones each agent in `agent`'s graph that isn't in `seen`, into `clones`. */
