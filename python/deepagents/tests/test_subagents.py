@@ -131,6 +131,9 @@ def _lanes_tasks(description_a: str, description_b: str) -> AIMessage:
 _LANES_TASK_TEXT = {
     "different": ("Ask lane a.", "Ask lane b."),
     "same": ("Ask a lane.", "Ask a lane."),
+    # Large enough that Deep Agents' filesystem middleware evicts each task
+    # prompt to a file named with ``uuid4`` and puts that path in the message.
+    "oversized": ("Ask lane a. " * 25000, "Ask lane b. " * 25000),
 }
 _LANES_HISTORY = (
     Path(__file__).parent / "histories" / "parallel_subagents_sequence_ids.json"
@@ -261,7 +264,7 @@ async def _model_ids_and_markers(handle: Any) -> tuple[list[str], list[str]]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("task_text", ["different", "same"])
+@pytest.mark.parametrize("task_text", ["different", "same", "oversized"])
 async def test_reordered_parallel_subagents_fail_replay(
     env: WorkflowEnvironment, task_text: str
 ) -> None:
@@ -366,6 +369,34 @@ def test_call_identity_ignores_message_ids_and_system_prompt() -> None:
     edited = [SystemMessage(content="Edited prompt."), *_turn("one")[1:]]
     assert _identity(_turn("one")) == _identity(_turn("one", ids=True))
     assert _identity(_turn("one")) == _identity(edited)
+
+
+def test_call_identity_ignores_offloaded_file_names() -> None:
+    """Random names offloading middleware writes into messages are left out.
+
+    Deep Agents' filesystem middleware evicts a large human message to a file
+    named with ``uuid4`` and records the path in the content and in
+    ``additional_kwargs["lc_evicted_to"]``; summarization does the same with a
+    ``session_<uuid4 hex>`` file. Neither replays identically.
+    """
+    import uuid as _uuid
+
+    from langchain_core.messages import HumanMessage
+
+    def offloaded(preview: str) -> list[Any]:
+        path = f"/conversation_history/{_uuid.uuid4()}.md"
+        session = f"/conversation_history/session_{_uuid.uuid4().hex}.md"
+        return [
+            HumanMessage(
+                content=f"{preview} The full content was saved to {path}.",
+                additional_kwargs={"lc_evicted_to": path},
+            ),
+            HumanMessage(content=f"Summary. History saved to {session}."),
+            *_turn("one")[2:],
+        ]
+
+    assert _identity(offloaded("Ask lane a.")) == _identity(offloaded("Ask lane a."))
+    assert _identity(offloaded("Ask lane a.")) != _identity(offloaded("Ask lane b."))
 
 
 def test_call_identity_falls_back_when_the_transcript_is_not_stable() -> None:

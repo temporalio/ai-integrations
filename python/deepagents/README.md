@@ -383,7 +383,10 @@ pass `TemporalModel("provider:name")` yourself.
 
 A model call made while another model call of the same run is in flight (for
 example two sub-agents running in parallel) gets an Activity id named after the
-call it answers: the agent or sub-agent and the messages it has so far. Activity
+call it answers: the agent or sub-agent and the messages it has so far, minus
+the values that do not replay identically (message ids, and the random file
+names Deep Agents' filesystem and summarization middleware give the messages
+they offload to the backend). Activity
 inputs are not compared on replay, but Activity ids are, so a change that makes
 parallel sub-agents schedule their model calls in a different order (a library
 upgrade, an `await` added in middleware) fails replay with a nondeterminism

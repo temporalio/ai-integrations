@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import re
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from datetime import timedelta
 from typing import Any
@@ -94,12 +95,51 @@ async def _call_model(
         raise
 
 
-def _without_id(dumped: Any) -> Any:
-    """Drop the message id from a ``dumpd`` message, which is not replay-stable."""
+# Random names Deep Agents' built-in middleware puts into message content when it
+# offloads to the backend, none of which replay identically: an evicted human
+# message's file (``uuid4()``), a summarization history file
+# (``session_<uuid4 hex>``) and an evicted tool result without a tool call id
+# (``unknown-<8 hex>``).
+_RANDOM_NAME = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"|session_[0-9a-f]{32}"
+    r"|unknown-[0-9a-f]{8}(?![0-9a-f])"
+)
+
+# ``additional_kwargs`` keys that only record where middleware offloaded a
+# message; the offloaded content itself is still in the message.
+_OFFLOAD_KEYS = frozenset({"lc_evicted_to"})
+
+
+def _normalize_random_names(value: Any) -> Any:
+    """Replace middleware-generated random names in every string of ``value``."""
+    if isinstance(value, str):
+        return _RANDOM_NAME.sub("<random>", value)
+    if isinstance(value, dict):
+        return {k: _normalize_random_names(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_random_names(v) for v in value]
+    return value
+
+
+def _replay_stable(dumped: Any) -> Any:
+    """A ``dumpd`` message with the values that do not replay identically removed.
+
+    Drops the message id (LangGraph assigns it with ``uuid4`` outside the
+    workflow's seeded random) and the offload bookkeeping in
+    ``additional_kwargs``, and normalizes the random file names that Deep
+    Agents' filesystem and summarization middleware write into the content
+    when they offload a large message.
+    """
     if isinstance(dumped, dict) and isinstance(dumped.get("kwargs"), dict):
         kwargs = {k: v for k, v in dumped["kwargs"].items() if k != "id"}
-        return {**dumped, "kwargs": kwargs}
-    return dumped
+        extra = kwargs.get("additional_kwargs")
+        if isinstance(extra, dict):
+            kwargs["additional_kwargs"] = {
+                k: v for k, v in extra.items() if k not in _OFFLOAD_KEYS
+            }
+        return _normalize_random_names({**dumped, "kwargs": kwargs})
+    return _normalize_random_names(dumped)
 
 
 def _has_repr(dumped: Any) -> bool:
@@ -226,7 +266,8 @@ class TemporalModel(BaseChatModel):
         the run config (``lc_agent_name``, which ``create_agent`` sets for each
         sub-agent) and the non-system messages of the request in ``dumpd`` form
         minus their ids, which LangGraph assigns with ``uuid4`` outside the
-        workflow's seeded random. System prompts, tool schemas and the model
+        workflow's seeded random, and with the random file names offloading
+        middleware writes into them normalized (see ``_replay_stable``). System prompts, tool schemas and the model
         name are left out, so editing them does not fail the replay of open
         runs. Returns None when the identity cannot be built (a value JSON
         cannot hold, one ``dumpd`` could only write as a ``repr``, or any other
@@ -242,7 +283,7 @@ class TemporalModel(BaseChatModel):
             metadata = ensure_config().get("metadata") or {}
             agent = str(metadata.get("lc_agent_name") or "")
             history = [m for m in messages if m.type != "system"]
-            dumped = [_without_id(_serde.dump_object(m)) for m in history]
+            dumped = [_replay_stable(_serde.dump_object(m)) for m in history]
             if _has_repr(dumped):
                 return None
             canonical = json.dumps(
