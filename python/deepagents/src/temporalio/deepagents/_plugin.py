@@ -17,16 +17,18 @@ inside a ``@workflow.defn`` with no other changes:
 * pushes the model / tool dispatch defaults down to the seams that read them.
 
 The plugin auto-propagates from a ``Client`` to any ``Worker`` built from it, so
-add it on exactly one side. If one instance is on the Client and one on the
-Worker, the Worker instance does not add an activity whose name (or, for a
-dynamic activity, the dynamic slot) is already registered, and still
-registered after its own step, by the same callable, a wrapper of it
-(``__wrapped__``), or, for a second instance, the Client instance's copy of the
-same built-in activity. The Worker keeps what the Client side registered,
-instead of failing with "More than one activity named ...". Any other repeated
-activity name, such as two instances on one side or a caller activity with a
-plugin activity's name, and any second dynamic activity, is left to the Worker,
-which refuses it.
+add it on exactly one side. One instance on the Client and one on the Worker
+are accepted only when they are the same object or were built from the same
+``model_provider``, ``backends`` factories and ``streaming_batch_interval``; any
+other second instance raises ``ValueError``. In the accepted case, the Worker
+instance does not add an activity whose name (or, for a dynamic activity, the
+dynamic slot) is already registered, and still registered after its own step,
+by the same callable, a wrapper of it (``__wrapped__``), or, for a second
+instance, the Client instance's copy of the same built-in activity. The Worker
+keeps what the Client side registered, instead of failing with "More than one
+activity named ...". Any other repeated activity name, such as a caller
+activity with a plugin activity's name, and any second dynamic activity, is
+left to the Worker, which refuses it.
 """
 
 from __future__ import annotations
@@ -133,6 +135,12 @@ class DeepAgentsPlugin(SimplePlugin):
         # wired-via-composition: consumed on the tool dispatch path in _tools.py
         # (_resolve_tool_options), renamed to ``options`` at the callsite.
         _tools.set_tool_defaults(self._tool_activity_options)
+
+        # What the activities are built from; a second instance on the Worker
+        # must match it (see _same_sources).
+        self._model_provider = model_provider
+        self._backends = dict(backends or {})
+        self._streaming_batch_interval = streaming_batch_interval
 
         # The activities that carry the nondeterministic work. model_provider and
         # the batch interval are captured here so API keys never enter an input.
@@ -247,10 +255,14 @@ class DeepAgentsPlugin(SimplePlugin):
     # -- worker config -------------------------------------------------------
 
     def configure_worker(self, config: Any) -> Any:
-        """Skip activities the Client's instance already registered."""
-        before = list(config.get("activities") or [])
-        config = super().configure_worker(config)
+        """Refuse a second instance; skip activities the Client's one registered."""
         client_instance = self._client_instance(config)
+        before = list(config.get("activities") or [])
+        if config.get("activities") is not None:
+            # A new list: the caller may pass a one-shot iterable, and a callable
+            # ``activities`` setting may append to the list it gets.
+            config["activities"] = list(before)
+        config = super().configure_worker(config)
         if client_instance is not None:
             config["activities"] = self._without_repeats(
                 before, config.get("activities") or [], client_instance
@@ -258,10 +270,11 @@ class DeepAgentsPlugin(SimplePlugin):
         return config
 
     def _client_instance(self, config: Any) -> DeepAgentsPlugin | None:
-        """The Client's instance, if this is the Worker's only instance.
+        """The Client's instance, if this call is the Worker instance's.
 
-        Only one instance on the Client and one on the Worker qualify. They can
-        be the same object, which the Worker then calls twice.
+        One instance on each side is accepted only when both are the same
+        object, which the Worker then calls twice, or were built from the same
+        sources. Any other second instance raises ``ValueError``.
         """
         client = config.get("client")
         client_plugins = client.config().get("plugins", []) if client else []
@@ -269,9 +282,40 @@ class DeepAgentsPlugin(SimplePlugin):
         on_worker = [
             p for p in config.get("plugins") or [] if isinstance(p, DeepAgentsPlugin)
         ]
-        if len(on_client) == 1 and len(on_worker) == 1 and on_worker[0] is self:
+        if len(on_client) > 1 or len(on_worker) > 1:
+            reason = ""
+        elif on_client and on_worker and not on_client[0]._same_sources(on_worker[0]):
+            reason = (
+                " with a different model_provider, backends or streaming_batch_interval"
+            )
+        elif on_client and on_worker and on_worker[0] is self:
             return on_client[0]
-        return None
+        else:
+            return None
+        raise ValueError(
+            f"DeepAgentsPlugin is registered {len(on_client) + len(on_worker)} "
+            f"times for this Worker ({len(on_client)} on the Client, "
+            f"{len(on_worker)} on the Worker){reason}. Use one DeepAgentsPlugin "
+            "instance on this Worker, or run the other instance on its own Worker "
+            "and task queue. One model_provider receives every model name, so it "
+            "can serve several models, and backends= takes every factory."
+        )
+
+    def _same_sources(self, other: DeepAgentsPlugin) -> bool:
+        """Whether ``other`` builds its activities from the same inputs.
+
+        ``model_provider`` and each backend factory must be the same object;
+        ``streaming_batch_interval`` must be equal.
+        """
+        return (
+            _same_callable(self._model_provider, other._model_provider)
+            and self._backends.keys() == other._backends.keys()
+            and all(
+                _same_callable(factory, other._backends[name])
+                for name, factory in self._backends.items()
+            )
+            and self._streaming_batch_interval == other._streaming_batch_interval
+        )
 
     def _without_repeats(
         self,

@@ -1,16 +1,19 @@
 """The plugin leaves repeated activity names to the Worker, which refuses them.
 
-The one exception is one instance on the Client and one on the Worker: the
-Worker keeps what the Client side registered, and the Worker instance does not
-add it again.
+The one exception is one instance on the Client and one on the Worker, the same
+object or built from the same sources: the Worker keeps what the Client side
+registered, and the Worker instance does not add it again. Any other second
+instance is refused by the plugin.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import functools
+import re
 import uuid
 from collections.abc import Callable, Sequence
+from datetime import timedelta
 from typing import Any, cast
 
 import pytest
@@ -87,21 +90,71 @@ def _own(plugin: DeepAgentsPlugin) -> list[Callable[..., object]]:
     return list(cast(Sequence[Callable[..., object]], plugin.activities))
 
 
+def _provider(model_name: str) -> Any:
+    raise AssertionError(f"model_provider called for {model_name}")
+
+
+def _backend() -> Any:
+    raise AssertionError("backend factory called")
+
+
+@pytest.mark.parametrize(
+    ("client_options", "worker_options", "message"),
+    [
+        ([{}, {}], [], "2 times for this Worker (2 on the Client, 0 on the Worker)."),
+        ([], [{}, {}], "2 times for this Worker (0 on the Client, 2 on the Worker)."),
+        ([{}], [{}, {}], "3 times for this Worker (1 on the Client, 2 on the Worker)."),
+        (
+            [{}],
+            [{"model_provider": _provider}],
+            "2 times for this Worker (1 on the Client, 1 on the Worker) with a different",
+        ),
+        (
+            [{"backends": {"fs": _backend}}],
+            [{"backends": {"fs": lambda: None}}],
+            "2 times for this Worker (1 on the Client, 1 on the Worker) with a different",
+        ),
+        (
+            [{}],
+            [{"streaming_batch_interval": timedelta(seconds=1)}],
+            "2 times for this Worker (1 on the Client, 1 on the Worker) with a different",
+        ),
+    ],
+    ids=[
+        "two-on-client",
+        "two-on-worker",
+        "one-on-client-two-on-worker",
+        "different-model-provider",
+        "different-backend-factory",
+        "different-batch-interval",
+    ],
+)
+async def test_second_instance_is_refused(
+    client: Client,
+    client_options: list[dict[str, Any]],
+    worker_options: list[dict[str, Any]],
+    message: str,
+) -> None:
+    with pytest.raises(
+        ValueError, match=re.escape(f"DeepAgentsPlugin is registered {message}")
+    ):
+        Worker(
+            _client_with(client, [DeepAgentsPlugin(**o) for o in client_options]),
+            task_queue=f"activity-registration-{uuid.uuid4()}",
+            activities=[fetch],
+            plugins=[DeepAgentsPlugin(**o) for o in worker_options],
+        )
+
+
 @pytest.mark.parametrize(
     ("client_plugins", "worker_plugins", "activities", "worker_extra"),
     [
-        (2, 0, [fetch], None),
-        (0, 2, [fetch], None),
-        (1, 2, [fetch], None),
         (1, 0, [fetch_v1, fetch], None),
         (1, 0, [caller_invoke_tool], None),
         (1, 1, [fetch], fetch_v1),
         (1, 1, [_endpoint("client")], _endpoint("worker")),
     ],
     ids=[
-        "two-on-client",
-        "two-on-worker",
-        "one-on-client-two-on-worker",
         "caller-activities-share-a-name",
         "caller-activity-uses-plugin-name",
         "worker-instance-activity-repeats-caller-name",
@@ -204,6 +257,8 @@ class _CopyConfig(SimplePlugin):
     [
         "same-instance",
         "two-instances",
+        "shared-options",
+        "same-instance-generator",
         "client-wrapper",
         "same-instance-client-wrapper",
         "worker-extra",
@@ -221,8 +276,17 @@ class _CopyConfig(SimplePlugin):
 async def test_one_instance_on_each_side_keeps_the_client_registration(
     client: Client, setup: str
 ) -> None:
-    on_client = DeepAgentsPlugin()
-    on_worker = on_client if setup.startswith("same-instance") else DeepAgentsPlugin()
+    options: dict[str, Any] = {}
+    if setup == "shared-options":
+        options = {
+            "model_provider": _provider,
+            "backends": {"fs": _backend},
+            "streaming_batch_interval": timedelta(seconds=1),
+        }
+    on_client = DeepAgentsPlugin(**options)
+    on_worker = (
+        on_client if setup.startswith("same-instance") else DeepAgentsPlugin(**options)
+    )
     client_own = _own(on_client)
     worker_own = _own(on_worker)
     client_plugins: list[ClientPlugin] = [on_client]
@@ -244,6 +308,10 @@ async def test_one_instance_on_each_side_keeps_the_client_registration(
         client_plugins.append(_CopyConfig())
     if setup.endswith("caller-copy"):
         activities = [fetch, client_own[0]]
+    if setup.endswith("generator"):
+        # A one-shot iterable, outside the Sequence type the Worker declares.
+        one_shot: Any = (a for a in [fetch])
+        activities = one_shot
     if setup.endswith("-extra"):
         extra = fallback if setup.endswith("dynamic-extra") else fetch
         given: list[Callable[..., Any]] = [*_own(on_worker), extra]
