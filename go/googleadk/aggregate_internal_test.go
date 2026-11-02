@@ -176,3 +176,38 @@ func TestAggregateResponsesFoldsAllLateFields(t *testing.T) {
 	assert.Equal(t, "SAFETY", agg.ErrorCode)
 	assert.Equal(t, "blocked by safety", agg.ErrorMessage)
 }
+
+// customStatusError stands for a provider SDK's error with an int StatusCode
+// field, as openai-go's *openai.Error has. TestOpenAIModelErrorIsNonRetryable
+// covers the real error that ADK's OpenAI model returns.
+type customStatusError struct{ StatusCode int }
+
+func (e customStatusError) Error() string { return fmt.Sprintf("status %d", e.StatusCode) }
+
+// TestClassifyModelErrorWrappedStatusCode proves the status is found when the
+// error is wrapped, also by a model supplied through Config.Models that joins
+// it with other errors, through either Unwrap form, and that the status rule
+// still applies.
+func TestClassifyModelErrorWrappedStatusCode(t *testing.T) {
+	ctxErr := errors.New("model context")
+	for code, retryable := range map[int]bool{400: false, 401: false, 404: false, 408: true, 409: true, 429: true, 500: true, 503: true} {
+		statusErr := &customStatusError{code}
+		for name, err := range map[string]error{
+			"value":       customStatusError{code},
+			"pointer":     statusErr,
+			"wrapped":     fmt.Errorf("openai: call failed: %w", statusErr),
+			"joined":      errors.Join(statusErr, nil),
+			"joined last": errors.Join(ctxErr, statusErr),
+			"after zero":  errors.Join(customStatusError{0}, statusErr),
+			"multiple %w": fmt.Errorf("%w: %w", ctxErr, statusErr),
+			"nested":      fmt.Errorf("outer: %w", errors.Join(ctxErr, fmt.Errorf("openai: %w", statusErr))),
+		} {
+			assert.Equal(t, code, apiErrorCode(err), "%s %d", name, code)
+			assert.Equal(t, !retryable, IsNonRetryable(classifyModelError(err)), "%s %d", name, code)
+		}
+	}
+	// Joined status-less errors stay retryable, and a genai.APIError anywhere
+	// in the tree still decides first.
+	assert.False(t, IsNonRetryable(classifyModelError(errors.Join(ctxErr, assert.AnError))), "joined transient")
+	assert.False(t, IsNonRetryable(classifyModelError(errors.Join(&customStatusError{404}, &genai.APIError{Code: 500}))), "joined genai 500")
+}

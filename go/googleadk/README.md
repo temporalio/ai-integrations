@@ -279,6 +279,9 @@ outside Temporal. To use another model, build the agent with
   a callback can only check its message (see **MCP, statelessly** above).
   Classify with `IsNonRetryable(err)`; never string-match. Upstream HTTP status
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
+  The status is read from a `genai.APIError`, or else from an int `StatusCode`
+  field of 400 or more on any error the model returns or wraps, as openai-go's
+  errors have. A custom `model.LLM` can expose its status the same way.
   A streamed call whose chunks could not all be published fails with
   `googleadk.StreamError` (see [Streaming](#streaming)).
   A non-streamed Gemini reply with no candidates, which is how Gemini answers a

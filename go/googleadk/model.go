@@ -591,8 +591,8 @@ func appendText(c *genai.Content, text string) {
 	c.Parts = append(c.Parts, &genai.Part{Text: text})
 }
 
-// classifyModelError maps a model-call failure to Temporal's retry contract. A
-// genai.APIError is classified by HTTP status (408/409/429 and 5xx retryable,
+// classifyModelError maps a model-call failure to Temporal's retry contract. An
+// error with an HTTP status is classified by it (408/409/429 and 5xx retryable,
 // other 4xx non-retryable); anything without a status is treated as a
 // retryable transient fault, except ADK's "empty response".
 func classifyModelError(err error) error {
@@ -632,7 +632,8 @@ func isMessageTooLarge(err error) bool {
 }
 
 // apiErrorCode extracts the HTTP status from a genai.APIError, which the SDK
-// returns sometimes by value and sometimes by pointer.
+// returns sometimes by value and sometimes by pointer, or else from another
+// provider SDK's error (see statusCodeField).
 func apiErrorCode(err error) int {
 	var ptr *genai.APIError
 	if errors.As(err, &ptr) && ptr != nil {
@@ -641,6 +642,38 @@ func apiErrorCode(err error) int {
 	var val genai.APIError
 	if errors.As(err, &val) {
 		return val.Code
+	}
+	if code := statusCodeField(err); code >= 400 {
+		return code
+	}
+	return 0
+}
+
+// statusCodeField returns the first non-zero int StatusCode field in err's
+// tree, as openai-go's *openai.Error has (ADK's OpenAI model wraps it), or 0
+// if there is none. It follows both Unwrap forms (errors.Join and multiple %w
+// produce the second), depth first, as errors.As does. Reading the field by
+// name avoids importing each provider's SDK.
+func statusCodeField(err error) int {
+	if err == nil {
+		return 0
+	}
+	if v := reflect.Indirect(reflect.ValueOf(err)); v.Kind() == reflect.Struct {
+		if sf, ok := v.Type().FieldByName("StatusCode"); ok {
+			if f, ferr := v.FieldByIndexErr(sf.Index); ferr == nil && f.CanInt() && f.Int() != 0 {
+				return int(f.Int())
+			}
+		}
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return statusCodeField(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if code := statusCodeField(e); code != 0 {
+				return code
+			}
+		}
 	}
 	return 0
 }
