@@ -8,23 +8,24 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from mcp import Client as MCPClient
 from mcp import StdioServerParameters, stdio_client
+from mcp.types import Tool
 from strands import tool
 from strands.hooks import BeforeModelCallEvent
-from strands.tools.mcp.mcp_client import MCPClient
 from strands.types.exceptions import EventLoopException
 
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
+from temporalio.mcp import TemporalMCPClient as DurableMCPClient
 from temporalio.strands_agents import (
     MCPToolNameConflictError,
     StrandsPlugin,
     TemporalAgent,
     TemporalMCPClient,
     TemporalSandbox,
-    _temporal_mcp_client,
 )
 from temporalio.strands_agents._temporal_mcp_tool import TemporalMCPTool
 from temporalio.worker import Replayer, Worker
@@ -32,16 +33,14 @@ from temporalio.workflow import NondeterminismError
 from tests.common import get_activities, load_history
 from tests.mock_model import MockModel
 
+_ECHO_PARAMS = StdioServerParameters(
+    command=sys.executable,
+    args=[str(Path(__file__).parent / "echo_mcp_server.py")],
+)
+
 
 def _echo_client_factory() -> MCPClient:
-    return MCPClient(
-        lambda: stdio_client(
-            StdioServerParameters(
-                command=sys.executable,
-                args=[str(Path(__file__).parent / "echo_mcp_server.py")],
-            )
-        )
-    )
+    return MCPClient(stdio_client(_ECHO_PARAMS))
 
 
 @workflow.defn
@@ -66,6 +65,12 @@ class MCPWorkflow:
 
 async def test_mcp(client: Client):
     task_queue = f"test_mcp-{uuid4()}"
+
+    # A default that captures the server's parameters, as in a loop over
+    # servers; the plugin must still call the factory with no arguments.
+    def echo_factory(params: StdioServerParameters = _ECHO_PARAMS) -> MCPClient:
+        return MCPClient(stdio_client(params))
+
     plugin = StrandsPlugin(
         models={
             "mock": lambda: MockModel(
@@ -75,16 +80,7 @@ async def test_mcp(client: Client):
                 ]
             )
         },
-        mcp_clients={
-            "echo": lambda: MCPClient(
-                lambda: stdio_client(
-                    StdioServerParameters(
-                        command=sys.executable,
-                        args=[str(Path(__file__).parent / "echo_mcp_server.py")],
-                    )
-                )
-            ),
-        },
+        mcp_clients={"echo": echo_factory},
     )
 
     async with Worker(
@@ -105,9 +101,9 @@ async def test_mcp(client: Client):
     history = await handle.fetch_history()
     assert get_activities(history) == [
         "strands_get_model_config",
-        "echo-list-tools",
+        "temporalio.mcp.echo.list-tools",
         "invoke_model",
-        "echo-call-tool",
+        "temporalio.mcp.echo.call-tool",
         "invoke_model",
     ]
 
@@ -140,14 +136,20 @@ class MCPReuseWorkflow:
 async def test_mcp_reuses_connection(client: Client):
     """Successive MCP tool calls reuse one cached worker-side connection."""
     task_queue = f"test_mcp_reuses_connection-{uuid4()}"
-    # Count how often the worker opens a connection. One lazily-opened
-    # connection serves the list-tools discovery and both tool calls (1);
-    # reconnecting per call would make it more.
+    # Count how often the worker opens and closes a connection. One
+    # lazily-opened connection serves the list-tools discovery and both tool
+    # calls (1); reconnecting per call would make it more.
     factory_calls = [0]
+    closed = asyncio.Event()
+
+    class ClosingClient(MCPClient):
+        async def __aexit__(self, *args: Any) -> None:
+            await super().__aexit__(*args)
+            closed.set()
 
     def counting_factory() -> MCPClient:
         factory_calls[0] += 1
-        return _echo_client_factory()
+        return ClosingClient(stdio_client(_ECHO_PARAMS))
 
     plugin = StrandsPlugin(
         models={
@@ -176,20 +178,21 @@ async def test_mcp_reuses_connection(client: Client):
             task_queue=task_queue,
         )
         assert await handle.result() == "Done!\n"
+        assert not closed.is_set()
 
-    # The worker context has exited, so its run_context finally evicted the
-    # cached connection.
-    assert "echo_cached" not in _temporal_mcp_client._CONNECTIONS
     assert factory_calls[0] == 1
+    # Worker shutdown closes the cached connection. Leaving ``async with Worker``
+    # does not wait for that, so wait for it here.
+    await asyncio.wait_for(closed.wait(), timeout=10)
 
     history = await handle.fetch_history()
     assert get_activities(history) == [
         "strands_get_model_config",
-        "echo_cached-list-tools",
+        "temporalio.mcp.echo_cached.list-tools",
         "invoke_model",
-        "echo_cached-call-tool",
+        "temporalio.mcp.echo_cached.call-tool",
         "invoke_model",
-        "echo_cached-call-tool",
+        "temporalio.mcp.echo_cached.call-tool",
         "invoke_model",
     ]
 
@@ -220,7 +223,7 @@ class MCPIdleWorkflow:
 
 
 async def test_mcp_connection_idle_timeout(client: Client):
-    """A short idle timeout evicts the cached connection while the worker runs."""
+    """A zero idle timeout closes the connection after every activity."""
     task_queue = f"test_mcp_connection_idle_timeout-{uuid4()}"
     factory_calls = [0]
 
@@ -238,10 +241,7 @@ async def test_mcp_connection_idle_timeout(client: Client):
             )
         },
         mcp_clients={"echo_idle": counting_factory},
-        # Short window so the cached call connection is evicted mid-run rather
-        # than only at worker shutdown. The idle timer only arms once the call
-        # releases the connection, so this can't tear it down mid-call.
-        mcp_connection_idle_timeout=timedelta(milliseconds=100),
+        mcp_connection_idle_timeout=timedelta(0),
     )
 
     async with Worker(
@@ -259,20 +259,8 @@ async def test_mcp_connection_idle_timeout(client: Client):
         )
         assert await handle.result() == "Done!\n"
 
-        # A connection was opened lazily (on the first list-tools/call-tool).
-        # How many times depends on whether the short idle timer fires between
-        # activities, so this only asserts that at least one was opened; the
-        # eviction-while-alive behavior is what the polling loop below checks.
-        assert factory_calls[0] >= 1
-
-        # Still inside the worker context: the short idle timer evicts the
-        # cached call connection on its own. Asserting eviction here -- with the
-        # worker alive -- proves it came from the idle timer, not shutdown.
-        for _ in range(100):
-            if "echo_idle" not in _temporal_mcp_client._CONNECTIONS:
-                break
-            await asyncio.sleep(0.1)
-        assert "echo_idle" not in _temporal_mcp_client._CONNECTIONS
+    # One connection for list-tools and another for call-tool.
+    assert factory_calls[0] == 2
 
 
 @workflow.defn
@@ -330,10 +318,9 @@ async def test_mcp_lists_tools_each_turn_when_uncached(client: Client):
     activities = get_activities(history)
     # One list-tools per model call -- the tools are re-listed every turn rather
     # than once for the workflow.
-    assert activities.count("echo_nocache-list-tools") == activities.count(
-        "invoke_model"
-    )
-    assert activities.count("echo_nocache-list-tools") == 3
+    list_tools = "temporalio.mcp.echo_nocache.list-tools"
+    assert activities.count(list_tools) == activities.count("invoke_model")
+    assert activities.count(list_tools) == 3
 
     await Replayer(
         workflows=[MCPNoCacheWorkflow],
@@ -341,7 +328,7 @@ async def test_mcp_lists_tools_each_turn_when_uncached(client: Client):
     ).replay_workflow(history)
 
 
-def _two_servers_agent() -> TemporalAgent:
+def _two_servers_agent(prefix_b: str | None = None) -> TemporalAgent:
     return TemporalAgent(
         model="mock",
         start_to_close_timeout=timedelta(seconds=30),
@@ -350,7 +337,9 @@ def _two_servers_agent() -> TemporalAgent:
                 server="echo_a", start_to_close_timeout=timedelta(seconds=30)
             ),
             TemporalMCPClient(
-                server="echo_b", start_to_close_timeout=timedelta(seconds=30)
+                server="echo_b",
+                prefix=prefix_b,
+                start_to_close_timeout=timedelta(seconds=30),
             ),
         ],
     )
@@ -368,6 +357,13 @@ class MCPTwoServersWorkflow:
         except ValueError as err:
             return f"refused: {err}"
         return str(result)
+
+
+@workflow.defn
+class MCPPrefixedServersWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        return str(await _two_servers_agent(prefix_b="b").invoke_async(prompt))
 
 
 @workflow.defn
@@ -422,8 +418,8 @@ async def test_mcp_duplicate_tool_names_are_refused(client: Client):
     history = await handle.fetch_history()
     assert get_activities(history) == [
         "strands_get_model_config",
-        "echo_a-list-tools",
-        "echo_b-list-tools",
+        "temporalio.mcp.echo_a.list-tools",
+        "temporalio.mcp.echo_b.list-tools",
     ]
     await Replayer(
         workflows=[MCPTwoServersWorkflow],
@@ -431,17 +427,19 @@ async def test_mcp_duplicate_tool_names_are_refused(client: Client):
     ).replay_workflow(history)
 
 
-# MCPTwoServersWorkflow histories recorded on main at 63d7aec, before duplicates
-# were refused, against a local dev server; only the worker identity and task
-# queue name were normalized. legacy_mcp_distinct_names: echo_b's MCPClient has
-# prefix="b", and the model calls echo, then b_echo. legacy_mcp_duplicate_names:
-# no prefixes, and the model calls echo, which ran on echo_b.
+# Histories recorded on main at 275b1e6, after the MCP Activities moved to
+# temporalio-mcp and before duplicates were refused, against a local dev server;
+# only the worker identity and task queue name were normalized.
+# legacy_mcp_distinct_names: MCPPrefixedServersWorkflow, where echo_b's
+# TemporalMCPClient has prefix="b", and the model calls echo, then b_echo.
+# legacy_mcp_duplicate_names: MCPTwoServersWorkflow, with no prefixes, and the
+# model calls echo, which ran on echo_b.
 
 
 async def test_mcp_replays_history_with_distinct_names():
     """Runs whose tool names never clashed schedule the same commands as before."""
     await Replayer(
-        workflows=[MCPTwoServersWorkflow], plugins=[StrandsPlugin(models={})]
+        workflows=[MCPPrefixedServersWorkflow], plugins=[StrandsPlugin(models={})]
     ).replay_workflow(load_history("legacy_mcp_distinct_names"))
 
 
@@ -489,7 +487,7 @@ class MCPMovingToolWorkflow:
         return " | ".join(str(result) for result in results)
 
 
-# Histories recorded on main at 63d7aec, as above, with stand-in list-tools and
+# Histories recorded on main at 275b1e6, as above, with stand-in list-tools and
 # call-tool Activities whose tools change between listings.
 # legacy_mcp_shared_client_drop: `shifting` lists echo, then other; agents A, B,
 # A share it, and A calls echo on its second turn, which main kept for it.
@@ -502,12 +500,12 @@ class MCPMovingToolWorkflow:
         (
             MCPSharedClientWorkflow,
             "legacy_mcp_shared_client_drop",
-            "'shifting-call-tool'.*'shifting-list-tools'",
+            r"'temporalio\.mcp\.shifting\.call-tool'.*'temporalio\.mcp\.shifting\.list-tools'",
         ),
         (
             MCPMovingToolWorkflow,
             "legacy_mcp_tool_moves",
-            "'mv_b-list-tools'.*'mv_b-call-tool'",
+            r"'temporalio\.mcp\.mv_b\.list-tools'.*'temporalio\.mcp\.mv_b\.call-tool'",
         ),
     ],
 )
@@ -531,19 +529,17 @@ def ping() -> str:
 _late_listings: Counter[str] = Counter()
 
 
-@activity.defn(name="late-list-tools")
-async def _late_list_tools() -> list[_temporal_mcp_client._MCPToolInfo]:
+@activity.defn(name="temporalio.mcp.late.list-tools")
+async def _late_list_tools(
+    request: dict[str, Any],  # pyright: ignore[reportUnusedParameter]
+) -> dict[str, Any]:
     """List nothing on a run's first call, then a tool named like `ping`."""
     run = activity.info().workflow_id or ""
     _late_listings[run] += 1
     if _late_listings[run] == 1:
-        return []
+        return {"tools": []}
     schema = {"type": "object", "properties": {}}
-    return [
-        _temporal_mcp_client._MCPToolInfo(
-            name="ping", description="", input_schema=schema, agent_name="ping"
-        )
-    ]
+    return {"tools": [{"name": "ping", "inputSchema": schema}]}
 
 
 @workflow.defn
@@ -666,10 +662,9 @@ async def test_other_errors_after_a_tool_call_stay_wrapped(client: Client):
 
 
 def _mcp_tool(server: str, name: str) -> TemporalMCPTool:
-    info = _temporal_mcp_client._MCPToolInfo(
-        name=name, description="", input_schema={}, agent_name=name
-    )
-    return TemporalMCPTool(server, info, {})
+    schema = {"type": "object", "properties": {}}
+    listed = Tool.model_validate({"name": name, "inputSchema": schema})
+    return TemporalMCPTool(DurableMCPClient(server), listed)
 
 
 async def _before_model_call(agent: TemporalAgent) -> None:
@@ -680,7 +675,7 @@ async def _before_model_call(agent: TemporalAgent) -> None:
 def _listing(
     provider: TemporalMCPClient, *names: str, log: list[str] | None = None
 ) -> Any:
-    """Stand in for {server}-list-tools; each call makes new tools, as _refresh() does."""
+    """Stand in for the list-tools Activity; each call makes new tools, as _refresh() does."""
 
     async def refresh() -> None:
         if log is not None:
@@ -753,7 +748,7 @@ async def test_mcp_duplicate_refused_again_after_caught(
             ("search",),
             2,
             "The agent has two TemporalMCPClient handles for MCP server 'a'. "
-            "Pass only one.",
+            "Give one a different prefix, or pass only one.",
         ),
     ],
 )
@@ -953,8 +948,8 @@ def _local_foo_bar() -> str:
         (
             "echo",
             "Tool name 'echo' already exists. MCP server 'a' lists it, and another "
-            "tool of the agent has it. Set a prefix on the server's MCPClient, or "
-            "drop the tool with tool_filters.",
+            "tool of the agent has it. Set a prefix on the server's "
+            "TemporalMCPClient, or drop the tool with its tool_filters.",
         ),
         ("foo-bar", "Tool name 'foo-bar' already exists as 'foo_bar'."),
         ("sandbox_shell", "Tool name 'sandbox_shell' already exists."),

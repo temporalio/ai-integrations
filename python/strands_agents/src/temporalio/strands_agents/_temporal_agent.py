@@ -44,8 +44,8 @@ def _duplicate_tool_name(
     if holder is None:
         source = (
             f"MCP server '{provider.server}' lists it, and another tool of the "
-            "agent has it. Set a prefix on the server's MCPClient, or drop the "
-            "tool with tool_filters."
+            "agent has it. Set a prefix on the server's TemporalMCPClient, or "
+            "drop the tool with its tool_filters."
         )
     elif holder is provider:
         both = "it twice" if other == name else "both names"
@@ -53,13 +53,13 @@ def _duplicate_tool_name(
     elif holder.server == provider.server:
         source = (
             "The agent has two TemporalMCPClient handles for MCP server "
-            f"'{provider.server}'. Pass only one."
+            f"'{provider.server}'. Give one a different prefix, or pass only one."
         )
     else:
         source = (
             f"MCP servers '{holder.server}' and '{provider.server}' both list it. "
-            "Set a different prefix on one server's MCPClient, or drop the tool "
-            "with tool_filters."
+            "Set a different prefix on one server's TemporalMCPClient, or drop "
+            "the tool with its tool_filters."
         )
     return MCPToolNameConflictError(f"{refused} {source}")
 

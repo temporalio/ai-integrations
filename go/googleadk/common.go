@@ -30,6 +30,9 @@ const (
 	ErrorTypeTool = "googleadk.ToolError"
 	// ErrorTypeMCP tags failures originating from an MCP list/call.
 	ErrorTypeMCP = "googleadk.McpError"
+	// ErrorTypeStream tags a streaming model call whose responses could not
+	// all be published to its Workflow Streams topic.
+	ErrorTypeStream = "googleadk.StreamError"
 	// ErrorTypeA2A tags failures originating from an A2A card fetch, message
 	// or cancellation.
 	ErrorTypeA2A = "googleadk.A2AError"
