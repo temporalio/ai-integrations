@@ -35,6 +35,13 @@ from temporalio.openai_agents._mcp_server_checks import (
 from temporalio.worker import PollerBehaviorSimpleMaximum, Worker
 from temporalio.workflow import ActivityConfig, ActivityHandle
 
+# What the deprecated routes' tool_filter error tells the user to do instead.
+_LEGACY_TOOL_FILTER_REMEDY = (
+    "use a static filter (create_static_tool_filter) on the factory's server, "
+    "or register the factory with OpenAIAgentsPlugin(mcp_servers=...) and pass "
+    "the filter to temporal_mcp_server(tool_filter=...)"
+)
+
 
 @dataclasses.dataclass
 class _StatelessListToolsArguments:
@@ -166,7 +173,9 @@ class StatelessMCPServerProvider:
             name: The name of the MCP server.
             server_factory: A function which will produce MCPServer instances. It should return a new server each time
                 so that state is not shared between workflow runs. It may accept a single positional parameter, which
-                receives a ``factory_argument`` from the workflow.
+                receives a ``factory_argument`` from the workflow. A callable ``tool_filter`` or a ``require_approval``
+                policy that can ask for approval on the returned server is rejected in every MCP operation; a static
+                filter is applied.
         """
         warnings.warn(
             "StatelessMCPServerProvider is deprecated; use "
@@ -192,7 +201,9 @@ class StatelessMCPServerProvider:
             )
         else:
             server = cast(Callable[[], MCPServer], self._server_factory)()
-        _reject_dynamic_tool_filter(self._server_name, server)
+        _reject_dynamic_tool_filter(
+            self._server_name, server, _LEGACY_TOOL_FILTER_REMEDY
+        )
         _reject_worker_side_require_approval(
             self._server_name, server, "stateless_mcp_server"
         )
@@ -470,7 +481,8 @@ class StatefulMCPServerProvider:
             name: The name of the MCP server.
             server_factory: A function which will produce MCPServer instances. It should return a new server each time
                 so that state is not shared between workflow runs. It receives an optional ``factory_argument`` from the
-                workflow.
+                workflow. A callable ``tool_filter`` or a ``require_approval`` policy that can ask for approval on the
+                returned server is rejected in every MCP operation; a static filter is applied.
         """
         warnings.warn(
             "StatefulMCPServerProvider is deprecated; use "
@@ -497,7 +509,9 @@ class StatefulMCPServerProvider:
 
         def _server() -> MCPServer:
             server = self._servers[_server_id()]
-            _reject_dynamic_tool_filter(self._server_name, server)
+            _reject_dynamic_tool_filter(
+                self._server_name, server, _LEGACY_TOOL_FILTER_REMEDY
+            )
             _reject_worker_side_require_approval(
                 self._server_name, server, "stateful_mcp_server"
             )

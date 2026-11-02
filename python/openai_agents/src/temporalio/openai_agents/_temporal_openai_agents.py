@@ -371,7 +371,10 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 Useful for testing or custom model integrations.
             mcp_server_providers: Legacy MCP server providers to register with the
                 worker. Deprecated; use ``mcp_servers`` for new MCP v2
-                integrations.
+                integrations. A provider's server with a callable
+                ``tool_filter`` or a ``require_approval`` policy that can ask for
+                approval is rejected in every MCP operation; a static filter is
+                applied.
             mcp_servers: Named OpenAI MCP server factories to register on the worker.
                 Each factory may declare at most one positional parameter, which
                 receives the workflow's ``factory_argument`` (``None`` when the

@@ -3144,7 +3144,8 @@ async def test_mcp_server_factory_settings_are_rejected(
         assert f"{route}(require_approval=...)" in message
     else:
         assert "'HelloServer' sets a callable tool_filter" in message
-        assert "temporal_mcp_server()" in message
+        assert "create_static_tool_filter" in message
+        assert "temporal_mcp_server(tool_filter=...)" in message
     # The rejected server is never connected, cleaned up or called.
     assert tracking_server.calls == []
     if stateful:

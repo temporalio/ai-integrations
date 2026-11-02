@@ -26,20 +26,23 @@ def _has_dynamic_tool_filter(server: MCPServer) -> bool:
     return callable(getattr(server, "tool_filter", None))
 
 
-def _reject_dynamic_tool_filter(name: str, server: MCPServer) -> None:
+def _reject_dynamic_tool_filter(
+    name: str,
+    server: MCPServer,
+    remedy: str = "pass the filter to temporal_mcp_server() instead",
+) -> None:
     """Fail fast on a worker-side filter that can never be applied.
 
     A callable ``tool_filter`` needs the run context and agent, which exist only
     in the workflow, so the Agents SDK rejects one on the worker side and the
     list-tools Activity would otherwise retry forever. A static filter needs
-    neither and is applied here as usual.
+    neither and is applied here as usual. ``remedy`` ends the error message.
     """
     if _has_dynamic_tool_filter(server):
         raise ApplicationError(
             f"MCP server {name!r} sets a callable tool_filter on its worker-side "
             "MCPServer, which cannot be applied there because the run context "
-            "and agent it receives exist only in the workflow; pass the filter "
-            "to temporal_mcp_server() instead",
+            f"and agent it receives exist only in the workflow; {remedy}",
             non_retryable=True,
         )
 
