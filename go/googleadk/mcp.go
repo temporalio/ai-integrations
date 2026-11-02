@@ -502,6 +502,13 @@ func (t *mcpProxyTool) Run(ctx agent.Context, args any) (map[string]any, error) 
 		}
 		return nil, fmt.Errorf("error tool %q %w", t.Name(), tool.ErrConfirmationRequired)
 	}
+	if out.Error != nil {
+		// The tool's own error, such as an MCP isError result. Give ADK an
+		// error with the tool's message, so callbacks and the model see it as
+		// they do without Temporal. Only the message crosses the Activity
+		// boundary, not the error's Go type.
+		return nil, errors.New(*out.Error)
+	}
 	if out.Result == nil {
 		return map[string]any{}, nil
 	}
@@ -524,10 +531,14 @@ type mcpCallInput struct {
 // mcpCallOutput is the serializable result of CallMcpTool. Confirmation is
 // non-nil when the tool paused on ADK's tool.ErrConfirmationRequired protocol
 // instead of running; the workflow-side proxy re-records it so the runner
-// surfaces the pause exactly like an in-workflow tool.
+// surfaces the pause exactly like an in-workflow tool. Error is the message of
+// the tool's own error, which the proxy hands to ADK; see CallMcpTool. Result
+// then holds {"error": message}, the response ADK builds from a tool error, so
+// a workflow worker without the Error field gives the model the same response.
 type mcpCallOutput struct {
 	Result       map[string]any
 	Confirmation *toolconfirmation.ToolConfirmation
+	Error        *string
 }
 
 // ListMcpTools returns the full declarations (name + description + parameters)
@@ -567,6 +578,16 @@ func (a *Activities) ListMcpTools(ctx context.Context, in mcpListInput) ([]*gena
 // confirmation protocol (e.g. mcptoolset's RequireConfirmation option) the
 // Activity succeeds with the pending confirmation in its output rather than
 // failing, so the workflow can pause the agent for the human.
+//
+// A tool's own error, one that wraps no other error and is not an
+// ApplicationError, also goes in the output, so the model sees it once, as it
+// does without Temporal. ADK's MCP tools return an isError result (and, before
+// ADK v2.4.0, a result with no text) that way. They wrap the error of a failed
+// MCP request, which still fails the Activity with a retryable McpError, as
+// does an error returned after the Activity's context is done, such as when
+// the Worker stops. An ApplicationError returned as is fails the Activity with
+// its own type and retryability; wrapped in another error, it fails as a
+// retryable wrapError.
 func (a *Activities) CallMcpTool(ctx context.Context, in mcpCallInput) (*mcpCallOutput, error) {
 	log := activity.GetLogger(ctx)
 	// No-op unless the user set a HeartbeatTimeout on the toolset's Activity
@@ -612,12 +633,35 @@ func (a *Activities) CallMcpTool(ctx context.Context, in mcpCallInput) (*mcpCall
 				return nil, newApplicationError(ErrorTypeMCP, false, runErr,
 					"tool %q failed: %v", in.Tool, runErr)
 			}
+			// An error after ctx is done, such as ctx.Err() when the Worker
+			// stops, is not the tool's answer, whatever it wraps.
+			if ctx.Err() == nil && isToolAnswer(runErr) {
+				msg := runErr.Error()
+				return &mcpCallOutput{Result: map[string]any{"error": msg}, Error: &msg}, nil
+			}
 			return nil, classifyToolError(ErrorTypeMCP, in.Tool, runErr)
 		}
 		return &mcpCallOutput{Result: res}, nil
 	}
 	return nil, newApplicationError(ErrorTypeMCP, false, nil,
 		"tool %q not found in MCP toolset %q", in.Tool, in.Toolset)
+}
+
+// isToolAnswer reports whether err, returned by an MCP tool's Run, is the
+// tool's own answer: an error that wraps no other error and is not an
+// ApplicationError.
+func isToolAnswer(err error) bool {
+	var appErr interface{ NonRetryable() bool }
+	if errors.As(err, &appErr) {
+		return false
+	}
+	switch e := err.(type) {
+	case interface{ Unwrap() error }:
+		return e.Unwrap() == nil
+	case interface{ Unwrap() []error }:
+		return len(e.Unwrap()) == 0
+	}
+	return true
 }
 
 // mcpToolset resolves the named toolset, running its registered factory at most

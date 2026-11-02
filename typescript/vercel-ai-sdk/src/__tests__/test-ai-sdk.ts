@@ -47,8 +47,9 @@ import {
   OpenTelemetryWorkflowClientInterceptor,
 } from '@temporalio/interceptors-opentelemetry';
 import { workflowInterceptorModules } from '@temporalio/testing';
-import { bundleWorkflowCode, DefaultLogger, Worker as CoreWorker } from '@temporalio/worker';
-import type { InjectedSinks } from '@temporalio/worker';
+import { SimplePlugin } from '@temporalio/plugin';
+import { bundleWorkflowCode, DefaultLogger, NativeConnection, Worker as CoreWorker } from '@temporalio/worker';
+import type { InjectedSinks, WorkerOptions } from '@temporalio/worker';
 import type { BaseContext } from '@temporalio/test-helpers';
 import {
   test as anyTest,
@@ -961,6 +962,88 @@ const createTestMcpClient = async () => {
   // Return real AI SDK MCP client connected to in-memory server
   return createMCPClient({ transport: clientTransport });
 };
+
+test('configureWorker refuses to replace a different Activity with the same name', (t) => {
+  const provider = new TestProvider(helloWorkflowGenerator());
+  const files = async () => ({}) as any;
+  const base = { taskQueue: 'tq' } as WorkerOptions;
+  const duplicate = (name: string) => ({
+    instanceOf: TypeError,
+    message: new RegExp(`^Duplicate registration of Activity '${name}': AiSdkPlugin would replace`),
+  });
+
+  // A caller Activity, another instance's provider, or another instance's MCP
+  // client factory under the same server name is refused.
+  const callerActivities = { ...base, activities: { invokeModel: async () => 'caller' } };
+  t.throws(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(callerActivities), duplicate('invokeModel'));
+  const withMcp = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } }).configureWorker(base);
+  const otherProvider = new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) });
+  t.throws(() => otherProvider.configureWorker(withMcp), duplicate('invokeModel'));
+  const otherFactory = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files: async () => ({}) as any } });
+  t.throws(() => otherFactory.configureWorker(withMcp), duplicate('files-listTools'));
+  // Another operation built from the same provider, registered under this name.
+  const aliased = { ...base, activities: { invokeModel: (createActivities(provider) as any).invokeEmbeddingModel } };
+  t.throws(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(aliased), duplicate('invokeModel'));
+
+  // configureWorker accepts the same instance twice (NativeConnection and
+  // Worker), the same options twice, and createActivities with the same
+  // provider. With workflowsPath, Worker.create still rejects a repeated
+  // AiSdkPlugin in the bundler: each one prepends its polyfill entry.
+  const plugin = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } });
+  t.notThrows(() => plugin.configureWorker(plugin.configureWorker(base)));
+  t.notThrows(() => new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } }).configureWorker(withMcp));
+  const callerSet = { ...base, activities: createActivities(provider) };
+  t.notThrows(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(callerSet));
+});
+
+test('runWorker refuses an Activity that a later plugin replaced, before polling', async (t) => {
+  const connection = await NativeConnection.connect({ address: t.context.env.address });
+  // StrandsPlugin also registers invokeModel; this plugin stands in for it.
+  const later = new SimplePlugin({ name: 'later', activities: { invokeModel: async () => 'other' } });
+  const worker = await Worker.create({
+    connection,
+    namespace: t.context.env.namespace,
+    taskQueue: 'test-ai-later-plugin',
+    plugins: [new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) }), later],
+  });
+  await t.throwsAsync(worker.run(), {
+    instanceOf: TypeError,
+    message: /^Duplicate registration of Activity 'invokeModel': a plugin applied after AiSdkPlugin replaced/,
+  });
+  t.is(worker.getState(), 'STOPPED');
+  // Throws if the Worker still holds the connection.
+  await connection.close();
+});
+
+test('runWorker starts the Worker at once, so runUntil stops it after its callback', async (t) => {
+  const connection = await NativeConnection.connect({ address: t.context.env.address });
+  // runUntil stops the Worker after its callback only if the Worker is already
+  // running. A callback that throws synchronously finishes before run() yields.
+  const alone = await Worker.create({
+    connection,
+    namespace: t.context.env.namespace,
+    taskQueue: 'test-ai-run-until-throws',
+    plugins: [new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) })],
+  });
+  await t.throwsAsync(
+    alone.runUntil(() => {
+      throw new Error('boom');
+    }),
+    { message: 'boom' }
+  );
+  t.is(alone.getState(), 'STOPPED');
+  // Each plugin's check runs before the Worker starts; none may yield.
+  const options = { modelProvider: new TestProvider(helloWorkflowGenerator()) };
+  const two = await Worker.create({
+    connection,
+    namespace: t.context.env.namespace,
+    taskQueue: 'test-ai-run-until-two',
+    plugins: [new AiSdkPlugin(options), new AiSdkPlugin(options)],
+  });
+  t.is(await two.runUntil(() => Promise.resolve('done')), 'done');
+  t.is(two.getState(), 'STOPPED');
+  await connection.close();
+});
 
 test('MCP tool schema survives activity serialization', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);

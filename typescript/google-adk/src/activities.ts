@@ -29,14 +29,16 @@ import { ApplicationFailure, CancelledFailure } from '@temporalio/common';
 // what counts as an abort (it is a structural check, not `instanceof Error`).
 import { isAbortError } from '@temporalio/common/lib/type-helpers';
 import { Context as ActivityContext } from '@temporalio/activity';
-import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
+import { FlushTimeoutError, WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 
 import {
   MCP_ERROR_FAILURE_TYPE,
   MCP_RESOURCES_UNSUPPORTED_FAILURE_TYPE,
   MCP_TOOL_NOT_FOUND_FAILURE_TYPE,
   MODEL_ERROR_FAILURE_TYPE,
+  STREAM_ERROR_FAILURE_TYPE,
 } from './error-types';
+import { withSources } from './activity-sources';
 import type { InvokeModelArgs, InvokeModelStreamingArgs, ModelActivities, WireLlmRequest } from './model';
 import type { MCPCallToolArgs, MCPReadResourceArgs, MCPResourceContents, MCPToolsetFactory } from './mcp';
 
@@ -89,9 +91,13 @@ export interface ModelActivitiesOptions {
 
 /** @internal */
 export function createModelActivities(options: ModelActivitiesOptions = {}): ModelActivities {
-  const resolveModel = (model: string): BaseLlm => options.modelProvider?.(model) ?? LLMRegistry.newLlm(model);
+  // Read once, so the Activities use the provider recorded with them below.
+  // It is still called as a method of `options`, as before, so a provider
+  // that reads `this` keeps working.
+  const { modelProvider } = options;
+  const resolveModel = (model: string): BaseLlm => modelProvider?.call(options, model) ?? LLMRegistry.newLlm(model);
 
-  return {
+  const activities: ModelActivities = {
     async 'adk-invokeModel'(args: InvokeModelArgs): Promise<LlmResponse[]> {
       const abortSignal = ActivityContext.current().cancellationSignal;
       const stopHeartbeat = startAdaptiveHeartbeat();
@@ -115,6 +121,8 @@ export function createModelActivities(options: ModelActivitiesOptions = {}): Mod
       const abortSignal = ActivityContext.current().cancellationSignal;
       const stopHeartbeat = startAdaptiveHeartbeat();
       let stream: ReturnType<typeof WorkflowStreamClient.fromWithinActivity> | undefined;
+      let publishFailure: ApplicationFailure | undefined;
+      const responses: LlmResponse[] = [];
       try {
         stream = WorkflowStreamClient.fromWithinActivity({
           batchInterval: args.batchInterval ?? DEFAULT_STREAM_BATCH_INTERVAL,
@@ -122,28 +130,35 @@ export function createModelActivities(options: ModelActivitiesOptions = {}): Mod
         const events = stream.topic<LlmResponse>(args.streamingTopic);
         const model = resolveModel(args.model);
         const request = fromWireRequest(args.request);
-        const responses: LlmResponse[] = [];
         for await (const response of model.generateContentAsync(request, true, abortSignal)) {
           // Heartbeat per chunk so a slow stream isn't mistaken for a stuck worker.
           ActivityContext.current().heartbeat();
           events.publish(response);
           responses.push(response);
         }
-        return responses;
       } catch (err) {
         rethrowIfCancelled(err, abortSignal);
         throw toApplicationFailure(err);
       } finally {
         try {
+          // Sends what is left; throws when a batch of the stream was not published.
           await stream?.[Symbol.asyncDispose]();
-        } catch {
-          /* a dispose failure must not mask the primary result/error */
+        } catch (err) {
+          // Thrown below, only when the model call succeeded: it must not mask the model's error.
+          publishFailure = streamPublishFailure(err, args);
         } finally {
           stopHeartbeat();
         }
       }
+      if (publishFailure) {
+        rethrowIfCancelled(publishFailure.cause, abortSignal);
+        throw publishFailure;
+      }
+      return responses;
     },
   };
+  // The provider may read `this`, so its receiver is part of what they depend on.
+  return withSources(activities, modelProvider === undefined ? [] : [modelProvider, options]);
 }
 
 /**
@@ -155,7 +170,7 @@ export function createMCPActivities(
 ): Record<string, (args: never) => Promise<unknown>> {
   const activities: Record<string, (args: never) => Promise<unknown>> = {};
   for (const [name, factory] of Object.entries(toolsets)) {
-    Object.assign(activities, mcpActivitiesForName(name, factory));
+    Object.assign(activities, withSources(mcpActivitiesForName(name, factory), [factory]));
   }
   return activities;
 }
@@ -458,6 +473,39 @@ export function toApplicationFailure(err: unknown, baseType: string = MODEL_ERRO
     type: status !== undefined ? `${baseType}.${status}` : baseType,
     nonRetryable: !retryable,
     nextRetryDelay: parseRetryAfter(headers),
+  });
+}
+
+/** The gRPC status codes `INVALID_ARGUMENT` and `RESOURCE_EXHAUSTED`. */
+const GRPC_INVALID_ARGUMENT = 3;
+const GRPC_RESOURCE_EXHAUSTED = 8;
+
+/**
+ * The failure for a streamed model call that succeeded while a batch of its
+ * stream was not published (`err` is what the stream client's dispose threw).
+ * A retry calls the model again, so it is non-retryable when that retry would
+ * fail the same way: the server refused the batch as invalid (gRPC
+ * `INVALID_ARGUMENT`, as for a batch over its payload size limit or past the
+ * run's Signal limit), the batch is over the server's gRPC message limit
+ * (`RESOURCE_EXHAUSTED` "larger than max"; rate limiting uses the same code
+ * with other messages), or the background flusher already retried the batch
+ * for its `maxRetryDuration` and dropped it (`FlushTimeoutError`). Anything
+ * else, such as a send during a server outage, stays retryable.
+ */
+function streamPublishFailure(err: unknown, args: InvokeModelStreamingArgs): ApplicationFailure {
+  const chain = [...causeChain(err)];
+  const refused = chain.some(
+    (e) =>
+      e.code === GRPC_INVALID_ARGUMENT ||
+      (e.code === GRPC_RESOURCE_EXHAUSTED && /larger than max/.test(String(e.message)))
+  );
+  return ApplicationFailure.create({
+    message:
+      `Could not publish the stream of model '${args.model}' to topic '${args.streamingTopic}': ` +
+      chain.map((e) => e.message).join(': '),
+    type: STREAM_ERROR_FAILURE_TYPE,
+    nonRetryable: err instanceof FlushTimeoutError || refused,
+    cause: err instanceof Error ? err : undefined,
   });
 }
 
