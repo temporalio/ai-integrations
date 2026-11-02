@@ -28,6 +28,7 @@ peerDependencyRules:
     - quill-delta
 
 overrides:
+  '@openai/agents-core': 'github:openai/openai-agents-js#52fcb5769c74844b198affe377e75fe04b1732a3&path:/packages/agents-core'
   'minimatch@>=7.0.0 <7.4.8': '>=7.4.8'
   serialize-javascript: '>=7.0.3'
   handlebars: '>=4.7.9'

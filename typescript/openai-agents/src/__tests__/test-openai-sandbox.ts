@@ -84,35 +84,50 @@ test.serial('applyManifest updates the Workflow-side manifest and survives resum
   });
 });
 
-test.serial('a SandboxAgent whose manifest carries a workerEnvValue survives an approval interruption', async (t) => {
-  const { createWorker, executeWorkflow } = helpers(t);
+for (const serialize of [false, true]) {
+  const stateKind = serialize ? 'serialized' : 'live';
+  test.serial(`a SandboxAgent with workerEnvValue resumes approval from ${stateKind} RunState`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
 
-  const client = new FakeSandboxClient();
-  const worker = await createWorker({
-    plugins: [
-      new OpenAIAgentsPlugin({
-        modelProvider: new FakeModelProvider([
-          toolCallResponse('run_command', { cmd: 'echo hello' }),
-          textResponse('Done.'),
-        ]),
-        modelParams: { startToCloseTimeout: '30s' },
-        sandboxClientProviders: [new SandboxClientProvider('fake', client)],
-        resolvableWorkerEnvVars: [MANIFEST_SECRET_VAR],
-      }),
-    ],
-  });
-
-  process.env[MANIFEST_SECRET_VAR] = MANIFEST_SECRET;
-  try {
-    await worker.runUntil(async () => {
-      t.is(await executeWorkflow(sandboxApprovalResumeWorkflow), 'Done.');
+    const client = new FakeSandboxClient();
+    const worker = await createWorker({
+      plugins: [
+        new OpenAIAgentsPlugin({
+          modelProvider: new FakeModelProvider([
+            toolCallResponse('run_command', { cmd: 'echo hello' }),
+            textResponse('Done.'),
+          ]),
+          modelParams: { startToCloseTimeout: '30s' },
+          sandboxClientProviders: [new SandboxClientProvider('fake', client)],
+          resolvableWorkerEnvVars: [MANIFEST_SECRET_VAR],
+        }),
+      ],
     });
-  } finally {
-    delete process.env[MANIFEST_SECRET_VAR];
-  }
 
-  t.true(client.resumeCalls >= 1, 'the preserved session is re-established through resume()');
-});
+    process.env[MANIFEST_SECRET_VAR] = MANIFEST_SECRET;
+    try {
+      await worker.runUntil(async () => {
+        const handle = await startWorkflow(sandboxApprovalResumeWorkflow, { args: [serialize] });
+        t.is(await handle.result(), 'Done.');
+
+        const { events } = await handle.fetchHistory();
+        const payloads =
+          events?.flatMap((event) => [
+            ...(event.activityTaskScheduledEventAttributes?.input?.payloads ?? []),
+            ...(event.activityTaskCompletedEventAttributes?.result?.payloads ?? []),
+            ...(event.workflowExecutionCompletedEventAttributes?.result?.payloads ?? []),
+          ]) ?? [];
+        const recordedData = payloads.map((payload) => Buffer.from(payload.data ?? []).toString('utf8')).join('\n');
+        t.true(recordedData.includes(MANIFEST_SECRET_VAR), 'history records the environment reference');
+        t.false(recordedData.includes(MANIFEST_SECRET), 'history must not record the resolved secret');
+      });
+    } finally {
+      delete process.env[MANIFEST_SECRET_VAR];
+    }
+
+    t.true(client.resumeCalls >= 1, 'the preserved session is re-established through resume()');
+  });
+}
 
 test('setArchiveLimits is forwarded to the persistWorkspace and hydrateWorkspace Activities', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);

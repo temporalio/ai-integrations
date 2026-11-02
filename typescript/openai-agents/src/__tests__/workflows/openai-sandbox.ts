@@ -1,4 +1,4 @@
-import { Agent, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
+import { Agent, RunState, type FunctionTool, type RunContext, type Tool } from '@openai/agents-core';
 import {
   Capability,
   Manifest,
@@ -100,7 +100,7 @@ class ApprovalSandboxCapability extends Capability {
   }
 }
 
-export async function sandboxApprovalResumeWorkflow(): Promise<string> {
+export async function sandboxApprovalResumeWorkflow(serialize = false): Promise<string> {
   const agent = new SandboxAgent({
     name: 'sandbox-approval',
     model: 'gpt-4o-mini',
@@ -114,9 +114,10 @@ export async function sandboxApprovalResumeWorkflow(): Promise<string> {
 
   const result = await runner.run(agent, 'run a command', { runConfig });
   if (result.interruptions.length === 0) return 'no-interruption';
-  for (const interruption of result.interruptions) result.state.approve(interruption);
+  const state = serialize ? await RunState.fromString(agent, result.state.toString()) : result.state;
+  for (const interruption of state.getInterruptions()) state.approve(interruption);
 
-  const resumed = await runner.run(agent, result.state, { runConfig });
+  const resumed = await runner.run(agent, state, { runConfig });
   return `${resumed.finalOutput}`;
 }
 

@@ -37,6 +37,8 @@ import { maybeTemporalSpan } from './span-helpers';
  */
 export class TemporalSandboxClient implements SandboxClient<SandboxClientOptions, TemporalSandboxSessionState> {
   readonly backendId: string;
+  /** Environment references are resolved and validated in Worker Activities. */
+  readonly environmentPreparation = 'client' as const;
   private readonly _name: string;
   private readonly _config: ActivityOptions;
 

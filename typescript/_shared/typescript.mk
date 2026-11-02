@@ -1,13 +1,17 @@
 # Each plugin installs and locks its own published dependencies.
 PNPM ?= pnpm
 TEST_ARGS ?=
+# Optional preparation for source-only dependencies, after installation.
+AFTER_SYNC ?=
 
 .PHONY: sync sync-latest lint test build clean help
 sync:
 	$(PNPM) install --frozen-lockfile
+	$(AFTER_SYNC)
 
 sync-latest:
 	$(PNPM) update --latest=false
+	$(AFTER_SYNC)
 
 lint:
 	$(PNPM) run lint
