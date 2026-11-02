@@ -417,6 +417,11 @@ input item types to `list[X]` for the whole process. Type checkers still see `It
 and in strict mode it rejects a tuple or generator there. Requests the `openai` client sends are
 unchanged.
 
+The payload converter also decodes your own `Iterable` fields as lists when they are the decoded
+value itself, fields of a dataclass or pydantic model, dict values or list items, so code that
+calls `next()` on them must use `iter()` first. Inside tuples, deques and sets they stay
+pydantic's one-shot iterators.
+
 Earlier versions decoded those fields as one-shot iterators, and a turn on carried items raised
 `TypeError: cannot pickle 'pydantic_core._pydantic_core.ValidatorIterator' object`. A run that
 caught that error and went on, such as a chat whose Update reports errors to the caller, fails with
