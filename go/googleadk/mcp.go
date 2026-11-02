@@ -182,6 +182,8 @@ type mcpListingsKey struct{}
 type mcpListings struct {
 	mu   sync.Mutex
 	runs map[mcpRunKey]*mcpRunState
+	// warned reports that fallBack has logged.
+	warned bool
 }
 
 // mcpRunKey identifies a toolset in one agent run: one agent in one execution
@@ -235,6 +237,10 @@ func listingsFrom(ctx context.Context) *mcpListings {
 // invocation ID, agent name or RunConfig: concurrent runs of one agent can
 // share all three.
 //
+// It reads only ADK's own context types, and only their direct fields. Any
+// other context, such as one a caller wraps around ADK's, does not tell its
+// agent run.
+//
 // Weak pointers made from the same invocation are equal, and stay distinct
 // from those made from any other, even after it is reclaimed.
 func agentRunOf(ctx context.Context) (weak.Pointer[byte], bool) {
@@ -243,7 +249,7 @@ func agentRunOf(ctx context.Context) (weak.Pointer[byte], bool) {
 		if v.Kind() == reflect.Interface {
 			v = v.Elem()
 		}
-		if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+		if !isADKContext(v) {
 			return weak.Pointer[byte]{}, false
 		}
 		if ic, ok := interfaceField(v, "invocationContext"); ok {
@@ -264,19 +270,37 @@ func agentRunOf(ctx context.Context) (weak.Pointer[byte], bool) {
 	return weak.Pointer[byte]{}, false
 }
 
-// weakTo returns a weak pointer to what the pointer v points to.
+// isADKContext reports whether v points to a struct of one of the ADK
+// packages that define its contexts.
+func isADKContext(v reflect.Value) bool {
+	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
+		return false
+	}
+	switch v.Elem().Type().PkgPath() {
+	case "google.golang.org/adk/v2/agent", "google.golang.org/adk/v2/internal/context":
+		return true
+	}
+	return false
+}
+
+// weakTo returns a weak pointer to the ADK context v points to.
 func weakTo(v reflect.Value) (weak.Pointer[byte], bool) {
-	if v.Kind() != reflect.Pointer || v.IsNil() {
+	if !isADKContext(v) {
 		return weak.Pointer[byte]{}, false
 	}
 	return weak.Make((*byte)(v.UnsafePointer())), true
 }
 
 // interfaceField returns the non-nil interface field name of the struct v
-// points to.
+// points to, if it is a direct field, not one promoted from an embedded
+// struct.
 func interfaceField(v reflect.Value, name string) (reflect.Value, bool) {
-	f := v.Elem().FieldByName(name)
-	if !f.IsValid() || f.Kind() != reflect.Interface || f.IsNil() {
+	sf, ok := v.Elem().Type().FieldByName(name)
+	if !ok || len(sf.Index) != 1 {
+		return reflect.Value{}, false
+	}
+	f := v.Elem().Field(sf.Index[0])
+	if f.Kind() != reflect.Interface || f.IsNil() {
 		return reflect.Value{}, false
 	}
 	return f, true
@@ -299,6 +323,7 @@ func (l *mcpListings) startRun(m *mcpToolset, ctx agent.ReadonlyContext) *mcpRun
 	}
 	run, ok := agentRunOf(ctx)
 	if !ok {
+		l.fallBack(m, ctx)
 		return nil
 	}
 	k := mcpRunKey{m, run}
@@ -329,11 +354,30 @@ func (l *mcpListings) current(m *mcpToolset, ctx context.Context) *mcpRunState {
 	}
 	run, ok := agentRunOf(ctx)
 	if !ok {
+		l.fallBack(m, ctx)
 		return nil
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.runs[mcpRunKey{m, run}]
+}
+
+// fallBack logs a warning, once per NewContext and not during replay, that
+// the toolset cannot tell ctx's agent run. This happens when ADK changes the
+// contexts agentRunOf reads, or when the caller wraps them.
+func (l *mcpListings) fallBack(m *mcpToolset, ctx context.Context) {
+	wfCtx, ok := workflowContext(ctx)
+	if !ok || workflow.IsReplaying(wfCtx) {
+		return
+	}
+	l.mu.Lock()
+	warned := l.warned
+	l.warned = true
+	l.mu.Unlock()
+	if !warned {
+		workflow.GetLogger(wfCtx).Warn("MCP toolset cannot tell which agent run called it, so it lists on every call; its Histories may not replay with another ADK release",
+			"toolset", m.name)
+	}
 }
 
 // processedList returns the list the first Tools call of the run returned,
