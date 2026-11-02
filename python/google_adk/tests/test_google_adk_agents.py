@@ -70,7 +70,7 @@ from temporalio.google_adk._model import (
 )
 from temporalio.worker import Worker
 from temporalio.workflow import ActivityConfig
-from tests.helpers.decorators import passthrough, unwrapped
+from tests.helpers.decorators import WrapOnAccess, passthrough, unwrapped
 from tests.helpers.opentelemetry import dump_spans
 from tests.helpers.postponed_annotations import PostponedHolder
 
@@ -1005,6 +1005,12 @@ class ComplexActivityMethodHolder:
         """Method wrapped by a decorator from another module."""
         return f"{self.prefix}:{passengers}"
 
+    @WrapOnAccess
+    @activity.defn
+    async def count_wrapped_on_access(self, passengers: int) -> str:
+        """Method whose decorator wraps it again on each access."""
+        return f"{self.prefix}:{passengers}"
+
     class __Private:
         """Its attribute in the class is mangled: ``_ComplexActivityMethodHolder__Private``."""
 
@@ -1684,6 +1690,7 @@ def test_activity_as_tool_preserves_metadata() -> None:
         (passthrough(ComplexActivityMethodHolder.echo_static), ["self"]),
         (passthrough(ComplexActivityMethodHolder.count_passengers), ["passengers"]),
         (passthrough(ComplexActivityMethodHolder.echo_decorated), ["self"]),
+        (ComplexActivityMethodHolder.count_wrapped_on_access, ["passengers"]),
     ]:
         tool = temporalio.google_adk.workflow.activity_as_tool(
             fn, start_to_close_timeout=timedelta(seconds=30)

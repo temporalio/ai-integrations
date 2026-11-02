@@ -279,7 +279,7 @@ def _is_method(fn: Callable) -> bool:
     A module-level or nested function, or a staticmethod, is called with every
     parameter. A function defined in a class body is found in that class to
     tell a method from a staticmethod; a class that can't be found, or whose
-    attribute isn't ``fn`` or a function ``fn`` wraps, raises ``ValueError``.
+    attribute doesn't wrap the same function as ``fn``, raises ``ValueError``.
     """
     qualname = fn.__qualname__.split(".")
     if len(qualname) < 2 or qualname[-2] == "<locals>":
@@ -306,17 +306,19 @@ def _is_method(fn: Callable) -> bool:
             " method, or rename a staticmethod's parameter."
         )
     static = isinstance(attr, staticmethod)
-    target = attr.__func__ if static else attr
-    # fn may wrap the attribute's function, as a functools.wraps decorator
-    # applied to Class.method does.
-    if inspect.unwrap(fn, stop=lambda f: f is target) is not target:
+    # Compare the innermost functions: a decorator applied to Class.method
+    # wraps the attribute's function, and a wrapt-style one stores a wrapper in
+    # the class that class access wraps again.
+    if inspect.unwrap(fn) is not inspect.unwrap(attr.__func__ if static else attr):
         # The class's name or attribute was rebound after fn was taken from it,
-        # so the attribute's binding isn't fn's.
+        # for example by reloading its module, so the attribute's binding isn't
+        # fn's.
         raise ValueError(
             f"Cannot tell whether '{fn.__qualname__}' is a method or a"
             f" staticmethod: '{'.'.join(qualname)}' reachable from the"
-            " function's globals is another object. Pass a bound method for a"
-            " method, or rename a staticmethod's parameter."
+            " function's globals is another object. Take the reference again"
+            " if its module was reloaded, pass a bound method for a method, or"
+            " rename a staticmethod's parameter."
         )
     return not static
 
