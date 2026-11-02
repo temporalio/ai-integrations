@@ -34,7 +34,10 @@
 // This package targets Google ADK for Go v2 (google.golang.org/adk/v2). It
 // depends on the deterministic platform seams (platform.WithTimeProvider,
 // platform.WithUUIDProvider and platform.WithTaskRunner) and the public
-// tool-declaration packer (tool/toolutils.PackTool). See go.mod.
+// tool-declaration packer (tool/toolutils.PackTool). See go.mod. MCP toolsets
+// also read unexported fields of ADK's context types, in its agent and
+// internal/context packages, to tell agent runs apart; when an ADK release
+// changes them, TestMcpAgentRunOfReadsOnlyADKContexts fails.
 package googleadk
 
 // PluginName identifies this integration for Temporal telemetry and usage
