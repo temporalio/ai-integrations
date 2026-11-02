@@ -93,7 +93,7 @@ def _inject_context(
     into a Temporal header under ``_temporal-langsmith-context``, enabling parent-child
     trace nesting across process boundaries (client → worker, workflow → activity).
     """
-    ls_headers = _run_headers(run_tree)
+    ls_headers = run_tree.to_headers()
     return {
         **headers,
         HEADER_KEY: _payload_converter.to_payloads([ls_headers])[0],
@@ -143,7 +143,7 @@ def _inject_nexus_context(
     run_tree: RunTree,
 ) -> dict[str, str]:
     """Inject LangSmith context into Nexus string headers."""
-    ls_headers = _run_headers(run_tree)
+    ls_headers = run_tree.to_headers()
     return {
         **headers,
         HEADER_KEY: json.dumps(ls_headers),
@@ -401,12 +401,8 @@ class _LangChainRuns:
         for key in (id_key, "parent_run_id", "trace_id"):
             if kwargs.get(key) is not None:
                 kwargs[key] = self.stable_id(kwargs[key])
-        if kwargs.get("start_time") is not None:
-            kwargs["start_time"] = entry[1]
         if isinstance(kwargs.get("end_time"), datetime):
             kwargs["end_time"] = self.end_time(kwargs["end_time"])
-        if kwargs.get("dotted_order"):
-            kwargs["dotted_order"] = self.dotted_order(kwargs["dotted_order"])
         return entry[0]
 
 
@@ -638,15 +634,6 @@ def _install_langchain_run_id_hook() -> None:
             "does not know; LangChain runs in workflows may be posted again on "
             "replay"
         )
-
-
-def _run_headers(run_tree: RunTree) -> dict[str, str]:
-    """Get a run's LangSmith headers, with stable IDs in workflow code."""
-    ls_headers = run_tree.to_headers()
-    runs = _get_langchain_runs()
-    if runs is not None and "langsmith-trace" in ls_headers:
-        ls_headers["langsmith-trace"] = runs.dotted_order(ls_headers["langsmith-trace"])
-    return ls_headers
 
 
 # ("post" or "patch", the run dict ``Client.create_run`` or ``update_run``
