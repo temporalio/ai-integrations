@@ -6,14 +6,19 @@ package googleadk
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"weak"
 
 	"github.com/nexus-rpc/sdk-go/nexus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
 	"google.golang.org/genai"
@@ -204,5 +209,119 @@ func TestMcpAgentRunOfReadsOnlyADKContexts(t *testing.T) {
 			_, ok := agentRunOf(ctx)
 			assert.False(t, ok, name)
 		}
+		// interfaceField reads only direct fields, so it does not go through
+		// the nil embedded pointer to the promoted context field.
+		_, ok := interfaceField(reflect.ValueOf(&embeddingContext{Context: parent}), "context")
+		assert.False(t, ok, "promoted field")
 	})
+}
+
+// callerReadonlyContext and callerContext are a caller's own contexts around
+// ADK's, which agentRunOf does not read.
+type callerReadonlyContext struct{ agent.ReadonlyContext }
+type callerContext struct{ agent.Context }
+
+// callerContextToolset passes its own contexts around ADK's to an MCP
+// toolset's Tools and ProcessRequest, and counts those calls.
+type callerContextToolset struct {
+	ts    *mcpToolset
+	calls *int
+}
+
+func (c callerContextToolset) Name() string { return c.ts.Name() }
+
+func (c callerContextToolset) Tools(ctx agent.ReadonlyContext) ([]tool.Tool, error) {
+	*c.calls++
+	return c.ts.Tools(&callerReadonlyContext{ctx})
+}
+
+func (c callerContextToolset) ProcessRequest(ctx agent.Context, req *model.LLMRequest) error {
+	*c.calls++
+	return c.ts.ProcessRequest(&callerContext{ctx}, req)
+}
+
+// callerContextWorkflow runs one MCP turn through callerContextToolset and
+// returns how many Tools and ProcessRequest calls the MCP toolset got.
+func callerContextWorkflow(ctx workflow.Context) (int, error) {
+	calls := 0
+	ts := callerContextToolset{NewMCPToolset(MCPToolsetOptions{Name: "search-server"}).(*mcpToolset), &calls}
+	root, err := llmagent.New(llmagent.Config{
+		Name:     "assistant",
+		Model:    NewModel("fake-model"),
+		Toolsets: []tool.Toolset{ts},
+	})
+	if err != nil {
+		return 0, err
+	}
+	r, err := runner.New(runner.Config{AppName: "test-app", Agent: root, SessionService: session.InMemoryService(), AutoCreateSession: true})
+	if err != nil {
+		return 0, err
+	}
+	for _, rerr := range r.Run(NewContext(ctx), "user-1", "session-1", genai.NewContentFromText("search", genai.RoleUser), agent.RunConfig{}) {
+		if rerr != nil {
+			return 0, rerr
+		}
+	}
+	return calls, nil
+}
+
+// warningLog keeps the messages of the warnings logged to it.
+type warningLog struct {
+	mu    sync.Mutex
+	warns []string
+}
+
+func (*warningLog) Debug(string, ...any) {}
+func (*warningLog) Info(string, ...any)  {}
+func (*warningLog) Error(string, ...any) {}
+
+func (l *warningLog) Warn(msg string, _ ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.warns = append(l.warns, msg)
+}
+
+// TestMcpFallbackListsOnEveryCall proves that a toolset that cannot tell the
+// agent run, here because a caller wraps ADK's contexts, lists on every Tools
+// and ProcessRequest call and logs one warning for the whole NewContext.
+func TestMcpFallbackListsOnEveryCall(t *testing.T) {
+	server := NewFakeMCPServer("search-server").AddTool("search", "search the web", nil,
+		func(map[string]any) (map[string]any, error) { return map[string]any{"hits": 1}, nil })
+	fm := NewFakeModel(
+		FunctionCallResponse("c1", "search", map[string]any{"query": "temporal"}),
+		TextResponse("done"),
+	)
+	acts, err := NewActivities(Config{
+		Models:      map[string]ModelFactory{"fake-model": func(context.Context, string) (model.LLM, error) { return fm, nil }},
+		MCPToolsets: map[string]MCPFactory{"search-server": server.Factory()},
+	})
+	require.NoError(t, err)
+
+	var s testsuite.WorkflowTestSuite
+	logs := &warningLog{}
+	s.SetLogger(logs)
+	env := s.NewTestWorkflowEnvironment()
+	acts.Register(listingsTestRegistry{env})
+	var listings atomic.Int32
+	env.SetOnActivityStartedListener(func(info *activity.Info, _ context.Context, _ converter.EncodedValues) {
+		if info.ActivityType.Name == ListMcpToolsActivityName {
+			listings.Add(1)
+		}
+	})
+	env.RegisterWorkflow(callerContextWorkflow)
+	env.ExecuteWorkflow(callerContextWorkflow)
+	require.True(t, env.IsWorkflowCompleted())
+	require.NoError(t, env.GetWorkflowError())
+
+	var calls int
+	require.NoError(t, env.GetWorkflowResult(&calls))
+	assert.GreaterOrEqual(t, calls, 3, "one Tools call and two ProcessRequest calls at least")
+	assert.Equal(t, calls, int(listings.Load()), "listings")
+	warned := 0
+	for _, msg := range logs.warns {
+		if strings.HasPrefix(msg, "MCP toolset cannot tell which agent run called it") {
+			warned++
+		}
+	}
+	assert.Equal(t, 1, warned, "warnings: %q", logs.warns)
 }

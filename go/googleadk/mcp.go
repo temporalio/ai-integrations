@@ -305,7 +305,7 @@ func interfaceField(v reflect.Value, name string) (reflect.Value, bool) {
 	if !ok || len(sf.Index) != 1 {
 		return reflect.Value{}, false
 	}
-	f := v.Elem().Field(sf.Index[0])
+	f := v.Elem().FieldByIndex(sf.Index)
 	if f.Kind() != reflect.Interface || f.IsNil() {
 		return reflect.Value{}, false
 	}
