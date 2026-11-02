@@ -688,7 +688,10 @@ for (const [title, stopOnFirstTool, stream, expectCancelled, maxTurns] of [
   ['Cancelling during a nested model call cancels a streamed run that then fails', false, true, true, 1],
   ['A run that stops on a nested tool completes when not cancelled', true, false, false, undefined],
 ] as const) {
-  test(title, async (t) => {
+  // Serial, as are the copied-tool approval tests below. Each test starts its own Worker, and on a slow
+  // CI runner starting all of them at once held a Workflow Task past the sandbox's 5-second limit, which
+  // crashes Node 22 ("async hook stack has become corrupted").
+  test.serial(title, async (t) => {
     const { createWorker, startWorkflow } = helpers(t);
     let nestedStarted!: () => void;
     const nestedCalled = new Promise<void>((resolve) => (nestedStarted = resolve));
@@ -796,7 +799,8 @@ for (const [title, legacyFirstRun, nestedCall] of [
 }
 
 for (const kind of ['original', 'alias', 'spread', 'namespace'] as const) {
-  test(`an approval inside a nested asTool() run resumes on result.state (${kind} tool)`, async (t) => {
+  // Serial, as the nested cancellation tests above explain.
+  test.serial(`an approval inside a nested asTool() run resumes on result.state (${kind} tool)`, async (t) => {
     const { createWorker, startWorkflow } = helpers(t);
     const answered = (request: any, callId: string) =>
       Array.isArray(request.input) &&
