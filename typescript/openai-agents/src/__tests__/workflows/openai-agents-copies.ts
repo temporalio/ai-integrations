@@ -1,6 +1,6 @@
 import { Agent, Handoff, tool, type Model, type Tool } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/workflow';
-import { TemporalOpenAIRunner } from '../../workflow';
+import { TemporalOpenAIRunner, agentAsTool } from '../../workflow';
 
 // A second copy of @openai/agents-core, as a dependency that ships its own copy would bring. The
 // test bundles this Workflow with `agents-core-copy` resolving to a copy of the package.
@@ -12,6 +12,7 @@ export type AgentCopyCase =
   | 'handoff-callback-model-object'
   | 'tool-model-object'
   | 'as-tool'
+  | 'deprecated-alias'
   | 'string-model';
 
 /**
@@ -19,7 +20,8 @@ export type AgentCopyCase =
  * patch when it loaded. The `*-model-object` cases give such an agent a `Model` object after the check
  * before the run: an `agent_start` listener, a custom `Handoff`'s callback, or a tool between two
  * turns. `as-tool` passes an `asTool()` tool from that copy, which the plugin can't trace back to its
- * agent. `string-model` is the supported control.
+ * agent. `deprecated-alias` passes one made with `agentAsTool`, which records it, as `agentAsTool` ran
+ * such agents before. `string-model` is the supported control.
  * Returns the run's failure or its output.
  */
 export async function agentCopyWorkflow(kind: AgentCopyCase): Promise<string> {
@@ -62,6 +64,16 @@ export async function agentCopyWorkflow(kind: AgentCopyCase): Promise<string> {
     const nested = new copy.Agent({ name: 'Nested', instructions: 'Answer.', model: 'nested-model' });
     const askNested = nested.asTool({ toolName: 'ask_nested' }) as unknown as Tool;
     lead = new Agent({ name: 'Lead', instructions: 'Answer.', model: 'lead-model', tools: [askNested] });
+  } else if (kind === 'deprecated-alias') {
+    const nested = new copy.Agent({ name: 'Nested', instructions: 'Answer as nested.', model: 'nested-model' });
+    lead = new Agent({
+      name: 'Lead',
+      instructions: 'Use the tool.',
+      model: 'lead-model',
+      // eslint-disable-next-line @typescript-eslint/no-deprecated -- tests the deprecated alias
+      tools: [agentAsTool(nested as unknown as Agent<any, any>, { toolName: 'ask_nested' })],
+      toolUseBehavior: 'stop_on_first_tool',
+    });
   } else {
     lead = new copy.Agent({ name: 'Lead', instructions: 'Answer.', model: 'lead-model' }) as unknown as Agent<any, any>;
   }

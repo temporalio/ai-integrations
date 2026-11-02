@@ -50,6 +50,7 @@ import {
   runModelOverrideWorkflow,
   sharedAgentApprovalWorkflow,
   summaryAgentWorkflow,
+  implicitModelSettingsWorkflow,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   mcpToolFilterResumeWorkflow,
@@ -368,7 +369,7 @@ test('a tool filter that throws while resuming from a RunState fails the run', a
   const worker = await createWorker({
     plugins: [
       new OpenAIAgentsPlugin({
-        modelProvider: new FakeModelProvider([textResponse('done')]),
+        modelProvider: new FakeModelProvider([toolCallResponse('confirm', {}), textResponse('done')]),
         mcpServerProviders: filterTestProviders(undefined, t.context.env.nativeConnection),
       }),
     ],
@@ -515,6 +516,7 @@ test('agent.asTool() setups that would run a model or sandbox in the Workflow fa
       'SandboxConfigurationError',
       /asTool\('ask_nested'\) runOptions.sandbox.client must be created/,
     ],
+    'undefined-tool': ['AgentsWorkflowError', /Cannot read properties of undefined/],
   };
 
   await worker.runUntil(async () => {
@@ -623,6 +625,8 @@ test('Agents from another copy of @openai/agents-core are checked before they ca
         async getResponse(request: any) {
           if (request.systemInstructions === 'Route.') return handoffResponse('transfer_to_desk');
           if (request.systemInstructions === 'Switch.') return toolCallResponse('switch_model', {});
+          if (request.systemInstructions === 'Use the tool.') return toolCallResponse('ask_nested', { input: 'q' });
+          if (request.systemInstructions === 'Answer as nested.') return textResponse('nested answer');
           if (request.systemInstructions === 'Answer as declared.') return textResponse('declared answer');
           return textResponse('copy answer');
         },
@@ -650,6 +654,7 @@ test('Agents from another copy of @openai/agents-core are checked before they ca
     'handoff-callback-model-object': [/^AgentsWorkflowError: .*Agent 'Picked' has a Model object/, 1],
     'tool-model-object': [/^AgentsWorkflowError: .*Agent 'Lead' has a Model object/, 1],
     'as-tool': [/^AgentsWorkflowError: .*tool 'ask_nested' looks like an agent.asTool\(\) tool/, 0],
+    'deprecated-alias': [/^nested answer$/, 2],
     'string-model': [/^copy answer$/, 1],
   };
   await worker.runUntil(async () => {
@@ -675,11 +680,13 @@ test('Agents from another copy of @openai/agents-core are checked before they ca
   });
 });
 
-for (const [title, stopOnFirstTool, stream, expectCancelled] of [
-  ['Cancelling during a nested model call cancels a run that stops on the tool', true, false, true],
-  ['Cancelling during a nested model call cancels a streamed run that stops on the tool', true, true, true],
-  ['Cancelling during a nested model call cancels a run that calls the model again', false, false, true],
-  ['A run that stops on a nested tool completes when not cancelled', true, false, false],
+for (const [title, stopOnFirstTool, stream, expectCancelled, maxTurns] of [
+  ['Cancelling during a nested model call cancels a run that stops on the tool', true, false, true, undefined],
+  ['Cancelling during a nested model call cancels a streamed run that stops on the tool', true, true, true, undefined],
+  ['Cancelling during a nested model call cancels a run that calls the model again', false, false, true, undefined],
+  ['Cancelling during a nested model call cancels a run that then fails', false, false, true, 1],
+  ['Cancelling during a nested model call cancels a streamed run that then fails', false, true, true, 1],
+  ['A run that stops on a nested tool completes when not cancelled', true, false, false, undefined],
 ] as const) {
   test(title, async (t) => {
     const { createWorker, startWorkflow } = helpers(t);
@@ -719,7 +726,7 @@ for (const [title, stopOnFirstTool, stream, expectCancelled] of [
 
     await worker.runUntil(async () => {
       const handle = await startWorkflow(nestedToolCancelWorkflow, {
-        args: [{ stopOnFirstTool, stream }],
+        args: [{ stopOnFirstTool, stream, maxTurns }],
         workflowExecutionTimeout: '30 seconds',
       });
       if (!expectCancelled) {
@@ -1238,15 +1245,18 @@ test('Streaming: useLocalActivity fails fast before scheduling an Activity', asy
   });
 });
 
-/** Calls fetchValue, ends after the tool result, then answers a second turn with its instructions. */
+/**
+ * Calls fetchValue, ends after the tool result, then answers a second turn with its instructions.
+ * Each answer depends only on the request, so several Workflows can share it.
+ */
 function hookProbeModelProvider(): ModelProvider {
-  let calls = 0;
   const model: Model = {
     async getResponse(request: ModelRequest): Promise<ModelResponse> {
-      calls++;
-      if (calls === 1) return toolCallResponse('fetchValue', { value: 'S-hook' });
-      if (calls === 2) return textResponse('done');
-      return textResponse(`next turn saw: ${request.systemInstructions}`);
+      const input = JSON.stringify(request.input);
+      if (input.includes('again')) return textResponse(`next turn saw: ${request.systemInstructions}`);
+      return input.includes('function_call_result')
+        ? textResponse('done')
+        : toolCallResponse('fetchValue', { value: 'S-hook' });
     },
     // eslint-disable-next-line require-yield
     async *getStreamedResponse(): AsyncIterable<StreamEvent> {
@@ -1256,7 +1266,7 @@ function hookProbeModelProvider(): ModelProvider {
   return { getModel: () => model };
 }
 
-test('agent.on listeners run and their context writes reach later turns', async (t) => {
+test('agent.on listeners run, their context writes reach later turns, and one that throws stops the run', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
   const plugin = new OpenAIAgentsPlugin({ modelProvider: hookProbeModelProvider() });
   const worker = await createWorker({
@@ -1264,16 +1274,22 @@ test('agent.on listeners run and their context writes reach later turns', async 
     activities: { fetchValue: async ({ value }: { value: string }) => value },
   });
 
-  const result = await worker.runUntil(executeWorkflow(agentHooksWorkflow, { workflowExecutionTimeout: '30 seconds' }));
-
-  t.deepEqual(result.events, [
-    'agent_start:true',
-    'agent_tool_end:fetchValue',
-    'agent_end:done',
-    'agent_start:true',
-    'agent_end:next turn saw: hook=S-hook',
-  ]);
-  t.is(result.nextTurnOutput, 'next turn saw: hook=S-hook');
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(agentHooksWorkflow, { workflowExecutionTimeout: '30 seconds' });
+    t.deepEqual(result.events, [
+      'agent_start:true',
+      'agent_tool_end:fetchValue',
+      'agent_end:done',
+      'agent_start:true',
+      'agent_end:next turn saw: hook=S-hook',
+    ]);
+    t.is(result.nextTurnOutput, 'next turn saw: hook=S-hook');
+    // As with Node's EventEmitter, a listener that throws fails the run.
+    const err = await t.throwsAsync(
+      executeWorkflow(agentHooksWorkflow, { args: [true], workflowExecutionTimeout: '30 seconds' })
+    );
+    t.regex(String((err as any)?.cause?.message), /a guard stopped the run/);
+  });
 });
 
 const deskActivities = {
@@ -1302,12 +1318,13 @@ test('A custom Handoff hands off to the agent its callback returns', async (t) =
   t.deepEqual(results, ['vip: vip answer', 'standard: standard answer']);
 });
 
-test('A ModelSummaryProvider gets the running agent; nested agent.asTool() calls get none', async (t) => {
+test('A ModelSummaryProvider gets the agent of each model call, in nested and resumed runs too', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
   const modelProvider = new FakeModelProvider([
     toolCallResponse('ask_expert', { input: 'q' }),
     textResponse('expert answer'),
     handoffResponse('transfer_to_billing'),
+    toolCallResponse('refund', {}),
     textResponse('billing done'),
   ]);
   const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider })] });
@@ -1322,8 +1339,66 @@ test('A ModelSummaryProvider gets the running agent; nested agent.asTool() calls
           .toString('utf-8')
           .replace(/"/g, '')
       );
-    t.deepEqual(summaries, ['agent:lead', 'agent:none', 'agent:lead', 'agent:billing']);
+    t.deepEqual(summaries, ['agent:lead', 'agent:expert', 'agent:lead', 'agent:billing', 'agent:billing']);
+    await replay(t, handle);
   });
+});
+
+test.serial('With no model named, the Worker adds the model settings defaults for its own default model', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const calls: { model: string; modelSettings: unknown; reasoningEffortImplicit: unknown }[] = [];
+  const provider = {
+    getModel(model?: string) {
+      return {
+        async getResponse(request: any) {
+          calls.push({
+            model: model ?? '',
+            modelSettings: request.modelSettings,
+            reasoningEffortImplicit: request._internal?.reasoningEffortImplicit,
+          });
+          return request.systemInstructions === 'Use the tool.'
+            ? toolCallResponse('ask_unnamed', { input: 'q' })
+            : textResponse('done');
+        },
+      } as unknown as FakeModel;
+    },
+  };
+  const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider: provider })] });
+  const run = async (leadModel: string | undefined) => {
+    const handle = await startWorkflow(implicitModelSettingsWorkflow, {
+      args: [leadModel, { temperature: 0.3 }],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    t.is(await handle.result(), 'done');
+    await replay(t, handle);
+  };
+  const previous = process.env.OPENAI_DEFAULT_MODEL;
+  try {
+    await worker.runUntil(async () => {
+      // The Workflow's default model is gpt-5.4-mini. A Worker whose default isn't a GPT-5 model gets
+      // none of its settings, directly or in a nested run.
+      process.env.OPENAI_DEFAULT_MODEL = 'gpt-4.1';
+      await run(undefined);
+      await run('gpt-5');
+      delete process.env.OPENAI_DEFAULT_MODEL;
+      await run(undefined);
+    });
+  } finally {
+    if (previous === undefined) delete process.env.OPENAI_DEFAULT_MODEL;
+    else process.env.OPENAI_DEFAULT_MODEL = previous;
+  }
+  const gpt5Defaults = { reasoning: { effort: 'none' }, text: { verbosity: 'low' } };
+  t.deepEqual(calls, [
+    { model: '', modelSettings: { temperature: 0.3 }, reasoningEffortImplicit: false },
+    // A named model keeps upstream's settings and its marker for an implicit effort.
+    {
+      model: 'gpt-5',
+      modelSettings: { reasoning: { effort: 'low' }, text: { verbosity: 'low' }, temperature: 0.3 },
+      reasoningEffortImplicit: true,
+    },
+    { model: '', modelSettings: { temperature: 0.3 }, reasoningEffortImplicit: false },
+    { model: '', modelSettings: { ...gpt5Defaults, temperature: 0.3 }, reasoningEffortImplicit: true },
+  ]);
 });
 
 test('runConfig.model leaves an agent that sets its own model on that model, as upstream', async (t) => {

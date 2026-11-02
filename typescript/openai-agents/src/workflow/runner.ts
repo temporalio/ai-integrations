@@ -231,53 +231,25 @@ export class TemporalOpenAIRunner {
       });
     }
 
-    validateSandboxRunConfig(agent, options?.runConfig?.sandbox);
-
-    const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
-
-    checkAgent(agent);
-
+    // Normalized, so a malformed agent graph, such as an `undefined` tool, fails the run.
     let preparedInput: string | AgentInputItem[] | RunState<TContext, TAgent>;
-    if (input instanceof RunState) {
-      // fromString lists tools, which runs MCP tool filters; their errors fail the run, as in the run below.
-      const restored = (await RunState.fromString(agent, input.toString()).catch((error: unknown) => {
-        throw normalizeAgentsRunError(error);
-      })) as RunState<TContext, TAgent>;
-      // A state with sandbox sessions runs restored, to drop upstream's live-session identity, which would
-      // otherwise resolve manifest environment references on the Workflow thread rather than in the resume
-      // Activity. Other states run as given: restoring finds an `asTool()` agent only through the tool
-      // object `asTool()` returned, so a copy's nested approvals would go to the parent agent.
-      if (input._sandbox !== undefined) {
-        checkRestoredInterruptions(agent, input);
-        preparedInput = restored;
-      } else {
-        preparedInput = input;
-      }
-      // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
-      preparedInput.clearTrace();
-    } else {
-      preparedInput = input;
+    try {
+      validateSandboxRunConfig(agent, options?.runConfig?.sandbox);
+      checkAgent(agent);
+      preparedInput = input instanceof RunState ? await prepareRunState(agent, input) : input;
+    } catch (error) {
+      throw normalizeAgentsRunError(error);
     }
 
-    // The agent a ModelSummaryProvider gets. Model calls made during a tool call belong to a
-    // nested `agent.asTool()` run, whose agent this runner doesn't see, so they get none.
-    let runningAgent: Agent<any, any> | undefined =
-      preparedInput instanceof RunState ? preparedInput._currentAgent : agent;
-    let toolCalls = 0;
+    const { model: modelOverride, ...runnerConfigOverrides } = options?.runConfig ?? {};
 
     // Every agent runs as written: the provider sends each model name to the model Activity.
     // Nested `agent.asTool()` runs take the model, provider and settings from this config, as upstream.
     const innerRunner = new Runner({
       ...runnerConfigOverrides,
       model: modelOverride,
-      modelProvider: new ActivityBackedModelProvider(this.modelParams, () =>
-        toolCalls === 0 ? runningAgent : undefined
-      ),
+      modelProvider: new ActivityBackedModelProvider(this.modelParams),
     });
-    // Upstream emits `agent_start` for the first agent and for each handoff target.
-    innerRunner.on('agent_start', (_context, started) => (runningAgent = started));
-    innerRunner.on('agent_tool_start', () => toolCalls++);
-    innerRunner.on('agent_tool_end', () => toolCalls--);
 
     const sharedRunOptions = {
       maxTurns: options?.maxTurns,
@@ -292,7 +264,7 @@ export class TemporalOpenAIRunner {
 
     // A tool can turn a CancelledFailure into its output: upstream `asTool()` returns a nested run's
     // failure to the parent model. A run that then ends on that output, for example with
-    // `toolUseBehavior: 'stop_on_first_tool'`, must not complete when its scope was cancelled.
+    // `toolUseBehavior: 'stop_on_first_tool'`, or fails another way, ends with the cancellation.
     const scope = CancellationScope.current();
     try {
       if (options?.stream === true) {
@@ -303,9 +275,14 @@ export class TemporalOpenAIRunner {
         // Upstream's stream loop ends through these internal methods, which its typings omit.
         const completion = streamed as unknown as { _done(): void; _raiseError(error: unknown): void };
         const done = completion._done.bind(streamed);
+        const raiseError = completion._raiseError.bind(streamed);
         completion._done = () => {
           if (!scope.consideredCancelled) return done();
-          scope.cancelRequested.then(done, (cancellation) => completion._raiseError(cancellation));
+          scope.cancelRequested.then(done, raiseError);
+        };
+        completion._raiseError = (error: unknown) => {
+          if (!scope.consideredCancelled) return raiseError(error);
+          scope.cancelRequested.then(() => raiseError(error), raiseError);
         };
         return streamed;
       }
@@ -313,6 +290,7 @@ export class TemporalOpenAIRunner {
       if (scope.consideredCancelled) await scope.cancelRequested;
       return result;
     } catch (error) {
+      if (scope.consideredCancelled) await scope.cancelRequested;
       throw normalizeAgentsRunError(error);
     } finally {
       await flushOpenSpans();
@@ -362,6 +340,27 @@ function collectAgents(roots: Agent<any, any>[], throughCopies: boolean): Set<Ag
     }
   }
   return seen;
+}
+
+/**
+ * A state with sandbox sessions holds upstream's live-session identity, which would resolve manifest
+ * environment references on the Workflow thread rather than in the resume Activity, so it's rebuilt
+ * with `fromString`, which also lists tools and so runs MCP tool filters. Other states resume as they
+ * are, as upstream: restoring finds an `asTool()` agent only through the tool object `asTool()`
+ * returned, and not an agent that only a custom `Handoff`'s callback picked.
+ */
+async function prepareRunState<TContext, TAgent extends Agent<any, any>>(
+  agent: TAgent,
+  state: RunState<TContext, TAgent>
+): Promise<RunState<TContext, TAgent>> {
+  let prepared = state;
+  if (state._sandbox !== undefined) {
+    checkRestoredInterruptions(agent, state);
+    prepared = (await RunState.fromString(agent, state.toString())) as RunState<TContext, TAgent>;
+  }
+  // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
+  prepared.clearTrace();
+  return prepared;
 }
 
 /**

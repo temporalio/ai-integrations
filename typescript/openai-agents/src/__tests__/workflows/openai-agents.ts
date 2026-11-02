@@ -12,6 +12,7 @@ import {
   type MCPToolFilterContext,
   type Model,
   type ModelProvider,
+  type ModelSettings,
   type Tool,
 } from '@openai/agents-core';
 import { SandboxAgent } from '@openai/agents-core/sandbox';
@@ -160,17 +161,34 @@ class FilterSession {
 }
 
 export async function mcpToolFilterResumeWorkflow(): Promise<string> {
-  // Resuming from a RunState rebuilds the context from JSON, so `session` loses `isAdmin()`.
-  const toolFilter = async ({ runContext }: MCPToolFilterContext) =>
-    (runContext.context as { session: FilterSession }).session.isAdmin();
+  // The run pauses on an approval. The resumed run keeps this context, as upstream, and the filter
+  // throws when it lists the tools again.
+  const context = { session: new FilterSession(), resumed: false };
+  const toolFilter = async ({ runContext }: MCPToolFilterContext) => {
+    const { session, resumed } = runContext.context as typeof context;
+    if (resumed) throw new Error('the tool filter failed on resume');
+    return session.isAdmin();
+  };
   const agent = new Agent({
     name: 'FirstAgent',
     instructions: 'You have access to MCP tools.',
     model: 'gpt-4o-mini',
     mcpServers: [statelessMcpServer('filterStateless', { toolFilter })],
+    tools: [
+      tool({
+        name: 'confirm',
+        description: 'Confirm.',
+        parameters: { type: 'object' as const, properties: {}, required: [], additionalProperties: false as const },
+        strict: true,
+        needsApproval: true,
+        execute: async () => 'confirmed',
+      }),
+    ],
   });
   const runner = new TemporalOpenAIRunner();
-  const result = await runner.run(agent, 'Hello', { context: { session: new FilterSession() } });
+  const result = await runner.run(agent, 'Hello', { context });
+  for (const interruption of result.interruptions) result.state.approve(interruption);
+  context.resumed = true;
   await runner.run(agent, result.state);
   return 'resumed';
 }
@@ -208,7 +226,8 @@ export type AgentToolRejection =
   | 'nested-handoff-model-object'
   | 'model-provider'
   | 'raw-sandbox'
-  | 'raw-sandbox-run-options';
+  | 'raw-sandbox-run-options'
+  | 'undefined-tool';
 
 /** Returns the failure for an `asTool()` setup that would run a model or sandbox in the Workflow. */
 export async function agentToolRejectedWorkflow(kind: AgentToolRejection): Promise<string> {
@@ -243,6 +262,8 @@ export async function agentToolRejectedWorkflow(kind: AgentToolRejection): Promi
         toolName: 'ask_nested',
         runOptions: { sandbox: rawSandbox },
       }),
+    // For example from a circular import.
+    'undefined-tool': () => undefined as unknown as Tool<any>,
   };
   const lead = new Agent({
     name: 'Lead',
@@ -382,9 +403,14 @@ export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection):
 
 /**
  * The lead calls `Nested` through `asTool()`. With `stopOnFirstTool`, the run ends on the tool's
- * output, so a cancellation that `asTool()` returned as text would otherwise complete the run.
+ * output, so a cancellation that `asTool()` returned as text would otherwise complete the run. With
+ * `maxTurns: 1`, the run fails with another error after the tool instead.
  */
-export async function nestedToolCancelWorkflow(input: { stopOnFirstTool: boolean; stream: boolean }): Promise<string> {
+export async function nestedToolCancelWorkflow(input: {
+  stopOnFirstTool: boolean;
+  stream: boolean;
+  maxTurns?: number;
+}): Promise<string> {
   new WorkflowStream();
   const nested = new Agent({ name: 'Nested', instructions: 'Answer as nested.', model: 'nested-model' });
   const lead = new Agent({
@@ -395,8 +421,8 @@ export async function nestedToolCancelWorkflow(input: { stopOnFirstTool: boolean
     toolUseBehavior: input.stopOnFirstTool ? 'stop_on_first_tool' : 'run_llm_again',
   });
   const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
-  if (!input.stream) return (await runner.run(lead, 'go')).finalOutput ?? '';
-  const result = await runner.run(lead, 'go', { stream: true });
+  if (!input.stream) return (await runner.run(lead, 'go', { maxTurns: input.maxTurns })).finalOutput ?? '';
+  const result = await runner.run(lead, 'go', { stream: true, maxTurns: input.maxTurns });
   for await (const _event of result);
   await result.completed;
   return result.finalOutput ?? '';
@@ -688,9 +714,10 @@ export interface AgentHooksResult {
 /**
  * `agent.on(...)` listeners, as in the upstream lifecycle hooks guide. The tool-end
  * listener writes the tool result into the run context, and a second turn runs only
- * when it did, so the Workflow's commands depend on the hook.
+ * when it did, so the Workflow's commands depend on the hook. With `guard`, an `agent_start`
+ * listener throws in the second turn.
  */
-export async function agentHooksWorkflow(): Promise<AgentHooksResult> {
+export async function agentHooksWorkflow(guard = false): Promise<AgentHooksResult> {
   const fetchValue = activityAsTool<(input: { value: string }) => Promise<string>>({
     name: 'fetchValue',
     description: 'Fetch a value',
@@ -714,6 +741,11 @@ export async function agentHooksWorkflow(): Promise<AgentHooksResult> {
     runContext.context.hookValue = result;
   });
   agent.on('agent_end', (_ctx, output) => events.push(`agent_end:${output}`));
+  if (guard) {
+    agent.on('agent_start', (runContext) => {
+      if (runContext.context.hookValue !== undefined) throw new Error('a guard stopped the run');
+    });
+  }
 
   const runner = new TemporalOpenAIRunner();
   const context: { hookValue?: string } = {};
@@ -748,21 +780,62 @@ export async function customHandoffWorkflow(tier: string): Promise<string> {
   return `${result.lastAgent?.name}: ${result.finalOutput}`;
 }
 
-/** A summary provider labels each model call with the agent it gets: lead, nested expert, handoff target. */
+/**
+ * A summary provider labels each model call with the agent it gets: lead, nested expert, and
+ * billing, before and after its approval resumes. A custom `Handoff`'s callback picks billing, which
+ * the graph doesn't declare.
+ */
 export async function summaryAgentWorkflow(): Promise<string> {
   const expert = new Agent({ name: 'expert', model: 'm', instructions: 'Answer as the expert.' });
-  const billing = new Agent({ name: 'billing', model: 'm', instructions: 'Answer as billing.' });
+  const refund = tool({
+    name: 'refund',
+    description: 'Refund the order.',
+    parameters: { type: 'object' as const, properties: {}, required: [], additionalProperties: false as const },
+    strict: true,
+    needsApproval: true,
+    execute: async () => 'refunded',
+  });
+  const billing = new Agent({ name: 'billing', model: 'm', instructions: 'Answer as billing.', tools: [refund] });
+  const support = new Agent({ name: 'support', model: 'm', instructions: 'Answer as support.' });
+  const desk = new Handoff(support, async () => billing);
+  desk.toolName = 'transfer_to_billing';
   const lead = new Agent({
     name: 'lead',
     model: 'm',
     instructions: 'Use the tools.',
     tools: [expert.asTool({ toolName: 'ask_expert' })],
-    handoffs: [billing],
+    handoffs: [desk],
   });
   const runner = new TemporalOpenAIRunner({
     defaultModelParams: { summary: { provide: (agent) => `agent:${agent?.name ?? 'none'}` } },
   });
-  return (await runner.run(lead, 'go')).finalOutput ?? '';
+  const first = await runner.run(lead, 'go');
+  for (const interruption of first.interruptions) first.state.approve(interruption);
+  return (await runner.run(lead, first.state)).finalOutput ?? '';
+}
+
+/**
+ * `Unnamed` names no model, in a run with its own model settings: run directly, or as the
+ * `asTool()` tool of a lead with `leadModel`.
+ */
+export async function implicitModelSettingsWorkflow(
+  leadModel: string | undefined,
+  runSettings: ModelSettings
+): Promise<string> {
+  const unnamed = new Agent({ name: 'Unnamed', instructions: 'Answer.' });
+  const agent =
+    leadModel === undefined
+      ? unnamed
+      : new Agent({
+          name: 'Lead',
+          instructions: 'Use the tool.',
+          model: leadModel,
+          tools: [unnamed.asTool({ toolName: 'ask_unnamed' })],
+          toolUseBehavior: 'stop_on_first_tool',
+        });
+  return (
+    (await new TemporalOpenAIRunner().run(agent, 'go', { runConfig: { modelSettings: runSettings } })).finalOutput ?? ''
+  );
 }
 
 /** `runConfig.model` with an agent that sets its own model. */

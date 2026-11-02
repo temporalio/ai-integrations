@@ -99,22 +99,29 @@ Differences from the upstream runner:
 
 - `runConfig.model` must be a model name string. The Worker's `modelProvider` resolves it inside the model Activity. As upstream, it applies to agents that set no model of their own. Upstream's docs say it overrides every agent's model, but its code and tests let an agent's own model win, and the plugin follows the code. The Python plugin follows the Python SDK, where the run's model wins.
 - `signal` is not supported. Use Temporal cancellation APIs, such as `CancellationScope`, to cancel Workflow work.
-- If the cancellation scope `run()` started in is cancelled, `run()` throws the `CancelledFailure`, and a streamed run fails with it, even if the run ended on a tool's output. As upstream, an `agent.asTool()` tool returns a nested run's failure, including a cancelled model Activity, as its output, and with `toolUseBehavior: 'stop_on_first_tool'` the run ends on that output.
+- If the cancellation scope `run()` started in is cancelled, `run()` throws the `CancelledFailure`, and a streamed run fails with it, even if the run ended on a tool's output or failed another way. As upstream, an `agent.asTool()` tool returns a nested run's failure, including a cancelled model Activity, as its output, and with `toolUseBehavior: 'stop_on_first_tool'` the run ends on that output.
 
 ### Upgrading open runs
 
-Runs started on an earlier version may not continue correctly on this one. Let them finish on the old Worker, or pin them to it with Worker Versioning, if they:
+The runner now runs your agents as written. Runs started on an earlier version pick up these changes as they continue, most with no replay error:
 
-- use `agentAsTool` or `agent.asTool()`;
-- set `runConfig.model` and have agents with a model of their own: those agents use their own model from their next model call;
-- set `useLocalActivity` or `cancellationType` in the runner's options: nested model calls now use the runner's Activity options;
-- have agent hooks (`agent.on(...)`), or a custom `Handoff` whose callback returns another agent: they now take effect.
+- `runConfig.model` applies only to agents that set no model of their own; those agents switch to their own model from their next model call.
+- A GPT-5 agent that sets no `modelSettings` gets upstream's default settings for its model, such as `reasoning.effort` and `text.verbosity`, and explicit GPT-5 `providerData.reasoning` reaches the model. Set `modelSettings: {}` on the agent to send none. An agent that names no model gets the defaults for the Worker's default model (`OPENAI_DEFAULT_MODEL`).
+- An agent with a `prompt` template and no model or tools gets the template's model and tools. Before, the Worker's default model and an empty tool list replaced them.
+- `Agent` subclass overrides, such as `getSystemPrompt`, run, and a `SandboxAgent`'s compaction threshold follows its model.
+- Agent hooks (`agent.on(...)`) fire, and a custom `Handoff` hands off to the agent its callback returns.
+- Nested `agent.asTool()` runs share the parent's run context, so their context writes and usage add up in the parent's result. Their model calls use the runner's Activity options, including `useLocalActivity` and `cancellationType`.
+- As upstream, one `SandboxAgent` object serves one run at a time. A second concurrent run, or a second parallel call of its `asTool()` tool, fails with `SandboxAgent '...' cannot be reused concurrently across runs`. Create one `SandboxAgent` per concurrent run, or set `modelSettings: { parallelToolCalls: false }` on an agent that calls a sandbox agent's tool.
+- A run cancelled during a nested model call ends cancelled, where it failed before. So does a run with `stop_on_first_tool` whose tool caught its own Activity's cancellation, which completed before.
+- An upstream `Runner` can't run agents in a Workflow, even with your own Workflow-safe model provider; use `TemporalOpenAIRunner`.
 
-A passing replay test of old histories doesn't show these runs are safe. Every model call is the same Activity type, and replay doesn't compare Activity inputs, so a run that now makes a different model call can replay without an error and continue with the wrong answer.
+Let runs that use `agentAsTool` or `agent.asTool()`, `runConfig.model`, `useLocalActivity` or `cancellationType`, agent hooks, custom `Handoff` callbacks or a shared `SandboxAgent` finish on the old Worker, or pin them to it with Worker Versioning.
 
-Before resuming a `RunState` saved on an earlier version, give agents unique names across handoffs and `asTool()` tools. The framework also finds `asTool()` agents by name when it restores a `RunState`, and `agentAsTool` tools weren't included, so a saved run can resume on the wrong agent.
+A passing replay test of old histories doesn't show these runs are safe. Every model call is the same Activity type, and replay doesn't compare Activity inputs, so a run that now makes a different model call can replay without an error and continue with the wrong answer. Model calls are also scheduled a little later in a turn, so work started at the same time, such as another tool's Activity or a parallel branch, can swap places with them. Replay then fails with `[TMPRL1100]`, or, when both are model calls, each gets the other's recorded answer. Histories of cancelled runs recorded before the upgrade fail replay, because those runs now end cancelled.
 
-`agentAsTool(agent, { toolName, toolDescription, customOutputExtractor })` is deprecated and will be removed in a later release. It returns `agent.asTool({ toolName, toolDescription, customOutputExtractor })`; call that instead. As upstream, a nested approval now pauses the parent run, where `agentAsTool` failed the tool call with `NestedAgentInterruption`.
+Before resuming a `RunState` saved on an earlier version, rename any `asTool()` agent that has the same name as the starting agent or one of its handoff targets, and keep the names of those agents. The framework also finds `asTool()` agents by name when it restores a `RunState`, and `agentAsTool` tools weren't included, so a saved run can resume on the wrong agent.
+
+`agentAsTool(agent, { toolName, toolDescription, customOutputExtractor })` is deprecated and will be removed in a later release. It returns `agent.asTool({ toolName, toolDescription, customOutputExtractor })`; call that instead. As upstream, a nested approval now pauses the parent run, where `agentAsTool` failed the run with `NestedAgentInterruption`: after `run()`, check `result.interruptions` when a nested agent has tools that need approval.
 
 ### Run state and approvals
 
@@ -431,9 +438,11 @@ const triage = new Agent({
 });
 ```
 
-As in the framework, the nested run takes the run's `model` (for agents that set none) and `modelSettings`. Its model Activities use the same options as the runner's. A nested approval pauses the parent run: approve it on the parent's `result.state` and resume, as in [Run state and approvals](#run-state-and-approvals).
+As in the framework, the nested run takes the run's `model` (for agents that set none) and `modelSettings`, and shares the parent's run context, so its context writes and usage add up in the parent. It doesn't take `traceIncludeSensitiveData`, guardrails or `handoffInputFilter`; in particular, its traces include tool inputs and outputs unless you set `runConfig: { traceIncludeSensitiveData: false }` in `asTool()`'s options. Its model Activities use the same options as the runner's. A nested approval pauses the parent run: approve it on the parent's `result.state` and resume, as in [Run state and approvals](#run-state-and-approvals).
 
-As upstream, the tool returns a nested run's failure to the parent model as its output, which starts with `An error occurred while running the tool. Please try again.` This includes model Activity failures that are not retried, such as an authentication error, model Activity timeouts, the plugin's checks in the nested run below, and a nested `SandboxAgent` in a run without `runConfig.sandbox`. The parent model may call the tool again until the run reaches `maxTurns`, and that error doesn't carry the cause. A `ModelSummaryProvider` gets `agent: undefined` for nested model calls.
+`asTool({ onStream })`, or a handler added with the tool's `on(...)`, makes the nested run stream. That needs the runner's `streamingTopic` and a hosted `WorkflowStream`, as in [Streaming](#streaming); otherwise the tool's output is the `StreamingTopicNotConfigured` error. Its events go to the parent's topic, without the nested agent's name.
+
+As upstream, the tool returns a nested run's failure to the parent model as its output, which starts with `An error occurred while running the tool. Please try again.` This includes model Activity failures that are not retried, such as an authentication error, model Activity timeouts, the plugin's checks in the nested run below, and a nested `SandboxAgent` in a run without `runConfig.sandbox`. The parent model may call the tool again until the run reaches `maxTurns`, and that error doesn't carry the cause. A `ModelSummaryProvider` gets the agent of each model call, nested ones included.
 
 The framework doesn't expose the agent behind an `asTool()` tool, so the plugin records it: in the Workflow, before your Workflow module loads, it wraps `Agent.prototype.asTool`. The runner uses that record to check the nested agent before the run. Create these tools in Workflow code with `agent.asTool()`. Copies, such as the ones `toolNamespace()` makes, keep the record, and a nested approval behind one resumes when you pass `result.state` back to `run()`. But the framework's `RunState.fromString` finds a nested agent only through the tool `asTool()` returned, so after it, as after `continueAsNew`, a nested approval behind a copy stays pending. A run with sandbox sessions is restored that way on each resume, so there the runner fails the resume with `AgentsWorkflowError` instead. The runner rejects an `asTool()` tool it can't trace back to its agent: one made by an agent from another copy of `@openai/agents-core`, or one created outside a Worker with the plugin before `@temporalio/openai-agents/workflow` was imported.
 
@@ -783,7 +792,7 @@ Any OpenAI Agents SDK `ModelProvider` can be passed as `modelProvider`. The prov
 | Sessions                | Supported                | Via `WorkflowSafeMemorySession`; upstream `MemorySession` is rejected                          |
 | Run state and approvals | Supported                | Serialize with `result.state.toString()` and rehydrate with `RunState.fromString`              |
 | Guardrails              | Supported                | Guardrail callbacks must be deterministic                                                      |
-| Agent lifecycle hooks   | Supported                | `agent.on(...)` listeners run in the Workflow and must be deterministic                        |
+| Agent lifecycle hooks   | Supported                | `agent.on(...)` listeners run in the Workflow and must be deterministic; see below the table   |
 | Tracing                 | Supported                | OpenAI hosted traces, custom `TracingProcessor`s, OTel, and optional `temporal:*` spans        |
 | Agent context           | Supported                | Activity tools receive a copy                                                                  |
 | `continueAsNew`         | Supported                | Plugin config propagates to the continuation                                                   |
@@ -792,3 +801,5 @@ Any OpenAI Agents SDK `ModelProvider` can be passed as `modelProvider`. The prov
 | Run model               | Supported                | `runConfig.model` names the model for agents that set none                                     |
 | Streaming               | Supported (experimental) | `run(agent, input, { stream: true })`; requires `streamingTopic` and a hosted `WorkflowStream` |
 | Voice agents            | Not supported            |                                                                                                |
+
+As in Node, an `agent.on(...)` or runner listener that throws fails the run. The framework doesn't await a listener's Promise, so an `async` listener that rejects fails the Workflow Task, which retries.

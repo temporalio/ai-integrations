@@ -1,5 +1,14 @@
 import test from 'ava';
-import { Agent, MemorySession, RunContext, Runner, handoff, toolNamespace } from '@openai/agents-core';
+import {
+  Agent,
+  MemorySession,
+  RunContext,
+  Runner,
+  handoff,
+  setDefaultModelProvider,
+  setTracingDisabled,
+  toolNamespace,
+} from '@openai/agents-core';
 import { SandboxAgent } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import { agentAsTool, getAgentToolRecord, installAgentToolInterception } from '../workflow/agent-tools';
@@ -66,13 +75,23 @@ test('installAgentToolInterception: installing again keeps one wrapper and its r
   t.notThrows(() => checkAgent(new Agent({ name: 'Parent', model: 'm', tools: [namespaced!] })));
 });
 
-test('agentAsTool: the deprecated alias returns the agent.asTool() tool', (t) => {
+test('agentAsTool: the deprecated alias returns the agent.asTool() tool', async (t) => {
   const agent = new Agent({ name: 'Nested', model: 'm' });
   // eslint-disable-next-line @typescript-eslint/no-deprecated -- tests the deprecated alias
-  const tool = agentAsTool(agent, { toolName: 'ask_nested', toolDescription: 'Ask the nested agent.' });
+  const tool = agentAsTool(agent, {
+    toolName: 'ask_nested',
+    toolDescription: 'Ask the nested agent.',
+    customOutputExtractor: (result) => `extracted:${result.finalOutput}`,
+  });
   t.is(tool.name, 'ask_nested');
   t.is(tool.description, 'Ask the nested agent.');
   t.is(getAgentToolRecord(tool)?.agent, agent);
+  // Outside a Workflow the nested run uses the default provider, and its output goes through the extractor.
+  setTracingDisabled(true);
+  setDefaultModelProvider({
+    getModel: () => ({ getResponse: async () => textResponse('nested answer'), async *getStreamedResponse() {} }),
+  });
+  t.is(await tool.invoke(new RunContext(), JSON.stringify({ input: 'q' })), 'extracted:nested answer');
 });
 
 test('installAgentToolInterception: records tools of Agent subclasses with the options they were made with', (t) => {

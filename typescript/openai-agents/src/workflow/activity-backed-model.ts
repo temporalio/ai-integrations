@@ -7,6 +7,7 @@ import {
   type ModelProvider,
   type ModelRequest,
   type ModelResponse,
+  type ModelSettings,
   type StreamEvent,
   type UsageInput,
 } from '@openai/agents-core';
@@ -49,7 +50,17 @@ export function toSerializedModelRequest(request: ModelRequest): SerializedModel
     conversationId: request.conversationId,
     tracing: request.tracing as JsonValue,
     overridePromptModel: request.overridePromptModel,
+    reasoningEffortImplicit: (request as { _internal?: { reasoningEffortImplicit?: boolean } })._internal
+      ?.reasoningEffortImplicit,
   };
+}
+
+/** What a model call needs from the run that makes it. */
+export interface ModelCallRun {
+  /** The agent whose model call it is. */
+  agent(): Agent<any, any> | undefined;
+  /** The run's own `modelSettings`. */
+  modelSettings(): ModelSettings | undefined;
 }
 
 function fromSerializedModelResponse(wire: SerializedModelResponse): ModelResponse {
@@ -77,7 +88,7 @@ export class ActivityBackedModel implements Model {
   constructor(
     private readonly modelName: string,
     modelParams: ModelActivityOptions,
-    private readonly runningAgent?: () => Agent<any, any> | undefined
+    private readonly run?: ModelCallRun
   ) {
     this.modelParams = modelParams;
 
@@ -106,17 +117,17 @@ export class ActivityBackedModel implements Model {
     return withGenerationSpan(async (span) => {
       span.spanData.model = this.modelName;
 
-      const wire = toSerializedModelRequest(request);
+      const agent = this.run?.agent();
       const input: InvokeModelActivityInput = {
         modelName: this.modelName,
-        request: wire,
+        request: this.toWire(request, agent),
       };
 
       const modelSummary = this.modelParams.summary;
       if (modelSummary && typeof modelSummary !== 'string') {
         const provider = modelSummary as ModelSummaryProvider;
         const systemInstructions = request.systemInstructions;
-        const summary = provider.provide(this.runningAgent?.(), systemInstructions, request.input);
+        const summary = provider.provide(agent, systemInstructions, request.input);
         const wireResponse = await this.activities.invokeModelActivity.executeWithOptions({ summary }, [input]);
         return fromSerializedModelResponse(wireResponse);
       }
@@ -143,9 +154,10 @@ export class ActivityBackedModel implements Model {
       });
     }
 
+    const agent = this.run?.agent();
     const input: InvokeModelStreamActivityInput = {
       modelName: this.modelName,
-      request: toSerializedModelRequest(request),
+      request: this.toWire(request, agent),
       streamingTopic,
       ...(this.modelParams.streamingBatchInterval !== undefined && {
         streamingBatchInterval:
@@ -161,7 +173,7 @@ export class ActivityBackedModel implements Model {
       const modelSummary = this.modelParams.summary;
       if (modelSummary && typeof modelSummary !== 'string') {
         const provider = modelSummary as ModelSummaryProvider;
-        const summary = provider.provide(this.runningAgent?.(), request.systemInstructions, request.input);
+        const summary = provider.provide(agent, request.systemInstructions, request.input);
         return this.activities.invokeModelStreamActivity.executeWithOptions({ summary }, [input]);
       }
 
@@ -174,20 +186,40 @@ export class ActivityBackedModel implements Model {
       yield fromSerializedStreamEvent(event);
     }
   }
+
+  /**
+   * With no model named, upstream adds the model settings defaults for the Workflow's default model,
+   * which the Worker may not use. If the agent set no model settings, send only the run's, and let
+   * the Worker add the defaults for its own default model, as upstream does in one process.
+   */
+  private toWire(request: ModelRequest, agent: Agent<any, any> | undefined): SerializedModelRequest {
+    const wire = toSerializedModelRequest(request);
+    const hasModelSettings = (agent as { hasExplicitModelSettings?(): boolean } | undefined)?.hasExplicitModelSettings;
+    if (this.modelName !== '' || agent === undefined || hasModelSettings?.call(agent) !== false) return wire;
+    const modelSettings: ModelSettings = { ...this.run?.modelSettings() };
+    // Upstream clears `toolChoice` after a tool call when the agent sets `resetToolChoice`.
+    if (request.modelSettings.toolChoice === undefined) delete modelSettings.toolChoice;
+    return { ...wire, modelSettings, reasoningEffortImplicit: undefined, implicitModelSettings: true };
+  }
 }
 
 /**
  * Resolves model names to `ActivityBackedModel`s. The runner gives it to its inner `Runner`, and
  * upstream passes it on to nested `agent.asTool()` runs, so their model calls are Activities too.
- * `runningAgent` names the agent a `ModelSummaryProvider` gets.
+ * The run check gives each run a copy bound to that run (see `installRunnerCheck`), so its model
+ * calls know their agent and the run's model settings.
  */
 export class ActivityBackedModelProvider implements ModelProvider {
   constructor(
     private readonly modelParams: ModelActivityOptions,
-    private readonly runningAgent?: () => Agent<any, any> | undefined
+    private readonly run?: ModelCallRun
   ) {}
 
+  forRun(run: ModelCallRun): ActivityBackedModelProvider {
+    return new ActivityBackedModelProvider(this.modelParams, run);
+  }
+
   getModel(modelName?: string): Model {
-    return new ActivityBackedModel(modelName ?? '', this.modelParams, this.runningAgent);
+    return new ActivityBackedModel(modelName ?? '', this.modelParams, this.run);
   }
 }

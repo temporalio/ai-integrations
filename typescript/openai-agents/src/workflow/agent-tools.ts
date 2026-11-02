@@ -135,7 +135,10 @@ export function agentAsTool<TAgent extends Agent<any, any>>(
   // eslint-disable-next-line @typescript-eslint/no-deprecated -- the alias takes its own deprecated options
   options: AgentAsToolOptions<TAgent>
 ): FunctionTool<any, any, any> {
-  return agent.asTool({
+  // This copy's `asTool`, which records the tool, also for an agent from another copy of
+  // `@openai/agents-core`, as `agentAsTool` ran such agents before.
+  const asTool = Agent.prototype.asTool as (this: Agent<any, any>, options: AnyAgentToolOptions) => AnyAgentTool;
+  return asTool.call(agent, {
     toolName: options.toolName,
     toolDescription: options.toolDescription,
     customOutputExtractor: options.customOutputExtractor as AnyAgentToolOptions['customOutputExtractor'],

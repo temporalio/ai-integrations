@@ -66,7 +66,7 @@ test('getStreamedResponse: dynamic summary routes through executeWithOptions', a
       streamingTopic: 'events',
       summary: provider,
     },
-    () => agent
+    { agent: () => agent, modelSettings: () => undefined }
   );
   const fake = fakeStreamActivities(events);
   (model as any).activities = fake.activities;

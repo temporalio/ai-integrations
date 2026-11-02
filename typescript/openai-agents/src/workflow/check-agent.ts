@@ -1,4 +1,13 @@
-import { Agent, Handoff, MemorySession, Runner, type RunContext, type Tool } from '@openai/agents-core';
+import {
+  Agent,
+  Handoff,
+  MemorySession,
+  RunState,
+  Runner,
+  type ModelSettings,
+  type RunContext,
+  type Tool,
+} from '@openai/agents-core';
 import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import { inWorkflowContext } from '@temporalio/workflow';
@@ -84,6 +93,8 @@ function checkAgentCopy(agent: Agent<any, any>): void {
 interface RunnerCheckState {
   original: (this: Runner, agent: Agent<any, any>, input: unknown, options?: RunOptionsLike) => Promise<unknown>;
   watched: WeakSet<Runner>;
+  /** The agent each run is on, for its model calls. */
+  runningAgents: WeakMap<Runner, Agent<any, any>>;
 }
 
 interface RunOptionsLike {
@@ -104,7 +115,9 @@ const runnerCheckState = Symbol.for('@temporalio/openai-agents/runnerCheck');
  *
  * Upstream emits `agent_start` on the runner before each agent's first model call, including an
  * agent that a custom `Handoff`'s callback returns, so the run installs the check before each model
- * call on the copy of `@openai/agents-core` of every agent it starts.
+ * call on the copy of `@openai/agents-core` of every agent it starts. It also tracks the agent the run
+ * is on, and gives the run a copy of the model provider bound to it, so each model call knows its
+ * agent and the run's model settings, in nested runs too.
  */
 export function installRunnerCheck(): void {
   const prototype = Runner.prototype as unknown as Record<symbol, RunnerCheckState | undefined>;
@@ -112,12 +125,16 @@ export function installRunnerCheck(): void {
   const state: RunnerCheckState = {
     original: Runner.prototype.run as RunnerCheckState['original'],
     watched: new WeakSet(),
+    runningAgents: new WeakMap(),
   };
   async function run(this: Runner, agent: Agent<any, any>, input: unknown, options?: RunOptionsLike) {
     if (!inWorkflowContext()) return state.original.call(this, agent, input, options);
     if (!state.watched.has(this)) {
       state.watched.add(this);
-      this.on('agent_start', (_context, started) => checkAgentCopy(started));
+      this.on('agent_start', (_context, started) => {
+        checkAgentCopy(started);
+        state.runningAgents.set(this, started);
+      });
     }
     const where = `The run of agent '${agent.name}'`;
     if (!(this.config.modelProvider instanceof ActivityBackedModelProvider)) {
@@ -148,6 +165,17 @@ export function installRunnerCheck(): void {
         nonRetryable: true,
       });
     }
+    // Upstream emits `agent_start` on a resumed state only if no agent run is active, so start from
+    // the state's current agent.
+    state.runningAgents.set(this, input instanceof RunState ? input._currentAgent : agent);
+    const config = this.config as unknown as {
+      modelProvider: ActivityBackedModelProvider;
+      modelSettings?: ModelSettings;
+    };
+    config.modelProvider = config.modelProvider.forRun({
+      agent: () => state.runningAgents.get(this),
+      modelSettings: () => config.modelSettings,
+    });
     // Upstream uses `options.sandbox ?? config.sandbox`, and passes the same to nested runs.
     const sandbox = options?.sandbox ?? this.config.sandbox;
     if (sandbox === undefined) return state.original.call(this, agent, input, options);
