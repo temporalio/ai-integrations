@@ -266,6 +266,10 @@ The Worker plugin does five things:
 - Adds Workflow, Activity, and Nexus interceptors for trace propagation.
 - Installs Workflow bundle polyfills required by the OpenAI Agents SDK.
 
+The model Activities are named `invokeModelActivity` and `invokeModelStreamActivity`. Provider Activity names start with the provider's name, such as `<name>-stateless-call-tool`. A different Activity with one of these names now fails with `Duplicate registration of Activity '<name>'`; earlier versions kept the last one without a warning. If it is registered before `OpenAIAgentsPlugin` (in the Worker's `activities` or by an earlier plugin), `Worker.create` fails. If a plugin applied after `OpenAIAgentsPlugin` replaces one, `worker.run()` fails before the Worker polls. `Worker.create` applies the Worker's `plugins` in order, then the `NativeConnection`'s. A plugin applied after `OpenAIAgentsPlugin` that wraps these Activities counts as replacing them; wrap Activity execution with an Activity interceptor (`interceptors.activity`) instead.
+
+Another `OpenAIAgentsPlugin`'s Activity counts as the same only when it was built from the same objects: the same `modelProvider` and `hostedToolCredentials` for the model Activities, and the same provider for a provider's Activities. So one instance on both the `NativeConnection` and the Worker, or two instances built from one options object, still start, while two instances with equal but separate providers fail.
+
 The Client plugin injects the OpenAI Agents config header into Workflow-starting calls. Attach one `OpenAIAgentsPlugin` instance per Client or Connection configuration. If multiple instances are chained, the last config header wins.
 
 `modelParams` controls scheduling for the model Activity:
