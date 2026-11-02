@@ -755,7 +755,15 @@ class TestReplay:
                 assert run.id == run_id
 
     @pytest.mark.parametrize(
-        "variant", ["", "own_tracer", "tags", "replica", "ambient_replica"]
+        "variant",
+        [
+            "",
+            "own_tracer",
+            "unhashable_own_tracer",
+            "tags",
+            "replica",
+            "ambient_replica",
+        ],
     )
     @pytest.mark.parametrize("add_temporal_runs", [False, True])
     async def test_each_run_written_once_on_replay(
@@ -767,7 +775,8 @@ class TestReplay:
     ) -> None:
         """With a cache of 0, a client at default settings writes each run once.
 
-        So does a write replica with a client of its own.
+        So does a write replica with a client of its own, and a client that
+        cannot be hashed, through a tracer of the workflow's own.
         """
         if variant == "replica" and "client" not in WriteReplica.__annotations__:
             pytest.skip("This LangSmith has no write replicas with a client")
@@ -789,7 +798,13 @@ class TestReplay:
             def _update_run(self, *args: Any, **kwargs: Any) -> None:
                 writes.append((self.label, "patch", args[0]))
 
-        ls_client = _RecordingClient(api_url="http://localhost:1", api_key="test")
+        class _UnhashableClient(_RecordingClient):
+            __hash__ = None  # type: ignore[assignment]
+
+        client_cls = (
+            _UnhashableClient if variant.startswith("unhashable") else _RecordingClient
+        )
+        ls_client = client_cls(api_url="http://localhost:1", api_key="test")
         replica_client = _RecordingClient(api_url="http://localhost:1", api_key="test")
         replica_client.label = "replica"
         _own_tracer_clients[:] = [ls_client, replica_client]
@@ -807,7 +822,7 @@ class TestReplay:
         ) as worker:
             await temporal_client.execute_workflow(
                 LangChainHelperWorkflow.run,
-                variant,
+                variant.removeprefix("unhashable_"),
                 id=f"replay-test-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
             )

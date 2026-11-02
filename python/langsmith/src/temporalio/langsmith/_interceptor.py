@@ -747,11 +747,40 @@ _MAX_OPEN_RUNS = 10_000
 # The runs each LangSmith client posted from workflow code that have not
 # ended, oldest first, for as long as the client lives.  A run that never
 # ends here, such as one whose workflow was terminated, is dropped after
-# _MAX_OPEN_RUNS others.
-_open_runs: weakref.WeakKeyDictionary[Any, OrderedDict[uuid.UUID, None]] = (
-    weakref.WeakKeyDictionary()
-)
+# _MAX_OPEN_RUNS others.  Keyed by the client's id(), so a client need not
+# be hashable, with a weak reference to the client that drops the record
+# when the client goes.
+_open_runs: dict[int, tuple[Callable[[], Any], OrderedDict[uuid.UUID, None]]] = {}
 _open_runs_lock = threading.Lock()
+
+
+def _client_open_runs(client: Any) -> OrderedDict[uuid.UUID, None]:
+    """Get the record of the open runs ``client`` posted from workflow code."""
+    key = id(client)
+    with _open_runs_lock:
+        entry = _open_runs.get(key)
+        if entry is not None and entry[0]() is client:
+            return entry[1]
+        ref: Callable[[], Any]
+        try:
+            ref = weakref.ref(client, lambda r: _forget_client(key, r))
+        except TypeError:
+            # Every langsmith.Client can be weakly referenced.  Another
+            # object that cannot is kept, with its record, for good.
+            ref = lambda: client  # noqa: E731
+        open_runs: OrderedDict[uuid.UUID, None] = OrderedDict()
+        _open_runs[key] = (ref, open_runs)
+        return open_runs
+
+
+def _forget_client(key: int, ref: Callable[[], Any]) -> None:
+    """Drop a collected client's record of its open runs."""
+    # This can run in any thread, from the garbage collector, even while
+    # _open_runs_lock is held, so it does not take the lock.  The client's
+    # id() is not reused until this returns.
+    entry = _open_runs.get(key)
+    if entry is not None and entry[0] is ref:
+        _open_runs.pop(key, None)
 
 
 def _replay_safe_client(client: Any) -> _ReplaySafeClient:
@@ -808,13 +837,7 @@ class _ReplaySafeClient(langsmith.Client):
         """Wrap a LangSmith client."""
         object.__setattr__(self, "_client", client)
         # Every wrapper of a client shares its record.
-        with _open_runs_lock:
-            try:
-                record = _open_runs.setdefault(client, OrderedDict())
-            except TypeError:
-                # A client without weak references keeps a record per wrapper.
-                record = OrderedDict()
-        object.__setattr__(self, "_open", record)
+        object.__setattr__(self, "_open", _client_open_runs(client))
 
     def __getattribute__(self, name: str) -> Any:
         """Delegate attribute access, other than to its own, to the wrapped client."""
