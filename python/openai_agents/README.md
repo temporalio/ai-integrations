@@ -568,8 +568,9 @@ start-to-close timeout, the retry fails with a non-retryable
 `ApplicationError(type="DedicatedWorkerFailure")` instead of connecting a new
 server with an empty session. Leaving the `async with` block then raises
 `ApplicationError(type="DedicatedWorkerFailure")`, whose cause is the session
-activity's `ActivityError` (none if the session ended in the workflow task that
-ended the block, since the SDK has dropped it). To recover, catch it around the block and open a
+activity's `ActivityError` (none if the block's last timer fired in the
+workflow task that brought the session's end, ahead of it, since the SDK then
+drops it). To recover, catch it around the block and open a
 new block, which connects a new, empty server (but see the note on same-name
 blocks below). A retry after a failed factory call, a failed first `connect()`,
 or a worker shutdown before the server connected connects again. A retry after a lost host or a
@@ -591,7 +592,9 @@ Some consequences:
   worker sooner. The session activity heartbeats every 30 seconds, or every
   half `heartbeat_timeout` if that is shorter.
 - An activity reset or unpause with `reset_heartbeat=True` clears the session's
-  heartbeat details, so the next attempt connects a new, empty server.
+  heartbeat details, so the next attempt connects a new, empty server. A
+  workflow reset to a point inside an open block also gives the new run a new,
+  empty server, with no error.
 - Sessions started on an earlier version left no such heartbeat details, so the
   deploy of this version still gives each open session a new, empty server one
   last time.
@@ -600,10 +603,11 @@ Some consequences:
   `ApplicationError(type="DedicatedWorkerFailure")`, which the block now raises
   after a refusal. A session that fails for another reason, such as one with a
   one-attempt `server_session_config` retry policy, or one whose attempts all
-  fail before connecting, still makes the block raise `ActivityError`, unless
-  it ended in the workflow task that ended the block, as when the block's last
-  timer fired: then the block raises `DedicatedWorkerFailure` with no cause,
-  where earlier versions raised a bare `asyncio.CancelledError`.
+  fail with an error before connecting (a factory call or first `connect()`
+  that raises), still makes the block raise `ActivityError`, unless the block's
+  last timer fired in the workflow task that brought the session's end, ahead
+  of it: then the block raises `DedicatedWorkerFailure` with no cause, where
+  earlier versions raised a bare `asyncio.CancelledError`.
 - The session activity's heartbeats go through your payload codec, so its
   `heartbeat_timeout` must comfortably exceed a heartbeat's encoding time. An
   attempt that connected no server waits at most 10 seconds for its heartbeats
@@ -637,21 +641,26 @@ that brings the operation's result, the caller gets the cancellation. A
 caller's own cancellation still cancels the operation, and a cancellation that
 leaves the block wins over the block's `DedicatedWorkerFailure`, though not over
 an `ActivityError` from a session that failed for another reason. On Python
-3.10, the plugin can't tell a caller cancelled in the workflow task in which its
-session ends from the session's end, so that caller gets
-`DedicatedWorkerFailure`, and code that catches it, as above, loses the
-cancellation.
+3.10, the plugin can't tell a workflow cancellation in the workflow task in
+which the session ends from the session's end. So a caller cancelled in that
+task, or a block that ends in it (after a Signal or an Update, or with a
+`WAIT_CANCELLATION_COMPLETED` session whose cancellation completes in it), gets
+`DedicatedWorkerFailure` in place of the cancellation, and code that catches
+it, as above, loses the cancellation.
 
 A run follows its session this way only once it records the patch marker
 `openai-agents-stateful-mcp-session-watch`, which it does at its first
 operation whose `config` has neither timeout. Histories recorded on an earlier
 version have no marker, so they schedule such operations as before and replay
-on this version. One change is not behind the marker: the
-`DedicatedWorkerFailure` a block raises when its session ended in the workflow
-task that ended the block, as above. A run recorded on an earlier version that
-hit this, caught the bare `CancelledError` and went on schedules different
-commands on this version and fails replay, so let such runs finish before
-upgrading. A run that continues on this version records the marker at its
+on this version, with two exceptions. A block whose last timer fired ahead of
+its session's end now raises `DedicatedWorkerFailure` with no cause, as above,
+so a run that hit this and caught the bare `CancelledError`, or that failed
+with it although it catches `ApplicationError` or `Exception` around the
+block, schedules different commands on this version. So can a run on Python
+3.10 that hit one of the cases above in which 3.10 raises
+`DedicatedWorkerFailure` in place of a cancellation. Let such open runs finish
+before upgrading, and expect replays of such closed runs (queries, replay
+tests) to fail. A run that continues on this version records the marker at its
 next such operation only if it scheduled none before the upgrade. Otherwise the
 Temporal Python SDK keeps the decision it made while replaying that earlier
 operation, so the run never records the marker and schedules such operations as

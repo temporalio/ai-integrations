@@ -23,7 +23,11 @@ export interface StatefulTemporalMCPServer extends MCPServer {
   /**
    * Ends the server's session. Throws an `ApplicationFailure` of type
    * `DedicatedWorkerFailure` if the session was refused, unless the caller's
-   * scope or the scope that connected the server is cancelled.
+   * scope, a scope around `cleanup()` but not around `connect()`, or the scope
+   * that connected the server is cancelled. After a Workflow catches a
+   * cancellation, its root scope stays cancelled, so it gets no such failure
+   * for a server connected outside `CancellationScope.nonCancellable()`. A
+   * session that failed for another reason throws its `ActivityFailure`.
    */
   cleanup(): Promise<void>;
 }

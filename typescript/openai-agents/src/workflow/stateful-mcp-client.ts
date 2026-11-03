@@ -104,6 +104,20 @@ async function handleWorkerFailure<T>(
 }
 
 /**
+ * Whether a scope around `scope`, up to but not including the scopes around
+ * `connectScope`, is cancelled. The Workflow's root scope stays cancelled after
+ * a caught Workflow cancellation, so only scopes between the two count.
+ */
+function cancelledBelow(scope: CancellationScope, connectScope: CancellationScope | undefined): boolean {
+  const connectLine = new Set<CancellationScope>();
+  for (let s = connectScope; s; s = s.parent) connectLine.add(s);
+  for (let s: CancellationScope | undefined = scope; s && !connectLine.has(s); s = s.parent) {
+    if (s.consideredCancelled) return true;
+  }
+  return false;
+}
+
+/**
  * Workflow-side handle for a stateful MCP server connection. Tool operations
  * route to a dedicated in-process Worker on a per-run Task Queue, preserving
  * server state across calls.
@@ -201,8 +215,10 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
    * Cancels the server-session Activity, tearing down the dedicated Worker. If
    * the session Activity failed with `DedicatedWorkerFailure`, throws an
    * `ApplicationFailure` of that type with the session's `ActivityFailure` as
-   * its cause, unless the caller's scope or the scope that connected the
-   * server is cancelled.
+   * its cause, unless the caller's scope, a scope around `cleanup()` that is
+   * not around `connect()`, or the scope that connected the server is
+   * cancelled. A session that failed for another reason throws its
+   * `ActivityFailure`.
    */
   async cleanup(): Promise<void> {
     if (this._sessionScope) {
@@ -219,7 +235,11 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
         ) {
           // A cancellation of the caller wins over the session's failure, as
           // when cleanup() runs in a finally after the caller was cancelled.
-          if (!CancellationScope.current().consideredCancelled && !connectScope?.consideredCancelled) {
+          if (
+            !CancellationScope.current().consideredCancelled &&
+            !connectScope?.consideredCancelled &&
+            !cancelledBelow(CancellationScope.current(), connectScope)
+          ) {
             throw this.sessionEndedFailure(err);
           }
         } else if (!isCancellation(err)) {
@@ -294,6 +314,8 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
           })
           .catch(() => {});
         const operation = scheduled.operation;
+        // The handler below shares this closure, so don't keep the result alive with it.
+        scheduled.operation = undefined;
         if (!operation) {
           throw scheduled.error;
         }

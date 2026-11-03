@@ -638,9 +638,12 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
 
         If the session activity failed with ``DedicatedWorkerFailure``, raises
         ``ApplicationError(type="DedicatedWorkerFailure")`` with the session's
-        ``ActivityError`` as its cause. If the session ended, for any reason, in
-        the workflow task that ended the block, raises it with no cause, since
-        the SDK dropped the session's result.
+        ``ActivityError`` as its cause. If the block's last timer fired in the
+        workflow task that brought the session's end, ahead of it, raises it
+        with no cause, whatever the session's error, since the SDK then drops
+        the session's result. A cancellation wins over this failure only when
+        it leaves the ``async with`` block: ``cleanup()`` called directly after
+        a workflow cancellation raises it.
         """
         if self._connect_handle:
             session = self._connect_handle
@@ -660,9 +663,9 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
                     or _cancel_requests() > cancels
                 ):
                     raise
-                # The session ended in the workflow task that ended the block,
-                # as when its last timer fired, and the SDK dropped its failure
-                # when the handle was cancelled.
+                # The block's last timer fired in the workflow task that
+                # brought the session's end, ahead of it, and cancelling the
+                # handle dropped the session's result.
                 raise ApplicationError(
                     "The stateful MCP server session activity has ended, so no "
                     "worker serves this server's operations.",
@@ -978,6 +981,11 @@ class StatefulMCPServerProvider:
                 # No server is built before the Temporal server holds the first
                 # heartbeat, which says a session may be open.
                 await heartbeats.wait_until_stored()
+                # A cancellation, such as a worker shutdown, doesn't interrupt
+                # the read-back, and Python 3.10 and 3.11's asyncio.wait_for can
+                # drop one.
+                if activity.is_cancelled():
+                    raise asyncio.CancelledError()
                 if server_id in self._servers:
                     raise ApplicationError(
                         "Cannot connect to an already running server. Use a distinct name if running multiple servers in one workflow."
@@ -1014,6 +1022,10 @@ class StatefulMCPServerProvider:
                 try:
                     if not rejected:
                         await server.connect()
+                        # Nor does every connect() observe it: close this server
+                        # instead of serving.
+                        if activity.is_cancelled():
+                            raise asyncio.CancelledError()
                         heartbeats.record_opened()
 
                     worker = Worker(

@@ -21,6 +21,7 @@ import {
   WithStartWorkflowOperation,
   WorkflowClient,
   WorkflowFailedError,
+  WorkflowNotFoundError,
   WorkflowUpdateStage,
 } from '@temporalio/client';
 import { ApplicationFailure, CancelledFailure, defaultPayloadConverter, type PayloadCodec } from '@temporalio/common';
@@ -915,10 +916,13 @@ for (const [kase, title] of [
     const { createWorker, startWorkflow } = helpers(t);
     let factoryCalls = 0;
     const describe = async (): Promise<never> => {
-      if (kase === 'refused' || kase === 'not found') {
-        const [code, status] = kase === 'refused' ? [7, 'PERMISSION_DENIED'] : [5, 'NOT_FOUND'];
-        const grpc = Object.assign(new Error(`${code} ${status}: Request refused.`), {
-          code,
+      if (kase === 'not found') {
+        // What the client throws for a NOT_FOUND describe.
+        throw new WorkflowNotFoundError('Workflow not found.', 'unknown', undefined);
+      }
+      if (kase === 'refused') {
+        const grpc = Object.assign(new Error('7 PERMISSION_DENIED: Request refused.'), {
+          code: 7,
           details: 'Request refused.',
           metadata: {},
         });
@@ -1157,10 +1161,12 @@ test.serial('Stateful MCP: a Workflow cancellation wins over the session it ende
   });
 });
 
-for (const nonCancellable of [false, true]) {
-test.serial(`Stateful MCP: a Workflow cancellation wins over a refused session in cleanup()${
-  nonCancellable ? ', also in a non-cancellable scope' : ''
-}`, async (t) => {
+for (const [mode, title] of [
+  ['finally', 'a Workflow cancellation wins over a refused session in cleanup()'],
+  ['nonCancellable', 'a Workflow cancellation wins over a refused session in cleanup(), also in a non-cancellable scope'],
+  ['stop', 'a cancelled scope between connect() and cleanup() wins over a refused session'],
+] as const) {
+test.serial(`Stateful MCP: ${title}`, async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
   let factoryCalls = 0;
   const worker = await createWorker({
@@ -1182,7 +1188,7 @@ test.serial(`Stateful MCP: a Workflow cancellation wins over a refused session i
   });
   await worker.runUntil(async () => {
     const handle = await startWorkflow(statefulMcpCancelledAfterRefusalWorkflow, {
-      args: [nonCancellable],
+      args: [mode],
       workflowExecutionTimeout: '60 seconds',
     });
     // Wait until the retry of the timed-out session Activity has been refused.
@@ -1192,6 +1198,11 @@ test.serial(`Stateful MCP: a Workflow cancellation wins over a refused session i
       );
     for (let i = 0; i < 300 && !(await refused()); i++) await new Promise((r) => setTimeout(r, 100));
     t.true(await refused(), 'the session Activity was refused');
+    if (mode === 'stop') {
+      await handle.signal(resumeSignal);
+      t.is(await handle.result(), 'stopped');
+      return;
+    }
     await handle.cancel();
     const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
     t.true(err?.cause instanceof CancelledFailure, String(err?.cause));

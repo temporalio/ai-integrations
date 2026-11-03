@@ -410,10 +410,31 @@ export async function statefulMcpCancelledCallerWorkflow(): Promise<string> {
   }
 }
 
-export async function statefulMcpCancelledAfterRefusalWorkflow(nonCancellable: boolean): Promise<string> {
+export async function statefulMcpCancelledAfterRefusalWorkflow(
+  mode: 'finally' | 'nonCancellable' | 'stop'
+): Promise<string> {
   // The session times out and its retry is refused while the Workflow waits.
   const server = statefulMcpServer('refusedCancel', { serverSessionConfig: { startToCloseTimeout: '5 seconds' } });
   await server.connect();
+  if (mode === 'stop') {
+    // A scope between connect() and cleanup() that a Signal cancels.
+    const stop = new CancellationScope();
+    setHandler(resumeSignal, () => stop.cancel());
+    try {
+      await stop.run(async () => {
+        try {
+          await server.listTools();
+          await condition(() => false);
+        } finally {
+          await CancellationScope.nonCancellable(() => server.cleanup());
+        }
+      });
+    } catch (err: unknown) {
+      if (isCancellation(err)) return 'stopped';
+      throw err;
+    }
+    return 'unreachable';
+  }
   try {
     await server.listTools();
     await condition(() => false);
@@ -422,7 +443,7 @@ export async function statefulMcpCancelledAfterRefusalWorkflow(nonCancellable: b
     // After the Workflow's cancellation, this must not replace it with the
     // session's DedicatedWorkerFailure, also when it runs in a scope that
     // can't be cancelled.
-    if (nonCancellable) {
+    if (mode === 'nonCancellable') {
       await CancellationScope.nonCancellable(() => server.cleanup());
     } else {
       await server.cleanup();
