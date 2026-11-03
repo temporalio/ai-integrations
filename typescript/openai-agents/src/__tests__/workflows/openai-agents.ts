@@ -410,6 +410,21 @@ export async function statefulMcpCancelledCallerWorkflow(): Promise<string> {
   }
 }
 
+export async function statefulMcpCancelledAfterRefusalWorkflow(): Promise<string> {
+  // The session times out and its retry is refused while the Workflow waits.
+  const server = statefulMcpServer('refusedCancel', { serverSessionConfig: { startToCloseTimeout: '5 seconds' } });
+  await server.connect();
+  try {
+    await server.listTools();
+    await condition(() => false);
+    return 'unreachable';
+  } finally {
+    // After the Workflow's cancellation, this must not replace it with the
+    // session's DedicatedWorkerFailure.
+    await server.cleanup();
+  }
+}
+
 export async function tracingApiKeyWorkflow(apiKey?: string): Promise<string> {
   const agent = new Agent({
     name: 'TracingKeyAgent',

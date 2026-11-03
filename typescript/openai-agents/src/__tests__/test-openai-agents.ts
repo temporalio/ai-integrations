@@ -56,6 +56,7 @@ import {
   statefulMcpSessionEndedWorkflow,
   statefulMcpOperationWaitingWorkflow,
   statefulMcpCancelledCallerWorkflow,
+  statefulMcpCancelledAfterRefusalWorkflow,
   resumeSignal,
   streamingAgentWorkflow,
   streamingLocalActivityWorkflow,
@@ -1139,6 +1140,44 @@ test('Stateful MCP: a Workflow cancellation wins over the session it ended', asy
     const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
     t.true(err?.cause instanceof CancelledFailure, String(err?.cause));
   });
+});
+
+test('Stateful MCP: a Workflow cancellation wins over a refused session in cleanup()', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  let factoryCalls = 0;
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([]),
+        mcpServerProviders: [
+          new StatefulMCPServerProvider(
+            'refusedCancel',
+            () => {
+              factoryCalls++;
+              return memoryServer('refusedCancel', 'S');
+            },
+            t.context.env.nativeConnection
+          ),
+        ],
+      }),
+    ],
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(statefulMcpCancelledAfterRefusalWorkflow, {
+      workflowExecutionTimeout: '60 seconds',
+    });
+    // Wait until the retry of the timed-out session Activity has been refused.
+    const refused = async () =>
+      ((await handle.fetchHistory()).events ?? []).some(
+        (e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED
+      );
+    for (let i = 0; i < 300 && !(await refused()); i++) await new Promise((r) => setTimeout(r, 100));
+    t.true(await refused(), 'the session Activity was refused');
+    await handle.cancel();
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    t.true(err?.cause instanceof CancelledFailure, String(err?.cause));
+  });
+  t.is(factoryCalls, 1);
 });
 
 test('Stateful MCP: a caller still cancels a queued operation without a schedule-to-start timeout', async (t) => {
