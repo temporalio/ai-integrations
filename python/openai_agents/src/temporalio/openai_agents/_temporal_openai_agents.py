@@ -1,8 +1,11 @@
 """Initialize Temporal OpenAI Agents overrides."""
 
 import dataclasses
+import functools
+import itertools
 import json
 import threading
+import types
 import typing
 import warnings
 from collections.abc import (
@@ -14,11 +17,13 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager, contextmanager
-from contextvars import Token
+from contextvars import ContextVar, Token
 from datetime import timedelta
 from weakref import WeakKeyDictionary
 
+import openai
 import pydantic
+import pydantic_core
 from agents import ModelProvider, Trace, set_trace_provider
 from agents.mcp import MCPServer
 from agents.run import get_default_agent_runner, set_default_agent_runner
@@ -29,6 +34,7 @@ from agents.tracing.provider import DefaultTraceProvider
 # one the SDK uses to parse live API responses. It is in a private module but
 # has no public alias.
 from openai._models import construct_type
+from pydantic.fields import FieldInfo
 from typing_extensions import NotRequired, Required, is_typeddict
 
 import temporalio.api.common.v1
@@ -209,14 +215,58 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
     """Build ``value`` into ``type_`` without enforcing required fields.
 
     OpenAI's ``construct_type`` handles its own response models, but not the
-    ``TypedDict`` and ``agents`` dataclass layers that wrap them (e.g.
-    ``ActivityModelInput`` and ``ModelResponse``). Walk those containers here,
-    then delegate their leaves to ``construct_type``. ``include_extras``
-    preserves the ``Annotated`` discriminators the unions rely on.
+    ``TypedDict``, dataclass and caller Pydantic model layers that wrap them (e.g.
+    ``ActivityModelInput``, ``ModelResponse`` or a Workflow result holding
+    ``raw_responses``). Walk those containers here, then delegate their leaves to
+    ``construct_type``. ``include_extras`` preserves the ``Annotated``
+    discriminators the unions rely on.
     """
     origin = typing.get_origin(type_)
     if origin in (Required, NotRequired):
         return _lenient_construct(typing.get_args(type_)[0], value)
+    if origin is typing.Annotated and (
+        _plugin_builds(typing.get_args(type_)[0]) or _changes_input(type_)
+    ):
+        # Validate with the metadata, so a caller's validators on it still run, also on an
+        # OpenAI model (see ``_may_hold``). Other Annotated types, such as OpenAI's
+        # discriminated unions, keep their metadata.
+        try:
+            return _lenient_validate(type_, value)
+        except (pydantic.ValidationError, pydantic_core.SchemaError):
+            return _lenient_construct(typing.get_args(type_)[0], value)
+    if origin in (typing.Union, types.UnionType):  # pyright: ignore[reportDeprecated]
+        # Optional fields and the ``str | list[...]`` input field: build the only
+        # variant that fits.
+        if value is None:
+            return None
+        variants = [
+            arg
+            for arg in typing.get_args(type_)
+            if arg is not type(None) and _may_hold(arg, value)
+        ]
+        if len(variants) == 1:
+            return _lenient_construct(variants[0], value)
+        if _plugin_builds(type_) or any(map(_changes_input, variants)):
+            # Variants told apart by their tags or validation (see ``_lenient_union``).
+            try:
+                return _lenient_validate(type_, value)
+            except (pydantic.ValidationError, pydantic_core.SchemaError):
+                pass
+        try:
+            return construct_type(type_=type_, value=value)
+        except TypeError:
+            # construct_type caches discriminated unions by weak reference, which
+            # ``X | Y`` unions do not support. Keep the decoded value.
+            return value
+    if origin is not None and (
+        is_typeddict(origin) or dataclasses.is_dataclass(origin)
+    ):
+        # A generic specialization such as ``Box[ModelResponse]``, whose field types only
+        # its schema resolves: validate it as declared, from any value its validators take.
+        try:
+            return _lenient_validate(type_, value)
+        except (pydantic.ValidationError, pydantic_core.SchemaError):
+            return construct_type(type_=type_, value=value)
     if is_typeddict(type_) and isinstance(value, dict):
         hints = typing.get_type_hints(type_, include_extras=True)
         return {
@@ -226,22 +276,625 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
     if origin is list and isinstance(value, list):
         (item_type,) = typing.get_args(type_)
         return [_lenient_construct(item_type, item) for item in value]
+    if origin is dict and isinstance(value, dict):
+        _, item_type = typing.get_args(type_) or (typing.Any, typing.Any)
+        return {key: _lenient_construct(item_type, item) for key, item in value.items()}
+    if isinstance(type_, type) and dataclasses.is_dataclass(type_):
+        # Any value: the dataclass's validators may turn it into an object first.
+        try:
+            return _lenient_validate(type_, value)
+        except (pydantic.ValidationError, pydantic_core.SchemaError):
+            pass
+        if isinstance(value, dict):
+            hints = typing.get_type_hints(type_, include_extras=True)
+            return type_(
+                **{
+                    field.name: _lenient_construct(
+                        hints.get(field.name, object), value[field.name]
+                    )
+                    for field in dataclasses.fields(type_)
+                    if field.name in value
+                }
+            )
     if (
         isinstance(type_, type)
-        and dataclasses.is_dataclass(type_)
-        and isinstance(value, dict)
+        and issubclass(type_, pydantic.BaseModel)
+        and not issubclass(type_, openai.BaseModel)
     ):
-        hints = typing.get_type_hints(type_, include_extras=True)
-        return type_(
-            **{
-                field.name: _lenient_construct(
-                    hints.get(field.name, object), value[field.name]
-                )
-                for field in dataclasses.fields(type_)
-                if field.name in value
-            }
-        )
+        try:
+            return _lenient_validate(type_, value)
+        except (pydantic.ValidationError, pydantic_core.SchemaError):
+            return construct_type(type_=type_, value=value)
     return construct_type(type_=type_, value=value)
+
+
+def _lenient_validate(type_: typing.Any, value: typing.Any) -> typing.Any:
+    """Validate a caller's model or dataclass whose OpenAI parts fail strict validation.
+
+    The value is validated as JSON against the type's own schema, so its aliases, extra fields,
+    root type, validators, ``Annotated`` metadata, strictness and JSON settings apply as they
+    do when the value is valid. Only the OpenAI models in it fall back to ``construct_type``
+    (see ``_lenient_schema``). Raises ``ValidationError`` when the value still does not
+    validate, and ``SchemaError`` if Pydantic cannot build the lenient copy of the type's schema.
+    """
+    try:
+        hash(type_)
+    except TypeError:
+        # Annotated metadata that cannot be a cache key.
+        validator = _lenient_validator.__wrapped__(type_)
+    else:
+        validator = _lenient_validator(type_)
+    return validator.validate_json(json.dumps(value))
+
+
+# A validator holds its type through its schema and functions, so a weak cache would never
+# release a type, such as a Workflow sandbox's copy of a caller's class. Keep only the most
+# recently used ones.
+@functools.lru_cache(maxsize=32)
+def _lenient_validator(type_: typing.Any) -> pydantic_core.SchemaValidator:
+    """A validator for the lenient copy of ``type_``'s Pydantic core schema."""
+    schema = pydantic.TypeAdapter(type_).core_schema
+    return pydantic_core.SchemaValidator(
+        _lenient_schema(schema, _schema_refs(schema, {}))
+    )
+
+
+# The choice a lenient union validates next: its original strict union, or the index of a
+# lenient variant.
+_union_choice: ContextVar[str | int] = ContextVar("_union_choice", default="strict")
+
+# Whether the next OpenAI model to validate is a lenient union variant reached through a
+# validator that can change the value, so it must check the value's kind and tags itself.
+_variant_check: ContextVar[bool] = ContextVar("_variant_check", default=False)
+
+_LENIENT_REF = ":lenient"
+
+
+def _lenient_schema(schema: typing.Any, refs: dict[str, typing.Any]) -> typing.Any:
+    """A copy of a Pydantic core schema in which OpenAI models fall back to ``construct_type``.
+
+    Each OpenAI model first validates strictly. A union first validates as the original strict
+    union, and only then as the one variant whose shape and ``Literal`` tags fit the value and
+    that validates, so the fallback never picks among several variants. Definitions are kept as they were for the
+    strict unions and copied, under a new ref, for the lenient ones.
+    """
+    if isinstance(schema, list | tuple):
+        return type(schema)(_lenient_schema(item, refs) for item in schema)
+    if not isinstance(schema, dict):
+        return schema
+    kind = schema.get("type")
+    if not isinstance(kind, str):
+        # A mapping of names to schemas, such as a model's fields.
+        return {key: _lenient_schema(item, refs) for key, item in schema.items()}
+    if kind == "definitions":
+        return {
+            **schema,
+            "schema": _lenient_schema(schema["schema"], refs),
+            "definitions": [
+                *schema["definitions"],
+                *(_lenient_schema(item, refs) for item in schema["definitions"]),
+            ],
+        }
+    if kind == "definition-ref":
+        return {**schema, "schema_ref": schema["schema_ref"] + _LENIENT_REF}
+    if kind == "union":
+        return _lenient_union(schema, refs)
+    copy: typing.Any = {
+        key: item if key in _SCHEMA_DATA_KEYS else _lenient_schema(item, refs)
+        for key, item in schema.items()
+    }
+    ref = copy.pop("ref", None)
+    if ref is not None:
+        ref += _LENIENT_REF
+    cls: typing.Any = schema.get("cls")
+    if kind == "typed-dict":
+        # The class only selects a prebuilt validator, which would skip the lenient copy.
+        copy.pop("cls", None)
+    if kind == "dataclass" and isinstance(cls, type):
+        return _lenient_dataclass(cls, copy, ref)
+    if kind != "model" or not isinstance(cls, type):
+        return {**copy, "ref": ref} if ref is not None else copy
+    if issubclass(cls, openai.BaseModel):
+
+        def validate(value: typing.Any, handler: typing.Any) -> typing.Any:
+            check = _variant_check.get()
+            # The models inside it are not the variant. The check holds again once this call
+            # returns, for a validator that calls its handler again.
+            token = _variant_check.set(False)
+            try:
+                return handler(value)
+            except pydantic.ValidationError:
+                if check and not _schema_may_hold(schema, value, refs):
+                    raise
+                return construct_type(type_=cls, value=value)
+            finally:
+                _variant_check.reset(token)
+
+        return pydantic_core.core_schema.no_info_wrap_validator_function(
+            validate, copy, ref=ref
+        )
+    if schema.get("custom_init"):
+        # Pydantic would call the model's own __init__; keep its strict validator. Its refs are
+        # renamed like the rest of the copy, so they stay unique beside the original definitions.
+        return _lenient_refs(schema)
+    # Pydantic-core reuses a complete model's own validator for a model schema, which would
+    # skip the lenient copy of its fields. Validate them into a stand-in with the same config,
+    # then move the state onto the model as pydantic-core does.
+    post_init = copy.pop("post_init", None)
+
+    model: typing.Any = cls
+
+    def build(state: _ModelState) -> typing.Any:
+        instance = model.__new__(model)
+        for name in _ModelState.__slots__:
+            try:
+                object.__setattr__(instance, name, object.__getattribute__(state, name))
+            except AttributeError:
+                pass
+        if post_init:
+            getattr(instance, post_init)(None)
+        return instance
+
+    def state(value: typing.Any) -> _ModelState:
+        copied = _ModelState()
+        for name in _ModelState.__slots__:
+            try:
+                object.__setattr__(copied, name, object.__getattribute__(value, name))
+            except AttributeError:
+                pass
+        return copied
+
+    stand_in = {**copy, "cls": _ModelState, "revalidate_instances": "always"}
+    return _keeping_instances(
+        model,
+        _revalidation(schema),
+        state,
+        pydantic_core.core_schema.no_info_after_validator_function(
+            build, typing.cast(typing.Any, stand_in)
+        ),
+        ref,
+    )
+
+
+# Numbers the stand-ins' refs, which must be unique in a schema.
+_stand_ins = itertools.count()
+
+
+def _keeping_instances(
+    cls: type,
+    revalidate: str,
+    state: Callable[[typing.Any], typing.Any],
+    stand_in: typing.Any,
+    ref: str | None,
+) -> typing.Any:
+    """A stand-in's schema that also takes instances of ``cls``, such as validators return.
+
+    pydantic-core keeps such an instance or revalidates it by its ``revalidate`` setting. The
+    stand-in, which always revalidates, revalidates a copy of its ``state``. A JSON value goes to
+    the stand-in as it is, so JSON validation still applies.
+    """
+    cs = pydantic_core.core_schema
+    stand_in_ref = f"{ref or cls.__qualname__}:{next(_stand_ins)}:stand-in"
+
+    def accept(value: typing.Any, handler: typing.Any) -> typing.Any:
+        return handler(state(value)) if _revalidates(revalidate, value, cls) else value
+
+    # pydantic-core takes refs only on top-level schemas and definitions, so the stand-in is
+    # defined here, and the ref, which a definitions list needs on its items, goes on this schema.
+    schema = cs.definitions_schema(
+        cs.union_schema(
+            [
+                cs.chain_schema(
+                    [
+                        cs.is_instance_schema(cls),
+                        cs.no_info_wrap_validator_function(
+                            accept, cs.definition_reference_schema(stand_in_ref)
+                        ),
+                    ]
+                ),
+                cs.definition_reference_schema(stand_in_ref),
+            ],
+            mode="left_to_right",
+        ),
+        [typing.cast(typing.Any, {**stand_in, "ref": stand_in_ref})],
+    )
+    return {**schema, "ref": ref} if ref is not None else schema
+
+
+def _revalidation(schema: dict[str, typing.Any]) -> str:
+    """A model or dataclass schema's ``revalidate_instances`` setting, as pydantic-core reads it."""
+    return schema.get("revalidate_instances") or (schema.get("config") or {}).get(
+        "revalidate_instances", "never"
+    )
+
+
+def _revalidates(revalidate: str, value: typing.Any, cls: type) -> bool:
+    """Whether pydantic-core revalidates an instance of ``cls`` under ``revalidate``."""
+    return revalidate == "always" or (
+        revalidate == "subclass-instances" and type(value) is not cls
+    )
+
+
+class _ModelState:
+    """The attributes pydantic-core sets on a model instance it validates."""
+
+    # pydantic-core sets these slots itself.
+    __slots__ = (
+        "__dict__",
+        "__pydantic_extra__",  # pyright: ignore[reportUninitializedInstanceVariable]
+        "__pydantic_fields_set__",  # pyright: ignore[reportUninitializedInstanceVariable]
+        "__pydantic_private__",  # pyright: ignore[reportUninitializedInstanceVariable]
+    )
+
+
+def _lenient_dataclass(
+    cls: typing.Any, copy: typing.Any, ref: str | None
+) -> typing.Any:
+    """Validate a dataclass's lenient fields into a stand-in, as ``_lenient_schema`` does models."""
+    post_init = copy.pop("post_init", False)
+    slots = copy.get("slots", False)
+
+    def build(state: _DataclassState) -> typing.Any:
+        instance = cls.__new__(cls)
+        # The fields and any extra fields the config allows, as pydantic-core sets them: one by
+        # one for slots, else as the whole __dict__, which skips properties of the same name.
+        if slots:
+            for name, item in state.__dict__.items():
+                object.__setattr__(instance, name, item)
+        else:
+            object.__setattr__(instance, "__dict__", state.__dict__)
+        if post_init:
+            instance.__post_init__(*state.init_vars)
+        return instance
+
+    # pydantic-core revalidates a dataclass instance from the fields its class declares.
+    state_cls = type(
+        "_DataclassState",
+        (_DataclassState,),
+        {"__slots__": (), "__dataclass_fields__": cls.__dataclass_fields__},
+    )
+
+    def state(value: typing.Any) -> _DataclassState:
+        copied = state_cls()
+        for field in dataclasses.fields(cls):
+            copied.__dict__[field.name] = getattr(value, field.name)
+        return copied
+
+    stand_in = {
+        **copy,
+        "cls": state_cls,
+        "post_init": True,
+        "revalidate_instances": "always",
+    }
+    return _keeping_instances(
+        cls,
+        _revalidation(copy),
+        state,
+        pydantic_core.core_schema.no_info_after_validator_function(
+            build, typing.cast(typing.Any, stand_in)
+        ),
+        ref,
+    )
+
+
+class _DataclassState:
+    """The fields pydantic-core sets on a dataclass instance it validates, and its init vars."""
+
+    __slots__ = ("__dict__", "init_vars")  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    def __post_init__(self, *init_vars: typing.Any) -> None:
+        self.init_vars = init_vars
+
+
+def _schema_refs(
+    schema: typing.Any, refs: dict[str, typing.Any]
+) -> dict[str, typing.Any]:
+    """Every schema in ``schema`` that has a ref, by ref."""
+    if isinstance(schema, list | tuple):
+        for item in schema:
+            _schema_refs(item, refs)
+    elif isinstance(schema, dict):
+        is_schema = isinstance(schema.get("type"), str)
+        if is_schema and isinstance(schema.get("ref"), str):
+            refs[schema["ref"]] = schema
+        for key, item in schema.items():
+            if not is_schema or key not in _SCHEMA_DATA_KEYS:
+                _schema_refs(item, refs)
+    return refs
+
+
+def _lenient_refs(schema: typing.Any) -> typing.Any:
+    """A copy of ``schema`` whose refs are renamed as in the lenient copy, and nothing else."""
+    if isinstance(schema, list | tuple):
+        return type(schema)(_lenient_refs(item) for item in schema)
+    if not isinstance(schema, dict):
+        return schema
+    is_schema = isinstance(schema.get("type"), str)
+    copy = {
+        key: item if is_schema and key in _SCHEMA_DATA_KEYS else _lenient_refs(item)
+        for key, item in schema.items()
+    }
+    for key in ("ref", "schema_ref"):
+        if is_schema and isinstance(copy.get(key), str):
+            copy[key] += _LENIENT_REF
+    return copy
+
+
+# Values in a core schema that are data or callables, not nested schemas.
+_SCHEMA_DATA_KEYS = frozenset(
+    {"cls", "config", "default", "expected", "function", "metadata", "serialization"}
+)
+
+
+def _lenient_union(
+    schema: dict[str, typing.Any], refs: dict[str, typing.Any]
+) -> typing.Any:
+    """A union that validates strictly first, then as the only variant that validates leniently."""
+    choices = [
+        choice[0] if isinstance(choice, tuple) else choice
+        for choice in schema["choices"]
+    ]
+    lenient = [_lenient_schema(choice, refs) for choice in choices]
+    strict = {key: item for key, item in schema.items() if key != "ref"}
+    # A variant whose value a before, wrap or plain validator can change is judged only after
+    # that validator runs: by its own validation, or for an OpenAI model, which builds from any
+    # object, by the kind and tag check in its lenient copy (see ``_lenient_schema``).
+    checks_itself = []
+    for choice in choices:
+        transformed, target = _variant_target(choice, refs)
+        checks_itself.append(
+            transformed
+            and isinstance(target, dict)
+            and target.get("type") == "model"
+            and isinstance(target.get("cls"), type)
+            and issubclass(target["cls"], openai.BaseModel)
+        )
+
+    def validate(value: typing.Any, handler: typing.Any) -> typing.Any:
+        token = _union_choice.set("strict")
+        try:
+            return handler(value)
+        except pydantic.ValidationError as error:
+            strict_error = error
+        finally:
+            _union_choice.reset(token)
+        # OpenAI models in a lenient variant build from any object, so only the variants whose
+        # kind and tags fit are tried. Their own validators and aliases then decide.
+        built: list[typing.Any] = []
+        for i, choice in enumerate(choices):
+            if len(built) > 1:
+                break
+            if not _schema_may_hold(choice, value, refs):
+                continue
+            token = _union_choice.set(i)
+            check = _variant_check.set(checks_itself[i])
+            try:
+                built.append(handler(value))
+            except pydantic.ValidationError:
+                pass
+            finally:
+                _variant_check.reset(check)
+                _union_choice.reset(token)
+        if len(built) != 1:
+            raise strict_error
+        return built[0]
+
+    return pydantic_core.core_schema.no_info_wrap_validator_function(
+        validate,
+        pydantic_core.core_schema.tagged_union_schema(
+            typing.cast(typing.Any, {"strict": strict, **dict(enumerate(lenient))}),
+            discriminator=lambda _: _union_choice.get(),
+        ),
+        ref=schema["ref"] + _LENIENT_REF if "ref" in schema else None,
+    )
+
+
+def _schema_may_hold(
+    schema: dict[str, typing.Any], value: typing.Any, refs: dict[str, typing.Any]
+) -> bool:
+    """Whether a union variant could hold a JSON ``value``, judged by its kind and tags.
+
+    A variant behind a validator that can change the value always may: the tags it is sent with
+    need not be the ones it validates.
+    """
+    transformed, target = _variant_target(schema, refs)
+    if transformed or target is None:
+        return True
+    schema = target
+    kind = schema.get("type")
+    if isinstance(value, list):
+        return kind in ("list", "tuple", "set", "frozenset", "any")
+    if isinstance(value, dict):
+        if kind not in ("model", "dataclass", "typed-dict", "dict", "any"):
+            return False
+        config = schema.get("config") or {}
+        return all(
+            _tag_fits(name, field, value, config)
+            for name, field in _schema_fields(schema)
+        )
+    return True
+
+
+# Validator schemas whose function can change the value before the schema inside sees it.
+_TRANSFORMS = frozenset({"function-before", "function-wrap", "function-plain"})
+
+
+def _variant_target(
+    schema: typing.Any, refs: dict[str, typing.Any]
+) -> tuple[bool, typing.Any]:
+    """The schema a union variant's value reaches past its wrappers, ``None`` if unknown.
+
+    Also whether a before, wrap or plain validator on the way can change the value.
+    """
+    transformed = False
+    while True:
+        kind = schema.get("type")
+        if kind == "definitions":
+            schema = schema["schema"]
+        elif kind == "definition-ref":
+            schema = refs.get(schema["schema_ref"])
+            if schema is None:
+                return transformed, None
+        elif kind in _TRANSFORMS:
+            transformed = True
+            if "schema" not in schema:
+                return transformed, schema
+            schema = schema["schema"]
+        elif kind in ("nullable", "default", "function-after") or (
+            kind == "model" and schema.get("root_model")
+        ):
+            schema = schema["schema"]
+        else:
+            # Pydantic puts a model's or dataclass's before validators inside its schema.
+            inner = schema.get("schema") if kind in ("model", "dataclass") else None
+            if isinstance(inner, dict) and inner.get("type") in _TRANSFORMS:
+                transformed = True
+            return transformed, schema
+
+
+def _schema_fields(schema: dict[str, typing.Any]) -> list[tuple[str, typing.Any]]:
+    """The fields of a model, dataclass or ``TypedDict`` core schema, by name."""
+    if schema.get("type") in ("model", "dataclass"):
+        inner = schema.get("schema")
+        fields = inner.get("fields") if isinstance(inner, dict) else None
+    else:
+        fields = schema.get("fields")
+    if isinstance(fields, dict):
+        return list(fields.items())
+    if isinstance(fields, list):
+        return [(field["name"], field) for field in fields]
+    return []
+
+
+def _tag_fits(
+    name: str,
+    field: dict[str, typing.Any],
+    value: dict[str, typing.Any],
+    config: typing.Any,
+) -> bool:
+    """Whether a JSON object holds an allowed value for a ``Literal`` field, or may omit it.
+
+    Other fields, and ``Literal`` fields of values that JSON does not keep as they are, always
+    fit. The key is looked up as the validator would, by alias and then by name as the type's
+    config allows.
+    """
+    tag = field.get("schema") or {}
+    required = field.get("required", True)
+    if tag.get("type") == "default":
+        tag = tag.get("schema") or {}
+        required = False
+    expected = tag.get("expected") if tag.get("type") == "literal" else None
+    if not expected or not all(
+        item is None or isinstance(item, str | int | float) for item in expected
+    ):
+        return True
+    alias = field.get("validation_alias")
+    if alias is None:
+        keys = [name]
+    elif isinstance(alias, str):
+        keys = [alias] if config.get("validate_by_alias", True) else []
+        if config.get("validate_by_name", False):
+            keys.append(name)
+    else:
+        # Alias paths and choices.
+        return True
+    for key in keys:
+        if key in value:
+            return value[key] in expected
+    return not required
+
+
+def _field_type(field: FieldInfo) -> typing.Any:
+    """A field's resolved type with the metadata Pydantic moved off it, such as union discriminators."""
+    if field.metadata:
+        return typing.Annotated[(field.annotation, *field.metadata)]  # pyright: ignore[reportInvalidTypeArguments]
+    return field.annotation
+
+
+def _plugin_builds(type_: typing.Any) -> bool:
+    """Whether the fallback builds ``type_`` itself rather than handing it to ``construct_type``."""
+    origin = typing.get_origin(type_)
+    if origin is typing.Annotated:
+        # Built with its metadata (see ``_lenient_construct``).
+        return _plugin_builds(typing.get_args(type_)[0])
+    if origin in (typing.Union, types.UnionType):  # pyright: ignore[reportDeprecated]
+        # An Optional of a type the plugin builds; OpenAI's own unions keep their metadata.
+        return any(
+            _plugin_builds(arg)
+            for arg in typing.get_args(type_)
+            if arg is not type(None)
+        )
+    if origin in (list, dict):
+        return True
+    # A generic specialization by its class.
+    cls = origin or type_
+    return is_typeddict(cls) or (
+        isinstance(cls, type)
+        and (
+            dataclasses.is_dataclass(cls)
+            or (
+                issubclass(cls, pydantic.BaseModel)
+                and not issubclass(cls, openai.BaseModel)
+            )
+        )
+    )
+
+
+def _may_hold(type_: typing.Any, value: typing.Any) -> bool:
+    """Whether a union variant could hold ``value``, judged by its container type.
+
+    A variant behind a validator that can change the value always may: its validation decides
+    after the validator runs.
+    """
+    if _changes_input(type_):
+        return True
+    origin = typing.get_origin(type_) or type_
+    if origin is typing.Annotated:
+        return _may_hold(typing.get_args(type_)[0], value)
+    if origin in (typing.Union, types.UnionType):  # pyright: ignore[reportDeprecated]
+        return any(_may_hold(arg, value) for arg in typing.get_args(type_))
+    if isinstance(origin, type) and issubclass(origin, pydantic.RootModel):
+        return _may_hold(_field_type(origin.model_fields["root"]), value)
+    if isinstance(value, list):
+        return origin is list
+    if isinstance(value, dict):
+        return (
+            origin is dict
+            or is_typeddict(origin)
+            or (
+                isinstance(origin, type)
+                and (
+                    dataclasses.is_dataclass(origin)
+                    or issubclass(origin, pydantic.BaseModel)
+                )
+            )
+        )
+    if isinstance(value, str):
+        return origin is str or isinstance(origin, type) and issubclass(origin, str)
+    return True
+
+
+def _changes_input(type_: typing.Any) -> bool:
+    """Whether ``type_`` has a validator that can change its value first.
+
+    Only types the plugin builds or validates are judged: its own and any ``Annotated`` type,
+    such as an OpenAI model behind a caller's validator. Lists, dicts and unions judge their
+    items' and variants' kinds themselves.
+    """
+    origin = typing.get_origin(type_)
+    if origin in (
+        list,
+        dict,
+        typing.Union,  # pyright: ignore[reportDeprecated]
+        types.UnionType,
+    ) or not (origin is typing.Annotated or _plugin_builds(type_)):
+        return False
+    try:
+        schema = pydantic.TypeAdapter(type_).core_schema
+    except (pydantic.PydanticUserError, pydantic.PydanticUndefinedAnnotation):
+        return False
+    transformed, _ = _variant_target(schema, _schema_refs(schema, {}))
+    return transformed
 
 
 class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):

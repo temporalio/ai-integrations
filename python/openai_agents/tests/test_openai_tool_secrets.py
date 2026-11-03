@@ -1,11 +1,17 @@
 """Tests for worker environment references in hosted tool secrets."""
 
+import dataclasses
+import gc
 import json
 import time
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Collection
-from typing import Any, cast
+from datetime import datetime, timezone
+from typing import Annotated, Any, Callable, Generic, Literal, TypeVar, cast
 
+import pydantic
+import pydantic.dataclasses
 import pytest
 from agents import (
     Agent,
@@ -25,6 +31,12 @@ from agents import (
 )
 from agents.items import TResponseStreamEvent
 from agents.tool import ApplyPatchTool, ShellTool, ShellToolEnvironment
+from openai.types.responses import (
+    ResponseFunctionToolCall,
+    ResponseOutputItem,
+    ResponseOutputMessage,
+    ResponseOutputText,
+)
 
 from temporalio import workflow
 from temporalio.client import Client
@@ -109,6 +121,864 @@ def test_lenient_activity_input_reconstructs_tools_and_handoffs():
     assert isinstance(tools[1], ApplyPatchTool)
     assert isinstance(tools[2], ShellTool)
     assert handoffs[0].agent_name == "helper"
+
+
+def test_lenient_activity_input_with_unvalidated_input_item():
+    # A function call item with an explicit None the next model input does not allow, as
+    # some model implementations write it. The tools must still decode as dataclasses.
+    activity_input: ActivityModelInput = {
+        "model_name": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{}",
+            }
+        ],
+        "model_settings": ModelSettings(),
+        "tools": [
+            FunctionToolInput(
+                name="get_weather",
+                description="Get the weather",
+                params_json_schema={"type": "object"},
+            )
+        ],
+        "tracing": ModelTracingInput.DISABLED,
+    }
+    converter = OpenAIPayloadConverter()
+    payload = converter.to_payload(activity_input)
+    raw = json.loads(payload.data)
+    raw["input"][0]["namespace"] = None
+    payload.data = json.dumps(raw).encode()
+
+    received = converter.from_payload(payload, ActivityModelInput)
+
+    assert isinstance(received["input"], list)
+    first_item: Any = received["input"][0]
+    assert first_item["namespace"] is None
+    received_tools = received.get("tools")
+    assert received_tools and isinstance(received_tools[0], FunctionToolInput)
+
+
+class _CallerResult(pydantic.BaseModel):
+    message: ResponseOutputMessage
+    responses: list[ModelResponse]
+    note: str | None = None
+
+
+def test_lenient_caller_model_keeps_its_type():
+    # An output_text part without annotations fails strict validation, as a drifted
+    # live response does. A caller's model holding it must still decode as that model.
+    message = ResponseOutputMessage(
+        id="msg_1",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[ResponseOutputText(type="output_text", text="done", annotations=[])],
+    )
+    value = _CallerResult(
+        message=message,
+        responses=[ModelResponse(output=[message], usage=Usage(), response_id="r1")],
+        note="kept",
+    )
+    converter = OpenAIPayloadConverter()
+    payload = converter.to_payload(value)
+    raw = json.loads(payload.data)
+    del raw["message"]["content"][0]["annotations"]
+    del raw["responses"][0]["output"][0]["content"][0]["annotations"]
+    payload.data = json.dumps(raw).encode()
+
+    received = converter.from_payload(payload, _CallerResult)
+
+    assert isinstance(received, _CallerResult)
+    assert isinstance(received.message, ResponseOutputMessage)
+    assert isinstance(received.message.content[0], ResponseOutputText)
+    assert received.message.content[0].text == "done"
+    assert isinstance(received.responses[0], ModelResponse)
+    assert isinstance(received.responses[0].output[0], ResponseOutputMessage)
+    assert received.note == "kept"
+
+
+class _ExtraResult(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+    message: ResponseOutputMessage
+
+
+class _NamedResult(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(validate_by_alias=False, validate_by_name=True)
+    text: str = pydantic.Field(alias="original")
+    original: str
+    message: ResponseOutputMessage
+
+
+_T = TypeVar("_T")
+
+
+class _WrappedResult(pydantic.BaseModel, Generic[_T]):
+    item: _T
+
+
+class _DescribedResult(pydantic.BaseModel):
+    record: Annotated[ModelResponse, pydantic.Field(description="record")]
+
+
+class _MappedResult(pydantic.BaseModel):
+    records: dict[str, ModelResponse]
+
+
+_RootResult = pydantic.RootModel[dict[str, ResponseOutputMessage]]
+
+
+class _UnionResult(pydantic.BaseModel):
+    call: ResponseOutputItem
+
+
+class _TimedResult(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(
+        ser_json_temporal="milliseconds", val_temporal_unit="milliseconds"
+    )
+    at: datetime
+    record: ModelResponse
+
+
+class _NormalizedResult(pydantic.BaseModel):
+    record: ModelResponse
+
+    @pydantic.field_validator("record", mode="before")
+    @classmethod
+    def _lower_id(cls, value: Any) -> Any:
+        # Reads the response as the mapping it was sent as.
+        return {**value, "response_id": value["response_id"].lower()}
+
+
+class _StrictResult(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(
+        strict=True, ser_json_bytes="base64", val_json_bytes="base64"
+    )
+    id: uuid.UUID
+    blob: bytes
+    record: ModelResponse
+
+
+@dataclasses.dataclass
+class _Holder:
+    record: Annotated[ModelResponse | None, pydantic.Field(description="response")] = (
+        None
+    )
+
+
+class _HeldResult(pydantic.BaseModel):
+    holder: _Holder
+
+
+class _ListRoot(pydantic.RootModel[list[ModelResponse]]):
+    pass
+
+
+class _ListedResult(pydantic.BaseModel):
+    records: _ListRoot | None = None
+
+
+class _Initialized(pydantic.BaseModel):
+    count: int
+
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+
+
+class _InitializedPairResult(pydantic.BaseModel):
+    first: _Initialized
+    second: _Initialized
+    record: ModelResponse
+
+
+@pydantic.dataclasses.dataclass(config=pydantic.ConfigDict(extra="allow"))
+class _ExtraSide:
+    name: str
+
+    @pydantic.model_serializer(mode="wrap")
+    def _with_extra(self, handler: Any) -> Any:
+        # Sends the extra field it was validated with.
+        return {**handler(self), "sentinel": cast(Any, self).sentinel}
+
+
+class _ExtraSideResult(pydantic.BaseModel):
+    side: _ExtraSide
+    record: ModelResponse
+
+
+class _TaggedA(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(serialize_by_alias=True)
+    kind: Literal["a"] = pydantic.Field(alias="Kind")
+    record: ModelResponse
+
+
+class _TaggedB(pydantic.BaseModel):
+    kind: Literal["b"]
+    record: ModelResponse
+
+
+@pydantic.dataclasses.dataclass
+class _TaggedC:
+    kind: Literal["c"]
+    record: ModelResponse
+
+
+class _TaggedResult(pydantic.BaseModel):
+    item: _TaggedA | _TaggedB | _TaggedC
+
+
+@pydantic.dataclasses.dataclass(config=pydantic.ConfigDict(extra="allow"))
+class _Labelled:
+    note: str
+
+    @pydantic.computed_field  # type: ignore[prop-decorator]
+    @property
+    def label(self) -> str:
+        # Sent with the fields, and read back as an extra field of the same name.
+        return self.note.upper()
+
+
+class _LabelledResult(pydantic.BaseModel):
+    side: _Labelled
+    record: ModelResponse
+
+
+class _CheckedA(pydantic.BaseModel):
+    kind: Literal["a"]
+    record: ModelResponse
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _check(cls, value: Any) -> Any:
+        return value
+
+
+class _CheckedB(pydantic.BaseModel):
+    kind: Literal["b"]
+    record: ModelResponse
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _check(cls, value: Any) -> Any:
+        return value
+
+
+class _ChoicesA(pydantic.BaseModel):
+    kind: Literal["a"] = pydantic.Field(
+        validation_alias=pydantic.AliasChoices("kind", "Kind")
+    )
+    record: ModelResponse
+
+
+class _PathB(pydantic.BaseModel):
+    kind: Literal["b"] = pydantic.Field(validation_alias=pydantic.AliasPath("kind"))
+    record: ModelResponse
+
+
+class _CheckedResult(pydantic.BaseModel):
+    item: _CheckedA | _CheckedB
+
+
+class _AliasFormResult(pydantic.BaseModel):
+    item: _ChoicesA | _PathB
+
+
+class _UpperA(pydantic.BaseModel):
+    kind: Literal["a"]
+    record: ModelResponse
+
+    @pydantic.field_serializer("kind")
+    def _upper(self, kind: str) -> str:
+        return kind.upper()
+
+    @pydantic.model_validator(mode="wrap")
+    @classmethod
+    def _lower(cls, value: Any, handler: Any) -> Any:
+        # Reads the tag it sent in upper case.
+        if isinstance(value, dict):
+            value = {**value, "kind": value["kind"].lower()}
+        return handler(value)
+
+
+class _NormalizedTagResult(pydantic.BaseModel):
+    item: _UpperA | _TaggedB
+
+
+def _lower_type(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {**value, "type": value["type"].lower()}
+    return value
+
+
+def _passthrough(value: Any, handler: Any) -> Any:
+    return handler(value)
+
+
+class _LoweredMessageResult(pydantic.BaseModel):
+    item: (
+        Annotated[ResponseOutputMessage, pydantic.BeforeValidator(_lower_type)]
+        | _TaggedB
+    )
+
+    @pydantic.model_serializer(mode="wrap")
+    def _upper_type(self, handler: Any) -> Any:
+        # Sends the message's type in upper case.
+        data = handler(self)
+        return {**data, "item": {**data["item"], "type": "MESSAGE"}}
+
+
+class _WrappedMessageResult(pydantic.BaseModel):
+    item: (
+        Annotated[ResponseOutputMessage, pydantic.WrapValidator(_passthrough)]
+        | _TaggedB
+    )
+
+
+def _retry(value: Any, handler: Any) -> Any:
+    try:
+        return handler(value)
+    except pydantic.ValidationError:
+        # Calls its handler again, as a validator that normalizes on error does.
+        return handler(value)
+
+
+class _RetriedMessageResult(pydantic.BaseModel):
+    item: Annotated[ResponseOutputMessage, pydantic.WrapValidator(_retry)] | _TaggedB
+
+
+class _TextResult(pydantic.BaseModel):
+    text: str
+    record: ModelResponse
+
+
+def _upper_text(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {**value, "text": value["text"].upper()}
+    return value
+
+
+def _upper_result(result: _TextResult) -> _TextResult:
+    return result.model_copy(update={"text": result.text.upper()})
+
+
+_UpperedResult: Any = Annotated[_TextResult, pydantic.AfterValidator(_upper_result)]
+
+
+class _TextA(pydantic.BaseModel):
+    kind: Literal["a"]
+    text: str
+    record: ModelResponse
+
+
+class _TextB(pydantic.BaseModel):
+    kind: Literal["b"]
+    text: str
+    record: ModelResponse
+
+
+_UpperedA: Any = Annotated[_TextA, pydantic.BeforeValidator(_upper_text)]
+_UpperedB: Any = Annotated[_TextB, pydantic.BeforeValidator(_upper_text)]
+_UpperedUnion: Any = _UpperedA | _UpperedB
+
+
+@dataclasses.dataclass
+class _Box(Generic[_T]):
+    note: str
+    record: _T
+
+
+def _from_list(value: Any) -> Any:
+    return {"record": value[0]} if isinstance(value, list) else value
+
+
+class _Listed(pydantic.BaseModel):
+    record: ModelResponse
+
+    @pydantic.model_serializer
+    def _serialize(self) -> Any:
+        return [self.record]
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _restore(cls, value: Any) -> Any:
+        return _from_list(value)
+
+
+_ListedOrInts: Any = _Listed | list[int]
+
+
+class _ListedEnvelope(pydantic.BaseModel):
+    item: _Listed | list[int]
+
+
+@pydantic.dataclasses.dataclass
+class _ListedBox(Generic[_T]):
+    record: _T
+
+    @pydantic.model_serializer
+    def _serialize(self) -> Any:
+        return [self.record]
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _restore(cls, value: Any) -> Any:
+        return _from_list(value)
+
+
+class _Leaf(pydantic.BaseModel):
+    count: int
+
+
+class _ReturnedLeafResult(pydantic.BaseModel):
+    leaf: Annotated[_Leaf, pydantic.BeforeValidator(_Leaf.model_validate)]
+    record: ModelResponse
+
+
+@pydantic.dataclasses.dataclass(
+    config=pydantic.ConfigDict(revalidate_instances="always")
+)
+class _Revalidated:
+    tag: str
+
+    @pydantic.field_validator("tag")
+    @classmethod
+    def _mark(cls, value: str) -> str:
+        return value + "!"
+
+
+class _ReturnedDataclassResult(pydantic.BaseModel):
+    side: Annotated[
+        _Revalidated, pydantic.BeforeValidator(lambda value: _Revalidated(**value))
+    ]
+    record: ModelResponse
+
+
+def _first(value: Any) -> Any:
+    return value[0] if isinstance(value, list) and len(value) == 1 else value
+
+
+_UnwrappedMessageOrInts: Any = (
+    Annotated[ResponseOutputMessage, pydantic.BeforeValidator(_first)] | list[int]
+)
+
+
+def _extra_side() -> _ExtraSide:
+    side = _ExtraSide(name="n")
+    cast(Any, side).sentinel = "keep-me"
+    return side
+
+
+_AT = datetime(1970, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
+_ID = uuid.UUID("12345678-1234-5678-1234-567812345678")
+_BLOB = b"\x00\xffbytes"
+
+
+def _message() -> ResponseOutputMessage:
+    return ResponseOutputMessage(
+        id="msg_1",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[ResponseOutputText(type="output_text", text="done", annotations=[])],
+    )
+
+
+def _call() -> ResponseFunctionToolCall:
+    return ResponseFunctionToolCall(
+        type="function_call", call_id="c1", name="f", arguments="{}"
+    )
+
+
+def _response() -> ModelResponse:
+    return ModelResponse(output=[_message()], usage=Usage(), response_id="r1")
+
+
+def _is_message(value: Any) -> bool:
+    return isinstance(value, ResponseOutputMessage) and isinstance(
+        value.content[0], ResponseOutputText
+    )
+
+
+def _is_response(value: Any) -> bool:
+    return isinstance(value, ModelResponse) and _is_message(value.output[0])
+
+
+@pytest.mark.parametrize(
+    "value,type_,path,check",
+    [
+        (
+            _ExtraResult(message=_message(), sentinel="keep-me"),  # type: ignore[call-arg]
+            _ExtraResult,
+            ["message", "content", 0, "annotations"],
+            lambda got: (
+                _is_message(got.message)
+                and got.model_extra == {"sentinel": "keep-me"}
+                and json.loads(got.model_dump_json())["sentinel"] == "keep-me"
+            ),
+        ),
+        (
+            _NamedResult.model_validate(
+                {"text": "A", "original": "B", "message": _message()}
+            ),
+            _NamedResult,
+            ["message", "content", 0, "annotations"],
+            lambda got: (
+                got.text == "A" and got.original == "B" and _is_message(got.message)
+            ),
+        ),
+        (
+            _WrappedResult[ModelResponse](item=_response()),
+            _WrappedResult[ModelResponse],
+            ["item", "output", 0, "content", 0, "annotations"],
+            lambda got: _is_response(got.item),
+        ),
+        (
+            _DescribedResult(record=_response()),
+            _DescribedResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: _is_response(got.record),
+        ),
+        (
+            _MappedResult(records={"a": _response()}),
+            _MappedResult,
+            ["records", "a", "output", 0, "content", 0, "annotations"],
+            lambda got: _is_response(got.records["a"]),
+        ),
+        (
+            _RootResult({"a": _message()}),
+            _RootResult,
+            ["a", "content", 0, "annotations"],
+            lambda got: _is_message(got.root["a"]),
+        ),
+        (
+            _UnionResult(call=_call()),
+            _UnionResult,
+            ["call", "arguments"],
+            lambda got: isinstance(got.call, ResponseFunctionToolCall),
+        ),
+        (
+            _TimedResult(at=_AT, record=_response()),
+            _TimedResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                got.at == _AT
+                and _is_response(got.record)
+                and json.loads(got.model_dump_json())["at"] == 1000.0
+            ),
+        ),
+        (
+            _NormalizedResult.model_construct(
+                record=ModelResponse(
+                    output=[_message()], usage=Usage(), response_id="R1"
+                )
+            ),
+            _NormalizedResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: _is_response(got.record) and got.record.response_id == "r1",
+        ),
+        (
+            _StrictResult(id=_ID, blob=_BLOB, record=_response()),
+            _StrictResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                got.id == _ID and got.blob == _BLOB and _is_response(got.record)
+            ),
+        ),
+        (
+            _HeldResult(holder=_Holder(record=_response())),
+            _HeldResult,
+            ["holder", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: _is_response(got.holder.record),
+        ),
+        (
+            _Holder(record=_response()),
+            _Holder,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: _is_response(got.record),
+        ),
+        (
+            _ListedResult(records=_ListRoot([_response()])),
+            _ListedResult,
+            ["records", 0, "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.records, _ListRoot) and _is_response(got.records.root[0])
+            ),
+        ),
+        (
+            _ListRoot([_response()]),
+            _ListRoot | None,
+            [0, "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _ListRoot) and _is_response(got.root[0]),
+        ),
+        (
+            _InitializedPairResult(
+                first=_Initialized(count=1),
+                second=_Initialized(count=2),
+                record=_response(),
+            ),
+            _InitializedPairResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.first, _Initialized)
+                and (got.first.count, got.second.count) == (1, 2)
+                and _is_response(got.record)
+            ),
+        ),
+        (
+            _ExtraSideResult(side=_extra_side(), record=_response()),
+            _ExtraSideResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                cast(Any, got.side).sentinel == "keep-me"
+                and json.loads(got.model_dump_json())["side"]["sentinel"] == "keep-me"
+                and _is_response(got.record)
+            ),
+        ),
+        (
+            _TaggedResult(item=_TaggedA(Kind="a", record=_response())),
+            _TaggedResult,
+            ["item", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _TaggedA) and _is_response(got.item.record)
+            ),
+        ),
+        (
+            _TaggedResult(item=_TaggedC(kind="c", record=_response())),
+            _TaggedResult,
+            ["item", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _TaggedC) and _is_response(got.item.record)
+            ),
+        ),
+        (
+            _TaggedB(kind="b", record=_response()),
+            _TaggedA | _TaggedB,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _TaggedB) and _is_response(got.record),
+        ),
+        (
+            _LabelledResult(side=_Labelled(note="n"), record=_response()),
+            _LabelledResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.side, _Labelled)
+                and got.side.label == "N"
+                and json.loads(got.model_dump_json())["side"]
+                == {"note": "n", "label": "N"}
+                and _is_response(got.record)
+            ),
+        ),
+        (
+            _CheckedResult(item=_CheckedB(kind="b", record=_response())),
+            _CheckedResult,
+            ["item", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _CheckedB) and _is_response(got.item.record)
+            ),
+        ),
+        (
+            _AliasFormResult(item=_ChoicesA(kind="a", record=_response())),
+            _AliasFormResult,
+            ["item", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _ChoicesA) and _is_response(got.item.record)
+            ),
+        ),
+        (
+            _AliasFormResult(item=_PathB(kind="b", record=_response())),
+            _AliasFormResult,
+            ["item", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got.item, _PathB) and _is_response(got.item.record),
+        ),
+        (
+            _NormalizedTagResult(item=_UpperA(kind="a", record=_response())),
+            _NormalizedTagResult,
+            ["item", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got.item, _UpperA) and _is_response(got.item.record),
+        ),
+        (
+            _LoweredMessageResult(item=_message()),
+            _LoweredMessageResult,
+            ["item", "content", 0, "annotations"],
+            lambda got: _is_message(got.item),
+        ),
+        (
+            _WrappedMessageResult(item=_TaggedB(kind="b", record=_response())),
+            _WrappedMessageResult,
+            ["item", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _TaggedB) and _is_response(got.item.record)
+            ),
+        ),
+        (
+            _RetriedMessageResult(item=_TaggedB(kind="b", record=_response())),
+            _RetriedMessageResult,
+            ["item", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _TaggedB) and _is_response(got.item.record)
+            ),
+        ),
+        (
+            _TextResult(text="done", record=_response()),
+            Annotated[_TextResult, pydantic.BeforeValidator(_upper_text)],
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got, _TextResult)
+                and got.text == "DONE"
+                and _is_response(got.record)
+            ),
+        ),
+        (
+            _TextResult(text="done", record=_response()),
+            _UpperedResult | None,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got, _TextResult)
+                and got.text == "DONE"
+                and _is_response(got.record)
+            ),
+        ),
+        (
+            _TextB(kind="b", text="done", record=_response()),
+            _UpperedUnion,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got, _TextB)
+                and got.text == "DONE"
+                and _is_response(got.record)
+            ),
+        ),
+        (
+            _Box(note="n", record=_response()),
+            _Box[ModelResponse],
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got, _Box) and got.note == "n" and _is_response(got.record)
+            ),
+        ),
+        (
+            _Listed(record=_response()),
+            _ListedOrInts,
+            [0, "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _Listed) and _is_response(got.record),
+        ),
+        (
+            _ListedEnvelope(item=_Listed(record=_response())),
+            _ListedEnvelope,
+            ["item", 0, "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got.item, _Listed) and _is_response(got.item.record),
+        ),
+        (
+            _ListedBox(record=_response()),
+            _ListedBox[ModelResponse],
+            [0, "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _ListedBox) and _is_response(got.record),
+        ),
+        (
+            _ReturnedLeafResult(leaf=_Leaf(count=3), record=_response()),
+            _ReturnedLeafResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.leaf, _Leaf)
+                and got.leaf.count == 3
+                and _is_response(got.record)
+            ),
+        ),
+        (
+            {"side": {"tag": "x"}, "record": _response()},
+            _ReturnedDataclassResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.side, _Revalidated)
+                and got.side.tag == "x!!"
+                and _is_response(got.record)
+            ),
+        ),
+        (
+            [_message()],
+            _UnwrappedMessageOrInts,
+            [0, "content", 0, "annotations"],
+            _is_message,
+        ),
+    ],
+    ids=[
+        "extra",
+        "alias-is-a-field-name",
+        "generic",
+        "annotated",
+        "dict",
+        "root-model",
+        "discriminated-union",
+        "millisecond-datetime",
+        "before-validator",
+        "strict-json",
+        "annotated-optional-in-dataclass",
+        "dataclass-with-annotated-optional",
+        "optional-root-model-field",
+        "optional-root-model",
+        "custom-init-fields-beside-a-response",
+        "dataclass-extra-beside-a-response",
+        "literal-tagged-union",
+        "literal-tagged-dataclass-in-union",
+        "literal-tagged-declared-union",
+        "dataclass-computed-property-beside-a-response",
+        "literal-tagged-union-behind-model-validators",
+        "literal-tag-with-alias-choices",
+        "literal-tag-with-alias-path",
+        "literal-tag-normalized-by-wrap-validator",
+        "openai-variant-behind-a-normalizing-validator",
+        "openai-variant-behind-a-wrap-validator",
+        "openai-variant-behind-a-retrying-wrap-validator",
+        "declared-annotated-before-validator",
+        "declared-optional-annotated-after-validator",
+        "declared-union-of-annotated-variants",
+        "declared-generic-dataclass",
+        "declared-union-with-list-restoring-validator",
+        "union-with-list-restoring-validator-in-a-model",
+        "declared-generic-dataclass-with-list-restoring-validator",
+        "model-returned-by-a-validator-beside-a-response",
+        "revalidated-dataclass-returned-by-a-validator-beside-a-response",
+        "declared-openai-variant-unwrapping-a-list",
+    ],
+)
+def test_lenient_caller_model_shapes(
+    value: Any, type_: Any, path: list[Any], check: Callable[[Any], bool]
+):
+    converter = OpenAIPayloadConverter()
+    payload = converter.to_payload(value)
+    raw = json.loads(payload.data)
+    node = raw
+    for key in path[:-1]:
+        node = node[key]
+    del node[path[-1]]
+    payload.data = json.dumps(raw).encode()
+
+    received = converter.from_payload(payload, type_)
+
+    if isinstance(type_, type):
+        assert isinstance(received, type_)
+    assert check(received)
+
+
+def test_lenient_fallback_releases_retired_caller_types():
+    # A Workflow sandbox imports a new copy of a caller's class for each run.
+    payload = OpenAIPayloadConverter().to_payload(_DescribedResult(record=_response()))
+    raw = json.loads(payload.data)
+    del raw["record"]["output"][0]["content"][0]["annotations"]
+    payload.data = json.dumps(raw).encode()
+    retired = []
+    for _ in range(100):
+        type_ = pydantic.create_model("_Retired", record=(ModelResponse, ...))
+        received = OpenAIPayloadConverter().from_payload(payload, type_)
+        assert isinstance(received, type_)
+        assert _is_response(cast(Any, received).record)
+        retired.append(weakref.ref(type_))
+        del type_, received
+    gc.collect()
+
+    assert sum(ref() is not None for ref in retired) <= 32
 
 
 def test_build_tool_reports_unreconstructed_dict():
