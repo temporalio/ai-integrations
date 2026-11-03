@@ -271,6 +271,7 @@ class _ReplacedInput:
     session_task_queue: str | None = None
     wait_cancellation: bool = False
     abandon: bool = False
+    wait_for_session_end: bool = False
 
 
 @dataclass
@@ -317,6 +318,12 @@ class StatefulMcpWorkerReplacedWorkflow:
             except ActivityError:
                 self._listed = []
             await workflow.wait_condition(lambda: self._resume)
+            if input.wait_for_session_end:
+                # A failure in server history can precede workflow delivery.
+                # Wait until the workflow has observed the session ending.
+                session = toolset._connect_handle
+                assert session is not None
+                await workflow.wait_condition(session.done)
             try:
                 return [t.name for t in await toolset.get_tools()]
             except ApplicationError as err:
@@ -573,6 +580,7 @@ async def test_stateful_operations_fail_after_session_refused(
                     session_task_queue=host_task_queue,
                     wait_cancellation=case.endswith("wait_cancellation"),
                     abandon=case.endswith("abandon"),
+                    wait_for_session_end=case.startswith("operation_after_refusal"),
                 ),
                 id=f"stateful-mcp-refused-{uuid.uuid4()}",
                 task_queue=task_queue,
@@ -597,11 +605,6 @@ async def test_stateful_operations_fail_after_session_refused(
         # The retried session activity is refused on the next host.
         async with Worker(client, task_queue=host_task_queue):
             if case.startswith("operation_after_refusal"):
-                async with asyncio.timeout(30):
-                    while not await _has_event(
-                        handle, EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED
-                    ):
-                        await asyncio.sleep(0.2)
                 await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
             async with asyncio.timeout(30):
                 with pytest.raises(WorkflowFailureError) as err:
