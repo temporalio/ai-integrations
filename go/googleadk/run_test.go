@@ -147,8 +147,8 @@ func (i bearerInterceptor) Before(ctx context.Context, req *a2aclient.Request) (
 // TestRemoteSubAgentErrorNotRetried proves an A2A call the remote agent
 // refuses, or a client the card cannot make, fails without retries, and the
 // turn ends as it would without Temporal: ADK turns the error into an event.
-// ADK v2.7+ rejects malformed network cards in ResolveA2AAgentCard; older
-// releases leave them to fail in SendA2AMessage.
+// Malformed network cards fail in ResolveA2AAgentCard; client and remote-call
+// errors fail in SendA2AMessage.
 // The last case is the control for the HTTP 401 ones: the caller's
 // A2AClientFactory adds the right credentials and the remote agent answers.
 func TestRemoteSubAgentErrorNotRetried(t *testing.T) {

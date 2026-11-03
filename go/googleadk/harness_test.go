@@ -95,7 +95,7 @@ type a2aServer struct {
 	// AlsoRESTPath, when set, makes the card also name a REST interface at
 	// that path, after the first one.
 	AlsoRESTPath string
-	// CardFile returns a trusted local card file as the source. ADK v2.7+
+	// CardFile returns a trusted local card file as the source. ADK
 	// validates all interface URLs in network-fetched cards before client
 	// construction; a local card lets transport-fallback tests reach it.
 	CardFile bool

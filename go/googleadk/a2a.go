@@ -374,8 +374,8 @@ func appendA2APart(parts a2a.ContentParts, p *a2a.Part) a2a.ContentParts {
 //   - an A2A error the remote agent answers with is not: sending again would
 //     start another task, and ADK turns the failed call into an error event,
 //     as without Temporal;
-//   - a card source ADK cannot read, an interface URL that does not parse, or
-//     a reply that is not valid JSON, is not;
+//   - a card source ADK cannot read, an interface URL that does not parse or
+//     is untrusted, or a reply that is not valid JSON, is not;
 //   - anything else, such as a network error or a card file missing on this
 //     worker, is.
 func a2aError(op string, err error) error {
@@ -397,6 +397,7 @@ func a2aRetryable(err error) bool {
 	case errors.As(err, &cardStatus):
 		retryable = retryableHTTPStatus(cardStatus.StatusCode)
 	case errors.As(err, &remote), errors.Is(err, remoteagent.ErrUnsupportedCardSource),
+		errors.Is(err, remoteagent.ErrUntrustedCardInterface),
 		errors.As(err, &syntaxErr), errors.As(err, &typeErr),
 		errors.As(err, &urlErr) && urlErr.Op == "parse":
 		retryable = false
