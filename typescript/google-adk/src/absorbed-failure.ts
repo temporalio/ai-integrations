@@ -14,7 +14,9 @@
  * completing with unfinished handlers is a user error Temporal already warns about. A
  * cancellation a Signal handler absorbed is the exception: it surfaces in the main
  * function's frame too, so the main function's cleanup runs before the execution ends.
- * Only the execution's own cancellation is recorded at all (see {@link executionCancellation}).
+ * Whatever a Signal handler absorbed is dropped if it returns after the main function: the
+ * execution is already ending. Only the execution's own cancellation is recorded at all
+ * (see {@link executionCancellation}).
  *
  * The same interceptor also converts the errors ADK 2.0's workflow runtime *throws* —
  * a node past its `timeout`, an output that failed its schema, an approval ADK refused
@@ -28,13 +30,14 @@
 import type { AsyncLocalStorage as ALS } from 'node:async_hooks';
 
 import { BaseNode, FunctionTool, PluginManager } from '@google/adk';
-import { ApplicationFailure, TemporalFailure } from '@temporalio/common';
+import { ActivityFailure, ApplicationFailure, TemporalFailure } from '@temporalio/common';
 import {
   AsyncLocalStorage,
   CancellationScope,
   ContinueAsNew,
   inWorkflowContext,
   isCancellation,
+  type ActivityInput,
   type WorkflowInterceptorsFactory,
 } from '@temporalio/workflow';
 
@@ -102,19 +105,22 @@ interface AbsorbedFailures {
    */
   answered: WeakMap<AbortSignal, Map<string, number>>;
   /**
-   * The reason the root scope was cancelled with, once the execution's cancellation request
-   * cancelled it. The SDK hands a scope's reason on to the scopes it cancels as the same
-   * object, so an operation that this request cancelled sees exactly this reason.
+   * The root scope's watch: its reason is the one the execution's cancellation request
+   * cancelled the root scope with. The SDK hands a scope's reason on to the scopes it
+   * cancels as the same object, so an operation that this request cancelled sees exactly
+   * this reason.
    */
-  executionCancel?: unknown;
-  /** The failures of operations whose scope this request cancelled first (see {@link watchScope}). */
+  root?: ScopeWatch;
+  /** One watch per scope that operations started in (see {@link scopeWatch}). */
+  scopes: WeakMap<CancellationScope, ScopeWatch>;
+  /** The watch of the scope each Activity started in, by `activityId` (see {@link noteActivityScope}). */
+  activities: Map<string, ScopeWatch>;
+  /** The failures of other operations whose scope this request cancelled first (see {@link watchScope}). */
   cancelledByExecution: WeakSet<object>;
   /** The ADK node attempt the running code belongs to (see {@link watchNodeAttempts}). */
   attempts: ALS<NodeAttempt>;
   /** What a tool or a plugin hook threw, per the plain `Error` ADK threw in its place (see {@link keepWrapped}). */
   wrapped: WeakMap<object, unknown>;
-  /** Where the running tool call keeps what its `execute` throws (see {@link watchWrappedErrors}). */
-  toolCall: ALS<Thrown>;
 }
 
 function recorded(): AbsorbedFailures {
@@ -125,10 +131,11 @@ function recorded(): AbsorbedFailures {
       frames: new AsyncLocalStorage<Frame>(),
       calls: 0,
       answered: new WeakMap(),
+      scopes: new WeakMap(),
+      activities: new Map(),
       cancelledByExecution: new WeakSet(),
       attempts: new AsyncLocalStorage<NodeAttempt>(),
       wrapped: new WeakMap(),
-      toolCall: new AsyncLocalStorage<Thrown>(),
     };
     global[ABSORBED] = state;
   }
@@ -189,18 +196,46 @@ export function recordAbsorbedFailure(err: unknown, call: ModelCall): void {
   openFrame()?.pending.push({ ...call, error: err });
 }
 
+/** The first cancellation to reach one scope. */
+interface ScopeWatch {
+  /** The reason the scope was cancelled with, once it was. */
+  reason?: unknown;
+}
+
 /**
- * Watches the root scope for the execution's cancellation request and keeps the reason it
- * cancels the root scope with. Run once per execution, before Workflow code starts, so this
- * reaction runs before any scope the request cancels in turn can react.
+ * The one watch of `scope`, created with the scope's only listener here the first time an
+ * operation starts in it, so a long-lived scope keeps one listener however many operations
+ * it runs.
+ */
+function scopeWatch(scope: CancellationScope): ScopeWatch {
+  const { scopes } = recorded();
+  let watch = scopes.get(scope);
+  if (watch === undefined) {
+    const created: ScopeWatch = {};
+    scope.cancelRequested.catch((reason: unknown) => {
+      created.reason = reason;
+    });
+    scopes.set(scope, created);
+    watch = created;
+  }
+  return watch;
+}
+
+/**
+ * Watches the root scope for the execution's cancellation request. Run once per execution,
+ * before Workflow code starts, so this reaction runs before any scope the request cancels
+ * in turn can react.
  */
 function watchExecutionCancel(): void {
-  const state = recorded();
   let root = CancellationScope.current();
   while (root.parent !== undefined) root = root.parent;
-  root.cancelRequested.catch((reason: unknown) => {
-    state.executionCancel = reason;
-  });
+  recorded().root = scopeWatch(root);
+}
+
+/** Whether the first cancellation to reach the watched scope was the execution's request. */
+function cancelledFirstByExecution(watch: ScopeWatch | undefined): boolean {
+  const reason = watch?.reason;
+  return reason !== undefined && reason === recorded().root?.reason;
 }
 
 /**
@@ -216,17 +251,26 @@ function watchExecutionCancel(): void {
 function watchScope(): (operation: Promise<unknown>) => void {
   const scope = CancellationScope.current();
   if (!scope.cancellable) return () => undefined;
-  let reason: unknown;
-  scope.cancelRequested.catch((cancelled: unknown) => {
-    reason = cancelled;
-  });
+  const watch = scopeWatch(scope);
   return (operation) => {
     operation.then(undefined, (err: unknown) => {
-      const state = recorded();
-      if (reason === undefined || reason !== state.executionCancel || !isCancellation(err)) return;
-      if (typeof err === 'object' && err !== null) state.cancelledByExecution.add(err);
+      if (!isCancellation(err) || !cancelledFirstByExecution(watch)) return;
+      if (typeof err === 'object' && err !== null) recorded().cancelledByExecution.add(err);
     });
   };
+}
+
+/**
+ * Notes the scope an Activity starts in, under the `activityId` its failure will carry, so
+ * {@link executionCancellation} can tell whether the execution's cancellation request
+ * cancelled it first, as {@link watchScope} does for other operations. Nothing is attached
+ * to the Activity's promise: Workflow code gets that promise as it is, and a handler on it
+ * would hide from the SDK an Activity failure that code never handles.
+ */
+function noteActivityScope(input: ActivityInput): void {
+  const scope = CancellationScope.current();
+  if (!scope.cancellable) return;
+  recorded().activities.set(input.options.activityId ?? `${input.seq}`, scopeWatch(scope));
 }
 
 /** Returns `operation`, watched as {@link watchScope} describes. */
@@ -260,7 +304,15 @@ function watchedEach<T>(started: Promise<T>, operations: (result: T) => Promise<
 function executionCancellation(err: unknown): unknown {
   const state = recorded();
   for (const current of causes(err)) {
-    if (current === state.executionCancel || state.cancelledByExecution.has(current)) return current;
+    if (current === state.root?.reason || state.cancelledByExecution.has(current)) return current;
+    if (
+      current instanceof ActivityFailure &&
+      current.activityId !== undefined &&
+      isCancellation(current) &&
+      cancelledFirstByExecution(state.activities.get(current.activityId))
+    ) {
+      return current;
+    }
   }
   return undefined;
 }
@@ -398,24 +450,24 @@ function telling<F extends (...args: never[]) => unknown>(fn: F, tell: () => Thr
 
 type Execute = (...args: never[]) => unknown;
 
-/** The `execute` functions {@link watchWrappedErrors} put in place of a tool's own. */
-const TELLING_EXECUTES = new WeakSet<Execute>();
-
 /**
  * Keeps the errors that a tool's `execute` and a plugin hook throw for the plain `Error`s
- * ADK throws in their place (see {@link keepWrapped}). A tool's `execute` is replaced, the
- * first time ADK runs the tool, by one that tells the call it runs in what it threw. What
- * ADK does is unchanged.
+ * ADK throws in their place (see {@link keepWrapped}). ADK's `FunctionTool.runAsync` calls
+ * `this.execute`, so each run gets an object that inherits everything from the tool but an
+ * `execute` that calls the tool's own and tells this run what it threw. The tool itself is
+ * left as it is, and what ADK does is unchanged.
  */
 function watchWrappedErrors(): void {
   const tool = FunctionTool.prototype as unknown as Record<PropertyKey, unknown>;
   const runAsync = tool.runAsync as (this: { execute: Execute }, request: unknown) => Promise<unknown>;
   tool.runAsync = function (this: { execute: Execute }, request: unknown): Promise<unknown> {
-    if (!TELLING_EXECUTES.has(this.execute)) {
-      this.execute = telling(this.execute, () => recorded().toolCall.getStore());
-      TELLING_EXECUTES.add(this.execute);
-    }
-    return keepWrapped((thrown) => recorded().toolCall.run(thrown, () => runAsync.call(this, request)));
+    const execute = this.execute;
+    return keepWrapped((thrown) => {
+      const run: unknown = Object.create(this, {
+        execute: { value: telling((...args: never[]) => execute.apply(this, args), () => thrown) },
+      });
+      return runAsync.call(run as { execute: Execute }, request);
+    });
   };
   const manager = PluginManager.prototype as unknown as Record<PropertyKey, unknown>;
   const runCallbacks = manager.runCallbacks as (
@@ -610,11 +662,19 @@ function toWorkflowFailure(err: unknown, frame: Frame): unknown {
  * before the execution ends CANCELLED. A Signal handler that raised it would end the
  * execution at once. The cancellation outranks the failures the handler also absorbed, so
  * it moves as the handler's whole outcome: none of them is left to raise in its place.
- * Kept by the handler's frame once the main function has returned.
+ * Once the main function has returned, the execution is ending, and whatever the handler
+ * absorbed is dropped: raising it would add a second terminal command to the one the main
+ * function already produced, which the server rejects on every Workflow Task.
  */
 function deferToMain(frame: Frame): void {
   const { main } = recorded();
-  if (frame.cancellation === undefined || main === undefined || main === frame || main.surfaced) return;
+  if (main === undefined || main === frame) return;
+  if (main.surfaced) {
+    frame.cancellation = undefined;
+    frame.pending = [];
+    return;
+  }
+  if (frame.cancellation === undefined) return;
   main.cancellation ??= frame.cancellation;
   frame.cancellation = undefined;
   frame.pending = [];
@@ -637,7 +697,14 @@ async function surfaceAbsorbedFailure<T>(
       const { main } = recorded();
       if (main !== undefined && main !== frame) raiseAbsorbed(main);
     }
-    throw toWorkflowFailure(err, frame);
+    const failure = toWorkflowFailure(err, frame);
+    // A Signal handler whose ADK graph run reported the absorbed cancellation (a node's
+    // `NodeReportedError`) hands it on like a handler that returned.
+    if (onReturn !== undefined && frame.cancellation !== undefined && failure === frame.cancellation) {
+      onReturn(frame);
+      if (frame.cancellation === undefined) return undefined as T;
+    }
+    throw failure;
   } finally {
     frame.surfaced = true;
   }
@@ -664,7 +731,10 @@ export const interceptors: WorkflowInterceptorsFactory = () => {
     ],
     outbound: [
       {
-        scheduleActivity: (input, next) => watched(next(input)),
+        scheduleActivity: (input, next) => {
+          noteActivityScope(input);
+          return next(input);
+        },
         scheduleLocalActivity: (input, next) => watched(next(input)),
         startChildWorkflowExecution: (input, next) => watchedEach(next(input), (promises) => promises),
         startNexusOperation: (input, next) => watchedEach(next(input), ({ result }) => [result]),

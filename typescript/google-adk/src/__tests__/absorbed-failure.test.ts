@@ -24,7 +24,7 @@ import {
   waitForScheduledActivities,
   withWorker,
 } from './helpers';
-import { cancellableActivity, echoId } from './test-activities';
+import { cancellableActivity, echoId, failingActivity } from './test-activities';
 import {
   adkAwaitSignal,
   adkChatUpdate,
@@ -47,6 +47,7 @@ import {
   agentRunnerRecoversFromModelError,
   agentRunnerRecoversOnlyTheSecondFailure,
   agentRunnerShieldedWaitThenCaughtCancel,
+  agentRunnerSignalTurnAfterMainEnds,
   agentRunnerSignalTurnThenCleanup,
   agentRunnerThrowingSummary,
   agentRunnerTimedOutTurnThenCaughtCancel,
@@ -54,6 +55,7 @@ import {
   agentRunnerUnawaitedSignalTurn,
   agentRunnerUpdateDriven,
   caughtModelCallError,
+  unhandledActivityFailure,
 } from './workflows';
 
 const getEnv = setupTestEnv(test);
@@ -167,13 +169,19 @@ test.serial('cancellingARunnerWhoseCallbackRecoversStillEndsCancelled', async (t
   });
 });
 
-/** Resolves once the Workflow's `stage` memo is `stage` (a Query would slow the Workflow). */
+/**
+ * Resolves once the Workflow's `stage` memo is `stage` (a Query would slow the Workflow), and
+ * throws as soon as the run has closed without reaching it.
+ */
 async function waitForStage(
-  handle: { describe(): Promise<{ memo?: Record<string, unknown> }> },
+  handle: { describe(): Promise<{ memo?: Record<string, unknown>; status: { name: string } }> },
   stage: string
 ): Promise<void> {
   const deadline = Date.now() + 10_000;
-  while ((await handle.describe()).memo?.stage !== stage) {
+  for (;;) {
+    const { memo, status } = await handle.describe();
+    if (memo?.stage === stage) return;
+    if (status.name !== 'RUNNING') throw new Error(`run ended ${status.name} before stage ${stage}`);
     if (Date.now() > deadline) throw new Error(`timed out waiting for stage ${stage}`);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
@@ -197,44 +205,57 @@ test.serial('cancellingAToolOrModelCallbackWaitEndsCancelled', async (t) => {
   // the turn on the error's function response. It turns a callback's cancelled Activity
   // into an error event, a plugin's first wrapped in a plain `Error`, that ends the turn.
   // The same waits on a Nexus operation that never starts fail with the operation's start,
-  // not its result.
+  // not its result. A tool or callback that rewraps its wait's error keeps it as `cause`.
   const endpoint = uid('adk-unpolled-endpoint');
   const nexusEndpoint = await env.createNexusEndpoint(endpoint, uid('adk-unpolled'));
   t.teardown(() => env.deleteNexusEndpoint(nexusEndpoint));
-  for (const nexus of [false, true]) {
-    for (const kind of ['tool', 'agent', 'plugin'] as const) {
-      const label = nexus ? `${kind} nexus` : kind;
-      const taskQueue = uid(`adk-${kind}-wait-cancel`);
-      const workflowId = uid(`wf-${kind}-wait-cancel`);
-      await withWorker(env, { taskQueue, plugins: [adkPlugin()], activities: { cancellableActivity } }, async () => {
-        const handle = await env.client.workflow.start(agentRunnerBlockedTurn, {
-          taskQueue,
-          workflowId,
-          args: nexus ? [kind, endpoint] : [kind],
-        });
-        await waitForStage(handle, 'blocked');
-        if (nexus) await waitForScheduledNexusOperation(handle);
-        else if (kind !== 'tool') await waitForScheduledActivities(env, workflowId, 'cancellableActivity');
-        await handle.cancel();
-        await t.throwsAsync(handle.result());
-        t.is((await handle.describe()).status.name, 'CANCELLED', label);
+  const kinds = ['tool', 'agent', 'plugin'] as const;
+  const cases = [
+    ...kinds.map((kind) => ({ kind, wait: 'plain' as const, nexus: false })),
+    ...kinds.map((kind) => ({ kind, wait: 'rewrapped' as const, nexus: false })),
+    ...kinds.map((kind) => ({ kind, wait: 'plain' as const, nexus: true })),
+  ];
+  for (const { kind, wait, nexus } of cases) {
+    const label = `${kind} ${wait}${nexus ? ' nexus' : ''}`;
+    const taskQueue = uid(`adk-${kind}-wait-cancel`);
+    const workflowId = uid(`wf-${kind}-wait-cancel`);
+    await withWorker(env, { taskQueue, plugins: [adkPlugin()], activities: { cancellableActivity } }, async () => {
+      const handle = await env.client.workflow.start(agentRunnerBlockedTurn, {
+        taskQueue,
+        workflowId,
+        args: nexus ? [kind, wait, endpoint] : [kind, wait],
       });
-    }
+      await waitForStage(handle, 'blocked');
+      if (nexus) await waitForScheduledNexusOperation(handle);
+      else if (kind !== 'tool') await waitForScheduledActivities(env, workflowId, 'cancellableActivity');
+      await handle.cancel();
+      await t.throwsAsync(handle.result(), undefined, label);
+      t.is((await handle.describe()).status.name, 'CANCELLED', label);
+    });
   }
 });
 
 test.serial('cancellingASignalDrivenTurnLetsTheMainFunctionCleanUpFirst', async (t) => {
   const env = getEnv();
   // With `failFirst`, the handler absorbed a model failure before the cancel; the cancel
-  // still outranks it and must not leave it behind to end the execution FAILED.
-  for (const failFirst of [false, true]) {
+  // still outranks it and must not leave it behind to end the execution FAILED. In a graph,
+  // ADK reports the agent node failed and the handler throws; the cancel waits all the same.
+  const cases = [
+    { failFirst: false, kind: 'tool' as const, graph: false },
+    { failFirst: true, kind: 'tool' as const, graph: false },
+    { failFirst: false, kind: 'agent' as const, graph: true },
+    { failFirst: false, kind: 'model' as const, graph: true },
+  ];
+  for (const { failFirst, kind, graph } of cases) {
+    const label = `failFirst=${failFirst} ${kind}${graph ? ' graph' : ''}`;
     const taskQueue = uid('adk-signal-turn-cleanup');
     const workflowId = uid('wf-signal-turn-cleanup');
-    await withWorker(env, { taskQueue, plugins: [adkPlugin()], activities: { echoId } }, async () => {
+    const activities = { echoId, cancellableActivity };
+    await withWorker(env, { taskQueue, plugins: [adkPlugin()], activities }, async () => {
       const handle = await env.client.workflow.start(agentRunnerSignalTurnThenCleanup, {
         taskQueue,
         workflowId,
-        args: [failFirst],
+        args: [failFirst, kind, graph],
       });
       await handle.signal(adkStartSignal);
       await waitForStage(handle, 'blocked');
@@ -242,14 +263,77 @@ test.serial('cancellingASignalDrivenTurnLetsTheMainFunctionCleanUpFirst', async 
       // The Signal handler's absorbed cancel waits for the main function, which is still
       // cleaning up between its two Activities.
       await waitForStage(handle, 'held');
-      t.is((await handle.describe()).status.name, 'RUNNING', `failFirst=${failFirst}`);
+      t.is((await handle.describe()).status.name, 'RUNNING', label);
       await handle.signal(adkDoneSignal);
-      await t.throwsAsync(handle.result());
-      t.is((await handle.describe()).status.name, 'CANCELLED', `failFirst=${failFirst}`);
+      await t.throwsAsync(handle.result(), undefined, label);
+      t.is((await handle.describe()).status.name, 'CANCELLED', label);
       const { events } = await handle.fetchHistory();
-      t.is(countScheduledActivities(events ?? [], 'echoId'), 2, `failFirst=${failFirst}`);
+      t.is(countScheduledActivities(events ?? [], 'echoId'), 2, label);
     });
   }
+});
+
+test.serial('cancellingASignalDrivenTurnAfterTheMainFunctionEndedClosesTheRun', async (t) => {
+  const env = getEnv();
+  // The main function ends first, by letting the cancellation through or by catching it and
+  // returning; the handler's callback Activity is cancelled in a later activation of the same
+  // task, and what the handler then absorbs must not add a second terminal command.
+  for (const kind of ['agent', 'plugin'] as const) {
+    for (const onCancel of ['raise', 'return'] as const) {
+      const label = `${kind} ${onCancel}`;
+      const taskQueue = uid('adk-signal-turn-after-main');
+      const workflowId = uid('wf-signal-turn-after-main');
+      await withWorker(env, { taskQueue, plugins: [adkPlugin()], activities: { cancellableActivity } }, async () => {
+        const handle = await env.client.workflow.start(agentRunnerSignalTurnAfterMainEnds, {
+          taskQueue,
+          workflowId,
+          args: [kind, onCancel],
+        });
+        await handle.signal(adkStartSignal);
+        await waitForStage(handle, 'blocked');
+        await waitForScheduledActivities(env, workflowId, 'cancellableActivity');
+        await handle.cancel();
+        const deadline = Date.now() + 10_000;
+        while ((await handle.describe()).status.name === 'RUNNING') {
+          if (Date.now() > deadline) throw new Error(`${label}: still RUNNING`);
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        t.is((await handle.describe()).status.name, onCancel === 'raise' ? 'CANCELLED' : 'COMPLETED', label);
+        const events = (await handle.fetchHistory()).events ?? [];
+        t.false(
+          events.some((e) => e.workflowTaskFailedEventAttributes || e.workflowTaskTimedOutEventAttributes),
+          `${label}: no Workflow Task failure or timeout`
+        );
+        t.true(
+          events.some((e) => e.activityTaskCancelRequestedEventAttributes),
+          `${label}: the callback's Activity is cancelled`
+        );
+      });
+    }
+  }
+});
+
+test.serial('anUnhandledActivityFailureStillFailsTheWorkflowTask', async (t) => {
+  const env = getEnv();
+  const taskQueue = uid('adk-unhandled-activity');
+  const workflowId = uid('wf-unhandled-activity');
+  await withWorker(env, { taskQueue, plugins: [adkPlugin()], activities: { failingActivity } }, async () => {
+    const handle = await env.client.workflow.start(unhandledActivityFailure, { taskQueue, workflowId });
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const { events } = await handle.fetchHistory();
+      const failed = (events ?? []).find((e) => e.workflowTaskFailedEventAttributes);
+      if (failed) {
+        t.regex(failed.workflowTaskFailedEventAttributes?.failure?.message ?? '', /Unhandled Promise rejection/);
+        break;
+      }
+      const { status } = await handle.describe();
+      if (status.name !== 'RUNNING') throw new Error(`run ended ${status.name} without a Workflow Task failure`);
+      if (Date.now() > deadline) throw new Error('no Workflow Task failure');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    await handle.terminate();
+  });
 });
 
 test.serial('aTimedOutTurnLeavesALaterCaughtCancelCompleted', async (t) => {
@@ -292,7 +376,7 @@ test.serial('aTimedOutTurnLeavesALaterCaughtCancelCompleted', async (t) => {
       await handle.cancel();
       // A cleanup that holds the timeout's error lets it reach ADK only after the cancel.
       if (cancelAt === 'cleanup') await handle.signal(adkDoneSignal);
-      t.is(await handle.result(), 'caught', label);
+      t.is(await handle.result().catch((err: unknown) => err), 'caught', label);
       t.is((await handle.describe()).status.name, 'COMPLETED', label);
     });
   }

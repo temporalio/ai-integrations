@@ -586,8 +586,9 @@ test.serial(
       await handle.cancel();
       // The execution's cancellation cancels the first attempt's call, which ADK hands to its
       // plugin manager, but ADK had moved past that call and the Workflow caught the cancel.
-      t.is((await handle.result()).text, 'answered-on-call-2');
-      t.is((await handle.describe()).status.name, 'COMPLETED');
+      const result = await handle.result().catch((err: unknown) => err);
+      t.is((result as { text?: unknown }).text, 'answered-on-call-2', 'model abandoned');
+      t.is((await handle.describe()).status.name, 'COMPLETED', 'model abandoned');
     });
     const events = await history(workflowId);
     const answered = indexOf(events, (e) => e.activityTaskCompletedEventAttributes != null);
@@ -640,7 +641,8 @@ test.serial(
             t.is((await handle.describe()).status.name, 'CANCELLED', label);
             return;
           }
-          outputs[mode] = (await handle.result()).output;
+          const result = await handle.result().catch((err: unknown) => err);
+          outputs[mode] = (result as { output?: unknown }).output;
           t.is((await handle.describe()).status.name, 'COMPLETED', label);
         });
         if (live) continue;
