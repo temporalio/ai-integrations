@@ -1,4 +1,4 @@
-import type { MCPToolFilterCallable, MCPToolFilterStatic } from '@openai/agents-core';
+import type { MCPToolFilterCallable, MCPToolFilterStatic, MCPToolMetaResolver } from '@openai/agents-core';
 import {
   ActivityFailure,
   ApplicationFailure,
@@ -122,6 +122,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
   private _connected = false;
   private _cachedTools: any[] | undefined;
   toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
+  toolMetaResolver?: MCPToolMetaResolver;
 
   constructor(name: string, options?: StatefulMcpServerOptions) {
     this._name = `${name}${MCP_STATEFUL_SUFFIX}`;
@@ -144,6 +145,9 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
       typeof toolFilter === 'function'
         ? (context, tool) => toolFilter({ ...context, serverName: name }, tool)
         : toolFilter;
+    // Give the resolver the name the caller passed, as statelessMcpServer() does, not the suffixed one.
+    const toolMetaResolver = options?.toolMetaResolver;
+    this.toolMetaResolver = toolMetaResolver && ((context) => toolMetaResolver({ ...context, serverName: name }));
   }
 
   get name(): string {
@@ -313,9 +317,15 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     return tools;
   }
 
-  async callTool(toolName: string, args: Record<string, unknown> | null): Promise<any> {
+  async callTool(
+    toolName: string,
+    args: Record<string, unknown> | null,
+    meta?: Record<string, unknown> | null
+  ): Promise<any> {
     this.assertConnected();
-    return this.executeOperation(this._name + MCP_CALL_TOOL_SUFFIX, [{ toolName, args }]);
+    return this.executeOperation(this._name + MCP_CALL_TOOL_SUFFIX, [
+      { toolName, args, ...(meta != null ? { meta } : {}) },
+    ]);
   }
 
   async invalidateToolsCache(): Promise<void> {
