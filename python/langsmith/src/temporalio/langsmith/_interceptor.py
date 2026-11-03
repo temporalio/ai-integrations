@@ -1046,14 +1046,22 @@ class _ReplaySafeRunTree(RunTree):
         Pre-computes ``end_time`` via ``workflow.now()`` in workflow context
         so ``RunTree.end()`` doesn't call ``datetime.now()`` (non-deterministic
         and sandbox-restricted), and no earlier than the start times
-        ``_LangChainRuns`` gave out.
+        ``_LangChainRuns`` gave out or the run's own start.
         """
         if _is_replaying():
             return
         if temporalio.workflow.in_workflow() and kwargs.get("end_time") is None:
             end = temporalio.workflow.now()
             runs = _get_langchain_runs()
-            kwargs["end_time"] = end if runs is None else runs.end_time(end)
+            if runs is not None:
+                end = runs.end_time(end)
+            # A run under a parent from headers starts no earlier than the
+            # header's time, which is after workflow.now() when the sender's
+            # clock is ahead.
+            start = getattr(self._run, "start_time", None)
+            if isinstance(start, datetime) and start.tzinfo is not None:
+                end = max(end, start)
+            kwargs["end_time"] = end
         self._run.end(**kwargs)
 
     def patch(self, *, exclude_inputs: bool | None = None) -> None:

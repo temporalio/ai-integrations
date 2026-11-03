@@ -364,15 +364,20 @@ class TestReplaySafety:
             kwargs = {"run_id": parent, "end_time": later}
             runs.remap(kwargs, "run_id")
             assert kwargs["end_time"] == later
-            # So does a plugin run ended at workflow.now().
+            # So does a plugin run ended at workflow.now(), and no earlier than
+            # its own start, which a parent from headers puts after
+            # workflow.now() when the sender's clock is ahead.
             run = MagicMock()
+            ahead = MagicMock(start_time=now + timedelta(seconds=30))
             with (
                 patch(_PATCH_IN_WORKFLOW, return_value=True),
                 patch(_PATCH_IS_REPLAYING, return_value=False),
                 patch(f"{_MOD}._get_langchain_runs", return_value=runs),
             ):
                 _ReplaySafeRunTree(run, executor=_make_executor()).end()
+                _ReplaySafeRunTree(ahead, executor=_make_executor()).end()
             run.end.assert_called_once_with(end_time=now + timedelta(microseconds=1))
+            ahead.end.assert_called_once_with(end_time=now + timedelta(seconds=30))
 
 
 # ===================================================================
