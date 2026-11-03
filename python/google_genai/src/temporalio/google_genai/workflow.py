@@ -9,16 +9,10 @@ workflows.  The key entry points are:
 
 from __future__ import annotations
 
-import collections
-import datetime
-import enum
 import functools
 import inspect
-import operator
 import sys
-import types
 import typing
-import uuid
 from collections.abc import Callable
 from dataclasses import is_dataclass
 from typing import Any
@@ -98,60 +92,6 @@ def _class_doc(cls: type) -> str | None:
     return None if doc == generated else doc
 
 
-def _runtime_annotation(annotation: Any, in_union: bool = False) -> Any:
-    """Replaces the types that Gemini can't check the model's JSON values against."""
-    # Gemini converts the model's arguments by walking into list items and dict
-    # values, and checking everything else, including each member of a union,
-    # with isinstance. That raises for Any, Annotated, Literal and
-    # parameterized generics, and fails for the JSON value of an enum, tuple,
-    # set, UUID or datetime. So give it the class of the value the model sends:
-    # the activity's payload converter decodes it into __call__'s type on the
-    # worker. The declaration loses their metadata, allowed values, formats
-    # and item types.
-    origin = typing.get_origin(annotation)
-    args = typing.get_args(annotation)
-    if origin is typing.Annotated:
-        return _runtime_annotation(args[0], in_union)
-    if origin is typing.Literal:
-        return functools.reduce(
-            operator.or_, dict.fromkeys(_runtime_annotation(type(a)) for a in args)
-        )
-    if annotation is Any:
-        return object
-    if origin in (typing.Union, types.UnionType):  # type: ignore[reportDeprecated]
-        runtime = tuple(_runtime_annotation(a, in_union=True) for a in args)
-        return (
-            functools.reduce(operator.or_, runtime) if runtime != args else annotation
-        )
-    if inspect.isclass(annotation) and issubclass(annotation, enum.Enum):
-        values = dict.fromkeys(type(m.value) for m in annotation)
-        return functools.reduce(operator.or_, values) if values else annotation
-    if annotation is datetime.datetime or (
-        inspect.isclass(annotation) and issubclass(annotation, uuid.UUID)
-    ):
-        return str
-    if (origin or annotation) in (tuple, set, frozenset, collections.deque):
-        # The model sends a JSON array.
-        items = [a for a in args if a is not Ellipsis]
-        if not items:
-            return list
-        item = functools.reduce(operator.or_, dict.fromkeys(items))
-        return _runtime_annotation(types.GenericAlias(list, (item,)), in_union)
-    if origin is list and args:
-        item = _runtime_annotation(args[0])
-        return annotation if item == args[0] else types.GenericAlias(list, (item,))
-    if origin is dict and len(args) == 2 and not in_union:
-        value = _runtime_annotation(args[1])
-        return (
-            annotation
-            if value == args[1]
-            else types.GenericAlias(dict, (args[0], value))
-        )
-    if args and inspect.isclass(origin):
-        return origin
-    return annotation
-
-
 def _call_signature(
     cls: type,
 ) -> tuple[inspect.Signature, dict[str, Any], str | None]:
@@ -203,11 +143,7 @@ def _call_signature(
             p = p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD)
         # Gemini builds the declaration from the resolved types, but converts
         # the model's arguments with the signature's, so give it those too.
-        annotation = hints.get(p.name, p.annotation)
-        if annotation is not inspect.Parameter.empty:
-            annotation = _runtime_annotation(annotation)
-            hints[p.name] = annotation
-        parameters.append(p.replace(annotation=annotation))
+        parameters.append(p.replace(annotation=hints.get(p.name, p.annotation)))
     # __call__'s own docstring, else the class's, else that of a __call__ it
     # inherits.
     doc = (

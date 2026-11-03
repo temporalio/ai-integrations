@@ -22,8 +22,6 @@ Tests cover:
 """
 
 import base64
-import collections
-import enum
 import functools
 import importlib.metadata
 import inspect
@@ -34,9 +32,9 @@ import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Annotated, Any, Callable, Literal, NamedTuple, cast
+from typing import Any, Callable, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -230,51 +228,6 @@ class TagParcel:
     async def __call__(self, parcel_id: "str") -> "str":
         self.calls.append(parcel_id)
         return f"Parcel {parcel_id} is tagged"
-
-
-@activity.defn
-class ShipParcel:
-    """Ship a parcel."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, Any, Any]] = []
-
-    # Types that Gemini can declare but not check with isinstance.
-    async def __call__(
-        self,
-        parcel_id: Annotated[str, "The parcel's ID."],
-        speed: Literal["standard", "express"],
-        note: Any,
-        labels: dict[str, Literal["fragile", "upright"]] | None = None,
-    ) -> str:
-        self.calls.append((parcel_id, speed, note, labels))
-        return f"Parcel {parcel_id} ships {speed} with {note!r} and {labels!r}"
-
-
-class Priority(enum.IntEnum):
-    LOW = 1
-    HIGH = 2
-
-
-@activity.defn
-class PackParcel:
-    """Pack a parcel."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[Any, ...]] = []
-
-    # Types whose JSON values Gemini can't check with isinstance, but which
-    # the activity's payload converter decodes.
-    async def __call__(
-        self,
-        priority: Priority,
-        items: tuple[str, ...],
-        sizes: set[int] | None = None,
-        sent: datetime | None = None,
-        ref: uuid.UUID | None = None,
-    ) -> str:
-        self.calls.append((priority, items, sizes, sent, ref))
-        return f"Packed {priority.name} with {items!r}, {sizes!r}, {sent}, {ref}"
 
 
 # ---------------------------------------------------------------------------
@@ -615,18 +568,6 @@ class MultipleToolsWorkflow:
                     ),
                     activity_as_tool(
                         TagParcel,
-                        activity_config=ActivityConfig(
-                            start_to_close_timeout=timedelta(seconds=10),
-                        ),
-                    ),
-                    activity_as_tool(
-                        ShipParcel,
-                        activity_config=ActivityConfig(
-                            start_to_close_timeout=timedelta(seconds=10),
-                        ),
-                    ),
-                    activity_as_tool(
-                        PackParcel,
                         activity_config=ActivityConfig(
                             start_to_close_timeout=timedelta(seconds=10),
                         ),
@@ -1132,8 +1073,6 @@ async def test_multiple_tools_sequential(client: Client):
     tool_tracker = ToolCallTracker()
     parcel_tracker = TrackParcel("acme-post")
     parcel_tagger = TagParcel()
-    parcel_shipper = ShipParcel()
-    parcel_packer = PackParcel()
     new_client, api_tracker = apply_plugin(
         client,
         [
@@ -1143,25 +1082,6 @@ async def test_multiple_tools_sequential(client: Client):
             ),
             make_function_call_response("TrackParcel", {"parcel_id": "P-1"}),
             make_function_call_response("TagParcel", {"parcel_id": "P-2"}),
-            make_function_call_response(
-                "ShipParcel",
-                {
-                    "parcel_id": "P-3",
-                    "speed": "express",
-                    "note": "ring twice",
-                    "labels": {"top": "upright"},
-                },
-            ),
-            make_function_call_response(
-                "PackParcel",
-                {
-                    "priority": 2,
-                    "items": ["box", "tape"],
-                    "sizes": [3],
-                    "sent": "2024-01-02T03:04:05",
-                    "ref": "12345678-1234-5678-1234-567812345678",
-                },
-            ),
             make_text_response("Tokyo is sunny; Paris is rainy."),
         ],
     )
@@ -1174,8 +1094,6 @@ async def test_multiple_tools_sequential(client: Client):
             tool_tracker.get_weather_country,
             parcel_tracker,
             parcel_tagger,
-            parcel_shipper,
-            parcel_packer,
         ],
     ) as worker:
         result = await new_client.execute_workflow(
@@ -1195,25 +1113,6 @@ async def test_multiple_tools_sequential(client: Client):
     # A quoted annotation is resolved for the call too.
     assert parcel_tagger.calls == ["P-2"]
     assert "Parcel P-2 is tagged" in json.dumps(api_tracker.requests[-1].request_dict)
-    # Annotated, Literal, Any and optional dict parameters reach the instance,
-    # and its result reaches the model.
-    assert parcel_shipper.calls == [
-        ("P-3", "express", "ring twice", {"top": "upright"})
-    ]
-    assert "Parcel P-3 ships express with 'ring twice' and {'top': 'upright'}" in (
-        json.dumps(api_tracker.requests[-1].request_dict)
-    )
-    # The JSON values of an enum, tuple, set, datetime and UUID reach the
-    # instance as those types, and its result reaches the model.
-    ref = uuid.UUID("12345678-1234-5678-1234-567812345678")
-    assert parcel_packer.calls == [
-        (Priority.HIGH, ("box", "tape"), {3}, datetime(2024, 1, 2, 3, 4, 5), ref)
-    ]
-    assert type(parcel_packer.calls[0][0]) is Priority
-    assert (
-        f"Packed HIGH with ('box', 'tape'), {{3}}, 2024-01-02 03:04:05, {ref}"
-        in json.dumps(api_tracker.requests[-1].request_dict)
-    )
     assert result == "Tokyo is sunny; Paris is rainy."
 
 
@@ -1803,41 +1702,6 @@ def test_activity_as_tool_preserves_doc():
     assert activity_as_tool(DataclassParcel).__doc__ == "Track a parcel."
 
 
-class Speed(enum.Enum):
-    STANDARD = "standard"
-    EXPRESS = "express"
-
-
-class Point(NamedTuple):
-    x: int
-    y: int
-
-
-@activity.defn
-class LabelParcel:
-    async def __call__(
-        self,
-        names: list[Annotated[str, "A name."]],
-        sizes: dict[str, Literal[1, 2]],
-        note: Annotated[str, "A note."] | None,
-        code: Literal[1, "A"] | None,
-        hooks: list[Callable],
-        extra: list[Any],
-        tags: dict[str, Literal["a"]] | list[Any] | None,
-        sizes_by_id: dict[str, dict[str, Literal[1]]],
-        pair: tuple[str, int] | None,
-        speed: Speed,
-        priorities: list[Priority] | None,
-        level: Literal[Priority.HIGH, "top"],
-        sent: datetime,
-        refs: frozenset[uuid.UUID],
-        rows: tuple,
-        queue: collections.deque[str],
-        point: Point,
-    ) -> str:
-        return ""
-
-
 def test_activity_as_tool_preserves_signature():
     """Returned wrapper has the correct parameter signature (self hidden)."""
     wrapper = activity_as_tool(ToolCallTracker.get_weather)
@@ -1853,38 +1717,6 @@ def test_activity_as_tool_preserves_signature():
     sig = inspect.signature(activity_as_tool(TagParcel))
     assert sig.parameters["parcel_id"].annotation is str
     assert sig.return_annotation is str
-    # Gemini can't check Any, Annotated, Literal or a parameterized generic
-    # with isinstance, so they become the classes they check, and an enum,
-    # tuple, set, deque, datetime or UUID becomes the class of its JSON value,
-    # also inside lists, dicts and unions. Gemini walks into list items and
-    # dict values, but not into a union's members. A NamedTuple is unchanged.
-    sig = inspect.signature(activity_as_tool(ShipParcel))
-    assert [p.annotation for p in sig.parameters.values()] == [
-        str,
-        str,
-        object,
-        dict | None,
-    ]
-    sig = inspect.signature(activity_as_tool(LabelParcel))
-    assert [p.annotation for p in sig.parameters.values()] == [
-        list[str],
-        dict[str, int],
-        str | None,
-        int | str | None,
-        list[Callable],
-        list[object],
-        dict | list[object] | None,
-        dict[str, dict[str, int]],
-        list[str | int] | None,
-        str,
-        list[int] | None,
-        int | str,
-        str,
-        list[str],
-        list,
-        list[str],
-        Point,
-    ]
 
 
 def test_activity_as_tool_multi_arg_signature():
