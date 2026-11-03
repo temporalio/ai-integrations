@@ -281,7 +281,8 @@ export type AgentToolRejection =
   | 'model-provider'
   | 'raw-sandbox'
   | 'raw-sandbox-run-options'
-  | 'undefined-tool';
+  | 'undefined-tool'
+  | 'undefined-handoff';
 
 /** Returns the failure for an `asTool()` setup that would run a model or sandbox in the Workflow. */
 export async function agentToolRejectedWorkflow(kind: AgentToolRejection): Promise<string> {
@@ -318,6 +319,8 @@ export async function agentToolRejectedWorkflow(kind: AgentToolRejection): Promi
       }),
     // For example from a circular import.
     'undefined-tool': () => undefined as unknown as Tool<any>,
+    // With an `undefined` handoff, set below.
+    'undefined-handoff': () => nested.asTool({ toolName: 'ask_nested' }),
   };
   const lead = new Agent({
     name: 'Lead',
@@ -325,6 +328,8 @@ export async function agentToolRejectedWorkflow(kind: AgentToolRejection): Promi
     model: 'lead-model',
     tools: [tools[kind]()],
   });
+  // The Agent constructor rejects an `undefined` handoff, so one can only appear later.
+  if (kind === 'undefined-handoff') lead.handoffs = [undefined as unknown as Agent];
   try {
     await new TemporalOpenAIRunner().run(lead, 'go', {
       runConfig: { sandbox: { client: temporalSandboxClient('unused') } },
@@ -883,28 +888,47 @@ export async function summaryAgentWorkflow(): Promise<string> {
   return (await runner.run(lead, first.state)).finalOutput ?? '';
 }
 
-/**
- * `Unnamed` names no model, in a run with its own model settings: run directly, or as the
- * `asTool()` tool of a lead with `leadModel`.
- */
-export async function implicitModelSettingsWorkflow(
-  leadModel: string | undefined,
-  runSettings: ModelSettings
-): Promise<string> {
-  const unnamed = new Agent({ name: 'Unnamed', instructions: 'Answer.' });
+export interface ImplicitSettingsCase {
+  runSettings: ModelSettings;
+  /** Run `Unnamed` as the `asTool()` tool of a lead with this model. */
+  leadModel?: string;
+  /** `Unnamed`'s own `modelSettings`. */
+  agentSettings?: ModelSettings;
+  /** Clear the `reasoning` and `text` defaults with run settings set to `undefined`. */
+  clearDefaults?: boolean;
+  /** `Unnamed` calls its `echo` tool before it answers. */
+  callsTool?: boolean;
+}
+
+/** `Unnamed` names no model, in a run with its own model settings, run directly or as an `asTool()` tool. */
+export async function implicitModelSettingsWorkflow(input: ImplicitSettingsCase): Promise<string> {
+  const echo = tool({
+    name: 'echo',
+    description: 'Echo.',
+    parameters: { type: 'object' as const, properties: {}, required: [], additionalProperties: false as const },
+    strict: true,
+    execute: async () => 'echoed',
+  });
+  const unnamed = new Agent({
+    name: 'Unnamed',
+    instructions: input.callsTool ? 'Use echo, then answer.' : 'Answer.',
+    ...(input.agentSettings && { modelSettings: input.agentSettings }),
+    ...(input.callsTool && { tools: [echo] }),
+  });
   const agent =
-    leadModel === undefined
+    input.leadModel === undefined
       ? unnamed
       : new Agent({
           name: 'Lead',
           instructions: 'Use the tool.',
-          model: leadModel,
+          model: input.leadModel,
           tools: [unnamed.asTool({ toolName: 'ask_unnamed' })],
           toolUseBehavior: 'stop_on_first_tool',
         });
-  return (
-    (await new TemporalOpenAIRunner().run(agent, 'go', { runConfig: { modelSettings: runSettings } })).finalOutput ?? ''
-  );
+  const modelSettings = input.clearDefaults
+    ? { ...input.runSettings, reasoning: undefined, text: undefined }
+    : input.runSettings;
+  return (await new TemporalOpenAIRunner().run(agent, 'go', { runConfig: { modelSettings } })).finalOutput ?? '';
 }
 
 /** `runConfig.model` with an agent that sets its own model. */

@@ -52,7 +52,10 @@ export function toSerializedModelResponse(response: ModelResponse): SerializedMo
  * Upstream's model settings defaults for this process's default model under the run's settings, as
  * upstream merges them when no model is named, and its `reasoningEffortImplicit` marker for them.
  */
-function withDefaultModelSettings(runSettings: ModelSettings): {
+function withDefaultModelSettings(
+  runSettings: ModelSettings,
+  cleared: (keyof ModelSettings)[] = []
+): {
   modelSettings: ModelSettings;
   reasoningEffortImplicit: boolean;
 } {
@@ -63,6 +66,7 @@ function withDefaultModelSettings(runSettings: ModelSettings): {
     modelSettings.reasoning = { ...defaults.reasoning, ...runSettings.reasoning };
   }
   if (defaults.text && runSettings.text) modelSettings.text = { ...defaults.text, ...runSettings.text };
+  for (const key of cleared) delete modelSettings[key];
   return {
     modelSettings,
     reasoningEffortImplicit: defaults.reasoning?.effort !== undefined && runSettings.reasoning?.effort === undefined,
@@ -74,7 +78,7 @@ async function fromSerializedModelRequest(
   hostedToolCredentials: HostedToolCredentialsResolver | undefined
 ): Promise<ModelRequest> {
   const { modelSettings, reasoningEffortImplicit } = wire.implicitModelSettings
-    ? withDefaultModelSettings(wire.modelSettings)
+    ? withDefaultModelSettings(wire.modelSettings, wire.clearedModelSettings)
     : { modelSettings: wire.modelSettings, reasoningEffortImplicit: wire.reasoningEffortImplicit };
   return {
     // Upstream's internal field, which its OpenAI models read.

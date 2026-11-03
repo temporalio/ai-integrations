@@ -103,7 +103,8 @@ class ApprovalSandboxCapability extends Capability {
   }
 }
 
-export async function sandboxApprovalResumeWorkflow(): Promise<string> {
+/** With `otherAgent`, resumes with an agent graph that doesn't have the paused agent. */
+export async function sandboxApprovalResumeWorkflow(otherAgent = false): Promise<string> {
   const agent = new SandboxAgent({
     name: 'sandbox-approval',
     model: 'gpt-4o-mini',
@@ -119,8 +120,18 @@ export async function sandboxApprovalResumeWorkflow(): Promise<string> {
   if (result.interruptions.length === 0) return 'no-interruption';
   for (const interruption of result.interruptions) result.state.approve(interruption);
 
-  const resumed = await runner.run(agent, result.state, { runConfig });
+  const resumeAgent = otherAgent ? new Agent({ name: 'other', model: 'gpt-4o-mini' }) : agent;
+  const resumed = await runner.run(resumeAgent, result.state, { runConfig });
   return `${resumed.finalOutput}`;
+}
+
+/** A `SandboxAgent` that names no model, with the default capabilities, which include compaction. */
+export async function sandboxNoModelWorkflow(): Promise<string> {
+  const agent = new SandboxAgent({ name: 'sandbox-no-model', instructions: 'Answer.' });
+  const result = await new TemporalOpenAIRunner().run(agent, 'hello', {
+    runConfig: { sandbox: { client: temporalSandboxClient('fake') } },
+  });
+  return `${result.finalOutput}`;
 }
 
 /**

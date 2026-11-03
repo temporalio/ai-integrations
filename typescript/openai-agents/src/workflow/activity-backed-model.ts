@@ -199,7 +199,21 @@ export class ActivityBackedModel implements Model {
     const modelSettings: ModelSettings = { ...this.run?.modelSettings() };
     // Upstream clears `toolChoice` after a tool call when the agent sets `resetToolChoice`.
     if (request.modelSettings.toolChoice === undefined) delete modelSettings.toolChoice;
-    return { ...wire, modelSettings, reasoningEffortImplicit: undefined, implicitModelSettings: true };
+    // A `SandboxAgent`'s capabilities add `providerData`, such as compaction, to the settings upstream
+    // calls its model with. The defaults never set it.
+    if (request.modelSettings.providerData !== undefined)
+      modelSettings.providerData = request.modelSettings.providerData;
+    // A run setting set to `undefined` clears a default upstream, but JSON would drop it.
+    const cleared = (Object.keys(modelSettings) as (keyof ModelSettings)[]).filter(
+      (key) => modelSettings[key] === undefined
+    );
+    return {
+      ...wire,
+      modelSettings,
+      reasoningEffortImplicit: undefined,
+      implicitModelSettings: true,
+      ...(cleared.length > 0 && { clearedModelSettings: cleared }),
+    };
   }
 }
 

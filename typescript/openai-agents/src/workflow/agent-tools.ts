@@ -128,7 +128,9 @@ export interface AgentAsToolOptions<TAgent extends Agent<any, any>> {
 
 /**
  * @deprecated Use `agent.asTool({ toolName, toolDescription, customOutputExtractor })`. This returns
- * that tool, and will be removed in a later release.
+ * that tool, and will be removed in a later release. It also accepts an agent from another copy of
+ * `@openai/agents-core`, whose own `agent.asTool()` tools the runner rejects, so moving to
+ * `agent.asTool()` needs a single copy of the package.
  */
 export function agentAsTool<TAgent extends Agent<any, any>>(
   agent: TAgent,

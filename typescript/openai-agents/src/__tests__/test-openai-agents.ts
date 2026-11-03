@@ -57,6 +57,7 @@ import {
   sharedAgentApprovalWorkflow,
   summaryAgentWorkflow,
   implicitModelSettingsWorkflow,
+  type ImplicitSettingsCase,
   localActivityAgentWorkflow,
   mcpFactoryArgWorkflow,
   mcpToolFilterResumeWorkflow,
@@ -625,6 +626,7 @@ test('agent.asTool() setups that would run a model or sandbox in the Workflow fa
       /asTool\('ask_nested'\) runOptions.sandbox.client must be created/,
     ],
     'undefined-tool': ['AgentsWorkflowError', /Cannot read properties of undefined/],
+    'undefined-handoff': ['AgentsWorkflowError', /Cannot read properties of undefined/],
   };
 
   await worker.runUntil(async () => {
@@ -1478,17 +1480,19 @@ test.serial('With no model named, the Worker adds the model settings defaults fo
             modelSettings: request.modelSettings,
             reasoningEffortImplicit: request._internal?.reasoningEffortImplicit,
           });
-          return request.systemInstructions === 'Use the tool.'
-            ? toolCallResponse('ask_unnamed', { input: 'q' })
-            : textResponse('done');
+          const answered =
+            Array.isArray(request.input) && request.input.some((item: any) => item.type === 'function_call_result');
+          if (request.systemInstructions === 'Use the tool.') return toolCallResponse('ask_unnamed', { input: 'q' });
+          if (request.systemInstructions === 'Use echo, then answer.' && !answered) return toolCallResponse('echo', {});
+          return textResponse('done');
         },
       } as unknown as FakeModel;
     },
   };
   const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider: provider })] });
-  const run = async (leadModel: string | undefined) => {
+  const run = async (input: ImplicitSettingsCase) => {
     const handle = await startWorkflow(implicitModelSettingsWorkflow, {
-      args: [leadModel, { temperature: 0.3 }],
+      args: [input],
       workflowExecutionTimeout: '30 seconds',
     });
     t.is(await handle.result(), 'done');
@@ -1500,10 +1504,19 @@ test.serial('With no model named, the Worker adds the model settings defaults fo
       // The Workflow's default model is gpt-5.4-mini. A Worker whose default isn't a GPT-5 model gets
       // none of its settings, directly or in a nested run.
       process.env.OPENAI_DEFAULT_MODEL = 'gpt-4.1';
-      await run(undefined);
-      await run('gpt-5');
+      await run({ runSettings: { temperature: 0.3 } });
+      await run({ leadModel: 'gpt-5', runSettings: { temperature: 0.3 } });
       delete process.env.OPENAI_DEFAULT_MODEL;
-      await run(undefined);
+      await run({ runSettings: { temperature: 0.3 } });
+      // The agent's own settings replace the defaults, as upstream.
+      await run({ runSettings: { temperature: 0.3 }, agentSettings: { temperature: 0.9 } });
+      // A nested run takes the run's settings without `toolChoice` and `parallelToolCalls`.
+      await run({ leadModel: 'gpt-5', runSettings: { temperature: 0.3, toolChoice: 'required', parallelToolCalls: true } });
+      // Upstream clears `toolChoice` after the tool call.
+      await run({ callsTool: true, runSettings: { temperature: 0.3, toolChoice: 'required' } });
+      await run({ runSettings: { reasoning: { summary: 'auto' } } });
+      await run({ runSettings: { reasoning: { effort: 'low' } } });
+      await run({ runSettings: { temperature: 0.3 }, clearDefaults: true });
     });
   } finally {
     if (previous === undefined) delete process.env.OPENAI_DEFAULT_MODEL;
@@ -1520,6 +1533,28 @@ test.serial('With no model named, the Worker adds the model settings defaults fo
     },
     { model: '', modelSettings: { temperature: 0.3 }, reasoningEffortImplicit: false },
     { model: '', modelSettings: { ...gpt5Defaults, temperature: 0.3 }, reasoningEffortImplicit: true },
+    { model: '', modelSettings: { temperature: 0.9 }, reasoningEffortImplicit: false },
+    {
+      model: 'gpt-5',
+      modelSettings: {
+        reasoning: { effort: 'low' },
+        text: { verbosity: 'low' },
+        temperature: 0.3,
+        toolChoice: 'required',
+        parallelToolCalls: true,
+      },
+      reasoningEffortImplicit: true,
+    },
+    { model: '', modelSettings: { ...gpt5Defaults, temperature: 0.3 }, reasoningEffortImplicit: true },
+    { model: '', modelSettings: { ...gpt5Defaults, temperature: 0.3, toolChoice: 'required' }, reasoningEffortImplicit: true },
+    { model: '', modelSettings: { ...gpt5Defaults, temperature: 0.3 }, reasoningEffortImplicit: true },
+    {
+      model: '',
+      modelSettings: { reasoning: { effort: 'none', summary: 'auto' }, text: { verbosity: 'low' } },
+      reasoningEffortImplicit: true,
+    },
+    { model: '', modelSettings: { reasoning: { effort: 'low' }, text: { verbosity: 'low' } }, reasoningEffortImplicit: false },
+    { model: '', modelSettings: { temperature: 0.3 }, reasoningEffortImplicit: true },
   ]);
 });
 

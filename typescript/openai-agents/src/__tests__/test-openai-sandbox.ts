@@ -17,6 +17,7 @@ import {
   sandboxExecWorkflow,
   sandboxManifestResumeWorkflow,
   sandboxNestedApprovalWorkflow,
+  sandboxNoModelWorkflow,
   sandboxValidationWorkflow,
 } from './workflows/openai-sandbox';
 
@@ -99,6 +100,7 @@ test.serial('a SandboxAgent whose manifest carries a workerEnvValue survives an 
         modelProvider: new FakeModelProvider([
           toolCallResponse('run_command', { cmd: 'echo hello' }),
           textResponse('Done.'),
+          toolCallResponse('run_command', { cmd: 'echo hello' }),
         ]),
         modelParams: { startToCloseTimeout: '30s' },
         sandboxClientProviders: [new SandboxClientProvider('fake', client)],
@@ -111,6 +113,12 @@ test.serial('a SandboxAgent whose manifest carries a workerEnvValue survives an 
   try {
     await worker.runUntil(async () => {
       t.is(await executeWorkflow(sandboxApprovalResumeWorkflow), 'Done.');
+      // Restoring the state fails when the agents given don't have the paused one, and the run fails.
+      const err = await t.throwsAsync(
+        executeWorkflow(sandboxApprovalResumeWorkflow, { args: [true], workflowExecutionTimeout: '20 seconds' })
+      );
+      t.is((err as any)?.cause?.type, 'AgentsWorkflowError');
+      t.regex(String((err as any)?.cause?.message), /not found/);
     });
   } finally {
     delete process.env[MANIFEST_SECRET_VAR];
@@ -129,33 +137,62 @@ for (const [copied, parentName, rebuilt] of [
   [false, 'Nested', true],
   [true, 'Nested', true],
 ] as const) {
-  test(`A nested approval behind ${copied ? 'a copy of an' : 'an'} asTool() tool in a sandbox run whose parent is named '${parentName}' ${copied ? 'fails the resume' : 'resumes'}${rebuilt ? ' with rebuilt agents' : ''}`, async (t) => {
-    const { createWorker, executeWorkflow } = helpers(t);
-    const worker = await createWorker({
-      plugins: [
-        new OpenAIAgentsPlugin({
-          modelProvider: new FakeModelProvider([
-            toolCallResponse('ask_nested', { input: 'q' }),
-            toolCallResponse('confirmAction', { reason: 'approved' }),
-            textResponse('nested done'),
-            textResponse('parent done'),
-          ]),
-          sandboxClientProviders: [new SandboxClientProvider('fake', new FakeSandboxClient())],
-        }),
-      ],
-    });
+  // Serial: each case starts a Worker, and starting many at once can starve a slow CI runner.
+  test.serial(
+    `A nested approval behind ${copied ? 'a copy of an' : 'an'} asTool() tool in a sandbox run whose parent is named '${parentName}' ${copied ? 'fails the resume' : 'resumes'}${rebuilt ? ' with rebuilt agents' : ''}`,
+    async (t) => {
+      const { createWorker, executeWorkflow } = helpers(t);
+      const worker = await createWorker({
+        plugins: [
+          new OpenAIAgentsPlugin({
+            modelProvider: new FakeModelProvider([
+              toolCallResponse('ask_nested', { input: 'q' }),
+              toolCallResponse('confirmAction', { reason: 'approved' }),
+              textResponse('nested done'),
+              textResponse('parent done'),
+            ]),
+            sandboxClientProviders: [new SandboxClientProvider('fake', new FakeSandboxClient())],
+          }),
+        ],
+      });
 
-    await worker.runUntil(async () => {
-      const result = await executeWorkflow(sandboxNestedApprovalWorkflow, { args: [copied, parentName, rebuilt] });
-      if (copied) {
-        t.regex(result, /^AgentsWorkflowError: The approval for 'confirmAction' of agent 'Nested' can't be resumed/);
-        t.regex(result, /executions=0$/);
-      } else {
-        t.is(result, 'parent done executions=1');
-      }
-    });
-  });
+      await worker.runUntil(async () => {
+        const result = await executeWorkflow(sandboxNestedApprovalWorkflow, { args: [copied, parentName, rebuilt] });
+        if (copied) {
+          t.regex(result, /^AgentsWorkflowError: The approval for 'confirmAction' of agent 'Nested' can't be resumed/);
+          t.regex(result, /executions=0$/);
+        } else {
+          t.is(result, 'parent done executions=1');
+        }
+      });
+    }
+  );
 }
+
+test("A SandboxAgent that names no model keeps its capabilities' providerData, such as compaction", async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const settings: any[] = [];
+  const provider = {
+    getModel() {
+      return {
+        async getResponse(request: any) {
+          settings.push(request.modelSettings);
+          return textResponse('done');
+        },
+      } as any;
+    },
+  };
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: provider,
+        sandboxClientProviders: [new SandboxClientProvider('fake', new FakeSandboxClient())],
+      }),
+    ],
+  });
+  await worker.runUntil(async () => t.is(await executeWorkflow(sandboxNoModelWorkflow), 'done'));
+  t.is(settings[0]?.providerData?.context_management?.[0]?.type, 'compaction');
+});
 
 test('setArchiveLimits is forwarded to the persistWorkspace and hydrateWorkspace Activities', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
