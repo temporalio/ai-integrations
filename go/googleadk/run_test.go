@@ -145,9 +145,10 @@ func (i bearerInterceptor) Before(ctx context.Context, req *a2aclient.Request) (
 }
 
 // TestRemoteSubAgentErrorNotRetried proves an A2A call the remote agent
-// refuses, or a client the card cannot make, fails the SendA2AMessage Activity
-// once, without retries, and the turn ends as it would without Temporal: ADK
-// turns the error into an event.
+// refuses, or a client the card cannot make, fails without retries, and the
+// turn ends as it would without Temporal: ADK turns the error into an event.
+// ADK v2.7+ rejects malformed network cards in ResolveA2AAgentCard; older
+// releases leave them to fail in SendA2AMessage.
 // The last case is the control for the HTTP 401 ones: the caller's
 // A2AClientFactory adds the right credentials and the remote agent answers.
 func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
@@ -275,7 +276,8 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 			require.NoError(t, env.GetWorkflowError())
 			var res runResult
 			require.NoError(t, env.GetWorkflowResult(&res))
-			assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName), "a refused A2A call must not be retried")
+			assert.Equal(t, 1, counter.get(googleadk.ResolveA2AAgentCardActivityName), "card resolution must not be retried")
+			assert.LessOrEqual(t, counter.get(googleadk.SendA2AMessageActivityName), 1, "a refused A2A call must not be retried")
 			if tc.wantError != "" {
 				require.Len(t, res.Errors, 1, "ADK turns the failed call into an error event")
 				assert.Contains(t, res.Errors[0], tc.wantError)
@@ -352,13 +354,13 @@ func TestRemoteSubAgentHTTPDelivered(t *testing.T) {
 		},
 		{
 			name:      "A2AClientFactory transport that fails to open once, other interface URL does not parse",
-			server:    a2aServer{Reply: answer, AlsoRESTPath: "/%zz"},
+			server:    a2aServer{Reply: answer, AlsoRESTPath: "/%zz", CardFile: true},
 			factory:   flakyA2AFactory(1),
 			wantSends: 2,
 		},
 		{
 			name:      "A2AClientFactory transport that opens, other interface URL does not parse",
-			server:    a2aServer{Reply: answer, AlsoRESTPath: "/%zz"},
+			server:    a2aServer{Reply: answer, AlsoRESTPath: "/%zz", CardFile: true},
 			factory:   flakyA2AFactory(),
 			wantSends: 1,
 		},

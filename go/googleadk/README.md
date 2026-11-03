@@ -45,8 +45,9 @@ and the `model.NewLLM` registry lookup from upstream `google.golang.org/adk/v2`
 Those seams have been in tagged ADK releases since v2.1.0; `go.mod` requires
 v2.3.0 for compatibility with OpenTelemetry log SDK v0.21.0. Request-order
 confirmation resume (google/adk-go#1169), available since v2.2.0, makes
-multi-decision confirmation resumes replay-stable. ADK sets the Go floor:
-1.26.6+. The replay-safe telemetry gate composes `workflow.IsReadOnly`.
+multi-decision confirmation resumes replay-stable. This package requires Go
+1.26.10+ so the latest-dependency checks can also run ADK v2.7.0. The replay-safe
+telemetry gate composes `workflow.IsReadOnly`.
 
 ## Samples
 

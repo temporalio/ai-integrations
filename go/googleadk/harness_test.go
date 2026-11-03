@@ -2,10 +2,13 @@ package googleadk_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"iter"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -92,6 +95,10 @@ type a2aServer struct {
 	// AlsoRESTPath, when set, makes the card also name a REST interface at
 	// that path, after the first one.
 	AlsoRESTPath string
+	// CardFile returns a trusted local card file as the source. ADK v2.7+
+	// validates all interface URLs in network-fetched cards before client
+	// construction; a local card lets transport-fallback tests reach it.
+	CardFile bool
 }
 
 // streamErrorHandler ends every stream with an error after its first n events.
@@ -120,8 +127,8 @@ func a2aReply(ev a2a.Event, err error) func(*a2asrv.ExecutorContext, func(a2a.Ev
 	return func(_ *a2asrv.ExecutorContext, yield func(a2a.Event, error) bool) { yield(ev, err) }
 }
 
-// startA2AServer starts an in-process A2A server and returns its URL and a
-// count of the requests it received.
+// startA2AServer starts an in-process A2A server and returns its card source
+// (the server URL, or a local file with CardFile) and request count.
 func startA2AServer(t *testing.T, cfg a2aServer) (string, *atomic.Int32) {
 	t.Helper()
 	var requests atomic.Int32
@@ -170,6 +177,13 @@ func startA2AServer(t *testing.T, cfg a2aServer) (string, *atomic.Int32) {
 		mux.Handle("/", a2asrv.NewRESTHandler(handler))
 	} else {
 		mux.Handle("/", a2asrv.NewJSONRPCHandler(handler))
+	}
+	if cfg.CardFile {
+		data, err := json.Marshal(card)
+		require.NoError(t, err)
+		source := filepath.Join(t.TempDir(), "agent-card.json")
+		require.NoError(t, os.WriteFile(source, data, 0600))
+		return source, &requests
 	}
 	return srv.URL, &requests
 }
