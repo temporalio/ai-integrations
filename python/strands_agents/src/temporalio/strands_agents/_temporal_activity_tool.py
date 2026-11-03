@@ -1,7 +1,14 @@
+import functools
 import inspect
 import json
+import sys
+import typing
 from collections.abc import Callable
+from dataclasses import is_dataclass
 from typing import Any
+
+if sys.version_info >= (3, 14):
+    import annotationlib  # type: ignore[reportUnreachable]
 
 from strands.interrupt import Interrupt
 from strands.tools.decorator import FunctionToolMetadata
@@ -23,9 +30,26 @@ class TemporalActivityTool(AgentTool):
         defn = activity._Definition.from_callable(activity_fn)
         if not defn or not defn.name:
             raise ValueError("activity_fn must be decorated with @activity.defn")
+        if not inspect.isclass(activity_fn) and hasattr(
+            type(activity_fn), "__temporal_activity_definition"
+        ):
+            raise ValueError(
+                f"Pass the activity class {type(activity_fn).__name__}, not an"
+                " instance of it"
+            )
         self._activity_name = defn.name
         self._options = options
-        self._signature = inspect.signature(activity_fn)
+        if inspect.isclass(activity_fn):
+            activity_fn = _call_stand_in(activity_fn)
+        signature = inspect.signature(activity_fn)
+        params = list(signature.parameters.values())
+        # A first parameter named `self` is the receiver of a method passed as
+        # Class.method, however it is annotated: the worker registers the bound
+        # method, so its instance supplies it. Strands leaves `self` out of the
+        # tool spec too.
+        if params and params[0].name == "self":
+            signature = signature.replace(parameters=params[1:])
+        self._signature = signature
         spec = FunctionToolMetadata(activity_fn).extract_metadata()
         spec["name"] = self._activity_name
         self._spec: ToolSpec = spec
@@ -85,6 +109,131 @@ class TemporalActivityTool(AgentTool):
                 content=[{"text": _to_text(result)}],
             )
         )
+
+
+def _call_function(method: Any) -> Callable | None:
+    """Return the function under a function, staticmethod, classmethod or partialmethod."""
+    while isinstance(method, (staticmethod, classmethod, functools.partialmethod)):
+        method = (
+            method.func
+            if isinstance(method, functools.partialmethod)
+            else method.__func__
+        )
+    return method if inspect.isfunction(method) else None
+
+
+def _docstring(fn: Any) -> str | None:
+    """Return ``fn``'s docstring, unless it is missing or blank."""
+    doc = getattr(fn, "__doc__", None) if fn is not None else None
+    return doc if doc and doc.strip() else None
+
+
+def _generated_class_doc(cls: type) -> str | None:
+    """Return the docstring dataclasses or namedtuple writes for a class that has none."""
+    if is_dataclass(cls):
+        try:
+            # Format it as dataclasses did when it made the class.
+            if sys.version_info >= (3, 14):
+                signature = inspect.signature(  # type: ignore[reportUnreachable]
+                    cls, annotation_format=annotationlib.Format.FORWARDREF
+                )
+                # 3.14 left a forward reference in the __init__ dataclasses
+                # generated unevaluated, and the field keeps the reference from
+                # that time.
+                annotate = getattr(cls.__init__, "__annotate__", None)
+                if getattr(annotate, "__generated_by_dataclasses__", False):
+                    field_types = {
+                        n: f.type for n, f in cls.__dataclass_fields__.items()
+                    }
+                    signature = signature.replace(
+                        parameters=[
+                            p.replace(annotation=field_types.get(p.name, p.annotation))
+                            for p in signature.parameters.values()
+                        ]
+                    )
+            else:
+                signature = inspect.signature(cls)  # type: ignore[reportUnreachable]
+            return cls.__name__ + str(signature).replace(" -> None", "")
+        except (TypeError, ValueError):
+            return cls.__name__
+    fields = getattr(cls, "_fields", None)
+    if issubclass(cls, tuple) and isinstance(fields, tuple):
+        names = ", ".join(fields) + ("," if len(fields) == 1 else "")
+        return f"{cls.__name__}({names})"
+    return None
+
+
+def _class_doc(cls: type) -> str | None:
+    """Return a class's own docstring, unless dataclasses or namedtuple wrote it."""
+    doc = _docstring(cls)
+    if doc is None or not doc.startswith(cls.__name__):
+        return doc
+    try:
+        generated = _generated_class_doc(cls)
+    except Exception:
+        # dataclasses would have failed the same way, so it didn't write this
+        # docstring.
+        return doc
+    return None if doc == generated else doc
+
+
+def _call_stand_in(cls: type) -> Callable:
+    """Return a stand-in for ``cls.__call__`` that Strands builds the tool spec from.
+
+    Workflow code references a callable-class activity by its class, but the
+    worker's registered instance runs ``__call__``, so the stand-in has
+    ``__call__``'s parameters as an instance binds it: without the receiver of a
+    method, classmethod or partialmethod, and with every parameter of a
+    staticmethod. It carries the class's name, ``__call__``'s types and the
+    tool's docstring. The tool never calls it.
+    """
+    calls = [vars(c)["__call__"] for c in cls.__mro__ if "__call__" in vars(c)]
+    func = _call_function(calls[0]) if calls else None
+    if func is None:
+        raise ValueError(
+            f"Activity class {cls.__name__} needs a __call__ that is a function,"
+            " staticmethod, classmethod or functools.partialmethod"
+        )
+    try:
+        call = calls[0].__get__(object(), cls)
+        signature = inspect.signature(call)
+        # Resolve the types in __call__'s own module: the stand-in has no globals.
+        hints = typing.get_type_hints(func, include_extras=True)
+    except Exception as e:
+        raise ValueError(
+            f"Cannot read the parameters of {cls.__name__}.__call__: {e}"
+        ) from e
+    # @activity.defn checks the constructor's signature, not __call__'s, so
+    # __call__ can take *args, keyword-only arguments or **kwargs, which the
+    # tool can't pass: it sends one argument per parameter, by position.
+    for p in signature.parameters.values():
+        if p.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            message = (
+                f"Activity class {cls.__name__} cannot take *args, keyword-only"
+                f" arguments or **kwargs in __call__ ('{p.name}'): the tool passes"
+                " one argument per parameter, by position"
+            )
+            if isinstance(calls[0], functools.partialmethod) and calls[0].keywords:
+                message += (
+                    ". Its functools.partialmethod binds an argument by keyword,"
+                    " which makes the arguments after it keyword-only"
+                )
+            raise ValueError(message)
+    stand_in = functools.partial(call)
+    setattr(stand_in, "__name__", cls.__name__)
+    stand_in.__annotations__ = hints
+    # __call__'s own docstring, else the class's, else that of a __call__ it
+    # inherits.
+    stand_in.__doc__ = (
+        _docstring(_call_function(vars(cls).get("__call__")))
+        or _class_doc(cls)
+        or next(filter(None, map(_docstring, map(_call_function, calls))), None)
+    )
+    return stand_in
 
 
 def _activity_error_event(tool_use_id: str, error: ActivityError) -> ToolResultEvent:

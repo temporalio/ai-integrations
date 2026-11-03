@@ -36,8 +36,18 @@ def activity_as_tool(
 ) -> AgentTool:
     """Wrap a Temporal activity as a Strands tool.
 
-    ``activity_fn`` must be decorated by ``@activity.defn``. All keyword
-    arguments are forwarded to ``workflow.execute_activity``.
+    ``activity_fn`` must be decorated by ``@activity.defn``. It can be a
+    function, a method passed as ``Class.method``, or a callable-class activity
+    passed as its class. The tool offers the parameters the activity is called
+    with: without a method's ``self``, and from ``__call__`` for a class. All
+    keyword arguments are forwarded to ``workflow.execute_activity``.
+
+    Raises:
+        ValueError: If ``activity_fn`` is not a named activity, or is an
+            instance of a callable-class activity; or if it is a class whose
+            ``__call__`` is not a function, staticmethod, classmethod or
+            ``functools.partialmethod``, can't be read, or takes ``*args``,
+            keyword-only arguments or ``**kwargs``.
     """
     options: dict[str, Any] = {
         "task_queue": task_queue,
