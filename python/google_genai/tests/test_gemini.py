@@ -224,13 +224,12 @@ class TagParcel:
     """Tag a parcel."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, tuple[str, ...]]] = []
+        self.calls: list[str] = []
 
-    # A quoted annotation, as `from __future__ import annotations` makes, and
-    # *args, which Gemini leaves out of the declaration.
-    async def __call__(self, parcel_id: "str", *tags: str) -> "str":
-        self.calls.append((parcel_id, tags))
-        return f"Parcel {parcel_id} has tags {tags!r}"
+    # A quoted annotation, as `from __future__ import annotations` makes.
+    async def __call__(self, parcel_id: "str") -> "str":
+        self.calls.append(parcel_id)
+        return f"Parcel {parcel_id} is tagged"
 
 
 @activity.defn
@@ -1193,10 +1192,9 @@ async def test_multiple_tools_sequential(client: Client):
     # The class tool takes __call__'s parameters, and the registered instance
     # gets the model's value.
     assert parcel_tracker.calls == ["P-1"]
-    # A quoted annotation is resolved for the call too, and *args stays empty
-    # instead of getting the empty tuple as one more argument.
-    assert parcel_tagger.calls == [("P-2", ())]
-    assert "Parcel P-2 has tags ()" in json.dumps(api_tracker.requests[-1].request_dict)
+    # A quoted annotation is resolved for the call too.
+    assert parcel_tagger.calls == ["P-2"]
+    assert "Parcel P-2 is tagged" in json.dumps(api_tracker.requests[-1].request_dict)
     # Annotated, Literal, Any and optional dict parameters reach the instance,
     # and its result reaches the model.
     assert parcel_shipper.calls == [
@@ -1921,6 +1919,12 @@ class KeywordOnlyCallActivity:
 
 
 @activity.defn
+class VarArgsCallActivity:
+    async def __call__(self, parcel_id: str, *tags: str) -> str:
+        return parcel_id
+
+
+@activity.defn
 class KwargsCallActivity:
     async def __call__(self, parcel_id: str, **extra: str) -> str:
         return parcel_id
@@ -1939,15 +1943,20 @@ class KeywordPartialCallActivity:
     [
         (NoCallActivity, "needs a __call__"),
         (UnresolvedCallActivity, "name 'MissingType' is not defined"),
-        (KeywordOnlyCallActivity, r"or \*\*kwargs in __call__ \('parcel_id'\)"),
-        (KwargsCallActivity, r"or \*\*kwargs in __call__ \('extra'\)"),
+        (
+            KeywordOnlyCallActivity,
+            r"cannot take \*args, keyword-only .* \('parcel_id'\)",
+        ),
+        (VarArgsCallActivity, r"cannot take \*args, keyword-only .* \('tags'\)"),
+        (KwargsCallActivity, r"cannot take \*args, keyword-only .* \('extra'\)"),
         (KeywordPartialCallActivity, "partialmethod binds an argument by keyword"),
+        (TrackParcel("acme-post"), "Pass the activity class TrackParcel"),
     ],
 )
 def test_activity_as_tool_rejects_unreadable_call(
     activity_def: Any, message: str
 ) -> None:
-    """A class whose __call__ the tool can't read or call fails when it is built."""
+    """A class whose __call__ the tool can't use, or an instance, fails when built."""
     with pytest.raises(ValueError, match=message):
         activity_as_tool(activity_def)
 

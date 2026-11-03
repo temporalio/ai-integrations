@@ -164,8 +164,8 @@ def _call_signature(
     func = _call_function(calls[0]) if calls else None
     if func is None:
         raise ValueError(
-            f"Activity class '{cls.__name__}' needs a __call__ that is a function,"
-            " staticmethod, classmethod or functools.partialmethod."
+            f"Activity class {cls.__name__} needs a __call__ that is a function,"
+            " staticmethod, classmethod or functools.partialmethod"
         )
     try:
         signature = inspect.signature(calls[0].__get__(object(), cls))
@@ -174,23 +174,27 @@ def _call_signature(
         hints = typing.get_type_hints(func, include_extras=True)
     except Exception as e:
         raise ValueError(
-            f"Cannot read the parameters of '{cls.__name__}.__call__': {e}"
+            f"Cannot read the parameters of {cls.__name__}.__call__: {e}"
         ) from e
     parameters = []
     for p in signature.parameters.values():
         # @activity.defn checks the constructor's signature, not __call__'s, so
-        # __call__ can take keyword-only arguments or **kwargs, which the tool
-        # can't pass: activities get their arguments by position.
-        if p.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.VAR_KEYWORD):
+        # __call__ can take *args, keyword-only arguments or **kwargs, which the
+        # tool can't pass: it sends one argument per parameter, by position.
+        if p.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
             message = (
-                f"Activity class '{cls.__name__}' cannot take keyword-only"
-                f" arguments or **kwargs in __call__ ('{p.name}'): activities get"
-                " their arguments by position."
+                f"Activity class {cls.__name__} cannot take *args, keyword-only"
+                f" arguments or **kwargs in __call__ ('{p.name}'): the tool passes"
+                " one argument per parameter, by position"
             )
             if isinstance(calls[0], functools.partialmethod) and calls[0].keywords:
                 message += (
-                    " Its functools.partialmethod binds an argument by keyword,"
-                    " which makes the arguments after it keyword-only."
+                    ". Its functools.partialmethod binds an argument by keyword,"
+                    " which makes the arguments after it keyword-only"
                 )
             raise ValueError(message)
         # Gemini passes every argument by name, so bind positional-only
@@ -256,9 +260,10 @@ def activity_as_tool(
     Raises:
         GoogleGenAIError: If ``fn`` is not decorated with ``@activity.defn`` or
             has no activity name.
-        ValueError: If ``fn`` is a class whose ``__call__`` is not a function,
-            staticmethod, classmethod or ``functools.partialmethod``, can't be
-            read, or takes keyword-only arguments or ``**kwargs``.
+        ValueError: If ``fn`` is an instance of a callable-class activity, or a
+            class whose ``__call__`` is not a function, staticmethod,
+            classmethod or ``functools.partialmethod``, can't be read, or takes
+            ``*args``, keyword-only arguments or ``**kwargs``.
     """
     ret = activity._Definition.from_callable(fn)
     if not ret:
@@ -271,13 +276,16 @@ def activity_as_tool(
             "Activity must have a name to be used as a Gemini tool",
             "invalid_tool",
         )
+    if not inspect.isclass(fn) and hasattr(type(fn), "__temporal_activity_definition"):
+        raise ValueError(
+            f"Pass the activity class {type(fn).__name__}, not an instance of it"
+        )
 
     config: ActivityConfig = {**(activity_config or {})}
     if "summary" not in config:
         config["summary"] = "tool_call"
 
     schema_fn: Callable = fn
-    is_class = inspect.isclass(fn)
     if inspect.isclass(fn):
         sig, annotations, doc = _call_signature(fn)
     else:
@@ -306,10 +314,7 @@ def activity_as_tool(
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
-        # A class's __call__ takes only positional parameters, and *args among
-        # them: pass its values one by one, not as one tuple. Gemini leaves
-        # *args out of the declaration, so it is empty.
-        activity_args = list(bound.args) if is_class else list(bound.arguments.values())
+        activity_args = list(bound.arguments.values())
         return await temporal_workflow.execute_activity(
             activity_name,
             args=activity_args,
