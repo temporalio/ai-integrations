@@ -643,14 +643,16 @@ async def test_a_turn_claude_code_starts_on_its_own_while_idle_is_watched(
     assert len(harness.cli_pids()) == 1
 
 
-async def test_partial_messages_go_to_the_stream_and_whole_ones_to_the_workflow(
+async def test_partial_messages_go_to_the_stream_and_the_workflow(
     harness: Harness,
 ) -> None:
     harness.answers = {"hi": "Hello."}
     async with harness.start(StreamingWorkflow, "hi") as handle:
         stream = WorkflowStreamClient.create(harness.client, handle.id)
         deltas: list[str] = []
+        published = 0
         async for item in stream.subscribe("events", poll_cooldown=timedelta(0)):
+            published += 1
             event = item.data["event"]
             if event["type"] == "content_block_delta":
                 deltas.append(event["delta"]["text"])
@@ -660,5 +662,9 @@ async def test_partial_messages_go_to_the_stream_and_whole_ones_to_the_workflow(
         messages = await handle.result()
 
     assert deltas == ["Hello."]
-    # The Workflow gets no StreamEvent.
-    assert messages == [["AssistantMessage", ["Hello."]], ["Result", "Hello."]]
+    # The Workflow gets each StreamEvent too, along with the whole messages.
+    assert messages.count(["StreamEvent"]) == published
+    assert [m for m in messages if m != ["StreamEvent"]] == [
+        ["AssistantMessage", ["Hello."]],
+        ["Result", "Hello."],
+    ]

@@ -111,12 +111,26 @@ def test_the_cli_gets_the_options_env() -> None:
     assert env["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] == "true"
 
 
-@pytest.mark.parametrize("partial", [True, False])
-def test_a_stream_goes_with_partial_messages_and_only_them(partial: bool) -> None:
+def test_without_a_stream_the_workflow_gets_the_stream_events() -> None:
+    event = {"type": "stream_event", "event": {"type": "message_start"}}
+    transport = TemporalTransport(ClaudeAgentOptions(include_partial_messages=True))
+
+    assert list(transport._handle_output([event, RESULT])) == [event, RESULT]  # pyright: ignore[reportPrivateUsage]
+
+
+def test_with_a_stream_the_stream_events_go_to_it_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[Any] = []
     topic = WorkflowTopicHandle[Any](cast(Any, None), "partial", cast(Any, Any))
-    options = ClaudeAgentOptions(include_partial_messages=partial)
-    with pytest.raises(ValueError, match="stream"):
-        TemporalTransport(options, stream=None if partial else topic)
+    monkeypatch.setattr(topic, "publish", published.append)
+    event = {"type": "stream_event", "event": {"type": "message_start"}}
+    transport = TemporalTransport(
+        ClaudeAgentOptions(include_partial_messages=True), stream=topic
+    )
+
+    assert list(transport._handle_output([event, RESULT])) == [event, RESULT]  # pyright: ignore[reportPrivateUsage]
+    assert published == [event]
 
 
 def test_settings_are_json_not_a_file_path() -> None:
