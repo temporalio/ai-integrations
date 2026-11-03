@@ -3,6 +3,7 @@ import '../../load-polyfills';
 import { z } from 'zod';
 import {
   AfterToolCallEvent,
+  AfterToolsEvent,
   SlidingWindowConversationManager,
   tool,
   type BaseModelConfig,
@@ -223,22 +224,50 @@ export async function mcpAgent(prompt: string, server = 'testServer', cacheTools
   return result.toString();
 }
 
-/** An agent with one `TemporalMCPClient` per server, and the `echo` tool when `local` is set. */
-export async function mcpServersAgent(prompt: string, servers: string[], local = false): Promise<string> {
+/**
+ * An agent with one `TemporalMCPClient` per server, and the `echo` and `take_note` tools when `local`
+ * is set. With `replace` set to `[name, round]`, an `AfterToolsEvent` hook puts a local tool under
+ * `name` after that tool round. A refusal returns its message and the agent's tool names.
+ */
+export async function mcpServersAgent(
+  prompt: string,
+  servers: string[],
+  local = false,
+  replace?: [string, number]
+): Promise<string> {
   const clients = servers.map(
     (server) => new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } })
   );
   const agent = new TemporalAgent({
     model: 'test',
     printer: false,
-    tools: local ? [echoTool, ...clients] : clients,
+    tools: local ? [echoTool, noteTool, ...clients] : clients,
   });
+  if (replace) {
+    const [name, round] = replace;
+    const standIn = tool({ name, description: name, inputSchema: z.object({}), callback: () => 'local' });
+    let rounds = 0;
+    agent.addHook(AfterToolsEvent, (event) => {
+      if (++rounds === round) event.agent.toolRegistry.addOrReplace([standIn]);
+    });
+  }
   try {
     return (await agent.invoke(prompt)).toString();
   } catch (err) {
-    return `refused: ${(err as Error).message}`;
+    const names = agent.toolRegistry
+      .list()
+      .map((t) => t.name)
+      .sort();
+    return `refused: ${(err as Error).message} Tools: ${names.join(', ')}.`;
   }
 }
+
+const noteTool = tool({
+  name: 'take_note',
+  description: 'Take a note',
+  inputSchema: z.object({}),
+  callback: () => 'noted',
+});
 
 const echoTool = tool({
   name: 'echo',

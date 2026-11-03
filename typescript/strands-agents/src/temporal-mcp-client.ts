@@ -4,6 +4,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import * as workflow from '@temporalio/workflow';
 import type { ActivityOptions } from '@temporalio/workflow';
 import { activityInfo, Context as ActivityContext } from '@temporalio/activity';
+import type { TemporalMCPTool } from './temporal-mcp-tool';
 
 /** Tool descriptor returned by the per-server `{server}-listTools` activity. */
 export interface McpToolInfo {
@@ -84,10 +85,11 @@ export class TemporalMCPClient extends McpClient {
   private readonly activityOptions: ActivityOptions;
   /** Whether the agent lists this server's tools once or re-lists each turn. */
   readonly cacheTools: boolean;
-  // The names this client's tools hold in each agent's registry since its last refresh. While the
-  // server lists a name, the name is this client's.
+  // The names this client's tools hold in each agent's registry: the names of the tools Strands
+  // added there, then the names of each refresh. While the server lists a name, the name is this
+  // client's, whatever tool workflow code puts under it.
   private readonly held = new WeakMap<ToolRegistryView, Set<string>>();
-  // The tools this client listed, to find the ones Strands registered when the agent initialized.
+  // The tools this client listed, to find its names in a registry it has no record for.
   private readonly listed = new WeakSet<object>();
 
   constructor(options: TemporalMCPClientOptions) {
@@ -128,54 +130,128 @@ export class TemporalMCPClient extends McpClient {
 
   /**
    * Re-list this server's tools and reconcile them into the agent's tool
-   * registry, dropping tools that no longer exist and adding new ones.
-   * {@link TemporalAgent} calls this on each agent turn when `cacheTools` is
-   * `false` so a mid-workflow MCP-server restart is reflected in the next call.
+   * registry, dropping tools that no longer exist and adding new ones, so a
+   * mid-workflow MCP-server restart is reflected in the next call.
+   * {@link TemporalAgent} re-lists its `cacheTools: false` clients together
+   * after each tool round instead, so a name can move between its servers.
    *
    * A listed name that another tool of the agent has, or that differs from one
    * only by `-` or `_`, throws Strands' `ToolValidationError` and leaves the
    * registry as it was, as Strands does when the agent first lists the server.
    */
   async refreshTools(registry: ToolRegistryView): Promise<void> {
+    const tools = (await this.listTools()) as unknown as TemporalMCPTool[];
+    TemporalMCPClient.apply(registry, [{ client: this, tools }]);
+  }
+
+  /**
+   * Re-list each of `clients`, the `cacheTools: false` clients of one agent in `tools` order, then
+   * check the new listings together and apply them, as {@link refreshTools} does for one client. So a
+   * name can move from one server to another between two tool rounds, and a name that two of the
+   * new listings share is refused. The servers are listed last to first, the order in which Strands
+   * ran one `AfterToolsEvent` hook per client, so their `listTools` activities keep their order.
+   *
+   * @internal
+   */
+  static async refreshAll(clients: TemporalMCPClient[], registry: ToolRegistryView): Promise<void> {
+    const listings: Listing[] = [];
+    for (const client of [...clients].reverse()) {
+      listings.unshift({ client, tools: (await client.listTools()) as unknown as TemporalMCPTool[] });
+    }
+    TemporalMCPClient.apply(registry, listings);
+  }
+
+  /**
+   * Make each of `clients` hold the name of each tool it listed that Strands adds to `registry`,
+   * the agent's registry, when Strands adds it. Strands adds a listing tool by tool and stops at a
+   * refused one, and a listing of an initialization that failed can add its tools after the agent
+   * initialized again, so only the tools that are added count, whenever they are.
+   *
+   * @internal
+   */
+  static holdAdded(clients: TemporalMCPClient[], registry: ToolRegistryView & { add(tool: never): void }): void {
+    const add = registry.add.bind(registry);
+    registry.add = (tool: never) => {
+      try {
+        add(tool);
+      } finally {
+        const present = new Set<object>(registry.list());
+        for (const added of [tool].flat() as { name: string }[]) {
+          const client = clients.find((c) => c.listed.has(added));
+          if (client === undefined || !present.has(added)) continue;
+          const names = client.held.get(registry) ?? new Set();
+          client.held.set(registry, names.add(added.name));
+        }
+      }
+    };
+  }
+
+  // The names this client's tools hold in `registry`.
+  private heldIn(registry: ToolRegistryView): Set<string> {
+    return this.held.get(registry) ?? new Set(registry.list().flatMap((t) => (this.listed.has(t) ? [t.name] : [])));
+  }
+
+  // Check `listings` against each other and the agent's other tools, then apply them: drop the names
+  // each client held and no longer lists, and add or replace the listed tools. A clash throws
+  // Strands' `ToolValidationError` and changes nothing.
+  private static apply(registry: ToolRegistryView, listings: Listing[]): void {
     // Imported lazily to avoid a circular module cycle with TemporalMCPTool.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { TemporalMCPTool } = require('./temporal-mcp-tool') as typeof import('./temporal-mcp-tool');
-    const fresh = await this.listTools();
-    const names = (fresh as unknown as { name: string }[]).map((t) => t.name);
-    const held =
-      this.held.get(registry) ?? new Set(registry.list().flatMap((t) => (this.listed.has(t) ? [t.name] : [])));
+    const held = new Map(listings.map(({ client }) => [client, client.heldIn(registry)]));
+    const freed = new Set([...held.values()].flatMap((names) => [...names]));
     const taken = new Map<string, { name: string }>();
     for (const tool of registry.list()) {
-      if (!held.has(tool.name)) taken.set(normalized(tool.name), tool);
+      if (!freed.has(tool.name)) taken.set(normalized(tool.name), tool);
     }
-    const seen = new Map<string, string>();
-    for (const name of names) {
-      const first = seen.get(normalized(name));
-      if (first !== undefined) {
-        throw duplicateToolName(name, first, `MCP server '${this.server}' lists ${first === name ? 'it twice' : 'both names'}.`);
+    const seen = new Map<string, { name: string; server: string }>();
+    for (const { client, tools } of listings) {
+      const own = new Map<string, string>();
+      for (const { name } of tools) {
+        const first = own.get(normalized(name));
+        if (first !== undefined) {
+          throw duplicateToolName(name, first, `MCP server '${client.server}' lists ${first === name ? 'it twice' : 'both names'}.`);
+        }
+        own.set(normalized(name), name);
+        const earlier = seen.get(normalized(name));
+        if (earlier !== undefined) throw duplicateToolName(name, earlier.name, clash(earlier.server, client.server));
+        const other = taken.get(normalized(name));
+        if (other !== undefined) {
+          throw duplicateToolName(name, other.name, clash(other instanceof TemporalMCPTool ? other.server : undefined, client.server));
+        }
       }
-      const other = taken.get(normalized(name));
-      if (other !== undefined) {
-        const source =
-          other instanceof TemporalMCPTool && other.server !== this.server
-            ? `MCP servers '${other.server}' and '${this.server}' both list it.`
-            : `MCP server '${this.server}' lists it, and another tool of the agent has it.`;
-        throw duplicateToolName(name, other.name, source);
+      for (const [key, name] of own) seen.set(key, { name, server: client.server });
+    }
+    for (const { client, tools } of listings) {
+      const names = new Set(tools.map((t) => t.name));
+      for (const name of held.get(client)!) {
+        if (!names.has(name)) registry.remove(name);
       }
-      seen.set(normalized(name), name);
     }
-    const freshNames = new Set(names);
-    for (const name of held) {
-      if (!freshNames.has(name)) registry.remove(name);
+    for (const { client, tools } of listings) {
+      registry.addOrReplace(tools as never[]);
+      client.held.set(registry, new Set(tools.map((t) => t.name)));
     }
-    registry.addOrReplace(fresh);
-    this.held.set(registry, freshNames);
   }
+}
+
+// One client's new listing.
+interface Listing {
+  client: TemporalMCPClient;
+  tools: TemporalMCPTool[];
 }
 
 // Strands' ToolRegistry refuses a name that differs from a registered one only by '-' or '_'.
 function normalized(name: string): string {
   return name.replaceAll('-', '_');
+}
+
+// Where two clashing tools come from: `server` lists the new one, and `other` the one the agent has,
+// when another server's.
+function clash(other: string | undefined, server: string): string {
+  return other !== undefined && other !== server
+    ? `MCP servers '${other}' and '${server}' both list it.`
+    : `MCP server '${server}' lists it, and another tool of the agent has it.`;
 }
 
 // Strands' words when its ToolRegistry refuses a name, then where the two tools come from.
