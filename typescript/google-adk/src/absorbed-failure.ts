@@ -45,6 +45,8 @@ import {
 // Not exported from the package root; the SDK untracks its own scope listeners with it.
 import { untrackPromise } from '@temporalio/workflow/lib/stack-helpers';
 // Not exported from the package root; holds the completion each Activity's promise settles by.
+// temporalio/sdk-typescript#2647 asks for a public way to see the error an Activity's promise
+// rejects with.
 import { getActivator } from '@temporalio/workflow/lib/global-attributes';
 
 import { ADK_RUNTIME_FAILURE_TYPES } from './error-types';

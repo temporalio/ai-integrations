@@ -396,10 +396,11 @@ const runner = new InMemoryRunner({ agent: graph });
   item of a `ParallelWorker` is an attempt of its own. That includes work a retry
   joins after the abandoned attempt started it, such as a retried `ParallelWorker`
   or `ctx.runNode` with an explicit `runId`: its cancellation is ignored too.
-  Today a node `timeout` cancelled mid-call fails Workflow Tasks until the timeout
-  ends the run ([#389](https://github.com/temporalio/ai-integrations/issues/389));
-  once that is fixed, such a run fails with `GoogleAdkNodeReportedError` instead
-  of ending CANCELLED.
+  Today any node `timeout` cancelled mid-call fails Workflow Tasks until the node
+  times out and fails the run
+  ([#389](https://github.com/temporalio/ai-integrations/issues/389)); once that
+  is fixed, a run whose retry joined such work fails with
+  `GoogleAdkNodeReportedError` instead of ending CANCELLED.
   Once the retry has answered, a model failure from that work no longer counts
   either: the plugin numbers model calls as they start, and ignores the failure
   of a call that started before the same agent's latest answer in that run.
@@ -599,13 +600,17 @@ an agent node is waiting on, ADK absorbs the cancelled call like any model error
 and reports the node as failed (`NodeReportedError`); the plugin ends the
 execution CANCELLED with the model Activity's own cancellation instead. A
 cancelled Activity node ends it CANCELLED the same way, inside a dynamic run too.
-So does a cancel that ADK absorbs in a tool or a model callback, such as a
-`LongRunningFunctionTool` waiting for a Signal or a `beforeModelCallback` waiting
-for an Activity: in an agent node it ends the execution CANCELLED rather than
-completing it (a tool) or failing it with `GoogleAdkNodeReportedError` (a model
-callback). A cancel absorbed in a Signal handler ends the execution when the
-main function returns, after its cleanup; if the main function has already
-returned, the execution ends as the main function did. A Signal handler that
+So does a cancel that ADK absorbs in a tool (its `requireConfirmation` predicate
+included) or a model callback, such as a `LongRunningFunctionTool` waiting for a
+Signal or a `beforeModelCallback` waiting for an Activity: in an agent node it
+ends the execution CANCELLED rather than completing it (a tool) or failing it
+with `GoogleAdkNodeReportedError` (a model callback). A cancel absorbed in a
+Signal handler ends the execution when the main function returns, after its
+cleanup; if the main function has already returned, the execution ends as the
+main function did. A cancellation that the handler's own later step throws
+after that (a `sleep` or an Activity after the ADK turn) is subject to
+[temporalio/sdk-typescript#2639](https://github.com/temporalio/sdk-typescript/issues/2639):
+such a run can stay RUNNING until the SDK fixes it. A Signal handler that
 throws instead, because a later step of its own rejects with the cancel or
 because its ADK graph run reports the node failed (`NodeReportedError`), ends
 the execution CANCELLED at once, before that cleanup: to clean up first, catch
