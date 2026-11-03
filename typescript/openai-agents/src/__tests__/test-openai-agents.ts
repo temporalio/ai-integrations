@@ -655,6 +655,7 @@ test('Agents from another copy of @openai/agents-core are checked before they ca
     'tool-model-object': [/^AgentsWorkflowError: .*Agent 'Lead' has a Model object/, 1],
     'as-tool': [/^AgentsWorkflowError: .*tool 'ask_nested' looks like an agent.asTool\(\) tool/, 0],
     'deprecated-alias': [/^nested answer$/, 2],
+    'deprecated-alias-override': [/^AgentsWorkflowError: .*tool 'ask_nested' looks like an agent.asTool\(\) tool/, 0],
     'string-model': [/^copy answer$/, 1],
   };
   await worker.runUntil(async () => {
@@ -798,7 +799,7 @@ for (const [title, legacyFirstRun, nestedCall] of [
   });
 }
 
-for (const kind of ['original', 'alias', 'spread', 'namespace'] as const) {
+for (const kind of ['original', 'alias', 'spread', 'namespace', 'override', 'alias-override'] as const) {
   // Serial, as the nested cancellation tests above explain.
   test.serial(`an approval inside a nested asTool() run resumes on result.state (${kind} tool)`, async (t) => {
     const { createWorker, startWorkflow } = helpers(t);
@@ -829,7 +830,16 @@ for (const kind of ['original', 'alias', 'spread', 'namespace'] as const) {
         args: [kind],
         workflowExecutionTimeout: '30 seconds',
       });
-      t.deepEqual(await handle.result(), { output: 'parent done', executions: 1, resumes: 1, pending: [] });
+      // An Agent subclass's asTool() override runs through the deprecated alias too: the parent pauses
+      // on the tool before the nested run starts.
+      const overridden = kind === 'override' || kind === 'alias-override';
+      t.deepEqual(await handle.result(), {
+        output: 'parent done',
+        executions: 1,
+        resumes: overridden ? 2 : 1,
+        paused: overridden ? [['ask_nested'], ['confirmAction']] : [['confirmAction']],
+        pending: [],
+      });
       await replay(t, handle);
     });
   });

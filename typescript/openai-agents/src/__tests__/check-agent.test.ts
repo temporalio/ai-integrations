@@ -86,6 +86,18 @@ test('agentAsTool: the deprecated alias returns the agent.asTool() tool', async 
   t.is(tool.name, 'ask_nested');
   t.is(tool.description, 'Ask the nested agent.');
   t.is(getAgentToolRecord(tool)?.agent, agent);
+  t.false(await tool.needsApproval(new RunContext(), {}, 'call'));
+  // An override of asTool runs, as with agent.asTool(), and the tool is recorded.
+  class ApprovedAgent extends Agent {
+    override asTool(options: any): any {
+      return super.asTool({ ...options, needsApproval: true });
+    }
+  }
+  const approved = new ApprovedAgent({ name: 'Approved', model: 'm' });
+  // eslint-disable-next-line @typescript-eslint/no-deprecated -- tests the deprecated alias
+  const approvedTool = agentAsTool(approved, { toolName: 'ask_approved' });
+  t.true(await approvedTool.needsApproval(new RunContext(), {}, 'call'));
+  t.is(getAgentToolRecord(approvedTool)?.agent, approved);
   // Outside a Workflow the nested run uses the default provider, and its output goes through the extractor.
   setTracingDisabled(true);
   setDefaultModelProvider({

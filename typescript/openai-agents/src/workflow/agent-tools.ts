@@ -135,12 +135,24 @@ export function agentAsTool<TAgent extends Agent<any, any>>(
   // eslint-disable-next-line @typescript-eslint/no-deprecated -- the alias takes its own deprecated options
   options: AgentAsToolOptions<TAgent>
 ): FunctionTool<any, any, any> {
-  // This copy's `asTool`, which records the tool, also for an agent from another copy of
-  // `@openai/agents-core`, as `agentAsTool` ran such agents before.
-  const asTool = Agent.prototype.asTool as (this: Agent<any, any>, options: AnyAgentToolOptions) => AnyAgentTool;
-  return asTool.call(agent, {
+  const toolOptions: AnyAgentToolOptions = {
     toolName: options.toolName,
     toolDescription: options.toolDescription,
     customOutputExtractor: options.customOutputExtractor as AnyAgentToolOptions['customOutputExtractor'],
-  });
+  };
+  // An override of `asTool` runs, as with `agent.asTool()`. Otherwise this copy's `asTool`, which
+  // records the tool, also for an agent from another copy of `@openai/agents-core`, as `agentAsTool`
+  // ran such agents before. An override on such an agent makes that copy's tool, which the runner rejects.
+  if (overridesAsTool(agent)) return agent.asTool(toolOptions);
+  const asTool = Agent.prototype.asTool as (this: Agent<any, any>, options: AnyAgentToolOptions) => AnyAgentTool;
+  return asTool.call(agent, toolOptions);
+}
+
+/** Whether `agent`'s `asTool` is not the one of the base `Agent` class of its copy of the package. */
+function overridesAsTool(agent: Agent<any, any>): boolean {
+  let base: object | undefined;
+  for (let proto: object | null = agent; proto !== null; proto = Object.getPrototypeOf(proto)) {
+    if (Object.prototype.hasOwnProperty.call(proto, 'asTool')) base = proto;
+  }
+  return base !== undefined && agent.asTool !== (base as Agent<any, any>).asTool;
 }

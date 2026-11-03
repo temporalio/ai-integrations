@@ -13,6 +13,7 @@ export type AgentCopyCase =
   | 'tool-model-object'
   | 'as-tool'
   | 'deprecated-alias'
+  | 'deprecated-alias-override'
   | 'string-model';
 
 /**
@@ -21,7 +22,9 @@ export type AgentCopyCase =
  * before the run: an `agent_start` listener, a custom `Handoff`'s callback, or a tool between two
  * turns. `as-tool` passes an `asTool()` tool from that copy, which the plugin can't trace back to its
  * agent. `deprecated-alias` passes one made with `agentAsTool`, which records it, as `agentAsTool` ran
- * such agents before. `string-model` is the supported control.
+ * such agents before. `deprecated-alias-override` passes one made with `agentAsTool` for a subclass that
+overrides `asTool`: the alias calls the override, which makes that copy's tool.
+`string-model` is the supported control.
  * Returns the run's failure or its output.
  */
 export async function agentCopyWorkflow(kind: AgentCopyCase): Promise<string> {
@@ -64,8 +67,14 @@ export async function agentCopyWorkflow(kind: AgentCopyCase): Promise<string> {
     const nested = new copy.Agent({ name: 'Nested', instructions: 'Answer.', model: 'nested-model' });
     const askNested = nested.asTool({ toolName: 'ask_nested' }) as unknown as Tool;
     lead = new Agent({ name: 'Lead', instructions: 'Answer.', model: 'lead-model', tools: [askNested] });
-  } else if (kind === 'deprecated-alias') {
-    const nested = new copy.Agent({ name: 'Nested', instructions: 'Answer as nested.', model: 'nested-model' });
+  } else if (kind === 'deprecated-alias' || kind === 'deprecated-alias-override') {
+    class ApprovedAgent extends copy.Agent<any, any> {
+      override asTool(options: any): any {
+        return super.asTool({ ...options, needsApproval: true });
+      }
+    }
+    const NestedClass = kind === 'deprecated-alias-override' ? ApprovedAgent : copy.Agent;
+    const nested = new NestedClass({ name: 'Nested', instructions: 'Answer as nested.', model: 'nested-model' });
     lead = new Agent({
       name: 'Lead',
       instructions: 'Use the tool.',

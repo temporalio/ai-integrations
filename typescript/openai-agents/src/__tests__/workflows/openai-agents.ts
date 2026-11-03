@@ -512,19 +512,29 @@ export async function sharedAgentApprovalWorkflow(input: SharedAgentApprovalInpu
   };
 }
 
-export type CopiedAgentToolKind = 'original' | 'alias' | 'spread' | 'namespace';
+export type CopiedAgentToolKind = 'original' | 'alias' | 'spread' | 'namespace' | 'override' | 'alias-override';
 
 export interface CopiedAgentToolApprovalResult {
   output: string;
   executions: number;
   resumes: number;
+  /** The interruptions of each pause, in order. */
+  paused: string[][];
   pending: string[];
+}
+
+/** An `Agent` subclass whose `asTool()` tools need approval before the nested run. */
+class ApprovedAgent<TContext = unknown> extends Agent<TContext, any> {
+  override asTool(options: any): any {
+    return super.asTool({ ...options, needsApproval: true });
+  }
 }
 
 /**
  * `Nested` pauses on an approval behind `ask_nested`: the `asTool()` tool, the deprecated alias's
  * tool, a spread copy or a `toolNamespace()` copy. Approves it on `result.state` and resumes, at
- * most three times.
+ * most three times. With `override` and `alias-override`, `Nested` is an `ApprovedAgent`, so the
+ * parent pauses on `ask_nested` itself first.
  */
 export async function copiedAgentToolApprovalWorkflow(
   kind: CopiedAgentToolKind
@@ -542,9 +552,11 @@ export async function copiedAgentToolApprovalWorkflow(
     needsApproval: true,
     execute: async () => `confirmed:${++executions}`,
   });
-  const nested = new Agent({ name: 'Nested', instructions: 'Answer as nested.', tools: [confirmAction] });
+  const nestedConfig = { name: 'Nested', instructions: 'Answer as nested.', tools: [confirmAction] };
+  const nested =
+    kind === 'override' || kind === 'alias-override' ? new ApprovedAgent(nestedConfig) : new Agent(nestedConfig);
   const askNested =
-    kind === 'alias'
+    kind === 'alias' || kind === 'alias-override'
       ? // eslint-disable-next-line @typescript-eslint/no-deprecated -- tests the deprecated alias
         agentAsTool(nested, { toolName: 'ask_nested' })
       : nested.asTool({ toolName: 'ask_nested' });
@@ -558,7 +570,9 @@ export async function copiedAgentToolApprovalWorkflow(
   const runner = new TemporalOpenAIRunner();
   let result = await runner.run(parent, 'go', { runConfig: { model: 'run-model' } });
   let resumes = 0;
+  const paused: string[][] = [];
   while (result.interruptions.length > 0 && resumes < 3) {
+    paused.push(result.interruptions.map((interruption) => interruption.name ?? ''));
     for (const interruption of result.interruptions) result.state.approve(interruption);
     result = await runner.run(parent, result.state, { runConfig: { model: 'run-model' } });
     resumes++;
@@ -567,6 +581,7 @@ export async function copiedAgentToolApprovalWorkflow(
     output: result.interruptions.length > 0 ? '' : (result.finalOutput ?? ''),
     executions,
     resumes,
+    paused,
     pending: result.interruptions.map((interruption) => interruption.name ?? ''),
   };
 }
