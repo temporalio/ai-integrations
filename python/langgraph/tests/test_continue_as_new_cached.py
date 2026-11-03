@@ -26,6 +26,7 @@ from temporalio.common import RetryPolicy
 from temporalio.langgraph import LangGraphPlugin, cache, graph
 from temporalio.langgraph._task_cache import (
     cache_key,
+    mark_failed,
     occurrence_key,
     set_task_cache,
 )
@@ -435,9 +436,23 @@ def _occurrence_keys() -> None:
     # carried through continue-as-new still hit; each repeat gets its own.
     assert [occurrence_key(key) for _ in range(3)] == [key, f"{key}#1", f"{key}#2"]
     assert occurrence_key(other) == other
+    # Another caller counts its own calls under its own keys.
+    assert [occurrence_key(key, "b1") for _ in range(2)] == [
+        f"{key}@b1",
+        f"{key}@b1#1",
+    ]
     # graph() and entrypoint() start counting again.
     set_task_cache({})
     assert occurrence_key(key) == key
+    # A failed call stores no result. After continue-as-new its place is
+    # skipped, so the first call gets the result of the retry that followed.
+    stored: dict[str, Any] = {}
+    set_task_cache(stored)
+    mark_failed(occurrence_key(key))
+    stored[occurrence_key(key)] = "retried"
+    set_task_cache(dict(stored))
+    assert occurrence_key(key) == f"{key}#1"
+    assert occurrence_key(key) == f"{key}#2"
 
 
 def test_repeated_calls_get_their_own_keys():

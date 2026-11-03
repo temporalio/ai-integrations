@@ -6,8 +6,10 @@ see the job finish under the plugin too.
 """
 
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import timedelta
+from functools import cache as once
 from typing import Any
 from uuid import uuid4
 
@@ -25,6 +27,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from temporalio import workflow
 from temporalio.client import Client, WorkflowHistory
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.langgraph import LangGraphPlugin, cache, entrypoint, graph
 from temporalio.worker import Replayer, Worker
 
@@ -140,6 +143,70 @@ def _repeat_plugin() -> LangGraphPlugin:
     )
 
 
+def wait_for_value(job_id: str, wait: bool) -> bool:
+    """If ``wait``, return once ``next_value`` has run for ``job_id``."""
+    deadline = time.monotonic() + 10
+    while wait and job_id not in _calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return wait
+
+
+def fail_first_call(job_id: str) -> str:
+    """Fail the first call for ``job_id``; later calls return a new value."""
+    value = next_value(job_id)
+    if value.endswith(":1"):
+        raise ApplicationError("first call fails", non_retryable=True)
+    return value
+
+
+_wait = task(wait_for_value)
+_next = task(next_value)
+_fail_first = task(fail_first_call)
+
+
+@task
+async def wait_then_call(job_id: str, wait: bool) -> str:
+    """Await an Activity of its own, then make the call the other branch makes."""
+    await _wait(job_id, wait)
+    return await _next(job_id)
+
+
+@once
+def _callers_plugin() -> LangGraphPlugin:
+    """Entrypoints whose identical calls come from parallel tasks or follow a failure.
+
+    Built once: the plugin wraps the module-level tasks above in place.
+    """
+
+    @lg_entrypoint()
+    async def two_branches(request: dict[str, Any]) -> dict[str, str]:
+        a = wait_then_call(request["job_id"], True)
+        b = wait_then_call(request["job_id"], False)
+        return {"a": await a, "b": await b}
+
+    @lg_entrypoint()
+    async def retry_on_failure(request: dict[str, Any]) -> list[str]:
+        try:
+            return [await _fail_first(request["job_id"])]
+        except ActivityError:
+            return ["failed", await _fail_first(request["job_id"])]
+
+    return LangGraphPlugin(
+        entrypoints={
+            "two-branches": two_branches,
+            "retry-on-failure": retry_on_failure,
+        },
+        tasks=[_wait, _next, _fail_first, wait_then_call],
+        activity_options={
+            "wait_for_value": {"execute_in": "activity"},
+            "next_value": {"execute_in": "activity"},
+            "fail_first_call": {"execute_in": "activity"},
+            "wait_then_call": {"execute_in": "workflow"},
+        },
+        default_activity_options=_ACTIVITY_OPTIONS,
+    )
+
+
 @dataclass
 class RepeatAcrossContinueAsNewInput:
     entrypoint: str
@@ -176,13 +243,17 @@ class RepeatAcrossContinueAsNewWorkflow:
 
 
 async def _repeat_across_continue_as_new(
-    client: Client, name: str, job_id: str, runs: int
+    client: Client,
+    name: str,
+    job_id: str,
+    runs: int,
+    plugin: LangGraphPlugin | None = None,
 ) -> tuple[list[Any], list[WorkflowHistory]]:
     """Run ``name`` over ``runs`` runs; return each run's results and history.
 
     Each run's history is replayed.
     """
-    plugin = _repeat_plugin()
+    plugin = plugin or _repeat_plugin()
     task_queue = f"repeat-runs-{uuid4()}"
     workflow_id = f"repeat-runs-{uuid4()}"
 
@@ -400,3 +471,43 @@ async def test_parallel_repeated_calls_after_continue_as_new(client: Client):
     assert sorted(seen[2]) == [f"{job_id}:{n}" for n in range(1, 5)]
     assert [len(_scheduled(h)) for h in histories] == [2, 1, 1]
     assert _calls[job_id] == 4
+
+
+@_needs_functional_api
+async def test_parallel_callers_keep_their_results_after_continue_as_new(
+    client: Client,
+):
+    """Identical calls from two parallel tasks are matched per task, not by arrival.
+
+    Each workflow-side task awaits an Activity of its own and then makes the
+    same call. In the first run, branch "a"'s Activity returns only after
+    "b"'s call has run, so "b" makes the call first. After continue-as-new
+    both Activities come from the cache, so "a" reaches the call first, and
+    must still get its own earlier result.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client, "two-branches", job_id, runs=2, plugin=_callers_plugin()
+    )
+
+    first = {"a": f"{job_id}:2", "b": f"{job_id}:1"}
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+@_needs_functional_api
+async def test_retry_after_failure_restored_after_continue_as_new(client: Client):
+    """After continue-as-new, a call that failed before gives its place to its retry.
+
+    The first run's first call fails and the entrypoint calls again. The
+    next run's first call gets the retry's result from the cache and runs
+    nothing.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client, "retry-on-failure", job_id, runs=2, plugin=_callers_plugin()
+    )
+
+    assert seen == [["failed", f"{job_id}:2"], [f"{job_id}:2"]]
+    assert [len(_scheduled(h)) for h in histories] == [2, 0]
+    assert _calls[job_id] == 2

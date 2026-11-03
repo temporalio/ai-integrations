@@ -412,7 +412,6 @@ def entrypoint(
             continue-as-new are not re-executed when the run makes them
             again, in the same order.
     """
-    set_task_cache(cache or {})
     entrypoints = _workflow_entrypoints.get(workflow.info().run_id)
     if entrypoints is None:
         raise RuntimeError(
@@ -422,6 +421,8 @@ def entrypoint(
         raise KeyError(
             f"Entrypoint {name!r} not found. Available entrypoints: {list(entrypoints)}"
         )
+    # Calls made by the entrypoint function itself keep their plain keys.
+    set_task_cache(cache or {}, entrypoint_node=next(iter(entrypoints[name].nodes)))
     return entrypoints[name]
 
 

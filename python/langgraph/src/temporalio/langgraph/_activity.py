@@ -39,6 +39,8 @@ from temporalio.langgraph._task_cache import (
     cache_key,
     cache_lookup,
     cache_put,
+    caller_scope,
+    mark_failed,
     occurrence_key,
 )
 
@@ -489,11 +491,12 @@ def wrap_execute_activity(
             langgraph_config["context_schema_id"] = schema_id
 
         # Check task result cache (for continue-as-new deduplication). Each
-        # repeat of an identical call in this run gets its own key, so it runs
-        # again, as in native LangGraph.
+        # repeat of an identical call from the same caller in this run gets
+        # its own key, so it runs again, as in native LangGraph.
         key = (
             occurrence_key(
-                cache_key(task_id, args, kwargs, langgraph_config.get("context"))
+                cache_key(task_id, args, kwargs, langgraph_config.get("context")),
+                caller_scope(),
             )
             if task_id
             else ""
@@ -501,10 +504,11 @@ def wrap_execute_activity(
         # The cache travels through workflow.continue_as_new(), so a Command is
         # stored in its payload form under a separate "<key>:command" entry and
         # rebuilt on lookup. cache_key() returns 32 hex characters and
-        # occurrence_key() adds at most "#<n>", so this namespace can't collide
-        # with a plain result key, and a result dict is never mistaken for a
-        # Command. Value types go under "<key>:types", so older Workflows still
-        # find the plain entry.
+        # occurrence_key() adds at most "@<scope>" and "#<n>", so this
+        # namespace can't collide with a plain result key, and a result dict
+        # is never mistaken for a Command. Value types go under "<key>:types",
+        # so older Workflows still find the plain entry, and a failed call
+        # leaves "<key>:failed".
         if task_id:
             found_command, command = cache_lookup(f"{key}:command")
             found_result, result = cache_lookup(key)
@@ -530,7 +534,12 @@ def wrap_execute_activity(
             summary = summary_fn(args, kwargs)
             if summary:
                 call_kwargs["summary"] = summary
-        output = await workflow.execute_activity(afunc, input, **call_kwargs)
+        try:
+            output = await workflow.execute_activity(afunc, input, **call_kwargs)
+        except Exception:
+            if task_id:
+                mark_failed(key)
+            raise
         if output.langgraph_interrupts is not None:
             raise GraphInterrupt(output.langgraph_interrupts)
 

@@ -1,11 +1,14 @@
 """Task result cache for continue-as-new support.
 
 Caches task results by (module.qualname, args, kwargs) hash and by how many
-identical calls came before in the run, so that previously completed calls
-are not re-executed after a continue-as-new when the run makes them again in
-the same order, while a call repeated within a run executes again. The cache
-state is a plain dict that can travel through workflow.continue_as_new().
+identical calls the same caller made before in the run, so that previously
+completed calls are not re-executed after a continue-as-new when the run makes
+them again in the same order, while a call repeated within a run executes
+again. The cache state is a plain dict that can travel through
+workflow.continue_as_new().
 """
+
+# pyright: reportMissingTypeStubs=false
 
 from __future__ import annotations
 
@@ -15,6 +18,8 @@ from hashlib import sha256
 from json import dumps
 from typing import Any
 
+from langchain_core.runnables.config import var_child_runnable_config
+from langgraph._internal._constants import NS_END, NS_SEP, PULL, PUSH
 from pydantic import BaseModel
 
 _task_cache: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -25,28 +30,75 @@ _task_cache: ContextVar[dict[str, Any] | None] = ContextVar(
 _key_uses: ContextVar[dict[str, int] | None] = ContextVar(
     "_temporal_task_key_uses", default=None
 )
+# The entrypoint's own node name, when the run is an entrypoint() call.
+_entrypoint_node: ContextVar[str | None] = ContextVar(
+    "_temporal_task_entrypoint_node", default=None
+)
 
 
-def set_task_cache(cache: dict[str, Any] | None) -> None:
+def set_task_cache(
+    cache: dict[str, Any] | None, entrypoint_node: str | None = None
+) -> None:
     """Set the task result cache for the current context and restart call counting."""
     _task_cache.set(cache)
     _key_uses.set({})
+    _entrypoint_node.set(entrypoint_node)
 
 
-def occurrence_key(key: str) -> str:
+def caller_scope() -> str:
+    """Return an ID for where the current call is made from, or ``""``.
+
+    Calls made by the entrypoint itself, and top-level graph nodes, return
+    ``""``. A call made from inside a workflow-side node or task, or a
+    subgraph, returns a hash of the subgraph nodes above it and the LangGraph
+    task path of its caller. LangGraph builds that path from the order in
+    which each task makes its calls, so it is the same in every run, while
+    the order in which parallel callers reach this point is not.
+    """
+    metadata = (var_child_runnable_config.get() or {}).get("metadata") or {}
+    path: tuple[Any, ...] = tuple(metadata.get("langgraph_path") or ())
+    namespace = str(metadata.get("langgraph_checkpoint_ns") or "")
+    outer = [part.split(NS_END)[0] for part in namespace.split(NS_SEP)[:-1]]
+    caller = (
+        path[1]
+        if len(path) > 2 and path[0] == PUSH and isinstance(path[1], tuple)
+        else None
+    )
+    root = _entrypoint_node.get()
+    if (caller is None and not outer) or (
+        root is not None and outer == [root] and caller == (PULL, root)
+    ):
+        return ""
+    return sha256(dumps([outer, caller], default=str).encode()).hexdigest()[:16]
+
+
+def occurrence_key(key: str, scope: str = "") -> str:
     """Return the cache key for this occurrence of a call in the current run.
 
-    The first call with ``key`` keeps it, so caches written by earlier
-    versions still match. The n-th repeat gets ``"<key>#<n>"``, so it does not
-    find an earlier call's result and runs again, while the same calls made in
-    the same order after continue-as-new find theirs.
+    Calls are counted per ``scope`` (see :func:`caller_scope`). The first call
+    with ``key`` from the entrypoint or a top-level node keeps it, so caches
+    written by earlier versions still match; other callers get
+    ``"<key>@<scope>"``. The n-th repeat adds ``"#<n>"``, so it does not find
+    an earlier call's result and runs again, while the same calls made in the
+    same order after continue-as-new find theirs. A place whose call failed
+    (see :func:`mark_failed`) is skipped, so a retry's result goes to the
+    first call that makes it after continue-as-new.
     """
+    base = f"{key}@{scope}" if scope else key
     uses = _key_uses.get()
     if uses is None:
-        return key
-    n = uses.get(key, 0)
-    uses[key] = n + 1
-    return key if n == 0 else f"{key}#{n}"
+        return base
+    while True:
+        n = uses.get(base, 0)
+        uses[base] = n + 1
+        occurrence = base if n == 0 else f"{base}#{n}"
+        if not cache_lookup(f"{occurrence}:failed")[0]:
+            return occurrence
+
+
+def mark_failed(key: str) -> None:
+    """Record that the call under ``key`` failed, so it stored no result."""
+    cache_put(f"{key}:failed", True)
 
 
 def get_task_cache() -> dict[str, Any] | None:
