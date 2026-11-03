@@ -69,6 +69,8 @@ func NewContext(ctx workflow.Context, opts ...ContextOption) context.Context {
 	base = platform.WithTimeProvider(base, func() time.Time { return workflow.Now(ctx) })
 	base = platform.WithUUIDProvider(base, newDeterministicUUIDProvider(ctx))
 	base = platform.WithTaskRunner(base, newWorkflowTaskRunner(ctx, cfg.sequentialToolFanout))
+	// Lets each MCP toolset list its tools once per model step.
+	base = context.WithValue(base, mcpListingsKey{}, &mcpListings{})
 	return base
 }
 

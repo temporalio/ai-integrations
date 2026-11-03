@@ -266,6 +266,10 @@ The Worker plugin does five things:
 - Adds Workflow, Activity, and Nexus interceptors for trace propagation.
 - Installs Workflow bundle polyfills required by the OpenAI Agents SDK.
 
+The model Activities are named `invokeModelActivity` and `invokeModelStreamActivity`. Provider Activity names start with the provider's name, such as `<name>-stateless-call-tool`. A different Activity with one of these names now fails with `Duplicate registration of Activity '<name>'`; earlier versions kept the last one without a warning. If it is registered before `OpenAIAgentsPlugin` (in the Worker's `activities` or by an earlier plugin), `Worker.create` fails. If a plugin applied after `OpenAIAgentsPlugin` replaces one, `worker.run()` fails before the Worker polls. `Worker.create` applies the Worker's `plugins` in order, then the `NativeConnection`'s. A plugin applied after `OpenAIAgentsPlugin` that wraps these Activities counts as replacing them; wrap Activity execution with an Activity interceptor (`interceptors.activity`) instead.
+
+Another `OpenAIAgentsPlugin`'s Activity counts as the same only when it was built from the same objects: the same `modelProvider` and `hostedToolCredentials` for the model Activities, and the same provider for a provider's Activities. So one instance on both the `NativeConnection` and the Worker, or two instances built from one options object, still start, while two instances with equal but separate providers fail.
+
 The Client plugin injects the OpenAI Agents config header into Workflow-starting calls. Attach one `OpenAIAgentsPlugin` instance per Client or Connection configuration. If multiple instances are chained, the last config header wins.
 
 `modelParams` controls scheduling for the model Activity:
@@ -511,6 +515,46 @@ export async function statefulMcpWorkflow(prompt: string): Promise<string> {
 
 Dedicated Worker startup and heartbeat failures surface as `ApplicationFailure` type (exported as `DEDICATED_WORKER_FAILURE_TYPE`).
 
+### MCP tool filters
+
+A static `toolFilter` on the server your factory returns, such as `createMCPToolStaticFilter({ blocked: ['delete_file'] })`, applies in the list-tools Activity, so the model is not offered a blocked tool. The filter applies only to the tool list: a run that listed tools before the Worker was upgraded keeps that list while it is cached.
+
+A callable filter gets the agent and the run context, which exist only in the Workflow, so the Worker refuses one on the factory's server: every list-tools and call-tool Activity for that server fails with a non-retryable `ApplicationFailure` of type `MCPToolFilterUnsupported` (exported as `TOOL_FILTER_UNSUPPORTED_TYPE`). A new run fails at its first list-tools Activity. A `statelessMcpServer()` run that listed tools on an older Worker instead gets a tool error, which the model reads, for each call to that server, and the run keeps going. So remove the callable filter from the factory's server before you upgrade Workers. Pass it as the `toolFilter` option of `statelessMcpServer()` or `statefulMcpServer()` instead:
+
+```ts
+const server = statelessMcpServer('files', {
+  toolFilter: async ({ agent }, tool) => tool.name !== 'delete_file' || agent.name === 'FileAdmin',
+});
+```
+
+The agent applies this option in the Workflow each time it lists tools; the handle caches the server's full tool list, not the filtered one. A callable filter runs for each tool on every listing, gets the name the server was registered with as `serverName`, and must be deterministic. An Activity or timer it awaits adds commands that older plugin versions never schedule, so let Workflows that use the option finish before you roll the plugin back. A filter assigned to a stateful handle later (`server.toolFilter = ...`) gets the handle's internal name, `<name>-stateful`. A callable filter also runs when a run resumes from a `RunState`, for example after a tool approval, and then sees the context rebuilt from JSON: plain objects, without class methods. If it throws there, the run fails with an `AgentsWorkflowError`.
+
+Because the handle caches the full list, the agent SDK's `invalidateServerToolsCache(name)` does not refresh a handle that has a filter. Call the handle's `invalidateToolsCache()` as well, which also works on older plugin versions. On older versions, `invalidateServerToolsCache(name)` alone refreshed a stateful handle with a `toolFilter` property assigned. Such a run schedules one list-tools Activity fewer on this version and fails replay, so let it finish before you upgrade.
+
+Older versions also let the agent SDK cache the filtered list of a handle with a `toolFilter` property assigned, per server and agent name, so a later run with another context got the first run's tools. This version filters every listing for its own run. A run that started on an older version, whose filter depends on the run context, and that called a tool the filter now removes fails replay on this version. Let such runs finish before you upgrade.
+
+### MCP request metadata
+
+A `toolMetaResolver` builds each tool call's MCP `_meta` from the run context, which exists only in the Workflow. Pass it as the `toolMetaResolver` option of `statelessMcpServer()` or `statefulMcpServer()`; it runs in Workflow code and must be deterministic. The call-tool Activity passes its result to the server's `callTool`. The Worker can't run a `toolMetaResolver` on the factory's server, so it refuses one: every list-tools and call-tool Activity for that server fails with a non-retryable `ApplicationFailure` of type `MCPToolMetaResolverUnsupported` (exported as `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`).
+
+```ts
+const server = statelessMcpServer('tickets', {
+  toolMetaResolver: ({ runContext }) => ({ tenant: (runContext.context as { tenant: string }).tenant }),
+});
+```
+
+A resolver also runs for tool calls after a run resumes from a `RunState`, for example after a tool approval, and then sees the context rebuilt from JSON: plain objects, without class methods. If it throws there, the model gets a tool error and the server isn't called.
+
+A new run with a `toolMetaResolver` on the factory's server fails at its first list-tools Activity. A `statelessMcpServer()` run that listed tools on an older Worker instead gets a tool error, which the model reads, for each call to that server, and the run keeps going. So remove the `toolMetaResolver` from the factory's server before you upgrade Workers.
+
+The `_meta` values are recorded in the call-tool Activity input in Workflow History, so don't put secrets in them.
+
+A call-tool Activity that runs on a Worker with an older plugin version drops the `_meta`, and nothing fails. Upgrade every Worker that runs the call-tool Activities, including Workers on a `taskQueue` you pass to `statelessMcpServer()`, before Workflows rely on `_meta`, or use Worker Versioning.
+
+Plugin versions before this option ignore it and don't run its resolver. An older version can replay a History only if it produces the same Workflow commands in the same order, and a resolver passed as this option can change them even when it is synchronous and never fails: the agent awaits it, which can reorder the Activities of parallel tool calls, and its changes to the run context can change later commands. An older version fails such a History with a nondeterminism error (`TMPRL1100`). Before you roll Workers back to an older plugin version, let the Workflows that use this option finish. Workflows with no resolver, or with a resolver set on the handle itself (`server.toolMetaResolver = ...`), run the same resolver code on older versions, so this option doesn't change their commands. On a `statefulMcpServer()` handle, a resolver set this way gets the handle's internal name, `<name>-stateful`, as `serverName`; the option gets `<name>`.
+
+Adding a resolver to a Workflow that has open runs, including moving one off the factory's server, can fail their replay for the same reasons, so guard the change with `patched()` or let those runs finish first.
+
 ## Sandbox agents
 
 > **Experimental** — sandbox support is subject to change prior to General Availability.
@@ -614,9 +658,9 @@ addTraceProcessor(new BatchTraceProcessor(new OpenAITracingExporter()));
 
 ### Tracing keys per run
 
-The exporter sends each span with its trace's key, or with its default key (`OPENAI_API_KEY` or `setTracingExportApiKey()`) when the trace has none. The plugin does not write tracing keys into Workflow history, so a trace that crosses a Temporal boundary arrives without its key. A key a run sets in Workflow code with `tracing: { apiKey }` applies to that run's Workflow spans only when the run starts its own trace. When the Workflow runs inside a trace a Client started, the run joins that trace and the Agents SDK ignores the run's key. Spans made in Activities (including stateful MCP operations) and Nexus handlers, and the Workflow spans of a trace that a Client started, with or without `tracingApiKey`, use the exporter's default key.
+The exporter sends each span with its trace's key, or with its default key (`OPENAI_API_KEY` or `setTracingExportApiKey()`) when the trace has none. A trace's own tracing key, set with `tracing: { apiKey }` on a run or `tracingApiKey` on a trace, is not supported. The plugin passes traces to Workflows, Activities and Nexus handlers in headers, which are stored in Event History, so it cannot pass the key, and their spans would be exported with another key. In Workflow code, `TemporalOpenAIRunner.run` with `tracing: { apiKey }` or inside such a trace, and `withTrace(name, fn, { tracingApiKey })`, throw. Starting, signaling, querying or updating a Workflow, or scheduling an Activity, child Workflow or Nexus operation, under such a trace throws too. Set the tracing key on every Client and Worker process instead. An Activity or Nexus handler called under a trace runs in the trace the plugin restored there: an agent run joins it and ignores `tracing: { apiKey }`, and the Worker's `tracingApiKey` option gives its spans a key. When the caller had no trace, the run starts its own trace and keeps `tracing: { apiKey }`, and the resolver is not called. A trace that the Activity or handler starts itself, with `withTrace(name, fn, { tracingApiKey })`, keeps its key in both cases; it is separate from the Workflow's trace, and Temporal calls under it throw. A run that used such a key in Workflow code before you deploy this version gets the error when it replays: let those runs finish first, or use Worker Versioning.
 
-To send those spans with another key, resolve it on the Worker with `tracingApiKey`. It gets the trace ID, and when known the trace name and the Workflow ID and type, and returns a key or `undefined` for the default:
+To use a different key per run, resolve it on the Worker with `tracingApiKey`. The plugin calls it for Workflow spans, and for spans made in Activities (including stateful MCP operations) and Nexus handlers under the trace the plugin restored there. It gets the trace ID, and when known the trace name and the Workflow ID and type, and returns a key or `undefined` for the default:
 
 ```ts
 const plugin = new OpenAIAgentsPlugin({
@@ -624,6 +668,8 @@ const plugin = new OpenAIAgentsPlugin({
   tracingApiKey: ({ workflowId }) => (workflowId?.startsWith('tenant-a-') ? tenantATracingKey : undefined),
 });
 ```
+
+The resolver runs only on Workers. A trace that a Client starts, and the spans the Client makes in it, keep the Client's default key. To keep a run under one key, start the Workflow outside a Client trace, so that the run starts its own trace, or have the resolver return the Client's key for that trace.
 
 ### OpenTelemetry
 
@@ -706,9 +752,9 @@ Most applications use two import paths: `@temporalio/openai-agents` in Worker an
 | `@temporalio/openai-agents/otel`                 | Worker or Client | Replay-safe OpenTelemetry setup                             |
 | `@temporalio/openai-agents/workflow-interceptor` | Worker bundling  | Manual `workflowInterceptorModules` wiring without a plugin |
 
-`@temporalio/openai-agents` exports `OpenAIAgentsPlugin`, MCP provider classes, `SandboxClientProvider`, model option types, hosted tool credential types, and `DEDICATED_WORKER_FAILURE_TYPE`. `OpenAIAgentsTraceClientInterceptor` is also public for Clients that need manual interceptor wiring instead of plugin registration.
+`@temporalio/openai-agents` exports `OpenAIAgentsPlugin`, MCP provider classes, `SandboxClientProvider`, model option types, hosted tool credential types, `DEDICATED_WORKER_FAILURE_TYPE`, `TOOL_FILTER_UNSUPPORTED_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`. `OpenAIAgentsTraceClientInterceptor` is also public for Clients that need manual interceptor wiring instead of plugin registration.
 
-`@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `agentAsTool`, `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, and `DEDICATED_WORKER_FAILURE_TYPE`.
+`@temporalio/openai-agents/workflow` exports Workflow-safe APIs: `TemporalOpenAIRunner`, `WorkflowSafeMemorySession`, `activityAsTool`, `nexusOperationAsTool`, `agentAsTool`, `statelessMcpServer`, `statefulMcpServer`, `temporalSandboxClient`, `workerEnvValue`, related option/definition types, `DEDICATED_WORKER_FAILURE_TYPE`, `TOOL_FILTER_UNSUPPORTED_TYPE` and `TOOL_META_RESOLVER_UNSUPPORTED_TYPE`.
 
 `@temporalio/openai-agents/otel` exports `createTracerProvider`, `TemporalIdGenerator`, `markReplaySafeTracerProvider`, `isReplaySafeTracerProvider`, and `TemporalOpenAIAgentsTracerProviderOptions`. Install optional peer dependency `@opentelemetry/sdk-trace-base` only when you use this OTel integration.
 
