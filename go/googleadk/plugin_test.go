@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
@@ -156,6 +157,15 @@ func TestNewPluginRejectsInvalidConfig(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "broken-model")
+}
+
+// TestNewPluginHasVersion proves the plugin has the Version method that SDKs
+// find by name and signature, and is still a client plugin too.
+func TestNewPluginHasVersion(t *testing.T) {
+	plugin, err := googleadk.NewPlugin(googleadk.Config{})
+	require.NoError(t, err)
+	assert.Implements(t, (*interface{ Version() string })(nil), plugin)
+	assert.Implements(t, (*client.Plugin)(nil), plugin)
 }
 
 // TestPluginRegistersActivitiesOnWorkerStart proves the plugin's StartWorker

@@ -1,3 +1,4 @@
+import importlib.metadata
 import typing
 from dataclasses import replace
 
@@ -227,3 +228,9 @@ def test_mcp_factory_that_returns_a_strands_client_fails_retryably() -> None:
     )
     # Retryable: the run waits for a fixed worker instead of failing.
     assert not error.value.non_retryable
+
+
+def test_plugin_reports_package_version() -> None:
+    assert StrandsPlugin().version() == importlib.metadata.version(
+        "temporalio-strands-agents"
+    )

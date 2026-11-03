@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import replace
 from datetime import timedelta
@@ -151,6 +152,13 @@ class StrandsPlugin(SimplePlugin):
             workflow_failure_exception_types=[ContextWindowOverflowException],
             run_context=mcp_plugin.run_context if mcp_plugin else None,
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-strands-agents")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
 
 
 def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], Client]:

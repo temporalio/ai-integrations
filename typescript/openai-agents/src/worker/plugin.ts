@@ -127,6 +127,16 @@ export interface OpenAIAgentsPluginOptions {
   tracingApiKey?: TracingApiKeyResolver;
 }
 
+/** Reads this package's version, which worker heartbeats report. Empty if it can't be read. */
+function packageVersion(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require('../../package.json') as { version?: string }).version ?? '';
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Temporal plugin integrating the OpenAI Agents SDK. Registers model
  * invocation Activities so Workflow-side ActivityBackedModel can delegate LLM
@@ -135,6 +145,9 @@ export interface OpenAIAgentsPluginOptions {
  * @experimental The OpenAI Agents plugin is an experimental feature; APIs may change without notice.
  */
 export class OpenAIAgentsPlugin extends SimplePlugin {
+  /** The package version, reported in worker heartbeats. */
+  readonly version = packageVersion();
+
   // The provider each provider Activity comes from, by Activity name, for the error message.
   private readonly activityProviders: ReadonlyMap<string, string>;
   private readonly tracingApiKey?: TracingApiKeyResolver;
