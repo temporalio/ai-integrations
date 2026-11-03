@@ -3,8 +3,9 @@
 Pydantic decodes an ``Iterable[X]`` field as a one-shot iterator, which cannot be copied, and in
 JSON mode it picks the ``Iterable`` side of ``str | Iterable[X]`` for a string
 (pydantic/pydantic#11219). Importing this module swaps those annotations for ``list[X]``, so every
-class built afterwards decodes carried items as lists and strings. Tool definitions keep their
-types, because other ``openai`` requests share them.
+class built afterwards decodes carried items as lists and strings. The swap does not enter tool
+definitions, because other ``openai`` requests share them; a type that items also hold, such as
+``LocalEnvironmentParam``, is swapped for both.
 """
 
 import collections.abc

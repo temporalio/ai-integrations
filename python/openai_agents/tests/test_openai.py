@@ -67,6 +67,7 @@ from agents.tool import CustomTool
 from agents.tool_context import ToolContext
 from openai import APIStatusError, AsyncOpenAI, BaseModel, RateLimitError
 from openai.types.responses import (
+    LocalEnvironmentParam,
     ResponseCodeInterpreterToolCall,
     ResponseCustomToolCall,
     ResponseFileSearchToolCall,
@@ -1451,6 +1452,9 @@ def test_type_swap_leaves_tool_definitions():
         typing_extensions.get_origin(hints(ResponseOutputMessageParam)["content"])
         is list
     )
+    # A shell call item holds the shell tool's local environment, so the
+    # swap changes it for the tool too.
+    assert typing_extensions.get_origin(hints(LocalEnvironmentParam)["skills"]) is list
 
 
 class CarriedChatState(pydantic.BaseModel):

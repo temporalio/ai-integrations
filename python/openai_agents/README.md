@@ -413,7 +413,9 @@ message's `content`, as lists.
 
 To do this, importing `temporalio.openai_agents` changes the `Iterable[X]` fields of the `openai`
 input item types (the `TypedDict`s in `TResponseInputItem`, except tool definitions such as
-`FileSearchToolParam`) to `list[X]` for the whole process. Type checkers still see `Iterable`. At
+`FileSearchToolParam`) to `list[X]` for the whole process. A type that an item shares with a tool
+definition changes for the tool too: with `openai` 3.8.0, that is `LocalEnvironmentParam`, so the
+shell tool's local `skills` is also a `list`. Type checkers still see `Iterable`. At
 runtime, `typing.get_type_hints()` reports `list`, your own pydantic validation of those types
 returns lists, and in strict mode it rejects a tuple or generator there. The `openai` client also
 stops turning an iterator in those fields into a list when it builds a request, so
