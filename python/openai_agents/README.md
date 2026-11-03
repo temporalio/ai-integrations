@@ -568,7 +568,8 @@ start-to-close timeout, the retry fails with a non-retryable
 `ApplicationError(type="DedicatedWorkerFailure")` instead of connecting a new
 server with an empty session. Leaving the `async with` block then raises
 `ApplicationError(type="DedicatedWorkerFailure")`, whose cause is the session
-activity's `ActivityError`. To recover, catch it around the block and open a
+activity's `ActivityError` (none if the session ended in the workflow task that
+ended the block, since the SDK has dropped it). To recover, catch it around the block and open a
 new block, which connects a new, empty server (but see the note on same-name
 blocks below). A retry after a failed factory call, a failed first `connect()`,
 or a worker shutdown before the server connected connects again. A retry after a lost host or a
@@ -589,21 +590,24 @@ Some consequences:
   ones that wait for a person, and set a `heartbeat_timeout` to notice a lost
   worker sooner. The session activity heartbeats every 30 seconds, or every
   half `heartbeat_timeout` if that is shorter.
-- An activity reset or unpause with `reset_heartbeat=True` clears the marker,
-  so the next attempt connects a new, empty server.
-- Sessions started on an earlier version recorded no marker, so the deploy of
-  this version still gives each open session a new, empty server one last time.
+- An activity reset or unpause with `reset_heartbeat=True` clears the session's
+  heartbeat details, so the next attempt connects a new, empty server.
+- Sessions started on an earlier version left no such heartbeat details, so the
+  deploy of this version still gives each open session a new, empty server one
+  last time.
 - Code that caught `ActivityError` around a block, which earlier versions
   raised when the session failed, must also catch
   `ApplicationError(type="DedicatedWorkerFailure")`, which the block now raises
-  after a refusal. A session that fails for another reason, such as running out
-  of a bounded `server_session_config` retry policy, still makes the block raise
-  `ActivityError`.
+  after a refusal. A session that fails for another reason, such as one with a
+  one-attempt `server_session_config` retry policy, or one whose attempts all
+  fail before connecting, still makes the block raise `ActivityError`.
 - The session activity's heartbeats go through your payload codec, so its
   `heartbeat_timeout` must comfortably exceed a heartbeat's encoding time. An
   attempt that connected no server waits at most 10 seconds for its heartbeats
-  to be encoded before it clears the marker; one that takes longer can make the
-  retry refuse.
+  to be encoded before it clears its heartbeat details; one that takes longer can
+  make the retry refuse. Encoding time also delays each block's first operation,
+  so keep it well under the 30 seconds the session activity waits for its first
+  heartbeat, and under the operations' `schedule_to_start_timeout`.
 - Blocks with the same name in one run use the same task queue. A later block
   refuses any operation the server scheduled for an earlier block, but until
   the earlier block's session activity notices its cancellation, which can take
@@ -628,9 +632,12 @@ the operation resolves one step after other activities that resolve in the same
 workflow task, and if another branch cancels the caller in the workflow task
 that brings the operation's result, the caller gets the cancellation. A
 caller's own cancellation still cancels the operation, and a cancellation that
-leaves the block wins over the session's failure. On Python 3.10, a caller that
-is cancelled in the workflow task in which its session ends gets
-`DedicatedWorkerFailure`.
+leaves the block wins over the block's `DedicatedWorkerFailure`, though not over
+an `ActivityError` from a session that failed for another reason. On Python
+3.10, the plugin can't tell a caller cancelled in the workflow task in which its
+session ends from the session's end, so that caller gets
+`DedicatedWorkerFailure`, and code that catches it, as above, loses the
+cancellation.
 
 A run follows its session this way only once it records the patch marker
 `openai-agents-stateful-mcp-session-watch`, which it does at its first
@@ -642,9 +649,10 @@ Temporal Python SDK keeps the decision it made while replaying that earlier
 operation, so the run never records the marker and schedules such operations as
 before until it ends: one scheduled after its session ended waits until the
 caller cancels it or the run ends. A run with the marker fails replay on an
-earlier version, and so does a run whose session got a refusal and that then
-caught the block's `ApplicationError`, so do not roll back while such runs are
-open. Drain the earlier version's workers before starting this one: while
+earlier version, and so can any run whose session failed with
+`DedicatedWorkerFailure` (a refused retry or a refused describe) and that then
+went on, whether it caught the block's failure or a cancellation, so do not roll
+back while such runs are open. Drain the earlier version's workers before starting this one: while
 workers of both versions run, a run whose session gets a refusal can fail
 replay when it moves from one to the other.
 

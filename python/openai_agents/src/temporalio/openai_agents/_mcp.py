@@ -544,16 +544,17 @@ class _SessionHeartbeats:
         if self._may_be_open and not self._opened:
             # This attempt connected no server, so a retry may connect again.
             # Send that last, after every earlier heartbeat: one still being
-            # encoded would otherwise replace it. If this wait is interrupted,
-            # the marker stays and the retry is refused. A codec may never
-            # finish, so clear anyway after _CLOSE_TIMEOUT: the clear has no
-            # details, so it skips the codec, and the worker waits only for an
-            # activity's last heartbeat. One that lands later only makes the
-            # retry refuse.
-            if self._sending:
-                await asyncio.wait(set(self._sending), timeout=_CLOSE_TIMEOUT)
-            self._may_be_open = False
-            self.beat()
+            # encoded would otherwise replace it. A codec may never finish, so
+            # clear after _CLOSE_TIMEOUT, or when the wait is interrupted, all
+            # the same: the clear has no details, so it skips the codec, and the
+            # worker waits only for an activity's last heartbeat. One that
+            # lands later only makes the retry refuse.
+            try:
+                if self._sending:
+                    await asyncio.wait(set(self._sending), timeout=_CLOSE_TIMEOUT)
+            finally:
+                self._may_be_open = False
+                self.beat()
 
 
 def _earlier_attempt_failure(details: Sequence[Any]) -> ApplicationError | None:
@@ -637,13 +638,35 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
 
         If the session activity failed with ``DedicatedWorkerFailure``, raises
         ``ApplicationError(type="DedicatedWorkerFailure")`` with the session's
-        ``ActivityError`` as its cause.
+        ``ActivityError`` as its cause, or with no cause if the session ended in
+        the workflow task that ended the block.
         """
         if self._connect_handle:
             session = self._connect_handle
+            coro = session.get_coro()
+            started = not (
+                inspect.iscoroutine(coro)
+                and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED
+            )
+            cancels = _cancel_requests()
             session.cancel()
             try:
                 await session
+            except asyncio.CancelledError:
+                if (
+                    not started
+                    or not session.cancelled()
+                    or _cancel_requests() > cancels
+                ):
+                    raise
+                # The session ended in the workflow task that ended the block,
+                # as when its last timer fired, and the SDK dropped its failure
+                # when the handle was cancelled.
+                raise ApplicationError(
+                    "The stateful MCP server session activity has ended, so no "
+                    "worker serves this server's operations.",
+                    type="DedicatedWorkerFailure",
+                ) from None
             except Exception as e:
                 if is_cancelled_exception(e):
                     pass
@@ -826,7 +849,8 @@ class StatefulMCPServerProvider:
     will have to handle cases where the dedicated worker fails, as Temporal is unable to seamlessly
     recreate any lost state in that case. It is discouraged to use this approach unless necessary.
 
-    Handling dedicated worker failure will entail catching ApplicationError with type "DedicatedWorkerFailure".
+    Handling dedicated worker failure will entail catching ApplicationError with type "DedicatedWorkerFailure",
+    which is also raised if the session activity is retried after it may have opened a session.
     Depending on the usage pattern, the caller will then have to either restart from the point at which the Stateful
     server was needed or handle continuing from that loss of state in some other way.
     """

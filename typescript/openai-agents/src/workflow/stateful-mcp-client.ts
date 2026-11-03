@@ -201,10 +201,13 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
    * Cancels the server-session Activity, tearing down the dedicated Worker. If
    * the session Activity failed with `DedicatedWorkerFailure`, throws an
    * `ApplicationFailure` of that type with the session's `ActivityFailure` as
-   * its cause, unless the caller's scope is cancelled.
+   * its cause, unless the caller's scope or the scope that connected the
+   * server is cancelled.
    */
   async cleanup(): Promise<void> {
     if (this._sessionScope) {
+      // Cancelled with the caller, also when cleanup() runs in CancellationScope.nonCancellable().
+      const connectScope = this._sessionScope.parent;
       this._sessionScope.cancel();
       try {
         await this._sessionPromise;
@@ -216,7 +219,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
         ) {
           // A cancellation of the caller wins over the session's failure, as
           // when cleanup() runs in a finally after the caller was cancelled.
-          if (!CancellationScope.current().consideredCancelled) {
+          if (!CancellationScope.current().consideredCancelled && !connectScope?.consideredCancelled) {
             throw this.sessionEndedFailure(err);
           }
         } else if (!isCancellation(err)) {

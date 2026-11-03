@@ -1155,7 +1155,10 @@ test('Stateful MCP: a Workflow cancellation wins over the session it ended', asy
   });
 });
 
-test('Stateful MCP: a Workflow cancellation wins over a refused session in cleanup()', async (t) => {
+for (const nonCancellable of [false, true]) {
+test(`Stateful MCP: a Workflow cancellation wins over a refused session in cleanup()${
+  nonCancellable ? ', also in a non-cancellable scope' : ''
+}`, async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
   let factoryCalls = 0;
   const worker = await createWorker({
@@ -1177,6 +1180,7 @@ test('Stateful MCP: a Workflow cancellation wins over a refused session in clean
   });
   await worker.runUntil(async () => {
     const handle = await startWorkflow(statefulMcpCancelledAfterRefusalWorkflow, {
+      args: [nonCancellable],
       workflowExecutionTimeout: '60 seconds',
     });
     // Wait until the retry of the timed-out session Activity has been refused.
@@ -1192,10 +1196,13 @@ test('Stateful MCP: a Workflow cancellation wins over a refused session in clean
   });
   t.is(factoryCalls, 1);
 });
+}
 
 test('Stateful MCP: a caller still cancels a queued operation without a schedule-to-start timeout', async (t) => {
-  const { createWorker, executeWorkflow } = helpers(t);
+  const { createWorker, startWorkflow } = helpers(t);
   const calls: string[] = [];
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
   const worker = await createWorker({
     plugins: [
       new OpenAIAgentsPlugin({
@@ -1206,7 +1213,7 @@ test('Stateful MCP: a caller still cancels a queued operation without a schedule
             () => {
               const server = memoryServer('sessionEnded', 'S', calls);
               // The session's Worker polls only after the call is cancelled.
-              server.connect = () => new Promise((r) => setTimeout(r, 3_000));
+              server.connect = () => released;
               return server;
             },
             t.context.env.nativeConnection
@@ -1216,11 +1223,17 @@ test('Stateful MCP: a caller still cancels a queued operation without a schedule
     ],
   });
   await worker.runUntil(async () => {
-    const result = await executeWorkflow(statefulMcpSessionEndedWorkflow, {
+    const handle = await startWorkflow(statefulMcpSessionEndedWorkflow, {
       args: [true],
       workflowExecutionTimeout: '30 seconds',
     });
-    t.deepEqual(result, ['cancelled', 'get=EMPTY session=S']);
+    const callCancelled = async () =>
+      ((await handle.fetchHistory()).events ?? []).some(
+        (e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_CANCELED
+      );
+    for (let i = 0; i < 200 && !(await callCancelled()); i++) await new Promise((r) => setTimeout(r, 100));
+    release();
+    t.deepEqual(await handle.result(), ['cancelled', 'get=EMPTY session=S']);
   });
   t.false(calls.includes('put'));
 });
