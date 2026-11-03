@@ -24,9 +24,14 @@ import (
 // publishes each to the streaming topic); with stream=false it yields a single
 // complete response, matching how a real model behaves on a non-streaming call.
 // It records the stream flag it last saw so a test can prove which path ran.
+// When final is set, a streamed call ends with it as one complete response, as
+// Gemini ends a stream with the aggregate; when fail is set, it ends with that
+// error instead.
 type chunkedModel struct {
 	name   string
 	chunks []string
+	final  string
+	fail   error
 
 	mu        sync.Mutex
 	sawStream bool
@@ -55,6 +60,16 @@ func (m *chunkedModel) GenerateContent(ctx context.Context, req *model.LLMReques
 			if !yield(resp, nil) {
 				return
 			}
+		}
+		if m.fail != nil {
+			yield(nil, m.fail)
+			return
+		}
+		if m.final != "" {
+			yield(&model.LLMResponse{
+				Content:      &genai.Content{Role: genai.RoleModel, Parts: []*genai.Part{{Text: m.final}}},
+				TurnComplete: true,
+			}, nil)
 		}
 	}
 }

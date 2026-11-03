@@ -44,7 +44,8 @@ logger = logging.getLogger(__name__)
 # Upper bound on how long worker shutdown waits for MCP transports to close.
 _CLOSE_TIMEOUT_SECONDS = 10.0
 # JSON-RPC errors that a retry of the same request cannot fix. INTERNAL_ERROR,
-# CONNECTION_CLOSED, REQUEST_TIMEOUT and unknown codes stay retryable.
+# CONNECTION_CLOSED, REQUEST_TIMEOUT, unknown codes and a lost session (see
+# _session_lost) stay retryable.
 _NON_RETRYABLE_PROTOCOL_ERRORS = {
     PARSE_ERROR,
     INVALID_REQUEST,
@@ -55,6 +56,23 @@ _NON_RETRYABLE_PROTOCOL_ERRORS = {
     UNSUPPORTED_PROTOCOL_VERSION,
     URL_ELICITATION_REQUIRED,
 }
+
+
+# A server answers HTTP 404 for a session it no longer knows, for example after a
+# restart, and the client must start a new session. MCP reports it only as
+# INVALID_REQUEST with no data and one of these messages: mcp's streamable HTTP
+# client uses "Session terminated" when the 404 body is not a JSON-RPC error,
+# and the MCP Python SDK server's body says "Session not found".
+_SESSION_LOST_MESSAGES = frozenset({"Session terminated", "Session not found"})
+
+
+def _session_lost(err: MCPError) -> bool:
+    """Whether the server no longer knows the connection's MCP session."""
+    return (
+        err.code == INVALID_REQUEST
+        and err.data is None
+        and err.message in _SESSION_LOST_MESSAGES
+    )
 
 
 def _dump(model: BaseModel) -> dict[str, Any]:
@@ -94,19 +112,25 @@ class _MCPActivities:
         request: _MCPRequest,
         operation: Callable[[_MCPBackend], Awaitable[_Result]],
     ) -> _Result:
+        has_session = False
         try:
             async with self._pool.backend(
                 server,
                 factory_argument=request.factory_argument,
             ) as backend:
+                # Only older-protocol connections have MCP sessions. Each
+                # Activity attempt opens its own, so a retry starts a new one.
+                has_session = not backend.cacheable
                 return await operation(backend)
         except MCPError as err:
             details = (err.code,) if err.data is None else (err.code, err.data)
+            session_lost = has_session and _session_lost(err)
             raise ApplicationError(
                 err.message,
                 *details,
                 type="MCPProtocolError",
-                non_retryable=err.code in _NON_RETRYABLE_PROTOCOL_ERRORS,
+                non_retryable=err.code in _NON_RETRYABLE_PROTOCOL_ERRORS
+                and not session_lost,
             ) from err
         except ValidationError as err:
             raise ApplicationError(
