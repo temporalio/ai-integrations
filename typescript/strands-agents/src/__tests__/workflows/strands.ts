@@ -227,7 +227,8 @@ export async function mcpAgent(prompt: string, server = 'testServer', cacheTools
 /**
  * An agent with one `TemporalMCPClient` per server, and the `echo` and `take_note` tools when `local`
  * is set. With `replace` set to `[name, round]`, an `AfterToolsEvent` hook puts a local tool under
- * `name` after that tool round. A refusal returns its message and the agent's tool names.
+ * `name` after that tool round. Each MCP activity is tried once. Returns the agent's answer, or a
+ * refusal's message, and then the agent's tool names.
  */
 export async function mcpServersAgent(
   prompt: string,
@@ -236,7 +237,8 @@ export async function mcpServersAgent(
   replace?: [string, number]
 ): Promise<string> {
   const clients = servers.map(
-    (server) => new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } })
+    (server) =>
+      new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds', retry: { maximumAttempts: 1 } } })
   );
   const agent = new TemporalAgent({
     model: 'test',
@@ -251,15 +253,38 @@ export async function mcpServersAgent(
       if (++rounds === round) event.agent.toolRegistry.addOrReplace([standIn]);
     });
   }
+  let result: string;
   try {
-    return (await agent.invoke(prompt)).toString();
+    result = (await agent.invoke(prompt)).toString();
   } catch (err) {
-    const names = agent.toolRegistry
-      .list()
-      .map((t) => t.name)
-      .sort();
-    return `refused: ${(err as Error).message} Tools: ${names.join(', ')}.`;
+    result = `refused: ${(err as Error).message}`;
   }
+  const names = agent.toolRegistry
+    .list()
+    .map((t) => t.name)
+    .sort();
+  return `${result} Tools: ${names.join(', ')}.`;
+}
+
+/**
+ * Two agents at once: `first` with the servers `a` and `b`, and `second` with the server `c` and an
+ * `auditHook` activity after each tool round. Its histories recorded on main pin when each
+ * re-listing is scheduled against the other agent's activities.
+ */
+export async function mcpAgentsSideBySide(prompt: string): Promise<string> {
+  const client = (server: string): TemporalMCPClient =>
+    new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } });
+  const first = new TemporalAgent({ model: 'first', printer: false, tools: [client('a'), client('b')] });
+  const second = new TemporalAgent({ model: 'second', printer: false, tools: [client('c')] });
+  second.addHook(
+    AfterToolsEvent,
+    strandsWorkflow.activityAsHook('auditHook', {
+      activityInput: () => 'after tools',
+      activityOptions: { startToCloseTimeout: '10 seconds' },
+    })
+  );
+  const results = await Promise.all([first.invoke(prompt), second.invoke(prompt)]);
+  return results.map(String).join(', ');
 }
 
 const noteTool = tool({

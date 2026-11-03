@@ -1210,7 +1210,7 @@ test('a re-listed MCP tool name is refused only while another tool of the agent 
     ({ name, description: name, toolSpec: { name, description: name, inputSchema: schema } }) as unknown as Tool;
   const listings = new Map<string, number>();
   const calls: string[] = [];
-  // Lists `first` at the agent's first listing and `later` from then on.
+  // Lists `first` at the agent's first listing and `later` from then on. A listing with `!fail` fails.
   class ChangingMcpClient extends StubMcpClient {
     constructor(
       private readonly label: string,
@@ -1222,7 +1222,9 @@ test('a re-listed MCP tool name is refused only while another tool of the agent 
     override async listTools(): Promise<never> {
       const count = (listings.get(this.label) ?? 0) + 1;
       listings.set(this.label, count);
-      return (count === 1 ? this.first : this.later).map(stubTool) as never;
+      const names = count === 1 ? this.first : this.later;
+      if (names.includes('!fail')) throw new Error(`${this.label} is down`);
+      return names.map(stubTool) as never;
     }
     override async callTool(tool: { name: string }, args: JSONValue): Promise<JSONValue> {
       calls.push(`${this.label}:${tool.name}`);
@@ -1278,8 +1280,14 @@ test('a re-listed MCP tool name is refused only while another tool of the agent 
     result: "refused: Tool with name 'x' already registered. MCP servers 'b' and 'a' both list it. Tools: other, x.",
     calls: ['a:other'],
   });
+  // a and b start listing names that differ only by '-' or '_'.
+  t.deepEqual(await run({ a: [['p'], ['x_y']], b: [['q'], ['x-y']] }, ['p']), {
+    result: "refused: Tool name 'x-y' already exists as 'x_y'. MCP servers 'a' and 'b' both list it. Tools: p, q.",
+    calls: ['a:p'],
+  });
   // c starts listing a name that a tool in `tools` has, or one that differs from it only by '-' or
-  // '_', or lists a name twice. The agent keeps the listFiles that c's refused listing drops.
+  // '_', or lists a name twice, or two that differ only by '-' or '_', or one Strands rejects. The
+  // agent keeps the listFiles that c's refused listing drops, and gets none of its new tools.
   for (const [later, refusal] of [
     [['echo'], "Tool with name 'echo' already registered. MCP server 'c' lists it, and another tool of the agent has it."],
     [
@@ -1287,25 +1295,57 @@ test('a re-listed MCP tool name is refused only while another tool of the agent 
       "Tool name 'take-note' already exists as 'take_note'. MCP server 'c' lists it, and another tool of the agent has it.",
     ],
     [['other', 'other'], "Tool with name 'other' already registered. MCP server 'c' lists it twice."],
+    [['x-y', 'x_y'], "Tool name 'x_y' already exists as 'x-y'. MCP server 'c' lists both names."],
+    [
+      ['newTool', 'bad.name'],
+      "Tool name must contain only alphanumeric characters, hyphens, and underscores. MCP server 'c' lists 'bad.name'.",
+    ],
   ] as [string[], string][]) {
     t.deepEqual(await run({ c: [['listFiles'], later] }, ['listFiles'], true), {
       result: `refused: ${refusal} Tools: echo, listFiles, take_note.`,
       calls: ['c:listFiles'],
     });
   }
+  // a's re-listing fails after b's, which adds a tool: the agent's tools stay as they were.
+  const failed = await run({ a: [['p'], ['!fail']], b: [['other'], ['other', 'new']] }, ['p']);
+  t.regex(failed.result, /^refused: .* Tools: other, p\.$/);
+  t.deepEqual(failed.calls, ['a:p']);
   // x moves from b to a, with the servers in either order: the model calls it on a.
   for (const servers of [
     { b: [['x'], ['later']], a: [['other'], ['x']] },
     { a: [['other'], ['x']], b: [['x'], ['later']] },
   ] as Record<string, [string[], string[]]>[]) {
-    t.deepEqual(await run(servers, ['other', 'x']), { result: 'done', calls: ['a:other', 'a:x'] });
+    t.deepEqual(await run(servers, ['other', 'x']), { result: 'done Tools: later, x.', calls: ['a:other', 'a:x'] });
   }
   // Workflow code puts a tool under the server's x in the first tool round: the server's tool is
   // back at the next model call.
   t.deepEqual(await run({ a: [['x'], ['x']] }, ['x', 'x'], false, ['x', 1]), {
-    result: 'done',
+    result: 'done Tools: x.',
     calls: ['a:x', 'a:x'],
   });
+  // b drops r, which no other server lists: r is gone, and so is a tool put under it.
+  for (const replace of [undefined, ['r', 1]] as ([string, number] | undefined)[]) {
+    t.deepEqual(await run({ b: [['r'], ['s']] }, ['r'], false, replace), { result: 'done Tools: s.', calls: ['b:r'] });
+  }
+});
+
+test('a history of two agents side by side recorded on main still replays', async (t) => {
+  // Recorded with `mcpAgentsSideBySide` on main at 017d88a, where each `cacheTools: false` client had
+  // its own `AfterToolsEvent` hook. `first`'s re-listing of `b` and `second`'s `auditHook` activity
+  // completed in one workflow task, so whether `a-listTools` or `c-listTools` comes next depends on
+  // how many microtasks each agent takes to schedule it.
+  const history = await loadHistory(
+    path.resolve(__dirname, '../../src/__tests__/histories/mcp-side-by-side-017d88a.json')
+  );
+  await t.notThrowsAsync(
+    Worker.runReplayHistory(
+      {
+        workflowBundle: t.context.workflowBundle,
+        plugins: [new StrandsPlugin({ models: { first: () => new StubModel([]), second: () => new StubModel([]) } })],
+      },
+      history
+    )
+  );
 });
 
 test('in-workflow tool() runs inside the workflow sandbox', async (t) => {

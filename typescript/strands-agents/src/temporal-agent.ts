@@ -82,12 +82,12 @@ export class TemporalAgent extends Agent {
     // re-list on each turn so a mid-workflow MCP-server restart is picked up.
     // `AfterToolsEvent` fires after a tool round completes, before the next
     // model call reads the tool registry — so the refresh lands on that call.
-    // One hook re-lists them all and checks the new listings together, so a
-    // name can move from one server to another.
+    // One hook per client, as each lists its server; the last of them checks
+    // the round's listings together, so a name can move from one server to
+    // another.
     const mcpClients = collectMcpClients(rest.tools);
-    const relisted = mcpClients.filter((client) => !client.cacheTools);
-    if (relisted.length > 0) {
-      this.addHook(AfterToolsEvent, (event) => TemporalMCPClient.refreshAll(relisted, event.agent.toolRegistry));
+    for (const hook of TemporalMCPClient.refreshHooks(mcpClients.filter((client) => !client.cacheTools))) {
+      this.addHook(AfterToolsEvent, hook);
     }
     // A name that Strands adds a client's tool under is that client's from then on.
     TemporalMCPClient.holdAdded(mcpClients, this.toolRegistry);
