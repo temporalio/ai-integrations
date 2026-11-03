@@ -498,7 +498,12 @@ async def test_plugin_tool_activity_heartbeat_boundary(
         env.client,
         task_queue="da-tool-hb",
         workflows=[ActivityAsToolWorkflow, SlowToolHeartbeatWorkflow],
-        activities=[echo_activity],
+        activities=[
+            echo_activity,
+            echo_twice,
+            EchoActivities().echo_method,
+            EchoClass("worker"),
+        ],
         plugins=[plugin],
     ):
         tool_handle = await env.client.start_workflow(
