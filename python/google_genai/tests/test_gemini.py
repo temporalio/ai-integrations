@@ -2,7 +2,8 @@
 
 Tests cover:
 - Basic generate_content through workflow
-- Tool calling via activity_as_tool (single arg, multi arg, class method)
+- Tool calling via activity_as_tool (single arg, multi arg, class method,
+  callable class)
 - Workflow method as a plain tool (runs in-workflow, not as an activity)
 - Tool failure propagation
 - Multiple sequential tool calls with arg verification
@@ -21,6 +22,7 @@ Tests cover:
 """
 
 import base64
+import functools
 import importlib.metadata
 import inspect
 import io
@@ -29,6 +31,7 @@ import threading
 import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Callable, cast
@@ -198,6 +201,20 @@ class ToolCallTracker:
         """Activity that always fails."""
         self.calls.append(("get_weather_failure", {"city": city}))
         raise ApplicationError("Weather service unavailable", non_retryable=True)
+
+
+@activity.defn
+class TrackParcel:
+    """Parcel tracking for one carrier."""
+
+    def __init__(self, carrier: str) -> None:
+        self.carrier = carrier
+        self.calls: list[str] = []
+
+    async def __call__(self, parcel_id: str) -> str:
+        """Track a parcel."""
+        self.calls.append(parcel_id)
+        return f"Parcel {parcel_id} is with {self.carrier}"
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +543,12 @@ class MultipleToolsWorkflow:
                     ),
                     activity_as_tool(
                         ToolCallTracker.get_weather_country,
+                        activity_config=ActivityConfig(
+                            start_to_close_timeout=timedelta(seconds=10),
+                        ),
+                    ),
+                    activity_as_tool(
+                        TrackParcel,
                         activity_config=ActivityConfig(
                             start_to_close_timeout=timedelta(seconds=10),
                         ),
@@ -1029,6 +1052,7 @@ async def test_tool_failure_propagation(client: Client):
 async def test_multiple_tools_sequential(client: Client):
     """Multiple tools called in sequence within one generate_content call."""
     tool_tracker = ToolCallTracker()
+    parcel_tracker = TrackParcel("acme-post")
     new_client, _ = apply_plugin(
         client,
         [
@@ -1036,6 +1060,7 @@ async def test_multiple_tools_sequential(client: Client):
             make_function_call_response(
                 "get_weather_country", {"city": "Paris", "country": "France"}
             ),
+            make_function_call_response("TrackParcel", {"parcel_id": "P-1"}),
             make_text_response("Tokyo is sunny; Paris is rainy."),
         ],
     )
@@ -1046,6 +1071,7 @@ async def test_multiple_tools_sequential(client: Client):
         activities=[
             tool_tracker.get_weather,
             tool_tracker.get_weather_country,
+            parcel_tracker,
         ],
     ) as worker:
         result = await new_client.execute_workflow(
@@ -1059,6 +1085,9 @@ async def test_multiple_tools_sequential(client: Client):
         ("get_weather", {"city": "Tokyo"}),
         ("get_weather_country", {"city": "Paris", "country": "France"}),
     ]
+    # The class tool takes __call__'s parameters, and the registered instance
+    # gets the model's value.
+    assert parcel_tracker.calls == ["P-1"]
     assert result == "Tokyo is sunny; Paris is rainy."
 
 
@@ -1624,10 +1653,28 @@ def test_activity_as_tool_preserves_name():
     assert wrapper.__name__ == "get_weather"
 
 
+@activity.defn
+class LocateParcel:
+    """Locate a parcel."""
+
+    async def __call__(self, parcel_id: str, /) -> str:
+        return parcel_id
+
+
+@dataclass
+class DataclassParcel(TrackParcel):
+    carrier: str = "acme-post"
+
+
 def test_activity_as_tool_preserves_doc():
     """Returned wrapper keeps the original docstring."""
     wrapper = activity_as_tool(ToolCallTracker.get_weather)
     assert wrapper.__doc__ == "Get the weather for a given city."
+    # A callable class's tool takes __call__'s own docstring, else the class's,
+    # unless dataclasses wrote it, else that of a __call__ it inherits.
+    assert activity_as_tool(TrackParcel).__doc__ == "Track a parcel."
+    assert activity_as_tool(LocateParcel).__doc__ == "Locate a parcel."
+    assert activity_as_tool(DataclassParcel).__doc__ == "Track a parcel."
 
 
 def test_activity_as_tool_preserves_signature():
@@ -1636,6 +1683,10 @@ def test_activity_as_tool_preserves_signature():
     sig = inspect.signature(wrapper)
     params = list(sig.parameters.keys())
     assert params == ["city"]
+    # Gemini passes arguments by name, so a positional-only parameter of a
+    # callable class's __call__ binds by name.
+    sig = inspect.signature(activity_as_tool(LocateParcel))
+    assert sig.bind(parcel_id="P-1").args == ("P-1",)
 
 
 def test_activity_as_tool_multi_arg_signature():
@@ -1650,6 +1701,55 @@ def test_activity_as_tool_is_async_callable():
     """Returned wrapper is an async callable."""
     wrapper = activity_as_tool(ToolCallTracker.get_weather)
     assert inspect.iscoroutinefunction(wrapper)
+
+
+@activity.defn
+class NoCallActivity:
+    pass
+
+
+class UnresolvedCallActivity(TrackParcel):
+    # Not decorated: @activity.defn would fail on the annotation itself.
+    async def __call__(self, parcel_id: "MissingType") -> str:  # type: ignore[name-defined] # pyright: ignore[reportUndefinedVariable] # noqa: F821
+        return str(parcel_id)
+
+
+@activity.defn
+class KeywordOnlyCallActivity:
+    async def __call__(self, *, parcel_id: str) -> str:
+        return parcel_id
+
+
+@activity.defn
+class KwargsCallActivity:
+    async def __call__(self, parcel_id: str, **extra: str) -> str:
+        return parcel_id
+
+
+@activity.defn
+class KeywordPartialCallActivity:
+    async def _track(self, parcel_id: str, carrier: str = "acme-post") -> str:
+        return f"{parcel_id}:{carrier}"
+
+    __call__ = functools.partialmethod(_track, carrier="fast-freight")
+
+
+@pytest.mark.parametrize(
+    "activity_def, message",
+    [
+        (NoCallActivity, "needs a __call__"),
+        (UnresolvedCallActivity, "name 'MissingType' is not defined"),
+        (KeywordOnlyCallActivity, r"or \*\*kwargs in __call__ \('parcel_id'\)"),
+        (KwargsCallActivity, r"or \*\*kwargs in __call__ \('extra'\)"),
+        (KeywordPartialCallActivity, "partialmethod binds an argument by keyword"),
+    ],
+)
+def test_activity_as_tool_rejects_unreadable_call(
+    activity_def: Any, message: str
+) -> None:
+    """A class whose __call__ the tool can't read or call fails when it is built."""
+    with pytest.raises(ValueError, match=message):
+        activity_as_tool(activity_def)
 
 
 # ===========================================================================
