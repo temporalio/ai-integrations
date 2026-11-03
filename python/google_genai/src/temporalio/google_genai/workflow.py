@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import functools
 import inspect
+import operator
 import sys
+import types
 import typing
 from collections.abc import Callable
 from dataclasses import is_dataclass
@@ -92,6 +94,26 @@ def _class_doc(cls: type) -> str | None:
     return None if doc == generated else doc
 
 
+def _runtime_annotation(annotation: Any) -> Any:
+    """Replaces ``Annotated`` and ``Literal`` in a type with the classes of their values."""
+    # Gemini converts the model's arguments with isinstance, which these forms
+    # don't support, so give it the classes they check. The declaration loses
+    # their metadata and allowed values.
+    origin = typing.get_origin(annotation)
+    args = typing.get_args(annotation)
+    if origin is typing.Annotated:
+        return _runtime_annotation(args[0])
+    if origin is typing.Literal:
+        return functools.reduce(operator.or_, dict.fromkeys(type(a) for a in args))
+    if origin in (list, dict, typing.Union, types.UnionType):  # type: ignore[reportDeprecated]
+        runtime = tuple(map(_runtime_annotation, args))
+        if runtime != args:
+            if origin in (list, dict):
+                return types.GenericAlias(origin, runtime)
+            return functools.reduce(operator.or_, runtime)
+    return annotation
+
+
 def _call_signature(
     cls: type,
 ) -> tuple[inspect.Signature, dict[str, Any], str | None]:
@@ -139,7 +161,11 @@ def _call_signature(
             p = p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD)
         # Gemini builds the declaration from the resolved types, but converts
         # the model's arguments with the signature's, so give it those too.
-        parameters.append(p.replace(annotation=hints.get(p.name, p.annotation)))
+        annotation = hints.get(p.name, p.annotation)
+        if annotation is not inspect.Parameter.empty:
+            annotation = _runtime_annotation(annotation)
+            hints[p.name] = annotation
+        parameters.append(p.replace(annotation=annotation))
     # __call__'s own docstring, else the class's, else that of a __call__ it
     # inherits.
     doc = (

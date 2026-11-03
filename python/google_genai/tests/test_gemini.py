@@ -34,7 +34,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Callable, cast
+from typing import Annotated, Any, Callable, Literal, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -229,6 +229,23 @@ class TagParcel:
     async def __call__(self, parcel_id: "str", *tags: str) -> "str":
         self.calls.append((parcel_id, tags))
         return f"Parcel {parcel_id} has tags {tags!r}"
+
+
+@activity.defn
+class ShipParcel:
+    """Ship a parcel."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    # Types that Gemini can declare but not check with isinstance.
+    async def __call__(
+        self,
+        parcel_id: Annotated[str, "The parcel's ID."],
+        speed: Literal["standard", "express"],
+    ) -> str:
+        self.calls.append((parcel_id, speed))
+        return f"Parcel {parcel_id} ships {speed}"
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +586,12 @@ class MultipleToolsWorkflow:
                     ),
                     activity_as_tool(
                         TagParcel,
+                        activity_config=ActivityConfig(
+                            start_to_close_timeout=timedelta(seconds=10),
+                        ),
+                    ),
+                    activity_as_tool(
+                        ShipParcel,
                         activity_config=ActivityConfig(
                             start_to_close_timeout=timedelta(seconds=10),
                         ),
@@ -1074,6 +1097,7 @@ async def test_multiple_tools_sequential(client: Client):
     tool_tracker = ToolCallTracker()
     parcel_tracker = TrackParcel("acme-post")
     parcel_tagger = TagParcel()
+    parcel_shipper = ShipParcel()
     new_client, api_tracker = apply_plugin(
         client,
         [
@@ -1083,6 +1107,9 @@ async def test_multiple_tools_sequential(client: Client):
             ),
             make_function_call_response("TrackParcel", {"parcel_id": "P-1"}),
             make_function_call_response("TagParcel", {"parcel_id": "P-2"}),
+            make_function_call_response(
+                "ShipParcel", {"parcel_id": "P-3", "speed": "express"}
+            ),
             make_text_response("Tokyo is sunny; Paris is rainy."),
         ],
     )
@@ -1095,6 +1122,7 @@ async def test_multiple_tools_sequential(client: Client):
             tool_tracker.get_weather_country,
             parcel_tracker,
             parcel_tagger,
+            parcel_shipper,
         ],
     ) as worker:
         result = await new_client.execute_workflow(
@@ -1115,6 +1143,12 @@ async def test_multiple_tools_sequential(client: Client):
     # instead of getting the empty tuple as one more argument.
     assert parcel_tagger.calls == [("P-2", ())]
     assert "Parcel P-2 has tags ()" in json.dumps(api_tracker.requests[-1].request_dict)
+    # Annotated and Literal parameters reach the instance, and its result
+    # reaches the model.
+    assert parcel_shipper.calls == [("P-3", "express")]
+    assert "Parcel P-3 ships express" in json.dumps(
+        api_tracker.requests[-1].request_dict
+    )
     assert result == "Tokyo is sunny; Paris is rainy."
 
 
@@ -1704,6 +1738,19 @@ def test_activity_as_tool_preserves_doc():
     assert activity_as_tool(DataclassParcel).__doc__ == "Track a parcel."
 
 
+@activity.defn
+class LabelParcel:
+    async def __call__(
+        self,
+        names: list[Annotated[str, "A name."]],
+        sizes: dict[str, Literal[1, 2]],
+        note: Annotated[str, "A note."] | None,
+        code: Literal[1, "A"] | None,
+        hooks: list[Callable],
+    ) -> str:
+        return ""
+
+
 def test_activity_as_tool_preserves_signature():
     """Returned wrapper has the correct parameter signature (self hidden)."""
     wrapper = activity_as_tool(ToolCallTracker.get_weather)
@@ -1719,6 +1766,19 @@ def test_activity_as_tool_preserves_signature():
     sig = inspect.signature(activity_as_tool(TagParcel))
     assert sig.parameters["parcel_id"].annotation is str
     assert sig.return_annotation is str
+    # Gemini can't check Annotated or Literal with isinstance, so they become
+    # the classes of their values, also inside lists, dicts and unions.
+    sig = inspect.signature(activity_as_tool(ShipParcel))
+    assert sig.parameters["parcel_id"].annotation is str
+    assert sig.parameters["speed"].annotation is str
+    sig = inspect.signature(activity_as_tool(LabelParcel))
+    assert [p.annotation for p in sig.parameters.values()] == [
+        list[str],
+        dict[str, int],
+        str | None,
+        int | str | None,
+        list[Callable],
+    ]
 
 
 def test_activity_as_tool_multi_arg_signature():
