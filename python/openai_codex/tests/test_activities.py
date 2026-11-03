@@ -31,8 +31,10 @@ async def test_overlapping_connect_and_write_retries() -> None:
         run(activities.connect, ConnectActivityInput()),
         run(activities.connect, ConnectActivityInput()),
     )
-    assert first == second and connector.connects == 1
-    process = connector.processes[0]
+    assert first == second
+    active = [process for process in connector.processes if not process.closed]
+    assert len(active) == 1
+    process = active[0]
     process.gate = asyncio.Event()
     request = WriteActivityInput(first.handle, 1, {"method": "ignored"})
     attempt = asyncio.create_task(run(activities.write, request))
@@ -243,42 +245,36 @@ async def test_connect_cancellation_cleans_unreturned_process() -> None:
     assert not activities._connections
 
 
-async def test_close_rejects_pending_and_delayed_launches() -> None:
+async def test_lost_connect_result_is_closed_at_worker_shutdown() -> None:
     from tests.helpers.protocol import ProtocolProcess
 
     entered = asyncio.Event()
     release = asyncio.Event()
     process = ProtocolProcess()
-    launches = 0
 
     class DelayedConnector:
         async def connect(self, request: ConnectActivityInput) -> ProtocolProcess:
-            nonlocal launches
-            assert request.handle == "reserved"
-            launches += 1
+            del request
             entered.set()
             await release.wait()
             return process
 
     activities = ConnectionActivities(DelayedConnector(), "private")
     run = ActivityEnvironment().run
-    request = ConnectActivityInput(handle="reserved")
+    request = ConnectActivityInput()
     attempt = asyncio.create_task(run(activities.connect, request))
     try:
         await entered.wait()
-        await run(activities.close, CloseActivityInput("reserved"))
         release.set()
-        with pytest.raises(ApplicationError, match="connection was closed"):
-            await attempt
-        assert process.closed
-        assert not activities._connections
-        with pytest.raises(ApplicationError, match="connection was closed"):
-            await run(activities.connect, request)
-        assert launches == 1
+        await attempt  # Its result never reaches the Workflow.
+        assert not process.closed
+        assert len(activities._connections) == 1
     finally:
         release.set()
         await asyncio.gather(attempt, return_exceptions=True)
         await activities.shut_down()
+    assert process.closed
+    assert not activities._connections
 
 
 async def test_connect_heartbeats_without_owner_details() -> None:

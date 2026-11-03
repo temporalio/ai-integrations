@@ -7,7 +7,7 @@ import asyncio
 import pytest
 from openai_codex import AsyncCodex, AsyncTurnHandle, CodexError
 from openai_codex.generated.v2_all import TurnCompletedNotification
-from openai_codex.models import Notification
+from openai_codex.models import Notification, UnknownNotification
 
 from temporalio import workflow
 from temporalio.openai_codex import OpenAICodexPlugin
@@ -93,6 +93,42 @@ async def test_application_runtime_errors_are_not_translated(
     with pytest.raises(RuntimeError) as raised:
         await turn.run()
     assert raised.value is error
+    assert subscription.closed
+
+
+async def test_turn_stream_tolerates_changed_completion_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    OpenAICodexPlugin()
+    monkeypatch.setattr(workflow, "in_workflow", lambda: True)
+    codex = AsyncCodex()
+    codex._initialized = True
+    changed = Notification(
+        "turn/completed", UnknownNotification({"turn": {"id": "turn"}})
+    )
+    completed = Notification(
+        "turn/completed",
+        TurnCompletedNotification.model_validate(
+            {
+                "threadId": "thread",
+                "turn": {"id": "turn", "items": [], "status": "completed"},
+            }
+        ),
+    )
+
+    class Subscription:
+        closed = False
+        events = iter([changed, completed])
+
+        async def next(self) -> Notification:
+            return next(self.events)
+
+        def close(self) -> None:
+            self.closed = True
+
+    subscription = Subscription()
+    turn = AsyncTurnHandle(codex, "thread", "turn", _subscription=subscription)
+    assert [event async for event in turn.stream()] == [changed, completed]
     assert subscription.closed
 
 

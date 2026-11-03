@@ -87,10 +87,18 @@ class StdoutFailureWorkflow:
 
 @workflow.defn
 class PendingWorkflow:
+    def __init__(self) -> None:
+        self.connected = False
+
     @workflow.run
     async def run(self) -> None:
         async with TemporalCodexClient():
+            self.connected = True
             await workflow.wait_condition(lambda: False)
+
+    @workflow.query
+    def is_connected(self) -> bool:
+        return self.connected
 
 
 @workflow.defn

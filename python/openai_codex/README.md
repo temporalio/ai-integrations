@@ -144,8 +144,7 @@ for long conversations.
 
 `OpenAICodexPlugin(connector=...)` accepts a `Connector` implementing
 `async connect(ConnectActivityInput) -> CodexProcess`. The input contains the upstream
-`CodexConfig` and a reserved connection `handle`, which a remote connector can use
-as an idempotency key. `CodexProcess` provides `write(message)`, `read() -> list[dict]`, and
+`CodexConfig`. `CodexProcess` provides `write(message)`, `read() -> list[dict]`, and
 `close()`. A read returns an ordered batch or an empty list at EOF. Close must be
 idempotent, tolerate overlap, support retries after cancellation, and unblock
 pending reads and writes. A transient
@@ -156,16 +155,16 @@ The default `SubprocessConnector` honors `codex_bin`, `launch_args_override`,
 `config_overrides`, `cwd`, and `env`. It merges `env` into the Worker's environment.
 Launch paths and runtime discovery are resolved on the Activity Worker. Custom
 connectors can reach a remote process; the returned connection object still lives
-on the Worker that created it. No Nexus service or tool-registration API is needed.
+on the Worker that created it. The connector owns cleanup of remote resources
+that outlive the Worker. No Nexus service or tool-registration API is needed.
 
 `CodexActivityOptions` overrides `connect`, `write`, `read`, and `close`, each using
 the Temporal SDK's `workflow.ActivityConfig`. Only
-`connect.task_queue` selects the queue that reserves the owning Worker. Launch
-then runs on that Worker's private queue, so cancellation can close a launch even
-if its result is lost. Both steps use the connect options. The other Activities use the private
-queue polled by the Worker holding the connection. They default to five-minute
-start-to-close timeouts, ten-second heartbeat timeouts, and a thirty-second
-schedule-to-start timeout for detecting a lost Worker.
+`connect.task_queue` selects the queue where Codex starts. The other Activities use
+the private queue polled by the Worker holding the connection. Activities default
+to five-minute start-to-close timeouts and ten-second heartbeat timeouts. Operations
+on an established connection also have a thirty-second schedule-to-start timeout
+for detecting a lost Worker.
 
 ## Recovery and operational limits
 
@@ -174,6 +173,8 @@ and lost completion results do not resend prompts, approvals, or notifications.
 Read batches stay buffered until a later read acknowledges them. Heartbeats let
 Temporal cancel blocked operations; context exit closes the process, and orderly
 Worker shutdown closes its connections.
+If a connect result is lost, its idle connection remains with the owning Worker
+until shutdown. Cleanup failures do not replace a Workflow's result or original error.
 
 A process connection is not durable storage. Losing its Worker produces
 `TransportClosedError`; the plugin does not automatically start a replacement
@@ -192,8 +193,7 @@ sensitive content must pass through history. Tests require no real credentials.
 Each protocol write and output batch adds Activity events to Workflow history.
 Long streams and long-lived sessions grow history; bound conversations and close
 connections before continuing as new. Worker memory also holds unacknowledged
-output and write-deduplication records until close, and closed connection IDs until
-Worker shutdown to reject delayed launches. Reads batch near Temporal's
+output and write-deduplication records until close. Reads batch near Temporal's
 payload warning threshold; a single oversized message is not split and can exceed
 the server's payload limit. Use upstream options to limit output and an external
 storage/payload strategy where needed. The subprocess reader accepts lines up to

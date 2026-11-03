@@ -41,8 +41,6 @@ class ConnectActivityInput:
     """Launch configuration, resolved on the Activity Worker."""
 
     config: CodexConfig = field(default_factory=CodexConfig)
-    handle: str | None = None
-    """Reserved connection identity, also useful for idempotent remote launches."""
 
 
 @dataclass
@@ -112,6 +110,7 @@ class Connector(Protocol):
 
     Raise CodexError for permanent failures and other exceptions for failures
     safe to retry. The returned process stays on this Worker.
+    The connector owns cleanup of remote resources that outlive the Worker.
     """
 
     async def connect(self, request: ConnectActivityInput) -> CodexProcess:

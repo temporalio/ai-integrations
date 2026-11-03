@@ -14,12 +14,11 @@ from pydantic import BaseModel
 from openai_codex import CodexConfig, CodexError, TransportClosedError
 from openai_codex._initialize_metadata import _split_user_agent
 from openai_codex._runtime_requirements import require_runtime_version
-from openai_codex.client import _params_dict
+from openai_codex.client import CodexClient, _params_dict
 from openai_codex.errors import (
     is_retryable_error,
     map_jsonrpc_error,
 )
-from openai_codex.generated.notification_registry import NOTIFICATION_MODELS
 from openai_codex.generated.v2_all import (
     AccountLoginCompletedNotification,
     AgentMessageDeltaNotification,
@@ -53,13 +52,12 @@ from openai_codex.models import (
     InitializeResponse,
     JsonObject,
     Notification,
-    UnknownNotification,
 )
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, is_cancelled_exception
 
-from ._constants import CLOSE, CONNECT, CONNECTION_LOST, READ, RESERVE, WRITE
+from ._constants import CLOSE, CONNECT, CONNECTION_LOST, READ, WRITE
 from ._errors import sdk_error
 from ._routing import Router, Subscription
 from ._types import (
@@ -127,48 +125,19 @@ class TemporalCodexClient:
                 return
             if self._lost:
                 raise TransportClosedError(CONNECTION_LOST)
-            reservation_options = self._activity_options.get("connect", {}).copy()
-            reservation_options.pop("activity_id", None)
-            reserving = asyncio.create_task(
-                self._execute(
-                    RESERVE,
-                    None,
-                    reservation_options,
-                    Connection,
-                )
-            )
-            try:
-                connection: Connection = await asyncio.shield(reserving)
-            except asyncio.CancelledError:
-                reserving.cancel()
-                await asyncio.gather(reserving, return_exceptions=True)
-                raise
-            self._connection = connection
-            connecting = asyncio.create_task(
-                self._execute(
-                    CONNECT,
-                    ConnectActivityInput(
-                        CodexConfig(
-                            **{
-                                field.name: getattr(self.config, field.name)
-                                for field in fields(CodexConfig)
-                            }
-                        ),
-                        connection.handle,
+            self._connection = await self._execute(
+                CONNECT,
+                ConnectActivityInput(
+                    CodexConfig(
+                        **{
+                            field.name: getattr(self.config, field.name)
+                            for field in fields(CodexConfig)
+                        }
                     ),
-                    self._activity_options.get("connect", {}),
-                    Connection,
-                )
+                ),
+                self._activity_options.get("connect", {}),
+                Connection,
             )
-            try:
-                await asyncio.shield(connecting)
-            except (Exception, asyncio.CancelledError):
-                # Stop queued/retrying launches. The owner and identity are
-                # already known, so close also covers late committed results.
-                connecting.cancel()
-                await asyncio.gather(connecting, return_exceptions=True)
-                await self.close()
-                raise
             self._router = Router()
             self._received = 0
             self._reader = asyncio.create_task(self._read_loop())
@@ -209,6 +178,10 @@ class TemporalCodexClient:
                     CloseActivityInput(self._connection.handle),
                     self._activity_options.get("close", {}),
                 )
+        except (CodexError, FileNotFoundError, PermissionError):
+            # Cleanup must not replace a successful result or the original error
+            # when the owning Worker is gone or its close Activity fails.
+            pass
         finally:
             self._connection = None
             self._runtime_version = None
@@ -229,7 +202,7 @@ class TemporalCodexClient:
             "retry_policy": RetryPolicy(backoff_coefficient=1.0),
             **config,
         }
-        if name != RESERVE:
+        if name != CONNECT:
             assert self._connection is not None
             options.setdefault("schedule_to_start_timeout", timedelta(seconds=30))
             options["task_queue"] = self._connection.task_queue
@@ -278,24 +251,18 @@ class TemporalCodexClient:
                             )
                         else:
                             method = message["method"]
+                            if not isinstance(method, str):
+                                continue
                             if self._stream is not None and method.lower().endswith(
                                 "delta"
                             ):
                                 self._stream.publish(message)
-                            params = message.get("params", {})
-                            model = NOTIFICATION_MODELS.get(method)
-                            try:
-                                payload = (
-                                    model.model_validate(params)
-                                    if model
-                                    else UnknownNotification(params=params)
-                                )
-                            except Exception:
-                                payload = UnknownNotification(
-                                    params=params if isinstance(params, dict) else {}
-                                )
                             self._router.route(
-                                Notification(method=method, payload=payload)
+                                # Upstream's coercion is stateless and tolerates
+                                # unknown methods and changed payload schemas.
+                                CodexClient._coerce_notification(
+                                    cast(Any, self), method, message.get("params")
+                                )
                             )
                     elif waiter := self._pending.get(str(message.get("id"))):
                         if waiter.done():
@@ -326,8 +293,10 @@ class TemporalCodexClient:
         try:
             method = message["method"]
             params = message.get("params")
-            if self._approval_handler is None:
-                result: Any = (
+            if not isinstance(method, str):
+                result: Any = {}
+            elif self._approval_handler is None:
+                result = (
                     {"decision": "accept"}
                     if method
                     in {

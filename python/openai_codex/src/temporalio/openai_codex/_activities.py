@@ -13,7 +13,7 @@ from openai_codex import CodexError, TransportClosedError
 from temporalio import activity
 from temporalio.service import PayloadLimitsConfig
 
-from ._constants import CLOSE, CONNECT, CONNECTION_LOST, READ, RESERVE, WRITE
+from ._constants import CLOSE, CONNECT, CONNECTION_LOST, READ, WRITE
 from ._errors import activity_error
 from ._heartbeat_decorator import auto_heartbeater
 from ._types import (
@@ -94,52 +94,34 @@ class ConnectionActivities:
         # Duplicate plugin instances share this owner's connector Worker.
         self.connector_worker_running = False
         self._connections: dict[str, _Connection] = {}
-        self._closed_handles: set[str] = set()
-        self._connect_lock = asyncio.Lock()
 
     def connected_activities(self) -> list[Callable[..., Any]]:
         """The Activities that reach a Codex ``connect`` started, so must run in this process."""
-        return [self.connect, self.write, self.read, self.close]
-
-    @activity.defn(name=RESERVE)
-    async def reserve(self, request: None) -> Connection:
-        """Select an owner before launching, without allocating a process."""
-        del request
-        info = activity.info()
-        return Connection(
-            f"{info.workflow_run_id}/{info.activity_id}", self.connector_queue
-        )
+        return [self.write, self.read, self.close]
 
     @activity.defn(name=CONNECT)
     @auto_heartbeater
     async def connect(self, request: ConnectActivityInput) -> Connection:
         """Start Codex, unless this launch started it already."""
         info = activity.info()
-        handle = request.handle or f"{info.workflow_run_id}/{info.activity_id}"
+        handle = f"{info.workflow_run_id}/{info.activity_id}"
 
-        async with self._connect_lock:
-            if handle in self._closed_handles:
-                raise activity_error(
-                    TransportClosedError("Codex connection was closed")
-                )
-            if handle not in self._connections:
-                # Shielded, so a cancelled launch still gets the process to close it.
-                connecting = asyncio.ensure_future(self._connector.connect(request))
-                try:
-                    process = await asyncio.shield(connecting)
-                    if handle in self._closed_handles:
-                        await process.close()
-                        raise TransportClosedError("Codex connection was closed")
-                    self._connections[handle] = _Connection(process)
-                except asyncio.CancelledError:
-                    # Finish a launch that outlived cancellation, then dispose of it.
-                    with contextlib.suppress(Exception):
-                        await (await connecting).close()
-                    raise
-                except CodexError as error:
-                    raise activity_error(error) from error
-                except (FileNotFoundError, PermissionError) as error:
-                    raise activity_error(error) from error
+        if handle not in self._connections:
+            # Shielded, so a cancelled launch still gets the process to close it.
+            connecting = asyncio.ensure_future(self._connector.connect(request))
+            try:
+                process = await asyncio.shield(connecting)
+                # An overlapping attempt may have finished first. Keep that
+                # connection and close this attempt's unused process.
+                connection = self._connections.setdefault(handle, _Connection(process))
+                if connection.process is not process:
+                    await process.close()
+            except asyncio.CancelledError:
+                with contextlib.suppress(Exception):
+                    await (await connecting).close()
+                raise
+            except (CodexError, FileNotFoundError, PermissionError) as error:
+                raise activity_error(error) from error
 
         return Connection(handle, self.connector_queue)
 
@@ -201,9 +183,6 @@ class ConnectionActivities:
     @auto_heartbeater
     async def close(self, request: CloseActivityInput) -> None:
         """Close Codex and everything it started."""
-        # A cancelled launch can still commit after this Activity runs. The
-        # known identity lets that launch close its process instead of storing it.
-        self._closed_handles.add(request.handle)
         connection = self._connections.get(request.handle)
         if connection is None:  # A retry of a close that succeeded.
             return

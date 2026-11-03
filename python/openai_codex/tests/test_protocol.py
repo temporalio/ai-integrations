@@ -7,7 +7,7 @@ import uuid
 from typing import Any
 
 import pytest
-from openai_codex import CodexConfig
+from openai_codex import CodexConfig, CodexError
 
 from temporalio import activity
 from temporalio.client import Client, WorkflowFailureError
@@ -244,14 +244,49 @@ async def test_workflow_cancellation_closes_process(client: Client) -> None:
         handle = await client.start_workflow(
             PendingWorkflow.run, id=queue, task_queue=queue
         )
-        import asyncio
-
-        while not connector.processes:
+        while not await handle.query(PendingWorkflow.is_connected):
             await asyncio.sleep(0.01)
         await handle.cancel()
         with pytest.raises(WorkflowFailureError):
             await handle.result()
         assert connector.processes[0].closed
+
+
+async def test_close_activity_failure_preserves_success_and_replay(
+    client: Client,
+) -> None:
+    class FailingCloseProcess(ProtocolProcess):
+        attempts = 0
+
+        async def close(self) -> None:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise CodexError("cleanup unavailable")
+            await super().close()
+
+    process = FailingCloseProcess()
+    connector = ProtocolConnector(lambda: process)
+    queue = f"close-failure-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=queue,
+        workflows=[InitializingWorkflow],
+        plugins=[OpenAICodexPlugin(connector=connector)],
+    ):
+        handle = await client.start_workflow(
+            InitializingWorkflow.run, False, id=queue, task_queue=queue
+        )
+        await handle.result()
+        assert process.attempts == 1 and not process.closed
+    assert process.closed
+    history = await handle.fetch_history()
+    assert not any(
+        event.HasField("workflow_task_failed_event_attributes")
+        for event in history.events
+    )
+    await Replayer(
+        workflows=[InitializingWorkflow], plugins=[OpenAICodexPlugin()]
+    ).replay_workflow(history)
 
 
 async def test_cancellation_with_unavailable_connector_queue(client: Client) -> None:
@@ -315,7 +350,7 @@ async def test_cancellation_stops_connect_retries(client: Client) -> None:
     ).replay_workflow(await handle.fetch_history())
 
 
-async def test_cancellation_closes_launch_with_lost_result(client: Client) -> None:
+async def test_worker_shutdown_closes_launch_with_lost_result(client: Client) -> None:
     committed = asyncio.Event()
 
     class LoseConnectResult(Interceptor):
@@ -349,7 +384,8 @@ async def test_cancellation_closes_launch_with_lost_result(client: Client) -> No
         with pytest.raises(WorkflowFailureError):
             await asyncio.wait_for(handle.result(), 5)
         assert connector.connects == 1
-        assert connector.processes[0].closed
+        assert not connector.processes[0].closed
+    assert connector.processes[0].closed
     await Replayer(
         workflows=[ConnectingWorkflow], plugins=[OpenAICodexPlugin()]
     ).replay_workflow(await handle.fetch_history())
@@ -372,7 +408,7 @@ async def test_cancelled_launch_closes_late_process(
 
     class DelayedConnector:
         async def connect(self, request: ConnectActivityInput) -> ProtocolProcess:
-            assert request.handle is not None
+            del request
             entered.set()
             await release.wait()
             return process
@@ -394,7 +430,7 @@ async def test_cancelled_launch_closes_late_process(
                 await asyncio.wait_for(handle.result(), 5)
         finally:
             release.set()
-        await asyncio.wait_for(closed.wait(), 5)
+    assert closed.is_set()
     await Replayer(
         workflows=[ConnectingWorkflow], plugins=[OpenAICodexPlugin()]
     ).replay_workflow(await handle.fetch_history())

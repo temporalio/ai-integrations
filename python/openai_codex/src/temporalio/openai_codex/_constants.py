@@ -1,7 +1,6 @@
 """Stable Activity names and connection failure text."""
 
 CONNECT = "openai-codex-connect"
-RESERVE = "openai-codex-reserve"
 WRITE = "openai-codex-write"
 READ = "openai-codex-read"
 CLOSE = "openai-codex-close"

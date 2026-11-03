@@ -9,7 +9,7 @@ from typing import Any
 
 from openai_codex import CodexError, _run, api
 from openai_codex._initialize_metadata import validate_initialize_metadata
-from openai_codex.generated.v2_all import Turn
+from openai_codex.generated.v2_all import Turn, TurnCompletedNotification
 from openai_codex.models import Notification
 from temporalio import workflow
 
@@ -89,6 +89,7 @@ def install_adapters() -> None:
                 yield event
                 if (
                     event.method == "turn/completed"
+                    and isinstance(event.payload, TurnCompletedNotification)
                     and event.payload.turn.id == self.id
                 ):
                     return

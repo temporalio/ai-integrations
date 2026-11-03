@@ -86,7 +86,7 @@ class OpenAICodexPlugin(SimplePlugin):
         activities = ConnectionActivities(
             self._connector, f"openai-codex-connector-{uuid.uuid4()}"
         )
-        config["activities"] = [*config.get("activities", []), activities.reserve]
+        config["activities"] = [*config.get("activities", []), activities.connect]
         return super().configure_worker(config)
 
     async def run_worker(

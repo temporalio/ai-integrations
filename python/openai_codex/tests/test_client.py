@@ -6,43 +6,106 @@ import asyncio
 from typing import Any
 
 import pytest
+from openai_codex import TransportClosedError
+from openai_codex.models import UnknownNotification
 
 from temporalio import workflow
 from temporalio.openai_codex._client import TemporalCodexClient
-from temporalio.openai_codex._constants import CLOSE, CONNECT, RESERVE
-from temporalio.openai_codex._types import CloseActivityInput, Connection
+from temporalio.openai_codex._constants import CLOSE, CONNECT
+from temporalio.openai_codex._types import Connection, Message, ReadResult
 
 
-@pytest.mark.parametrize("stage", [RESERVE, CONNECT])
-@pytest.mark.parametrize("late_result", [False, True])
+@pytest.mark.parametrize("body_fails", [False, True])
+async def test_cleanup_failure_preserves_context_result(
+    monkeypatch: pytest.MonkeyPatch, body_fails: bool
+) -> None:
+    client = TemporalCodexClient()
+    client._connection = Connection("connection", "owner")
+
+    async def start() -> None:
+        pass
+
+    async def execute(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise TransportClosedError("owner unavailable")
+
+    monkeypatch.setattr(client, "start", start)
+    monkeypatch.setattr(client, "_execute", execute)
+
+    async def run() -> str:
+        async with client:
+            if body_fails:
+                raise ValueError("original failure")
+            return "success"
+
+    if body_fails:
+        with pytest.raises(ValueError, match="original failure"):
+            await run()
+    else:
+        assert await run() == "success"
+    assert client._connection is None
+    assert client._reader is None
+
+
+@pytest.mark.parametrize("method", [None, 42, [], {}, "future/event", "turn/completed"])
+async def test_unexpected_notification_keeps_reader_running(
+    monkeypatch: pytest.MonkeyPatch, method: Any
+) -> None:
+    client = TemporalCodexClient()
+    client._connection = Connection("connection", "owner")
+    waiter = asyncio.get_running_loop().create_future()
+    client._pending["request"] = waiter
+    release = asyncio.Event()
+    messages: list[Message] = [
+        {"method": method, "params": ["changed format"]},
+        {"method": "future/event", "params": {"value": "retained"}},
+        {"id": "request", "result": {"value": "success"}},
+    ]
+
+    async def execute(*args: Any, **kwargs: Any) -> ReadResult:
+        del args, kwargs
+        if client._received:
+            await release.wait()
+        return ReadResult(messages)
+
+    monkeypatch.setattr(client, "_execute", execute)
+    reader = asyncio.create_task(client._read_loop())
+    try:
+        assert await waiter == {"value": "success"}
+        assert client._router.error is None
+        if isinstance(method, str):
+            event = await client.next_notification()
+            assert event.method == method
+            assert isinstance(event.payload, UnknownNotification)
+            assert event.payload.params == {}
+        event = await client.next_notification()
+        assert isinstance(event.payload, UnknownNotification)
+        assert event.payload.params == {"value": "retained"}
+        assert client._received == len(messages)
+    finally:
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+
+
 async def test_cancelled_start_stops_pending_operation(
-    monkeypatch: pytest.MonkeyPatch, stage: str, late_result: bool
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(workflow, "in_workflow", lambda: True)
     client = TemporalCodexClient()
     entered = asyncio.Event()
-    release = asyncio.Event()
     cancelled = asyncio.Event()
-    closed: list[str] = []
-    connection = Connection("reserved", "owner")
 
     async def execute(
         name: str, arg: Any, config: workflow.ActivityConfig, result_type: Any = None
     ) -> Any:
-        del config, result_type
-        if name == CLOSE:
-            assert isinstance(arg, CloseActivityInput)
-            closed.append(arg.handle)
-            return None
-        if name == stage:
-            entered.set()
-            try:
-                await release.wait()
-            except asyncio.CancelledError:
-                cancelled.set()
-                if not late_result:
-                    raise
-        return connection
+        del arg, config, result_type
+        assert name == CONNECT
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
 
     monkeypatch.setattr(client, "_execute", execute)
     starting = asyncio.create_task(client.start())
@@ -54,11 +117,9 @@ async def test_cancelled_start_stops_pending_operation(
         with pytest.raises(asyncio.CancelledError):
             await starting
         assert cancelled.is_set()
-        assert closed == ([connection.handle] if stage == CONNECT else [])
         assert client._connection is None
         assert client._reader is None
     finally:
-        release.set()
         starting.cancel()
         await asyncio.gather(starting, return_exceptions=True)
 
