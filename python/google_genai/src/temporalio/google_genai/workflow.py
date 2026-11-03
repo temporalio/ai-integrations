@@ -9,12 +9,16 @@ workflows.  The key entry points are:
 
 from __future__ import annotations
 
+import collections
+import datetime
+import enum
 import functools
 import inspect
 import operator
 import sys
 import types
 import typing
+import uuid
 from collections.abc import Callable
 from dataclasses import is_dataclass
 from typing import Any
@@ -95,18 +99,23 @@ def _class_doc(cls: type) -> str | None:
 
 
 def _runtime_annotation(annotation: Any, in_union: bool = False) -> Any:
-    """Replaces the forms of a type that Gemini can't check with the classes they check."""
+    """Replaces the types that Gemini can't check the model's JSON values against."""
     # Gemini converts the model's arguments by walking into list items and dict
     # values, and checking everything else, including each member of a union,
     # with isinstance. That raises for Any, Annotated, Literal and
-    # parameterized generics, so give it the classes they check. The
-    # declaration loses their metadata, allowed values and item types.
+    # parameterized generics, and fails for the JSON value of an enum, tuple,
+    # set, UUID or datetime. So give it the class of the value the model sends:
+    # the activity's payload converter decodes it into __call__'s type on the
+    # worker. The declaration loses their metadata, allowed values, formats
+    # and item types.
     origin = typing.get_origin(annotation)
     args = typing.get_args(annotation)
     if origin is typing.Annotated:
         return _runtime_annotation(args[0], in_union)
     if origin is typing.Literal:
-        return functools.reduce(operator.or_, dict.fromkeys(type(a) for a in args))
+        return functools.reduce(
+            operator.or_, dict.fromkeys(_runtime_annotation(type(a)) for a in args)
+        )
     if annotation is Any:
         return object
     if origin in (typing.Union, types.UnionType):  # type: ignore[reportDeprecated]
@@ -114,6 +123,20 @@ def _runtime_annotation(annotation: Any, in_union: bool = False) -> Any:
         return (
             functools.reduce(operator.or_, runtime) if runtime != args else annotation
         )
+    if inspect.isclass(annotation) and issubclass(annotation, enum.Enum):
+        values = dict.fromkeys(type(m.value) for m in annotation)
+        return functools.reduce(operator.or_, values) if values else annotation
+    if annotation is datetime.datetime or (
+        inspect.isclass(annotation) and issubclass(annotation, uuid.UUID)
+    ):
+        return str
+    if (origin or annotation) in (tuple, set, frozenset, collections.deque):
+        # The model sends a JSON array.
+        items = [a for a in args if a is not Ellipsis]
+        if not items:
+            return list
+        item = functools.reduce(operator.or_, dict.fromkeys(items))
+        return _runtime_annotation(types.GenericAlias(list, (item,)), in_union)
     if origin is list and args:
         item = _runtime_annotation(args[0])
         return annotation if item == args[0] else types.GenericAlias(list, (item,))
