@@ -669,7 +669,9 @@ Some consequences:
   previous one during that time. Likewise, after a refusal caused by a
   start-to-close timeout on a live worker, the timed-out attempt keeps serving
   the queue with its server until its worker cancels it, so the refused block's
-  own operations, and a recovery block's, can still reach that server.
+  own operations, and a recovery block's, can still reach that server. Don't
+  open two blocks with the same name at the same time: one block's operations
+  can then fail with `DedicatedWorkerFailure`, or both blocks use one server.
 
 Only the session activity's worker serves the server's operations. An operation
 whose `config` has a `schedule_to_start_timeout`, as the default `config` does,

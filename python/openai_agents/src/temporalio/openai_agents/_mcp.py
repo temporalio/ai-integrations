@@ -925,11 +925,14 @@ class StatefulMCPServerProvider:
             ):
                 # Every server block of a run uses the same task queue. An
                 # operation first scheduled before this session belongs to an
-                # earlier block, which has ended, and must not run against this
-                # server.
+                # earlier block, or to a same-name block open at the same time,
+                # and must not run against this server.
                 raise ApplicationError(
-                    "This operation belongs to an earlier stateful MCP server "
-                    "session of this workflow run, which has ended.",
+                    "This operation was scheduled before the stateful MCP server "
+                    "session activity that now serves this server name in this "
+                    "workflow run, so it belongs to an earlier block with the "
+                    "same name, or to one open at the same time. Use a distinct "
+                    "name for each stateful MCP server open at the same time.",
                     type="DedicatedWorkerFailure",
                     non_retryable=True,
                 )
