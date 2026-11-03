@@ -1,15 +1,17 @@
 import functools
+import gc
 import inspect
 import json
 import sys
 import typing
 from collections.abc import Callable
 from dataclasses import is_dataclass
-from typing import Any
+from typing import Annotated, Any
 
 if sys.version_info >= (3, 14):
     import annotationlib  # type: ignore[reportUnreachable]
 
+from pydantic import BaseModel, Field, create_model
 from strands.interrupt import Interrupt
 from strands.tools.decorator import FunctionToolMetadata
 from strands.types._events import ToolInterruptEvent, ToolResultEvent
@@ -44,11 +46,10 @@ class TemporalActivityTool(AgentTool):
             activity_fn = _call_stand_in(activity_fn)
         signature = inspect.signature(activity_fn)
         params = list(signature.parameters.values())
-        # A first parameter named `self` of a function defined in a class body
-        # is the receiver of a method passed as Class.method, however it is
-        # annotated: the worker registers the bound method, so its instance
-        # supplies it.
-        if params and params[0].name == "self" and _defined_in_class(activity_fn):
+        # A first parameter named `self` of a method passed as Class.method is
+        # its receiver, however it is annotated: the worker registers the bound
+        # method, so its instance supplies it. A staticmethod has no receiver.
+        if params and params[0].name == "self" and _defined_as_method(activity_fn):
             params = params[1:]
         # The model's input binds by name; the activity still gets it by position.
         self._signature = signature.replace(
@@ -133,16 +134,50 @@ class _ActivityToolMetadata(FunctionToolMetadata):
         self._inputs = signature.parameters
         super().__init__(func)
 
-    def _is_special_parameter(self, param_name: str) -> bool:
-        return param_name not in self._inputs
+    def _create_input_model(self) -> type[BaseModel]:
+        # Pydantic refuses some field names, such as ones with a leading
+        # underscore, so each field is named after its position and aliased to
+        # its parameter: the schema's properties keep the parameters' names.
+        fields: dict[str, Any] = {}
+        for i, (name, param) in enumerate(self._inputs.items()):
+            annotation = param.annotation
+            if isinstance(annotation, str):
+                annotation = self.type_hints.get(name, annotation)
+            if annotation is inspect.Parameter.empty:
+                annotation = Any
+            default = ... if param.default is inspect.Parameter.empty else param.default
+            field_type, field = self._extract_annotated_metadata(
+                annotation, name, default
+            )
+            fields[f"input_{i}"] = (Annotated[field_type, Field(alias=name)], field)
+        return create_model(f"{self.func.__name__.capitalize()}Tool", **fields)
 
 
-def _defined_in_class(fn: Any) -> bool:
-    """Return whether ``fn`` is a function defined in a class body."""
+def _defined_as_method(fn: Any) -> bool:
+    """Return whether ``fn`` is a function a class body defines as a method.
+
+    The worker registers such a function bound to an instance, unlike one the
+    class wraps in ``staticmethod``.
+    """
     if not inspect.isfunction(fn):
         return False
     scopes = fn.__qualname__.split(".")
-    return len(scopes) > 1 and scopes[-2] != "<locals>"
+    if len(scopes) < 2 or scopes[-2] == "<locals>":
+        return False
+    owner: Any = sys.modules.get(fn.__module__)
+    for scope in scopes[:-1]:
+        owner = getattr(owner, "__dict__", {}).get(scope)
+    if inspect.isclass(owner):
+        attr = vars(owner).get(scopes[-1])
+        if attr is fn:
+            return True
+        if isinstance(attr, staticmethod) and attr.__func__ is fn:
+            return False
+    # The class can't be reached by name, as when a function defines it: look
+    # for a staticmethod that wraps the function.
+    return not any(
+        isinstance(r, staticmethod) and r.__func__ is fn for r in gc.get_referrers(fn)
+    )
 
 
 def _call_function(method: Any) -> Callable | None:

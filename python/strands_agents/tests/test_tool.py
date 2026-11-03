@@ -57,6 +57,14 @@ class Shipping:
     async def quote(self, parcel_id: str) -> str:
         return f"quote for {parcel_id} via {self.carrier}"
 
+    @staticmethod
+    @activity.defn(name="price_parcel")
+    async def price(
+        self: str = "default-carrier",  # pyright: ignore[reportSelfClsParameterName]
+        parcel_id: str = "default-parcel",
+    ) -> str:
+        return f"{self}:{parcel_id}"
+
 
 @activity.defn(name="ship_parcel")
 class ShipParcel:
@@ -87,6 +95,15 @@ class WeighParcel:
         return f"weigh {parcel_id} with {cls.__name__}"
 
 
+@activity.defn(name="stamp_parcel")
+class StampParcel:
+    def __init__(self, parcel_id: str) -> None:
+        self.parcel_id = parcel_id
+
+    async def __call__(self, _parcel_id: str) -> str:
+        return f"stamp {_parcel_id}"
+
+
 @workflow.defn
 class ToolWorkflow:
     def __init__(self) -> None:
@@ -103,12 +120,17 @@ class ToolWorkflow:
                 activity_as_tool(
                     TrackParcel, start_to_close_timeout=timedelta(seconds=15)
                 ),
-                activity_as_tool(
-                    Shipping.quote, start_to_close_timeout=timedelta(seconds=15)
-                ),
                 *(
-                    activity_as_tool(cls, start_to_close_timeout=timedelta(seconds=15))
-                    for cls in (ShipParcel, HandOverParcel, LabelParcel, WeighParcel)
+                    activity_as_tool(fn, start_to_close_timeout=timedelta(seconds=15))
+                    for fn in (
+                        Shipping.quote,
+                        Shipping.price,
+                        ShipParcel,
+                        HandOverParcel,
+                        LabelParcel,
+                        WeighParcel,
+                        StampParcel,
+                    )
                 ),
             ],
         )
@@ -139,6 +161,7 @@ async def test_tool(client: Client, tmp_path: Path):
                     },
                     {"name": "track_parcel", "input": {"parcel_id": "P-1"}},
                     {"name": "quote_parcel", "input": {"parcel_id": "P-2"}},
+                    {"name": "price_parcel", "input": {"parcel_id": "P-8"}},
                     {"name": "ship_parcel", "input": {"parcel_id": "P-3"}},
                     {
                         "name": "ship_parcel",
@@ -150,6 +173,7 @@ async def test_tool(client: Client, tmp_path: Path):
                     },
                     {"name": "label_parcel", "input": {"self": "P-6"}},
                     {"name": "weigh_parcel", "input": {"parcel_id": "P-7"}},
+                    {"name": "stamp_parcel", "input": {"_parcel_id": "P-9"}},
                     "Done!",
                 ]
             )
@@ -164,10 +188,12 @@ async def test_tool(client: Client, tmp_path: Path):
             read_file_activity,
             TrackParcel("acme-post"),
             Shipping("acme-post").quote,
+            Shipping.price,
             ShipParcel("unused"),
             HandOverParcel(),
             LabelParcel(),
             WeighParcel(),
+            StampParcel("unused"),
         ],
         plugins=[plugin],
         max_cached_workflows=0,
@@ -197,6 +223,8 @@ async def test_tool(client: Client, tmp_path: Path):
         "invoke_model",
         "quote_parcel",
         "invoke_model",
+        "price_parcel",
+        "invoke_model",
         "ship_parcel",
         "invoke_model",
         "ship_parcel",
@@ -207,30 +235,53 @@ async def test_tool(client: Client, tmp_path: Path):
         "invoke_model",
         "weigh_parcel",
         "invoke_model",
+        "stamp_parcel",
+        "invoke_model",
     ]
     assert _activity_calls(client, history, "parcel") == [
         (["P-1"], "parcel P-1 via acme-post"),
         (["P-2"], "quote for P-2 via acme-post"),
+        (["default-carrier", "P-8"], "default-carrier:P-8"),
         (["P-3", "road"], "ship P-3 by road"),
         (["P-4", "rail"], "ship P-4 by rail"),
         (["Ana", "P-5"], "hand P-5 to Ana"),
         (["P-6"], "label P-6"),
         (["P-7"], "weigh P-7 with WeighParcel"),
+        (["P-9"], "stamp P-9"),
     ]
+
+    # A class a function defines can't be reached by name.
+    class LocalShipping:
+        @activity.defn(name="local_quote")
+        async def quote(self, parcel_id: str) -> str:
+            return parcel_id
+
+        @staticmethod
+        @activity.defn(name="local_price")
+        async def price(
+            self: str,  # pyright: ignore[reportSelfClsParameterName]
+            parcel_id: str,
+        ) -> str:
+            return f"{self}:{parcel_id}"
+
     cases: list[tuple[Callable[..., Any], list[str], list[str]]] = [
         (TrackParcel, ["parcel_id"], ["parcel_id"]),
         (Shipping.quote, ["parcel_id"], ["parcel_id"]),
+        (Shipping.price, ["self", "parcel_id"], []),
+        (LocalShipping.quote, ["parcel_id"], ["parcel_id"]),
+        (LocalShipping.price, ["self", "parcel_id"], ["self", "parcel_id"]),
         (ShipParcel, ["parcel_id", "carrier"], ["parcel_id"]),
         (HandOverParcel, ["agent", "cls"], ["agent", "cls"]),
         (LabelParcel, ["self"], ["self"]),
         (WeighParcel, ["parcel_id"], ["parcel_id"]),
+        (StampParcel, ["_parcel_id"], ["_parcel_id"]),
     ]
     for activity_fn, properties, required in cases:
         schema = activity_as_tool(
             activity_fn, start_to_close_timeout=timedelta(seconds=15)
         ).tool_spec["inputSchema"]["json"]
         assert list(schema["properties"]) == properties
-        assert schema["required"] == required
+        assert schema.get("required", []) == required
 
     await Replayer(
         workflows=[ToolWorkflow],
