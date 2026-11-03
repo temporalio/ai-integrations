@@ -13,6 +13,7 @@ model call went through an activity.
 
 from __future__ import annotations
 
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -40,6 +41,10 @@ from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
 # needs >= 3.11), and with the package absent the type checkers mis-resolve
 # the name against this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
+StateBackend = pytest.importorskip("deepagents.backends").StateBackend
+SummarizationMiddleware = pytest.importorskip(
+    "deepagents.middleware"
+).SummarizationMiddleware
 
 with workflow.unsafe.imports_passed_through():
     from langchain.agents.middleware import AgentMiddleware
@@ -108,19 +113,21 @@ async def test_subagent_calls_route_to_activities(env: WorkflowEnvironment) -> N
 # handing each sub-agent the other's recorded answer.
 
 
-def _lanes_tasks(description_a: str, description_b: str) -> AIMessage:
+def _lanes_tasks(
+    description_a: str, description_b: str, subagents: tuple[str, str] = ("a", "b")
+) -> AIMessage:
     return AIMessage(
         content="",
         tool_calls=[
             {
                 "name": "task",
                 "id": "task-a",
-                "args": {"description": description_a, "subagent_type": "a"},
+                "args": {"description": description_a, "subagent_type": subagents[0]},
             },
             {
                 "name": "task",
                 "id": "task-b",
-                "args": {"description": description_b, "subagent_type": "b"},
+                "args": {"description": description_b, "subagent_type": subagents[1]},
             },
         ],
     )
@@ -134,7 +141,15 @@ _LANES_TASK_TEXT = {
     # Large enough that Deep Agents' filesystem middleware evicts each task
     # prompt to a file named with ``uuid4`` and puts that path in the message.
     "oversized": ("Ask lane a. " * 25000, "Ask lane b. " * 25000),
+    # Both tasks go to one sub-agent and differ only in a UUID the caller
+    # supplies, which must stay part of the identity.
+    "customers": (
+        "Look up customer 11111111-1111-4111-8111-111111111111.",
+        "Look up customer 22222222-2222-4222-8222-222222222222.",
+    ),
 }
+# The sub-agents the two tasks go to, when not lanes a and b.
+_LANES_SUBAGENTS = {"customers": ("b", "b")}
 _LANES_HISTORY = (
     Path(__file__).parent / "histories" / "parallel_subagents_sequence_ids.json"
 )
@@ -144,7 +159,13 @@ _PATCH_ID = "deepagents.parallel-model-call-ids"
 def _lanes_provider(task_text: str = "different") -> Any:
     """A model provider with one script per model name, so lanes stay apart."""
     scripts: dict[str, list[Any]] = {
-        "fake:main": [_lanes_tasks(*_LANES_TASK_TEXT[task_text]), "Both answered."],
+        "fake:main": [
+            _lanes_tasks(
+                *_LANES_TASK_TEXT[task_text],
+                _LANES_SUBAGENTS.get(task_text, ("a", "b")),
+            ),
+            "Both answered.",
+        ],
         "fake:a": ["A-answer"],
         "fake:b": ["B-answer"],
     }
@@ -160,7 +181,7 @@ def _lanes_provider(task_text: str = "different") -> Any:
 
 
 class _LaneAWaitsForB(AgentMiddleware):
-    """Main-agent middleware: when ``wait``, lane a starts only once lane b's model call is in flight.
+    """Main-agent middleware: when ``wait``, task a starts only once lane b's model call is in flight.
 
     Stands in for any change that reorders parallel sub-agents' model calls (a
     LangGraph or Deep Agents upgrade, an ``await`` added in middleware). It
@@ -173,7 +194,7 @@ class _LaneAWaitsForB(AgentMiddleware):
         self.b_started = False
 
     async def awrap_tool_call(self, request: Any, handler: Any) -> Any:
-        if self.wait and request.tool_call["args"].get("subagent_type") == "a":
+        if self.wait and request.tool_call["id"] == "task-a":
             await workflow.wait_condition(lambda: self.b_started)
         return await handler(request)
 
@@ -264,7 +285,7 @@ async def _model_ids_and_markers(handle: Any) -> tuple[list[str], list[str]]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("task_text", ["different", "same", "oversized"])
+@pytest.mark.parametrize("task_text", ["different", "same", "oversized", "customers"])
 async def test_reordered_parallel_subagents_fail_replay(
     env: WorkflowEnvironment, task_text: str
 ) -> None:
@@ -279,7 +300,8 @@ async def test_reordered_parallel_subagents_fail_replay(
             id=f"da-parallel-lanes-{uuid.uuid4()}",
             task_queue=f"da-parallel-lanes-{task_text}",
         )
-        assert await handle.result() == ["task-a=A-answer", "task-b=B-answer"]
+        answer_a = "B-answer" if task_text == "customers" else "A-answer"
+        assert await handle.result() == [f"task-a={answer_a}", "task-b=B-answer"]
         history = await handle.fetch_history()
     await _replay(ParallelLanesWorkflow, history)
     with pytest.raises(NondeterminismError, match="Activity id"):
@@ -330,6 +352,134 @@ async def test_sequence_id_history_still_replays() -> None:
     """
     history = WorkflowHistory.from_json("parallel-lanes", _LANES_HISTORY.read_text())
     await _replay(ParallelLanesWorkflow, history)
+
+
+# Summarization offloads a sub-agent's older messages to a history file whose
+# name and ``## Summarized at <now>`` heading change on every run; an unchanged
+# workflow whose sub-agent read that file back must still replay.
+_HISTORY_FILE = re.compile(r"/conversation_history/session_[0-9a-f]{32}\.md")
+
+
+class _ReadsSummarizedHistory(FakeModel):
+    """Lists files until summarization offloads its history, reads that file, then answers."""
+
+    answer: str = ""
+
+    def __init__(self, answer: str) -> None:
+        super().__init__(["unused"], answer=answer)
+
+    def _respond(self, messages: list[Any]) -> AIMessage:
+        if any(
+            m.type == "tool" and "Summarized at" in str(m.content) for m in messages
+        ):
+            return AIMessage(content=self.answer)
+        paths = [p for m in messages for p in _HISTORY_FILE.findall(str(m.content))]
+        tool_call_id = f"call-{uuid.uuid4().hex[:8]}"
+        if paths:
+            call = {"name": "read_file", "args": {"file_path": paths[0]}}
+        else:
+            call = {"name": "ls", "args": {"path": "/"}}
+        return AIMessage(content="", tool_calls=[{**call, "id": tool_call_id}])
+
+    def _generate(self, messages: list[Any], *args: Any, **kwargs: Any) -> Any:
+        from langchain_core.outputs import ChatGeneration, ChatResult
+
+        return ChatResult(generations=[ChatGeneration(message=self._respond(messages))])
+
+    async def _agenerate(self, messages: list[Any], *args: Any, **kwargs: Any) -> Any:
+        return self._generate(messages)
+
+
+def _summarized_lanes_provider() -> Any:
+    main_calls = 0
+
+    def provider(name: str) -> FakeModel:
+        nonlocal main_calls
+        if name == "fake:main":
+            main_calls += 1
+            if main_calls == 1:
+                return FakeModel([_lanes_tasks("Ask lane a.", "Ask lane b.")])
+            return FakeModel(["Both answered."])
+        if name == "fake:summarizer":
+            return FakeModel(["Listed the root."])
+        return _ReadsSummarizedHistory(f"{name}-answer")
+
+    return provider
+
+
+@workflow.defn
+class SummarizedLanesWorkflow:
+    @workflow.run
+    async def run(self) -> list[str]:
+        def lane(name: str) -> dict[str, Any]:
+            return {
+                "name": name,
+                "description": f"Lane {name}.",
+                "system_prompt": "Answer.",
+                "model": f"fake:{name}",
+                "middleware": [
+                    SummarizationMiddleware(
+                        "fake:summarizer",
+                        backend=StateBackend(),
+                        trigger=("messages", 8),
+                        keep=("messages", 2),
+                    )
+                ],
+            }
+
+        agent = create_deep_agent(model="fake:main", subagents=[lane("a"), lane("b")])
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": "Ask both lanes."}]}
+        )
+        return sorted(
+            f"{m.tool_call_id}={m.content}"
+            for m in result["messages"]
+            if m.type == "tool"
+        )
+
+
+@pytest.mark.asyncio
+async def test_parallel_subagents_reading_summarized_history_replay(
+    env: WorkflowEnvironment,
+) -> None:
+    async with Worker(
+        env.client,
+        task_queue="da-summarized-lanes",
+        workflows=[SummarizedLanesWorkflow],
+        plugins=[DeepAgentsPlugin(model_provider=_summarized_lanes_provider())],
+    ):
+        handle = await env.client.start_workflow(
+            SummarizedLanesWorkflow.run,
+            id=f"da-summarized-lanes-{uuid.uuid4()}",
+            task_queue="da-summarized-lanes",
+        )
+        assert await handle.result() == [
+            "task-a=fake:a-answer",
+            "task-b=fake:b-answer",
+        ]
+        history = await handle.fetch_history()
+
+    # The lanes' calls overlapped, so some were named; none of the named ones
+    # carried the summarized history a lane read back, which reads differently
+    # on replay.
+    named_inputs = [
+        b"".join(
+            p.data for p in e.activity_task_scheduled_event_attributes.input.payloads
+        )
+        for e in history.events
+        if e.HasField("activity_task_scheduled_event_attributes")
+        and e.activity_task_scheduled_event_attributes.activity_type.name
+        == INVOKE_MODEL
+        and e.activity_task_scheduled_event_attributes.activity_id.startswith(
+            "deepagents.model:"
+        )
+    ]
+    assert named_inputs
+    assert not [data for data in named_inputs if b"## Summarized at" in data]
+    await Replayer(
+        workflows=[SummarizedLanesWorkflow],
+        plugins=[DeepAgentsPlugin(model_provider=_summarized_lanes_provider())],
+    ).replay_workflow(history)
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +547,54 @@ def test_call_identity_ignores_offloaded_file_names() -> None:
 
     assert _identity(offloaded("Ask lane a.")) == _identity(offloaded("Ask lane a."))
     assert _identity(offloaded("Ask lane a.")) != _identity(offloaded("Ask lane b."))
+
+
+def test_call_identity_keeps_uuids_in_request_data() -> None:
+    """A UUID the caller supplies, outside a middleware-generated path, counts."""
+    from langchain_core.messages import HumanMessage
+
+    def lookup(customer: str) -> list[Any]:
+        call = {"name": "lookup", "args": {"customer": customer}, "id": "tc-1"}
+        return [
+            HumanMessage(content=f"Look up customer {customer}."),
+            AIMessage(content="", tool_calls=[call]),
+        ]
+
+    first = "11111111-1111-4111-8111-111111111111"
+    second = "22222222-2222-4222-8222-222222222222"
+    assert _identity(lookup(first)) != _identity(lookup(second))
+    # Only the name middleware gave the file is normalized, not the folder's
+    # other contents.
+    assert _identity(
+        [HumanMessage(content=f"Read /conversation_history/{first}.txt")]
+    ) != _identity([HumanMessage(content=f"Read /conversation_history/{second}.txt")])
+
+
+def test_call_identity_falls_back_after_reading_an_offloaded_file() -> None:
+    """A call that read back a file offloading middleware wrote keeps its sequence id.
+
+    On replay the middleware writes the file under a new name, and
+    summarization with a new ``## Summarized at`` heading, so what the tool
+    returned differs from the original run.
+    """
+    from langchain_core.messages import ToolMessage
+
+    def read(path: str) -> list[Any]:
+        call = {"name": "read_file", "args": {"file_path": path}, "id": "tc-1"}
+        return [
+            *_turn("one")[1:],
+            AIMessage(content="", tool_calls=[call]),
+            ToolMessage(
+                content="## Summarized at 2026-11-03T13:19:49+00:00",
+                tool_call_id="tc-1",
+            ),
+        ]
+
+    session = "/conversation_history/session_" + "0" * 32 + ".md"
+    assert _identity(read(session)) is None
+    assert _identity(read("/large_tool_results/unknown-0123abcd")) is None
+    # A large tool result offloaded under its tool call id replays identically.
+    assert _identity(read("/large_tool_results/tc-1")) is not None
 
 
 def test_call_identity_falls_back_when_the_transcript_is_not_stable() -> None:

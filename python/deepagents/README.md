@@ -385,8 +385,13 @@ A model call made while another model call of the same run is in flight (for
 example two sub-agents running in parallel) gets an Activity id named after the
 call it answers: the agent or sub-agent and the messages it has so far, minus
 the values that do not replay identically (message ids, and the random file
-names Deep Agents' filesystem and summarization middleware give the messages
-they offload to the backend). Activity
+names Deep Agents' filesystem and summarization middleware give the files they
+offload to the backend, where those names appear in a path; the same kind of
+value anywhere else in a message, such as a customer's UUID, still counts). A
+call whose transcript has a tool call on one of those offloaded files (reading
+back a summarized history, say) keeps the SDK's sequence id, because on replay
+the middleware writes the file under a new name and the tool reads back
+something else. Activity
 inputs are not compared on replay, but Activity ids are, so a change that makes
 parallel sub-agents schedule their model calls in a different order (a library
 upgrade, an `await` added in middleware) fails replay with a nondeterminism

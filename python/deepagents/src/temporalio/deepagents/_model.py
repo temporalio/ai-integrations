@@ -95,15 +95,29 @@ async def _call_model(
         raise
 
 
-# Random names Deep Agents' built-in middleware puts into message content when it
-# offloads to the backend, none of which replay identically: an evicted human
-# message's file (``uuid4()``), a summarization history file
-# (``session_<uuid4 hex>``) and an evicted tool result without a tool call id
-# (``unknown-<8 hex>``).
-_RANDOM_NAME = re.compile(
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-    r"|session_[0-9a-f]{32}"
-    r"|unknown-[0-9a-f]{8}(?![0-9a-f])"
+# Random names Deep Agents' built-in middleware gives the files it offloads to
+# the backend, none of which replay identically. Each is matched only in the
+# path the middleware writes it into, so the same kind of value in a prompt, a
+# tool argument or a tool result (a customer's UUID, say) stays part of the
+# identity:
+#
+# * the file of an evicted human message, ``conversation_history/<uuid4>.md``;
+# * a summarization history file, ``conversation_history/session_<uuid4 hex>.md``;
+# * an evicted tool result without a tool call id,
+#   ``large_tool_results/unknown-<8 hex>``.
+_GENERATED_NAME = re.compile(
+    r"(?<=conversation_history/)"
+    r"(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"|session_[0-9a-f]{32})(?=\.md)"
+    r"|(?<=large_tool_results/)unknown-[0-9a-f]{8}(?![0-9a-f])"
+)
+
+# A tool call whose arguments point at those files. On replay the middleware
+# writes them under new names (and summarization stamps a new
+# ``## Summarized at <now>`` heading), so what such a call reads back differs
+# from the original run.
+_GENERATED_FILE_REFERENCE = re.compile(
+    r"conversation_history|large_tool_results/unknown-"
 )
 
 # ``additional_kwargs`` keys that only record where middleware offloaded a
@@ -111,14 +125,14 @@ _RANDOM_NAME = re.compile(
 _OFFLOAD_KEYS = frozenset({"lc_evicted_to"})
 
 
-def _normalize_random_names(value: Any) -> Any:
-    """Replace middleware-generated random names in every string of ``value``."""
+def _normalize_generated(value: Any) -> Any:
+    """Replace middleware-generated file names in every string of ``value``."""
     if isinstance(value, str):
-        return _RANDOM_NAME.sub("<random>", value)
+        return _GENERATED_NAME.sub("<generated>", value)
     if isinstance(value, dict):
-        return {k: _normalize_random_names(v) for k, v in value.items()}
+        return {k: _normalize_generated(v) for k, v in value.items()}
     if isinstance(value, list):
-        return [_normalize_random_names(v) for v in value]
+        return [_normalize_generated(v) for v in value]
     return value
 
 
@@ -127,9 +141,9 @@ def _replay_stable(dumped: Any) -> Any:
 
     Drops the message id (LangGraph assigns it with ``uuid4`` outside the
     workflow's seeded random) and the offload bookkeeping in
-    ``additional_kwargs``, and normalizes the random file names that Deep
-    Agents' filesystem and summarization middleware write into the content
-    when they offload a large message.
+    ``additional_kwargs``, and normalizes the random file names Deep Agents'
+    filesystem and summarization middleware give the files they offload to
+    the backend (see ``_GENERATED_NAME``).
     """
     if isinstance(dumped, dict) and isinstance(dumped.get("kwargs"), dict):
         kwargs = {k: v for k, v in dumped["kwargs"].items() if k != "id"}
@@ -138,8 +152,21 @@ def _replay_stable(dumped: Any) -> Any:
             kwargs["additional_kwargs"] = {
                 k: v for k, v in extra.items() if k not in _OFFLOAD_KEYS
             }
-        return _normalize_random_names({**dumped, "kwargs": kwargs})
-    return _normalize_random_names(dumped)
+        return _normalize_generated({**dumped, "kwargs": kwargs})
+    return _normalize_generated(dumped)
+
+
+def _reads_generated_file(message: BaseMessage) -> bool:
+    """Whether ``message`` calls a tool on a file offloading middleware wrote.
+
+    Decided from the model's own tool calls, which replay from history, never
+    from the tool result, which is what differs on replay.
+    """
+    for call in getattr(message, "tool_calls", None) or []:
+        args = json.dumps(call.get("args"), sort_keys=True, default=str)
+        if _GENERATED_FILE_REFERENCE.search(args):
+            return True
+    return False
 
 
 def _has_repr(dumped: Any) -> bool:
@@ -267,11 +294,14 @@ class TemporalModel(BaseChatModel):
         sub-agent) and the non-system messages of the request in ``dumpd`` form
         minus their ids, which LangGraph assigns with ``uuid4`` outside the
         workflow's seeded random, and with the random file names offloading
-        middleware writes into them normalized (see ``_replay_stable``). System prompts, tool schemas and the model
+        middleware writes into them normalized (see ``_replay_stable``).
+        System prompts, tool schemas and the model
         name are left out, so editing them does not fail the replay of open
         runs. Returns None when the identity cannot be built (a value JSON
         cannot hold, one ``dumpd`` could only write as a ``repr``, or any other
-        error); the call then keeps its sequence id. Only computed for a call that
+        error) or would not replay (a tool call in the transcript reads a file
+        offloading middleware wrote, see ``_reads_generated_file``); the call
+        then keeps its sequence id. Only computed for a call that
         overlaps another one (see ``_model_activity_id`` in ``workflow``).
         """
         with workflow.unsafe.imports_passed_through():
@@ -283,6 +313,8 @@ class TemporalModel(BaseChatModel):
             metadata = ensure_config().get("metadata") or {}
             agent = str(metadata.get("lc_agent_name") or "")
             history = [m for m in messages if m.type != "system"]
+            if any(_reads_generated_file(m) for m in history):
+                return None
             dumped = [_replay_stable(_serde.dump_object(m)) for m in history]
             if _has_repr(dumped):
                 return None
