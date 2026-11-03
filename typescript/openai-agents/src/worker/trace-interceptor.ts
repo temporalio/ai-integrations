@@ -28,12 +28,13 @@ export interface TracingApiKeyContext {
  * Returns the tracing export API key for a trace, Worker-side, or `undefined`
  * to leave the exporter's default key. The plugin calls it for spans made in
  * Activities (including stateful MCP operations) and Nexus handlers under the
- * trace the plugin restored there, and for Workflow traces and spans. Workflow code and Clients can't give a trace its
- * own key: the plugin refuses a run's `tracing: { apiKey }` and a keyed trace at
- * Temporal boundaries, so use this to choose a key per run. It runs only on
- * Workers: a trace that a Client starts, and the spans the Client makes in it,
- * keep the Client's default key. The plugin does not send keys to the Workflow
- * or write them to Workflow history.
+ * trace the plugin restored there, and for Workflow traces and spans.
+ * Workflow code and Clients can't give a trace its own key: the plugin
+ * refuses a run's `tracing: { apiKey }` and a keyed trace at Temporal
+ * boundaries, so use this to choose a key per run. It runs only on Workers: a
+ * trace that a Client starts, and the spans the Client makes in it, keep the
+ * Client's default key. The plugin does not send keys to the Workflow or
+ * write them to Workflow history.
  *
  * Called often, so keep it fast. A throw fails the Activity or Nexus operation,
  * and drops the Workflow span with a warning.
