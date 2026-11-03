@@ -112,9 +112,14 @@ func NewPlugin(cfg Config) (worker.Plugin, error) {
 type versionedPlugin struct{ *temporal.SimplePlugin }
 
 // Version returns this module's version without the leading "v", or "" when
-// the build has no module information for it.
+// the build has no version for it.
 func (versionedPlugin) Version() string {
-	info, ok := debug.ReadBuildInfo()
+	return moduleVersion(debug.ReadBuildInfo())
+}
+
+// moduleVersion finds this module's version in the build info. A directory
+// replace has no version, which the build info records as "(devel)".
+func moduleVersion(info *debug.BuildInfo, ok bool) string {
 	if !ok {
 		return ""
 	}
@@ -122,6 +127,9 @@ func (versionedPlugin) Version() string {
 		if dep.Path == "go.temporal.io/googleadk" {
 			if dep.Replace != nil {
 				dep = dep.Replace
+			}
+			if dep.Version == "(devel)" {
+				return ""
 			}
 			return strings.TrimPrefix(dep.Version, "v")
 		}

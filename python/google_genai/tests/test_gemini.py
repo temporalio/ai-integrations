@@ -21,6 +21,7 @@ Tests cover:
 """
 
 import base64
+import importlib.metadata
 import inspect
 import io
 import json
@@ -2359,3 +2360,8 @@ async def test_side_effects_activity_scheduling(client: Client):
         "get_weather": 1,
         "get_weather_country": 1,
     }
+
+
+def test_plugin_reports_package_version() -> None:
+    plugin = GoogleGenAIPlugin(GeminiClient(api_key="fake-test-key"))
+    assert plugin.version() == importlib.metadata.version("temporalio-google-genai")

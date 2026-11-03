@@ -29,6 +29,16 @@ export interface AiSdkPluginOptions {
   mcpConnectionIdleTimeout?: Duration;
 }
 
+/** Reads this package's version, which worker heartbeats report. Empty if it can't be read. */
+function packageVersion(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require('../package.json') as { version?: string }).version ?? '';
+  } catch {
+    return '';
+  }
+}
+
 /**
  * A Temporal plugin that integrates AI SDK providers for use in workflows.
  * This plugin creates activities that allow workflows to invoke AI models.
@@ -37,6 +47,9 @@ export interface AiSdkPluginOptions {
  * workflow bundle doesn't pull in the worker-side activities and their disallowed imports.
  */
 export class AiSdkPlugin extends SimplePlugin {
+  /** The package version, reported in worker heartbeats. */
+  readonly version = packageVersion();
+
   constructor(options: AiSdkPluginOptions) {
     const mcpServerNames = Object.keys(options.mcpClientFactories ?? {});
     super({

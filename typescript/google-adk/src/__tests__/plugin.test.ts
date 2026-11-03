@@ -3,7 +3,7 @@
  * `configureWorker` output without bundling or executing a Workflow.
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 
@@ -356,5 +356,5 @@ test('configureWorker refuses to replace a different Activity with the same name
 });
 
 test('reports the package version for worker heartbeats', (t) => {
-  t.regex(new GoogleAdkPlugin().version, /^\d+\.\d+\.\d+/);
+  t.is(new GoogleAdkPlugin().version, JSON.parse(readFileSync(path.join(__dirname, '../../package.json'), 'utf8')).version);
 });

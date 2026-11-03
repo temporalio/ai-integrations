@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.metadata
 import json
 import sys
 import uuid
@@ -372,3 +373,9 @@ async def test_a_line_over_max_buffer_size_fails_as_in_the_sdk(
     assert isinstance(error, ApplicationError)
     assert error.type == "CLIJSONDecodeError"
     assert "maximum buffer size of 10 bytes" in error.message
+
+
+def test_plugin_reports_package_version() -> None:
+    assert ClaudeAgentSDKPlugin().version() == importlib.metadata.version(
+        "temporalio-claude-agent-sdk"
+    )
