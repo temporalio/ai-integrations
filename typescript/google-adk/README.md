@@ -393,13 +393,16 @@ const runner = new InMemoryRunner({ agent: graph });
   itself fails or is cancelled. A cancellation of that work never counts, whenever
   it arrives: the plugin tracks each node attempt and ignores a cancellation that
   ADK absorbs in an attempt the node's timeout abandoned, while a retry or another
-  item of a `ParallelWorker` is an attempt of its own. Once the retry has answered,
-  a model failure from that work no longer counts either: the plugin numbers
-  model calls as they start, and ignores the failure of a call that started
-  before the same agent's latest answer in that run. Bound an
-  agent's model call with the model Activity's own `startToCloseTimeout` or
-  `scheduleToCloseTimeout` (`TemporalModel`'s `activity` options) instead, and
-  put a deadline on Activity work with `activityNode`.
+  item of a `ParallelWorker` is an attempt of its own. That includes work a retry
+  joins after the abandoned attempt started it, such as a retried `ParallelWorker`
+  or `ctx.runNode` with an explicit `runId`: its cancellation is ignored too, and
+  the run fails with `GoogleAdkNodeReportedError` instead of ending CANCELLED.
+  Once the retry has answered, a model failure from that work no longer counts
+  either: the plugin numbers model calls as they start, and ignores the failure
+  of a call that started before the same agent's latest answer in that run.
+  Bound an agent's model call with the model Activity's own
+  `startToCloseTimeout` or `scheduleToCloseTimeout` (`TemporalModel`'s `activity`
+  options) instead, and put a deadline on Activity work with `activityNode`.
 - **Fan-in.** Use a `JoinNode`: it is the node type that waits for every
   predecessor, and its input is the map from predecessor name to that node's
   output. ADK's `waitForOutput` flag is not a fan-in gate (it parks a node that
@@ -596,12 +599,16 @@ cancelled Activity node ends it CANCELLED the same way, inside a dynamic run too
 So does a cancel that ADK absorbs in a tool or a model callback, such as a
 `LongRunningFunctionTool` waiting for a Signal or a `beforeModelCallback` waiting
 for an Activity: in an agent node it ends the execution CANCELLED rather than
-failing it with `GoogleAdkNodeReportedError`. A cancel absorbed in a Signal
-handler ends the execution when the main function returns, after its cleanup.
-Only the execution's own cancellation counts, followed from the operation it
-cancelled: a cancel that only an inner scope (`CancellationScope.withTimeout`)
-caused, or any other error, leaves the outcome to the Workflow, even when the
-Workflow's cancellation was requested meanwhile.
+completing it (a tool) or failing it with `GoogleAdkNodeReportedError` (a model
+callback). A cancel absorbed in a Signal handler ends the execution when the
+main function returns, after its cleanup; if the main function has already
+returned, the execution ends as the main function did. Only the execution's own
+cancellation counts, followed from the operation it cancelled: a cancel that
+only an inner scope (`CancellationScope.withTimeout`) caused, or any other error
+a tool or callback throws, leaves the outcome to the Workflow, even when the
+Workflow's cancellation was requested meanwhile. A recorded cancellation
+outranks the errors ADK's runtime throws, but not an error the Workflow's own
+code throws after the turn: that one still decides how the execution ends.
 
 A failing sibling does not cancel the execution either. When a graph node fails,
 ADK aborts the run and waits for the nodes still running before failing it. The
