@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_core.runnables import RunnableLambda
 
 from temporalio.api.common.v1 import Payload
 from temporalio.bridge.proto.workflow_activation import (
@@ -37,6 +38,7 @@ from temporalio.langsmith._interceptor import (
     _end_run_on_exception,
     _extract_context,
     _inject_context,
+    _install_langchain_run_id_hook,
     _LangChainRuns,
     _LangSmithWorkflowInboundInterceptor,
     _maybe_run,
@@ -468,6 +470,33 @@ class TestReplaySafety:
                 _ReplaySafeRunTree(ahead, executor=_make_executor()).end()
             run.end.assert_called_once_with(end_time=now + timedelta(microseconds=1))
             ahead.end.assert_called_once_with(end_time=now + timedelta(seconds=30))
+
+    @pytest.mark.parametrize("run_id", [None, uuid.uuid4()])
+    async def test_astream_events_root_run_id(self, run_id: uuid.UUID | None) -> None:
+        """``astream_events`` gives its root run the workflow's ID, or the caller's.
+
+        It generates that ID itself, not in LangChain's callback manager.  It
+        can't finish in a workflow (temporalio/sdk-python#2083), so this runs
+        it outside one, in the plugin's tracing context.
+        """
+        _install_langchain_run_id_hook()
+        stable = uuid.uuid4()
+        runs = MagicMock(spec=_LangChainRuns)
+        runs.new_id.return_value = stable
+
+        async def step(text: str) -> str:
+            return text
+
+        config: Any = {} if run_id is None else {"run_id": run_id}
+        with patch(f"{_MOD}._plugin_langchain_runs", return_value=runs):
+            events = [
+                event
+                async for event in RunnableLambda(step).astream_events(
+                    "hi", config=config, version="v2"
+                )
+            ]
+        assert events
+        assert {event["run_id"] for event in events} == {str(run_id or stable)}
 
 
 # ===================================================================

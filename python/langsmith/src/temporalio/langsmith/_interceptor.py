@@ -763,15 +763,36 @@ def _replay_safe_persist(persist: Callable[..., Any]) -> Callable[..., Any]:
     return _persist_run_single
 
 
+def _hook_run_id_generator(module: Any) -> bool:
+    """Make a LangChain module generate its run IDs with ``_stable_run_ids``.
+
+    Returns whether the module generates them in a way this knows.
+    """
+    # The names the module calls; none is in its __all__.
+    if hasattr(module, "uuid7"):
+        # langchain-core 0.3.83 to 0.3.86, and 1.1.1 on
+        setattr(module, "uuid7", _stable_run_ids(getattr(module, "uuid7")))
+    elif getattr(module, "uuid4", None) is uuid.uuid4:
+        # The event stream of earlier releases calls uuid4()
+        setattr(module, "uuid4", _stable_run_ids(uuid.uuid4))
+    elif getattr(module, "uuid", None) is uuid:
+        # The callback manager of earlier releases calls uuid.uuid4()
+        setattr(module, "uuid", _UuidModule(_stable_run_ids(uuid.uuid4)))
+    else:
+        return False
+    return True
+
+
 def _install_langchain_run_id_hook() -> None:
     """Make the run IDs LangChain generates in workflow code stable.
 
     LangChain's callback manager generates an ID for each run the caller
-    gave none.  In workflow code these come from ``_LangChainRuns.new_id``
-    instead, so the IDs LangChain's callbacks get are the IDs LangSmith
-    stores, and a replay generates them again.  The same goes for runs made
-    inside a LangChain step, such as by ``@traceable``.  A caller's own
-    ``run_id`` is kept.  Safe to call more than once.
+    gave none, and ``astream_events`` one for its root run.  In workflow
+    code these come from ``_LangChainRuns.new_id`` instead, so the IDs
+    LangChain's callbacks get are the IDs LangSmith stores, and a replay
+    generates them again.  The same goes for runs made inside a LangChain
+    step, such as by ``@traceable``.  A caller's own ``run_id`` is kept.
+    Safe to call more than once.
     """
     global _langchain_run_id_hook_installed  # noqa: PLW0603
     if _langchain_run_id_hook_installed:
@@ -783,6 +804,7 @@ def _install_langchain_run_id_hook() -> None:
     setattr(run_tree, "create_child", _stable_child_ids(run_tree.create_child))
     try:
         import langchain_core.callbacks.manager as manager
+        import langchain_core.tracers.event_stream as event_stream
         from langchain_core.tracers.langchain import LangChainTracer
     except ImportError:
         return
@@ -796,14 +818,8 @@ def _install_langchain_run_id_hook() -> None:
         "_persist_run_single",
         _replay_safe_persist(getattr(LangChainTracer, "_persist_run_single")),
     )
-    # The names the manager calls; neither is in its __all__.
-    if hasattr(manager, "uuid7"):
-        # langchain-core 0.3.83 to 0.3.86, and 1.1.1 on
-        setattr(manager, "uuid7", _stable_run_ids(getattr(manager, "uuid7")))
-    elif getattr(manager, "uuid", None) is uuid:
-        # Earlier releases call uuid.uuid4()
-        setattr(manager, "uuid", _UuidModule(_stable_run_ids(uuid.uuid4)))
-    else:
+    hooked = [_hook_run_id_generator(module) for module in (manager, event_stream)]
+    if not all(hooked):
         logger.warning(
             "This langchain-core generates run IDs in a way the LangSmith plugin "
             "does not know; LangChain runs in workflows may be posted again on "
