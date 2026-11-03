@@ -1,13 +1,20 @@
 """Workflow-specific primitives for working with the OpenAI Agents SDK in a workflow context"""
 
+import dataclasses
 import functools
 import inspect
 import json
+import re
+import sys
+import types
 import typing
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import timedelta
 from typing import Any
+
+if sys.version_info >= (3, 14):
+    import annotationlib  # type: ignore[reportUnreachable]
 
 import nexusrpc
 from agents import (
@@ -17,7 +24,11 @@ from agents import (
     _debug,
     default_tool_error_function,
 )
-from agents.function_schema import FuncSchema, function_schema
+from agents.function_schema import (
+    FuncSchema,
+    function_schema,
+    generate_func_documentation,
+)
 from agents.tool import (
     FunctionTool,
     ToolErrorFunction,
@@ -101,6 +112,132 @@ async def _tool_argument_error(
     return result
 
 
+def _call_function(method: Any) -> Callable | None:
+    """Return the function under a function, staticmethod, classmethod or partialmethod."""
+    while isinstance(method, (staticmethod, classmethod, functools.partialmethod)):
+        method = (
+            method.func
+            if isinstance(method, functools.partialmethod)
+            else method.__func__
+        )
+    return method if inspect.isfunction(method) else None
+
+
+def _generated_class_doc(cls: type) -> str | None:
+    """Return the docstring dataclasses or namedtuple writes for a class that has none."""
+    if dataclasses.is_dataclass(cls):
+        try:
+            # Format it as dataclasses did when it made the class.
+            if sys.version_info >= (3, 14):
+                signature = inspect.signature(  # type: ignore[reportUnreachable]
+                    cls, annotation_format=annotationlib.Format.FORWARDREF
+                )
+                # 3.14 left a forward reference in the __init__ dataclasses generated
+                # unevaluated, and the field keeps the reference from that time.
+                annotate = getattr(cls.__init__, "__annotate__", None)
+                if getattr(annotate, "__generated_by_dataclasses__", False):
+                    types = {n: f.type for n, f in cls.__dataclass_fields__.items()}
+                    signature = signature.replace(
+                        parameters=[
+                            p.replace(annotation=types.get(p.name, p.annotation))
+                            for p in signature.parameters.values()
+                        ]
+                    )
+            else:
+                signature = inspect.signature(cls)  # type: ignore[reportUnreachable]
+            return cls.__name__ + str(signature).replace(" -> None", "")
+        except (TypeError, ValueError):
+            return cls.__name__
+    fields = getattr(cls, "_fields", None)
+    if issubclass(cls, tuple) and isinstance(fields, tuple):
+        names = ", ".join(fields) + ("," if len(fields) == 1 else "")
+        return f"{cls.__name__}({names})"
+    return None
+
+
+def _docstring(fn: Callable | None) -> str | None:
+    """Return ``fn``'s docstring, unless it is missing, blank or not a string."""
+    doc = fn.__doc__ if fn is not None else None
+    return doc if isinstance(doc, str) and doc.strip() else None
+
+
+def _type_hints(fn: Callable) -> dict[str, Any]:
+    """Return ``fn``'s annotations resolved in its own module, keeping ``Annotated`` metadata.
+
+    Unlike ``typing.get_type_hints(fn)`` on Python 3.10, this doesn't wrap a parameter with a
+    ``None`` default in ``Optional``, which would hide a context type or ``Annotated`` metadata.
+    Like it, this resolves the function's own type parameters, such as ``T`` in ``def f[T]``.
+    It skips the return annotation, which the tool doesn't use, so a function marked with
+    ``@typing.no_type_check`` whose return type can't be resolved still gets its parameter types.
+    """
+    # inspect.get_annotations also reads __annotate__, which Python 3.14's update_wrapper
+    # copies to a decorator in place of __annotations__.
+    annotations = dict(inspect.get_annotations(fn))
+    annotations.pop("return", None)
+    return typing.get_type_hints(
+        types.SimpleNamespace(__annotations__=annotations),
+        globalns=getattr(inspect.unwrap(fn), "__globals__", {}),
+        localns={p.__name__: p for p in getattr(fn, "__type_params__", ())},
+        include_extras=True,
+    )
+
+
+def _class_doc(cls: type) -> str | None:
+    """Return a class's own docstring, unless it has no summary or is one dataclasses or
+    namedtuple wrote.
+    """
+    doc = _docstring(cls)
+    # Such as a docstring that documents only the constructor's Args:.
+    if doc is None or not _summary(inspect.cleandoc(doc)):
+        return None
+    if not doc.startswith(cls.__name__):
+        return doc
+    try:
+        generated = _generated_class_doc(cls)
+    except Exception:
+        # dataclasses would have failed the same way, so it didn't write this docstring.
+        return doc
+    return None if doc == generated else doc
+
+
+# The Google-style section headers the Agents SDK looks for, in any case. Its docstring parser
+# reads one on a docstring's first line as plain text, so a description that starts with one is
+# no summary.
+_GOOGLE_SECTION = re.compile(
+    r"(Args|Arguments|Params|Parameters|Returns|Raises):\s*$", re.IGNORECASE
+)
+
+
+def _summary(description: str | None) -> str | None:
+    """Return ``description``, unless it is empty or starts with a Google section header."""
+    if not description or _GOOGLE_SECTION.match(description.splitlines()[0]):
+        return None
+    return description
+
+
+def _doc_summary(doc: str) -> str | None:
+    """Return the summary function_schema would take from a docstring."""
+    return _summary(
+        generate_func_documentation(
+            _tool_stand_in(lambda: None, "summary", {}, doc)
+        ).description
+    )
+
+
+def _tool_stand_in(
+    call: Callable, name: str, hints: dict[str, Any], doc: str | None
+) -> Callable:
+    """Wrap ``call`` with the name, docstring and annotations function_schema should read.
+
+    A partial has no module globals, so ``hints`` are resolved in the function's own module.
+    """
+    stand_in = functools.partial(call)
+    setattr(stand_in, "__name__", name)
+    stand_in.__annotations__ = hints
+    stand_in.__doc__ = doc
+    return stand_in
+
+
 def activity_as_tool(
     fn: Callable,
     *,
@@ -129,7 +266,10 @@ def activity_as_tool(
     For undocumented arguments, refer to :py:mod:`workflow` and :py:meth:`start_activity`
 
     Args:
-        fn: A Temporal activity function to convert to a tool.
+        fn: A Temporal activity function to convert to a tool, a method passed as
+            ``Class.method``, or a callable-class activity passed as its class. For a
+            ``__call__`` set with ``functools.partialmethod``, the SDK runs an async one as
+            sync before Python 3.13 and decodes its arguments without their types.
         strict_json_schema: Whether the tool should follow a strict schema.
             See https://openai.github.io/openai-agents-python/ref/tool/#agents.tool.FunctionTool.strict_json_schema
         failure_error_function: Formats the error text returned to the model
@@ -144,7 +284,13 @@ def activity_as_tool(
         An OpenAI agent tool that wraps the provided activity.
 
     Raises:
-        ApplicationError: If the function is not properly decorated as a Temporal activity.
+        ValueError: If the function is not decorated as a Temporal activity, or is a dynamic
+            activity, which has no name; if it is a callable-class activity passed as an
+            instance, or whose ``__call__`` is not a function, or a staticmethod, classmethod or
+            ``functools.partialmethod`` over a function, can't be read, or takes keyword-only
+            arguments; or if the activity takes ``**kwargs``. Errors from building the schema,
+            such as the Agents SDK's ``UserError`` or pydantic's schema errors, propagate
+            unchanged.
 
     Example:
         >>> @activity.defn
@@ -162,30 +308,82 @@ def activity_as_tool(
     """
     ret = activity._Definition.from_callable(fn)
     if not ret:
-        raise ApplicationError(
-            "Bare function without tool and activity decorators is not supported",
-            "invalid_tool",
+        raise ValueError(
+            "Bare function without tool and activity decorators is not supported"
         )
     if ret.name is None:
-        raise ApplicationError(
-            "Input activity must have a name to be made into a tool",
-            "invalid_tool",
+        raise ValueError("Input activity must have a name to be made into a tool")
+    if not inspect.isclass(fn) and hasattr(type(fn), "__temporal_activity_definition"):
+        raise ValueError(
+            f"Pass the activity class {type(fn).__name__}, not an instance of it"
         )
-    # If the provided callable has a first argument of `self`, partially apply it with the same metadata
-    # The actual instance will be picked up by the activity execution, the partially applied function will never actually be executed
-    params = list(inspect.signature(fn).parameters.keys())
-    if len(params) > 0 and params[0] == "self":
-        partial = functools.partial(fn, None)
-        setattr(partial, "__name__", fn.__name__)
-        partial.__annotations__ = getattr(fn, "__annotations__")
-        setattr(
-            partial,
-            "__temporal_activity_definition",
-            getattr(fn, "__temporal_activity_definition"),
+    owner: type | None = None
+    if inspect.isclass(fn):
+        owner = fn
+        # Workflow code references a callable-class activity by its class, but the worker's
+        # registered instance runs __call__, so build the tool from __call__ as an instance binds
+        # it: without the receiver of a method, classmethod or partialmethod, and with every
+        # parameter of a staticmethod. The tool never calls this stand-in binding.
+        calls = [vars(c)["__call__"] for c in fn.__mro__ if "__call__" in vars(c)]
+        func = _call_function(calls[0]) if calls else None
+        if func is None:
+            raise ValueError(
+                f"Activity class {fn.__name__} needs a __call__ that is a function, or a "
+                "staticmethod, classmethod or functools.partialmethod over a function"
+            )
+        try:
+            call = calls[0].__get__(object(), fn)
+            hints = _type_hints(func)
+            parameters = inspect.signature(call).parameters.values()
+        except Exception as e:
+            raise ValueError(
+                f"Cannot build a tool from {fn.__name__}.__call__: {e}"
+            ) from e
+        # @activity.defn checks the constructor's signature, not __call__'s, so __call__ can
+        # take keyword-only arguments, which run_activity can't pass.
+        if any(p.kind is inspect.Parameter.KEYWORD_ONLY for p in parameters):
+            message = f"Activity class {fn.__name__} cannot take keyword-only arguments in __call__"
+            if isinstance(calls[0], functools.partialmethod) and calls[0].keywords:
+                message += (
+                    ": its functools.partialmethod binds an argument by keyword, which makes"
+                    " the arguments after it keyword-only"
+                )
+            raise ValueError(message)
+        # __call__'s own docstring, else the class's, else that of a __call__ it inherits.
+        doc = (
+            _docstring(_call_function(vars(fn).get("__call__")))
+            or _class_doc(fn)
+            or next(filter(None, map(_docstring, map(_call_function, calls))), None)
         )
-        partial.__doc__ = fn.__doc__
-        fn = partial
+        fn = _tool_stand_in(call, fn.__name__, hints, doc)
+    else:
+        # Drop a first argument named `self`, however it is annotated, as before: a method passed
+        # as Class.method, even one assigned from a module function, is registered bound to an
+        # instance that fills it, and the function alone can't show how it is registered.
+        # Partially apply it; the partial is never executed.
+        params = list(inspect.signature(fn).parameters.keys())
+        if len(params) > 0 and params[0] == "self":
+            fn = _tool_stand_in(
+                functools.partial(fn, None),
+                fn.__name__,
+                _type_hints(fn),
+                fn.__doc__,
+            )
+    # run_activity passes only positional arguments, so it would drop the model's **kwargs.
+    if any(
+        p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in inspect.signature(fn).parameters.values()
+    ):
+        raise ValueError(f"Activity {fn.__name__} cannot take **kwargs")
     schema = function_schema(fn)
+    if owner is not None and not _summary(schema.description):
+        # A __call__ docstring with only sections, such as `:param:` fields, a NumPy Parameters
+        # section or a Google Args: section, has no summary; use the class's own, else none, so a
+        # section is never shown as the summary. Keep the parameter descriptions, and keep it apart
+        # from the summary argument, which labels the scheduled activity.
+        class_doc = _class_doc(owner)
+        class_summary = _doc_summary(class_doc) if class_doc else None
+        schema = dataclasses.replace(schema, description=class_summary)
 
     async def run_activity(ctx: RunContextWrapper[Any], input: str) -> Any:
         try:
@@ -508,8 +706,9 @@ def temporal_mcp_server(
             of using the worker connection cache.
         server_options: OpenAI Agents ``MCPServer`` options such as
             ``require_approval`` and ``failure_error_function``. Set them here:
-            on the factory's server, a callable ``tool_filter`` and a
-            ``require_approval`` policy that can ask for approval are rejected.
+            on the factory's server, a callable ``tool_filter``, a
+            ``require_approval`` policy that can ask for approval and a
+            ``tool_meta_resolver`` are rejected.
     """
     try:
         from temporalio.mcp import TemporalMCPClient

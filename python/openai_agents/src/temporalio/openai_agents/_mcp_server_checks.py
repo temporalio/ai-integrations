@@ -21,20 +21,28 @@ from temporalio.exceptions import ApplicationError
 _SDK_APPROVAL_EVALUATOR = getattr(MCPServer, "_get_needs_approval_for_tool", None)
 
 
-def _reject_dynamic_tool_filter(name: str, server: MCPServer) -> None:
+def _has_dynamic_tool_filter(server: MCPServer) -> bool:
+    """Return whether the server has a callable ``tool_filter``."""
+    return callable(getattr(server, "tool_filter", None))
+
+
+def _reject_dynamic_tool_filter(
+    name: str,
+    server: MCPServer,
+    remedy: str = "pass the filter to temporal_mcp_server() instead",
+) -> None:
     """Fail fast on a worker-side filter that can never be applied.
 
     A callable ``tool_filter`` needs the run context and agent, which exist only
     in the workflow, so the Agents SDK rejects one on the worker side and the
     list-tools Activity would otherwise retry forever. A static filter needs
-    neither and is applied here as usual.
+    neither and is applied here as usual. ``remedy`` ends the error message.
     """
-    if callable(getattr(server, "tool_filter", None)):
+    if _has_dynamic_tool_filter(server):
         raise ApplicationError(
             f"MCP server {name!r} sets a callable tool_filter on its worker-side "
             "MCPServer, which cannot be applied there because the run context "
-            "and agent it receives exist only in the workflow; pass the filter "
-            "to temporal_mcp_server() instead",
+            f"and agent it receives exist only in the workflow; {remedy}",
             non_retryable=True,
         )
 
@@ -61,6 +69,32 @@ def _has_worker_side_require_approval(server: MCPServer) -> bool:
         evaluator is not None and evaluator is not _SDK_APPROVAL_EVALUATOR
     ) or type(server).__getattribute__ is not object.__getattribute__
     return callable(policy) or bool(policy) or overridden
+
+
+def _has_worker_side_tool_meta_resolver(server: MCPServer) -> bool:
+    """Return whether the server sets a ``tool_meta_resolver``."""
+    return getattr(server, "tool_meta_resolver", None) is not None
+
+
+def _reject_worker_side_tool_meta_resolver(
+    name: str,
+    server: MCPServer,
+    remedy: str = "pass it to temporal_mcp_server(tool_meta_resolver=...)",
+) -> None:
+    """Raise when the factory's server has a ``tool_meta_resolver``; see the message.
+
+    The resolver needs the run context, which exists only in the workflow, so the
+    worker cannot run it, and the agent never reads the factory's copy. ``remedy``
+    says where to set it instead.
+    """
+    if _has_worker_side_tool_meta_resolver(server):
+        raise ApplicationError(
+            f"MCP server {name!r} sets tool_meta_resolver on its worker-side "
+            "MCPServer, which cannot run there because the run context it "
+            f"receives exists only in the workflow; {remedy}, and remove it from "
+            "the factory's server",
+            non_retryable=True,
+        )
 
 
 def _reject_worker_side_require_approval(

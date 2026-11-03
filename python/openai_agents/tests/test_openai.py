@@ -1,12 +1,24 @@
+import abc
 import asyncio
 import copy
+import functools
 import json
 import os
+import sys
 import uuid
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    NamedTuple,
+    TypeVar,
+    cast,
+    no_type_check,
+)
 
 import nexusrpc
 import pydantic
@@ -93,7 +105,7 @@ import temporalio.openai_agents as openai_agents
 from temporalio import activity, workflow
 from temporalio.api.common.v1 import Payload
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
-from temporalio.common import RetryPolicy
+from temporalio.common import RawValue, RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import (
     ActivityError,
@@ -231,14 +243,32 @@ async def get_weather_context(ctx: RunContextWrapper[str], city: str) -> Weather
     return Weather(city=city, temperature_range="14-20C", conditions=ctx.context)
 
 
+# A string annotation naming a module-level alias must resolve in this module.
+CityName = str
+
+
 class ActivityWeatherService:
     @activity.defn
-    async def get_weather_method(self, city: str) -> Weather:
+    async def get_weather_method(self, city: "CityName") -> Weather:
         """
         Get the weather for a given city.
         """
         return Weather(
             city=city, temperature_range="14-20C", conditions="Sunny with wind."
+        )
+
+
+@activity.defn
+class ActivityWeatherClass:
+    def __init__(self, conditions: str) -> None:
+        self.conditions = conditions
+
+    async def __call__(self, city: "CityName") -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
         )
 
 
@@ -293,6 +323,12 @@ def weather_mock_model():
                 call_id="call-get-weather-method",
                 item_id="item-get-weather-method",
             ),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo"}',
+                "ActivityWeatherClass",
+                call_id="call-get-weather-class",
+                item_id="item-get-weather-class",
+            ),
             ResponseBuilders.output_message("Test weather result"),
         ]
     )
@@ -331,6 +367,10 @@ class ToolsWorkflow:
                 ),
                 openai_agents.workflow.activity_as_tool(
                     ActivityWeatherService.get_weather_method,
+                    start_to_close_timeout=timedelta(seconds=10),
+                ),
+                openai_agents.workflow.activity_as_tool(
+                    ActivityWeatherClass,
                     start_to_close_timeout=timedelta(seconds=10),
                 ),
                 openai_agents.workflow.activity_as_tool(
@@ -385,6 +425,7 @@ async def test_tool_workflow(client: Client):
                 get_weather_country,
                 get_weather_context,
                 ActivityWeatherService().get_weather_method,
+                ActivityWeatherClass("Cloudy"),
             ],
         ) as worker:
             workflow_handle = await client.start_workflow(
@@ -399,11 +440,20 @@ async def test_tool_workflow(client: Client):
             assert result == "Test weather result"
 
             events = []
+            class_activity_inputs = []
             async for e in workflow_handle.fetch_history_events():
                 if e.HasField("activity_task_completed_event_attributes"):
                     events.append(e)
+                elif e.HasField("activity_task_scheduled_event_attributes"):
+                    attrs = e.activity_task_scheduled_event_attributes
+                    if attrs.activity_type.name == "ActivityWeatherClass":
+                        class_activity_inputs.append(
+                            [p.data.decode() for p in attrs.input.payloads]
+                        )
 
-            assert len(events) == 11
+            # The callable class's __call__ gets the model's arguments, not its constructor.
+            assert class_activity_inputs == [['"Tokyo"']]
+            assert len(events) == 13
             assert (
                 "function_call"
                 in events[0]
@@ -465,11 +515,583 @@ async def test_tool_workflow(client: Client):
                 .data.decode()
             )
             assert (
-                "Test weather result"
+                "function_call"
                 in events[10]
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
             )
+            assert (
+                "Cloudy"
+                in events[11]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Test weather result"
+                in events[12]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+
+
+@activity.defn
+class ActivityWeatherPartialMethodCall:
+    async def get_weather(self, conditions: str, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions=conditions)
+
+    __call__ = functools.partialmethod(get_weather, "Rainy")
+
+
+# In these two, `self` is a real parameter: binding __call__ has already dropped the receiver.
+@activity.defn
+class ActivityWeatherStaticCall(abc.ABC):
+    @staticmethod
+    async def __call__(self: str) -> Weather:  # type: ignore[reportSelfClsParameterName]
+        return Weather(city=self, temperature_range="14-20C", conditions="Foggy")
+
+
+@activity.defn
+class ActivityWeatherClassMethodCall:
+    @classmethod
+    async def __call__(cls, self: str) -> Weather:  # type: ignore[reportSelfClsParameterName]
+        return Weather(city=self, temperature_range="14-20C", conditions="Windy")
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherDataclass:
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherDocumentedDataclass:
+    """ActivityWeatherDocumentedDataclass(city) gets the weather for a given city."""
+
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+class WeatherBase:
+    """
+    Weather tools.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherDerived(WeatherBase):
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Cloudy")
+
+
+@activity.defn
+class ActivityWeatherDocumentedDerived(WeatherBase):
+    """
+    Look up the weather for a city.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """ """
+        return Weather(city=city, temperature_range="14-20C", conditions="Cloudy")
+
+
+class Unprintable:
+    def __repr__(self) -> str:
+        raise TypeError("can't be printed")
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherUnprintableDefault:
+    # Documented, or Python 3.10's dataclasses fails to write its docstring.
+    """
+    Weather tools.
+    """
+
+    client: Unprintable = Unprintable()
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+# The self-type idiom from before typing.Self.
+WeatherServiceT = TypeVar("WeatherServiceT", bound="WeatherCallService")
+
+
+class WeatherCallService:
+    @activity.defn
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+    @activity.defn
+    async def get_weather(self: WeatherServiceT, city: str) -> Weather:  # type: ignore[reportInvalidTypeVarUse]
+        # The Worker registers the bound method, so the instance fills an annotated `self` too.
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherSectionsOnlyCall:
+    """
+    Get the weather for a given city.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        :param city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherDocProperty:
+    @property
+    def __doc__(self) -> str:  # type: ignore
+        return "Per-instance weather."
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherTuple(NamedTuple):
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+@activity.defn
+async def get_weather_shared(self: Any, city: str) -> Weather:  # type: ignore[reportUnusedParameter]
+    return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+class WeatherAssignedService:
+    # Assigned from a module function, this is still registered bound to an instance.
+    get_weather = get_weather_shared
+
+
+class WeatherCachedService:
+    # On Python 3.14, update_wrapper gives the cache __annotate__ instead of __annotations__.
+    @activity.defn
+    @functools.lru_cache
+    def get_weather(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherCustomInit:
+    count: int
+
+    def __init__(self, count: str) -> None:
+        self.count = int(count)
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherNoTypeCheck:
+    # The tool skips the return annotation, so the unknown one is never resolved; the
+    # parameter's still is.
+    @no_type_check
+    async def __call__(self, city: "CityName") -> "UnknownReturn":  # type: ignore # noqa: F821
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+class WeatherNoTypeCheckService:
+    @activity.defn
+    @no_type_check
+    async def get_weather(self, city: "CityName") -> "UnknownReturn":  # type: ignore # noqa: F821
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "target, parameter, description",
+    [
+        # Not abc.ABC's docstring: only the class's own is a fallback.
+        (ActivityWeatherStaticCall, "self", ""),
+        (ActivityWeatherClassMethodCall, "self", ""),
+        # Before Python 3.13 the SDK runs an async partialmethod as sync, so
+        # test_tool_workflow can't run this form; the tool's schema is the part this plugin builds.
+        (ActivityWeatherPartialMethodCall, "city", "Get the weather for a given city."),
+        # Not the docstring a dataclass writes from its constructor.
+        (ActivityWeatherDataclass, "city", ""),
+        (
+            ActivityWeatherDocumentedDataclass,
+            "city",
+            "ActivityWeatherDocumentedDataclass(city) gets the weather for a given city.",
+        ),
+        # The overridden __call__'s docstring, not the base class's.
+        (ActivityWeatherDerived, "city", "Get the weather for a given city."),
+        # The class's own docstring before an inherited __call__'s; a blank one is skipped.
+        (ActivityWeatherDocumentedDerived, "city", "Look up the weather for a city."),
+        # A documented __call__ needs no class docstring, so the default is never printed.
+        (
+            ActivityWeatherUnprintableDefault,
+            "city",
+            "Get the weather for a given city.",
+        ),
+        # Not object.__call__'s docstring.
+        (WeatherCallService.__call__, "city", ""),
+        (WeatherCallService.get_weather, "city", ""),
+        (WeatherAssignedService.get_weather, "city", ""),
+        (WeatherCachedService.get_weather, "city", ""),
+        # Not the docstring dataclasses writes from the handwritten __init__.
+        (ActivityWeatherCustomInit, "city", ""),
+        # Not the docstring namedtuple writes.
+        (ActivityWeatherTuple, "city", ""),
+        # A __doc__ that isn't a string is no description.
+        (ActivityWeatherDocProperty, "city", ""),
+        (ActivityWeatherNoTypeCheck, "city", ""),
+        (WeatherNoTypeCheckService.get_weather, "city", ""),
+    ],
+)
+def test_callable_class_tool_schema(target: Any, parameter: str, description: str):
+    tool = openai_agents.workflow.activity_as_tool(
+        target, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.params_json_schema["properties"] == {
+        parameter: {"title": parameter.title(), "type": "string"}
+    }
+    assert tool.description == description
+
+
+@activity.defn
+class ActivityWeatherGoogleArgsCall:
+    """
+    Get the weather for a given city.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        Args:
+            city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherArgsOnlyClassDoc:
+    """
+    Args:
+        conditions: Default conditions.
+    """
+
+    def __init__(self, conditions: str = "Sunny") -> None:
+        self.conditions = conditions
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        :param city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherArgsOnlyCall:
+    async def __call__(self, city: str) -> Weather:
+        """
+        args:
+            city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherParametersOnlyDerived(WeatherBase):
+    """
+    Parameters:
+        conditions: Default conditions.
+    """
+
+
+@activity.defn
+class ActivityWeatherReturnsOnlyClassDoc:
+    """
+    Returns:
+        The weather.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "cls, description, city_description",
+    [
+        # A __call__ docstring with only parameters has no summary, so the class's is used.
+        (
+            ActivityWeatherSectionsOnlyCall,
+            "Get the weather for a given city.",
+            "Name of the city.",
+        ),
+        # The Agents SDK reads a leading Google Args: section as text, not a summary.
+        (ActivityWeatherGoogleArgsCall, "Get the weather for a given city.", None),
+        # A class docstring with only Args: has no summary either.
+        (ActivityWeatherArgsOnlyClassDoc, "", "Name of the city."),
+        # With no class summary to use instead, a section is no description.
+        (ActivityWeatherArgsOnlyCall, "", None),
+        (ActivityWeatherReturnsOnlyClassDoc, "", None),
+        # A class docstring with only a section gives way to an inherited __call__ docstring.
+        (
+            ActivityWeatherParametersOnlyDerived,
+            "Get the weather for a given city.",
+            None,
+        ),
+    ],
+)
+def test_callable_class_tool_summary_from_class_docstring(
+    cls: type, description: str, city_description: str | None
+):
+    tool = openai_agents.workflow.activity_as_tool(
+        cls, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.description == description
+    assert tool.params_json_schema["properties"]["city"].get("description") == (
+        city_description
+    )
+
+
+@pytest.mark.parametrize(
+    "target, summary, scheduled_summary",
+    [
+        # The class's summary labels the activity only when the caller passes none.
+        (ActivityWeatherSectionsOnlyCall, None, "Get the weather for a given city."),
+        (ActivityWeatherSectionsOnlyCall, "Caller summary", "Caller summary"),
+        (ActivityWeatherDataclass, None, None),
+        (ActivityWeatherDataclass, "Caller summary", "Caller summary"),
+        # A section-only docstring labels nothing.
+        (ActivityWeatherArgsOnlyCall, None, None),
+        (ActivityWeatherArgsOnlyCall, "Caller summary", "Caller summary"),
+        (ActivityWeatherReturnsOnlyClassDoc, None, None),
+    ],
+)
+async def test_callable_class_tool_activity_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    target: Any,
+    summary: str | None,
+    scheduled_summary: str | None,
+):
+    summaries: list[str | None] = []
+
+    async def execute_activity(*args: Any, **kwargs: Any) -> str:  # type: ignore[reportUnusedParameter]
+        summaries.append(kwargs["summary"])
+        return "Sunny"
+
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    tool = openai_agents.workflow.activity_as_tool(
+        target, start_to_close_timeout=timedelta(seconds=10), summary=summary
+    )
+    assert isinstance(tool, FunctionTool)
+    arguments = '{"city":"Tokyo"}'
+    context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call-get-weather",
+        tool_arguments=arguments,
+    )
+    await tool.on_invoke_tool(context, arguments)
+    assert summaries == [scheduled_summary]
+
+
+class WeatherDefaultsService:
+    @activity.defn
+    async def get_weather_context(
+        self,
+        ctx: RunContextWrapper[Any] = None,  # type: ignore
+        city: str = "Tokyo",
+    ) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions=ctx.context)
+
+    @activity.defn
+    async def get_weather_alias(
+        self,
+        city: Annotated[str, pydantic.Field(alias="cityName")] = None,  # type: ignore
+    ) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "target, parameters",
+    [
+        (WeatherDefaultsService.get_weather_context, ["city"]),
+        (WeatherDefaultsService.get_weather_alias, ["cityName"]),
+    ],
+)
+def test_method_tool_with_none_defaults(target: Any, parameters: list[str]):
+    # Python 3.10's typing.get_type_hints would wrap these in Optional, hiding the context type
+    # and the alias.
+    tool = openai_agents.workflow.activity_as_tool(
+        target, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert list(tool.params_json_schema["properties"]) == parameters
+
+
+async def get_weather_undecorated(city: str) -> Weather:
+    return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn(dynamic=True)
+async def get_weather_dynamic(args: Sequence[RawValue]) -> Weather:  # type: ignore[reportUnusedParameter]
+    return Weather(city="Tokyo", temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherNoCall:
+    pass
+
+
+async def get_weather_no_city() -> Weather:
+    return Weather(city="Tokyo", temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherNoParamCall:
+    # Bound to an instance, a function with no parameters can't take `self`.
+    __call__ = get_weather_no_city
+
+
+@activity.defn
+class ActivityWeatherKeywordOnlyCall:
+    async def __call__(self, *, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherKwargsCall:
+    async def __call__(self, city: str, **extra: str) -> Weather:  # type: ignore[reportUnusedParameter]
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+async def get_weather_kwargs(city: str, **extra: str) -> Weather:  # type: ignore[reportUnusedParameter]
+    return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherPartialMethodKeyword:
+    async def get_weather(self, conditions: str, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions=conditions)
+
+    __call__ = functools.partialmethod(get_weather, conditions="Rainy")
+
+
+class ActivityWeatherBadAnnotation(ActivityWeatherClass):
+    # Not decorated, so only activity_as_tool reads this annotation.
+    async def __call__(self, city: "asyncio.Nope") -> Weather:  # type: ignore
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "target, message",
+    [
+        # These two raised an ApplicationError that failed the run before this change.
+        (get_weather_undecorated, "Bare function without tool and activity decorators"),
+        (get_weather_dynamic, "must have a name to be made into a tool"),
+        (ActivityWeatherNoCall, "needs a __call__ that is a function"),
+        (ActivityWeatherNoParamCall, "invalid method signature"),
+        (ActivityWeatherKeywordOnlyCall, "cannot take keyword-only arguments"),
+        (ActivityWeatherPartialMethodKeyword, "binds an argument by keyword"),
+        (ActivityWeatherKwargsCall, r"cannot take \*\*kwargs"),
+        (get_weather_kwargs, r"cannot take \*\*kwargs"),
+        (ActivityWeatherBadAnnotation, "has no attribute 'Nope'"),
+        (ActivityWeatherClass("Cloudy"), "not an instance of it"),
+    ],
+)
+def test_invalid_callable_class_tool(target: Any, message: str):
+    with pytest.raises(ValueError, match=message):
+        openai_agents.workflow.activity_as_tool(
+            target, start_to_close_timeout=timedelta(seconds=10)
+        )
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 14), reason="only Python 3.14 can define these classes"
+)
+def test_callable_class_tool_on_python_314():
+    # The forward reference resolves only after dataclasses made the class and its docstring.
+    @dataclass
+    class ActivityWeatherForwardRef:
+        station: Station  # type: ignore
+
+        async def __call__(self, city: str) -> Weather:
+            return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+    class Station:  # type: ignore[reportUnusedClass]
+        pass
+
+    tool = openai_agents.workflow.activity_as_tool(
+        activity.defn(ActivityWeatherForwardRef),
+        start_to_close_timeout=timedelta(seconds=10),
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.description == ""
+
+    # From 3.14 a bare functools.partial binds like a method, so @activity.defn takes it.
+    class ActivityWeatherPartialCall:
+        __call__ = functools.partial(get_weather_no_city)
+
+    with pytest.raises(ValueError, match="needs a __call__ that is a function"):
+        openai_agents.workflow.activity_as_tool(
+            activity.defn(ActivityWeatherPartialCall),
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="only Python 3.12 can define these functions"
+)
+def test_generic_tool_on_python_312():
+    # Postponed annotations name the function's own type parameter.
+    namespace: dict[str, Any] = {"activity": activity, "Weather": Weather}
+    exec(
+        "from __future__ import annotations\n"
+        "@activity.defn\n"
+        "class ActivityWeatherGenericCall:\n"
+        "    async def __call__[T: str](self, cities: list[T]) -> Weather: ...\n"
+        "class WeatherGenericService:\n"
+        "    @activity.defn\n"
+        "    async def get_weather[T: str](self, cities: list[T]) -> Weather: ...\n",
+        namespace,
+    )
+    for target in [
+        namespace["ActivityWeatherGenericCall"],
+        namespace["WeatherGenericService"].get_weather,
+    ]:
+        tool = openai_agents.workflow.activity_as_tool(
+            target, start_to_close_timeout=timedelta(seconds=10)
+        )
+        assert isinstance(tool, FunctionTool)
+        assert tool.params_json_schema["properties"] == {
+            "cities": {"items": {"type": "string"}, "title": "Cities", "type": "array"}
+        }
 
 
 @activity.defn
@@ -3490,19 +4112,28 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
                 )
 
 
-@pytest.mark.parametrize("instance_evaluator", [False, True])
+@pytest.mark.parametrize(
+    "setting",
+    ["require_approval", "instance_evaluator", "tool_filter", "tool_meta_resolver"],
+)
 @pytest.mark.parametrize("stateful", [True, False])
-async def test_mcp_server_factory_require_approval_is_rejected(
-    client: Client, stateful: bool, instance_evaluator: bool
+async def test_mcp_server_factory_settings_are_rejected(
+    client: Client, stateful: bool, setting: str
 ):
-    if instance_evaluator:
+    if setting == "require_approval":
+        tracking_server = get_tracking_server("HelloServer", require_approval="always")
+    elif setting == "instance_evaluator":
         # The default policy, but an evaluator that always asks.
         tracking_server = get_tracking_server("HelloServer")
         tracking_server._get_needs_approval_for_tool = (  # type: ignore[method-assign]
             lambda tool, agent: True  # type: ignore[reportUnknownLambdaType]
         )
+    elif setting == "tool_meta_resolver":
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server.tool_meta_resolver = lambda context: {"tenant": "t-1"}  # type: ignore[attr-defined]
     else:
-        tracking_server = get_tracking_server("HelloServer", require_approval="always")
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server.tool_filter = lambda context, tool: True  # type: ignore[attr-defined]
     server: StatefulMCPServerProvider | StatelessMCPServerProvider = (
         StatefulMCPServerProvider("HelloServer", lambda _: tracking_server)
         if stateful
@@ -3543,9 +4174,19 @@ async def test_mcp_server_factory_require_approval_is_rejected(
     assert isinstance(err.value.cause, ActivityError)
     assert isinstance(err.value.cause.cause, ApplicationError)
     assert err.value.cause.cause.non_retryable
-    route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
-    assert "'HelloServer' sets require_approval" in err.value.cause.cause.message
-    assert f"{route}(require_approval=...)" in err.value.cause.cause.message
+    message = err.value.cause.cause.message
+    if setting == "tool_meta_resolver":
+        route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+        assert "'HelloServer' sets tool_meta_resolver" in message
+        assert f"on the server {route}() gives the workflow" in message
+    elif setting != "tool_filter":
+        route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+        assert "'HelloServer' sets require_approval" in message
+        assert f"{route}(require_approval=...)" in message
+    else:
+        assert "'HelloServer' sets a callable tool_filter" in message
+        assert "create_static_tool_filter" in message
+        assert "temporal_mcp_server(tool_filter=...)" in message
     # The rejected server is never connected, cleaned up or called.
     assert tracking_server.calls == []
     if stateful:

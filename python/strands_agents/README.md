@@ -606,11 +606,18 @@ class ChatWorkflow:
 
 ## MCP
 
-`StrandsPlugin(mcp_clients=...)` takes a mapping of `name → MCPClient factory`, mirroring the `models=` pattern. The plugin registers per-server `{name}-call-tool` and `{name}-list-tools` activities. Workflow-side, `TemporalMCPClient(server="name")` is a pure handle: it references the server by name, discovers tools by running `{name}-list-tools`, and carries the per-call activity options.
+MCP support runs on [`temporalio-mcp`](https://github.com/temporalio/ai-integrations/tree/main/python/mcp) and the MCP Python SDK v2. Install it with the `mcp` extra:
+
+```bash
+uv add "temporalio-strands-agents[mcp]"
+```
+
+`StrandsPlugin(mcp_clients=...)` takes a mapping of `name → mcp.Client factory`, mirroring the `models=` pattern. The plugin registers the `temporalio-mcp` activities for each server, such as `temporalio.mcp.{name}.list-tools` and `temporalio.mcp.{name}.call-tool`. Workflow-side, `TemporalMCPClient(server="name")` is a pure handle: it references the server by name, discovers tools by running `list-tools`, and carries the per-call activity options.
+
+These are the activities that `temporalio.mcp.MCPPlugin` registers, so `temporalio.mcp.TemporalMCPClient` can also use these servers, for prompts and resources for example. Don't register the same server name through `MCPPlugin` or `OpenAIAgentsPlugin` on the same worker: Temporal rejects the duplicate activity types.
 
 ```python
-from mcp import StdioServerParameters, stdio_client
-from strands.tools.mcp.mcp_client import MCPClient
+from mcp import Client, StdioServerParameters, stdio_client
 from temporalio.strands_agents import TemporalMCPClient
 
 # workflow
@@ -628,32 +635,70 @@ Worker(
     ...,
     plugins=[StrandsPlugin(
         mcp_clients={
-            "echo": lambda: MCPClient(
-                lambda: stdio_client(
-                    StdioServerParameters(command="...", args=[...]),
-                ),
+            "echo": lambda: Client(
+                stdio_client(StdioServerParameters(command="...", args=[...])),
             ),
         },
     )],
 )
 ```
 
-Each factory returns a fully configured `MCPClient`, so you can pass options like `tool_filters`, `prefix`, `elicitation_callback`, or `tasks_config` to it.
+Connection options such as `elicitation_callback` or `read_timeout_seconds` go on the `mcp.Client`. A tool call that needs several rounds (`InputRequiredResult`) runs all of them inside one call-tool activity, through the `mcp.Client`'s callbacks.
 
-By default, `TemporalMCPClient` re-lists the server's tools (via `{name}-list-tools`) on every agent turn, so an MCP server that is restarted mid-workflow — with tools added, removed, or renamed — is picked up. To list the tools just once at the beginning of the workflow and reuse that schema for the workflow's lifetime (one fewer activity per turn), set `cache_tools=True`:
+`TemporalMCPClient` takes `prefix` and `tool_filters`, which work as on Strands' `MCPClient`: the agent sees `{prefix}_{name}`, and filters match the server's tool name. A callable filter receives the workflow-side `TemporalMCPTool`, a Strands `MCPAgentTool` whose `mcp_client` is the durable client, and runs in the workflow, so it must be deterministic:
+
+```python
+github = TemporalMCPClient(
+    server="github",
+    prefix="gh",
+    tool_filters={"allowed": ["search_issues", re.compile("get_.*")]},
+    start_to_close_timeout=timedelta(seconds=30),
+)
+```
+
+A tool that reports an error returns a failed tool result to the agent. Errors a retry cannot fix, such as an unknown tool or invalid arguments, reach the agent at once as a failed tool result. Internal server errors, timeouts and lost connections fail the attempt and are retried under the activity's `retry_policy`. See the [`temporalio-mcp` README](https://github.com/temporalio/ai-integrations/tree/main/python/mcp#errors-and-retries) for which errors are retried.
+
+Without `start_to_close_timeout` or `schedule_to_close_timeout`, the MCP activities get a one-minute `start_to_close_timeout`. The default retry policy retries without limit, so an agent turn waits while its MCP server is down. To give up instead, bound the retries:
+
+```python
+echo = TemporalMCPClient(
+    server="echo",
+    start_to_close_timeout=timedelta(seconds=30),
+    retry_policy=RetryPolicy(maximum_attempts=3),
+)
+```
+
+A call-tool activity that runs out of attempts returns a failed tool result to the agent, which can go on without the tool. A list-tools activity that runs out of attempts does not reach the agent. It runs before every model call, and the result depends on which Strands event-loop cycle makes that call, not on how many model calls came before it. In the first cycle of an `invoke_async()`, the `ActivityError` propagates from the call and, if the workflow does not catch it, fails the workflow. That covers the first model call of every invocation, including one on an agent whose earlier invocations completed, and a model call that an `AfterModelCallEvent` hook repeats in that cycle by setting `retry = True`. Strands starts a new cycle after the agent runs tools, and when it asks the model again for a `structured_output_model` result that the model answered in plain text, so no tool needs to have run. In such a cycle, including a model call a hook repeats there, Strands wraps the `ActivityError` in an `EventLoopException`: the workflow task fails on every retry, and the workflow stays open until it is reset or terminated. With `cache_tools=True`, a `TemporalMCPClient` stops listing after its first successful listing, so only that first listing can fail.
+
+Tool names must be unique on one agent. Two tools may not have the same name, or names that differ only by `-` or `_`: for example two servers that both list `search`, a server that lists a name twice, or a server tool named like a tool in `tools=[...]`, a `TemporalSandbox` tool or a tool a Signal handler adds while the servers list. `TemporalAgent` learns its MCP tools only when it lists them, so the model call after that listing raises `MCPToolNameConflictError`, a `ValueError` and a non-retryable `ApplicationError`: the first one, or, with `cache_tools=False`, a later one if a server starts listing such a name. It is raised again at every later model call while the duplicate lasts; between `cache_tools=True` listings, that is the rest of the run. This holds for an agent built before or after its clients listed. Give one `TemporalMCPClient` a different `prefix`, or drop the tool with its `tool_filters`. While a server lists a name, the name is the server's: a tool you put under it is replaced at the next model call, and a tool you remove comes back, also with `cache_tools=True`. A `structured_output_model` named like an MCP tool the agent already has gets Strands' own `ValueError` when the call starts, as in Strands.
+
+The error fails the Workflow when it escapes the Workflow's run method or a Signal handler, with `StrandsPlugin` on the client or only on the Worker, because replay would raise it again. Escaping an Update handler, it fails only that Update, and the run stays open. Strands' `Swarm` records it as a failed node, and an agent used as a tool returns it as an error result, so neither fails the Workflow. If Workflow code catches it, or an Update failed, and calls the agent again, first remove the messages that Strands added to `agent.messages` during that call (the prompt, and any tool calls and results), as for any error during an agent call. A new `prefix` renames that server's tools, and new `tool_filters` can drop some, in every replay: an open run fails to replay if its model called a renamed or dropped tool, if its Workflow code acted on one among the agent's tools (for example on `'x' in agent.tool_names`), or if it met the error and went on, since the refused turn now proceeds. So deploy such a change with Worker Versioning. To recover a run that met the error, reset it to before the first listing that returned a tool the change renames or drops. A later reset point, such as just before the first refused listing, recovers it only if the run had not met the error before that point and neither the model nor Workflow code used those tools before it.
+
+Earlier versions let the later tool replace the earlier one in most of these cases. A run that started before you deploy this version can fail to replay on it if one of its agents met such a duplicate, including two handles of one server and names that differ only by `-` or `_`. It can also fail if a server's tools changed during the run: a tool that moves from one server to another in one turn now stays, where earlier versions could lose it, and an agent that shares an uncached client with another agent now drops the tools the server stopped listing, where earlier versions kept them. And an agent built after another agent listed a client they share has none of that client's tools until its first model call, where earlier versions gave it the last listing at construction. A call to one of them that its initial `messages` end with, which Strands runs before that model call, now finds no such tool, and Workflow code that reads its `tool_names` or `tool_registry` before then can take another path, though no names clashed and the servers kept their tools. So can Strands' estimate of that model call's input tokens, which now leaves those tools out, so proactive context compression can run at a different model call. An agent that shares a `cache_tools=True` client with another agent and was built before that agent's first listing now gets the client's tools at its first model call; earlier versions never gave it those tools. Workflow code that reads its tools can take another path, and runs in which it calls them fail to replay on earlier versions. An agent whose `cache_tools=True` client's tool Workflow code replaced or removed now gets the server's tool back at the next model call; earlier versions kept the change. Last, an agent now applies a turn's listings together, once every server due that turn has listed, where earlier versions added each server's tools as soon as it listed. Until then the agent's tools stay as they were before that turn, and they stay so if a listing fails. Workflow code that reads the agent's tools before the turn's listings are applied can take another path, though no names clashed and the servers kept their tools: for example a Signal or Update handler that runs while a later server lists, even if every listing then succeeds, or code that catches a failed listing. Let those runs finish first, or use Worker Versioning.
+
+By default, `TemporalMCPClient` re-lists the server's tools (via `list-tools`) on every agent turn, so an MCP server that is restarted mid-workflow — with tools added, removed, or renamed — is picked up. To list the tools just once at the beginning of the workflow and reuse that schema for the workflow's lifetime (one fewer activity per turn), set `cache_tools=True`:
 
 ```python
 echo = TemporalMCPClient(server="echo", cache_tools=True, start_to_close_timeout=timedelta(seconds=30))
 ```
 
-To amortize connection setup, the `{name}-call-tool` and `{name}-list-tools` activities share a worker-process MCP connection that is opened lazily and reused across calls. The connection is disconnected after it sits idle for `mcp_connection_idle_timeout` (default 5 minutes); the timer resets on every reuse:
+Each listing records the server's full tool list in the workflow history, before `tool_filters` apply. For a server with many tools, use `cache_tools=True` so the list is recorded once. Call-tool results are also recorded as the server returns them, including content the agent does not receive, such as audio; a result over Temporal's payload size limit fails the activity.
+
+To amortize connection setup, the MCP activities share a worker-process connection that is opened lazily and reused across calls. Only servers that negotiate the modern MCP protocol share a connection; a server on an older protocol, such as one built with MCP Python SDK 1.x, gets a new connection for every activity (a new process for stdio). The connection is disconnected after it sits idle for `mcp_connection_idle_timeout` (default 5 minutes); the timer resets on every reuse. `None` keeps connections until the worker shuts down, and `timedelta(0)` closes them as soon as they are idle:
 
 ```python
 StrandsPlugin(
-    mcp_clients={"echo": lambda: MCPClient(...)},
+    mcp_clients={"echo": lambda: Client(...)},
     mcp_connection_idle_timeout=timedelta(seconds=30),
 )
 ```
+
+Earlier versions used Strands' `MCPClient` factories and the `{name}-list-tools` and `{name}-call-tool` activities. To upgrade:
+
+- Return an `mcp.Client` from each factory, and move `prefix` and `tool_filters` from the factory to `TemporalMCPClient`. `mcp.Client` doesn't take them: a factory that still passes `prefix=` fails every MCP activity with a `TypeError`, which is retried. A factory that still returns Strands' `MCPClient` fails every MCP activity with an error that says so, also retried until the worker is fixed. Without distinct prefixes, same-named tools from different servers are refused (see above).
+- Callable `tool_filters` now run in the workflow, so they must be deterministic.
+- Set connection options on `mcp.Client`. Strands `MCPClient` options without an `mcp.Client` counterpart, such as `startup_timeout`, no longer apply.
+- Workflows started on earlier versions that use MCP tools must finish on workers running them before those workers are upgraded.
 
 ## Observability
 
