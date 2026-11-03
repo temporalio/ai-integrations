@@ -553,8 +553,13 @@ unless it never asks for approval. So are a callable `tool_filter` and a
 `tool_meta_resolver` there, in every MCP operation, direct `call_tool()` and
 prompt calls included; a static filter still works. On these routes, set a
 resolver on the server that `stateless_mcp_server()` or `stateful_mcp_server()`
-gives the workflow (`server.tool_meta_resolver = ...`). Remove such a filter or
-resolver from the factory in the same deploy, or let open runs finish first.
+gives the workflow (`server.tool_meta_resolver = ...`); it then gets
+`<name>-stateless` or `<name>-stateful` as `server_name`. As with
+`temporal_mcp_server()`, it runs in the workflow and must be deterministic, its
+result is recorded in workflow history, and adding it to a workflow with open
+runs needs `workflow.patched()` or those runs to finish first. Remove such a
+filter or resolver from the factory in the same deploy, or let open runs finish
+first.
 
 ### Hosted MCP Tool
 
