@@ -455,23 +455,47 @@ type Thrown = (error: unknown) => void;
 
 /**
  * Runs `call`, an ADK method that throws a plain `Error` in place of the error that code it
- * runs threw, with no `cause`: `FunctionTool.runAsync` for a tool's `execute`, and
- * `PluginManager.runCallbacks` for a plugin hook before ADK 2.2.1. That error is kept for
- * the one ADK throws, so {@link executionCancellation} can follow it, before the returned
- * promise rejects with it. Each call keeps its own, so a tool or callback that runs another
- * tool keeps the chain of every run in between. The returned promise rejects as `call`'s
- * does, so one that no code awaits still fails the Workflow Task.
+ * runs threw, with no `cause`: `FunctionTool.runAsync` for a tool's own methods, and
+ * `PluginManager.runCallbacks` for a plugin hook before ADK 2.2.1. The latest error that code
+ * threw is kept for the one ADK throws, when `replaces` says ADK's error stands for it, so
+ * {@link executionCancellation} can follow it, before the returned promise rejects with it.
+ * Each call keeps its own, so a tool or callback that runs another tool keeps the chain of
+ * every run in between. The returned promise rejects as `call`'s does, so one that no code
+ * awaits still fails the Workflow Task.
  */
-function keepWrapped(call: (thrown: Thrown) => Promise<unknown>): Promise<unknown> {
+function keepWrapped(
+  call: (thrown: Thrown) => Promise<unknown>,
+  replaces: (wrapper: object, error: unknown) => boolean = () => true
+): Promise<unknown> {
   let thrown: { error: unknown } | undefined;
   return call((error) => {
     thrown = { error };
   }).then(undefined, (wrapper: unknown) => {
-    if (thrown !== undefined && thrown.error !== wrapper && typeof wrapper === 'object' && wrapper !== null) {
+    if (
+      thrown !== undefined &&
+      thrown.error !== wrapper &&
+      typeof wrapper === 'object' &&
+      wrapper !== null &&
+      replaces(wrapper, thrown.error)
+    ) {
       recorded().wrapped.set(wrapper, thrown.error);
     }
     throw wrapper;
   });
+}
+
+/**
+ * Whether `wrapper` is the plain `Error` that `FunctionTool.runAsync` throws in place of
+ * `error` (ADK 2.0 to 2.4): no `cause`, and the message `Error in tool '<name>': <message>`.
+ * Any other error is not linked, so a change in ADK's text fails closed.
+ */
+function replacesToolError(name: unknown, wrapper: object, error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    wrapper instanceof Error &&
+    (wrapper as { cause?: unknown }).cause === undefined &&
+    wrapper.message === `Error in tool '${String(name)}': ${message}`
+  );
 }
 
 /** `fn`, telling what it throws to the {@link Thrown} that `tell` returns when it is called. */
@@ -492,33 +516,37 @@ function telling<F extends (...args: never[]) => unknown>(fn: F, tell: () => Thr
 type Execute = (...args: never[]) => unknown;
 
 /**
- * Keeps the errors that a tool's `execute` and a plugin hook throw for the plain `Error`s
- * ADK throws in their place (see {@link keepWrapped}). ADK's `FunctionTool.runAsync` calls
- * `this.execute`, so each run gets a proxy of the tool whose `execute` calls the tool's own
- * and tells this run what it threw. Every other method read through the proxy is bound to
- * the tool, so `validateArgs`, `checkConfirmation` and a `requireConfirmation` predicate run
- * on the tool itself. The tool is left as it is, and what ADK does is unchanged.
+ * Keeps the errors that a tool's methods and a plugin hook throw for the plain `Error`s ADK
+ * throws in their place (see {@link keepWrapped}). ADK's `FunctionTool.runAsync` calls
+ * `this.execute`, `this.validateArgs` and `this.checkConfirmation` (which runs a
+ * `requireConfirmation` predicate), so each run gets a proxy of the tool whose `execute`
+ * calls the tool's own, and whose other methods are bound to the tool, so they run on the
+ * tool itself. Each tells this run what it threw. The tool is left as it is, and what ADK
+ * does is unchanged.
  */
 function watchWrappedErrors(): void {
   const tool = FunctionTool.prototype as unknown as Record<PropertyKey, unknown>;
   const runAsync = tool.runAsync as (this: object, request: unknown) => Promise<unknown>;
-  tool.runAsync = function (this: { execute: Execute }, request: unknown): Promise<unknown> {
-    return keepWrapped((thrown) => {
-      const execute = telling(
-        (...args: never[]) => this.execute(...args),
-        () => thrown
-      );
-      // The target is an empty object that inherits from the tool, so a frozen tool's own
-      // `execute` binds no Proxy invariant; every read goes to the tool itself.
-      const run = new Proxy(Object.create(this) as object, {
-        get: (_target, key) => {
-          if (key === 'execute') return execute;
-          const value: unknown = Reflect.get(this, key, this);
-          return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(this) : value;
-        },
-      });
-      return runAsync.call(run, request);
-    });
+  tool.runAsync = function (this: { execute: Execute; name?: unknown }, request: unknown): Promise<unknown> {
+    return keepWrapped(
+      (thrown) => {
+        const tell = () => thrown;
+        const execute = telling((...args: never[]) => this.execute(...args), tell);
+        // The target is an empty object that inherits from the tool, so a frozen tool's own
+        // `execute` binds no Proxy invariant; every read goes to the tool itself.
+        const run = new Proxy(Object.create(this) as object, {
+          get: (_target, key) => {
+            if (key === 'execute') return execute;
+            const value: unknown = Reflect.get(this, key, this);
+            return typeof value === 'function'
+              ? telling((value as (...args: unknown[]) => unknown).bind(this), tell)
+              : value;
+          },
+        });
+        return runAsync.call(run, request);
+      },
+      (wrapper, error) => replacesToolError(this.name, wrapper, error)
+    );
   };
   const manager = PluginManager.prototype as unknown as Record<PropertyKey, unknown>;
   const runCallbacks = manager.runCallbacks as (

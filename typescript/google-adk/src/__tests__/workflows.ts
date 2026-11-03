@@ -593,7 +593,7 @@ class PolicyPlugin extends BasePlugin {
 }
 
 /** Where a {@link blockedTurn} waits. */
-export type BlockedTurnKind = 'tool' | 'agent' | 'plugin' | 'model';
+export type BlockedTurnKind = 'tool' | 'agent' | 'plugin' | 'model' | 'predicate' | 'predicate-activity';
 
 /**
  * How the tool or callback of a {@link blockedTurn} waits: as it is (`plain`); inside
@@ -621,8 +621,9 @@ export async function childTimedOutActivity(): Promise<string> {
  * A runner turn that waits until it is cancelled, with nothing cancellable after the wait:
  * in a `LongRunningFunctionTool` waiting in Workflow code for an approval that never comes
  * (`tool`), in a `beforeModelCallback`, the agent's own or an ADK plugin's, awaiting a policy
- * Activity that runs until it is cancelled (`agent`, `plugin`), or in a slow model call
- * (`model`, always `plain`). With `nexusEndpoint`, the tool or callback waits instead for a
+ * Activity that runs until it is cancelled (`agent`, `plugin`), in a `FunctionTool`'s async
+ * `requireConfirmation` predicate waiting the way the tool or the callbacks do (`predicate`,
+ * `predicate-activity`, always `plain`), or in a slow model call (`model`, always `plain`). With `nexusEndpoint`, the tool or callback waits instead for a
  * Nexus operation on that endpoint, whose task queue no Worker polls, so the operation never
  * starts. `stage` is told when the wait starts, and when a `shielded-cleanup` wait's cleanup
  * does. With `graph`, the agent runs as the only node of an ADK `Workflow`.
@@ -688,6 +689,29 @@ function blockedTurn(
   const failingChild = async (): Promise<void> => {
     await executeChild(childTimedOutActivity);
   };
+  if (kind === 'predicate' || kind === 'predicate-activity') {
+    const { cancellableActivity } = proxyActivities<BlockingActivities>({ startToCloseTimeout: '1 minute' });
+    const tool = new FunctionTool({
+      name: 'wait_approval',
+      description: 'Run once a policy check allows it.',
+      execute: async () => ({ status: 'approved' }),
+      requireConfirmation: async (_args, toolContext) => {
+        // As for `tool`, the turn ends on the tool's response, so no model call follows.
+        toolContext!.actions.skipSummarization = true;
+        stage('blocked');
+        if (kind === 'predicate') await condition(() => false);
+        else await cancellableActivity();
+        return false;
+      },
+    });
+    return runAgentTurn(
+      new TemporalModel('call-wait-approval-model', SINGLE_ATTEMPT),
+      'hi',
+      undefined,
+      { tools: [tool] },
+      graph
+    );
+  }
   if (kind === 'tool') {
     const waitForApproval = shaped(
       wait === 'child'

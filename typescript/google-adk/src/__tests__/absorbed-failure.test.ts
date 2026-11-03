@@ -233,7 +233,8 @@ test.serial('cancellingAToolOrModelCallbackWaitEndsCancelled', async (t) => {
   // The same waits on a Nexus operation that never starts fail with the operation's start,
   // not its result. A tool or callback that rewraps its wait's error keeps it as `cause`.
   // One that waits in another tool's `runAsync` gets that run's plain `Error`, which ADK
-  // wraps again for the outer tool.
+  // wraps again for the outer tool. A tool's `requireConfirmation` predicate that waits gets
+  // the same plain `Error` from ADK as `execute` does.
   const endpoint = uid('adk-unpolled-endpoint');
   const nexusEndpoint = await env.createNexusEndpoint(endpoint, uid('adk-unpolled'));
   t.teardown(() => env.deleteNexusEndpoint(nexusEndpoint));
@@ -243,6 +244,8 @@ test.serial('cancellingAToolOrModelCallbackWaitEndsCancelled', async (t) => {
     ...kinds.map((kind) => ({ kind, wait: 'rewrapped' as const, nexus: false })),
     ...kinds.map((kind) => ({ kind, wait: 'nested' as const, nexus: false })),
     ...kinds.map((kind) => ({ kind, wait: 'plain' as const, nexus: true })),
+    { kind: 'predicate' as const, wait: 'plain' as const, nexus: false },
+    { kind: 'predicate-activity' as const, wait: 'plain' as const, nexus: false },
   ];
   for (const { kind, wait, nexus } of cases) {
     const label = `${kind} ${wait}${nexus ? ' nexus' : ''}`;
@@ -256,7 +259,9 @@ test.serial('cancellingAToolOrModelCallbackWaitEndsCancelled', async (t) => {
       });
       await waitForStage(handle, 'blocked', label);
       if (nexus) await waitForScheduledNexusOperation(handle);
-      else if (kind !== 'tool') await waitForScheduledActivities(env, workflowId, 'cancellableActivity');
+      else if (kind !== 'tool' && kind !== 'predicate') {
+        await waitForScheduledActivities(env, workflowId, 'cancellableActivity');
+      }
       await handle.cancel();
       await t.throwsAsync(handle.result(), undefined, label);
       t.is((await handle.describe()).status.name, 'CANCELLED', label);
