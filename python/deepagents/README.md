@@ -406,6 +406,31 @@ worker is unaffected, and the original function is restored when the worker
 stops. If you would rather be explicit, use `create_temporal_deep_agent` or
 pass `TemporalModel("provider:name")` yourself.
 
+Each plugin instance registers four Activities: `deepagents.invoke_model`,
+`deepagents.invoke_model_streaming`, `deepagents.invoke_tool` and
+`deepagents.backend_op`. Use one `DeepAgentsPlugin` per Worker: one
+`model_provider` receives every model name, so it can serve several models, and
+`backends` takes every factory. The same instance on both the Client and the
+Worker works. So do one instance on the Client and one on the Worker built with
+the same `model_provider` and `backends` factories (the same objects) and the
+same `streaming_batch_interval`; two default instances match. Any other second
+instance fails at Worker start with a `ValueError` that names
+`DeepAgentsPlugin`. With one instance on each side, the Worker instance does
+not add an Activity whose name is already
+registered, and still registered after its own step, by the same function, the
+Client instance's copy of the same built-in Activity, or a wrapper of either
+that sets `__wrapped__` (as `functools.wraps` does).
+A dynamic Activity counts the same way, with the dynamic slot as its name.
+An Activity registered under another name, such as a wrapper with an alias,
+does not count. So the Worker keeps what the Client side
+registered, including a wrapper a later Client plugin put around it if that
+wrapper sets `__wrapped__`, and any
+other Activity given to the Worker instance is still added. Any other repeated
+Activity name fails at Worker start with `ValueError: More than one activity
+named ...`, as it does without the plugin. That includes a caller Activity
+with one of these names. A second, different
+dynamic Activity fails with `TypeError: More than one dynamic activity`.
+
 ## Composing with other plugins
 
 This plugin carries no tracing context of its own. For observability, compose it
