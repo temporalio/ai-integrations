@@ -138,6 +138,18 @@ def test_typescript_checks_tarball_and_clean_consumer_after_testing() -> None:
     assert "make sync-latest" in sync["run"] and "make sync" in sync["run"]
 
 
+def test_python_checks_fresh_resolution_before_installing_the_committed_lock() -> None:
+    workflow = yaml.safe_load((REPO / ".github/workflows/_python-plugin.yml").read_text())
+    steps = workflow["jobs"]["test"]["steps"]
+    check = next(step for step in steps if step.get("name") == "Check dependency resolution under the cooldown")
+    sync = next(step for step in steps if step.get("name") == "Sync environment")
+    assert check["if"] == "matrix.dist && inputs.deps == 'locked'"
+    assert check["run"] == 'cd "$PLUGIN_DIR" && make check-deps'
+    assert steps.index(check) < steps.index(sync)
+    assert "locked) make sync ;;" in sync["run"]
+    assert "latest) make sync-latest ;;" in sync["run"]
+
+
 def test_go_release_reuses_the_full_matrix_and_verifies_the_same_commit() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())
     assert doc[True]["push"]["tags"] == ["go/*/v*"]
