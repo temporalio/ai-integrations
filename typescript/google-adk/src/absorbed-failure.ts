@@ -12,11 +12,12 @@
  * is open surfaces there, and one recorded after a handler frame returned surfaces in the
  * main function's. One recorded after the main function returned never surfaces —
  * completing with unfinished handlers is a user error Temporal already warns about. A
- * cancellation a Signal handler absorbed is the exception: it surfaces in the main
- * function's frame too, so the main function's cleanup runs before the execution ends.
- * Whatever a Signal handler absorbed is dropped if it returns after the main function: the
- * execution is already ending. Only the execution's own cancellation is recorded at all
- * (see {@link executionCancellation}).
+ * cancellation a Signal handler absorbed is the exception: when the handler returns, it
+ * surfaces in the main function's frame, so the main function's cleanup runs before the
+ * execution ends; a handler that throws raises it at once. Once the main function has
+ * ended, a Signal handler that returns drops what it absorbed, and one that throws its
+ * absorbed cancellation drops that: the execution is already ending. Only the execution's
+ * own cancellation is recorded at all (see {@link executionCancellation}).
  *
  * The same interceptor also converts the errors ADK 2.0's workflow runtime *throws* —
  * a node past its `timeout`, an output that failed its schema, an approval ADK refused
@@ -30,7 +31,13 @@
 import type { AsyncLocalStorage as ALS } from 'node:async_hooks';
 
 import { BaseNode, FunctionTool, PluginManager } from '@google/adk';
-import { ActivityFailure, ApplicationFailure, TemporalFailure } from '@temporalio/common';
+import {
+  ActivityFailure,
+  ApplicationFailure,
+  ChildWorkflowFailure,
+  NexusOperationFailure,
+  TemporalFailure,
+} from '@temporalio/common';
 import {
   AsyncLocalStorage,
   CancellationScope,
@@ -40,6 +47,8 @@ import {
   type ActivityInput,
   type WorkflowInterceptorsFactory,
 } from '@temporalio/workflow';
+// Not exported from the package root; the SDK untracks its own scope listeners with it.
+import { untrackPromise } from '@temporalio/workflow/lib/stack-helpers';
 
 import { ADK_RUNTIME_FAILURE_TYPES } from './error-types';
 
@@ -121,6 +130,8 @@ interface AbsorbedFailures {
   attempts: ALS<NodeAttempt>;
   /** What a tool or a plugin hook threw, per the plain `Error` ADK threw in its place (see {@link keepWrapped}). */
   wrapped: WeakMap<object, unknown>;
+  /** What a tool's `execute` threw, per the call's tool context (see {@link watchWrappedErrors}). */
+  toolThrew: WeakMap<object, unknown>;
 }
 
 function recorded(): AbsorbedFailures {
@@ -136,6 +147,7 @@ function recorded(): AbsorbedFailures {
       cancelledByExecution: new WeakSet(),
       attempts: new AsyncLocalStorage<NodeAttempt>(),
       wrapped: new WeakMap(),
+      toolThrew: new WeakMap(),
     };
     global[ABSORBED] = state;
   }
@@ -205,16 +217,19 @@ interface ScopeWatch {
 /**
  * The one watch of `scope`, created with the scope's only listener here the first time an
  * operation starts in it, so a long-lived scope keeps one listener however many operations
- * it runs.
+ * it runs. The listener is untracked, as the SDK does with its own, so it stays out of the
+ * Workflow's stack trace.
  */
 function scopeWatch(scope: CancellationScope): ScopeWatch {
   const { scopes } = recorded();
   let watch = scopes.get(scope);
   if (watch === undefined) {
     const created: ScopeWatch = {};
-    scope.cancelRequested.catch((reason: unknown) => {
-      created.reason = reason;
-    });
+    untrackPromise(
+      scope.cancelRequested.catch((reason: unknown) => {
+        created.reason = reason;
+      })
+    );
     scopes.set(scope, created);
     watch = created;
   }
@@ -268,9 +283,12 @@ function watchScope(): (operation: Promise<unknown>) => void {
  * would hide from the SDK an Activity failure that code never handles.
  */
 function noteActivityScope(input: ActivityInput): void {
+  const { activities } = recorded();
+  const id = input.options.activityId ?? `${input.seq}`;
   const scope = CancellationScope.current();
-  if (!scope.cancellable) return;
-  recorded().activities.set(input.options.activityId ?? `${input.seq}`, scopeWatch(scope));
+  // A custom `activityId` can be used again: the latest Activity with it decides.
+  if (scope.cancellable) activities.set(id, scopeWatch(scope));
+  else activities.delete(id);
 }
 
 /** Returns `operation`, watched as {@link watchScope} describes. */
@@ -303,15 +321,26 @@ function watchedEach<T>(started: Promise<T>, operations: (result: T) => Promise<
  */
 function executionCancellation(err: unknown): unknown {
   const state = recorded();
+  // Activity ids are only this execution's until the chain reaches another execution's
+  // failures: a child Workflow's or a Nexus operation's Activities are numbered the same way.
+  let own = true;
   for (const current of causes(err)) {
     if (current === state.root?.reason || state.cancelledByExecution.has(current)) return current;
     if (
+      own &&
       current instanceof ActivityFailure &&
       current.activityId !== undefined &&
       isCancellation(current) &&
       cancelledFirstByExecution(state.activities.get(current.activityId))
     ) {
       return current;
+    }
+    if (
+      current instanceof ActivityFailure ||
+      current instanceof ChildWorkflowFailure ||
+      current instanceof NexusOperationFailure
+    ) {
+      own = false;
     }
   }
   return undefined;
@@ -416,9 +445,9 @@ type Thrown = (error: unknown) => void;
 
 /**
  * Runs `call`, an ADK method that throws a plain `Error` in place of the error that code it
- * runs threw, with no `cause`: `FunctionTool.runAsync` for a tool's `execute`, and
- * `PluginManager.runCallbacks` for a plugin hook before ADK 2.2.1. That error is kept for
- * the one ADK throws, so {@link executionCancellation} can follow it.
+ * runs threw, with no `cause`: `PluginManager.runCallbacks` for a plugin hook before ADK
+ * 2.2.1. That error is kept for the one ADK throws, so {@link executionCancellation} can
+ * follow it. Only ADK awaits what `call` returns, so marking it handled here hides nothing.
  */
 function keepWrapped(call: (thrown: Thrown) => Promise<unknown>): Promise<unknown> {
   let thrown: { error: unknown } | undefined;
@@ -452,22 +481,33 @@ type Execute = (...args: never[]) => unknown;
 
 /**
  * Keeps the errors that a tool's `execute` and a plugin hook throw for the plain `Error`s
- * ADK throws in their place (see {@link keepWrapped}). ADK's `FunctionTool.runAsync` calls
- * `this.execute`, so each run gets an object that inherits everything from the tool but an
- * `execute` that calls the tool's own and tells this run what it threw. The tool itself is
- * left as it is, and what ADK does is unchanged.
+ * ADK throws in their place. ADK's `FunctionTool.runAsync` calls `this.execute`, so each run
+ * gets a proxy of the tool whose `execute` calls the tool's own and keeps what it threw for
+ * the call's tool context, which ADK hands on with its error (see {@link keepToolError}).
+ * Every other method read through the proxy is bound to the tool, so `validateArgs`,
+ * `checkConfirmation` and a `requireConfirmation` predicate run on the tool itself. The
+ * tool is left as it is, the promise `runAsync` returns is ADK's own, and what ADK does is
+ * unchanged. A plugin hook's error is kept by {@link keepWrapped}.
  */
 function watchWrappedErrors(): void {
   const tool = FunctionTool.prototype as unknown as Record<PropertyKey, unknown>;
-  const runAsync = tool.runAsync as (this: { execute: Execute }, request: unknown) => Promise<unknown>;
-  tool.runAsync = function (this: { execute: Execute }, request: unknown): Promise<unknown> {
-    const execute = this.execute;
-    return keepWrapped((thrown) => {
-      const run: unknown = Object.create(this, {
-        execute: { value: telling((...args: never[]) => execute.apply(this, args), () => thrown) },
-      });
-      return runAsync.call(run as { execute: Execute }, request);
+  const runAsync = tool.runAsync as (this: object, request: { toolContext?: unknown }) => Promise<unknown>;
+  tool.runAsync = function (this: { execute: Execute }, request: { toolContext?: unknown }): Promise<unknown> {
+    const context = request?.toolContext;
+    const execute = telling(
+      (...args: never[]) => this.execute(...args),
+      () => (error) => {
+        if (typeof context === 'object' && context !== null) recorded().toolThrew.set(context, error);
+      }
+    );
+    const run = new Proxy(this, {
+      get(tool, key) {
+        if (key === 'execute') return execute;
+        const value: unknown = Reflect.get(tool, key, tool);
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(tool) : value;
+      },
     });
+    return runAsync.call(run, request);
   };
   const manager = PluginManager.prototype as unknown as Record<PropertyKey, unknown>;
   const runCallbacks = manager.runCallbacks as (
@@ -509,12 +549,31 @@ function watchErrorHandoffs(): void {
   watchWrappedErrors();
   watchNodeAttempts();
   for (const method of ['runOnToolErrorCallback', 'runOnModelErrorCallback']) {
-    const original = proto[method] as (this: PluginManager, params: { error?: unknown }) => Promise<unknown>;
-    proto[method] = function (this: PluginManager, params: { error?: unknown }): Promise<unknown> {
+    const original = proto[method] as (this: PluginManager, params: HandedOff) => Promise<unknown>;
+    proto[method] = function (this: PluginManager, params: HandedOff): Promise<unknown> {
+      keepToolError(params);
       recordCancellation(params.error);
       return original.call(this, params);
     };
   }
+}
+
+/** What ADK hands its plugin manager with an error, as far as it is read here. */
+interface HandedOff {
+  error?: unknown;
+  toolContext?: unknown;
+}
+
+/**
+ * Keeps what the tool's `execute` threw for the plain `Error` ADK hands on in its place,
+ * found by the tool context ADK hands on with it (see {@link watchWrappedErrors}).
+ */
+function keepToolError({ error, toolContext }: HandedOff): void {
+  if (typeof toolContext !== 'object' || toolContext === null) return;
+  const { toolThrew, wrapped } = recorded();
+  if (!toolThrew.has(toolContext)) return;
+  const thrown = toolThrew.get(toolContext);
+  if (thrown !== error && typeof error === 'object' && error !== null) wrapped.set(error, thrown);
 }
 
 if (inWorkflowContext()) watchErrorHandoffs();
@@ -664,7 +723,9 @@ function toWorkflowFailure(err: unknown, frame: Frame): unknown {
  * it moves as the handler's whole outcome: none of them is left to raise in its place.
  * Once the main function has returned, the execution is ending, and whatever the handler
  * absorbed is dropped: raising it would add a second terminal command to the one the main
- * function already produced, which the server rejects on every Workflow Task.
+ * function already produced, which the server rejects on every Workflow Task. A Signal
+ * handler that throws instead raises the cancellation at once, unless the main function has
+ * ended.
  */
 function deferToMain(frame: Frame): void {
   const { main } = recorded();
@@ -698,11 +759,18 @@ async function surfaceAbsorbedFailure<T>(
       if (main !== undefined && main !== frame) raiseAbsorbed(main);
     }
     const failure = toWorkflowFailure(err, frame);
-    // A Signal handler whose ADK graph run reported the absorbed cancellation (a node's
-    // `NodeReportedError`) hands it on like a handler that returned.
-    if (onReturn !== undefined && frame.cancellation !== undefined && failure === frame.cancellation) {
+    // A Signal handler that throws raises its absorbed cancellation at once, as any handler
+    // that throws does, an ADK runtime error such as a graph's `NodeReportedError` included.
+    // Once the main function has ended, that would add a second terminal command, so it is
+    // dropped as when the handler returns (see `deferToMain`).
+    if (
+      onReturn !== undefined &&
+      frame.cancellation !== undefined &&
+      failure === frame.cancellation &&
+      recorded().main?.surfaced === true
+    ) {
       onReturn(frame);
-      if (frame.cancellation === undefined) return undefined as T;
+      return undefined as T;
     }
     throw failure;
   } finally {

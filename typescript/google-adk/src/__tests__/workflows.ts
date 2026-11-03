@@ -14,6 +14,7 @@ import { isIP } from 'node:net';
 import {
   BasePlugin,
   createEvent,
+  FunctionTool,
   generateClientFunctionCallId,
   InMemoryRunner,
   isFinalResponse,
@@ -36,6 +37,7 @@ import {
   createNexusServiceClient,
   defineSignal,
   defineUpdate,
+  executeChild,
   isCancellation,
   proxyActivities,
   setHandler,
@@ -597,10 +599,20 @@ export type BlockedTurnKind = 'tool' | 'agent' | 'plugin' | 'model';
  * `CancellationScope.nonCancellable(() => CancellationScope.withTimeout('1 second', ...))`
  * (`shielded`); the same, then a cleanup in the non-cancellable scope that holds the
  * timeout's error until {@link adkDoneSignal} (`shielded-cleanup`); as it is, rethrowing its
- * error wrapped in a new `Error` with the original as `cause` (`rewrapped`); or not at all,
- * throwing an ordinary error instead (`throws`).
+ * error wrapped in a new `Error` with the original as `cause` (`rewrapped`); as it is, but on
+ * a child Workflow that fails with its own cancelled Activity (`child`, see
+ * {@link childTimedOutActivity}); or not at all, throwing an ordinary error instead (`throws`).
  */
-export type BlockedTurnWait = 'plain' | 'shielded' | 'shielded-cleanup' | 'rewrapped' | 'throws';
+export type BlockedTurnWait = 'plain' | 'shielded' | 'shielded-cleanup' | 'rewrapped' | 'child' | 'throws';
+
+/**
+ * A child Workflow whose first Activity its 1-second timeout scope cancels, so it fails with
+ * that `ActivityFailure` (whose `activityId` is '1', as the parent's first Activity's is).
+ */
+export async function childTimedOutActivity(): Promise<string> {
+  const { cancellableActivity } = proxyActivities<BlockingActivities>({ startToCloseTimeout: '1 minute' });
+  return CancellationScope.withTimeout('1 second', () => cancellableActivity());
+}
 
 /**
  * A runner turn that waits until it is cancelled, with nothing cancellable after the wait:
@@ -632,7 +644,7 @@ function blockedTurn(
   const shaped = (body: () => Promise<void>) => async (): Promise<void> => {
     stage('blocked');
     if (wait === 'throws') throw new Error('policy refused the request');
-    if (wait === 'plain') return body();
+    if (wait === 'plain' || wait === 'child') return body();
     if (wait === 'rewrapped') {
       try {
         return await body();
@@ -658,8 +670,17 @@ function blockedTurn(
     });
     await client.executeOperation('wait' as never, undefined as never, { cancellationType: 'TRY_CANCEL' });
   };
+  const failingChild = async (): Promise<void> => {
+    await executeChild(childTimedOutActivity);
+  };
   if (kind === 'tool') {
-    const waitForApproval = shaped(nexusEndpoint === undefined ? () => condition(() => false) : unstartedNexusOperation);
+    const waitForApproval = shaped(
+      wait === 'child'
+        ? failingChild
+        : nexusEndpoint === undefined
+          ? () => condition(() => false)
+          : unstartedNexusOperation
+    );
     const tool = new LongRunningFunctionTool({
       name: 'wait_approval',
       description: 'Wait for a person to approve.',
@@ -681,11 +702,13 @@ function blockedTurn(
   }
   const { cancellableActivity } = proxyActivities<BlockingActivities>({ startToCloseTimeout: '1 minute' });
   const runCheck = shaped(
-    nexusEndpoint === undefined
-      ? async () => {
-          await cancellableActivity();
-        }
-      : unstartedNexusOperation
+    wait === 'child'
+      ? failingChild
+      : nexusEndpoint === undefined
+        ? async () => {
+            await cancellableActivity();
+          }
+        : unstartedNexusOperation
   );
   const check = async (): Promise<undefined> => {
     await runCheck();
@@ -709,24 +732,24 @@ export async function agentRunnerBlockedTurn(
 /**
  * A Signal handler runs a {@link blockedTurn} (through a `LongRunningFunctionTool` unless
  * `kind` says otherwise, as a one-node ADK graph with `graph`), after a failing model turn
- * when `failFirst` is set, while the main function waits, shielded from cancellation, for
- * the turn to end, then cleans up through two Activities with a wait for
+ * when `failFirst` is set and followed by a step of its own (a one-second `sleep`) when
+ * `ownStep` is set, and then marks the turn ended. The main function waits, shielded from
+ * cancellation, for that mark, then cleans up through two Activities with a wait for
  * {@link adkDoneSignal} between them.
  */
 export async function agentRunnerSignalTurnThenCleanup(
   failFirst = false,
   kind: BlockedTurnKind = 'tool',
-  graph = false
+  graph = false,
+  ownStep = false
 ): Promise<string> {
   let turnEnded = false;
   let released = false;
   setHandler(adkStartSignal, async () => {
-    try {
-      if (failFirst) await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), 'hi');
-      await blockedTurn(kind, setStage, 'plain', undefined, graph);
-    } finally {
-      turnEnded = true;
-    }
+    if (failFirst) await runAgentTurn(new TemporalModel('boom', SINGLE_ATTEMPT), 'hi');
+    await blockedTurn(kind, setStage, 'plain', undefined, graph);
+    if (ownStep) await sleep('1 second');
+    turnEnded = true;
   });
   setHandler(adkDoneSignal, () => {
     released = true;
@@ -743,17 +766,19 @@ export async function agentRunnerSignalTurnThenCleanup(
 }
 
 /**
- * A Signal handler runs a {@link blockedTurn} while the main function waits for it, still
- * cancellable, so when the Workflow is cancelled the main function ends first: it lets the
- * cancellation through (`raise`) or catches it and returns (`return`).
+ * A Signal handler runs a {@link blockedTurn} (as a one-node ADK graph with `graph`) while
+ * the main function waits for it, still cancellable, so when the Workflow is cancelled the
+ * main function ends first: it lets the cancellation through (`raise`) or catches it and
+ * returns (`return`).
  */
 export async function agentRunnerSignalTurnAfterMainEnds(
   kind: BlockedTurnKind,
-  onCancel: 'raise' | 'return'
+  onCancel: 'raise' | 'return',
+  graph = false
 ): Promise<string> {
   let turnEnded = false;
   setHandler(adkStartSignal, async () => {
-    await blockedTurn(kind, setStage);
+    await blockedTurn(kind, setStage, 'plain', undefined, graph);
     turnEnded = true;
   });
   try {
@@ -766,15 +791,58 @@ export async function agentRunnerSignalTurnAfterMainEnds(
 }
 
 /**
- * Starts a failing Activity it never awaits, then waits, with no ADK at all. The SDK fails
- * the Workflow Task for the unhandled failure, and the plugin must leave that to it.
+ * One turn that runs a `FunctionTool`, reporting afterwards whether the tool's `execute` is
+ * still the function it was built with, and whether its `requireConfirmation` predicate,
+ * written as a `function`, ran with the tool as `this`.
  */
-export async function unhandledActivityFailure(): Promise<string> {
-  const { failingActivity } = proxyActivities<{ failingActivity(): Promise<never> }>({
-    startToCloseTimeout: '1 minute',
-    retry: { maximumAttempts: 1 },
+export async function agentRunnerToolKeepsItsExecute(): Promise<{
+  same: boolean;
+  name: string;
+  length: number;
+  predicateOnTool: boolean;
+}> {
+  async function approve(_args: unknown, _context: unknown): Promise<{ status: string }> {
+    return { status: 'approved' };
+  }
+  let predicateOnTool = false;
+  const tool = new FunctionTool({
+    name: 'wait_approval',
+    description: 'Approve.',
+    execute: approve,
+    requireConfirmation(this: unknown) {
+      predicateOnTool = this === tool;
+      return false;
+    },
   });
-  void failingActivity();
+  await runAgentTurn(new TemporalModel('call-wait-approval-model', SINGLE_ATTEMPT), 'hi', undefined, {
+    tools: [tool],
+  });
+  const execute = (tool as unknown as { execute: (...args: unknown[]) => unknown }).execute;
+  return { same: execute === approve, name: execute.name, length: execute.length, predicateOnTool };
+}
+
+/**
+ * Starts a failing Activity (`activity`), or a `FunctionTool` run whose `execute` throws
+ * (`tool`), that it never awaits, then waits. The SDK fails the Workflow Task for the
+ * unhandled failure, and the plugin must leave that to it.
+ */
+export async function unhandledFailure(what: 'activity' | 'tool' = 'activity'): Promise<string> {
+  if (what === 'tool') {
+    const tool = new FunctionTool({
+      name: 'boom_tool',
+      description: 'Fails.',
+      execute: async () => {
+        throw new Error('tool boom');
+      },
+    });
+    void tool.runAsync({ args: {}, toolContext: {} as never });
+  } else {
+    const { failingActivity } = proxyActivities<{ failingActivity(): Promise<never> }>({
+      startToCloseTimeout: '1 minute',
+      retry: { maximumAttempts: 1 },
+    });
+    void failingActivity();
+  }
   await sleep('2 seconds');
   return 'completed';
 }
@@ -847,6 +915,25 @@ export async function agentRunnerCaughtCancelThenFailingTurn(kind: BlockedTurnKi
     if (!isCancellation(err)) throw err;
   }
   await blockedTurn(kind, setStage, 'throws');
+  return 'caught';
+}
+
+/**
+ * Runs an Activity (so its id is '1'), catches the Workflow's cancellation in a wait outside
+ * ADK, then runs a {@link blockedTurn}, shielded from that cancellation, whose tool or
+ * callback awaits a child Workflow that fails with its own cancelled Activity '1'.
+ */
+export async function agentRunnerCaughtCancelThenChildFailure(kind: BlockedTurnKind): Promise<string> {
+  const { echoId } = proxyActivities<BlockingActivities>({ startToCloseTimeout: '1 minute' });
+  await echoId('first');
+  setStage('waiting');
+  try {
+    await condition(() => false);
+    return 'not cancelled';
+  } catch (err) {
+    if (!isCancellation(err)) throw err;
+  }
+  await CancellationScope.nonCancellable(() => blockedTurn(kind, setStage, 'child'));
   return 'caught';
 }
 
