@@ -18,7 +18,10 @@ from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
-from ._failure_converter import strands_failure_converter_class
+from ._failure_converter import (
+    strands_failure_converter_class,
+    strands_failure_converter_class_keeping_caller,
+)
 from ._model_activity import ModelActivity
 from ._sandbox_activity import SandboxActivities, SandboxFactory
 from ._sync_calls import refuse_sync_calls_in_workflows
@@ -210,11 +213,24 @@ def _workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
 def _data_converter(converter: DataConverter | None) -> DataConverter:
     if converter is None:
         converter = pydantic_data_converter
-    elif converter.payload_converter_class is not DefaultPayloadConverter:
-        return converter
+        payload_converter_class = converter.payload_converter_class
+    elif converter.payload_converter_class is DefaultPayloadConverter:
+        payload_converter_class = pydantic_data_converter.payload_converter_class
+    else:
+        # Keep the caller's payload converter (for example ``pydantic_data_converter``),
+        # but still install the failure converter: Activity-tool interrupts and the
+        # non-retryable Strands exceptions depend on it.
+        payload_converter_class = converter.payload_converter_class
+        return replace(
+            converter,
+            payload_converter_class=payload_converter_class,
+            failure_converter_class=strands_failure_converter_class_keeping_caller(
+                converter.failure_converter_class
+            ),
+        )
     return replace(
         converter,
-        payload_converter_class=pydantic_data_converter.payload_converter_class,
+        payload_converter_class=payload_converter_class,
         failure_converter_class=strands_failure_converter_class(
             converter.failure_converter_class
         ),

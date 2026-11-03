@@ -12,11 +12,15 @@ from strands.tools.mcp import MCPClient as StrandsMCPClient
 import temporalio.strands_agents._plugin as plugin_module
 from temporalio.api.failure.v1 import Failure
 from temporalio.client import ClientConfig
-from temporalio.contrib.pydantic import PydanticPayloadConverter
+from temporalio.contrib.pydantic import (
+    PydanticPayloadConverter,
+    pydantic_data_converter,
+)
 from temporalio.converter import (
     DataConverter,
     DefaultFailureConverter,
     DefaultFailureConverterWithEncodedAttributes,
+    FailureConverter,
     PayloadConverter,
 )
 from temporalio.exceptions import ApplicationError
@@ -107,7 +111,24 @@ def test_custom_payload_converter_is_preserved() -> None:
     configured = StrandsPlugin(models={}).configure_client(_client_config(supplied))[
         "data_converter"
     ]
-    assert configured is supplied
+    assert configured.payload_converter_class is PydanticPayloadConverter
+    assert configured.payload_codec is supplied.payload_codec
+
+
+@pytest.mark.parametrize("target", ["client", "replayer"])
+def test_custom_payload_converter_gets_strands_failure_converter(target: str) -> None:
+    supplied = pydantic_data_converter
+    configured = _configure(target, supplied)
+    assert configured.payload_converter_class is supplied.payload_converter_class
+    assert configured.failure_converter_class is StrandsFailureConverter
+    failure = Failure()
+    configured.failure_converter.to_failure(
+        InterruptException(Interrupt(id="i1", name="approval", reason="ok?")),
+        configured.payload_converter,
+        failure,
+    )
+    assert failure.application_failure_info.type == "StrandsInterrupt"
+    assert failure.application_failure_info.non_retryable
 
 
 class DomainError(Exception):
@@ -209,6 +230,72 @@ def test_other_failure_converter_is_replaced(target: str) -> None:
     )
     assert isinstance(decoded, ApplicationError)
     assert decoded.type == "DomainError"
+
+
+@pytest.mark.parametrize("target", ["client", "replayer"])
+def test_custom_payload_converter_keeps_caller_failure_decoding(target: str) -> None:
+    # With a non-default payload converter the caller's failure converter was
+    # always preserved; its decoding must still run for recorded failures.
+    supplied = replace(
+        pydantic_data_converter, failure_converter_class=DomainFailureConverter
+    )
+    configured = _configure(target, supplied)
+    failure = Failure()
+    configured.failure_converter.to_failure(
+        ApplicationError("boom", type="DomainError"),
+        configured.payload_converter,
+        failure,
+    )
+    decoded = configured.failure_converter.from_failure(
+        failure, configured.payload_converter
+    )
+    assert isinstance(decoded, DomainError)
+    # Strands handling is still added on top.
+    interrupt = Failure()
+    configured.failure_converter.to_failure(
+        InterruptException(Interrupt(id="i1", name="approval", reason="ok?")),
+        configured.payload_converter,
+        interrupt,
+    )
+    assert interrupt.application_failure_info.type == "StrandsInterrupt"
+    assert interrupt.application_failure_info.non_retryable
+    # Running the plugin again on its own output keeps it.
+    again = _configure(target, configured)
+    assert isinstance(
+        again.failure_converter.from_failure(failure, again.payload_converter),
+        DomainError,
+    )
+
+
+class MinimalFailureConverter(FailureConverter):
+    def to_failure(
+        self,
+        exception: BaseException,
+        payload_converter: PayloadConverter,
+        failure: Failure,
+    ) -> None:
+        failure.message = str(exception)
+        failure.application_failure_info.type = type(exception).__name__
+
+    def from_failure(
+        self, failure: Failure, payload_converter: PayloadConverter
+    ) -> BaseException:
+        return DomainError(failure.message)
+
+
+@pytest.mark.parametrize("target", ["client", "replayer"])
+def test_minimal_failure_converter_with_custom_payload_converter_is_kept(
+    target: str,
+) -> None:
+    supplied = replace(
+        pydantic_data_converter, failure_converter_class=MinimalFailureConverter
+    )
+    configured = _configure(target, supplied)
+    assert configured.failure_converter_class is MinimalFailureConverter
+    decoded = configured.failure_converter.from_failure(
+        Failure(message="x"), configured.payload_converter
+    )
+    assert isinstance(decoded, DomainError)
 
 
 def test_mcp_factory_that_returns_a_strands_client_fails_retryably() -> None:
