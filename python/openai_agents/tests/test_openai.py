@@ -705,16 +705,17 @@ class ActivityWeatherCustomInit:
 
 @activity.defn
 class ActivityWeatherNoTypeCheck:
-    # typing.get_type_hints skips these annotations, so the unknown one is never resolved.
+    # The tool skips the return annotation, so the unknown one is never resolved; the
+    # parameter's still is.
     @no_type_check
-    async def __call__(self, city: str) -> "UnknownReturn":  # type: ignore # noqa: F821
+    async def __call__(self, city: "CityName") -> "UnknownReturn":  # type: ignore # noqa: F821
         return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
 
 
 class WeatherNoTypeCheckService:
     @activity.defn
     @no_type_check
-    async def get_weather(self, city: str) -> "UnknownReturn":  # type: ignore # noqa: F821
+    async def get_weather(self, city: "CityName") -> "UnknownReturn":  # type: ignore # noqa: F821
         return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
 
 
@@ -801,6 +802,35 @@ class ActivityWeatherArgsOnlyClassDoc:
         return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
 
 
+@activity.defn
+class ActivityWeatherArgsOnlyCall:
+    async def __call__(self, city: str) -> Weather:
+        """
+        args:
+            city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherParametersOnlyDerived(WeatherBase):
+    """
+    Parameters:
+        conditions: Default conditions.
+    """
+
+
+@activity.defn
+class ActivityWeatherReturnsOnlyClassDoc:
+    """
+    Returns:
+        The weather.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
 @pytest.mark.parametrize(
     "cls, description, city_description",
     [
@@ -814,6 +844,15 @@ class ActivityWeatherArgsOnlyClassDoc:
         (ActivityWeatherGoogleArgsCall, "Get the weather for a given city.", None),
         # A class docstring with only Args: has no summary either.
         (ActivityWeatherArgsOnlyClassDoc, "", "Name of the city."),
+        # With no class summary to use instead, a section is no description.
+        (ActivityWeatherArgsOnlyCall, "", None),
+        (ActivityWeatherReturnsOnlyClassDoc, "", None),
+        # A class docstring with only a section gives way to an inherited __call__ docstring.
+        (
+            ActivityWeatherParametersOnlyDerived,
+            "Get the weather for a given city.",
+            None,
+        ),
     ],
 )
 def test_callable_class_tool_summary_from_class_docstring(
@@ -837,6 +876,10 @@ def test_callable_class_tool_summary_from_class_docstring(
         (ActivityWeatherSectionsOnlyCall, "Caller summary", "Caller summary"),
         (ActivityWeatherDataclass, None, None),
         (ActivityWeatherDataclass, "Caller summary", "Caller summary"),
+        # A section-only docstring labels nothing.
+        (ActivityWeatherArgsOnlyCall, None, None),
+        (ActivityWeatherArgsOnlyCall, "Caller summary", "Caller summary"),
+        (ActivityWeatherReturnsOnlyClassDoc, None, None),
     ],
 )
 async def test_callable_class_tool_activity_summary(

@@ -166,16 +166,16 @@ def _type_hints(fn: Callable) -> dict[str, Any]:
 
     Unlike ``typing.get_type_hints(fn)`` on Python 3.10, this doesn't wrap a parameter with a
     ``None`` default in ``Optional``, which would hide a context type or ``Annotated`` metadata.
-    Like it, this resolves the function's own type parameters, such as ``T`` in ``def f[T]``,
-    and returns no hints for a function marked with ``@typing.no_type_check``.
+    Like it, this resolves the function's own type parameters, such as ``T`` in ``def f[T]``.
+    It skips the return annotation, which the tool doesn't use, so a function marked with
+    ``@typing.no_type_check`` whose return type can't be resolved still gets its parameter types.
     """
-    # Check before reading __annotations__, which evaluates them on Python 3.14.
-    if getattr(fn, "__no_type_check__", None):
-        return {}
+    # inspect.get_annotations also reads __annotate__, which Python 3.14's update_wrapper
+    # copies to a decorator in place of __annotations__.
+    annotations = dict(inspect.get_annotations(fn))
+    annotations.pop("return", None)
     return typing.get_type_hints(
-        # inspect.get_annotations also reads __annotate__, which Python 3.14's update_wrapper
-        # copies to a decorator in place of __annotations__.
-        types.SimpleNamespace(__annotations__=dict(inspect.get_annotations(fn))),
+        types.SimpleNamespace(__annotations__=annotations),
         globalns=getattr(inspect.unwrap(fn), "__globals__", {}),
         localns={p.__name__: p for p in getattr(fn, "__type_params__", ())},
         include_extras=True,
@@ -183,9 +183,14 @@ def _type_hints(fn: Callable) -> dict[str, Any]:
 
 
 def _class_doc(cls: type) -> str | None:
-    """Return a class's own docstring, unless dataclasses or namedtuple wrote it."""
+    """Return a class's own docstring, unless it has no summary or is one dataclasses or
+    namedtuple wrote.
+    """
     doc = _docstring(cls)
-    if doc is None or not doc.startswith(cls.__name__):
+    # Such as a docstring that documents only the constructor's Args:.
+    if doc is None or not _summary(inspect.cleandoc(doc)):
+        return None
+    if not doc.startswith(cls.__name__):
         return doc
     try:
         generated = _generated_class_doc(cls)
@@ -195,9 +200,12 @@ def _class_doc(cls: type) -> str | None:
     return None if doc == generated else doc
 
 
-# The Google-style section headers the Agents SDK looks for. Its docstring parser reads one on a
-# docstring's first line as plain text, so a description that starts with one is no summary.
-_GOOGLE_SECTION = re.compile(r"(Args|Arguments|Returns|Raises):\s*$")
+# The Google-style section headers the Agents SDK looks for, in any case. Its docstring parser
+# reads one on a docstring's first line as plain text, so a description that starts with one is
+# no summary.
+_GOOGLE_SECTION = re.compile(
+    r"(Args|Arguments|Params|Parameters|Returns|Raises):\s*$", re.IGNORECASE
+)
 
 
 def _summary(description: str | None) -> str | None:
@@ -278,10 +286,11 @@ def activity_as_tool(
     Raises:
         ValueError: If the function is not decorated as a Temporal activity, or is a dynamic
             activity, which has no name; if it is a callable-class activity passed as an
-            instance, or whose ``__call__`` is not a function, staticmethod, classmethod or
-            ``functools.partialmethod``, can't be read, or takes keyword-only arguments; or if
-            the activity takes ``**kwargs``. Errors from building the schema, such as the Agents
-            SDK's ``UserError`` or pydantic's schema errors, propagate unchanged.
+            instance, or whose ``__call__`` is not a function, or a staticmethod, classmethod or
+            ``functools.partialmethod`` over a function, can't be read, or takes keyword-only
+            arguments; or if the activity takes ``**kwargs``. Errors from building the schema,
+            such as the Agents SDK's ``UserError`` or pydantic's schema errors, propagate
+            unchanged.
 
     Example:
         >>> @activity.defn
@@ -319,8 +328,8 @@ def activity_as_tool(
         func = _call_function(calls[0]) if calls else None
         if func is None:
             raise ValueError(
-                f"Activity class {fn.__name__} needs a __call__ that is a function, "
-                "staticmethod, classmethod or functools.partialmethod"
+                f"Activity class {fn.__name__} needs a __call__ that is a function, or a "
+                "staticmethod, classmethod or functools.partialmethod over a function"
             )
         try:
             call = calls[0].__get__(object(), fn)
@@ -369,12 +378,12 @@ def activity_as_tool(
     schema = function_schema(fn)
     if owner is not None and not _summary(schema.description):
         # A __call__ docstring with only sections, such as `:param:` fields, a NumPy Parameters
-        # section or a Google Args: section, has no summary; use the class's own. Keep it apart
+        # section or a Google Args: section, has no summary; use the class's own, else none, so a
+        # section is never shown as the summary. Keep the parameter descriptions, and keep it apart
         # from the summary argument, which labels the scheduled activity.
         class_doc = _class_doc(owner)
         class_summary = _doc_summary(class_doc) if class_doc else None
-        if class_summary:
-            schema = function_schema(fn, description_override=class_summary)
+        schema = dataclasses.replace(schema, description=class_summary)
 
     async def run_activity(ctx: RunContextWrapper[Any], input: str) -> Any:
         try:
