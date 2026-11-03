@@ -1329,23 +1329,25 @@ test('a re-listed MCP tool name is refused only while another tool of the agent 
   }
 });
 
-test('a history of two agents side by side recorded on main still replays', async (t) => {
-  // Recorded with `mcpAgentsSideBySide` on main at 017d88a, where each `cacheTools: false` client had
-  // its own `AfterToolsEvent` hook. `first`'s re-listing of `b` and `second`'s `auditHook` activity
-  // completed in one workflow task, so whether `a-listTools` or `c-listTools` comes next depends on
-  // how many microtasks each agent takes to schedule it.
-  const history = await loadHistory(
-    path.resolve(__dirname, '../../src/__tests__/histories/mcp-side-by-side-017d88a.json')
-  );
-  await t.notThrowsAsync(
-    Worker.runReplayHistory(
-      {
-        workflowBundle: t.context.workflowBundle,
-        plugins: [new StrandsPlugin({ models: { first: () => new StubModel([]), second: () => new StubModel([]) } })],
-      },
-      history
-    )
-  );
+test('histories of a re-listing beside another coroutine recorded on main still replay', async (t) => {
+  // Recorded on main at 017d88a, where each `cacheTools: false` client had its own `AfterToolsEvent`
+  // hook. The re-listing of `b` and another coroutine's activity completed in one workflow task, so
+  // whether `a-listTools` or that coroutine's next activity comes next depends on how many
+  // microtasks each takes to schedule it. Main scheduled `second`'s `c-listTools` first in
+  // `mcpAgentsSideBySide`, and `a-listTools` first in `mcpAgentBesideCoroutine`.
+  for (const file of ['mcp-side-by-side-017d88a.json', 'mcp-beside-coroutine-017d88a.json']) {
+    const history = await loadHistory(path.resolve(__dirname, '../../src/__tests__/histories', file));
+    await t.notThrowsAsync(
+      Worker.runReplayHistory(
+        {
+          workflowBundle: t.context.workflowBundle,
+          plugins: [new StrandsPlugin({ models: { first: () => new StubModel([]), second: () => new StubModel([]) } })],
+        },
+        history
+      ),
+      file
+    );
+  }
 });
 
 test('in-workflow tool() runs inside the workflow sandbox', async (t) => {

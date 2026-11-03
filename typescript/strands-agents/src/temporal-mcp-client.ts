@@ -132,8 +132,9 @@ export class TemporalMCPClient extends McpClient {
    * Re-list this server's tools and reconcile them into the agent's tool
    * registry, dropping tools that no longer exist and adding new ones, so a
    * mid-workflow MCP-server restart is reflected in the next call.
-   * {@link TemporalAgent} re-lists its `cacheTools: false` clients together
-   * after each tool round instead, so a name can move between its servers.
+   * {@link TemporalAgent} instead re-lists each of its `cacheTools: false`
+   * clients in its own hook after each tool round, and checks and applies
+   * their listings together, so a name can move between its servers.
    *
    * A listed name that another tool of the agent has, that differs from one
    * only by `-` or `_`, that the listing has twice, or that Strands rejects

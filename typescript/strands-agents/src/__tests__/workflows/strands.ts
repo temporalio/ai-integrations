@@ -287,6 +287,29 @@ export async function mcpAgentsSideBySide(prompt: string): Promise<string> {
   return results.map(String).join(', ');
 }
 
+/**
+ * An agent with the servers `a` and `b`, and a hook added after construction that, at the first tool
+ * round, starts a coroutine beside the re-listing: it lists `z`, awaits `null` twice and lists `y`.
+ * Its history recorded on main pins when the re-listing of `a` is scheduled against `y`'s listing.
+ */
+export async function mcpAgentBesideCoroutine(prompt: string): Promise<string> {
+  const client = (server: string): TemporalMCPClient =>
+    new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } });
+  const agent = new TemporalAgent({ model: 'first', printer: false, tools: [client('a'), client('b')] });
+  let side: Promise<void> | undefined;
+  agent.addHook(AfterToolsEvent, () => {
+    side ??= (async () => {
+      await client('z').listTools();
+      await null;
+      await null;
+      await client('y').listTools();
+    })();
+  });
+  const result = await agent.invoke(prompt);
+  await side;
+  return String(result);
+}
+
 const noteTool = tool({
   name: 'take_note',
   description: 'Take a note',
