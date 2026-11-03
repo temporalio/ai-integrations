@@ -31,8 +31,11 @@ export interface SerializedModelRequest {
    * the model in the same process.
    */
   implicitModelSettings?: boolean;
-  /** With `implicitModelSettings`, the run settings set to `undefined`, which clear a default. */
-  clearedModelSettings?: (keyof ModelSettings)[];
+  /**
+   * With `implicitModelSettings`, the run settings set to `undefined`, which clear a default: a key,
+   * or a key of `reasoning` or `text` such as `reasoning.effort`.
+   */
+  clearedModelSettings?: string[];
 }
 
 export interface SerializedModelResponse {

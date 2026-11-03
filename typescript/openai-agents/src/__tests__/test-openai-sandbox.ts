@@ -112,7 +112,8 @@ test.serial('a SandboxAgent whose manifest carries a workerEnvValue survives an 
   process.env[MANIFEST_SECRET_VAR] = MANIFEST_SECRET;
   try {
     await worker.runUntil(async () => {
-      t.is(await executeWorkflow(sandboxApprovalResumeWorkflow), 'Done.');
+      // The approved sandbox tool writes the caller's context object, not a copy rebuilt from JSON.
+      t.is(await executeWorkflow(sandboxApprovalResumeWorkflow), 'Done. writes=sandbox-tool');
       // Restoring the state fails when the agents given don't have the paused one, and the run fails.
       const err = await t.throwsAsync(
         executeWorkflow(sandboxApprovalResumeWorkflow, { args: [true], workflowExecutionTimeout: '20 seconds' })

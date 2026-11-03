@@ -695,6 +695,11 @@ test('Agents picked or changed during the run are checked before they call their
       1,
     ],
     'tool-start-memory-session': [/^An error occurred while running the tool.*agent 'Nested' has a MemorySession/, 1],
+    'tool-start-tracing-key': [/^An error occurred while running the tool.*cannot pass a trace's own tracing key/, 1],
+    'tool-start-run-config-tracing-key': [
+      /^An error occurred while running the tool.*cannot pass a trace's own tracing key/,
+      1,
+    ],
     'tool-option-model-provider-undefined': [
       /^AgentsWorkflowError: .*asTool\('ask_nested'\) sets runConfig.modelProvider/,
       0,
@@ -1517,6 +1522,9 @@ test.serial('With no model named, the Worker adds the model settings defaults fo
       await run({ runSettings: { reasoning: { summary: 'auto' } } });
       await run({ runSettings: { reasoning: { effort: 'low' } } });
       await run({ runSettings: { temperature: 0.3 }, clearDefaults: true });
+      await run({ runSettings: { temperature: 0.3 }, clearNestedDefaults: true });
+      // An empty `text` keeps the default verbosity.
+      await run({ runSettings: { text: {} } });
     });
   } finally {
     if (previous === undefined) delete process.env.OPENAI_DEFAULT_MODEL;
@@ -1555,6 +1563,8 @@ test.serial('With no model named, the Worker adds the model settings defaults fo
     },
     { model: '', modelSettings: { reasoning: { effort: 'low' }, text: { verbosity: 'low' } }, reasoningEffortImplicit: false },
     { model: '', modelSettings: { temperature: 0.3 }, reasoningEffortImplicit: true },
+    { model: '', modelSettings: { reasoning: {}, text: {}, temperature: 0.3 }, reasoningEffortImplicit: true },
+    { model: '', modelSettings: gpt5Defaults, reasoningEffortImplicit: true },
   ]);
 });
 
@@ -1698,6 +1708,8 @@ test("tracingApiKey gives spans that cross a Temporal boundary the key the Worke
       'withTraceOnly',
       'traceContext',
       'activity',
+      'asToolRunOptions',
+      'asToolRunConfig',
     ] as const) {
       const handle = await wfClient.start(tracingKeyRefusedWorkflow, {
         taskQueue,

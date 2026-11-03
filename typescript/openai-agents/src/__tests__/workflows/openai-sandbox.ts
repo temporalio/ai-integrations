@@ -75,7 +75,10 @@ export async function sandboxAgentWorkflow(): Promise<string> {
   return `${result.finalOutput}`;
 }
 
-/** A sandbox tool that interrupts for approval, so the run preserves its owned session. */
+/**
+ * A sandbox tool that interrupts for approval, so the run preserves its owned session. It records
+ * its call in the run context's `writes`.
+ */
 class ApprovalSandboxCapability extends Capability {
   readonly type = 'approval_sandbox';
 
@@ -92,8 +95,9 @@ class ApprovalSandboxCapability extends Capability {
           additionalProperties: false,
         } as any,
         strict: true,
-        invoke: async (_ctx: RunContext<any>, input: string): Promise<string> => {
+        invoke: async (ctx: RunContext<{ writes: string[] }>, input: string): Promise<string> => {
           if (!this._session) throw new Error('approval_sandbox capability is not bound to a session');
+          ctx.context.writes.push('sandbox-tool');
           return this._session.execCommand!(JSON.parse(input));
         },
         needsApproval: async () => true,
@@ -103,7 +107,10 @@ class ApprovalSandboxCapability extends Capability {
   }
 }
 
-/** With `otherAgent`, resumes with an agent graph that doesn't have the paused agent. */
+/**
+ * With `otherAgent`, resumes with an agent graph that doesn't have the paused agent. Returns the
+ * output and the tool calls the caller's context object got.
+ */
 export async function sandboxApprovalResumeWorkflow(otherAgent = false): Promise<string> {
   const agent = new SandboxAgent({
     name: 'sandbox-approval',
@@ -116,13 +123,14 @@ export async function sandboxApprovalResumeWorkflow(otherAgent = false): Promise
   const runner = new TemporalOpenAIRunner();
   const runConfig = { sandbox: { client: temporalSandboxClient('fake') } };
 
-  const result = await runner.run(agent, 'run a command', { runConfig });
+  const context = { writes: [] as string[] };
+  const result = await runner.run(agent, 'run a command', { runConfig, context });
   if (result.interruptions.length === 0) return 'no-interruption';
   for (const interruption of result.interruptions) result.state.approve(interruption);
 
   const resumeAgent = otherAgent ? new Agent({ name: 'other', model: 'gpt-4o-mini' }) : agent;
   const resumed = await runner.run(resumeAgent, result.state, { runConfig });
-  return `${resumed.finalOutput}`;
+  return `${resumed.finalOutput} writes=${context.writes.join(',')}`;
 }
 
 /** A `SandboxAgent` that names no model, with the default capabilities, which include compaction. */

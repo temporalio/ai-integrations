@@ -7,10 +7,12 @@ import {
   type ModelSettings,
   type RunContext,
   type Tool,
+  type TracingConfig,
 } from '@openai/agents-core';
 import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
 import { inWorkflowContext } from '@temporalio/workflow';
+import { refuseTracingApiKey } from '../common/headers';
 import { ActivityBackedModelProvider } from './activity-backed-model';
 import { type AgentToolRecord, checkAgentToolOptions, getAgentToolRecord, isUnrecordedAgentTool } from './agent-tools';
 import { validateTemporalSandboxClient } from './sandbox-client';
@@ -100,6 +102,7 @@ interface RunnerCheckState {
 interface RunOptionsLike {
   session?: unknown;
   sandbox?: SandboxRunConfig;
+  tracing?: TracingConfig;
 }
 
 const runnerCheckState = Symbol.for('@temporalio/openai-agents/runnerCheck');
@@ -108,8 +111,9 @@ const runnerCheckState = Symbol.for('@temporalio/openai-agents/runnerCheck');
  * Checks what each `Runner` run in the Workflow uses, as it starts: the runner's own, and the one
  * upstream builds for each `agent.asTool()` call. Upstream builds that nested config only then, after
  * the tool's schema, its `inputBuilder` and any listener ran, and spreads the tool's `runConfig` over
- * what it inherits, so this is the one place that sees the provider, model, session and sandbox the
- * run uses. The model provider must be the runner's, which sends model calls to Activities. The run
+ * what it inherits, so this is the one place that sees the provider, model, session, sandbox and
+ * tracing key the run uses. The model provider must be the runner's, which sends model calls to
+ * Activities. A resumed nested run would carry its tracing key, which the plugin refuses. The run
  * gets a frozen copy of its sandbox config, which upstream reads as it goes, so a later change to the
  * caller's object, such as an `agent_start` listener's, doesn't reach it.
  *
@@ -136,6 +140,8 @@ export function installRunnerCheck(): void {
         state.runningAgents.set(this, started);
       });
     }
+    // Upstream takes the run's key, or else its config's.
+    refuseTracingApiKey(options?.tracing?.apiKey ?? this.config.tracing?.apiKey);
     const where = `The run of agent '${agent.name}'`;
     if (!(this.config.modelProvider instanceof ActivityBackedModelProvider)) {
       throw ApplicationFailure.create({

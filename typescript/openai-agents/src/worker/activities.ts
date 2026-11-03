@@ -54,7 +54,7 @@ export function toSerializedModelResponse(response: ModelResponse): SerializedMo
  */
 function withDefaultModelSettings(
   runSettings: ModelSettings,
-  cleared: (keyof ModelSettings)[] = []
+  cleared: string[] = []
 ): {
   modelSettings: ModelSettings;
   reasoningEffortImplicit: boolean;
@@ -66,7 +66,11 @@ function withDefaultModelSettings(
     modelSettings.reasoning = { ...defaults.reasoning, ...runSettings.reasoning };
   }
   if (defaults.text && runSettings.text) modelSettings.text = { ...defaults.text, ...runSettings.text };
-  for (const key of cleared) delete modelSettings[key];
+  for (const key of cleared) {
+    const [outer, inner] = key.split('.') as [keyof ModelSettings, string | undefined];
+    if (inner === undefined) delete modelSettings[outer];
+    else delete (modelSettings[outer] as Record<string, unknown> | undefined)?.[inner];
+  }
   return {
     modelSettings,
     reasoningEffortImplicit: defaults.reasoning?.effort !== undefined && runSettings.reasoning?.effort === undefined,

@@ -190,7 +190,9 @@ export class ActivityBackedModel implements Model {
   /**
    * With no model named, upstream adds the model settings defaults for the Workflow's default model,
    * which the Worker may not use. If the agent set no model settings, send only the run's, and let
-   * the Worker add the defaults for its own default model, as upstream does in one process.
+   * the Worker add the defaults for its own default model, as upstream does in one process. A
+   * `SandboxAgent` takes this path too, so the run's settings win over the defaults; upstream gives
+   * its run copy the defaults as its own settings, which win.
    */
   private toWire(request: ModelRequest, agent: Agent<any, any> | undefined): SerializedModelRequest {
     const wire = toSerializedModelRequest(request);
@@ -203,10 +205,16 @@ export class ActivityBackedModel implements Model {
     // calls its model with. The defaults never set it.
     if (request.modelSettings.providerData !== undefined)
       modelSettings.providerData = request.modelSettings.providerData;
-    // A run setting set to `undefined` clears a default upstream, but JSON would drop it.
-    const cleared = (Object.keys(modelSettings) as (keyof ModelSettings)[]).filter(
-      (key) => modelSettings[key] === undefined
-    );
+    // A run setting set to `undefined` clears a default upstream, but JSON would drop it. The defaults
+    // also set keys of `reasoning` and `text`, which upstream merges key by key.
+    const cleared: string[] = [];
+    for (const [key, value] of Object.entries(modelSettings)) {
+      if (value === undefined) cleared.push(key);
+      else if (key === 'reasoning' || key === 'text') {
+        for (const [nested, nestedValue] of Object.entries(value ?? {}))
+          if (nestedValue === undefined) cleared.push(`${key}.${nested}`);
+      }
+    }
     return {
       ...wire,
       modelSettings,

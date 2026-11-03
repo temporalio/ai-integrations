@@ -353,9 +353,9 @@ function collectAgents(roots: Agent<any, any>[], throughCopies: boolean): Set<Ag
 /**
  * A state with sandbox sessions holds upstream's live-session identity, which would resolve manifest
  * environment references on the Workflow thread rather than in the resume Activity, so it's rebuilt
- * with `fromString`, which also lists tools and so runs MCP tool filters. Other states resume as they
- * are, as upstream: restoring finds an `asTool()` agent only through the tool object `asTool()`
- * returned, and not an agent that only a custom `Handoff`'s callback picked.
+ * from its string, with its own context objects. That also lists tools and so runs MCP tool filters.
+ * Other states resume as they are, as upstream: restoring finds an `asTool()` agent only through the
+ * tool object `asTool()` returned, and not an agent that only a custom `Handoff`'s callback picked.
  */
 async function prepareRunState<TContext, TAgent extends Agent<any, any>>(
   agent: TAgent,
@@ -364,7 +364,10 @@ async function prepareRunState<TContext, TAgent extends Agent<any, any>>(
   let prepared = state;
   if (state._sandbox !== undefined) {
     checkRestoredInterruptions(agent, state);
-    prepared = (await RunState.fromString(agent, state.toString())) as RunState<TContext, TAgent>;
+    prepared = (await RunState.fromStringWithContext(agent, state.toString(), state._context)) as RunState<
+      TContext,
+      TAgent
+    >;
   }
   // Suppress upstream Runner.run's withTrace(state._trace, ...) branch; we want the current Workflow's trace.
   prepared.clearTrace();

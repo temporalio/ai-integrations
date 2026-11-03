@@ -9,6 +9,8 @@ import {
 } from '@openai/agents-core';
 import type { SandboxRunConfig } from '@openai/agents-core/sandbox';
 import { ApplicationFailure } from '@temporalio/common';
+import { inWorkflowContext } from '@temporalio/workflow';
+import { refuseTracingApiKey } from '../common/headers';
 import { validateTemporalSandboxClient } from './sandbox-client';
 
 type AnyAgentTool = AgentTool<any, any, any>;
@@ -53,6 +55,12 @@ export function installAgentToolInterception(): void {
   function asTool(this: Agent<any, any>, options: AnyAgentToolOptions): AnyAgentTool {
     // Upstream reads its options when the tool is made, so record them then too.
     const tool = state.original.call(this, options);
+    // The nested run would carry a tracing key, so refuse it here, as `run()` refuses its own: in
+    // Workflow code, the error fails the Workflow Task until the code changes.
+    if (inWorkflowContext()) {
+      refuseTracingApiKey(options.runConfig?.tracing?.apiKey);
+      refuseTracingApiKey(options.runOptions?.tracing?.apiKey);
+    }
     state.records.set(tool.on, { agent: this, tool, runConfig: options.runConfig, runOptions: options.runOptions });
     return tool;
   }
@@ -129,8 +137,8 @@ export interface AgentAsToolOptions<TAgent extends Agent<any, any>> {
 /**
  * @deprecated Use `agent.asTool({ toolName, toolDescription, customOutputExtractor })`. This returns
  * that tool, and will be removed in a later release. It also accepts an agent from another copy of
- * `@openai/agents-core`, whose own `agent.asTool()` tools the runner rejects, so moving to
- * `agent.asTool()` needs a single copy of the package.
+ * `@openai/agents-core`, unless its class overrides `asTool()`. The runner rejects the `agent.asTool()`
+ * tools of such agents, so moving them to `agent.asTool()` needs a single copy of the package.
  */
 export function agentAsTool<TAgent extends Agent<any, any>>(
   agent: TAgent,

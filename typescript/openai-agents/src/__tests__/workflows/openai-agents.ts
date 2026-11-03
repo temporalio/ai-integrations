@@ -351,6 +351,8 @@ export type RunningAgentRejection =
   | 'input-builder-model-provider'
   | 'tool-start-clear-model-provider'
   | 'tool-start-memory-session'
+  | 'tool-start-tracing-key'
+  | 'tool-start-run-config-tracing-key'
   | 'tool-option-model-provider-undefined'
   | 'tool-start-run-model-name';
 
@@ -362,7 +364,7 @@ export type RunningAgentRejection =
  * The `*-model-provider-undefined` and `-clear-` kinds remove the runner's provider with an explicit
  * `modelProvider: undefined`, which upstream spreads over the inherited one; a registered default
  * provider would then run the inline model. `tool-start-memory-session` sets a `MemorySession` in the
- * tool's `runOptions`.
+ * tool's `runOptions`, and the `*-tracing-key` kinds a tracing key in its `runOptions` or `runConfig`.
  * Returns the run's failure, or its output when a nested run's failure became the tool's output.
  */
 export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection): Promise<string> {
@@ -401,20 +403,24 @@ export async function runningAgentRejectedWorkflow(kind: RunningAgentRejection):
     kind === 'input-builder-model-provider' ||
     kind === 'tool-start-clear-model-provider' ||
     kind === 'tool-start-memory-session' ||
+    kind === 'tool-start-tracing-key' ||
+    kind === 'tool-start-run-config-tracing-key' ||
     kind === 'tool-option-model-provider-undefined' ||
     kind === 'tool-start-run-model-name'
   ) {
     setDefaultModelProvider({ getModel: () => inlineModel });
     // The run model reaches `Nested` only through the tool's runConfig, which the changes replace.
     const modelLess = new Agent({ name: 'Nested', instructions: 'Answer as nested.' });
-    const runConfig: { model?: string | Model; modelProvider?: ModelProvider } =
+    const runConfig: { model?: string | Model; modelProvider?: ModelProvider; tracing?: { apiKey: string } } =
       kind === 'tool-option-model-provider-undefined'
         ? { model: 'nested-run-model', modelProvider: undefined }
         : { model: 'nested-run-model' };
-    const runOptions: { session?: MemorySession } = {};
+    const runOptions: { session?: MemorySession; tracing?: { apiKey: string } } = {};
     const change = () => {
       if (kind === 'tool-start-run-model-object') runConfig.model = inlineModel;
       else if (kind === 'tool-start-memory-session') runOptions.session = new MemorySession();
+      else if (kind === 'tool-start-tracing-key') runOptions.tracing = { apiKey: 'sk-tool' };
+      else if (kind === 'tool-start-run-config-tracing-key') runConfig.tracing = { apiKey: 'sk-tool' };
       else if (kind === 'tool-start-run-model-name') runConfig.model = 'changed-run-model';
       else if (kind === 'tool-start-clear-model-provider') runConfig.modelProvider = undefined;
       else if (kind !== 'tool-option-model-provider-undefined')
@@ -896,6 +902,8 @@ export interface ImplicitSettingsCase {
   agentSettings?: ModelSettings;
   /** Clear the `reasoning` and `text` defaults with run settings set to `undefined`. */
   clearDefaults?: boolean;
+  /** Clear the `reasoning.effort` and `text.verbosity` defaults with nested run settings set to `undefined`. */
+  clearNestedDefaults?: boolean;
   /** `Unnamed` calls its `echo` tool before it answers. */
   callsTool?: boolean;
 }
@@ -925,9 +933,10 @@ export async function implicitModelSettingsWorkflow(input: ImplicitSettingsCase)
           tools: [unnamed.asTool({ toolName: 'ask_unnamed' })],
           toolUseBehavior: 'stop_on_first_tool',
         });
-  const modelSettings = input.clearDefaults
-    ? { ...input.runSettings, reasoning: undefined, text: undefined }
-    : input.runSettings;
+  let modelSettings = input.runSettings;
+  if (input.clearDefaults) modelSettings = { ...modelSettings, reasoning: undefined, text: undefined };
+  if (input.clearNestedDefaults)
+    modelSettings = { ...modelSettings, reasoning: { effort: undefined }, text: { verbosity: undefined } };
   return (await new TemporalOpenAIRunner().run(agent, 'go', { runConfig: { modelSettings } })).finalOutput ?? '';
 }
 
@@ -955,7 +964,9 @@ export type TracingKeyEntryPoint =
   | 'withTrace'
   | 'withTraceOnly'
   | 'traceContext'
-  | 'activity';
+  | 'activity'
+  | 'asToolRunOptions'
+  | 'asToolRunConfig';
 
 export async function tracingKeyRefusedWorkflow(entryPoint: TracingKeyEntryPoint): Promise<string> {
   const agent = new Agent({
@@ -997,6 +1008,12 @@ export async function tracingKeyRefusedWorkflow(entryPoint: TracingKeyEntryPoint
         break;
       case 'activity':
         await withTraceContext({ trace: keyedTrace() }, () => notRegistered());
+        break;
+      case 'asToolRunOptions':
+        agent.asTool({ toolName: 'ask', runOptions: { tracing: { apiKey: 'sk-tool' } } });
+        break;
+      case 'asToolRunConfig':
+        agent.asTool({ toolName: 'ask', runConfig: { tracing: { apiKey: 'sk-tool' } } });
         break;
     }
   } catch (e) {
