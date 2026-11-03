@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast, get_origin, get_type_hints
 
 import nexusrpc
 import pydantic
@@ -74,6 +74,7 @@ from openai.types.responses import (
     ResponseFunctionWebSearch,
     ResponseInputTextParam,
     ResponseOutputMessage,
+    ResponseOutputMessageParam,
 )
 from openai.types.responses.response_file_search_tool_call import Result
 from openai.types.responses.response_function_web_search import ActionSearch
@@ -84,6 +85,7 @@ from openai.types.responses.response_output_item import (
 )
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 from openai.types.shared import Reasoning
+from openai.types.shared_params import CompoundFilter
 from pydantic import ConfigDict, Field, TypeAdapter
 
 import temporalio.openai_agents as openai_agents
@@ -1288,6 +1290,20 @@ class OwnCustomToolOutputModel(pydantic.BaseModel):
     item: OwnCustomToolOutput
 
 
+class OwnCustomToolOutputStrictModel(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
+    item: OwnCustomToolOutput
+
+
+class OwnExtraValuesModel(pydantic.BaseModel):
+    model_config = ConfigDict(extra="allow")
+    __pydantic_extra__: dict[str, Iterable[int]] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
+        init=False
+    )
+
+
 @dataclass
 class PricedOrder:
     id: str
@@ -1347,6 +1363,23 @@ def _dated_items(state: Any) -> Any:
             lambda state: state.item["output"],
             "pong",
         ),
+        (
+            OwnCustomToolOutputStrictModel(
+                carried_at=CARRIED_AT,
+                item={
+                    "type": "custom_tool_call_output",
+                    "call_id": "c1",
+                    "output": "pong",
+                },
+            ),
+            lambda state: (state.carried_at, state.item["output"]),
+            (CARRIED_AT, "pong"),
+        ),
+        (
+            OwnExtraValuesModel.model_validate({"values": [1, 2]}),
+            lambda state: state.__pydantic_extra__["values"],
+            [1, 2],
+        ),
         (_priced_order(), lambda state: state.id, "o-1"),
     ],
     ids=[
@@ -1357,6 +1390,8 @@ def _dated_items(state: Any) -> Any:
         "extra-model",
         "own-iterable-field",
         "own-str-or-iterable",
+        "strict-own-str-or-iterable",
+        "own-iterable-extra-field",
         "unset-init-false-field",
     ],
 )
@@ -1376,6 +1411,7 @@ def test_state_decodes_iterables_as_lists(carried: Any, read: Any, expected: Any
 class CarriedItemsWithResponse:
     last_message: ResponseOutputMessage
     input_items: list[TResponseInputItem]
+    values: Iterable[int]
 
 
 def test_carried_input_items_decode_as_lists_in_lenient_fallback():
@@ -1385,14 +1421,22 @@ def test_carried_input_items_decode_as_lists_in_lenient_fallback():
     payload = Payload(
         metadata={"encoding": b"json/plain"},
         data=json.dumps(
-            {"last_message": message, "input_items": CARRIED_ITEMS}
+            {"last_message": message, "input_items": CARRIED_ITEMS, "values": [1, 2]}
         ).encode(),
     )
     converter = OpenAIPayloadConverter()
     (state,) = converter.from_payloads([payload], [CarriedItemsWithResponse])
     assert type(state) is CarriedItemsWithResponse
     assert state.input_items == CARRIED_ITEMS
+    assert state.values == [1, 2]
     copy.deepcopy(state)
+
+
+def test_type_swap_leaves_tool_definitions():
+    # Requests that take tool definitions, such as vector_stores.search
+    # filters, must still turn iterators into lists.
+    assert get_origin(get_type_hints(CompoundFilter)["filters"]) is Iterable
+    assert get_origin(get_type_hints(ResponseOutputMessageParam)["content"]) is list
 
 
 class CarriedChatState(pydantic.BaseModel):

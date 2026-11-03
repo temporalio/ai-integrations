@@ -271,6 +271,8 @@ def _list_decoded_iterators(value: typing.Any) -> typing.Any:
             object.__setattr__(
                 value, name, _list_decoded_iterators(getattr(value, name))
             )
+        if value.__pydantic_extra__:
+            _list_decoded_iterators(value.__pydantic_extra__)
     elif dataclasses.is_dataclass(value) and not isinstance(value, type):
         for field in dataclasses.fields(value):
             # Pydantic leaves an init=False field unset.
@@ -294,8 +296,8 @@ class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
     ``content``, as one-shot iterators. The Agents SDK deep-copies run input
     and cannot copy them, and reading one empties it, so they are decoded as
     lists instead. ``_openai_types`` changes the openai item types so that
-    pydantic builds lists itself; this walk covers classes built before the
-    plugin was imported.
+    pydantic builds lists itself; this walk covers the types it does not
+    reach, such as classes built before the plugin was imported.
     """
 
     def from_payload(
@@ -312,14 +314,30 @@ class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
                 # In JSON mode, pydantic decodes a string for
                 # ``Union[str, Iterable[...]]``, such as a custom tool's output,
                 # as an iterator over its characters. Python mode keeps the string.
-                value = self._type_adapter(type_hint).validate_python(
-                    json.loads(payload.data)
+                # JSON mode accepted everything else, so don't apply strict mode,
+                # which rejects JSON strings for types such as datetime.
+                value = self._adapter(type_hint).validate_python(
+                    json.loads(payload.data), strict=False
                 )
                 return _list_decoded_iterators(value)
         except pydantic.ValidationError:
             if type_hint is None:
                 raise
-            return _lenient_construct(type_hint, json.loads(payload.data))
+            return _list_decoded_iterators(
+                _lenient_construct(type_hint, json.loads(payload.data))
+            )
+
+    def _adapter(self, type_hint: typing.Any) -> pydantic.TypeAdapter[typing.Any]:
+        """Return the cached type adapter, as the base class does."""
+        try:
+            return self._type_adapter(type_hint)
+        except TypeError:
+            # An unhashable hint bypasses the cache; any other TypeError is real.
+            try:
+                hash(type_hint)
+            except TypeError:
+                return pydantic.TypeAdapter(type_hint)
+            raise
 
 
 class OpenAIPayloadConverter(CompositePayloadConverter):
