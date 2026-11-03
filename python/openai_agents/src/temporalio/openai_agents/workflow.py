@@ -4,6 +4,7 @@ import dataclasses
 import functools
 import inspect
 import json
+import re
 import sys
 import types
 import typing
@@ -165,10 +166,18 @@ def _type_hints(fn: Callable) -> dict[str, Any]:
 
     Unlike ``typing.get_type_hints(fn)`` on Python 3.10, this doesn't wrap a parameter with a
     ``None`` default in ``Optional``, which would hide a context type or ``Annotated`` metadata.
+    Like it, this resolves the function's own type parameters, such as ``T`` in ``def f[T]``,
+    and returns no hints for a function marked with ``@typing.no_type_check``.
     """
+    # Check before reading __annotations__, which evaluates them on Python 3.14.
+    if getattr(fn, "__no_type_check__", None):
+        return {}
     return typing.get_type_hints(
-        types.SimpleNamespace(__annotations__=dict(fn.__annotations__)),
+        # inspect.get_annotations also reads __annotate__, which Python 3.14's update_wrapper
+        # copies to a decorator in place of __annotations__.
+        types.SimpleNamespace(__annotations__=dict(inspect.get_annotations(fn))),
         globalns=getattr(inspect.unwrap(fn), "__globals__", {}),
+        localns={p.__name__: p for p in getattr(fn, "__type_params__", ())},
         include_extras=True,
     )
 
@@ -186,11 +195,25 @@ def _class_doc(cls: type) -> str | None:
     return None if doc == generated else doc
 
 
+# The Google-style section headers the Agents SDK looks for. Its docstring parser reads one on a
+# docstring's first line as plain text, so a description that starts with one is no summary.
+_GOOGLE_SECTION = re.compile(r"(Args|Arguments|Returns|Raises):\s*$")
+
+
+def _summary(description: str | None) -> str | None:
+    """Return ``description``, unless it is empty or starts with a Google section header."""
+    if not description or _GOOGLE_SECTION.match(description.splitlines()[0]):
+        return None
+    return description
+
+
 def _doc_summary(doc: str) -> str | None:
     """Return the summary function_schema would take from a docstring."""
-    return generate_func_documentation(
-        _tool_stand_in(lambda: None, "summary", {}, doc)
-    ).description
+    return _summary(
+        generate_func_documentation(
+            _tool_stand_in(lambda: None, "summary", {}, doc)
+        ).description
+    )
 
 
 def _tool_stand_in(
@@ -253,10 +276,12 @@ def activity_as_tool(
         An OpenAI agent tool that wraps the provided activity.
 
     Raises:
-        ValueError: If the function is not properly decorated as a Temporal activity,
-            or is a callable-class activity passed as an instance, or whose ``__call__`` is
-            not a function, staticmethod, classmethod or ``functools.partialmethod``, can't
-            be read, or takes keyword-only arguments; or if the activity takes ``**kwargs``.
+        ValueError: If the function is not decorated as a Temporal activity, or is a dynamic
+            activity, which has no name; if it is a callable-class activity passed as an
+            instance, or whose ``__call__`` is not a function, staticmethod, classmethod or
+            ``functools.partialmethod``, can't be read, or takes keyword-only arguments; or if
+            the activity takes ``**kwargs``. Errors from building the schema, such as the Agents
+            SDK's ``UserError`` or pydantic's schema errors, propagate unchanged.
 
     Example:
         >>> @activity.defn
@@ -342,13 +367,14 @@ def activity_as_tool(
     ):
         raise ValueError(f"Activity {fn.__name__} cannot take **kwargs")
     schema = function_schema(fn)
-    if owner is not None and not schema.description:
-        # A __call__ docstring with only sections, such as Args:, has no summary; use the
-        # class's own.
+    if owner is not None and not _summary(schema.description):
+        # A __call__ docstring with only sections, such as `:param:` fields, a NumPy Parameters
+        # section or a Google Args: section, has no summary; use the class's own. Keep it apart
+        # from the summary argument, which labels the scheduled activity.
         class_doc = _class_doc(owner)
-        summary = _doc_summary(class_doc) if class_doc else None
-        if summary:
-            schema = function_schema(fn, description_override=summary)
+        class_summary = _doc_summary(class_doc) if class_doc else None
+        if class_summary:
+            schema = function_schema(fn, description_override=class_summary)
 
     async def run_activity(ctx: RunContextWrapper[Any], input: str) -> Any:
         try:

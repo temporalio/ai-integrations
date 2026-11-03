@@ -5,10 +5,19 @@ import json
 import os
 import sys
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple, TypeVar, cast
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    NamedTuple,
+    TypeVar,
+    cast,
+    no_type_check,
+)
 
 import nexusrpc
 import pydantic
@@ -87,7 +96,7 @@ from pydantic import ConfigDict, Field, TypeAdapter
 import temporalio.openai_agents as openai_agents
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
-from temporalio.common import RetryPolicy
+from temporalio.common import RawValue, RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import (
     ActivityError,
@@ -674,6 +683,14 @@ class WeatherAssignedService:
     get_weather = get_weather_shared
 
 
+class WeatherCachedService:
+    # On Python 3.14, update_wrapper gives the cache __annotate__ instead of __annotations__.
+    @activity.defn
+    @functools.lru_cache
+    def get_weather(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
 @activity.defn
 @dataclass
 class ActivityWeatherCustomInit:
@@ -683,6 +700,21 @@ class ActivityWeatherCustomInit:
         self.count = int(count)
 
     async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherNoTypeCheck:
+    # typing.get_type_hints skips these annotations, so the unknown one is never resolved.
+    @no_type_check
+    async def __call__(self, city: str) -> "UnknownReturn":  # type: ignore # noqa: F821
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+class WeatherNoTypeCheckService:
+    @activity.defn
+    @no_type_check
+    async def get_weather(self, city: str) -> "UnknownReturn":  # type: ignore # noqa: F821
         return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
 
 
@@ -716,12 +748,15 @@ class ActivityWeatherCustomInit:
         (WeatherCallService.__call__, "city", ""),
         (WeatherCallService.get_weather, "city", ""),
         (WeatherAssignedService.get_weather, "city", ""),
+        (WeatherCachedService.get_weather, "city", ""),
         # Not the docstring dataclasses writes from the handwritten __init__.
         (ActivityWeatherCustomInit, "city", ""),
         # Not the docstring namedtuple writes.
         (ActivityWeatherTuple, "city", ""),
         # A __doc__ that isn't a string is no description.
         (ActivityWeatherDocProperty, "city", ""),
+        (ActivityWeatherNoTypeCheck, "city", ""),
+        (WeatherNoTypeCheckService.get_weather, "city", ""),
     ],
 )
 def test_callable_class_tool_schema(target: Any, parameter: str, description: str):
@@ -735,16 +770,101 @@ def test_callable_class_tool_schema(target: Any, parameter: str, description: st
     assert tool.description == description
 
 
-def test_callable_class_tool_summary_from_class_docstring():
-    # A __call__ docstring with only parameters has no summary, so the class's is used.
+@activity.defn
+class ActivityWeatherGoogleArgsCall:
+    """
+    Get the weather for a given city.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        Args:
+            city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherArgsOnlyClassDoc:
+    """
+    Args:
+        conditions: Default conditions.
+    """
+
+    def __init__(self, conditions: str = "Sunny") -> None:
+        self.conditions = conditions
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        :param city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "cls, description, city_description",
+    [
+        # A __call__ docstring with only parameters has no summary, so the class's is used.
+        (
+            ActivityWeatherSectionsOnlyCall,
+            "Get the weather for a given city.",
+            "Name of the city.",
+        ),
+        # The Agents SDK reads a leading Google Args: section as text, not a summary.
+        (ActivityWeatherGoogleArgsCall, "Get the weather for a given city.", None),
+        # A class docstring with only Args: has no summary either.
+        (ActivityWeatherArgsOnlyClassDoc, "", "Name of the city."),
+    ],
+)
+def test_callable_class_tool_summary_from_class_docstring(
+    cls: type, description: str, city_description: str | None
+):
     tool = openai_agents.workflow.activity_as_tool(
-        ActivityWeatherSectionsOnlyCall, start_to_close_timeout=timedelta(seconds=10)
+        cls, start_to_close_timeout=timedelta(seconds=10)
     )
     assert isinstance(tool, FunctionTool)
-    assert tool.description == "Get the weather for a given city."
-    assert tool.params_json_schema["properties"]["city"]["description"] == (
-        "Name of the city."
+    assert tool.description == description
+    assert tool.params_json_schema["properties"]["city"].get("description") == (
+        city_description
     )
+
+
+@pytest.mark.parametrize(
+    "target, summary, scheduled_summary",
+    [
+        # The class's summary labels the activity only when the caller passes none.
+        (ActivityWeatherSectionsOnlyCall, None, "Get the weather for a given city."),
+        (ActivityWeatherSectionsOnlyCall, "Caller summary", "Caller summary"),
+        (ActivityWeatherDataclass, None, None),
+        (ActivityWeatherDataclass, "Caller summary", "Caller summary"),
+    ],
+)
+async def test_callable_class_tool_activity_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    target: Any,
+    summary: str | None,
+    scheduled_summary: str | None,
+):
+    summaries: list[str | None] = []
+
+    async def execute_activity(*args: Any, **kwargs: Any) -> str:  # type: ignore[reportUnusedParameter]
+        summaries.append(kwargs["summary"])
+        return "Sunny"
+
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    tool = openai_agents.workflow.activity_as_tool(
+        target, start_to_close_timeout=timedelta(seconds=10), summary=summary
+    )
+    assert isinstance(tool, FunctionTool)
+    arguments = '{"city":"Tokyo"}'
+    context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call-get-weather",
+        tool_arguments=arguments,
+    )
+    await tool.on_invoke_tool(context, arguments)
+    assert summaries == [scheduled_summary]
 
 
 class WeatherDefaultsService:
@@ -779,6 +899,15 @@ def test_method_tool_with_none_defaults(target: Any, parameters: list[str]):
     )
     assert isinstance(tool, FunctionTool)
     assert list(tool.params_json_schema["properties"]) == parameters
+
+
+async def get_weather_undecorated(city: str) -> Weather:
+    return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn(dynamic=True)
+async def get_weather_dynamic(args: Sequence[RawValue]) -> Weather:  # type: ignore[reportUnusedParameter]
+    return Weather(city="Tokyo", temperature_range="14-20C", conditions="Sunny")
 
 
 @activity.defn
@@ -830,6 +959,9 @@ class ActivityWeatherBadAnnotation(ActivityWeatherClass):
 @pytest.mark.parametrize(
     "target, message",
     [
+        # These two raised an ApplicationError that failed the run before this change.
+        (get_weather_undecorated, "Bare function without tool and activity decorators"),
+        (get_weather_dynamic, "must have a name to be made into a tool"),
         (ActivityWeatherNoCall, "needs a __call__ that is a function"),
         (ActivityWeatherNoParamCall, "invalid method signature"),
         (ActivityWeatherKeywordOnlyCall, "cannot take keyword-only arguments"),
@@ -878,6 +1010,35 @@ def test_callable_class_tool_on_python_314():
             activity.defn(ActivityWeatherPartialCall),
             start_to_close_timeout=timedelta(seconds=10),
         )
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="only Python 3.12 can define these functions"
+)
+def test_generic_tool_on_python_312():
+    # Postponed annotations name the function's own type parameter.
+    namespace: dict[str, Any] = {"activity": activity, "Weather": Weather}
+    exec(
+        "from __future__ import annotations\n"
+        "@activity.defn\n"
+        "class ActivityWeatherGenericCall:\n"
+        "    async def __call__[T: str](self, cities: list[T]) -> Weather: ...\n"
+        "class WeatherGenericService:\n"
+        "    @activity.defn\n"
+        "    async def get_weather[T: str](self, cities: list[T]) -> Weather: ...\n",
+        namespace,
+    )
+    for target in [
+        namespace["ActivityWeatherGenericCall"],
+        namespace["WeatherGenericService"].get_weather,
+    ]:
+        tool = openai_agents.workflow.activity_as_tool(
+            target, start_to_close_timeout=timedelta(seconds=10)
+        )
+        assert isinstance(tool, FunctionTool)
+        assert tool.params_json_schema["properties"] == {
+            "cities": {"items": {"type": "string"}, "title": "Cities", "type": "array"}
+        }
 
 
 @activity.defn
