@@ -350,6 +350,32 @@ worker = Worker(
 )
 ```
 
+If the activity fails, the agent run fails with a retryable `AgentsWorkflowError`.
+This is how plain Temporal treats an activity failure that the workflow does not catch.
+So a workflow retry policy reruns the whole agent run, model calls included, even when the activity raised a non-retryable `ApplicationError`.
+To stop the rerun, raise a non-retryable `ApplicationError` in workflow code.
+For example, call the activity from a `@function_tool` and raise its non-retryable error again from there:
+
+```python
+from agents import function_tool
+from temporalio.exceptions import ActivityError, ApplicationError
+
+@function_tool(failure_error_function=None)
+async def get_weather_or_fail(city: str) -> Weather:
+    """Get the weather for a given city."""
+    try:
+        return await workflow.execute_activity(
+            get_weather, city, start_to_close_timeout=timedelta(seconds=10)
+        )
+    except ActivityError as e:
+        if isinstance(e.cause, ApplicationError) and e.cause.non_retryable:
+            raise ApplicationError(e.cause.message, non_retryable=True) from e
+        raise
+```
+
+`failure_error_function=None` makes the error fail the run.
+With the default, the tool returns the error text to the model instead.
+
 ### Calling OpenAI Agents Tools inside Temporal Workflows
 
 For simple computations that don't involve external calls, you can call the tool directly from the workflow by using the standard OpenAI Agents SDK `@function_tool` decorator.
