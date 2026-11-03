@@ -19,6 +19,7 @@ from temporalio.converter import (
     DataConverter,
     DefaultFailureConverter,
     DefaultFailureConverterWithEncodedAttributes,
+    FailureConverter,
     PayloadConverter,
 )
 from temporalio.exceptions import ApplicationError
@@ -263,6 +264,37 @@ def test_custom_payload_converter_keeps_caller_failure_decoding(target: str) -> 
         again.failure_converter.from_failure(failure, again.payload_converter),
         DomainError,
     )
+
+
+class MinimalFailureConverter(FailureConverter):
+    def to_failure(
+        self,
+        exception: BaseException,
+        payload_converter: PayloadConverter,
+        failure: Failure,
+    ) -> None:
+        failure.message = str(exception)
+        failure.application_failure_info.type = type(exception).__name__
+
+    def from_failure(
+        self, failure: Failure, payload_converter: PayloadConverter
+    ) -> BaseException:
+        return DomainError(failure.message)
+
+
+@pytest.mark.parametrize("target", ["client", "replayer"])
+def test_minimal_failure_converter_with_custom_payload_converter_is_kept(
+    target: str,
+) -> None:
+    supplied = replace(
+        pydantic_data_converter, failure_converter_class=MinimalFailureConverter
+    )
+    configured = _configure(target, supplied)
+    assert configured.failure_converter_class is MinimalFailureConverter
+    decoded = configured.failure_converter.from_failure(
+        Failure(message="x"), configured.payload_converter
+    )
+    assert isinstance(decoded, DomainError)
 
 
 def test_mcp_factory_that_returns_a_strands_client_fails_retryably() -> None:
