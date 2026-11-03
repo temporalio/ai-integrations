@@ -596,9 +596,13 @@ A run follows its session this way only once it records the patch marker
 `openai-agents-stateful-mcp-session-watch`, which it does at its first
 operation whose `config` has neither timeout. Histories recorded on an earlier
 version have no marker, so they schedule such operations as before and replay
-on this version; a run that continues on this version records the marker at its
-next such operation. A run with the marker fails replay on an earlier version,
-so do not roll back while such runs are open.
+on this version. A run that continues on this version records the marker at its
+next such operation only if it scheduled none before the upgrade. Otherwise the
+Temporal Python SDK keeps the decision it made while replaying that earlier
+operation, so the run never records the marker and schedules such operations as
+before until it ends: one scheduled after its session ended waits until the
+caller cancels it or the run ends. A run with the marker fails replay on an
+earlier version, so do not roll back while such runs are open.
 
 ### Hosted MCP Tool
 
