@@ -55,6 +55,8 @@ from agents import (
     Runner,
     SQLiteSession,
     Tool,
+    ToolGuardrailFunctionOutput,
+    ToolInputGuardrailData,
     TResponseInputItem,
     Usage,
     function_tool,
@@ -64,6 +66,7 @@ from agents import (
     set_default_openai_api,
     set_default_openai_client,
     set_default_openai_key,
+    tool_input_guardrail,
     trace,
 )
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
@@ -4113,9 +4116,20 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
                 )
 
 
+@tool_input_guardrail
+def reject_tool_input(_data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
+    return ToolGuardrailFunctionOutput.reject_content("blocked")
+
+
 @pytest.mark.parametrize(
     "setting",
-    ["require_approval", "instance_evaluator", "tool_filter", "tool_meta_resolver"],
+    [
+        "require_approval",
+        "instance_evaluator",
+        "tool_filter",
+        "tool_meta_resolver",
+        "tool_input_guardrails",
+    ],
 )
 @pytest.mark.parametrize("stateful", [True, False])
 async def test_mcp_server_factory_settings_are_rejected(
@@ -4132,6 +4146,9 @@ async def test_mcp_server_factory_settings_are_rejected(
     elif setting == "tool_meta_resolver":
         tracking_server = get_tracking_server("HelloServer")
         tracking_server.tool_meta_resolver = lambda context: {"tenant": "t-1"}  # type: ignore[attr-defined]
+    elif setting == "tool_input_guardrails":
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server.tool_input_guardrails = [reject_tool_input]  # type: ignore[attr-defined]
     else:
         tracking_server = get_tracking_server("HelloServer")
         tracking_server.tool_filter = lambda context, tool: True  # type: ignore[attr-defined]
@@ -4179,6 +4196,10 @@ async def test_mcp_server_factory_settings_are_rejected(
     if setting == "tool_meta_resolver":
         route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
         assert "'HelloServer' sets tool_meta_resolver" in message
+        assert f"on the server {route}() gives the workflow" in message
+    elif setting == "tool_input_guardrails":
+        route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+        assert "'HelloServer' sets tool_input_guardrails" in message
         assert f"on the server {route}() gives the workflow" in message
     elif setting != "tool_filter":
         route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
