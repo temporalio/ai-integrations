@@ -44,12 +44,10 @@ def activity_as_tool(
 
     Raises:
         ValueError: If ``activity_fn`` is not a named activity, or is an
-            instance of a callable-class activity; if it is a class whose
+            instance of a callable-class activity; or if it is a class whose
             ``__call__`` is not a function, staticmethod, classmethod or
             ``functools.partialmethod``, can't be read, or takes ``*args``,
-            keyword-only arguments or ``**kwargs``; or if its first parameter
-            is ``self`` and it is defined in a class that can't be reached by
-            name, such as one a function defines.
+            keyword-only arguments or ``**kwargs``.
     """
     options: dict[str, Any] = {
         "task_queue": task_queue,

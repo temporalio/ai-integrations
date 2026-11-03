@@ -5,12 +5,11 @@ import sys
 import typing
 from collections.abc import Callable
 from dataclasses import is_dataclass
-from typing import Annotated, Any
+from typing import Any
 
 if sys.version_info >= (3, 14):
     import annotationlib  # type: ignore[reportUnreachable]
 
-from pydantic import BaseModel, Field, create_model
 from strands.interrupt import Interrupt
 from strands.tools.decorator import FunctionToolMetadata
 from strands.types._events import ToolInterruptEvent, ToolResultEvent
@@ -40,15 +39,16 @@ class TemporalActivityTool(AgentTool):
             )
         self._activity_name = defn.name
         self._options = options
-        if inspect.isclass(activity_fn):
-            # The stand-in's parameters are already bound: none is a receiver.
-            activity_fn = _call_stand_in(activity_fn)
+        is_class = inspect.isclass(activity_fn)
+        if is_class:
+            activity_fn = _call_stand_in(typing.cast(type, activity_fn))
         signature = inspect.signature(activity_fn)
         params = list(signature.parameters.values())
-        # A first parameter named `self` of a method passed as Class.method is
-        # its receiver, however it is annotated: the worker registers the bound
-        # method, so its instance supplies it. A staticmethod has no receiver.
-        if params and params[0].name == "self" and _defined_as_method(activity_fn):
+        # A first parameter named `self` is the receiver of a method passed as
+        # Class.method, however it is annotated: the worker registers the bound
+        # method, so its instance supplies it. Strands leaves `self` out of the
+        # tool spec too. The stand-in's parameters are already bound.
+        if not is_class and params and params[0].name == "self":
             params = params[1:]
         # The model's input binds by name; the activity still gets it by position.
         self._signature = signature.replace(
@@ -59,7 +59,7 @@ class TemporalActivityTool(AgentTool):
                 for p in params
             ]
         )
-        spec = _ActivityToolMetadata(activity_fn, self._signature).extract_metadata()
+        spec = FunctionToolMetadata(activity_fn).extract_metadata()
         spec["name"] = self._activity_name
         self._spec: ToolSpec = spec
 
@@ -118,76 +118,6 @@ class TemporalActivityTool(AgentTool):
                 content=[{"text": _to_text(result)}],
             )
         )
-
-
-class _ActivityToolMetadata(FunctionToolMetadata):
-    """Builds the tool spec from every parameter of the tool's binding signature.
-
-    Strands leaves parameters named ``self``, ``cls`` and ``agent`` out of the
-    spec because it supplies them to its own tools. The tool sends the activity
-    only the model's input, so they are inputs too.
-    """
-
-    def __init__(self, func: Callable, signature: inspect.Signature) -> None:
-        # Set before the base class builds the input model.
-        self._inputs = signature.parameters
-        super().__init__(func)
-
-    def _create_input_model(self) -> type[BaseModel]:
-        # Pydantic refuses some field names, such as ones with a leading
-        # underscore, so each field is named after its position and aliased to
-        # its parameter: the schema's properties keep the parameters' names.
-        fields: dict[str, Any] = {}
-        for i, (name, param) in enumerate(self._inputs.items()):
-            annotation = param.annotation
-            if isinstance(annotation, str):
-                annotation = self.type_hints.get(name, annotation)
-            if annotation is inspect.Parameter.empty:
-                annotation = Any
-            default = ... if param.default is inspect.Parameter.empty else param.default
-            field_type, field = self._extract_annotated_metadata(
-                annotation, name, default
-            )
-            fields[f"input_{i}"] = (Annotated[field_type, Field(alias=name)], field)
-        # Pydantic resolves forward references left in the types, such as the
-        # one in list["Parcel"], in the model's module: the activity's.
-        return create_model(
-            f"{self.func.__name__.capitalize()}Tool",
-            __module__=self.func.__module__,
-            **fields,
-        )
-
-
-def _defined_as_method(fn: Any) -> bool:
-    """Return whether ``fn`` is a function a class body defines as a method.
-
-    The worker registers such a function bound to an instance, unlike one the
-    class wraps in ``staticmethod``. Only the class tells them apart, so it is
-    found by the function's module and qualname.
-
-    Raises:
-        ValueError: If ``fn`` is defined in a class that can't be reached by
-            name, such as one a function defines.
-    """
-    if not inspect.isfunction(fn):
-        return False
-    scopes = fn.__qualname__.split(".")
-    if len(scopes) < 2 or scopes[-2] == "<locals>":
-        return False
-    owner: Any = sys.modules.get(fn.__module__)
-    for scope in scopes[:-1]:
-        owner = getattr(owner, "__dict__", {}).get(scope)
-    attr = vars(owner).get(scopes[-1]) if inspect.isclass(owner) else None
-    if isinstance(attr, staticmethod) and attr.__func__ is fn:
-        return False
-    if attr is fn:
-        return True
-    raise ValueError(
-        f"Cannot tell whether the first parameter 'self' of {fn.__qualname__} is"
-        f" a receiver: its class can't be reached by name in {fn.__module__}."
-        " Define the class at module level, pass a bound method, or rename the"
-        " parameter"
-    )
 
 
 def _call_function(method: Any) -> Callable | None:
@@ -304,7 +234,6 @@ def _call_stand_in(cls: type) -> Callable:
             raise ValueError(message)
     stand_in = functools.partial(call)
     setattr(stand_in, "__name__", cls.__name__)
-    setattr(stand_in, "__module__", func.__module__)
     stand_in.__annotations__ = hints
     # __call__'s own docstring, else the class's, else that of a __call__ it
     # inherits.
