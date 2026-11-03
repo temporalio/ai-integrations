@@ -180,7 +180,8 @@ and `projectName` are mutually exclusive. Agent addressing is a LangSmith beta
 feature that must be enabled for the workspace.
 
 Native `traceable(fn, { address: ... })` and runtime traceable configuration
-also select destinations for new root traces inside Workflows. Child runs
+also select destinations for new root traces in Workflows, Activities, and
+Nexus handlers. Child runs
 inherit their parent's destination, following LangSmith's native rules. Plugin
 defaults apply when a new root names no destination.
 Destinations follow the trace through Activities, child Workflows, and Nexus,
@@ -234,7 +235,7 @@ constructor defaults and write methods within Workflow handlers: IDs use an
 independent deterministic random stream, timestamps use Workflow time, and
 writes go through the Worker sink and are suppressed during replay. Root runs
 remain real roots; LangSmith controls child creation and replica inheritance.
-Activities and code outside Workflows use LangSmith's normal behavior.
+Activities use LangSmith's native IDs and write methods.
 
 ## Process-wide effects to be aware of
 
@@ -244,6 +245,12 @@ Activities and code outside Workflows use LangSmith's normal behavior.
   backed by the SDK-provided `AsyncLocalStorage`. This is what lets unchanged
   `traceable` calls find their parent inside a Workflow. It is scoped to the
   workflow bundle and does not affect your client/worker process context.
+- **Worker routing defaults.** The plugin wraps LangSmith's destination and
+  shared-client hooks. Defaults apply only within parentless Activity and
+  Nexus handlers when `addTemporalRuns: false`; each call carries its own
+  destination, client, and replicas in async context. No placeholder run is
+  installed. Explicit run configuration and native child inheritance take
+  precedence.
 
 ## Composing with other plugins
 

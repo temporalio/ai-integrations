@@ -22,10 +22,10 @@ import {
   runCancelNexusHandlerRunName,
   runStartNexusHandlerRunName,
   runTreeFromContext,
-  rootRunTree,
 } from './run-tree';
 import type { EmitterConfig } from './sinks';
 import { bindReplicaCredentials, destination } from './routing';
+import { withRunTreeDefaults } from './worker-run-tree';
 
 /**
  * Reconstruct the propagated parent run from a LangSmith trace context, wired to
@@ -92,8 +92,8 @@ export function createActivityInboundInterceptor(config: EmitterConfig): Activit
       if (!config.addTemporalRuns) {
         // Propagation only: nest the user's body `traceable` runs under the
         // reconstructed parent without emitting a Temporal-operation run.
-        // Without a parent, an invisible factory supplies defaults to independent root traceables.
-        return withRunTree(parent ?? rootRunTree(config), () => next(input));
+        // Without a parent, native roots fall back to the plugin's routing defaults.
+        return parent ? withRunTree(parent, () => next(input)) : withRunTreeDefaults(config, () => next(input));
       }
       const activityType = ctx.info.activityType;
       const run = buildRunTree(config, {
@@ -127,7 +127,7 @@ export function createNexusInboundInterceptor(config: EmitterConfig): NexusInbou
     }
     const parent = reconstructParentRun(config, nexusContext(input.ctx.headers));
     if (!config.addTemporalRuns) {
-      return withRunTree(parent ?? rootRunTree(config), () => next(input));
+      return parent ? withRunTree(parent, () => next(input)) : withRunTreeDefaults(config, () => next(input));
     }
     const run = buildRunTree(config, {
       name: nameOf(input.ctx.service, input.ctx.operation),

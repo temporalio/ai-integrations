@@ -227,16 +227,3 @@ export function buildRunTree(config: EmitterConfig, params: RunTreeParams): RunT
     tracingEnabled: true,
   });
 }
-
-/** An invisible worker-side factory gives unparented traceables the plugin's destination and client. */
-export function rootRunTree(config: EmitterConfig): RunTree {
-  const factory = buildRunTree(config, { name: 'temporal-routing-parent', runType: RUN_TYPE.CHAIN, parent: undefined });
-  factory.createChild = (child) => new RunTree({
-    ...child,
-    ...destination(child, factory),
-    replicas: child.replicas ?? factory.replicas,
-    client: config.client,
-    tracingEnabled: true,
-  });
-  return factory;
-}
