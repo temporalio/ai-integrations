@@ -3720,6 +3720,49 @@ async def test_stateful_mcp_server_without_describe_permission(
         assert any("permission to describe" in m for m in messages), messages
 
 
+@pytest.mark.timeout(90)
+async def test_stateful_mcp_server_worker_shutdown_while_closing(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    # Every "may be open" heartbeat hangs in encoding, so the read-back fails at
+    # its deadline and the attempt then waits in close() for those heartbeats.
+    # A worker shutdown during that wait must still let the attempt end.
+    monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
+    monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 60.0)
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        config = client.config()
+        config["data_converter"] = dataclasses.replace(
+            client.data_converter, payload_codec=_StallMayBeOpenCodec()
+        )
+        worker_client = env.applied_on_client(Client(**config))
+        client = env.applied_on_client(client)
+        worker = new_worker(
+            worker_client, McpServerStatefulRetriedWorkflow, max_cached_workflows=0
+        )
+        worker_task = asyncio.create_task(worker.run())
+        handle = await client.start_workflow(
+            McpServerStatefulRetriedWorkflow.run,
+            args=[timedelta(hours=1), timedelta(seconds=5), None],
+            id=f"mcp-server-shutdown-closing-{uuid.uuid4()}",
+            task_queue=worker.task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+        # Past the 2-second deadline, the attempt waits in close().
+        await asyncio.sleep(5)
+
+        async def shut_down() -> None:
+            await worker.shutdown()
+            await worker_task
+
+        await asyncio.wait_for(shut_down(), timeout=20)
+        await handle.terminate()
+
+
 @dataclass
 class _SessionEndedInput:
     case: str
