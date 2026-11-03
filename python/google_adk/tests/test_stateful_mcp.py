@@ -252,13 +252,13 @@ server.run()
 """
 
 
-def _stdio_toolset(server: str) -> McpToolset:
+def _stdio_toolset(server: str, *, timeout: float = 30) -> McpToolset:
     return McpToolset(
         connection_params=StdioConnectionParams(
             server_params=StdioServerParameters(
                 command=sys.executable, args=["-c", server]
             ),
-            timeout=30,
+            timeout=timeout,
         )
     )
 
@@ -266,11 +266,13 @@ def _stdio_toolset(server: str) -> McpToolset:
 @dataclass
 class _ReplacedInput:
     name: str = "stateful_server"
-    heartbeat_timeout: bool = False
+    heartbeat_timeout: float | None = None
+    start_to_close_timeout: float = 20
     schedule_to_start_timeout: bool = True
     session_task_queue: str | None = None
     wait_cancellation: bool = False
     abandon: bool = False
+    wait_for_session_end: bool = False
 
 
 @dataclass
@@ -291,7 +293,7 @@ class StatefulMcpWorkerReplacedWorkflow:
     @workflow.run
     async def run(self, input: _ReplacedInput) -> list[str]:
         config = ActivityConfig(
-            start_to_close_timeout=timedelta(seconds=20),
+            start_to_close_timeout=timedelta(seconds=input.start_to_close_timeout),
             retry_policy=RetryPolicy(maximum_attempts=1),
         )
         if input.schedule_to_start_timeout:
@@ -305,8 +307,10 @@ class StatefulMcpWorkerReplacedWorkflow:
         server_session_config = ActivityConfig(
             start_to_close_timeout=timedelta(hours=1)
         )
-        if input.heartbeat_timeout:
-            server_session_config["heartbeat_timeout"] = timedelta(seconds=5)
+        if input.heartbeat_timeout is not None:
+            server_session_config["heartbeat_timeout"] = timedelta(
+                seconds=input.heartbeat_timeout
+            )
         if input.session_task_queue:
             server_session_config["task_queue"] = input.session_task_queue
         async with TemporalStatefulMcpToolSet(
@@ -317,6 +321,12 @@ class StatefulMcpWorkerReplacedWorkflow:
             except ActivityError:
                 self._listed = []
             await workflow.wait_condition(lambda: self._resume)
+            if input.wait_for_session_end:
+                # A failure in server history can precede workflow delivery.
+                # Wait until the workflow has observed the session ending.
+                session = toolset._connect_handle
+                assert session is not None
+                await workflow.wait_condition(session.done)
             try:
                 return [t.name for t in await toolset.get_tools()]
             except ApplicationError as err:
@@ -414,6 +424,7 @@ class _DelayMayBeOpenCodec(PayloadCodec):
         return list(payloads)
 
 
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize(
     "case",
     [
@@ -438,6 +449,10 @@ async def test_stateful_session_after_worker_replaced(
         # The attempt stops waiting for a heartbeat still being encoded before
         # it finishes, and the failure is encoded after it would.
         monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 0.5)
+    # Only the test watchdog should expire during graceful replacement.
+    # Service timeouts must not turn a slow runner into a lost session.
+    activity_timeout = timedelta(hours=1).total_seconds()
+    monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", activity_timeout)
     codec = _DelayMayBeOpenCodec()
     if delayed_heartbeats:
         # Each heartbeat takes longer to encode than the interval, so one is
@@ -457,7 +472,7 @@ async def test_stateful_session_after_worker_replaced(
         server = (
             "pass" if first_connection_fails and factory_calls == 1 else _MCP_SERVER
         )
-        return _stdio_toolset(server)
+        return _stdio_toolset(server, timeout=activity_timeout)
 
     provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
     client = _make_client(client, provider)
@@ -471,26 +486,25 @@ async def test_stateful_session_after_worker_replaced(
     ):
         handle = await client.start_workflow(
             StatefulMcpWorkerReplacedWorkflow.run,
-            _ReplacedInput(heartbeat_timeout=heartbeat_timeout),
+            _ReplacedInput(
+                heartbeat_timeout=activity_timeout if heartbeat_timeout else None,
+                start_to_close_timeout=activity_timeout,
+                schedule_to_start_timeout=False,
+                wait_for_session_end=not first_connection_fails,
+            ),
             id=f"stateful-mcp-replaced-{uuid.uuid4()}",
             task_queue=task_queue,
-            execution_timeout=timedelta(seconds=50),
         )
         listed = await handle.execute_update(
             StatefulMcpWorkerReplacedWorkflow.wait_listed
         )
         assert listed == ([] if first_connection_fails else ["echo"])
-        async with asyncio.timeout(20):
-            while True:
-                session = await _session_activity(handle)
-                if session and (
-                    session.heartbeat_details.payloads or not heartbeat_timeout
-                ):
-                    break
-                await asyncio.sleep(0.1)
+        # Listing tools runs only after the session's first heartbeat is stored.
         if case == "heartbeat_details_replaced":
             # Replace the session activity's heartbeat details from outside the
             # worker. Its failure on shutdown carries the marker again.
+            session = await _session_activity(handle)
+            assert session is not None
             await client.get_async_activity_handle(
                 workflow_id=handle.id,
                 run_id=handle.result_run_id,
@@ -505,13 +519,7 @@ async def test_stateful_session_after_worker_replaced(
         workflows=[StatefulMcpWorkerReplacedWorkflow],
         max_cached_workflows=0,
     ):
-        if not first_connection_fails:
-            # Let the retried session activity fail before the next get_tools.
-            async with asyncio.timeout(30):
-                while not await _has_event(
-                    handle, EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED
-                ):
-                    await asyncio.sleep(0.2)
+        # The workflow waits for session failure before its next operation.
         await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
         if first_connection_fails:
             # No session was opened, so the retry builds the toolset again,
@@ -573,6 +581,7 @@ async def test_stateful_operations_fail_after_session_refused(
                     session_task_queue=host_task_queue,
                     wait_cancellation=case.endswith("wait_cancellation"),
                     abandon=case.endswith("abandon"),
+                    wait_for_session_end=case.startswith("operation_after_refusal"),
                 ),
                 id=f"stateful-mcp-refused-{uuid.uuid4()}",
                 task_queue=task_queue,
@@ -597,11 +606,6 @@ async def test_stateful_operations_fail_after_session_refused(
         # The retried session activity is refused on the next host.
         async with Worker(client, task_queue=host_task_queue):
             if case.startswith("operation_after_refusal"):
-                async with asyncio.timeout(30):
-                    while not await _has_event(
-                        handle, EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED
-                    ):
-                        await asyncio.sleep(0.2)
                 await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
             async with asyncio.timeout(30):
                 with pytest.raises(WorkflowFailureError) as err:
@@ -658,7 +662,7 @@ async def test_stateful_session_heartbeats_within_heartbeat_timeout(client: Clie
     ):
         handle = await client.start_workflow(
             StatefulMcpWorkerReplacedWorkflow.run,
-            _ReplacedInput(heartbeat_timeout=True),
+            _ReplacedInput(heartbeat_timeout=5),
             id=f"stateful-mcp-heartbeat-{uuid.uuid4()}",
             task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
@@ -1395,7 +1399,7 @@ async def test_stateful_session_marker_kept_by_worker_heartbeats(
     ):
         handle = await client.start_workflow(
             StatefulMcpWorkerReplacedWorkflow.run,
-            _ReplacedInput(heartbeat_timeout=True),
+            _ReplacedInput(heartbeat_timeout=5),
             id=f"stateful-mcp-marker-{uuid.uuid4()}",
             task_queue=task_queue,
             execution_timeout=timedelta(seconds=50),
