@@ -217,6 +217,58 @@ def _auto_heartbeater(fn: Callable) -> Callable:
     return wrapped
 
 
+def _is_async_callable(fn: Any) -> bool:
+    """Whether calling ``fn`` only creates a coroutine (``async def``, a bound
+    async method, a ``functools.partial`` of one, or an object whose
+    ``__call__`` is ``async def``)."""
+    return inspect.iscoroutinefunction(fn) or inspect.iscoroutinefunction(
+        getattr(fn, "__call__", None)
+    )
+
+
+async def _call_backend(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Call a backend method or factory without blocking the activity's loop.
+
+    A native async callable runs directly on the activity's event loop, so it
+    never waits for a free thread in the default executor (which slow
+    synchronous model, tool or backend calls may be holding). A synchronous
+    callable (``subprocess.run`` in ``LocalShellBackend.execute``, filesystem
+    reads) runs on a worker thread so the auto-heartbeater keeps beating. That
+    thread gets a copy of the activity context whose heartbeat is handed back
+    to the activity's loop: the SDK's heartbeat for an async activity schedules
+    a task on the running loop and fails from any other thread. An awaitable
+    returned either way is awaited on the loop.
+    """
+    if _is_async_callable(fn):
+        result = fn(*args, **kwargs)
+    else:
+        loop = asyncio.get_running_loop()
+        context = (
+            activity._Context.current()  # pyright: ignore[reportPrivateUsage]
+            if activity.in_activity()
+            else None
+        )
+
+        def run() -> Any:
+            # asyncio.to_thread runs this in a copy of the caller's contextvars,
+            # so the context set here is seen only by this call.
+            if context is not None and context.heartbeat is not None:
+                heartbeat = context.heartbeat
+
+                def heartbeat_from_thread(*details: Any) -> None:
+                    loop.call_soon_threadsafe(heartbeat, *details)
+
+                activity._Context.set(  # pyright: ignore[reportPrivateUsage]
+                    dataclasses.replace(context, heartbeat=heartbeat_from_thread)
+                )
+            return fn(*args, **kwargs)
+
+        result = await asyncio.to_thread(run)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
 def _translate_api_error(exc: Exception) -> ApplicationError | None:
     """Map an LLM SDK HTTP error onto Temporal's retry contract.
 
@@ -523,10 +575,7 @@ class DeepAgentActivities:
                     type="DeepAgentsUnknownBackendFactory",
                     non_retryable=True,
                 )
-            # Preserve the activity context without blocking heartbeat tasks.
-            backend = await asyncio.to_thread(factory, input.factory_argument)
-            if inspect.isawaitable(backend):
-                backend = await backend
+            backend = await _call_backend(factory, input.factory_argument)
         else:
             backend = lookup_backend(input.backend_ref)
         if backend is None:
@@ -544,18 +593,13 @@ class DeepAgentActivities:
                 type="DeepAgentsUnknownBackendOp",
                 non_retryable=True,
             )
-        # Sync backend methods (``subprocess.run`` in LocalShellBackend.execute,
-        # filesystem reads) must not block the event loop the heartbeat task
-        # needs; like the factory call above, they run on a worker thread. An
-        # async method called in a thread only creates its coroutine, which is
-        # awaited below on the loop.
-        result = await asyncio.to_thread(
+        # Sync methods run on a worker thread so they don't block the event
+        # loop the heartbeat task needs; async methods run on the loop.
+        result = await _call_backend(
             method,
             *_serde.load_backend_result(input.args),
             **_serde.load_backend_result(input.kwargs),
         )
-        if asyncio.iscoroutine(result):
-            result = await result
         # Protocol results are plain dataclasses whose attributes the
         # middleware reads in-workflow — tag them so the stub can rebuild
         # the real type instead of receiving a decayed dict.

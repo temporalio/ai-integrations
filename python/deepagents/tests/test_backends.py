@@ -12,9 +12,12 @@ A state-only backend needs no wrapping — that path is covered against the real
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import gc
 import inspect
 import sys
+import threading
 import time
 import uuid
 from datetime import timedelta
@@ -31,7 +34,7 @@ pytestmark = pytest.mark.skipif(
 pytest.importorskip("deepagents")
 pytest.importorskip("langchain_core")
 
-from temporalio import workflow
+from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
 from temporalio.deepagents import DeepAgentsPlugin, TemporalBackend
 from temporalio.deepagents._tools import (
@@ -254,6 +257,97 @@ async def test_blocking_backend_op_survives_heartbeat_timeout(
             task_queue="da-backend-blocking",
         )
     assert out == "slow contents of notes.txt"
+
+
+class ProgressReadBackend:
+    """A SYNC backend that reports progress with ``activity.heartbeat`` while it
+    works. It runs on a worker thread, so its heartbeats must be handed back to
+    the activity's event loop."""
+
+    def read(self, file_path: str) -> str:
+        for step in range(3):
+            activity.heartbeat(f"step {step}")
+            time.sleep(0.2)
+        return f"contents of {file_path} on attempt {activity.info().attempt}"
+
+
+class AsyncReadBackend:
+    """A native async backend: ``backend_op`` must run it on the event loop."""
+
+    async def read(self, file_path: str) -> str:
+        await asyncio.sleep(0)
+        return f"async contents of {file_path}"
+
+
+@workflow.defn
+class OneReadWorkflow:
+    @workflow.run
+    async def run(self, ref: str, path: str) -> str:
+        backends = {"progress": ProgressReadBackend, "async": AsyncReadBackend}
+        backend = TemporalBackend(
+            backends[ref](),
+            activity_options={
+                "start_to_close_timeout": timedelta(seconds=5),
+                "heartbeat_timeout": timedelta(seconds=2),
+                "retry_policy": RetryPolicy(maximum_attempts=1),
+            },
+        )
+        return await backend.read(path)
+
+
+@pytest.mark.asyncio
+async def test_sync_backend_progress_heartbeats(env: WorkflowEnvironment) -> None:
+    """A synchronous backend method that calls ``activity.heartbeat`` succeeds
+    on its first attempt. Its thread gets a heartbeat that the activity's loop
+    sends; the SDK's own heartbeat for an async activity fails with "no running
+    event loop" when called from a worker thread."""
+    async with Worker(
+        env.client,
+        task_queue="da-backend-progress",
+        workflows=[OneReadWorkflow],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        out = await env.client.execute_workflow(
+            OneReadWorkflow.run,
+            args=["progress", "notes.txt"],
+            id=f"da-backend-progress-{uuid.uuid4()}",
+            task_queue="da-backend-progress",
+        )
+    assert out == "contents of notes.txt on attempt 1"
+
+
+@pytest.mark.asyncio
+async def test_async_backend_op_runs_with_busy_default_executor(
+    env: WorkflowEnvironment,
+) -> None:
+    """A native async backend method runs on the activity's event loop, so it
+    completes while every thread of the default executor is held by slow
+    synchronous work. Created on a thread, its coroutine would wait for a free
+    thread past its start-to-close timeout."""
+    loop = asyncio.get_running_loop()
+    busy = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(busy)
+    release = threading.Event()
+    blocker = loop.run_in_executor(None, release.wait)
+    try:
+        async with Worker(
+            env.client,
+            task_queue="da-backend-async-busy",
+            workflows=[OneReadWorkflow],
+            plugins=[DeepAgentsPlugin()],
+        ):
+            out = await env.client.execute_workflow(
+                OneReadWorkflow.run,
+                args=["async", "notes.txt"],
+                id=f"da-backend-async-busy-{uuid.uuid4()}",
+                task_queue="da-backend-async-busy",
+            )
+    finally:
+        release.set()
+        await blocker
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor())
+        busy.shutdown(wait=False)
+    assert out == "async contents of notes.txt"
 
 
 TEXT_FILE = ("/notes.txt", b"hello\n")
