@@ -972,15 +972,16 @@ class _ReplaySafeClient(langsmith.Client):
     ``_ReplaySafeRunTree`` (see ``_replay_safe_tracer``).  In workflow code,
     their IDs are already stable (see ``_LangChainRuns``); this records their
     start times, keeps their end times after them, and holds back their
-    writes while history replays.  A callback runs the client's own
-    steps before its write, synchronously, live or replaying, so errors
-    those steps raise, such as from a redaction callback, reach LangChain's
-    tracer each time.  Errors from the write itself are logged, since a
-    replay does not write.  At the first write after a replay, the held
-    writes of the replayed runs that are still open, and that their client
-    has not posted, are made, as after a worker restart.  Other calls, and
-    writes from other threads such as ``_ReplaySafeRunTree``'s background
-    I/O, go to the wrapped client as is.
+    writes while history replays, except a run's end in the eviction after
+    the workflow has ended (see ``_LangChainRuns.hold``).  A callback runs
+    the client's own steps before its write, synchronously, live or
+    replaying, so errors those steps raise, such as from a redaction
+    callback, reach LangChain's tracer each time.  Errors from the write
+    itself are logged, since a replay does not write.  At the first write
+    after a replay, the held writes of the replayed runs that are still
+    open, and that their client has not posted, are made, as after a worker
+    restart.  Other calls, and writes from other threads such as
+    ``_ReplaySafeRunTree``'s background I/O, go to the wrapped client as is.
     """
 
     _OWN: ClassVar[frozenset[str]] = frozenset(
