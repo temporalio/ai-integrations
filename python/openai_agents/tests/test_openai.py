@@ -2,6 +2,7 @@ import abc
 import asyncio
 import copy
 import functools
+import importlib.metadata
 import json
 import os
 import sys
@@ -4692,3 +4693,9 @@ async def test_alignment_uses_the_workflow_workers_defaults(
                 result_type=str,
             )
     assert model.settings == [ModelSettings()]
+
+
+def test_plugin_reports_package_version() -> None:
+    assert openai_agents.OpenAIAgentsPlugin().version() == importlib.metadata.version(
+        "temporalio-openai-agents"
+    )

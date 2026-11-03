@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib.metadata
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -93,3 +94,10 @@ class LangSmithPlugin(SimplePlugin):
             workflow_runner=workflow_runner,
             run_context=run_context,
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-langsmith")
+        except importlib.metadata.PackageNotFoundError:
+            return ""

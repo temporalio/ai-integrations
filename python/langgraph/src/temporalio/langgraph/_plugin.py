@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import inspect
 import sys
 import warnings
@@ -325,6 +326,13 @@ class LangGraphPlugin(SimplePlugin):
                 )
             ],
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-langgraph")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
 
     def execute(
         self,

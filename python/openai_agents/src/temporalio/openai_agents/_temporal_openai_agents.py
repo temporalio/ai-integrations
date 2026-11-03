@@ -1,6 +1,7 @@
 """Initialize Temporal OpenAI Agents overrides."""
 
 import dataclasses
+import importlib.metadata
 import json
 import threading
 import typing
@@ -636,6 +637,13 @@ class OpenAIAgentsPlugin(SimplePlugin):
             workflow_failure_exception_types=[AgentsWorkflowError],
             run_context=lambda: run_context(),
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-openai-agents")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
 
     @contextmanager
     def tracing_context(self) -> Generator[None, None, None]:

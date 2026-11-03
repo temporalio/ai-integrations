@@ -33,6 +33,7 @@ left to the Worker, which refuses it.
 
 from __future__ import annotations
 
+import importlib.metadata
 import inspect
 import sys
 import warnings
@@ -165,6 +166,13 @@ class DeepAgentsPlugin(SimplePlugin):
             workflow_failure_exception_types=_workflow_failure_exception_types,
             run_context=self._run_context,
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-deepagents")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
 
     def _configure_data_converter(
         self, converter: DataConverter | None
