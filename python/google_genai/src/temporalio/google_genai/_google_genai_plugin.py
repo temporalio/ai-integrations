@@ -55,10 +55,6 @@ def _data_converter(converter: DataConverter | None) -> DataConverter:
 class GoogleGenAIPlugin(SimplePlugin):
     """A Temporal Worker Plugin configured for the Google Gemini SDK.
 
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
-
     This plugin registers the ``gemini_api_client_async_request`` activity
     using the provided ``genai.Client`` with real credentials.  Workflows
     construct a :class:`temporalio.google_genai.TemporalAsyncClient`

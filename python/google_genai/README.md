@@ -1,6 +1,6 @@
 # Google Gemini SDK Integration for Temporal
 
-> Release stage: [Public Preview](https://docs.temporal.io/develop/python/integrations/google-genai).
+> Release stage: [Generally Available](https://docs.temporal.io/develop/python/integrations/google-genai).
 
 ## Overview
 

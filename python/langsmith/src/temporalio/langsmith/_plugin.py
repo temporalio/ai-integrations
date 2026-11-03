@@ -27,10 +27,6 @@ from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 class LangSmithPlugin(SimplePlugin):
     """LangSmith tracing plugin for Temporal SDK.
 
-    .. warning::
-        This class is experimental and may change in future versions.
-        Use with caution in production environments.
-
     Provides automatic LangSmith run creation for workflows, activities,
     and other Temporal operations with context propagation.
     """
