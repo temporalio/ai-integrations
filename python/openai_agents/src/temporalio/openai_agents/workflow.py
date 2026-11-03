@@ -707,8 +707,8 @@ def temporal_mcp_server(
         server_options: OpenAI Agents ``MCPServer`` options such as
             ``require_approval`` and ``failure_error_function``. Set them here:
             on the factory's server, a callable ``tool_filter``, a
-            ``require_approval`` policy that can ask for approval and a
-            ``tool_meta_resolver`` are rejected.
+            ``require_approval`` policy that can ask for approval, a
+            ``tool_meta_resolver`` and tool guardrails are rejected.
     """
     try:
         from temporalio.mcp import TemporalMCPClient

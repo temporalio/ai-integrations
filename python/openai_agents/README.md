@@ -486,9 +486,9 @@ worker-side OpenAI `MCPServer`. Configure workflow-facing behavior such as
 openai-agents 0.22.3, tool input and output guardrails on
 `temporal_mcp_server(...)`, where the OpenAI agent can use it. On the
 worker-side server, a static `tool_filter` still filters the listed tools, a
-callable `tool_filter`, a `require_approval` policy and a `tool_meta_resolver`
-are rejected as described below, and the other settings are ignored. Custom `MCPServer` method
-implementations still execute worker-side.
+callable `tool_filter`, a `require_approval` policy, a `tool_meta_resolver` and
+tool guardrails are rejected as described below, and the other settings are
+ignored. Custom `MCPServer` method implementations still execute worker-side.
 
 A callable `tool_filter` on the worker-side server is rejected, because the run
 context and agent it receives exist only in the workflow. A callable
@@ -508,16 +508,22 @@ run context it receives exists only in the workflow. Pass it to
 workflow and must be deterministic. Its result is recorded in workflow history,
 so it must not hold secrets.
 
+Tool input and output guardrails on the worker-side server are rejected as well:
+the agent never reads that copy, so they would never run. Pass them to
+`temporal_mcp_server(tool_input_guardrails=..., tool_output_guardrails=...)`
+instead, where they run in the workflow and must be deterministic.
+
 These checks run in every MCP Activity. A run that already holds its cached tool
 list, the default, first meets them when it calls a tool: the agent gets the
 error as the tool's output, and the run can complete without the tool. Let open
 runs finish before you upgrade or add such a setting to the factory's server.
-A resolver there never had an effect, so removing it from the factory's server
-in the same deploy is enough.
+A resolver or guardrail there never had an effect, so removing it from the
+factory's server in the same deploy is enough.
 Moving the policy into `temporal_mcp_server(require_approval=...)` is also a
 workflow change: an open run that already called one of that server's tools
-fails replay with a nondeterminism error. Moving a resolver there is a workflow
-change too, so guard it with `workflow.patched()` or let open runs finish first.
+fails replay with a nondeterminism error. Moving a resolver or guardrail there
+is a workflow change too, so guard it with `workflow.patched()` or let open runs
+finish first.
 
 Every MCP operation is a Temporal Activity. The workflow-side tool list is
 cached by default; pass `cache_tools_list=False` to refresh it on every Agents
@@ -588,17 +594,18 @@ The legacy stateful path retains its dedicated per-workflow worker and
 persistent-session behavior. To require tool approval on these servers, pass
 `require_approval` to `stateless_mcp_server()` or `stateful_mcp_server()`;
 as with `temporal_mcp_server()`, a policy on the factory's server is rejected
-unless it never asks for approval. So are a callable `tool_filter` and a
-`tool_meta_resolver` there, in every MCP operation, direct `call_tool()` and
-prompt calls included; a static filter still works. On these routes, set a
-resolver on the server that `stateless_mcp_server()` or `stateful_mcp_server()`
-gives the workflow (`server.tool_meta_resolver = ...`); it then gets
+unless it never asks for approval. So are a callable `tool_filter`, a
+`tool_meta_resolver` and tool guardrails there, in every MCP operation, direct
+`call_tool()` and prompt calls included; a static filter still works. On these
+routes, set a resolver or guardrails on the server that `stateless_mcp_server()`
+or `stateful_mcp_server()` gives the workflow (`server.tool_meta_resolver = ...`,
+`server.tool_input_guardrails = [...]`); a resolver then gets
 `<name>-stateless` or `<name>-stateful` as `server_name`. As with
-`temporal_mcp_server()`, it runs in the workflow and must be deterministic, its
-result is recorded in workflow history, and adding it to a workflow with open
-runs needs `workflow.patched()` or those runs to finish first. Remove such a
-filter or resolver from the factory in the same deploy, or let open runs finish
-first.
+`temporal_mcp_server()`, they run in the workflow and must be deterministic, a
+resolver's result is recorded in workflow history, and adding them to a workflow
+with open runs needs `workflow.patched()` or those runs to finish first. Remove
+such a filter, resolver or guardrail from the factory in the same deploy, or let
+open runs finish first.
 
 ### Hosted MCP Tool
 
