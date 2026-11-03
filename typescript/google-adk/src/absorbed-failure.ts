@@ -31,19 +31,14 @@
 import type { AsyncLocalStorage as ALS } from 'node:async_hooks';
 
 import { BaseNode, FunctionTool, PluginManager } from '@google/adk';
-import {
-  ActivityFailure,
-  ApplicationFailure,
-  ChildWorkflowFailure,
-  NexusOperationFailure,
-  TemporalFailure,
-} from '@temporalio/common';
+import { ActivityFailure, ApplicationFailure, TemporalFailure } from '@temporalio/common';
 import {
   AsyncLocalStorage,
   CancellationScope,
   ContinueAsNew,
   inWorkflowContext,
   isCancellation,
+  type ActivateInput,
   type ActivityInput,
   type WorkflowInterceptorsFactory,
 } from '@temporalio/workflow';
@@ -122,8 +117,10 @@ interface AbsorbedFailures {
   root?: ScopeWatch;
   /** One watch per scope that operations started in (see {@link scopeWatch}). */
   scopes: WeakMap<CancellationScope, ScopeWatch>;
-  /** The watch of the scope each Activity started in, by `activityId` (see {@link noteActivityScope}). */
-  activities: Map<string, ScopeWatch>;
+  /** The watch of the scope each Activity in flight started in, by its `seq` (see {@link noteActivityScope}). */
+  activities: Map<number, ScopeWatch>;
+  /** The same watch, per the failure an Activity was resolved with (see {@link noteActivityResolutions}). */
+  activityFailures: WeakMap<object, ScopeWatch>;
   /** The failures of other operations whose scope this request cancelled first (see {@link watchScope}). */
   cancelledByExecution: WeakSet<object>;
   /** The ADK node attempt the running code belongs to (see {@link watchNodeAttempts}). */
@@ -144,6 +141,7 @@ function recorded(): AbsorbedFailures {
       answered: new WeakMap(),
       scopes: new WeakMap(),
       activities: new Map(),
+      activityFailures: new WeakMap(),
       cancelledByExecution: new WeakSet(),
       attempts: new AsyncLocalStorage<NodeAttempt>(),
       wrapped: new WeakMap(),
@@ -276,19 +274,37 @@ function watchScope(): (operation: Promise<unknown>) => void {
 }
 
 /**
- * Notes the scope an Activity starts in, under the `activityId` its failure will carry, so
+ * Notes the scope an Activity starts in, under the Activity's `seq`, so
  * {@link executionCancellation} can tell whether the execution's cancellation request
  * cancelled it first, as {@link watchScope} does for other operations. Nothing is attached
  * to the Activity's promise: Workflow code gets that promise as it is, and a handler on it
- * would hide from the SDK an Activity failure that code never handles.
+ * would hide from the SDK an Activity failure that code never handles. The `seq` is the
+ * Activity's own; an `activityId` may be used again once an Activity has closed.
  */
 function noteActivityScope(input: ActivityInput): void {
-  const { activities } = recorded();
-  const id = input.options.activityId ?? `${input.seq}`;
   const scope = CancellationScope.current();
-  // A custom `activityId` can be used again: the latest Activity with it decides.
-  if (scope.cancellable) activities.set(id, scopeWatch(scope));
-  else activities.delete(id);
+  if (!scope.cancellable) return;
+  recorded().activities.set(input.seq, scopeWatch(scope));
+}
+
+/**
+ * Moves the watch {@link noteActivityScope} noted for each Activity this activation fails to
+ * the failure it fails with: the SDK keeps that object as the `failure` of the
+ * `ActivityFailure` it rejects the Activity's promise with. Run before the SDK resolves the
+ * jobs, which it does with the same objects. A child Workflow's or a Nexus operation's own
+ * Activities fail other objects, so their `ActivityFailure`s never match.
+ */
+function noteActivityResolutions(activation: ActivateInput['activation']): void {
+  const { activities, activityFailures } = recorded();
+  for (const job of activation.jobs ?? []) {
+    const { seq, result } = job.resolveActivity ?? {};
+    if (typeof seq !== 'number') continue;
+    const watch = activities.get(seq);
+    if (watch === undefined) continue;
+    activities.delete(seq);
+    const failure = result?.cancelled?.failure ?? result?.failed?.failure;
+    if (typeof failure === 'object' && failure !== null) activityFailures.set(failure, watch);
+  }
 }
 
 /** Returns `operation`, watched as {@link watchScope} describes. */
@@ -321,26 +337,15 @@ function watchedEach<T>(started: Promise<T>, operations: (result: T) => Promise<
  */
 function executionCancellation(err: unknown): unknown {
   const state = recorded();
-  // Activity ids are only this execution's until the chain reaches another execution's
-  // failures: a child Workflow's or a Nexus operation's Activities are numbered the same way.
-  let own = true;
   for (const current of causes(err)) {
     if (current === state.root?.reason || state.cancelledByExecution.has(current)) return current;
     if (
-      own &&
       current instanceof ActivityFailure &&
-      current.activityId !== undefined &&
+      current.failure !== undefined &&
       isCancellation(current) &&
-      cancelledFirstByExecution(state.activities.get(current.activityId))
+      cancelledFirstByExecution(state.activityFailures.get(current.failure))
     ) {
       return current;
-    }
-    if (
-      current instanceof ActivityFailure ||
-      current instanceof ChildWorkflowFailure ||
-      current instanceof NexusOperationFailure
-    ) {
-      own = false;
     }
   }
   return undefined;
@@ -795,6 +800,14 @@ export const interceptors: WorkflowInterceptorsFactory = () => {
         handleUpdate: (input, next) => surfaceAbsorbedFailure({ pending: [], surfaced: false }, () => next(input)),
         handleSignal: (input, next) =>
           surfaceAbsorbedFailure({ pending: [], surfaced: false }, () => next(input), deferToMain),
+      },
+    ],
+    internals: [
+      {
+        activate: (input, next) => {
+          noteActivityResolutions(input.activation);
+          next(input);
+        },
       },
     ],
     outbound: [

@@ -791,6 +791,57 @@ export async function agentRunnerSignalTurnAfterMainEnds(
 }
 
 /**
+ * A runner turn whose `beforeModelCallback` keeps the error of one policy Activity, runs a
+ * second, and rethrows the first, both under one `activityId` when `reuse` is set (allowed
+ * once the first has closed: each waits for its cancellation to complete). With
+ * `execution-first`, the first waits until the Workflow's cancellation cancels it and the
+ * second is a shielded cleanup that its 1-second timeout scope cancels; with
+ * `timeout-first`, the first is that shielded wait and the second waits until the
+ * Workflow's cancellation cancels it. `stage` is `blocked` once the wait the cancellation
+ * must reach has started; the turn then returns `caught`.
+ */
+export async function agentRunnerRetainedActivityError(
+  order: 'execution-first' | 'timeout-first',
+  reuse: boolean
+): Promise<string> {
+  const policy = (activityId: string) =>
+    proxyActivities<BlockingActivities>({
+      startToCloseTimeout: '1 minute',
+      heartbeatTimeout: '5 seconds',
+      cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+      activityId,
+    }).cancellableActivity;
+  const waitForCancel = async (activityId: string): Promise<void> => {
+    setStage('blocked');
+    await policy(activityId)();
+  };
+  const timedOut = async (activityId: string): Promise<void> => {
+    await CancellationScope.nonCancellable(() =>
+      CancellationScope.withTimeout('1 second', () => policy(activityId)())
+    );
+  };
+  const [first, second] = order === 'execution-first' ? [waitForCancel, timedOut] : [timedOut, waitForCancel];
+  const check = async (): Promise<undefined> => {
+    let kept: unknown;
+    try {
+      await first('policy');
+    } catch (err) {
+      kept = err;
+    }
+    try {
+      await second(reuse ? 'policy' : 'policy-2');
+    } catch {
+      // Handled: only the first Activity's error leaves the callback.
+    }
+    throw kept;
+  };
+  await runAgentTurn(new TemporalModel('fake-model', SINGLE_ATTEMPT), 'hi', undefined, {
+    beforeModelCallback: check,
+  });
+  return 'caught';
+}
+
+/**
  * One turn that runs a `FunctionTool`, reporting afterwards whether the tool's `execute` is
  * still the function it was built with, and whether its `requireConfirmation` predicate,
  * written as a `function`, ran with the tool as `this`.

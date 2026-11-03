@@ -47,6 +47,7 @@ import {
   agentRunnerRecoversFromCancelledModel,
   agentRunnerRecoversFromModelError,
   agentRunnerRecoversOnlyTheSecondFailure,
+  agentRunnerRetainedActivityError,
   agentRunnerShieldedWaitThenCaughtCancel,
   agentRunnerSignalTurnAfterMainEnds,
   agentRunnerSignalTurnThenCleanup,
@@ -357,6 +358,35 @@ test.serial('cancellingASignalDrivenTurnAfterTheMainFunctionEndedClosesTheRun', 
         );
       });
     }
+  }
+});
+
+test.serial('aKeptActivityErrorKeepsItsOwnCancellationSourceWhenItsIdIsReused', async (t) => {
+  const env = getEnv();
+  // A callback keeps one Activity's error, runs a second Activity, and rethrows the first.
+  // What decides the run is how the first Activity was cancelled, whether the second used
+  // the same `activityId` or not.
+  const cases = [
+    { order: 'execution-first' as const, status: 'CANCELLED' as const },
+    { order: 'timeout-first' as const, status: 'COMPLETED' as const },
+  ].flatMap((c) => [true, false].map((reuse) => ({ ...c, reuse })));
+  for (const { order, reuse, status } of cases) {
+    const label = `${order} reuse=${reuse}`;
+    const taskQueue = uid('adk-reused-activity-id');
+    const workflowId = uid('wf-reused-activity-id');
+    await withWorker(env, { taskQueue, plugins: [adkPlugin()], activities: { cancellableActivity } }, async () => {
+      const handle = await env.client.workflow.start(agentRunnerRetainedActivityError, {
+        taskQueue,
+        workflowId,
+        args: [order, reuse],
+      });
+      await waitForStage(handle, 'blocked', label);
+      await waitForScheduledActivities(env, workflowId, 'cancellableActivity', order === 'execution-first' ? 1 : 2);
+      await handle.cancel();
+      const result = await handle.result().catch((err: unknown) => err);
+      if (status === 'COMPLETED') t.is(result, 'caught', label);
+      t.is((await handle.describe()).status.name, status, label);
+    });
   }
 });
 
