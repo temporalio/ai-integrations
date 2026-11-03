@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import gc
 import uuid
+import weakref
+from collections import OrderedDict
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -24,6 +26,7 @@ from temporalio.langsmith._interceptor import (
     _LangChainRuns,
     _LangSmithWorkflowInboundInterceptor,
     _maybe_run,
+    _open_runs,
     _post_pending,
     _ReplaySafeClient,
     _ReplaySafeRunTree,
@@ -304,6 +307,26 @@ class TestReplaySafety:
         gc.collect()
         assert list(_ReplaySafeClient(mock_client)._open) == [run_id]
         assert list(_ReplaySafeClient(MagicMock())._open) == []
+
+    def test_client_record_dropped_with_its_client(self) -> None:
+        """A client's record of its open runs goes when the client does."""
+        client = MagicMock()
+        key = id(client)
+        _ReplaySafeClient(client)._add_open(uuid.uuid4())
+        ref = _open_runs[key][0]
+        del client
+        gc.collect()
+        assert ref() is None
+        assert _open_runs.get(key, (None, None))[0] is not ref
+
+    def test_stale_record_not_reused(self) -> None:
+        """A new client at a collected client's address starts with no open runs."""
+        client, dead = MagicMock(), MagicMock()
+        stale = weakref.ref(dead)
+        del dead
+        gc.collect()
+        _open_runs[id(client)] = (stale, OrderedDict({uuid.uuid4(): None}))
+        assert list(_ReplaySafeClient(client)._open) == []
 
     def test_run_does_not_end_before_it_starts(self) -> None:
         """A run's end time is no earlier than any start time given out."""

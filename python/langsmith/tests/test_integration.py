@@ -916,7 +916,7 @@ class TestReplay:
         )
         assert [run["error"] for run in posts + patches if run.get("error")] == []
 
-        # Runs start in the order they were made, after their parents.
+        # Runs start in the order they were made, no earlier than their parents.
         def as_datetime(value: datetime | str) -> datetime:
             if isinstance(value, datetime):
                 return value
@@ -937,6 +937,10 @@ class TestReplay:
             if run.get("dotted_order"):
                 assert run["dotted_order"] == orders[str(run["id"])], run
         for run in posts:
+            # The run's own segment carries its start time.
+            assert run["dotted_order"].split(".")[-1] == as_datetime(
+                run["start_time"]
+            ).strftime("%Y%m%dT%H%M%S%fZ") + str(run["id"]), run["name"]
             parent = str(run.get("parent_run_id"))
             if parent in starts:
                 assert starts[parent] <= starts[str(run["id"])], run["name"]
