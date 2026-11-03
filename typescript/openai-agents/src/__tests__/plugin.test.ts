@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
 import test from 'ava';
 import type { NativeConnection, WorkerOptions } from '@temporalio/worker';
 import { StatelessMCPServerProvider } from '../worker/mcp-provider';
@@ -70,4 +73,8 @@ test('configureWorker refuses to replace a different Activity with the same name
       "Duplicate registration of Activity 'invokeModelActivity': OpenAIAgentsPlugin would replace a different " +
       `Activity with this name. Rename ${tail}`,
   });
+});
+
+test('reports the package version for worker heartbeats', (t) => {
+  t.is(new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) }).version, JSON.parse(readFileSync(path.join(__dirname, '../../package.json'), 'utf8')).version);
 });

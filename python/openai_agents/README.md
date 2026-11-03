@@ -405,6 +405,45 @@ for interruption in state.get_interruptions():
 result = await Runner.run(agent, state)  # or Runner.run_streamed(agent, state)
 ```
 
+### Carrying input items across `continue_as_new`
+
+A workflow can also carry `result.to_input_list()` across `continue_as_new` and pass the items to
+`Runner.run` in the next run. The plugin decodes their `Iterable` fields, such as an assistant
+message's `content`, as lists.
+
+To do this, importing `temporalio.openai_agents` changes the `Iterable[X]` fields of the `openai`
+input item types (the `TypedDict`s in `TResponseInputItem`, except tool definitions such as
+`FileSearchToolParam`) to `list[X]` for the whole process. A type that an item shares with a tool
+definition changes for the tool too: with `openai` 3.8.0, that is `LocalEnvironmentParam`, so the
+shell tool's local `skills` is also a `list`. Type checkers still see `Iterable`. At
+runtime, `typing.get_type_hints()` reports `list`, your own pydantic validation of those types
+returns lists, and in strict mode it rejects a tuple or generator there. The `openai` client also
+stops turning an iterator in those fields into a list when it builds a request, so
+`client.responses.create(...)` with, for example, an assistant message's `content` given as
+`iter([...])` raises `TypeError: Object of type list_iterator is not JSON serializable`. Pass lists
+there, for example with `list(...)`.
+
+The change reaches only classes built after `temporalio.openai_agents` is imported, so import it
+before the modules that define your Workflow inputs, Activity results or other classes that hold
+input items. Classes it does not reach, such as a class built earlier or, on Python 3.14, a
+`TypedDict` subclass of an item type, rely on the payload converter, which lists the iterators it
+finds when it decodes them. Tool definitions inside items, such as a `tool_search_output` item's
+tools, also rely on it, so inside a tuple, deque or set they stay one-shot iterators.
+
+The payload converter also decodes your own `Iterable` fields as lists when they are the decoded
+value itself, fields of a dataclass or pydantic model (extra fields too), dict values or list items,
+so code that calls `next()` on them must use `iter()` first. Inside tuples, deques and sets they
+stay pydantic's one-shot iterators.
+
+Earlier versions decoded those fields as one-shot iterators, and a turn on carried items raised
+`TypeError: cannot pickle 'pydantic_core._pydantic_core.ValidatorIterator' object`. A run that
+caught that error and went on, such as a chat whose Update reports errors to the caller, fails with
+`[TMPRL1100]` on its next Workflow Task after you deploy this version. Let those runs finish on the
+earlier version first, or keep them there with Worker Versioning. A chat that waits for its next
+message may never finish, so use Worker Versioning for it. Do not roll a Worker back to an earlier
+version while runs that ran a turn on carried items with this version are open: they fail replay
+there.
+
 ## MCP Support
 
 The durable MCP integration uses MCP Python SDK v2 and the optional `mcp`

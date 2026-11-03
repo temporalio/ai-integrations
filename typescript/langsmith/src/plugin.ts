@@ -75,6 +75,16 @@ export interface LangSmithPluginOptions {
   metadata?: Record<string, unknown>;
 }
 
+/** Reads this package's version, which worker heartbeats report. Empty if it can't be read. */
+function packageVersion(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require('../package.json') as { version?: string }).version ?? '';
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Temporal plugin that adds LangSmith observability to a Client + Worker.
  *
@@ -90,6 +100,9 @@ export interface LangSmithPluginOptions {
  * @experimental Plugins is an experimental feature; APIs may change without notice.
  */
 export class LangSmithPlugin extends SimplePlugin {
+  /** The package version, reported in worker heartbeats. */
+  readonly version = packageVersion();
+
   private readonly client: Client;
   private readonly emitter: EmitterConfig;
   private readonly workflowConfig: Omit<WorkflowLangSmithConfig, 'destination'>;

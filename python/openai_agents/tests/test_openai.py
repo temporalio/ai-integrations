@@ -1,14 +1,16 @@
 import abc
 import asyncio
+import copy
 import dataclasses
 import functools
+import importlib.metadata
 import json
 import os
 import sys
 import uuid
-from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
-from datetime import timedelta
+from collections.abc import AsyncIterator, Iterable, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from types import FrameType
 from typing import (
     TYPE_CHECKING,
@@ -24,6 +26,7 @@ from typing import (
 import nexusrpc
 import pydantic
 import pytest
+import typing_extensions
 from agents import (
     Agent,
     AgentBase,
@@ -79,11 +82,15 @@ from agents.tool import CustomTool
 from agents.tool_context import ToolContext
 from openai import APIStatusError, AsyncOpenAI, BaseModel, RateLimitError
 from openai.types.responses import (
+    LocalEnvironmentParam,
     ResponseCodeInterpreterToolCall,
     ResponseCustomToolCall,
     ResponseFileSearchToolCall,
     ResponseFunctionToolCall,
     ResponseFunctionWebSearch,
+    ResponseInputTextParam,
+    ResponseOutputMessage,
+    ResponseOutputMessageParam,
 )
 from openai.types.responses.response_file_search_tool_call import Result
 from openai.types.responses.response_function_web_search import ActionSearch
@@ -94,6 +101,7 @@ from openai.types.responses.response_output_item import (
 )
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 from openai.types.shared import Reasoning
+from openai.types.shared_params import CompoundFilter
 from pydantic import ConfigDict, Field, TypeAdapter
 
 import temporalio.openai_agents as openai_agents
@@ -122,6 +130,7 @@ from temporalio.exceptions import (
 )
 from temporalio.openai_agents import (
     ModelActivityParameters,
+    OpenAIPayloadConverter,
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
     _mcp,
@@ -1768,6 +1777,401 @@ async def test_customer_service_workflow(client: Client):
             )
 
 
+class InputRecordingModel(TestModel):
+    """Read each call's input as ``OpenAIResponsesModel`` does, and record it."""
+
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        """Return the responses in order."""
+        remaining = iter(responses)
+        super().__init__(lambda: next(remaining))
+        self.inputs: list[list[TResponseInputItem]] = []
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> ModelResponse:
+        """Record the input before producing the next response."""
+        self.inputs.append(ItemHelpers.input_to_new_input_list(input))
+        return await super().get_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            **kwargs,
+        )
+
+
+@workflow.defn
+class CarriedItemsWorkflow:
+    """Runs a turn on items carried across Continue-As-New, as a chat does."""
+
+    @workflow.run
+    async def run(self, input_items: list[TResponseInputItem]) -> str:
+        try:
+            # Read the carried replies before the turn, as a chat that shows
+            # its history does.
+            items = cast(list[dict[str, Any]], input_items)
+            replies = [
+                part["text"]
+                for item in items
+                if item.get("role") == "assistant"
+                for part in item["content"]
+            ]
+            result = await Runner.run(
+                Agent(name="Assistant", instructions="Answer."),
+                input_items + [{"content": "Next", "role": "user"}],
+            )
+        except Exception as e:
+            return f"Turn failed: {e}"
+        return f"{result.final_output}; carried replies: {replies}"
+
+
+# Pydantic decodes the assistant message's content as a one-shot iterator,
+# and the custom tool's string output as an iterator over its characters.
+CARRIED_ITEMS: list[TResponseInputItem] = [
+    {
+        "id": "msg-carried",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
+    },
+    {
+        "type": "custom_tool_call",
+        "call_id": "c1",
+        "name": "echo",
+        "input": "pong",
+    },
+    {"type": "custom_tool_call_output", "call_id": "c1", "output": "pong"},
+]
+
+
+async def test_carried_input_items(client: Client):
+    input_items: list[TResponseInputItem] = [
+        {"content": "Hi", "role": "user"},
+        *CARRIED_ITEMS,
+    ]
+    model = InputRecordingModel([ResponseBuilders.output_message("test")])
+    async with AgentEnvironment(model=model) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, CarriedItemsWorkflow) as worker:
+            result = await client.execute_workflow(
+                CarriedItemsWorkflow.run,
+                input_items,
+                id=f"carried-items-workflow-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            assert result == "test; carried replies: ['Hello!']"
+    assert model.inputs == [input_items + [{"content": "Next", "role": "user"}]]
+
+
+CARRIED_AT = datetime(2026, 10, 31, 12, tzinfo=timezone.utc)
+
+
+class CarriedItemsModel(pydantic.BaseModel):
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+class CarriedItemsStrictModel(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+@pydantic.dataclasses.dataclass
+class CarriedItemsState:
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+@pydantic.dataclasses.dataclass(config=ConfigDict(strict=True))
+class CarriedItemsStrictState:
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+class CarriedItemsExtraModel(pydantic.BaseModel):
+    # Undeclared fields hold carried items, and pydantic keeps them in model_extra.
+    model_config = ConfigDict(extra="allow")
+    # Pydantic's documented way to type extra values; BaseModel declares it as optional.
+    __pydantic_extra__: dict[str, list[TResponseInputItem]] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
+        init=False
+    )
+    carried_at: datetime
+
+
+class OwnValuesModel(pydantic.BaseModel):
+    # The app's own Iterable field, which only the converter's walk lists.
+    values: Iterable[int]
+
+
+class OwnCustomToolOutput(typing_extensions.TypedDict):
+    # Same union as openai's custom tool output, which the swap leaves alone here.
+    type: Literal["custom_tool_call_output"]
+    call_id: str
+    output: str | Iterable[ResponseInputTextParam]
+
+
+class OwnCustomToolOutputModel(pydantic.BaseModel):
+    item: OwnCustomToolOutput
+
+
+class OwnCustomToolOutputStrictModel(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
+    item: OwnCustomToolOutput
+
+
+class OwnExtraValuesModel(pydantic.BaseModel):
+    model_config = ConfigDict(extra="allow")
+    __pydantic_extra__: dict[str, Iterable[int]] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
+        init=False
+    )
+
+
+@dataclass
+class PricedOrder:
+    id: str
+    # Pydantic leaves an init=False field unset when it decodes the order.
+    total: float = field(init=False)
+
+
+def _priced_order() -> PricedOrder:
+    order = PricedOrder("o-1")
+    order.total = 9.5
+    return order
+
+
+def _dated_items(state: Any) -> Any:
+    return state.carried_at, state.input_items
+
+
+@pytest.mark.parametrize(
+    "carried,read,expected",
+    [
+        (
+            CarriedItemsModel(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsStrictModel(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsState(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsStrictState(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsExtraModel.model_validate(
+                {"carried_at": CARRIED_AT, "carried": CARRIED_ITEMS}
+            ),
+            lambda state: (state.carried_at, state.__pydantic_extra__["carried"]),
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (OwnValuesModel(values=[1, 2]), lambda state: state.values, [1, 2]),
+        (
+            OwnCustomToolOutputModel(
+                item={
+                    "type": "custom_tool_call_output",
+                    "call_id": "c1",
+                    "output": "pong",
+                }
+            ),
+            lambda state: state.item["output"],
+            "pong",
+        ),
+        (
+            OwnCustomToolOutputStrictModel(
+                carried_at=CARRIED_AT,
+                item={
+                    "type": "custom_tool_call_output",
+                    "call_id": "c1",
+                    "output": "pong",
+                },
+            ),
+            lambda state: (state.carried_at, state.item["output"]),
+            (CARRIED_AT, "pong"),
+        ),
+        (
+            OwnExtraValuesModel.model_validate({"values": [1, 2]}),
+            lambda state: state.__pydantic_extra__["values"],
+            [1, 2],
+        ),
+        (_priced_order(), lambda state: state.id, "o-1"),
+    ],
+    ids=[
+        "model",
+        "strict-model",
+        "dataclass",
+        "strict-dataclass",
+        "extra-model",
+        "own-iterable-field",
+        "own-str-or-iterable",
+        "strict-own-str-or-iterable",
+        "own-iterable-extra-field",
+        "unset-init-false-field",
+    ],
+)
+def test_state_decodes_iterables_as_lists(carried: Any, read: Any, expected: Any):
+    # Workflows often carry the items in a model or dataclass, as the
+    # documented chat does. The app's own Iterable fields go through the
+    # converter's walk.
+    converter = OpenAIPayloadConverter()
+    (payload,) = converter.to_payloads([carried])
+    (state,) = converter.from_payloads([payload], [type(carried)])
+    assert type(state) is type(carried)
+    copy.deepcopy(state)
+    assert read(state) == expected
+
+
+def test_unhashable_type_hint_keeps_string_output():
+    # The dict makes the hint unhashable, so the retry can't use the adapter cache.
+    hint: Any = Annotated[OwnCustomToolOutput, {"doc": "x"}]
+    item = {"type": "custom_tool_call_output", "call_id": "c1", "output": "pong"}
+    converter = OpenAIPayloadConverter()
+    (decoded,) = converter.from_payloads(converter.to_payloads([item]), [hint])
+    assert decoded["output"] == "pong"
+
+
+@pydantic.dataclasses.dataclass
+class CarriedItemsWithResponse:
+    last_message: ResponseOutputMessage
+    input_items: list[TResponseInputItem]
+    values: Iterable[int]
+
+
+def test_carried_input_items_decode_as_lists_in_lenient_fallback():
+    # The message lacks the required status, as a response from a newer API
+    # might, so the converter falls back to lenient construction.
+    message = {key: value for key, value in CARRIED_ITEMS[0].items() if key != "status"}
+    payload = Payload(
+        metadata={"encoding": b"json/plain"},
+        data=json.dumps(
+            {"last_message": message, "input_items": CARRIED_ITEMS, "values": [1, 2]}
+        ).encode(),
+    )
+    converter = OpenAIPayloadConverter()
+    (state,) = converter.from_payloads([payload], [CarriedItemsWithResponse])
+    assert type(state) is CarriedItemsWithResponse
+    assert state.input_items == CARRIED_ITEMS
+    assert state.values == [1, 2]
+    copy.deepcopy(state)
+
+
+def test_type_swap_leaves_tool_definitions():
+    # Requests that take tool definitions, such as vector_stores.search
+    # filters, must still turn iterators into lists.
+    # typing_extensions strips Required on every Python version.
+    hints = typing_extensions.get_type_hints
+    assert typing_extensions.get_origin(hints(CompoundFilter)["filters"]) is Iterable
+    assert (
+        typing_extensions.get_origin(hints(ResponseOutputMessageParam)["content"])
+        is list
+    )
+    # A shell call item holds the shell tool's local environment, so the
+    # swap changes it for the tool too.
+    assert typing_extensions.get_origin(hints(LocalEnvironmentParam)["skills"]) is list
+
+
+class CarriedChatState(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+@workflow.defn
+class CarriedCustomToolChatWorkflow:
+    @workflow.run
+    async def run(self, state: CarriedChatState | None = None) -> str:
+        async def echo(ctx: ToolContext[Any], input: str) -> str:  # type: ignore[reportUnusedParameter]
+            return input
+
+        agent = Agent[str](
+            name="custom-tool-agent",
+            instructions="Use the echo tool.",
+            tools=[
+                CustomTool(
+                    name="echo",
+                    description="Echo the input string back.",
+                    on_invoke_tool=echo,
+                )
+            ],
+        )
+        if state is None:
+            result = await Runner.run(starting_agent=agent, input="say something")
+            workflow.continue_as_new(
+                CarriedChatState(
+                    carried_at=CARRIED_AT, input_items=result.to_input_list()
+                )
+            )
+        copy.deepcopy(state.input_items)
+        result = await Runner.run(
+            starting_agent=agent,
+            input=state.input_items + [{"content": "Next", "role": "user"}],
+        )
+        return f"{result.final_output}; {state.carried_at.isoformat()}"
+
+
+async def test_carried_custom_tool_output_across_continue_as_new(client: Client):
+    model = InputRecordingModel(
+        [
+            ModelResponse(
+                output=[
+                    ResponseCustomToolCall(
+                        call_id="c1",
+                        input="ping",
+                        name="echo",
+                        type="custom_tool_call",
+                    )
+                ],
+                usage=Usage(),
+                response_id=None,
+            ),
+            ResponseBuilders.output_message("done"),
+            ResponseBuilders.output_message("next done"),
+        ]
+    )
+    async with AgentEnvironment(model=model) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, CarriedCustomToolChatWorkflow) as worker:
+            result = await client.execute_workflow(
+                CarriedCustomToolChatWorkflow.run,
+                id=f"carried-custom-tool-chat-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+    assert result == "next done; 2026-10-31T12:00:00+00:00"
+    items = [dict(i) for i in model.inputs[2]]
+    (output,) = [i for i in items if i.get("type") == "custom_tool_call_output"]
+    assert output["output"] == "ping"
+    replies = [i for i in items if i.get("role") == "assistant"]
+    assert [type(r["content"]) for r in replies] == [list]
+
+
 class InputGuardrailModel(Model):
     __test__ = False
     responses: list[ModelResponse] = [
@@ -3029,7 +3433,7 @@ async def test_hosted_mcp_tool(client: Client):
 
 
 def custom_tool_mock_model():
-    return TestModel.returning_responses(
+    return InputRecordingModel(
         [
             ModelResponse(
                 output=[
@@ -3074,7 +3478,8 @@ class CustomToolWorkflow:
 
 
 async def test_custom_tool_workflow(client: Client):
-    async with AgentEnvironment(model=custom_tool_mock_model()) as env:
+    model = custom_tool_mock_model()
+    async with AgentEnvironment(model=model) as env:
         client = env.applied_on_client(client)
 
         async with new_worker(client, CustomToolWorkflow) as worker:
@@ -3086,6 +3491,12 @@ async def test_custom_tool_workflow(client: Client):
             )
             result = await workflow_handle.result()
             assert result == "done:ping"
+    # The model Activity decodes the tool's string output as a string.
+    assert model.inputs[1][-1] == {
+        "call_id": "c1",
+        "output": "ping",
+        "type": "custom_tool_call_output",
+    }
 
 
 class AssertDifferentModelProvider(ModelProvider):
@@ -5289,3 +5700,9 @@ async def test_alignment_uses_the_workflow_workers_defaults(
                 result_type=str,
             )
     assert model.settings == [ModelSettings()]
+
+
+def test_plugin_reports_package_version() -> None:
+    assert openai_agents.OpenAIAgentsPlugin().version() == importlib.metadata.version(
+        "temporalio-openai-agents"
+    )

@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import type { TestFn } from 'ava';
 import {
@@ -1804,4 +1805,8 @@ test('captured history replays deterministically', async (t) => {
     },
     history!
   );
+});
+
+test('StrandsPlugin reports the package version for worker heartbeats', (t) => {
+  t.is(new StrandsPlugin({ models: { test: () => new StubModel([]) } }).version, JSON.parse(readFileSync(path.join(__dirname, '../../package.json'), 'utf8')).version);
 });
