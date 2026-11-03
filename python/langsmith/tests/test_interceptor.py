@@ -22,6 +22,7 @@ from temporalio.langsmith._interceptor import (
     HEADER_KEY,
     _end_run_on_exception,
     _extract_context,
+    _finish_langchain_runs,
     _inject_context,
     _LangChainRuns,
     _LangSmithWorkflowInboundInterceptor,
@@ -327,6 +328,20 @@ class TestReplaySafety:
         gc.collect()
         _open_runs[id(client)] = (stale, OrderedDict({uuid.uuid4(): None}))
         assert list(_ReplaySafeClient(client)._open) == []
+
+    def test_finish_with_workflow_getattr_that_raises(self) -> None:
+        """A workflow class whose ``__getattr__`` raises doesn't fail its end."""
+
+        class _Workflow:
+            def __getattr__(self, name: str) -> Any:
+                return self.__dict__["_state"][name]
+
+        with (
+            patch(_PATCH_IN_WORKFLOW, return_value=True),
+            patch(_PATCH_IS_REPLAYING, return_value=False),
+            patch(f"{_MOD}.temporalio.workflow.instance", return_value=_Workflow()),
+        ):
+            _finish_langchain_runs(None)
 
     def test_run_does_not_end_before_it_starts(self) -> None:
         """A run's end time is no earlier than any start time given out."""

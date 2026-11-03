@@ -476,11 +476,12 @@ def _finish_langchain_runs(err: BaseException | None) -> None:
         ):
             return
         inst = temporalio.workflow.instance()
+        # A workflow class's own __getattr__ can raise anything.
+        runs = getattr(inst, "__temporal_langsmith_langchain_runs", None)
     except Exception:
         # Workflow APIs are mocked (unit tests).
         return
-    runs = getattr(inst, "__temporal_langsmith_langchain_runs", None)
-    if runs is not None:
+    if isinstance(runs, _LangChainRuns):
         runs.finished = True
 
 
