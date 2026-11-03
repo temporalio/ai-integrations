@@ -654,15 +654,17 @@ class _SessionHeartbeats:
         if self._may_be_open and not self._opened:
             # This attempt opened no session, so a retry may build the toolset.
             # Send that last, after every earlier heartbeat: one still being
-            # encoded would otherwise replace it. If this wait is interrupted,
-            # the marker stays and the retry is refused. If it times out, clear
-            # anyway: the worker reports the attempt only after its last
-            # heartbeat task, and the clear has no details to encode. A slower
-            # heartbeat that lands later only makes the retry refuse.
-            if self._sending:
-                await asyncio.wait(set(self._sending), timeout=_CLOSE_TIMEOUT)
-            self._may_be_open = False
-            self.beat()
+            # encoded would otherwise replace it. If the wait times out or is
+            # interrupted, clear anyway: the worker reports the attempt only
+            # after its last heartbeat task, and the clear has no details to
+            # encode. A slower heartbeat that lands later only makes the retry
+            # refuse.
+            try:
+                if self._sending:
+                    await asyncio.wait(set(self._sending), timeout=_CLOSE_TIMEOUT)
+            finally:
+                self._may_be_open = False
+                self.beat()
 
 
 def _already_running_failure() -> ApplicationError:

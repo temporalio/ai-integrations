@@ -1115,6 +1115,46 @@ async def test_stateful_session_ends_with_the_blocks_last_timer(client: Client):
     assert err.value.cause.type == "DedicatedWorkerFailure"
 
 
+@pytest.mark.timeout(90)
+async def test_stateful_session_worker_shutdown_while_closing(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    # Every "may be open" heartbeat hangs in encoding, so the read-back fails at
+    # its deadline and the attempt then waits in close() for those heartbeats.
+    # A worker shutdown during that wait must still let the attempt end.
+    monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
+    monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 60.0)
+    provider = TemporalStatefulMcpToolSetProvider(
+        "stateful_server", lambda _: _stdio_toolset(_MCP_SERVER)
+    )
+    config = client.config()
+    config["data_converter"] = dataclasses.replace(
+        client.data_converter, payload_codec=_StallMayBeOpenEncodeCodec()
+    )
+    worker_client = _make_client(Client(**config), provider)
+    task_queue = f"adk-stateful-mcp-shutdown-closing-{uuid.uuid4()}"
+    worker = Worker(
+        worker_client,
+        task_queue=task_queue,
+        workflows=[StatefulMcpWorkerReplacedWorkflow],
+        max_cached_workflows=0,
+    )
+    worker_task = asyncio.create_task(worker.run())
+    handle = await client.start_workflow(
+        StatefulMcpWorkerReplacedWorkflow.run,
+        _ReplacedInput(),
+        id=f"stateful-mcp-shutdown-closing-{uuid.uuid4()}",
+        task_queue=task_queue,
+        execution_timeout=timedelta(seconds=60),
+    )
+    # Past the 2-second deadline, the attempt waits in close().
+    await asyncio.sleep(5)
+    async with asyncio.timeout(20):
+        await worker.shutdown()
+        await worker_task
+    await handle.terminate()
+
+
 # Without a heartbeat timeout the worker sends a heartbeat at most every 30
 # seconds, and the reset arrives in its response.
 @pytest.mark.timeout(90)
