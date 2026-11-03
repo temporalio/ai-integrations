@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypedDict
 
 from openai_codex import CodexConfig
+from openai_codex.models import JsonObject
 from temporalio import workflow
+from temporalio.contrib.workflow_streams import WorkflowTopicHandle
 
 Message = dict[str, Any]
+ApprovalHandler = Callable[[str, JsonObject | None], JsonObject | Awaitable[JsonObject]]
 
 
 class CodexActivityOptions(TypedDict, total=False):
@@ -18,6 +22,18 @@ class CodexActivityOptions(TypedDict, total=False):
     write: workflow.ActivityConfig
     read: workflow.ActivityConfig
     close: workflow.ActivityConfig
+
+
+@dataclass(slots=True)
+class TemporalCodexConfig(CodexConfig):
+    """Codex launch configuration with options used only in Workflow code."""
+
+    approval_handler: ApprovalHandler | None = None
+    """Handle server requests in Workflow code, including asynchronous approvals."""
+    activity_options: CodexActivityOptions | None = None
+    """Override the connection's Activity options."""
+    stream: WorkflowTopicHandle[Message] | None = None
+    """Publish delta notifications to this Workflow Stream topic."""
 
 
 @dataclass
@@ -72,7 +88,8 @@ class CodexProcess(Protocol):
     """A Codex app-server connection owned by one Worker.
 
     Reads are serialized and survive cancelled Activity attempts. Close must
-    tolerate overlapping calls and unblock outstanding reads and writes.
+    tolerate overlapping calls, be retryable after cancellation, and unblock
+    outstanding reads and writes.
     A write that raises a retryable exception must not have committed its message;
     use CodexError for ambiguous or permanent failures.
     """

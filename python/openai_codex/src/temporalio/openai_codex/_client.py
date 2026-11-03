@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator
+from dataclasses import fields
 from datetime import timedelta
 from typing import Any, TypeVar, cast
 
@@ -13,9 +14,8 @@ from pydantic import BaseModel
 from openai_codex import CodexConfig, CodexError, TransportClosedError
 from openai_codex._initialize_metadata import _split_user_agent
 from openai_codex._runtime_requirements import require_runtime_version
-from openai_codex.client import _active_turn_id_from_error, _params_dict
+from openai_codex.client import _params_dict
 from openai_codex.errors import (
-    InvalidRequestError,
     is_retryable_error,
     map_jsonrpc_error,
 )
@@ -25,16 +25,12 @@ from openai_codex.generated.v2_all import (
     AgentMessageDeltaNotification,
     CancelLoginAccountResponse,
     GetAccountResponse,
-    IdleThreadStatus,
     LoginAccountResponse,
     LogoutAccountResponse,
     ModelListResponse,
     ThreadArchiveResponse,
     ThreadCompactStartResponse,
     ThreadForkResponse,
-    ThreadGoalClearResponse,
-    ThreadGoalSetResponse,
-    ThreadGoalStatus,
     ThreadListResponse,
     ThreadReadResponse,
     ThreadResumeResponse,
@@ -65,7 +61,7 @@ from temporalio.exceptions import ActivityError, is_cancelled_exception
 
 from ._constants import CLOSE, CONNECT, CONNECTION_LOST, READ, RESERVE, WRITE
 from ._errors import sdk_error
-from ._routing import GoalOperation, Router, Subscription
+from ._routing import Router, Subscription
 from ._types import (
     CloseActivityInput,
     CodexActivityOptions,
@@ -74,11 +70,11 @@ from ._types import (
     Message,
     ReadActivityInput,
     ReadResult,
+    TemporalCodexConfig,
     WriteActivityInput,
 )
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
-ApprovalHandler = Callable[[str, JsonObject | None], JsonObject | Awaitable[JsonObject]]
 
 
 class TemporalCodexClient:
@@ -88,17 +84,15 @@ class TemporalCodexClient:
     other protocol operations, just as with upstream AsyncCodexClient.
     """
 
-    def __init__(
-        self,
-        config: CodexConfig | None = None,
-        approval_handler: ApprovalHandler | None = None,
-        *,
-        activity_options: CodexActivityOptions | None = None,
-    ) -> None:
+    def __init__(self, config: CodexConfig | None = None) -> None:
         """Configure a connection; no process starts until start or context entry."""
         self.config = config or CodexConfig()
-        self._approval_handler = approval_handler
-        self._activity_options: CodexActivityOptions = activity_options or {}
+        options = (
+            config if isinstance(config, TemporalCodexConfig) else TemporalCodexConfig()
+        )
+        self._approval_handler = options.approval_handler
+        self._activity_options: CodexActivityOptions = options.activity_options or {}
+        self._stream = options.stream
         self._connection: Connection | None = None
         self._lost = False
         self._reader: asyncio.Task[None] | None = None
@@ -153,7 +147,15 @@ class TemporalCodexClient:
             connecting = asyncio.create_task(
                 self._execute(
                     CONNECT,
-                    ConnectActivityInput(self.config, connection.handle),
+                    ConnectActivityInput(
+                        CodexConfig(
+                            **{
+                                field.name: getattr(self.config, field.name)
+                                for field in fields(CodexConfig)
+                            }
+                        ),
+                        connection.handle,
+                    ),
                     self._activity_options.get("connect", {}),
                     Connection,
                 )
@@ -276,6 +278,10 @@ class TemporalCodexClient:
                             )
                         else:
                             method = message["method"]
+                            if self._stream is not None and method.lower().endswith(
+                                "delta"
+                            ):
+                                self._stream.publish(message)
                             params = message.get("params", {})
                             model = NOTIFICATION_MODELS.get(method)
                             try:
@@ -452,10 +458,6 @@ class TemporalCodexClient:
         for_handle: bool,
     ) -> tuple[Any, Subscription | None]:
         async with self._thread_locks.setdefault(thread_id, asyncio.Lock()):
-            if thread_id in self._router.goals:
-                raise InvalidRequestError(
-                    -32600, f"thread has an active goal operation: {thread_id}"
-                )
             cursors = {key: state.end for key, state in self._router.turns.items()}
             self._router.pending += 1
             try:
@@ -530,101 +532,6 @@ class TemporalCodexClient:
                 )
                 delay = min(max_delay_s, delay * 2)
         raise AssertionError("unreachable")
-
-    def register_goal_operation(self, thread_id: str) -> GoalOperation:
-        """Register a thread-scoped goal route."""
-        state = self._reserve_goal(thread_id)
-        state.routing = True
-        return state
-
-    def _reserve_goal(self, thread_id: str) -> GoalOperation:
-        if thread_id in self._router.goals:
-            raise RuntimeError(
-                f"thread {thread_id!r} already has an active goal operation"
-            )
-        state = GoalOperation(thread_id)
-        if self._router.error is not None:
-            state.inbox.fail(self._router.error)
-        self._router.goals[thread_id] = state
-        return state
-
-    def unregister_goal_operation(self, state: GoalOperation) -> None:
-        """Release one goal operation's route."""
-        if self._router.goals.get(state.thread_id) is state:
-            self._router.goals.pop(state.thread_id)
-
-    async def next_goal_notification(self, state: GoalOperation) -> Notification:
-        """Wait for a notification routed to a goal operation."""
-        return await state.inbox.next()
-
-    async def start_goal_operation(
-        self, thread_id: str, objective: str
-    ) -> tuple[GoalOperation, str]:
-        """Set a persisted goal and wait for its runtime-generated first turn."""
-        async with self._thread_locks.setdefault(thread_id, asyncio.Lock()):
-            thread = (await self.thread_read(thread_id)).thread
-            if not isinstance(thread.status.root, IdleThreadStatus):
-                raise InvalidRequestError(
-                    -32600, f"thread must be idle before starting a goal: {thread_id}"
-                )
-            if thread.ephemeral or thread.path is None:
-                raise InvalidRequestError(
-                    -32600,
-                    f"thread must be persisted before starting a goal: {thread_id}",
-                )
-            state = self._reserve_goal(thread_id)
-            try:
-                await self.thread_goal_clear(thread_id)
-                state.routing = True
-                await self.thread_goal_set(
-                    thread_id, objective=objective, status=ThreadGoalStatus.active
-                )
-                try:
-                    await workflow.wait_condition(
-                        lambda: (
-                            state.logical_turn_id is not None
-                            or state.inbox.error is not None
-                        ),
-                        timeout=30,
-                    )
-                except asyncio.TimeoutError as error:
-                    raise CodexError(
-                        "timed out waiting for goal turn to start after 30 seconds"
-                    ) from error
-                if state.inbox.error is not None:
-                    raise state.inbox.error
-                assert state.logical_turn_id is not None
-                return state, state.logical_turn_id
-            except BaseException:
-                await self.cancel_goal_operation(state)
-                state.finish()
-                self.unregister_goal_operation(state)
-                raise
-
-    async def cancel_goal_operation(self, state: GoalOperation) -> None:
-        """Pause continuation and interrupt the active physical turn when possible."""
-        try:
-            await self.pause_goal(state.thread_id)
-        except Exception:
-            pass
-        turn_id = (
-            state.current_turn_id
-            or getattr(state.completed_turn, "id", None)
-            or state.logical_turn_id
-        )
-        if turn_id is None:
-            return
-        try:
-            await self.turn_interrupt(state.thread_id, turn_id)
-        except InvalidRequestError as error:
-            active = _active_turn_id_from_error(error)
-            if active and active != turn_id:
-                try:
-                    await self.turn_interrupt(state.thread_id, active)
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
     async def account_login_start(
         self, params: V2LoginAccountParams | JsonObject
@@ -752,15 +659,6 @@ class TemporalCodexClient:
         )
         return result
 
-    async def thread_goal_clear(self, thread_id: str) -> ThreadGoalClearResponse:
-        """Send the typed thread/goal/clear request."""
-        result = await self.request(
-            "thread/goal/clear",
-            {"threadId": thread_id},
-            response_model=ThreadGoalClearResponse,
-        )
-        return result
-
     async def turn_interrupt(
         self, thread_id: str, turn_id: str
     ) -> TurnInterruptResponse:
@@ -798,27 +696,6 @@ class TemporalCodexClient:
             response_model=ModelListResponse,
         )
         return result
-
-    async def thread_goal_set(
-        self,
-        thread_id: str,
-        *,
-        objective: str | None = None,
-        status: ThreadGoalStatus | None = None,
-    ) -> ThreadGoalSetResponse:
-        """Create or update a thread's persisted goal."""
-        params: JsonObject = {"threadId": thread_id}
-        if objective is not None:
-            params["objective"] = objective
-        if status is not None:
-            params["status"] = status.value
-        return await self.request(
-            "thread/goal/set", params, response_model=ThreadGoalSetResponse
-        )
-
-    async def pause_goal(self, thread_id: str) -> ThreadGoalSetResponse:
-        """Pause the active persisted goal."""
-        return await self.thread_goal_set(thread_id, status=ThreadGoalStatus.paused)
 
     async def wait_for_turn_completed(self, turn_id: str) -> TurnCompletedNotification:
         """Consume the low-level turn route through its completion notification."""

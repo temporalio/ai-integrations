@@ -55,47 +55,90 @@ In Workflows, collected failed turns raise `CodexError` with the upstream error
 message, so an uncaught provider failure fails the Workflow. Streaming still yields
 the upstream turn-completion notification, including its failure status and error.
 
-## Explicit protocol client
+## Approvals and Activity options
 
-`TemporalCodexClient` mirrors `openai_codex.async_client.AsyncCodexClient` operations
-and adds `notify`, approval callbacks, and Activity overrides. Context entry starts
-the process; **call `initialize()` explicitly** before other protocol operations.
-Requests accept upstream parameter models or wire-format dictionaries and return
-upstream Pydantic models.
+Pass `TemporalCodexConfig`, a subclass of the upstream `CodexConfig`, to
+`AsyncCodex` for Workflow-specific options:
 
 ```python
 from datetime import timedelta
-from temporalio.openai_codex import CodexActivityOptions, TemporalCodexClient
+from openai_codex import AsyncCodex
+from temporalio.openai_codex import CodexActivityOptions, TemporalCodexConfig
 from temporalio.workflow import ActivityConfig
 
 async def approve(method, params):
-    # This runs in Workflow code. It can wait for a Workflow Signal or Update,
-    # or schedule an Activity, while the message reader continues running.
+    # Runs in Workflow code. It can wait for a Signal or Update, or call an Activity.
     return {"decision": "accept"}
 
-async with TemporalCodexClient(
+async with AsyncCodex(TemporalCodexConfig(
+    cwd="/workspace",
     approval_handler=approve,
     activity_options=CodexActivityOptions(
         connect=ActivityConfig(start_to_close_timeout=timedelta(minutes=2)),
     ),
-) as codex:
-    await codex.initialize()
-    thread = await codex.thread_start({"sandbox": "read-only"})
-    turn = await codex.turn_start(thread.thread.id, "Describe the project.")
-    completed = await codex.wait_for_turn_completed(turn.turn.id)
+)) as codex:
+    thread = await codex.thread_start()
+    result = await thread.run("Describe the project.")
 ```
 
 Synchronous and asynchronous approval handlers receive `(method, params)` as in
 upstream `CodexClient`. Keep callbacks deterministic; put I/O in Activities. Without
 a handler, command and file-change approval requests receive `{"decision": "accept"}`
 and other server requests receive `{}`, matching the SDK default. Set Codex's
-approval and sandbox policies deliberately for your application.
+approval and sandbox policies deliberately for your application. These additional
+options apply inside Workflows; ordinary SDK calls use upstream behavior.
 
-The client also supports account login/read/logout and login-completion routing,
-thread lifecycle methods, typed `request`, independent turn subscriptions, steering,
-interruption, streaming deltas, and persisted goal operations. Goal operations
-reserve a thread route and receive its continuation turns; cancel a goal operation
-to pause it and interrupt the active physical turn.
+Only the base `CodexConfig` fields are passed to the connect Activity. Approval
+callbacks, Activity options, and stream topic handles stay in Workflow code.
+
+## Token-by-Token Output
+
+Use the optional `stream` topic to expose generated output to callers outside the
+Workflow. [Workflow Streams](https://docs.temporal.io/develop/python/workflows/workflow-streams)
+is currently in Public Preview. Create the stream in `@workflow.init`, then pass
+its topic in `TemporalCodexConfig`:
+
+```python
+from openai_codex import AsyncCodex
+from temporalio import workflow
+from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.openai_codex import TemporalCodexConfig
+
+
+@workflow.defn
+class StreamingWorkflow:
+    @workflow.init
+    def __init__(self, prompt: str) -> None:
+        self.events = WorkflowStream().topic("codex")
+
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        async with AsyncCodex(TemporalCodexConfig(stream=self.events)) as codex:
+            thread = await codex.thread_start()
+            result = await thread.run(prompt)
+            return result.final_response or ""
+```
+
+An external caller subscribes using the Workflow ID:
+
+```python
+from temporalio.contrib.workflow_streams import WorkflowStreamClient
+
+stream = WorkflowStreamClient.create(client, workflow_id)
+async for item in stream.subscribe(["codex"], result_type=dict):
+    notification = item.data
+    print(notification["method"], notification["params"])
+```
+
+Each item is a JSON-RPC delta notification with `method` and `params`, including
+thread, turn, and item IDs when provided by Codex. Notifications whose method ends
+in `delta` (case insensitive) are published once by the connection's reader,
+including agent text, reasoning, and command output. They remain available through
+upstream `turn.stream()` as well. Activity retries and multiple turn subscribers
+do not duplicate these publications. Explicitly repeating a turn can generate
+new output; consumers should use the IDs to associate it with the correct turn.
+Streaming adds Workflow memory use; apply the Workflow Streams retention guidance
+for long conversations.
 
 ## Connectors and launch configuration
 
@@ -104,7 +147,8 @@ to pause it and interrupt the active physical turn.
 `CodexConfig` and a reserved connection `handle`, which a remote connector can use
 as an idempotency key. `CodexProcess` provides `write(message)`, `read() -> list[dict]`, and
 `close()`. A read returns an ordered batch or an empty list at EOF. Close must be
-idempotent, tolerate overlap, and unblock pending reads and writes. A transient
+idempotent, tolerate overlap, support retries after cancellation, and unblock
+pending reads and writes. A transient
 write failure must guarantee that the message was not committed; report ambiguous
 or permanent failures with `CodexError` so they are not blindly retried.
 

@@ -7,11 +7,15 @@ import uuid
 from typing import Any
 
 import pytest
+from openai_codex import CodexConfig
 
 from temporalio import activity
 from temporalio.client import Client, WorkflowFailureError
+from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.openai_codex import ConnectActivityInput, OpenAICodexPlugin
+from temporalio.openai_codex import _plugin as plugin_module
 from temporalio.openai_codex._types import Message
+from temporalio.runtime import Runtime, TelemetryConfig
 from temporalio.worker import (
     ActivityInboundInterceptor,
     ExecuteActivityInput,
@@ -28,6 +32,7 @@ from tests.helpers.workflows import (
     JoiningTurnWorkflow,
     PendingWorkflow,
     ProtocolWorkflow,
+    StreamingWorkflow,
 )
 
 
@@ -111,6 +116,94 @@ class LoseResults(Interceptor):
         return Inbound(next)
 
 
+@pytest.mark.parametrize("lost_results", [False, True])
+async def test_external_stream_preserves_turn_stream_and_replay(
+    client: Client, lost_results: bool
+) -> None:
+    deltas: list[Message] = [
+        {
+            "method": method,
+            "params": {
+                "threadId": "thread",
+                "turnId": "turn",
+                "itemId": "item",
+                "delta": text,
+                **({"contentIndex": 0} if "reasoning" in method else {}),
+            },
+        }
+        for method, text in [
+            ("item/agentMessage/delta", "hello"),
+            ("item/reasoning/textDelta", "thinking"),
+            ("item/commandExecution/outputDelta", "output"),
+        ]
+    ]
+
+    class StreamingProcess(ProtocolProcess):
+        async def write(self, message: Message) -> None:
+            if message.get("method") != "turn/start":
+                await super().write(message)
+                return
+            self.writes.append(message)
+            self.output.put_nowait(
+                [
+                    {
+                        "id": message["id"],
+                        "result": {
+                            "turn": {"id": "turn", "items": [], "status": "inProgress"}
+                        },
+                    },
+                    *deltas,
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread",
+                            "turn": {"id": "turn", "items": [], "status": "completed"},
+                        },
+                    },
+                ]
+            )
+
+    class StreamingConnector(ProtocolConnector):
+        async def connect(self, request: ConnectActivityInput) -> ProtocolProcess:
+            assert type(request.config) is CodexConfig
+            assert request.config == CodexConfig(cwd="/workspace")
+            await super().connect(request)
+            return self.processes[-1]
+
+    connector = StreamingConnector(StreamingProcess)
+    queue = f"streaming-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=queue,
+        workflows=[StreamingWorkflow],
+        plugins=[OpenAICodexPlugin(connector=connector)],
+        interceptors=[LoseResults()] if lost_results else [],
+    ):
+        handle = await client.start_workflow(
+            StreamingWorkflow.run, id=queue, task_queue=queue
+        )
+        stream = WorkflowStreamClient.create(client, handle.id)
+        items: list[Message] = []
+        async for item in stream.subscribe(["codex"], result_type=dict):
+            items.append(item.data)
+            if len(items) == len(deltas):
+                break
+        await handle.signal(StreamingWorkflow.finish)
+        assert await handle.result() == [
+            *(delta["method"] for delta in deltas),
+            "turn/completed",
+        ]
+        # Read the stream again after completion, including any duplicate publications.
+        assert [
+            item.data async for item in stream.subscribe(["codex"], result_type=dict)
+        ] == deltas
+        assert items == deltas
+    assert connector.processes[0].closed
+    await Replayer(
+        workflows=[StreamingWorkflow], plugins=[OpenAICodexPlugin()]
+    ).replay_workflow(await handle.fetch_history())
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("lost_results", [False, True])
 async def test_approval_callbacks(
@@ -131,8 +224,9 @@ async def test_approval_callbacks(
         assert await handle.result() == ["item/commandExecution/requestApproval"]
     process = connector.processes[0]
     assert process.closed
-    assert len(process.writes) == (4 if asynchronous else 3)
-    assert len({str(msg["id"]) for msg in process.writes}) == len(process.writes)
+    assert len(process.writes) == (6 if asynchronous else 5)
+    request_ids = [str(msg["id"]) for msg in process.writes if "id" in msg]
+    assert len(set(request_ids)) == len(request_ids)
     await Replayer(
         workflows=[ProtocolWorkflow], plugins=[OpenAICodexPlugin()]
     ).replay_workflow(await handle.fetch_history())
@@ -400,26 +494,82 @@ async def test_worker_loss_does_not_restart_connection(client: Client) -> None:
 
 
 @pytest.mark.parametrize("same_instance", [False, True])
+@pytest.mark.parametrize("on_client", [False, True])
 async def test_repeated_plugin_registration(
-    client: Client, same_instance: bool
+    client: Client, same_instance: bool, on_client: bool
 ) -> None:
     connector = ProtocolConnector()
     plugin = OpenAICodexPlugin(connector=connector)
     queue = f"duplicate-{uuid.uuid4()}"
-    async with Worker(
-        client,
-        task_queue=queue,
-        workflows=[ProtocolWorkflow],
-        plugins=[
-            plugin,
-            plugin if same_instance else OpenAICodexPlugin(connector=connector),
-        ],
-    ):
+    other = plugin if same_instance else OpenAICodexPlugin(connector=connector)
+    if on_client:
+        client = Client(client.service_client, plugins=[plugin])
+        with pytest.warns(UserWarning, match="same plugin type"):
+            worker = Worker(
+                client,
+                task_queue=queue,
+                workflows=[ProtocolWorkflow],
+                plugins=[other],
+            )
+    else:
+        worker = Worker(
+            client,
+            task_queue=queue,
+            workflows=[ProtocolWorkflow],
+            plugins=[plugin, other],
+        )
+    async with worker:
         assert await client.execute_workflow(
             ProtocolWorkflow.run, False, id=queue, task_queue=queue
         ) == ["item/commandExecution/requestApproval"]
     assert connector.connects == 1
     assert connector.processes[0].closed
+
+
+async def test_shared_plugin_supports_workers_on_the_same_queue(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    connector = ProtocolConnector()
+    plugin = OpenAICodexPlugin(connector=connector)
+    queue = f"shared-workers-{uuid.uuid4()}"
+    connector_workers: list[Worker] = []
+    connectors_started = asyncio.Event()
+
+    def create_connector_worker(*args: Any, **kwargs: Any) -> Worker:
+        worker = Worker(*args, **kwargs)
+        connector_workers.append(worker)
+        if len(connector_workers) == 2:
+            connectors_started.set()
+        return worker
+
+    monkeypatch.setattr(plugin_module, "Worker", create_connector_worker)
+    first = Worker(
+        client, task_queue=queue, workflows=[ProtocolWorkflow], plugins=[plugin]
+    )
+    # Core disallows overlapping pollers in one Runtime; each Worker needs its own.
+    second_client = await Client.connect(
+        client.service_client.config.target_host,
+        namespace=client.namespace,
+        runtime=Runtime(telemetry=TelemetryConfig()),
+    )
+    second = Worker(
+        second_client, task_queue=queue, workflows=[ProtocolWorkflow], plugins=[plugin]
+    )
+    async with first, second:
+        await asyncio.wait_for(connectors_started.wait(), 5)
+        assert len(connector_workers) == 2
+        assert len({worker.task_queue for worker in connector_workers}) == 2
+        results = await asyncio.gather(
+            *(
+                client.execute_workflow(
+                    ProtocolWorkflow.run, False, id=f"{queue}-{index}", task_queue=queue
+                )
+                for index in range(2)
+            )
+        )
+        assert results == [["item/commandExecution/requestApproval"]] * 2
+    assert connector.connects == 2
+    assert all(process.closed for process in connector.processes)
 
 
 @pytest.mark.parametrize("high_level", [False, True])

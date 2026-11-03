@@ -62,7 +62,6 @@ class CodexProcessConnection:
         self._process = process
         self._output: asyncio.Queue[Message | BaseException] = asyncio.Queue()
         self._stderr: deque[str] = deque(maxlen=400)
-        self._write_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._closed = False
         self._stderr_task = asyncio.create_task(self._drain_stderr())
@@ -84,6 +83,9 @@ class CodexProcessConnection:
                 if not isinstance(message, dict):
                     raise CodexError(f"Invalid JSON-RPC payload: {message!r}")
                 self._output.put_nowait(message)
+            # Stdout can close before the stderr pump reads the final lines.
+            # A process can close stdout while leaving stderr open indefinitely.
+            await asyncio.wait([self._stderr_task], timeout=2)
             raise TransportClosedError(
                 "Codex process closed stdout. stderr_tail="
                 + "\n".join(self._stderr)[-2000:]
@@ -96,15 +98,14 @@ class CodexProcessConnection:
             self._output.put_nowait(terminal)
 
     async def write(self, message: Message) -> None:
-        """Serialize writes; an ambiguous broken pipe permanently ends the session."""
-        async with self._write_lock:
-            if self._closed or self._process.stdin is None:
-                raise TransportClosedError("Codex process is not running")
-            try:
-                self._process.stdin.write((json.dumps(message) + "\n").encode())
-                await self._process.stdin.drain()
-            except (OSError, RuntimeError) as error:
-                raise TransportClosedError(str(error)) from error
+        """Write a message; an ambiguous broken pipe permanently ends the session."""
+        if self._closed or self._process.stdin is None:
+            raise TransportClosedError("Codex process is not running")
+        try:
+            self._process.stdin.write((json.dumps(message) + "\n").encode())
+            await self._process.stdin.drain()
+        except (OSError, RuntimeError) as error:
+            raise TransportClosedError(str(error)) from error
 
     async def read(self) -> list[Message]:
         """Return queued output before reporting an exit or malformed message."""
@@ -125,7 +126,6 @@ class CodexProcessConnection:
         async with self._close_lock:
             if self._closed:
                 return
-            self._closed = True
             if self._process.stdin is not None:
                 self._process.stdin.close()
             if self._process.returncode is None:
@@ -145,3 +145,4 @@ class CodexProcessConnection:
             await asyncio.gather(
                 self._stdout_task, self._stderr_task, return_exceptions=True
             )
+            self._closed = True

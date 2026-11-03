@@ -19,7 +19,7 @@ from ._types import Connector
 
 
 class OpenAICodexPlugin(SimplePlugin):
-    """Use AsyncCodex or TemporalCodexClient in Workflows.
+    """Use AsyncCodex in Workflows.
 
     Activities reach Codex through the configured connector. A private Worker
     queue routes subsequent operations to the process holding the connection.
@@ -37,10 +37,6 @@ class OpenAICodexPlugin(SimplePlugin):
 
         install_adapters()
         self._connector = connector or SubprocessConnector()
-
-        # Each Worker's Activities, by its task queue.
-        self._workers: list[ConnectionActivities] = []
-        self._running: set[Worker] = set()
 
         def workflow_runner(runner: WorkflowRunner | None) -> WorkflowRunner:
             if not runner:
@@ -80,9 +76,7 @@ class OpenAICodexPlugin(SimplePlugin):
         if task_queue.startswith("openai-codex-connector-"):
             return config
         if any(
-            getattr(fn, "__temporal_activity_definition", None)
-            and getattr(fn, "__temporal_activity_definition").name
-            == "openai-codex-reserve"
+            isinstance(getattr(fn, "__self__", None), ConnectionActivities)
             for fn in config.get("activities", [])
         ):
             return config
@@ -92,7 +86,6 @@ class OpenAICodexPlugin(SimplePlugin):
         activities = ConnectionActivities(
             self._connector, f"openai-codex-connector-{uuid.uuid4()}"
         )
-        self._workers.append(activities)
         config["activities"] = [*config.get("activities", []), activities.reserve]
         return super().configure_worker(config)
 
@@ -107,22 +100,23 @@ class OpenAICodexPlugin(SimplePlugin):
             (
                 owner
                 for fn in worker.config(active_config=True).get("activities", [])
-                if (owner := getattr(fn, "__self__", None)) in self._workers
+                if isinstance(
+                    owner := getattr(fn, "__self__", None), ConnectionActivities
+                )
             ),
             None,
         )
-        if activities is None or worker in self._running:
+        if activities is None or activities.connector_worker_running:
             await next(worker)
             return
-        self._running.add(worker)
-        connector_worker = Worker(
-            worker.client,
-            task_queue=activities.connector_queue,
-            activities=activities.connected_activities(),
-            interceptors=worker.config().get("interceptors", []),
-        )
-
+        activities.connector_worker_running = True
         try:
+            connector_worker = Worker(
+                worker.client,
+                task_queue=activities.connector_queue,
+                activities=activities.connected_activities(),
+                interceptors=worker.config().get("interceptors", []),
+            )
             async with connector_worker:
                 await super().run_worker(worker, next)
         finally:
@@ -130,5 +124,4 @@ class OpenAICodexPlugin(SimplePlugin):
             try:
                 await asyncio.shield(activities.shut_down())
             finally:
-                self._running.discard(worker)
-                self._workers.remove(activities)
+                activities.connector_worker_running = False

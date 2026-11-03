@@ -9,13 +9,6 @@ from typing import Any
 
 from openai_codex import TransportClosedError
 from openai_codex.generated.notification_registry import notification_turn_id
-from openai_codex.generated.v2_all import (
-    ThreadGoalClearedNotification,
-    ThreadGoalStatus,
-    ThreadGoalUpdatedNotification,
-    TurnCompletedNotification,
-    TurnStartedNotification,
-)
 from openai_codex.models import Notification, UnknownNotification
 
 
@@ -113,68 +106,6 @@ class Subscription:
             self.state.prune()
 
 
-@dataclass
-class GoalOperation:
-    """State and events for one thread's goal operation."""
-
-    thread_id: str
-    inbox: Inbox = field(default_factory=Inbox)
-    logical_turn_id: str | None = None
-    current_turn_id: str | None = None
-    started_turn: Any = None
-    completed_turn: Any = None
-    status: Any = None
-    cleared: bool = False
-    interrupted: bool = False
-    interrupt_requested: bool = False
-    routing: bool = False
-    finished: bool = False
-
-    def observe(self, event: Notification) -> bool:
-        """Update the goal while retaining every routed notification."""
-        if not self.routing and not event.method.startswith("thread/goal/"):
-            return False
-        payload = event.payload
-        if isinstance(payload, TurnStartedNotification):
-            self.current_turn_id = payload.turn.id
-            self.logical_turn_id = self.logical_turn_id or self.current_turn_id
-            self.started_turn = self.started_turn or payload.turn
-        elif isinstance(payload, TurnCompletedNotification):
-            self.completed_turn = payload.turn
-            if self.current_turn_id == payload.turn.id:
-                self.current_turn_id = None
-        elif isinstance(payload, ThreadGoalUpdatedNotification):
-            self.status = payload.goal.status
-            if self.status == ThreadGoalStatus.active:
-                self.cleared = False
-        elif isinstance(payload, ThreadGoalClearedNotification):
-            self.cleared = True
-        if (
-            self.completed_turn is not None
-            and self.current_turn_id is None
-            and (
-                self.cleared
-                or self.status
-                in {
-                    ThreadGoalStatus.paused,
-                    ThreadGoalStatus.blocked,
-                    ThreadGoalStatus.usage_limited,
-                    ThreadGoalStatus.budget_limited,
-                    ThreadGoalStatus.complete,
-                }
-            )
-        ):
-            self.finished = True
-        self.inbox.put(event)
-        return True
-
-    def finish(self) -> None:
-        """End the operation and wake waiters."""
-        self.finished = True
-        self.current_turn_id = None
-        self.inbox.fail(TransportClosedError("Goal operation finished"))
-
-
 class Router:
     """Route notifications, buffering races with turn/start and login replies."""
 
@@ -184,7 +115,6 @@ class Router:
         self.logins: dict[str, Inbox] = {}
         self.turns: dict[str, TurnEvents] = {}
         self.defaults: dict[str, Subscription] = {}
-        self.goals: dict[str, GoalOperation] = {}
         self.pending = 0
         self.error: BaseException | None = None
 
@@ -232,19 +162,8 @@ class Router:
             turn_id = raw.get("turnId") or (
                 nested.get("id") if isinstance(nested, dict) else None
             )
-            thread_id = raw.get("threadId")
         else:
             turn_id = notification_turn_id(payload)
-            thread_id = getattr(payload, "thread_id", None)
-        goal = self.goals.get(thread_id) if isinstance(thread_id, str) else None
-        if (
-            goal
-            and (turn_id or event.method.startswith("thread/goal/"))
-            and goal.observe(event)
-        ):
-            if goal.finished:
-                self.goals.pop(goal.thread_id, None)
-            return
         if isinstance(turn_id, str):
             state = self.turns.setdefault(turn_id, TurnEvents())
             state.events[state.end] = event
@@ -273,5 +192,3 @@ class Router:
         for state in self.turns.values():
             state.error = error
             state.changed.set()
-        for goal in self.goals.values():
-            goal.inbox.fail(error)

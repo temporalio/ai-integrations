@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 from typing import Any
 
 import pytest
 from openai_codex import AsyncChatgptLoginHandle, AsyncCodex, TransportClosedError
-from openai_codex.async_client import AsyncCodexClient
 from openai_codex.generated.v2_all import (
     AccountLoginCompletedNotification,
     LoginAccountResponse,
@@ -16,7 +14,8 @@ from openai_codex.generated.v2_all import (
 from openai_codex.models import Notification, UnknownNotification
 
 from temporalio import workflow
-from temporalio.openai_codex import OpenAICodexPlugin, TemporalCodexClient
+from temporalio.openai_codex import OpenAICodexPlugin
+from temporalio.openai_codex._client import TemporalCodexClient
 from temporalio.openai_codex._routing import Router
 from temporalio.openai_codex._types import Message
 
@@ -177,16 +176,6 @@ async def test_failure_wakes_all_consumers_and_future_turns() -> None:
     assert all(isinstance(result, TransportClosedError) for result in results)
     with pytest.raises(TransportClosedError):
         await router.subscribe("later").next()
-
-
-def test_public_low_level_operations_match_upstream() -> None:
-    for name, value in vars(AsyncCodexClient).items():
-        if name.startswith("_") or not callable(value):
-            continue
-        assert hasattr(TemporalCodexClient, name), name
-        expected = inspect.signature(value).parameters
-        actual = inspect.signature(getattr(TemporalCodexClient, name)).parameters
-        assert list(expected) == list(actual), name
 
 
 async def test_upstream_approval_defaults() -> None:

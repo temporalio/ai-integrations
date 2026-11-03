@@ -20,7 +20,9 @@ from openai_codex.models import JsonObject
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.openai_codex import TemporalCodexClient
+from temporalio.contrib.workflow_streams import WorkflowStream
+from temporalio.openai_codex import TemporalCodexConfig
+from temporalio.openai_codex._client import TemporalCodexClient
 
 with workflow.unsafe.imports_passed_through():
     from tests.helpers.protocol import Echo
@@ -103,7 +105,9 @@ class ConnectingWorkflow:
             connect["task_queue"] = queue
         if abandon:
             connect["cancellation_type"] = workflow.ActivityCancellationType.ABANDON
-        async with TemporalCodexClient(activity_options={"connect": connect}):
+        async with TemporalCodexClient(
+            TemporalCodexConfig(activity_options={"connect": connect})
+        ):
             await workflow.wait_condition(lambda: False)
 
 
@@ -121,7 +125,9 @@ class ClosingApprovalWorkflow:
             finished = True
             return {"decision": "accept"}
 
-        async with TemporalCodexClient(approval_handler=approve) as client:
+        async with TemporalCodexClient(
+            TemporalCodexConfig(approval_handler=approve)
+        ) as client:
             try:
                 await client.request("approval", None, response_model=Echo)
             except TransportClosedError:
@@ -150,9 +156,13 @@ class ProtocolWorkflow:
             ).value == "nested"
             return sync_approve(method, params)
 
-        async with TemporalCodexClient(
-            approval_handler=async_approve if asynchronous else sync_approve
-        ) as client:
+        async with AsyncCodex(
+            TemporalCodexConfig(
+                approval_handler=async_approve if asynchronous else sync_approve
+            )
+        ) as codex:
+            assert isinstance(codex._client, TemporalCodexClient)
+            client = codex._client
             response = await client.request("approval", None, response_model=Echo)
             assert response.value == "accept"
             try:
@@ -169,10 +179,12 @@ class ConnectionLossWorkflow:
     @workflow.run
     async def run(self) -> str:
         async with TemporalCodexClient(
-            activity_options={
-                "read": {"schedule_to_start_timeout": timedelta(seconds=1)},
-                "write": {"schedule_to_start_timeout": timedelta(seconds=1)},
-            }
+            TemporalCodexConfig(
+                activity_options={
+                    "read": {"schedule_to_start_timeout": timedelta(seconds=1)},
+                    "write": {"schedule_to_start_timeout": timedelta(seconds=1)},
+                }
+            )
         ) as client:
             await workflow.wait_condition(lambda: self.proceed)
             try:
@@ -222,32 +234,6 @@ class ControlWorkflow:
     @workflow.signal
     def resume(self) -> None:
         self.proceed = True
-
-
-@workflow.defn
-class GoalWorkflow:
-    @workflow.run
-    async def run(self, config: CodexConfig) -> str:
-        async with TemporalCodexClient(config) as codex:
-            await codex.initialize()
-            thread = await codex.thread_start({"sandbox": "read-only"})
-            initial = await codex.turn_start(
-                thread.thread.id, "Prepare the persisted thread."
-            )
-            # Discard the initial turn after waiting for its durable rollout.
-            # The completion is emitted before the model has any goal set.
-            await codex.wait_for_turn_completed(initial.turn.id)
-            state, turn_id = await codex.start_goal_operation(
-                thread.thread.id, "Say hello once."
-            )
-            assert turn_id
-            await codex.cancel_goal_operation(state)
-            assert (
-                await codex.pause_goal(thread.thread.id)
-            ).goal.status.value == "paused"
-            await codex.thread_goal_clear(thread.thread.id)
-            codex.unregister_goal_operation(state)
-            return "paused"
 
 
 @workflow.defn
@@ -329,3 +315,36 @@ class JoiningTurnWorkflow:
                 return events
             finally:
                 await stream.aclose()
+
+
+@workflow.defn
+class StreamingWorkflow:
+    @workflow.init
+    def __init__(self) -> None:
+        self.events = WorkflowStream().topic("codex")
+        self.finished = False
+
+    @workflow.run
+    async def run(self) -> list[str]:
+        async def approve(method: str, params: JsonObject | None) -> JsonObject:
+            del method, params
+            return {"decision": "accept"}
+
+        async with AsyncCodex(
+            TemporalCodexConfig(
+                cwd="/workspace",
+                approval_handler=approve,
+                activity_options={
+                    "read": {"start_to_close_timeout": timedelta(minutes=1)}
+                },
+                stream=self.events,
+            )
+        ) as codex:
+            turn = await AsyncThread(codex, "thread").turn("Say hello.")
+            methods = [event.method async for event in turn.stream()]
+            await workflow.wait_condition(lambda: self.finished)
+            return methods
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.finished = True

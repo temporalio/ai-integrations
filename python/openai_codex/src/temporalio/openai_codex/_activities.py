@@ -15,7 +15,7 @@ from temporalio.service import PayloadLimitsConfig
 
 from ._constants import CLOSE, CONNECT, CONNECTION_LOST, READ, RESERVE, WRITE
 from ._errors import activity_error
-from ._heartbeat_decorator import auto_heartbeater, heartbeat
+from ._heartbeat_decorator import auto_heartbeater
 from ._types import (
     CloseActivityInput,
     CodexProcess,
@@ -43,8 +43,6 @@ class _Connection:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     writes: dict[int, asyncio.Task[None]] = field(default_factory=dict)
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    close_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    closing: asyncio.Task[None] | None = None
 
     async def write_process(self, message: Message) -> None:
         """Keep later writes behind an earlier attempt that outlived its caller."""
@@ -52,25 +50,15 @@ class _Connection:
             await self.process.write(message)
 
     async def close(self) -> None:
-        """Retain cleanup across cancelled and overlapping close attempts."""
-        if self.closing is None:
-            self.closing = asyncio.create_task(self._close())
-        await asyncio.shield(self.closing)
-
-    async def _close(self) -> None:
-        async with self.close_lock:
-            try:
-                await self.process.close()
-            except Exception:
-                self.closing = None
-                raise
-            pending: list[asyncio.Future[Any]] = list(self.writes.values())
-            if self.reading is not None:
-                pending.append(self.reading)
-            for task in pending:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
+        """Close the process and release retained read and write tasks."""
+        await self.process.close()
+        pending: list[asyncio.Future[Any]] = list(self.writes.values())
+        if self.reading is not None:
+            pending.append(self.reading)
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
     async def read_process(self) -> list[Message]:
         """Wait for the process's next output.
@@ -103,6 +91,8 @@ class ConnectionActivities:
         """
         self._connector = connector
         self.connector_queue = connector_queue
+        # Duplicate plugin instances share this owner's connector Worker.
+        self.connector_worker_running = False
         self._connections: dict[str, _Connection] = {}
         self._closed_handles: set[str] = set()
         self._connect_lock = asyncio.Lock()
@@ -127,12 +117,6 @@ class ConnectionActivities:
         info = activity.info()
         handle = request.handle or f"{info.workflow_run_id}/{info.activity_id}"
 
-        if (
-            activity.info().heartbeat_details
-            and list(activity.info().heartbeat_details)[0] != self.connector_queue
-        ):
-            raise activity_error(TransportClosedError(CONNECTION_LOST))
-        heartbeat(self.connector_queue)
         async with self._connect_lock:
             if handle in self._closed_handles:
                 raise activity_error(

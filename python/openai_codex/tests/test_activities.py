@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from openai_codex import CodexConfig, CodexError, TransportClosedError
@@ -13,6 +13,7 @@ from openai_codex import CodexConfig, CodexError, TransportClosedError
 from temporalio.exceptions import ApplicationError
 from temporalio.openai_codex import ConnectActivityInput, SubprocessConnector
 from temporalio.openai_codex._activities import ConnectionActivities, _fit_payload
+from temporalio.openai_codex._subprocess import CodexProcessConnection
 from temporalio.openai_codex._types import (
     CloseActivityInput,
     ReadActivityInput,
@@ -106,6 +107,66 @@ async def test_subprocess_errors(script: str, error: type[Exception]) -> None:
             await process.read()
     finally:
         await asyncio.gather(process.close(), process.close())
+
+
+async def test_stdout_eof_waits_for_final_stderr() -> None:
+    process = await SubprocessConnector().connect(
+        ConnectActivityInput(
+            CodexConfig(
+                launch_args_override=(
+                    sys.executable,
+                    "-c",
+                    "import os, sys, time; os.close(1); time.sleep(0.03); "
+                    "print('final diagnostic', file=sys.stderr, flush=True)",
+                )
+            )
+        )
+    )
+    try:
+        with pytest.raises(TransportClosedError, match="final diagnostic"):
+            await process.read()
+    finally:
+        await process.close()
+
+
+async def test_cancelled_subprocess_close_can_be_retried() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class Process:
+        stdin = None
+        stdout = asyncio.StreamReader()
+        stderr = asyncio.StreamReader()
+        returncode: int | None = None
+        reaped = False
+
+        def terminate(self) -> None:
+            pass
+
+        async def wait(self) -> int:
+            entered.set()
+            await release.wait()
+            self.reaped = True
+            self.returncode = 0
+            return 0
+
+    process = Process()
+    connection = CodexProcessConnection(
+        cast(asyncio.subprocess.Process, cast(object, process))
+    )
+    closing = asyncio.create_task(connection.close())
+    try:
+        await entered.wait()
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        release.set()
+        await asyncio.gather(connection.close(), connection.close())
+        assert process.reaped
+        assert connection._stdout_task.done() and connection._stderr_task.done()
+    finally:
+        release.set()
+        await connection.close()
 
 
 async def test_stdout_line_limit_is_a_permanent_read_error() -> None:
@@ -220,7 +281,7 @@ async def test_close_rejects_pending_and_delayed_launches() -> None:
         await activities.shut_down()
 
 
-async def test_heartbeat_retains_launch_owner() -> None:
+async def test_connect_heartbeats_without_owner_details() -> None:
     import dataclasses
     from datetime import timedelta
 
@@ -240,10 +301,11 @@ async def test_heartbeat_retains_launch_owner() -> None:
     environment.on_heartbeat = lambda *args: beats.append(args)
     activities = ConnectionActivities(DelayedConnector(), "private")
     await environment.run(activities.connect, ConnectActivityInput())
-    assert len(beats) >= 3 and all(beat == ("private",) for beat in beats)
+    assert len(beats) >= 3 and all(beat == () for beat in beats)
     await activities.shut_down()
     environment.info = dataclasses.replace(
         environment.info, heartbeat_details=("another-worker",)
     )
-    with pytest.raises(ApplicationError, match="Lost the connection"):
-        await environment.run(activities.connect, ConnectActivityInput())
+    connection = await environment.run(activities.connect, ConnectActivityInput())
+    assert connection.task_queue == "private"
+    await activities.shut_down()

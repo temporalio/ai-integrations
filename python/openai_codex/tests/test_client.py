@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from temporalio import workflow
-from temporalio.openai_codex import TemporalCodexClient
+from temporalio.openai_codex._client import TemporalCodexClient
 from temporalio.openai_codex._constants import CLOSE, CONNECT, RESERVE
 from temporalio.openai_codex._types import CloseActivityInput, Connection
 

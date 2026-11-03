@@ -173,28 +173,3 @@ async def test_steer_and_interrupt(
         ).replay_workflow(await handle.fetch_history())
     finally:
         model.close()
-
-
-async def test_goals(client: Client, tmp_path: Path) -> None:
-    from tests.helpers.workflows import GoalWorkflow
-
-    model = LocalModel(tmp_path)
-    queue = f"goal-{uuid.uuid4()}"
-    config = model.config()
-    config.config_overrides += ("features.goals=true",)
-    try:
-        async with Worker(
-            client,
-            task_queue=queue,
-            workflows=[GoalWorkflow],
-            plugins=[OpenAICodexPlugin()],
-        ):
-            handle = await client.start_workflow(
-                GoalWorkflow.run, config, id=queue, task_queue=queue
-            )
-            assert await handle.result() == "paused"
-        await Replayer(
-            workflows=[GoalWorkflow], plugins=[OpenAICodexPlugin()]
-        ).replay_workflow(await handle.fetch_history())
-    finally:
-        model.close()
