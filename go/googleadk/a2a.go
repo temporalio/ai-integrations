@@ -519,19 +519,18 @@ func (e *a2aHTTPStatusError) Error() string { return "unexpected HTTP status: " 
 //	})
 //
 // Without it, only model calls check, and only the agents below the agent that
-// makes the call. The runner plugin also catches a remote root agent, one
-// under a sequential, loop or parallel agent, and one reached by transfer. It
-// does not see a remote agent wrapped as a tool with agenttool, which is not
-// part of the tree.
+// makes the call: its sub-agents and the agents its tools wrap with agenttool.
+// The runner plugin also catches a remote root agent, one under a sequential,
+// loop or parallel agent, one reached by transfer, and one reached through a
+// model callback that gets past the model-call check: a BeforeModelCallbacks
+// entry that answers instead of the model, or an OnModelErrorCallbacks entry
+// that turns the refusal into a transfer. It finds agents wrapped with
+// agenttool in an agent's Tools, but not in its Toolsets.
 func NewRunnerPlugin(root agent.Agent) (*plugin.Plugin, error) {
 	return plugin.New(plugin.Config{
 		Name: "googleadk",
 		BeforeRunCallback: func(agent.InvocationContext) (*genai.Content, error) {
-			remote := root
-			if !remoteAgentSendsFromWorkflow(root) {
-				remote = findRemoteAgent(root)
-			}
-			if remote != nil {
+			if remote := findRemoteAgent(root); remote != nil {
 				return nil, remoteAgentError(remote)
 			}
 			return nil, nil

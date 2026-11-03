@@ -81,6 +81,11 @@ func TestRemoteSubAgentRejected(t *testing.T) {
 		sa.WorkflowSideA2A = true
 		return []subAgentSpec{sa}
 	}
+	workflowSideTool := func(url string) []subAgentSpec {
+		sas := workflowSide(url)
+		sas[0].AsTool = true
+		return sas
+	}
 	for _, tc := range []struct {
 		name string
 		in   func(url string) runInput
@@ -106,6 +111,25 @@ func TestRemoteSubAgentRejected(t *testing.T) {
 			},
 			wantSent: true,
 		},
+		{
+			name: "wrapped with agenttool",
+			in: func(url string) runInput {
+				return runInput{ModelName: "tool-model", UserMessage: "ask the remote agent", SubAgents: workflowSideTool(url)}
+			},
+		},
+		{
+			name: "wrapped with agenttool and called from a model callback, with the runner plugin",
+			in: func(url string) runInput {
+				return runInput{ModelName: "tool-model", CallToolFromCallback: "remote", RunnerPlugin: true, UserMessage: "ask the remote agent", SubAgents: workflowSideTool(url)}
+			},
+		},
+		{
+			name: "wrapped with agenttool and called from a model callback, without the runner plugin",
+			in: func(url string) runInput {
+				return runInput{ModelName: "tool-model", CallToolFromCallback: "remote", UserMessage: "ask the remote agent", SubAgents: workflowSideTool(url)}
+			},
+			wantSent: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			url, requests := startA2AServer(t, a2aServer{
@@ -113,7 +137,13 @@ func TestRemoteSubAgentRejected(t *testing.T) {
 			})
 			var s testsuite.WorkflowTestSuite
 			env, counter := newEnv(t, &s, googleadk.Config{
-				Models: map[string]googleadk.ModelFactory{"root-model": transferToRemoteModel()},
+				Models: map[string]googleadk.ModelFactory{
+					"root-model": transferToRemoteModel(),
+					"tool-model": scriptedModelFactory(
+						googleadk.FunctionCallResponse("c1", "remote", map[string]any{"request": "hello"}),
+						googleadk.TextResponse("done"),
+					),
+				},
 			})
 
 			env.ExecuteWorkflow(agentRunWorkflow, tc.in(url))

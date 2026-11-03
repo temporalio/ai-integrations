@@ -32,6 +32,7 @@ import (
 	"google.golang.org/adk/v2/runner"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
+	"google.golang.org/adk/v2/tool/agenttool"
 	"google.golang.org/adk/v2/tool/functiontool"
 
 	"go.temporal.io/googleadk"
@@ -58,6 +59,9 @@ type subAgentSpec struct {
 	// WorkflowSideA2A makes that remote agent use ADK's own providers instead,
 	// which fetch the card and send messages from Workflow code.
 	WorkflowSideA2A bool
+	// AsTool gives that remote agent to the root as a tool, wrapped with
+	// agenttool, instead of as a sub-agent.
+	AsTool bool
 }
 
 // remoteSubAgent is a remote A2A sub-agent named "remote" with its card at url.
@@ -198,6 +202,10 @@ type runInput struct {
 	// RequestModel, when set, installs a BeforeModelCallback on the root agent
 	// that sets LLMRequest.Model to it.
 	RequestModel *string
+	// CallToolFromCallback, when set, installs a BeforeModelCallback on the
+	// root agent that answers instead of the model: it calls this tool, then
+	// ends the turn.
+	CallToolFromCallback string
 }
 
 // runResult is the serializable output of agentRunWorkflow.
@@ -241,6 +249,7 @@ type agentBuild struct {
 	toolsets       []tool.Toolset
 	subAgents      []agent.Agent
 	requestModel   *string
+	callTool       string
 	// sessionService overrides the default in-memory session service. Tests that
 	// need to inspect session state/events after the run (state mutation,
 	// continue-as-new) supply their own and read it back via ExportSession.
@@ -263,6 +272,16 @@ func runAgent(ctx workflow.Context, b agentBuild) (runResult, error) {
 		beforeModel = append(beforeModel, func(_ agent.Context, req *model.LLMRequest) (*model.LLMResponse, error) {
 			req.Model = *b.requestModel
 			return nil, nil
+		})
+	}
+	if b.callTool != "" {
+		beforeModel = append(beforeModel, func(_ agent.Context, req *model.LLMRequest) (*model.LLMResponse, error) {
+			for _, p := range req.Contents[len(req.Contents)-1].Parts {
+				if p.FunctionResponse != nil {
+					return googleadk.TextResponse("done"), nil
+				}
+			}
+			return googleadk.FunctionCallResponse("c1", b.callTool, map[string]any{"request": "hello"}), nil
 		})
 	}
 	var root agent.Agent
@@ -432,7 +451,11 @@ func agentRunWorkflow(ctx workflow.Context, in runInput) (runResult, error) {
 			if rerr != nil {
 				return runResult{}, rerr
 			}
-			subAgents = append(subAgents, remote)
+			if sa.AsTool {
+				tools = append(tools, agenttool.New(remote, nil))
+			} else {
+				subAgents = append(subAgents, remote)
+			}
 			continue
 		}
 		child, cerr := llmagent.New(llmagent.Config{
@@ -465,6 +488,7 @@ func agentRunWorkflow(ctx workflow.Context, in runInput) (runResult, error) {
 		toolsets:       toolsets,
 		subAgents:      subAgents,
 		requestModel:   in.RequestModel,
+		callTool:       in.CallToolFromCallback,
 	})
 }
 
