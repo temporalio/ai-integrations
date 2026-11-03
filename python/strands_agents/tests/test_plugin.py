@@ -230,6 +230,41 @@ def test_other_failure_converter_is_replaced(target: str) -> None:
     assert decoded.type == "DomainError"
 
 
+@pytest.mark.parametrize("target", ["client", "replayer"])
+def test_custom_payload_converter_keeps_caller_failure_decoding(target: str) -> None:
+    # With a non-default payload converter the caller's failure converter was
+    # always preserved; its decoding must still run for recorded failures.
+    supplied = replace(
+        pydantic_data_converter, failure_converter_class=DomainFailureConverter
+    )
+    configured = _configure(target, supplied)
+    failure = Failure()
+    configured.failure_converter.to_failure(
+        ApplicationError("boom", type="DomainError"),
+        configured.payload_converter,
+        failure,
+    )
+    decoded = configured.failure_converter.from_failure(
+        failure, configured.payload_converter
+    )
+    assert isinstance(decoded, DomainError)
+    # Strands handling is still added on top.
+    interrupt = Failure()
+    configured.failure_converter.to_failure(
+        InterruptException(Interrupt(id="i1", name="approval", reason="ok?")),
+        configured.payload_converter,
+        interrupt,
+    )
+    assert interrupt.application_failure_info.type == "StrandsInterrupt"
+    assert interrupt.application_failure_info.non_retryable
+    # Running the plugin again on its own output keeps it.
+    again = _configure(target, configured)
+    assert isinstance(
+        again.failure_converter.from_failure(failure, again.payload_converter),
+        DomainError,
+    )
+
+
 def test_mcp_factory_that_returns_a_strands_client_fails_retryably() -> None:
     # A factory left as it was for Strands' MCPClient, the common upgrade mistake.
     def old_factory() -> typing.Any:
