@@ -257,8 +257,31 @@ export async function mcpServersAgent(
   try {
     result = (await agent.invoke(prompt)).toString();
   } catch (err) {
-    result = `refused: ${(err as Error).message}`;
+    const cause = (err as Error).cause as Error | undefined;
+    result = `refused: ${(err as Error).message}${cause ? ` (${cause.message})` : ''}`;
   }
+  const names = agent.toolRegistry
+    .list()
+    .map((t) => t.name)
+    .sort();
+  return `${result} Tools: ${names.join(', ')}.`;
+}
+
+/**
+ * Servers `a` and `b`, told apart with `prefix`; `b`'s `toolFilters` let through tools whose server
+ * name starts with `ec`, or is `skip`, except the one the agent sees as `b_skip`.
+ */
+export async function mcpPrefixedServersAgent(prompt: string): Promise<string> {
+  const activityOptions = { startToCloseTimeout: '10 seconds' } as const;
+  const a = new TemporalMCPClient({ server: 'a', prefix: 'a', activityOptions });
+  const b = new TemporalMCPClient({
+    server: 'b',
+    prefix: 'b',
+    activityOptions,
+    toolFilters: { allowed: [/ec/, 'skip'], rejected: [(tool) => tool.name === 'b_skip'] },
+  });
+  const agent = new TemporalAgent({ model: 'test', printer: false, tools: [a, b] });
+  const result = (await agent.invoke(prompt)).toString();
   const names = agent.toolRegistry
     .list()
     .map((t) => t.name)

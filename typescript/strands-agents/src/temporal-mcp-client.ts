@@ -47,11 +47,35 @@ const STUB_TRANSPORT: Transport = {
  *   one extra `{server}-listTools` activity per tool round.
  * - `true` — list once at the beginning of the workflow and reuse for all
  *   turns. Cheaper, but the tool list is fixed for the workflow's lifetime.
+ *
+ * `prefix` and `toolFilters` work as on Strands' `McpClient`: the agent sees
+ * `{prefix}_{name}`, and string and `RegExp` filters match the server's tool
+ * name. A callback filter receives the workflow-side {@link TemporalMCPTool}
+ * and runs in the workflow, so it must be deterministic.
  */
 export interface TemporalMCPClientOptions {
   server: string;
   activityOptions?: ActivityOptions;
   cacheTools?: boolean;
+  /** Prefix for the agent's tool names, applied as `{prefix}_{name}`. */
+  prefix?: string;
+  /** Which of the server's tools the agent gets. */
+  toolFilters?: McpToolFilters;
+}
+
+/**
+ * Matches a tool, as in Strands' `McpToolMatcher`: a string matches the
+ * server's tool name exactly, a `RegExp` matches it from the start, and a
+ * callback receives the tool under the name the agent sees.
+ */
+export type McpToolMatcher = string | RegExp | ((tool: TemporalMCPTool) => boolean);
+
+/** Which of a server's tools the agent gets, as in Strands' `McpToolFilters`. */
+export interface McpToolFilters {
+  /** When present, only tools that match at least one matcher. */
+  allowed?: McpToolMatcher[];
+  /** Tools that match at least one matcher are left out, even when also allowed. */
+  rejected?: McpToolMatcher[];
 }
 
 /**
@@ -70,8 +94,9 @@ export interface ToolRegistryView {
  *
  * The transport factory and tool discovery live worker-side via
  * `StrandsPlugin({ mcpClients: { server: () => new McpClient(...) } })`.
- * This handle only carries the server name (which selects the registered
- * factory) and the per-call activity options.
+ * This handle carries the server name (which selects the registered
+ * factory), the tool `prefix` and `toolFilters`, and the per-call activity
+ * options.
  *
  * Extends {@link McpClient} so it can be passed directly in an
  * {@link AgentConfig.tools | Agent.tools} array (Strands' `flattenTools`
@@ -83,6 +108,8 @@ export interface ToolRegistryView {
 export class TemporalMCPClient extends McpClient {
   private readonly server: string;
   private readonly activityOptions: ActivityOptions;
+  private readonly prefix: string | undefined;
+  private readonly toolFilters: McpToolFilters | undefined;
   /** Whether the agent lists this server's tools once or re-lists each turn. */
   readonly cacheTools: boolean;
   // The names this client's tools hold in each agent's registry: the names of the tools Strands
@@ -97,6 +124,8 @@ export class TemporalMCPClient extends McpClient {
     this.server = options.server;
     this.activityOptions = options.activityOptions ?? {};
     this.cacheTools = options.cacheTools ?? false;
+    this.prefix = options.prefix;
+    this.toolFilters = options.toolFilters;
   }
 
   override async connect(): Promise<void> {
@@ -123,7 +152,9 @@ export class TemporalMCPClient extends McpClient {
       ...this.activityOptions,
     });
     const infos = await activities[listToolsActivityName(this.server)]!({ server: this.server });
-    const tools = infos.map((info) => new TemporalMCPTool(this.server, info, this.activityOptions));
+    const tools = infos
+      .map((info) => new TemporalMCPTool(this.server, info, this.activityOptions, this.prefix))
+      .filter((tool) => included(tool, this.toolFilters));
     for (const tool of tools) this.listed.add(tool);
     return tools as never[];
   }
@@ -262,6 +293,21 @@ interface Listing {
   tools: TemporalMCPTool[];
 }
 
+// Strands' McpClient filter rule: whether `filters` let the agent have `tool`.
+function included(tool: TemporalMCPTool, filters: McpToolFilters | undefined): boolean {
+  if (!filters) return true;
+  if (filters.allowed !== undefined && !filters.allowed.some((m) => matches(tool, m))) return false;
+  return !(filters.rejected !== undefined && filters.rejected.some((m) => matches(tool, m)));
+}
+
+function matches(tool: TemporalMCPTool, matcher: McpToolMatcher): boolean {
+  if (typeof matcher === 'function') return matcher(tool);
+  if (typeof matcher === 'string') return matcher === tool.serverToolName;
+  // The sticky flag anchors the match at the start of the name, as Strands does.
+  const anchored = new RegExp(matcher.source, matcher.flags.includes('y') ? matcher.flags : `${matcher.flags}y`);
+  return anchored.test(tool.serverToolName);
+}
+
 // Strands' words when its ToolRegistry rejects a tool name, or undefined when it accepts it.
 function rejection(name: string): string | undefined {
   if (name.length < 1 || name.length > 64) return 'Tool name must be between 1 and 64 characters';
@@ -313,6 +359,7 @@ export function buildListToolsActivity(
     const record = connections.acquire(server, factory);
     try {
       const client = await record.client;
+      refuseFactoryPrefix(server, client);
       const tools = await client.listTools();
       return tools.map((t) => ({
         name: t.name,
@@ -333,6 +380,20 @@ export function buildListToolsActivity(
   };
   Object.defineProperty(fn, 'name', { value: name });
   return fn;
+}
+
+// A prefix on the factory's McpClient renames the tools the agent sees, and the callTool activity
+// then asks the server for those names. Refuse it, retryably, so a run waits for a fixed worker.
+function refuseFactoryPrefix(server: string, client: McpClient): void {
+  // Strands' McpClient keeps the option in a private field.
+  const prefix = (client as unknown as { _prefix?: string })._prefix;
+  if (prefix) {
+    throw new Error(
+      `The McpClient that the StrandsPlugin mcpClients factory returns for MCP server '${server}' sets ` +
+        `prefix '${prefix}'. Set it on the workflow-side TemporalMCPClient instead: ` +
+        `new TemporalMCPClient({ server: '${server}', prefix: '${prefix}' }).`
+    );
+  }
 }
 
 /**

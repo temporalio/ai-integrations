@@ -53,6 +53,7 @@ import {
   interruptAgent,
   inWorkflowToolAgent,
   mcpAgent,
+  mcpPrefixedServersAgent,
   mcpServersAgent,
   retryConfigAgent,
   statefulAgent,
@@ -177,8 +178,11 @@ function toolCallTurn(toolName: string, toolUseId: string, input: object): Model
 class StubMcpClient extends McpClient {
   private readonly toolList: Tool[];
 
-  constructor(toolList: Array<{ name: string; description: string; inputSchema: unknown }>) {
-    super({ transport: STUB_TRANSPORT });
+  constructor(
+    toolList: Array<{ name: string; description: string; inputSchema: unknown }>,
+    options: { prefix?: string } = {}
+  ) {
+    super({ transport: STUB_TRANSPORT, ...options });
     this.toolList = toolList.map(
       (t) =>
         ({
@@ -1327,6 +1331,56 @@ test('a re-listed MCP tool name is refused only while another tool of the agent 
   for (const replace of [undefined, ['r', 1]] as ([string, number] | undefined)[]) {
     t.deepEqual(await run({ b: [['r'], ['s']] }, ['r'], false, replace), { result: 'done Tools: s.', calls: ['b:r'] });
   }
+});
+
+test('prefix and toolFilters on TemporalMCPClient rename and filter tools, and calls use the server names', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+  const schema = { type: 'object', properties: {} };
+  const tools = ['echo', 'skip', 'other'].map((name) => ({ name, description: name, inputSchema: schema }));
+  const calls: string[] = [];
+  class RecordingMcpClient extends StubMcpClient {
+    constructor(private readonly label: string) {
+      super(tools);
+    }
+    override async callTool(tool: { name: string }, args: JSONValue): Promise<JSONValue> {
+      calls.push(`${this.label}:${tool.name}`);
+      return super.callTool(tool, args);
+    }
+  }
+  const worker = await createWorker({
+    plugins: [
+      new StrandsPlugin({
+        models: {
+          test: () =>
+            new StubModel([toolCallTurn('a_echo', 'call_1', {}), toolCallTurn('b_echo', 'call_2', {}), textTurn('done')]),
+        },
+        mcpClients: { a: () => new RecordingMcpClient('a'), b: () => new RecordingMcpClient('b') },
+      }),
+    ],
+  });
+  t.is(
+    await worker.runUntil(executeWorkflow(mcpPrefixedServersAgent, { args: ['go'] })),
+    'done Tools: a_echo, a_other, a_skip, b_echo.'
+  );
+  t.deepEqual(calls, ['a:echo', 'b:echo']);
+
+  // A prefix on the factory's McpClient fails the listing, with the fix in the error.
+  const refusing = await createWorker({
+    plugins: [
+      new StrandsPlugin({
+        models: { test: () => new StubModel([textTurn('done')]) },
+        mcpClients: { p: () => new StubMcpClient(tools, { prefix: 'p' }) },
+      }),
+    ],
+  });
+  const refused = await refusing.runUntil(executeWorkflow(mcpServersAgent, { args: ['go', ['p']] }));
+  t.true(
+    refused.includes(
+      "for MCP server 'p' sets prefix 'p'. Set it on the workflow-side TemporalMCPClient instead: " +
+        "new TemporalMCPClient({ server: 'p', prefix: 'p' })."
+    ),
+    refused
+  );
 });
 
 test('histories of a re-listing beside another coroutine recorded on main still replay', async (t) => {
