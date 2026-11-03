@@ -299,6 +299,10 @@ class _LangChainRuns:
         self.pending: dict[
             tuple[int, uuid.UUID], tuple[_ReplaySafeClient, list[_HeldWrite]]
         ] = {}
+        # Set when the workflow ends, not replaying.  The eviction that
+        # follows cancels coroutines still running a run with replay set, and
+        # their runs' end writes are made, not held back.
+        self.finished = False
 
         def reseed(seed: int) -> None:
             self._rng.seed(f"temporal-langsmith-langchain-{seed}")
@@ -425,6 +429,32 @@ def _get_langchain_runs() -> _LangChainRuns | None:
         return runs
     except Exception:
         return None
+
+
+def _finish_langchain_runs(err: BaseException | None) -> None:
+    """Mark the workflow's ``_LangChainRuns`` finished if the workflow ends.
+
+    ``err`` is what the run method raised, or ``None`` if it returned.  An
+    error that fails only the workflow task, which is retried, does not end
+    the workflow.
+    """
+    try:
+        if _is_replaying():
+            return
+        if err is not None and not (
+            isinstance(
+                err, (temporalio.workflow.ContinueAsNewError, asyncio.CancelledError)
+            )
+            or temporalio.workflow.is_failure_exception(err)
+        ):
+            return
+        inst = temporalio.workflow.instance()
+    except Exception:
+        # Workflow APIs are mocked (unit tests).
+        return
+    runs = getattr(inst, "__temporal_langsmith_langchain_runs", None)
+    if runs is not None:
+        runs.finished = True
 
 
 _langchain_run_id_hook_installed = False
@@ -869,7 +899,7 @@ class _ReplaySafeClient(langsmith.Client):
             return self._client.update_run(*args, **kwargs)
         ended = kwargs.get("end_time") is not None
         held = _prepare_write(self._client, "update_run", kwargs)
-        if _is_replaying():
+        if _is_replaying() and not (ended and runs.finished):
             if ended:
                 runs.pending.pop((id(self._client), run_id), None)
             return None
@@ -1563,7 +1593,13 @@ class _LangSmithWorkflowInboundInterceptor(
             f"RunWorkflow:{wf_type}",
             input.headers,
         ):
-            return await super().execute_workflow(input)
+            try:
+                result = await super().execute_workflow(input)
+            except BaseException as err:
+                _finish_langchain_runs(err)
+                raise
+            _finish_langchain_runs(None)
+            return result
 
     async def handle_signal(self, input: temporalio.worker.HandleSignalInput) -> None:
         with self._workflow_maybe_run(f"HandleSignal:{input.signal}", input.headers):

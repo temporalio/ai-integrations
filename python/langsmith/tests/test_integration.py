@@ -254,6 +254,34 @@ class LangChainSignalWorkflow:
 
 
 @workflow.defn
+class LangChainRaceWorkflow:
+    """Races two LangChain runnables and returns when the first ends.
+
+    The step of ``race_a`` waits for the signal; ``race_b``'s never ends.
+    """
+
+    def __init__(self) -> None:
+        self._released = False
+
+    @workflow.signal
+    def release(self) -> None:
+        self._released = True
+
+    @workflow.run
+    async def run(self) -> str:
+        async def wait(name: str) -> str:
+            await workflow.wait_condition(lambda: self._released and name == "a")
+            return name
+
+        tasks = [
+            asyncio.create_task(RunnableLambda(wait, name=f"race_{name}").ainvoke(name))
+            for name in "ab"
+        ]
+        done, _ = await workflow.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        return done.pop().result()
+
+
+@workflow.defn
 class LangChainTwoClientsWorkflow:
     """Runs two LangChain runnables at once, each traced to its own client.
 
@@ -1260,6 +1288,75 @@ class TestReplay:
         patches = [str(run["id"]) for op, run in writes if op == "patch"]
         assert posts
         assert sorted(set(patches)) == sorted(posts)
+
+    @pytest.mark.parametrize("max_cached_workflows", [0, 1000])
+    async def test_open_run_ended_when_workflow_ends(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+        max_cached_workflows: int,
+    ) -> None:
+        """A run still open when its workflow returns is ended, with an error.
+
+        The eviction after the workflow ends cancels the run's coroutine.
+        """
+        get_runtime_environment()
+        langsmith.env.get_langchain_env_var_metadata()
+        writes: list[tuple[str, dict[str, Any]]] = []
+
+        class _RecordingClient(langsmith.Client):
+            def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("post", args[0]))
+
+            def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("patch", args[0]))
+
+        config = client.config()
+        config["plugins"] = [
+            LangSmithPlugin(
+                client=_RecordingClient(
+                    api_url="http://localhost:1",
+                    api_key="test",
+                    auto_batch_tracing=False,
+                )
+            )
+        ]
+        temporal_client = Client(**config)
+        async with new_worker(
+            temporal_client,
+            LangChainRaceWorkflow,
+            max_cached_workflows=max_cached_workflows,
+        ) as worker:
+            handle = await temporal_client.start_workflow(
+                LangChainRaceWorkflow.run,
+                id=f"replay-test-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+            for _ in range(100):
+                history = await handle.fetch_history()
+                if any(
+                    e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED
+                    for e in history.events
+                ):
+                    break
+                await asyncio.sleep(0.1)
+            await handle.signal(LangChainRaceWorkflow.release)
+            assert await handle.result() == "a"
+
+        names = {str(run["id"]): run["name"] for op, run in writes if op == "post"}
+        assert sorted((names[str(run["id"])], op) for op, run in writes) == [
+            ("race_a", "patch"),
+            ("race_a", "post"),
+            ("race_b", "patch"),
+            ("race_b", "post"),
+        ]
+        [ended] = [
+            run
+            for op, run in writes
+            if op == "patch" and names[str(run["id"])] == "race_b"
+        ]
+        assert ended["error"]
+        assert ended["end_time"]
 
 
 # ---------------------------------------------------------------------------
