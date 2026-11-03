@@ -43,6 +43,7 @@ from tests.test_openai import (
         # Recorded on this version, with the patch marker.
         "stateful-mcp-cancel-wait-marker-workflow-history.json",
         "stateful-mcp-gather-wait-marker-workflow-history.json",
+        "tools-workflow-callable-class-history.json",
         "tools-workflow-history.json",
     ],
 )
