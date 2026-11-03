@@ -71,6 +71,32 @@ def _has_worker_side_require_approval(server: MCPServer) -> bool:
     return callable(policy) or bool(policy) or overridden
 
 
+def _has_worker_side_tool_meta_resolver(server: MCPServer) -> bool:
+    """Return whether the server sets a ``tool_meta_resolver``."""
+    return getattr(server, "tool_meta_resolver", None) is not None
+
+
+def _reject_worker_side_tool_meta_resolver(
+    name: str,
+    server: MCPServer,
+    remedy: str = "pass it to temporal_mcp_server(tool_meta_resolver=...)",
+) -> None:
+    """Raise when the factory's server has a ``tool_meta_resolver``; see the message.
+
+    The resolver needs the run context, which exists only in the workflow, so the
+    worker cannot run it, and the agent never reads the factory's copy. ``remedy``
+    says where to set it instead.
+    """
+    if _has_worker_side_tool_meta_resolver(server):
+        raise ApplicationError(
+            f"MCP server {name!r} sets tool_meta_resolver on its worker-side "
+            "MCPServer, which cannot run there because the run context it "
+            f"receives exists only in the workflow; {remedy}, and remove it from "
+            "the factory's server",
+            non_retryable=True,
+        )
+
+
 def _reject_worker_side_require_approval(
     name: str, server: MCPServer, route: str
 ) -> None:
