@@ -62,7 +62,7 @@ with workflow.unsafe.imports_passed_through():
     from harbor.models.job.config import JobConfig
     from harbor.models.job.result import JobStats
 
-    from temporalio.harbor import TrialOutcome, aggregate_job, execute_trial, plan_job
+    from temporalio.harbor import aggregate_job, execute_trial, plan_job
 
 
 @workflow.defn
@@ -71,19 +71,17 @@ class EvalJob:
     async def run(self, config: JobConfig) -> JobStats:
         plan = await plan_job(config)
         outcomes = await asyncio.gather(
-            *(execute_trial(trial) for trial in plan.trials), return_exceptions=True
+            *(execute_trial(trial) for trial in plan.trials)
         )
-        result = await aggregate_job(
-            plan, [o for o in outcomes if isinstance(o, TrialOutcome)]
-        )
+        result = await aggregate_job(plan, outcomes)
         return result.stats
 ```
 
-`return_exceptions=True` lets the job finish when some trial could not run at all, and the job is
-aggregated from the outcomes that came back; a trial with no outcome counts as pending in the
-job's statistics, not as errored. `aggregate_job` returns harbor's `JobResult`, which carries every
-trial's result, so the workflow returns only its `stats`: a whole `JobResult` for a large job can
-exceed Temporal's 2 MB payload limit.
+A trial that runs and fails comes back as an outcome, as `harbor run` records it. `execute_trial`
+raises only when a trial could not run at all, for example because a `${VAR}` its config names is
+unset on the worker, and then the job fails, as it does in harbor. `aggregate_job` returns harbor's
+`JobResult`, which carries every trial's result, so the workflow returns only its `stats`: a whole
+`JobResult` for a large job can exceed Temporal's 2 MB payload limit.
 
 Start it with the same `JobConfig` you would give `harbor run`:
 
@@ -252,8 +250,8 @@ that text reaches history as harbor recorded it; `TrialHooks.redact` says which.
 - Concurrency is bounded per worker process, by `max_concurrent_activities`. Harbor runs 4 trials
   at a time by default, so set it to what one machine and your providers can take.
 - Any worker can run any trial, so local task paths and credentials must exist on every worker.
-- Literal secret values in `env` are masked when a config crosses Temporal, so give them as
-  `${VAR}`, with the variable set on every worker.
+- Pass every secret in `env` as `${VAR}`, with the variable set on every worker. A literal value
+  can reach workflow history unmasked.
 - Each trial writes its directory on the worker that ran it. `jobs_dir` must be storage that every
   worker shares for harbor's tools (`harbor view`, `harbor upload`, `harbor job resume`) to see the
   whole job.
