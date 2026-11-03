@@ -1,5 +1,4 @@
 import functools
-import gc
 import inspect
 import json
 import sys
@@ -157,7 +156,12 @@ def _defined_as_method(fn: Any) -> bool:
     """Return whether ``fn`` is a function a class body defines as a method.
 
     The worker registers such a function bound to an instance, unlike one the
-    class wraps in ``staticmethod``.
+    class wraps in ``staticmethod``. Only the class tells them apart, so it is
+    found by the function's module and qualname.
+
+    Raises:
+        ValueError: If ``fn`` is defined in a class that can't be reached by
+            name, such as one a function defines.
     """
     if not inspect.isfunction(fn):
         return False
@@ -167,16 +171,16 @@ def _defined_as_method(fn: Any) -> bool:
     owner: Any = sys.modules.get(fn.__module__)
     for scope in scopes[:-1]:
         owner = getattr(owner, "__dict__", {}).get(scope)
-    if inspect.isclass(owner):
-        attr = vars(owner).get(scopes[-1])
-        if attr is fn:
-            return True
-        if isinstance(attr, staticmethod) and attr.__func__ is fn:
-            return False
-    # The class can't be reached by name, as when a function defines it: look
-    # for a staticmethod that wraps the function.
-    return not any(
-        isinstance(r, staticmethod) and r.__func__ is fn for r in gc.get_referrers(fn)
+    attr = vars(owner).get(scopes[-1]) if inspect.isclass(owner) else None
+    if isinstance(attr, staticmethod) and attr.__func__ is fn:
+        return False
+    if attr is fn:
+        return True
+    raise ValueError(
+        f"Cannot tell whether the first parameter 'self' of {fn.__qualname__} is"
+        f" a receiver: its class can't be reached by name in {fn.__module__}."
+        " Define the class at module level, pass a bound method, or rename the"
+        " parameter"
     )
 
 

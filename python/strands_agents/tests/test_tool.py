@@ -1,3 +1,5 @@
+import gc
+import weakref
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
@@ -250,26 +252,10 @@ async def test_tool(client: Client, tmp_path: Path):
         (["P-9"], "stamp P-9"),
     ]
 
-    # A class a function defines can't be reached by name.
-    class LocalShipping:
-        @activity.defn(name="local_quote")
-        async def quote(self, parcel_id: str) -> str:
-            return parcel_id
-
-        @staticmethod
-        @activity.defn(name="local_price")
-        async def price(
-            self: str,  # pyright: ignore[reportSelfClsParameterName]
-            parcel_id: str,
-        ) -> str:
-            return f"{self}:{parcel_id}"
-
     cases: list[tuple[Callable[..., Any], list[str], list[str]]] = [
         (TrackParcel, ["parcel_id"], ["parcel_id"]),
         (Shipping.quote, ["parcel_id"], ["parcel_id"]),
         (Shipping.price, ["self", "parcel_id"], []),
-        (LocalShipping.quote, ["parcel_id"], ["parcel_id"]),
-        (LocalShipping.price, ["self", "parcel_id"], ["self", "parcel_id"]),
         (ShipParcel, ["parcel_id", "carrier"], ["parcel_id"]),
         (HandOverParcel, ["agent", "cls"], ["agent", "cls"]),
         (LabelParcel, ["self"], ["self"]),
@@ -341,3 +327,36 @@ class VarKeywordCall:
 def test_activity_as_tool_refuses(activity_fn: Callable[..., Any], message: str):
     with pytest.raises(ValueError, match=message):
         activity_as_tool(activity_fn, start_to_close_timeout=timedelta(seconds=15))
+
+
+def _local_shipping() -> tuple[weakref.ref[type], list[Callable[..., Any]]]:
+    # A class a function defines can't be reached by name.
+    class LocalShipping:
+        @activity.defn(name="local_quote")
+        async def quote(self, parcel_id: str) -> str:
+            return parcel_id
+
+        @staticmethod
+        @activity.defn(name="local_price")
+        async def price(
+            self: str = "carrier",  # pyright: ignore[reportSelfClsParameterName]
+            parcel_id: str = "parcel",
+        ) -> str:
+            return f"{self}:{parcel_id}"
+
+    return weakref.ref(LocalShipping), [LocalShipping.quote, LocalShipping.price]
+
+
+def test_activity_as_tool_refuses_method_of_unreachable_class():
+    # Only the class tells a method from a staticmethod: the refusal doesn't
+    # depend on whether the class is still alive.
+    owner, activity_fns = _local_shipping()
+    for collected in (False, True):
+        if collected:
+            gc.collect()
+            assert owner() is None
+        for activity_fn in activity_fns:
+            with pytest.raises(ValueError, match="can't be reached by name"):
+                activity_as_tool(
+                    activity_fn, start_to_close_timeout=timedelta(seconds=15)
+                )
