@@ -29,6 +29,10 @@ from temporalio.langsmith._run_tree import (
     install_run_tree_overrides,
     workflow_run_tree_context,
 )
+from temporalio.langsmith._tracing import (
+    destination_context,
+    install_addressing_override,
+)
 
 
 def _env_destination(client: langsmith.Client) -> dict[str, Any] | None:
@@ -232,15 +236,8 @@ def _install_aio_to_thread_override() -> None:
 def _destination(
     project_name: str | None,
     address: str | None,
-    parent: RunTree | None = None,
 ) -> dict[str, Any]:
-    """Inherit the upstream destination before applying local defaults."""
-    if parent is not None:
-        parent_address = getattr(parent, "address", None)
-        if isinstance(parent_address, str):
-            return {"address": parent_address}
-        if isinstance(parent.session_name, str):
-            return {"project_name": parent.session_name}
+    """Name the plugin's default destination, without consulting the environment."""
     if address is not None:
         return {"address": address}
     if project_name is not None:
@@ -445,6 +442,7 @@ class LangSmithInterceptor(
         self._default_metadata = default_metadata or {}
         self._default_tags = default_tags or []
         self._executor = ThreadPoolExecutor(max_workers=1)
+        install_addressing_override()
 
     @contextmanager
     def maybe_run(
@@ -609,9 +607,13 @@ class _LangSmithActivityInboundInterceptor(
         tracing_args: dict[str, Any] = {
             "client": self._config._client,
             "parent": parent,
-            **_destination(self._config._project_name, self._config._address, parent),
         }
-        with tracing_context(**tracing_args):
+        with (
+            destination_context(
+                _destination(self._config._project_name, self._config._address)
+            ),
+            tracing_context(**tracing_args),
+        ):
             with self._config.maybe_run(
                 f"RunActivity:{info.activity_type}",
                 run_type="tool",
@@ -656,9 +658,6 @@ class _LangSmithWorkflowInboundInterceptor(
             tracing_args: dict[str, Any] = {
                 "client": self._config._client,
                 "parent": parent,
-                **_destination(
-                    self._config._project_name, self._config._address, parent
-                ),
             }
             if parent is None and self._config._destination is None:
                 tracing_args["enabled"] = False
@@ -667,7 +666,12 @@ class _LangSmithWorkflowInboundInterceptor(
                 "temporalWorkflowID": info.workflow_id,
                 "temporalRunID": info.run_id,
             }
-            with tracing_context(**tracing_args):
+            with (
+                destination_context(
+                    _destination(self._config._project_name, self._config._address)
+                ),
+                tracing_context(**tracing_args),
+            ):
                 with self._config.maybe_run(
                     name,
                     parent=parent,
@@ -820,9 +824,13 @@ class _LangSmithNexusOperationInboundInterceptor(
         tracing_args: dict[str, Any] = {
             "client": self._config._client,
             "parent": parent,
-            **_destination(self._config._project_name, self._config._address, parent),
         }
-        with tracing_context(**tracing_args):
+        with (
+            destination_context(
+                _destination(self._config._project_name, self._config._address)
+            ),
+            tracing_context(**tracing_args),
+        ):
             with self._config.maybe_run(
                 f"RunStartNexusOperationHandler:{input.ctx.service}/{input.ctx.operation}",
                 run_type="tool",
@@ -837,9 +845,13 @@ class _LangSmithNexusOperationInboundInterceptor(
         tracing_args: dict[str, Any] = {
             "client": self._config._client,
             "parent": parent,
-            **_destination(self._config._project_name, self._config._address, parent),
         }
-        with tracing_context(**tracing_args):
+        with (
+            destination_context(
+                _destination(self._config._project_name, self._config._address)
+            ),
+            tracing_context(**tracing_args),
+        ):
             with self._config.maybe_run(
                 f"RunCancelNexusOperationHandler:{input.ctx.service}/{input.ctx.operation}",
                 run_type="tool",

@@ -234,7 +234,10 @@ beta and enables it per workspace; the workspace must support the feature.
 
 Native `@langsmith.traceable(address=...)` and
 `langsmith.tracing_context(address=...)` also work when creating new traces
-inside Workflows. A child run inherits its existing parent's destination.
+inside Workflows. The plugin's `project_name` or `address` supplies a default
+after explicit LangSmith destinations, including decorator and `langsmith_extra`
+arguments, and before `langsmith.configure()` or environment defaults.
+A child run inherits its existing parent's destination.
 The destination propagates through Activities, child Workflows, and Nexus,
 including when `add_temporal_runs=False`. Project-based tracing continues to
 work with earlier supported LangSmith versions.

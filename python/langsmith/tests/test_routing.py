@@ -269,6 +269,33 @@ async def test_agent_destination_across_temporal(
 
 
 @pytest.mark.parametrize(
+    "source", ["decorator", "context", "extra", "trace", "async-trace"]
+)
+@pytest.mark.parametrize(
+    "fallback", [{"project_name": "worker-fallback"}, {"address": OTHER_ADDRESS}]
+)
+async def test_explicit_destination_outranks_plugin_default(
+    client: Client,
+    env: WorkflowEnvironment,
+    source: str,
+    fallback: dict[str, Any],
+) -> None:
+    """Explicit roots override plugin defaults and propagate unchanged on replay."""
+    mock = make_mock_ls_client(InMemoryRunCollector())
+    plugin = LangSmithPlugin(client=mock, **fallback)
+    handle, _ = await _execute(client, env, plugin, source)
+    creates = [call.kwargs for call in mock.create_run.call_args_list]
+    assert {run["name"] for run in creates} >= {
+        "routing-step",
+        "traceable_activity",
+        "nexus_direct_traceable",
+    }
+    assert all(run.get("address") == ADDRESS for run in creates)
+    assert all(run.get("session_name") is None for run in creates)
+    await _assert_replay_is_silent(handle, plugin, mock, client)
+
+
+@pytest.mark.parametrize(
     "source,add_temporal_runs",
     [("headers", False), ("headers", True), ("replicas", False)],
 )
