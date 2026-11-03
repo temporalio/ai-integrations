@@ -11,7 +11,11 @@ import {
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import { TemporalOpenAIRunner, statelessMcpServer, statefulMcpServer } from '../../workflow';
 
-export { statefulMcpCancelWorkflow, statefulMcpGatherWorkflow } from './stateful-mcp-replay';
+export {
+  statefulMcpCallerCancelWorkflow,
+  statefulMcpCancelWorkflow,
+  statefulMcpGatherWorkflow,
+} from './stateful-mcp-replay';
 
 export interface StreamingAgentResult {
   finalOutput: string;

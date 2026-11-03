@@ -8,6 +8,7 @@ from temporalio.openai_agents import OpenAIAgentsPlugin
 from temporalio.worker import Replayer
 from tests.helpers.stateful_replay import (
     StatefulMcpCancelWorkflow,
+    StatefulMcpGatherWaitWorkflow,
     StatefulMcpGatherWorkflow,
 )
 from tests.test_openai import (
@@ -37,6 +38,7 @@ from tests.test_openai import (
         # another activity (gather) or with a workflow cancel (cancel).
         "stateful-mcp-cancel-workflow-history.json",
         "stateful-mcp-gather-workflow-history.json",
+        "stateful-mcp-gather-wait-workflow-history.json",
         "tools-workflow-history.json",
     ],
 )
@@ -59,6 +61,7 @@ async def test_replay(file_name: str) -> None:
                 OutputGuardrailWorkflow,
                 RunModelProviderWorkflow,
                 StatefulMcpGatherWorkflow,
+                StatefulMcpGatherWaitWorkflow,
                 StatefulMcpCancelWorkflow,
             ],
             plugins=[OpenAIAgentsPlugin()],

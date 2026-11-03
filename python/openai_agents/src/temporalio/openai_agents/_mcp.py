@@ -339,6 +339,10 @@ class _StatefulServerSessionArguments:
 # Seconds between heartbeats of the ``-server-session`` activity.
 _HEARTBEAT_INTERVAL = 30.0
 
+# Patch marker of runs whose operations without a schedule-to-start or
+# schedule-to-close timeout follow the session activity.
+_SESSION_WATCH_PATCH = "openai-agents-stateful-mcp-session-watch"
+
 # Seconds the ``-server-session`` activity waits for the server to show its
 # first heartbeat.
 _STORE_TIMEOUT = 30.0
@@ -628,12 +632,16 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
         schedule_to_start_timeout or schedule_to_close_timeout already ends an
         operation once that worker is gone. Without either, the operation would
         wait forever, so fail it with DedicatedWorkerFailure once the session
-        activity has ended.
+        activity has ended. Only runs with the patch marker do this: runs
+        recorded before it schedule the operation as earlier versions did, so
+        their histories replay.
         """
         session = self._connect_handle
         assert session
-        if self._config.get("schedule_to_start_timeout") or self._config.get(
-            "schedule_to_close_timeout"
+        if (
+            self._config.get("schedule_to_start_timeout")
+            or self._config.get("schedule_to_close_timeout")
+            or not workflow.patched(_SESSION_WATCH_PATCH)
         ):
             return await workflow.execute_activity(
                 activity, args=args, result_type=result_type, **self._config

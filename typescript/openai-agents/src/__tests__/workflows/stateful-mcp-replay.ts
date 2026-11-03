@@ -2,15 +2,24 @@
 // `src/__tests__/histories/stateful-mcp-*.json` were recorded with these
 // Workflows on earlier versions of the plugin, and test-openai-agents.ts
 // replays them on this one.
-import { proxyActivities } from '@temporalio/workflow';
+import {
+  CancellationScope,
+  condition,
+  defineSignal,
+  isCancellation,
+  proxyActivities,
+  setHandler,
+} from '@temporalio/workflow';
 import { statefulMcpServer } from '../../workflow';
 
 // Each branch's follow-up has its own Activity type, so that a replay that
 // schedules them in another order fails instead of swapping their results.
 const activities = proxyActivities<Record<string, () => Promise<string>>>({ startToCloseTimeout: '10 seconds' });
 
-function replayServer(scheduleToStartTimeout: boolean) {
-  return statefulMcpServer('statefulReplay', {
+export const statefulReplayCancel = defineSignal('statefulReplayCancel');
+
+function replayServer(scheduleToStartTimeout: boolean, name = 'statefulReplay') {
+  return statefulMcpServer(name, {
     config: {
       startToCloseTimeout: '20 seconds',
       retryPolicy: { maximumAttempts: 1 },
@@ -54,4 +63,34 @@ export async function statefulMcpCancelWorkflow(scheduleToStartTimeout: boolean)
   } finally {
     await server.cleanup();
   }
+}
+
+/**
+ * Calls on two stateful servers, the first without a schedule-to-start
+ * timeout, in one caller scope that a Signal cancels while both calls wait;
+ * each branch then schedules its own recovery Activity.
+ */
+export async function statefulMcpCallerCancelWorkflow(): Promise<string[]> {
+  const a = replayServer(false, 'statefulReplayA');
+  const b = replayServer(true, 'statefulReplayB');
+  await a.connect();
+  await b.connect();
+  let cancelled = false;
+  setHandler(statefulReplayCancel, () => {
+    cancelled = true;
+  });
+  const recover = (name: string) => (err: unknown) => {
+    if (!isCancellation(err)) throw err;
+    return CancellationScope.nonCancellable(() => activities[`statefulReplayRecover${name}`]!());
+  };
+  const scope = new CancellationScope();
+  const calls = scope.run(() =>
+    Promise.all([a.callTool('slow', {}).catch(recover('A')), b.callTool('slow', {}).catch(recover('B'))])
+  );
+  await condition(() => cancelled);
+  scope.cancel();
+  const out = (await calls).map((o) => (typeof o === 'string' ? o : JSON.stringify(o)));
+  await a.cleanup();
+  await b.cleanup();
+  return out;
 }

@@ -849,8 +849,14 @@ for (const [kase, title] of [
 test('Stateful MCP: histories recorded on an earlier version replay', async (t) => {
   // Recorded on main at ea04762 with the Workflow Worker stopped, so that one
   // activation resolves a stateful tool call together with plain Activities
-  // (gather) or with a Workflow cancel (cancel).
-  for (const name of ['stateful-mcp-gather.json', 'stateful-mcp-gather-sts0.json', 'stateful-mcp-cancel-sts0.json']) {
+  // (gather) or with a Workflow cancel (cancel); and a caller's cancellation of
+  // calls to two servers, one without a schedule-to-start timeout (caller-cancel).
+  for (const name of [
+    'stateful-mcp-gather.json',
+    'stateful-mcp-gather-sts0.json',
+    'stateful-mcp-cancel-sts0.json',
+    'stateful-mcp-caller-cancel.json',
+  ]) {
     const file = path.resolve(__dirname, '../../src/__tests__/histories', name);
     const history = historyFromJSON(JSON.parse(readFileSync(file, 'utf8')));
     await t.notThrowsAsync(

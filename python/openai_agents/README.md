@@ -532,9 +532,8 @@ def weather_server() -> MCPServerStreamableHttp:
 
 `StatelessMCPServerProvider`, `StatefulMCPServerProvider`, the plugin's
 `mcp_server_providers` option, `stateless_mcp_server()`, and
-`stateful_mcp_server()` are deprecated. They remain supported for source
-compatibility and, except for the runs described at the end of this section,
-workflow-history compatibility, and can still run with MCP Python SDK v1 when
+`stateful_mcp_server()` are deprecated. They remain supported for source and
+workflow-history compatibility and can still run with MCP Python SDK v1 when
 the `mcp` extra is not installed. New integrations should use `mcp_servers` and
 `temporal_mcp_server()`, which require the `mcp` extra and MCP Python SDK v2.
 The legacy stateful path retains its dedicated per-workflow worker and
@@ -593,26 +592,13 @@ stays on the session's task queue until one of its timeouts expires or the run
 ends, and a later `stateful_mcp_server()` block with the same name refuses it.
 A caller's own cancellation still cancels the operation.
 
-This changes the commands such an operation schedules, so some runs that
-started on an earlier version fail replay on this one with a nondeterminism
-error (`[TMPRL1100]`): those whose session activity ended (timed out, failed or
-completed) before the workflow left the `stateful_mcp_server()` block, and that
-then scheduled an operation whose `config` has neither a
-`schedule_to_start_timeout` nor a `schedule_to_close_timeout`. This holds
-whether that operation still waits or the caller's own deadline or
-cancellation ended it and the run moved on, and it can hold for an operation
-already running when the session ended. Runs whose operations have either
-timeout, including those with the default `config`, are not affected. Nor
-are runs in which the session did not end while the workflow used the server,
-except with `cancellation_type=WAIT_CANCELLATION_COMPLETED` and neither
-timeout: the workflow then waits for the operation or the session, whichever
-ends first, so a stateful operation and another activity that finish in the
-same workflow task resume in a different order than on earlier versions, and
-such runs fail replay too, in both directions. Before you upgrade, find such
-open runs and reset them to before the session ended (or, for the second kind,
-let them finish on the earlier version), or terminate them. A run that this
-version failed this way fails replay on an earlier version, so do not roll back
-while such runs are open.
+A run follows its session this way only once it records the patch marker
+`openai-agents-stateful-mcp-session-watch`, which it does at its first
+operation whose `config` has neither timeout. Histories recorded on an earlier
+version have no marker, so they schedule such operations as before and replay
+on this version; a run that continues on this version records the marker at its
+next such operation. A run with the marker fails replay on an earlier version,
+so do not roll back while such runs are open.
 
 ### Hosted MCP Tool
 
