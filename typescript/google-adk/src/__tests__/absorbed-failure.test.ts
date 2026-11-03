@@ -231,6 +231,8 @@ test.serial('cancellingAToolOrModelCallbackWaitEndsCancelled', async (t) => {
   // into an error event, a plugin's first wrapped in a plain `Error`, that ends the turn.
   // The same waits on a Nexus operation that never starts fail with the operation's start,
   // not its result. A tool or callback that rewraps its wait's error keeps it as `cause`.
+  // One that waits in another tool's `runAsync` gets that run's plain `Error`, which ADK
+  // wraps again for the outer tool.
   const endpoint = uid('adk-unpolled-endpoint');
   const nexusEndpoint = await env.createNexusEndpoint(endpoint, uid('adk-unpolled'));
   t.teardown(() => env.deleteNexusEndpoint(nexusEndpoint));
@@ -238,6 +240,7 @@ test.serial('cancellingAToolOrModelCallbackWaitEndsCancelled', async (t) => {
   const cases = [
     ...kinds.map((kind) => ({ kind, wait: 'plain' as const, nexus: false })),
     ...kinds.map((kind) => ({ kind, wait: 'rewrapped' as const, nexus: false })),
+    ...kinds.map((kind) => ({ kind, wait: 'nested' as const, nexus: false })),
     ...kinds.map((kind) => ({ kind, wait: 'plain' as const, nexus: true })),
   ];
   for (const { kind, wait, nexus } of cases) {

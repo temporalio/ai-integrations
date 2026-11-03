@@ -23,6 +23,7 @@ import {
   RequestInput,
   stringifyContent,
   Workflow,
+  type Context,
   type LlmAgentConfig,
   type LlmRequest,
   type LlmResponse,
@@ -601,9 +602,11 @@ export type BlockedTurnKind = 'tool' | 'agent' | 'plugin' | 'model';
  * timeout's error until {@link adkDoneSignal} (`shielded-cleanup`); as it is, rethrowing its
  * error wrapped in a new `Error` with the original as `cause` (`rewrapped`); as it is, but on
  * a child Workflow that fails with its own cancelled Activity (`child`, see
- * {@link childTimedOutActivity}); or not at all, throwing an ordinary error instead (`throws`).
+ * {@link childTimedOutActivity}); as it is, but in another `FunctionTool` that the tool or
+ * callback runs through `runAsync`, the tool with its own tool context (`nested`); or not at
+ * all, throwing an ordinary error instead (`throws`).
  */
-export type BlockedTurnWait = 'plain' | 'shielded' | 'shielded-cleanup' | 'rewrapped' | 'child' | 'throws';
+export type BlockedTurnWait = 'plain' | 'shielded' | 'shielded-cleanup' | 'rewrapped' | 'child' | 'nested' | 'throws';
 
 /**
  * A child Workflow whose first Activity its 1-second timeout scope cancels, so it fails with
@@ -641,10 +644,22 @@ function blockedTurn(
       released = true;
     });
   }
-  const shaped = (body: () => Promise<void>) => async (): Promise<void> => {
+  const shaped = (body: () => Promise<void>) => async (toolContext?: Context): Promise<void> => {
     stage('blocked');
     if (wait === 'throws') throw new Error('policy refused the request');
     if (wait === 'plain' || wait === 'child') return body();
+    if (wait === 'nested') {
+      const inner = new FunctionTool({
+        name: 'inner_wait',
+        description: 'Wait inside another tool.',
+        execute: async () => {
+          await body();
+          return {};
+        },
+      });
+      await inner.runAsync({ args: {}, toolContext: toolContext as Context });
+      return;
+    }
     if (wait === 'rewrapped') {
       try {
         return await body();
@@ -688,7 +703,7 @@ function blockedTurn(
         // From ADK 2.3 the tool's error goes to the model as a function response; this ends
         // the turn on that response instead, so no model call follows on any ADK release.
         toolContext!.actions.skipSummarization = true;
-        await waitForApproval();
+        await waitForApproval(toolContext);
         return { status: 'approved' };
       },
     });

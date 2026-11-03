@@ -127,8 +127,6 @@ interface AbsorbedFailures {
   attempts: ALS<NodeAttempt>;
   /** What a tool or a plugin hook threw, per the plain `Error` ADK threw in its place (see {@link keepWrapped}). */
   wrapped: WeakMap<object, unknown>;
-  /** What a tool's `execute` threw, per the call's tool context (see {@link watchWrappedErrors}). */
-  toolThrew: WeakMap<object, unknown>;
 }
 
 function recorded(): AbsorbedFailures {
@@ -145,7 +143,6 @@ function recorded(): AbsorbedFailures {
       cancelledByExecution: new WeakSet(),
       attempts: new AsyncLocalStorage<NodeAttempt>(),
       wrapped: new WeakMap(),
-      toolThrew: new WeakMap(),
     };
     global[ABSORBED] = state;
   }
@@ -450,21 +447,23 @@ type Thrown = (error: unknown) => void;
 
 /**
  * Runs `call`, an ADK method that throws a plain `Error` in place of the error that code it
- * runs threw, with no `cause`: `PluginManager.runCallbacks` for a plugin hook before ADK
- * 2.2.1. That error is kept for the one ADK throws, so {@link executionCancellation} can
- * follow it. Only ADK awaits what `call` returns, so marking it handled here hides nothing.
+ * runs threw, with no `cause`: `FunctionTool.runAsync` for a tool's `execute`, and
+ * `PluginManager.runCallbacks` for a plugin hook before ADK 2.2.1. That error is kept for
+ * the one ADK throws, so {@link executionCancellation} can follow it, before the returned
+ * promise rejects with it. Each call keeps its own, so a tool or callback that runs another
+ * tool keeps the chain of every run in between. The returned promise rejects as `call`'s
+ * does, so one that no code awaits still fails the Workflow Task.
  */
 function keepWrapped(call: (thrown: Thrown) => Promise<unknown>): Promise<unknown> {
   let thrown: { error: unknown } | undefined;
-  const result = call((error) => {
+  return call((error) => {
     thrown = { error };
-  });
-  result.then(undefined, (wrapper: unknown) => {
+  }).then(undefined, (wrapper: unknown) => {
     if (thrown !== undefined && thrown.error !== wrapper && typeof wrapper === 'object' && wrapper !== null) {
       recorded().wrapped.set(wrapper, thrown.error);
     }
+    throw wrapper;
   });
-  return result;
 }
 
 /** `fn`, telling what it throws to the {@link Thrown} that `tell` returns when it is called. */
@@ -486,33 +485,30 @@ type Execute = (...args: never[]) => unknown;
 
 /**
  * Keeps the errors that a tool's `execute` and a plugin hook throw for the plain `Error`s
- * ADK throws in their place. ADK's `FunctionTool.runAsync` calls `this.execute`, so each run
- * gets a proxy of the tool whose `execute` calls the tool's own and keeps what it threw for
- * the call's tool context, which ADK hands on with its error (see {@link keepToolError}).
- * Every other method read through the proxy is bound to the tool, so `validateArgs`,
- * `checkConfirmation` and a `requireConfirmation` predicate run on the tool itself. The
- * tool is left as it is, the promise `runAsync` returns is ADK's own, and what ADK does is
- * unchanged. A plugin hook's error is kept by {@link keepWrapped}.
+ * ADK throws in their place (see {@link keepWrapped}). ADK's `FunctionTool.runAsync` calls
+ * `this.execute`, so each run gets a proxy of the tool whose `execute` calls the tool's own
+ * and tells this run what it threw. Every other method read through the proxy is bound to
+ * the tool, so `validateArgs`, `checkConfirmation` and a `requireConfirmation` predicate run
+ * on the tool itself. The tool is left as it is, and what ADK does is unchanged.
  */
 function watchWrappedErrors(): void {
   const tool = FunctionTool.prototype as unknown as Record<PropertyKey, unknown>;
-  const runAsync = tool.runAsync as (this: object, request: { toolContext?: unknown }) => Promise<unknown>;
-  tool.runAsync = function (this: { execute: Execute }, request: { toolContext?: unknown }): Promise<unknown> {
-    const context = request?.toolContext;
-    const execute = telling(
-      (...args: never[]) => this.execute(...args),
-      () => (error) => {
-        if (typeof context === 'object' && context !== null) recorded().toolThrew.set(context, error);
-      }
-    );
-    const run = new Proxy(this, {
-      get(tool, key) {
-        if (key === 'execute') return execute;
-        const value: unknown = Reflect.get(tool, key, tool);
-        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(tool) : value;
-      },
+  const runAsync = tool.runAsync as (this: object, request: unknown) => Promise<unknown>;
+  tool.runAsync = function (this: { execute: Execute }, request: unknown): Promise<unknown> {
+    return keepWrapped((thrown) => {
+      const execute = telling(
+        (...args: never[]) => this.execute(...args),
+        () => thrown
+      );
+      const run = new Proxy(this, {
+        get(tool, key) {
+          if (key === 'execute') return execute;
+          const value: unknown = Reflect.get(tool, key, tool);
+          return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(tool) : value;
+        },
+      });
+      return runAsync.call(run, request);
     });
-    return runAsync.call(run, request);
   };
   const manager = PluginManager.prototype as unknown as Record<PropertyKey, unknown>;
   const runCallbacks = manager.runCallbacks as (
@@ -554,31 +550,12 @@ function watchErrorHandoffs(): void {
   watchWrappedErrors();
   watchNodeAttempts();
   for (const method of ['runOnToolErrorCallback', 'runOnModelErrorCallback']) {
-    const original = proto[method] as (this: PluginManager, params: HandedOff) => Promise<unknown>;
-    proto[method] = function (this: PluginManager, params: HandedOff): Promise<unknown> {
-      keepToolError(params);
+    const original = proto[method] as (this: PluginManager, params: { error?: unknown }) => Promise<unknown>;
+    proto[method] = function (this: PluginManager, params: { error?: unknown }): Promise<unknown> {
       recordCancellation(params.error);
       return original.call(this, params);
     };
   }
-}
-
-/** What ADK hands its plugin manager with an error, as far as it is read here. */
-interface HandedOff {
-  error?: unknown;
-  toolContext?: unknown;
-}
-
-/**
- * Keeps what the tool's `execute` threw for the plain `Error` ADK hands on in its place,
- * found by the tool context ADK hands on with it (see {@link watchWrappedErrors}).
- */
-function keepToolError({ error, toolContext }: HandedOff): void {
-  if (typeof toolContext !== 'object' || toolContext === null) return;
-  const { toolThrew, wrapped } = recorded();
-  if (!toolThrew.has(toolContext)) return;
-  const thrown = toolThrew.get(toolContext);
-  if (thrown !== error && typeof error === 'object' && error !== null) wrapped.set(error, thrown);
 }
 
 if (inWorkflowContext()) watchErrorHandoffs();
