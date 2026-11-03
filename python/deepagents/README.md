@@ -394,13 +394,15 @@ pass `TemporalModel("provider:name")` yourself.
 
 Over the same worker lifetime the plugin also replaces LangGraph's checkpoint-id
 generator (`langgraph.checkpoint.base.id.uuid6`, wall-clock time plus `random`)
-with a replay-stable drop-in, again only answering inside a workflow. Task ids,
-`checkpoint_ns`, and `Interrupt.id` are all derived from checkpoint ids, so this
-is what makes them identical across replay of one history. The replacement is
-process-global for the worker's lifetime: a worker that also runs
-`temporalio-langgraph` workflows gets the same replay-stable ids inside those
-workflows. An id minted before you deploy this version is not reproduced after
-it (it was already unstable across replay); re-query pending approvals after
+with a replay-stable drop-in. Task ids, `checkpoint_ns`, and `Interrupt.id` are
+all derived from checkpoint ids, so this is what makes them identical across
+replay of one history. The drop-in only answers inside workflow runs on a Worker
+with this plugin: outside workflows, and in workflows on another Worker of the
+same process that runs LangGraph without the plugin (for example
+`temporalio-langgraph` workflows), LangGraph's own `uuid6` answers as before. A
+reference to `uuid6` imported while the worker runs keeps working after it
+stops. An id minted before you deploy this version is not reproduced after it
+(it was already unstable across replay); re-query pending approvals after
 deploying or rolling back rather than trusting ids recorded earlier.
 
 Each plugin instance registers four Activities: `deepagents.invoke_model`,

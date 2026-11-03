@@ -15,9 +15,11 @@ computes.
 Replay can supply neither wall-clock time nor entropy, so while a worker is
 running, :func:`install_checkpoint_id_patch` swaps the ``uuid6`` bindings
 LangGraph's checkpoint modules hold for :func:`_workflow_uuid6`, a drop-in
-built only from replay-safe inputs. Outside workflows the original ``uuid6``
-still answers, so client-side LangGraph use in the same process is
-untouched.
+built only from replay-safe inputs. Only workflow runs that carry the
+plugin's :class:`CheckpointIdInterceptor` get the drop-in: outside workflows,
+and in workflows on another Worker of the same process that runs LangGraph
+without the plugin, the original ``uuid6`` still answers, so that code is
+untouched and leaves no per-run state behind.
 
 The time field carries the workflow's own time, with a per-run floor.
 ``workflow.time_ns()`` is the current workflow task's *recorded* timestamp:
@@ -70,9 +72,12 @@ _UUID6_EPOCH_OFFSET_TICKS = 122192928000000000
 # Highest tick minted so far, per workflow run. Keyed by run id because one
 # worker interleaves many runs on a single event loop and a shared value
 # would make a run's ids depend on that interleaving; plain dict operations,
-# with no await between them, cannot interleave. Entries are dropped when
-# the run finishes and reset when its workflow instance is (re)created — see
-# :class:`CheckpointIdInterceptor` for why resetting is replay-safe.
+# with no await between them, cannot interleave. Only
+# :class:`CheckpointIdInterceptor` adds an entry (reset to 0 when the
+# workflow instance is (re)created — see it for why that is replay-safe) and
+# drops it when the run finishes, and a run with no entry is not patched, so
+# a run on a Worker without that interceptor never creates an entry no one
+# would remove.
 _last_tick: dict[str, int] = {}
 
 
@@ -200,9 +205,15 @@ def install_checkpoint_id_patch() -> None:
     def patched_uuid6(node: int | None = None, clock_seq: int | None = None) -> Any:
         # Inert outside workflows: the same worker process may run plain
         # client- or activity-side LangGraph code, which keeps real uuid6.
-        if workflow.in_workflow():
+        # Inert too in a workflow run without CheckpointIdInterceptor (another
+        # Worker in this process running LangGraph without the plugin): it
+        # keeps real uuid6 and gets no tick-floor entry it could never drop.
+        # Delegates to the local ``original``, not the module global, so a
+        # reference imported while patched (``from ... import uuid6``) keeps
+        # working after the last worker uninstalls the patch.
+        if workflow.in_workflow() and workflow.info().run_id in _last_tick:
             return _workflow_uuid6(node, clock_seq)
-        return _original_uuid6(node, clock_seq)
+        return original(node, clock_seq)
 
     for module in modules:
         setattr(module, "uuid6", patched_uuid6)
@@ -230,7 +241,7 @@ def uninstall_checkpoint_id_patch() -> None:
 
 
 class CheckpointIdInterceptor(Interceptor):
-    """Scope the per-run tick floor to the workflow instance's lifetime."""
+    """Enable replay-stable checkpoint ids for a run, for its instance's lifetime."""
 
     def workflow_interceptor_class(
         self, input: WorkflowInterceptorClassInput
@@ -249,7 +260,9 @@ class CheckpointIdInterceptor(Interceptor):
                 # A newly constructed instance re-executes its run from the
                 # start (first task after an eviction, every replay), so the
                 # tick floor must restart with it to re-derive the same ids.
-                _last_tick.pop(self._run_id, None)
+                # The entry also marks the run as one the patched uuid6
+                # serves: runs without this interceptor keep real uuid6.
+                _last_tick[self._run_id] = 0
                 super().init(outbound)
 
             async def execute_workflow(self, input: ExecuteWorkflowInput) -> Any:

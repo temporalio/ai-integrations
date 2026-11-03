@@ -516,6 +516,92 @@ async def test_checkpoint_patch_inert_outside_workflows_and_restored(
         pytest.fail("worker shutdown never restored the original uuid6")
 
 
+def test_checkpoint_uuid6_imported_while_patched_survives_uninstall() -> None:
+    # A module that runs `from langgraph.checkpoint.base.id import uuid6`
+    # while a worker is up keeps the patched function after the last worker
+    # shuts down; restoring the module attributes cannot reach that
+    # reference. It must keep delegating to the real uuid6, not to a cleared
+    # global (TypeError: 'NoneType' object is not callable).
+    from temporalio.deepagents import _checkpoint_ids
+
+    original = checkpoint_id_module.uuid6
+    _checkpoint_ids.install_checkpoint_id_patch()
+    try:
+        imported = checkpoint_id_module.uuid6
+        assert imported is not original
+    finally:
+        _checkpoint_ids.uninstall_checkpoint_id_patch()
+    assert checkpoint_id_module.uuid6 is original
+
+    # Wall-clock time in uuid6's epoch, within five minutes (100-ns ticks).
+    wall = original().time
+    assert abs(imported().time - wall) < 5 * 60 * 10**7
+
+
+@workflow.defn(sandboxed=False)
+class PlainLangGraphIdWorkflow:
+    """A workflow on a Worker without DeepAgentsPlugin that mints a checkpoint id."""
+
+    @workflow.run
+    async def run(self) -> str:
+        # Looked up at call time, so it is the patched binding while a
+        # DeepAgentsPlugin worker is running in this process.
+        return str(checkpoint_id_module.uuid6(clock_seq=0))
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_patch_leaves_plugin_free_workers_alone(
+    env: WorkflowEnvironment,
+) -> None:
+    # The patch is process-wide, but per-run state is cleaned up only by the
+    # plugin's CheckpointIdInterceptor. A Worker running LangGraph without
+    # the plugin has no such interceptor, so its runs must keep real uuid6
+    # and leave no tick-floor entry behind, completed and evicted runs alike
+    # (max_cached_workflows=0 evicts after every task).
+    from temporalio.deepagents import _checkpoint_ids
+
+    original = checkpoint_id_module.uuid6
+    async with Worker(
+        env.client,
+        task_queue=f"da-idle-{uuid.uuid4()}",
+        workflows=[InterruptIdsWorkflow],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        for _ in range(100):
+            if checkpoint_id_module.uuid6 is not original:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("worker never installed the checkpoint-id patch")
+
+        plain_queue = f"plain-langgraph-{uuid.uuid4()}"
+        run_ids = []
+        async with Worker(
+            env.client,
+            task_queue=plain_queue,
+            workflows=[PlainLangGraphIdWorkflow],
+            max_cached_workflows=0,
+        ):
+            for _ in range(3):
+                handle = await env.client.start_workflow(
+                    PlainLangGraphIdWorkflow.run,
+                    id=f"plain-langgraph-{uuid.uuid4()}",
+                    task_queue=plain_queue,
+                )
+                minted = await handle.result()
+                run_ids.append(handle.result_run_id)
+                # Real uuid6: wall-clock time, and not the run-derived node
+                # the replay-stable drop-in would have used.
+                wall = original().time
+                assert (
+                    abs(checkpoint_id_module.UUID(minted).time - wall) < 5 * 60 * 10**7
+                )
+                run_node, _ = _checkpoint_ids._run_id_bits(handle.result_run_id or "")
+                assert checkpoint_id_module.UUID(minted).node != run_node
+
+        assert not set(run_ids) & set(_checkpoint_ids._last_tick)
+
+
 @pytest.mark.asyncio
 async def test_failed_checkpoint_install_unwinds_earlier_patches(
     monkeypatch: pytest.MonkeyPatch,
