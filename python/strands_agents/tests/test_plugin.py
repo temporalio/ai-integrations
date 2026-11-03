@@ -11,7 +11,10 @@ from strands.tools.mcp import MCPClient as StrandsMCPClient
 import temporalio.strands_agents._plugin as plugin_module
 from temporalio.api.failure.v1 import Failure
 from temporalio.client import ClientConfig
-from temporalio.contrib.pydantic import PydanticPayloadConverter, pydantic_data_converter
+from temporalio.contrib.pydantic import (
+    PydanticPayloadConverter,
+    pydantic_data_converter,
+)
 from temporalio.converter import (
     DataConverter,
     DefaultFailureConverter,
