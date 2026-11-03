@@ -150,18 +150,18 @@ export function callToolActivityName(server: string): string {
 
 /**
  * Builds the per-server `{server}-listTools` activity. Enumerates the server's
- * tools live over the shared worker-process connection on every call, so the
- * agent sees the server's current tools even if it is redeployed mid-workflow.
- * Runs whenever a workflow calls {@link TemporalMCPClient.listTools}.
+ * tools live over the plugin's connection on every call, so the agent sees the
+ * server's current tools even if it is redeployed mid-workflow. Runs whenever a
+ * workflow calls {@link TemporalMCPClient.listTools}.
  */
 export function buildListToolsActivity(
   server: string,
   factory: () => McpClient,
-  idleMs: number = MCP_CONNECTION_IDLE_MS
+  connections: McpConnections
 ): (input: { server: string }) => Promise<McpToolInfo[]> {
   const name = listToolsActivityName(server);
   const fn = async (_input: { server: string }): Promise<McpToolInfo[]> => {
-    const record = acquireConnection(server, factory);
+    const record = connections.acquire(server, factory);
     try {
       const client = await record.client;
       const tools = await client.listTools();
@@ -174,12 +174,12 @@ export function buildListToolsActivity(
       // The session may be broken (e.g. the server was redeployed); stop handing
       // it out so the next call reconnects to the current deployment. It is
       // closed once the calls still using it have finished.
-      markBroken(server, record);
+      connections.retire(server, record);
       throw err;
     } finally {
-      // Closes the connection if it was marked broken and this was the last
-      // in-flight call; otherwise lets idle eviction resume.
-      releaseConnection(server, record, idleMs);
+      // Closes the connection if it was retired and this was the last in-flight
+      // call; otherwise lets idle eviction resume.
+      connections.release(server, record);
     }
   };
   Object.defineProperty(fn, 'name', { value: name });
@@ -191,7 +191,7 @@ export function buildListToolsActivity(
  * disconnected. The window only starts once no {@link callToolActivityName |
  * callTool} or {@link listToolsActivityName | listTools} activity is using the
  * connection, so a call that runs longer than this is never cut off. Override
- * per worker via `StrandsPlugin({ mcpConnectionIdleTimeout })`.
+ * per plugin via `StrandsPlugin({ mcpConnectionIdleTimeout })`.
  */
 export const MCP_CONNECTION_IDLE_MS = 5 * 60 * 1000;
 
@@ -202,84 +202,24 @@ interface ConnectionRecord {
   /** Number of activities currently using this connection. */
   inflight: number;
   /**
-   * Set after a failed call. A broken record is no longer handed out to new
-   * calls, and is only disconnected once `inflight` drops back to 0, so an
-   * error in one concurrent call can't close the session under its siblings.
+   * Set after a failed call, or when the last Worker using the plugin stops
+   * while a call still uses the connection. A retired record is no longer
+   * handed out to new calls, and is only disconnected once `inflight` drops
+   * back to 0, so one call can't close the session under its siblings.
    */
-  broken: boolean;
+  retired: boolean;
   /** Armed only while `inflight` is 0. */
   idleTimer?: NodeJS.Timeout;
 }
 
-// Worker-process cache, keyed by server name. Activities run in the worker's
-// Node process, so this module state is shared across every activity invocation on the worker.
-const CONNECTIONS: Map<string, ConnectionRecord> = new Map();
-
-export async function _evictConnection(server: string): Promise<void> {
-  const record = CONNECTIONS.get(server);
-  if (record === undefined) return;
-  // Delete before awaiting: a call arriving during `disconnect` must open a
-  // fresh connection rather than join the one being torn down.
-  CONNECTIONS.delete(server);
-  if (record.idleTimer !== undefined) {
-    clearTimeout(record.idleTimer);
-    record.idleTimer = undefined;
-  }
-  await closeRecord(record);
-}
-
-/**
- * Return the cached connection for `server`, opening one lazily if needed, and
- * mark a call in flight so idle eviction can't disconnect underneath it.
- * Concurrent first-callers dedupe onto a single connect handshake by awaiting
- * the same record. Every caller must {@link releaseConnection} once its call
- * completes.
- */
-function acquireConnection(server: string, factory: () => McpClient): ConnectionRecord {
-  let record = CONNECTIONS.get(server);
-  if (record === undefined) {
-    const entry: ConnectionRecord = {
-      inflight: 0,
-      broken: false,
-      client: (async () => {
-        const client = factory();
-        await client.connect();
-        return client;
-      })(),
-    };
-    // If the connect handshake fails, drop the rejected promise so the next
-    // call retries instead of caching the failure forever.
-    entry.client.catch(() => {
-      if (CONNECTIONS.get(server) === entry) CONNECTIONS.delete(server);
-    });
-    CONNECTIONS.set(server, entry);
-    record = entry;
-  }
-  record.inflight += 1;
-  if (record.idleTimer !== undefined) {
-    clearTimeout(record.idleTimer);
-    record.idleTimer = undefined;
-  }
-  return record;
-}
-
-/**
- * Flag `record` as suspect after a failed call. It is unpublished at once so
- * new calls open a fresh connection, but not disconnected until the calls
- * still using it have released it (see {@link releaseConnection}).
- */
-function markBroken(server: string, record: ConnectionRecord): void {
-  // Already evicted or replaced; whoever did that is closing it.
-  if (CONNECTIONS.get(server) !== record) return;
-  record.broken = true;
-  CONNECTIONS.delete(server);
+function clearIdleTimer(record: ConnectionRecord): void {
   if (record.idleTimer !== undefined) {
     clearTimeout(record.idleTimer);
     record.idleTimer = undefined;
   }
 }
 
-/** Disconnect a record that is no longer in {@link CONNECTIONS}. Best-effort. */
+/** Disconnect a record that is no longer handed out. Best-effort. */
 async function closeRecord(record: ConnectionRecord): Promise<void> {
   try {
     const client = await record.client;
@@ -290,48 +230,140 @@ async function closeRecord(record: ConnectionRecord): Promise<void> {
 }
 
 /**
- * Mark a call done. Once no calls remain in flight, disconnect a broken
- * connection or arm idle eviction for a healthy one.
+ * The worker-process MCP connections of one {@link StrandsPlugin}, keyed by
+ * server name. Workers that share a plugin instance share its connections;
+ * another plugin instance opens its own through its own factories, even for
+ * the same server name. The plugin's `runContext` counts the Workers using
+ * them, and the last one to stop closes them. A connection that a call still
+ * uses is closed when that call finishes.
  */
-function releaseConnection(server: string, record: ConnectionRecord, idleMs: number): void {
-  record.inflight -= 1;
-  if (record.broken) {
-    if (record.inflight === 0) void closeRecord(record);
-    return;
+export class McpConnections {
+  private readonly records: Map<string, ConnectionRecord> = new Map();
+  private workers = 0;
+
+  /**
+   * @param idleMs how long an idle connection stays open; defaults to
+   * {@link MCP_CONNECTION_IDLE_MS}.
+   */
+  constructor(private readonly idleMs: number = MCP_CONNECTION_IDLE_MS) {}
+
+  /** Runs one Worker; once no Worker uses these connections, closes them. */
+  async use(next: () => Promise<void>): Promise<void> {
+    this.workers += 1;
+    try {
+      await next();
+    } finally {
+      this.workers -= 1;
+      if (this.workers === 0) {
+        await Promise.all([...this.records.keys()].map((server) => this.evict(server)));
+      }
+    }
   }
-  // Only the record still cached under this server arms a timer; a record
-  // already evicted must not schedule one, or it could later evict a
-  // different, healthy connection for the same server.
-  if (record.inflight > 0 || CONNECTIONS.get(server) !== record) return;
-  const timer = setTimeout(() => {
-    // `acquireConnection` clears this timer synchronously, so a pending timer
-    // implies the connection is still idle; re-checked to keep that invariant
-    // local.
-    if (record.inflight === 0) void _evictConnection(server);
-  }, idleMs);
-  // Don't let an idle MCP connection keep the worker process alive.
-  timer.unref?.();
-  record.idleTimer = timer;
+
+  /**
+   * Stop handing out `server`'s connection, and disconnect it now or when the
+   * last call still using it finishes.
+   */
+  async evict(server: string): Promise<void> {
+    const record = this.records.get(server);
+    if (record === undefined) return;
+    // Delete before awaiting: a call arriving during `disconnect` must open a
+    // fresh connection rather than join the one being torn down.
+    this.records.delete(server);
+    clearIdleTimer(record);
+    if (record.inflight > 0) {
+      record.retired = true;
+      return;
+    }
+    await closeRecord(record);
+  }
+
+  /**
+   * Return the cached connection for `server`, opening one lazily if needed,
+   * and mark a call in flight so idle eviction can't disconnect underneath it.
+   * Concurrent first-callers dedupe onto a single connect handshake by awaiting
+   * the same record. Every caller must {@link release} once its call completes.
+   */
+  acquire(server: string, factory: () => McpClient): ConnectionRecord {
+    let record = this.records.get(server);
+    if (record === undefined) {
+      const entry: ConnectionRecord = {
+        inflight: 0,
+        retired: false,
+        client: (async () => {
+          const client = factory();
+          await client.connect();
+          return client;
+        })(),
+      };
+      // If the connect handshake fails, drop the rejected promise so the next
+      // call retries instead of caching the failure forever.
+      entry.client.catch(() => {
+        if (this.records.get(server) === entry) this.records.delete(server);
+      });
+      this.records.set(server, entry);
+      record = entry;
+    }
+    record.inflight += 1;
+    clearIdleTimer(record);
+    return record;
+  }
+
+  /**
+   * Flag `record` as suspect after a failed call. It is unpublished at once so
+   * new calls open a fresh connection, but not disconnected until the calls
+   * still using it have released it (see {@link release}).
+   */
+  retire(server: string, record: ConnectionRecord): void {
+    // Already evicted or replaced; whoever did that is closing it.
+    if (this.records.get(server) !== record) return;
+    record.retired = true;
+    this.records.delete(server);
+    clearIdleTimer(record);
+  }
+
+  /**
+   * Mark a call done. Once no calls remain in flight, disconnect a retired
+   * connection or arm idle eviction for a healthy one.
+   */
+  release(server: string, record: ConnectionRecord): void {
+    record.inflight -= 1;
+    if (record.retired) {
+      if (record.inflight === 0) void closeRecord(record);
+      return;
+    }
+    // Only the record still cached under this server arms a timer; a record
+    // already evicted must not schedule one, or it could later evict a
+    // different, healthy connection for the same server.
+    if (record.inflight > 0 || this.records.get(server) !== record) return;
+    const timer = setTimeout(() => {
+      // `acquire` clears this timer synchronously, so a pending timer implies
+      // the connection is still idle; re-checked to keep that invariant local.
+      if (record.inflight === 0) void this.evict(server);
+    }, this.idleMs);
+    // Don't let an idle MCP connection keep the worker process alive.
+    timer.unref?.();
+    record.idleTimer = timer;
+  }
 }
 
 /**
- * Builds the per-server `{server}-callTool` activity. Reuses a worker-process
- * MCP session opened lazily through the user-supplied factory — successive
- * calls share one connection rather than reconnecting per call. Idle
- * connections are disconnected after `idleMs` (defaults to
- * {@link MCP_CONNECTION_IDLE_MS}).
+ * Builds the per-server `{server}-callTool` activity. Reuses the plugin's MCP
+ * session, opened lazily through the user-supplied factory — successive calls
+ * share one connection rather than reconnecting per call. Idle connections are
+ * disconnected after the plugin's idle timeout.
  */
 export function buildCallToolActivity(
   server: string,
   factory: () => McpClient,
-  idleMs: number = MCP_CONNECTION_IDLE_MS
+  connections: McpConnections
 ): (input: CallToolInput) => Promise<JSONValue> {
   const name = callToolActivityName(server);
   const fn = async (input: CallToolInput): Promise<JSONValue> => {
     ActivityContext.current().log.debug(`Calling MCP tool ${input.toolName} on server ${server}`, {
       activityId: activityInfo().activityId,
     });
-    const record = acquireConnection(server, factory);
+    const record = connections.acquire(server, factory);
     // Dispatch by name without re-listing tools on the connection: the agent
     // already has the schema from `listTools`, and `McpClient.callTool` only
     // reads `tool.name` to build the request. A minimal `{ name }` matches the
@@ -343,12 +375,12 @@ export function buildCallToolActivity(
     } catch (err) {
       // The session may be broken; stop handing it out so the next call
       // reconnects. It is closed once the calls still using it have finished.
-      markBroken(server, record);
+      connections.retire(server, record);
       throw err;
     } finally {
-      // Closes the connection if it was marked broken and this was the last
-      // in-flight call; otherwise lets idle eviction resume.
-      releaseConnection(server, record, idleMs);
+      // Closes the connection if it was retired and this was the last in-flight
+      // call; otherwise lets idle eviction resume.
+      connections.release(server, record);
     }
   };
   Object.defineProperty(fn, 'name', { value: name });

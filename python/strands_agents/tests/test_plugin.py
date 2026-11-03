@@ -6,6 +6,7 @@ from botocore.config import Config as BotocoreConfig
 from strands.interrupt import Interrupt, InterruptException
 from strands.models import Model
 from strands.models.bedrock import DEFAULT_READ_TIMEOUT
+from strands.tools.mcp import MCPClient as StrandsMCPClient
 
 import temporalio.strands_agents._plugin as plugin_module
 from temporalio.api.failure.v1 import Failure
@@ -207,3 +208,22 @@ def test_other_failure_converter_is_replaced(target: str) -> None:
     )
     assert isinstance(decoded, ApplicationError)
     assert decoded.type == "DomainError"
+
+
+def test_mcp_factory_that_returns_a_strands_client_fails_retryably() -> None:
+    # A factory left as it was for Strands' MCPClient, the common upgrade mistake.
+    def old_factory() -> typing.Any:
+        return StrandsMCPClient(typing.cast(typing.Any, lambda: None))
+
+    create = plugin_module._client_factory("old", old_factory)
+
+    with pytest.raises(ApplicationError) as error:
+        create()
+
+    assert error.value.message == (
+        "MCP server factory 'old' returned strands.tools.mcp.mcp_client.MCPClient, "
+        "not mcp.Client; mcp_clients factories must return an mcp.Client "
+        "(see the upgrade notes in the plugin README)"
+    )
+    # Retryable: the run waits for a fixed worker instead of failing.
+    assert not error.value.non_retryable
