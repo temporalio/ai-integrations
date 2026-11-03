@@ -18,7 +18,10 @@ from temporalio.bridge.proto.workflow_activation import (
     WorkflowActivationJob,
 )
 from temporalio.bridge.proto.workflow_commands import (
+    CancelWorkflowExecution,
     CompleteWorkflowExecution,
+    ContinueAsNewWorkflowExecution,
+    FailWorkflowExecution,
     WorkflowCommand,
 )
 from temporalio.bridge.proto.workflow_completion import (
@@ -97,14 +100,15 @@ class TestEndingEvictions:
         # Completions are made per case: the worker can change one after
         # ``activate`` returns it.
         def ends() -> WorkflowActivationCompletion:
-            return WorkflowActivationCompletion(
-                successful=Success(
-                    commands=[
-                        WorkflowCommand(
-                            complete_workflow_execution=CompleteWorkflowExecution()
-                        )
-                    ]
-                )
+            return ends_with(
+                WorkflowCommand(complete_workflow_execution=CompleteWorkflowExecution())
+            )()
+
+        def ends_with(
+            command: WorkflowCommand,
+        ) -> Callable[[], WorkflowActivationCompletion]:
+            return lambda: WorkflowActivationCompletion(
+                successful=Success(commands=[command])
             )
 
         def waits() -> WorkflowActivationCompletion:
@@ -136,6 +140,11 @@ class TestEndingEvictions:
             return WorkflowActivation(run_id="run", is_replaying=True, jobs=[job])
 
         reasons = RemoveFromCache.EvictionReason
+        fail = WorkflowCommand(fail_workflow_execution=FailWorkflowExecution())
+        cancel = WorkflowCommand(cancel_workflow_execution=CancelWorkflowExecution())
+        continue_as_new = WorkflowCommand(
+            continue_as_new_workflow_execution=ContinueAsNewWorkflowExecution()
+        )
         cases: list[
             tuple[
                 list[
@@ -152,6 +161,10 @@ class TestEndingEvictions:
             # The workflow ends; Core evicts it, from a full cache or not.
             ([(task(), ends, sent)], reasons.WORKFLOW_EXECUTION_ENDING, True),
             ([(task(), ends, sent)], reasons.CACHE_FULL, True),
+            # It fails, is cancelled or continues as new.
+            ([(task(), ends_with(fail), sent)], reasons.CACHE_FULL, True),
+            ([(task(), ends_with(cancel), sent)], reasons.CACHE_FULL, True),
+            ([(task(), ends_with(continue_as_new), sent)], reasons.CACHE_FULL, True),
             # The task that would end it fails, as when its result can't be
             # serialized, or after a signal handler failed the workflow.  With
             # no room in the cache, Core gives the eviction after it as full.
