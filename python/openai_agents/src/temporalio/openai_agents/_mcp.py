@@ -638,8 +638,9 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
 
         If the session activity failed with ``DedicatedWorkerFailure``, raises
         ``ApplicationError(type="DedicatedWorkerFailure")`` with the session's
-        ``ActivityError`` as its cause, or with no cause if the session ended in
-        the workflow task that ended the block.
+        ``ActivityError`` as its cause. If the session ended, for any reason, in
+        the workflow task that ended the block, raises it with no cause, since
+        the SDK dropped the session's result.
         """
         if self._connect_handle:
             session = self._connect_handle

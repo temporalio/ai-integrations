@@ -600,7 +600,10 @@ Some consequences:
   `ApplicationError(type="DedicatedWorkerFailure")`, which the block now raises
   after a refusal. A session that fails for another reason, such as one with a
   one-attempt `server_session_config` retry policy, or one whose attempts all
-  fail before connecting, still makes the block raise `ActivityError`.
+  fail before connecting, still makes the block raise `ActivityError`, unless
+  it ended in the workflow task that ended the block, as when the block's last
+  timer fired: then the block raises `DedicatedWorkerFailure` with no cause,
+  where earlier versions raised a bare `asyncio.CancelledError`.
 - The session activity's heartbeats go through your payload codec, so its
   `heartbeat_timeout` must comfortably exceed a heartbeat's encoding time. An
   attempt that connected no server waits at most 10 seconds for its heartbeats
@@ -643,7 +646,12 @@ A run follows its session this way only once it records the patch marker
 `openai-agents-stateful-mcp-session-watch`, which it does at its first
 operation whose `config` has neither timeout. Histories recorded on an earlier
 version have no marker, so they schedule such operations as before and replay
-on this version. A run that continues on this version records the marker at its
+on this version. One change is not behind the marker: the
+`DedicatedWorkerFailure` a block raises when its session ended in the workflow
+task that ended the block, as above. A run recorded on an earlier version that
+hit this, caught the bare `CancelledError` and went on schedules different
+commands on this version and fails replay, so let such runs finish before
+upgrading. A run that continues on this version records the marker at its
 next such operation only if it scheduled none before the upgrade. Otherwise the
 Temporal Python SDK keeps the decision it made while replaying that earlier
 operation, so the run never records the marker and schedules such operations as
@@ -651,7 +659,8 @@ before until it ends: one scheduled after its session ended waits until the
 caller cancels it or the run ends. A run with the marker fails replay on an
 earlier version, and so can any run whose session failed with
 `DedicatedWorkerFailure` (a refused retry or a refused describe) and that then
-went on, whether it caught the block's failure or a cancellation, so do not roll
+went on, whether it caught the block's failure or a cancellation, and any run
+that caught that unmarked `DedicatedWorkerFailure` and went on, so do not roll
 back while such runs are open. Drain the earlier version's workers before starting this one: while
 workers of both versions run, a run whose session gets a refusal can fail
 replay when it moves from one to the other.
