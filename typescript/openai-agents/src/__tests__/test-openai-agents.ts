@@ -716,7 +716,9 @@ function assertSessionRefused(t: ExecutionContext, err: WorkflowFailedError | un
   t.is((cause as ApplicationFailure).type, DEDICATED_WORKER_FAILURE_TYPE);
 }
 
-test('Stateful MCP: a retried session Activity fails instead of opening a new session', async (t) => {
+// The session tests below wait on timeouts, shutdowns and other Workers, so they run one at a
+// time: run alongside the rest of this file, they starved small CI runners into timeouts.
+test.serial('Stateful MCP: a retried session Activity fails instead of opening a new session', async (t) => {
   const { createWorker, startWorkflow, taskQueue } = helpers(t);
   // Worker A runs in a child process, so the test can kill the session's host.
   const bundleDir = mkdtempSync(path.join(os.tmpdir(), 'stateful-mcp-host-'));
@@ -791,7 +793,7 @@ test('Stateful MCP: a retried session Activity fails instead of opening a new se
   }
 });
 
-test('Stateful MCP: a session Activity retried after a failed connect connects again', async (t) => {
+test.serial('Stateful MCP: a session Activity retried after a failed connect connects again', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
 
   let factoryCalls = 0;
@@ -834,7 +836,7 @@ test('Stateful MCP: a session Activity retried after a failed connect connects a
 });
 
 for (const ignoresCancel of [false, true]) {
-test(`Stateful MCP: a session Activity retried after a shutdown before connecting connects again${
+test.serial(`Stateful MCP: a session Activity retried after a shutdown before connecting connects again${
   ignoresCancel ? ', with a connect() that ignores cancellation' : ''
 }`, async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
@@ -909,7 +911,7 @@ for (const [kase, title] of [
   ['describe stalls', 'a session Activity whose describe never returns fails at the deadline'],
   ['decode stalls', 'a session Activity that never finishes decoding its read-back fails at the deadline'],
 ] as const) {
-  test(`Stateful MCP: ${title}`, async (t) => {
+  test.serial(`Stateful MCP: ${title}`, async (t) => {
     const { createWorker, startWorkflow } = helpers(t);
     let factoryCalls = 0;
     const describe = async (): Promise<never> => {
@@ -1002,7 +1004,7 @@ for (const [kase, title] of [
   });
 }
 
-test('Stateful MCP: histories recorded on an earlier version replay', async (t) => {
+test.serial('Stateful MCP: histories recorded on an earlier version replay', async (t) => {
   // Recorded on main at ea04762 with the Workflow Worker stopped, so that one
   // activation resolves a stateful tool call together with plain Activities
   // (gather) or with a Workflow cancel (cancel); and a caller's cancellation of
@@ -1031,7 +1033,7 @@ test('Stateful MCP: histories recorded on an earlier version replay', async (t) 
   }
 });
 
-test('Stateful MCP: an operation without a schedule-to-start timeout fails once the session ends', async (t) => {
+test.serial('Stateful MCP: an operation without a schedule-to-start timeout fails once the session ends', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
   const calls: string[] = [];
   const plugin = () =>
@@ -1072,7 +1074,7 @@ test('Stateful MCP: an operation without a schedule-to-start timeout fails once 
   t.is(operations.length, 1);
 });
 
-test('Stateful MCP: an operation waiting without a schedule-to-start timeout fails when the session ends', async (t) => {
+test.serial('Stateful MCP: an operation waiting without a schedule-to-start timeout fails when the session ends', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
   const calls: string[] = [];
   const plugin = () =>
@@ -1121,7 +1123,7 @@ test('Stateful MCP: an operation waiting without a schedule-to-start timeout fai
   t.false(calls.includes('get'));
 });
 
-test('Stateful MCP: a Workflow cancellation wins over the session it ended', async (t) => {
+test.serial('Stateful MCP: a Workflow cancellation wins over the session it ended', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
   const calls: string[] = [];
   const worker = await createWorker({
@@ -1156,7 +1158,7 @@ test('Stateful MCP: a Workflow cancellation wins over the session it ended', asy
 });
 
 for (const nonCancellable of [false, true]) {
-test(`Stateful MCP: a Workflow cancellation wins over a refused session in cleanup()${
+test.serial(`Stateful MCP: a Workflow cancellation wins over a refused session in cleanup()${
   nonCancellable ? ', also in a non-cancellable scope' : ''
 }`, async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
@@ -1198,7 +1200,7 @@ test(`Stateful MCP: a Workflow cancellation wins over a refused session in clean
 });
 }
 
-test('Stateful MCP: a caller still cancels a queued operation without a schedule-to-start timeout', async (t) => {
+test.serial('Stateful MCP: a caller still cancels a queued operation without a schedule-to-start timeout', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
   const calls: string[] = [];
   let release!: () => void;
