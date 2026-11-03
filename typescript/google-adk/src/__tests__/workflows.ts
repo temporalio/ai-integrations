@@ -857,17 +857,20 @@ export async function agentRunnerRetainedActivityError(
 }
 
 /**
- * One turn that runs a `FunctionTool`, reporting afterwards whether the tool's `execute` is
- * still the function it was built with, and whether its `requireConfirmation` predicate,
- * written as a `function`, ran with the tool as `this`.
+ * One turn that runs a `FunctionTool`, frozen when `frozen` is set, reporting afterwards
+ * whether its `execute` ran and is still the function it was built with, and whether its
+ * `requireConfirmation` predicate, written as a `function`, ran with the tool as `this`.
  */
-export async function agentRunnerToolKeepsItsExecute(): Promise<{
+export async function agentRunnerToolKeepsItsExecute(frozen = false): Promise<{
+  ran: boolean;
   same: boolean;
   name: string;
   length: number;
   predicateOnTool: boolean;
 }> {
+  let ran = false;
   async function approve(_args: unknown, _context: unknown): Promise<{ status: string }> {
+    ran = true;
     return { status: 'approved' };
   }
   let predicateOnTool = false;
@@ -880,11 +883,12 @@ export async function agentRunnerToolKeepsItsExecute(): Promise<{
       return false;
     },
   });
+  if (frozen) Object.freeze(tool);
   await runAgentTurn(new TemporalModel('call-wait-approval-model', SINGLE_ATTEMPT), 'hi', undefined, {
     tools: [tool],
   });
   const execute = (tool as unknown as { execute: (...args: unknown[]) => unknown }).execute;
-  return { same: execute === approve, name: execute.name, length: execute.length, predicateOnTool };
+  return { ran, same: execute === approve, name: execute.name, length: execute.length, predicateOnTool };
 }
 
 /**

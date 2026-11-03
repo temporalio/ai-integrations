@@ -404,10 +404,19 @@ test.serial('aKeptActivityErrorKeepsItsOwnCancellationSourceWhenItsIdIsReused', 
 test.serial('aToolKeepsItsOwnExecute', async (t) => {
   const env = getEnv();
   const taskQueue = uid('adk-tool-execute');
-  const workflowId = uid('wf-tool-execute');
   await withWorker(env, { taskQueue, plugins: [adkPlugin()] }, async () => {
-    const handle = await env.client.workflow.start(agentRunnerToolKeepsItsExecute, { taskQueue, workflowId });
-    t.deepEqual(await handle.result(), { same: true, name: 'approve', length: 2, predicateOnTool: true });
+    for (const frozen of [false, true]) {
+      const handle = await env.client.workflow.start(agentRunnerToolKeepsItsExecute, {
+        taskQueue,
+        workflowId: uid('wf-tool-execute'),
+        args: [frozen],
+      });
+      t.deepEqual(
+        await handle.result(),
+        { ran: true, same: true, name: 'approve', length: 2, predicateOnTool: true },
+        frozen ? 'frozen' : 'plain'
+      );
+    }
   });
 });
 

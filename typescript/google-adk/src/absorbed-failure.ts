@@ -282,7 +282,8 @@ function watchScope(): (operation: Promise<unknown>) => void {
  */
 function noteActivityScope(input: ActivityInput): void {
   const scope = CancellationScope.current();
-  if (!scope.cancellable) return;
+  // The SDK never schedules an Activity in a cancelled scope; it fails with the scope's reason.
+  if (!scope.cancellable || scope.consideredCancelled) return;
   recorded().activities.set(input.seq, scopeWatch(scope));
 }
 
@@ -507,11 +508,13 @@ function watchWrappedErrors(): void {
         (...args: never[]) => this.execute(...args),
         () => thrown
       );
-      const run = new Proxy(this, {
-        get(tool, key) {
+      // The target is an empty object that inherits from the tool, so a frozen tool's own
+      // `execute` binds no Proxy invariant; every read goes to the tool itself.
+      const run = new Proxy(Object.create(this) as object, {
+        get: (_target, key) => {
           if (key === 'execute') return execute;
-          const value: unknown = Reflect.get(tool, key, tool);
-          return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(tool) : value;
+          const value: unknown = Reflect.get(this, key, this);
+          return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(this) : value;
         },
       });
       return runAsync.call(run, request);
