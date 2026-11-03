@@ -642,7 +642,10 @@ def stateful_mcp_server(
         config: Optional activity configuration for MCP operation activities.
                Defaults to 1-minute start-to-close and 30-second schedule-to-start timeouts.
         server_session_config: Optional activity configuration for the connection activity.
-                       Defaults to 1-hour start-to-close timeout.
+                       Defaults to 1-hour start-to-close timeout. That timeout is the longest the
+                       block can stay open: the activity then times out, and its retry fails with
+                       ``DedicatedWorkerFailure``. Raise it for long blocks, such as ones that wait
+                       for a person, and set a ``heartbeat_timeout`` to notice a lost worker sooner.
         factory_argument: Optional argument to be provided to the factory when producing an MCPServer.
                Must not contain secrets.
         require_approval: Optional OpenAI Agents approval policy for this server's tools, with the

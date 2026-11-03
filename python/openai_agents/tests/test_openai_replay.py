@@ -6,6 +6,12 @@ import pytest
 from temporalio.client import WorkflowHistory
 from temporalio.openai_agents import OpenAIAgentsPlugin
 from temporalio.worker import Replayer
+from tests.helpers.stateful_replay import (
+    StatefulMcpCancelWaitWorkflow,
+    StatefulMcpCancelWorkflow,
+    StatefulMcpGatherWaitWorkflow,
+    StatefulMcpGatherWorkflow,
+)
 from tests.test_openai import (
     AgentsAsToolsWorkflow,
     CustomerServiceWorkflow,
@@ -28,6 +34,15 @@ from tests.test_openai import (
         "output-guardrail-workflow-history.json",
         "research-workflow-history.json",
         "run-model-provider-workflow-history.json",
+        # Recorded on main at ea04762 with the workflow worker stopped, so
+        # that one activation resolves a stateful MCP call together with
+        # another activity (gather) or with a workflow cancel (cancel).
+        "stateful-mcp-cancel-workflow-history.json",
+        "stateful-mcp-gather-workflow-history.json",
+        "stateful-mcp-gather-wait-workflow-history.json",
+        # Recorded on this version, with the patch marker.
+        "stateful-mcp-cancel-wait-marker-workflow-history.json",
+        "stateful-mcp-gather-wait-marker-workflow-history.json",
         "tools-workflow-callable-class-history.json",
         "tools-workflow-history.json",
     ],
@@ -50,6 +65,10 @@ async def test_replay(file_name: str) -> None:
                 InputGuardrailWorkflow,
                 OutputGuardrailWorkflow,
                 RunModelProviderWorkflow,
+                StatefulMcpGatherWorkflow,
+                StatefulMcpGatherWaitWorkflow,
+                StatefulMcpCancelWorkflow,
+                StatefulMcpCancelWaitWorkflow,
             ],
             plugins=[OpenAIAgentsPlugin()],
         ).replay_workflow(WorkflowHistory.from_json("fake", history_json))
