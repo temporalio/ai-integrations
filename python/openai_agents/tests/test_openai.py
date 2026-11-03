@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
 import nexusrpc
 import pydantic
@@ -1405,6 +1405,15 @@ def test_state_decodes_iterables_as_lists(carried: Any, read: Any, expected: Any
     assert type(state) is type(carried)
     copy.deepcopy(state)
     assert read(state) == expected
+
+
+def test_unhashable_type_hint_keeps_string_output():
+    # The dict makes the hint unhashable, so the retry can't use the adapter cache.
+    hint: Any = Annotated[OwnCustomToolOutput, {"doc": "x"}]
+    item = {"type": "custom_tool_call_output", "call_id": "c1", "output": "pong"}
+    converter = OpenAIPayloadConverter()
+    (decoded,) = converter.from_payloads(converter.to_payloads([item]), [hint])
+    assert decoded["output"] == "pong"
 
 
 @pydantic.dataclasses.dataclass
