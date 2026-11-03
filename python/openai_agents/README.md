@@ -657,8 +657,8 @@ Some consequences:
 - The session activity's heartbeats go through your payload codec, so its
   `heartbeat_timeout` must comfortably exceed a heartbeat's encoding time. An
   attempt that connected no server waits at most 10 seconds for its heartbeats
-  to be encoded before it clears its heartbeat details; one that takes longer can
-  make the retry refuse. Encoding time also delays each block's first operation,
+  to be encoded, then cancels the ones still being encoded and clears its
+  heartbeat details. Encoding time also delays each block's first operation,
   so keep it well under the 30 seconds the session activity waits for its first
   heartbeat, and under the operations' `schedule_to_start_timeout`.
 - Blocks with the same name in one run use the same task queue. A later block

@@ -4387,6 +4387,7 @@ class _DelayMayBeOpenCodec(PayloadCodec):
         "session_timed_out",
         "first_connect_fails",
         "first_connect_fails_delayed_heartbeats",
+        "first_connect_fails_close_wait_ends_delayed_heartbeats",
         "shutdown_before_connect_delayed_heartbeats",
         "shutdown_before_connect_ignored",
         "short_heartbeat_timeout",
@@ -4399,6 +4400,10 @@ async def test_stateful_mcp_server_session_retried(
     shutdown_before_connect = case.startswith("shutdown_before_connect")
     delayed_heartbeats = case.endswith("delayed_heartbeats")
     codec = _DelayMayBeOpenCodec()
+    if "close_wait_ends" in case:
+        # The attempt stops waiting for a heartbeat still being encoded before
+        # it finishes, and the failure is encoded after it would.
+        monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 0.5)
     if delayed_heartbeats:
         monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 1.0)
         # Each heartbeat takes longer to encode than the interval, so one is

@@ -561,14 +561,17 @@ class _SessionHeartbeats:
             # This attempt connected no server, so a retry may connect again.
             # Send that last, after every earlier heartbeat: one still being
             # encoded would otherwise replace it. A codec may never finish, so
-            # clear after _CLOSE_TIMEOUT, or when the wait is interrupted, all
-            # the same: the clear has no details, so it skips the codec, and the
-            # worker waits only for an activity's last heartbeat. One that
-            # lands later only makes the retry refuse.
+            # after _CLOSE_TIMEOUT, or when the wait is interrupted, cancel the
+            # heartbeats still being encoded and clear all the same: the clear
+            # has no details, so it skips the codec, and the worker waits only
+            # for an activity's last heartbeat.
             try:
                 if self._sending:
                     await asyncio.wait(set(self._sending), timeout=_CLOSE_TIMEOUT)
             finally:
+                # Only "may be open" heartbeats can still be pending here.
+                for task in list(self._sending):
+                    task.cancel()
                 self._may_be_open = False
                 self.beat()
 
