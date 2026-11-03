@@ -16,19 +16,14 @@ export class EventTargetPolyfill {
     if (arr) this._listeners[type] = arr.filter((l) => l !== listener);
   }
 
+  // agents-core emits its events through this in the Workflow, and through Node's EventEmitter
+  // outside it. As there, a listener that throws stops the dispatch, and its error reaches the code
+  // that emitted the event, such as the run loop, which fails the run. A streamed run rejects
+  // `completed` with the error as it is, as with its other errors.
   dispatchEvent(event: { type: string }): boolean {
     (event as any).target = this;
     (event as any).currentTarget = this;
-    const arr = this._listeners[event.type];
-    if (arr) {
-      arr.forEach((l) => {
-        try {
-          l(event);
-        } catch {
-          // Isolate listener errors — one bad listener shouldn't break dispatch
-        }
-      });
-    }
+    for (const listener of [...(this._listeners[event.type] ?? [])]) listener(event);
     return true;
   }
 }
