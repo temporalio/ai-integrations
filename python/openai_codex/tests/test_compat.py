@@ -5,12 +5,37 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from openai_codex import AsyncCodex, AsyncTurnHandle, CodexError
+from openai_codex import AsyncCodex, AsyncTurnHandle, CodexError, TransportClosedError
 from openai_codex.generated.v2_all import TurnCompletedNotification
-from openai_codex.models import Notification
+from openai_codex.models import Notification, UnknownNotification
 
 from temporalio import workflow
 from temporalio.openai_codex import OpenAICodexPlugin
+from temporalio.openai_codex._routing import Router
+
+
+async def test_unknown_turn_completion_raises_sdk_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    OpenAICodexPlugin()
+    monkeypatch.setattr(workflow, "in_workflow", lambda: True)
+    codex = AsyncCodex()
+    codex._initialized = True
+    router = Router()
+    subscription = router.subscribe("turn")
+    router.route(
+        Notification(
+            method="turn/completed",
+            payload=UnknownNotification(
+                params={"threadId": "thread", "turn": {"id": "turn"}}
+            ),
+        )
+    )
+    turn = AsyncTurnHandle(codex, "thread", "turn", _subscription=subscription)
+
+    with pytest.raises(TransportClosedError, match="Turn is no longer streaming"):
+        await turn.run()
+    assert subscription.closed
 
 
 @pytest.mark.parametrize("in_workflow", [False, True])
