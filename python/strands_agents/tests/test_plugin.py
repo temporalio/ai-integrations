@@ -11,7 +11,7 @@ from strands.tools.mcp import MCPClient as StrandsMCPClient
 import temporalio.strands_agents._plugin as plugin_module
 from temporalio.api.failure.v1 import Failure
 from temporalio.client import ClientConfig
-from temporalio.contrib.pydantic import PydanticPayloadConverter
+from temporalio.contrib.pydantic import PydanticPayloadConverter, pydantic_data_converter
 from temporalio.converter import (
     DataConverter,
     DefaultFailureConverter,
@@ -106,7 +106,24 @@ def test_custom_payload_converter_is_preserved() -> None:
     configured = StrandsPlugin(models={}).configure_client(_client_config(supplied))[
         "data_converter"
     ]
-    assert configured is supplied
+    assert configured.payload_converter_class is PydanticPayloadConverter
+    assert configured.payload_codec is supplied.payload_codec
+
+
+@pytest.mark.parametrize("target", ["client", "replayer"])
+def test_custom_payload_converter_gets_strands_failure_converter(target: str) -> None:
+    supplied = pydantic_data_converter
+    configured = _configure(target, supplied)
+    assert configured.payload_converter_class is supplied.payload_converter_class
+    assert configured.failure_converter_class is StrandsFailureConverter
+    failure = Failure()
+    configured.failure_converter.to_failure(
+        InterruptException(Interrupt(id="i1", name="approval", reason="ok?")),
+        configured.payload_converter,
+        failure,
+    )
+    assert failure.application_failure_info.type == "StrandsInterrupt"
+    assert failure.application_failure_info.non_retryable
 
 
 class DomainError(Exception):
