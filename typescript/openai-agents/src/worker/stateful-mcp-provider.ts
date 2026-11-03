@@ -51,15 +51,18 @@ const DESCRIBE_REFUSALS = new Map([
   [16, 'UNAUTHENTICATED'],
 ]);
 
-/** Describes a describe error that retrying cannot fix, or returns undefined. */
-function describeRefusal(err: unknown): string | undefined {
+// Describe errors that mean the Worker's client lacks permission.
+const DESCRIBE_PERMISSION_ERRORS = new Set(['PERMISSION_DENIED', 'UNAUTHENTICATED']);
+
+/** The status of a describe error that retrying cannot fix, or undefined. */
+function describeRefusal(err: unknown): { status: string; details: string } | undefined {
   if (err instanceof WorkflowNotFoundError || err instanceof NamespaceNotFoundError) {
-    return `NOT_FOUND: ${err.message}`;
+    return { status: 'NOT_FOUND', details: err.message };
   }
   // The client wraps other gRPC errors in a ServiceError.
   const cause = (err as { cause?: { code?: unknown; details?: unknown } } | undefined)?.cause;
   const status = typeof cause?.code === 'number' ? DESCRIBE_REFUSALS.get(cause.code) : undefined;
-  return status && `${status}: ${String(cause?.details)}`;
+  return status ? { status, details: String(cause?.details) } : undefined;
 }
 
 /** The failure for a retry whose earlier attempt opened, or may have opened, a session. */
@@ -163,8 +166,12 @@ class SessionHeartbeats {
       } catch (err) {
         const refusal = describeRefusal(err);
         if (refusal) {
+          const status = `${refusal.status}: ${refusal.details}`;
+          const reason = DESCRIBE_PERMISSION_ERRORS.has(refusal.status)
+            ? `the server refused it (${status}). Give the Worker's client permission to describe Workflows in this namespace.`
+            : `the server could not describe this Workflow run (${status}).`;
           throw ApplicationFailure.create({
-            message: `The stateful MCP server session Activity confirms its first heartbeat with DescribeWorkflowExecution, and the server refused it (${refusal}). Give the Worker's client permission to describe Workflows in this namespace.`,
+            message: `The stateful MCP server session Activity confirms its first heartbeat with DescribeWorkflowExecution, and ${reason}`,
             type: DEDICATED_WORKER_FAILURE_TYPE,
             nonRetryable: true,
             cause: err instanceof Error ? err : undefined,
@@ -246,7 +253,8 @@ class SessionHeartbeats {
  * Workflow run via a dedicated in-process Worker on a per-run Task Queue.
  *
  * Callers must handle `ApplicationFailure` with type `"DedicatedWorkerFailure"`
- * if the dedicated Worker fails to start or misses a heartbeat.
+ * if the dedicated Worker fails to start or misses a heartbeat, or if the
+ * session Activity is retried after it may have opened a session.
  */
 export class StatefulMCPServerProvider {
   private readonly _name: string;
@@ -323,6 +331,8 @@ export class StatefulMCPServerProvider {
         // No server is built before the Temporal server holds the first
         // heartbeat, which says a session may be open.
         await heartbeats.waitUntilStored();
+        // A cancellation, such as a Worker shutdown, doesn't interrupt the read-back.
+        if (ctx.cancellationSignal.aborted) throw ctx.cancellationSignal.reason;
         if (this._servers.has(sid)) {
           throw ApplicationFailure.create({
             message:
@@ -337,6 +347,8 @@ export class StatefulMCPServerProvider {
         try {
           this._servers.set(sid, server);
           await server.connect();
+          // Nor does every connect() observe it: close this server instead of serving.
+          if (ctx.cancellationSignal.aborted) throw ctx.cancellationSignal.reason;
           heartbeats.recordOpened();
 
           const { Worker } = await import('@temporalio/worker');

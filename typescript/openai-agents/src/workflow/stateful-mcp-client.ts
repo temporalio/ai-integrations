@@ -197,7 +197,7 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
    * Cancels the server-session Activity, tearing down the dedicated Worker. If
    * the session Activity failed with `DedicatedWorkerFailure`, throws an
    * `ApplicationFailure` of that type with the session's `ActivityFailure` as
-   * its cause.
+   * its cause, unless the caller's scope is cancelled.
    */
   async cleanup(): Promise<void> {
     if (this._sessionScope) {
@@ -210,9 +210,12 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
           err.cause instanceof ApplicationFailure &&
           err.cause.type === DEDICATED_WORKER_FAILURE_TYPE
         ) {
-          throw this.sessionEndedFailure(err);
-        }
-        if (!isCancellation(err)) {
+          // A cancellation of the caller wins over the session's failure, as
+          // when cleanup() runs in a finally after the caller was cancelled.
+          if (!CancellationScope.current().consideredCancelled) {
+            throw this.sessionEndedFailure(err);
+          }
+        } else if (!isCancellation(err)) {
           throw err;
         }
       }
@@ -261,30 +264,39 @@ export class StatefulMCPServerReference implements StatefulTemporalMCPServer {
     if (msOptionalToNumber(this._operationConfig.scheduleToStartTimeout) || !patched(SESSION_WATCH_PATCH)) {
       return handleWorkerFailure(() => scheduleActivity<R>(activity, args, this._operationConfig));
     }
+    // The caller's own cancellation wins over the session's end.
+    const callerScope = CancellationScope.current();
     let cancelledBySession = false;
     return handleWorkerFailure(
       () => {
-        if (this._sessionSettled) {
+        if (this._sessionSettled && !callerScope.consideredCancelled) {
           throw this.sessionEndedFailure();
         }
         // A child of the caller's scope, so the caller's cancellation still
         // reaches the operation, and the session's end cancels only this one.
         const scope = new CancellationScope();
-        let operation!: Promise<R>;
+        const scheduled: { operation?: Promise<R>; error?: unknown } = {};
         // run() calls this at once; awaiting run()'s own promise would add steps.
         scope
-          .run(() => {
-            operation = scheduleActivity<R>(activity, args, this._operationConfig);
-            return operation;
+          .run(async () => {
+            try {
+              scheduled.operation = scheduleActivity<R>(activity, args, this._operationConfig);
+            } catch (err) {
+              scheduled.error = err;
+            }
           })
           .catch(() => {});
+        const operation = scheduled.operation;
+        if (!operation) {
+          throw scheduled.error;
+        }
         void this._sessionEnded!.then(() => {
           cancelledBySession = true;
           scope.cancel();
         });
         return operation;
       },
-      () => (cancelledBySession ? this.sessionEndedFailure() : undefined)
+      () => (cancelledBySession && !callerScope.consideredCancelled ? this.sessionEndedFailure() : undefined)
     );
   }
 

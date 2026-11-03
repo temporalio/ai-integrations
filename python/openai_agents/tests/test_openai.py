@@ -3474,6 +3474,71 @@ async def test_stateful_mcp_server_session_retried(
             await expect_refused(handle)
 
 
+@workflow.defn
+class McpServerStatefulCancelledAfterRefusalWorkflow:
+    """Waits in a block whose session gets refused, recovering as the README says."""
+
+    @workflow.run
+    async def run(self) -> str:
+        try:
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer",
+                server_session_config=ActivityConfig(
+                    start_to_close_timeout=timedelta(seconds=6)
+                ),
+            ) as server:
+                await server.list_tools()
+                await workflow.wait_condition(lambda: False)
+        except ApplicationError as err:
+            if err.type != "DedicatedWorkerFailure":
+                raise
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer"
+            ) as server:
+                await server.list_tools()
+        return "recovered"
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_mcp_server_cancelled_after_refusal(client: Client):
+    # The session times out on a live worker and its retry is refused while the
+    # block waits. Cancelling the workflow then cancels the run: the block's
+    # DedicatedWorkerFailure doesn't replace the cancellation, so the
+    # README's recovery code doesn't swallow it.
+    factory_calls = 0
+
+    def factory(_: Any) -> MCPServer:
+        nonlocal factory_calls
+        factory_calls += 1
+        return get_tracking_server("HelloServer")
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, McpServerStatefulCancelledAfterRefusalWorkflow
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulCancelledAfterRefusalWorkflow.run,
+                id=f"mcp-server-cancelled-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+
+            async def refused() -> None:
+                assert await _session_failed(handle)
+
+            await assert_eventually(refused, timeout=timedelta(seconds=30))
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as err:
+                await asyncio.wait_for(handle.result(), timeout=20)
+
+    assert isinstance(err.value.cause, CancelledError)
+    assert factory_calls == 1
+
+
 class _DenyDescribe(Interceptor):
     def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
         return _DenyDescribeOutbound(next)
@@ -3494,6 +3559,20 @@ class _StallDescribeOutbound(OutboundInterceptor):
         await asyncio.Event().wait()
 
 
+class _OtherAttemptDescribe(Interceptor):
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _OtherAttemptDescribeOutbound(next)
+
+
+class _OtherAttemptDescribeOutbound(OutboundInterceptor):
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        # As if a later attempt of the session activity had replaced this one.
+        description = await super().describe_workflow(input)
+        for pending in description.raw_description.pending_activities:
+            pending.attempt += 1
+        return description
+
+
 class _StallReadBackCodec(PayloadCodec):
     """Never finishes decoding the details the session activity reads back."""
 
@@ -3507,7 +3586,9 @@ class _StallReadBackCodec(PayloadCodec):
 
 
 @pytest.mark.timeout(90)
-@pytest.mark.parametrize("case", ["refused", "describe_stalls", "decode_stalls"])
+@pytest.mark.parametrize(
+    "case", ["refused", "describe_stalls", "decode_stalls", "other_attempt"]
+)
 async def test_stateful_mcp_server_without_describe_permission(
     client: Client, case: str, monkeypatch: pytest.MonkeyPatch
 ):
@@ -3532,7 +3613,11 @@ async def test_stateful_mcp_server_without_describe_permission(
                 client.data_converter, payload_codec=_StallReadBackCodec()
             )
         else:
-            interceptor = _DenyDescribe() if case == "refused" else _StallDescribe()
+            interceptor = {
+                "refused": _DenyDescribe,
+                "describe_stalls": _StallDescribe,
+                "other_attempt": _OtherAttemptDescribe,
+            }[case]()
             config["interceptors"] = [*config["interceptors"], interceptor]
         worker_client = env.applied_on_client(Client(**config))
         client = env.applied_on_client(client)
@@ -3559,12 +3644,16 @@ async def test_stateful_mcp_server_without_describe_permission(
                     ]
                     assert failures
 
-                # The attempt fails at the 2-second deadline and is retried.
+                # The attempt fails (at the 2-second deadline when stalled) and
+                # is retried.
                 await assert_eventually(attempt_failed, timeout=timedelta(seconds=20))
                 await handle.terminate()
                 assert servers == []
                 assert failures == [
-                    "The server did not show the stateful MCP server session "
+                    "This stateful MCP server session activity attempt is no "
+                    "longer the current one."
+                    if case == "other_attempt"
+                    else "The server did not show the stateful MCP server session "
                     "activity's first heartbeat within 2 seconds."
                 ]
                 return

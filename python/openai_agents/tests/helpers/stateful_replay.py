@@ -99,12 +99,25 @@ class StatefulMcpGatherWaitWorkflow:
         return await _gather(host_task_queue, wait_cancellation=True)
 
 
+async def _cancel(host_task_queue: str, wait_cancellation: bool) -> str:
+    async with _server(host_task_queue, wait_cancellation) as server:
+        await server.call_tool("slow", {})
+        return await _follow_up(stateful_replay_follow_up_a, host_task_queue)
+
+
 @workflow.defn
 class StatefulMcpCancelWorkflow:
     """A stateful tool call awaited directly, then another activity."""
 
     @workflow.run
     async def run(self, host_task_queue: str) -> str:
-        async with _server(host_task_queue) as server:
-            await server.call_tool("slow", {})
-            return await _follow_up(stateful_replay_follow_up_a, host_task_queue)
+        return await _cancel(host_task_queue, wait_cancellation=False)
+
+
+@workflow.defn
+class StatefulMcpCancelWaitWorkflow:
+    """As StatefulMcpCancelWorkflow, with WAIT_CANCELLATION_COMPLETED operations."""
+
+    @workflow.run
+    async def run(self, host_task_queue: str) -> str:
+        return await _cancel(host_task_queue, wait_cancellation=True)

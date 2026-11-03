@@ -23,7 +23,7 @@ import {
   WorkflowFailedError,
   WorkflowUpdateStage,
 } from '@temporalio/client';
-import { ApplicationFailure, type PayloadCodec } from '@temporalio/common';
+import { ApplicationFailure, CancelledFailure, defaultPayloadConverter, type PayloadCodec } from '@temporalio/common';
 import { historyFromJSON } from '@temporalio/common/lib/proto-utils';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
@@ -52,6 +52,8 @@ import {
   statefulMcpSlowConnectHeartbeatWorkflow,
   statefulMcpRetriedWorkflow,
   statefulMcpSessionEndedWorkflow,
+  statefulMcpOperationWaitingWorkflow,
+  statefulMcpCancelledCallerWorkflow,
   resumeSignal,
   streamingAgentWorkflow,
   streamingLocalActivityWorkflow,
@@ -633,6 +635,21 @@ test('Stateful MCP: a retried session Activity fails instead of opening a new se
     await waitFor('ready');
     const handle = await startWorkflow(statefulMcpRetriedWorkflow, { workflowExecutionTimeout: '90 seconds' });
     await waitFor('put');
+    // Kill the host once the server holds "opened" and a periodic heartbeat has
+    // followed it, so the refusal relies on periodic heartbeats keeping it.
+    const details = async () => {
+      const { raw } = await handle.describe();
+      const session = (raw.pendingActivities ?? []).find((p) =>
+        p.activityType?.name?.endsWith('-server-session')
+      );
+      const payload = session?.heartbeatDetails?.payloads?.[0];
+      return payload ? defaultPayloadConverter.fromPayload(payload) : undefined;
+    };
+    for (let i = 0; i < 100 && (await details()) !== 'mcp-session-opened'; i++) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    await new Promise((r) => setTimeout(r, 3_500));
+    t.is(await details(), 'mcp-session-opened');
     host.kill('SIGKILL');
 
     // Worker B takes the retried session Activity after the heartbeat timeout.
@@ -655,7 +672,14 @@ test('Stateful MCP: a retried session Activity fails instead of opening a new se
       ],
     });
     await worker.runUntil(async () => {
-      assertSessionRefused(t, await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError }));
+      const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+      assertSessionRefused(t, err);
+      const messages: string[] = [];
+      for (let cause: unknown = err; cause instanceof Error; cause = cause.cause) messages.push(cause.message);
+      t.true(
+        messages.some((m) => m.includes('opened an MCP session')),
+        messages.join(' <- ')
+      );
     });
     // A new server would open a new MCP session without the old one's state.
     t.is(factoryCalls, 0);
@@ -707,7 +731,10 @@ test('Stateful MCP: a session Activity retried after a failed connect connects a
   });
 });
 
-test('Stateful MCP: a session Activity retried after a shutdown before connecting connects again', async (t) => {
+for (const ignoresCancel of [false, true]) {
+test(`Stateful MCP: a session Activity retried after a shutdown before connecting connects again${
+  ignoresCancel ? ', with a connect() that ignores cancellation' : ''
+}`, async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
 
   let connectCalls = 0;
@@ -720,8 +747,11 @@ test('Stateful MCP: a session Activity retried after a shutdown before connectin
           (): MCPServer => {
             const server = memoryServer('slowConnectTest', 'S');
             server.connect = async () => {
-              // The first connect lasts until the Worker's shutdown cancels it.
-              if (++connectCalls === 1) await Context.current().sleep(30_000);
+              // The first connect lasts until the Worker's shutdown cancels it,
+              // or 3 seconds that the shutdown doesn't interrupt.
+              if (++connectCalls === 1) {
+                await (ignoresCancel ? new Promise((r) => setTimeout(r, 3_000)) : Context.current().sleep(30_000));
+              }
             };
             server.listTools = async () => [
               {
@@ -739,9 +769,11 @@ test('Stateful MCP: a session Activity retried after a shutdown before connectin
   // Slows the encoding of "may be open" heartbeats. The first one reaches the
   // server before connect(); the clearing heartbeat then queues behind a
   // periodic one that is still being encoded when the shutdown cancels connect().
+  let heartbeatDelays = 0;
   const slowHeartbeats: PayloadCodec = {
     async encode(payloads) {
       if (payloads.some((p) => Buffer.from(p.data ?? []).toString().includes('mcp-session-may-be-open'))) {
+        heartbeatDelays++;
         await new Promise((r) => setTimeout(r, 2_000));
       }
       return payloads;
@@ -758,6 +790,7 @@ test('Stateful MCP: a session Activity retried after a shutdown before connectin
     return handle;
   });
   t.is(connectCalls, 1);
+  t.true(heartbeatDelays > 0);
 
   const second = await createWorker({ plugins: [plugin()] });
   await second.runUntil(async () => {
@@ -766,6 +799,7 @@ test('Stateful MCP: a session Activity retried after a shutdown before connectin
   });
   t.is(connectCalls, 2);
 });
+}
 
 for (const [kase, title] of [
   ['refused', 'a session Activity that may not describe its Workflow fails at once'],
@@ -863,6 +897,8 @@ test('Stateful MCP: histories recorded on an earlier version replay', async (t) 
     'stateful-mcp-gather-sts0.json',
     'stateful-mcp-cancel-sts0.json',
     'stateful-mcp-caller-cancel.json',
+    // Recorded on this version, with the patch marker.
+    'stateful-mcp-caller-cancel-marker.json',
   ]) {
     const file = path.resolve(__dirname, '../../src/__tests__/histories', name);
     const history = historyFromJSON(JSON.parse(readFileSync(file, 'utf8')));
@@ -919,6 +955,89 @@ test('Stateful MCP: an operation without a schedule-to-start timeout fails once 
   );
   // No operation was scheduled after the session ended.
   t.is(operations.length, 1);
+});
+
+test('Stateful MCP: an operation waiting without a schedule-to-start timeout fails when the session ends', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const calls: string[] = [];
+  const plugin = () =>
+    new OpenAIAgentsPlugin({
+      modelProvider: new FakeModelProvider([]),
+      mcpServerProviders: [
+        new StatefulMCPServerProvider(
+          'sessionEnded',
+          () => {
+            const server = memoryServer('sessionEnded', 'S', calls);
+            const callTool = server.callTool.bind(server);
+            // "hold" runs until its Worker shuts down; the session's Worker runs one call at a time.
+            server.callTool = async (tool, args) => {
+              if (tool === 'hold') {
+                calls.push('hold');
+                await Context.current().sleep(30_000).catch(() => {});
+                return [];
+              }
+              return callTool(tool, args);
+            };
+            return server;
+          },
+          t.context.env.nativeConnection
+        ),
+      ],
+    });
+
+  const first = await createWorker({ plugins: [plugin()] });
+  const handle = await first.runUntil(async () => {
+    const handle = await startWorkflow(statefulMcpOperationWaitingWorkflow, { workflowExecutionTimeout: '40 seconds' });
+    for (let i = 0; i < 300 && !calls.includes('hold'); i++) await new Promise((r) => setTimeout(r, 100));
+    await handle.signal(resumeSignal);
+    const calledTools = async () =>
+      ((await handle.fetchHistory()).events ?? []).filter((e) =>
+        e.activityTaskScheduledEventAttributes?.activityType?.name?.endsWith('-call-tool')
+      ).length;
+    for (let i = 0; i < 300 && (await calledTools()) < 2; i++) await new Promise((r) => setTimeout(r, 100));
+    return handle;
+  });
+  // The first Worker shut down gracefully while "get" waited behind "hold": the
+  // session Activity completed, and the waiting call fails without running.
+  const second = await createWorker({ plugins: [plugin()] });
+  await second.runUntil(async () => {
+    t.deepEqual(await handle.result(), [DEDICATED_WORKER_FAILURE_TYPE]);
+  });
+  t.false(calls.includes('get'));
+});
+
+test('Stateful MCP: a Workflow cancellation wins over the session it ended', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const calls: string[] = [];
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([]),
+        mcpServerProviders: [
+          new StatefulMCPServerProvider(
+            'sessionEnded',
+            () => {
+              const server = memoryServer('sessionEnded', 'S', calls);
+              server.callTool = async () => {
+                calls.push('hold');
+                await Context.current().sleep(30_000).catch(() => {});
+                return [];
+              };
+              return server;
+            },
+            t.context.env.nativeConnection
+          ),
+        ],
+      }),
+    ],
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(statefulMcpCancelledCallerWorkflow, { workflowExecutionTimeout: '30 seconds' });
+    for (let i = 0; i < 300 && !calls.includes('hold'); i++) await new Promise((r) => setTimeout(r, 100));
+    await handle.cancel();
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    t.true(err?.cause instanceof CancelledFailure, String(err?.cause));
+  });
 });
 
 test('Stateful MCP: a caller still cancels a queued operation without a schedule-to-start timeout', async (t) => {

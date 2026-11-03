@@ -317,6 +317,47 @@ export async function statefulMcpSessionEndedWorkflow(cancelQueued: boolean): Pr
   return out;
 }
 
+export async function statefulMcpOperationWaitingWorkflow(): Promise<string[]> {
+  // No schedule-to-start timeout: only the session's end stops "get" waiting.
+  const server = statefulMcpServer('sessionEnded', { config: { scheduleToStartTimeout: 0 } });
+  let resumed = false;
+  setHandler(resumeSignal, () => {
+    resumed = true;
+  });
+  await server.connect();
+  try {
+    // "hold" takes the session Worker's only slot, so "get" waits behind it.
+    const hold = server.callTool('hold', {}).catch(() => undefined);
+    await condition(() => resumed);
+    const get = await server.callTool('get', {}).then(
+      (content) => text(content),
+      (err: unknown) => (err instanceof ApplicationFailure ? `${err.type}` : String(err))
+    );
+    await hold;
+    return [get];
+  } finally {
+    await server.cleanup();
+  }
+}
+
+export async function statefulMcpCancelledCallerWorkflow(): Promise<string> {
+  const server = statefulMcpServer('sessionEnded', { config: { scheduleToStartTimeout: 0 } });
+  await server.connect();
+  try {
+    try {
+      await server.callTool('hold', {});
+    } catch (err: unknown) {
+      if (!isCancellation(err)) throw err;
+    }
+    // The Workflow's cancellation also ended the session; this call must still
+    // reject with the cancellation, not with DedicatedWorkerFailure.
+    await server.listTools();
+    return 'listed';
+  } finally {
+    await server.cleanup();
+  }
+}
+
 export async function tracingApiKeyWorkflow(apiKey?: string): Promise<string> {
   const agent = new Agent({
     name: 'TracingKeyAgent',

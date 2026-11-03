@@ -7,6 +7,7 @@ from temporalio.client import WorkflowHistory
 from temporalio.openai_agents import OpenAIAgentsPlugin
 from temporalio.worker import Replayer
 from tests.helpers.stateful_replay import (
+    StatefulMcpCancelWaitWorkflow,
     StatefulMcpCancelWorkflow,
     StatefulMcpGatherWaitWorkflow,
     StatefulMcpGatherWorkflow,
@@ -39,6 +40,9 @@ from tests.test_openai import (
         "stateful-mcp-cancel-workflow-history.json",
         "stateful-mcp-gather-workflow-history.json",
         "stateful-mcp-gather-wait-workflow-history.json",
+        # Recorded on this version, with the patch marker.
+        "stateful-mcp-cancel-wait-marker-workflow-history.json",
+        "stateful-mcp-gather-wait-marker-workflow-history.json",
         "tools-workflow-history.json",
     ],
 )
@@ -63,6 +67,7 @@ async def test_replay(file_name: str) -> None:
                 StatefulMcpGatherWorkflow,
                 StatefulMcpGatherWaitWorkflow,
                 StatefulMcpCancelWorkflow,
+                StatefulMcpCancelWaitWorkflow,
             ],
             plugins=[OpenAIAgentsPlugin()],
         ).replay_workflow(WorkflowHistory.from_json("fake", history_json))

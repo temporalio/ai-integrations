@@ -562,7 +562,8 @@ session may be open until the attempt ends without one. Before it connects, the
 session activity reads its workflow's description (`DescribeWorkflowExecution`)
 until the Temporal server shows its first heartbeat, so the worker's client
 needs permission to describe the workflow; without it, the session activity
-fails with a non-retryable `DedicatedWorkerFailure` that says so.
+fails with a non-retryable `DedicatedWorkerFailure` that says so. Other describe
+errors are retried, and the session activity's last failure carries them.
 
 Some consequences:
 
@@ -574,12 +575,25 @@ Some consequences:
   half `heartbeat_timeout` if that is shorter.
 - An activity reset or unpause with `reset_heartbeat=True` clears the marker,
   so the next attempt connects a new, empty server.
+- Sessions started on an earlier version recorded no marker, so the deploy of
+  this version still gives each open session a new, empty server one last time.
+- Code that caught `ActivityError` around a block, which earlier versions
+  raised when the session failed, must also catch
+  `ApplicationError(type="DedicatedWorkerFailure")`, which the block now raises
+  after a refusal. A session that fails for another reason, such as running out
+  of a bounded `server_session_config` retry policy, still makes the block raise
+  `ActivityError`.
+- The session activity's heartbeats go through your payload codec, so its
+  `heartbeat_timeout` must comfortably exceed a heartbeat's encoding time.
 - Blocks with the same name in one run use the same task queue. A later block
   refuses any operation the server scheduled for an earlier block, but until
   the earlier block's session activity notices its cancellation, which can take
   one heartbeat interval, it serves the later block's operations with the
   earlier block's server. Don't rely on a new block being isolated from the
-  previous one during that time.
+  previous one during that time. Likewise, after a refusal caused by a
+  start-to-close timeout on a live worker, the timed-out attempt keeps serving
+  the queue with its server until its worker cancels it, so the refused block's
+  own operations, and a recovery block's, can still reach that server.
 
 Only the session activity's worker serves the server's operations. An operation
 whose `config` has a `schedule_to_start_timeout`, as the default `config` does,
@@ -588,9 +602,16 @@ neither fails with `DedicatedWorkerFailure` as soon as the session activity has
 ended, with the session's failure as its cause, and an operation still waiting
 then is cancelled. With `cancellation_type=WAIT_CANCELLATION_COMPLETED` that
 operation is not cancelled, because no worker may be left to acknowledge it. It
-stays on the session's task queue until one of its timeouts expires or the run
-ends, and a later `stateful_mcp_server()` block with the same name refuses it.
-A caller's own cancellation still cancels the operation.
+stays on the session's task queue until the run ends, and a later
+`stateful_mcp_server()` block with the same name refuses it. The caller of such
+an operation waits for the operation or the session, whichever ends first, so
+the operation resolves one step after other activities that resolve in the same
+workflow task, and if another branch cancels the caller in the workflow task
+that brings the operation's result, the caller gets the cancellation. A
+caller's own cancellation still cancels the operation, and a cancellation that
+leaves the block wins over the session's failure. On Python 3.10, a caller that
+is cancelled in the workflow task in which its session ends gets
+`DedicatedWorkerFailure`.
 
 A run follows its session this way only once it records the patch marker
 `openai-agents-stateful-mcp-session-watch`, which it does at its first
@@ -602,7 +623,11 @@ Temporal Python SDK keeps the decision it made while replaying that earlier
 operation, so the run never records the marker and schedules such operations as
 before until it ends: one scheduled after its session ended waits until the
 caller cancels it or the run ends. A run with the marker fails replay on an
-earlier version, so do not roll back while such runs are open.
+earlier version, and so does a run whose session got a refusal and that then
+caught the block's `ApplicationError`, so do not roll back while such runs are
+open. Drain the earlier version's workers before starting this one: while
+workers of both versions run, a run whose session gets a refusal can fail
+replay when it moves from one to the other.
 
 ### Hosted MCP Tool
 

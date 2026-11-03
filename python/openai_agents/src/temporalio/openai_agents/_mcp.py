@@ -347,6 +347,12 @@ _SESSION_WATCH_PATCH = "openai-agents-stateful-mcp-session-watch"
 # first heartbeat.
 _STORE_TIMEOUT = 30.0
 
+# Describe errors that mean the worker's client lacks permission.
+_DESCRIBE_PERMISSION_ERRORS = {
+    RPCStatusCode.PERMISSION_DENIED,
+    RPCStatusCode.UNAUTHENTICATED,
+}
+
 # Describe errors that retrying cannot fix.
 _DESCRIBE_REFUSALS = {
     RPCStatusCode.PERMISSION_DENIED,
@@ -445,13 +451,22 @@ class _SessionHeartbeats:
                     )
                 except RPCError as err:
                     if err.status in _DESCRIBE_REFUSALS:
+                        status = f"{err.status.name}: {err.message}"
+                        if err.status in _DESCRIBE_PERMISSION_ERRORS:
+                            reason = (
+                                f"the server refused it ({status}). Give the "
+                                "worker's client permission to describe "
+                                "workflows in this namespace."
+                            )
+                        else:
+                            reason = (
+                                "the server could not describe this workflow "
+                                f"run ({status})."
+                            )
                         raise ApplicationError(
                             "The stateful MCP server session activity confirms "
                             "its first heartbeat with DescribeWorkflowExecution, "
-                            "and the server refused it "
-                            f"({err.status.name}: {err.message}). Give the "
-                            "worker's client permission to describe workflows "
-                            "in this namespace.",
+                            f"and {reason}",
                             type="DedicatedWorkerFailure",
                             non_retryable=True,
                         ) from err
@@ -534,6 +549,12 @@ def _earlier_attempt_failure(details: Sequence[Any]) -> ApplicationError | None:
         type="DedicatedWorkerFailure",
         non_retryable=True,
     )
+
+
+def _task_cancelling() -> bool:
+    """Whether the current task is being cancelled (Python 3.11 and later)."""
+    cancelling = getattr(asyncio.current_task(), "cancelling", None)
+    return bool(cancelling and cancelling())
 
 
 def _session_ended_failure(session: ActivityHandle) -> ApplicationError:
@@ -621,7 +642,13 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        await self.cleanup()
+        try:
+            await self.cleanup()
+        except ApplicationError:
+            # A cancellation leaving the block wins over the session's failure.
+            if exc_value is not None and is_cancelled_exception(exc_value):
+                return
+            raise
 
     async def _execute_operation(
         self, activity: str, args: list[Any], result_type: type
@@ -671,7 +698,11 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
             try:
                 return await operation
             except BaseException as err:
-                if cancelled_by_session and is_cancelled_exception(err):
+                if (
+                    cancelled_by_session
+                    and is_cancelled_exception(err)
+                    and not _task_cancelling()
+                ):
                     raise _session_ended_failure(session)
                 raise
             finally:
