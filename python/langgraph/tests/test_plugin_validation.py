@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 from dataclasses import make_dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -139,3 +140,9 @@ async def test_unregistered_context_type_raises(
     wrapped = wrap_execute_activity(wrap_activity(async_node))
     with raises(ValueError, match="is not registered"):
         await wrapped({}, runtime=Runtime(context=Context(user_id="alice")))
+
+
+def test_plugin_reports_package_version() -> None:
+    assert LangGraphPlugin().version() == importlib.metadata.version(
+        "temporalio-langgraph"
+    )

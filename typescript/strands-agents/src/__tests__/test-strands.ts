@@ -1656,3 +1656,7 @@ test('captured history replays deterministically', async (t) => {
     history!
   );
 });
+
+test('StrandsPlugin reports the package version for worker heartbeats', (t) => {
+  t.regex(new StrandsPlugin({ models: { test: () => new StubModel([]) } }).version, /^\d+\.\d+\.\d+/);
+});

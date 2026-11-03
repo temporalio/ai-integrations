@@ -354,3 +354,7 @@ test('configureWorker refuses to replace a different Activity with the same name
   t.is(typeof both['weather-callTool'], 'function');
   t.is(typeof both['news-callTool'], 'function');
 });
+
+test('reports the package version for worker heartbeats', (t) => {
+  t.regex(new GoogleAdkPlugin().version, /^\d+\.\d+\.\d+/);
+});

@@ -3,6 +3,8 @@ package googleadk
 import (
 	"context"
 	"log/slog"
+	"runtime/debug"
+	"strings"
 	"sync"
 
 	"go.opentelemetry.io/otel"
@@ -62,7 +64,7 @@ func NewPlugin(cfg Config) (worker.Plugin, error) {
 		warnOnNonReplaySafeTelemetryProviders(log.NewStructuredLogger(slog.Default()),
 			otel.GetTracerProvider(), otelloglobal.GetLoggerProvider(), otel.GetMeterProvider())
 	}
-	return temporal.NewSimplePlugin(temporal.SimplePluginOptions{
+	p, err := temporal.NewSimplePlugin(temporal.SimplePluginOptions{
 		Name: "go.temporal.io/googleadk",
 		// Once per replayer construction — the replayer-side counterpart of
 		// the worker-start warning; RunContextBefore would repeat it per
@@ -99,4 +101,30 @@ func NewPlugin(cfg Config) (worker.Plugin, error) {
 			_ = acts.Close()
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+	return versionedPlugin{p}, nil
+}
+
+// versionedPlugin adds Version, which SDKs that report plugin versions in
+// worker heartbeats call. Older SDKs ignore it.
+type versionedPlugin struct{ *temporal.SimplePlugin }
+
+// Version returns this module's version without the leading "v", or "" when
+// the build has no module information for it.
+func (versionedPlugin) Version() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	for _, dep := range info.Deps {
+		if dep.Path == "go.temporal.io/googleadk" {
+			if dep.Replace != nil {
+				dep = dep.Replace
+			}
+			return strings.TrimPrefix(dep.Version, "v")
+		}
+	}
+	return ""
 }

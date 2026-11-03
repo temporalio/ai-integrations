@@ -71,3 +71,7 @@ test('configureWorker refuses to replace a different Activity with the same name
       `Activity with this name. Rename ${tail}`,
   });
 });
+
+test('reports the package version for worker heartbeats', (t) => {
+  t.regex(new OpenAIAgentsPlugin({ modelProvider: new FakeModelProvider([]) }).version, /^\d+\.\d+\.\d+/);
+});
