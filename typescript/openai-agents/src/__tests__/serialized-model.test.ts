@@ -48,6 +48,7 @@ test('toSerializedModelRequest: shape snapshot pins the exact key set', (t) => {
     'overridePromptModel',
     'previousResponseId',
     'prompt',
+    'reasoningEffortImplicit',
     'systemInstructions',
     'tools',
     'toolsExplicitlyProvided',
