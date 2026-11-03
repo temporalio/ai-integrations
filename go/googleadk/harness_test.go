@@ -3,10 +3,10 @@ package googleadk_test
 import (
 	"context"
 	"errors"
-	"fmt"
 	"iter"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -60,16 +60,9 @@ type subAgentSpec struct {
 	// WorkflowSideA2A makes that remote agent use ADK's own providers instead,
 	// which fetch the card and send messages from Workflow code.
 	WorkflowSideA2A bool
-	// AsTool gives the child to the root as a tool, wrapped with agenttool,
-	// instead of as a sub-agent.
+	// AsTool gives that remote agent to the root as a tool, wrapped with
+	// agenttool, instead of as a sub-agent.
 	AsTool bool
-	// SharedLevels puts the child below that many levels of two LLM agents.
-	// Each holds both agents of the level below as tools, wrapped with
-	// agenttool, so every agent below the top is shared.
-	SharedLevels int
-	// SelfTool makes the child, when it is an LLM agent, and each agent of
-	// SharedLevels also hold itself as a tool, wrapped with agenttool.
-	SelfTool bool
 }
 
 // remoteSubAgent is a remote A2A sub-agent named "remote" with its card at url.
@@ -444,7 +437,6 @@ func agentRunWorkflow(ctx workflow.Context, in runInput) (runResult, error) {
 
 	var subAgents []agent.Agent
 	for _, sa := range in.SubAgents {
-		var children []agent.Agent
 		if sa.RemoteCardURL != "" {
 			cfg := remoteagent.A2AConfig{
 				Name:              sa.Name,
@@ -460,36 +452,23 @@ func agentRunWorkflow(ctx workflow.Context, in runInput) (runResult, error) {
 			if rerr != nil {
 				return runResult{}, rerr
 			}
-			children = []agent.Agent{remote}
-		} else {
-			child, cerr := toolAgent(sa.Name, sa.Description, sa.ModelName, nil, sa.SelfTool)
-			if cerr != nil {
-				return runResult{}, cerr
-			}
-			children = []agent.Agent{child}
-		}
-		for level := 1; level <= sa.SharedLevels; level++ {
-			var wrapped []tool.Tool
-			for _, c := range children {
-				wrapped = append(wrapped, agenttool.New(c, nil))
-			}
-			children = nil
-			for _, side := range []string{"a", "b"} {
-				name := fmt.Sprintf("shared_%d_%s", level, side)
-				shared, serr := toolAgent(name, "shared agent", sa.ModelName, wrapped, sa.SelfTool)
-				if serr != nil {
-					return runResult{}, serr
-				}
-				children = append(children, shared)
-			}
-		}
-		for _, c := range children {
 			if sa.AsTool {
-				tools = append(tools, agenttool.New(c, nil))
+				tools = append(tools, agenttool.New(remote, nil))
 			} else {
-				subAgents = append(subAgents, c)
+				subAgents = append(subAgents, remote)
 			}
+			continue
 		}
+		child, cerr := llmagent.New(llmagent.Config{
+			Name:        sa.Name,
+			Description: sa.Description,
+			Model:       googleadk.NewModel(sa.ModelName),
+			Instruction: "child agent",
+		})
+		if cerr != nil {
+			return runResult{}, cerr
+		}
+		subAgents = append(subAgents, child)
 	}
 
 	var ctxOpts []googleadk.ContextOption
@@ -518,24 +497,33 @@ func agentRunWorkflow(ctx workflow.Context, in runInput) (runResult, error) {
 // Test helpers.
 // ----------------------------------------------------------------------------
 
-// toolAgent builds an LLM child agent with tools. With self, it also holds
-// itself as its first tool, wrapped with agenttool: llmagent keeps the Tools
-// slice it is given, so that entry is set after the agent exists.
-func toolAgent(name, description, modelName string, tools []tool.Tool, self bool) (agent.Agent, error) {
-	if self {
-		tools = append([]tool.Tool{nil}, tools...)
+// warnLog keeps the messages of the warnings logged to it.
+type warnLog struct {
+	mu    sync.Mutex
+	warns []string
+}
+
+func (*warnLog) Debug(string, ...any) {}
+func (*warnLog) Info(string, ...any)  {}
+func (*warnLog) Error(string, ...any) {}
+
+func (l *warnLog) Warn(msg string, _ ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.warns = append(l.warns, msg)
+}
+
+// count returns how many of the warnings start with prefix.
+func (l *warnLog) count(prefix string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, w := range l.warns {
+		if strings.HasPrefix(w, prefix) {
+			n++
+		}
 	}
-	a, err := llmagent.New(llmagent.Config{
-		Name:        name,
-		Description: description,
-		Model:       googleadk.NewModel(modelName),
-		Instruction: "child agent",
-		Tools:       tools,
-	})
-	if err == nil && self {
-		tools[0] = agenttool.New(a, nil)
-	}
-	return a, err
+	return n
 }
 
 // noopTool builds a real in-workflow function tool whose handler is a no-op. The

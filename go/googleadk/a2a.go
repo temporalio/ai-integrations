@@ -524,14 +524,15 @@ func (e *a2aHTTPStatusError) Error() string { return "unexpected HTTP status: " 
 // loop or parallel agent, one reached by transfer, and one reached through a
 // model callback that gets past the model-call check: a BeforeModelCallbacks
 // entry that answers instead of the model, or an OnModelErrorCallbacks entry
-// that turns the refusal into a transfer. It finds agents wrapped with
-// agenttool in an agent's Tools, but not in its Toolsets.
+// that turns the refusal into a transfer. It sees the agent that an agenttool
+// in an agent's Tools wraps, but not one in its Toolsets, and not the agents
+// below a wrapped agent.
 func NewRunnerPlugin(root agent.Agent) (*plugin.Plugin, error) {
 	return plugin.New(plugin.Config{
 		Name: "googleadk",
 		BeforeRunCallback: func(agent.InvocationContext) (*genai.Content, error) {
-			if remote := findRemoteAgent(root); remote != nil {
-				return nil, remoteAgentError(remote)
+			if name := findRemoteAgent(root); name != "" {
+				return nil, remoteAgentError(name)
 			}
 			return nil, nil
 		},

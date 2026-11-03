@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unsafe"
 
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/activity"
@@ -155,96 +154,79 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 // with agenttool, is a remote A2A agent that sends from Workflow code. History
 // does not record those requests, so a replay sends them again.
 func rejectRemoteAgents(ctx context.Context, req *model.LLMRequest) error {
-	var agents []agent.Agent
 	if ic, ok := ctx.(agent.InvocationContext); ok && ic.Agent() != nil {
-		agents = append(agents, ic.Agent().SubAgents()...)
+		if name := findRemoteAgent(ic.Agent().SubAgents()...); name != "" {
+			return remoteAgentError(name)
+		}
 	}
 	// In name order, so the error names the same agent on every replay.
 	for _, name := range slices.Sorted(maps.Keys(req.Tools)) {
-		if a := agentToolAgent(req.Tools[name]); a != nil {
-			agents = append(agents, a)
+		if wrapsRemoteAgent(req.Tools[name]) {
+			return remoteAgentError(name)
 		}
-	}
-	if remote := findRemoteAgent(agents...); remote != nil {
-		return remoteAgentError(remote)
 	}
 	return nil
 }
 
-// remoteAgentError is the error that refuses remote, a remote A2A agent that
-// sends from Workflow code.
-func remoteAgentError(remote agent.Agent) error {
+// remoteAgentError is the error that refuses the remote A2A agent named name,
+// which sends from Workflow code.
+func remoteAgentError(name string) error {
 	return fmt.Errorf("googleadk: agent %q is a remote A2A agent that sends its requests from "+
 		"Workflow code, and they repeat on replay. Set its ClientProvider to "+
 		"googleadk.NewA2AClientProvider and its AgentCardProvider to "+
-		"googleadk.NewA2AAgentCardProvider (or set a static AgentCard)", remote.Name())
+		"googleadk.NewA2AAgentCardProvider (or set a static AgentCard)", name)
 }
 
-// findRemoteAgent returns the first of agents, or of the agents below them,
-// that is a remote A2A agent sending from Workflow code, or nil.
-func findRemoteAgent(agents ...agent.Agent) agent.Agent {
-	return findRemoteAgentFrom(agents, map[agent.Agent]bool{})
-}
-
-// findRemoteAgentFrom is findRemoteAgent, skipping the agents in visited and
-// adding the ones it checks. With agenttool, one agent can sit below several
-// agents or below itself, so each agent is checked once.
-func findRemoteAgentFrom(agents []agent.Agent, visited map[agent.Agent]bool) agent.Agent {
+// findRemoteAgent returns the name of the first of agents, or of the agents
+// below them, that is a remote A2A agent sending from Workflow code, or "".
+// Below an agent are its sub-agents and the agents that the tools in its Tools
+// wrap with agenttool, but not the agents below a wrapped agent: see
+// wrapsRemoteAgent.
+func findRemoteAgent(agents ...agent.Agent) string {
 	for _, a := range agents {
-		if a == nil || visited[a] {
+		if a == nil {
 			continue
 		}
-		visited[a] = true
-		if remoteAgentSendsFromWorkflow(a) {
-			return a
+		if remoteAgentSendsFromWorkflow(reflect.ValueOf(a)) {
+			return a.Name()
 		}
-		if found := findRemoteAgentFrom(agentsBelow(a), visited); found != nil {
-			return found
-		}
-	}
-	return nil
-}
-
-// agentsBelow returns the sub-agents of a and the agents that the tools in its
-// Tools wrap with agenttool. llmagent keeps its tools in internal state, so
-// they are read with reflection.
-func agentsBelow(a agent.Agent) []agent.Agent {
-	agents := slices.Clone(a.SubAgents())
-	if f := reflectField(reflect.ValueOf(a), "Tools"); f.IsValid() && f.CanInterface() {
-		tools, _ := f.Interface().([]tool.Tool)
-		for _, t := range tools {
-			if wrapped := agentToolAgent(t); wrapped != nil {
-				agents = append(agents, wrapped)
+		// llmagent keeps its tools in internal state, read with reflection.
+		if f := reflectField(reflect.ValueOf(a), "Tools"); f.IsValid() && f.CanInterface() {
+			tools, _ := f.Interface().([]tool.Tool)
+			for _, t := range tools {
+				if wrapsRemoteAgent(t) {
+					return t.Name()
+				}
 			}
 		}
+		if name := findRemoteAgent(a.SubAgents()...); name != "" {
+			return name
+		}
 	}
-	return agents
+	return ""
 }
 
-// agentToolAgent returns the agent that t runs when t was built by ADK's
-// agenttool.New, or nil. agenttool keeps the agent in an unexported field,
-// which reflection reads only through unsafe.
-func agentToolAgent(t any) agent.Agent {
+// wrapsRemoteAgent reports whether t was built by ADK's agenttool.New around a
+// remote A2A agent that sends from Workflow code. agenttool keeps the agent in
+// an unexported field. Reflection can read its fields but not call its
+// methods, so the agents below it are not seen, such as a remote agent under a
+// sequential, loop or parallel agent that agenttool wraps. An agent on
+// NewModel below it checks its own sub-agents and tools at its model calls.
+func wrapsRemoteAgent(t any) bool {
 	v := reflect.ValueOf(t)
 	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct ||
 		v.Elem().Type().PkgPath() != "google.golang.org/adk/v2/tool/agenttool" {
-		return nil
+		return false
 	}
-	f := v.Elem().FieldByName("agent")
-	if !f.IsValid() || f.Type() != reflect.TypeFor[agent.Agent]() {
-		return nil
-	}
-	a, _ := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface().(agent.Agent)
-	return a
+	return remoteAgentSendsFromWorkflow(v.Elem().FieldByName("agent"))
 }
 
-// remoteAgentSendsFromWorkflow reports whether a was built by
+// remoteAgentSendsFromWorkflow reports whether v holds an agent built by
 // remoteagent.NewA2A, which the deprecated agent/remoteagent package also
 // calls, without NewA2AClientProvider, or with a card it fetches without
 // NewA2AAgentCardProvider. ADK keeps the agent type and its A2A config in
 // internal state, so they are read with reflection.
-func remoteAgentSendsFromWorkflow(a agent.Agent) bool {
-	v := reflect.ValueOf(a)
+func remoteAgentSendsFromWorkflow(v reflect.Value) bool {
 	t := reflectField(v, "AgentType")
 	if !t.IsValid() || t.Kind() != reflect.String || t.String() != "RemoteAgent" {
 		return false
