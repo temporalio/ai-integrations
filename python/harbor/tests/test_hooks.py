@@ -584,7 +584,7 @@ async def test_skills_resolve_off_the_event_loop(
 
     monkeypatch.setattr(harbor.skills, "resolve_skill_sources", resolve)
     monkeypatch.setattr(harbor.trial.trial, "resolve_skill_sources", resolve)
-    agent = AgentConfig(name="oracle", skills=["org/skills@v1"])
+    agent = AgentConfig(import_path=agents.SKILLS_AGENT, skills=["org/skills@v1"])
     config = _trial(tasks.passing(tmp_path / "tasks"), tmp_path / "trials", agent)
     outcome = await _environment(client).run(
         HarborActivities(hooks=TrialHooks()).run_trial, _input(config)

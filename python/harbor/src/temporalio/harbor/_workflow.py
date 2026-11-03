@@ -114,10 +114,10 @@ async def plan_job(
             workflow's.
 
     Raises:
-        ApplicationError: Non-retryable, if ``config`` is a regrade job, which
-            is not supported, if an argument or a trial's configuration is
-            invalid, if a trial's name is not a single path component, or if
-            two trials are given the same name.
+        ApplicationError: Non-retryable, if ``config`` sets ``source_jobs``
+            (a regrade or diff job), which is not supported, if an argument or
+            a trial's configuration is invalid, if a trial's name is not a
+            single path component, or if two trials are given the same name.
         ActivityError: If planning failed, including when harbor rejected the
             job's configuration or ``jobs_dir/job_name`` holds a different one.
     """
@@ -127,10 +127,11 @@ async def plan_job(
         config = config.model_copy(
             update={"job_name": workflow.now().strftime("%Y-%m-%d__%H-%M-%S")}
         )
-    if config.is_regrade:
+    if config.source_jobs:
         raise ApplicationError(
-            "regrade jobs are not supported by temporalio.harbor",
-            type="HarborRegradeUnsupported",
+            "jobs derived from source_jobs (regrade or diff) are not supported "
+            "by temporalio.harbor",
+            type="HarborSourceJobsUnsupported",
             non_retryable=True,
         )
     if config.retry != RetryConfig():
@@ -277,7 +278,9 @@ async def execute_trial(
     ``NetworkConnectionError``. A trial whose name is not a single path
     component, or that harbor rejects as misconfigured while creating it,
     for example because an agent option is invalid or a ``${VAR}`` its
-    config names is unset on the worker, fails without a retry. For a trial
+    config names is unset on the worker, or as it starts, before its
+    environment, for example because the agent does not support the skills
+    or MCP servers its config names, fails without a retry. For a trial
     harbor ran, the error is an ``ApplicationError`` whose type is harbor's
     exception class name, with the outcome attached; after
     ``ApiRateLimitError``, the next attempt waits 2 minutes. A worker's

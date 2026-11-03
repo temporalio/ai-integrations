@@ -10,6 +10,7 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 TRANSCRIPT_AGENT = "tests.harbor_fixtures.agents:TranscriptAgent"
+SKILLS_AGENT = "tests.harbor_fixtures.agents:SkillsAgent"
 FAILING_AGENT = "tests.harbor_fixtures.agents:FailingAgent"
 TOKENS = 4_000
 
@@ -44,6 +45,12 @@ class TranscriptAgent(BaseAgent):
             }
         ]
         context.metadata = {"transcript": "x" * 50_000}
+
+
+class SkillsAgent(TranscriptAgent):
+    """A ``TranscriptAgent`` that declares skills, which harbor requires to give it any."""
+
+    capabilities = TranscriptAgent.capabilities.model_copy(update={"skills": True})
 
 
 class FailingAgent(BaseAgent):

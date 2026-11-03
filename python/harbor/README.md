@@ -154,10 +154,13 @@ Temporal runs a trial again when:
 - an agent run ended in one of harbor's transient provider errors. After a rate limit, the next
   attempt waits 2 minutes.
 
-A trial harbor rejects as misconfigured when the worker creates it, for example because a `${VAR}`
-in its config is unset there, fails without a retry. Pass `retry_policy=` to `execute_trial` to
-replace the default policy. A worker can also send a recorded trial back to Temporal, for example
-one whose verifier failed, by raising an `ApplicationError` from `TrialHooks.output` (see below).
+A trial harbor rejects as misconfigured fails without a retry: when the worker creates it, for
+example because a `${VAR}` in its config is unset there, or as it starts, before its environment,
+for example because its agent does not support the skills or MCP servers its config names. Harbor
+records the second kind in the trial's result, which `execute_trial` returns. Pass `retry_policy=`
+to `execute_trial` to replace the default policy. A worker can also send a recorded trial back to
+Temporal, for example one whose verifier failed, by raising an `ApplicationError` from
+`TrialHooks.output` (see below).
 
 When Temporal stops retrying a trial, `execute_trial` returns the most recent outcome any attempt
 produced, or raises if no attempt produced one.
@@ -258,7 +261,8 @@ that text reaches history as harbor recorded it; `TrialHooks.redact` says which.
   is pinned to the content hash planning resolved.
 - Agent skills given as a git ref resolve again for each trial, on the worker that runs it. Use an
   immutable tag, or a local path present on every worker.
-- Regrade jobs (`JobConfig.source_jobs`) are not supported. `plan_job` rejects them.
+- Jobs derived from source jobs (`JobConfig.source_jobs`), regrade or diff, are not supported.
+  `plan_job` rejects them.
 
 One workflow keeps every trial's outcome in its history and every unfinished trial pending.
 Temporal's limits on pending Activities and on message size put the ceiling for one workflow at

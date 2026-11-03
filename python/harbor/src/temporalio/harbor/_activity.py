@@ -138,12 +138,14 @@ def _cap(result: TrialResult) -> TrialResult:
     return result.model_copy(update=update)
 
 
-def _retried(result: TrialResult) -> ExceptionInfo | None:
-    """The recorded exception for which Temporal runs the trial again, if any.
+def _raised(result: TrialResult) -> ExceptionInfo | None:
+    """The recorded exception the attempt raises, if any.
 
     That is the first exception when no agent started, else the first
     transient provider error. Harbor sets ``agent_execution`` as an agent
     starts: on the result, or on each step's result for a multi-step trial.
+    Temporal runs the trial again unless harbor rejected the trial's
+    configuration as it started (:func:`_rejected`).
     """
     steps = result.step_results or []
     recorded = sorted(
@@ -153,6 +155,22 @@ def _retried(result: TrialResult) -> ExceptionInfo | None:
     if all(r.agent_execution is None for r in [result, *steps]):
         return next(iter(recorded), None)
     return next((exc for exc in recorded if exc.exception_type in _TRANSIENT), None)
+
+
+def _rejected(result: TrialResult) -> bool:
+    """Whether harbor rejected the trial's configuration as the trial started.
+
+    Before it starts the environment, harbor checks that the agent can honor
+    what the trial configures for it, such as skills, MCP servers and a
+    trajectory to load, and raises ``ValueError`` when it cannot, as
+    ``Trial.create`` does for a misconfigured trial.
+    """
+    exc = result.exception_info
+    return (
+        exc is not None
+        and exc.exception_type == ValueError.__name__
+        and result.environment_setup is None
+    )
 
 
 def _healthcheck_sec(check: HealthcheckConfig | None) -> float:
@@ -176,7 +194,7 @@ def _collect_sec(hooks: list[VerifierCollectConfig]) -> float:
 def trial_timeout(
     trial: TrialConfig, task: TaskDefinition, untimed_agent_timeout: timedelta
 ) -> timedelta:
-    """The phase timeouts harbor 0.23's ``Trial`` enforces for a trial, added up.
+    """The phase timeouts harbor 0.25's ``Trial`` enforces for a trial, added up.
 
     Each is resolved exactly as ``Trial`` resolves it. An agent harbor runs
     with no timeout counts as ``untimed_agent_timeout``.
@@ -207,12 +225,11 @@ def trial_timeout(
     build = resolve(
         task.environment.build_timeout_sec, trial.environment_build_timeout_multiplier
     )
-    setup = resolve(
-        trial.agent.override_setup_timeout_sec
-        if trial.agent.override_setup_timeout_sec is not None
-        else Trial._AGENT_SETUP_TIMEOUT_SEC,
-        trial.agent_setup_timeout_multiplier,
-    )
+    setup_sec = trial.agent.override_setup_timeout_sec
+    if setup_sec is None:
+        agent_class = AgentFactory.get_agent_class_from_config(trial.agent)
+        setup_sec = agent_class.DEFAULT_SETUP_TIMEOUT_SEC
+    setup = resolve(setup_sec, trial.agent_setup_timeout_multiplier)
     # A user agent adds its own setup, and the bridge's setup, trajectory
     # export and teardown, each bounded by the agent setup timeout.
     total = build + setup * (5 if trial.user_agent is not None else 1)
@@ -606,21 +623,12 @@ class HarborActivities:
                 ]
                 for i, task in enumerate(definitions)
             ]
-        # Harbor resolves a package dataset by its ref alone and rejects one
-        # that sets both ref and version.
-        datasets = [
-            dataset.model_copy(update={"version": None})
-            if dataset.is_package()
-            else dataset
-            for dataset in config.datasets
-        ]
         lock = await asyncio.to_thread(
             build_job_lock,
             config=config,
             trial_configs=trials,
             task_download_results=downloads,
         )
-        recorded = config.model_copy(update={"datasets": datasets})
 
         def write() -> None:
             job_dir = config.jobs_dir / config.job_name
@@ -632,14 +640,14 @@ class HarborActivities:
                 except ValueError:
                     existing = None
                 # As harbor does. An equal one may be an earlier attempt's.
-                if existing is None or existing != recorded:
+                if existing is None or existing != config:
                     raise ApplicationError(
                         f"Job directory {job_dir} already exists with a "
                         "different config.",
                         type="FileExistsError",
                         non_retryable=True,
                     )
-            path.write_text(recorded.model_dump_json(indent=4, exclude_defaults=True))
+            path.write_text(config.model_dump_json(indent=4, exclude_defaults=True))
             (job_dir / LOCK_FILENAME).write_text(
                 lock.model_dump_json(indent=4, exclude_none=True)
             )
@@ -651,7 +659,7 @@ class HarborActivities:
                 task.get_task_id().get_name().split("/")[-1] for task in task_configs
             ],
             timeouts=timeouts,
-            datasets=datasets,
+            datasets=config.datasets,
         )
 
     @activity.defn(name=RUN_TRIAL)
@@ -665,10 +673,10 @@ class HarborActivities:
         :meth:`TrialHooks.trial_created` raises, it raises for Temporal to run
         the trial again. It raises without a retry when the trial's name is not
         a single path component, when harbor rejects the trial's configuration
-        while creating it, and when :meth:`TrialHooks.redact` raises. An
-        ``ApplicationError`` from :meth:`TrialHooks.output` reaches Temporal as
-        the hook raised it; anything else it raises fails the attempt without
-        a retry.
+        while creating it or as it starts, before its environment, and when
+        :meth:`TrialHooks.redact` raises. An ``ApplicationError`` from
+        :meth:`TrialHooks.output` reaches Temporal as the hook raised it;
+        anything else it raises fails the attempt without a retry.
         """
         info = activity.info()
         hooks = self._hooks
@@ -788,20 +796,21 @@ class HarborActivities:
                                 non_retryable=True,
                             )
                         outcome.output = output
-                    retried = _retried(result)
-                    if retried is not None:
+                    raised = _raised(result)
+                    if raised is not None:
                         try:
                             message = _redact_strings(
-                                retried.exception_message, hooks, context
+                                raised.exception_message, hooks, context
                             )
                         except _RedactFailed as failed:
                             raise failed.failure from None
                         raise ApplicationError(
                             message[:_TEXT_MAX],
-                            type=retried.exception_type,
+                            type=raised.exception_type,
+                            non_retryable=_rejected(result),
                             next_retry_delay=(
                                 timedelta(minutes=2)
-                                if retried.exception_type == ApiRateLimitError.__name__
+                                if raised.exception_type == ApiRateLimitError.__name__
                                 else None
                             ),
                         )

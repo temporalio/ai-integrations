@@ -14,6 +14,7 @@ from typing import Any, cast
 
 import pytest
 from harbor.models.job.config import JobConfig, RetryConfig
+from harbor.models.task.config import MCPServerConfig
 from harbor.models.trial.config import (
     AgentConfig,
     EnvironmentConfig,
@@ -789,6 +790,49 @@ async def test_misconfigured_trial_is_not_retried(
     assert cause.non_retryable
     assert "HARBOR_TEST_UNSET_VAR" in cause.message
     assert await history.final_attempts(handle) == [1]
+
+
+def _with_skills(tmp_path: Path) -> AgentConfig:
+    skill = tmp_path / "skills" / "greeting"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: greeting\ndescription: Hi.\n---\n")
+    return AgentConfig(name="oracle", skills=[str(skill)])
+
+
+def _with_mcp_server(_: Path) -> AgentConfig:
+    server = MCPServerConfig(name="docs", url="http://localhost:9/sse")
+    return AgentConfig(name="oracle", mcp_servers=[server])
+
+
+@on_posix
+@pytest.mark.parametrize(
+    "agent",
+    [
+        pytest.param(_with_skills, id="skills"),
+        pytest.param(_with_mcp_server, id="mcp-servers"),
+    ],
+)
+async def test_unsupported_agent_capability_is_not_retried(
+    harbor_client: Client, tmp_path: Path, agent: Callable[[Path], AgentConfig]
+) -> None:
+    # Harbor checks what the agent supports as the trial starts, before its
+    # environment, so the trial comes back with the error harbor recorded.
+    config = _trial(
+        tasks.passing(tmp_path / "tasks"), tmp_path / "trials", "answers__0"
+    )
+    config.agent = agent(tmp_path)
+    outcome, attempts, failures = await _with_two_attempts(harbor_client, config)
+
+    recorded = outcome.result.exception_info
+    assert recorded is not None
+    assert recorded.exception_type == "ValueError"
+    assert "does not support" in recorded.exception_message
+    assert outcome.result.environment_setup is None
+    assert outcome.attempt == 1
+    assert attempts == [1]
+    [failure] = failures
+    assert failure.application_failure_info.type == "ValueError"
+    assert failure.application_failure_info.non_retryable
 
 
 @on_posix
