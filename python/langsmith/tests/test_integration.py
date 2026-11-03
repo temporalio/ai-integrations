@@ -286,7 +286,7 @@ class LangChainRaceWorkflow:
     The step of ``race_a`` waits for ``release``; ``race_b``'s never ends.
     ``fail`` fails the workflow from its signal handler, and ``crash`` fails
     the workflow task.  ``release_slowly`` and ``fail_slowly`` block their
-    activation for a second, so that a signal sent meanwhile makes the
+    activation for half a second, so that a signal sent meanwhile makes the
     server reject its completion.  After ``release_unserializable``, the workflow
     returns a result that can't be serialized, which fails the workflow
     task.  After ``release_uncodable`` it returns ``_UNCODABLE``, and
@@ -366,10 +366,10 @@ class LangChainRaceWorkflow:
 
 
 def _block() -> None:
-    """Block a live activation for a second, less than the deadlock timeout."""
+    """Block a live activation for half a second, well under the deadlock timeout."""
     if not workflow.unsafe.is_replaying_history_events():
         with workflow.unsafe.sandbox_unrestricted():
-            time.sleep(1)
+            time.sleep(0.5)
 
 
 _UNCODABLE = "uncodable"
@@ -1533,6 +1533,13 @@ class TestReplay:
                     op == "post" and run["name"] == name for op, run in writes
                 ), name
 
+        async def tasks_started(handle: WorkflowHandle[Any, Any]) -> int:
+            history = await handle.fetch_history()
+            return sum(
+                e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_STARTED
+                for e in history.events
+            )
+
         async def wait_for(
             handle: WorkflowHandle[Any, Any], event: EventType.ValueType
         ) -> None:
@@ -1562,12 +1569,17 @@ class TestReplay:
             )
             await wait_for(handle, EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED)
             if rejected:
+                started = await tasks_started(handle)
                 await handle.signal(
                     LangChainRaceWorkflow.fail_slowly
                     if fail
                     else LangChainRaceWorkflow.release_slowly
                 )
-                await asyncio.sleep(0.3)
+                # Sent once the signal's task has started, while it blocks.
+                for _ in range(100):
+                    if await tasks_started(handle) > started:
+                        break
+                    await asyncio.sleep(0.02)
                 await handle.signal(LangChainRaceWorkflow.other)
             if not task_fails:
                 if fail:
