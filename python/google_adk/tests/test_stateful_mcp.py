@@ -668,13 +668,21 @@ async def test_stateful_session_heartbeats_within_heartbeat_timeout(client: Clie
 
 
 class _DenyDescribe(Interceptor):
+    def __init__(self, status: RPCStatusCode) -> None:
+        super().__init__()
+        self.status = status
+
     def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
-        return _DenyDescribeOutbound(next)
+        return _DenyDescribeOutbound(next, self.status)
 
 
 class _DenyDescribeOutbound(OutboundInterceptor):
+    def __init__(self, next: OutboundInterceptor, status: RPCStatusCode) -> None:
+        super().__init__(next)
+        self.status = status
+
     async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
-        raise RPCError("Request unauthorized.", RPCStatusCode.PERMISSION_DENIED, b"")
+        raise RPCError("Request refused.", self.status, b"")
 
 
 class _StallDescribeOutbound(OutboundInterceptor):
@@ -716,6 +724,20 @@ class _OnceDescribeOutbound(OutboundInterceptor):
         return description
 
 
+class _StallMayBeOpenEncodeCodec(PayloadCodec):
+    """Never finishes encoding the worker's "may be open" heartbeats."""
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_heartbeat_async") and any(
+            _mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads
+        ):
+            await asyncio.Event().wait()
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+
 class _StallReadBackCodec(PayloadCodec):
     """Never finishes decoding the details the session activity reads back."""
 
@@ -733,8 +755,10 @@ class _StallReadBackCodec(PayloadCodec):
     "case",
     [
         "refused",
+        "not_found",
         "describe_stalls",
         "decode_stalls",
+        "heartbeat_encode_stalls",
         "unavailable_once",
         "other_attempt_once",
     ],
@@ -748,6 +772,7 @@ async def test_stateful_session_without_describe_permission(
     # A transient describe error is retried within the attempt, and a describe
     # that shows another attempt fails this one, which is retried.
     monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
+    monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 1.0)
     factory_calls = 0
 
     def factory(_: Any) -> McpToolset:
@@ -757,14 +782,23 @@ async def test_stateful_session_without_describe_permission(
 
     provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
     config = client.config()
-    if case == "decode_stalls":
+    if case.endswith("code_stalls"):
+        # A heartbeat that never finishes encoding is still the attempt's
+        # last heartbeat task when it ends; the attempt must still complete.
+        codec = (
+            _StallReadBackCodec()
+            if case == "decode_stalls"
+            else _StallMayBeOpenEncodeCodec()
+        )
         config["data_converter"] = dataclasses.replace(
-            client.data_converter, payload_codec=_StallReadBackCodec()
+            client.data_converter, payload_codec=codec
         )
     else:
         interceptor = (
-            _DenyDescribe()
+            _DenyDescribe(RPCStatusCode.PERMISSION_DENIED)
             if case == "refused"
+            else _DenyDescribe(RPCStatusCode.NOT_FOUND)
+            if case == "not_found"
             else _StallDescribe()
             if case.endswith("stalls")
             else _OnceDescribe(case)
@@ -796,7 +830,7 @@ async def test_stateful_session_without_describe_permission(
             assert await handle.result() == ["echo"]
             assert factory_calls == 1
             return
-        if case != "refused":
+        if case not in ("refused", "not_found"):
             # The attempt fails at the 2-second deadline and is retried.
             async with asyncio.timeout(20):
                 while True:
@@ -822,29 +856,35 @@ async def test_stateful_session_without_describe_permission(
     while cause is not None:
         messages.append(str(cause))
         cause = cause.__cause__
-    assert any("permission to describe" in m for m in messages), messages
+    if case == "refused":
+        assert any("permission to describe" in m for m in messages), messages
+    else:
+        # Only a permission error gets the permission advice.
+        assert any("could not describe this workflow run" in m for m in messages)
+        assert not any("permission" in m for m in messages), messages
 
 
-class _SlowFirstDescribe(Interceptor):
-    """Delays the first describe, so the first session is still reading back."""
+class _HoldFirstDescribe(Interceptor):
+    """Holds the first describe until ``release`` is set."""
 
     def __init__(self) -> None:
         super().__init__()
         self.calls = 0
+        self.release = asyncio.Event()
 
     def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
-        return _SlowFirstDescribeOutbound(next, self)
+        return _HoldFirstDescribeOutbound(next, self)
 
 
-class _SlowFirstDescribeOutbound(OutboundInterceptor):
-    def __init__(self, next: OutboundInterceptor, owner: _SlowFirstDescribe) -> None:
+class _HoldFirstDescribeOutbound(OutboundInterceptor):
+    def __init__(self, next: OutboundInterceptor, owner: _HoldFirstDescribe) -> None:
         super().__init__(next)
         self.owner = owner
 
     async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
         self.owner.calls += 1
         if self.owner.calls == 1:
-            await asyncio.sleep(3)
+            await self.owner.release.wait()
         return await super().describe_workflow(input)
 
 
@@ -862,7 +902,7 @@ class StatefulMcpTwoBlocksWorkflow:
         async with TemporalStatefulMcpToolSet(
             "stateful_server", config=config
         ) as toolset:
-            # List after the first session's delayed read-back has ended.
+            # List once the first session has finished its read-back.
             await workflow.sleep(5)
             return [t.name for t in await toolset.get_tools()]
 
@@ -870,13 +910,19 @@ class StatefulMcpTwoBlocksWorkflow:
 @pytest.mark.timeout(90)
 async def test_stateful_sessions_with_one_name_in_one_worker(client: Client):
     # The first block exits while its session is still reading back its first
-    # heartbeat, and the second block's session starts on the same worker. It
-    # must wait for the first one, not register next to it.
-    provider = TemporalStatefulMcpToolSetProvider(
-        "stateful_server", lambda _: _stdio_toolset(_MCP_SERVER)
-    )
+    # heartbeat. The second block's session registers meanwhile. The first
+    # session's read-back then ends, and it must not register over the second.
+    factory_calls = 0
+
+    def factory(_: Any) -> McpToolset:
+        nonlocal factory_calls
+        factory_calls += 1
+        return _stdio_toolset(_MCP_SERVER)
+
+    provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
+    hold = _HoldFirstDescribe()
     config = client.config()
-    config["interceptors"] = [*config["interceptors"], _SlowFirstDescribe()]
+    config["interceptors"] = [*config["interceptors"], hold]
     worker_client = _make_client(Client(**config), provider)
     task_queue = f"adk-stateful-mcp-one-name-{uuid.uuid4()}"
     async with Worker(
@@ -885,13 +931,20 @@ async def test_stateful_sessions_with_one_name_in_one_worker(client: Client):
         workflows=[StatefulMcpTwoBlocksWorkflow],
         max_cached_workflows=0,
     ):
-        result = await client.execute_workflow(
+        handle = await client.start_workflow(
             StatefulMcpTwoBlocksWorkflow.run,
             id=f"stateful-mcp-one-name-{uuid.uuid4()}",
             task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
+        # Only the second session can register while the first is held.
+        async with asyncio.timeout(20):
+            while not provider._toolsets:
+                await asyncio.sleep(0.05)
+        hold.release.set()
+        result = await handle.result()
     assert result == ["echo"]
+    assert factory_calls == 1
 
 
 @workflow.defn
@@ -913,6 +966,14 @@ class StatefulMcpBlockEndsWorkflow:
                 ),
             ) as toolset:
                 return [t.name for t in await toolset.get_tools()]
+        if case == "compensation_raise_first":
+            # After a caught workflow cancel, a block whose body fails before
+            # its first await leaves with the body's error.
+            try:
+                await workflow.wait_condition(lambda: False)
+            except asyncio.CancelledError:
+                async with TemporalStatefulMcpToolSet("stateful_server", config=config):
+                    raise ApplicationError("compensation failed", non_retryable=True)
         # A tool kept from an earlier block, called first in a later block.
         async with TemporalStatefulMcpToolSet(
             "stateful_server", config=config
@@ -924,7 +985,9 @@ class StatefulMcpBlockEndsWorkflow:
 
 
 @pytest.mark.timeout(90)
-@pytest.mark.parametrize("case", ["factory_fails", "tool_from_earlier_block"])
+@pytest.mark.parametrize(
+    "case", ["factory_fails", "tool_from_earlier_block", "compensation_raise_first"]
+)
 async def test_stateful_block_exit_error(client: Client, case: str):
     def factory(_: Any) -> McpToolset:
         if case == "factory_fails":
@@ -940,14 +1003,26 @@ async def test_stateful_block_exit_error(client: Client, case: str):
         workflows=[StatefulMcpBlockEndsWorkflow],
         max_cached_workflows=0,
     ):
+        handle = await client.start_workflow(
+            StatefulMcpBlockEndsWorkflow.run,
+            case,
+            id=f"stateful-mcp-block-ends-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+        if case == "compensation_raise_first":
+            async with asyncio.timeout(20):
+                while not await _has_event(
+                    handle, EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED
+                ):
+                    await asyncio.sleep(0.1)
+            await handle.cancel()
         with pytest.raises(WorkflowFailureError) as err:
-            await client.execute_workflow(
-                StatefulMcpBlockEndsWorkflow.run,
-                case,
-                id=f"stateful-mcp-block-ends-{uuid.uuid4()}",
-                task_queue=task_queue,
-                execution_timeout=timedelta(seconds=60),
-            )
+            await handle.result()
+    if case == "compensation_raise_first":
+        assert isinstance(err.value.cause, ApplicationError)
+        assert err.value.cause.message == "compensation failed"
+        return
     # Whatever ended the session, the error is the one the docstrings name.
     assert isinstance(err.value.cause, ApplicationError)
     assert err.value.cause.type == "DedicatedWorkerFailure"
@@ -962,6 +1037,82 @@ async def test_stateful_block_exit_error(client: Client, case: str):
         else "List the toolset's tools again inside an open block."
     )
     assert any(expected in message for message in messages), messages
+
+
+@workflow.defn
+class StatefulMcpTimerAtExitWorkflow:
+    def __init__(self) -> None:
+        self._listed = False
+
+    @workflow.run
+    async def run(self, host_task_queue: str) -> str:
+        async with TemporalStatefulMcpToolSet(
+            "stateful_server",
+            config=ActivityConfig(
+                start_to_close_timeout=timedelta(seconds=20),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            ),
+            server_session_config=ActivityConfig(
+                task_queue=host_task_queue,
+                start_to_close_timeout=timedelta(hours=1),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            ),
+        ) as toolset:
+            await toolset.get_tools()
+            self._listed = True
+            await workflow.sleep(2)
+        return "block exited normally"
+
+    @workflow.update
+    async def wait_listed(self) -> None:
+        await workflow.wait_condition(lambda: self._listed)
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_session_ends_with_the_blocks_last_timer(client: Client):
+    # The block's last timer fires and its session ends in the same workflow
+    # task, timer first. The SDK then drops the session's failure when the
+    # block cancels it, and the block must still raise DedicatedWorkerFailure.
+    provider = TemporalStatefulMcpToolSetProvider(
+        "stateful_server", lambda _: _stdio_toolset(_MCP_SERVER)
+    )
+    client = _make_client(client, provider)
+    task_queue = f"adk-stateful-mcp-timer-exit-{uuid.uuid4()}"
+    host_task_queue = f"{task_queue}-host"
+    async with Worker(client, task_queue=host_task_queue):
+        async with Worker(
+            client,
+            task_queue=task_queue,
+            workflows=[StatefulMcpTimerAtExitWorkflow],
+            max_cached_workflows=0,
+        ):
+            handle = await client.start_workflow(
+                StatefulMcpTimerAtExitWorkflow.run,
+                host_task_queue,
+                id=f"stateful-mcp-timer-exit-{uuid.uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            await handle.execute_update(StatefulMcpTimerAtExitWorkflow.wait_listed)
+        # No workflow worker: the timer fires while nothing processes it.
+        async with asyncio.timeout(20):
+            while not await _has_event(handle, EventType.EVENT_TYPE_TIMER_FIRED):
+                await asyncio.sleep(0.1)
+    # The session's host shut down gracefully, and its one attempt failed.
+    async with asyncio.timeout(20):
+        while not await _has_event(handle, EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED):
+            await asyncio.sleep(0.1)
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StatefulMcpTimerAtExitWorkflow],
+        max_cached_workflows=0,
+    ):
+        async with asyncio.timeout(20):
+            with pytest.raises(WorkflowFailureError) as err:
+                await handle.result()
+    assert isinstance(err.value.cause, ApplicationError)
+    assert err.value.cause.type == "DedicatedWorkerFailure"
 
 
 # Without a heartbeat timeout the worker sends a heartbeat at most every 30

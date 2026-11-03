@@ -1,6 +1,7 @@
 import asyncio
 import contextvars
 import functools
+import inspect
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -464,6 +465,10 @@ _HEARTBEAT_INTERVAL = 30.0
 # first heartbeat.
 _STORE_TIMEOUT = 30.0
 
+# Seconds an ending attempt waits for its earlier heartbeats before it clears
+# the "may be open" marker anyway.
+_CLOSE_TIMEOUT = 10.0
+
 # Describe errors that retrying cannot fix.
 _DESCRIBE_REFUSALS = {
     RPCStatusCode.PERMISSION_DENIED,
@@ -650,11 +655,21 @@ class _SessionHeartbeats:
             # This attempt opened no session, so a retry may build the toolset.
             # Send that last, after every earlier heartbeat: one still being
             # encoded would otherwise replace it. If this wait is interrupted,
-            # the marker stays and the retry is refused.
+            # the marker stays and the retry is refused. If it times out, clear
+            # anyway: the worker reports the attempt only after its last
+            # heartbeat task, and the clear has no details to encode. A slower
+            # heartbeat that lands later only makes the retry refuse.
             if self._sending:
-                await asyncio.wait(set(self._sending))
+                await asyncio.wait(set(self._sending), timeout=_CLOSE_TIMEOUT)
             self._may_be_open = False
             self.beat()
+
+
+def _already_running_failure() -> ApplicationError:
+    return ApplicationError(
+        "Cannot connect to an already running toolset. Use a distinct name if "
+        "running multiple stateful toolsets in one workflow."
+    )
 
 
 def _stopping_error() -> ApplicationError:
@@ -790,8 +805,6 @@ class TemporalStatefulMcpToolSetProvider:
         self._name = name + "-stateful"
         self._toolset_factory = toolset_factory
         self._toolsets: dict[str, _RunningToolset] = {}
-        # Run-scoped names of the session activities running in this worker.
-        self._sessions: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -854,11 +867,8 @@ class TemporalStatefulMcpToolSetProvider:
             failure = _earlier_attempt_failure(activity.info().heartbeat_details)
             if failure:
                 raise failure
-            if server_id in self._sessions:
-                raise ApplicationError(
-                    "Cannot connect to an already running toolset. Use a distinct "
-                    "name if running multiple stateful toolsets in one workflow."
-                )
+            if server_id in self._toolsets:
+                raise _already_running_failure()
 
             # Created only once the duplicate-connect check has passed, and
             # cancelled in the outermost ``finally`` below so it is torn down
@@ -872,22 +882,23 @@ class TemporalStatefulMcpToolSetProvider:
                 # Heartbeat well within a shorter heartbeat timeout too.
                 interval = min(interval, heartbeat_timeout.total_seconds() / 2)
             heartbeat_task = asyncio.create_task(heartbeat_every(interval, heartbeats))
-            # Hold the name until this attempt ends: the read-back below awaits,
-            # and another session with this name must not pass the check above
-            # meanwhile. Nothing since the check has awaited.
-            self._sessions.add(server_id)
             try:
                 # No MCP session opens before the server holds the first
                 # heartbeat, which says a session may be open.
                 await heartbeats.wait_until_stored()
+                # Another session with this name may have started during the
+                # read-back. Check again, and register before the next await.
+                if server_id in self._toolsets:
+                    raise _already_running_failure()
                 toolset = self._toolset_factory(args.factory_argument if args else None)
+                running = _RunningToolset(
+                    toolset,
+                    heartbeats,
+                    _record_opened_sessions(toolset, heartbeats),
+                    activity.info().scheduled_time,
+                )
                 try:
-                    self._toolsets[server_id] = _RunningToolset(
-                        toolset,
-                        heartbeats,
-                        _record_opened_sessions(toolset, heartbeats),
-                        activity.info().scheduled_time,
-                    )
+                    self._toolsets[server_id] = running
                     try:
                         worker = Worker(
                             activity.client(),
@@ -901,17 +912,15 @@ class TemporalStatefulMcpToolSetProvider:
                     finally:
                         await toolset.close()
                 finally:
-                    self._toolsets.pop(server_id, None)
+                    if self._toolsets.get(server_id) is running:
+                        del self._toolsets[server_id]
             finally:
+                heartbeat_task.cancel()
                 try:
-                    heartbeat_task.cancel()
-                    try:
-                        await heartbeat_task
-                    except asyncio.CancelledError:
-                        pass
-                    await heartbeats.close()
-                finally:
-                    self._sessions.discard(server_id)
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                await heartbeats.close()
 
         return (connect,)
 
@@ -1060,16 +1069,35 @@ class TemporalStatefulMcpToolSet(BaseToolset):
         """
         if self._connect_handle:
             session = self._connect_handle
+            # Decide before cancelling whether the session's task ever ran: a
+            # session cancelled before it started ends cancelled, and so does
+            # one that ended on its own in this workflow task, because the SDK
+            # drops its result when it is cancelled.
+            coro = session.get_coro()
+            started = not (
+                inspect.iscoroutine(coro)
+                and inspect.getcoroutinestate(coro) == inspect.CORO_CREATED
+            )
+            current = asyncio.current_task()
+            cancels = current.cancelling() if current else 0
             session.cancel()
             try:
                 await session
             except asyncio.CancelledError:
-                # A session cancelled before it started ends without an
-                # ActivityError. Keep a cancellation of this coroutine itself.
-                current = asyncio.current_task()
-                if session.cancelled() and not (current and current.cancelling()):
+                if not session.cancelled() or (
+                    current and current.cancelling() > cancels
+                ):
+                    # A cancellation of this coroutine itself.
+                    raise
+                if not started:
                     return
-                raise
+                # The session ended in this workflow task, and the SDK dropped
+                # its failure when it was cancelled.
+                raise ApplicationError(
+                    "The stateful MCP session activity has ended, so no worker "
+                    "serves this toolset's operations.",
+                    type="DedicatedWorkerFailure",
+                ) from None
             except Exception as e:
                 if is_cancelled_exception(e):
                     return
