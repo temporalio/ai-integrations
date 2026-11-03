@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Literal, cast, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import nexusrpc
 import pydantic
@@ -1435,8 +1435,13 @@ def test_carried_input_items_decode_as_lists_in_lenient_fallback():
 def test_type_swap_leaves_tool_definitions():
     # Requests that take tool definitions, such as vector_stores.search
     # filters, must still turn iterators into lists.
-    assert get_origin(get_type_hints(CompoundFilter)["filters"]) is Iterable
-    assert get_origin(get_type_hints(ResponseOutputMessageParam)["content"]) is list
+    # typing_extensions strips Required on every Python version.
+    hints = typing_extensions.get_type_hints
+    assert typing_extensions.get_origin(hints(CompoundFilter)["filters"]) is Iterable
+    assert (
+        typing_extensions.get_origin(hints(ResponseOutputMessageParam)["content"])
+        is list
+    )
 
 
 class CarriedChatState(pydantic.BaseModel):
