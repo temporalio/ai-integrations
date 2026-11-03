@@ -262,6 +262,13 @@ class LangChainSignalWorkflow:
     def release(self) -> None:
         self._released = True
 
+    @workflow.update
+    async def step(self) -> str:
+        async def step(text: str) -> str:
+            return text
+
+        return await RunnableLambda(step, name="step").ainvoke("update")
+
     @workflow.run
     async def run(self, shared_tracer: bool = False) -> str:
         async def wait(text: str) -> str:
@@ -1722,6 +1729,71 @@ class TestReplay:
             "post",
             "post",
         ]
+
+    async def test_update_runs_keep_their_own_ids(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+    ) -> None:
+        """An update's runs don't take the IDs of the run method's runs.
+
+        On a worker without the workflow cached, an update right after a first
+        workflow task with no commands runs its handler, then the run method
+        again, live in one task.  A replay runs the run method first.
+        """
+        get_runtime_environment()
+        langsmith.env.get_langchain_env_var_metadata()
+        writes: list[tuple[str, dict[str, Any]]] = []
+
+        class _RecordingClient(langsmith.Client):
+            def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("post", args[0]))
+
+            def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("patch", args[0]))
+
+        config = client.config()
+        config["plugins"] = [
+            LangSmithPlugin(
+                client=_RecordingClient(
+                    api_url="http://localhost:1",
+                    api_key="test",
+                    auto_batch_tracing=False,
+                )
+            )
+        ]
+        temporal_client = Client(**config)
+        async with new_worker(
+            temporal_client, LangChainSignalWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await temporal_client.start_workflow(
+                LangChainSignalWorkflow.run,
+                id=f"replay-test-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+            for _ in range(100):
+                history = await handle.fetch_history()
+                if any(
+                    e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED
+                    for e in history.events
+                ):
+                    break
+                await asyncio.sleep(0.1)
+            assert await handle.execute_update(LangChainSignalWorkflow.step) == "update"
+            await handle.signal(LangChainSignalWorkflow.release)
+            assert await handle.result() == "secret"
+
+        posts = [run for op, run in writes if op == "post"]
+        names: dict[str, set[str]] = {}
+        for run in posts:
+            names.setdefault(str(run["id"]), set()).add(run["name"])
+        assert all(len(each) == 1 for each in names.values()), names
+        # The trace is the root factory's run, built for each handler call.
+        traces = {
+            name: {str(run["trace_id"]) for run in posts if run["name"] == name}
+            for name in ("wait", "step")
+        }
+        assert traces["step"] and not traces["step"] & traces["wait"], traces
 
     async def test_run_under_header_parent_keeps_start_time(
         self,

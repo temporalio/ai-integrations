@@ -290,6 +290,17 @@ def _uuid_from_random(rng: random.Random) -> uuid.UUID:
     return uuid.UUID(int=rng.getrandbits(128), version=4)
 
 
+def _uuid7_from_random(rng: random.Random) -> uuid.UUID:
+    """Generate a UUIDv7 from ``workflow.now()`` and a workflow-bound generator."""
+    # 48 bits of Unix milliseconds, then version, variant and random bits.
+    # Python before 3.14 rejects version=7 in UUID().
+    millis = int(temporalio.workflow.now().timestamp() * 1000)
+    value = (millis & (1 << 48) - 1) << 80 | rng.getrandbits(80)
+    value = value & ~(0xF << 76) | 0x7 << 76
+    value = value & ~(0x3 << 62) | 0x2 << 62
+    return uuid.UUID(int=value)
+
+
 # ---------------------------------------------------------------------------
 # Replay safety for LangChain tracer runs
 # ---------------------------------------------------------------------------
@@ -302,7 +313,11 @@ class _LangChainRuns:
     replay would make the same runs again as new ones.  In workflow code,
     the IDs LangChain generates come from ``new_id``, a workflow-seeded
     generator (see ``_install_langchain_run_id_hook``), so callbacks and
-    LangSmith see the same ID.  A run ID the caller chose, such as
+    LangSmith see the same ID.  The IDs are UUIDv7s that carry the
+    ``workflow.now()`` of the task that makes them, so code that Temporal runs
+    again live in a later task, such as the run method after an update's
+    handler on a worker without the workflow cached, gets new IDs instead of
+    those of other runs.  A run ID the caller chose, such as
     ``config["run_id"]``, is kept.  Every run's start time comes from
     ``workflow.now()`` when the run starts, at least 1 microsecond after the
     run before it, so runs keep the order they started in.  The generator is
@@ -330,17 +345,9 @@ class _LangChainRuns:
         reseed(temporalio.workflow.random_seed())
         temporalio.workflow.register_random_seed_callback(reseed)
 
-    def new_id(self, version: int) -> uuid.UUID:
-        """Generate a run ID, a UUID of ``version`` 4 or 7, like LangChain's."""
-        if version == 4:
-            return _uuid_from_random(self._rng)
-        # UUIDv7: 48 bits of Unix milliseconds, then version, variant and
-        # random bits.  Python before 3.14 rejects version=7 in UUID().
-        millis = int(temporalio.workflow.now().timestamp() * 1000)
-        value = (millis & (1 << 48) - 1) << 80 | self._rng.getrandbits(80)
-        value = value & ~(0xF << 76) | 0x7 << 76
-        value = value & ~(0x3 << 62) | 0x2 << 62
-        return uuid.UUID(int=value)
+    def new_id(self) -> uuid.UUID:
+        """Generate a run ID."""
+        return _uuid7_from_random(self._rng)
 
     def add(self, run_id: Any, *, start: Any = None) -> uuid.UUID:
         """Give a run, which keeps its ID, a stable start time, once.
@@ -365,7 +372,7 @@ class _LangChainRuns:
         The ID comes from a generator of its own, so ``add_temporal_runs``
         does not change the IDs of LangChain's runs.
         """
-        run_id = self.add(_uuid_from_random(self._root_rng))
+        run_id = self.add(_uuid7_from_random(self._root_rng))
         return run_id, self._ids[str(run_id)][1]
 
     def start_time(self, run_id: Any) -> datetime:
@@ -639,7 +646,7 @@ def _replay_safe_replicas(run: RunTree) -> None:
     run.replicas = replicas
 
 
-def _stable_run_ids(generate: Callable[..., Any], version: int) -> Callable[..., Any]:
+def _stable_run_ids(generate: Callable[..., Any]) -> Callable[..., Any]:
     """Wrap a LangChain run ID generator to use ``_LangChainRuns.new_id``.
 
     It calls ``generate`` outside the tracing context this plugin sets for
@@ -648,7 +655,7 @@ def _stable_run_ids(generate: Callable[..., Any], version: int) -> Callable[...,
 
     def generate_run_id(*args: Any, **kwargs: Any) -> Any:
         runs = None if args or kwargs else _plugin_langchain_runs()
-        return generate(*args, **kwargs) if runs is None else runs.new_id(version)
+        return generate(*args, **kwargs) if runs is None else runs.new_id()
 
     return generate_run_id
 
@@ -684,7 +691,7 @@ def _stable_child_ids(create_child: Callable[..., Any]) -> Callable[..., Any]:
         if runs is None:
             return create_child(self, *args, run_id=run_id, **kwargs)
         if run_id is None:
-            run_id = runs.new_id(7)
+            run_id = runs.new_id()
         # The start time is stable before the child's dotted order is built,
         # since a replica writes the child under another ID.
         if kwargs.get("start_time") is None:
@@ -792,10 +799,10 @@ def _install_langchain_run_id_hook() -> None:
     # The names the manager calls; neither is in its __all__.
     if hasattr(manager, "uuid7"):
         # langchain-core 0.3.83 to 0.3.86, and 1.1.1 on
-        setattr(manager, "uuid7", _stable_run_ids(getattr(manager, "uuid7"), 7))
+        setattr(manager, "uuid7", _stable_run_ids(getattr(manager, "uuid7")))
     elif getattr(manager, "uuid", None) is uuid:
         # Earlier releases call uuid.uuid4()
-        setattr(manager, "uuid", _UuidModule(_stable_run_ids(uuid.uuid4, 4)))
+        setattr(manager, "uuid", _UuidModule(_stable_run_ids(uuid.uuid4)))
     else:
         logger.warning(
             "This langchain-core generates run IDs in a way the LangSmith plugin "
