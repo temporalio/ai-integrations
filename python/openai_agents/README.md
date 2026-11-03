@@ -423,13 +423,15 @@ there, for example with `list(...)`.
 
 The change reaches only classes built after `temporalio.openai_agents` is imported, so import it
 before the modules that define your Workflow inputs, Activity results or other classes that hold
-input items. For a class built earlier, the payload converter still lists the iterators, but a
-strict model that holds a custom tool's output can decode as a plain `dict`.
+input items. Classes it does not reach, such as a class built earlier or, on Python 3.14, a
+`TypedDict` subclass of an item type, rely on the payload converter, which lists the iterators it
+finds when it decodes them. Tool definitions inside items, such as a `tool_search_output` item's
+tools, also rely on it, so inside a tuple, deque or set they stay one-shot iterators.
 
 The payload converter also decodes your own `Iterable` fields as lists when they are the decoded
-value itself, fields of a dataclass or pydantic model, dict values or list items, so code that
-calls `next()` on them must use `iter()` first. Inside tuples, deques and sets they stay
-pydantic's one-shot iterators.
+value itself, fields of a dataclass or pydantic model (extra fields too), dict values or list items,
+so code that calls `next()` on them must use `iter()` first. Inside tuples, deques and sets they
+stay pydantic's one-shot iterators.
 
 Earlier versions decoded those fields as one-shot iterators, and a turn on carried items raised
 `TypeError: cannot pickle 'pydantic_core._pydantic_core.ValidatorIterator' object`. A run that
