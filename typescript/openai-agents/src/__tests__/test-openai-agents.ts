@@ -16,7 +16,13 @@ import {
   withTrace,
 } from '@openai/agents-core';
 import { Context } from '@temporalio/activity';
-import { ServiceError, WorkflowClient, WorkflowFailedError } from '@temporalio/client';
+import {
+  ServiceError,
+  WithStartWorkflowOperation,
+  WorkflowClient,
+  WorkflowFailedError,
+  WorkflowUpdateStage,
+} from '@temporalio/client';
 import { ApplicationFailure, type PayloadCodec } from '@temporalio/common';
 import { historyFromJSON } from '@temporalio/common/lib/proto-utils';
 import { temporal } from '@temporalio/proto';
@@ -51,6 +57,7 @@ import {
   streamingLocalActivityWorkflow,
   streamingNoTopicWorkflow,
   tracingApiKeyWorkflow,
+  tracingKeyRefusedWorkflow,
 } from './workflows/openai-agents';
 import { makeTestFunction } from './helpers/test-fn';
 import { type FakeModel, FakeModelProvider, textResponse, toolCallResponse } from './stubs/openai-agents';
@@ -1080,7 +1087,7 @@ class SpanningModelProvider implements ModelProvider {
   }
 }
 
-test('tracingApiKey gives spans that cross a Temporal boundary the key the Worker resolves', async (t) => {
+test("tracingApiKey gives spans that cross a Temporal boundary the key the Worker resolves, and a trace's own key is refused", async (t) => {
   const { createWorker, taskQueue } = helpers(t);
 
   getGlobalTraceProvider().setDisabled(false);
@@ -1158,31 +1165,95 @@ test('tracingApiKey gives spans that cross a Temporal boundary the key the Worke
   });
 
   let clientTraceId = '';
+  const refusal = "The OpenAI Agents plugin cannot pass a trace's own tracing key";
   await worker.runUntil(async () => {
-    // The run sets its own key in Workflow code.
+    // The run starts its own trace.
     await wfClient.execute(tracingApiKeyWorkflow, {
       taskQueue,
       workflowId: runWorkflowId,
+      workflowExecutionTimeout: '30 seconds',
+    });
+    // The client starts the Workflows inside its trace.
+    await withTrace('tracing-key-client-trace', async () => {
+      clientTraceId = getCurrentTrace()!.traceId;
+      await wfClient.execute(tracingApiKeyWorkflow, {
+        taskQueue,
+        workflowId: traceWorkflowId,
+        workflowExecutionTimeout: '30 seconds',
+      });
+      await wfClient.execute(statefulMcpIsolationWorkflow, {
+        taskQueue,
+        workflowId: mcpWorkflowId,
+        workflowExecutionTimeout: '30 seconds',
+      });
+    });
+
+    // A trace's own key is refused in Workflow code before the model call, and at any other Temporal call.
+    for (const entryPoint of [
+      'run',
+      'stream',
+      'runConfig',
+      'withTrace',
+      'withTraceOnly',
+      'traceContext',
+      'activity',
+    ] as const) {
+      const handle = await wfClient.start(tracingKeyRefusedWorkflow, {
+        taskQueue,
+        workflowId: `tracing-key-refused-${entryPoint}-${Date.now()}`,
+        args: [entryPoint],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      const result = await handle.result();
+      t.true(result.startsWith(`refused: ${refusal}`), `${entryPoint}: ${result}`);
+      const { events } = await handle.fetchHistory();
+      const scheduled = events?.filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED) ?? [];
+      t.is(scheduled.length, 0, `${entryPoint}: no Activity`);
+    }
+    // Uncaught, the refusal fails the Workflow Task, which is retried until the code changes.
+    const uncaught = await wfClient.start(tracingApiKeyWorkflow, {
+      taskQueue,
+      workflowId: `tracing-key-uncaught-${Date.now()}`,
       args: ['sk-run'],
       workflowExecutionTimeout: '30 seconds',
     });
-    // The client starts the Workflow inside a trace with its own key.
+    let taskFailure: string | null | undefined;
+    for (let i = 0; i < 50 && taskFailure == null; i++) {
+      const { events } = await uncaught.fetchHistory();
+      taskFailure = events?.find((e) => e.eventType === EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED)
+        ?.workflowTaskFailedEventAttributes?.failure?.message;
+      if (taskFailure == null) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    t.true(taskFailure?.startsWith(refusal), `an uncaught refusal fails the Workflow Task: ${taskFailure}`);
+    await uncaught.terminate();
+    // The client is refused when it calls a Workflow inside a trace with its own key.
+    const keyedOptions = {
+      taskQueue,
+      workflowId: `tracing-key-client-key-${Date.now()}`,
+      workflowExecutionTimeout: '30 seconds' as const,
+    };
+    const keyedHandle = wfClient.getHandle(keyedOptions.workflowId);
+    const clientCalls = {
+      start: () => wfClient.start(tracingApiKeyWorkflow, keyedOptions),
+      signal: () => keyedHandle.signal('unused'),
+      query: () => keyedHandle.query('unused'),
+      startUpdate: () => keyedHandle.startUpdate('unused', { waitForStage: WorkflowUpdateStage.ACCEPTED }),
+      signalWithStart: () => wfClient.signalWithStart(tracingApiKeyWorkflow, { ...keyedOptions, signal: 'unused' }),
+      startUpdateWithStart: () =>
+        wfClient.startUpdateWithStart('unused', {
+          waitForStage: WorkflowUpdateStage.ACCEPTED,
+          startWorkflowOperation: new WithStartWorkflowOperation(tracingApiKeyWorkflow, {
+            ...keyedOptions,
+            workflowIdConflictPolicy: 'FAIL',
+          }),
+        }),
+    };
     await withTrace(
-      'tracing-key-client-trace',
+      'tracing-key-keyed-client-trace',
       async () => {
-        clientTraceId = getCurrentTrace()!.traceId;
-        // The run's own key does not apply inside the client's trace.
-        await wfClient.execute(tracingApiKeyWorkflow, {
-          taskQueue,
-          workflowId: traceWorkflowId,
-          args: ['sk-run'],
-          workflowExecutionTimeout: '30 seconds',
-        });
-        await wfClient.execute(statefulMcpIsolationWorkflow, {
-          taskQueue,
-          workflowId: mcpWorkflowId,
-          workflowExecutionTimeout: '30 seconds',
-        });
+        for (const [name, call] of Object.entries(clientCalls)) {
+          await t.throwsAsync(call, { message: (message) => message.startsWith(refusal) }, name);
+        }
       },
       { tracingApiKey: 'sk-client' }
     );
@@ -1197,10 +1268,10 @@ test('tracingApiKey gives spans that cross a Temporal boundary the key the Worke
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
-  t.deepEqual(keysIn(runTraceId, 'model-call'), ['sk-resolved-run'], 'Activity span of a run with its own key');
-  t.deepEqual(keysIn(runTraceId, 'agent'), ['sk-run'], 'the run keeps its own key on its Workflow spans');
-  t.deepEqual(keysIn(clientTraceId, 'model-call'), ['sk-resolved-trace'], 'Activity span in a keyed client trace');
-  t.deepEqual(keysIn(clientTraceId, 'agent'), ['sk-resolved-trace'], 'Workflow span in a keyed client trace');
+  t.deepEqual(keysIn(runTraceId, 'model-call'), ['sk-resolved-run'], 'Activity span of a run');
+  t.deepEqual(keysIn(runTraceId, 'agent'), ['sk-resolved-run'], 'Workflow span of a run');
+  t.deepEqual(keysIn(clientTraceId, 'model-call'), ['sk-resolved-trace'], 'Activity span in a client trace');
+  t.deepEqual(keysIn(clientTraceId, 'agent'), ['sk-resolved-trace'], 'Workflow span in a client trace');
   t.deepEqual(keysIn(clientTraceId, 'mcp-connect'), ['sk-resolved-mcp'], 'stateful MCP span on the main Worker');
   t.deepEqual(keysIn(clientTraceId, 'mcp-list-tools'), ['sk-resolved-mcp'], 'listTools span on the dedicated Worker');
   t.deepEqual(keysIn(clientTraceId, 'mcp-call-tool'), ['sk-resolved-mcp'], 'callTool span on the dedicated Worker');
