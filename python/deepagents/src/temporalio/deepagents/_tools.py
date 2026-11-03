@@ -27,17 +27,23 @@ so any activity worker can construct the backend independently.
 
 from __future__ import annotations
 
+import functools
 import importlib
 import inspect
+import sys
 import threading
+import typing
 import uuid as _uuid
 import warnings
 import weakref
 from collections.abc import Mapping
+from dataclasses import is_dataclass
 from datetime import timedelta
-from functools import wraps
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable
+
+if sys.version_info >= (3, 14):
+    import annotationlib  # type: ignore[reportUnreachable]
 
 from temporalio import activity as activity_mod
 from temporalio import workflow
@@ -219,6 +225,141 @@ _OWNED_ACTIVITY_OPTIONS = frozenset(
 )
 
 
+def _call_function(method: Any) -> Callable | None:
+    """Return the function under a function, staticmethod, classmethod or partialmethod."""
+    while isinstance(method, (staticmethod, classmethod, functools.partialmethod)):
+        method = (
+            method.func
+            if isinstance(method, functools.partialmethod)
+            else method.__func__
+        )
+    return method if inspect.isfunction(method) else None
+
+
+def _docstring(fn: Any) -> str | None:
+    """Return ``fn``'s docstring, unless it is missing or blank."""
+    doc = getattr(fn, "__doc__", None) if fn is not None else None
+    return doc if doc and doc.strip() else None
+
+
+def _generated_class_doc(cls: type) -> str | None:
+    """Return the docstring dataclasses or namedtuple writes for a class that has none."""
+    if is_dataclass(cls):
+        try:
+            # Format it as dataclasses did when it made the class.
+            if sys.version_info >= (3, 14):
+                signature = inspect.signature(  # type: ignore[reportUnreachable]
+                    cls, annotation_format=annotationlib.Format.FORWARDREF
+                )
+                # 3.14 left a forward reference in the __init__ dataclasses
+                # generated unevaluated, and the field keeps the reference from
+                # that time.
+                annotate = getattr(cls.__init__, "__annotate__", None)
+                if getattr(annotate, "__generated_by_dataclasses__", False):
+                    field_types = {
+                        n: f.type for n, f in cls.__dataclass_fields__.items()
+                    }
+                    signature = signature.replace(
+                        parameters=[
+                            p.replace(annotation=field_types.get(p.name, p.annotation))
+                            for p in signature.parameters.values()
+                        ]
+                    )
+            else:
+                signature = inspect.signature(cls)  # type: ignore[reportUnreachable]
+            return cls.__name__ + str(signature).replace(" -> None", "")
+        except (TypeError, ValueError):
+            return cls.__name__
+    fields = getattr(cls, "_fields", None)
+    if issubclass(cls, tuple) and isinstance(fields, tuple):
+        names = ", ".join(fields) + ("," if len(fields) == 1 else "")
+        return f"{cls.__name__}({names})"
+    return None
+
+
+def _class_doc(cls: type) -> str | None:
+    """Return a class's own docstring, unless dataclasses or namedtuple wrote it."""
+    doc = _docstring(cls)
+    if doc is None or not doc.startswith(cls.__name__):
+        return doc
+    try:
+        generated = _generated_class_doc(cls)
+    except Exception:
+        # dataclasses would have failed the same way, so it didn't write this
+        # docstring.
+        return doc
+    return None if doc == generated else doc
+
+
+def _tool_signature(
+    activity: Callable,
+) -> tuple[inspect.Signature, dict[str, Any], str | None]:
+    """Return the parameters the model fills, their types, and the tool's docstring."""
+    if inspect.isclass(activity):
+        # Workflow code references a callable-class activity by its class, but the
+        # worker's registered instance runs __call__, so take __call__'s parameters
+        # as an instance binds it: without the receiver of a method, classmethod or
+        # partialmethod, and with every parameter of a staticmethod.
+        calls = [vars(c)["__call__"] for c in activity.__mro__ if "__call__" in vars(c)]
+        func = _call_function(calls[0]) if calls else None
+        if func is None:
+            raise ValueError(
+                f"activity_as_tool requires {activity.__name__} to have a __call__ "
+                "that is a function, staticmethod, classmethod or "
+                "functools.partialmethod."
+            )
+        try:
+            signature = inspect.signature(calls[0].__get__(object(), activity))
+            hints = typing.get_type_hints(func, include_extras=True)
+        except Exception as e:
+            raise ValueError(
+                f"activity_as_tool cannot read {activity.__name__}.__call__: {e}"
+            ) from e
+        # A functools.partialmethod that binds an argument by keyword makes the
+        # arguments after it keyword-only.
+        bound_by_keyword = isinstance(calls[0], functools.partialmethod) and bool(
+            calls[0].keywords
+        )
+        # __call__'s own docstring, else the class's, else that of a __call__ it inherits.
+        doc = (
+            _docstring(_call_function(vars(activity).get("__call__")))
+            or _class_doc(activity)
+            or next(filter(None, map(_docstring, map(_call_function, calls))), None)
+        )
+    else:
+        signature = inspect.signature(activity)
+        hints = typing.get_type_hints(activity, include_extras=True)
+        doc = activity.__doc__
+        bound_by_keyword = False
+        # A first parameter named `self` is the receiver of a method passed as
+        # Class.method, however it is annotated: the worker registers the bound
+        # method, so its instance supplies it.
+        params = list(signature.parameters.values())
+        if params and params[0].name == "self":
+            signature = signature.replace(parameters=params[1:])
+    # The tool passes the model's arguments to the activity by position, one per
+    # parameter, so it can't pass *args, keyword-only arguments or **kwargs. The
+    # model names every argument, positional-only ones included.
+    parameters = []
+    for p in signature.parameters.values():
+        if p.kind is inspect.Parameter.VAR_POSITIONAL:
+            raise ValueError(f"activity_as_tool cannot pass *{p.name}.")
+        if p.kind is inspect.Parameter.KEYWORD_ONLY:
+            message = f"activity_as_tool cannot pass keyword-only argument {p.name!r}."
+            if bound_by_keyword:
+                message += (
+                    " Its functools.partialmethod binds an argument by keyword,"
+                    " which makes the arguments after it keyword-only."
+                )
+            raise ValueError(message)
+        if p.kind is inspect.Parameter.VAR_KEYWORD:
+            raise ValueError(f"activity_as_tool cannot pass **{p.name}.")
+        if p.kind is inspect.Parameter.POSITIONAL_ONLY:
+            p = p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        parameters.append(p)
+    return signature.replace(parameters=parameters), hints, doc
+
+
 def activity_as_tool(
     activity: Callable,
     *,
@@ -236,7 +377,8 @@ def activity_as_tool(
     ``workflow.execute_activity`` — Temporal owns its retries and timeout.
 
     Args:
-        activity: A function decorated with ``@activity.defn``.
+        activity: A function decorated with ``@activity.defn``, a method passed
+            as ``Class.method``, or a callable-class activity passed as its class.
         start_to_close_timeout: Required per-call timeout for the activity.
         name: Override the tool name advertised to the model (defaults to
             the activity definition name).
@@ -253,6 +395,13 @@ def activity_as_tool(
             keys owned by this helper (``start_to_close_timeout``,
             ``retry_policy``, ``summary``, ``activity_id``, ``arg``,
             ``args``) are rejected.
+
+    Raises:
+        ValueError: If ``activity`` is not a named activity, is an instance of a
+            callable-class activity, is a class without a ``__call__`` the tool
+            can use, or takes arguments the tool can't pass: ``*args``,
+            keyword-only arguments or ``**kwargs``; or if
+            ``activity_options`` contains an option this helper owns.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import StructuredTool
@@ -269,7 +418,15 @@ def activity_as_tool(
             "activity_as_tool requires a named activity (dynamic activities "
             "have no definition name); pass name= explicitly."
         )
-    tool_desc = description or (activity.__doc__ or f"Temporal activity {tool_name}.")
+    if not inspect.isclass(activity) and hasattr(
+        type(activity), "__temporal_activity_definition"
+    ):
+        raise ValueError(
+            f"activity_as_tool requires the activity class {type(activity).__name__}, "
+            "not an instance of it."
+        )
+    signature, hints, doc = _tool_signature(activity)
+    tool_desc = description or (doc or f"Temporal activity {tool_name}.")
     act_summary = summary or f"tool:{tool_name}"
     owned = _OWNED_ACTIVITY_OPTIONS & set(activity_options or ())
     if owned:
@@ -288,35 +445,22 @@ def activity_as_tool(
     opts["retry_policy"] = retry_policy
     opts["summary"] = act_summary
 
-    # Temporal activities take positional arguments only. StructuredTool infers
-    # the model-facing schema from ``_run``'s signature, so we mirror the activity's
-    # own parameter names onto ``_run`` (via ``@wraps``) and then map the keyword
-    # call the model produces onto the activity's parameters, one argument each.
-    import inspect
-
-    params = [
-        p
-        for p in inspect.signature(activity).parameters.values()
-        if p.name not in ("self", "cls")
-    ]
-
-    @wraps(activity)
     async def _run(*args: Any, **kwargs: Any) -> Any:
-        values = list(args)
-        for param in params[len(args) :]:
-            if param.name in kwargs:
-                values.append(kwargs[param.name])
-            elif param.default is not inspect.Parameter.empty:
-                # Pass the default too: the worker decodes arguments with the
-                # activity's type hints only when every parameter has a value.
-                values.append(param.default)
-            else:
-                raise TypeError(f"{tool_name} missing argument {param.name!r}")
+        # The model's arguments go to the activity by position, in parameter order.
+        # Defaults are passed too: the worker decodes arguments with the
+        # activity's type hints only when every parameter has a value.
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
         return await workflow.execute_activity(
             activity,
-            args=values,
+            args=bound.args,
             **opts,
         )
+
+    # StructuredTool builds the model-facing schema from _run's signature and types.
+    setattr(_run, "__signature__", signature)
+    _run.__annotations__ = hints
+    _run.__doc__ = doc
 
     _ROUTED_TOOL_NAMES.add(tool_name)
     return StructuredTool.from_function(

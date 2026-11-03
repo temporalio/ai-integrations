@@ -227,7 +227,7 @@ class GoogleAdkPlugin(SimplePlugin):
                         "google.adk",
                         "google.genai",
                         "mcp",
-                        # ADK imports OpenTelemetry context lazily for graph workflows.
+                        # ADK 2.9+ imports OpenTelemetry context on every agent turn.
                         "opentelemetry",
                         # ADK probes these optional model SDKs lazily on each LLM turn.
                         "anthropic",
