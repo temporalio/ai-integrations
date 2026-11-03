@@ -10,7 +10,12 @@ import {
   withTrace,
 } from '@openai/agents-core';
 import type { MCPServer, Model, ModelProvider, Span, SpanData, TracingProcessor } from '@openai/agents-core';
-import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
+import {
+  WithStartWorkflowOperation,
+  WorkflowClient,
+  WorkflowFailedError,
+  WorkflowUpdateStage,
+} from '@temporalio/client';
 import type { ApplicationFailure } from '@temporalio/common';
 import { temporal } from '@temporalio/proto';
 import { helpers } from '@temporalio/test-helpers';
@@ -30,6 +35,8 @@ import {
   mcpFactoryArgWorkflow,
   mcpToolFilterResumeWorkflow,
   mcpToolFilterWorkflow,
+  mcpToolMetaWorkflow,
+  statefulMcpFactoryResolverWorkflow,
   summaryOverrideStringWorkflow,
   statefulMcpNotConnectedWorkflow,
   statefulMcpIsolationWorkflow,
@@ -39,6 +46,7 @@ import {
   streamingLocalActivityWorkflow,
   streamingNoTopicWorkflow,
   tracingApiKeyWorkflow,
+  tracingKeyRefusedWorkflow,
 } from './workflows/openai-agents';
 import { makeTestFunction } from './helpers/test-fn';
 import { type FakeModel, FakeModelProvider, textResponse, toolCallResponse } from './stubs/openai-agents';
@@ -192,8 +200,9 @@ test('factoryArgument is passed through to MCP activities', async (t) => {
           },
         ];
       },
-      async callTool(_toolName: string, _args: Record<string, unknown> | null) {
+      async callTool(...callArgs: unknown[]) {
         t.deepEqual(factoryArgument, { tenantId: 'tenant-42' }, 'factoryArgument should be passed to callTool');
+        t.is(callArgs.length, 2, 'callTool should get no meta argument when there is no toolMetaResolver');
         return [{ type: 'text', text: '2026-01-01' }];
       },
       async invalidateToolsCache() {},
@@ -334,6 +343,104 @@ test('a tool filter that throws while resuming from a RunState fails the run', a
       { instanceOf: WorkflowFailedError }
     );
     t.is((err?.cause as ApplicationFailure | undefined)?.type, 'AgentsWorkflowError');
+  });
+});
+
+function metaTestServer(name: string, metas: unknown[]): MCPServer {
+  return {
+    cacheToolsList: false,
+    name,
+    async connect() {},
+    async close() {},
+    async listTools() {
+      return [
+        {
+          name: 'echo_meta',
+          description: 'Records the request _meta',
+          inputSchema: {
+            type: 'object' as const,
+            properties: {},
+            required: [] as string[],
+            additionalProperties: false,
+          },
+        },
+      ];
+    },
+    async callTool(_toolName: string, _args: Record<string, unknown> | null, meta?: Record<string, unknown> | null) {
+      metas.push(meta);
+      return [{ type: 'text', text: 'ok' }];
+    },
+    async invalidateToolsCache() {},
+  };
+}
+
+test('MCP toolMetaResolver sends _meta on stateless and stateful servers', async (t) => {
+  const { createWorker, executeWorkflow } = helpers(t);
+
+  const metas: unknown[] = [];
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([
+          toolCallResponse('echo_meta', {}),
+          textResponse('stateless done'),
+          toolCallResponse('echo_meta', {}),
+          textResponse('stateful done'),
+        ]),
+        mcpServerProviders: [
+          new StatelessMCPServerProvider('metaStateless', () => metaTestServer('metaStateless', metas)),
+          new StatefulMCPServerProvider(
+            'metaStateful',
+            () => metaTestServer('metaStateful', metas),
+            t.context.env.nativeConnection
+          ),
+        ],
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    t.is(
+      await executeWorkflow(mcpToolMetaWorkflow, { args: [false], workflowExecutionTimeout: '30 seconds' }),
+      'stateless done'
+    );
+    t.is(
+      await executeWorkflow(mcpToolMetaWorkflow, { args: [true], workflowExecutionTimeout: '30 seconds' }),
+      'stateful done'
+    );
+  });
+
+  t.deepEqual(metas, [
+    { tenant: 'tenant-7', tool: 'echo_meta', server: 'metaStateless' },
+    { tenant: 'tenant-7', tool: 'echo_meta', server: 'metaStateful' },
+  ]);
+});
+
+test('Stateful MCP: a factory toolMetaResolver fails the operations', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([]),
+        mcpServerProviders: [
+          new StatefulMCPServerProvider(
+            'factoryResolver',
+            () => ({ ...metaTestServer('factoryResolver', []), toolMetaResolver: () => ({ tenant: 'tenant-7' }) }),
+            t.context.env.nativeConnection
+          ),
+        ],
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(statefulMcpFactoryResolverWorkflow, { workflowExecutionTimeout: '20 seconds' });
+    t.deepEqual(await handle.result(), [
+      'MCPToolMetaResolverUnsupported:true',
+      'MCPToolMetaResolverUnsupported:true',
+      'cleanup-success',
+    ]);
   });
 });
 
@@ -715,7 +822,7 @@ class SpanningModelProvider implements ModelProvider {
   }
 }
 
-test('tracingApiKey gives spans that cross a Temporal boundary the key the Worker resolves', async (t) => {
+test("tracingApiKey gives spans that cross a Temporal boundary the key the Worker resolves, and a trace's own key is refused", async (t) => {
   const { createWorker, taskQueue } = helpers(t);
 
   getGlobalTraceProvider().setDisabled(false);
@@ -793,31 +900,95 @@ test('tracingApiKey gives spans that cross a Temporal boundary the key the Worke
   });
 
   let clientTraceId = '';
+  const refusal = "The OpenAI Agents plugin cannot pass a trace's own tracing key";
   await worker.runUntil(async () => {
-    // The run sets its own key in Workflow code.
+    // The run starts its own trace.
     await wfClient.execute(tracingApiKeyWorkflow, {
       taskQueue,
       workflowId: runWorkflowId,
+      workflowExecutionTimeout: '30 seconds',
+    });
+    // The client starts the Workflows inside its trace.
+    await withTrace('tracing-key-client-trace', async () => {
+      clientTraceId = getCurrentTrace()!.traceId;
+      await wfClient.execute(tracingApiKeyWorkflow, {
+        taskQueue,
+        workflowId: traceWorkflowId,
+        workflowExecutionTimeout: '30 seconds',
+      });
+      await wfClient.execute(statefulMcpIsolationWorkflow, {
+        taskQueue,
+        workflowId: mcpWorkflowId,
+        workflowExecutionTimeout: '30 seconds',
+      });
+    });
+
+    // A trace's own key is refused in Workflow code before the model call, and at any other Temporal call.
+    for (const entryPoint of [
+      'run',
+      'stream',
+      'runConfig',
+      'withTrace',
+      'withTraceOnly',
+      'traceContext',
+      'activity',
+    ] as const) {
+      const handle = await wfClient.start(tracingKeyRefusedWorkflow, {
+        taskQueue,
+        workflowId: `tracing-key-refused-${entryPoint}-${Date.now()}`,
+        args: [entryPoint],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      const result = await handle.result();
+      t.true(result.startsWith(`refused: ${refusal}`), `${entryPoint}: ${result}`);
+      const { events } = await handle.fetchHistory();
+      const scheduled = events?.filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED) ?? [];
+      t.is(scheduled.length, 0, `${entryPoint}: no Activity`);
+    }
+    // Uncaught, the refusal fails the Workflow Task, which is retried until the code changes.
+    const uncaught = await wfClient.start(tracingApiKeyWorkflow, {
+      taskQueue,
+      workflowId: `tracing-key-uncaught-${Date.now()}`,
       args: ['sk-run'],
       workflowExecutionTimeout: '30 seconds',
     });
-    // The client starts the Workflow inside a trace with its own key.
+    let taskFailure: string | null | undefined;
+    for (let i = 0; i < 50 && taskFailure == null; i++) {
+      const { events } = await uncaught.fetchHistory();
+      taskFailure = events?.find((e) => e.eventType === EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED)
+        ?.workflowTaskFailedEventAttributes?.failure?.message;
+      if (taskFailure == null) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    t.true(taskFailure?.startsWith(refusal), `an uncaught refusal fails the Workflow Task: ${taskFailure}`);
+    await uncaught.terminate();
+    // The client is refused when it calls a Workflow inside a trace with its own key.
+    const keyedOptions = {
+      taskQueue,
+      workflowId: `tracing-key-client-key-${Date.now()}`,
+      workflowExecutionTimeout: '30 seconds' as const,
+    };
+    const keyedHandle = wfClient.getHandle(keyedOptions.workflowId);
+    const clientCalls = {
+      start: () => wfClient.start(tracingApiKeyWorkflow, keyedOptions),
+      signal: () => keyedHandle.signal('unused'),
+      query: () => keyedHandle.query('unused'),
+      startUpdate: () => keyedHandle.startUpdate('unused', { waitForStage: WorkflowUpdateStage.ACCEPTED }),
+      signalWithStart: () => wfClient.signalWithStart(tracingApiKeyWorkflow, { ...keyedOptions, signal: 'unused' }),
+      startUpdateWithStart: () =>
+        wfClient.startUpdateWithStart('unused', {
+          waitForStage: WorkflowUpdateStage.ACCEPTED,
+          startWorkflowOperation: new WithStartWorkflowOperation(tracingApiKeyWorkflow, {
+            ...keyedOptions,
+            workflowIdConflictPolicy: 'FAIL',
+          }),
+        }),
+    };
     await withTrace(
-      'tracing-key-client-trace',
+      'tracing-key-keyed-client-trace',
       async () => {
-        clientTraceId = getCurrentTrace()!.traceId;
-        // The run's own key does not apply inside the client's trace.
-        await wfClient.execute(tracingApiKeyWorkflow, {
-          taskQueue,
-          workflowId: traceWorkflowId,
-          args: ['sk-run'],
-          workflowExecutionTimeout: '30 seconds',
-        });
-        await wfClient.execute(statefulMcpIsolationWorkflow, {
-          taskQueue,
-          workflowId: mcpWorkflowId,
-          workflowExecutionTimeout: '30 seconds',
-        });
+        for (const [name, call] of Object.entries(clientCalls)) {
+          await t.throwsAsync(call, { message: (message) => message.startsWith(refusal) }, name);
+        }
       },
       { tracingApiKey: 'sk-client' }
     );
@@ -832,10 +1003,10 @@ test('tracingApiKey gives spans that cross a Temporal boundary the key the Worke
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
 
-  t.deepEqual(keysIn(runTraceId, 'model-call'), ['sk-resolved-run'], 'Activity span of a run with its own key');
-  t.deepEqual(keysIn(runTraceId, 'agent'), ['sk-run'], 'the run keeps its own key on its Workflow spans');
-  t.deepEqual(keysIn(clientTraceId, 'model-call'), ['sk-resolved-trace'], 'Activity span in a keyed client trace');
-  t.deepEqual(keysIn(clientTraceId, 'agent'), ['sk-resolved-trace'], 'Workflow span in a keyed client trace');
+  t.deepEqual(keysIn(runTraceId, 'model-call'), ['sk-resolved-run'], 'Activity span of a run');
+  t.deepEqual(keysIn(runTraceId, 'agent'), ['sk-resolved-run'], 'Workflow span of a run');
+  t.deepEqual(keysIn(clientTraceId, 'model-call'), ['sk-resolved-trace'], 'Activity span in a client trace');
+  t.deepEqual(keysIn(clientTraceId, 'agent'), ['sk-resolved-trace'], 'Workflow span in a client trace');
   t.deepEqual(keysIn(clientTraceId, 'mcp-connect'), ['sk-resolved-mcp'], 'stateful MCP span on the main Worker');
   t.deepEqual(keysIn(clientTraceId, 'mcp-list-tools'), ['sk-resolved-mcp'], 'listTools span on the dedicated Worker');
   t.deepEqual(keysIn(clientTraceId, 'mcp-call-tool'), ['sk-resolved-mcp'], 'callTool span on the dedicated Worker');

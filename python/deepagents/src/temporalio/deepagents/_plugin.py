@@ -17,14 +17,24 @@ inside a ``@workflow.defn`` with no other changes:
 * pushes the model / tool dispatch defaults down to the seams that read them.
 
 The plugin auto-propagates from a ``Client`` to any ``Worker`` built from it, so
-add it on exactly one side. ``configure_worker`` additionally de-duplicates
-activities by name, so a user who mistakenly adds it on both sides gets a clean
-no-op instead of a "More than one activity named ..." crash.
+add it on exactly one side. One instance on the Client and one on the Worker
+are accepted only when they are the same object or were built from the same
+``model_provider``, ``backends`` factories and ``streaming_batch_interval``; any
+other second instance raises ``ValueError``. In the accepted case, the Worker
+instance does not add an activity whose name (or, for a dynamic activity, the
+dynamic slot) is already registered, and still registered after its own step,
+by the same callable, a wrapper of it (``__wrapped__``), or, for a second
+instance, the Client instance's copy of the same built-in activity. The Worker
+keeps what the Client side registered, instead of failing with "More than one
+activity named ...". Any other repeated activity name, such as a caller
+activity with a plugin activity's name, and any second dynamic activity, is
+left to the Worker, which refuses it.
 """
 
 from __future__ import annotations
 
 import importlib.metadata
+import inspect
 import sys
 import warnings
 from collections.abc import AsyncGenerator, Mapping, Sequence
@@ -127,6 +137,12 @@ class DeepAgentsPlugin(SimplePlugin):
         # (_resolve_tool_options), renamed to ``options`` at the callsite.
         _tools.set_tool_defaults(self._tool_activity_options)
 
+        # What the activities are built from; a second instance on the Worker
+        # must match it (see _differences).
+        self._model_provider = model_provider
+        self._backends = dict(backends or {})
+        self._streaming_batch_interval = streaming_batch_interval
+
         # The activities that carry the nondeterministic work. model_provider and
         # the batch interval are captured here so API keys never enter an input.
         self._activities = DeepAgentActivities(
@@ -134,16 +150,17 @@ class DeepAgentsPlugin(SimplePlugin):
             backends=backends,
             streaming_batch_interval=streaming_batch_interval,
         )
-        activities = [
+        # Kept apart from the public ``activities`` setting, which callers may change.
+        self._builtin_activities = (
             self._activities.invoke_model,
             self._activities.invoke_model_streaming,
             self._activities.invoke_tool,
             self._activities.backend_op,
-        ]
+        )
 
         super().__init__(
             "langchain.DeepAgentsPlugin",
-            activities=activities,
+            activities=list(self._builtin_activities),
             data_converter=self._configure_data_converter,
             workflow_runner=self._make_workflow_runner(),
             workflow_failure_exception_types=_workflow_failure_exception_types,
@@ -246,12 +263,160 @@ class DeepAgentsPlugin(SimplePlugin):
     # -- worker config -------------------------------------------------------
 
     def configure_worker(self, config: Any) -> Any:
-        """Deduplicate activity registrations after the base configuration."""
+        """Refuse a second instance; skip activities the Client's one registered."""
+        client_instance = self._client_instance(config)
+        before = list(config.get("activities") or [])
+        if config.get("activities") is not None:
+            # A new list: the caller may pass a one-shot iterable, and a callable
+            # ``activities`` setting may append to the list it gets.
+            config["activities"] = list(before)
         config = super().configure_worker(config)
-        activities = config.get("activities")
-        if activities:
-            config["activities"] = _dedupe_activities(activities)
+        if client_instance is not None:
+            # A list: an ``activities`` callable may return a one-shot iterable.
+            config["activities"] = self._without_repeats(
+                before, list(config.get("activities") or []), client_instance
+            )
         return config
+
+    def _client_instance(self, config: Any) -> DeepAgentsPlugin | None:
+        """The Client's instance, if this call is the Worker instance's.
+
+        One instance on each side is accepted only when both are the same
+        object, which the Worker then calls twice, or were built from the same
+        sources. Any other second instance raises ``ValueError``.
+        """
+        client = config.get("client")
+        client_plugins = client.config().get("plugins", []) if client else []
+        on_client = [p for p in client_plugins if isinstance(p, DeepAgentsPlugin)]
+        on_worker = [
+            p for p in config.get("plugins") or [] if isinstance(p, DeepAgentsPlugin)
+        ]
+        differences = (
+            on_client[0]._differences(on_worker[0]) if on_client and on_worker else []
+        )
+        if len(on_client) > 1 or len(on_worker) > 1:
+            reason = ""
+        elif differences:
+            reason = f" with a different {' and '.join(differences)}"
+        elif on_client and on_worker and on_worker[0] is self:
+            return on_client[0]
+        else:
+            return None
+        raise ValueError(
+            f"DeepAgentsPlugin is registered {len(on_client) + len(on_worker)} "
+            f"times for this Worker ({len(on_client)} on the Client, "
+            f"{len(on_worker)} on the Worker){reason}. Use one DeepAgentsPlugin "
+            "instance for this Worker: one model_provider receives every model "
+            "name, so it can serve several models, and backends= takes every "
+            "factory. To run another instance, build its Worker from a Client "
+            "without DeepAgentsPlugin, on its own task queue; in one process, "
+            "model_activity_options, tool_activity_options and streaming_topic "
+            "still come from the instance built last."
+        )
+
+    def _differences(self, other: DeepAgentsPlugin) -> list[str]:
+        """The inputs of ``other``'s activities that differ from this instance's.
+
+        ``model_provider`` and each backend factory must be the same object;
+        ``streaming_batch_interval`` must be equal.
+        """
+        same_backends = self._backends.keys() == other._backends.keys() and all(
+            _same_callable(factory, other._backends[name])
+            for name, factory in self._backends.items()
+        )
+        same = {
+            "model_provider": _same_callable(
+                self._model_provider, other._model_provider
+            ),
+            "backends": same_backends,
+            "streaming_batch_interval": (
+                self._streaming_batch_interval == other._streaming_batch_interval
+            ),
+        }
+        return [name for name, is_same in same.items() if not is_same]
+
+    def _without_repeats(
+        self,
+        before: Sequence[Any],
+        after: Sequence[Any],
+        client_instance: DeepAgentsPlugin,
+    ) -> list[Any]:
+        """Drop the activities this call added that repeat a kept registration.
+
+        An activity registered before this call that is still in ``after``
+        keeps its activity name, or the dynamic slot if it is dynamic. An added
+        activity with that name or slot repeats it when the kept callable is it
+        or wraps it, or, for one of this instance's built-in activities, is or
+        wraps the Client instance's copy of it. Dropping such a repeat never
+        changes which code runs under the name; any other repeat reaches the
+        Worker's duplicate-name or duplicate-dynamic check.
+        """
+        remaining = list(before)
+        added: list[bool] = []
+        kept_keys: dict[tuple[str | None], list[Any]] = {}
+        for act in after:
+            index = _index_of(act, remaining)
+            added.append(index is None)
+            if index is not None:
+                del remaining[index]
+                key = _activity_key(act)
+                if key is not None:
+                    kept_keys.setdefault(key, []).extend(_wrapped_chain(act))
+        counterparts = list(
+            zip(self._builtin_activities, client_instance._builtin_activities)
+        )
+        kept: list[Any] = []
+        for act, is_added in zip(after, added):
+            key = _activity_key(act) if is_added else None
+            chain = kept_keys.get(key, []) if key is not None else []
+            if _index_of(act, chain) is not None or any(
+                _same_callable(act, own) and _index_of(client_copy, chain) is not None
+                for own, client_copy in counterparts
+            ):
+                continue
+            kept.append(act)
+        return kept
+
+
+def _same_callable(a: Any, b: Any) -> bool:
+    """Whether ``a`` and ``b`` are one callable, without calling ``__eq__``.
+
+    Two bound methods of one function on one object count as one callable;
+    any other pair must be the same object. Callables that only compare equal
+    are different registrations.
+    """
+    if a is b:
+        return True
+    return (
+        inspect.ismethod(a)
+        and inspect.ismethod(b)
+        and a.__self__ is b.__self__
+        and a.__func__ is b.__func__
+    )
+
+
+def _index_of(act: Any, acts: Sequence[Any]) -> int | None:
+    """The index of the first entry of ``acts`` that is ``act``, or ``None``."""
+    return next((i for i, other in enumerate(acts) if _same_callable(act, other)), None)
+
+
+def _wrapped_chain(act: Any) -> list[Any]:
+    """``act`` and the callables it wraps, following ``__wrapped__``."""
+    chain: list[Any] = []
+    while act is not None and len(chain) < 100:
+        chain.append(act)
+        act = getattr(act, "__wrapped__", None)
+    return chain
+
+
+def _activity_key(act: Any) -> tuple[str | None] | None:
+    """``(name,)`` for the activity ``act`` registers, or ``None`` if it has none.
+
+    A dynamic activity has no name, so its key is ``(None,)``: the one dynamic
+    slot a Worker has.
+    """
+    defn = activity_mod._Definition.from_callable(act)
+    return (defn.name,) if defn is not None else None
 
 
 def _workflow_failure_exception_types(
@@ -320,23 +485,3 @@ def _install_langsmith_temporal_override() -> None:
         langsmith.set_runtime_overrides(aio_to_thread=_temporal_aio_to_thread)
     except Exception:
         pass
-
-
-def _dedupe_activities(activities: Sequence[Any]) -> list[Any]:
-    """Drop duplicate activity registrations by defn name, keeping the first.
-
-    Guards the "plugin added on both Client and Worker" trap, where the plugin's
-    activities would otherwise be appended twice and the worker would reject the
-    duplicate names.
-    """
-    seen: set[str] = set()
-    out: list[Any] = []
-    for act in activities:
-        defn = activity_mod._Definition.from_callable(act)
-        name = defn.name if defn is not None else getattr(act, "__name__", repr(act))
-        key = name or repr(act)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(act)
-    return out

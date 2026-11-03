@@ -3081,7 +3081,8 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
 
 
 @pytest.mark.parametrize(
-    "setting", ["require_approval", "instance_evaluator", "tool_filter"]
+    "setting",
+    ["require_approval", "instance_evaluator", "tool_filter", "tool_meta_resolver"],
 )
 @pytest.mark.parametrize("stateful", [True, False])
 async def test_mcp_server_factory_settings_are_rejected(
@@ -3095,6 +3096,9 @@ async def test_mcp_server_factory_settings_are_rejected(
         tracking_server._get_needs_approval_for_tool = (  # type: ignore[method-assign]
             lambda tool, agent: True  # type: ignore[reportUnknownLambdaType]
         )
+    elif setting == "tool_meta_resolver":
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server.tool_meta_resolver = lambda context: {"tenant": "t-1"}  # type: ignore[attr-defined]
     else:
         tracking_server = get_tracking_server("HelloServer")
         tracking_server.tool_filter = lambda context, tool: True  # type: ignore[attr-defined]
@@ -3139,7 +3143,11 @@ async def test_mcp_server_factory_settings_are_rejected(
     assert isinstance(err.value.cause.cause, ApplicationError)
     assert err.value.cause.cause.non_retryable
     message = err.value.cause.cause.message
-    if setting != "tool_filter":
+    if setting == "tool_meta_resolver":
+        route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+        assert "'HelloServer' sets tool_meta_resolver" in message
+        assert f"on the server {route}() gives the workflow" in message
+    elif setting != "tool_filter":
         route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
         assert "'HelloServer' sets require_approval" in message
         assert f"{route}(require_approval=...)" in message

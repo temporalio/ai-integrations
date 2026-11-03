@@ -447,8 +447,8 @@ worker-side OpenAI `MCPServer`. Configure workflow-facing behavior such as
 openai-agents 0.22.3, tool input and output guardrails on
 `temporal_mcp_server(...)`, where the OpenAI agent can use it. On the
 worker-side server, a static `tool_filter` still filters the listed tools, a
-callable `tool_filter` and a `require_approval` policy are rejected as described
-below, and the other settings are ignored. Custom `MCPServer` method
+callable `tool_filter`, a `require_approval` policy and a `tool_meta_resolver`
+are rejected as described below, and the other settings are ignored. Custom `MCPServer` method
 implementations still execute worker-side.
 
 A callable `tool_filter` on the worker-side server is rejected, because the run
@@ -463,13 +463,22 @@ Agents SDK normalizes to no approval is allowed there: `"never"`, `False`, or a
 mapping or tool list with only `"never"` entries. A callable policy is always
 rejected, because it cannot be evaluated on the worker.
 
+A `tool_meta_resolver` on the worker-side server is rejected too, because the
+run context it receives exists only in the workflow. Pass it to
+`temporal_mcp_server(tool_meta_resolver=...)` instead, where it runs in the
+workflow and must be deterministic. Its result is recorded in workflow history,
+so it must not hold secrets.
+
 These checks run in every MCP Activity. A run that already holds its cached tool
 list, the default, first meets them when it calls a tool: the agent gets the
 error as the tool's output, and the run can complete without the tool. Let open
 runs finish before you upgrade or add such a setting to the factory's server.
+A resolver there never had an effect, so removing it from the factory's server
+in the same deploy is enough.
 Moving the policy into `temporal_mcp_server(require_approval=...)` is also a
 workflow change: an open run that already called one of that server's tools
-fails replay with a nondeterminism error.
+fails replay with a nondeterminism error. Moving a resolver there is a workflow
+change too, so guard it with `workflow.patched()` or let open runs finish first.
 
 Every MCP operation is a Temporal Activity. The workflow-side tool list is
 cached by default; pass `cache_tools_list=False` to refresh it on every Agents
@@ -540,10 +549,17 @@ The legacy stateful path retains its dedicated per-workflow worker and
 persistent-session behavior. To require tool approval on these servers, pass
 `require_approval` to `stateless_mcp_server()` or `stateful_mcp_server()`;
 as with `temporal_mcp_server()`, a policy on the factory's server is rejected
-unless it never asks for approval. So is a callable `tool_filter` there, in
-every MCP operation, direct `call_tool()` and prompt calls included; a static
-filter still works. Remove such a filter from the factory in the same deploy,
-or let open runs finish first.
+unless it never asks for approval. So are a callable `tool_filter` and a
+`tool_meta_resolver` there, in every MCP operation, direct `call_tool()` and
+prompt calls included; a static filter still works. On these routes, set a
+resolver on the server that `stateless_mcp_server()` or `stateful_mcp_server()`
+gives the workflow (`server.tool_meta_resolver = ...`); it then gets
+`<name>-stateless` or `<name>-stateful` as `server_name`. As with
+`temporal_mcp_server()`, it runs in the workflow and must be deterministic, its
+result is recorded in workflow history, and adding it to a workflow with open
+runs needs `workflow.patched()` or those runs to finish first. Remove such a
+filter or resolver from the factory in the same deploy, or let open runs finish
+first.
 
 ### Hosted MCP Tool
 
@@ -959,12 +975,16 @@ A trace's own tracing key, set with `RunConfig(tracing={"api_key": ...})` or
 `trace(..., tracing={"api_key": ...})`, is not supported. The plugin passes traces to Workflows and
 Activities in headers, which are stored in Event History, so it cannot pass the key, and their spans
 would be exported with another key. In Workflow code, `Runner.run`, `Runner.run_streamed` and
-`trace()` raise `ValueError` when given such a key. Starting a Workflow, or scheduling an Activity or
-child Workflow, under such a trace raises it too. Agent runs inside Activities can still use their
-own key. Set the tracing key on every client and Worker process instead, with
-`set_tracing_export_api_key` or `OPENAI_API_KEY`. A run that used such a key in Workflow code
-before you deploy this version gets the error when it replays: let those runs finish first, or use
-Worker Versioning.
+`trace()` raise `ValueError` when given such a key. Starting, signaling, querying or updating a
+Workflow, or scheduling an Activity or child Workflow, under such a trace raises it too. Set the
+tracing key on every client and Worker process instead, with `set_tracing_export_api_key` or
+`OPENAI_API_KEY`. An Activity called under a trace runs in the trace the plugin restored there: an
+agent run joins it and ignores the key in its `RunConfig`, so its spans use the Worker's default
+key. When the caller had no trace, the run starts its own trace and keeps that key. A trace that the
+Activity starts itself, with `trace(..., tracing={"api_key": ...})`, keeps its key in both cases; it
+is separate from the Workflow's trace, and Temporal calls under it raise. A run that used such a key
+in Workflow code before you deploy this version gets the error when it replays: let those runs
+finish first, or use Worker Versioning.
 
 ## OpenTelemetry Integration
 
