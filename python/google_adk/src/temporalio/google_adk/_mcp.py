@@ -655,14 +655,16 @@ class _SessionHeartbeats:
             # This attempt opened no session, so a retry may build the toolset.
             # Send that last, after every earlier heartbeat: one still being
             # encoded would otherwise replace it. If the wait times out or is
-            # interrupted, clear anyway: the worker reports the attempt only
-            # after its last heartbeat task, and the clear has no details to
-            # encode. A slower heartbeat that lands later only makes the retry
-            # refuse.
+            # interrupted, cancel the heartbeats still being encoded and clear
+            # anyway: the worker reports the attempt only after its last
+            # heartbeat task, and the clear has no details to encode.
             try:
                 if self._sending:
                     await asyncio.wait(set(self._sending), timeout=_CLOSE_TIMEOUT)
             finally:
+                # Only "may be open" heartbeats can still be pending here.
+                for task in list(self._sending):
+                    task.cancel()
                 self._may_be_open = False
                 self.beat()
 
@@ -736,11 +738,15 @@ class _RunningToolset:
             # Every toolset block of a run uses the same task queue, which the
             # workflow and a running session of any version agree on. An
             # operation the server scheduled before this session belongs to an
-            # earlier block, which has ended, and must not run against this
-            # toolset. A retry keeps its first scheduled time.
+            # earlier block, or to a same-name block open at the same time, and
+            # must not run against this toolset. A retry keeps its first
+            # scheduled time.
             raise ApplicationError(
-                "This operation belongs to an earlier stateful MCP session of "
-                "this workflow run, which has ended.",
+                "This operation was scheduled before the stateful MCP session "
+                "activity that now serves this toolset name in this workflow "
+                "run, so it belongs to an earlier block with the same name, or "
+                "to one open at the same time. Use a distinct name for each "
+                "stateful toolset open at the same time.",
                 type="DedicatedWorkerFailure",
                 non_retryable=True,
             )
@@ -1067,8 +1073,15 @@ class TemporalStatefulMcpToolSet(BaseToolset):
         If the session activity ended on its own, raises
         ``ApplicationError(type="DedicatedWorkerFailure")`` with the session's
         ``ActivityError`` as its cause, as tool calls and ``get_tools`` inside
-        the block do.
+        the block do. If the session ended in the workflow task that runs this
+        cleanup, the SDK drops its result when it is cancelled, so the error
+        has no cause; and if a cancellation, such as a workflow cancel or an
+        ``asyncio.timeout``, is then leaving the ``async with`` block, the
+        cancellation leaves it instead.
         """
+        await self._cleanup(cancelling=False)
+
+    async def _cleanup(self, *, cancelling: bool) -> None:
         if self._connect_handle:
             session = self._connect_handle
             # Decide before cancelling whether the session's task ever ran: a
@@ -1091,7 +1104,9 @@ class TemporalStatefulMcpToolSet(BaseToolset):
                 ):
                     # A cancellation of this coroutine itself.
                     raise
-                if not started:
+                if not started or cancelling:
+                    # Never ran, or a cancellation already leaving the block
+                    # wins over the result the SDK dropped.
                     return
                 # The session ended in this workflow task, and the SDK dropped
                 # its failure when it was cancelled.
@@ -1125,7 +1140,9 @@ class TemporalStatefulMcpToolSet(BaseToolset):
         traceback: TracebackType | None,
     ) -> None:
         """Cleans up the toolset when exiting the context manager."""
-        await self.cleanup()
+        await self._cleanup(
+            cancelling=exc_value is not None and is_cancelled_exception(exc_value)
+        )
 
     @_handle_worker_failure
     async def get_tools(

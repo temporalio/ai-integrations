@@ -16,12 +16,12 @@
 ``temporalio.google_adk._mcp``.
 
 These drive the real ``connect`` -> dedicated-worker -> ``get_tools`` path
-through a Temporal workflow, mostly against an in-memory fake ``McpToolset``
-(no subprocess, no real MCP server) so they run in CI. They prove the properties
-the reviewer asked for: one toolset is built per workflow run, ``factory_argument``
-is consumed exactly once per run, distinct runs never share a toolset, and the
-toolset is torn down when the workflow completes. The worker replacement and
-host loss tests run a real MCP server over stdio.
+through a Temporal workflow. The first tests use an in-memory fake ``McpToolset``
+(no subprocess, no real MCP server). They prove the properties the reviewer
+asked for: one toolset is built per workflow run, ``factory_argument`` is
+consumed exactly once per run, distinct runs never share a toolset, and the
+toolset is torn down when the workflow completes. Most other tests run a real
+MCP server over stdio.
 """
 
 import asyncio
@@ -63,7 +63,7 @@ from temporalio.converter import (
     DefaultFailureConverterWithEncodedAttributes,
     PayloadCodec,
 )
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, CancelledError
 from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Replayer, Worker
 from temporalio.workflow import ActivityCancellationType, ActivityConfig
@@ -421,6 +421,7 @@ class _DelayMayBeOpenCodec(PayloadCodec):
         "heartbeat_details_replaced",
         "first_connection_fails",
         "first_connection_fails_delayed_heartbeats",
+        "first_connection_fails_close_wait_ends_delayed_heartbeats",
         "heartbeat_timeout_session_opened",
         "heartbeat_timeout_first_connection_fails",
     ],
@@ -433,6 +434,10 @@ async def test_stateful_session_after_worker_replaced(
     delayed_heartbeats = case.endswith("delayed_heartbeats")
     if heartbeat_timeout or delayed_heartbeats:
         monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 1.0)
+    if "close_wait_ends" in case:
+        # The attempt stops waiting for a heartbeat still being encoded before
+        # it finishes, and the failure is encoded after it would.
+        monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 0.5)
     codec = _DelayMayBeOpenCodec()
     if delayed_heartbeats:
         # Each heartbeat takes longer to encode than the interval, so one is
@@ -725,13 +730,19 @@ class _OnceDescribeOutbound(OutboundInterceptor):
 
 
 class _StallMayBeOpenEncodeCodec(PayloadCodec):
-    """Never finishes encoding the worker's "may be open" heartbeats."""
+    """Never finishes encoding "may be open" heartbeats after the first ``passed``."""
+
+    def __init__(self, passed: int = 0) -> None:
+        self.passed = passed
 
     async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
         if _encoding_in("_heartbeat_async") and any(
             _mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads
         ):
-            await asyncio.Event().wait()
+            if self.passed:
+                self.passed -= 1
+            else:
+                await asyncio.Event().wait()
         return list(payloads)
 
     async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
@@ -783,8 +794,9 @@ async def test_stateful_session_without_describe_permission(
     provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
     config = client.config()
     if case.endswith("code_stalls"):
-        # A heartbeat that never finishes encoding is still the attempt's
-        # last heartbeat task when it ends; the attempt must still complete.
+        # A heartbeat that never finishes encoding would be the attempt's last
+        # heartbeat task without the clear that close() sends after it; the
+        # attempt must still complete.
         codec = (
             _StallReadBackCodec()
             if case == "decode_stalls"
@@ -1045,7 +1057,7 @@ class StatefulMcpTimerAtExitWorkflow:
         self._listed = False
 
     @workflow.run
-    async def run(self, host_task_queue: str) -> str:
+    async def run(self, host_task_queue: str, case: str) -> str:
         async with TemporalStatefulMcpToolSet(
             "stateful_server",
             config=ActivityConfig(
@@ -1060,7 +1072,10 @@ class StatefulMcpTimerAtExitWorkflow:
         ) as toolset:
             await toolset.get_tools()
             self._listed = True
-            await workflow.sleep(2)
+            if case == "timer_first":
+                await workflow.sleep(2)
+            else:
+                await workflow.wait_condition(lambda: False)
         return "block exited normally"
 
     @workflow.update
@@ -1069,10 +1084,15 @@ class StatefulMcpTimerAtExitWorkflow:
 
 
 @pytest.mark.timeout(90)
-async def test_stateful_session_ends_with_the_blocks_last_timer(client: Client):
-    # The block's last timer fires and its session ends in the same workflow
-    # task, timer first. The SDK then drops the session's failure when the
-    # block cancels it, and the block must still raise DedicatedWorkerFailure.
+@pytest.mark.parametrize("case", ["timer_first", "cancel_first", "cancel_healthy"])
+async def test_stateful_session_ends_with_the_blocks_last_task(
+    client: Client, case: str
+):
+    # The session ends in the block's last workflow task, after the block's
+    # last timer fires or after a workflow cancel. The SDK then drops the
+    # session's failure when the block cancels it. After the timer, the block
+    # must still raise DedicatedWorkerFailure; a workflow cancel already
+    # leaving the block must stay a cancel.
     provider = TemporalStatefulMcpToolSetProvider(
         "stateful_server", lambda _: _stdio_toolset(_MCP_SERVER)
     )
@@ -1088,15 +1108,30 @@ async def test_stateful_session_ends_with_the_blocks_last_timer(client: Client):
         ):
             handle = await client.start_workflow(
                 StatefulMcpTimerAtExitWorkflow.run,
-                host_task_queue,
+                args=[host_task_queue, case],
                 id=f"stateful-mcp-timer-exit-{uuid.uuid4()}",
                 task_queue=task_queue,
                 execution_timeout=timedelta(seconds=60),
             )
             await handle.execute_update(StatefulMcpTimerAtExitWorkflow.wait_listed)
-        # No workflow worker: the timer fires while nothing processes it.
+            if case == "cancel_healthy":
+                # Control: the session is still running when the cancel leaves.
+                await handle.cancel()
+                with pytest.raises(WorkflowFailureError) as err:
+                    await handle.result()
+                assert isinstance(err.value.cause, CancelledError)
+                return
+        # No workflow worker: the timer fires, or the cancel is requested,
+        # while nothing processes it.
+        if case == "cancel_first":
+            await handle.cancel()
+        event = (
+            EventType.EVENT_TYPE_TIMER_FIRED
+            if case == "timer_first"
+            else EventType.EVENT_TYPE_WORKFLOW_EXECUTION_CANCEL_REQUESTED
+        )
         async with asyncio.timeout(20):
-            while not await _has_event(handle, EventType.EVENT_TYPE_TIMER_FIRED):
+            while not await _has_event(handle, event):
                 await asyncio.sleep(0.1)
     # The session's host shut down gracefully, and its one attempt failed.
     async with asyncio.timeout(20):
@@ -1111,47 +1146,73 @@ async def test_stateful_session_ends_with_the_blocks_last_timer(client: Client):
         async with asyncio.timeout(20):
             with pytest.raises(WorkflowFailureError) as err:
                 await handle.result()
+    if case == "cancel_first":
+        assert isinstance(err.value.cause, CancelledError)
+        return
     assert isinstance(err.value.cause, ApplicationError)
     assert err.value.cause.type == "DedicatedWorkerFailure"
+    # The SDK dropped the session's result, so the error has no cause.
+    assert err.value.cause.cause is None
 
 
 @pytest.mark.timeout(90)
 async def test_stateful_session_worker_shutdown_while_closing(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ):
-    # Every "may be open" heartbeat hangs in encoding, so the read-back fails at
-    # its deadline and the attempt then waits in close() for those heartbeats.
-    # A worker shutdown during that wait must still let the attempt end.
+    # The first "may be open" heartbeat reaches the server, the later ones hang
+    # in encoding, and the read-back hangs, so the attempt fails at its deadline
+    # and then waits in close() for those heartbeats. A worker shutdown during
+    # that wait must still let the attempt end, with the clear as its last
+    # heartbeat details.
     monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
     monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 60.0)
+    monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 0.5)
+    closing = asyncio.Event()
+    close = _mcp._SessionHeartbeats.close
+
+    async def close_and_flag(self: _mcp._SessionHeartbeats) -> None:
+        # close() does not await before its wait, so once this is set, the
+        # attempt waits there.
+        closing.set()
+        await close(self)
+
+    monkeypatch.setattr(_mcp._SessionHeartbeats, "close", close_and_flag)
     provider = TemporalStatefulMcpToolSetProvider(
         "stateful_server", lambda _: _stdio_toolset(_MCP_SERVER)
     )
     config = client.config()
     config["data_converter"] = dataclasses.replace(
-        client.data_converter, payload_codec=_StallMayBeOpenEncodeCodec()
+        client.data_converter, payload_codec=_StallMayBeOpenEncodeCodec(passed=1)
     )
+    config["interceptors"] = [*config["interceptors"], _StallDescribe()]
     worker_client = _make_client(Client(**config), provider)
     task_queue = f"adk-stateful-mcp-shutdown-closing-{uuid.uuid4()}"
-    worker = Worker(
+    async with Worker(
         worker_client,
         task_queue=task_queue,
         workflows=[StatefulMcpWorkerReplacedWorkflow],
         max_cached_workflows=0,
-    )
-    worker_task = asyncio.create_task(worker.run())
-    handle = await client.start_workflow(
-        StatefulMcpWorkerReplacedWorkflow.run,
-        _ReplacedInput(),
-        id=f"stateful-mcp-shutdown-closing-{uuid.uuid4()}",
-        task_queue=task_queue,
-        execution_timeout=timedelta(seconds=60),
-    )
-    # Past the 2-second deadline, the attempt waits in close().
-    await asyncio.sleep(5)
+    ) as worker:
+        handle = await client.start_workflow(
+            StatefulMcpWorkerReplacedWorkflow.run,
+            _ReplacedInput(),
+            id=f"stateful-mcp-shutdown-closing-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+        async with asyncio.timeout(20):
+            await closing.wait()
+        async with asyncio.timeout(20):
+            await worker.shutdown()
+    # The attempt's failure carried the clear over the first heartbeat, so its
+    # retry may build the toolset.
     async with asyncio.timeout(20):
-        await worker.shutdown()
-        await worker_task
+        while True:
+            session = await _session_activity(handle)
+            if session and session.attempt == 2:
+                break
+            await asyncio.sleep(0.2)
+    assert not session.heartbeat_details.payloads
     await handle.terminate()
 
 
