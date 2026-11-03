@@ -215,14 +215,47 @@ outside Temporal. To use another model, build the agent with
   handler retried, wrap its cause with `%w` or return a retryable
   `temporal.ApplicationError`.
 
-  If an agent or a runner plugin has a tool-error callback, or an after-tool
-  callback that treats errors differently from results, don't run Workers of an
-  earlier version and this one on the same Task Queue. An earlier Workflow
-  Worker hands this version's tool error to ADK as a result and skips the
-  callback, so the run fails to replay on the other version or closes as
-  `Failed`. Deploy this version on a new Task Queue, or stop every earlier
-  Worker before you start this version's. If you roll back, keep runs that ran
-  on this version on its Workers until they close.
+  - The toolset lists its tools once per model step, at the same point with
+    every ADK release, so its Histories replay from ADK v2.3.0 to v2.7.0. A
+    toolset wrapped in another that does not forward `ProcessRequest`, such as
+    `tool.FilterToolset` or `tool.WithConfirmation`, lists each time ADK asks
+    for its tools: in every model step with ADK v2.6.0 and later, and only in
+    the first step of an agent run before. So a History in which an agent with
+    such a toolset took a second model step in one run does not replay across
+    ADK v2.6.0; one-step runs do. Use `MCPToolsetOptions.ToolFilter` instead of
+    `tool.FilterToolset`, and `mcptoolset`'s `RequireConfirmation` option
+    instead of `tool.WithConfirmation`.
+  - From the second model step of an agent run, a toolset in the agent's
+    `Toolsets` declares only the tools the server lists, and `ToolFilter`
+    allows, for that step. A model call to an MCP tool it no longer declares
+    gets ADK's tool-not-found error: no `CallMcpTool` Activity and no before-
+    or after-tool callbacks run, but on-tool-error callbacks do. In the first
+    step, and with a wrapped toolset on ADK v2.5.0 and earlier, such a call
+    still runs `CallMcpTool`; for a tool the server no longer lists, it fails
+    with a non-retryable `McpError`.
+  - From the second model step, your own `Tools` calls on such a toolset, for
+    example from an `InstructionProvider`, return the agent run's first list,
+    so they don't see changes the server or `ToolFilter` makes during the run.
+    To read the current list, call `Tools` on a second `NewMCPToolset` that is
+    not in the agent's `Toolsets`.
+
+  To upgrade to this version:
+  - A run that used `NewMCPToolset` directly in an agent's `Toolsets` before
+    you deploy this version fails replay on it with `[TMPRL1100]`, with or
+    without a tool call, and so does such a run on this version after a
+    rollback. Let those runs finish first, or keep them on the earlier version
+    with Worker Versioning. Runs whose MCP toolsets are all wrapped replay and
+    continue across the upgrade and a rollback, with the ADK release they ran
+    on.
+  - If an agent or a runner plugin has a tool-error callback, or an after-tool
+    callback that treats errors differently from results, don't run Workers of
+    an earlier version and this one on the same Task Queue. An earlier Workflow
+    Worker hands this version's tool error to ADK as a result and skips the
+    callback, so the run fails to replay on the other version or closes as
+    `Failed`. Deploy this version on a new Task Queue or, once the runs in the
+    item above have finished, stop every earlier Worker before you start this
+    version's. If you roll back, keep runs that ran on this version on its
+    Workers until they close.
 - **Remote A2A agents.** Build ADK's remote agent (`remoteagent.NewA2A`) with
   `AgentCardProvider: googleadk.NewA2AAgentCardProvider(cardURL, activityOptions)`
   and `ClientProvider: googleadk.NewA2AClientProvider(activityOptions)`. The card
@@ -279,8 +312,16 @@ outside Temporal. To use another model, build the agent with
   a callback can only check its message (see **MCP, statelessly** above).
   Classify with `IsNonRetryable(err)`; never string-match. Upstream HTTP status
   drives retryability (`408`/`409`/`429`/`5xx` retryable, other `4xx` not).
+  The status is read from a `genai.APIError`, or else from an int `StatusCode`
+  field of 400 or more on any error the model returns or wraps, as openai-go's
+  errors have. A custom `model.LLM` can expose its status the same way.
   A streamed call whose chunks could not all be published fails with
   `googleadk.StreamError` (see [Streaming](#streaming)).
+  A non-streamed Gemini reply with no candidates, which is how Gemini answers a
+  blocked prompt, fails at once as a non-retryable `googleadk.ModelError`, like
+  a permanent `4xx`: ADK returns it as `empty response`, with no status. With
+  `WithStreaming`, ADK returns the block as a response with an `ErrorCode`
+  instead. Other errors without a status are retried.
 - **Disable model-SDK retries in your `ModelFactory`.** `InvokeModel` already runs
   under Temporal's `RetryPolicy`; leaving the model client's own retries on retries
   a transient failure twice over. Let Temporal own retries.

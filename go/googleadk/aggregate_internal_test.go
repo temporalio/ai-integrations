@@ -8,6 +8,8 @@ package googleadk
 // publish side channel is exercised by the dev-server-gated integration test.
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -80,7 +82,7 @@ func TestAggregateResponsesNilNext(t *testing.T) {
 
 // TestClassifyModelErrorRetryability proves the HTTP-status → retry-contract
 // mapping used by InvokeModel: 429/5xx retryable, other 4xx non-retryable,
-// status-less errors retryable.
+// status-less errors retryable except ADK's "empty response".
 func TestClassifyModelErrorRetryability(t *testing.T) {
 	cases := []struct {
 		code      int
@@ -102,6 +104,22 @@ func TestClassifyModelErrorRetryability(t *testing.T) {
 		classified := classifyModelError(err)
 		assert.Equal(t, !tc.retryable, IsNonRetryable(classified), "code %d", tc.code)
 	}
+
+	// ADK's Gemini model returns this untyped error for a reply with no
+	// candidates, such as a blocked prompt.
+	empty := fmt.Errorf("empty response")
+	assert.True(t, IsNonRetryable(classifyModelError(empty)), "empty response")
+	assert.True(t, IsNonRetryable(classifyModelError(fmt.Errorf("wrapped: %w", empty))), "wrapped empty response")
+	// A model supplied through Config.Models may wrap it with other errors.
+	ctxErr := errors.New("model context")
+	assert.True(t, IsNonRetryable(classifyModelError(errors.Join(ctxErr, empty))), "joined empty response")
+	assert.True(t, IsNonRetryable(classifyModelError(fmt.Errorf("%w: %w", ctxErr, empty))), "multiple %w empty response")
+	assert.True(t, IsNonRetryable(classifyModelError(fmt.Errorf("outer: %w", errors.Join(ctxErr, empty)))), "nested joined empty response")
+	// Without it, joined status-less errors stay retryable, and an HTTP status
+	// still decides.
+	assert.False(t, IsNonRetryable(classifyModelError(errors.Join(ctxErr, assert.AnError))), "joined transient")
+	assert.False(t, IsNonRetryable(classifyModelError(errors.Join(&genai.APIError{Code: 500}, empty))), "joined 500")
+	assert.True(t, IsNonRetryable(classifyModelError(errors.Join(&genai.APIError{Code: 400}, ctxErr))), "joined 400")
 }
 
 // TestStreamPublishErrorRetryability proves the retry contract for a stream
@@ -157,4 +175,39 @@ func TestAggregateResponsesFoldsAllLateFields(t *testing.T) {
 	assert.Equal(t, -0.25, agg.AvgLogprobs)
 	assert.Equal(t, "SAFETY", agg.ErrorCode)
 	assert.Equal(t, "blocked by safety", agg.ErrorMessage)
+}
+
+// customStatusError stands for a provider SDK's error with an int StatusCode
+// field, as openai-go's *openai.Error has. TestOpenAIModelErrorIsNonRetryable
+// covers the real error that ADK's OpenAI model returns.
+type customStatusError struct{ StatusCode int }
+
+func (e customStatusError) Error() string { return fmt.Sprintf("status %d", e.StatusCode) }
+
+// TestClassifyModelErrorWrappedStatusCode proves the status is found when the
+// error is wrapped, also by a model supplied through Config.Models that joins
+// it with other errors, through either Unwrap form, and that the status rule
+// still applies.
+func TestClassifyModelErrorWrappedStatusCode(t *testing.T) {
+	ctxErr := errors.New("model context")
+	for code, retryable := range map[int]bool{400: false, 401: false, 404: false, 408: true, 409: true, 429: true, 500: true, 503: true} {
+		statusErr := &customStatusError{code}
+		for name, err := range map[string]error{
+			"value":       customStatusError{code},
+			"pointer":     statusErr,
+			"wrapped":     fmt.Errorf("openai: call failed: %w", statusErr),
+			"joined":      errors.Join(statusErr, nil),
+			"joined last": errors.Join(ctxErr, statusErr),
+			"after zero":  errors.Join(customStatusError{0}, statusErr),
+			"multiple %w": fmt.Errorf("%w: %w", ctxErr, statusErr),
+			"nested":      fmt.Errorf("outer: %w", errors.Join(ctxErr, fmt.Errorf("openai: %w", statusErr))),
+		} {
+			assert.Equal(t, code, apiErrorCode(err), "%s %d", name, code)
+			assert.Equal(t, !retryable, IsNonRetryable(classifyModelError(err)), "%s %d", name, code)
+		}
+	}
+	// Joined status-less errors stay retryable, and a genai.APIError anywhere
+	// in the tree still decides first.
+	assert.False(t, IsNonRetryable(classifyModelError(errors.Join(ctxErr, assert.AnError))), "joined transient")
+	assert.False(t, IsNonRetryable(classifyModelError(errors.Join(&customStatusError{404}, &genai.APIError{Code: 500}))), "joined genai 500")
 }

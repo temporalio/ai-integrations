@@ -2,6 +2,7 @@ import type { Span as AgentSpan, SpanData, Trace as AgentTrace, TracingProcessor
 import { proxySinks, workflowInfo } from '@temporalio/workflow';
 import { AGENT_TRACING_SINK_NAME } from '../common/agent-sink-types';
 import type { AgentTracingSinks, SerializedAgentSpan, SerializedAgentTrace } from '../common/agent-sink-types';
+import { refuseTracingApiKey } from '../common/headers';
 import { getCurrentPluginConfig } from './plugin-config-store';
 
 function isReplayingHistoryEvents(): boolean {
@@ -97,6 +98,9 @@ export function clearOpenSpans(): void {
 
 export class WorkflowAgentSinkProcessor implements TracingProcessor {
   async onTraceStart(trace: AgentTrace): Promise<void> {
+    // Refuses a trace that Workflow code starts with its own tracing key, such as
+    // withTrace(name, fn, { tracingApiKey }): the trace's start rejects with it.
+    refuseTracingApiKey(trace.tracingApiKey);
     if (isReplayingHistoryEvents()) return;
     agentTracingSink().dispatch({
       kind: 'trace_start',
