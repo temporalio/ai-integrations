@@ -217,6 +217,20 @@ class TrackParcel:
         return f"Parcel {parcel_id} is with {self.carrier}"
 
 
+@activity.defn
+class TagParcel:
+    """Tag a parcel."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    # A quoted annotation, as `from __future__ import annotations` makes, and
+    # *args, which Gemini leaves out of the declaration.
+    async def __call__(self, parcel_id: "str", *tags: str) -> "str":
+        self.calls.append((parcel_id, tags))
+        return f"Parcel {parcel_id} has tags {tags!r}"
+
+
 # ---------------------------------------------------------------------------
 # Test helper: tracking gemini_api_client_async_request activity
 # ---------------------------------------------------------------------------
@@ -549,6 +563,12 @@ class MultipleToolsWorkflow:
                     ),
                     activity_as_tool(
                         TrackParcel,
+                        activity_config=ActivityConfig(
+                            start_to_close_timeout=timedelta(seconds=10),
+                        ),
+                    ),
+                    activity_as_tool(
+                        TagParcel,
                         activity_config=ActivityConfig(
                             start_to_close_timeout=timedelta(seconds=10),
                         ),
@@ -1053,7 +1073,8 @@ async def test_multiple_tools_sequential(client: Client):
     """Multiple tools called in sequence within one generate_content call."""
     tool_tracker = ToolCallTracker()
     parcel_tracker = TrackParcel("acme-post")
-    new_client, _ = apply_plugin(
+    parcel_tagger = TagParcel()
+    new_client, api_tracker = apply_plugin(
         client,
         [
             make_function_call_response("get_weather", {"city": "Tokyo"}),
@@ -1061,6 +1082,7 @@ async def test_multiple_tools_sequential(client: Client):
                 "get_weather_country", {"city": "Paris", "country": "France"}
             ),
             make_function_call_response("TrackParcel", {"parcel_id": "P-1"}),
+            make_function_call_response("TagParcel", {"parcel_id": "P-2"}),
             make_text_response("Tokyo is sunny; Paris is rainy."),
         ],
     )
@@ -1072,6 +1094,7 @@ async def test_multiple_tools_sequential(client: Client):
             tool_tracker.get_weather,
             tool_tracker.get_weather_country,
             parcel_tracker,
+            parcel_tagger,
         ],
     ) as worker:
         result = await new_client.execute_workflow(
@@ -1088,6 +1111,10 @@ async def test_multiple_tools_sequential(client: Client):
     # The class tool takes __call__'s parameters, and the registered instance
     # gets the model's value.
     assert parcel_tracker.calls == ["P-1"]
+    # A quoted annotation is resolved for the call too, and *args stays empty
+    # instead of getting the empty tuple as one more argument.
+    assert parcel_tagger.calls == [("P-2", ())]
+    assert "Parcel P-2 has tags ()" in json.dumps(api_tracker.requests[-1].request_dict)
     assert result == "Tokyo is sunny; Paris is rainy."
 
 
@@ -1687,6 +1714,11 @@ def test_activity_as_tool_preserves_signature():
     # callable class's __call__ binds by name.
     sig = inspect.signature(activity_as_tool(LocateParcel))
     assert sig.bind(parcel_id="P-1").args == ("P-1",)
+    # Gemini converts the model's arguments with the signature's types, so
+    # they are resolved.
+    sig = inspect.signature(activity_as_tool(TagParcel))
+    assert sig.parameters["parcel_id"].annotation is str
+    assert sig.return_annotation is str
 
 
 def test_activity_as_tool_multi_arg_signature():

@@ -137,7 +137,9 @@ def _call_signature(
         # parameters by name too.
         if p.kind is inspect.Parameter.POSITIONAL_ONLY:
             p = p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD)
-        parameters.append(p)
+        # Gemini builds the declaration from the resolved types, but converts
+        # the model's arguments with the signature's, so give it those too.
+        parameters.append(p.replace(annotation=hints.get(p.name, p.annotation)))
     # __call__'s own docstring, else the class's, else that of a __call__ it
     # inherits.
     doc = (
@@ -145,7 +147,11 @@ def _call_signature(
         or _class_doc(cls)
         or next(filter(None, map(_docstring, map(_call_function, calls))), None)
     )
-    return signature.replace(parameters=parameters), hints, doc
+    signature = signature.replace(
+        parameters=parameters,
+        return_annotation=hints.get("return", signature.return_annotation),
+    )
+    return signature, hints, doc
 
 
 def activity_as_tool(
@@ -207,6 +213,7 @@ def activity_as_tool(
         config["summary"] = "tool_call"
 
     schema_fn: Callable = fn
+    is_class = inspect.isclass(fn)
     if inspect.isclass(fn):
         sig, annotations, doc = _call_signature(fn)
     else:
@@ -235,7 +242,10 @@ def activity_as_tool(
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
-        activity_args = list(bound.arguments.values())
+        # A class's __call__ takes only positional parameters, and *args among
+        # them: pass its values one by one, not as one tuple. Gemini leaves
+        # *args out of the declaration, so it is empty.
+        activity_args = list(bound.args) if is_class else list(bound.arguments.values())
         return await temporal_workflow.execute_activity(
             activity_name,
             args=activity_args,
