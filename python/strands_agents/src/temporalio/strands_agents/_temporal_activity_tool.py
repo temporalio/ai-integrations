@@ -40,17 +40,26 @@ class TemporalActivityTool(AgentTool):
         self._activity_name = defn.name
         self._options = options
         if inspect.isclass(activity_fn):
+            # The stand-in's parameters are already bound: none is a receiver.
             activity_fn = _call_stand_in(activity_fn)
         signature = inspect.signature(activity_fn)
         params = list(signature.parameters.values())
-        # A first parameter named `self` is the receiver of a method passed as
-        # Class.method, however it is annotated: the worker registers the bound
-        # method, so its instance supplies it. Strands leaves `self` out of the
-        # tool spec too.
-        if params and params[0].name == "self":
-            signature = signature.replace(parameters=params[1:])
-        self._signature = signature
-        spec = FunctionToolMetadata(activity_fn).extract_metadata()
+        # A first parameter named `self` of a function defined in a class body
+        # is the receiver of a method passed as Class.method, however it is
+        # annotated: the worker registers the bound method, so its instance
+        # supplies it.
+        if params and params[0].name == "self" and _defined_in_class(activity_fn):
+            params = params[1:]
+        # The model's input binds by name; the activity still gets it by position.
+        self._signature = signature.replace(
+            parameters=[
+                p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                if p.kind is inspect.Parameter.POSITIONAL_ONLY
+                else p
+                for p in params
+            ]
+        )
+        spec = _ActivityToolMetadata(activity_fn, self._signature).extract_metadata()
         spec["name"] = self._activity_name
         self._spec: ToolSpec = spec
 
@@ -109,6 +118,31 @@ class TemporalActivityTool(AgentTool):
                 content=[{"text": _to_text(result)}],
             )
         )
+
+
+class _ActivityToolMetadata(FunctionToolMetadata):
+    """Builds the tool spec from every parameter of the tool's binding signature.
+
+    Strands leaves parameters named ``self``, ``cls`` and ``agent`` out of the
+    spec because it supplies them to its own tools. The tool sends the activity
+    only the model's input, so they are inputs too.
+    """
+
+    def __init__(self, func: Callable, signature: inspect.Signature) -> None:
+        # Set before the base class builds the input model.
+        self._inputs = signature.parameters
+        super().__init__(func)
+
+    def _is_special_parameter(self, param_name: str) -> bool:
+        return param_name not in self._inputs
+
+
+def _defined_in_class(fn: Any) -> bool:
+    """Return whether ``fn`` is a function defined in a class body."""
+    if not inspect.isfunction(fn):
+        return False
+    scopes = fn.__qualname__.split(".")
+    return len(scopes) > 1 and scopes[-2] != "<locals>"
 
 
 def _call_function(method: Any) -> Callable | None:
