@@ -183,14 +183,22 @@ func remoteAgentError(remote agent.Agent) error {
 // findRemoteAgent returns the first of agents, or of the agents below them,
 // that is a remote A2A agent sending from Workflow code, or nil.
 func findRemoteAgent(agents ...agent.Agent) agent.Agent {
+	return findRemoteAgentFrom(agents, map[agent.Agent]bool{})
+}
+
+// findRemoteAgentFrom is findRemoteAgent, skipping the agents in visited and
+// adding the ones it checks. With agenttool, one agent can sit below several
+// agents or below itself, so each agent is checked once.
+func findRemoteAgentFrom(agents []agent.Agent, visited map[agent.Agent]bool) agent.Agent {
 	for _, a := range agents {
-		if a == nil {
+		if a == nil || visited[a] {
 			continue
 		}
+		visited[a] = true
 		if remoteAgentSendsFromWorkflow(a) {
 			return a
 		}
-		if found := findRemoteAgent(agentsBelow(a)...); found != nil {
+		if found := findRemoteAgentFrom(agentsBelow(a), visited); found != nil {
 			return found
 		}
 	}
