@@ -137,7 +137,7 @@ class DeepAgentsPlugin(SimplePlugin):
         _tools.set_tool_defaults(self._tool_activity_options)
 
         # What the activities are built from; a second instance on the Worker
-        # must match it (see _same_sources).
+        # must match it (see _differences).
         self._model_provider = model_provider
         self._backends = dict(backends or {})
         self._streaming_batch_interval = streaming_batch_interval
@@ -264,8 +264,9 @@ class DeepAgentsPlugin(SimplePlugin):
             config["activities"] = list(before)
         config = super().configure_worker(config)
         if client_instance is not None:
+            # A list: an ``activities`` callable may return a one-shot iterable.
             config["activities"] = self._without_repeats(
-                before, config.get("activities") or [], client_instance
+                before, list(config.get("activities") or []), client_instance
             )
         return config
 
@@ -282,12 +283,13 @@ class DeepAgentsPlugin(SimplePlugin):
         on_worker = [
             p for p in config.get("plugins") or [] if isinstance(p, DeepAgentsPlugin)
         ]
+        differences = (
+            on_client[0]._differences(on_worker[0]) if on_client and on_worker else []
+        )
         if len(on_client) > 1 or len(on_worker) > 1:
             reason = ""
-        elif on_client and on_worker and not on_client[0]._same_sources(on_worker[0]):
-            reason = (
-                " with a different model_provider, backends or streaming_batch_interval"
-            )
+        elif differences:
+            reason = f" with a different {' and '.join(differences)}"
         elif on_client and on_worker and on_worker[0] is self:
             return on_client[0]
         else:
@@ -296,26 +298,34 @@ class DeepAgentsPlugin(SimplePlugin):
             f"DeepAgentsPlugin is registered {len(on_client) + len(on_worker)} "
             f"times for this Worker ({len(on_client)} on the Client, "
             f"{len(on_worker)} on the Worker){reason}. Use one DeepAgentsPlugin "
-            "instance on this Worker, or run the other instance on its own Worker "
-            "and task queue. One model_provider receives every model name, so it "
-            "can serve several models, and backends= takes every factory."
+            "instance for this Worker: one model_provider receives every model "
+            "name, so it can serve several models, and backends= takes every "
+            "factory. To run another instance, build its Worker from a Client "
+            "without DeepAgentsPlugin, on its own task queue; in one process, "
+            "model_activity_options, tool_activity_options and streaming_topic "
+            "still come from the instance built last."
         )
 
-    def _same_sources(self, other: DeepAgentsPlugin) -> bool:
-        """Whether ``other`` builds its activities from the same inputs.
+    def _differences(self, other: DeepAgentsPlugin) -> list[str]:
+        """The inputs of ``other``'s activities that differ from this instance's.
 
         ``model_provider`` and each backend factory must be the same object;
         ``streaming_batch_interval`` must be equal.
         """
-        return (
-            _same_callable(self._model_provider, other._model_provider)
-            and self._backends.keys() == other._backends.keys()
-            and all(
-                _same_callable(factory, other._backends[name])
-                for name, factory in self._backends.items()
-            )
-            and self._streaming_batch_interval == other._streaming_batch_interval
+        same_backends = self._backends.keys() == other._backends.keys() and all(
+            _same_callable(factory, other._backends[name])
+            for name, factory in self._backends.items()
         )
+        same = {
+            "model_provider": _same_callable(
+                self._model_provider, other._model_provider
+            ),
+            "backends": same_backends,
+            "streaming_batch_interval": (
+                self._streaming_batch_interval == other._streaming_batch_interval
+            ),
+        }
+        return [name for name, is_same in same.items() if not is_same]
 
     def _without_repeats(
         self,

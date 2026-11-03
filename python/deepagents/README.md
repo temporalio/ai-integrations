@@ -383,12 +383,14 @@ same `streaming_batch_interval`; two default instances match. Any other second
 instance fails at Worker start with a `ValueError` that names
 `DeepAgentsPlugin`. With one instance on each side, the Worker instance does
 not add an Activity whose name is already
-registered, and still registered after its own step, by the same function, a
-wrapper of it, or the Client instance's copy of the same built-in Activity.
+registered, and still registered after its own step, by the same function, the
+Client instance's copy of the same built-in Activity, or a wrapper of either
+that sets `__wrapped__` (as `functools.wraps` does).
 A dynamic Activity counts the same way, with the dynamic slot as its name.
 An Activity registered under another name, such as a wrapper with an alias,
 does not count. So the Worker keeps what the Client side
-registered, including any wrapper a later Client plugin put around it, and any
+registered, including a wrapper a later Client plugin put around it if that
+wrapper sets `__wrapped__`, and any
 other Activity given to the Worker instance is still added. Any other repeated
 Activity name fails at Worker start with `ValueError: More than one activity
 named ...`, as it does without the plugin. That includes a caller Activity

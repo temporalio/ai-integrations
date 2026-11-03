@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import itertools
 import re
 import uuid
 from collections.abc import Callable, Sequence
@@ -107,17 +108,17 @@ def _backend() -> Any:
         (
             [{}],
             [{"model_provider": _provider}],
-            "2 times for this Worker (1 on the Client, 1 on the Worker) with a different",
+            "2 times for this Worker (1 on the Client, 1 on the Worker) with a different model_provider.",
         ),
         (
             [{"backends": {"fs": _backend}}],
             [{"backends": {"fs": lambda: None}}],
-            "2 times for this Worker (1 on the Client, 1 on the Worker) with a different",
+            "2 times for this Worker (1 on the Client, 1 on the Worker) with a different backends.",
         ),
         (
             [{}],
             [{"streaming_batch_interval": timedelta(seconds=1)}],
-            "2 times for this Worker (1 on the Client, 1 on the Worker) with a different",
+            "2 times for this Worker (1 on the Client, 1 on the Worker) with a different streaming_batch_interval.",
         ),
     ],
     ids=[
@@ -266,6 +267,7 @@ class _CopyConfig(SimplePlugin):
         "same-instance-callable-extra",
         "same-instance-dynamic-extra",
         "same-instance-callable-dynamic-extra",
+        "same-instance-callable-iterator",
         "same-instance-copying-client-plugin",
         "same-instance-caller-copy",
         "client-alias",
@@ -304,6 +306,13 @@ async def test_one_instance_on_each_side_keeps_the_client_registration(
             return [*kept, *worker_own]
 
         on_worker.activities = replace_builtins
+    if setup.endswith("callable-iterator"):
+
+        def chain_own(existing: Any) -> Any:
+            # A one-shot iterable, outside the Sequence type the setting declares.
+            return itertools.chain(existing or [], worker_own)
+
+        on_worker.activities = chain_own
     if setup.endswith("copying-client-plugin"):
         client_plugins.append(_CopyConfig())
     if setup.endswith("caller-copy"):
