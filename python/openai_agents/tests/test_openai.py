@@ -1,15 +1,30 @@
+import abc
 import asyncio
+import copy
+import functools
+import importlib.metadata
 import json
 import os
+import sys
 import uuid
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Literal, cast
+from collections.abc import AsyncIterator, Iterable, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    NamedTuple,
+    TypeVar,
+    cast,
+    no_type_check,
+)
 
 import nexusrpc
 import pydantic
 import pytest
+import typing_extensions
 from agents import (
     Agent,
     AgentBase,
@@ -65,11 +80,15 @@ from agents.tool import CustomTool
 from agents.tool_context import ToolContext
 from openai import APIStatusError, AsyncOpenAI, BaseModel, RateLimitError
 from openai.types.responses import (
+    LocalEnvironmentParam,
     ResponseCodeInterpreterToolCall,
     ResponseCustomToolCall,
     ResponseFileSearchToolCall,
     ResponseFunctionToolCall,
     ResponseFunctionWebSearch,
+    ResponseInputTextParam,
+    ResponseOutputMessage,
+    ResponseOutputMessageParam,
 )
 from openai.types.responses.response_file_search_tool_call import Result
 from openai.types.responses.response_function_web_search import ActionSearch
@@ -80,12 +99,14 @@ from openai.types.responses.response_output_item import (
 )
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 from openai.types.shared import Reasoning
+from openai.types.shared_params import CompoundFilter
 from pydantic import ConfigDict, Field, TypeAdapter
 
 import temporalio.openai_agents as openai_agents
 from temporalio import activity, workflow
+from temporalio.api.common.v1 import Payload
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
-from temporalio.common import RetryPolicy
+from temporalio.common import RawValue, RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import (
     ActivityError,
@@ -95,6 +116,7 @@ from temporalio.exceptions import (
 )
 from temporalio.openai_agents import (
     ModelActivityParameters,
+    OpenAIPayloadConverter,
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
 )
@@ -222,14 +244,32 @@ async def get_weather_context(ctx: RunContextWrapper[str], city: str) -> Weather
     return Weather(city=city, temperature_range="14-20C", conditions=ctx.context)
 
 
+# A string annotation naming a module-level alias must resolve in this module.
+CityName = str
+
+
 class ActivityWeatherService:
     @activity.defn
-    async def get_weather_method(self, city: str) -> Weather:
+    async def get_weather_method(self, city: "CityName") -> Weather:
         """
         Get the weather for a given city.
         """
         return Weather(
             city=city, temperature_range="14-20C", conditions="Sunny with wind."
+        )
+
+
+@activity.defn
+class ActivityWeatherClass:
+    def __init__(self, conditions: str) -> None:
+        self.conditions = conditions
+
+    async def __call__(self, city: "CityName") -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
         )
 
 
@@ -284,6 +324,12 @@ def weather_mock_model():
                 call_id="call-get-weather-method",
                 item_id="item-get-weather-method",
             ),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo"}',
+                "ActivityWeatherClass",
+                call_id="call-get-weather-class",
+                item_id="item-get-weather-class",
+            ),
             ResponseBuilders.output_message("Test weather result"),
         ]
     )
@@ -322,6 +368,10 @@ class ToolsWorkflow:
                 ),
                 openai_agents.workflow.activity_as_tool(
                     ActivityWeatherService.get_weather_method,
+                    start_to_close_timeout=timedelta(seconds=10),
+                ),
+                openai_agents.workflow.activity_as_tool(
+                    ActivityWeatherClass,
                     start_to_close_timeout=timedelta(seconds=10),
                 ),
                 openai_agents.workflow.activity_as_tool(
@@ -376,6 +426,7 @@ async def test_tool_workflow(client: Client):
                 get_weather_country,
                 get_weather_context,
                 ActivityWeatherService().get_weather_method,
+                ActivityWeatherClass("Cloudy"),
             ],
         ) as worker:
             workflow_handle = await client.start_workflow(
@@ -390,11 +441,20 @@ async def test_tool_workflow(client: Client):
             assert result == "Test weather result"
 
             events = []
+            class_activity_inputs = []
             async for e in workflow_handle.fetch_history_events():
                 if e.HasField("activity_task_completed_event_attributes"):
                     events.append(e)
+                elif e.HasField("activity_task_scheduled_event_attributes"):
+                    attrs = e.activity_task_scheduled_event_attributes
+                    if attrs.activity_type.name == "ActivityWeatherClass":
+                        class_activity_inputs.append(
+                            [p.data.decode() for p in attrs.input.payloads]
+                        )
 
-            assert len(events) == 11
+            # The callable class's __call__ gets the model's arguments, not its constructor.
+            assert class_activity_inputs == [['"Tokyo"']]
+            assert len(events) == 13
             assert (
                 "function_call"
                 in events[0]
@@ -456,11 +516,583 @@ async def test_tool_workflow(client: Client):
                 .data.decode()
             )
             assert (
-                "Test weather result"
+                "function_call"
                 in events[10]
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
             )
+            assert (
+                "Cloudy"
+                in events[11]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Test weather result"
+                in events[12]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+
+
+@activity.defn
+class ActivityWeatherPartialMethodCall:
+    async def get_weather(self, conditions: str, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions=conditions)
+
+    __call__ = functools.partialmethod(get_weather, "Rainy")
+
+
+# In these two, `self` is a real parameter: binding __call__ has already dropped the receiver.
+@activity.defn
+class ActivityWeatherStaticCall(abc.ABC):
+    @staticmethod
+    async def __call__(self: str) -> Weather:  # type: ignore[reportSelfClsParameterName]
+        return Weather(city=self, temperature_range="14-20C", conditions="Foggy")
+
+
+@activity.defn
+class ActivityWeatherClassMethodCall:
+    @classmethod
+    async def __call__(cls, self: str) -> Weather:  # type: ignore[reportSelfClsParameterName]
+        return Weather(city=self, temperature_range="14-20C", conditions="Windy")
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherDataclass:
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherDocumentedDataclass:
+    """ActivityWeatherDocumentedDataclass(city) gets the weather for a given city."""
+
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+class WeatherBase:
+    """
+    Weather tools.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherDerived(WeatherBase):
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Cloudy")
+
+
+@activity.defn
+class ActivityWeatherDocumentedDerived(WeatherBase):
+    """
+    Look up the weather for a city.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """ """
+        return Weather(city=city, temperature_range="14-20C", conditions="Cloudy")
+
+
+class Unprintable:
+    def __repr__(self) -> str:
+        raise TypeError("can't be printed")
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherUnprintableDefault:
+    # Documented, or Python 3.10's dataclasses fails to write its docstring.
+    """
+    Weather tools.
+    """
+
+    client: Unprintable = Unprintable()
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+# The self-type idiom from before typing.Self.
+WeatherServiceT = TypeVar("WeatherServiceT", bound="WeatherCallService")
+
+
+class WeatherCallService:
+    @activity.defn
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+    @activity.defn
+    async def get_weather(self: WeatherServiceT, city: str) -> Weather:  # type: ignore[reportInvalidTypeVarUse]
+        # The Worker registers the bound method, so the instance fills an annotated `self` too.
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherSectionsOnlyCall:
+    """
+    Get the weather for a given city.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        :param city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherDocProperty:
+    @property
+    def __doc__(self) -> str:  # type: ignore
+        return "Per-instance weather."
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherTuple(NamedTuple):
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+@activity.defn
+async def get_weather_shared(self: Any, city: str) -> Weather:  # type: ignore[reportUnusedParameter]
+    return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+class WeatherAssignedService:
+    # Assigned from a module function, this is still registered bound to an instance.
+    get_weather = get_weather_shared
+
+
+class WeatherCachedService:
+    # On Python 3.14, update_wrapper gives the cache __annotate__ instead of __annotations__.
+    @activity.defn
+    @functools.lru_cache
+    def get_weather(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherCustomInit:
+    count: int
+
+    def __init__(self, count: str) -> None:
+        self.count = int(count)
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherNoTypeCheck:
+    # The tool skips the return annotation, so the unknown one is never resolved; the
+    # parameter's still is.
+    @no_type_check
+    async def __call__(self, city: "CityName") -> "UnknownReturn":  # type: ignore # noqa: F821
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+class WeatherNoTypeCheckService:
+    @activity.defn
+    @no_type_check
+    async def get_weather(self, city: "CityName") -> "UnknownReturn":  # type: ignore # noqa: F821
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "target, parameter, description",
+    [
+        # Not abc.ABC's docstring: only the class's own is a fallback.
+        (ActivityWeatherStaticCall, "self", ""),
+        (ActivityWeatherClassMethodCall, "self", ""),
+        # Before Python 3.13 the SDK runs an async partialmethod as sync, so
+        # test_tool_workflow can't run this form; the tool's schema is the part this plugin builds.
+        (ActivityWeatherPartialMethodCall, "city", "Get the weather for a given city."),
+        # Not the docstring a dataclass writes from its constructor.
+        (ActivityWeatherDataclass, "city", ""),
+        (
+            ActivityWeatherDocumentedDataclass,
+            "city",
+            "ActivityWeatherDocumentedDataclass(city) gets the weather for a given city.",
+        ),
+        # The overridden __call__'s docstring, not the base class's.
+        (ActivityWeatherDerived, "city", "Get the weather for a given city."),
+        # The class's own docstring before an inherited __call__'s; a blank one is skipped.
+        (ActivityWeatherDocumentedDerived, "city", "Look up the weather for a city."),
+        # A documented __call__ needs no class docstring, so the default is never printed.
+        (
+            ActivityWeatherUnprintableDefault,
+            "city",
+            "Get the weather for a given city.",
+        ),
+        # Not object.__call__'s docstring.
+        (WeatherCallService.__call__, "city", ""),
+        (WeatherCallService.get_weather, "city", ""),
+        (WeatherAssignedService.get_weather, "city", ""),
+        (WeatherCachedService.get_weather, "city", ""),
+        # Not the docstring dataclasses writes from the handwritten __init__.
+        (ActivityWeatherCustomInit, "city", ""),
+        # Not the docstring namedtuple writes.
+        (ActivityWeatherTuple, "city", ""),
+        # A __doc__ that isn't a string is no description.
+        (ActivityWeatherDocProperty, "city", ""),
+        (ActivityWeatherNoTypeCheck, "city", ""),
+        (WeatherNoTypeCheckService.get_weather, "city", ""),
+    ],
+)
+def test_callable_class_tool_schema(target: Any, parameter: str, description: str):
+    tool = openai_agents.workflow.activity_as_tool(
+        target, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.params_json_schema["properties"] == {
+        parameter: {"title": parameter.title(), "type": "string"}
+    }
+    assert tool.description == description
+
+
+@activity.defn
+class ActivityWeatherGoogleArgsCall:
+    """
+    Get the weather for a given city.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        Args:
+            city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherArgsOnlyClassDoc:
+    """
+    Args:
+        conditions: Default conditions.
+    """
+
+    def __init__(self, conditions: str = "Sunny") -> None:
+        self.conditions = conditions
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        :param city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherArgsOnlyCall:
+    async def __call__(self, city: str) -> Weather:
+        """
+        args:
+            city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherParametersOnlyDerived(WeatherBase):
+    """
+    Parameters:
+        conditions: Default conditions.
+    """
+
+
+@activity.defn
+class ActivityWeatherReturnsOnlyClassDoc:
+    """
+    Returns:
+        The weather.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "cls, description, city_description",
+    [
+        # A __call__ docstring with only parameters has no summary, so the class's is used.
+        (
+            ActivityWeatherSectionsOnlyCall,
+            "Get the weather for a given city.",
+            "Name of the city.",
+        ),
+        # The Agents SDK reads a leading Google Args: section as text, not a summary.
+        (ActivityWeatherGoogleArgsCall, "Get the weather for a given city.", None),
+        # A class docstring with only Args: has no summary either.
+        (ActivityWeatherArgsOnlyClassDoc, "", "Name of the city."),
+        # With no class summary to use instead, a section is no description.
+        (ActivityWeatherArgsOnlyCall, "", None),
+        (ActivityWeatherReturnsOnlyClassDoc, "", None),
+        # A class docstring with only a section gives way to an inherited __call__ docstring.
+        (
+            ActivityWeatherParametersOnlyDerived,
+            "Get the weather for a given city.",
+            None,
+        ),
+    ],
+)
+def test_callable_class_tool_summary_from_class_docstring(
+    cls: type, description: str, city_description: str | None
+):
+    tool = openai_agents.workflow.activity_as_tool(
+        cls, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.description == description
+    assert tool.params_json_schema["properties"]["city"].get("description") == (
+        city_description
+    )
+
+
+@pytest.mark.parametrize(
+    "target, summary, scheduled_summary",
+    [
+        # The class's summary labels the activity only when the caller passes none.
+        (ActivityWeatherSectionsOnlyCall, None, "Get the weather for a given city."),
+        (ActivityWeatherSectionsOnlyCall, "Caller summary", "Caller summary"),
+        (ActivityWeatherDataclass, None, None),
+        (ActivityWeatherDataclass, "Caller summary", "Caller summary"),
+        # A section-only docstring labels nothing.
+        (ActivityWeatherArgsOnlyCall, None, None),
+        (ActivityWeatherArgsOnlyCall, "Caller summary", "Caller summary"),
+        (ActivityWeatherReturnsOnlyClassDoc, None, None),
+    ],
+)
+async def test_callable_class_tool_activity_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    target: Any,
+    summary: str | None,
+    scheduled_summary: str | None,
+):
+    summaries: list[str | None] = []
+
+    async def execute_activity(*args: Any, **kwargs: Any) -> str:  # type: ignore[reportUnusedParameter]
+        summaries.append(kwargs["summary"])
+        return "Sunny"
+
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    tool = openai_agents.workflow.activity_as_tool(
+        target, start_to_close_timeout=timedelta(seconds=10), summary=summary
+    )
+    assert isinstance(tool, FunctionTool)
+    arguments = '{"city":"Tokyo"}'
+    context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call-get-weather",
+        tool_arguments=arguments,
+    )
+    await tool.on_invoke_tool(context, arguments)
+    assert summaries == [scheduled_summary]
+
+
+class WeatherDefaultsService:
+    @activity.defn
+    async def get_weather_context(
+        self,
+        ctx: RunContextWrapper[Any] = None,  # type: ignore
+        city: str = "Tokyo",
+    ) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions=ctx.context)
+
+    @activity.defn
+    async def get_weather_alias(
+        self,
+        city: Annotated[str, pydantic.Field(alias="cityName")] = None,  # type: ignore
+    ) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "target, parameters",
+    [
+        (WeatherDefaultsService.get_weather_context, ["city"]),
+        (WeatherDefaultsService.get_weather_alias, ["cityName"]),
+    ],
+)
+def test_method_tool_with_none_defaults(target: Any, parameters: list[str]):
+    # Python 3.10's typing.get_type_hints would wrap these in Optional, hiding the context type
+    # and the alias.
+    tool = openai_agents.workflow.activity_as_tool(
+        target, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert list(tool.params_json_schema["properties"]) == parameters
+
+
+async def get_weather_undecorated(city: str) -> Weather:
+    return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn(dynamic=True)
+async def get_weather_dynamic(args: Sequence[RawValue]) -> Weather:  # type: ignore[reportUnusedParameter]
+    return Weather(city="Tokyo", temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherNoCall:
+    pass
+
+
+async def get_weather_no_city() -> Weather:
+    return Weather(city="Tokyo", temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherNoParamCall:
+    # Bound to an instance, a function with no parameters can't take `self`.
+    __call__ = get_weather_no_city
+
+
+@activity.defn
+class ActivityWeatherKeywordOnlyCall:
+    async def __call__(self, *, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherKwargsCall:
+    async def __call__(self, city: str, **extra: str) -> Weather:  # type: ignore[reportUnusedParameter]
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+async def get_weather_kwargs(city: str, **extra: str) -> Weather:  # type: ignore[reportUnusedParameter]
+    return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherPartialMethodKeyword:
+    async def get_weather(self, conditions: str, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions=conditions)
+
+    __call__ = functools.partialmethod(get_weather, conditions="Rainy")
+
+
+class ActivityWeatherBadAnnotation(ActivityWeatherClass):
+    # Not decorated, so only activity_as_tool reads this annotation.
+    async def __call__(self, city: "asyncio.Nope") -> Weather:  # type: ignore
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "target, message",
+    [
+        # These two raised an ApplicationError that failed the run before this change.
+        (get_weather_undecorated, "Bare function without tool and activity decorators"),
+        (get_weather_dynamic, "must have a name to be made into a tool"),
+        (ActivityWeatherNoCall, "needs a __call__ that is a function"),
+        (ActivityWeatherNoParamCall, "invalid method signature"),
+        (ActivityWeatherKeywordOnlyCall, "cannot take keyword-only arguments"),
+        (ActivityWeatherPartialMethodKeyword, "binds an argument by keyword"),
+        (ActivityWeatherKwargsCall, r"cannot take \*\*kwargs"),
+        (get_weather_kwargs, r"cannot take \*\*kwargs"),
+        (ActivityWeatherBadAnnotation, "has no attribute 'Nope'"),
+        (ActivityWeatherClass("Cloudy"), "not an instance of it"),
+    ],
+)
+def test_invalid_callable_class_tool(target: Any, message: str):
+    with pytest.raises(ValueError, match=message):
+        openai_agents.workflow.activity_as_tool(
+            target, start_to_close_timeout=timedelta(seconds=10)
+        )
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 14), reason="only Python 3.14 can define these classes"
+)
+def test_callable_class_tool_on_python_314():
+    # The forward reference resolves only after dataclasses made the class and its docstring.
+    @dataclass
+    class ActivityWeatherForwardRef:
+        station: Station  # type: ignore
+
+        async def __call__(self, city: str) -> Weather:
+            return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+    class Station:  # type: ignore[reportUnusedClass]
+        pass
+
+    tool = openai_agents.workflow.activity_as_tool(
+        activity.defn(ActivityWeatherForwardRef),
+        start_to_close_timeout=timedelta(seconds=10),
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.description == ""
+
+    # From 3.14 a bare functools.partial binds like a method, so @activity.defn takes it.
+    class ActivityWeatherPartialCall:
+        __call__ = functools.partial(get_weather_no_city)
+
+    with pytest.raises(ValueError, match="needs a __call__ that is a function"):
+        openai_agents.workflow.activity_as_tool(
+            activity.defn(ActivityWeatherPartialCall),
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="only Python 3.12 can define these functions"
+)
+def test_generic_tool_on_python_312():
+    # Postponed annotations name the function's own type parameter.
+    namespace: dict[str, Any] = {"activity": activity, "Weather": Weather}
+    exec(
+        "from __future__ import annotations\n"
+        "@activity.defn\n"
+        "class ActivityWeatherGenericCall:\n"
+        "    async def __call__[T: str](self, cities: list[T]) -> Weather: ...\n"
+        "class WeatherGenericService:\n"
+        "    @activity.defn\n"
+        "    async def get_weather[T: str](self, cities: list[T]) -> Weather: ...\n",
+        namespace,
+    )
+    for target in [
+        namespace["ActivityWeatherGenericCall"],
+        namespace["WeatherGenericService"].get_weather,
+    ]:
+        tool = openai_agents.workflow.activity_as_tool(
+            target, start_to_close_timeout=timedelta(seconds=10)
+        )
+        assert isinstance(tool, FunctionTool)
+        assert tool.params_json_schema["properties"] == {
+            "cities": {"items": {"type": "string"}, "title": "Cities", "type": "array"}
+        }
 
 
 @activity.defn
@@ -1127,6 +1759,401 @@ async def test_customer_service_workflow(client: Client):
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
             )
+
+
+class InputRecordingModel(TestModel):
+    """Read each call's input as ``OpenAIResponsesModel`` does, and record it."""
+
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        """Return the responses in order."""
+        remaining = iter(responses)
+        super().__init__(lambda: next(remaining))
+        self.inputs: list[list[TResponseInputItem]] = []
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> ModelResponse:
+        """Record the input before producing the next response."""
+        self.inputs.append(ItemHelpers.input_to_new_input_list(input))
+        return await super().get_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            **kwargs,
+        )
+
+
+@workflow.defn
+class CarriedItemsWorkflow:
+    """Runs a turn on items carried across Continue-As-New, as a chat does."""
+
+    @workflow.run
+    async def run(self, input_items: list[TResponseInputItem]) -> str:
+        try:
+            # Read the carried replies before the turn, as a chat that shows
+            # its history does.
+            items = cast(list[dict[str, Any]], input_items)
+            replies = [
+                part["text"]
+                for item in items
+                if item.get("role") == "assistant"
+                for part in item["content"]
+            ]
+            result = await Runner.run(
+                Agent(name="Assistant", instructions="Answer."),
+                input_items + [{"content": "Next", "role": "user"}],
+            )
+        except Exception as e:
+            return f"Turn failed: {e}"
+        return f"{result.final_output}; carried replies: {replies}"
+
+
+# Pydantic decodes the assistant message's content as a one-shot iterator,
+# and the custom tool's string output as an iterator over its characters.
+CARRIED_ITEMS: list[TResponseInputItem] = [
+    {
+        "id": "msg-carried",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
+    },
+    {
+        "type": "custom_tool_call",
+        "call_id": "c1",
+        "name": "echo",
+        "input": "pong",
+    },
+    {"type": "custom_tool_call_output", "call_id": "c1", "output": "pong"},
+]
+
+
+async def test_carried_input_items(client: Client):
+    input_items: list[TResponseInputItem] = [
+        {"content": "Hi", "role": "user"},
+        *CARRIED_ITEMS,
+    ]
+    model = InputRecordingModel([ResponseBuilders.output_message("test")])
+    async with AgentEnvironment(model=model) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, CarriedItemsWorkflow) as worker:
+            result = await client.execute_workflow(
+                CarriedItemsWorkflow.run,
+                input_items,
+                id=f"carried-items-workflow-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            assert result == "test; carried replies: ['Hello!']"
+    assert model.inputs == [input_items + [{"content": "Next", "role": "user"}]]
+
+
+CARRIED_AT = datetime(2026, 10, 31, 12, tzinfo=timezone.utc)
+
+
+class CarriedItemsModel(pydantic.BaseModel):
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+class CarriedItemsStrictModel(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+@pydantic.dataclasses.dataclass
+class CarriedItemsState:
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+@pydantic.dataclasses.dataclass(config=ConfigDict(strict=True))
+class CarriedItemsStrictState:
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+class CarriedItemsExtraModel(pydantic.BaseModel):
+    # Undeclared fields hold carried items, and pydantic keeps them in model_extra.
+    model_config = ConfigDict(extra="allow")
+    # Pydantic's documented way to type extra values; BaseModel declares it as optional.
+    __pydantic_extra__: dict[str, list[TResponseInputItem]] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
+        init=False
+    )
+    carried_at: datetime
+
+
+class OwnValuesModel(pydantic.BaseModel):
+    # The app's own Iterable field, which only the converter's walk lists.
+    values: Iterable[int]
+
+
+class OwnCustomToolOutput(typing_extensions.TypedDict):
+    # Same union as openai's custom tool output, which the swap leaves alone here.
+    type: Literal["custom_tool_call_output"]
+    call_id: str
+    output: str | Iterable[ResponseInputTextParam]
+
+
+class OwnCustomToolOutputModel(pydantic.BaseModel):
+    item: OwnCustomToolOutput
+
+
+class OwnCustomToolOutputStrictModel(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
+    item: OwnCustomToolOutput
+
+
+class OwnExtraValuesModel(pydantic.BaseModel):
+    model_config = ConfigDict(extra="allow")
+    __pydantic_extra__: dict[str, Iterable[int]] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
+        init=False
+    )
+
+
+@dataclass
+class PricedOrder:
+    id: str
+    # Pydantic leaves an init=False field unset when it decodes the order.
+    total: float = field(init=False)
+
+
+def _priced_order() -> PricedOrder:
+    order = PricedOrder("o-1")
+    order.total = 9.5
+    return order
+
+
+def _dated_items(state: Any) -> Any:
+    return state.carried_at, state.input_items
+
+
+@pytest.mark.parametrize(
+    "carried,read,expected",
+    [
+        (
+            CarriedItemsModel(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsStrictModel(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsState(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsStrictState(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsExtraModel.model_validate(
+                {"carried_at": CARRIED_AT, "carried": CARRIED_ITEMS}
+            ),
+            lambda state: (state.carried_at, state.__pydantic_extra__["carried"]),
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (OwnValuesModel(values=[1, 2]), lambda state: state.values, [1, 2]),
+        (
+            OwnCustomToolOutputModel(
+                item={
+                    "type": "custom_tool_call_output",
+                    "call_id": "c1",
+                    "output": "pong",
+                }
+            ),
+            lambda state: state.item["output"],
+            "pong",
+        ),
+        (
+            OwnCustomToolOutputStrictModel(
+                carried_at=CARRIED_AT,
+                item={
+                    "type": "custom_tool_call_output",
+                    "call_id": "c1",
+                    "output": "pong",
+                },
+            ),
+            lambda state: (state.carried_at, state.item["output"]),
+            (CARRIED_AT, "pong"),
+        ),
+        (
+            OwnExtraValuesModel.model_validate({"values": [1, 2]}),
+            lambda state: state.__pydantic_extra__["values"],
+            [1, 2],
+        ),
+        (_priced_order(), lambda state: state.id, "o-1"),
+    ],
+    ids=[
+        "model",
+        "strict-model",
+        "dataclass",
+        "strict-dataclass",
+        "extra-model",
+        "own-iterable-field",
+        "own-str-or-iterable",
+        "strict-own-str-or-iterable",
+        "own-iterable-extra-field",
+        "unset-init-false-field",
+    ],
+)
+def test_state_decodes_iterables_as_lists(carried: Any, read: Any, expected: Any):
+    # Workflows often carry the items in a model or dataclass, as the
+    # documented chat does. The app's own Iterable fields go through the
+    # converter's walk.
+    converter = OpenAIPayloadConverter()
+    (payload,) = converter.to_payloads([carried])
+    (state,) = converter.from_payloads([payload], [type(carried)])
+    assert type(state) is type(carried)
+    copy.deepcopy(state)
+    assert read(state) == expected
+
+
+def test_unhashable_type_hint_keeps_string_output():
+    # The dict makes the hint unhashable, so the retry can't use the adapter cache.
+    hint: Any = Annotated[OwnCustomToolOutput, {"doc": "x"}]
+    item = {"type": "custom_tool_call_output", "call_id": "c1", "output": "pong"}
+    converter = OpenAIPayloadConverter()
+    (decoded,) = converter.from_payloads(converter.to_payloads([item]), [hint])
+    assert decoded["output"] == "pong"
+
+
+@pydantic.dataclasses.dataclass
+class CarriedItemsWithResponse:
+    last_message: ResponseOutputMessage
+    input_items: list[TResponseInputItem]
+    values: Iterable[int]
+
+
+def test_carried_input_items_decode_as_lists_in_lenient_fallback():
+    # The message lacks the required status, as a response from a newer API
+    # might, so the converter falls back to lenient construction.
+    message = {key: value for key, value in CARRIED_ITEMS[0].items() if key != "status"}
+    payload = Payload(
+        metadata={"encoding": b"json/plain"},
+        data=json.dumps(
+            {"last_message": message, "input_items": CARRIED_ITEMS, "values": [1, 2]}
+        ).encode(),
+    )
+    converter = OpenAIPayloadConverter()
+    (state,) = converter.from_payloads([payload], [CarriedItemsWithResponse])
+    assert type(state) is CarriedItemsWithResponse
+    assert state.input_items == CARRIED_ITEMS
+    assert state.values == [1, 2]
+    copy.deepcopy(state)
+
+
+def test_type_swap_leaves_tool_definitions():
+    # Requests that take tool definitions, such as vector_stores.search
+    # filters, must still turn iterators into lists.
+    # typing_extensions strips Required on every Python version.
+    hints = typing_extensions.get_type_hints
+    assert typing_extensions.get_origin(hints(CompoundFilter)["filters"]) is Iterable
+    assert (
+        typing_extensions.get_origin(hints(ResponseOutputMessageParam)["content"])
+        is list
+    )
+    # A shell call item holds the shell tool's local environment, so the
+    # swap changes it for the tool too.
+    assert typing_extensions.get_origin(hints(LocalEnvironmentParam)["skills"]) is list
+
+
+class CarriedChatState(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+@workflow.defn
+class CarriedCustomToolChatWorkflow:
+    @workflow.run
+    async def run(self, state: CarriedChatState | None = None) -> str:
+        async def echo(ctx: ToolContext[Any], input: str) -> str:  # type: ignore[reportUnusedParameter]
+            return input
+
+        agent = Agent[str](
+            name="custom-tool-agent",
+            instructions="Use the echo tool.",
+            tools=[
+                CustomTool(
+                    name="echo",
+                    description="Echo the input string back.",
+                    on_invoke_tool=echo,
+                )
+            ],
+        )
+        if state is None:
+            result = await Runner.run(starting_agent=agent, input="say something")
+            workflow.continue_as_new(
+                CarriedChatState(
+                    carried_at=CARRIED_AT, input_items=result.to_input_list()
+                )
+            )
+        copy.deepcopy(state.input_items)
+        result = await Runner.run(
+            starting_agent=agent,
+            input=state.input_items + [{"content": "Next", "role": "user"}],
+        )
+        return f"{result.final_output}; {state.carried_at.isoformat()}"
+
+
+async def test_carried_custom_tool_output_across_continue_as_new(client: Client):
+    model = InputRecordingModel(
+        [
+            ModelResponse(
+                output=[
+                    ResponseCustomToolCall(
+                        call_id="c1",
+                        input="ping",
+                        name="echo",
+                        type="custom_tool_call",
+                    )
+                ],
+                usage=Usage(),
+                response_id=None,
+            ),
+            ResponseBuilders.output_message("done"),
+            ResponseBuilders.output_message("next done"),
+        ]
+    )
+    async with AgentEnvironment(model=model) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, CarriedCustomToolChatWorkflow) as worker:
+            result = await client.execute_workflow(
+                CarriedCustomToolChatWorkflow.run,
+                id=f"carried-custom-tool-chat-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+    assert result == "next done; 2026-10-31T12:00:00+00:00"
+    items = [dict(i) for i in model.inputs[2]]
+    (output,) = [i for i in items if i.get("type") == "custom_tool_call_output"]
+    assert output["output"] == "ping"
+    replies = [i for i in items if i.get("role") == "assistant"]
+    assert [type(r["content"]) for r in replies] == [list]
 
 
 class InputGuardrailModel(Model):
@@ -2390,7 +3417,7 @@ async def test_hosted_mcp_tool(client: Client):
 
 
 def custom_tool_mock_model():
-    return TestModel.returning_responses(
+    return InputRecordingModel(
         [
             ModelResponse(
                 output=[
@@ -2435,7 +3462,8 @@ class CustomToolWorkflow:
 
 
 async def test_custom_tool_workflow(client: Client):
-    async with AgentEnvironment(model=custom_tool_mock_model()) as env:
+    model = custom_tool_mock_model()
+    async with AgentEnvironment(model=model) as env:
         client = env.applied_on_client(client)
 
         async with new_worker(client, CustomToolWorkflow) as worker:
@@ -2447,6 +3475,12 @@ async def test_custom_tool_workflow(client: Client):
             )
             result = await workflow_handle.result()
             assert result == "done:ping"
+    # The model Activity decodes the tool's string output as a string.
+    assert model.inputs[1][-1] == {
+        "call_id": "c1",
+        "output": "ping",
+        "type": "custom_tool_call_output",
+    }
 
 
 class AssertDifferentModelProvider(ModelProvider):
@@ -3659,3 +4693,9 @@ async def test_alignment_uses_the_workflow_workers_defaults(
                 result_type=str,
             )
     assert model.settings == [ModelSettings()]
+
+
+def test_plugin_reports_package_version() -> None:
+    assert openai_agents.OpenAIAgentsPlugin().version() == importlib.metadata.version(
+        "temporalio-openai-agents"
+    )

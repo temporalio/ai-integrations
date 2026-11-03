@@ -2,6 +2,8 @@
  * Test AI SDK integration with Temporal workflows
  */
 import { randomUUID } from 'crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import type {
   EmbeddingModelV4,
   EmbeddingModelV4CallOptions,
@@ -994,6 +996,11 @@ test('configureWorker refuses to replace a different Activity with the same name
   t.notThrows(() => new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } }).configureWorker(withMcp));
   const callerSet = { ...base, activities: createActivities(provider) };
   t.notThrows(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(callerSet));
+});
+
+test('AiSdkPlugin reports the package version for worker heartbeats', (t) => {
+  const plugin = new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) });
+  t.is(plugin.version, JSON.parse(readFileSync(path.join(__dirname, '../../package.json'), 'utf8')).version);
 });
 
 test('runWorker refuses an Activity that a later plugin replaced, before polling', async (t) => {

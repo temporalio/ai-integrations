@@ -3,6 +3,7 @@ import '../../load-polyfills';
 import { z } from 'zod';
 import {
   AfterToolCallEvent,
+  AfterToolsEvent,
   SlidingWindowConversationManager,
   tool,
   type BaseModelConfig,
@@ -222,6 +223,99 @@ export async function mcpAgent(prompt: string, server = 'testServer', cacheTools
   const result = await agent.invoke(prompt);
   return result.toString();
 }
+
+/**
+ * An agent with one `TemporalMCPClient` per server, and the `echo` and `take_note` tools when `local`
+ * is set. With `replace` set to `[name, round]`, an `AfterToolsEvent` hook puts a local tool under
+ * `name` after that tool round. Each MCP activity is tried once. Returns the agent's answer, or a
+ * refusal's message, and then the agent's tool names.
+ */
+export async function mcpServersAgent(
+  prompt: string,
+  servers: string[],
+  local = false,
+  replace?: [string, number]
+): Promise<string> {
+  const clients = servers.map(
+    (server) =>
+      new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds', retry: { maximumAttempts: 1 } } })
+  );
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    tools: local ? [echoTool, noteTool, ...clients] : clients,
+  });
+  if (replace) {
+    const [name, round] = replace;
+    const standIn = tool({ name, description: name, inputSchema: z.object({}), callback: () => 'local' });
+    let rounds = 0;
+    agent.addHook(AfterToolsEvent, (event) => {
+      if (++rounds === round) event.agent.toolRegistry.addOrReplace([standIn]);
+    });
+  }
+  let result: string;
+  try {
+    result = (await agent.invoke(prompt)).toString();
+  } catch (err) {
+    result = `refused: ${(err as Error).message}`;
+  }
+  const names = agent.toolRegistry
+    .list()
+    .map((t) => t.name)
+    .sort();
+  return `${result} Tools: ${names.join(', ')}.`;
+}
+
+/**
+ * Two agents at once: `first` with the servers `a` and `b`, and `second` with the server `c` and an
+ * `auditHook` activity after each tool round. Its histories recorded on main pin when each
+ * re-listing is scheduled against the other agent's activities.
+ */
+export async function mcpAgentsSideBySide(prompt: string): Promise<string> {
+  const client = (server: string): TemporalMCPClient =>
+    new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } });
+  const first = new TemporalAgent({ model: 'first', printer: false, tools: [client('a'), client('b')] });
+  const second = new TemporalAgent({ model: 'second', printer: false, tools: [client('c')] });
+  second.addHook(
+    AfterToolsEvent,
+    strandsWorkflow.activityAsHook('auditHook', {
+      activityInput: () => 'after tools',
+      activityOptions: { startToCloseTimeout: '10 seconds' },
+    })
+  );
+  const results = await Promise.all([first.invoke(prompt), second.invoke(prompt)]);
+  return results.map(String).join(', ');
+}
+
+/**
+ * An agent with the servers `a` and `b`, and a hook added after construction that, at the first tool
+ * round, starts a coroutine beside the re-listing: it lists `z`, awaits `null` twice and lists `y`.
+ * Its history recorded on main pins when the re-listing of `a` is scheduled against `y`'s listing.
+ */
+export async function mcpAgentBesideCoroutine(prompt: string): Promise<string> {
+  const client = (server: string): TemporalMCPClient =>
+    new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } });
+  const agent = new TemporalAgent({ model: 'first', printer: false, tools: [client('a'), client('b')] });
+  let side: Promise<void> | undefined;
+  agent.addHook(AfterToolsEvent, () => {
+    side ??= (async () => {
+      await client('z').listTools();
+      await null;
+      await null;
+      await client('y').listTools();
+    })();
+  });
+  const result = await agent.invoke(prompt);
+  await side;
+  return String(result);
+}
+
+const noteTool = tool({
+  name: 'take_note',
+  description: 'Take a note',
+  inputSchema: z.object({}),
+  callback: () => 'noted',
+});
 
 const echoTool = tool({
   name: 'echo',

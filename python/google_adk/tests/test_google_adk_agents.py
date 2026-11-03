@@ -16,6 +16,7 @@
 
 import asyncio
 import functools
+import importlib.metadata
 import inspect
 import json
 import logging
@@ -2011,3 +2012,9 @@ def test_json_output_schema_left_unchanged() -> None:
     request.set_output_schema(CityWeather.model_json_schema())
 
     assert _with_serializable_response_schema(request) is request
+
+
+def test_plugin_reports_package_version() -> None:
+    assert GoogleAdkPlugin().version() == importlib.metadata.version(
+        "temporalio-google-adk"
+    )

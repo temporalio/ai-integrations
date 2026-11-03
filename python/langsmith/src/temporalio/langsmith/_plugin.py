@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import functools
+import importlib.metadata
 import types
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
@@ -204,3 +205,10 @@ class LangSmithPlugin(SimplePlugin):
         if runner is not None:
             config["unsandboxed_workflow_runner"] = _mark_ending_evictions(runner)
         return config
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-langsmith")
+        except importlib.metadata.PackageNotFoundError:
+            return ""

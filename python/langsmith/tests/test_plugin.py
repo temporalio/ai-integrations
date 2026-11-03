@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib.metadata
 import threading
 import uuid
 from collections.abc import Callable
@@ -82,6 +83,10 @@ class TestPluginConstruction:
         assert interceptor._add_temporal_runs is False
         assert interceptor._default_metadata == {"env": "prod"}
         assert interceptor._default_tags == ["v1"]
+
+    def test_reports_package_version(self) -> None:
+        plugin = LangSmithPlugin(client=MagicMock())
+        assert plugin.version() == importlib.metadata.version("temporalio-langsmith")
 
 
 class TestEndingEvictions:
