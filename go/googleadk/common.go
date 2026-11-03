@@ -30,6 +30,9 @@ const (
 	ErrorTypeTool = "googleadk.ToolError"
 	// ErrorTypeMCP tags failures originating from an MCP list/call.
 	ErrorTypeMCP = "googleadk.McpError"
+	// ErrorTypeStream tags a streaming model call whose responses could not
+	// all be published to its Workflow Streams topic.
+	ErrorTypeStream = "googleadk.StreamError"
 	// ErrorTypeA2A tags failures originating from an A2A card fetch, message
 	// or cancellation.
 	ErrorTypeA2A = "googleadk.A2AError"
@@ -86,6 +89,29 @@ func IsNonRetryable(err error) bool {
 // may succeed on a retry: 408, 409, 429 and 5xx may, other statuses may not.
 func retryableHTTPStatus(code int) bool {
 	return code == 408 || code == 409 || code == 429 || (code >= 500 && code < 600)
+}
+
+// isEmptyResponse reports whether err, or any error it wraps through either
+// Unwrap form (as errors.Join and multiple %w produce), is ADK's untyped
+// "empty response".
+func isEmptyResponse(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err.Error() == "empty response" {
+		return true
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return isEmptyResponse(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if isEmptyResponse(e) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // newApplicationError builds a typed Temporal ApplicationError. retryable=false

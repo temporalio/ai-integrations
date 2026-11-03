@@ -809,8 +809,6 @@ test('an MCP tool gives the model the error its callTool activity failed with', 
         models: {
           test: () => new StubModel([toolCallTurn('listFiles', 'call_1', { path: '/' }), textTurn('no files')]),
         },
-        // Distinct server name so the worker-process connection cache can't be
-        // shared with another test's server.
         mcpClients: { failingServer: factory },
       }),
     ],
@@ -860,8 +858,6 @@ test('successive MCP tool calls reuse one cached worker-side connection', async 
               textTurn('done'),
             ]),
         },
-        // Distinct server name so the worker-process connection cache can't be
-        // shared with the sibling MCP test running in the same process.
         mcpClients: { cachingServer: factory },
       }),
     ],
@@ -909,8 +905,6 @@ test('mcpConnectionIdleTimeout evicts the cached connection while the worker run
         models: {
           test: () => new StubModel([toolCallTurn('listFiles', 'call_1', { path: '/' }), textTurn('done')]),
         },
-        // Distinct server name so the worker-process connection cache can't be
-        // shared with the sibling MCP tests running in the same process.
         mcpClients: { idleServer: factory },
         // Short idle window (duration string form) so the cached call connection
         // is evicted mid-run rather than only at worker shutdown.
@@ -966,8 +960,6 @@ test('mcpConnectionIdleTimeout does not evict a connection with a call in flight
         models: {
           test: () => new StubModel([toolCallTurn('listFiles', 'call_1', { path: '/' }), textTurn('done')]),
         },
-        // Distinct server name so the worker-process connection cache can't be
-        // shared with the sibling MCP tests running in the same process.
         mcpClients: { slowServer: factory },
         // Idle window far shorter than the tool call it must not interrupt.
         mcpConnectionIdleTimeout: '50ms',
@@ -983,6 +975,135 @@ test('mcpConnectionIdleTimeout does not evict a connection with a call in flight
     t.is(result, 'done');
     t.is(counters.disconnectsDuringCall, 0, 'idle timer disconnected a connection with a call in flight');
   });
+});
+
+/**
+ * MCP clients for the two-Worker tests. Each records the calls it handles and whether it was
+ * disconnected during one of them; `holdNextCall` holds the next call until released.
+ */
+function twoWorkerMcpClients() {
+  const state = {
+    handledBy: [] as string[],
+    disconnects: [] as string[],
+    disconnectsDuringCall: [] as string[],
+    hold: undefined as { started: () => void; release: Promise<void> } | undefined,
+  };
+  class LabeledMcpClient extends StubMcpClient {
+    private callsInFlight = 0;
+
+    constructor(private readonly label: string) {
+      super([{ name: 'listFiles', description: 'List files', inputSchema: { type: 'object', properties: {} } }]);
+    }
+    override async disconnect(): Promise<void> {
+      state.disconnects.push(this.label);
+      if (this.callsInFlight > 0) state.disconnectsDuringCall.push(this.label);
+    }
+    override async callTool(tool: { name: string }, args: JSONValue): Promise<JSONValue> {
+      state.handledBy.push(this.label);
+      this.callsInFlight++;
+      try {
+        const hold = state.hold;
+        state.hold = undefined;
+        if (hold) {
+          hold.started();
+          await hold.release;
+        }
+        return await super.callTool(tool, args);
+      } finally {
+        this.callsInFlight--;
+      }
+    }
+  }
+  const holdNextCall = () => {
+    let started!: () => void;
+    let release!: () => void;
+    const callStarted = new Promise<void>((resolve) => (started = resolve));
+    state.hold = { started, release: new Promise<void>((resolve) => (release = resolve)) };
+    return { callStarted, release };
+  };
+  return { state, holdNextCall, factory: (label: string) => (): McpClient => new LabeledMcpClient(label) };
+}
+
+test('two Workers with their own StrandsPlugin keep their own MCP server for one name', async (t) => {
+  t.timeout(60_000);
+  const { createWorker, taskQueue } = helpers(t);
+  const { state, holdNextCall, factory } = twoWorkerMcpClients();
+  const turns = (runs: number) =>
+    Array.from({ length: runs }).flatMap(() => [toolCallTurn('listFiles', 'call_1', {}), textTurn('done')]);
+  const plugin = (label: string, runs: number) =>
+    new StrandsPlugin({
+      models: { test: () => new StubModel(turns(runs)) },
+      mcpClients: { sharedName: factory(label) },
+    });
+  const queues = { A: taskQueue, B: `${taskQueue}-b` };
+  let runs = 0;
+  const run = (queue: string) =>
+    t.context.env.client.workflow.execute(mcpAgent, {
+      taskQueue: queue,
+      workflowId: `${queue}-${++runs}`,
+      args: ['list files', 'sharedName'],
+    });
+  const workerA = await createWorker({ plugins: [plugin('A', 1)] });
+  const workerB = await createWorker({ taskQueue: queues.B, plugins: [plugin('B', 2)] });
+
+  await workerB.runUntil(async () => {
+    const runningA = workerA.run();
+    try {
+      t.is(await run(queues.A), 'done');
+      t.is(await run(queues.B), 'done');
+      t.deepEqual(state.handledBy, ['A', 'B'], "each Worker's call must reach its own plugin's MCP server");
+
+      // Worker A stops while Worker B's call is in flight.
+      const held = holdNextCall();
+      const result = run(queues.B);
+      await held.callStarted;
+      workerA.shutdown();
+      await runningA;
+      held.release();
+      t.is(await result, 'done');
+      t.deepEqual(state.disconnectsDuringCall, [], "Worker A's stop must not close Worker B's connection");
+      t.deepEqual(state.disconnects, ['A']);
+    } finally {
+      if (workerA.getState() === 'RUNNING') workerA.shutdown();
+      await runningA;
+    }
+  });
+  t.deepEqual(state.disconnects, ['A', 'B']);
+});
+
+test("stopping one of two Workers that share a StrandsPlugin keeps the other's MCP connection", async (t) => {
+  t.timeout(60_000);
+  const { createWorker, taskQueue } = helpers(t);
+  const { state, holdNextCall, factory } = twoWorkerMcpClients();
+  const plugin = new StrandsPlugin({
+    models: { test: () => new StubModel([toolCallTurn('listFiles', 'call_1', {}), textTurn('done')]) },
+    mcpClients: { sharedPlugin: factory('S') },
+  });
+  const workerA = await createWorker({ plugins: [plugin] });
+  const workerB = await createWorker({ taskQueue: `${taskQueue}-b`, plugins: [plugin] });
+
+  await workerB.runUntil(async () => {
+    const runningA = workerA.run();
+    try {
+      const held = holdNextCall();
+      const result = t.context.env.client.workflow.execute(mcpAgent, {
+        taskQueue: `${taskQueue}-b`,
+        workflowId: `${taskQueue}-b`,
+        args: ['list files', 'sharedPlugin'],
+      });
+      await held.callStarted;
+      workerA.shutdown();
+      await runningA;
+      held.release();
+      t.is(await result, 'done');
+      t.deepEqual(state.disconnects, [], 'the connection stays open while Worker B uses the plugin');
+    } finally {
+      if (workerA.getState() === 'RUNNING') workerA.shutdown();
+      await runningA;
+    }
+  });
+  // The last Worker using the plugin closes it.
+  t.deepEqual(state.disconnects, ['S']);
 });
 
 test('TemporalMCPClient re-lists tools each turn by default and picks up mid-run additions', async (t) => {

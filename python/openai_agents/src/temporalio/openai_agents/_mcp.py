@@ -27,11 +27,31 @@ from temporalio.exceptions import (
 )
 from temporalio.openai_agents._heartbeat_decorator import auto_heartbeater
 from temporalio.openai_agents._mcp_server_checks import (
+    _has_dynamic_tool_filter,
     _has_worker_side_require_approval,
+    _has_worker_side_tool_meta_resolver,
+    _reject_dynamic_tool_filter,
     _reject_worker_side_require_approval,
+    _reject_worker_side_tool_meta_resolver,
 )
 from temporalio.worker import PollerBehaviorSimpleMaximum, Worker
 from temporalio.workflow import ActivityConfig, ActivityHandle
+
+# What the deprecated routes' tool_filter error tells the user to do instead.
+_LEGACY_TOOL_FILTER_REMEDY = (
+    "use a static filter (create_static_tool_filter) on the factory's server, "
+    "or register the factory with OpenAIAgentsPlugin(mcp_servers=...) and pass "
+    "the filter to temporal_mcp_server(tool_filter=...)"
+)
+
+
+def _legacy_tool_meta_resolver_remedy(route: str) -> str:
+    """What the deprecated routes' tool_meta_resolver error tells the user to do."""
+    return (
+        f"set tool_meta_resolver on the server {route}() gives the workflow, or "
+        "register the factory with OpenAIAgentsPlugin(mcp_servers=...) and pass "
+        "it to temporal_mcp_server(tool_meta_resolver=...)"
+    )
 
 
 @dataclasses.dataclass
@@ -164,7 +184,9 @@ class StatelessMCPServerProvider:
             name: The name of the MCP server.
             server_factory: A function which will produce MCPServer instances. It should return a new server each time
                 so that state is not shared between workflow runs. It may accept a single positional parameter, which
-                receives a ``factory_argument`` from the workflow.
+                receives a ``factory_argument`` from the workflow. A callable ``tool_filter``, a ``require_approval``
+                policy that can ask for approval, or a ``tool_meta_resolver`` on the returned server is rejected in
+                every MCP operation; a static filter is applied.
         """
         warnings.warn(
             "StatelessMCPServerProvider is deprecated; use "
@@ -190,8 +212,16 @@ class StatelessMCPServerProvider:
             )
         else:
             server = cast(Callable[[], MCPServer], self._server_factory)()
+        _reject_dynamic_tool_filter(
+            self._server_name, server, _LEGACY_TOOL_FILTER_REMEDY
+        )
         _reject_worker_side_require_approval(
             self._server_name, server, "stateless_mcp_server"
+        )
+        _reject_worker_side_tool_meta_resolver(
+            self._server_name,
+            server,
+            _legacy_tool_meta_resolver_remedy("stateless_mcp_server"),
         )
         return server
 
@@ -467,7 +497,9 @@ class StatefulMCPServerProvider:
             name: The name of the MCP server.
             server_factory: A function which will produce MCPServer instances. It should return a new server each time
                 so that state is not shared between workflow runs. It receives an optional ``factory_argument`` from the
-                workflow.
+                workflow. A callable ``tool_filter``, a ``require_approval`` policy that can ask for approval, or a
+                ``tool_meta_resolver`` on the returned server is rejected in every MCP operation; a static filter is
+                applied.
         """
         warnings.warn(
             "StatefulMCPServerProvider is deprecated; use "
@@ -494,8 +526,16 @@ class StatefulMCPServerProvider:
 
         def _server() -> MCPServer:
             server = self._servers[_server_id()]
+            _reject_dynamic_tool_filter(
+                self._server_name, server, _LEGACY_TOOL_FILTER_REMEDY
+            )
             _reject_worker_side_require_approval(
                 self._server_name, server, "stateful_mcp_server"
+            )
+            _reject_worker_side_tool_meta_resolver(
+                self._server_name,
+                server,
+                _legacy_tool_meta_resolver_remedy("stateful_mcp_server"),
             )
             return server
 
@@ -538,11 +578,17 @@ class StatefulMCPServerProvider:
                     "Cannot connect to an already running server. Use a distinct name if running multiple servers in one workflow."
                 )
             server = self._server_factory(args.factory_argument if args else None)
-            # A server with a worker-side approval policy is never connected.
-            # The dedicated worker still runs, and each of its operations fails
-            # with the policy error, so the workflow sees that error at its
-            # first MCP call whatever its schedule-to-start timeout.
-            rejected = _has_worker_side_require_approval(server)
+            # A server with a callable tool filter, a worker-side approval
+            # policy or a tool_meta_resolver is never connected. The dedicated worker still runs, and
+            # each of its operations fails with the same error, so the workflow
+            # sees that error at its first MCP call whatever its
+            # schedule-to-start timeout.
+            has_filter = _has_dynamic_tool_filter(server)
+            rejected = (
+                has_filter
+                or _has_worker_side_require_approval(server)
+                or _has_worker_side_tool_meta_resolver(server)
+            )
             self._servers[server_id] = server
             try:
                 try:

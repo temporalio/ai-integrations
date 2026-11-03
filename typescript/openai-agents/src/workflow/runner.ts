@@ -1,6 +1,7 @@
 import {
   type Agent,
   type AgentInputItem,
+  getCurrentTrace,
   Handoff,
   MemorySession,
   Runner,
@@ -28,6 +29,7 @@ import {
   type SerializableModelActivityOptions,
 } from '../common/model-activity-options';
 import { unwrapTemporalFailure } from '../common/errors';
+import { refuseTracingApiKey } from '../common/headers';
 import { ActivityBackedModelProvider } from './activity-backed-model';
 import { getAgentToolRecord } from './agent-tools';
 import { checkAgent } from './check-agent';
@@ -203,6 +205,12 @@ export class TemporalOpenAIRunner {
     input: string | AgentInputItem[] | RunState<TContext, TAgent>,
     options?: TemporalRunOptions<TContext>
   ): Promise<RunResult<any, TAgent> | StreamedRunResult<TContext, TAgent>> {
+    // Model calls run in an Activity, which cannot get a tracing key set on the run or its trace.
+    // Refuse it here: inside the upstream runner the refusal would fail the Workflow, not its task.
+    refuseTracingApiKey(options?.tracing?.apiKey);
+    refuseTracingApiKey((options?.runConfig as { tracing?: TracingConfig } | undefined)?.tracing?.apiKey);
+    refuseTracingApiKey(getCurrentTrace()?.tracingApiKey);
+
     const session = options?.session;
     if (session instanceof MemorySession) {
       throw ApplicationFailure.create({

@@ -334,7 +334,7 @@ const echo = new TemporalMCPClient({
 });
 ```
 
-To amortize connection setup, the `{name}-listTools` and `{name}-callTool` activities share one worker-process MCP connection and reuse it across calls. The connection is disconnected after it sits idle for `mcpConnectionIdleTimeout` (default 5 minutes); the timer resets on every reuse. `mcpConnectionIdleTimeout` accepts a millisecond number or a duration string (e.g. `'30 seconds'`), like `startToCloseTimeout`:
+To amortize connection setup, the `{name}-listTools` and `{name}-callTool` activities share one MCP connection per server and reuse it across calls. Each `StrandsPlugin` instance has its own connections: workers that use the same instance (for example through the `NativeConnection`) share them, and another `StrandsPlugin` opens its own through its own factory, even for the same server name. The connection is disconnected after it sits idle for `mcpConnectionIdleTimeout` (default 5 minutes), and when the last worker using the plugin stops; a call still running keeps it open until it finishes. The idle timer resets on every reuse. `mcpConnectionIdleTimeout` accepts a millisecond number or a duration string (e.g. `'30 seconds'`), like `startToCloseTimeout`:
 
 ```ts
 new StrandsPlugin({
