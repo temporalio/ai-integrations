@@ -68,6 +68,7 @@ from temporalio.service import RPCError, RPCStatusCode
 from temporalio.worker import Replayer, Worker
 from temporalio.workflow import ActivityCancellationType, ActivityConfig
 from tests.helpers.stateful_replay import (
+    StatefulMcpCancelWaitWorkflow,
     StatefulMcpCancelWorkflow,
     StatefulMcpGatherWorkflow,
 )
@@ -686,6 +687,35 @@ class _StallDescribe(Interceptor):
         return _StallDescribeOutbound(next)
 
 
+class _OnceDescribe(Interceptor):
+    """Changes only the first describe: raises UNAVAILABLE, or reports another attempt."""
+
+    def __init__(self, case: str) -> None:
+        super().__init__()
+        self.case = case
+        self.calls = 0
+
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _OnceDescribeOutbound(next, self)
+
+
+class _OnceDescribeOutbound(OutboundInterceptor):
+    def __init__(self, next: OutboundInterceptor, owner: _OnceDescribe) -> None:
+        super().__init__(next)
+        self.owner = owner
+
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        self.owner.calls += 1
+        first = self.owner.calls == 1
+        if first and self.owner.case == "unavailable_once":
+            raise RPCError("Unavailable.", RPCStatusCode.UNAVAILABLE, b"")
+        description = await super().describe_workflow(input)
+        if first and self.owner.case == "other_attempt_once":
+            for pending in description.raw_description.pending_activities:
+                pending.attempt += 1
+        return description
+
+
 class _StallReadBackCodec(PayloadCodec):
     """Never finishes decoding the details the session activity reads back."""
 
@@ -699,13 +729,24 @@ class _StallReadBackCodec(PayloadCodec):
 
 
 @pytest.mark.timeout(90)
-@pytest.mark.parametrize("case", ["refused", "describe_stalls", "decode_stalls"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "refused",
+        "describe_stalls",
+        "decode_stalls",
+        "unavailable_once",
+        "other_attempt_once",
+    ],
+)
 async def test_stateful_session_without_describe_permission(
     client: Client, case: str, monkeypatch: pytest.MonkeyPatch
 ):
     # The worker's client may not describe the workflow: the session activity
     # fails at once with an error that says so, and the run fails with it. A
     # describe or decoding that never ends fails the attempt at the deadline.
+    # A transient describe error is retried within the attempt, and a describe
+    # that shows another attempt fails this one, which is retried.
     monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
     factory_calls = 0
 
@@ -721,7 +762,13 @@ async def test_stateful_session_without_describe_permission(
             client.data_converter, payload_codec=_StallReadBackCodec()
         )
     else:
-        interceptor = _DenyDescribe() if case == "refused" else _StallDescribe()
+        interceptor = (
+            _DenyDescribe()
+            if case == "refused"
+            else _StallDescribe()
+            if case.endswith("stalls")
+            else _OnceDescribe(case)
+        )
         config["interceptors"] = [*config["interceptors"], interceptor]
     worker_client = _make_client(Client(**config), provider)
     task_queue = f"adk-stateful-mcp-describe-{uuid.uuid4()}"
@@ -738,6 +785,17 @@ async def test_stateful_session_without_describe_permission(
             task_queue=task_queue,
             execution_timeout=timedelta(seconds=60),
         )
+        if case.endswith("_once"):
+            assert await handle.execute_update(
+                StatefulMcpWorkerReplacedWorkflow.wait_listed
+            ) == ["echo"]
+            session = await _session_activity(handle)
+            assert session
+            assert session.attempt == (2 if case == "other_attempt_once" else 1)
+            await handle.signal(StatefulMcpWorkerReplacedWorkflow.resume)
+            assert await handle.result() == ["echo"]
+            assert factory_calls == 1
+            return
         if case != "refused":
             # The attempt fails at the 2-second deadline and is retried.
             async with asyncio.timeout(20):
@@ -765,6 +823,145 @@ async def test_stateful_session_without_describe_permission(
         messages.append(str(cause))
         cause = cause.__cause__
     assert any("permission to describe" in m for m in messages), messages
+
+
+class _SlowFirstDescribe(Interceptor):
+    """Delays the first describe, so the first session is still reading back."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _SlowFirstDescribeOutbound(next, self)
+
+
+class _SlowFirstDescribeOutbound(OutboundInterceptor):
+    def __init__(self, next: OutboundInterceptor, owner: _SlowFirstDescribe) -> None:
+        super().__init__(next)
+        self.owner = owner
+
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        self.owner.calls += 1
+        if self.owner.calls == 1:
+            await asyncio.sleep(3)
+        return await super().describe_workflow(input)
+
+
+@workflow.defn
+class StatefulMcpTwoBlocksWorkflow:
+    @workflow.run
+    async def run(self) -> list[str]:
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=20),
+            schedule_to_start_timeout=timedelta(seconds=10),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        async with TemporalStatefulMcpToolSet("stateful_server", config=config):
+            await workflow.sleep(0.5)
+        async with TemporalStatefulMcpToolSet(
+            "stateful_server", config=config
+        ) as toolset:
+            # List after the first session's delayed read-back has ended.
+            await workflow.sleep(5)
+            return [t.name for t in await toolset.get_tools()]
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_sessions_with_one_name_in_one_worker(client: Client):
+    # The first block exits while its session is still reading back its first
+    # heartbeat, and the second block's session starts on the same worker. It
+    # must wait for the first one, not register next to it.
+    provider = TemporalStatefulMcpToolSetProvider(
+        "stateful_server", lambda _: _stdio_toolset(_MCP_SERVER)
+    )
+    config = client.config()
+    config["interceptors"] = [*config["interceptors"], _SlowFirstDescribe()]
+    worker_client = _make_client(Client(**config), provider)
+    task_queue = f"adk-stateful-mcp-one-name-{uuid.uuid4()}"
+    async with Worker(
+        worker_client,
+        task_queue=task_queue,
+        workflows=[StatefulMcpTwoBlocksWorkflow],
+        max_cached_workflows=0,
+    ):
+        result = await client.execute_workflow(
+            StatefulMcpTwoBlocksWorkflow.run,
+            id=f"stateful-mcp-one-name-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+    assert result == ["echo"]
+
+
+@workflow.defn
+class StatefulMcpBlockEndsWorkflow:
+    @workflow.run
+    async def run(self, case: str) -> list[str]:
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=20),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        if case == "factory_fails":
+            # A session that ends on its own, without a refused retry.
+            async with TemporalStatefulMcpToolSet(
+                "stateful_server",
+                config=config,
+                server_session_config=ActivityConfig(
+                    start_to_close_timeout=timedelta(minutes=1),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                ),
+            ) as toolset:
+                return [t.name for t in await toolset.get_tools()]
+        # A tool kept from an earlier block, called first in a later block.
+        async with TemporalStatefulMcpToolSet(
+            "stateful_server", config=config
+        ) as toolset:
+            tools = await toolset.get_tools()
+        async with TemporalStatefulMcpToolSet("stateful_server", config=config):
+            await tools[0].run_async(args={"text": "x"}, tool_context=_tool_context())
+        return []
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize("case", ["factory_fails", "tool_from_earlier_block"])
+async def test_stateful_block_exit_error(client: Client, case: str):
+    def factory(_: Any) -> McpToolset:
+        if case == "factory_fails":
+            raise RuntimeError("factory failed")
+        return _stdio_toolset(_MCP_SERVER)
+
+    provider = TemporalStatefulMcpToolSetProvider("stateful_server", factory)
+    client = _make_client(client, provider)
+    task_queue = f"adk-stateful-mcp-block-ends-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[StatefulMcpBlockEndsWorkflow],
+        max_cached_workflows=0,
+    ):
+        with pytest.raises(WorkflowFailureError) as err:
+            await client.execute_workflow(
+                StatefulMcpBlockEndsWorkflow.run,
+                case,
+                id=f"stateful-mcp-block-ends-{uuid.uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+    # Whatever ended the session, the error is the one the docstrings name.
+    assert isinstance(err.value.cause, ApplicationError)
+    assert err.value.cause.type == "DedicatedWorkerFailure"
+    messages: list[str] = []
+    cause: BaseException | None = err.value.cause
+    while cause is not None:
+        messages.append(str(cause))
+        cause = cause.__cause__
+    expected = (
+        "factory failed"
+        if case == "factory_fails"
+        else "List the toolset's tools again inside an open block."
+    )
+    assert any(expected in message for message in messages), messages
 
 
 # Without a heartbeat timeout the worker sends a heartbeat at most every 30
@@ -956,8 +1153,12 @@ async def test_stateful_session_marker_kept_by_worker_heartbeats(
             assert await handle.execute_update(
                 StatefulMcpWorkerReplacedWorkflow.wait_listed
             ) == ["echo"]
-            # Watch the worker's delayed heartbeats arrive.
-            await asyncio.sleep(6)
+            # Wait for the worker's delayed marker heartbeat, then check that
+            # the marker stays.
+            async with asyncio.timeout(15):
+                while True not in observed:
+                    await asyncio.sleep(0.1)
+            await asyncio.sleep(3)
         finally:
             observer.cancel()
 
@@ -1485,14 +1686,24 @@ async def test_stateful_operation_of_ended_session_not_run_by_next_block(
 
 
 @pytest.mark.parametrize(
-    "file_name", ["stateful_mcp_gather.json", "stateful_mcp_cancel.json"]
+    "file_name",
+    [
+        "stateful_mcp_gather.json",
+        "stateful_mcp_cancel.json",
+        "stateful_mcp_cancel_wait.json",
+    ],
 )
 async def test_stateful_mcp_histories_from_main_replay(file_name: str) -> None:
     # Recorded on main at 88745dc with the workflow worker stopped, so that one
     # activation resolves a stateful tool call together with another activity
-    # (gather) or with a workflow cancel (cancel).
+    # (gather) or with a workflow cancel (cancel; cancel_wait with
+    # WAIT_CANCELLATION_COMPLETED).
     history_json = (Path(__file__).with_name("histories") / file_name).read_text()
     await Replayer(
-        workflows=[StatefulMcpGatherWorkflow, StatefulMcpCancelWorkflow],
+        workflows=[
+            StatefulMcpGatherWorkflow,
+            StatefulMcpCancelWorkflow,
+            StatefulMcpCancelWaitWorkflow,
+        ],
         plugins=[GoogleAdkPlugin()],
     ).replay_workflow(WorkflowHistory.from_json("replay", history_json))

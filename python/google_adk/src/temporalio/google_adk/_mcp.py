@@ -568,13 +568,25 @@ class _SessionHeartbeats:
                         )
                     except RPCError as err:
                         if err.status in _DESCRIBE_REFUSALS:
+                            if err.status in (
+                                RPCStatusCode.PERMISSION_DENIED,
+                                RPCStatusCode.UNAUTHENTICATED,
+                            ):
+                                reason = (
+                                    f"the server refused it ({err.status.name}: "
+                                    f"{err.message}). Give the worker's client "
+                                    "permission to describe workflows in this "
+                                    "namespace."
+                                )
+                            else:
+                                reason = (
+                                    "the server could not describe this workflow "
+                                    f"run ({err.status.name}: {err.message})."
+                                )
                             raise ApplicationError(
                                 "The stateful MCP session activity confirms its "
                                 "first heartbeat with DescribeWorkflowExecution, "
-                                "and the server refused it "
-                                f"({err.status.name}: {err.message}). Give the "
-                                "worker's client permission to describe "
-                                "workflows in this namespace.",
+                                f"and {reason}",
                                 type="DedicatedWorkerFailure",
                                 non_retryable=True,
                             ) from err
@@ -778,6 +790,8 @@ class TemporalStatefulMcpToolSetProvider:
         self._name = name + "-stateful"
         self._toolset_factory = toolset_factory
         self._toolsets: dict[str, _RunningToolset] = {}
+        # Run-scoped names of the session activities running in this worker.
+        self._sessions: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -840,7 +854,7 @@ class TemporalStatefulMcpToolSetProvider:
             failure = _earlier_attempt_failure(activity.info().heartbeat_details)
             if failure:
                 raise failure
-            if server_id in self._toolsets:
+            if server_id in self._sessions:
                 raise ApplicationError(
                     "Cannot connect to an already running toolset. Use a distinct "
                     "name if running multiple stateful toolsets in one workflow."
@@ -858,6 +872,10 @@ class TemporalStatefulMcpToolSetProvider:
                 # Heartbeat well within a shorter heartbeat timeout too.
                 interval = min(interval, heartbeat_timeout.total_seconds() / 2)
             heartbeat_task = asyncio.create_task(heartbeat_every(interval, heartbeats))
+            # Hold the name until this attempt ends: the read-back below awaits,
+            # and another session with this name must not pass the check above
+            # meanwhile. Nothing since the check has awaited.
+            self._sessions.add(server_id)
             try:
                 # No MCP session opens before the server holds the first
                 # heartbeat, which says a session may be open.
@@ -885,12 +903,15 @@ class TemporalStatefulMcpToolSetProvider:
                 finally:
                     self._toolsets.pop(server_id, None)
             finally:
-                heartbeat_task.cancel()
                 try:
-                    await heartbeat_task
-                except asyncio.CancelledError:
-                    pass
-                await heartbeats.close()
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+                    await heartbeats.close()
+                finally:
+                    self._sessions.discard(server_id)
 
         return (connect,)
 
@@ -1032,23 +1053,27 @@ class TemporalStatefulMcpToolSet(BaseToolset):
     async def cleanup(self) -> None:
         """Cancels the dedicated session activity and awaits its teardown.
 
-        If the session activity failed with ``DedicatedWorkerFailure``, raises
+        If the session activity ended on its own, raises
         ``ApplicationError(type="DedicatedWorkerFailure")`` with the session's
-        ``ActivityError`` as its cause.
+        ``ActivityError`` as its cause, as tool calls and ``get_tools`` inside
+        the block do.
         """
         if self._connect_handle:
             session = self._connect_handle
             session.cancel()
             try:
                 await session
+            except asyncio.CancelledError:
+                # A session cancelled before it started ends without an
+                # ActivityError. Keep a cancellation of this coroutine itself.
+                current = asyncio.current_task()
+                if session.cancelled() and not (current and current.cancelling()):
+                    return
+                raise
             except Exception as e:
                 if is_cancelled_exception(e):
                     return
-                if (
-                    isinstance(e, ActivityError)
-                    and isinstance(e.cause, ApplicationError)
-                    and e.cause.type == "DedicatedWorkerFailure"
-                ):
+                if isinstance(e, ActivityError):
                     raise _session_ended_failure(session) from e
                 raise
             finally:

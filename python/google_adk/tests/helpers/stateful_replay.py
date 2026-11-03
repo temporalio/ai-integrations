@@ -12,7 +12,7 @@ from typing import cast
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
-from temporalio.workflow import ActivityConfig
+from temporalio.workflow import ActivityCancellationType, ActivityConfig
 
 with workflow.unsafe.imports_passed_through():
     from google.adk.events import EventActions
@@ -68,13 +68,20 @@ def _tool_context() -> ToolContext:
     )
 
 
-def _toolset(host_task_queue: str) -> TemporalStatefulMcpToolSet:
+def _toolset(
+    host_task_queue: str, wait_cancellation: bool = False
+) -> TemporalStatefulMcpToolSet:
+    config = ActivityConfig(
+        start_to_close_timeout=timedelta(seconds=20),
+        retry_policy=RetryPolicy(maximum_attempts=1),
+    )
+    if wait_cancellation:
+        config["cancellation_type"] = (
+            ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+        )
     return TemporalStatefulMcpToolSet(
         "stateful_replay",
-        config=ActivityConfig(
-            start_to_close_timeout=timedelta(seconds=20),
-            retry_policy=RetryPolicy(maximum_attempts=1),
-        ),
+        config=config,
         server_session_config=ActivityConfig(
             task_queue=host_task_queue, start_to_close_timeout=timedelta(hours=1)
         ),
@@ -124,6 +131,25 @@ class StatefulMcpCancelWorkflow:
     @workflow.run
     async def run(self, host_task_queue: str) -> str:
         async with _toolset(host_task_queue) as toolset:
+            tools = {t.name: t for t in await toolset.get_tools()}
+            result = await tools["slow"].run_async(
+                args={"text": "x"}, tool_context=_tool_context()
+            )
+            await workflow.execute_activity(
+                follow_up_a,
+                task_queue=host_task_queue,
+                start_to_close_timeout=timedelta(seconds=10),
+            )
+            return str(result)
+
+
+@workflow.defn
+class StatefulMcpCancelWaitWorkflow:
+    """StatefulMcpCancelWorkflow with WAIT_CANCELLATION_COMPLETED operations."""
+
+    @workflow.run
+    async def run(self, host_task_queue: str) -> str:
+        async with _toolset(host_task_queue, wait_cancellation=True) as toolset:
             tools = {t.name: t for t in await toolset.get_tools()}
             result = await tools["slow"].run_async(
                 args={"text": "x"}, tool_context=_tool_context()
