@@ -319,7 +319,7 @@ class _LangChainRuns:
         ] = {}
         # Set when the workflow ends, not replaying.  The eviction that
         # follows cancels coroutines still running a run with replay set, and
-        # their runs' end writes are made, not held back.
+        # their runs' end writes are made, not held back (see ``hold``).
         self.finished = False
 
         def reseed(seed: int) -> None:
@@ -380,6 +380,16 @@ class _LangChainRuns:
             start = self._last_start + timedelta(microseconds=1)
         self._last_start = start
         return start
+
+    def hold(self, ended: bool) -> bool:
+        """Whether to hold back a run write, which is while history replays.
+
+        A write that ends a run after the workflow has ended is made.  A
+        run's end is a ``create_run`` call for a run with deferred inputs,
+        which is posted only when it ends, and an ``update_run`` call for
+        any other.
+        """
+        return _is_replaying() and not (ended and self.finished)
 
     def end_time(self, end: datetime) -> datetime:
         """Get an end time no earlier than any start time given out so far.
@@ -450,9 +460,10 @@ def _get_langchain_runs() -> _LangChainRuns | None:
 def _finish_langchain_runs(err: BaseException | None) -> None:
     """Mark the workflow's ``_LangChainRuns`` finished if the workflow ends.
 
-    ``err`` is what the run method raised, or ``None`` if it returned.  An
-    error that fails only the workflow task, which is retried, does not end
-    the workflow.
+    ``err`` is what the run method or a signal handler raised, or ``None``
+    if the run method returned.  Either can end the workflow; an update
+    handler cannot.  An error that fails only the workflow task, which is
+    retried, does not end the workflow.
     """
     try:
         if _is_replaying():
@@ -898,7 +909,7 @@ class _ReplaySafeClient(langsmith.Client):
         # An empty list: the client's sampling dropped the run.
         if not held:
             return None
-        if _is_replaying():
+        if runs.hold(ended):
             if not ended:
                 runs.pending[id(self._client), run_id] = (self, held)
             return None
@@ -916,7 +927,7 @@ class _ReplaySafeClient(langsmith.Client):
             return self._client.update_run(*args, **kwargs)
         ended = kwargs.get("end_time") is not None
         held = _prepare_write(self._client, "update_run", kwargs)
-        if _is_replaying() and not (ended and runs.finished):
+        if runs.hold(ended):
             if ended:
                 runs.pending.pop((id(self._client), run_id), None)
             return None
@@ -1620,7 +1631,12 @@ class _LangSmithWorkflowInboundInterceptor(
 
     async def handle_signal(self, input: temporalio.worker.HandleSignalInput) -> None:
         with self._workflow_maybe_run(f"HandleSignal:{input.signal}", input.headers):
-            return await super().handle_signal(input)
+            try:
+                return await super().handle_signal(input)
+            except BaseException as err:
+                # A signal handler that raises a failure fails the workflow.
+                _finish_langchain_runs(err)
+                raise
 
     async def handle_query(self, input: temporalio.worker.HandleQueryInput) -> Any:
         if input.query.startswith("__temporal") or input.query in _BUILTIN_QUERIES:
