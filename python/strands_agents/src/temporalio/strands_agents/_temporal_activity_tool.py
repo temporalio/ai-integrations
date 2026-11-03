@@ -149,7 +149,13 @@ class _ActivityToolMetadata(FunctionToolMetadata):
                 annotation, name, default
             )
             fields[f"input_{i}"] = (Annotated[field_type, Field(alias=name)], field)
-        return create_model(f"{self.func.__name__.capitalize()}Tool", **fields)
+        # Pydantic resolves forward references left in the types, such as the
+        # one in list["Parcel"], in the model's module: the activity's.
+        return create_model(
+            f"{self.func.__name__.capitalize()}Tool",
+            __module__=self.func.__module__,
+            **fields,
+        )
 
 
 def _defined_as_method(fn: Any) -> bool:
@@ -298,6 +304,7 @@ def _call_stand_in(cls: type) -> Callable:
             raise ValueError(message)
     stand_in = functools.partial(call)
     setattr(stand_in, "__name__", cls.__name__)
+    setattr(stand_in, "__module__", func.__module__)
     stand_in.__annotations__ = hints
     # __call__'s own docstring, else the class's, else that of a __call__ it
     # inherits.

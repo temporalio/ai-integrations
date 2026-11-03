@@ -1,9 +1,10 @@
 import gc
 import weakref
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, List  # pyright: ignore[reportDeprecated]
 from uuid import uuid4
 
 import pytest
@@ -106,6 +107,35 @@ class StampParcel:
         return f"stamp {_parcel_id}"
 
 
+@dataclass
+class Parcel:
+    parcel_id: str
+
+
+@activity.defn(name="load_parcel")
+class LoadParcel:
+    def __init__(self, parcels: list[Parcel]) -> None:
+        self.parcels = parcels
+
+    # A forward reference nested in an annotation resolves in this module.
+    # typing.List, unlike list, makes it a ForwardRef that the worker's
+    # converter resolves on Python 3.10 too.
+    async def __call__(
+        self,
+        parcels: List["Parcel"],  # pyright: ignore[reportDeprecated]
+    ) -> str:
+        return "load " + ", ".join(p.parcel_id for p in parcels)
+
+
+@activity.defn(name="sort_parcel")
+class SortParcel:
+    def __init__(self, parcels: list[Parcel]) -> None:
+        self.parcels = parcels
+
+    async def __call__(self, parcels: list["Parcel"]) -> str:
+        return ", ".join(p.parcel_id for p in parcels)
+
+
 @workflow.defn
 class ToolWorkflow:
     def __init__(self) -> None:
@@ -132,6 +162,7 @@ class ToolWorkflow:
                         LabelParcel,
                         WeighParcel,
                         StampParcel,
+                        LoadParcel,
                     )
                 ),
             ],
@@ -176,6 +207,10 @@ async def test_tool(client: Client, tmp_path: Path):
                     {"name": "label_parcel", "input": {"self": "P-6"}},
                     {"name": "weigh_parcel", "input": {"parcel_id": "P-7"}},
                     {"name": "stamp_parcel", "input": {"_parcel_id": "P-9"}},
+                    {
+                        "name": "load_parcel",
+                        "input": {"parcels": [{"parcel_id": "P-10"}]},
+                    },
                     "Done!",
                 ]
             )
@@ -196,6 +231,7 @@ async def test_tool(client: Client, tmp_path: Path):
             LabelParcel(),
             WeighParcel(),
             StampParcel("unused"),
+            LoadParcel([]),
         ],
         plugins=[plugin],
         max_cached_workflows=0,
@@ -239,6 +275,8 @@ async def test_tool(client: Client, tmp_path: Path):
         "invoke_model",
         "stamp_parcel",
         "invoke_model",
+        "load_parcel",
+        "invoke_model",
     ]
     assert _activity_calls(client, history, "parcel") == [
         (["P-1"], "parcel P-1 via acme-post"),
@@ -250,6 +288,7 @@ async def test_tool(client: Client, tmp_path: Path):
         (["P-6"], "label P-6"),
         (["P-7"], "weigh P-7 with WeighParcel"),
         (["P-9"], "stamp P-9"),
+        ([[{"parcel_id": "P-10"}]], "load P-10"),
     ]
 
     cases: list[tuple[Callable[..., Any], list[str], list[str]]] = [
@@ -261,6 +300,8 @@ async def test_tool(client: Client, tmp_path: Path):
         (LabelParcel, ["self"], ["self"]),
         (WeighParcel, ["parcel_id"], ["parcel_id"]),
         (StampParcel, ["_parcel_id"], ["_parcel_id"]),
+        (LoadParcel, ["parcels"], ["parcels"]),
+        (SortParcel, ["parcels"], ["parcels"]),
     ]
     for activity_fn, properties, required in cases:
         schema = activity_as_tool(
@@ -268,6 +309,10 @@ async def test_tool(client: Client, tmp_path: Path):
         ).tool_spec["inputSchema"]["json"]
         assert list(schema["properties"]) == properties
         assert schema.get("required", []) == required
+        if activity_fn in (LoadParcel, SortParcel):
+            assert schema["$defs"]["Parcel"]["properties"] == {
+                "parcel_id": {"title": "Parcel Id", "type": "string"}
+            }
 
     await Replayer(
         workflows=[ToolWorkflow],
