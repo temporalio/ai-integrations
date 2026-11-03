@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from harbor.agents.factory import AgentFactory
 from harbor.models.bridge import BridgeConfig, BridgeKind
 from harbor.models.task.config import TaskConfig as TaskDefinition
 from harbor.models.trial.config import (
@@ -20,7 +21,6 @@ from harbor.models.trial.config import (
     VerifierConfig,
 )
 from harbor.trial.multi_step import MultiStepTrial
-from harbor.trial.trial import Trial
 
 from temporalio.client import Client
 from temporalio.harbor._activity import trial_timeout
@@ -77,8 +77,10 @@ build_timeout_sec = 300.0
             environment_build_timeout_multiplier=0.5,
         ),
         _trial(agent=AgentConfig(max_timeout_sec=1000), verifier_timeout_multiplier=4),
+        # Hermes sets its own default setup timeout.
+        _trial(agent=AgentConfig(name="hermes"), agent_setup_timeout_multiplier=2),
     ],
-    ids=["task", "overrides-caps-multipliers", "cap-above-task"],
+    ids=["task", "overrides-caps-multipliers", "cap-above-task", "agent-setup-default"],
 )
 def test_single_step_sum_matches_harbor(trial: TrialConfig) -> None:
     task = _task(_TIMED)
@@ -98,9 +100,9 @@ def test_single_step_sum_matches_harbor(trial: TrialConfig) -> None:
 def test_agent_setup_defaults_to_harbors() -> None:
     trial = _trial()
     task = _task(_TIMED)
-    assert (
-        _harbor(trial, task)._agent_setup_timeout_sec == Trial._AGENT_SETUP_TIMEOUT_SEC
-    )
+    agent = AgentFactory.get_agent_class_from_config(trial.agent)
+    harbor = _harbor(trial, task)
+    assert harbor._agent_setup_timeout_sec == agent.DEFAULT_SETUP_TIMEOUT_SEC == 360
     assert trial_timeout(trial, task, _UNTIMED) == timedelta(
         seconds=300 + 360 + 120 + 90
     )

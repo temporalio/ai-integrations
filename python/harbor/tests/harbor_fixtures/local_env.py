@@ -54,6 +54,11 @@ class LocalEnvironment(BaseEnvironment):
             return logs / path[len("/logs") :].lstrip("/")
         return self._root / path.lstrip("/")
 
+    def _is_host_path(self, path: str, host_path: Path | str) -> bool:
+        # Harbor copies /logs to and from the trial directory, which for this
+        # environment is the same directory.
+        return self._map(path).resolve() == Path(host_path).resolve()
+
     def _rewrite(self, command: str) -> str:
         return _ROOT_RE.sub(lambda m: str(self._map(m.group(1))), command)
 
@@ -101,13 +106,19 @@ class LocalEnvironment(BaseEnvironment):
         shutil.copy2(source_path, target)
 
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+        if self._is_host_path(target_dir, source_dir):
+            return
         shutil.copytree(source_dir, self._map(target_dir), dirs_exist_ok=True)
 
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
+        if self._is_host_path(source_path, target_path):
+            return
         Path(target_path).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(self._map(source_path), target_path)
 
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
+        if self._is_host_path(source_dir, target_dir):
+            return
         source = self._map(source_dir)
         if source.exists():
             shutil.copytree(source, target_dir, dirs_exist_ok=True)

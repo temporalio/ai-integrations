@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from harbor.job import Job
@@ -477,7 +477,7 @@ async def test_metrics_come_from_the_package_version_resolved(
     # Planning resolves the dataset and looks up its metric; aggregation looks
     # the metric up again, by the content hash planning pinned.
     assert registry.lookups == [
-        "org/ds@latest",
+        f"org/ds@{dataset.version or 'latest'}",
         "org/ds@sha256:v1",
         "org/ds@sha256:v1",
     ]
@@ -505,16 +505,21 @@ async def test_plan_pins_only_package_datasets(
     ]
 
 
-async def test_regrade_rejected(harbor_client: Client, tmp_path: Path) -> None:
+@pytest.mark.parametrize("action", ["regrade", "diff"])
+async def test_jobs_from_source_jobs_rejected(
+    harbor_client: Client, tmp_path: Path, action: Literal["regrade", "diff"]
+) -> None:
     config = _config(
         tmp_path,
         source_jobs=[
-            SourceJobConfig(action="regrade", type="local", path=tmp_path / "old")
+            SourceJobConfig(action=action, type="local", path=tmp_path / "old")
         ],
     )
-    cause, _ = await _planning_failure(harbor_client, PlanJob, config)
+    cause, handle = await _planning_failure(harbor_client, PlanJob, config)
     assert isinstance(cause, ApplicationError)
-    assert cause.type == "HarborRegradeUnsupported"
+    assert cause.type == "HarborSourceJobsUnsupported"
+    assert cause.non_retryable
+    assert await history.scheduled(handle) == []
 
 
 async def test_trial_names_can_be_derived(
