@@ -375,13 +375,11 @@ class _LangChainRuns:
             return max(end, self._last_start)
         return end
 
-    def stable_id(self, run_id: Any) -> Any:
-        """Get a run's stable ID, or ``run_id`` for a run this class does not know."""
-        entry = self._ids.get(str(run_id))
-        return run_id if entry is None else entry[0]
-
     def dotted_order(self, dotted_order: str) -> str:
-        """Rewrite each ``<start time><run ID>`` segment this class knows."""
+        """Rebuild each ``<start time><run ID>`` segment of a run this class knows.
+
+        The segment gets the run's start time here.
+        """
         segments = []
         for segment in dotted_order.split("."):
             entry = self._ids.get(segment[-36:])
@@ -391,26 +389,21 @@ class _LangChainRuns:
         return ".".join(segments)
 
     def relink(self, run: RunTree) -> None:
-        """Point a run at the stable IDs of the runs above it."""
+        """Start a run after a parent this class knows, and rebuild its dotted order."""
         if str(run.parent_run_id) in self._ids:
             # Start after the parent, like the parent's other children.
             run.start_time = self.start_time(run.id)
-        run.parent_run_id = self.stable_id(run.parent_run_id)
-        run.trace_id = self.stable_id(run.trace_id)
         run.dotted_order = self.dotted_order(run.dotted_order)
 
     def remap(self, kwargs: dict[str, Any], id_key: str) -> uuid.UUID | None:
-        """Rewrite a run write's IDs in place and return the run's stable ID.
+        """Keep a run write's end time after the start times, and get the run's ID.
 
-        Returns ``None``, leaving ``kwargs`` alone, for a run this class
-        does not know.
+        The end time is changed in place.  Returns ``None``, leaving
+        ``kwargs`` alone, for a run this class does not know.
         """
         entry = self._ids.get(str(kwargs.get(id_key)))
         if entry is None:
             return None
-        for key in (id_key, "parent_run_id", "trace_id"):
-            if kwargs.get(key) is not None:
-                kwargs[key] = self.stable_id(kwargs[key])
         if isinstance(kwargs.get("end_time"), datetime):
             kwargs["end_time"] = self.end_time(kwargs["end_time"])
         return entry[0]
@@ -838,8 +831,9 @@ class _ReplaySafeClient(langsmith.Client):
 
     LangChain's tracers write their runs through this client, not through
     ``_ReplaySafeRunTree`` (see ``_replay_safe_tracer``).  In workflow code,
-    this gives those runs stable IDs (see ``_LangChainRuns``) and holds back
-    their writes while history replays.  A callback runs the client's own
+    their IDs are already stable (see ``_LangChainRuns``); this records their
+    start times, keeps their end times after them, and holds back their
+    writes while history replays.  A callback runs the client's own
     steps before its write, synchronously, live or replaying, so errors
     those steps raise, such as from a redaction callback, reach LangChain's
     tracer each time.  Errors from the write itself are logged, since a
