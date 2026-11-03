@@ -163,6 +163,15 @@ async def _stream_traceable_activity() -> str:
     )
 
 
+@workflow.defn
+class TraceableHelperWorkflow:
+    """Calls a @traceable helper around an activity."""
+
+    @workflow.run
+    async def run(self) -> str:
+        return await _call_traceable_activity()
+
+
 # The clients of the tracers workflows make of their own; tests set them.
 _own_tracer_clients: list[Any] = []
 
@@ -1437,6 +1446,71 @@ class TestReplay:
             "post",
             "post",
         ]
+
+    async def test_run_under_header_parent_keeps_start_time(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+    ) -> None:
+        """A run under a parent from headers is patched as it was posted.
+
+        With a cache of 0 the run's patch comes after a replay, which reads
+        the headers again.
+        """
+        get_runtime_environment()
+        langsmith.env.get_langchain_env_var_metadata()
+        writes: list[tuple[str, dict[str, Any]]] = []
+
+        class _RecordingClient(langsmith.Client):
+            def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("post", args[0]))
+
+            def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("patch", args[0]))
+
+        ls_client = _RecordingClient(
+            api_url="http://localhost:1", api_key="test", auto_batch_tracing=False
+        )
+        config = client.config()
+        config["plugins"] = [LangSmithPlugin(client=ls_client)]
+        temporal_client = Client(**config)
+        async with new_worker(
+            temporal_client,
+            TraceableHelperWorkflow,
+            activities=[traceable_activity],
+            max_cached_workflows=0,
+        ) as worker:
+            with langsmith.trace("client", client=ls_client):
+                handle = await temporal_client.start_workflow(
+                    TraceableHelperWorkflow.run,
+                    id=f"replay-test-{uuid.uuid4()}",
+                    task_queue=worker.task_queue,
+                )
+            await handle.result()
+
+        def writes_of(op: str) -> list[dict[str, Any]]:
+            return [run for o, run in writes if o == op and str(run["id"]) in ids]
+
+        for _ in range(100):
+            ids = {
+                str(run["id"])
+                for op, run in writes
+                if op == "post" and run["name"] == "call_traceable_activity"
+            }
+            if ids and writes_of("patch"):
+                break
+            await asyncio.sleep(0.05)
+        [posted] = writes_of("post")
+        [patched] = writes_of("patch")
+
+        def start(run: dict[str, Any]) -> datetime:
+            value = run["start_time"]
+            return (
+                value if isinstance(value, datetime) else datetime.fromisoformat(value)
+            )
+
+        assert start(patched) == start(posted)
+        assert patched["dotted_order"] == posted["dotted_order"]
 
 
 # ---------------------------------------------------------------------------

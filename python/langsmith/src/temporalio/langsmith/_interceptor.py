@@ -13,7 +13,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Generator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, ClassVar, NoReturn, Protocol
 
 import langsmith
@@ -115,6 +115,21 @@ def _inject_current_context(
     return headers
 
 
+def _start_at_header_time(run: RunTree) -> None:
+    """Start a run built from headers at the time its dotted order records.
+
+    ``RunTree.from_headers`` starts it at the wall-clock time, which is new
+    on each replay, and a child run starts no earlier than its parent.  A
+    dotted order that can't be read leaves it so.
+    """
+    try:
+        run.start_time = datetime.strptime(
+            run.dotted_order.split(".")[-1][:-36], "%Y%m%dT%H%M%S%fZ"
+        ).replace(tzinfo=timezone.utc)
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+
 def _extract_context(
     headers: Mapping[str, Payload],
     executor: ThreadPoolExecutor,
@@ -134,6 +149,7 @@ def _extract_context(
     run = RunTree.from_headers(ls_headers)
     if run is None:
         return None
+    _start_at_header_time(run)
     run.ls_client = ls_client
     return _ReplaySafeRunTree(run, executor=executor)
 
@@ -163,6 +179,7 @@ def _extract_nexus_context(
     run = RunTree.from_headers(ls_headers)
     if run is None:
         return None
+    _start_at_header_time(run)
     run.ls_client = ls_client
     return _ReplaySafeRunTree(run, executor=executor)
 
