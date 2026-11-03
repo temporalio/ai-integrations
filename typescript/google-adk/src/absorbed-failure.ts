@@ -31,7 +31,7 @@
 import type { AsyncLocalStorage as ALS } from 'node:async_hooks';
 
 import { BaseNode, FunctionTool, PluginManager } from '@google/adk';
-import { ActivityFailure, ApplicationFailure, TemporalFailure } from '@temporalio/common';
+import { ApplicationFailure, TemporalFailure } from '@temporalio/common';
 import {
   AsyncLocalStorage,
   CancellationScope,
@@ -44,6 +44,8 @@ import {
 } from '@temporalio/workflow';
 // Not exported from the package root; the SDK untracks its own scope listeners with it.
 import { untrackPromise } from '@temporalio/workflow/lib/stack-helpers';
+// Not exported from the package root; holds the completion each Activity's promise settles by.
+import { getActivator } from '@temporalio/workflow/lib/global-attributes';
 
 import { ADK_RUNTIME_FAILURE_TYPES } from './error-types';
 
@@ -119,8 +121,8 @@ interface AbsorbedFailures {
   scopes: WeakMap<CancellationScope, ScopeWatch>;
   /** The watch of the scope each Activity in flight started in, by its `seq` (see {@link noteActivityScope}). */
   activities: Map<number, ScopeWatch>;
-  /** The same watch, per the failure an Activity was resolved with (see {@link noteActivityResolutions}). */
-  activityFailures: WeakMap<object, ScopeWatch>;
+  /** The same watch, per the error an Activity's promise was rejected with (see {@link noteActivityResolutions}). */
+  activityErrors: WeakMap<object, ScopeWatch>;
   /** The failures of other operations whose scope this request cancelled first (see {@link watchScope}). */
   cancelledByExecution: WeakSet<object>;
   /** The ADK node attempt the running code belongs to (see {@link watchNodeAttempts}). */
@@ -139,7 +141,7 @@ function recorded(): AbsorbedFailures {
       answered: new WeakMap(),
       scopes: new WeakMap(),
       activities: new Map(),
-      activityFailures: new WeakMap(),
+      activityErrors: new WeakMap(),
       cancelledByExecution: new WeakSet(),
       attempts: new AsyncLocalStorage<NodeAttempt>(),
       wrapped: new WeakMap(),
@@ -285,22 +287,32 @@ function noteActivityScope(input: ActivityInput): void {
 }
 
 /**
- * Moves the watch {@link noteActivityScope} noted for each Activity this activation fails to
- * the failure it fails with: the SDK keeps that object as the `failure` of the
- * `ActivityFailure` it rejects the Activity's promise with. Run before the SDK resolves the
- * jobs, which it does with the same objects. A child Workflow's or a Nexus operation's own
- * Activities fail other objects, so their `ActivityFailure`s never match.
+ * Moves the watch {@link noteActivityScope} noted for each Activity this activation resolves
+ * to the error its promise is rejected with, whatever the failure converter made of the
+ * activation's failure: the SDK's own `reject` for that promise is wrapped, so nothing is
+ * attached to the promise. Run before the SDK resolves the jobs. A child Workflow's or a
+ * Nexus operation's own Activities settle other promises, so their errors never match.
  */
 function noteActivityResolutions(activation: ActivateInput['activation']): void {
-  const { activities, activityFailures } = recorded();
+  const { activities, activityErrors } = recorded();
+  // An SDK that moves this internal skips the note instead of failing every Workflow Task.
+  const completions = getActivator().completions?.activity;
   for (const job of activation.jobs ?? []) {
-    const { seq, result } = job.resolveActivity ?? {};
+    const seq = job.resolveActivity?.seq;
     if (typeof seq !== 'number') continue;
     const watch = activities.get(seq);
     if (watch === undefined) continue;
     activities.delete(seq);
-    const failure = result?.cancelled?.failure ?? result?.failed?.failure;
-    if (typeof failure === 'object' && failure !== null) activityFailures.set(failure, watch);
+    const completion = completions?.get(seq);
+    if (completion === undefined) continue;
+    const { reject } = completion;
+    completions.set(seq, {
+      ...completion,
+      reject: (err: Error) => {
+        activityErrors.set(err, watch);
+        reject(err);
+      },
+    });
   }
 }
 
@@ -336,12 +348,7 @@ function executionCancellation(err: unknown): unknown {
   const state = recorded();
   for (const current of causes(err)) {
     if (current === state.root?.reason || state.cancelledByExecution.has(current)) return current;
-    if (
-      current instanceof ActivityFailure &&
-      current.failure !== undefined &&
-      isCancellation(current) &&
-      cancelledFirstByExecution(state.activityFailures.get(current.failure))
-    ) {
+    if (isCancellation(current) && cancelledFirstByExecution(state.activityErrors.get(current))) {
       return current;
     }
   }

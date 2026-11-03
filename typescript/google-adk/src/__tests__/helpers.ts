@@ -116,6 +116,9 @@ export const reverseDef: MockMCPToolDefinition = {
 /** Absolute path to the test workflows source bundled into the sandbox. */
 export const workflowsPath = path.resolve(here, '../../src/__tests__/workflows.ts');
 
+/** Absolute path to the compiled failure converter module that converts a copy of each failure. */
+export const copyingFailureConverterPath = path.resolve(here, './copying-failure-converter.js');
+
 /** A model that always raises a non-retryable (HTTP 400) error. */
 export class ThrowingLlm extends BaseLlm {
   static override readonly supportedModels: Array<string | RegExp> = ['boom'];
@@ -356,6 +359,8 @@ export interface WithWorkerOptions {
    * still evaluates first, these follow.
    */
   workflowInterceptorModules?: string[];
+  /** A failure converter module for the Workflows and the Worker. */
+  failureConverterPath?: string;
 }
 
 const bundleCache = new Map<string, Promise<WorkflowBundle>>();
@@ -370,7 +375,7 @@ const bundleCache = new Map<string, Promise<WorkflowBundle>>();
  * `configureBundler` runs twice per miss (here, then in the bundler), so it must also be pure.
  */
 function getWorkflowBundle(
-  options: Pick<BundleOptions, 'workflowsPath' | 'workflowInterceptorModules' | 'plugins'>
+  options: Pick<BundleOptions, 'workflowsPath' | 'workflowInterceptorModules' | 'plugins' | 'failureConverterPath'>
 ): Promise<WorkflowBundle> {
   const plugins = options.plugins ?? [];
   const resolved = plugins.reduce<BundleOptions>((acc, plugin) => plugin.configureBundler?.(acc) ?? acc, options);
@@ -412,6 +417,7 @@ export async function withWorker<T>(
     workflowsPath,
     workflowInterceptorModules: options.workflowInterceptorModules,
     plugins: options.plugins,
+    failureConverterPath: options.failureConverterPath,
   });
   const worker = await Worker.create({
     connection: env.nativeConnection,
@@ -421,6 +427,7 @@ export async function withWorker<T>(
     plugins: options.plugins,
     activities: options.activities,
     maxCachedWorkflows: options.maxCachedWorkflows ?? 0,
+    dataConverter: options.failureConverterPath ? { failureConverterPath: options.failureConverterPath } : undefined,
   });
   return worker.runUntil(fn());
 }

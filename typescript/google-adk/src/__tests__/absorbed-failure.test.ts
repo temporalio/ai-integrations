@@ -16,6 +16,7 @@ import { ApplicationFailure, TimeoutFailure } from '@temporalio/common';
 
 import { GoogleAdkPlugin } from '../index';
 import {
+  copyingFailureConverterPath,
   countScheduledActivities,
   defaultTestProvider,
   findInCauseChain,
@@ -368,16 +369,23 @@ test.serial('aKeptActivityErrorKeepsItsOwnCancellationSourceWhenItsIdIsReused', 
   const env = getEnv();
   // A callback keeps one Activity's error, runs a second Activity, and rethrows the first.
   // What decides the run is how the first Activity was cancelled, whether the second used
-  // the same `activityId` or not.
+  // the same `activityId` or not, and whether a failure converter converted a copy of the
+  // Activity's failure.
   const cases = [
     { order: 'execution-first' as const, status: 'CANCELLED' as const },
     { order: 'timeout-first' as const, status: 'COMPLETED' as const },
-  ].flatMap((c) => [true, false].map((reuse) => ({ ...c, reuse })));
-  for (const { order, reuse, status } of cases) {
-    const label = `${order} reuse=${reuse}`;
+  ].flatMap((c) => [true, false].flatMap((reuse) => [false, true].map((copying) => ({ ...c, reuse, copying }))));
+  for (const { order, reuse, copying, status } of cases) {
+    const label = `${order} reuse=${reuse}${copying ? ' copying converter' : ''}`;
     const taskQueue = uid('adk-reused-activity-id');
     const workflowId = uid('wf-reused-activity-id');
-    await withWorker(env, { taskQueue, plugins: [adkPlugin()], activities: { cancellableActivity } }, async () => {
+    const options = {
+      taskQueue,
+      plugins: [adkPlugin()],
+      activities: { cancellableActivity },
+      failureConverterPath: copying ? copyingFailureConverterPath : undefined,
+    };
+    await withWorker(env, options, async () => {
       const handle = await env.client.workflow.start(agentRunnerRetainedActivityError, {
         taskQueue,
         workflowId,
