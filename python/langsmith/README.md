@@ -174,6 +174,8 @@ Temporal Workflows are deterministic and get replayed from event history on reco
 
 You don't need to do anything special for this. Your `@traceable` functions behave the same whether it's a fresh execution or a replay, and so do LangChain runnables.
 
+Run IDs follow the order in which Workflow code makes runs. A deploy that changes the runs a running Workflow has already made, such as a changed chain or graph or a langchain-core or LangGraph upgrade, changes the IDs of its later runs. Temporal doesn't detect this, and the runs made before the deploy are never ended. Changing `add_temporal_runs` does the same to `@traceable` runs, though not to LangChain's. Gate such changes with `workflow.patched` or Worker Versioning.
+
 ### Example: Worker Crash Mid-Workflow
 
 ```

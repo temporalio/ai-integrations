@@ -290,6 +290,7 @@ class _LangChainRuns:
 
     def __init__(self) -> None:
         self._rng = random.Random()
+        self._root_rng = random.Random()
         self._ids: dict[str, tuple[uuid.UUID, datetime]] = {}
         self._last_start: datetime | None = None
         # Writes held back during replay, for runs that are still open, with
@@ -306,6 +307,7 @@ class _LangChainRuns:
 
         def reseed(seed: int) -> None:
             self._rng.seed(f"temporal-langsmith-langchain-{seed}")
+            self._root_rng.seed(f"temporal-langsmith-root-{seed}")
 
         reseed(temporalio.workflow.random_seed())
         temporalio.workflow.register_random_seed_callback(reseed)
@@ -340,8 +342,12 @@ class _LangChainRuns:
         return entry[0]
 
     def new_run(self) -> tuple[uuid.UUID, datetime]:
-        """Get a stable ID and start time for a new run, and add it."""
-        run_id = self.add(_uuid_from_random(self._rng))
+        """Get a stable ID and start time for a root factory's run, and add it.
+
+        The ID comes from a generator of its own, so ``add_temporal_runs``
+        does not change the IDs of LangChain's runs.
+        """
+        run_id = self.add(_uuid_from_random(self._root_rng))
         return run_id, self._ids[str(run_id)][1]
 
     def start_time(self, run_id: Any) -> datetime:

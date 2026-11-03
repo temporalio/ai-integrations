@@ -1358,6 +1358,82 @@ class TestReplay:
         assert ended["error"]
         assert ended["end_time"]
 
+    @pytest.mark.parametrize("first", [False, True])
+    async def test_run_id_kept_when_add_temporal_runs_changes(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+        first: bool,
+    ) -> None:
+        """A run open across Workers with different ``add_temporal_runs`` keeps its ID."""
+        get_runtime_environment()
+        langsmith.env.get_langchain_env_var_metadata()
+        writes: list[tuple[str, dict[str, Any]]] = []
+
+        class _RecordingClient(langsmith.Client):
+            def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("post", args[0]))
+
+            def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                writes.append(("patch", args[0]))
+
+        def temporal_client(add_temporal_runs: bool) -> Client:
+            config = client.config()
+            config["plugins"] = [
+                LangSmithPlugin(
+                    client=_RecordingClient(
+                        api_url="http://localhost:1",
+                        api_key="test",
+                        auto_batch_tracing=False,
+                    ),
+                    add_temporal_runs=add_temporal_runs,
+                )
+            ]
+            return Client(**config)
+
+        task_queue = str(uuid.uuid4())
+        # A cache of 0, so the second Worker replays the open run.
+        async with new_worker(
+            temporal_client(first),
+            LangChainSignalWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            handle = await client.start_workflow(
+                LangChainSignalWorkflow.run,
+                id=f"replay-test-{uuid.uuid4()}",
+                task_queue=task_queue,
+            )
+            for _ in range(100):
+                history = await handle.fetch_history()
+                if any(
+                    e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED
+                    for e in history.events
+                ):
+                    break
+                await asyncio.sleep(0.1)
+        async with new_worker(
+            temporal_client(not first),
+            LangChainSignalWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            await handle.signal(LangChainSignalWorkflow.release)
+            assert await handle.result() == "secret"
+
+        # Each Worker's client posted the run, under one ID, and the second
+        # ended it.
+        [run_id] = {
+            str(run["id"])
+            for op, run in writes
+            if op == "post" and run["name"] == "wait"
+        }
+        assert sorted(op for op, run in writes if str(run["id"]) == run_id) == [
+            "patch",
+            "post",
+            "post",
+        ]
+
 
 # ---------------------------------------------------------------------------
 # TestErrorTracing
