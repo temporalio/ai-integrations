@@ -30,6 +30,11 @@ import temporalio.converter
 import temporalio.worker
 import temporalio.workflow
 from temporalio.api.common.v1 import Payload
+from temporalio.bridge.proto.workflow_activation import (
+    RemoveFromCache,
+    WorkflowActivation,
+)
+from temporalio.bridge.proto.workflow_completion import WorkflowActivationCompletion
 from temporalio.exceptions import ApplicationError, ApplicationErrorCategory
 
 
@@ -317,10 +322,6 @@ class _LangChainRuns:
         self.pending: dict[
             tuple[int, uuid.UUID], tuple[_ReplaySafeClient, list[_HeldWrite]]
         ] = {}
-        # Set when the workflow ends, not replaying.  The eviction that
-        # follows cancels coroutines still running a run with replay set, and
-        # their runs' end writes are made, not held back (see ``hold``).
-        self.finished = False
 
         def reseed(seed: int) -> None:
             self._rng.seed(f"temporal-langsmith-langchain-{seed}")
@@ -384,12 +385,16 @@ class _LangChainRuns:
     def hold(self, ended: bool) -> bool:
         """Whether to hold back a run write, which is while history replays.
 
-        A write that ends a run after the workflow has ended is made.  A
-        run's end is a ``create_run`` call for a run with deferred inputs,
-        which is posted only when it ends, and an ``update_run`` call for
-        any other.
+        A write that ends a run in the eviction after the workflow has ended
+        is made.  A run's end is a ``create_run`` call for a run with
+        deferred inputs, which is posted only when it ends, and an
+        ``update_run`` call for any other.
         """
-        return _is_replaying() and not (ended and self.finished)
+        if not _is_replaying():
+            return False
+        return (
+            not ended or _activation.ending_run_id != temporalio.workflow.info().run_id
+        )
 
     def end_time(self, end: datetime) -> datetime:
         """Get an end time no earlier than any start time given out so far.
@@ -457,32 +462,137 @@ def _get_langchain_runs() -> _LangChainRuns | None:
         return None
 
 
-def _finish_langchain_runs(err: BaseException | None) -> None:
-    """Mark the workflow's ``_LangChainRuns`` finished if the workflow ends.
+# Commands that end a workflow.
+_ENDING_COMMANDS = frozenset(
+    {
+        "complete_workflow_execution",
+        "fail_workflow_execution",
+        "cancel_workflow_execution",
+        "continue_as_new_workflow_execution",
+    }
+)
 
-    ``err`` is what the run method or a signal handler raised, or ``None``
-    if the run method returned.  Either can end the workflow; an update
-    handler cannot.  An error that fails only the workflow task, which is
-    retried, does not end the workflow.
+# Reasons for the eviction after a workflow task that ended the workflow:
+# with no room in the cache, Core evicts after every workflow task.
+_ENDING_EVICTIONS = frozenset(
+    {
+        RemoveFromCache.EvictionReason.WORKFLOW_EXECUTION_ENDING,
+        RemoveFromCache.EvictionReason.CACHE_FULL,
+    }
+)
+
+
+def _ends_workflow(completion: WorkflowActivationCompletion) -> bool:
+    """Whether the worker sent a completion, and it ends the workflow.
+
+    The worker sets a completion's run ID and encodes its payloads after the
+    workflow instance returns it, and if encoding fails, as when a payload
+    codec raises, it makes the same completion a failed one.  After a
+    deadlock it sends another completion instead.  So this is read once the
+    completion is sent, at the next activation.
     """
-    try:
-        if _is_replaying():
-            return
-        if err is not None and not (
-            isinstance(
-                err, (temporalio.workflow.ContinueAsNewError, asyncio.CancelledError)
+    return (
+        bool(completion.run_id)
+        and completion.HasField("successful")
+        and any(
+            command.WhichOneof("variant") in _ENDING_COMMANDS
+            for command in completion.successful.commands
+        )
+    )
+
+
+class _Activation(threading.local):
+    """The workflow activation ``_EndingEvictions`` is making in this thread.
+
+    Workflow code runs in the thread that activates it, so an activation of
+    another workflow, or a replay of the same one, can't see or change this
+    one's.  ``marked`` is set while ``_EndingEvictions`` makes an
+    activation, and ``ending_run_id`` is the workflow's run ID while it is
+    the eviction after the workflow ended.  The eviction cancels coroutines
+    still running a run, with replay set, and their runs' end writes are
+    made, not held back (see ``_LangChainRuns.hold``).  Workflow code can't
+    tell this eviction from one after a failed workflow task, which the
+    workflow goes on from.
+    """
+
+    marked = False
+    ending_run_id: str | None = None
+
+
+_activation = _Activation()
+
+
+class _EndingEvictions:
+    """Marks the eviction after a workflow ended, from the workflow's activations.
+
+    The workflow has ended when an activation, not replaying, completed with
+    a command that ends it, the worker sent that completion, and no later
+    completion failed or wasn't sent.  The eviction after it is marked if
+    its reason is one after a workflow ends, so not one after a completion
+    the server rejected.  Each completion is read at the next activation,
+    once it is sent (see ``_ends_workflow``).
+    """
+
+    def __init__(
+        self, activate: Callable[[WorkflowActivation], WorkflowActivationCompletion]
+    ) -> None:
+        self._activate = activate
+        # The last activation: whether it replayed, and its completion.
+        self.last: tuple[bool, WorkflowActivationCompletion] | None = None
+        # The completion that ended the workflow, and each one after it.
+        self._since_end: list[WorkflowActivationCompletion] = []
+
+    def activate(self, act: WorkflowActivation) -> WorkflowActivationCompletion:
+        """Make an activation, marking it if it is the eviction after the end."""
+        if self.last is not None:
+            replaying, completion = self.last
+            if not replaying and _ends_workflow(completion):
+                self._since_end = [completion]
+            elif self._since_end:
+                self._since_end.append(completion)
+        ending = (
+            bool(self._since_end)
+            and all(c.run_id and c.HasField("successful") for c in self._since_end[1:])
+            and any(
+                job.HasField("remove_from_cache")
+                and job.remove_from_cache.reason in _ENDING_EVICTIONS
+                for job in act.jobs
             )
-            or temporalio.workflow.is_failure_exception(err)
-        ):
-            return
-        inst = temporalio.workflow.instance()
-        # A workflow class's own __getattr__ can raise anything.
-        runs = getattr(inst, "__temporal_langsmith_langchain_runs", None)
-    except Exception:
-        # Workflow APIs are mocked (unit tests).
+        )
+        _activation.marked = True
+        _activation.ending_run_id = act.run_id if ending else None
+        try:
+            completion = self._activate(act)
+        finally:
+            _activation.marked = False
+            _activation.ending_run_id = None
+        self.last = (act.is_replaying, completion)
+        return completion
+
+
+def _watch_activations() -> None:
+    """Mark the eviction after the current workflow ends, if nothing does yet.
+
+    ``LangSmithPlugin``'s workflow runner marks it.  ``LangSmithInterceptor``
+    registered without the plugin installs no runner, so the workflow
+    instance's own activations go through ``_EndingEvictions`` from the
+    next one on.  Called in the workflow's first activation, which is
+    counted as it would have been.
+    """
+    if _activation.marked:
         return
-    if isinstance(runs, _LangChainRuns):
-        runs.finished = True
+    try:
+        if not temporalio.workflow.in_workflow():
+            return
+        runtime = temporalio.workflow._Runtime.current()
+        completion = getattr(runtime, "_current_completion")
+        evictions = _EndingEvictions(getattr(runtime, "activate"))
+    except Exception:
+        # Workflow APIs are mocked (unit tests), or this SDK has no such
+        # instance: the runs stay open.
+        return
+    evictions.last = (_is_replaying(), completion)
+    setattr(runtime, "activate", evictions.activate)
 
 
 _langchain_run_id_hook_installed = False
@@ -1625,27 +1735,17 @@ class _LangSmithWorkflowInboundInterceptor(
     async def execute_workflow(
         self, input: temporalio.worker.ExecuteWorkflowInput
     ) -> Any:
+        _watch_activations()
         wf_type = temporalio.workflow.info().workflow_type
         with self._workflow_maybe_run(
             f"RunWorkflow:{wf_type}",
             input.headers,
         ):
-            try:
-                result = await super().execute_workflow(input)
-            except BaseException as err:
-                _finish_langchain_runs(err)
-                raise
-            _finish_langchain_runs(None)
-            return result
+            return await super().execute_workflow(input)
 
     async def handle_signal(self, input: temporalio.worker.HandleSignalInput) -> None:
         with self._workflow_maybe_run(f"HandleSignal:{input.signal}", input.headers):
-            try:
-                return await super().handle_signal(input)
-            except BaseException as err:
-                # A signal handler that raises a failure fails the workflow.
-                _finish_langchain_runs(err)
-                raise
+            return await super().handle_signal(input)
 
     async def handle_query(self, input: temporalio.worker.HandleQueryInput) -> Any:
         if input.query.startswith("__temporal") or input.query in _BUILTIN_QUERIES:

@@ -16,13 +16,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from temporalio.api.common.v1 import Payload
+from temporalio.bridge.proto.workflow_activation import (
+    RemoveFromCache,
+    WorkflowActivation,
+    WorkflowActivationJob,
+)
+from temporalio.bridge.proto.workflow_commands import (
+    FailWorkflowExecution,
+    WorkflowCommand,
+)
+from temporalio.bridge.proto.workflow_completion import (
+    Success,
+    WorkflowActivationCompletion,
+)
 from temporalio.exceptions import ApplicationError, ApplicationErrorCategory
 from temporalio.langsmith import LangSmithInterceptor
 from temporalio.langsmith._interceptor import (
     HEADER_KEY,
+    _activation,
     _end_run_on_exception,
     _extract_context,
-    _finish_langchain_runs,
     _inject_context,
     _LangChainRuns,
     _LangSmithWorkflowInboundInterceptor,
@@ -31,6 +44,7 @@ from temporalio.langsmith._interceptor import (
     _post_pending,
     _ReplaySafeClient,
     _ReplaySafeRunTree,
+    _watch_activations,
 )
 from temporalio.worker import HandleQueryInput
 
@@ -329,19 +343,95 @@ class TestReplaySafety:
         _open_runs[id(client)] = (stale, OrderedDict({uuid.uuid4(): None}))
         assert list(_ReplaySafeClient(client)._open) == []
 
-    def test_finish_with_workflow_getattr_that_raises(self) -> None:
-        """A workflow class whose ``__getattr__`` raises doesn't fail its end."""
+    def test_activations_watched_without_runner(self) -> None:
+        """Without the plugin's runner, the workflow's activations are watched.
 
-        class _Workflow:
-            def __getattr__(self, name: str) -> Any:
-                return self.__dict__["_state"][name]
+        ``LangSmithInterceptor`` registered alone wraps the workflow
+        instance's ``activate`` in its first activation, which counts too.
+        The eviction after it is marked only if the worker sent that
+        activation's completion, and it ends the workflow.
+        """
 
+        def ends() -> WorkflowActivationCompletion:
+            return WorkflowActivationCompletion(
+                successful=Success(
+                    commands=[
+                        WorkflowCommand(fail_workflow_execution=FailWorkflowExecution())
+                    ]
+                )
+            )
+
+        # What happens to the first activation's completion once the
+        # workflow has ended in it.
+        def sent(completion: WorkflowActivationCompletion) -> None:
+            completion.run_id = "run"
+
+        def task_fails(completion: WorkflowActivationCompletion) -> None:
+            # Another handler fails the task, or the result can't be
+            # serialized.
+            completion.failed.failure.message = "failed"
+            sent(completion)
+
+        def encoding_fails(completion: WorkflowActivationCompletion) -> None:
+            sent(completion)
+            completion.failed.failure.message = "Failed encoding completion"
+
+        def not_sent(_: WorkflowActivationCompletion) -> None:
+            pass
+
+        eviction = WorkflowActivation(
+            run_id="run",
+            is_replaying=True,
+            jobs=[
+                WorkflowActivationJob(
+                    remove_from_cache=RemoveFromCache(
+                        reason=RemoveFromCache.EvictionReason.CACHE_FULL
+                    )
+                )
+            ],
+        )
+        for change, marked in (
+            (sent, True),
+            (task_fails, False),
+            (encoding_fails, False),
+            (not_sent, False),
+        ):
+            completion, seen = ends(), []
+
+            class _Runtime:
+                _current_completion = completion
+
+                def activate(
+                    self, act: WorkflowActivation
+                ) -> WorkflowActivationCompletion:
+                    seen.append(_activation.ending_run_id == act.run_id)
+                    return WorkflowActivationCompletion(successful=Success())
+
+            runtime = _Runtime()
+            with (
+                patch(_PATCH_IN_WORKFLOW, return_value=True),
+                patch(_PATCH_IS_REPLAYING, return_value=False),
+                patch(
+                    f"{_MOD}.temporalio.workflow._Runtime.current",
+                    return_value=runtime,
+                ),
+            ):
+                _watch_activations()
+            change(completion)
+            runtime.activate(eviction)
+            assert seen == [marked], change.__name__
+            assert not _activation.marked and _activation.ending_run_id is None
+
+        # Under the plugin's runner, it is left alone.
+        runtime = MagicMock()
+        activate = runtime.activate
         with (
             patch(_PATCH_IN_WORKFLOW, return_value=True),
-            patch(_PATCH_IS_REPLAYING, return_value=False),
-            patch(f"{_MOD}.temporalio.workflow.instance", return_value=_Workflow()),
+            patch(f"{_MOD}.temporalio.workflow._Runtime.current", return_value=runtime),
+            patch.object(_activation, "marked", True),
         ):
-            _finish_langchain_runs(None)
+            _watch_activations()
+        assert runtime.activate is activate
 
     def test_run_does_not_end_before_it_starts(self) -> None:
         """A run's end time is no earlier than any start time given out."""

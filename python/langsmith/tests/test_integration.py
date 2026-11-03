@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import gc
+import threading
+import time
 import uuid
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -25,16 +28,23 @@ from langsmith.run_helpers import get_tracing_context
 from langsmith.run_trees import WriteReplica
 
 from temporalio import activity, common, nexus, workflow
-from temporalio.api.enums.v1 import EventType
+from temporalio.api.common.v1 import Payload
+from temporalio.api.enums.v1 import EventType, WorkflowTaskFailedCause
 from temporalio.client import (
     Client,
+    WorkflowExecutionStatus,
     WorkflowFailureError,
     WorkflowHandle,
 )
+from temporalio.converter import DataConverter, PayloadCodec
 from temporalio.exceptions import ApplicationError
-from temporalio.langsmith import LangSmithPlugin
+from temporalio.langsmith import LangSmithInterceptor, LangSmithPlugin
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import UnsandboxedWorkflowRunner
+from temporalio.worker import Replayer, UnsandboxedWorkflowRunner, WorkflowRunner
+from temporalio.worker.workflow_sandbox import (
+    SandboxedWorkflowRunner,
+    SandboxRestrictions,
+)
 from tests.helpers import new_worker
 from tests.helpers.langsmith import (
     InMemoryRunCollector,
@@ -267,20 +277,61 @@ class LangChainRaceWorkflow:
     """Races two LangChain runnables and returns when the first ends.
 
     The step of ``race_a`` waits for ``release``; ``race_b``'s never ends.
-    ``fail`` fails the workflow from its signal handler.  With ``deferred``,
-    the runnables take their input as a stream.
+    ``fail`` fails the workflow from its signal handler, and ``crash`` fails
+    the workflow task.  ``release_slowly`` and ``fail_slowly`` block their
+    activation for a second, so that a signal sent meanwhile makes the
+    server reject its completion.  After ``release_unserializable``, the workflow
+    returns a result that can't be serialized, which fails the workflow
+    task.  After ``release_uncodable`` it returns ``_UNCODABLE``, and
+    ``fail_uncodable`` fails it with that as its details, which
+    ``_FailingCodec`` can fail to encode.  With ``deferred``, the runnables
+    take their input as a stream.
     """
 
     def __init__(self) -> None:
         self._released = False
+        self._unserializable = False
+        self._uncodable = False
 
     @workflow.signal
     def release(self) -> None:
         self._released = True
 
     @workflow.signal
+    def release_unserializable(self) -> None:
+        self._released = True
+        self._unserializable = True
+
+    @workflow.signal
+    def release_uncodable(self) -> None:
+        self._released = True
+        self._uncodable = True
+
+    @workflow.signal
     def fail(self) -> None:
         raise ApplicationError("failed by signal")
+
+    @workflow.signal
+    def fail_uncodable(self) -> None:
+        raise ApplicationError("failed by signal", _UNCODABLE)
+
+    @workflow.signal
+    def crash(self) -> None:
+        raise RuntimeError("workflow task failed by signal")
+
+    @workflow.signal
+    def release_slowly(self) -> None:
+        self._released = True
+        _block()
+
+    @workflow.signal
+    def fail_slowly(self) -> None:
+        _block()
+        raise ApplicationError("failed by signal")
+
+    @workflow.signal
+    def other(self) -> None:
+        pass
 
     @workflow.run
     async def run(self, deferred: bool = False) -> str:
@@ -303,7 +354,37 @@ class LangChainRaceWorkflow:
             for name in "ab"
         ]
         done, _ = await workflow.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        return done.pop().result()
+        result: Any = object() if self._unserializable else done.pop().result()
+        return _UNCODABLE if self._uncodable else result
+
+
+def _block() -> None:
+    """Block a live activation for a second, less than the deadlock timeout."""
+    if not workflow.unsafe.is_replaying_history_events():
+        with workflow.unsafe.sandbox_unrestricted():
+            time.sleep(1)
+
+
+_UNCODABLE = "uncodable"
+
+
+class _FailingCodec(PayloadCodec):
+    """Fails to encode a payload of ``_UNCODABLE`` while ``broken``."""
+
+    def __init__(self) -> None:
+        self.broken = True
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if self.broken and any(p.data == f'"{_UNCODABLE}"'.encode() for p in payloads):
+            raise RuntimeError("codec failed")
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+
+class _SubclassedRunner(SandboxedWorkflowRunner):
+    """A subclass of the sandboxed runner, changing nothing."""
 
 
 @workflow.defn
@@ -1321,6 +1402,22 @@ class TestReplay:
     @pytest.mark.parametrize("max_cached_workflows", [0, 1000])
     @pytest.mark.parametrize("deferred", [False, True])
     @pytest.mark.parametrize("fail", [False, True])
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "",
+            "subclassed",
+            "interceptor",
+            "replayed",
+            "task",
+            "codec",
+            "rejected",
+            "interceptor-task",
+            "interceptor-codec",
+            "interceptor-rejected",
+            "interceptor-sandboxed-codec",
+        ],
+    )
     async def test_open_run_ended_when_workflow_ends(
         self,
         client: Client,
@@ -1328,77 +1425,227 @@ class TestReplay:
         max_cached_workflows: int,
         deferred: bool,
         fail: bool,
+        case: str,
     ) -> None:
         """A run still open when its workflow ends is ended, with an error.
 
         The eviction after the workflow ends cancels the run's coroutine.
         The workflow returns, or a signal handler fails it.  A run with
-        deferred inputs is posted only when it ends.
+        deferred inputs is posted only when it ends.  With ``task_fails``,
+        the workflow task in which the workflow would end fails instead, and
+        the eviction after it doesn't end the runs: the workflow goes on.
+        It fails in the workflow (``task``), or when the worker encodes its
+        completion (``codec``), which is then fixed so the workflow ends.
+        With ``subclassed``, the workers run a subclass of the sandboxed
+        runner.  With ``interceptor``, ``LangSmithInterceptor`` is registered
+        on the client without the plugin, and the workflow is not sandboxed.
+        With ``replayed``, the workflow's history is replayed, with the
+        plugin, while the eviction after it ended is between end writes.
+        With ``rejected``, the server rejects the completion that would end
+        the workflow, which then ends in a later task.  The ``interceptor-``
+        cases fail or reject the task with the interceptor registered alone,
+        on a sandboxed runner with ``interceptor-sandboxed-codec``.
         """
+        interceptor = case.startswith("interceptor")
+        variant = case.rpartition("-")[2] if interceptor else case
+        variant = "" if variant == "interceptor" else variant
+        task_fails = variant if variant in ("task", "codec") else ""
+        rejected = variant == "rejected"
         get_runtime_environment()
         langsmith.env.get_langchain_env_var_metadata()
         writes: list[tuple[str, dict[str, Any]]] = []
+        # With ``replayed``, the first end write with an error, which only the
+        # eviction after the workflow ends makes, waits for ``resumed``.
+        paused, resumed = threading.Event(), threading.Event()
 
         class _RecordingClient(langsmith.Client):
             def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                self._pause(args[0])
                 writes.append(("post", args[0]))
 
             def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                self._pause(args[0])
                 writes.append(("patch", args[0]))
 
+            def _pause(self, run: dict[str, Any]) -> None:
+                if case == "replayed" and run.get("error") and not paused.is_set():
+                    paused.set()
+                    assert resumed.wait(30)
+
+        ls_client = _RecordingClient(
+            api_url="http://localhost:1",
+            api_key="test",
+            auto_batch_tracing=False,
+        )
         config = client.config()
-        config["plugins"] = [
-            LangSmithPlugin(
-                client=_RecordingClient(
-                    api_url="http://localhost:1",
-                    api_key="test",
-                    auto_batch_tracing=False,
+        plugin = LangSmithPlugin(client=ls_client)
+        if interceptor:
+            config["interceptors"] = [LangSmithInterceptor(client=ls_client)]
+        else:
+            config["plugins"] = [plugin]
+        codec = _FailingCodec()
+        config["data_converter"] = dataclasses.replace(
+            DataConverter.default, payload_codec=codec
+        )
+        temporal_client = Client(**config)
+        runner: WorkflowRunner = SandboxedWorkflowRunner()
+        if case == "subclassed":
+            runner = _SubclassedRunner()
+        elif "sandboxed" in case:
+            runner = SandboxedWorkflowRunner(
+                restrictions=SandboxRestrictions.default.with_passthrough_modules(
+                    "langsmith", "langchain_core", "opentelemetry"
                 )
             )
-        ]
-        temporal_client = Client(**config)
+        elif interceptor:
+            runner = UnsandboxedWorkflowRunner()
+
+        def end_writes(name: str) -> list[dict[str, Any]]:
+            names = {str(run["id"]): run["name"] for op, run in writes if op == "post"}
+            return [
+                run
+                for _, run in writes
+                if names.get(str(run["id"])) == name and run.get("end_time")
+            ]
+
+        async def assert_task_failed_and_runs_open(
+            handle: WorkflowHandle[Any, Any],
+        ) -> None:
+            await wait_for(handle, EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED)
+            # Let the retried workflow task fail too.
+            await asyncio.sleep(1)
+            status = (await handle.describe()).status
+            assert status == WorkflowExecutionStatus.RUNNING
+            # The runs open when the workflow task failed are not ended, and
+            # langchain-core releases that defer a RunnableGenerator's inputs
+            # don't post them.  Only race_a's step can finish, in the failed
+            # task, as in any task that fails.
+            for name in ("race_a", "race_b") if fail else ("race_b",):
+                assert not end_writes(name), name
+                assert deferred or any(
+                    op == "post" and run["name"] == name for op, run in writes
+                ), name
+
+        async def wait_for(
+            handle: WorkflowHandle[Any, Any], event: EventType.ValueType
+        ) -> None:
+            for _ in range(100):
+                history = await handle.fetch_history()
+                if any(e.event_type == event for e in history.events):
+                    return
+                await asyncio.sleep(0.1)
+            raise AssertionError(f"no {event} in history")
+
+        task_queue = str(uuid.uuid4())
+        # A worker that stops with the workflow cached drops its instance with
+        # no eviction, so the second worker below takes it from a cache of 0.
+        restarts = task_fails == "task" and fail
         async with new_worker(
             temporal_client,
             LangChainRaceWorkflow,
-            max_cached_workflows=max_cached_workflows,
-        ) as worker:
+            task_queue=task_queue,
+            workflow_runner=runner,
+            max_cached_workflows=0 if restarts else max_cached_workflows,
+        ):
             handle = await temporal_client.start_workflow(
                 LangChainRaceWorkflow.run,
                 deferred,
                 id=f"replay-test-{uuid.uuid4()}",
-                task_queue=worker.task_queue,
+                task_queue=task_queue,
             )
-            for _ in range(100):
-                history = await handle.fetch_history()
-                if any(
-                    e.event_type == EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED
-                    for e in history.events
-                ):
-                    break
-                await asyncio.sleep(0.1)
-            if fail:
+            await wait_for(handle, EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED)
+            if rejected:
+                await handle.signal(
+                    LangChainRaceWorkflow.fail_slowly
+                    if fail
+                    else LangChainRaceWorkflow.release_slowly
+                )
+                await asyncio.sleep(0.3)
+                await handle.signal(LangChainRaceWorkflow.other)
+            if not task_fails:
+                if fail:
+                    if not rejected:
+                        await handle.signal(LangChainRaceWorkflow.fail)
+                    with pytest.raises(WorkflowFailureError):
+                        await handle.result()
+                else:
+                    if not rejected:
+                        await handle.signal(LangChainRaceWorkflow.release)
+                    assert await handle.result() == "a"
+                if rejected:
+                    history = await handle.fetch_history()
+                    assert any(
+                        e.workflow_task_failed_event_attributes.cause
+                        == WorkflowTaskFailedCause.WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND
+                        for e in history.events
+                    )
+                if case == "replayed":
+                    # Released only when the replay is done, or the eviction
+                    # makes no end write and the wait times out.
+                    try:
+                        assert await asyncio.to_thread(paused.wait, 30)
+                        await Replayer(
+                            workflows=[LangChainRaceWorkflow],
+                            plugins=[plugin],
+                            data_converter=config["data_converter"],
+                        ).replay_workflow(await handle.fetch_history())
+                    finally:
+                        resumed.set()
+            elif task_fails == "codec":
+                await handle.signal(
+                    LangChainRaceWorkflow.fail_uncodable
+                    if fail
+                    else LangChainRaceWorkflow.release_uncodable
+                )
+                await assert_task_failed_and_runs_open(handle)
+                # The same workflow goes on, and ends, once it can be encoded.
+                codec.broken = False
+                if fail:
+                    with pytest.raises(WorkflowFailureError):
+                        await handle.result()
+                else:
+                    assert await handle.result() == _UNCODABLE
+            elif not fail:
+                await handle.signal(LangChainRaceWorkflow.release_unserializable)
+                await assert_task_failed_and_runs_open(handle)
+        if task_fails == "task":
+            if restarts:
+                # Sent while no worker polls, both signals reach the workflow in
+                # one activation: the first fails the workflow, the second
+                # fails the workflow task.
                 await handle.signal(LangChainRaceWorkflow.fail)
-                with pytest.raises(WorkflowFailureError):
-                    await handle.result()
-            else:
-                await handle.signal(LangChainRaceWorkflow.release)
-                assert await handle.result() == "a"
+                await handle.signal(LangChainRaceWorkflow.crash)
+                async with new_worker(
+                    temporal_client,
+                    LangChainRaceWorkflow,
+                    task_queue=task_queue,
+                    workflow_runner=runner,
+                    max_cached_workflows=max_cached_workflows,
+                ):
+                    await assert_task_failed_and_runs_open(handle)
+            await handle.terminate()
+            return
 
         names = {str(run["id"]): run["name"] for op, run in writes if op == "post"}
         assert sorted(set(names.values())) == ["race_a", "race_b"]
         for name in ("race_a", "race_b"):
-            ops = sorted(op for op, run in writes if names[str(run["id"])] == name)
+            # A released race_a's step finishes again in each workflow task
+            # that fails, as any run does; each run open when the workflow
+            # ends is ended once.
+            repeats = (
+                (task_fails == "codec" or rejected) and not fail and name == "race_a"
+            )
+            ops = [op for op, run in writes if names[str(run["id"])] == name]
+            ops = sorted(set(ops) if repeats else ops)
             # langchain-core releases that defer a RunnableGenerator's inputs
             # post its run only when it ends; earlier ones post it when it
             # starts, like any other run.
             assert ops == ["patch", "post"] or (deferred and ops == ["post"]), name
-            [ended] = [
-                run
-                for _, run in writes
-                if names[str(run["id"])] == name and run.get("end_time")
-            ]
+            ended = end_writes(name)
+            assert len(ended) == 1 or (repeats and ended), name
             # Only race_a's step can finish, and only if released.
-            assert bool(ended.get("error")) == (fail or name == "race_b"), name
+            for run in ended:
+                assert bool(run.get("error")) == (fail or name == "race_b"), name
 
     @pytest.mark.parametrize("first", [False, True])
     async def test_run_id_kept_when_add_temporal_runs_changes(
