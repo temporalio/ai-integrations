@@ -236,16 +236,18 @@ class ShipParcel:
     """Ship a parcel."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, str, Any, Any]] = []
 
     # Types that Gemini can declare but not check with isinstance.
     async def __call__(
         self,
         parcel_id: Annotated[str, "The parcel's ID."],
         speed: Literal["standard", "express"],
+        note: Any,
+        labels: dict[str, Literal["fragile", "upright"]] | None = None,
     ) -> str:
-        self.calls.append((parcel_id, speed))
-        return f"Parcel {parcel_id} ships {speed}"
+        self.calls.append((parcel_id, speed, note, labels))
+        return f"Parcel {parcel_id} ships {speed} with {note!r} and {labels!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -1108,7 +1110,13 @@ async def test_multiple_tools_sequential(client: Client):
             make_function_call_response("TrackParcel", {"parcel_id": "P-1"}),
             make_function_call_response("TagParcel", {"parcel_id": "P-2"}),
             make_function_call_response(
-                "ShipParcel", {"parcel_id": "P-3", "speed": "express"}
+                "ShipParcel",
+                {
+                    "parcel_id": "P-3",
+                    "speed": "express",
+                    "note": "ring twice",
+                    "labels": {"top": "upright"},
+                },
             ),
             make_text_response("Tokyo is sunny; Paris is rainy."),
         ],
@@ -1143,11 +1151,13 @@ async def test_multiple_tools_sequential(client: Client):
     # instead of getting the empty tuple as one more argument.
     assert parcel_tagger.calls == [("P-2", ())]
     assert "Parcel P-2 has tags ()" in json.dumps(api_tracker.requests[-1].request_dict)
-    # Annotated and Literal parameters reach the instance, and its result
-    # reaches the model.
-    assert parcel_shipper.calls == [("P-3", "express")]
-    assert "Parcel P-3 ships express" in json.dumps(
-        api_tracker.requests[-1].request_dict
+    # Annotated, Literal, Any and optional dict parameters reach the instance,
+    # and its result reaches the model.
+    assert parcel_shipper.calls == [
+        ("P-3", "express", "ring twice", {"top": "upright"})
+    ]
+    assert "Parcel P-3 ships express with 'ring twice' and {'top': 'upright'}" in (
+        json.dumps(api_tracker.requests[-1].request_dict)
     )
     assert result == "Tokyo is sunny; Paris is rainy."
 
@@ -1747,6 +1757,10 @@ class LabelParcel:
         note: Annotated[str, "A note."] | None,
         code: Literal[1, "A"] | None,
         hooks: list[Callable],
+        extra: list[Any],
+        tags: dict[str, Literal["a"]] | list[Any] | None,
+        sizes_by_id: dict[str, dict[str, Literal[1]]],
+        pair: tuple[str, int] | None,
     ) -> str:
         return ""
 
@@ -1766,11 +1780,17 @@ def test_activity_as_tool_preserves_signature():
     sig = inspect.signature(activity_as_tool(TagParcel))
     assert sig.parameters["parcel_id"].annotation is str
     assert sig.return_annotation is str
-    # Gemini can't check Annotated or Literal with isinstance, so they become
-    # the classes of their values, also inside lists, dicts and unions.
+    # Gemini can't check Any, Annotated, Literal or a parameterized generic
+    # with isinstance, so they become the classes they check, also inside
+    # lists, dicts and unions. Gemini walks into list items and dict values,
+    # but not into a union's members.
     sig = inspect.signature(activity_as_tool(ShipParcel))
-    assert sig.parameters["parcel_id"].annotation is str
-    assert sig.parameters["speed"].annotation is str
+    assert [p.annotation for p in sig.parameters.values()] == [
+        str,
+        str,
+        object,
+        dict | None,
+    ]
     sig = inspect.signature(activity_as_tool(LabelParcel))
     assert [p.annotation for p in sig.parameters.values()] == [
         list[str],
@@ -1778,6 +1798,10 @@ def test_activity_as_tool_preserves_signature():
         str | None,
         int | str | None,
         list[Callable],
+        list[object],
+        dict | list[object] | None,
+        dict[str, dict[str, int]],
+        tuple | None,
     ]
 
 

@@ -94,23 +94,38 @@ def _class_doc(cls: type) -> str | None:
     return None if doc == generated else doc
 
 
-def _runtime_annotation(annotation: Any) -> Any:
-    """Replaces ``Annotated`` and ``Literal`` in a type with the classes of their values."""
-    # Gemini converts the model's arguments with isinstance, which these forms
-    # don't support, so give it the classes they check. The declaration loses
-    # their metadata and allowed values.
+def _runtime_annotation(annotation: Any, in_union: bool = False) -> Any:
+    """Replaces the forms of a type that Gemini can't check with the classes they check."""
+    # Gemini converts the model's arguments by walking into list items and dict
+    # values, and checking everything else, including each member of a union,
+    # with isinstance. That raises for Any, Annotated, Literal and
+    # parameterized generics, so give it the classes they check. The
+    # declaration loses their metadata, allowed values and item types.
     origin = typing.get_origin(annotation)
     args = typing.get_args(annotation)
     if origin is typing.Annotated:
-        return _runtime_annotation(args[0])
+        return _runtime_annotation(args[0], in_union)
     if origin is typing.Literal:
         return functools.reduce(operator.or_, dict.fromkeys(type(a) for a in args))
-    if origin in (list, dict, typing.Union, types.UnionType):  # type: ignore[reportDeprecated]
-        runtime = tuple(map(_runtime_annotation, args))
-        if runtime != args:
-            if origin in (list, dict):
-                return types.GenericAlias(origin, runtime)
-            return functools.reduce(operator.or_, runtime)
+    if annotation is Any:
+        return object
+    if origin in (typing.Union, types.UnionType):  # type: ignore[reportDeprecated]
+        runtime = tuple(_runtime_annotation(a, in_union=True) for a in args)
+        return (
+            functools.reduce(operator.or_, runtime) if runtime != args else annotation
+        )
+    if origin is list and args:
+        item = _runtime_annotation(args[0])
+        return annotation if item == args[0] else types.GenericAlias(list, (item,))
+    if origin is dict and len(args) == 2 and not in_union:
+        value = _runtime_annotation(args[1])
+        return (
+            annotation
+            if value == args[1]
+            else types.GenericAlias(dict, (args[0], value))
+        )
+    if args and inspect.isclass(origin):
+        return origin
     return annotation
 
 
