@@ -363,6 +363,10 @@ _SESSION_WATCH_PATCH = "openai-agents-stateful-mcp-session-watch"
 # first heartbeat.
 _STORE_TIMEOUT = 30.0
 
+# Seconds an attempt that connected no MCP server waits for heartbeats still
+# being encoded before it clears its marker.
+_CLOSE_TIMEOUT = 10.0
+
 # Describe errors that mean the worker's client lacks permission.
 _DESCRIBE_PERMISSION_ERRORS = {
     RPCStatusCode.PERMISSION_DENIED,
@@ -541,9 +545,13 @@ class _SessionHeartbeats:
             # This attempt connected no server, so a retry may connect again.
             # Send that last, after every earlier heartbeat: one still being
             # encoded would otherwise replace it. If this wait is interrupted,
-            # the marker stays and the retry is refused.
+            # the marker stays and the retry is refused. A codec may never
+            # finish, so clear anyway after _CLOSE_TIMEOUT: the clear has no
+            # details, so it skips the codec, and the worker waits only for an
+            # activity's last heartbeat. One that lands later only makes the
+            # retry refuse.
             if self._sending:
-                await asyncio.wait(set(self._sending))
+                await asyncio.wait(set(self._sending), timeout=_CLOSE_TIMEOUT)
             self._may_be_open = False
             self.beat()
 
@@ -567,10 +575,10 @@ def _earlier_attempt_failure(details: Sequence[Any]) -> ApplicationError | None:
     )
 
 
-def _task_cancelling() -> bool:
-    """Whether the current task is being cancelled (Python 3.11 and later)."""
+def _cancel_requests() -> int:
+    """Pending cancellation requests of the current task (Python 3.11 and later)."""
     cancelling = getattr(asyncio.current_task(), "cancelling", None)
-    return bool(cancelling and cancelling())
+    return cancelling() if cancelling else 0
 
 
 def _session_ended_failure(session: ActivityHandle) -> ApplicationError:
@@ -711,13 +719,15 @@ class _StatefulMCPServerReference(MCPServer, AbstractAsyncContextManager):  # ty
                     operation.cancel()
 
             session.add_done_callback(cancel_operation)
+            # A count, not a flag: it stays up after code catches a cancellation.
+            cancels = _cancel_requests()
             try:
                 return await operation
             except BaseException as err:
                 if (
                     cancelled_by_session
                     and is_cancelled_exception(err)
-                    and not _task_cancelling()
+                    and _cancel_requests() <= cancels
                 ):
                     raise _session_ended_failure(session)
                 raise

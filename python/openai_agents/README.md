@@ -600,7 +600,10 @@ Some consequences:
   of a bounded `server_session_config` retry policy, still makes the block raise
   `ActivityError`.
 - The session activity's heartbeats go through your payload codec, so its
-  `heartbeat_timeout` must comfortably exceed a heartbeat's encoding time.
+  `heartbeat_timeout` must comfortably exceed a heartbeat's encoding time. An
+  attempt that connected no server waits at most 10 seconds for its heartbeats
+  to be encoded before it clears the marker; one that takes longer can make the
+  retry refuse.
 - Blocks with the same name in one run use the same task queue. A later block
   refuses any operation the server scheduled for an earlier block, but until
   the earlier block's session activity notices its cancellation, which can take

@@ -3548,13 +3548,21 @@ async def test_stateful_mcp_server_cancelled_after_refusal(client: Client):
 
 
 class _DenyDescribe(Interceptor):
+    def __init__(self, status: RPCStatusCode = RPCStatusCode.PERMISSION_DENIED) -> None:
+        super().__init__()
+        self._status = status
+
     def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
-        return _DenyDescribeOutbound(next)
+        return _DenyDescribeOutbound(next, self._status)
 
 
 class _DenyDescribeOutbound(OutboundInterceptor):
+    def __init__(self, next: OutboundInterceptor, status: RPCStatusCode) -> None:
+        super().__init__(next)
+        self._status = status
+
     async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
-        raise RPCError("Request unauthorized.", RPCStatusCode.PERMISSION_DENIED, b"")
+        raise RPCError("Request refused.", self._status, b"")
 
 
 class _StallDescribe(Interceptor):
@@ -3593,17 +3601,41 @@ class _StallReadBackCodec(PayloadCodec):
         return list(payloads)
 
 
+class _StallMayBeOpenCodec(PayloadCodec):
+    """Never finishes encoding the worker's "may be open" heartbeats."""
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_heartbeat_async") and any(
+            _mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads
+        ):
+            await asyncio.Event().wait()
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+
 @pytest.mark.timeout(90)
 @pytest.mark.parametrize(
-    "case", ["refused", "describe_stalls", "decode_stalls", "other_attempt"]
+    "case",
+    [
+        "refused",
+        "not_found",
+        "describe_stalls",
+        "decode_stalls",
+        "encode_stalls",
+        "other_attempt",
+    ],
 )
 async def test_stateful_mcp_server_without_describe_permission(
     client: Client, case: str, monkeypatch: pytest.MonkeyPatch
 ):
     # The worker's client may not describe the workflow: the session activity
     # fails at once with an error that says so, and the run fails with it. A
-    # describe or decoding that never ends fails the attempt at the deadline.
+    # describe or decoding that never ends fails the attempt at the deadline,
+    # and so does a heartbeat whose encoding never ends.
     monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
+    monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 1.0)
     servers: list[Any] = []
 
     def factory(_: Any) -> MCPServer:
@@ -3616,16 +3648,21 @@ async def test_stateful_mcp_server_without_describe_permission(
         model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
     ) as env:
         config = client.config()
-        if case == "decode_stalls":
+        codec = {
+            "decode_stalls": _StallReadBackCodec,
+            "encode_stalls": _StallMayBeOpenCodec,
+        }.get(case)
+        if codec:
             config["data_converter"] = dataclasses.replace(
-                client.data_converter, payload_codec=_StallReadBackCodec()
+                client.data_converter, payload_codec=codec()
             )
         else:
             interceptor = {
-                "refused": _DenyDescribe,
-                "describe_stalls": _StallDescribe,
-                "other_attempt": _OtherAttemptDescribe,
-            }[case]()
+                "refused": _DenyDescribe(),
+                "not_found": _DenyDescribe(RPCStatusCode.NOT_FOUND),
+                "describe_stalls": _StallDescribe(),
+                "other_attempt": _OtherAttemptDescribe(),
+            }[case]
             config["interceptors"] = [*config["interceptors"], interceptor]
         worker_client = env.applied_on_client(Client(**config))
         client = env.applied_on_client(client)
@@ -3639,7 +3676,7 @@ async def test_stateful_mcp_server_without_describe_permission(
                 task_queue=worker.task_queue,
                 execution_timeout=timedelta(seconds=60),
             )
-            if case != "refused":
+            if case not in ("refused", "not_found"):
                 failures: list[str] = []
 
                 async def attempt_failed() -> None:
@@ -3676,7 +3713,11 @@ async def test_stateful_mcp_server_without_describe_permission(
     while cause is not None:
         messages.append(str(cause))
         cause = cause.__cause__
-    assert any("permission to describe" in m for m in messages), messages
+    if case == "not_found":
+        assert any("could not describe this workflow run" in m for m in messages)
+        assert not any("permission" in m for m in messages), messages
+    else:
+        assert any("permission to describe" in m for m in messages), messages
 
 
 @dataclass
@@ -3717,6 +3758,12 @@ class McpServerStatefulSessionEndedWorkflow:
         )
         if input.case == "numeric_session_id":
             server_session_config["activity_id"] = "100"
+        if input.case == "operation_waiting_after_cancel":
+            # Work after a caught cancellation still gets the session's failure.
+            try:
+                await workflow.wait_condition(lambda: False)
+            except asyncio.CancelledError:
+                pass
         if input.case == "next_block_custom_ids":
             server_session_config["activity_id"] = "session-1"
         out: list[str] = []
@@ -3789,6 +3836,7 @@ class McpServerStatefulSessionEndedWorkflow:
         "operation_waiting",
         "operation_waiting_abandon",
         "operation_waiting_wait_cancellation",
+        "operation_waiting_after_cancel",
         "operation_after_refusal",
         "next_block",
         "next_block_custom_ids",
@@ -3845,6 +3893,8 @@ async def test_stateful_mcp_server_operations_after_session_ended(
                     task_queue=task_queue,
                     execution_timeout=timedelta(seconds=80),
                 )
+                if case == "operation_waiting_after_cancel":
+                    await handle.cancel()
                 if case == "operation_cancelled":
                     assert await handle.result() == ["CancelledError", "Say-Hello"]
                     # The cancelled call never ran once the session's worker polled.
@@ -3921,7 +3971,7 @@ async def test_stateful_mcp_server_operations_after_session_ended(
     assert any(
         event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED
         for event in events
-    ) == (case == "operation_waiting")
+    ) == (case in ("operation_waiting", "operation_waiting_after_cancel"))
 
 
 async def test_model_conversion_loops():

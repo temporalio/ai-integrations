@@ -905,6 +905,7 @@ test(`Stateful MCP: a session Activity retried after a shutdown before connectin
 
 for (const [kase, title] of [
   ['refused', 'a session Activity that may not describe its Workflow fails at once'],
+  ['not found', 'a session Activity that cannot describe its Workflow run fails at once'],
   ['describe stalls', 'a session Activity whose describe never returns fails at the deadline'],
   ['decode stalls', 'a session Activity that never finishes decoding its read-back fails at the deadline'],
 ] as const) {
@@ -912,10 +913,11 @@ for (const [kase, title] of [
     const { createWorker, startWorkflow } = helpers(t);
     let factoryCalls = 0;
     const describe = async (): Promise<never> => {
-      if (kase === 'refused') {
-        const grpc = Object.assign(new Error('7 PERMISSION_DENIED: Request unauthorized.'), {
-          code: 7,
-          details: 'Request unauthorized.',
+      if (kase === 'refused' || kase === 'not found') {
+        const [code, status] = kase === 'refused' ? [7, 'PERMISSION_DENIED'] : [5, 'NOT_FOUND'];
+        const grpc = Object.assign(new Error(`${code} ${status}: Request refused.`), {
+          code,
+          details: 'Request refused.',
           metadata: {},
         });
         throw new ServiceError('Failed to describe workflow', { cause: grpc });
@@ -959,7 +961,7 @@ for (const [kase, title] of [
         args: [false],
         workflowExecutionTimeout: '60 seconds',
       });
-      if (kase !== 'refused') {
+      if (kase !== 'refused' && kase !== 'not found') {
         // The attempt fails at the 30-second deadline and is retried.
         let failures: string[] = [];
         for (let i = 0; i < 400 && !failures.length; i++) {
@@ -979,10 +981,21 @@ for (const [kase, title] of [
       assertSessionRefused(t, err);
       const messages: string[] = [];
       for (let cause: unknown = err; cause instanceof Error; cause = cause.cause) messages.push(cause.message);
-      t.true(
-        messages.some((m) => m.includes('permission to describe')),
-        messages.join(' <- ')
-      );
+      if (kase === 'not found') {
+        t.true(
+          messages.some((m) => m.includes('could not describe this Workflow run')),
+          messages.join(' <- ')
+        );
+        t.false(
+          messages.some((m) => m.includes('permission')),
+          messages.join(' <- ')
+        );
+      } else {
+        t.true(
+          messages.some((m) => m.includes('permission to describe')),
+          messages.join(' <- ')
+        );
+      }
     });
     // The session Activity failed before it built a server.
     t.is(factoryCalls, 0);
