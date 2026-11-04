@@ -57,19 +57,21 @@ def _stream_publish_error(err: Exception, model: str, topic: str) -> Application
 
     A retry calls the model again, so the error is non-retryable when the retry
     would fail the same way: the server refused the batch as invalid (over the
-    payload size limit, or past the run's Signal limit), the batch is over the
-    server's gRPC message limit, or the stream client gave up on it after
-    retrying for its max retry duration. Other failures, such as a server
-    outage, stay retryable. The Go and Java Google ADK plugins use the same type.
+    payload size limit, or past the run's Signal limit), or the batch is over the
+    server's gRPC message limit. Other failures, such as a server outage, stay
+    retryable. The Go and Java Google ADK plugins use the same type.
+
+    Unlike Go and TypeScript, the stream client's ``TimeoutError`` after its max
+    retry duration stays retryable: the Python client stops at a refused batch
+    at once and raises its ``RPCError``, so a ``TimeoutError`` means the server
+    was down or rate limiting for that long. Revisit this if a later client
+    retries refused batches too.
     """
-    non_retryable = isinstance(err, TimeoutError) or (
-        isinstance(err, RPCError)
-        and (
-            err.status == RPCStatusCode.INVALID_ARGUMENT
-            or (
-                err.status == RPCStatusCode.RESOURCE_EXHAUSTED
-                and "larger than max" in err.message
-            )
+    non_retryable = isinstance(err, RPCError) and (
+        err.status == RPCStatusCode.INVALID_ARGUMENT
+        or (
+            err.status == RPCStatusCode.RESOURCE_EXHAUSTED
+            and "larger than max" in err.message
         )
     )
     return ApplicationError(
@@ -298,10 +300,10 @@ class TemporalModel(BaseLlm):
                 ``googleadk.StreamError`` ``ApplicationError``. It is
                 non-retryable when a retry would call the model again
                 and fail the same way: the server refused a batch over
-                its size limits or past the run's Signal limit, or the
-                stream client gave up after its 10-minute retry limit.
-                Streaming support is experimental and may change in
-                future versions.
+                its size limits or past the run's Signal limit. Other
+                failures are retried, even after the stream client's
+                10-minute retry limit. Streaming support is experimental
+                and may change in future versions.
             streaming_batch_interval: Interval between automatic
                 flushes for the stream publisher used by the streaming
                 activity. Streaming support is experimental and may

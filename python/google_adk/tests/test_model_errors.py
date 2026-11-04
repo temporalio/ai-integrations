@@ -319,7 +319,8 @@ _BATCH_REFUSED = RPCError(
             ),
             True,
         ),
-        (TimeoutError("Flush retry exceeded max_retry_duration (0:10:00)."), True),
+        # Python's stream client gives up only after retryable failures.
+        (TimeoutError("Flush retry exceeded max_retry_duration (0:10:00)."), False),
         (
             RPCError(
                 "namespace rate limit exceeded", RPCStatusCode.RESOURCE_EXHAUSTED, b""
