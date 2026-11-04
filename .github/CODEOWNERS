@@ -17,7 +17,7 @@
 /typescript/langsmith/ @xumaple @brianstrauch @patbeqo
 /typescript/openai-agents/ @xumaple @DABH @brianstrauch
 /typescript/strands-agents/ @brianstrauch @DABH
-/typescript/vercel-ai-sdk/ @brianstrauch @patbeqo
+/typescript/vercel-ai-sdk/ @brianstrauch
 
 /go/googleadk/ @DABH @brianstrauch
 
