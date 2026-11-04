@@ -41,7 +41,12 @@ from temporalio.converter import DataConverter, PayloadCodec
 from temporalio.exceptions import ApplicationError
 from temporalio.langsmith import LangSmithInterceptor, LangSmithPlugin
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Replayer, UnsandboxedWorkflowRunner, WorkflowRunner
+from temporalio.worker import (
+    Replayer,
+    UnsandboxedWorkflowRunner,
+    Worker,
+    WorkflowRunner,
+)
 from temporalio.worker.workflow_sandbox import (
     SandboxedWorkflowRunner,
     SandboxRestrictions,
@@ -253,8 +258,9 @@ class LangChainSignalWorkflow:
     """Runs a LangChain runnable whose step waits for a signal.
 
     With ``shared_tracer``, the runnable gets the tracer in
-    ``_shared_tracers``, so run it unsandboxed.  The ``step`` update's step
-    can wait for ``release_step``.
+    ``_shared_tracers``, so run it unsandboxed.  The ``step`` update runs
+    ``prepare | step``, with ``tag`` after each name, and its step can wait
+    for ``release_step``.
     """
 
     def __init__(self) -> None:
@@ -270,13 +276,19 @@ class LangChainSignalWorkflow:
         self._step_released = True
 
     @workflow.update
-    async def step(self, wait: bool = False) -> str:
+    async def step(self, wait: bool = False, tag: str = "") -> str:
+        async def prepare(text: str) -> str:
+            return text
+
         async def step(text: str) -> str:
             if wait:
                 await workflow.wait_condition(lambda: self._step_released)
             return text
 
-        return await RunnableLambda(step, name="step").ainvoke("update")
+        chain = RunnableLambda(prepare, name=f"prepare{tag}") | RunnableLambda(
+            step, name=f"step{tag}"
+        )
+        return await chain.ainvoke("update")
 
     @workflow.run
     async def run(self, shared_tracer: bool = False) -> str:
@@ -1751,20 +1763,22 @@ class TestReplay:
             "post",
         ]
 
-    @pytest.mark.parametrize("wait", [False, True])
+    @pytest.mark.parametrize("case", ["", "open", "two"])
     async def test_update_runs_keep_their_own_ids(
         self,
         client: Client,
         env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
-        wait: bool,
+        case: str,
     ) -> None:
         """An update's runs don't take the IDs of the run method's runs.
 
         On a worker without the workflow cached, an update right after a first
         workflow task with no commands runs its handler, then the run method
         again, live in one task.  A replay runs the run method first.  With
-        ``wait``, the update's run stays open into a later task, whose replay
-        must make it again under its own ID for its end to reach it.
+        ``open``, the update's run stays open into a later task, whose replay
+        must make it again under its own ID for its end to reach it.  With
+        ``two``, two updates sent while no worker polls run in one task, and
+        each keeps IDs of its own.
         """
         get_runtime_environment()
         langsmith.env.get_langchain_env_var_metadata()
@@ -1788,13 +1802,21 @@ class TestReplay:
             )
         ]
         temporal_client = Client(**config)
-        async with new_worker(
-            temporal_client, LangChainSignalWorkflow, max_cached_workflows=0
-        ) as worker:
+        task_queue = str(uuid.uuid4())
+
+        def worker() -> Worker:
+            return new_worker(
+                temporal_client,
+                LangChainSignalWorkflow,
+                task_queue=task_queue,
+                max_cached_workflows=0,
+            )
+
+        async with worker():
             handle = await temporal_client.start_workflow(
                 LangChainSignalWorkflow.run,
                 id=f"replay-test-{uuid.uuid4()}",
-                task_queue=worker.task_queue,
+                task_queue=task_queue,
             )
             for _ in range(100):
                 history = await handle.fetch_history()
@@ -1804,18 +1826,48 @@ class TestReplay:
                 ):
                     break
                 await asyncio.sleep(0.1)
-            update = await handle.start_update(
-                LangChainSignalWorkflow.step,
-                wait,
-                wait_for_stage=WorkflowUpdateStage.ACCEPTED
-                if wait
-                else WorkflowUpdateStage.COMPLETED,
-            )
-            if wait:
-                await handle.signal(LangChainSignalWorkflow.release_step)
-            assert await update.result() == "update"
-            await handle.signal(LangChainSignalWorkflow.release)
-            assert await handle.result() == "secret"
+            if case != "two":
+                update = await handle.start_update(
+                    LangChainSignalWorkflow.step,
+                    case == "open",
+                    wait_for_stage=WorkflowUpdateStage.ACCEPTED
+                    if case == "open"
+                    else WorkflowUpdateStage.COMPLETED,
+                )
+                if case == "open":
+                    await handle.signal(LangChainSignalWorkflow.release_step)
+                assert await update.result() == "update"
+                await handle.signal(LangChainSignalWorkflow.release)
+                assert await handle.result() == "secret"
+        if case == "two":
+            updates = [
+                asyncio.create_task(
+                    handle.execute_update(
+                        LangChainSignalWorkflow.step, args=[False, tag]
+                    )
+                )
+                for tag in ("_a", "_b")
+            ]
+            # Let the server admit both before a worker polls.
+            await asyncio.sleep(1)
+            async with worker():
+                assert await asyncio.gather(*updates) == ["update", "update"]
+                await handle.signal(LangChainSignalWorkflow.release)
+                assert await handle.result() == "secret"
+            # Both were accepted in one workflow task.
+            history = await handle.fetch_history()
+            kinds = [
+                e.event_type
+                for e in history.events
+                if e.event_type
+                in (
+                    EventType.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ACCEPTED,
+                    EventType.EVENT_TYPE_WORKFLOW_TASK_COMPLETED,
+                )
+            ]
+            accepted = EventType.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ACCEPTED
+            first = kinds.index(accepted)
+            assert kinds[first : first + 2] == [accepted, accepted], kinds
 
         posts = [run for op, run in writes if op == "post"]
         names: dict[str, set[str]] = {}
@@ -1823,11 +1875,13 @@ class TestReplay:
             names.setdefault(str(run["id"]), set()).add(run["name"])
         assert all(len(each) == 1 for each in names.values()), names
         # The trace is the root factory's run, built for each handler call.
+        steps = ["step_a", "step_b"] if case == "two" else ["step"]
         traces = {
             name: {str(run["trace_id"]) for run in posts if run["name"] == name}
-            for name in ("wait", "step")
+            for name in ["wait", *steps]
         }
-        assert traces["step"] and not traces["step"] & traces["wait"], traces
+        for step in steps:
+            assert traces[step] and not traces[step] & traces["wait"], traces
         # Each end goes to a run posted with the same name, trace and parent,
         # and the update's run gets its end.  Start times, and so dotted
         # orders, still come from one chain for the workflow.
@@ -1839,9 +1893,9 @@ class TestReplay:
             for key in ("name", "trace_id", "parent_run_id"):
                 if run.get(key) is not None:
                     assert str(run[key]) == str(post.get(key)), (key, run, post)
-        steps = {key for key, run in posted.items() if run["name"] == "step"}
+        step_ids = {key for key, run in posted.items() if run["name"] in steps}
         ended = {str(run["id"]) for run in patches if run.get("end_time")}
-        assert steps and steps <= ended, (steps, writes)
+        assert step_ids and step_ids <= ended, (step_ids, writes)
 
     async def test_run_under_header_parent_keeps_start_time(
         self,
