@@ -1,6 +1,7 @@
 """Worker plugin for durable MCP clients."""
 
 import dataclasses
+import importlib.metadata
 from collections.abc import Mapping
 from datetime import timedelta
 
@@ -71,3 +72,10 @@ class MCPPlugin(SimplePlugin):
             workflow_runner=workflow_runner,
             run_context=mcp_activities.run_context,
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-mcp")
+        except importlib.metadata.PackageNotFoundError:
+            return ""

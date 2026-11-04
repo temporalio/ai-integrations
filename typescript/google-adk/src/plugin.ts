@@ -656,6 +656,16 @@ export interface GoogleAdkPluginOptions {
   autoRouteModels?: boolean;
 }
 
+/** Reads this package's version, which worker heartbeats report. Empty if it can't be read. */
+function packageVersion(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require('../package.json') as { version?: string }).version ?? '';
+  } catch {
+    return '';
+  }
+}
+
 /**
  * The Temporal plugin for the Google Agent Development Kit (`@google/adk`).
  *
@@ -669,6 +679,9 @@ export interface GoogleAdkPluginOptions {
  * @experimental
  */
 export class GoogleAdkPlugin extends SimplePlugin {
+  /** The package version, reported in worker heartbeats. */
+  readonly version = packageVersion();
+
   private readonly autoRouteModels: boolean;
 
   /**

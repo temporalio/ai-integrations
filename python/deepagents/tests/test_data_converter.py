@@ -1,5 +1,6 @@
 """Data converter composition preserves codecs and compatible custom settings."""
 
+import importlib.metadata
 import zlib
 from collections.abc import Sequence
 from dataclasses import replace
@@ -115,3 +116,9 @@ def test_existing_incompatible_converter_is_preserved_on_error() -> None:
 def test_default_converter() -> None:
     configured = DeepAgentsPlugin().configure_client(_client_config())["data_converter"]
     assert configured.payload_converter_class is DeepAgentsPayloadConverter
+
+
+def test_plugin_reports_package_version() -> None:
+    assert DeepAgentsPlugin().version() == importlib.metadata.version(
+        "temporalio-deepagents"
+    )

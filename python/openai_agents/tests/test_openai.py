@@ -1,15 +1,32 @@
+import abc
 import asyncio
+import copy
+import dataclasses
+import functools
+import importlib.metadata
 import json
 import os
+import sys
 import uuid
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Literal, cast
+from collections.abc import AsyncIterator, Iterable, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from types import FrameType
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    NamedTuple,
+    TypeVar,
+    cast,
+    no_type_check,
+)
 
 import nexusrpc
 import pydantic
 import pytest
+import typing_extensions
 from agents import (
     Agent,
     AgentBase,
@@ -40,6 +57,8 @@ from agents import (
     Runner,
     SQLiteSession,
     Tool,
+    ToolGuardrailFunctionOutput,
+    ToolInputGuardrailData,
     TResponseInputItem,
     Usage,
     function_tool,
@@ -49,6 +68,7 @@ from agents import (
     set_default_openai_api,
     set_default_openai_client,
     set_default_openai_key,
+    tool_input_guardrail,
     trace,
 )
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
@@ -65,11 +85,15 @@ from agents.tool import CustomTool
 from agents.tool_context import ToolContext
 from openai import APIStatusError, AsyncOpenAI, BaseModel, RateLimitError
 from openai.types.responses import (
+    LocalEnvironmentParam,
     ResponseCodeInterpreterToolCall,
     ResponseCustomToolCall,
     ResponseFileSearchToolCall,
     ResponseFunctionToolCall,
     ResponseFunctionWebSearch,
+    ResponseInputTextParam,
+    ResponseOutputMessage,
+    ResponseOutputMessageParam,
 )
 from openai.types.responses.response_file_search_tool_call import Result
 from openai.types.responses.response_function_web_search import ActionSearch
@@ -80,13 +104,27 @@ from openai.types.responses.response_output_item import (
 )
 from openai.types.responses.response_prompt_param import ResponsePromptParam
 from openai.types.shared import Reasoning
+from openai.types.shared_params import CompoundFilter
 from pydantic import ConfigDict, Field, TypeAdapter
 
 import temporalio.openai_agents as openai_agents
 from temporalio import activity, workflow
-from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
-from temporalio.common import RetryPolicy
+from temporalio.api.common.v1 import Payload
+from temporalio.api.enums.v1 import EventType
+from temporalio.client import (
+    Client,
+    DescribeWorkflowInput,
+    Interceptor,
+    OutboundInterceptor,
+    WorkflowFailureError,
+    WorkflowHandle,
+)
+from temporalio.common import RawValue, RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.converter import (
+    DefaultFailureConverterWithEncodedAttributes,
+    PayloadCodec,
+)
 from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
@@ -95,8 +133,10 @@ from temporalio.exceptions import (
 )
 from temporalio.openai_agents import (
     ModelActivityParameters,
+    OpenAIPayloadConverter,
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
+    _mcp,
 )
 from temporalio.openai_agents._invoke_model_activity import (
     _build_tool,
@@ -119,6 +159,7 @@ from temporalio.openai_agents.testing import (
     TestModel,
     TestModelProvider,
 )
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.testing import WorkflowEnvironment
 from temporalio.workflow import ActivityConfig
 from tests.helpers import assert_eventually, new_worker
@@ -222,14 +263,32 @@ async def get_weather_context(ctx: RunContextWrapper[str], city: str) -> Weather
     return Weather(city=city, temperature_range="14-20C", conditions=ctx.context)
 
 
+# A string annotation naming a module-level alias must resolve in this module.
+CityName = str
+
+
 class ActivityWeatherService:
     @activity.defn
-    async def get_weather_method(self, city: str) -> Weather:
+    async def get_weather_method(self, city: "CityName") -> Weather:
         """
         Get the weather for a given city.
         """
         return Weather(
             city=city, temperature_range="14-20C", conditions="Sunny with wind."
+        )
+
+
+@activity.defn
+class ActivityWeatherClass:
+    def __init__(self, conditions: str) -> None:
+        self.conditions = conditions
+
+    async def __call__(self, city: "CityName") -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
         )
 
 
@@ -284,6 +343,12 @@ def weather_mock_model():
                 call_id="call-get-weather-method",
                 item_id="item-get-weather-method",
             ),
+            ResponseBuilders.tool_call(
+                '{"city":"Tokyo"}',
+                "ActivityWeatherClass",
+                call_id="call-get-weather-class",
+                item_id="item-get-weather-class",
+            ),
             ResponseBuilders.output_message("Test weather result"),
         ]
     )
@@ -322,6 +387,10 @@ class ToolsWorkflow:
                 ),
                 openai_agents.workflow.activity_as_tool(
                     ActivityWeatherService.get_weather_method,
+                    start_to_close_timeout=timedelta(seconds=10),
+                ),
+                openai_agents.workflow.activity_as_tool(
+                    ActivityWeatherClass,
                     start_to_close_timeout=timedelta(seconds=10),
                 ),
                 openai_agents.workflow.activity_as_tool(
@@ -376,6 +445,7 @@ async def test_tool_workflow(client: Client):
                 get_weather_country,
                 get_weather_context,
                 ActivityWeatherService().get_weather_method,
+                ActivityWeatherClass("Cloudy"),
             ],
         ) as worker:
             workflow_handle = await client.start_workflow(
@@ -390,11 +460,20 @@ async def test_tool_workflow(client: Client):
             assert result == "Test weather result"
 
             events = []
+            class_activity_inputs = []
             async for e in workflow_handle.fetch_history_events():
                 if e.HasField("activity_task_completed_event_attributes"):
                     events.append(e)
+                elif e.HasField("activity_task_scheduled_event_attributes"):
+                    attrs = e.activity_task_scheduled_event_attributes
+                    if attrs.activity_type.name == "ActivityWeatherClass":
+                        class_activity_inputs.append(
+                            [p.data.decode() for p in attrs.input.payloads]
+                        )
 
-            assert len(events) == 11
+            # The callable class's __call__ gets the model's arguments, not its constructor.
+            assert class_activity_inputs == [['"Tokyo"']]
+            assert len(events) == 13
             assert (
                 "function_call"
                 in events[0]
@@ -456,11 +535,583 @@ async def test_tool_workflow(client: Client):
                 .data.decode()
             )
             assert (
-                "Test weather result"
+                "function_call"
                 in events[10]
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
             )
+            assert (
+                "Cloudy"
+                in events[11]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+            assert (
+                "Test weather result"
+                in events[12]
+                .activity_task_completed_event_attributes.result.payloads[0]
+                .data.decode()
+            )
+
+
+@activity.defn
+class ActivityWeatherPartialMethodCall:
+    async def get_weather(self, conditions: str, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions=conditions)
+
+    __call__ = functools.partialmethod(get_weather, "Rainy")
+
+
+# In these two, `self` is a real parameter: binding __call__ has already dropped the receiver.
+@activity.defn
+class ActivityWeatherStaticCall(abc.ABC):
+    @staticmethod
+    async def __call__(self: str) -> Weather:  # type: ignore[reportSelfClsParameterName]
+        return Weather(city=self, temperature_range="14-20C", conditions="Foggy")
+
+
+@activity.defn
+class ActivityWeatherClassMethodCall:
+    @classmethod
+    async def __call__(cls, self: str) -> Weather:  # type: ignore[reportSelfClsParameterName]
+        return Weather(city=self, temperature_range="14-20C", conditions="Windy")
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherDataclass:
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherDocumentedDataclass:
+    """ActivityWeatherDocumentedDataclass(city) gets the weather for a given city."""
+
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+class WeatherBase:
+    """
+    Weather tools.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherDerived(WeatherBase):
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Cloudy")
+
+
+@activity.defn
+class ActivityWeatherDocumentedDerived(WeatherBase):
+    """
+    Look up the weather for a city.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """ """
+        return Weather(city=city, temperature_range="14-20C", conditions="Cloudy")
+
+
+class Unprintable:
+    def __repr__(self) -> str:
+        raise TypeError("can't be printed")
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherUnprintableDefault:
+    # Documented, or Python 3.10's dataclasses fails to write its docstring.
+    """
+    Weather tools.
+    """
+
+    client: Unprintable = Unprintable()
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        Get the weather for a given city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+# The self-type idiom from before typing.Self.
+WeatherServiceT = TypeVar("WeatherServiceT", bound="WeatherCallService")
+
+
+class WeatherCallService:
+    @activity.defn
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+    @activity.defn
+    async def get_weather(self: WeatherServiceT, city: str) -> Weather:  # type: ignore[reportInvalidTypeVarUse]
+        # The Worker registers the bound method, so the instance fills an annotated `self` too.
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherSectionsOnlyCall:
+    """
+    Get the weather for a given city.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        :param city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherDocProperty:
+    @property
+    def __doc__(self) -> str:  # type: ignore
+        return "Per-instance weather."
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherTuple(NamedTuple):
+    conditions: str
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(
+            city=city, temperature_range="14-20C", conditions=self.conditions
+        )
+
+
+@activity.defn
+async def get_weather_shared(self: Any, city: str) -> Weather:  # type: ignore[reportUnusedParameter]
+    return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+class WeatherAssignedService:
+    # Assigned from a module function, this is still registered bound to an instance.
+    get_weather = get_weather_shared
+
+
+class WeatherCachedService:
+    # On Python 3.14, update_wrapper gives the cache __annotate__ instead of __annotations__.
+    @activity.defn
+    @functools.lru_cache
+    def get_weather(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+@dataclass
+class ActivityWeatherCustomInit:
+    count: int
+
+    def __init__(self, count: str) -> None:
+        self.count = int(count)
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherNoTypeCheck:
+    # The tool skips the return annotation, so the unknown one is never resolved; the
+    # parameter's still is.
+    @no_type_check
+    async def __call__(self, city: "CityName") -> "UnknownReturn":  # type: ignore # noqa: F821
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+class WeatherNoTypeCheckService:
+    @activity.defn
+    @no_type_check
+    async def get_weather(self, city: "CityName") -> "UnknownReturn":  # type: ignore # noqa: F821
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "target, parameter, description",
+    [
+        # Not abc.ABC's docstring: only the class's own is a fallback.
+        (ActivityWeatherStaticCall, "self", ""),
+        (ActivityWeatherClassMethodCall, "self", ""),
+        # Before Python 3.13 the SDK runs an async partialmethod as sync, so
+        # test_tool_workflow can't run this form; the tool's schema is the part this plugin builds.
+        (ActivityWeatherPartialMethodCall, "city", "Get the weather for a given city."),
+        # Not the docstring a dataclass writes from its constructor.
+        (ActivityWeatherDataclass, "city", ""),
+        (
+            ActivityWeatherDocumentedDataclass,
+            "city",
+            "ActivityWeatherDocumentedDataclass(city) gets the weather for a given city.",
+        ),
+        # The overridden __call__'s docstring, not the base class's.
+        (ActivityWeatherDerived, "city", "Get the weather for a given city."),
+        # The class's own docstring before an inherited __call__'s; a blank one is skipped.
+        (ActivityWeatherDocumentedDerived, "city", "Look up the weather for a city."),
+        # A documented __call__ needs no class docstring, so the default is never printed.
+        (
+            ActivityWeatherUnprintableDefault,
+            "city",
+            "Get the weather for a given city.",
+        ),
+        # Not object.__call__'s docstring.
+        (WeatherCallService.__call__, "city", ""),
+        (WeatherCallService.get_weather, "city", ""),
+        (WeatherAssignedService.get_weather, "city", ""),
+        (WeatherCachedService.get_weather, "city", ""),
+        # Not the docstring dataclasses writes from the handwritten __init__.
+        (ActivityWeatherCustomInit, "city", ""),
+        # Not the docstring namedtuple writes.
+        (ActivityWeatherTuple, "city", ""),
+        # A __doc__ that isn't a string is no description.
+        (ActivityWeatherDocProperty, "city", ""),
+        (ActivityWeatherNoTypeCheck, "city", ""),
+        (WeatherNoTypeCheckService.get_weather, "city", ""),
+    ],
+)
+def test_callable_class_tool_schema(target: Any, parameter: str, description: str):
+    tool = openai_agents.workflow.activity_as_tool(
+        target, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.params_json_schema["properties"] == {
+        parameter: {"title": parameter.title(), "type": "string"}
+    }
+    assert tool.description == description
+
+
+@activity.defn
+class ActivityWeatherGoogleArgsCall:
+    """
+    Get the weather for a given city.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        Args:
+            city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherArgsOnlyClassDoc:
+    """
+    Args:
+        conditions: Default conditions.
+    """
+
+    def __init__(self, conditions: str = "Sunny") -> None:
+        self.conditions = conditions
+
+    async def __call__(self, city: str) -> Weather:
+        """
+        :param city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherArgsOnlyCall:
+    async def __call__(self, city: str) -> Weather:
+        """
+        args:
+            city: Name of the city.
+        """
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherParametersOnlyDerived(WeatherBase):
+    """
+    Parameters:
+        conditions: Default conditions.
+    """
+
+
+@activity.defn
+class ActivityWeatherReturnsOnlyClassDoc:
+    """
+    Returns:
+        The weather.
+    """
+
+    async def __call__(self, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "cls, description, city_description",
+    [
+        # A __call__ docstring with only parameters has no summary, so the class's is used.
+        (
+            ActivityWeatherSectionsOnlyCall,
+            "Get the weather for a given city.",
+            "Name of the city.",
+        ),
+        # The Agents SDK reads a leading Google Args: section as text, not a summary.
+        (ActivityWeatherGoogleArgsCall, "Get the weather for a given city.", None),
+        # A class docstring with only Args: has no summary either.
+        (ActivityWeatherArgsOnlyClassDoc, "", "Name of the city."),
+        # With no class summary to use instead, a section is no description.
+        (ActivityWeatherArgsOnlyCall, "", None),
+        (ActivityWeatherReturnsOnlyClassDoc, "", None),
+        # A class docstring with only a section gives way to an inherited __call__ docstring.
+        (
+            ActivityWeatherParametersOnlyDerived,
+            "Get the weather for a given city.",
+            None,
+        ),
+    ],
+)
+def test_callable_class_tool_summary_from_class_docstring(
+    cls: type, description: str, city_description: str | None
+):
+    tool = openai_agents.workflow.activity_as_tool(
+        cls, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.description == description
+    assert tool.params_json_schema["properties"]["city"].get("description") == (
+        city_description
+    )
+
+
+@pytest.mark.parametrize(
+    "target, summary, scheduled_summary",
+    [
+        # The class's summary labels the activity only when the caller passes none.
+        (ActivityWeatherSectionsOnlyCall, None, "Get the weather for a given city."),
+        (ActivityWeatherSectionsOnlyCall, "Caller summary", "Caller summary"),
+        (ActivityWeatherDataclass, None, None),
+        (ActivityWeatherDataclass, "Caller summary", "Caller summary"),
+        # A section-only docstring labels nothing.
+        (ActivityWeatherArgsOnlyCall, None, None),
+        (ActivityWeatherArgsOnlyCall, "Caller summary", "Caller summary"),
+        (ActivityWeatherReturnsOnlyClassDoc, None, None),
+    ],
+)
+async def test_callable_class_tool_activity_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    target: Any,
+    summary: str | None,
+    scheduled_summary: str | None,
+):
+    summaries: list[str | None] = []
+
+    async def execute_activity(*args: Any, **kwargs: Any) -> str:  # type: ignore[reportUnusedParameter]
+        summaries.append(kwargs["summary"])
+        return "Sunny"
+
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    tool = openai_agents.workflow.activity_as_tool(
+        target, start_to_close_timeout=timedelta(seconds=10), summary=summary
+    )
+    assert isinstance(tool, FunctionTool)
+    arguments = '{"city":"Tokyo"}'
+    context = ToolContext(
+        context=None,
+        tool_name=tool.name,
+        tool_call_id="call-get-weather",
+        tool_arguments=arguments,
+    )
+    await tool.on_invoke_tool(context, arguments)
+    assert summaries == [scheduled_summary]
+
+
+class WeatherDefaultsService:
+    @activity.defn
+    async def get_weather_context(
+        self,
+        ctx: RunContextWrapper[Any] = None,  # type: ignore
+        city: str = "Tokyo",
+    ) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions=ctx.context)
+
+    @activity.defn
+    async def get_weather_alias(
+        self,
+        city: Annotated[str, pydantic.Field(alias="cityName")] = None,  # type: ignore
+    ) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "target, parameters",
+    [
+        (WeatherDefaultsService.get_weather_context, ["city"]),
+        (WeatherDefaultsService.get_weather_alias, ["cityName"]),
+    ],
+)
+def test_method_tool_with_none_defaults(target: Any, parameters: list[str]):
+    # Python 3.10's typing.get_type_hints would wrap these in Optional, hiding the context type
+    # and the alias.
+    tool = openai_agents.workflow.activity_as_tool(
+        target, start_to_close_timeout=timedelta(seconds=10)
+    )
+    assert isinstance(tool, FunctionTool)
+    assert list(tool.params_json_schema["properties"]) == parameters
+
+
+async def get_weather_undecorated(city: str) -> Weather:
+    return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn(dynamic=True)
+async def get_weather_dynamic(args: Sequence[RawValue]) -> Weather:  # type: ignore[reportUnusedParameter]
+    return Weather(city="Tokyo", temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherNoCall:
+    pass
+
+
+async def get_weather_no_city() -> Weather:
+    return Weather(city="Tokyo", temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherNoParamCall:
+    # Bound to an instance, a function with no parameters can't take `self`.
+    __call__ = get_weather_no_city
+
+
+@activity.defn
+class ActivityWeatherKeywordOnlyCall:
+    async def __call__(self, *, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherKwargsCall:
+    async def __call__(self, city: str, **extra: str) -> Weather:  # type: ignore[reportUnusedParameter]
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+async def get_weather_kwargs(city: str, **extra: str) -> Weather:  # type: ignore[reportUnusedParameter]
+    return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@activity.defn
+class ActivityWeatherPartialMethodKeyword:
+    async def get_weather(self, conditions: str, city: str) -> Weather:
+        return Weather(city=city, temperature_range="14-20C", conditions=conditions)
+
+    __call__ = functools.partialmethod(get_weather, conditions="Rainy")
+
+
+class ActivityWeatherBadAnnotation(ActivityWeatherClass):
+    # Not decorated, so only activity_as_tool reads this annotation.
+    async def __call__(self, city: "asyncio.Nope") -> Weather:  # type: ignore
+        return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+
+@pytest.mark.parametrize(
+    "target, message",
+    [
+        # These two raised an ApplicationError that failed the run before this change.
+        (get_weather_undecorated, "Bare function without tool and activity decorators"),
+        (get_weather_dynamic, "must have a name to be made into a tool"),
+        (ActivityWeatherNoCall, "needs a __call__ that is a function"),
+        (ActivityWeatherNoParamCall, "invalid method signature"),
+        (ActivityWeatherKeywordOnlyCall, "cannot take keyword-only arguments"),
+        (ActivityWeatherPartialMethodKeyword, "binds an argument by keyword"),
+        (ActivityWeatherKwargsCall, r"cannot take \*\*kwargs"),
+        (get_weather_kwargs, r"cannot take \*\*kwargs"),
+        (ActivityWeatherBadAnnotation, "has no attribute 'Nope'"),
+        (ActivityWeatherClass("Cloudy"), "not an instance of it"),
+    ],
+)
+def test_invalid_callable_class_tool(target: Any, message: str):
+    with pytest.raises(ValueError, match=message):
+        openai_agents.workflow.activity_as_tool(
+            target, start_to_close_timeout=timedelta(seconds=10)
+        )
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 14), reason="only Python 3.14 can define these classes"
+)
+def test_callable_class_tool_on_python_314():
+    # The forward reference resolves only after dataclasses made the class and its docstring.
+    @dataclass
+    class ActivityWeatherForwardRef:
+        station: Station  # type: ignore
+
+        async def __call__(self, city: str) -> Weather:
+            return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
+
+    class Station:  # type: ignore[reportUnusedClass]
+        pass
+
+    tool = openai_agents.workflow.activity_as_tool(
+        activity.defn(ActivityWeatherForwardRef),
+        start_to_close_timeout=timedelta(seconds=10),
+    )
+    assert isinstance(tool, FunctionTool)
+    assert tool.description == ""
+
+    # From 3.14 a bare functools.partial binds like a method, so @activity.defn takes it.
+    class ActivityWeatherPartialCall:
+        __call__ = functools.partial(get_weather_no_city)
+
+    with pytest.raises(ValueError, match="needs a __call__ that is a function"):
+        openai_agents.workflow.activity_as_tool(
+            activity.defn(ActivityWeatherPartialCall),
+            start_to_close_timeout=timedelta(seconds=10),
+        )
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 12), reason="only Python 3.12 can define these functions"
+)
+def test_generic_tool_on_python_312():
+    # Postponed annotations name the function's own type parameter.
+    namespace: dict[str, Any] = {"activity": activity, "Weather": Weather}
+    exec(
+        "from __future__ import annotations\n"
+        "@activity.defn\n"
+        "class ActivityWeatherGenericCall:\n"
+        "    async def __call__[T: str](self, cities: list[T]) -> Weather: ...\n"
+        "class WeatherGenericService:\n"
+        "    @activity.defn\n"
+        "    async def get_weather[T: str](self, cities: list[T]) -> Weather: ...\n",
+        namespace,
+    )
+    for target in [
+        namespace["ActivityWeatherGenericCall"],
+        namespace["WeatherGenericService"].get_weather,
+    ]:
+        tool = openai_agents.workflow.activity_as_tool(
+            target, start_to_close_timeout=timedelta(seconds=10)
+        )
+        assert isinstance(tool, FunctionTool)
+        assert tool.params_json_schema["properties"] == {
+            "cities": {"items": {"type": "string"}, "title": "Cities", "type": "array"}
+        }
 
 
 @activity.defn
@@ -1127,6 +1778,401 @@ async def test_customer_service_workflow(client: Client):
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
             )
+
+
+class InputRecordingModel(TestModel):
+    """Read each call's input as ``OpenAIResponsesModel`` does, and record it."""
+
+    def __init__(self, responses: list[ModelResponse]) -> None:
+        """Return the responses in order."""
+        remaining = iter(responses)
+        super().__init__(lambda: next(remaining))
+        self.inputs: list[list[TResponseInputItem]] = []
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> ModelResponse:
+        """Record the input before producing the next response."""
+        self.inputs.append(ItemHelpers.input_to_new_input_list(input))
+        return await super().get_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            **kwargs,
+        )
+
+
+@workflow.defn
+class CarriedItemsWorkflow:
+    """Runs a turn on items carried across Continue-As-New, as a chat does."""
+
+    @workflow.run
+    async def run(self, input_items: list[TResponseInputItem]) -> str:
+        try:
+            # Read the carried replies before the turn, as a chat that shows
+            # its history does.
+            items = cast(list[dict[str, Any]], input_items)
+            replies = [
+                part["text"]
+                for item in items
+                if item.get("role") == "assistant"
+                for part in item["content"]
+            ]
+            result = await Runner.run(
+                Agent(name="Assistant", instructions="Answer."),
+                input_items + [{"content": "Next", "role": "user"}],
+            )
+        except Exception as e:
+            return f"Turn failed: {e}"
+        return f"{result.final_output}; carried replies: {replies}"
+
+
+# Pydantic decodes the assistant message's content as a one-shot iterator,
+# and the custom tool's string output as an iterator over its characters.
+CARRIED_ITEMS: list[TResponseInputItem] = [
+    {
+        "id": "msg-carried",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
+    },
+    {
+        "type": "custom_tool_call",
+        "call_id": "c1",
+        "name": "echo",
+        "input": "pong",
+    },
+    {"type": "custom_tool_call_output", "call_id": "c1", "output": "pong"},
+]
+
+
+async def test_carried_input_items(client: Client):
+    input_items: list[TResponseInputItem] = [
+        {"content": "Hi", "role": "user"},
+        *CARRIED_ITEMS,
+    ]
+    model = InputRecordingModel([ResponseBuilders.output_message("test")])
+    async with AgentEnvironment(model=model) as env:
+        client = env.applied_on_client(client)
+
+        async with new_worker(client, CarriedItemsWorkflow) as worker:
+            result = await client.execute_workflow(
+                CarriedItemsWorkflow.run,
+                input_items,
+                id=f"carried-items-workflow-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            assert result == "test; carried replies: ['Hello!']"
+    assert model.inputs == [input_items + [{"content": "Next", "role": "user"}]]
+
+
+CARRIED_AT = datetime(2026, 10, 31, 12, tzinfo=timezone.utc)
+
+
+class CarriedItemsModel(pydantic.BaseModel):
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+class CarriedItemsStrictModel(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+@pydantic.dataclasses.dataclass
+class CarriedItemsState:
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+@pydantic.dataclasses.dataclass(config=ConfigDict(strict=True))
+class CarriedItemsStrictState:
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+class CarriedItemsExtraModel(pydantic.BaseModel):
+    # Undeclared fields hold carried items, and pydantic keeps them in model_extra.
+    model_config = ConfigDict(extra="allow")
+    # Pydantic's documented way to type extra values; BaseModel declares it as optional.
+    __pydantic_extra__: dict[str, list[TResponseInputItem]] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
+        init=False
+    )
+    carried_at: datetime
+
+
+class OwnValuesModel(pydantic.BaseModel):
+    # The app's own Iterable field, which only the converter's walk lists.
+    values: Iterable[int]
+
+
+class OwnCustomToolOutput(typing_extensions.TypedDict):
+    # Same union as openai's custom tool output, which the swap leaves alone here.
+    type: Literal["custom_tool_call_output"]
+    call_id: str
+    output: str | Iterable[ResponseInputTextParam]
+
+
+class OwnCustomToolOutputModel(pydantic.BaseModel):
+    item: OwnCustomToolOutput
+
+
+class OwnCustomToolOutputStrictModel(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
+    item: OwnCustomToolOutput
+
+
+class OwnExtraValuesModel(pydantic.BaseModel):
+    model_config = ConfigDict(extra="allow")
+    __pydantic_extra__: dict[str, Iterable[int]] = Field(  # pyright: ignore[reportIncompatibleVariableOverride]
+        init=False
+    )
+
+
+@dataclass
+class PricedOrder:
+    id: str
+    # Pydantic leaves an init=False field unset when it decodes the order.
+    total: float = field(init=False)
+
+
+def _priced_order() -> PricedOrder:
+    order = PricedOrder("o-1")
+    order.total = 9.5
+    return order
+
+
+def _dated_items(state: Any) -> Any:
+    return state.carried_at, state.input_items
+
+
+@pytest.mark.parametrize(
+    "carried,read,expected",
+    [
+        (
+            CarriedItemsModel(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsStrictModel(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsState(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsStrictState(carried_at=CARRIED_AT, input_items=CARRIED_ITEMS),
+            _dated_items,
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (
+            CarriedItemsExtraModel.model_validate(
+                {"carried_at": CARRIED_AT, "carried": CARRIED_ITEMS}
+            ),
+            lambda state: (state.carried_at, state.__pydantic_extra__["carried"]),
+            (CARRIED_AT, CARRIED_ITEMS),
+        ),
+        (OwnValuesModel(values=[1, 2]), lambda state: state.values, [1, 2]),
+        (
+            OwnCustomToolOutputModel(
+                item={
+                    "type": "custom_tool_call_output",
+                    "call_id": "c1",
+                    "output": "pong",
+                }
+            ),
+            lambda state: state.item["output"],
+            "pong",
+        ),
+        (
+            OwnCustomToolOutputStrictModel(
+                carried_at=CARRIED_AT,
+                item={
+                    "type": "custom_tool_call_output",
+                    "call_id": "c1",
+                    "output": "pong",
+                },
+            ),
+            lambda state: (state.carried_at, state.item["output"]),
+            (CARRIED_AT, "pong"),
+        ),
+        (
+            OwnExtraValuesModel.model_validate({"values": [1, 2]}),
+            lambda state: state.__pydantic_extra__["values"],
+            [1, 2],
+        ),
+        (_priced_order(), lambda state: state.id, "o-1"),
+    ],
+    ids=[
+        "model",
+        "strict-model",
+        "dataclass",
+        "strict-dataclass",
+        "extra-model",
+        "own-iterable-field",
+        "own-str-or-iterable",
+        "strict-own-str-or-iterable",
+        "own-iterable-extra-field",
+        "unset-init-false-field",
+    ],
+)
+def test_state_decodes_iterables_as_lists(carried: Any, read: Any, expected: Any):
+    # Workflows often carry the items in a model or dataclass, as the
+    # documented chat does. The app's own Iterable fields go through the
+    # converter's walk.
+    converter = OpenAIPayloadConverter()
+    (payload,) = converter.to_payloads([carried])
+    (state,) = converter.from_payloads([payload], [type(carried)])
+    assert type(state) is type(carried)
+    copy.deepcopy(state)
+    assert read(state) == expected
+
+
+def test_unhashable_type_hint_keeps_string_output():
+    # The dict makes the hint unhashable, so the retry can't use the adapter cache.
+    hint: Any = Annotated[OwnCustomToolOutput, {"doc": "x"}]
+    item = {"type": "custom_tool_call_output", "call_id": "c1", "output": "pong"}
+    converter = OpenAIPayloadConverter()
+    (decoded,) = converter.from_payloads(converter.to_payloads([item]), [hint])
+    assert decoded["output"] == "pong"
+
+
+@pydantic.dataclasses.dataclass
+class CarriedItemsWithResponse:
+    last_message: ResponseOutputMessage
+    input_items: list[TResponseInputItem]
+    values: Iterable[int]
+
+
+def test_carried_input_items_decode_as_lists_in_lenient_fallback():
+    # The message lacks the required status, as a response from a newer API
+    # might, so the converter falls back to lenient construction.
+    message = {key: value for key, value in CARRIED_ITEMS[0].items() if key != "status"}
+    payload = Payload(
+        metadata={"encoding": b"json/plain"},
+        data=json.dumps(
+            {"last_message": message, "input_items": CARRIED_ITEMS, "values": [1, 2]}
+        ).encode(),
+    )
+    converter = OpenAIPayloadConverter()
+    (state,) = converter.from_payloads([payload], [CarriedItemsWithResponse])
+    assert type(state) is CarriedItemsWithResponse
+    assert state.input_items == CARRIED_ITEMS
+    assert state.values == [1, 2]
+    copy.deepcopy(state)
+
+
+def test_type_swap_leaves_tool_definitions():
+    # Requests that take tool definitions, such as vector_stores.search
+    # filters, must still turn iterators into lists.
+    # typing_extensions strips Required on every Python version.
+    hints = typing_extensions.get_type_hints
+    assert typing_extensions.get_origin(hints(CompoundFilter)["filters"]) is Iterable
+    assert (
+        typing_extensions.get_origin(hints(ResponseOutputMessageParam)["content"])
+        is list
+    )
+    # A shell call item holds the shell tool's local environment, so the
+    # swap changes it for the tool too.
+    assert typing_extensions.get_origin(hints(LocalEnvironmentParam)["skills"]) is list
+
+
+class CarriedChatState(pydantic.BaseModel):
+    # Strict Python-mode validation rejects the datetime's JSON string.
+    model_config = ConfigDict(strict=True)
+    carried_at: datetime
+    input_items: list[TResponseInputItem]
+
+
+@workflow.defn
+class CarriedCustomToolChatWorkflow:
+    @workflow.run
+    async def run(self, state: CarriedChatState | None = None) -> str:
+        async def echo(ctx: ToolContext[Any], input: str) -> str:  # type: ignore[reportUnusedParameter]
+            return input
+
+        agent = Agent[str](
+            name="custom-tool-agent",
+            instructions="Use the echo tool.",
+            tools=[
+                CustomTool(
+                    name="echo",
+                    description="Echo the input string back.",
+                    on_invoke_tool=echo,
+                )
+            ],
+        )
+        if state is None:
+            result = await Runner.run(starting_agent=agent, input="say something")
+            workflow.continue_as_new(
+                CarriedChatState(
+                    carried_at=CARRIED_AT, input_items=result.to_input_list()
+                )
+            )
+        copy.deepcopy(state.input_items)
+        result = await Runner.run(
+            starting_agent=agent,
+            input=state.input_items + [{"content": "Next", "role": "user"}],
+        )
+        return f"{result.final_output}; {state.carried_at.isoformat()}"
+
+
+async def test_carried_custom_tool_output_across_continue_as_new(client: Client):
+    model = InputRecordingModel(
+        [
+            ModelResponse(
+                output=[
+                    ResponseCustomToolCall(
+                        call_id="c1",
+                        input="ping",
+                        name="echo",
+                        type="custom_tool_call",
+                    )
+                ],
+                usage=Usage(),
+                response_id=None,
+            ),
+            ResponseBuilders.output_message("done"),
+            ResponseBuilders.output_message("next done"),
+        ]
+    )
+    async with AgentEnvironment(model=model) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, CarriedCustomToolChatWorkflow) as worker:
+            result = await client.execute_workflow(
+                CarriedCustomToolChatWorkflow.run,
+                id=f"carried-custom-tool-chat-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+    assert result == "next done; 2026-10-31T12:00:00+00:00"
+    items = [dict(i) for i in model.inputs[2]]
+    (output,) = [i for i in items if i.get("type") == "custom_tool_call_output"]
+    assert output["output"] == "ping"
+    replies = [i for i in items if i.get("role") == "assistant"]
+    assert [type(r["content"]) for r in replies] == [list]
 
 
 class InputGuardrailModel(Model):
@@ -2390,7 +3436,7 @@ async def test_hosted_mcp_tool(client: Client):
 
 
 def custom_tool_mock_model():
-    return TestModel.returning_responses(
+    return InputRecordingModel(
         [
             ModelResponse(
                 output=[
@@ -2435,7 +3481,8 @@ class CustomToolWorkflow:
 
 
 async def test_custom_tool_workflow(client: Client):
-    async with AgentEnvironment(model=custom_tool_mock_model()) as env:
+    model = custom_tool_mock_model()
+    async with AgentEnvironment(model=model) as env:
         client = env.applied_on_client(client)
 
         async with new_worker(client, CustomToolWorkflow) as worker:
@@ -2447,6 +3494,12 @@ async def test_custom_tool_workflow(client: Client):
             )
             result = await workflow_handle.result()
             assert result == "done:ping"
+    # The model Activity decodes the tool's string output as a string.
+    assert model.inputs[1][-1] == {
+        "call_id": "c1",
+        "output": "ping",
+        "type": "custom_tool_call_output",
+    }
 
 
 class AssertDifferentModelProvider(ModelProvider):
@@ -3079,9 +4132,20 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
                 )
 
 
+@tool_input_guardrail
+def reject_tool_input(_data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
+    return ToolGuardrailFunctionOutput.reject_content("blocked")
+
+
 @pytest.mark.parametrize(
     "setting",
-    ["require_approval", "instance_evaluator", "tool_filter", "tool_meta_resolver"],
+    [
+        "require_approval",
+        "instance_evaluator",
+        "tool_filter",
+        "tool_meta_resolver",
+        "tool_input_guardrails",
+    ],
 )
 @pytest.mark.parametrize("stateful", [True, False])
 async def test_mcp_server_factory_settings_are_rejected(
@@ -3098,6 +4162,9 @@ async def test_mcp_server_factory_settings_are_rejected(
     elif setting == "tool_meta_resolver":
         tracking_server = get_tracking_server("HelloServer")
         tracking_server.tool_meta_resolver = lambda context: {"tenant": "t-1"}  # type: ignore[attr-defined]
+    elif setting == "tool_input_guardrails":
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server.tool_input_guardrails = [reject_tool_input]  # type: ignore[attr-defined]
     else:
         tracking_server = get_tracking_server("HelloServer")
         tracking_server.tool_filter = lambda context, tool: True  # type: ignore[attr-defined]
@@ -3145,6 +4212,10 @@ async def test_mcp_server_factory_settings_are_rejected(
     if setting == "tool_meta_resolver":
         route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
         assert "'HelloServer' sets tool_meta_resolver" in message
+        assert f"on the server {route}() gives the workflow" in message
+    elif setting == "tool_input_guardrails":
+        route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+        assert "'HelloServer' sets tool_input_guardrails" in message
         assert f"on the server {route}() gives the workflow" in message
     elif setting != "tool_filter":
         route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
@@ -3198,6 +4269,1030 @@ async def test_stateful_mcp_server_no_worker(client: Client):
                 err.value.cause.message
                 == "MCP Stateful Server Worker failed to schedule activity."
             )
+
+
+@workflow.defn
+class McpServerStatefulRetriedWorkflow:
+    def __init__(self) -> None:
+        self._listed: list[str] | None = None
+        self._resume = False
+
+    @workflow.run
+    async def run(
+        self,
+        session_start_to_close: timedelta,
+        schedule_to_start: timedelta,
+        session_heartbeat_timeout: timedelta | None = None,
+    ) -> list[str]:
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=10),
+            schedule_to_start_timeout=schedule_to_start,
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        async with openai_agents.workflow.stateful_mcp_server(
+            "HelloServer",
+            config=config,
+            server_session_config=ActivityConfig(
+                start_to_close_timeout=session_start_to_close,
+                heartbeat_timeout=session_heartbeat_timeout,
+            ),
+        ) as server:
+            self._listed = [tool.name for tool in await server.list_tools()]
+            await workflow.wait_condition(lambda: self._resume)
+            try:
+                return [tool.name for tool in await server.list_tools()]
+            except ApplicationError:
+                # Leaving the block raises the session activity's failure.
+                pass
+        return []
+
+    @workflow.update
+    async def wait_listed(self) -> list[str]:
+        await workflow.wait_condition(lambda: self._listed is not None)
+        return self._listed or []
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+
+def _assert_session_refused(err: WorkflowFailureError) -> None:
+    # What leaves the block is the type the docstrings name.
+    assert isinstance(err.cause, ApplicationError)
+    assert err.cause.type == "DedicatedWorkerFailure"
+    # Refused by the retried session activity, not only by an operation timing
+    # out.
+    cause: BaseException | None = err.cause
+    while cause is not None and not (
+        isinstance(cause, ApplicationError) and cause.non_retryable
+    ):
+        cause = cause.__cause__
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "DedicatedWorkerFailure"
+
+
+async def _session_failed(handle: WorkflowHandle[Any, Any]) -> bool:
+    sessions: set[int] = set()
+    async for event in handle.fetch_history_events():
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+            name = event.activity_task_scheduled_event_attributes.activity_type.name
+            if name.endswith("-server-session"):
+                sessions.add(event.event_id)
+        elif event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED:
+            failed = event.activity_task_failed_event_attributes
+            if failed.scheduled_event_id in sessions:
+                return True
+    return False
+
+
+def _encoding_in(name: str) -> bool:
+    frame: FrameType | None = sys._getframe()
+    while frame and frame.f_code.co_name != name:
+        frame = frame.f_back
+    return frame is not None
+
+
+class _DelayMayBeOpenCodec(PayloadCodec):
+    """Delays the worker's "may be open" heartbeats, and longer its activity failures.
+
+    A "may be open" heartbeat sent before the attempt clears it then finishes
+    encoding after the clearing one, but before the attempt's failure.
+    """
+
+    def __init__(self) -> None:
+        self.heartbeat_delays = 0
+        self.failure_delays = 0
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_heartbeat_async"):
+            if any(_mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads):
+                self.heartbeat_delays += 1
+                await asyncio.sleep(1.5)
+        elif _encoding_in("_handle_start_activity_task") and _encoding_in(
+            "encode_failure"
+        ):
+            self.failure_delays += 1
+            await asyncio.sleep(3)
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "worker_replaced",
+        "session_timed_out",
+        "first_connect_fails",
+        "first_connect_fails_delayed_heartbeats",
+        "first_connect_fails_close_wait_ends_delayed_heartbeats",
+        "shutdown_before_connect_delayed_heartbeats",
+        "shutdown_before_connect_ignored",
+        "short_heartbeat_timeout",
+    ],
+)
+async def test_stateful_mcp_server_session_retried(
+    client: Client, case: str, monkeypatch: pytest.MonkeyPatch
+):
+    first_connect_fails = case.startswith("first_connect_fails")
+    shutdown_before_connect = case.startswith("shutdown_before_connect")
+    delayed_heartbeats = case.endswith("delayed_heartbeats")
+    codec = _DelayMayBeOpenCodec()
+    if "close_wait_ends" in case:
+        # The attempt stops waiting for a heartbeat still being encoded before
+        # it finishes, and the failure is encoded after it would.
+        monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 0.5)
+    if delayed_heartbeats:
+        monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 1.0)
+        # Each heartbeat takes longer to encode than the interval, so one is
+        # always being encoded when the first connect fails or is cancelled.
+        config = client.config()
+        config["data_converter"] = dataclasses.replace(
+            client.data_converter,
+            payload_codec=codec,
+            failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
+        )
+        client = Client(**config)
+    factory_calls = 0
+    connecting = False
+
+    def factory(_: Any) -> MCPServer:
+        nonlocal factory_calls
+        factory_calls += 1
+        server = get_tracking_server("HelloServer")
+        if shutdown_before_connect and factory_calls == 1:
+
+            async def hang_connect() -> None:
+                nonlocal connecting
+                connecting = True
+                try:
+                    # Until the worker's shutdown cancels it.
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    if case != "shutdown_before_connect_ignored":
+                        raise
+                    # A connect() that ignores the cancellation and connects.
+
+            server.connect = hang_connect  # type: ignore[method-assign]
+        if first_connect_fails and factory_calls == 1:
+
+            async def fail_connect() -> None:
+                if delayed_heartbeats:
+                    await asyncio.sleep(2.5)
+                raise RuntimeError("first connect failed")
+
+            server.connect = fail_connect  # type: ignore[method-assign]
+        return server
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        task_queue = str(uuid.uuid4())
+
+        async def expect_refused(handle: WorkflowHandle[Any, Any]) -> None:
+            # The fix fails the retried session activity; without it, a retry
+            # calls the factory again.
+            async def refused_or_retried() -> None:
+                assert await _session_failed(handle) or factory_calls > 1
+
+            await assert_eventually(refused_or_retried, timeout=timedelta(seconds=40))
+            await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+            with pytest.raises(WorkflowFailureError) as err:
+                await handle.result()
+            # A new server would open a new MCP session without the old one's
+            # state.
+            assert factory_calls == 1
+            _assert_session_refused(err.value)
+
+        async with new_worker(
+            client,
+            McpServerStatefulRetriedWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            handle = await client.start_workflow(
+                McpServerStatefulRetriedWorkflow.run,
+                args=[
+                    timedelta(seconds=5)
+                    if case == "session_timed_out"
+                    else timedelta(hours=1),
+                    # Long enough for the retry of an attempt that never connected.
+                    timedelta(
+                        seconds=30
+                        if first_connect_fails or shutdown_before_connect
+                        else 5
+                    ),
+                    timedelta(seconds=4) if case == "short_heartbeat_timeout" else None,
+                ],
+                id=f"mcp-server-retried-{uuid.uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=80),
+            )
+            if shutdown_before_connect:
+
+                async def connect_started() -> None:
+                    assert connecting
+
+                # The first worker shuts down while its first connect() runs.
+                await assert_eventually(connect_started, timeout=timedelta(seconds=30))
+            else:
+                assert await handle.execute_update(
+                    McpServerStatefulRetriedWorkflow.wait_listed
+                ) == ["Say-Hello"]
+            if first_connect_fails:
+                # No session was opened, so the retry connects again.
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 2
+                if delayed_heartbeats:
+                    # The SDK functions the codec looks for still exist.
+                    assert codec.heartbeat_delays and codec.failure_delays
+                return
+            if case == "session_timed_out":
+                await expect_refused(handle)
+                return
+            if case == "short_heartbeat_timeout":
+                # The session heartbeats within its 4-second heartbeat timeout,
+                # so it is not retried.
+                await asyncio.sleep(10)
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 1
+                return
+
+        # The first worker shut down gracefully, as in a deployment, and
+        # Temporal retries the session activity on the next one.
+        async with new_worker(
+            client,
+            McpServerStatefulRetriedWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            if shutdown_before_connect:
+                # No session was opened, so the retry connects again.
+                assert await handle.execute_update(
+                    McpServerStatefulRetriedWorkflow.wait_listed
+                ) == ["Say-Hello"]
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 2
+                if delayed_heartbeats:
+                    # The SDK functions the codec looks for still exist.
+                    assert codec.heartbeat_delays and codec.failure_delays
+                return
+            await expect_refused(handle)
+
+
+@workflow.defn
+class McpServerStatefulCancelledAfterRefusalWorkflow:
+    """Waits in a block whose session gets refused, recovering as the README says."""
+
+    @workflow.run
+    async def run(self) -> str:
+        try:
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer",
+                server_session_config=ActivityConfig(
+                    start_to_close_timeout=timedelta(seconds=6)
+                ),
+            ) as server:
+                await server.list_tools()
+                await workflow.wait_condition(lambda: False)
+        except ApplicationError as err:
+            if err.type != "DedicatedWorkerFailure":
+                raise
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer"
+            ) as server:
+                await server.list_tools()
+        return "recovered"
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_mcp_server_cancelled_after_refusal(client: Client):
+    # The session times out on a live worker and its retry is refused while the
+    # block waits. Cancelling the workflow then cancels the run: the block's
+    # DedicatedWorkerFailure doesn't replace the cancellation, so the
+    # README's recovery code doesn't swallow it.
+    factory_calls = 0
+
+    def factory(_: Any) -> MCPServer:
+        nonlocal factory_calls
+        factory_calls += 1
+        return get_tracking_server("HelloServer")
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, McpServerStatefulCancelledAfterRefusalWorkflow
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulCancelledAfterRefusalWorkflow.run,
+                id=f"mcp-server-cancelled-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+
+            async def refused() -> None:
+                assert await _session_failed(handle)
+
+            await assert_eventually(refused, timeout=timedelta(seconds=30))
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as err:
+                await asyncio.wait_for(handle.result(), timeout=20)
+
+    assert isinstance(err.value.cause, CancelledError)
+    assert factory_calls == 1
+
+
+class _DenyDescribe(Interceptor):
+    def __init__(self, status: RPCStatusCode = RPCStatusCode.PERMISSION_DENIED) -> None:
+        super().__init__()
+        self._status = status
+
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _DenyDescribeOutbound(next, self._status)
+
+
+class _DenyDescribeOutbound(OutboundInterceptor):
+    def __init__(self, next: OutboundInterceptor, status: RPCStatusCode) -> None:
+        super().__init__(next)
+        self._status = status
+
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        raise RPCError("Request refused.", self._status, b"")
+
+
+class _StallDescribe(Interceptor):
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _StallDescribeOutbound(next)
+
+
+class _StallDescribeOutbound(OutboundInterceptor):
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        await asyncio.Event().wait()
+
+
+class _OtherAttemptDescribe(Interceptor):
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _OtherAttemptDescribeOutbound(next)
+
+
+class _OtherAttemptDescribeOutbound(OutboundInterceptor):
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        # As if a later attempt of the session activity had replaced this one.
+        description = await super().describe_workflow(input)
+        for pending in description.raw_description.pending_activities:
+            pending.attempt += 1
+        return description
+
+
+class _StallReadBackCodec(PayloadCodec):
+    """Never finishes decoding the details the session activity reads back."""
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_read_back"):
+            await asyncio.Event().wait()
+        return list(payloads)
+
+
+class _StallMayBeOpenCodec(PayloadCodec):
+    """Never finishes encoding "may be open" heartbeats after the first ``passed``."""
+
+    def __init__(self, passed: int = 0) -> None:
+        self.passed = passed
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_heartbeat_async") and any(
+            _mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads
+        ):
+            if self.passed:
+                self.passed -= 1
+            else:
+                await asyncio.Event().wait()
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "refused",
+        "not_found",
+        "describe_stalls",
+        "decode_stalls",
+        "encode_stalls",
+        "other_attempt",
+    ],
+)
+async def test_stateful_mcp_server_without_describe_permission(
+    client: Client, case: str, monkeypatch: pytest.MonkeyPatch
+):
+    # The worker's client may not describe the workflow: the session activity
+    # fails at once with an error that says so, and the run fails with it. A
+    # describe or decoding that never ends fails the attempt at the deadline,
+    # and so does a heartbeat whose encoding never ends.
+    monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
+    monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 1.0)
+    servers: list[Any] = []
+
+    def factory(_: Any) -> MCPServer:
+        server = get_tracking_server("HelloServer")
+        servers.append(server)
+        return server
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        config = client.config()
+        codec = {
+            "decode_stalls": _StallReadBackCodec,
+            "encode_stalls": _StallMayBeOpenCodec,
+        }.get(case)
+        if codec:
+            config["data_converter"] = dataclasses.replace(
+                client.data_converter, payload_codec=codec()
+            )
+        else:
+            interceptor = {
+                "refused": _DenyDescribe(),
+                "not_found": _DenyDescribe(RPCStatusCode.NOT_FOUND),
+                "describe_stalls": _StallDescribe(),
+                "other_attempt": _OtherAttemptDescribe(),
+            }[case]
+            config["interceptors"] = [*config["interceptors"], interceptor]
+        worker_client = env.applied_on_client(Client(**config))
+        client = env.applied_on_client(client)
+        async with new_worker(
+            worker_client, McpServerStatefulRetriedWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulRetriedWorkflow.run,
+                args=[timedelta(hours=1), timedelta(seconds=5), None],
+                id=f"mcp-server-describe-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            if case not in ("refused", "not_found"):
+                failures: list[str] = []
+
+                async def attempt_failed() -> None:
+                    description = await handle.describe()
+                    failures[:] = [
+                        pending.last_failure.message
+                        for pending in description.raw_description.pending_activities
+                        if pending.activity_type.name.endswith("-server-session")
+                        and pending.last_failure.message
+                    ]
+                    assert failures
+
+                # The attempt fails (at the 2-second deadline when stalled) and
+                # is retried.
+                await assert_eventually(attempt_failed, timeout=timedelta(seconds=20))
+                await handle.terminate()
+                assert servers == []
+                assert failures == [
+                    "This stateful MCP server session activity attempt is no "
+                    "longer the current one."
+                    if case == "other_attempt"
+                    else "The server did not show the stateful MCP server session "
+                    "activity's first heartbeat within 2 seconds."
+                ]
+                return
+            with pytest.raises(WorkflowFailureError) as err:
+                await asyncio.wait_for(handle.result(), timeout=20)
+
+    # The session activity failed before it built a server.
+    assert servers == []
+    _assert_session_refused(err.value)
+    messages: list[str] = []
+    cause: BaseException | None = err.value
+    while cause is not None:
+        messages.append(str(cause))
+        cause = cause.__cause__
+    if case == "not_found":
+        assert any("could not describe this workflow run" in m for m in messages)
+        assert not any("permission" in m for m in messages), messages
+    else:
+        assert any("permission to describe" in m for m in messages), messages
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_mcp_server_worker_shutdown_while_closing(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    # The first "may be open" heartbeat reaches the server, the later ones hang
+    # in encoding, and the read-back hangs, so the attempt fails at its deadline
+    # and then waits in close() for those heartbeats. A worker shutdown during
+    # that wait must still let the attempt end, with the clear as its last
+    # heartbeat details.
+    monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
+    monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 60.0)
+    monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 0.5)
+    closing = asyncio.Event()
+    close = _mcp._SessionHeartbeats.close
+
+    async def close_and_flag(self: _mcp._SessionHeartbeats) -> None:
+        # close() does not await before its wait, so once this is set, the
+        # attempt waits there.
+        closing.set()
+        await close(self)
+
+    monkeypatch.setattr(_mcp._SessionHeartbeats, "close", close_and_flag)
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        config = client.config()
+        config["data_converter"] = dataclasses.replace(
+            client.data_converter, payload_codec=_StallMayBeOpenCodec(passed=1)
+        )
+        config["interceptors"] = [*config["interceptors"], _StallDescribe()]
+        worker_client = env.applied_on_client(Client(**config))
+        client = env.applied_on_client(client)
+        async with new_worker(
+            worker_client, McpServerStatefulRetriedWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulRetriedWorkflow.run,
+                args=[timedelta(hours=1), timedelta(seconds=5), None],
+                id=f"mcp-server-shutdown-closing-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            await asyncio.wait_for(closing.wait(), timeout=20)
+            await asyncio.wait_for(worker.shutdown(), timeout=20)
+
+        # The attempt's failure carried the clear over the first heartbeat, so
+        # its retry may connect.
+        async def retried() -> Any:
+            description = await handle.describe()
+            sessions = [
+                pending
+                for pending in description.raw_description.pending_activities
+                if pending.activity_type.name.endswith("-server-session")
+            ]
+            assert sessions and sessions[0].attempt == 2
+            return sessions[0]
+
+        session = await assert_eventually(retried, timeout=timedelta(seconds=20))
+        assert not session.heartbeat_details.payloads
+        await handle.terminate()
+
+
+@dataclass
+class _SessionEndedInput:
+    case: str
+    session_task_queue: str
+
+
+@workflow.defn
+class McpServerStatefulSessionEndedWorkflow:
+    def __init__(self) -> None:
+        self._listed: list[str] | None = None
+        self._resume = False
+        self._failure: list[str] = []
+
+    @workflow.run
+    async def run(self, input: _SessionEndedInput) -> list[str]:
+        # No schedule-to-start timeout: only the session's end stops an
+        # operation waiting on the session's task queue.
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=20),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        if input.case == "schedule_to_close":
+            # The timeout ends the operation, so it keeps its commands.
+            config["schedule_to_close_timeout"] = timedelta(seconds=3)
+        if input.case.startswith("next_block") or input.case.endswith(
+            "wait_cancellation"
+        ):
+            config["cancellation_type"] = (
+                workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+            )
+        if input.case.endswith("abandon"):
+            config["cancellation_type"] = workflow.ActivityCancellationType.ABANDON
+        server_session_config = ActivityConfig(
+            start_to_close_timeout=timedelta(hours=1),
+            task_queue=input.session_task_queue,
+        )
+        if input.case == "numeric_session_id":
+            server_session_config["activity_id"] = "100"
+        if input.case == "operation_waiting_after_cancel":
+            # Work after a caught cancellation still gets the session's failure.
+            try:
+                await workflow.wait_condition(lambda: False)
+            except asyncio.CancelledError:
+                pass
+        if input.case == "next_block_custom_ids":
+            server_session_config["activity_id"] = "session-1"
+        out: list[str] = []
+        try:
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer",
+                config=config,
+                server_session_config=server_session_config,
+            ) as server:
+                if input.case == "numeric_session_id":
+                    # The first operations get default IDs below the session's.
+                    tools = [tool.name for tool in await server.list_tools()]
+                    await server.call_tool("Say-Hello", {"name": "First"})
+                    return tools
+                if input.case == "operation_cancelled":
+                    # Cancelled while queued, before the session's worker polls.
+                    call = asyncio.create_task(
+                        server.call_tool("Say-Hello", {"name": "Cancelled"})
+                    )
+                    await workflow.sleep(1)
+                    call.cancel()
+                    try:
+                        await call
+                    except ActivityError as err:
+                        out.append(type(err.cause).__name__)
+                    return out + [tool.name for tool in await server.list_tools()]
+                self._listed = [tool.name for tool in await server.list_tools()]
+                await workflow.wait_condition(lambda: self._resume)
+                if input.case.startswith("next_block"):
+                    await server.call_tool("Say-Hello", {"name": "Old"})
+                else:
+                    try:
+                        await server.list_tools()
+                    except ApplicationError as err:
+                        # The block's exit replaces this error, so keep its causes.
+                        cause: BaseException | None = err
+                        while cause is not None:
+                            self._failure.append(str(cause))
+                            cause = cause.__cause__
+                        raise
+        except (ApplicationError, ActivityError):
+            if not input.case.startswith("next_block"):
+                raise
+        if input.case == "next_block_custom_ids":
+            server_session_config["activity_id"] = "session-2"
+        # A later block with the same name uses the same task queue.
+        async with openai_agents.workflow.stateful_mcp_server(
+            "HelloServer", config=config, server_session_config=server_session_config
+        ) as server:
+            return [tool.name for tool in await server.list_tools()]
+
+    @workflow.update
+    async def wait_listed(self) -> list[str]:
+        await workflow.wait_condition(lambda: self._listed is not None)
+        return self._listed or []
+
+    @workflow.query
+    def failure(self) -> list[str]:
+        return self._failure
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "operation_waiting",
+        "operation_waiting_abandon",
+        "operation_waiting_wait_cancellation",
+        "operation_waiting_after_cancel",
+        "operation_after_refusal",
+        "next_block",
+        "next_block_custom_ids",
+        "operation_cancelled",
+        "schedule_to_close",
+        "numeric_session_id",
+    ],
+)
+async def test_stateful_mcp_server_operations_after_session_ended(
+    client: Client, case: str
+):
+    servers: list[Any] = []
+    call_cancelled = asyncio.Event()
+
+    def factory(_: Any) -> MCPServer:
+        server = get_tracking_server("HelloServer")
+        if case == "operation_cancelled":
+            connect = server.connect
+
+            async def slow_connect() -> None:
+                # The session's worker polls only after the call is cancelled.
+                await call_cancelled.wait()
+                await connect()
+
+            server.connect = slow_connect  # type: ignore[method-assign]
+        servers.append(server)
+        return server
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        task_queue = str(uuid.uuid4())
+        host_task_queue = f"{task_queue}-host"
+
+        def operations() -> list[str]:
+            return [
+                event.activity_task_scheduled_event_attributes.activity_type.name
+                for event in events
+                if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+                and "-server-session"
+                not in (
+                    event.activity_task_scheduled_event_attributes.activity_type.name
+                )
+            ]
+
+        async with new_worker(
+            client, McpServerStatefulSessionEndedWorkflow, task_queue=task_queue
+        ):
+            async with new_worker(client, task_queue=host_task_queue):
+                handle = await client.start_workflow(
+                    McpServerStatefulSessionEndedWorkflow.run,
+                    _SessionEndedInput(case, host_task_queue),
+                    id=f"mcp-server-session-ended-{uuid.uuid4()}",
+                    task_queue=task_queue,
+                    execution_timeout=timedelta(seconds=80),
+                )
+                if case == "operation_waiting_after_cancel":
+                    await handle.cancel()
+                if case == "operation_cancelled":
+
+                    async def cancelled() -> None:
+                        history = [e async for e in handle.fetch_history_events()]
+                        assert any(
+                            e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_CANCELED
+                            for e in history
+                        )
+
+                    try:
+                        await assert_eventually(
+                            cancelled, timeout=timedelta(seconds=20)
+                        )
+                    finally:
+                        call_cancelled.set()
+                    assert await handle.result() == ["CancelledError", "Say-Hello"]
+                    # The cancelled call never ran once the session's worker polled.
+                    assert "call_tool" not in servers[0].calls
+                    return
+                if case == "numeric_session_id":
+                    assert await handle.result() == ["Say-Hello"]
+                    assert "call_tool" in servers[0].calls
+                    return
+                assert await handle.execute_update(
+                    McpServerStatefulSessionEndedWorkflow.wait_listed
+                ) == ["Say-Hello"]
+            # The session's host shut down gracefully after the session opened.
+
+            if case.startswith(("operation_waiting", "next_block")):
+                await handle.signal(McpServerStatefulSessionEndedWorkflow.resume)
+
+                # Wait until the operation waits beside the retried session.
+                async def operation_pending() -> None:
+                    description = await handle.describe()
+                    assert len(description.raw_description.pending_activities) >= 2
+
+                await assert_eventually(
+                    operation_pending,
+                    timeout=timedelta(seconds=20),
+                    interval=timedelta(milliseconds=100),
+                )
+
+            # The retried session activity is refused on the next host.
+            async with new_worker(client, task_queue=host_task_queue):
+                if case in ("operation_after_refusal", "schedule_to_close"):
+
+                    async def session_failed() -> None:
+                        assert await _session_failed(handle)
+
+                    await assert_eventually(
+                        session_failed, timeout=timedelta(seconds=30)
+                    )
+                    await handle.signal(McpServerStatefulSessionEndedWorkflow.resume)
+                result: list[str] | None = None
+                failure: WorkflowFailureError | None = None
+                try:
+                    result = await asyncio.wait_for(handle.result(), timeout=30)
+                except WorkflowFailureError as e:
+                    failure = e
+                causes: list[str] = []
+                if case.startswith("operation_waiting"):
+                    causes = await handle.query(
+                        McpServerStatefulSessionEndedWorkflow.failure
+                    )
+
+    events = [event async for event in handle.fetch_history_events()]
+    if case.startswith("next_block"):
+        # The second block's server got its own session; the first block's call
+        # did not run against it.
+        assert result == ["Say-Hello"]
+        assert len(servers) == 2
+        assert "call_tool" not in servers[1].calls
+        return
+    assert len(servers) == 1
+    assert failure
+    _assert_session_refused(failure)
+    if case.startswith("operation_waiting"):
+        # The operation's own error names the session's refusal as its cause,
+        # in every cancellation mode.
+        assert any("An earlier attempt" in cause for cause in causes), causes
+    # The waiting operation was cancelled (ABANDON and WAIT_CANCELLATION_COMPLETED
+    # request no cancel); none was scheduled after the session ended. An
+    # operation with a schedule-to-close timeout is scheduled as before the fix,
+    # and that timeout ends it.
+    assert operations() == ["HelloServer-stateful-list-tools"] * (
+        2 if case.startswith(("operation_waiting", "schedule_to_close")) else 1
+    )
+    assert any(
+        event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED
+        for event in events
+    ) == (case in ("operation_waiting", "operation_waiting_after_cancel"))
+
+
+@workflow.defn
+class McpServerStatefulOneTaskWorkflow:
+    """A block whose session's end reaches the workflow with another event."""
+
+    def __init__(self) -> None:
+        self._listed = False
+        self._resume = False
+
+    @workflow.run
+    async def run(self, input: _SessionEndedInput) -> str:
+        # No schedule-to-start timeout: the waiting operation follows the session.
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=20),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        try:
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer",
+                config=config,
+                server_session_config=ActivityConfig(
+                    start_to_close_timeout=timedelta(hours=1),
+                    task_queue=input.session_task_queue,
+                ),
+            ) as server:
+                await server.list_tools()
+                self._listed = True
+                if input.case == "timer_first":
+                    await workflow.sleep(10)
+                else:
+                    await workflow.wait_condition(lambda: self._resume)
+                    if input.case == "cancel_with_refusal":
+                        await server.list_tools()
+        except ApplicationError as err:
+            # The README's recovery.
+            if err.type != "DedicatedWorkerFailure":
+                raise
+            return "recovered"
+        return "completed"
+
+    @workflow.query
+    def listed(self) -> bool:
+        return self._listed
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case", ["timer_first", "cancel_with_refusal", "signal_with_refusal"]
+)
+async def test_stateful_mcp_server_session_end_with_other_events(
+    client: Client, case: str
+):
+    # The workflow worker is stopped until the session's refusal and other
+    # events, the block's last timer, a workflow cancel, or a Signal that ends
+    # the block and a workflow cancel, are all in history, so that one workflow
+    # task brings them.
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        task_queue = str(uuid.uuid4())
+        host_task_queue = f"{task_queue}-host"
+
+        def workflow_worker() -> Any:
+            return new_worker(
+                client,
+                McpServerStatefulOneTaskWorkflow,
+                task_queue=task_queue,
+                max_cached_workflows=0,
+            )
+
+        async with workflow_worker():
+            async with new_worker(client, task_queue=host_task_queue):
+                handle = await client.start_workflow(
+                    McpServerStatefulOneTaskWorkflow.run,
+                    _SessionEndedInput(case, host_task_queue),
+                    id=f"mcp-server-one-task-{uuid.uuid4()}",
+                    task_queue=task_queue,
+                    execution_timeout=timedelta(seconds=80),
+                )
+
+                async def listed() -> None:
+                    assert await handle.query(McpServerStatefulOneTaskWorkflow.listed)
+
+                await assert_eventually(listed, timeout=timedelta(seconds=20))
+            # The session's host shut down gracefully, so its retry waits.
+            if case == "cancel_with_refusal":
+                await handle.signal(McpServerStatefulOneTaskWorkflow.resume)
+
+                async def operation_pending() -> None:
+                    description = await handle.describe()
+                    assert len(description.raw_description.pending_activities) >= 2
+
+                await assert_eventually(
+                    operation_pending, timeout=timedelta(seconds=20)
+                )
+
+        if case == "signal_with_refusal":
+            await handle.signal(McpServerStatefulOneTaskWorkflow.resume)
+        if case == "timer_first":
+
+            async def timer_fired() -> None:
+                events = [e async for e in handle.fetch_history_events()]
+                assert any(
+                    e.event_type == EventType.EVENT_TYPE_TIMER_FIRED for e in events
+                )
+
+            await assert_eventually(timer_fired, timeout=timedelta(seconds=30))
+        # The next host refuses the retried session.
+        async with new_worker(client, task_queue=host_task_queue):
+
+            async def session_failed() -> None:
+                assert await _session_failed(handle)
+
+            await assert_eventually(session_failed, timeout=timedelta(seconds=30))
+            if case != "timer_first":
+                await handle.cancel()
+            async with workflow_worker():
+                if case == "timer_first":
+                    # The block raises the documented error, so the recovery runs.
+                    assert await handle.result() == "recovered"
+                elif not hasattr(asyncio.Task, "cancelling"):
+                    # Python 3.10 can't tell the workflow's cancellation from the
+                    # session's end, as the README says.
+                    assert await handle.result() == "recovered"
+                else:
+                    # The workflow's cancellation wins over the session's end.
+                    with pytest.raises(WorkflowFailureError) as err:
+                        await handle.result()
+                    assert isinstance(err.value.cause, CancelledError)
+
+
+@workflow.defn
+class McpServerStatefulEmptyBlockWorkflow:
+    @workflow.run
+    async def run(self) -> None:
+        async with openai_agents.workflow.stateful_mcp_server("HelloServer"):
+            pass
+
+
+async def test_stateful_mcp_server_empty_block(client: Client):
+    # The session activity never started, so leaving the block raises the bare
+    # CancelledError that earlier versions raise (#391), not a
+    # DedicatedWorkerFailure for a session that ended.
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, McpServerStatefulEmptyBlockWorkflow) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulEmptyBlockWorkflow.run,
+                id=f"mcp-server-empty-block-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            with pytest.raises(WorkflowFailureError) as err:
+                await handle.result()
+            assert isinstance(err.value.cause, CancelledError)
 
 
 async def test_model_conversion_loops():
@@ -3659,3 +5754,9 @@ async def test_alignment_uses_the_workflow_workers_defaults(
                 result_type=str,
             )
     assert model.settings == [ModelSettings()]
+
+
+def test_plugin_reports_package_version() -> None:
+    assert openai_agents.OpenAIAgentsPlugin().version() == importlib.metadata.version(
+        "temporalio-openai-agents"
+    )

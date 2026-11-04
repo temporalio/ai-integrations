@@ -81,11 +81,19 @@ func TestRemoteSubAgentRejected(t *testing.T) {
 		sa.WorkflowSideA2A = true
 		return []subAgentSpec{sa}
 	}
+	workflowSideTool := func(url string) []subAgentSpec {
+		sas := workflowSide(url)
+		sas[0].AsTool = true
+		return sas
+	}
 	for _, tc := range []struct {
 		name string
 		in   func(url string) runInput
 		// wantSent is set for the control: the remote agent runs and sends.
 		wantSent bool
+		// wantDone is set for a remote agent with the plugin's providers: the
+		// run answers, and each A2A request comes from an Activity.
+		wantDone bool
 	}{
 		{
 			name: "below the agent making a model call",
@@ -106,19 +114,70 @@ func TestRemoteSubAgentRejected(t *testing.T) {
 			},
 			wantSent: true,
 		},
+		{
+			name: "wrapped with agenttool",
+			in: func(url string) runInput {
+				return runInput{ModelName: "tool-model", UserMessage: "ask the remote agent", SubAgents: workflowSideTool(url)}
+			},
+		},
+		{
+			name: "wrapped with agenttool and called from a model callback, with the runner plugin",
+			in: func(url string) runInput {
+				return runInput{ModelName: "tool-model", CallToolFromCallback: "remote", RunnerPlugin: true, UserMessage: "ask the remote agent", SubAgents: workflowSideTool(url)}
+			},
+		},
+		{
+			name: "wrapped with agenttool and called from a model callback, without the runner plugin",
+			in: func(url string) runInput {
+				return runInput{ModelName: "tool-model", CallToolFromCallback: "remote", UserMessage: "ask the remote agent", SubAgents: workflowSideTool(url)}
+			},
+			wantSent: true,
+		},
+		{
+			name: "with the plugin's providers, wrapped with agenttool",
+			in: func(url string) runInput {
+				sa := remoteSubAgent(url)
+				sa.AsTool = true
+				return runInput{ModelName: "tool-model", UserMessage: "ask the remote agent", SubAgents: []subAgentSpec{sa}}
+			},
+			wantDone: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			url, requests := startA2AServer(t, a2aServer{
 				Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil),
 			})
 			var s testsuite.WorkflowTestSuite
+			logs := &warnLog{}
+			s.SetLogger(logs)
 			env, counter := newEnv(t, &s, googleadk.Config{
-				Models: map[string]googleadk.ModelFactory{"root-model": transferToRemoteModel()},
+				Models: map[string]googleadk.ModelFactory{
+					"root-model": transferToRemoteModel(),
+					"tool-model": scriptedModelFactory(
+						googleadk.FunctionCallResponse("c1", "remote", map[string]any{"request": "hello"}),
+						googleadk.TextResponse("done"),
+					),
+				},
 			})
 
 			env.ExecuteWorkflow(agentRunWorkflow, tc.in(url))
 
 			require.True(t, env.IsWorkflowCompleted())
+			wantWarnings := 0
+			if tc.wantSent {
+				wantWarnings = 1 // one per NewContext, however many requests
+			}
+			assert.Equal(t, wantWarnings, logs.count("HTTP request sent from Workflow code"), "warnings: %q", logs.warns)
+			if tc.wantDone {
+				require.NoError(t, env.GetWorkflowError())
+				var res runResult
+				require.NoError(t, env.GetWorkflowResult(&res))
+				assert.Contains(t, res.Texts, "done")
+				// One request per card or message Activity, none from Workflow code.
+				assert.EqualValues(t, counter.get(googleadk.ResolveA2AAgentCardActivityName)+
+					counter.get(googleadk.SendA2AMessageActivityName), requests.Load())
+				return
+			}
 			if tc.wantSent {
 				require.NoError(t, env.GetWorkflowError())
 				assert.Positive(t, requests.Load(), "without the runner plugin, the remote agent sends from Workflow code")

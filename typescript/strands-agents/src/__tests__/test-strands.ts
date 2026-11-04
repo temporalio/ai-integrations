@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import type { TestFn } from 'ava';
 import {
@@ -23,7 +24,7 @@ import {
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
 import { bundleWorkflowCode, DefaultLogger, NativeConnection, Worker, type WorkerOptions } from '@temporalio/worker';
-import { DeterminismViolationError } from '@temporalio/workflow';
+import { ActivityCancellationType, DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { STRANDS_MALFORMED_INTERRUPT_TYPE, StrandsPlugin } from '..';
 import { ModelActivity } from '../model-activity';
@@ -43,6 +44,8 @@ import {
   activityToolAgent,
   failActivities,
   approveSignal,
+  cancellableAgent,
+  cancellableModelCall,
   compressionAgent,
   defaultModelAgent,
   doneSignal,
@@ -53,6 +56,8 @@ import {
   interruptAgent,
   inWorkflowToolAgent,
   mcpAgent,
+  mcpPrefixedServersAgent,
+  mcpServersAgent,
   retryConfigAgent,
   statefulAgent,
   statefulChatAgent,
@@ -176,8 +181,11 @@ function toolCallTurn(toolName: string, toolUseId: string, input: object): Model
 class StubMcpClient extends McpClient {
   private readonly toolList: Tool[];
 
-  constructor(toolList: Array<{ name: string; description: string; inputSchema: unknown }>) {
-    super({ transport: STUB_TRANSPORT });
+  constructor(
+    toolList: Array<{ name: string; description: string; inputSchema: unknown }>,
+    options: { prefix?: string } = {}
+  ) {
+    super({ transport: STUB_TRANSPORT, ...options });
     this.toolList = toolList.map(
       (t) =>
         ({
@@ -649,12 +657,14 @@ test('a history whose code depends on when a handler finishes still replays', as
   );
 });
 
-test('invokeModel reconstructs Message instances from wire data', async (t) => {
+test('invokeModel gives the model Message instances and an AbortSignal', async (t) => {
   // Strands content-block and Message classes have lossy `toJSON()` methods.
   // After Temporal's default payload converter serializes activity input,
   // the receiving side sees plain Bedrock-shape objects without the `type`
   // discriminator. ModelActivity must call `Message.fromMessageData` so the
-  // user's `Model.stream` receives real Strands types.
+  // user's `Model.stream` receives real Strands types. The agent's
+  // `cancelSignal` arrives as a plain object too, and model clients such as
+  // OpenAI's call its `addEventListener`.
   t.timeout(60_000);
   const { createWorker, executeWorkflow } = helpers(t);
 
@@ -663,8 +673,10 @@ test('invokeModel reconstructs Message instances from wire data', async (t) => {
   // reachable from the assertion below.
   let receivedFirstMessage: unknown;
   let firstBlockIsTextBlock = false;
+  let receivedSignal: unknown;
   class AssertingStub extends StubModel {
     override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+      receivedSignal = options?.cancelSignal;
       if (receivedFirstMessage === undefined) {
         receivedFirstMessage = messages[0];
         const first = messages[0];
@@ -688,7 +700,136 @@ test('invokeModel reconstructs Message instances from wire data', async (t) => {
 
   t.true(receivedFirstMessage instanceof Message, 'expected first message to be a Message instance');
   t.true(firstBlockIsTextBlock, 'expected first content block to be a TextBlock instance');
+  t.true(receivedSignal instanceof AbortSignal, 'expected cancelSignal to be an AbortSignal');
 });
+
+for (const streaming of [false, true]) {
+  const path = streaming ? 'invokeModelStreaming' : 'invokeModel';
+  test(`cancelling the workflow aborts the model call in ${path} and cancels the workflow`, async (t) => {
+    t.timeout(60_000);
+    const { createWorker, startWorkflow } = helpers(t);
+    let receivedSignal: unknown;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => (markStarted = resolve));
+    // Waits for its cancel signal, then fails as OpenAI's client does: an error named `Error`.
+    class AbortingStub extends StubModel {
+      override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+        receivedSignal = options?.cancelSignal;
+        const aborted = await new Promise<boolean>((resolve) => {
+          options?.cancelSignal?.addEventListener('abort', () => resolve(true));
+          markStarted();
+        });
+        if (aborted) throw new Error('Request was aborted.');
+        yield* super.stream(messages, options);
+      }
+    }
+
+    const worker = await createWorker({
+      plugins: [new StrandsPlugin({ models: { test: () => new AbortingStub([]) } })],
+    });
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(cancellableModelCall, { args: [streaming] });
+      await started;
+      await handle.cancel();
+      const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+      t.true(err!.cause instanceof CancelledFailure, `expected a CancelledFailure, got ${err!.cause}`);
+      const { events } = await handle.fetchHistory();
+      t.true(events!.some((e) => e.activityTaskCanceledEventAttributes), 'expected ActivityTaskCanceled');
+      t.false(events!.some((e) => e.activityTaskFailedEventAttributes), 'expected no ActivityTaskFailed');
+      t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');
+    });
+    t.true(receivedSignal instanceof AbortSignal && receivedSignal.aborted, 'expected the model signal to abort');
+  });
+}
+
+for (const cancellationType of [
+  ActivityCancellationType.TRY_CANCEL,
+  ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+]) {
+  test(`cancelling a TemporalAgent workflow with ${cancellationType} aborts the model call and cancels the workflow`, async (t) => {
+    t.timeout(60_000);
+    const { createWorker, startWorkflow } = helpers(t);
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => (markStarted = resolve));
+    let markAborted!: () => void;
+    const aborted = new Promise<void>((resolve) => (markAborted = resolve));
+    // Waits for its cancel signal, then fails as OpenAI's client does: an error named `Error`.
+    class AbortingStub extends StubModel {
+      // eslint-disable-next-line require-yield
+      override async *stream(_messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+        await new Promise<void>((resolve) => {
+          options?.cancelSignal?.addEventListener('abort', () => resolve());
+          markStarted();
+        });
+        markAborted();
+        throw new Error('Request was aborted.');
+      }
+    }
+
+    const worker = await createWorker({
+      plugins: [new StrandsPlugin({ models: { test: () => new AbortingStub([]) } })],
+    });
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(cancellableAgent, { args: [cancellationType] });
+      await started;
+      await handle.cancel();
+      const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+      t.true(err!.cause instanceof CancelledFailure, `expected a CancelledFailure, got ${err!.cause}`);
+      // The model's signal aborts while the worker runs, not because it shuts down.
+      await aborted;
+      const { events } = await handle.fetchHistory();
+      t.true(events!.some((e) => e.activityTaskCancelRequestedEventAttributes), 'expected ActivityTaskCancelRequested');
+      t.false(events!.some((e) => e.workflowTaskFailedEventAttributes), 'expected no WorkflowTaskFailed');
+      t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');
+      if (cancellationType === ActivityCancellationType.WAIT_CANCELLATION_COMPLETED) {
+        t.true(events!.some((e) => e.activityTaskCanceledEventAttributes), 'expected ActivityTaskCanceled');
+      }
+    });
+  });
+
+  test(`cancelling a TemporalAgent workflow with ${cancellationType} while the model ignores its signal`, async (t) => {
+    t.timeout(60_000);
+    const { createWorker, startWorkflow } = helpers(t);
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => (markStarted = resolve));
+    let markAborted!: () => void;
+    const aborted = new Promise<void>((resolve) => (markAborted = resolve));
+    // Keeps going once its cancel signal aborts, as models that ignore `cancelSignal` do.
+    class IgnoringStub extends StubModel {
+      override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+        await new Promise<void>((resolve) => {
+          options?.cancelSignal?.addEventListener('abort', () => resolve());
+          markStarted();
+        });
+        markAborted();
+        yield* super.stream(messages, options);
+      }
+    }
+
+    const worker = await createWorker({
+      plugins: [new StrandsPlugin({ models: { test: () => new IgnoringStub([textTurn('late result')]) } })],
+    });
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(cancellableAgent, { args: [cancellationType] });
+      await started;
+      await handle.cancel();
+      if (cancellationType === ActivityCancellationType.WAIT_CANCELLATION_COMPLETED) {
+        // The workflow waits for the activity, which completes, so the run completes with its result.
+        t.is((await handle.result()).trim(), 'late result');
+        const { events } = await handle.fetchHistory();
+        t.true(events!.some((e) => e.activityTaskCompletedEventAttributes), 'expected ActivityTaskCompleted');
+        t.true(events!.some((e) => e.workflowExecutionCompletedEventAttributes), 'expected WorkflowExecutionCompleted');
+        t.false(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected no WorkflowExecutionCanceled');
+      } else {
+        const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+        t.true(err!.cause instanceof CancelledFailure, `expected a CancelledFailure, got ${err!.cause}`);
+        const { events } = await handle.fetchHistory();
+        t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');
+      }
+      await aborted;
+    });
+  });
+}
 
 test('activityAsTool dispatches a registered activity from the agent loop', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
@@ -1201,6 +1342,239 @@ test('cacheTools: true lists tools once for the whole workflow', async (t) => {
   t.is(counters.listCalls, 1);
 });
 
+test('a re-listed MCP tool name is refused only while another tool of the agent keeps it', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+
+  const schema = { type: 'object', properties: {} };
+  const stubTool = (name: string): Tool =>
+    ({ name, description: name, toolSpec: { name, description: name, inputSchema: schema } }) as unknown as Tool;
+  const listings = new Map<string, number>();
+  const calls: string[] = [];
+  // Lists `first` at the agent's first listing and `later` from then on. A listing with `!fail` fails.
+  class ChangingMcpClient extends StubMcpClient {
+    constructor(
+      private readonly label: string,
+      private readonly first: string[],
+      private readonly later: string[]
+    ) {
+      super([]);
+    }
+    override async listTools(): Promise<never> {
+      const count = (listings.get(this.label) ?? 0) + 1;
+      listings.set(this.label, count);
+      const names = count === 1 ? this.first : this.later;
+      if (names.includes('!fail')) throw new Error(`${this.label} is down`);
+      return names.map(stubTool) as never;
+    }
+    override async callTool(tool: { name: string }, args: JSONValue): Promise<JSONValue> {
+      calls.push(`${this.label}:${tool.name}`);
+      return super.callTool(tool, args);
+    }
+  }
+
+  // Runs one agent with a client per server, in order, each listing `[first, later]`. The model
+  // calls each tool in `turns`, one per model call, then answers `done`. Each workflow task replays
+  // the run, and its history replays at the end.
+  const run = async (
+    servers: Record<string, [string[], string[]]>,
+    turns: string[],
+    local = false,
+    replace?: [string, number],
+    prefix?: string
+  ): Promise<{ result: string; calls: string[] }> => {
+    listings.clear();
+    calls.length = 0;
+    const plugin = (): StrandsPlugin =>
+      new StrandsPlugin({
+        models: {
+          test: () =>
+            new StubModel([...turns.map((name, i) => toolCallTurn(name, `call_${i + 1}`, {})), textTurn('done')]),
+        },
+        mcpClients: Object.fromEntries(
+          Object.entries(servers).map(([server, [first, later]]) => [
+            server,
+            () => new ChangingMcpClient(server, first, later),
+          ])
+        ),
+      });
+    const worker = await createWorker({ plugins: [plugin()], maxCachedWorkflows: 0 });
+    return worker.runUntil(async () => {
+      const handle = await startWorkflow(mcpServersAgent, {
+        args: ['list files', Object.keys(servers), local, replace, prefix],
+      });
+      const result = await handle.result();
+      await Worker.runReplayHistory(
+        { workflowBundle: t.context.workflowBundle, plugins: [plugin()] },
+        await handle.fetchHistory()
+      );
+      return { result, calls: [...calls] };
+    });
+  };
+
+  const fixOne =
+    "Set a prefix (or a different one) on one server's TemporalMCPClient, or drop the tool from one with its toolFilters.";
+  const fixThis = (name: string) =>
+    `Set a prefix (or a different one) on the server's TemporalMCPClient, or drop '${name}' with its toolFilters.`;
+  // b starts listing a's tool after the first tool call, with the servers in either order.
+  t.deepEqual(await run({ a: [['listFiles'], ['listFiles']], b: [['other'], ['listFiles']] }, ['listFiles']), {
+    result:
+      "refused: Tool with name 'listFiles' already registered. MCP servers 'a' and 'b' both list it. " +
+      `${fixOne} Tools: listFiles, other.`,
+    calls: ['a:listFiles'],
+  });
+  t.deepEqual(await run({ b: [['x'], ['x']], a: [['other'], ['x']] }, ['other']), {
+    result: `refused: Tool with name 'x' already registered. MCP servers 'b' and 'a' both list it. ${fixOne} Tools: other, x.`,
+    calls: ['a:other'],
+  });
+  // The same with prefix `gh` on both: the refusal also gives the servers' own name.
+  const prefixed = { a: [['search'], ['search']], b: [['other'], ['other', 'search']] } as Record<string, [string[], string[]]>;
+  t.deepEqual(await run(prefixed, ['gh_other'], false, undefined, 'gh'), {
+    result:
+      "refused: Tool with name 'gh_search' already registered. MCP servers 'a' (as 'search') and 'b' (as 'search') " +
+      `both list it. ${fixOne} Tools: gh_other, gh_search.`,
+    calls: ['b:other'],
+  });
+  // a and b start listing names that differ only by '-' or '_'.
+  t.deepEqual(await run({ a: [['p'], ['x_y']], b: [['q'], ['x-y']] }, ['p']), {
+    result:
+      "refused: Tool name 'x-y' already exists as 'x_y'. MCP servers 'a' and 'b' both list it. " +
+      `${fixOne} Tools: p, q.`,
+    calls: ['a:p'],
+  });
+  // c starts listing a name that a tool in `tools` has, or one that differs from it only by '-' or
+  // '_', or lists a name twice, or two that differ only by '-' or '_', or one Strands rejects. The
+  // agent keeps the listFiles that c's refused listing drops, and gets none of its new tools.
+  for (const [later, refusal] of [
+    [
+      ['echo'],
+      "Tool with name 'echo' already registered. MCP server 'c' lists it, and another tool of the agent has it. " +
+        fixThis('echo'),
+    ],
+    [
+      ['take-note'],
+      "Tool name 'take-note' already exists as 'take_note'. MCP server 'c' lists it, and another tool of the agent has " +
+        `it. ${fixThis('take-note')}`,
+    ],
+    [['other', 'other'], "Tool with name 'other' already registered. MCP server 'c' lists it twice."],
+    [['x-y', 'x_y'], "Tool name 'x_y' already exists as 'x-y'. MCP server 'c' lists both names."],
+    [
+      ['newTool', 'bad.name'],
+      "Tool name must contain only alphanumeric characters, hyphens, and underscores. MCP server 'c' lists 'bad.name'. " +
+        "Drop it with the toolFilters of the server's TemporalMCPClient.",
+    ],
+  ] as [string[], string][]) {
+    t.deepEqual(await run({ c: [['listFiles'], later] }, ['listFiles'], true), {
+      result: `refused: ${refusal} Tools: echo, listFiles, take_note.`,
+      calls: ['c:listFiles'],
+    });
+  }
+  // a's re-listing fails after b's, which adds a tool: the agent's tools stay as they were.
+  const failed = await run({ a: [['p'], ['!fail']], b: [['other'], ['other', 'new']] }, ['p']);
+  t.regex(failed.result, /^refused: .* Tools: other, p\.$/);
+  t.deepEqual(failed.calls, ['a:p']);
+  // x moves from b to a, with the servers in either order: the model calls it on a.
+  for (const servers of [
+    { b: [['x'], ['later']], a: [['other'], ['x']] },
+    { a: [['other'], ['x']], b: [['x'], ['later']] },
+  ] as Record<string, [string[], string[]]>[]) {
+    t.deepEqual(await run(servers, ['other', 'x']), { result: 'done Tools: later, x.', calls: ['a:other', 'a:x'] });
+  }
+  // Workflow code puts a tool under the server's x in the first tool round: the server's tool is
+  // back at the next model call.
+  t.deepEqual(await run({ a: [['x'], ['x']] }, ['x', 'x'], false, ['x', 1]), {
+    result: 'done Tools: x.',
+    calls: ['a:x', 'a:x'],
+  });
+  // b drops r, which no other server lists: r is gone, and so is a tool put under it.
+  for (const replace of [undefined, ['r', 1]] as ([string, number] | undefined)[]) {
+    t.deepEqual(await run({ b: [['r'], ['s']] }, ['r'], false, replace), { result: 'done Tools: s.', calls: ['b:r'] });
+  }
+});
+
+test('prefix and toolFilters on TemporalMCPClient rename and filter tools, and calls use the server names', async (t) => {
+  const { createWorker, executeWorkflow, startWorkflow } = helpers(t);
+  const schema = { type: 'object', properties: {} };
+  const tools = ['echo', 'skip', 'other'].map((name) => ({ name, description: name, inputSchema: schema }));
+  const calls: string[] = [];
+  class RecordingMcpClient extends StubMcpClient {
+    constructor(private readonly label: string) {
+      super(tools);
+    }
+    override async callTool(tool: { name: string }, args: JSONValue): Promise<JSONValue> {
+      calls.push(`${this.label}:${tool.name}`);
+      return super.callTool(tool, args);
+    }
+  }
+  // The tool names the model is offered at its first call.
+  let offered: string[] | undefined;
+  class OfferedModel extends StubModel {
+    override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+      offered ??= (options?.toolSpecs ?? []).map((spec) => spec.name).sort();
+      yield* super.stream(messages, options);
+    }
+  }
+  const plugin = (): StrandsPlugin =>
+    new StrandsPlugin({
+      models: {
+        test: () =>
+          new OfferedModel([toolCallTurn('a_echo', 'call_1', {}), toolCallTurn('b_other', 'call_2', {}), textTurn('done')]),
+      },
+      mcpClients: { a: () => new RecordingMcpClient('a'), b: () => new RecordingMcpClient('b') },
+    });
+  // Every workflow task replays the run, and its history replays at the end: the callback filter
+  // runs in workflow code.
+  const worker = await createWorker({ plugins: [plugin()], maxCachedWorkflows: 0 });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(mcpPrefixedServersAgent, { args: ['go'] });
+    t.is(await handle.result(), 'done Tools: a_echo, a_other, a_skip, b_other.');
+    await Worker.runReplayHistory(
+      { workflowBundle: t.context.workflowBundle, plugins: [plugin()] },
+      await handle.fetchHistory()
+    );
+  });
+  t.deepEqual(offered, ['a_echo', 'a_other', 'a_skip', 'b_other']);
+  t.deepEqual(calls, ['a:echo', 'b:other']);
+
+  // A prefix on the factory's McpClient fails the listing, with the fix in the error.
+  const refusing = await createWorker({
+    plugins: [
+      new StrandsPlugin({
+        models: { test: () => new StubModel([textTurn('done')]) },
+        mcpClients: { p: () => new StubMcpClient(tools, { prefix: 'p' }) },
+      }),
+    ],
+  });
+  const refused = await refusing.runUntil(executeWorkflow(mcpServersAgent, { args: ['go', ['p']] }));
+  t.true(
+    refused.includes(
+      "for MCP server 'p' sets prefix 'p'. Set it on the workflow-side TemporalMCPClient instead: " +
+        "new TemporalMCPClient({ server: 'p', prefix: 'p' })."
+    ),
+    refused
+  );
+});
+
+test('histories of a re-listing beside another coroutine recorded on main still replay', async (t) => {
+  // Recorded on main at 017d88a, where each `cacheTools: false` client had its own `AfterToolsEvent`
+  // hook. The re-listing of `b` and another coroutine's activity completed in one workflow task, so
+  // whether `a-listTools` or that coroutine's next activity comes next depends on how many
+  // microtasks each takes to schedule it. Main scheduled `second`'s `c-listTools` first in
+  // `mcpAgentsSideBySide`, and `a-listTools` first in `mcpAgentBesideCoroutine`.
+  for (const file of ['mcp-side-by-side-017d88a.json', 'mcp-beside-coroutine-017d88a.json']) {
+    const history = await loadHistory(path.resolve(__dirname, '../../src/__tests__/histories', file));
+    await t.notThrowsAsync(
+      Worker.runReplayHistory(
+        {
+          workflowBundle: t.context.workflowBundle,
+          plugins: [new StrandsPlugin({ models: { first: () => new StubModel([]), second: () => new StubModel([]) } })],
+        },
+        history
+      ),
+      file
+    );
+  }
+});
+
 test('in-workflow tool() runs inside the workflow sandbox', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
 
@@ -1655,4 +2029,8 @@ test('captured history replays deterministically', async (t) => {
     },
     history!
   );
+});
+
+test('StrandsPlugin reports the package version for worker heartbeats', (t) => {
+  t.is(new StrandsPlugin({ models: { test: () => new StubModel([]) } }).version, JSON.parse(readFileSync(path.join(__dirname, '../../package.json'), 'utf8')).version);
 });

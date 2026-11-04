@@ -608,12 +608,24 @@ an upgrade would newly pass through ungated.
   agent from the deprecated `agent/remoteagent` package. They fetch their agent
   card and send messages from Workflow code, so every replay would send them
   again. A model call from an agent with such a remote agent below it returns an
-  error and schedules no Activity. That check misses a remote agent that is not
-  below an agent making a model call: a remote root agent, one under a
-  sequential, loop or parallel agent, and one reached by transfer. To catch
-  those, add `googleadk.NewRunnerPlugin(root)` to the runner's plugins: it fails
-  every run, before any agent runs, while the tree under `root` holds such an
-  agent. Neither check sees a remote agent wrapped as a tool with `agenttool`.
+  error and schedules no Activity. Below means among its sub-agents, at any
+  depth, or wrapped with `agenttool` by one of their tools or the call's own.
+  That check misses a remote agent that is not below an agent making a model
+  call: a remote root agent, one under a sequential, loop or parallel agent,
+  and one reached by transfer. Model callbacks can also get past it: a
+  `BeforeModelCallbacks` entry that answers instead of the model skips the
+  check, and an `OnModelErrorCallbacks` entry can turn the refusal into a
+  transfer to the remote agent. Only `googleadk.NewRunnerPlugin(root)` catches
+  these: add it to the runner's plugins, and it fails every run, before any
+  agent runs, while the tree under `root` holds such an agent. It sees an
+  agent wrapped with `agenttool` in an agent's `Tools`, but not in its
+  `Toolsets`. Neither check sees a remote agent further inside an agent that
+  `agenttool` wraps, such as one under a sequential, loop or parallel agent
+  there: ADK gives no way to reach the wrapped agent's own sub-agents. An agent
+  on `NewModel` inside it still checks the agents below it at its own model
+  calls. For the requests that still go out, `NewContext` logs one warning,
+  outside replay, the first time an HTTP request carries its context. It only
+  warns: the request still goes out.
 
   An open run that made such a model call on an earlier version fails to replay
   on this one with a non-determinism error. Let those runs finish before you
