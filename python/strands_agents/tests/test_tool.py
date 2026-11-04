@@ -1,4 +1,6 @@
+import functools
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,7 @@ from temporalio.strands_agents.workflow import activity_as_tool
 from temporalio.worker import Replayer, Worker
 from tests.common import get_activities
 from tests.mock_model import MockModel
+from tests.postponed_activities import LoadParcels
 
 
 @tool
@@ -74,6 +77,66 @@ class WeighParcel:
         return f"weigh {parcel_id} with {cls.__name__}"
 
 
+@activity.defn(name="locate_parcel")
+async def locate_parcel(parcel_id: str, /) -> str:
+    return f"locate {parcel_id}"
+
+
+@activity.defn(name="describe_parcel")
+class DescribeParcel:
+    """Track a parcel through the carrier network.
+
+    Args:
+        carrier: The carrier the activity is built with.
+    """
+
+    def __init__(self, carrier: str) -> None:
+        self.carrier = carrier
+
+    async def __call__(self, parcel_id: str) -> str:
+        """
+        Args:
+            parcel_id: The parcel to track.
+        """
+        return parcel_id
+
+
+class _Quoting:
+    async def __call__(self, parcel_id: str) -> str:
+        """Quote shipping for a parcel."""
+        return parcel_id
+
+
+@activity.defn(name="quote_dataclass")
+@dataclass
+class QuoteDataclass(_Quoting):
+    carrier: str = "road"
+
+
+@activity.defn(name="doc_property")
+class DocProperty:
+    __doc__ = property(lambda self: "per-instance doc")  # pyright: ignore[reportAssignmentType]
+
+    async def __call__(self, parcel_id: str) -> str:
+        return parcel_id
+
+
+@activity.defn(name="static_parcel")
+class StaticParcel:
+    @staticmethod
+    async def __call__(parcel_id: str) -> str:
+        return parcel_id
+
+
+async def _route(_self: Any, origin: str, destination: str, parcel_id: str) -> str:
+    return f"{parcel_id} from {origin} to {destination}"
+
+
+@activity.defn(name="route_parcel")
+class RouteParcel:
+    __call__ = functools.partialmethod(_route, "SFO")
+
+
 @workflow.defn
 class ToolWorkflow:
     def __init__(self) -> None:
@@ -96,6 +159,7 @@ class ToolWorkflow:
                         Shipping.quote,
                         ShipParcel,
                         WeighParcel,
+                        locate_parcel,
                     )
                 ),
             ],
@@ -133,6 +197,7 @@ async def test_tool(client: Client, tmp_path: Path):
                         "input": {"parcel_id": "P-4", "carrier": "rail"},
                     },
                     {"name": "weigh_parcel", "input": {"parcel_id": "P-7"}},
+                    {"name": "locate_parcel", "input": {"parcel_id": "P-8"}},
                     "Done!",
                 ]
             )
@@ -149,6 +214,7 @@ async def test_tool(client: Client, tmp_path: Path):
             Shipping("acme-post").quote,
             ShipParcel("unused"),
             WeighParcel(),
+            locate_parcel,
         ],
         plugins=[plugin],
         max_cached_workflows=0,
@@ -184,6 +250,8 @@ async def test_tool(client: Client, tmp_path: Path):
         "invoke_model",
         "weigh_parcel",
         "invoke_model",
+        "locate_parcel",
+        "invoke_model",
     ]
     assert _activity_calls(client, history, "parcel") == [
         (["P-1"], "parcel P-1 via acme-post"),
@@ -191,20 +259,44 @@ async def test_tool(client: Client, tmp_path: Path):
         (["P-3", "road"], "ship P-3 by road"),
         (["P-4", "rail"], "ship P-4 by rail"),
         (["P-7"], "weigh P-7 with WeighParcel"),
+        (["P-8"], "locate P-8"),
     ]
 
-    cases: list[tuple[Callable[..., Any], list[str], list[str]]] = [
-        (TrackParcel, ["parcel_id"], ["parcel_id"]),
-        (Shipping.quote, ["parcel_id"], ["parcel_id"]),
-        (ShipParcel, ["parcel_id", "carrier"], ["parcel_id"]),
-        (WeighParcel, ["parcel_id"], ["parcel_id"]),
+    cases: list[tuple[Callable[..., Any], list[str], list[str], str]] = [
+        (TrackParcel, ["parcel_id"], ["parcel_id"], "TrackParcel"),
+        (Shipping.quote, ["parcel_id"], ["parcel_id"], "quote"),
+        (ShipParcel, ["parcel_id", "carrier"], ["parcel_id"], "ShipParcel"),
+        (WeighParcel, ["parcel_id"], ["parcel_id"], "WeighParcel"),
+        (locate_parcel, ["parcel_id"], ["parcel_id"], "locate_parcel"),
+        (
+            DescribeParcel,
+            ["parcel_id"],
+            ["parcel_id"],
+            "Track a parcel through the carrier network.",
+        ),
+        (QuoteDataclass, ["parcel_id"], ["parcel_id"], "Quote shipping for a parcel."),
+        (DocProperty, ["parcel_id"], ["parcel_id"], "DocProperty"),
+        (StaticParcel, ["parcel_id"], ["parcel_id"], "StaticParcel"),
+        (
+            RouteParcel,
+            ["destination", "parcel_id"],
+            ["destination", "parcel_id"],
+            "RouteParcel",
+        ),
+        (LoadParcels, ["parcels"], ["parcels"], "LoadParcels"),
     ]
-    for activity_fn, properties, required in cases:
-        schema = activity_as_tool(
+    for activity_fn, properties, required, description in cases:
+        spec = activity_as_tool(
             activity_fn, start_to_close_timeout=timedelta(seconds=15)
-        ).tool_spec["inputSchema"]["json"]
+        ).tool_spec
+        schema = spec["inputSchema"]["json"]
         assert list(schema["properties"]) == properties
         assert schema.get("required", []) == required
+        assert spec["description"] == description
+        if activity_fn is DescribeParcel:
+            assert schema["properties"]["parcel_id"]["description"] == (
+                "The parcel to track."
+            )
 
     await Replayer(
         workflows=[ToolWorkflow],
@@ -252,6 +344,16 @@ class VarKeywordCall:
         return parcel_id
 
 
+@activity.defn
+class NoCall:
+    pass
+
+
+@activity.defn
+class KeywordPartialCall:
+    __call__ = functools.partialmethod(_route, origin="SFO")
+
+
 @pytest.mark.parametrize(
     "activity_fn, message",
     [
@@ -259,6 +361,8 @@ class VarKeywordCall:
         (VarArgsCall, r"cannot take \*args, keyword-only .* \('tags'\)"),
         (VarKeywordCall, r"cannot take \*args, keyword-only .* \('options'\)"),
         (TrackParcel("acme-post"), "Pass the activity class TrackParcel"),
+        (NoCall, "needs a __call__"),
+        (KeywordPartialCall, "binds an argument by keyword"),
     ],
 )
 def test_activity_as_tool_refuses(activity_fn: Callable[..., Any], message: str):

@@ -132,9 +132,23 @@ def _call_function(method: Any) -> Callable | None:
 
 
 def _docstring(fn: Any) -> str | None:
-    """Return ``fn``'s docstring, unless it is missing or blank."""
+    """Return ``fn``'s docstring, unless it is missing, blank or not a string."""
     doc = getattr(fn, "__doc__", None) if fn is not None else None
-    return doc if doc and doc.strip() else None
+    return doc if isinstance(doc, str) and doc.strip() else None
+
+
+# The section headers Strands leaves out of a tool's description.
+_ARGS_HEADERS = ("args:", "arguments:", "parameters:", "param:", "params:")
+
+
+def _description(doc: str) -> str | None:
+    """Return the text before ``doc``'s first Args section, or ``None`` if there is none."""
+    lines: list[str] = []
+    for line in inspect.cleandoc(doc).splitlines():
+        if line.strip().lower().startswith(_ARGS_HEADERS):
+            break
+        lines.append(line)
+    return "\n".join(lines).strip() or None
 
 
 def _generated_class_doc(cls: type) -> str | None:
@@ -173,17 +187,24 @@ def _generated_class_doc(cls: type) -> str | None:
 
 
 def _class_doc(cls: type) -> str | None:
-    """Return a class's own docstring, unless dataclasses or namedtuple wrote it."""
+    """Return a class's own description, unless dataclasses or namedtuple wrote it.
+
+    The description is the text before the docstring's Args section, which
+    documents the constructor.
+    """
     doc = _docstring(cls)
-    if doc is None or not doc.startswith(cls.__name__):
-        return doc
-    try:
-        generated = _generated_class_doc(cls)
-    except Exception:
-        # dataclasses would have failed the same way, so it didn't write this
-        # docstring.
-        return doc
-    return None if doc == generated else doc
+    if doc is None:
+        return None
+    if doc.startswith(cls.__name__):
+        try:
+            generated = _generated_class_doc(cls)
+        except Exception:
+            # dataclasses would have failed the same way, so it didn't write
+            # this docstring.
+            generated = None
+        if doc == generated:
+            return None
+    return _description(doc)
 
 
 def _call_stand_in(cls: type) -> Callable:
@@ -235,11 +256,16 @@ def _call_stand_in(cls: type) -> Callable:
     stand_in = functools.partial(call)
     setattr(stand_in, "__name__", cls.__name__)
     stand_in.__annotations__ = hints
-    # __call__'s own docstring, else the class's, else that of a __call__ it
-    # inherits.
+    # __call__'s own docstring, else the class's description, else the docstring
+    # of a __call__ it inherits. A __call__ docstring with only an Args section
+    # gets the class's description in front.
+    own = _docstring(_call_function(vars(cls).get("__call__")))
+    class_doc = _class_doc(cls)
+    if own is not None and class_doc is not None and _description(own) is None:
+        own = class_doc + "\n\n" + inspect.cleandoc(own)
     stand_in.__doc__ = (
-        _docstring(_call_function(vars(cls).get("__call__")))
-        or _class_doc(cls)
+        own
+        or class_doc
         or next(filter(None, map(_docstring, map(_call_function, calls))), None)
     )
     return stand_in
