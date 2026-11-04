@@ -1938,11 +1938,16 @@ class TestReplay:
                 id=f"replay-test-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
             )
-            assert await handle.execute_update(LangChainSignalWorkflow.step) == "update"
+            assert (
+                await handle.execute_update(LangChainSignalWorkflow.step, args=[False])
+                == "update"
+            )
             before = live_generators()
             for _ in range(50):
                 assert (
-                    await handle.execute_update(LangChainSignalWorkflow.step)
+                    await handle.execute_update(
+                        LangChainSignalWorkflow.step, args=[False]
+                    )
                     == "update"
                 )
             # Two per update, 100 in all, if they stayed.
