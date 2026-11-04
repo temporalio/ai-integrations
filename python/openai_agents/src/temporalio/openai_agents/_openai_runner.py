@@ -3,10 +3,12 @@ import contextlib
 import contextvars
 import dataclasses
 import sys
+import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Generator
 from typing import Any, Callable
 
+import agents.run_context
 from agents import (
     Agent,
     AgentsException,
@@ -23,7 +25,6 @@ from agents import (
     TContext,
     TResponseInputItem,
 )
-from agents._public_agent import get_public_agent, set_public_agent
 from agents.run import DEFAULT_AGENT_RUNNER, AgentRunner, RunOptions
 from agents.sandbox import SandboxAgent
 from typing_extensions import Unpack
@@ -72,9 +73,7 @@ def _convert_agent(
     visited.add(id(agent))
     if new_agent is None:
         new_agent = dataclasses.replace(agent)
-        # Every run makes a new copy, so the SDK must see the caller's agent as the
-        # copy's identity, for example to own an approval given with always_approve.
-        set_public_agent(new_agent, get_public_agent(agent))
+        _share_approval_owner_token(agent, new_agent)
         seen[id(agent)] = new_agent
     else:
         for field in dataclasses.fields(agent):
@@ -134,6 +133,61 @@ def _convert_agent(
         for tool in agent.tools
     ]
     return new_agent
+
+
+# From openai-agents 0.23, a function tool approval belongs to one agent object: its
+# key holds a weak reference to the agent and the owner token kept on the agent.
+_FunctionToolApprovalKey: Any = getattr(
+    agents.run_context, "_FunctionToolApprovalKey", None
+)
+_APPROVAL_IDENTITY_ATTR = "_function_approval_identity"
+
+
+def _share_approval_owner_token(agent: Agent[Any], new_agent: Agent[Any]) -> None:
+    """Give the copy the owner token of the agent it copies.
+
+    The copy itself still owns its approvals, so the run's state and its checkpoints
+    keep them and callbacks get the agent that runs. The shared token lets
+    ``_move_approvals_to_run_agents`` find them for the next run's copy.
+    """
+    if _FunctionToolApprovalKey is None:
+        return
+    identity = getattr(agent, _APPROVAL_IDENTITY_ATTR, None)
+    if identity is None or identity[0]() is not agent:
+        identity = (weakref.ref(agent), uuid.uuid4().hex)
+        setattr(agent, _APPROVAL_IDENTITY_ATTR, identity)
+    setattr(new_agent, _APPROVAL_IDENTITY_ATTR, (weakref.ref(new_agent), identity[1]))
+
+
+def _move_approvals_to_run_agents(
+    context: RunContextWrapper[Any], starting_agent: Agent[Any]
+) -> None:
+    """Give the agents this run uses the approvals of other copies of the same agent.
+
+    An approval given with ``always_approve`` belongs to the copy, or to the caller's
+    agent restored from a checkpoint, that asked for it. The SDK looks it up by the
+    agent that runs, so it moves to that agent, and a separate agent keeps none.
+    """
+    if _FunctionToolApprovalKey is None:
+        return
+    from agents._run_state_agent_identity import _iter_agent_graph
+
+    owners: dict[str, Agent[Any]] = {}
+    for agent in _iter_agent_graph(starting_agent):
+        identity = getattr(agent, _APPROVAL_IDENTITY_ATTR, None)
+        if identity is not None and identity[0]() is agent:
+            owners.setdefault(identity[1], agent)
+    approvals: dict[Any, Any] = context._approvals
+    for key in list(approvals):
+        # The SDK reattaches a key without an agent reference itself.
+        if not isinstance(key, _FunctionToolApprovalKey) or key._agent_ref is None:
+            continue
+        owner = owners.get(key.owner_token)
+        if owner is None or key.agent is owner:
+            continue
+        record = approvals.pop(key)
+        # A decision the running agent already has wins.
+        approvals.setdefault(_FunctionToolApprovalKey(owner, key.tool_key), record)
 
 
 # True during an agent run, so the Workflow loop runs sync function tools inline.
@@ -279,6 +333,7 @@ class TemporalOpenAIRunner(AgentRunner):
     def _prepare_workflow_run(
         self,
         starting_agent: Agent[TContext],
+        input: str | list[TResponseInputItem] | RunState[TContext],
         kwargs: RunOptions[TContext],
     ) -> tuple[Agent[Any], RunConfig]:
         """Workflow-only validation and ``kwargs`` rewrite shared by ``run()`` and ``run_streamed()``."""
@@ -386,7 +441,16 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         kwargs["run_config"] = run_config
-        return _convert_agent(self.model_params, starting_agent, None), run_config
+        converted_agent = _convert_agent(self.model_params, starting_agent, None)
+        # A resumed run uses the context and agents of its state.
+        context: object = kwargs.get("context")
+        run_agent: Agent[Any] = converted_agent
+        if isinstance(input, RunState):
+            context = input._context or context
+            run_agent = input._starting_agent or converted_agent
+        if isinstance(context, RunContextWrapper):
+            _move_approvals_to_run_agents(context, run_agent)
+        return converted_agent, run_config
 
     async def run(
         self,
@@ -402,7 +466,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 **kwargs,
             )
 
-        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        converted_agent, run_config = self._prepare_workflow_run(
+            starting_agent, input, kwargs
+        )
 
         with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             try:
@@ -474,7 +540,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 "heartbeats or the workflow stream signal channel)."
             )
 
-        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        converted_agent, run_config = self._prepare_workflow_run(
+            starting_agent, input, kwargs
+        )
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.

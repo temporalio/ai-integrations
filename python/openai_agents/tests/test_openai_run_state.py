@@ -484,12 +484,14 @@ async def _approve_always_then_run_again(
     streamed: bool,
     use_handoff: str,
     next_agent: str,
+    approval: str,
     run_config: RunConfig | None = None,
 ) -> dict[str, Any]:
-    """Approve ``transfer_funds`` permanently, then run again with the same context.
+    """Approve ``transfer_funds``, resume, then run again with the same context.
 
     ``next_agent`` is ``"same"`` to run the same agent again, or ``"other"`` to run
-    an equal but separate one.
+    an equal but separate one. ``approval`` is ``"always"`` or ``"once"``, with a
+    ``"_checkpoint"`` suffix to restore the state from its string before resuming.
     """
 
     def make_agent() -> Agent[None]:
@@ -510,7 +512,9 @@ async def _approve_always_then_run_again(
     )
     assert len(result.interruptions) == 1
     state = result.to_state()
-    state.approve(result.interruptions[0], always_approve=True)
+    state.approve(result.interruptions[0], always_approve=approval.startswith("always"))
+    if approval.endswith("_checkpoint"):
+        state = await RunState.from_string(agent, state.to_string())
     resumed = await _run(agent, state, streamed=streamed, run_config=run_config)
     assert resumed.final_output == "Transfer complete."
     again = await _run(
@@ -526,14 +530,64 @@ async def _approve_always_then_run_again(
 @workflow.defn
 class ApproveAlwaysThenRunAgainWorkflow:
     @workflow.init
-    def __init__(self, streamed: bool, use_handoff: str, next_agent: str) -> None:
+    def __init__(
+        self, streamed: bool, use_handoff: str, next_agent: str, approval: str
+    ) -> None:
         self.stream = WorkflowStream()
 
     @workflow.run
     async def run(
-        self, streamed: bool, use_handoff: str, next_agent: str
+        self, streamed: bool, use_handoff: str, next_agent: str, approval: str
     ) -> dict[str, Any]:
-        return await _approve_always_then_run_again(streamed, use_handoff, next_agent)
+        return await _approve_always_then_run_again(
+            streamed, use_handoff, next_agent, approval
+        )
+
+
+async def _replace_tools_in_callback(run_config: RunConfig | None = None) -> list[str]:
+    """An ``is_enabled`` callback replaces ``agent.tools``; the next turn uses them."""
+    called: list[str] = []
+
+    @function_tool
+    async def replacement() -> str:
+        """Finish the job."""
+        called.append("replacement")
+        return "replaced"
+
+    def swap_tools(_ctx: RunContextWrapper[Any], agent: Any) -> bool:
+        # Keep ``original``: before 0.23, the SDK finds the tool to call in the
+        # agent's current tools.
+        agent.tools = [original, replacement]
+        return True
+
+    @function_tool(is_enabled=swap_tools)
+    async def original() -> str:
+        """Start the job."""
+        called.append("original")
+        return "started"
+
+    agent = Agent[None](name="Swapper", tools=[original])
+    result = await Runner.run(agent, "Go.", run_config=run_config)
+    return [*called, str(result.final_output)]
+
+
+def _replace_tools_reply(
+    _instructions: str | None, input: str | list[TResponseInputItem]
+) -> ModelResponse:
+    if _has_tool_output(input, "call-replacement"):
+        return ResponseBuilders.output_message("done")
+    if _has_tool_output(input, "call-original"):
+        return ResponseBuilders.tool_call(
+            "{}", "replacement", call_id="call-replacement"
+        )
+    return ResponseBuilders.tool_call("{}", "original", call_id="call-original")
+
+
+@workflow.defn
+class ReplaceToolsInCallbackWorkflow:
+    @workflow.run
+    async def run(self) -> list[str]:
+        return await _replace_tools_in_callback()
 
 
 @workflow.defn
@@ -789,6 +843,7 @@ class RepeatedRunsWorkflow:
 ALL_WORKFLOWS = [
     ResumeRunStateWorkflow,
     ApproveAlwaysThenRunAgainWorkflow,
+    ReplaceToolsInCallbackWorkflow,
     ResumeAcrossContinueAsNewWorkflow,
     ResumeWithInputFilterWorkflow,
     ConcurrentNestedResumeWorkflow,
@@ -871,21 +926,26 @@ async def test_resume_run_state_after_handoff(
 @pytest.mark.parametrize("streamed", [False, True])
 @pytest.mark.parametrize("use_handoff", ["none", "object"])
 @pytest.mark.parametrize("next_agent", ["same", "other"])
+@pytest.mark.parametrize("approval", ["always", "always_checkpoint", "once_checkpoint"])
 async def test_always_approve_applies_to_later_runs_like_the_sdk(
-    client: Client, streamed: bool, use_handoff: str, next_agent: str
+    client: Client, streamed: bool, use_handoff: str, next_agent: str, approval: str
 ):
     """A permanent approval binds to the user's agent, not the plugin's copy of it.
 
     The plugin converts the agent again on every run, so the next run must still
-    find the approval. From openai-agents 0.23, a separate agent must not.
+    find the approval, also after a checkpoint. From openai-agents 0.23, a separate
+    agent must not.
     """
     expected = await _approve_always_then_run_again(
         streamed,
         use_handoff,
         next_agent,
+        approval,
         RunConfig(model=ScriptedModel(_fresh_call_id_reply())),
     )
-    if next_agent == "same":
+    if approval == "once_checkpoint":
+        assert expected == {"interruptions": 1, "final": None}
+    elif next_agent == "same":
         assert expected == {"interruptions": 0, "final": "Transfer complete."}
     elif hasattr(RunContextWrapper, "_resolve_function_approval_owners"):
         # openai-agents 0.23 binds a permanent approval to the agent that got it.
@@ -897,6 +957,18 @@ async def test_always_approve_applies_to_later_runs_like_the_sdk(
         streamed,
         use_handoff,
         next_agent,
+        approval,
+    )
+    assert result == expected
+
+
+async def test_tools_replaced_in_is_enabled_callback_run_on_next_turn(client: Client):
+    expected = await _replace_tools_in_callback(
+        RunConfig(model=ScriptedModel(_replace_tools_reply))
+    )
+    assert expected == ["original", "replacement", "done"]
+    result, _ = await _execute(
+        client, ScriptedModel(_replace_tools_reply), ReplaceToolsInCallbackWorkflow.run
     )
     assert result == expected
 
