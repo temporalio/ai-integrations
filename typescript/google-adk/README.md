@@ -387,15 +387,26 @@ const runner = new InMemoryRunner({ agent: graph });
 - **Agent node timeouts.** A `timeout` on an `LlmAgent` node is ADK's own
   deadline, and it never reaches the agent's model call: ADK runs the agent with
   the run's abort signal rather than the node's. When the node times out, its
-  model Activity keeps running, and a `retryConfig` that retries
-  `NodeTimeoutError` starts the next attempt beside it; the calls left open are
-  only cancelled when the run itself fails or is cancelled. Once the retry has
-  answered, a failure from one of them no longer counts, whenever it arrives: the
-  plugin numbers model calls as they start, and ignores the failure of a call
-  that started before the same agent's latest answer in that run. Bound an
-  agent's model call with the model Activity's own `startToCloseTimeout` or
-  `scheduleToCloseTimeout` (`TemporalModel`'s `activity` options) instead, and
-  put a deadline on Activity work with `activityNode`.
+  model Activity keeps running, and so does a tool or model callback it was
+  waiting on; a `retryConfig` that retries `NodeTimeoutError` starts the next
+  attempt beside it, and the work left open is only cancelled when the run
+  itself fails or is cancelled. A cancellation of that work never counts, whenever
+  it arrives: the plugin tracks each node attempt and ignores a cancellation that
+  ADK absorbs in an attempt the node's timeout abandoned, while a retry or another
+  item of a `ParallelWorker` is an attempt of its own. That includes work a retry
+  joins after the abandoned attempt started it, such as a retried `ParallelWorker`
+  or `ctx.runNode` with an explicit `runId`: its cancellation is ignored too.
+  Today any node `timeout` cancelled mid-call fails Workflow Tasks until the node
+  times out and fails the run
+  ([#389](https://github.com/temporalio/ai-integrations/issues/389)); once that
+  is fixed, a run whose retry joined such work fails with
+  `GoogleAdkNodeReportedError` instead of ending CANCELLED.
+  Once the retry has answered, a model failure from that work no longer counts
+  either: the plugin numbers model calls as they start, and ignores the failure
+  of a call that started before the same agent's latest answer in that run.
+  Bound an agent's model call with the model Activity's own
+  `startToCloseTimeout` or `scheduleToCloseTimeout` (`TemporalModel`'s `activity`
+  options) instead, and put a deadline on Activity work with `activityNode`.
 - **Fan-in.** Use a `JoinNode`: it is the node type that waits for every
   predecessor, and its input is the map from predecessor name to that node's
   output. ADK's `waitForOutput` flag is not a fan-in gate (it parks a node that
@@ -589,6 +600,28 @@ an agent node is waiting on, ADK absorbs the cancelled call like any model error
 and reports the node as failed (`NodeReportedError`); the plugin ends the
 execution CANCELLED with the model Activity's own cancellation instead. A
 cancelled Activity node ends it CANCELLED the same way, inside a dynamic run too.
+So does a cancel that ADK absorbs in a tool (its `requireConfirmation` predicate
+included) or a model callback, such as a `LongRunningFunctionTool` waiting for a
+Signal or a `beforeModelCallback` waiting for an Activity: in an agent node it
+ends the execution CANCELLED rather than completing it (a tool) or failing it
+with `GoogleAdkNodeReportedError` (a model callback). A cancel absorbed in a
+Signal handler ends the execution when the main function returns, after its
+cleanup; if the main function has already returned, the execution ends as the
+main function did. A cancellation that the handler's own later step throws
+after that (a `sleep` or an Activity after the ADK turn) is subject to
+[temporalio/sdk-typescript#2639](https://github.com/temporalio/sdk-typescript/issues/2639):
+such a run can stay RUNNING until the SDK fixes it. A Signal handler that
+throws instead, because a later step of its own rejects with the cancel or
+because its ADK graph run reports the node failed (`NodeReportedError`), ends
+the execution CANCELLED at once, before that cleanup: to clean up first, catch
+the error in the handler or run the turn in the main function. Only the
+execution's own cancellation counts, followed from the operation it cancelled: a
+cancel that only an inner scope (`CancellationScope.withTimeout`) caused, or any
+other error a tool or callback throws, leaves the outcome to the Workflow, even
+when the Workflow's cancellation was requested meanwhile. A recorded
+cancellation outranks the errors ADK's runtime throws, but not an error the
+Workflow's own code throws after the turn: that one still decides how the
+execution ends.
 
 A failing sibling does not cancel the execution either. When a graph node fails,
 ADK aborts the run and waits for the nodes still running before failing it. The

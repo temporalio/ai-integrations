@@ -96,6 +96,16 @@ function strandsActivityInbound(ctx: ActivityContext): ActivityInboundCallsInter
   };
 }
 
+/** Reads this package's version, which worker heartbeats report. Empty if it can't be read. */
+function packageVersion(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require('../package.json') as { version?: string }).version ?? '';
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Temporal plugin that runs Strands Agents inside Temporal workflows. Model,
  * MCP tool, and (via {@link workflow.activityAsTool}) custom-tool invocations
@@ -109,6 +119,9 @@ function strandsActivityInbound(ctx: ActivityContext): ActivityInboundCallsInter
  * ```
  */
 export class StrandsPlugin extends SimplePlugin {
+  /** The package version, reported in worker heartbeats. */
+  readonly version = packageVersion();
+
   constructor(options: StrandsPluginOptions = {}) {
     let modelFactories = options.models;
     let defaultName: string | undefined;

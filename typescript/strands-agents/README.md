@@ -95,7 +95,7 @@ Before its first model call, each `TemporalAgent` reads the model's `modelId` an
 
 A worker model that keeps the conversation server-side, such as `OpenAIModel` with `stateful: true`, gets the agent's `modelState`, such as the last response id, on each model call through `TemporalAgent`, and the agent clears its messages after each turn, as natively. As in Strands, such an agent cannot use a `conversationManager` or `contextManager`; because `TemporalAgent` learns that the model is stateful when it reads the config, it throws at the agent's first invocation instead of at construction. Catch that error, or the workflow task fails and is retried until you remove the manager and redeploy the worker. With no manager given, such an agent keeps Strands' default sliding window manager, which Strands picks before the agent reads the config, where natively it would use `NullConversationManager`. Through the plugin that manager has nothing to trim: the agent clears its messages after each turn, before the manager runs, and a context window overflow reaches the agent as a model error. A custom model that reports `stateful` but does not use `modelState` ran statelessly through earlier versions, with the agent keeping its messages; it now gets only each turn's new message, and an agent that gives it a manager now throws. Report `stateful` as false for such a model to keep the earlier behavior.
 
-`OpenAIModel` calls through `TemporalAgent`, stateful or not, currently work only with `@strands-agents/sdk` releases before 1.15.0. From 1.15.0, Strands passes an `AbortSignal` in the model's stream options, the signal reaches the model activity as a plain object, and the OpenAI client fails with `signal.addEventListener is not a function` before it sends a request. Temporal retries that activity until its retry policy or timeout runs out.
+`OpenAIModel` calls through `TemporalAgent`, stateful or not, work with current `@strands-agents/sdk` releases because the model activities give the model their own cancellation signal (see [Cancellation](#cancellation)). Earlier versions of this plugin passed the agent's signal, which reached the model activity as a plain object, so from `@strands-agents/sdk` 1.15.0 the OpenAI client failed with `signal.addEventListener is not a function` before it sent a request. During a rollout, such calls on a worker without this change fail and are retried until an upgraded worker takes them.
 
 Stateful model calls run as their own activities, `strandsInvokeStatefulModel` and `strandsInvokeStatefulModelStreaming`, chosen from the stateful flag that `strandsGetModelConfig` returns, so a run that uses a stateful model needs the workflow and the config activity from the same version. An earlier workflow that reads this version's config schedules `invokeModel`, and this version then fails to replay the run with a nondeterminism error. This version's workflow that reads an earlier config, which has no flag, keeps the stateless path for the rest of the run, and an upgraded worker fails each of its model calls with a non-retryable `StatefulModelOnStatelessPath` error. Changing a worker model between stateful and stateless, such as adding `stateful: true` to a deployed `OpenAIModel`, also applies only to new runs: an open run keeps the mode its config read recorded, and its model calls fail with `StatefulModelOnStatelessPath`, or with `StatelessModelOnStatefulPath` when the model became stateless. None of these runs recovers. The agent's `invoke()` throws an `ActivityFailure` whose cause has that type, so unless the workflow catches it, the run fails; reset a run you want to continue. Roll out with Worker Versioning, keeping each run's workflow and activity workers on one version, including any task queue set in `activityOptions`. Without it, stop the runs that use a stateful model, replace every worker on those task queues, and then start new runs.
 
@@ -127,6 +127,24 @@ A model activity that fails for good, times out or is cancelled ends the turn wi
 Workflow code that catches these errors around `invoke()` by class sees the `ApplicationFailure` or `ActivityFailure` instead: match on the failure's `type`, or read the original error from its `cause`. Your own activity interceptors, and those of plugins listed before `StrandsPlugin`, run outside the plugin's and see the `ApplicationFailure`; those of plugins listed after it run inside and see the original error.
 
 If your worker lists one of these errors in `workflowFailureErrorTypes`, the run used to fail with a retryable failure, so a workflow retry policy started another run. The plugin's failure is non-retryable, so that run is no longer retried.
+
+## Cancellation
+
+The model gets the model activity's cancellation signal as `cancelSignal`. Once the worker learns that the activity was cancelled, the signal is aborted. Only a model that passes `cancelSignal` to its client stops the call; the model activity then ends as cancelled. In `@strands-agents/sdk` 1.19.0, `OpenAIModel` and `BedrockModel` do this, but `AnthropicModel`, `GoogleModel` and `VercelModel` ignore `cancelSignal`. With a model that ignores it, the provider call keeps running after cancellation, and the activity can still complete with the model's result. The worker learns of the cancellation through the activity's heartbeats, which the model activities send only when `activityOptions.heartbeatTimeout` is set. Without a `heartbeatTimeout`, the model call runs to completion after its activity is cancelled. `agent.cancel()` in workflow code does not cancel the model activity.
+
+Through `TemporalAgent`, cancelling the workflow during a model call cancels the model activity. With the default `TRY_CANCEL` cancellation type, the workflow does not wait for the activity: the run is cancelled at once (see [Retries](#retries)), and the model call is aborted once the worker learns of the cancellation. With `WAIT_CANCELLATION_COMPLETED`, the workflow waits for the model activity to end. If it ends as cancelled, so does the run. If it completes instead, as it can with a model that ignores `cancelSignal` or without a `heartbeatTimeout`, the agent gets the model's result and the turn carries on, so the run can complete normally rather than as cancelled:
+
+```ts
+import { ActivityCancellationType } from '@temporalio/workflow';
+
+new TemporalAgent({
+  activityOptions: {
+    startToCloseTimeout: '60 seconds',
+    heartbeatTimeout: '10 seconds',
+    cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+  },
+});
+```
 
 ## Snapshots
 
