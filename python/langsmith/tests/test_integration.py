@@ -43,9 +43,13 @@ from temporalio.exceptions import ApplicationError
 from temporalio.langsmith import LangSmithInterceptor, LangSmithPlugin
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import (
+    HandleUpdateInput,
+    Interceptor,
     Replayer,
     UnsandboxedWorkflowRunner,
     Worker,
+    WorkflowInboundInterceptor,
+    WorkflowInterceptorClassInput,
     WorkflowRunner,
 )
 from temporalio.worker.workflow_sandbox import (
@@ -261,12 +265,14 @@ class LangChainSignalWorkflow:
     With ``shared_tracer``, the runnable gets the tracer in
     ``_shared_tracers``, so run it unsandboxed.  The ``step`` update runs
     ``prepare | step``, with ``tag`` after each name, and its step can wait
-    for ``release_step``.
+    for ``release_step``.  With ``fail_once``, its first call raises after
+    the chain.
     """
 
     def __init__(self) -> None:
         self._released = False
         self._step_released = False
+        self._failed = False
 
     @workflow.signal
     def release(self) -> None:
@@ -277,7 +283,9 @@ class LangChainSignalWorkflow:
         self._step_released = True
 
     @workflow.update
-    async def step(self, wait: bool = False, tag: str = "") -> str:
+    async def step(
+        self, wait: bool = False, tag: str = "", fail_once: bool = False
+    ) -> str:
         async def prepare(text: str) -> str:
             return text
 
@@ -289,7 +297,11 @@ class LangChainSignalWorkflow:
         chain = RunnableLambda(prepare, name=f"prepare{tag}") | RunnableLambda(
             step, name=f"step{tag}"
         )
-        return await chain.ainvoke("update")
+        result = await chain.ainvoke("update")
+        if fail_once and not self._failed:
+            self._failed = True
+            raise ApplicationError("first call")
+        return result
 
     @workflow.run
     async def run(self, shared_tracer: bool = False) -> str:
@@ -299,6 +311,23 @@ class LangChainSignalWorkflow:
 
         config: Any = {"callbacks": _shared_tracers[:1]} if shared_tracer else {}
         return await RunnableLambda(wait, name="wait").ainvoke("secret", config=config)
+
+
+class _CallUpdateAgainInterceptor(Interceptor):
+    """Calls an update's handler again when it raises."""
+
+    def workflow_interceptor_class(
+        self, input: WorkflowInterceptorClassInput
+    ) -> type[WorkflowInboundInterceptor]:
+        return _CallUpdateAgainInbound
+
+
+class _CallUpdateAgainInbound(WorkflowInboundInterceptor):
+    async def handle_update_handler(self, input: HandleUpdateInput) -> Any:
+        try:
+            return await super().handle_update_handler(input)
+        except ApplicationError:
+            return await super().handle_update_handler(input)
 
 
 @workflow.defn
@@ -1779,7 +1808,7 @@ class TestReplay:
             "post",
         ]
 
-    @pytest.mark.parametrize("case", ["", "open", "two"])
+    @pytest.mark.parametrize("case", ["", "open", "two", "called_again"])
     async def test_update_runs_keep_their_own_ids(
         self,
         client: Client,
@@ -1794,7 +1823,9 @@ class TestReplay:
         ``open``, the update's run stays open into a later task, whose replay
         must make it again under its own ID for its end to reach it.  With
         ``two``, two updates sent while no worker polls run in one task, and
-        each keeps IDs of its own.
+        each keeps IDs of its own.  With ``called_again``, an interceptor
+        outside the plugin's calls the update's handler again after it
+        raises, in the same task, and the second call gets new IDs.
         """
         get_runtime_environment()
         langsmith.env.get_langchain_env_var_metadata()
@@ -1807,16 +1838,24 @@ class TestReplay:
             def _update_run(self, *args: Any, **kwargs: Any) -> None:
                 writes.append(("patch", args[0]))
 
-        config = client.config()
-        config["plugins"] = [
-            LangSmithPlugin(
-                client=_RecordingClient(
-                    api_url="http://localhost:1",
-                    api_key="test",
-                    auto_batch_tracing=False,
-                )
+        plugin = LangSmithPlugin(
+            client=_RecordingClient(
+                api_url="http://localhost:1",
+                api_key="test",
+                auto_batch_tracing=False,
             )
-        ]
+        )
+        config = client.config()
+        extra: dict[str, Any] = {}
+        if case == "called_again":
+            # The Worker's interceptors are outside its plugins' ones.
+            extra = {
+                "plugins": [plugin],
+                "interceptors": [_CallUpdateAgainInterceptor()],
+                "workflow_runner": UnsandboxedWorkflowRunner(),
+            }
+        else:
+            config["plugins"] = [plugin]
         temporal_client = Client(**config)
         task_queue = str(uuid.uuid4())
 
@@ -1826,6 +1865,7 @@ class TestReplay:
                 LangChainSignalWorkflow,
                 task_queue=task_queue,
                 max_cached_workflows=0,
+                **extra,
             )
 
         async with worker():
@@ -1845,7 +1885,7 @@ class TestReplay:
             if case != "two":
                 update = await handle.start_update(
                     LangChainSignalWorkflow.step,
-                    args=[case == "open"],
+                    args=[case == "open", "", case == "called_again"],
                     wait_for_stage=WorkflowUpdateStage.ACCEPTED
                     if case == "open"
                     else WorkflowUpdateStage.COMPLETED,
@@ -1890,6 +1930,10 @@ class TestReplay:
         for run in posts:
             names.setdefault(str(run["id"]), set()).add(run["name"])
         assert all(len(each) == 1 for each in names.values()), names
+        # No two posts of the updates' runs share an ID, as a second call of
+        # one update, with the same names, would.
+        update_ids = [str(run["id"]) for run in posts if run["name"] != "wait"]
+        assert len(set(update_ids)) == len(update_ids), update_ids
         # The trace is the root factory's run, built for each handler call.
         steps = ["step_a", "step_b"] if case == "two" else ["step"]
         traces = {
