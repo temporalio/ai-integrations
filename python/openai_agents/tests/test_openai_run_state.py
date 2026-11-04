@@ -228,6 +228,32 @@ def _make_triage(use_handoff_object: bool) -> Agent[None]:
     )
 
 
+def _make_runtime_triage() -> Agent[None]:
+    """Triage whose handoff returns the Banker only when it runs, without ``_agent_ref``."""
+    banker = _make_banker()
+
+    async def invoke(_context: RunContextWrapper[Any], _args: str) -> Agent[None]:
+        return banker
+
+    return Agent[None](
+        name="Triage",
+        instructions="Hand off to the Banker.",
+        handoffs=[
+            Handoff(
+                tool_name="transfer_to_banker",
+                tool_description="Hand off to the Banker.",
+                input_json_schema={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                on_invoke_handoff=invoke,
+                agent_name="Banker",
+            )
+        ],
+    )
+
+
 class YieldingHooks(RunHooks[None]):
     """Hooks that suspend between the input filter and the model call."""
 
@@ -495,6 +521,8 @@ async def _approve_always_then_run_again(
     """
 
     def make_agent() -> Agent[None]:
+        if use_handoff == "runtime":
+            return _make_runtime_triage()
         return (
             _make_banker()
             if use_handoff == "none"
@@ -525,6 +553,86 @@ async def _approve_always_then_run_again(
         context=resumed.context_wrapper,
     )
     return {"interruptions": len(again.interruptions), "final": again.final_output}
+
+
+async def _approve_always_then_run_concurrently(
+    streamed: bool, use_handoff: str, run_config: RunConfig | None = None
+) -> dict[str, Any]:
+    """Approve ``transfer_funds`` permanently, then run twice at once with the context.
+
+    The first run waits in an ``is_enabled`` callback until the second one finishes.
+    """
+    hold = False
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_first_run(_ctx: RunContextWrapper[Any], _agent: Any) -> bool:
+        nonlocal hold
+        if hold:
+            hold = False
+            held.set()
+            await release.wait()
+        return True
+
+    @function_tool(is_enabled=hold_first_run)
+    async def idle() -> str:
+        """Do nothing."""
+        return ""
+
+    agent = (
+        _make_banker()
+        if use_handoff == "none"
+        else _make_triage(use_handoff == "object")
+    )
+    agent.tools = [*agent.tools, idle]
+    result = await _run(
+        agent,
+        "Move 5 dollars.",
+        streamed=streamed,
+        run_config=run_config,
+        context=RunContextWrapper[None](context=None),
+    )
+    assert len(result.interruptions) == 1
+    state = result.to_state()
+    state.approve(result.interruptions[0], always_approve=True)
+    resumed = await _run(agent, state, streamed=streamed, run_config=run_config)
+    assert resumed.final_output == "Transfer complete."
+
+    hold = True
+    first = asyncio.create_task(
+        _run(
+            agent,
+            "Move 5 dollars.",
+            streamed=streamed,
+            run_config=run_config,
+            context=resumed.context_wrapper,
+        )
+    )
+    await held.wait()
+    second = await _run(
+        agent,
+        "Move 5 dollars.",
+        streamed=streamed,
+        run_config=run_config,
+        context=resumed.context_wrapper,
+    )
+    release.set()
+    runs = [await first, second]
+    return {
+        "interruptions": [len(run.interruptions) for run in runs],
+        "final": [run.final_output for run in runs],
+    }
+
+
+@workflow.defn
+class ApproveAlwaysThenRunConcurrentlyWorkflow:
+    @workflow.init
+    def __init__(self, streamed: bool, use_handoff: str) -> None:
+        self.stream = WorkflowStream()
+
+    @workflow.run
+    async def run(self, streamed: bool, use_handoff: str) -> dict[str, Any]:
+        return await _approve_always_then_run_concurrently(streamed, use_handoff)
 
 
 @workflow.defn
@@ -843,6 +951,7 @@ class RepeatedRunsWorkflow:
 ALL_WORKFLOWS = [
     ResumeRunStateWorkflow,
     ApproveAlwaysThenRunAgainWorkflow,
+    ApproveAlwaysThenRunConcurrentlyWorkflow,
     ReplaceToolsInCallbackWorkflow,
     ResumeAcrossContinueAsNewWorkflow,
     ResumeWithInputFilterWorkflow,
@@ -924,17 +1033,25 @@ async def test_resume_run_state_after_handoff(
 
 
 @pytest.mark.parametrize("streamed", [False, True])
-@pytest.mark.parametrize("use_handoff", ["none", "object"])
 @pytest.mark.parametrize("next_agent", ["same", "other"])
-@pytest.mark.parametrize("approval", ["always", "always_checkpoint", "once_checkpoint"])
+@pytest.mark.parametrize(
+    ("use_handoff", "approval"),
+    [
+        *itertools.product(
+            ["none", "object"], ["always", "always_checkpoint", "once_checkpoint"]
+        ),
+        # The SDK can't restore a checkpoint whose agent a handoff returned at runtime.
+        ("runtime", "always"),
+    ],
+)
 async def test_always_approve_applies_to_later_runs_like_the_sdk(
     client: Client, streamed: bool, use_handoff: str, next_agent: str, approval: str
 ):
     """A permanent approval binds to the user's agent, not the plugin's copy of it.
 
     The plugin converts the agent again on every run, so the next run must still
-    find the approval, also after a checkpoint. From openai-agents 0.23, a separate
-    agent must not.
+    find the approval, also after a checkpoint or through a handoff that returns its
+    agent at runtime. From openai-agents 0.23, a separate agent must not.
     """
     expected = await _approve_always_then_run_again(
         streamed,
@@ -958,6 +1075,29 @@ async def test_always_approve_applies_to_later_runs_like_the_sdk(
         use_handoff,
         next_agent,
         approval,
+    )
+    assert result == expected
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("use_handoff", ["none", "object"])
+async def test_always_approve_applies_to_concurrent_runs_like_the_sdk(
+    client: Client, streamed: bool, use_handoff: str
+):
+    """A run that is still going keeps a permanent approval when another run starts."""
+    expected = await _approve_always_then_run_concurrently(
+        streamed, use_handoff, RunConfig(model=ScriptedModel(_fresh_call_id_reply()))
+    )
+    assert expected == {
+        "interruptions": [0, 0],
+        "final": ["Transfer complete.", "Transfer complete."],
+    }
+    result, _ = await _execute(
+        client,
+        ScriptedModel(_fresh_call_id_reply()),
+        ApproveAlwaysThenRunConcurrentlyWorkflow.run,
+        streamed,
+        use_handoff,
     )
     assert result == expected
 

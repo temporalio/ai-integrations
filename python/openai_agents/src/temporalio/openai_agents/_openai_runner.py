@@ -100,7 +100,10 @@ def _convert_agent(
                 ] = original_invoke,
             ) -> Agent:
                 handoff_agent = await invoke_func(context, args)
-                return _convert_agent(model_params, handoff_agent, seen)
+                converted = _convert_agent(model_params, handoff_agent, seen)
+                # A target chosen at runtime was not in the graph when the run started.
+                _share_approvals_with_run_agents(context, converted)
+                return converted
 
             new_handoff = dataclasses.replace(handoff, on_invoke_handoff=on_invoke)
             handoff_agent = (
@@ -148,7 +151,7 @@ def _share_approval_owner_token(agent: Agent[Any], new_agent: Agent[Any]) -> Non
 
     The copy itself still owns its approvals, so the run's state and its checkpoints
     keep them and callbacks get the agent that runs. The shared token lets
-    ``_move_approvals_to_run_agents`` find them for the next run's copy.
+    ``_share_approvals_with_run_agents`` find them for other copies.
     """
     if _FunctionToolApprovalKey is None:
         return
@@ -159,14 +162,16 @@ def _share_approval_owner_token(agent: Agent[Any], new_agent: Agent[Any]) -> Non
     setattr(new_agent, _APPROVAL_IDENTITY_ATTR, (weakref.ref(new_agent), identity[1]))
 
 
-def _move_approvals_to_run_agents(
+def _share_approvals_with_run_agents(
     context: RunContextWrapper[Any], starting_agent: Agent[Any]
 ) -> None:
-    """Give the agents this run uses the approvals of other copies of the same agent.
+    """Give the agents a run uses the approvals of other copies of the same agent.
 
-    An approval given with ``always_approve`` belongs to the copy, or to the caller's
-    agent restored from a checkpoint, that asked for it. The SDK looks it up by the
-    agent that runs, so it moves to that agent, and a separate agent keeps none.
+    An approval belongs to the copy, or to the caller's agent restored from a
+    checkpoint, that asked for it, and the SDK looks it up by the agent that runs.
+    Each agent here gets its own key to the same record, which the SDK updates in
+    place, so every copy, including one in a run that is still going, sees one
+    decision. A separate agent has a different token and gets none.
     """
     if _FunctionToolApprovalKey is None:
         return
@@ -178,16 +183,21 @@ def _move_approvals_to_run_agents(
         if identity is not None and identity[0]() is agent:
             owners.setdefault(identity[1], agent)
     approvals: dict[Any, Any] = context._approvals
-    for key in list(approvals):
+    shared: dict[tuple[str, str], Any] = {}
+    for key, record in list(approvals.items()):
         # The SDK reattaches a key without an agent reference itself.
         if not isinstance(key, _FunctionToolApprovalKey) or key._agent_ref is None:
             continue
         owner = owners.get(key.owner_token)
         if owner is None or key.agent is owner:
             continue
-        record = approvals.pop(key)
+        if key.agent is None:
+            # The copy is gone, so nothing can look this key up again.
+            del approvals[key]
+        shared[(key.owner_token, key.tool_key)] = record
+    for (token, tool_key), record in shared.items():
         # A decision the running agent already has wins.
-        approvals.setdefault(_FunctionToolApprovalKey(owner, key.tool_key), record)
+        approvals.setdefault(_FunctionToolApprovalKey(owners[token], tool_key), record)
 
 
 # True during an agent run, so the Workflow loop runs sync function tools inline.
@@ -444,12 +454,17 @@ class TemporalOpenAIRunner(AgentRunner):
         converted_agent = _convert_agent(self.model_params, starting_agent, None)
         # A resumed run uses the context and agents of its state.
         context: object = kwargs.get("context")
-        run_agent: Agent[Any] = converted_agent
+        run_agents = [converted_agent]
         if isinstance(input, RunState):
             context = input._context or context
-            run_agent = input._starting_agent or converted_agent
+            run_agents = [
+                agent
+                for agent in (input._starting_agent, input._current_agent)
+                if agent is not None
+            ] or run_agents
         if isinstance(context, RunContextWrapper):
-            _move_approvals_to_run_agents(context, run_agent)
+            for run_agent in run_agents:
+                _share_approvals_with_run_agents(context, run_agent)
         return converted_agent, run_config
 
     async def run(
