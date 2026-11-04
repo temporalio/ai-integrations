@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.metadata
 import threading
+import types
 import uuid
 from collections.abc import Callable
 from typing import Any, cast
@@ -356,12 +357,16 @@ class TestEndingEvictions:
             # Marking again changes nothing.
             assert _mark_ending_evictions(runner) is runner
 
-    @pytest.mark.parametrize("delegating", [False, True])
-    def test_runner_that_cannot_be_copied_marked(self, delegating: bool) -> None:
-        """A runner that can't be copied with a subclass is wrapped instead.
+    @pytest.mark.parametrize("kind", ["final", "delegating", "sandboxed_delegating"])
+    def test_runner_that_cannot_be_copied_marked(self, kind: str) -> None:
+        """A runner that ``copy.copy`` can't copy is still marked.
 
-        Its class can't be subclassed, or, with ``delegating``, it delegates
-        through ``__getattr__``, on which ``copy.copy`` recurses.
+        A runner whose class can't be subclassed (``final``), or that
+        delegates through ``__getattr__``, on which ``copy.copy`` recurses
+        (``delegating``), is wrapped.  A ``SandboxedWorkflowRunner`` subclass
+        that delegates is a dataclass, rebuilt with ``dataclasses.replace``,
+        so it stays one, and a plugin after this one can still change its
+        restrictions.
         """
 
         class _Final(UnsandboxedWorkflowRunner):
@@ -381,10 +386,31 @@ class TestEndingEvictions:
             def create_instance(self, det: Any) -> WorkflowInstance:
                 return self._inner.create_instance(det)
 
-        runner = _mark_ending_evictions(_Delegating() if delegating else _Final())
-        with patch.object(
-            UnsandboxedWorkflowRunner, "create_instance"
-        ) as create_instance:
+        @dataclasses.dataclass(frozen=True)
+        class _SandboxedDelegating(SandboxedWorkflowRunner):
+            def __post_init__(self) -> None:
+                object.__setattr__(self, "_metrics", types.SimpleNamespace())
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._metrics, name)
+
+        runner = _mark_ending_evictions(
+            {
+                "final": _Final,
+                "delegating": _Delegating,
+                "sandboxed_delegating": _SandboxedDelegating,
+            }[kind]()
+        )
+        base: type[WorkflowRunner] = UnsandboxedWorkflowRunner
+        if kind == "sandboxed_delegating":
+            assert isinstance(runner, _SandboxedDelegating)
+            runner = dataclasses.replace(
+                runner,
+                restrictions=runner.restrictions.with_passthrough_modules("other"),
+            )
+            assert "other" in runner.restrictions.passthrough_modules
+            base = SandboxedWorkflowRunner
+        with patch.object(base, "create_instance") as create_instance:
             instance = runner.create_instance(MagicMock())
         assert isinstance(instance, _EndingEvictionInstance)
         assert instance._instance is create_instance.return_value
@@ -393,12 +419,12 @@ class TestEndingEvictions:
         """The wrapping runner and instance pass every call to what they wrap."""
         inner_runner = MagicMock(spec=WorkflowRunner)
         runner = _Runner(inner_runner)
-        defn, det, types = MagicMock(), MagicMock(), [ValueError]
+        defn, det, failure_types = MagicMock(), MagicMock(), [ValueError]
         runner.prepare_workflow(defn)
         inner_runner.prepare_workflow.assert_called_once_with(defn)
-        runner.set_worker_level_failure_exception_types(types)
+        runner.set_worker_level_failure_exception_types(failure_types)
         inner_runner.set_worker_level_failure_exception_types.assert_called_once_with(
-            types
+            failure_types
         )
         instance = runner.create_instance(det)
         inner_runner.create_instance.assert_called_once_with(det)

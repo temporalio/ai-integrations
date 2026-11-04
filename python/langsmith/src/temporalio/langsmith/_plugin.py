@@ -115,16 +115,25 @@ def _mark_ending_evictions(runner: WorkflowRunner) -> WorkflowRunner:
     The copy's class is a subclass of the runner's own, so the copy keeps the
     runner's behavior and type: a ``SandboxedWorkflowRunner``, or a subclass
     of it, stays one, and other plugins can still change its restrictions.
-    The worker uses the copy, so what a runner records on itself in
-    ``create_instance`` goes to the copy, not to the runner passed in.  A
-    runner whose class can't be subclassed, or that can't be copied, such as
-    one that delegates through ``__getattr__`` (``copy.copy`` recurses on
-    it), is wrapped instead.
+    The worker uses a shallow copy, so an attribute a runner sets on itself
+    in ``create_instance`` is set on the copy, while an object it changes in
+    place, such as a list it appends to, stays shared with the runner passed
+    in.  ``copy.copy`` recurses on a runner that delegates through
+    ``__getattr__``; such a runner that is a dataclass, as a
+    ``SandboxedWorkflowRunner`` subclass is, is rebuilt with
+    ``dataclasses.replace``, which runs its ``__init__``.  A runner whose
+    class can't be subclassed, or that can't be copied otherwise, is wrapped
+    instead.
     """
     if isinstance(runner, (_MarkingRunner, _Runner)):
         return runner
     try:
-        marked = copy.copy(runner)
+        try:
+            marked = copy.copy(runner)
+        except Exception:
+            if not dataclasses.is_dataclass(runner):
+                raise
+            marked = dataclasses.replace(runner)
         object.__setattr__(marked, "__class__", _marking_class(type(runner)))
     except Exception:
         return _Runner(runner)
