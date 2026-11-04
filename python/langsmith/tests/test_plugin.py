@@ -42,6 +42,7 @@ from temporalio.worker import (
     UnsandboxedWorkflowRunner,
     WorkerConfig,
     WorkflowInstance,
+    WorkflowRunner,
 )
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 from tests.helpers import new_worker
@@ -334,14 +335,32 @@ class TestEndingEvictions:
             # Marking again changes nothing.
             assert _mark_ending_evictions(runner) is runner
 
-    def test_runner_that_cannot_be_subclassed_marked(self) -> None:
-        """A runner whose class can't be subclassed is wrapped instead."""
+    @pytest.mark.parametrize("delegating", [False, True])
+    def test_runner_that_cannot_be_copied_marked(self, delegating: bool) -> None:
+        """A runner that can't be copied with a subclass is wrapped instead.
+
+        Its class can't be subclassed, or, with ``delegating``, it delegates
+        through ``__getattr__``, on which ``copy.copy`` recurses.
+        """
 
         class _Final(UnsandboxedWorkflowRunner):
             def __init_subclass__(cls, **kwargs: Any) -> None:
                 raise TypeError("final")
 
-        runner = _mark_ending_evictions(_Final())
+        class _Delegating(WorkflowRunner):
+            def __init__(self) -> None:
+                self._inner = UnsandboxedWorkflowRunner()
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            def prepare_workflow(self, defn: Any) -> None:
+                self._inner.prepare_workflow(defn)
+
+            def create_instance(self, det: Any) -> WorkflowInstance:
+                return self._inner.create_instance(det)
+
+        runner = _mark_ending_evictions(_Delegating() if delegating else _Final())
         with patch.object(
             UnsandboxedWorkflowRunner, "create_instance"
         ) as create_instance:
