@@ -313,7 +313,7 @@ _BATCH_REFUSED = RPCError(
         (_BATCH_REFUSED, True),
         (
             RPCError(
-                "grpc: received message larger than max (5242880 vs. 4194304)",
+                "grpc: received message after decompression larger than max 4194304",
                 RPCStatusCode.RESOURCE_EXHAUSTED,
                 b"",
             ),
@@ -355,3 +355,34 @@ async def test_model_error_wins_over_failed_stream_publish() -> None:
 async def test_cancellation_wins_over_failed_stream_publish() -> None:
     exc = await _run_refused_stream(_BATCH_REFUSED, cancel=True)
     assert isinstance(exc, asyncio.CancelledError), exc
+
+
+async def test_cancellation_during_last_publish_stays_cancelled() -> None:
+    _StreamingModel.error = None
+    _StreamingModel.wait = False
+    _StreamingModel.streamed = asyncio.Event()
+    LLMRegistry.register(_StreamingModel)
+    sending = asyncio.Event()
+
+    async def slow_signal(*_args: object, **_kwargs: object) -> None:
+        sending.set()
+        await asyncio.Event().wait()
+
+    client = MagicMock()
+    client.data_converter = DataConverter.default
+    client.get_workflow_handle.return_value.signal = AsyncMock(side_effect=slow_signal)
+    env = ActivityEnvironment(client=client)
+    call = asyncio.ensure_future(
+        env.run(
+            invoke_model_streaming,
+            StreamingInvokeInput(
+                llm_request=_request("streaming-model"),
+                streaming_topic="events",
+                streaming_batch_interval=timedelta(hours=1),
+            ),
+        )
+    )
+    await sending.wait()
+    env.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
