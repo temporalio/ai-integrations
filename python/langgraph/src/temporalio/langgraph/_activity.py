@@ -39,9 +39,8 @@ from temporalio.langgraph._task_cache import (
     cache_key,
     cache_lookup,
     cache_put,
-    caller_scope,
-    mark_failed,
     occurrence_key,
+    release,
 )
 
 # Per-run dedupe so we only warn once when a user passes a Store via
@@ -495,8 +494,7 @@ def wrap_execute_activity(
         # its own key, so it runs again, as in native LangGraph.
         key = (
             occurrence_key(
-                cache_key(task_id, args, kwargs, langgraph_config.get("context")),
-                caller_scope(),
+                cache_key(task_id, args, kwargs, langgraph_config.get("context"))
             )
             if task_id
             else ""
@@ -507,8 +505,7 @@ def wrap_execute_activity(
         # occurrence_key() adds at most "@<scope>" and "#<n>", so this
         # namespace can't collide with a plain result key, and a result dict
         # is never mistaken for a Command. Value types go under "<key>:types",
-        # so older Workflows still find the plain entry, and a failed call
-        # leaves "<key>:failed".
+        # so older Workflows still find the plain entry.
         if task_id:
             found_command, command = cache_lookup(f"{key}:command")
             found_result, result = cache_lookup(key)
@@ -536,12 +533,12 @@ def wrap_execute_activity(
                 call_kwargs["summary"] = summary
         try:
             output = await workflow.execute_activity(afunc, input, **call_kwargs)
-        except Exception:
+            if output.langgraph_interrupts is not None:
+                raise GraphInterrupt(output.langgraph_interrupts)
+        except BaseException:
             if task_id:
-                mark_failed(key)
+                release(key)
             raise
-        if output.langgraph_interrupts is not None:
-            raise GraphInterrupt(output.langgraph_interrupts)
 
         # Store in cache for future continue-as-new cycles.
         if task_id:

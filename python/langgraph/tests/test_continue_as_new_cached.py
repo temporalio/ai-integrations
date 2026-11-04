@@ -26,8 +26,9 @@ from temporalio.common import RetryPolicy
 from temporalio.langgraph import LangGraphPlugin, cache, graph
 from temporalio.langgraph._task_cache import (
     cache_key,
-    mark_failed,
+    call_scope,
     occurrence_key,
+    release,
     set_task_cache,
 )
 from temporalio.worker import Worker
@@ -436,23 +437,32 @@ def _occurrence_keys() -> None:
     # carried through continue-as-new still hit; each repeat gets its own.
     assert [occurrence_key(key) for _ in range(3)] == [key, f"{key}#1", f"{key}#2"]
     assert occurrence_key(other) == other
-    # Another caller counts its own calls under its own keys.
-    assert [occurrence_key(key, "b1") for _ in range(2)] == [
-        f"{key}@b1",
-        f"{key}@b1#1",
-    ]
+    # Each call of a workflow-side node or task counts its own calls under
+    # its own keys.
+    with call_scope("node"):
+        first = [occurrence_key(key) for _ in range(2)]
+    with call_scope("node"):
+        second = occurrence_key(key)
+    assert first[0].startswith(f"{key}@") and first[1] == f"{first[0]}#1"
+    assert second not in (key, first[0])
     # graph() and entrypoint() start counting again.
     set_task_cache({})
     assert occurrence_key(key) == key
-    # A failed call stores no result. After continue-as-new its place is
-    # skipped, so the first call gets the result of the retry that followed.
-    stored: dict[str, Any] = {}
-    set_task_cache(stored)
-    mark_failed(occurrence_key(key))
-    stored[occurrence_key(key)] = "retried"
-    set_task_cache(dict(stored))
-    assert occurrence_key(key) == f"{key}#1"
-    assert occurrence_key(key) == f"{key}#2"
+    # A call that failed or was interrupted stored no result, so the next
+    # identical call takes its place. Places go back lowest first.
+    set_task_cache({})
+    calls = [occurrence_key(key) for _ in range(3)]
+    release(calls[1])
+    release(calls[0])
+    assert [occurrence_key(key) for _ in range(3)] == [key, f"{key}#1", f"{key}#3"]
+    # A node or task call that raised gives its place back too, so its retry
+    # counts on in the same scope.
+    inner: list[str] = []
+    with pytest.raises(ValueError), call_scope("node"):
+        inner.append(occurrence_key(key))
+        raise ValueError
+    with call_scope("node"):
+        assert occurrence_key(key) == f"{inner[0]}#1"
 
 
 def test_repeated_calls_get_their_own_keys():

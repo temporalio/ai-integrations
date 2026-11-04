@@ -8,97 +8,101 @@ again. The cache state is a plain dict that can travel through
 workflow.continue_as_new().
 """
 
-# pyright: reportMissingTypeStubs=false
-
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Generator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from hashlib import sha256
+from heapq import heappop, heappush
 from json import dumps
 from typing import Any
 
-from langchain_core.runnables.config import var_child_runnable_config
-from langgraph._internal._constants import NS_END, NS_SEP, PULL, PUSH
 from pydantic import BaseModel
 
 _task_cache: ContextVar[dict[str, Any] | None] = ContextVar(
     "_temporal_task_cache", default=None
 )
-# How many times each cache key has been used since set_task_cache(). It is
-# not part of the cache, so it does not travel through continue-as-new.
+# Per key, how many places calls in this run have taken, and the places given
+# back by calls that stored no result. Neither is part of the cache, so they
+# do not travel through continue-as-new.
 _key_uses: ContextVar[dict[str, int] | None] = ContextVar(
     "_temporal_task_key_uses", default=None
 )
-# The entrypoint's own node name, when the run is an entrypoint() call.
-_entrypoint_node: ContextVar[str | None] = ContextVar(
-    "_temporal_task_entrypoint_node", default=None
+_free_places: ContextVar[dict[str, list[int]] | None] = ContextVar(
+    "_temporal_task_free_places", default=None
 )
+# The call of a workflow-side node or task that the current code runs in (see
+# call_scope()), or "" outside one.
+_scope: ContextVar[str] = ContextVar("_temporal_task_scope", default="")
 
 
-def set_task_cache(
-    cache: dict[str, Any] | None, entrypoint_node: str | None = None
-) -> None:
+def set_task_cache(cache: dict[str, Any] | None) -> None:
     """Set the task result cache for the current context and restart call counting."""
     _task_cache.set(cache)
     _key_uses.set({})
-    _entrypoint_node.set(entrypoint_node)
+    _free_places.set({})
 
 
-def caller_scope() -> str:
-    """Return an ID for where the current call is made from, or ``""``.
-
-    Calls made by the entrypoint itself, and top-level graph nodes, return
-    ``""``. A call made from inside a workflow-side node or task, or a
-    subgraph, returns a hash of the subgraph nodes above it and the LangGraph
-    task path of its caller. LangGraph builds that path from the order in
-    which each task makes its calls, so it is the same in every run, while
-    the order in which parallel callers reach this point is not.
-    """
-    metadata = (var_child_runnable_config.get() or {}).get("metadata") or {}
-    path: tuple[Any, ...] = tuple(metadata.get("langgraph_path") or ())
-    namespace = str(metadata.get("langgraph_checkpoint_ns") or "")
-    outer = [part.split(NS_END)[0] for part in namespace.split(NS_SEP)[:-1]]
-    caller = (
-        path[1]
-        if len(path) > 2 and path[0] == PUSH and isinstance(path[1], tuple)
-        else None
-    )
-    root = _entrypoint_node.get()
-    if (caller is None and not outer) or (
-        root is not None and outer == [root] and caller == (PULL, root)
-    ):
-        return ""
-    return sha256(dumps([outer, caller], default=str).encode()).hexdigest()[:16]
-
-
-def occurrence_key(key: str, scope: str = "") -> str:
+def occurrence_key(key: str) -> str:
     """Return the cache key for this occurrence of a call in the current run.
 
-    Calls are counted per ``scope`` (see :func:`caller_scope`). The first call
-    with ``key`` from the entrypoint or a top-level node keeps it, so caches
-    written by earlier versions still match; other callers get
-    ``"<key>@<scope>"``. The n-th repeat adds ``"#<n>"``, so it does not find
-    an earlier call's result and runs again, while the same calls made in the
-    same order after continue-as-new find theirs. A place whose call failed
-    (see :func:`mark_failed`) is skipped, so a retry's result goes to the
-    first call that makes it after continue-as-new.
+    Calls are counted per scope (see :func:`call_scope`). The first call with
+    ``key`` from the entrypoint or a top-level node keeps it, so caches
+    written by earlier versions still match; calls made in a workflow-side
+    node or task get ``"<key>@<scope>"``. The n-th repeat adds ``"#<n>"``, so
+    it does not find an earlier call's result and runs again, while the same
+    calls made in the same order after continue-as-new find theirs. A call
+    takes the first place that a failed or interrupted call gave back (see
+    :func:`release`).
     """
+    scope = _scope.get()
     base = f"{key}@{scope}" if scope else key
-    uses = _key_uses.get()
-    if uses is None:
+    uses, free = _key_uses.get(), _free_places.get()
+    if uses is None or free is None:
         return base
-    while True:
+    if free.get(base):
+        n = heappop(free[base])
+    else:
         n = uses.get(base, 0)
         uses[base] = n + 1
-        occurrence = base if n == 0 else f"{base}#{n}"
-        if not cache_lookup(f"{occurrence}:failed")[0]:
-            return occurrence
+    return base if n == 0 else f"{base}#{n}"
 
 
-def mark_failed(key: str) -> None:
-    """Record that the call under ``key`` failed, so it stored no result."""
-    cache_put(f"{key}:failed", True)
+def release(key: str) -> None:
+    """Give back the place of the call under ``key``: it stored no result.
+
+    The call failed or was interrupted, so the next identical call in its
+    scope, such as a retry or the resumed call, takes its place, and after
+    continue-as-new the first call gets that call's result.
+    """
+    free = _free_places.get()
+    if free is not None:
+        base, sep, n = key.rpartition("#")
+        heappush(free.setdefault(base if sep else key, []), int(n) if sep else 0)
+
+
+@contextmanager
+def call_scope(name: str) -> Generator[None, None, None]:
+    """Count the calls made in this block per call of the workflow-side ``name``.
+
+    The scope is a hash of the enclosing scope, ``name`` and its place among
+    the enclosing scope's calls of ``name``, taken before the call awaits
+    anything. So it is the same in every run that makes the same calls in the
+    same order, whatever order parallel calls finish in. If the block raises,
+    its place is given back, as a failed call's is.
+    """
+    # Hex, like a cache key, so release() can split off the place.
+    key = occurrence_key(sha256(name.encode()).hexdigest()[:32])
+    token = _scope.set(sha256(key.encode()).hexdigest()[:16])
+    try:
+        yield
+    except BaseException:
+        release(key)
+        raise
+    finally:
+        _scope.reset(token)
 
 
 def get_task_cache() -> dict[str, Any] | None:

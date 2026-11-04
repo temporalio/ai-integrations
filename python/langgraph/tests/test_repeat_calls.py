@@ -14,6 +14,8 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.func import (  # pyright: ignore[reportMissingTypeStubs]
     entrypoint as lg_entrypoint,
 )
@@ -23,6 +25,7 @@ from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
     START,
     StateGraph,
 )
+from langgraph.types import Command, interrupt
 from typing_extensions import NotRequired, TypedDict
 
 from temporalio import workflow
@@ -171,6 +174,28 @@ async def wait_then_call(job_id: str, wait: bool) -> str:
     return await _next(job_id)
 
 
+class ValueState(TypedDict):
+    job_id: str
+    value: NotRequired[str]
+
+
+def fetch_value(state: ValueState) -> dict[str, str]:
+    return {"value": next_value(state["job_id"])}
+
+
+_value_graph = StateGraph(ValueState)
+_value_graph.add_node("fetch", fetch_value, metadata={"execute_in": "activity"})
+_value_graph.add_edge(START, "fetch")
+
+
+@task
+async def wait_then_subgraph(job_id: str, wait: bool) -> str:
+    """Like ``wait_then_call``, but make the call through a subgraph."""
+    await _wait(job_id, wait)
+    result = await _value_graph.compile().ainvoke({"job_id": job_id})
+    return result["value"]
+
+
 @once
 def _callers_plugin() -> LangGraphPlugin:
     """Entrypoints whose identical calls come from parallel tasks or follow a failure.
@@ -191,17 +216,35 @@ def _callers_plugin() -> LangGraphPlugin:
         except ActivityError:
             return ["failed", await _fail_first(request["job_id"])]
 
+    @lg_entrypoint()
+    async def retry_then_task(request: dict[str, Any]) -> list[str]:
+        try:
+            first = await _fail_first(request["job_id"])
+        except ActivityError:
+            first = await _fail_first(request["job_id"])
+        return [first, await wait_then_call(request["job_id"], False)]
+
+    @lg_entrypoint()
+    async def two_subgraphs(request: dict[str, Any]) -> dict[str, str]:
+        a = wait_then_subgraph(request["job_id"], True)
+        b = wait_then_subgraph(request["job_id"], False)
+        return {"a": await a, "b": await b}
+
     return LangGraphPlugin(
+        graphs={"value": _value_graph},
         entrypoints={
             "two-branches": two_branches,
             "retry-on-failure": retry_on_failure,
+            "retry-then-task": retry_then_task,
+            "two-subgraphs": two_subgraphs,
         },
-        tasks=[_wait, _next, _fail_first, wait_then_call],
+        tasks=[_wait, _next, _fail_first, wait_then_call, wait_then_subgraph],
         activity_options={
             "wait_for_value": {"execute_in": "activity"},
             "next_value": {"execute_in": "activity"},
             "fail_first_call": {"execute_in": "activity"},
             "wait_then_call": {"execute_in": "workflow"},
+            "wait_then_subgraph": {"execute_in": "workflow"},
         },
         default_activity_options=_ACTIVITY_OPTIONS,
     )
@@ -209,7 +252,7 @@ def _callers_plugin() -> LangGraphPlugin:
 
 @dataclass
 class RepeatAcrossContinueAsNewInput:
-    entrypoint: str
+    name: str
     job_id: str
     runs: int
     cache: dict[str, Any] | None = None
@@ -225,14 +268,44 @@ class RepeatAcrossContinueAsNewWorkflow:
 
     @workflow.run
     async def run(self, input: RepeatAcrossContinueAsNewInput) -> list[Any]:
-        result = await entrypoint(input.entrypoint, cache=input.cache).ainvoke(
+        result = await entrypoint(input.name, cache=input.cache).ainvoke(
             {"job_id": input.job_id, "calls": len(input.seen) + 2}
         )
         seen = [*input.seen, result]
         if len(seen) < input.runs:
             workflow.continue_as_new(
                 RepeatAcrossContinueAsNewInput(
-                    entrypoint=input.entrypoint,
+                    name=input.name,
+                    job_id=input.job_id,
+                    runs=input.runs,
+                    cache=cache(),
+                    seen=seen,
+                )
+            )
+        return seen
+
+
+@workflow.defn
+class ApproveAcrossContinueAsNewWorkflow:
+    """Runs graph ``name``, resuming it with "yes" if it interrupts.
+
+    Then continues-as-new with the cache until it has run ``runs`` times.
+    Returns whether each run was interrupted, and its answer.
+    """
+
+    @workflow.run
+    async def run(self, input: RepeatAcrossContinueAsNewInput) -> list[Any]:
+        app = graph(input.name, cache=input.cache).compile(checkpointer=InMemorySaver())
+        config = RunnableConfig({"configurable": {"thread_id": "1"}})
+        result = await app.ainvoke({"job_id": input.job_id}, config)
+        interrupted = "__interrupt__" in result
+        if interrupted:
+            result = await app.ainvoke(Command(resume="yes"), config)
+        seen = [*input.seen, [interrupted, result["answer"]]]
+        if len(seen) < input.runs:
+            workflow.continue_as_new(
+                RepeatAcrossContinueAsNewInput(
+                    name=input.name,
                     job_id=input.job_id,
                     runs=input.runs,
                     cache=cache(),
@@ -248,6 +321,7 @@ async def _repeat_across_continue_as_new(
     job_id: str,
     runs: int,
     plugin: LangGraphPlugin | None = None,
+    workflow_cls: Any = RepeatAcrossContinueAsNewWorkflow,
 ) -> tuple[list[Any], list[WorkflowHistory]]:
     """Run ``name`` over ``runs`` runs; return each run's results and history.
 
@@ -260,12 +334,12 @@ async def _repeat_across_continue_as_new(
     async with Worker(
         client,
         task_queue=task_queue,
-        workflows=[RepeatAcrossContinueAsNewWorkflow],
+        workflows=[workflow_cls],
         plugins=[plugin],
     ):
         handle = await client.start_workflow(
-            RepeatAcrossContinueAsNewWorkflow.run,
-            RepeatAcrossContinueAsNewInput(entrypoint=name, job_id=job_id, runs=runs),
+            workflow_cls.run,
+            RepeatAcrossContinueAsNewInput(name=name, job_id=job_id, runs=runs),
             id=workflow_id,
             task_queue=task_queue,
             execution_timeout=timedelta(seconds=30),
@@ -287,7 +361,7 @@ async def _repeat_across_continue_as_new(
         )
     assert len(histories) == runs
 
-    replayer = Replayer(workflows=[RepeatAcrossContinueAsNewWorkflow], plugins=[plugin])
+    replayer = Replayer(workflows=[workflow_cls], plugins=[plugin])
     for history in histories:
         await replayer.replay_workflow(history)
     return seen, histories
@@ -509,5 +583,86 @@ async def test_retry_after_failure_restored_after_continue_as_new(client: Client
     )
 
     assert seen == [["failed", f"{job_id}:2"], [f"{job_id}:2"]]
+    assert [len(_scheduled(h)) for h in histories] == [2, 0]
+    assert _calls[job_id] == 2
+
+
+@_needs_functional_api
+async def test_task_after_retry_restored_after_continue_as_new(client: Client):
+    """A workflow-side task called after a retried failure keeps its results.
+
+    After continue-as-new the first call gets the retry's result without
+    failing, so the entrypoint makes one call fewer before the task. The
+    task's own calls must still find their results.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client, "retry-then-task", job_id, runs=2, plugin=_callers_plugin()
+    )
+
+    first = [f"{job_id}:2", f"{job_id}:3"]
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+@_needs_functional_api
+async def test_parallel_subgraph_calls_keep_their_results_after_continue_as_new(
+    client: Client,
+):
+    """Two parallel tasks that invoke the same subgraph keep their own results.
+
+    As in ``test_parallel_callers_keep_their_results_after_continue_as_new``,
+    branch "b" reaches the subgraph first in the first run and "a" does after
+    continue-as-new.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client, "two-subgraphs", job_id, runs=2, plugin=_callers_plugin()
+    )
+
+    first = {"a": f"{job_id}:2", "b": f"{job_id}:1"}
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+class ApproveState(TypedDict):
+    job_id: str
+    answer: NotRequired[str]
+
+
+def approve(state: ApproveState) -> dict[str, str]:
+    """Take a new value, then ask for approval."""
+    value = next_value(state["job_id"])
+    return {"answer": f"{interrupt('approve?')} {value}"}
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 11),
+    reason="interrupt() requires Python >= 3.11 for async context propagation",
+)
+async def test_interrupted_call_restored_after_continue_as_new(client: Client):
+    """An interrupted call gives its place to the resumed call.
+
+    The first run's node interrupts and is resumed, so its Activity runs
+    twice. After continue-as-new the run gets the resumed answer from the
+    cache: no interrupt, no Activity.
+    """
+    job_id = f"job-{uuid4()}"
+    g = StateGraph(ApproveState)
+    g.add_node("approve", approve, metadata={"execute_in": "activity"})
+    g.add_edge(START, "approve")
+    plugin = LangGraphPlugin(
+        graphs={"approve": g}, default_activity_options=_ACTIVITY_OPTIONS
+    )
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "approve",
+        job_id,
+        runs=2,
+        plugin=plugin,
+        workflow_cls=ApproveAcrossContinueAsNewWorkflow,
+    )
+
+    assert seen == [[True, f"yes {job_id}:2"], [False, f"yes {job_id}:2"]]
     assert [len(_scheduled(h)) for h in histories] == [2, 0]
     assert _calls[job_id] == 2

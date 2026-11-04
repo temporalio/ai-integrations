@@ -371,7 +371,10 @@ class LangGraphPlugin(SimplePlugin):
             )
         elif execute_in == "workflow":
             return wrap_workflow(
-                func, streaming_topic=self._streaming_topic, summary_fn=summary_fn
+                activity_name,
+                func,
+                streaming_topic=self._streaming_topic,
+                summary_fn=summary_fn,
             )
         else:
             raise ValueError(f"Invalid execute_in value: {execute_in}")
@@ -412,6 +415,7 @@ def entrypoint(
             continue-as-new are not re-executed when the run makes them
             again, in the same order.
     """
+    set_task_cache(cache or {})
     entrypoints = _workflow_entrypoints.get(workflow.info().run_id)
     if entrypoints is None:
         raise RuntimeError(
@@ -421,8 +425,6 @@ def entrypoint(
         raise KeyError(
             f"Entrypoint {name!r} not found. Available entrypoints: {list(entrypoints)}"
         )
-    # Calls made by the entrypoint function itself keep their plain keys.
-    set_task_cache(cache or {}, entrypoint_node=next(iter(entrypoints[name].nodes)))
     return entrypoints[name]
 
 
