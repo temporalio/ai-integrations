@@ -216,6 +216,7 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 		server    a2aServer
 		factory   *a2aclient.Factory
 		sse       bool
+		cardFails bool
 		wantError string
 		wantText  string
 	}{
@@ -281,17 +282,19 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 		{
 			name:      "card with an interface URL that does not parse",
 			server:    a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), REST: true, Path: "/%zz"},
+			cardFails: true,
 			wantError: "invalid URL escape",
 		},
 		{
-			// JSON-RPC parses the URL on each call, not when the client is made.
 			name:      "card with a JSON-RPC interface URL that does not parse",
 			server:    a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), Path: "/%zz"},
+			cardFails: true,
 			wantError: "invalid URL escape",
 		},
 		{
 			name:      "card whose interface URLs all do not parse",
 			server:    a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), REST: true, Path: "/%zz", AlsoRESTPath: "/%zy"},
+			cardFails: true,
 			wantError: "invalid URL escape",
 		},
 		{
@@ -336,7 +339,11 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 			var res runResult
 			require.NoError(t, env.GetWorkflowResult(&res))
 			assert.Equal(t, 1, counter.get(googleadk.ResolveA2AAgentCardActivityName), "card resolution must not be retried")
-			assert.LessOrEqual(t, counter.get(googleadk.SendA2AMessageActivityName), 1, "a refused A2A call must not be retried")
+			if tc.cardFails {
+				assert.Zero(t, counter.get(googleadk.SendA2AMessageActivityName), "a rejected card must not reach SendA2AMessage")
+			} else {
+				assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName), "a refused A2A call must not be retried")
+			}
 			if tc.wantError != "" {
 				require.Len(t, res.Errors, 1, "ADK turns the failed call into an error event")
 				assert.Contains(t, res.Errors[0], tc.wantError)
