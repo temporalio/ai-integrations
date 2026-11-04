@@ -210,8 +210,14 @@ class TestEndingEvictions:
                 reasons.CACHE_FULL,
                 True,
             ),
-            # The activation that would end it deadlocks, and returns later.
+            # The activation that would end it deadlocks, and returns later,
+            # or a later one does.
             ([(task(), ends, not_sent)], reasons.CACHE_FULL, False),
+            (
+                [(task(), ends, sent), (task(), waits, not_sent)],
+                reasons.CACHE_FULL,
+                False,
+            ),
             # The server rejects the completion.
             ([(task(), ends, sent)], reasons.UNHANDLED_COMMAND, False),
             # A replayed end, as in the replayer, and no end.

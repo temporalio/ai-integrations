@@ -471,6 +471,21 @@ class TestReplaySafety:
             run.end.assert_called_once_with(end_time=now + timedelta(microseconds=1))
             ahead.end.assert_called_once_with(end_time=now + timedelta(seconds=30))
 
+    def test_run_ids_are_v7_from_workflow_time(self) -> None:
+        """LangChain run IDs and root factory IDs are UUIDv7s of ``workflow.now()``."""
+        now = datetime.now(timezone.utc)
+        with (
+            patch(_PATCH_WF_NOW, return_value=now),
+            patch(f"{_MOD}.temporalio.workflow.random_seed", return_value=1),
+            patch(f"{_MOD}.temporalio.workflow.register_random_seed_callback"),
+        ):
+            runs = _LangChainRuns()
+            ids = [runs.new_id(), runs.new_run()[0]]
+        for run_id in ids:
+            assert run_id.version == 7
+            assert run_id.variant == uuid.RFC_4122
+            assert run_id.int >> 80 == int(now.timestamp() * 1000)
+
     @pytest.mark.parametrize("run_id", [None, uuid.uuid4()])
     async def test_astream_events_root_run_id(self, run_id: uuid.UUID | None) -> None:
         """``astream_events`` gives its root run the workflow's ID, or the caller's.

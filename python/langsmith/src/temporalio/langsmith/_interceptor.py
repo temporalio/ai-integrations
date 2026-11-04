@@ -496,15 +496,12 @@ def _ends_workflow(completion: WorkflowActivationCompletion) -> bool:
     workflow instance returns it, and if encoding fails, as when a payload
     codec raises, it makes the same completion a failed one.  After a
     deadlock it sends another completion instead.  So this is read once the
-    completion is sent, at the next activation.
+    completion is sent, at the next activation.  A failed completion has no
+    commands.
     """
-    return (
-        bool(completion.run_id)
-        and completion.HasField("successful")
-        and any(
-            command.WhichOneof("variant") in _ENDING_COMMANDS
-            for command in completion.successful.commands
-        )
+    return bool(completion.run_id) and any(
+        command.WhichOneof("variant") in _ENDING_COMMANDS
+        for command in completion.successful.commands
     )
 
 
