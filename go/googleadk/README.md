@@ -42,11 +42,9 @@ This package depends on the deterministic ADK `platform` seams
 (`WithTimeProvider`, `WithUUIDProvider`, `WithTaskRunner`), `tool/toolutils.PackTool`,
 and the `model.NewLLM` registry lookup from upstream `google.golang.org/adk/v2`
 (the registry itself stays application-owned; this package never registers into it).
-Those seams have been in tagged ADK releases since v2.1.0; `go.mod` requires
-v2.3.0 for compatibility with OpenTelemetry log SDK v0.21.0. Request-order
-confirmation resume (google/adk-go#1169), available since v2.2.0, makes
-multi-decision confirmation resumes replay-stable. ADK sets the Go floor:
-1.26.6+. The replay-safe telemetry gate composes `workflow.IsReadOnly`.
+The minimum supported ADK version is v2.6.0. This package requires Go 1.26.10+
+so the latest-dependency checks can also run ADK v2.7.0. The replay-safe telemetry
+gate composes `workflow.IsReadOnly`.
 
 ## Samples
 
@@ -215,24 +213,23 @@ outside Temporal. To use another model, build the agent with
   handler retried, wrap its cause with `%w` or return a retryable
   `temporal.ApplicationError`.
 
-  - The toolset lists its tools once per model step, at the same point with
-    every ADK release, so its Histories replay from ADK v2.3.0 to v2.7.0. A
-    toolset wrapped in another that does not forward `ProcessRequest`, such as
-    `tool.FilterToolset` or `tool.WithConfirmation`, lists each time ADK asks
-    for its tools: in every model step with ADK v2.6.0 and later, and only in
-    the first step of an agent run before. So a History in which an agent with
-    such a toolset took a second model step in one run does not replay across
-    ADK v2.6.0; one-step runs do. Use `MCPToolsetOptions.ToolFilter` instead of
-    `tool.FilterToolset`, and `mcptoolset`'s `RequireConfirmation` option
-    instead of `tool.WithConfirmation`.
+  - The toolset lists its tools once per model step and preserves the command
+    order and UUID consumption of Histories recorded with earlier ADK releases.
+    A toolset wrapped in another that does not forward `ProcessRequest`, such
+    as `tool.FilterToolset` or `tool.WithConfirmation`, lists each time ADK asks
+    for its tools, in every model step. Before ADK v2.6.0, such a toolset listed
+    only in the first step of an agent run. A History recorded before v2.6.0 in
+    which an agent with such a toolset took a second model step in one run does
+    not replay on v2.6.0 or later; one-step runs do. Use
+    `MCPToolsetOptions.ToolFilter` instead of `tool.FilterToolset`, and
+    `mcptoolset`'s `RequireConfirmation` option instead of `tool.WithConfirmation`.
   - From the second model step of an agent run, a toolset in the agent's
     `Toolsets` declares only the tools the server lists, and `ToolFilter`
     allows, for that step. A model call to an MCP tool it no longer declares
     gets ADK's tool-not-found error: no `CallMcpTool` Activity and no before-
     or after-tool callbacks run, but on-tool-error callbacks do. In the first
-    step, and with a wrapped toolset on ADK v2.5.0 and earlier, such a call
-    still runs `CallMcpTool`; for a tool the server no longer lists, it fails
-    with a non-retryable `McpError`.
+    step, such a call still runs `CallMcpTool`; for a tool the server no longer
+    lists, it fails with a non-retryable `McpError`.
   - From the second model step, your own `Tools` calls on such a toolset, for
     example from an `InstructionProvider`, return the agent run's first list,
     so they don't see changes the server or `ToolFilter` makes during the run.
