@@ -303,8 +303,7 @@ We then pass this through the `activity_as_tool` helper function to create an Op
 ```python
 from dataclasses import dataclass
 from datetime import timedelta
-from temporalio import activity, workflow
-from temporalio.contrib import openai_agents
+from temporalio import activity, openai_agents, workflow
 from agents import Agent, Runner
 
 @dataclass
