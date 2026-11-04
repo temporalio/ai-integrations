@@ -199,8 +199,9 @@ async def invoke_model_streaming(
         batch_interval=input.streaming_batch_interval,
     )
     events = stream.topic(input.streaming_topic, type=LlmResponse)
-    # The stream's exit sends the last batch. If that fails, subscribers did not
-    # get every response, so the call fails instead of returning as if they had.
+    # The stream's exit sends the last batch, and raises the error of a batch the
+    # background flush failed to send. Either way subscribers did not get every
+    # response, so the call fails instead of returning as if they had.
     # A model error, or the Activity's cancellation, stays the call's error.
     await stream.__aenter__()
     try:
@@ -297,13 +298,25 @@ class TemporalModel(BaseLlm):
                 to receive the publishes; otherwise the signals are
                 unhandled and dropped. If the chunks cannot all be
                 published, the model activity fails with a
-                ``googleadk.StreamError`` ``ApplicationError``. It is
+                ``googleadk.StreamError`` ``ApplicationError``. In the
+                Workflow, ``runner.run_async`` raises it as an
+                ``ActivityError`` caused by that ``ApplicationError``,
+                so ``try``/``except`` around the run catches it. It is
                 non-retryable when a retry would call the model again
-                and fail the same way: the server refused a batch over
-                its size limits or past the run's Signal limit. Other
-                failures are retried, even after the stream client's
-                10-minute retry limit. Streaming support is experimental
-                and may change in future versions.
+                and fail the same way: for a batch over the server's
+                size limits (2 MiB per payload and 4 MiB per gRPC
+                message by default), configure external storage on the
+                Worker's Client and on every subscriber's Client, or
+                keep responses smaller. For a run past its Signal limit
+                (each batch is one Signal; a run accepts 10,000 by
+                default, counting the Workflow's other Signals),
+                continue-as-new well before that, or use a longer
+                ``streaming_batch_interval``. Other failures, such as a
+                server outage, are retried, even one that outlasts the
+                stream client's 10-minute retry limit; the retry calls
+                the model again and publishes its stream again.
+                Streaming support is experimental and may change in
+                future versions.
             streaming_batch_interval: Interval between automatic
                 flushes for the stream publisher used by the streaming
                 activity. Streaming support is experimental and may
