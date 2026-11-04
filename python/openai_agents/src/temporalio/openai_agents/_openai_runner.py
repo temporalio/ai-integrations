@@ -70,14 +70,19 @@ def _convert_agent(
     if isinstance(agent.model, _TemporalModelStub):
         return agent
 
+    if new_agent is not None and not _is_copy_of(new_agent, agent):
+        # The agent this copy was made from is gone and another one has its id.
+        new_agent = None
+
     visited.add(id(agent))
+    created = new_agent is None
     if new_agent is None:
         new_agent = dataclasses.replace(agent)
         _share_approval_owner_token(agent, new_agent)
         seen[id(agent)] = new_agent
     else:
         for field in dataclasses.fields(agent):
-            if field.init:
+            if field.init and field.name != "tools":
                 setattr(new_agent, field.name, getattr(agent, field.name))
 
     name = _model_name(agent)
@@ -100,10 +105,7 @@ def _convert_agent(
                 ] = original_invoke,
             ) -> Agent:
                 handoff_agent = await invoke_func(context, args)
-                converted = _convert_agent(model_params, handoff_agent, seen)
-                # A target chosen at runtime was not in the graph when the run started.
-                _share_approvals_with_run_agents(context, converted)
-                return converted
+                return _convert_agent(model_params, handoff_agent, seen)
 
             new_handoff = dataclasses.replace(handoff, on_invoke_handoff=on_invoke)
             handoff_agent = (
@@ -124,18 +126,42 @@ def _convert_agent(
         current_run_model_settings=_current_run_model_settings.get,
     )
     new_agent.handoffs = new_handoffs
-    new_agent.tools = [
-        dataclasses.replace(
-            tool,
-            _agent_instance=_convert_agent(
+    previous_tools = [] if created else new_agent.tools
+    new_tools: list[Any] = []
+    for tool in agent.tools:
+        if isinstance(tool, FunctionTool) and isinstance(tool._agent_instance, Agent):
+            instance = _convert_agent(
                 model_params, tool._agent_instance, seen, visited=visited
-            ),
-        )
-        if isinstance(tool, FunctionTool) and isinstance(tool._agent_instance, Agent)
-        else tool
-        for tool in agent.tools
-    ]
+            )
+            tool = _agent_tool_copy(tool, instance, previous_tools)
+        new_tools.append(tool)
+    # Another run may be using this copy, and from openai-agents 0.24 the SDK fails
+    # concurrent runs of an agent whose tools list is replaced.
+    if (
+        created
+        or len(new_agent.tools) != len(new_tools)
+        or any(a is not b for a, b in zip(new_agent.tools, new_tools))
+    ):
+        new_agent.tools = new_tools
     return new_agent
+
+
+_SOURCE_TOOL_ATTR = "_temporal_source_tool"
+
+
+def _agent_tool_copy(
+    tool: FunctionTool, instance: Agent[Any], previous_tools: list[Any]
+) -> FunctionTool:
+    """Copy an agent-as-tool to run the converted agent, or reuse an earlier copy."""
+    for previous in previous_tools:
+        if (
+            getattr(previous, _SOURCE_TOOL_ATTR, None) is tool
+            and getattr(previous, "_agent_instance", None) is instance
+        ):
+            return previous
+    new_tool = dataclasses.replace(tool, _agent_instance=instance)
+    setattr(new_tool, _SOURCE_TOOL_ATTR, tool)
+    return new_tool
 
 
 # From openai-agents 0.23, a function tool approval belongs to one agent object: its
@@ -146,12 +172,33 @@ _FunctionToolApprovalKey: Any = getattr(
 _APPROVAL_IDENTITY_ATTR = "_function_approval_identity"
 
 
+_EXECUTION_AGENTS_ATTR = "_temporal_execution_agents"
+
+
+def _execution_agents(context: object) -> dict[int, Agent[Any]] | None:
+    """The copies of agents that all runs with this context share.
+
+    The stock SDK runs the caller's agent, so each agent has one approval owner. The
+    plugin runs a copy, and one copy per agent and context keeps one owner: every
+    run, resume and checkpoint with the context finds the same decision, also when
+    it is made in another run. ``RunState`` contexts are shallow copies, so they
+    share the cache.
+    """
+    if _FunctionToolApprovalKey is None or not isinstance(context, RunContextWrapper):
+        return None
+    agents_by_id = context.__dict__.get(_EXECUTION_AGENTS_ATTR)
+    if agents_by_id is None:
+        agents_by_id = {}
+        setattr(context, _EXECUTION_AGENTS_ATTR, agents_by_id)
+    return agents_by_id
+
+
 def _share_approval_owner_token(agent: Agent[Any], new_agent: Agent[Any]) -> None:
     """Give the copy the owner token of the agent it copies.
 
-    The copy itself still owns its approvals, so the run's state and its checkpoints
-    keep them and callbacks get the agent that runs. The shared token lets
-    ``_share_approvals_with_run_agents`` find them for other copies.
+    The copy itself owns its approvals, so the run's state and its checkpoints keep
+    them and callbacks get the agent that runs. The shared token lets
+    ``_move_approvals_to_run_agents`` match decisions of the caller's agent.
     """
     if _FunctionToolApprovalKey is None:
         return
@@ -162,16 +209,47 @@ def _share_approval_owner_token(agent: Agent[Any], new_agent: Agent[Any]) -> Non
     setattr(new_agent, _APPROVAL_IDENTITY_ATTR, (weakref.ref(new_agent), identity[1]))
 
 
-def _share_approvals_with_run_agents(
+def _is_copy_of(new_agent: Agent[Any], agent: Agent[Any]) -> bool:
+    """Whether a cached copy was made from this agent."""
+    if _FunctionToolApprovalKey is None:
+        return True
+    identity = getattr(agent, _APPROVAL_IDENTITY_ATTR, None)
+    copy_identity = getattr(new_agent, _APPROVAL_IDENTITY_ATTR, None)
+    return (
+        identity is not None
+        and identity[0]() is agent
+        and copy_identity is not None
+        and copy_identity[1] == identity[1]
+    )
+
+
+def _reuse_copies_in_state(
+    agents_by_id: dict[int, Agent[Any]], starting_agent: Agent[Any]
+) -> None:
+    """Share the copies a resumed state runs with later runs of its context.
+
+    The first run may not have had this context, for example when it got no
+    ``RunContextWrapper``, so its copies are not cached yet.
+    """
+    from agents._run_state_agent_identity import _iter_agent_graph
+
+    for agent in _iter_agent_graph(starting_agent):
+        model = agent.model
+        if isinstance(model, _TemporalModelStub) and model.agent is not None:
+            agents_by_id.setdefault(id(model.agent), agent)
+
+
+def _move_approvals_to_run_agents(
     context: RunContextWrapper[Any], starting_agent: Agent[Any]
 ) -> None:
-    """Give the agents a run uses the approvals of other copies of the same agent.
+    """Move decisions held by other copies of the run's agents to those agents.
 
-    An approval belongs to the copy, or to the caller's agent restored from a
-    checkpoint, that asked for it, and the SDK looks it up by the agent that runs.
-    Each agent here gets its own key to the same record, which the SDK updates in
-    place, so every copy, including one in a run that is still going, sees one
-    decision. A separate agent has a different token and gets none.
+    Runs with one context use the same copies, so this only matters after
+    ``RunState.from_string``: it restores decisions to the caller's agents, which
+    run the resume, while later runs use copies of them. Moving keeps one key for
+    each agent and tool, so one record holds the latest decision and name-only
+    queries such as ``is_tool_approved`` find it. A separate agent has a different
+    token and gets nothing.
     """
     if _FunctionToolApprovalKey is None:
         return
@@ -183,7 +261,6 @@ def _share_approvals_with_run_agents(
         if identity is not None and identity[0]() is agent:
             owners.setdefault(identity[1], agent)
     approvals: dict[Any, Any] = context._approvals
-    shared: dict[tuple[str, str], Any] = {}
     for key, record in list(approvals.items()):
         # The SDK reattaches a key without an agent reference itself.
         if not isinstance(key, _FunctionToolApprovalKey) or key._agent_ref is None:
@@ -191,13 +268,9 @@ def _share_approvals_with_run_agents(
         owner = owners.get(key.owner_token)
         if owner is None or key.agent is owner:
             continue
-        if key.agent is None:
-            # The copy is gone, so nothing can look this key up again.
-            del approvals[key]
-        shared[(key.owner_token, key.tool_key)] = record
-    for (token, tool_key), record in shared.items():
+        del approvals[key]
         # A decision the running agent already has wins.
-        approvals.setdefault(_FunctionToolApprovalKey(owners[token], tool_key), record)
+        approvals.setdefault(_FunctionToolApprovalKey(owner, key.tool_key), record)
 
 
 # True during an agent run, so the Workflow loop runs sync function tools inline.
@@ -451,20 +524,26 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         kwargs["run_config"] = run_config
-        converted_agent = _convert_agent(self.model_params, starting_agent, None)
         # A resumed run uses the context and agents of its state.
         context: object = kwargs.get("context")
-        run_agents = [converted_agent]
+        run_agents: list[Agent[Any]] = []
         if isinstance(input, RunState):
             context = input._context or context
             run_agents = [
                 agent
                 for agent in (input._starting_agent, input._current_agent)
                 if agent is not None
-            ] or run_agents
-        if isinstance(context, RunContextWrapper):
+            ]
+        agents_by_id = _execution_agents(context)
+        if agents_by_id is not None:
             for run_agent in run_agents:
-                _share_approvals_with_run_agents(context, run_agent)
+                _reuse_copies_in_state(agents_by_id, run_agent)
+        converted_agent = _convert_agent(
+            self.model_params, starting_agent, agents_by_id
+        )
+        if isinstance(context, RunContextWrapper):
+            for run_agent in run_agents or [converted_agent]:
+                _move_approvals_to_run_agents(context, run_agent)
         return converted_agent, run_config
 
     async def run(
