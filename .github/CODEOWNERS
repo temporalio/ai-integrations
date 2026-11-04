@@ -1,2 +1,25 @@
-# Every path in this repository is owned by the AI SDK team.
+# The AI SDK team owns every path not listed below.
 * @temporalio/ai-sdk
+
+# Plugins. The first name is the owner; the others can also approve.
+/python/claude_agent_sdk/ @patbeqo @brianstrauch
+/python/deepagents/ @DABH @brianstrauch
+/python/google_adk/ @xumaple @DABH @brianstrauch
+/python/google_genai/ @JasonSteving99 @brianstrauch
+/python/langgraph/ @DABH @brianstrauch
+/python/langsmith/ @xumaple @brianstrauch @patbeqo
+/python/mcp/ @brianstrauch @DABH
+/python/openai_agents/ @xumaple @DABH @brianstrauch
+/python/strands_agents/ @brianstrauch @DABH
+/python/typesafe/ @patbeqo @brianstrauch
+
+/typescript/google-adk/ @xumaple @DABH
+/typescript/langsmith/ @xumaple @brianstrauch @patbeqo
+/typescript/openai-agents/ @xumaple @DABH @brianstrauch
+/typescript/strands-agents/ @brianstrauch @DABH
+/typescript/vercel-ai-sdk/ @brianstrauch
+
+/go/googleadk/ @DABH @brianstrauch
+
+/java/google-adk/ @DABH @brianstrauch
+/java/spring-ai/ @brianstrauch @DABH @patbeqo
