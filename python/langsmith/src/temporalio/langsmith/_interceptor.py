@@ -1826,7 +1826,8 @@ class _LangSmithWorkflowInboundInterceptor(
             try:
                 _update_id.reset(token)
             except ValueError:
-                # A coroutine closed from another context, as at eviction.
+                # Garbage collection closed the coroutine outside its task,
+                # as with disable_safe_workflow_eviction=True.
                 pass
 
 
