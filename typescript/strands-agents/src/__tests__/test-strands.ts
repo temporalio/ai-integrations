@@ -24,7 +24,7 @@ import {
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
 import { bundleWorkflowCode, DefaultLogger, NativeConnection, Worker, type WorkerOptions } from '@temporalio/worker';
-import { DeterminismViolationError } from '@temporalio/workflow';
+import { ActivityCancellationType, DeterminismViolationError } from '@temporalio/workflow';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { STRANDS_MALFORMED_INTERRUPT_TYPE, StrandsPlugin } from '..';
 import { ModelActivity } from '../model-activity';
@@ -44,6 +44,8 @@ import {
   activityToolAgent,
   failActivities,
   approveSignal,
+  cancellableAgent,
+  cancellableModelCall,
   compressionAgent,
   defaultModelAgent,
   doneSignal,
@@ -54,6 +56,7 @@ import {
   interruptAgent,
   inWorkflowToolAgent,
   mcpAgent,
+  mcpPrefixedServersAgent,
   mcpServersAgent,
   retryConfigAgent,
   statefulAgent,
@@ -178,8 +181,11 @@ function toolCallTurn(toolName: string, toolUseId: string, input: object): Model
 class StubMcpClient extends McpClient {
   private readonly toolList: Tool[];
 
-  constructor(toolList: Array<{ name: string; description: string; inputSchema: unknown }>) {
-    super({ transport: STUB_TRANSPORT });
+  constructor(
+    toolList: Array<{ name: string; description: string; inputSchema: unknown }>,
+    options: { prefix?: string } = {}
+  ) {
+    super({ transport: STUB_TRANSPORT, ...options });
     this.toolList = toolList.map(
       (t) =>
         ({
@@ -651,12 +657,14 @@ test('a history whose code depends on when a handler finishes still replays', as
   );
 });
 
-test('invokeModel reconstructs Message instances from wire data', async (t) => {
+test('invokeModel gives the model Message instances and an AbortSignal', async (t) => {
   // Strands content-block and Message classes have lossy `toJSON()` methods.
   // After Temporal's default payload converter serializes activity input,
   // the receiving side sees plain Bedrock-shape objects without the `type`
   // discriminator. ModelActivity must call `Message.fromMessageData` so the
-  // user's `Model.stream` receives real Strands types.
+  // user's `Model.stream` receives real Strands types. The agent's
+  // `cancelSignal` arrives as a plain object too, and model clients such as
+  // OpenAI's call its `addEventListener`.
   t.timeout(60_000);
   const { createWorker, executeWorkflow } = helpers(t);
 
@@ -665,8 +673,10 @@ test('invokeModel reconstructs Message instances from wire data', async (t) => {
   // reachable from the assertion below.
   let receivedFirstMessage: unknown;
   let firstBlockIsTextBlock = false;
+  let receivedSignal: unknown;
   class AssertingStub extends StubModel {
     override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+      receivedSignal = options?.cancelSignal;
       if (receivedFirstMessage === undefined) {
         receivedFirstMessage = messages[0];
         const first = messages[0];
@@ -690,7 +700,136 @@ test('invokeModel reconstructs Message instances from wire data', async (t) => {
 
   t.true(receivedFirstMessage instanceof Message, 'expected first message to be a Message instance');
   t.true(firstBlockIsTextBlock, 'expected first content block to be a TextBlock instance');
+  t.true(receivedSignal instanceof AbortSignal, 'expected cancelSignal to be an AbortSignal');
 });
+
+for (const streaming of [false, true]) {
+  const path = streaming ? 'invokeModelStreaming' : 'invokeModel';
+  test(`cancelling the workflow aborts the model call in ${path} and cancels the workflow`, async (t) => {
+    t.timeout(60_000);
+    const { createWorker, startWorkflow } = helpers(t);
+    let receivedSignal: unknown;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => (markStarted = resolve));
+    // Waits for its cancel signal, then fails as OpenAI's client does: an error named `Error`.
+    class AbortingStub extends StubModel {
+      override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+        receivedSignal = options?.cancelSignal;
+        const aborted = await new Promise<boolean>((resolve) => {
+          options?.cancelSignal?.addEventListener('abort', () => resolve(true));
+          markStarted();
+        });
+        if (aborted) throw new Error('Request was aborted.');
+        yield* super.stream(messages, options);
+      }
+    }
+
+    const worker = await createWorker({
+      plugins: [new StrandsPlugin({ models: { test: () => new AbortingStub([]) } })],
+    });
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(cancellableModelCall, { args: [streaming] });
+      await started;
+      await handle.cancel();
+      const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+      t.true(err!.cause instanceof CancelledFailure, `expected a CancelledFailure, got ${err!.cause}`);
+      const { events } = await handle.fetchHistory();
+      t.true(events!.some((e) => e.activityTaskCanceledEventAttributes), 'expected ActivityTaskCanceled');
+      t.false(events!.some((e) => e.activityTaskFailedEventAttributes), 'expected no ActivityTaskFailed');
+      t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');
+    });
+    t.true(receivedSignal instanceof AbortSignal && receivedSignal.aborted, 'expected the model signal to abort');
+  });
+}
+
+for (const cancellationType of [
+  ActivityCancellationType.TRY_CANCEL,
+  ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+]) {
+  test(`cancelling a TemporalAgent workflow with ${cancellationType} aborts the model call and cancels the workflow`, async (t) => {
+    t.timeout(60_000);
+    const { createWorker, startWorkflow } = helpers(t);
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => (markStarted = resolve));
+    let markAborted!: () => void;
+    const aborted = new Promise<void>((resolve) => (markAborted = resolve));
+    // Waits for its cancel signal, then fails as OpenAI's client does: an error named `Error`.
+    class AbortingStub extends StubModel {
+      // eslint-disable-next-line require-yield
+      override async *stream(_messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+        await new Promise<void>((resolve) => {
+          options?.cancelSignal?.addEventListener('abort', () => resolve());
+          markStarted();
+        });
+        markAborted();
+        throw new Error('Request was aborted.');
+      }
+    }
+
+    const worker = await createWorker({
+      plugins: [new StrandsPlugin({ models: { test: () => new AbortingStub([]) } })],
+    });
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(cancellableAgent, { args: [cancellationType] });
+      await started;
+      await handle.cancel();
+      const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+      t.true(err!.cause instanceof CancelledFailure, `expected a CancelledFailure, got ${err!.cause}`);
+      // The model's signal aborts while the worker runs, not because it shuts down.
+      await aborted;
+      const { events } = await handle.fetchHistory();
+      t.true(events!.some((e) => e.activityTaskCancelRequestedEventAttributes), 'expected ActivityTaskCancelRequested');
+      t.false(events!.some((e) => e.workflowTaskFailedEventAttributes), 'expected no WorkflowTaskFailed');
+      t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');
+      if (cancellationType === ActivityCancellationType.WAIT_CANCELLATION_COMPLETED) {
+        t.true(events!.some((e) => e.activityTaskCanceledEventAttributes), 'expected ActivityTaskCanceled');
+      }
+    });
+  });
+
+  test(`cancelling a TemporalAgent workflow with ${cancellationType} while the model ignores its signal`, async (t) => {
+    t.timeout(60_000);
+    const { createWorker, startWorkflow } = helpers(t);
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => (markStarted = resolve));
+    let markAborted!: () => void;
+    const aborted = new Promise<void>((resolve) => (markAborted = resolve));
+    // Keeps going once its cancel signal aborts, as models that ignore `cancelSignal` do.
+    class IgnoringStub extends StubModel {
+      override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+        await new Promise<void>((resolve) => {
+          options?.cancelSignal?.addEventListener('abort', () => resolve());
+          markStarted();
+        });
+        markAborted();
+        yield* super.stream(messages, options);
+      }
+    }
+
+    const worker = await createWorker({
+      plugins: [new StrandsPlugin({ models: { test: () => new IgnoringStub([textTurn('late result')]) } })],
+    });
+    await worker.runUntil(async () => {
+      const handle = await startWorkflow(cancellableAgent, { args: [cancellationType] });
+      await started;
+      await handle.cancel();
+      if (cancellationType === ActivityCancellationType.WAIT_CANCELLATION_COMPLETED) {
+        // The workflow waits for the activity, which completes, so the run completes with its result.
+        t.is((await handle.result()).trim(), 'late result');
+        const { events } = await handle.fetchHistory();
+        t.true(events!.some((e) => e.activityTaskCompletedEventAttributes), 'expected ActivityTaskCompleted');
+        t.true(events!.some((e) => e.workflowExecutionCompletedEventAttributes), 'expected WorkflowExecutionCompleted');
+        t.false(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected no WorkflowExecutionCanceled');
+      } else {
+        const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+        t.true(err!.cause instanceof CancelledFailure, `expected a CancelledFailure, got ${err!.cause}`);
+        const { events } = await handle.fetchHistory();
+        t.true(events!.some((e) => e.workflowExecutionCanceledEventAttributes), 'expected WorkflowExecutionCanceled');
+      }
+      await aborted;
+    });
+  });
+}
 
 test('activityAsTool dispatches a registered activity from the agent loop', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
@@ -1240,7 +1379,8 @@ test('a re-listed MCP tool name is refused only while another tool of the agent 
     servers: Record<string, [string[], string[]]>,
     turns: string[],
     local = false,
-    replace?: [string, number]
+    replace?: [string, number],
+    prefix?: string
   ): Promise<{ result: string; calls: string[] }> => {
     listings.clear();
     calls.length = 0;
@@ -1260,7 +1400,7 @@ test('a re-listed MCP tool name is refused only while another tool of the agent 
     const worker = await createWorker({ plugins: [plugin()], maxCachedWorkflows: 0 });
     return worker.runUntil(async () => {
       const handle = await startWorkflow(mcpServersAgent, {
-        args: ['list files', Object.keys(servers), local, replace],
+        args: ['list files', Object.keys(servers), local, replace, prefix],
       });
       const result = await handle.result();
       await Worker.runReplayHistory(
@@ -1271,35 +1411,56 @@ test('a re-listed MCP tool name is refused only while another tool of the agent 
     });
   };
 
+  const fixOne =
+    "Set a prefix (or a different one) on one server's TemporalMCPClient, or drop the tool from one with its toolFilters.";
+  const fixThis = (name: string) =>
+    `Set a prefix (or a different one) on the server's TemporalMCPClient, or drop '${name}' with its toolFilters.`;
   // b starts listing a's tool after the first tool call, with the servers in either order.
   t.deepEqual(await run({ a: [['listFiles'], ['listFiles']], b: [['other'], ['listFiles']] }, ['listFiles']), {
     result:
-      "refused: Tool with name 'listFiles' already registered. MCP servers 'a' and 'b' both list it. Tools: listFiles, other.",
+      "refused: Tool with name 'listFiles' already registered. MCP servers 'a' and 'b' both list it. " +
+      `${fixOne} Tools: listFiles, other.`,
     calls: ['a:listFiles'],
   });
   t.deepEqual(await run({ b: [['x'], ['x']], a: [['other'], ['x']] }, ['other']), {
-    result: "refused: Tool with name 'x' already registered. MCP servers 'b' and 'a' both list it. Tools: other, x.",
+    result: `refused: Tool with name 'x' already registered. MCP servers 'b' and 'a' both list it. ${fixOne} Tools: other, x.`,
     calls: ['a:other'],
+  });
+  // The same with prefix `gh` on both: the refusal also gives the servers' own name.
+  const prefixed = { a: [['search'], ['search']], b: [['other'], ['other', 'search']] } as Record<string, [string[], string[]]>;
+  t.deepEqual(await run(prefixed, ['gh_other'], false, undefined, 'gh'), {
+    result:
+      "refused: Tool with name 'gh_search' already registered. MCP servers 'a' (as 'search') and 'b' (as 'search') " +
+      `both list it. ${fixOne} Tools: gh_other, gh_search.`,
+    calls: ['b:other'],
   });
   // a and b start listing names that differ only by '-' or '_'.
   t.deepEqual(await run({ a: [['p'], ['x_y']], b: [['q'], ['x-y']] }, ['p']), {
-    result: "refused: Tool name 'x-y' already exists as 'x_y'. MCP servers 'a' and 'b' both list it. Tools: p, q.",
+    result:
+      "refused: Tool name 'x-y' already exists as 'x_y'. MCP servers 'a' and 'b' both list it. " +
+      `${fixOne} Tools: p, q.`,
     calls: ['a:p'],
   });
   // c starts listing a name that a tool in `tools` has, or one that differs from it only by '-' or
   // '_', or lists a name twice, or two that differ only by '-' or '_', or one Strands rejects. The
   // agent keeps the listFiles that c's refused listing drops, and gets none of its new tools.
   for (const [later, refusal] of [
-    [['echo'], "Tool with name 'echo' already registered. MCP server 'c' lists it, and another tool of the agent has it."],
+    [
+      ['echo'],
+      "Tool with name 'echo' already registered. MCP server 'c' lists it, and another tool of the agent has it. " +
+        fixThis('echo'),
+    ],
     [
       ['take-note'],
-      "Tool name 'take-note' already exists as 'take_note'. MCP server 'c' lists it, and another tool of the agent has it.",
+      "Tool name 'take-note' already exists as 'take_note'. MCP server 'c' lists it, and another tool of the agent has " +
+        `it. ${fixThis('take-note')}`,
     ],
     [['other', 'other'], "Tool with name 'other' already registered. MCP server 'c' lists it twice."],
     [['x-y', 'x_y'], "Tool name 'x_y' already exists as 'x-y'. MCP server 'c' lists both names."],
     [
       ['newTool', 'bad.name'],
-      "Tool name must contain only alphanumeric characters, hyphens, and underscores. MCP server 'c' lists 'bad.name'.",
+      "Tool name must contain only alphanumeric characters, hyphens, and underscores. MCP server 'c' lists 'bad.name'. " +
+        "Drop it with the toolFilters of the server's TemporalMCPClient.",
     ],
   ] as [string[], string][]) {
     t.deepEqual(await run({ c: [['listFiles'], later] }, ['listFiles'], true), {
@@ -1328,6 +1489,69 @@ test('a re-listed MCP tool name is refused only while another tool of the agent 
   for (const replace of [undefined, ['r', 1]] as ([string, number] | undefined)[]) {
     t.deepEqual(await run({ b: [['r'], ['s']] }, ['r'], false, replace), { result: 'done Tools: s.', calls: ['b:r'] });
   }
+});
+
+test('prefix and toolFilters on TemporalMCPClient rename and filter tools, and calls use the server names', async (t) => {
+  const { createWorker, executeWorkflow, startWorkflow } = helpers(t);
+  const schema = { type: 'object', properties: {} };
+  const tools = ['echo', 'skip', 'other'].map((name) => ({ name, description: name, inputSchema: schema }));
+  const calls: string[] = [];
+  class RecordingMcpClient extends StubMcpClient {
+    constructor(private readonly label: string) {
+      super(tools);
+    }
+    override async callTool(tool: { name: string }, args: JSONValue): Promise<JSONValue> {
+      calls.push(`${this.label}:${tool.name}`);
+      return super.callTool(tool, args);
+    }
+  }
+  // The tool names the model is offered at its first call.
+  let offered: string[] | undefined;
+  class OfferedModel extends StubModel {
+    override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+      offered ??= (options?.toolSpecs ?? []).map((spec) => spec.name).sort();
+      yield* super.stream(messages, options);
+    }
+  }
+  const plugin = (): StrandsPlugin =>
+    new StrandsPlugin({
+      models: {
+        test: () =>
+          new OfferedModel([toolCallTurn('a_echo', 'call_1', {}), toolCallTurn('b_other', 'call_2', {}), textTurn('done')]),
+      },
+      mcpClients: { a: () => new RecordingMcpClient('a'), b: () => new RecordingMcpClient('b') },
+    });
+  // Every workflow task replays the run, and its history replays at the end: the callback filter
+  // runs in workflow code.
+  const worker = await createWorker({ plugins: [plugin()], maxCachedWorkflows: 0 });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(mcpPrefixedServersAgent, { args: ['go'] });
+    t.is(await handle.result(), 'done Tools: a_echo, a_other, a_skip, b_other.');
+    await Worker.runReplayHistory(
+      { workflowBundle: t.context.workflowBundle, plugins: [plugin()] },
+      await handle.fetchHistory()
+    );
+  });
+  t.deepEqual(offered, ['a_echo', 'a_other', 'a_skip', 'b_other']);
+  t.deepEqual(calls, ['a:echo', 'b:other']);
+
+  // A prefix on the factory's McpClient fails the listing, with the fix in the error.
+  const refusing = await createWorker({
+    plugins: [
+      new StrandsPlugin({
+        models: { test: () => new StubModel([textTurn('done')]) },
+        mcpClients: { p: () => new StubMcpClient(tools, { prefix: 'p' }) },
+      }),
+    ],
+  });
+  const refused = await refusing.runUntil(executeWorkflow(mcpServersAgent, { args: ['go', ['p']] }));
+  t.true(
+    refused.includes(
+      "for MCP server 'p' sets prefix 'p'. Set it on the workflow-side TemporalMCPClient instead: " +
+        "new TemporalMCPClient({ server: 'p', prefix: 'p' })."
+    ),
+    refused
+  );
 });
 
 test('histories of a re-listing beside another coroutine recorded on main still replay', async (t) => {

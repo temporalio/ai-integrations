@@ -303,8 +303,7 @@ We then pass this through the `activity_as_tool` helper function to create an Op
 ```python
 from dataclasses import dataclass
 from datetime import timedelta
-from temporalio import activity, workflow
-from temporalio.contrib import openai_agents
+from temporalio import activity, openai_agents, workflow
 from agents import Agent, Runner
 
 @dataclass
@@ -349,6 +348,38 @@ worker = Worker(
     activities=[get_weather],
 )
 ```
+
+If the activity fails, the agent run fails with a retryable `AgentsWorkflowError`.
+This is how plain Temporal treats an activity failure that the workflow does not catch.
+So a workflow retry policy reruns the whole agent run, model calls included, even when the activity's error was non-retryable.
+To stop the rerun, catch the error around the run and raise a non-retryable `ApplicationError` in its place:
+
+```python
+from temporalio.exceptions import ActivityError, ApplicationError, RetryState
+from temporalio.openai_agents import AgentsWorkflowError
+
+@workflow.defn
+class WeatherAgent:
+    @workflow.run
+    async def run(self, question: str) -> str:
+        agent = ...  # as above
+        try:
+            result = await Runner.run(starting_agent=agent, input=question)
+        except AgentsWorkflowError as e:
+            failure = e.__cause__  # the tool's ActivityError
+            if (
+                isinstance(failure, ActivityError)
+                and failure.retry_state == RetryState.NON_RETRYABLE_FAILURE
+            ):
+                raise ApplicationError(str(failure.cause), non_retryable=True) from e
+            raise
+        return result.final_output
+```
+
+With `Runner.run_streamed`, put the `async for` loop over `result.stream_events()` inside the `try`: the error is raised there.
+When a tool's activity fails, the `AgentsWorkflowError`'s `__cause__` is that tool's `ActivityError`.
+`RetryState.NON_RETRYABLE_FAILURE` covers an error raised with `non_retryable=True` and one whose type is in the activity retry policy's `non_retryable_error_types`.
+The `failure_error_function` of `activity_as_tool()` does not change any of this: it only formats the error returned to the model when the tool's arguments are invalid.
 
 ### Calling OpenAI Agents Tools inside Temporal Workflows
 
@@ -486,9 +517,9 @@ worker-side OpenAI `MCPServer`. Configure workflow-facing behavior such as
 openai-agents 0.22.3, tool input and output guardrails on
 `temporal_mcp_server(...)`, where the OpenAI agent can use it. On the
 worker-side server, a static `tool_filter` still filters the listed tools, a
-callable `tool_filter`, a `require_approval` policy and a `tool_meta_resolver`
-are rejected as described below, and the other settings are ignored. Custom `MCPServer` method
-implementations still execute worker-side.
+callable `tool_filter`, a `require_approval` policy, a `tool_meta_resolver` and
+tool guardrails are rejected as described below, and the other settings are
+ignored. Custom `MCPServer` method implementations still execute worker-side.
 
 A callable `tool_filter` on the worker-side server is rejected, because the run
 context and agent it receives exist only in the workflow. A callable
@@ -508,16 +539,22 @@ run context it receives exists only in the workflow. Pass it to
 workflow and must be deterministic. Its result is recorded in workflow history,
 so it must not hold secrets.
 
+Tool input and output guardrails on the worker-side server are rejected as well:
+the agent never reads that copy, so they would never run. Pass them to
+`temporal_mcp_server(tool_input_guardrails=..., tool_output_guardrails=...)`
+instead, where they run in the workflow and must be deterministic.
+
 These checks run in every MCP Activity. A run that already holds its cached tool
 list, the default, first meets them when it calls a tool: the agent gets the
 error as the tool's output, and the run can complete without the tool. Let open
 runs finish before you upgrade or add such a setting to the factory's server.
-A resolver there never had an effect, so removing it from the factory's server
-in the same deploy is enough.
+A resolver or guardrail there never had an effect, so removing it from the
+factory's server in the same deploy is enough.
 Moving the policy into `temporal_mcp_server(require_approval=...)` is also a
 workflow change: an open run that already called one of that server's tools
-fails replay with a nondeterminism error. Moving a resolver there is a workflow
-change too, so guard it with `workflow.patched()` or let open runs finish first.
+fails replay with a nondeterminism error. Moving a resolver or guardrail there
+is a workflow change too, so guard it with `workflow.patched()` or let open runs
+finish first.
 
 Every MCP operation is a Temporal Activity. The workflow-side tool list is
 cached by default; pass `cache_tools_list=False` to refresh it on every Agents
@@ -588,17 +625,134 @@ The legacy stateful path retains its dedicated per-workflow worker and
 persistent-session behavior. To require tool approval on these servers, pass
 `require_approval` to `stateless_mcp_server()` or `stateful_mcp_server()`;
 as with `temporal_mcp_server()`, a policy on the factory's server is rejected
-unless it never asks for approval. So are a callable `tool_filter` and a
-`tool_meta_resolver` there, in every MCP operation, direct `call_tool()` and
-prompt calls included; a static filter still works. On these routes, set a
-resolver on the server that `stateless_mcp_server()` or `stateful_mcp_server()`
-gives the workflow (`server.tool_meta_resolver = ...`); it then gets
+unless it never asks for approval. So are a callable `tool_filter`, a
+`tool_meta_resolver` and tool guardrails there, in every MCP operation, direct
+`call_tool()` and prompt calls included; a static filter still works. On these
+routes, set a resolver or guardrails on the server that `stateless_mcp_server()`
+or `stateful_mcp_server()` gives the workflow (`server.tool_meta_resolver = ...`,
+`server.tool_input_guardrails = [...]`); a resolver then gets
 `<name>-stateless` or `<name>-stateful` as `server_name`. As with
-`temporal_mcp_server()`, it runs in the workflow and must be deterministic, its
-result is recorded in workflow history, and adding it to a workflow with open
-runs needs `workflow.patched()` or those runs to finish first. Remove such a
-filter or resolver from the factory in the same deploy, or let open runs finish
-first.
+`temporal_mcp_server()`, they run in the workflow and must be deterministic, a
+resolver's result is recorded in workflow history, and adding them to a workflow
+with open runs needs `workflow.patched()` or those runs to finish first. Remove
+such a filter, resolver or guardrail from the factory in the same deploy, or let
+open runs finish first.
+
+Temporal cannot recreate a stateful server's session on another worker. If its
+`-server-session` activity is retried after the server connected, for example
+after a graceful worker shutdown, a lost host or the session activity's
+start-to-close timeout, the retry fails with a non-retryable
+`ApplicationError(type="DedicatedWorkerFailure")` instead of connecting a new
+server with an empty session. Leaving the `async with` block then raises
+`ApplicationError(type="DedicatedWorkerFailure")`, whose cause is the session
+activity's `ActivityError` (none if the block's last timer fired in the
+workflow task that brought the session's end, ahead of it, since the SDK then
+drops it). To recover, catch it around the block and open a
+new block, which connects a new, empty server (but see the note on same-name
+blocks below). A retry after a failed factory call, a failed first `connect()`,
+or a worker shutdown before the server connected connects again. A retry after a lost host or a
+timed-out attempt fails even when the server never connected: the worker sends
+heartbeats later, and the plugin cannot wait for one, so every heartbeat says a
+session may be open until the attempt ends without one. Before it connects, the
+session activity reads its workflow's description (`DescribeWorkflowExecution`)
+until the Temporal server shows its first heartbeat, so the worker's client
+needs permission to describe the workflow; without it, the session activity
+fails with a non-retryable `DedicatedWorkerFailure` that says so. Other describe
+errors are retried, and the session activity's last failure carries them.
+
+Some consequences:
+
+- The session activity's `start_to_close_timeout` in `server_session_config`,
+  one hour by default, is the longest a block can stay open, since the attempt
+  then times out and its retry is refused. Raise it for long blocks, such as
+  ones that wait for a person, and set a `heartbeat_timeout` to notice a lost
+  worker sooner. The session activity heartbeats every 30 seconds, or every
+  half `heartbeat_timeout` if that is shorter.
+- An activity reset or unpause with `reset_heartbeat=True` clears the session's
+  heartbeat details, so the next attempt connects a new, empty server. A
+  workflow reset to a point inside an open block also gives the new run a new,
+  empty server, with no error.
+- Sessions started on an earlier version left no such heartbeat details, so the
+  deploy of this version still gives each open session a new, empty server one
+  last time.
+- Code that caught `ActivityError` around a block, which earlier versions
+  raised when the session failed, must also catch
+  `ApplicationError(type="DedicatedWorkerFailure")`, which the block now raises
+  after a refusal. A session that fails for another reason, such as one with a
+  one-attempt `server_session_config` retry policy, or one whose attempts all
+  fail with an error before connecting (a factory call or first `connect()`
+  that raises), still makes the block raise `ActivityError`, unless the block's
+  last timer fired in the workflow task that brought the session's end, ahead
+  of it: then the block raises `DedicatedWorkerFailure` with no cause, where
+  earlier versions raised a bare `asyncio.CancelledError`.
+- The session activity's heartbeats go through your payload codec, so its
+  `heartbeat_timeout` must comfortably exceed a heartbeat's encoding time. An
+  attempt that connected no server waits at most 10 seconds for its heartbeats
+  to be encoded, then cancels the ones still being encoded and clears its
+  heartbeat details. Encoding time also delays each block's first operation,
+  so keep it well under the 30 seconds the session activity waits for its first
+  heartbeat, and under the operations' `schedule_to_start_timeout`.
+- Blocks with the same name in one run use the same task queue. A later block
+  refuses any operation the server scheduled for an earlier block, but until
+  the earlier block's session activity notices its cancellation, which can take
+  one heartbeat interval, it serves the later block's operations with the
+  earlier block's server. Don't rely on a new block being isolated from the
+  previous one during that time. Likewise, after a refusal caused by a
+  start-to-close timeout on a live worker, the timed-out attempt keeps serving
+  the queue with its server until its worker cancels it, so the refused block's
+  own operations, and a recovery block's, can still reach that server. Don't
+  open two blocks with the same name at the same time: one block's operations
+  can then fail with an `ActivityError` whose cause is `DedicatedWorkerFailure`,
+  or both blocks use one server.
+
+Only the session activity's worker serves the server's operations. An operation
+whose `config` has a `schedule_to_start_timeout`, as the default `config` does,
+or a `schedule_to_close_timeout` fails when that timeout expires. One with
+neither fails with `DedicatedWorkerFailure` as soon as the session activity has
+ended, with the session's failure as its cause, and an operation still waiting
+then is cancelled. With `cancellation_type=WAIT_CANCELLATION_COMPLETED` that
+operation is not cancelled, because no worker may be left to acknowledge it. It
+stays on the session's task queue until the run ends, and a later
+`stateful_mcp_server()` block with the same name refuses it. The caller of such
+an operation waits for the operation or the session, whichever ends first, so
+the operation resolves one step after other activities that resolve in the same
+workflow task, and if another branch cancels the caller in the workflow task
+that brings the operation's result, the caller gets the cancellation. A
+caller's own cancellation still cancels the operation, and a cancellation that
+leaves the block wins over the block's `DedicatedWorkerFailure`, though not over
+an `ActivityError` from a session that failed for another reason. On Python
+3.10, the plugin can't tell a workflow cancellation in the workflow task in
+which the session ends from the session's end. So a caller cancelled in that
+task, or a block that ends in it (after a Signal or an Update, or with a
+`WAIT_CANCELLATION_COMPLETED` session whose cancellation completes in it), gets
+`DedicatedWorkerFailure` in place of the cancellation, and code that catches
+it, as above, loses the cancellation.
+
+A run follows its session this way only once it records the patch marker
+`openai-agents-stateful-mcp-session-watch`, which it does at its first
+operation whose `config` has neither timeout. Histories recorded on an earlier
+version have no marker, so they schedule such operations as before and replay
+on this version, with two exceptions. A block whose last timer fired ahead of
+its session's end now raises `DedicatedWorkerFailure` with no cause, as above,
+so a run that hit this and caught the bare `CancelledError`, or that failed
+with it although it catches `ApplicationError` or `Exception` around the
+block, schedules different commands on this version. So can a run on Python
+3.10 that hit one of the cases above in which 3.10 raises
+`DedicatedWorkerFailure` in place of a cancellation. Let such open runs finish
+before upgrading, and expect replays of such closed runs (queries, replay
+tests) to fail. A run that continues on this version records the marker at its
+next such operation only if it scheduled none before the upgrade. Otherwise the
+Temporal Python SDK keeps the decision it made while replaying that earlier
+operation, so the run never records the marker and schedules such operations as
+before until it ends: one scheduled after its session ended waits until the
+caller cancels it or the run ends. A run with the marker fails replay on an
+earlier version, and so can any run whose session failed with
+`DedicatedWorkerFailure` (a refused retry or a refused describe) and that then
+went on, whether it caught the block's failure or a cancellation, and any run
+that caught that unmarked `DedicatedWorkerFailure` and went on, so do not roll
+back while such runs are open. Drain the earlier version's workers before starting this one: while
+workers of both versions run, a run whose session gets a refusal can fail
+replay when it moves from one to the other.
 
 ### Hosted MCP Tool
 

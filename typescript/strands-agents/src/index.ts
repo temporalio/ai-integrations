@@ -7,6 +7,8 @@ export { TemporalModel, type TemporalModelOptions } from './temporal-model';
 export {
   TemporalMCPClient,
   type TemporalMCPClientOptions,
+  type McpToolFilters,
+  type McpToolMatcher,
   type McpToolInfo,
   type CallToolInput,
 } from './temporal-mcp-client';

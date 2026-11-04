@@ -20,7 +20,18 @@ import {
   type Tool,
 } from '@openai/agents-core';
 import { SandboxAgent } from '@openai/agents-core/sandbox';
-import { ActivityFailure, ApplicationFailure, continueAsNew, proxyActivities } from '@temporalio/workflow';
+import {
+  ActivityFailure,
+  ApplicationFailure,
+  CancellationScope,
+  condition,
+  continueAsNew,
+  defineSignal,
+  isCancellation,
+  proxyActivities,
+  setHandler,
+  sleep,
+} from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import {
   TemporalOpenAIRunner,
@@ -30,6 +41,12 @@ import {
   statefulMcpServer,
   temporalSandboxClient,
 } from '../../workflow';
+
+export {
+  statefulMcpCallerCancelWorkflow,
+  statefulMcpCancelWorkflow,
+  statefulMcpGatherWorkflow,
+} from './stateful-mcp-replay';
 
 export interface StreamingAgentResult {
   finalOutput: string;
@@ -783,6 +800,154 @@ export async function statefulMcpSlowConnectHeartbeatWorkflow(): Promise<string>
     return `connected:${tools.length}`;
   } finally {
     await server.cleanup();
+  }
+}
+
+const text = (content: unknown): string =>
+  (content as { text?: string }[]).map((c) => c.text ?? '').join('');
+
+export async function statefulMcpRetriedWorkflow(): Promise<string[]> {
+  const server = statefulMcpServer('retried', {
+    serverSessionConfig: { heartbeatTimeout: '2 seconds' },
+    config: { scheduleToStartTimeout: '5 seconds' },
+  });
+  await server.connect();
+  const out: string[] = [];
+  try {
+    out.push(text(await server.callTool('put', { value: 'V' })));
+    // The session's host is lost here, and Temporal retries the session Activity.
+    await sleep('10 seconds');
+    try {
+      out.push(text(await server.callTool('get', {})));
+    } catch (err: unknown) {
+      // Leaving the block reports the session Activity's failure.
+      out.push(String(err));
+    }
+  } finally {
+    await server.cleanup();
+  }
+  return out;
+}
+
+export const resumeSignal = defineSignal('resume');
+
+export async function statefulMcpSessionEndedWorkflow(cancelQueued: boolean): Promise<string[]> {
+  // No schedule-to-start timeout: only the session's end stops an operation
+  // waiting on the session's Task Queue.
+  const server = statefulMcpServer('sessionEnded', { config: { scheduleToStartTimeout: 0 } });
+  let resumed = false;
+  setHandler(resumeSignal, () => {
+    resumed = true;
+  });
+  await server.connect();
+  const out: string[] = [];
+  try {
+    if (cancelQueued) {
+      // Cancelled while queued, before the session's Worker polls.
+      const scope = new CancellationScope();
+      const call = scope.run(() => server.callTool('put', { value: 'cancelled' }));
+      await sleep('1 second');
+      scope.cancel();
+      try {
+        await call;
+      } catch (err: unknown) {
+        out.push(isCancellation(err) ? 'cancelled' : String(err));
+      }
+      out.push(text(await server.callTool('get', {})));
+      return out;
+    }
+    out.push(text(await server.callTool('put', { value: 'V' })));
+    await condition(() => resumed);
+    try {
+      out.push(text(await server.callTool('get', {})));
+    } catch (err: unknown) {
+      out.push(err instanceof ApplicationFailure ? `${err.type}` : String(err));
+    }
+  } finally {
+    await server.cleanup();
+  }
+  return out;
+}
+
+export async function statefulMcpOperationWaitingWorkflow(): Promise<string[]> {
+  // No schedule-to-start timeout: only the session's end stops "get" waiting.
+  const server = statefulMcpServer('sessionEnded', { config: { scheduleToStartTimeout: 0 } });
+  let resumed = false;
+  setHandler(resumeSignal, () => {
+    resumed = true;
+  });
+  await server.connect();
+  try {
+    // "hold" takes the session Worker's only slot, so "get" waits behind it.
+    const hold = server.callTool('hold', {}).catch(() => undefined);
+    await condition(() => resumed);
+    const get = await server.callTool('get', {}).then(
+      (content) => text(content),
+      (err: unknown) => (err instanceof ApplicationFailure ? `${err.type}` : String(err))
+    );
+    await hold;
+    return [get];
+  } finally {
+    await server.cleanup();
+  }
+}
+
+export async function statefulMcpCancelledCallerWorkflow(): Promise<string> {
+  const server = statefulMcpServer('sessionEnded', { config: { scheduleToStartTimeout: 0 } });
+  await server.connect();
+  try {
+    try {
+      await server.callTool('hold', {});
+    } catch (err: unknown) {
+      if (!isCancellation(err)) throw err;
+    }
+    // The Workflow's cancellation also ended the session; this call must still
+    // reject with the cancellation, not with DedicatedWorkerFailure.
+    await server.listTools();
+    return 'listed';
+  } finally {
+    await server.cleanup();
+  }
+}
+
+export async function statefulMcpCancelledAfterRefusalWorkflow(
+  mode: 'finally' | 'nonCancellable' | 'stop'
+): Promise<string> {
+  // The session times out and its retry is refused while the Workflow waits.
+  const server = statefulMcpServer('refusedCancel', { serverSessionConfig: { startToCloseTimeout: '5 seconds' } });
+  await server.connect();
+  if (mode === 'stop') {
+    // A scope between connect() and cleanup() that a Signal cancels.
+    const stop = new CancellationScope();
+    setHandler(resumeSignal, () => stop.cancel());
+    try {
+      await stop.run(async () => {
+        try {
+          await server.listTools();
+          await condition(() => false);
+        } finally {
+          await CancellationScope.nonCancellable(() => server.cleanup());
+        }
+      });
+    } catch (err: unknown) {
+      if (isCancellation(err)) return 'stopped';
+      throw err;
+    }
+    return 'unreachable';
+  }
+  try {
+    await server.listTools();
+    await condition(() => false);
+    return 'unreachable';
+  } finally {
+    // After the Workflow's cancellation, this must not replace it with the
+    // session's DedicatedWorkerFailure, also when it runs in a scope that
+    // can't be cancelled.
+    if (mode === 'nonCancellable') {
+      await CancellationScope.nonCancellable(() => server.cleanup());
+    } else {
+      await server.cleanup();
+    }
   }
 }
 

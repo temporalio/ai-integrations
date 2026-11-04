@@ -447,8 +447,8 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 worker. Deprecated; use ``mcp_servers`` for new MCP v2
                 integrations. A provider's server with a callable
                 ``tool_filter``, a ``require_approval`` policy that can ask for
-                approval, or a ``tool_meta_resolver`` is rejected in every MCP
-                operation; a static filter is applied.
+                approval, a ``tool_meta_resolver``, or a tool guardrail is
+                rejected in every MCP operation; a static filter is applied.
             mcp_servers: Named OpenAI MCP server factories to register on the worker.
                 Each factory may declare at most one positional parameter, which
                 receives the workflow's ``factory_argument`` (``None`` when the
@@ -457,8 +457,9 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 Activities. A factory called with a workflow ``factory_argument``
                 always creates a fresh server for that Activity. A factory's server
                 with a callable ``tool_filter``, a ``require_approval`` policy
-                that can ask for approval, or a ``tool_meta_resolver`` is
-                rejected; pass those to ``workflow.temporal_mcp_server()``.
+                that can ask for approval, a ``tool_meta_resolver``, or a tool
+                guardrail is rejected; pass those to
+                ``workflow.temporal_mcp_server()``.
             mcp_connection_idle_timeout: How long an idle modern MCP connection
                 remains cached. Defaults to five minutes. None disables idle
                 eviction, and zero disables reuse.
