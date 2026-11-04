@@ -99,6 +99,24 @@ Two things worth noticing:
 - Tools, real-I/O backends, human-in-the-loop, streaming, and continue-as-new
   each get a section below.
 
+## Model profiles
+
+Deep Agents sizes summarization from the model's LangChain profile
+(`max_input_tokens`). Only the model name reaches the Workflow, so give the
+plugin each model's profile:
+
+```python
+from temporalio.deepagents import DeepAgentsPlugin
+
+plugin = DeepAgentsPlugin(
+    model_profiles={"anthropic:claude-haiku-4-5": {"max_input_tokens": 200_000}},
+)
+```
+
+A `TemporalModel` built with `profile=` keeps its own. The profile is read in
+Workflow code, so setting or changing it can change when an agent summarizes,
+and a run in flight across that change may fail replay.
+
 ## Configuring activity options
 
 Per agent (recommended): `create_temporal_deep_agent(..., activity_options=...)`

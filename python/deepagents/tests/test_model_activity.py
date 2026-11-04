@@ -269,3 +269,34 @@ async def test_repeated_identical_model_call_resamples(
     assert out == "first answer|second answer", out
     counts = await count_scheduled_activities(handle)
     assert counts["deepagents.invoke_model"] == 2, counts
+
+
+@workflow.defn
+class ModelProfileWorkflow:
+    @workflow.run
+    async def run(self, model_name: str) -> Any:
+        return TemporalModel(model=model_name).profile
+
+
+@pytest.mark.asyncio
+async def test_model_profile_from_plugin(env: WorkflowEnvironment) -> None:
+    # Deep Agents sizes summarization from model.profile (#374).
+    plugin = DeepAgentsPlugin(
+        model_profiles={"fake:profiled": {"max_input_tokens": 200_000}},
+    )
+    async with Worker(
+        env.client,
+        task_queue="da-model-profile",
+        workflows=[ModelProfileWorkflow],
+        plugins=[plugin],
+    ):
+        profiles = [
+            await env.client.execute_workflow(
+                ModelProfileWorkflow.run,
+                name,
+                id=f"da-model-profile-{uuid.uuid4()}",
+                task_queue="da-model-profile",
+            )
+            for name in ("fake:profiled", "fake:model")
+        ]
+    assert profiles == [{"max_input_tokens": 200_000}, None]
