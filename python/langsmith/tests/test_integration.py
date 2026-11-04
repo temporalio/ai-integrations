@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import gc
+import random
 import threading
 import time
 import uuid
@@ -1896,6 +1897,58 @@ class TestReplay:
         step_ids = {key for key, run in posted.items() if run["name"] in steps}
         ended = {str(run["id"]) for run in patches if run.get("end_time")}
         assert step_ids and step_ids <= ended, (step_ids, writes)
+
+    async def test_update_generators_released(
+        self,
+        client: Client,
+        env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+    ) -> None:
+        """An update's run ID generators go when its handler is done.
+
+        They don't stay with the workflow while it is cached.
+        """
+        get_runtime_environment()
+        langsmith.env.get_langchain_env_var_metadata()
+
+        class _RecordingClient(langsmith.Client):
+            def _create_run(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            def _update_run(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+        def live_generators() -> int:
+            gc.collect()
+            return sum(type(o) is random.Random for o in gc.get_objects())
+
+        config = client.config()
+        config["plugins"] = [
+            LangSmithPlugin(
+                client=_RecordingClient(
+                    api_url="http://localhost:1",
+                    api_key="test",
+                    auto_batch_tracing=False,
+                )
+            )
+        ]
+        temporal_client = Client(**config)
+        async with new_worker(temporal_client, LangChainSignalWorkflow) as worker:
+            handle = await temporal_client.start_workflow(
+                LangChainSignalWorkflow.run,
+                id=f"replay-test-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
+            assert await handle.execute_update(LangChainSignalWorkflow.step) == "update"
+            before = live_generators()
+            for _ in range(50):
+                assert (
+                    await handle.execute_update(LangChainSignalWorkflow.step)
+                    == "update"
+                )
+            # Two per update, 100 in all, if they stayed.
+            assert live_generators() - before < 10
+            await handle.signal(LangChainSignalWorkflow.release)
+            assert await handle.result() == "secret"
 
     async def test_run_under_header_parent_keeps_start_time(
         self,

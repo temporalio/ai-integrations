@@ -307,14 +307,30 @@ def _uuid7_from_random(rng: random.Random) -> uuid.UUID:
 # ---------------------------------------------------------------------------
 
 
-# The ID of the update whose handler is running, set by
-# _LangSmithWorkflowInboundInterceptor.  On a worker without the workflow
-# cached, an update right after a first workflow task with no commands runs
-# its handler, then the run method, live in one task, while a replay runs
-# the run method first (temporalio/sdk-python#2080).  An update's runs draw
-# their IDs from generators of its own, which don't depend on that order.
-_update_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "temporal_langsmith_update_id", default=None
+class _UpdateCall:
+    """An update handler call: its update ID and its run ID generators.
+
+    On a worker without the workflow cached, an update right after a first
+    workflow task with no commands runs its handler, then the run method,
+    live in one task, while a replay runs the run method first
+    (temporalio/sdk-python#2080).  An update's runs draw their IDs from
+    generators of its own, which don't depend on that order.  The context
+    holds the call while its handler runs (see ``_update_call``), so the
+    generators go with the handler's task and the tasks it starts.
+    """
+
+    __slots__ = ("id", "rngs")
+
+    def __init__(self, update_id: str) -> None:
+        self.id = update_id
+        # The LangChain and root factory generators, and the reseed count
+        # they were made at; made on first use.
+        self.rngs: tuple[random.Random, random.Random, int] | None = None
+
+
+# The update handler call running, set by _LangSmithWorkflowInboundInterceptor.
+_update_call: contextvars.ContextVar[_UpdateCall | None] = contextvars.ContextVar(
+    "temporal_langsmith_update_call", default=None
 )
 
 
@@ -330,7 +346,7 @@ class _LangChainRuns:
     again live in a later task, such as the run method after an update's
     handler on a worker without the workflow cached, gets new IDs instead of
     those of other runs.  Each update handler call draws its IDs from
-    generators of its own, seeded with its update ID (see ``_update_id``).
+    generators of its own, seeded with its update ID (see ``_UpdateCall``).
     A run ID the caller chose, such as ``config["run_id"]``, is kept.  Every
     run's start time comes from ``workflow.now()`` when the run starts, at
     least 1 microsecond after the run before it in the workflow, so runs
@@ -342,8 +358,7 @@ class _LangChainRuns:
         self._rng = random.Random()
         self._root_rng = random.Random()
         self._seed = 0
-        # The generators of each update handler call, by update ID.
-        self._update_rngs: dict[str, tuple[random.Random, random.Random]] = {}
+        self._reseeds = 0
         self._ids: dict[str, tuple[uuid.UUID, datetime]] = {}
         self._last_start: datetime | None = None
         # Writes held back during replay, for runs that are still open, with
@@ -356,26 +371,25 @@ class _LangChainRuns:
 
         def reseed(seed: int) -> None:
             self._seed = seed
+            self._reseeds += 1
             self._rng.seed(f"temporal-langsmith-langchain-{seed}")
             self._root_rng.seed(f"temporal-langsmith-root-{seed}")
-            self._update_rngs.clear()
 
         reseed(temporalio.workflow.random_seed())
         temporalio.workflow.register_random_seed_callback(reseed)
 
     def _rngs(self) -> tuple[random.Random, random.Random]:
         """Get the LangChain and root factory generators to draw from."""
-        update_id = _update_id.get()
-        if update_id is None:
+        call = _update_call.get()
+        if call is None:
             return self._rng, self._root_rng
-        rngs = self._update_rngs.get(update_id)
-        if rngs is None:
-            rngs = (
-                random.Random(f"temporal-langsmith-langchain-{self._seed}-{update_id}"),
-                random.Random(f"temporal-langsmith-root-{self._seed}-{update_id}"),
+        if call.rngs is None or call.rngs[2] != self._reseeds:
+            call.rngs = (
+                random.Random(f"temporal-langsmith-langchain-{self._seed}-{call.id}"),
+                random.Random(f"temporal-langsmith-root-{self._seed}-{call.id}"),
+                self._reseeds,
             )
-            self._update_rngs[update_id] = rngs
-        return rngs
+        return call.rngs[0], call.rngs[1]
 
     def new_id(self) -> uuid.UUID:
         """Generate a run ID."""
@@ -1816,7 +1830,7 @@ class _LangSmithWorkflowInboundInterceptor(
         self, input: temporalio.worker.HandleUpdateInput
     ) -> Any:
         # Before the root factory, whose ID comes from the update's generator.
-        token = _update_id.set(input.id)
+        token = _update_call.set(_UpdateCall(input.id))
         try:
             with self._workflow_maybe_run(
                 f"HandleUpdate:{input.update}", input.headers
@@ -1824,7 +1838,7 @@ class _LangSmithWorkflowInboundInterceptor(
                 return await super().handle_update_handler(input)
         finally:
             try:
-                _update_id.reset(token)
+                _update_call.reset(token)
             except ValueError:
                 # Garbage collection closed the coroutine outside its task,
                 # as with disable_safe_workflow_eviction=True.
