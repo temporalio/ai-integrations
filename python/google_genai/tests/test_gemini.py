@@ -34,7 +34,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Callable, cast
+from typing import Any, Callable, NamedTuple, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -564,12 +564,14 @@ class MultipleToolsWorkflow:
                         TrackParcel,
                         activity_config=ActivityConfig(
                             start_to_close_timeout=timedelta(seconds=10),
+                            retry_policy=RetryPolicy(maximum_attempts=1),
                         ),
                     ),
                     activity_as_tool(
                         TagParcel,
                         activity_config=ActivityConfig(
                             start_to_close_timeout=timedelta(seconds=10),
+                            retry_policy=RetryPolicy(maximum_attempts=1),
                         ),
                     ),
                 ],
@@ -1691,15 +1693,44 @@ class DataclassParcel(TrackParcel):
     carrier: str = "acme-post"
 
 
+class ShopParcel(TrackParcel):
+    """Track parcels for one shop."""
+
+
+@activity.defn
+class ParcelRef(NamedTuple):
+    parcel_id: str
+
+    async def __call__(self) -> str:
+        return self.parcel_id
+
+
+@activity.defn
+class StaticParcel:
+    @staticmethod
+    async def __call__(parcel_id: str) -> str:
+        return parcel_id
+
+
+@activity.defn
+class ClassParcel:
+    @classmethod
+    async def __call__(cls, parcel_id: str) -> str:
+        return parcel_id
+
+
 def test_activity_as_tool_preserves_doc():
     """Returned wrapper keeps the original docstring."""
     wrapper = activity_as_tool(ToolCallTracker.get_weather)
     assert wrapper.__doc__ == "Get the weather for a given city."
     # A callable class's tool takes __call__'s own docstring, else the class's,
-    # unless dataclasses wrote it, else that of a __call__ it inherits.
+    # unless dataclasses or namedtuple wrote it, else that of a __call__ it
+    # inherits.
     assert activity_as_tool(TrackParcel).__doc__ == "Track a parcel."
     assert activity_as_tool(LocateParcel).__doc__ == "Locate a parcel."
+    assert activity_as_tool(ShopParcel).__doc__ == "Track parcels for one shop."
     assert activity_as_tool(DataclassParcel).__doc__ == "Track a parcel."
+    assert activity_as_tool(ParcelRef).__doc__ is None
 
 
 def test_activity_as_tool_preserves_signature():
@@ -1712,6 +1743,11 @@ def test_activity_as_tool_preserves_signature():
     # callable class's __call__ binds by name.
     sig = inspect.signature(activity_as_tool(LocateParcel))
     assert sig.bind(parcel_id="P-1").args == ("P-1",)
+    # A staticmethod __call__ keeps every parameter; a classmethod drops cls.
+    for cls in (StaticParcel, ClassParcel):
+        assert list(inspect.signature(activity_as_tool(cls)).parameters) == [
+            "parcel_id"
+        ]
     # Gemini converts the model's arguments with the signature's types, so
     # they are resolved.
     sig = inspect.signature(activity_as_tool(TagParcel))
