@@ -102,10 +102,9 @@ def _set_destination_env(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -
 
 
 def _env_address() -> Any:
-    """The address the current env names, in the installed LangSmith's own form."""
-    address = getattr(RunTree(name="env-probe"), "address", None)
-    if address is None:
-        pytest.skip("This LangSmith version has no agent addresses.")
+    """The address the current env names."""
+    address = RunTree(name="env-probe").address
+    assert address is not None
     return address
 
 
@@ -193,12 +192,8 @@ async def test_bad_agent_env_leaves_workflow_code_untraced(
     add_temporal_runs: bool,
 ) -> None:
     _set_destination_env(monkeypatch, agent_env)
-    try:
+    with pytest.raises(LangSmithUserError):
         RunTree(name="env-probe")
-    except LangSmithUserError:
-        pass
-    else:
-        pytest.skip("This LangSmith version can address runs from this env.")
     temporal_client, _, mock_ls_client = _make_client_and_collector(
         client, add_temporal_runs=add_temporal_runs
     )
@@ -355,8 +350,7 @@ async def test_bad_agent_env_runs_under_a_parent_join_it(
     if env.supports_time_skipping:
         pytest.skip("Time-skipping server doesn't persist headers.")
     _set_destination_env(monkeypatch, agent_env)
-    if _env_destination(LangSmithClient(api_key="test")) is not None:
-        pytest.skip("This LangSmith version can address runs from this env.")
+    assert _env_destination(LangSmithClient(api_key="test")) is None
 
     mock_ls_client = await _run_workflow(
         client,
@@ -408,12 +402,8 @@ def test_env_destination_is_none_for_a_bad_env(
     monkeypatch: pytest.MonkeyPatch, agent_env: dict[str, str]
 ) -> None:
     _set_destination_env(monkeypatch, agent_env)
-    try:
+    with pytest.raises(LangSmithUserError):
         RunTree(name="env-probe")
-    except LangSmithUserError:
-        pass
-    else:
-        pytest.skip("This LangSmith version can address runs from this env.")
     assert _env_destination(LangSmithClient(api_key="test")) is None
 
 
@@ -446,7 +436,7 @@ def test_root_factory_children_inherit_an_address(
 
     child = factory.create_child(name="traceable-fn", run_type="chain")
 
-    assert getattr(child, "address", None) == address
+    assert child.address == address
     assert child.session_name is None
 
 
@@ -477,6 +467,6 @@ def test_temporal_run_inherits_parent_address(
                 assert run.parent_run_id == parent.id
                 assert run.trace_id == parent.trace_id
                 assert run.session_name is None
-                assert getattr(run, "address", None) == address
+                assert run.address == address
     finally:
         interceptor._executor.shutdown(wait=True)
