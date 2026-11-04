@@ -30,12 +30,14 @@ from temporalio.bridge.proto.workflow_completion import (
     Success,
     WorkflowActivationCompletion,
 )
+from temporalio import workflow
 from temporalio.client import Client, WorkflowHandle
 from temporalio.langsmith import LangSmithInterceptor, LangSmithPlugin
 from temporalio.langsmith._interceptor import _activation
 from temporalio.langsmith._plugin import (
     _EndingEvictionInstance,
     _mark_ending_evictions,
+    _Runner,
 )
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import (
@@ -88,6 +90,19 @@ class TestPluginConstruction:
     def test_reports_package_version(self) -> None:
         plugin = LangSmithPlugin(client=MagicMock())
         assert plugin.version() == importlib.metadata.version("temporalio-langsmith")
+
+
+@workflow.defn(sandboxed=False)
+class _UnsandboxedMarkWorkflow:
+    """Returns whether its first activation was marked.
+
+    A runner of the plugin's marks every activation.  Without one,
+    ``_watch_activations`` marks them from the second on.
+    """
+
+    @workflow.run
+    async def run(self) -> bool:
+        return _activation.marked
 
 
 class TestEndingEvictions:
@@ -367,6 +382,50 @@ class TestEndingEvictions:
             instance = runner.create_instance(MagicMock())
         assert isinstance(instance, _EndingEvictionInstance)
         assert instance._instance is create_instance.return_value
+
+    def test_wrappers_forward(self) -> None:
+        """The wrapping runner and instance pass every call to what they wrap."""
+        inner_runner = MagicMock(spec=WorkflowRunner)
+        runner = _Runner(inner_runner)
+        defn, det, types = MagicMock(), MagicMock(), [ValueError]
+        runner.prepare_workflow(defn)
+        inner_runner.prepare_workflow.assert_called_once_with(defn)
+        runner.set_worker_level_failure_exception_types(types)
+        inner_runner.set_worker_level_failure_exception_types.assert_called_once_with(
+            types
+        )
+        instance = runner.create_instance(det)
+        inner_runner.create_instance.assert_called_once_with(det)
+        assert isinstance(instance, _EndingEvictionInstance)
+        assert instance._instance is inner_runner.create_instance.return_value
+
+        inner = MagicMock(spec=WorkflowInstance)
+        instance = _EndingEvictionInstance(inner)
+        command_info = MagicMock()
+        assert (
+            instance.get_serialization_context(command_info)
+            is inner.get_serialization_context.return_value
+        )
+        inner.get_serialization_context.assert_called_once_with(command_info)
+        assert (
+            instance.get_external_store_context(command_info)
+            is inner.get_external_store_context.return_value
+        )
+        inner.get_external_store_context.assert_called_once_with(command_info)
+        assert instance.get_info() is inner.get_info.return_value
+        assert instance.get_thread_id() is inner.get_thread_id.return_value
+
+    async def test_unsandboxed_workflow_marked(self, client: Client) -> None:
+        """A workflow not sandboxed runs on the plugin's runner from the start."""
+        config = client.config()
+        config["plugins"] = [LangSmithPlugin(client=MagicMock())]
+        temporal_client = Client(**config)
+        async with new_worker(temporal_client, _UnsandboxedMarkWorkflow) as worker:
+            assert await temporal_client.execute_workflow(
+                _UnsandboxedMarkWorkflow.run,
+                id=f"marked-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
 
 
 class TestPluginIntegration:
