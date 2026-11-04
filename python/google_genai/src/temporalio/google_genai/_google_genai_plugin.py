@@ -113,7 +113,7 @@ class GoogleGenAIPlugin(SimplePlugin):
                 ``tools`` list; ``list_tools`` / ``call_tool`` then run as the
                 ``{name}-list-tools`` / ``{name}-call-tool`` activities against a
                 worker-side connection. Requires the
-                ``temporalio-google-genai[mcp]`` extra (MCP Python SDK v1).
+                ``temporalio-google-genai[mcp]`` extra (MCP Python SDK v1 or v2).
             mcp_connection_idle_timeout: How long a worker-process MCP
                 connection stays open while idle before being disconnected
                 (the timer resets on each reuse).  Defaults to 5 minutes.

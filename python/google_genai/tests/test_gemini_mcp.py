@@ -61,13 +61,21 @@ _ECHO_SERVER = str(Path(__file__).parent / "echo_mcp_server.py")
 @asynccontextmanager
 async def _echo_session() -> AsyncGenerator[ClientSession, None]:
     """Yield an initialized session to the echo MCP server over in-memory streams."""
-    from mcp.shared.memory import create_connected_server_and_client_session
-
     # Imported here so the sandbox's re-import of this module stays side-effect free.
     from tests.echo_mcp_server import mcp as echo_server
 
-    async with create_connected_server_and_client_session(echo_server) as session:
-        yield session
+    try:
+        from mcp import Client  # type: ignore[attr-defined]
+    except ImportError:  # MCP 1.x
+        from mcp.shared.memory import (  # type: ignore[attr-defined]
+            create_connected_server_and_client_session,  # pyright: ignore[reportAttributeAccessIssue]
+        )
+
+        async with create_connected_server_and_client_session(echo_server) as session:
+            yield session
+        return
+    async with Client(echo_server) as client:
+        yield client.session
 
 
 @asynccontextmanager
