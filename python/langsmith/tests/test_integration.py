@@ -1758,6 +1758,7 @@ class TestReplay:
             return Client(**config)
 
         task_queue = str(uuid.uuid4())
+        update: Any = None
         # A cache of 0, so the second Worker replays the open run.
         async with new_worker(
             temporal_client(first),
@@ -1790,7 +1791,7 @@ class TestReplay:
             task_queue=task_queue,
             max_cached_workflows=0,
         ):
-            if handler == "update":
+            if update is not None:
                 await handle.signal(LangChainSignalWorkflow.release_step)
                 assert await update.result() == "update"
             await handle.signal(LangChainSignalWorkflow.release)
