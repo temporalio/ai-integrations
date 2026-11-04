@@ -1688,14 +1688,21 @@ class TestReplay:
             for run in ended:
                 assert bool(run.get("error")) == (fail or name == "race_b"), name
 
+    @pytest.mark.parametrize("handler", ["run", "update"])
     @pytest.mark.parametrize("first", [False, True])
     async def test_run_id_kept_when_add_temporal_runs_changes(
         self,
         client: Client,
         env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
         first: bool,
+        handler: str,
     ) -> None:
-        """A run open across Workers with different ``add_temporal_runs`` keeps its ID."""
+        """A run open across Workers with different ``add_temporal_runs`` keeps its ID.
+
+        The run is the run method's ``wait``, or an update's ``step``, whose
+        root factory, made only with ``add_temporal_runs`` off, draws from a
+        generator apart from its LangChain runs'.
+        """
         get_runtime_environment()
         langsmith.env.get_langchain_env_var_metadata()
         writes: list[tuple[str, dict[str, Any]]] = []
@@ -1742,21 +1749,29 @@ class TestReplay:
                 ):
                     break
                 await asyncio.sleep(0.1)
+            if handler == "update":
+                update = await handle.start_update(
+                    LangChainSignalWorkflow.step,
+                    args=[True],
+                    wait_for_stage=WorkflowUpdateStage.ACCEPTED,
+                )
         async with new_worker(
             temporal_client(not first),
             LangChainSignalWorkflow,
             task_queue=task_queue,
             max_cached_workflows=0,
         ):
+            if handler == "update":
+                await handle.signal(LangChainSignalWorkflow.release_step)
+                assert await update.result() == "update"
             await handle.signal(LangChainSignalWorkflow.release)
             assert await handle.result() == "secret"
 
         # Each Worker's client posted the run, under one ID, and the second
         # ended it.
+        name = "wait" if handler == "run" else "step"
         [run_id] = {
-            str(run["id"])
-            for op, run in writes
-            if op == "post" and run["name"] == "wait"
+            str(run["id"]) for op, run in writes if op == "post" and run["name"] == name
         }
         assert sorted(op for op, run in writes if str(run["id"]) == run_id) == [
             "patch",
