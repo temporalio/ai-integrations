@@ -406,12 +406,13 @@ class TestEndingEvictions:
             def __getattr__(self, name: str) -> Any:
                 return getattr(self._metrics, name)
 
-        given = {
+        makers: dict[str, Callable[[], WorkflowRunner]] = {
             "final": _Final,
             "delegating": _Delegating,
             "dataclass_delegating": _DataclassDelegating,
             "sandboxed_delegating": _SandboxedDelegating,
-        }[kind]()
+        }
+        given = makers[kind]()
         runner = _mark_ending_evictions(given)
         base: type[WorkflowRunner] = UnsandboxedWorkflowRunner
         if kind != "sandboxed_delegating":
