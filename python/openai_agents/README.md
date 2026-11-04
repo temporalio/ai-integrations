@@ -303,8 +303,7 @@ We then pass this through the `activity_as_tool` helper function to create an Op
 ```python
 from dataclasses import dataclass
 from datetime import timedelta
-from temporalio import activity, workflow
-from temporalio.contrib import openai_agents
+from temporalio import activity, openai_agents, workflow
 from agents import Agent, Runner
 
 @dataclass
@@ -349,6 +348,38 @@ worker = Worker(
     activities=[get_weather],
 )
 ```
+
+If the activity fails, the agent run fails with a retryable `AgentsWorkflowError`.
+This is how plain Temporal treats an activity failure that the workflow does not catch.
+So a workflow retry policy reruns the whole agent run, model calls included, even when the activity's error was non-retryable.
+To stop the rerun, catch the error around the run and raise a non-retryable `ApplicationError` in its place:
+
+```python
+from temporalio.exceptions import ActivityError, ApplicationError, RetryState
+from temporalio.openai_agents import AgentsWorkflowError
+
+@workflow.defn
+class WeatherAgent:
+    @workflow.run
+    async def run(self, question: str) -> str:
+        agent = ...  # as above
+        try:
+            result = await Runner.run(starting_agent=agent, input=question)
+        except AgentsWorkflowError as e:
+            failure = e.__cause__  # the tool's ActivityError
+            if (
+                isinstance(failure, ActivityError)
+                and failure.retry_state == RetryState.NON_RETRYABLE_FAILURE
+            ):
+                raise ApplicationError(str(failure.cause), non_retryable=True) from e
+            raise
+        return result.final_output
+```
+
+With `Runner.run_streamed`, put the `async for` loop over `result.stream_events()` inside the `try`: the error is raised there.
+When a tool's activity fails, the `AgentsWorkflowError`'s `__cause__` is that tool's `ActivityError`.
+`RetryState.NON_RETRYABLE_FAILURE` covers an error raised with `non_retryable=True` and one whose type is in the activity retry policy's `non_retryable_error_types`.
+The `failure_error_function` of `activity_as_tool()` does not change any of this: it only formats the error returned to the model when the tool's arguments are invalid.
 
 ### Calling OpenAI Agents Tools inside Temporal Workflows
 
