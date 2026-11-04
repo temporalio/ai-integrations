@@ -351,29 +351,33 @@ worker = Worker(
 
 If the activity fails, the agent run fails with a retryable `AgentsWorkflowError`.
 This is how plain Temporal treats an activity failure that the workflow does not catch.
-So a workflow retry policy reruns the whole agent run, model calls included, even when the activity raised a non-retryable `ApplicationError`.
-To stop the rerun, raise a non-retryable `ApplicationError` in workflow code.
-For example, call the activity from a `@function_tool` and raise its non-retryable error again from there:
+So a workflow retry policy reruns the whole agent run, model calls included, even when the activity's error was non-retryable.
+To stop the rerun, catch the error around the run and raise a non-retryable `ApplicationError` in its place:
 
 ```python
-from agents import function_tool
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, RetryState
+from temporalio.openai_agents import AgentsWorkflowError
 
-@function_tool(failure_error_function=None)
-async def get_weather_or_fail(city: str) -> Weather:
-    """Get the weather for a given city."""
-    try:
-        return await workflow.execute_activity(
-            get_weather, city, start_to_close_timeout=timedelta(seconds=10)
-        )
-    except ActivityError as e:
-        if isinstance(e.cause, ApplicationError) and e.cause.non_retryable:
-            raise ApplicationError(e.cause.message, non_retryable=True) from e
-        raise
+@workflow.defn
+class WeatherAgent:
+    @workflow.run
+    async def run(self, question: str) -> str:
+        agent = ...  # as above
+        try:
+            result = await Runner.run(starting_agent=agent, input=question)
+        except AgentsWorkflowError as e:
+            failure = e.__cause__  # the tool's ActivityError
+            if (
+                isinstance(failure, ActivityError)
+                and failure.retry_state == RetryState.NON_RETRYABLE_FAILURE
+            ):
+                raise ApplicationError(str(failure.cause), non_retryable=True) from e
+            raise
+        return result.final_output
 ```
 
-`failure_error_function=None` makes the error fail the run.
-With the default, the tool returns the error text to the model instead.
+`RetryState.NON_RETRYABLE_FAILURE` covers an error raised with `non_retryable=True` and one whose type is in the activity retry policy's `non_retryable_error_types`.
+The `failure_error_function` of `activity_as_tool()` does not change any of this: it only formats the error returned to the model when the tool's arguments are invalid.
 
 ### Calling OpenAI Agents Tools inside Temporal Workflows
 
