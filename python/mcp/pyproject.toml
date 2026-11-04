@@ -21,6 +21,7 @@ dependencies = [
   "mcp>=2,<3",
   "mcp-types>=2,<3",
   "pydantic>=2,<3",
+  "exceptiongroup>=1.0; python_version < '3.11'",
 ]
 
 [project.urls]
