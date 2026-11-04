@@ -55,6 +55,16 @@ export interface TemporalAgentOptions extends Omit<AgentConfig, 'model' | 'retry
  * Strands' `retryStrategy` is disabled; configure retries via
  * `activityOptions.retry` here and on the activity options accepted by
  * {@link activityAsTool}, {@link activityAsHook}, and {@link TemporalMCPClient}.
+ *
+ * Cancelling a model activity aborts the model call only when
+ * `activityOptions.heartbeatTimeout` is set, since the worker learns of the
+ * cancellation through the activity's heartbeats, and only when the model
+ * passes `cancelSignal` to its client (Strands' `AnthropicModel` does not). A
+ * model that ignores it keeps running and its activity can still complete with
+ * the model's result. A workflow cancel during a model call cancels the model
+ * activity. With `TRY_CANCEL` the run ends as cancelled at once. With
+ * `WAIT_CANCELLATION_COMPLETED` it ends as cancelled only if the activity
+ * does; if the activity completes, the turn continues with the model's result.
  */
 export class TemporalAgent extends Agent {
   private readonly managerGiven: boolean;

@@ -97,6 +97,35 @@ def _reject_worker_side_tool_meta_resolver(
         )
 
 
+def _has_worker_side_tool_guardrails(server: MCPServer) -> bool:
+    """Return whether the server sets tool input or output guardrails."""
+    return bool(getattr(server, "tool_input_guardrails", None)) or bool(
+        getattr(server, "tool_output_guardrails", None)
+    )
+
+
+def _reject_worker_side_tool_guardrails(
+    name: str,
+    server: MCPServer,
+    remedy: str = "pass them to temporal_mcp_server(tool_input_guardrails=..., "
+    "tool_output_guardrails=...)",
+) -> None:
+    """Raise when the factory's server has tool guardrails; see the message.
+
+    The agent builds its tools from the workflow-side server, so guardrails on
+    the factory's server would never run. ``remedy`` says where to set them
+    instead.
+    """
+    if _has_worker_side_tool_guardrails(server):
+        raise ApplicationError(
+            f"MCP server {name!r} sets tool_input_guardrails or "
+            "tool_output_guardrails on its worker-side MCPServer; the agent "
+            f"never reads that copy, so they would never run; {remedy}, and "
+            "remove them from the factory's server",
+            non_retryable=True,
+        )
+
+
 def _reject_worker_side_require_approval(
     name: str, server: MCPServer, route: str
 ) -> None:

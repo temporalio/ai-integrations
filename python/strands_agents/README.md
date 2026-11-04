@@ -419,6 +419,8 @@ Worker(
 )
 ```
 
+`activity_as_tool` also takes a method passed as `Class.method`, with the bound method registered on the worker, and a callable-class activity passed as its class, with an instance registered. The tool offers the parameters the activity is called with: a method's without `self`, and a class's `__call__` parameters. An instance, or a `__call__` that takes `*args`, keyword-only arguments or `**kwargs`, raises `ValueError`, and parameters named `agent` or `cls` are not offered, as in Strands' own tools. Runs from versions before this behavior whose model called a method tool, a class tool whose constructor parameters differ from `__call__`'s, or a function tool with a positional-only parameter, fail replay with it: let them finish before upgrading, or use Worker Versioning.
+
 If a tool's activity fails, the agent receives a failed tool result containing
 the activity's error message, and `AfterToolCallEvent.exception` contains the
 underlying exception. This also applies when an MCP tool's call-tool activity

@@ -1,6 +1,7 @@
 import abc
 import asyncio
 import copy
+import dataclasses
 import functools
 import importlib.metadata
 import json
@@ -10,6 +11,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from types import FrameType
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -55,6 +57,8 @@ from agents import (
     Runner,
     SQLiteSession,
     Tool,
+    ToolGuardrailFunctionOutput,
+    ToolInputGuardrailData,
     TResponseInputItem,
     Usage,
     function_tool,
@@ -64,6 +68,7 @@ from agents import (
     set_default_openai_api,
     set_default_openai_client,
     set_default_openai_key,
+    tool_input_guardrail,
     trace,
 )
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
@@ -105,9 +110,21 @@ from pydantic import ConfigDict, Field, TypeAdapter
 import temporalio.openai_agents as openai_agents
 from temporalio import activity, workflow
 from temporalio.api.common.v1 import Payload
-from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
+from temporalio.api.enums.v1 import EventType
+from temporalio.client import (
+    Client,
+    DescribeWorkflowInput,
+    Interceptor,
+    OutboundInterceptor,
+    WorkflowFailureError,
+    WorkflowHandle,
+)
 from temporalio.common import RawValue, RetryPolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.converter import (
+    DefaultFailureConverterWithEncodedAttributes,
+    PayloadCodec,
+)
 from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
@@ -119,6 +136,7 @@ from temporalio.openai_agents import (
     OpenAIPayloadConverter,
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
+    _mcp,
 )
 from temporalio.openai_agents._invoke_model_activity import (
     _build_tool,
@@ -141,6 +159,7 @@ from temporalio.openai_agents.testing import (
     TestModel,
     TestModelProvider,
 )
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.testing import WorkflowEnvironment
 from temporalio.workflow import ActivityConfig
 from tests.helpers import assert_eventually, new_worker
@@ -4113,9 +4132,20 @@ async def test_mcp_server_factory_argument(client: Client, stateful: bool):
                 )
 
 
+@tool_input_guardrail
+def reject_tool_input(_data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput:
+    return ToolGuardrailFunctionOutput.reject_content("blocked")
+
+
 @pytest.mark.parametrize(
     "setting",
-    ["require_approval", "instance_evaluator", "tool_filter", "tool_meta_resolver"],
+    [
+        "require_approval",
+        "instance_evaluator",
+        "tool_filter",
+        "tool_meta_resolver",
+        "tool_input_guardrails",
+    ],
 )
 @pytest.mark.parametrize("stateful", [True, False])
 async def test_mcp_server_factory_settings_are_rejected(
@@ -4132,6 +4162,9 @@ async def test_mcp_server_factory_settings_are_rejected(
     elif setting == "tool_meta_resolver":
         tracking_server = get_tracking_server("HelloServer")
         tracking_server.tool_meta_resolver = lambda context: {"tenant": "t-1"}  # type: ignore[attr-defined]
+    elif setting == "tool_input_guardrails":
+        tracking_server = get_tracking_server("HelloServer")
+        tracking_server.tool_input_guardrails = [reject_tool_input]  # type: ignore[attr-defined]
     else:
         tracking_server = get_tracking_server("HelloServer")
         tracking_server.tool_filter = lambda context, tool: True  # type: ignore[attr-defined]
@@ -4179,6 +4212,10 @@ async def test_mcp_server_factory_settings_are_rejected(
     if setting == "tool_meta_resolver":
         route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
         assert "'HelloServer' sets tool_meta_resolver" in message
+        assert f"on the server {route}() gives the workflow" in message
+    elif setting == "tool_input_guardrails":
+        route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
+        assert "'HelloServer' sets tool_input_guardrails" in message
         assert f"on the server {route}() gives the workflow" in message
     elif setting != "tool_filter":
         route = "stateful_mcp_server" if stateful else "stateless_mcp_server"
@@ -4232,6 +4269,1030 @@ async def test_stateful_mcp_server_no_worker(client: Client):
                 err.value.cause.message
                 == "MCP Stateful Server Worker failed to schedule activity."
             )
+
+
+@workflow.defn
+class McpServerStatefulRetriedWorkflow:
+    def __init__(self) -> None:
+        self._listed: list[str] | None = None
+        self._resume = False
+
+    @workflow.run
+    async def run(
+        self,
+        session_start_to_close: timedelta,
+        schedule_to_start: timedelta,
+        session_heartbeat_timeout: timedelta | None = None,
+    ) -> list[str]:
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=10),
+            schedule_to_start_timeout=schedule_to_start,
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        async with openai_agents.workflow.stateful_mcp_server(
+            "HelloServer",
+            config=config,
+            server_session_config=ActivityConfig(
+                start_to_close_timeout=session_start_to_close,
+                heartbeat_timeout=session_heartbeat_timeout,
+            ),
+        ) as server:
+            self._listed = [tool.name for tool in await server.list_tools()]
+            await workflow.wait_condition(lambda: self._resume)
+            try:
+                return [tool.name for tool in await server.list_tools()]
+            except ApplicationError:
+                # Leaving the block raises the session activity's failure.
+                pass
+        return []
+
+    @workflow.update
+    async def wait_listed(self) -> list[str]:
+        await workflow.wait_condition(lambda: self._listed is not None)
+        return self._listed or []
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+
+def _assert_session_refused(err: WorkflowFailureError) -> None:
+    # What leaves the block is the type the docstrings name.
+    assert isinstance(err.cause, ApplicationError)
+    assert err.cause.type == "DedicatedWorkerFailure"
+    # Refused by the retried session activity, not only by an operation timing
+    # out.
+    cause: BaseException | None = err.cause
+    while cause is not None and not (
+        isinstance(cause, ApplicationError) and cause.non_retryable
+    ):
+        cause = cause.__cause__
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "DedicatedWorkerFailure"
+
+
+async def _session_failed(handle: WorkflowHandle[Any, Any]) -> bool:
+    sessions: set[int] = set()
+    async for event in handle.fetch_history_events():
+        if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+            name = event.activity_task_scheduled_event_attributes.activity_type.name
+            if name.endswith("-server-session"):
+                sessions.add(event.event_id)
+        elif event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED:
+            failed = event.activity_task_failed_event_attributes
+            if failed.scheduled_event_id in sessions:
+                return True
+    return False
+
+
+def _encoding_in(name: str) -> bool:
+    frame: FrameType | None = sys._getframe()
+    while frame and frame.f_code.co_name != name:
+        frame = frame.f_back
+    return frame is not None
+
+
+class _DelayMayBeOpenCodec(PayloadCodec):
+    """Delays the worker's "may be open" heartbeats, and longer its activity failures.
+
+    A "may be open" heartbeat sent before the attempt clears it then finishes
+    encoding after the clearing one, but before the attempt's failure.
+    """
+
+    def __init__(self) -> None:
+        self.heartbeat_delays = 0
+        self.failure_delays = 0
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_heartbeat_async"):
+            if any(_mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads):
+                self.heartbeat_delays += 1
+                await asyncio.sleep(1.5)
+        elif _encoding_in("_handle_start_activity_task") and _encoding_in(
+            "encode_failure"
+        ):
+            self.failure_delays += 1
+            await asyncio.sleep(3)
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "worker_replaced",
+        "session_timed_out",
+        "first_connect_fails",
+        "first_connect_fails_delayed_heartbeats",
+        "first_connect_fails_close_wait_ends_delayed_heartbeats",
+        "shutdown_before_connect_delayed_heartbeats",
+        "shutdown_before_connect_ignored",
+        "short_heartbeat_timeout",
+    ],
+)
+async def test_stateful_mcp_server_session_retried(
+    client: Client, case: str, monkeypatch: pytest.MonkeyPatch
+):
+    first_connect_fails = case.startswith("first_connect_fails")
+    shutdown_before_connect = case.startswith("shutdown_before_connect")
+    delayed_heartbeats = case.endswith("delayed_heartbeats")
+    codec = _DelayMayBeOpenCodec()
+    if "close_wait_ends" in case:
+        # The attempt stops waiting for a heartbeat still being encoded before
+        # it finishes, and the failure is encoded after it would.
+        monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 0.5)
+    if delayed_heartbeats:
+        monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 1.0)
+        # Each heartbeat takes longer to encode than the interval, so one is
+        # always being encoded when the first connect fails or is cancelled.
+        config = client.config()
+        config["data_converter"] = dataclasses.replace(
+            client.data_converter,
+            payload_codec=codec,
+            failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
+        )
+        client = Client(**config)
+    factory_calls = 0
+    connecting = False
+
+    def factory(_: Any) -> MCPServer:
+        nonlocal factory_calls
+        factory_calls += 1
+        server = get_tracking_server("HelloServer")
+        if shutdown_before_connect and factory_calls == 1:
+
+            async def hang_connect() -> None:
+                nonlocal connecting
+                connecting = True
+                try:
+                    # Until the worker's shutdown cancels it.
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    if case != "shutdown_before_connect_ignored":
+                        raise
+                    # A connect() that ignores the cancellation and connects.
+
+            server.connect = hang_connect  # type: ignore[method-assign]
+        if first_connect_fails and factory_calls == 1:
+
+            async def fail_connect() -> None:
+                if delayed_heartbeats:
+                    await asyncio.sleep(2.5)
+                raise RuntimeError("first connect failed")
+
+            server.connect = fail_connect  # type: ignore[method-assign]
+        return server
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        task_queue = str(uuid.uuid4())
+
+        async def expect_refused(handle: WorkflowHandle[Any, Any]) -> None:
+            # The fix fails the retried session activity; without it, a retry
+            # calls the factory again.
+            async def refused_or_retried() -> None:
+                assert await _session_failed(handle) or factory_calls > 1
+
+            await assert_eventually(refused_or_retried, timeout=timedelta(seconds=40))
+            await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+            with pytest.raises(WorkflowFailureError) as err:
+                await handle.result()
+            # A new server would open a new MCP session without the old one's
+            # state.
+            assert factory_calls == 1
+            _assert_session_refused(err.value)
+
+        async with new_worker(
+            client,
+            McpServerStatefulRetriedWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            handle = await client.start_workflow(
+                McpServerStatefulRetriedWorkflow.run,
+                args=[
+                    timedelta(seconds=5)
+                    if case == "session_timed_out"
+                    else timedelta(hours=1),
+                    # Long enough for the retry of an attempt that never connected.
+                    timedelta(
+                        seconds=30
+                        if first_connect_fails or shutdown_before_connect
+                        else 5
+                    ),
+                    timedelta(seconds=4) if case == "short_heartbeat_timeout" else None,
+                ],
+                id=f"mcp-server-retried-{uuid.uuid4()}",
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=80),
+            )
+            if shutdown_before_connect:
+
+                async def connect_started() -> None:
+                    assert connecting
+
+                # The first worker shuts down while its first connect() runs.
+                await assert_eventually(connect_started, timeout=timedelta(seconds=30))
+            else:
+                assert await handle.execute_update(
+                    McpServerStatefulRetriedWorkflow.wait_listed
+                ) == ["Say-Hello"]
+            if first_connect_fails:
+                # No session was opened, so the retry connects again.
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 2
+                if delayed_heartbeats:
+                    # The SDK functions the codec looks for still exist.
+                    assert codec.heartbeat_delays and codec.failure_delays
+                return
+            if case == "session_timed_out":
+                await expect_refused(handle)
+                return
+            if case == "short_heartbeat_timeout":
+                # The session heartbeats within its 4-second heartbeat timeout,
+                # so it is not retried.
+                await asyncio.sleep(10)
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 1
+                return
+
+        # The first worker shut down gracefully, as in a deployment, and
+        # Temporal retries the session activity on the next one.
+        async with new_worker(
+            client,
+            McpServerStatefulRetriedWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            if shutdown_before_connect:
+                # No session was opened, so the retry connects again.
+                assert await handle.execute_update(
+                    McpServerStatefulRetriedWorkflow.wait_listed
+                ) == ["Say-Hello"]
+                await handle.signal(McpServerStatefulRetriedWorkflow.resume)
+                assert await handle.result() == ["Say-Hello"]
+                assert factory_calls == 2
+                if delayed_heartbeats:
+                    # The SDK functions the codec looks for still exist.
+                    assert codec.heartbeat_delays and codec.failure_delays
+                return
+            await expect_refused(handle)
+
+
+@workflow.defn
+class McpServerStatefulCancelledAfterRefusalWorkflow:
+    """Waits in a block whose session gets refused, recovering as the README says."""
+
+    @workflow.run
+    async def run(self) -> str:
+        try:
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer",
+                server_session_config=ActivityConfig(
+                    start_to_close_timeout=timedelta(seconds=6)
+                ),
+            ) as server:
+                await server.list_tools()
+                await workflow.wait_condition(lambda: False)
+        except ApplicationError as err:
+            if err.type != "DedicatedWorkerFailure":
+                raise
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer"
+            ) as server:
+                await server.list_tools()
+        return "recovered"
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_mcp_server_cancelled_after_refusal(client: Client):
+    # The session times out on a live worker and its retry is refused while the
+    # block waits. Cancelling the workflow then cancels the run: the block's
+    # DedicatedWorkerFailure doesn't replace the cancellation, so the
+    # README's recovery code doesn't swallow it.
+    factory_calls = 0
+
+    def factory(_: Any) -> MCPServer:
+        nonlocal factory_calls
+        factory_calls += 1
+        return get_tracking_server("HelloServer")
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, McpServerStatefulCancelledAfterRefusalWorkflow
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulCancelledAfterRefusalWorkflow.run,
+                id=f"mcp-server-cancelled-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+
+            async def refused() -> None:
+                assert await _session_failed(handle)
+
+            await assert_eventually(refused, timeout=timedelta(seconds=30))
+            await handle.cancel()
+            with pytest.raises(WorkflowFailureError) as err:
+                await asyncio.wait_for(handle.result(), timeout=20)
+
+    assert isinstance(err.value.cause, CancelledError)
+    assert factory_calls == 1
+
+
+class _DenyDescribe(Interceptor):
+    def __init__(self, status: RPCStatusCode = RPCStatusCode.PERMISSION_DENIED) -> None:
+        super().__init__()
+        self._status = status
+
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _DenyDescribeOutbound(next, self._status)
+
+
+class _DenyDescribeOutbound(OutboundInterceptor):
+    def __init__(self, next: OutboundInterceptor, status: RPCStatusCode) -> None:
+        super().__init__(next)
+        self._status = status
+
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        raise RPCError("Request refused.", self._status, b"")
+
+
+class _StallDescribe(Interceptor):
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _StallDescribeOutbound(next)
+
+
+class _StallDescribeOutbound(OutboundInterceptor):
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        await asyncio.Event().wait()
+
+
+class _OtherAttemptDescribe(Interceptor):
+    def intercept_client(self, next: OutboundInterceptor) -> OutboundInterceptor:
+        return _OtherAttemptDescribeOutbound(next)
+
+
+class _OtherAttemptDescribeOutbound(OutboundInterceptor):
+    async def describe_workflow(self, input: DescribeWorkflowInput) -> Any:
+        # As if a later attempt of the session activity had replaced this one.
+        description = await super().describe_workflow(input)
+        for pending in description.raw_description.pending_activities:
+            pending.attempt += 1
+        return description
+
+
+class _StallReadBackCodec(PayloadCodec):
+    """Never finishes decoding the details the session activity reads back."""
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_read_back"):
+            await asyncio.Event().wait()
+        return list(payloads)
+
+
+class _StallMayBeOpenCodec(PayloadCodec):
+    """Never finishes encoding "may be open" heartbeats after the first ``passed``."""
+
+    def __init__(self, passed: int = 0) -> None:
+        self.passed = passed
+
+    async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        if _encoding_in("_heartbeat_async") and any(
+            _mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads
+        ):
+            if self.passed:
+                self.passed -= 1
+            else:
+                await asyncio.Event().wait()
+        return list(payloads)
+
+    async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
+        return list(payloads)
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "refused",
+        "not_found",
+        "describe_stalls",
+        "decode_stalls",
+        "encode_stalls",
+        "other_attempt",
+    ],
+)
+async def test_stateful_mcp_server_without_describe_permission(
+    client: Client, case: str, monkeypatch: pytest.MonkeyPatch
+):
+    # The worker's client may not describe the workflow: the session activity
+    # fails at once with an error that says so, and the run fails with it. A
+    # describe or decoding that never ends fails the attempt at the deadline,
+    # and so does a heartbeat whose encoding never ends.
+    monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
+    monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 1.0)
+    servers: list[Any] = []
+
+    def factory(_: Any) -> MCPServer:
+        server = get_tracking_server("HelloServer")
+        servers.append(server)
+        return server
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        config = client.config()
+        codec = {
+            "decode_stalls": _StallReadBackCodec,
+            "encode_stalls": _StallMayBeOpenCodec,
+        }.get(case)
+        if codec:
+            config["data_converter"] = dataclasses.replace(
+                client.data_converter, payload_codec=codec()
+            )
+        else:
+            interceptor = {
+                "refused": _DenyDescribe(),
+                "not_found": _DenyDescribe(RPCStatusCode.NOT_FOUND),
+                "describe_stalls": _StallDescribe(),
+                "other_attempt": _OtherAttemptDescribe(),
+            }[case]
+            config["interceptors"] = [*config["interceptors"], interceptor]
+        worker_client = env.applied_on_client(Client(**config))
+        client = env.applied_on_client(client)
+        async with new_worker(
+            worker_client, McpServerStatefulRetriedWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulRetriedWorkflow.run,
+                args=[timedelta(hours=1), timedelta(seconds=5), None],
+                id=f"mcp-server-describe-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            if case not in ("refused", "not_found"):
+                failures: list[str] = []
+
+                async def attempt_failed() -> None:
+                    description = await handle.describe()
+                    failures[:] = [
+                        pending.last_failure.message
+                        for pending in description.raw_description.pending_activities
+                        if pending.activity_type.name.endswith("-server-session")
+                        and pending.last_failure.message
+                    ]
+                    assert failures
+
+                # The attempt fails (at the 2-second deadline when stalled) and
+                # is retried.
+                await assert_eventually(attempt_failed, timeout=timedelta(seconds=20))
+                await handle.terminate()
+                assert servers == []
+                assert failures == [
+                    "This stateful MCP server session activity attempt is no "
+                    "longer the current one."
+                    if case == "other_attempt"
+                    else "The server did not show the stateful MCP server session "
+                    "activity's first heartbeat within 2 seconds."
+                ]
+                return
+            with pytest.raises(WorkflowFailureError) as err:
+                await asyncio.wait_for(handle.result(), timeout=20)
+
+    # The session activity failed before it built a server.
+    assert servers == []
+    _assert_session_refused(err.value)
+    messages: list[str] = []
+    cause: BaseException | None = err.value
+    while cause is not None:
+        messages.append(str(cause))
+        cause = cause.__cause__
+    if case == "not_found":
+        assert any("could not describe this workflow run" in m for m in messages)
+        assert not any("permission" in m for m in messages), messages
+    else:
+        assert any("permission to describe" in m for m in messages), messages
+
+
+@pytest.mark.timeout(90)
+async def test_stateful_mcp_server_worker_shutdown_while_closing(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    # The first "may be open" heartbeat reaches the server, the later ones hang
+    # in encoding, and the read-back hangs, so the attempt fails at its deadline
+    # and then waits in close() for those heartbeats. A worker shutdown during
+    # that wait must still let the attempt end, with the clear as its last
+    # heartbeat details.
+    monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
+    monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 60.0)
+    monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 0.5)
+    closing = asyncio.Event()
+    close = _mcp._SessionHeartbeats.close
+
+    async def close_and_flag(self: _mcp._SessionHeartbeats) -> None:
+        # close() does not await before its wait, so once this is set, the
+        # attempt waits there.
+        closing.set()
+        await close(self)
+
+    monkeypatch.setattr(_mcp._SessionHeartbeats, "close", close_and_flag)
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        config = client.config()
+        config["data_converter"] = dataclasses.replace(
+            client.data_converter, payload_codec=_StallMayBeOpenCodec(passed=1)
+        )
+        config["interceptors"] = [*config["interceptors"], _StallDescribe()]
+        worker_client = env.applied_on_client(Client(**config))
+        client = env.applied_on_client(client)
+        async with new_worker(
+            worker_client, McpServerStatefulRetriedWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulRetriedWorkflow.run,
+                args=[timedelta(hours=1), timedelta(seconds=5), None],
+                id=f"mcp-server-shutdown-closing-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            await asyncio.wait_for(closing.wait(), timeout=20)
+            await asyncio.wait_for(worker.shutdown(), timeout=20)
+
+        # The attempt's failure carried the clear over the first heartbeat, so
+        # its retry may connect.
+        async def retried() -> Any:
+            description = await handle.describe()
+            sessions = [
+                pending
+                for pending in description.raw_description.pending_activities
+                if pending.activity_type.name.endswith("-server-session")
+            ]
+            assert sessions and sessions[0].attempt == 2
+            return sessions[0]
+
+        session = await assert_eventually(retried, timeout=timedelta(seconds=20))
+        assert not session.heartbeat_details.payloads
+        await handle.terminate()
+
+
+@dataclass
+class _SessionEndedInput:
+    case: str
+    session_task_queue: str
+
+
+@workflow.defn
+class McpServerStatefulSessionEndedWorkflow:
+    def __init__(self) -> None:
+        self._listed: list[str] | None = None
+        self._resume = False
+        self._failure: list[str] = []
+
+    @workflow.run
+    async def run(self, input: _SessionEndedInput) -> list[str]:
+        # No schedule-to-start timeout: only the session's end stops an
+        # operation waiting on the session's task queue.
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=20),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        if input.case == "schedule_to_close":
+            # The timeout ends the operation, so it keeps its commands.
+            config["schedule_to_close_timeout"] = timedelta(seconds=3)
+        if input.case.startswith("next_block") or input.case.endswith(
+            "wait_cancellation"
+        ):
+            config["cancellation_type"] = (
+                workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+            )
+        if input.case.endswith("abandon"):
+            config["cancellation_type"] = workflow.ActivityCancellationType.ABANDON
+        server_session_config = ActivityConfig(
+            start_to_close_timeout=timedelta(hours=1),
+            task_queue=input.session_task_queue,
+        )
+        if input.case == "numeric_session_id":
+            server_session_config["activity_id"] = "100"
+        if input.case == "operation_waiting_after_cancel":
+            # Work after a caught cancellation still gets the session's failure.
+            try:
+                await workflow.wait_condition(lambda: False)
+            except asyncio.CancelledError:
+                pass
+        if input.case == "next_block_custom_ids":
+            server_session_config["activity_id"] = "session-1"
+        out: list[str] = []
+        try:
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer",
+                config=config,
+                server_session_config=server_session_config,
+            ) as server:
+                if input.case == "numeric_session_id":
+                    # The first operations get default IDs below the session's.
+                    tools = [tool.name for tool in await server.list_tools()]
+                    await server.call_tool("Say-Hello", {"name": "First"})
+                    return tools
+                if input.case == "operation_cancelled":
+                    # Cancelled while queued, before the session's worker polls.
+                    call = asyncio.create_task(
+                        server.call_tool("Say-Hello", {"name": "Cancelled"})
+                    )
+                    await workflow.sleep(1)
+                    call.cancel()
+                    try:
+                        await call
+                    except ActivityError as err:
+                        out.append(type(err.cause).__name__)
+                    return out + [tool.name for tool in await server.list_tools()]
+                self._listed = [tool.name for tool in await server.list_tools()]
+                await workflow.wait_condition(lambda: self._resume)
+                if input.case.startswith("next_block"):
+                    await server.call_tool("Say-Hello", {"name": "Old"})
+                else:
+                    try:
+                        await server.list_tools()
+                    except ApplicationError as err:
+                        # The block's exit replaces this error, so keep its causes.
+                        cause: BaseException | None = err
+                        while cause is not None:
+                            self._failure.append(str(cause))
+                            cause = cause.__cause__
+                        raise
+        except (ApplicationError, ActivityError):
+            if not input.case.startswith("next_block"):
+                raise
+        if input.case == "next_block_custom_ids":
+            server_session_config["activity_id"] = "session-2"
+        # A later block with the same name uses the same task queue.
+        async with openai_agents.workflow.stateful_mcp_server(
+            "HelloServer", config=config, server_session_config=server_session_config
+        ) as server:
+            return [tool.name for tool in await server.list_tools()]
+
+    @workflow.update
+    async def wait_listed(self) -> list[str]:
+        await workflow.wait_condition(lambda: self._listed is not None)
+        return self._listed or []
+
+    @workflow.query
+    def failure(self) -> list[str]:
+        return self._failure
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "operation_waiting",
+        "operation_waiting_abandon",
+        "operation_waiting_wait_cancellation",
+        "operation_waiting_after_cancel",
+        "operation_after_refusal",
+        "next_block",
+        "next_block_custom_ids",
+        "operation_cancelled",
+        "schedule_to_close",
+        "numeric_session_id",
+    ],
+)
+async def test_stateful_mcp_server_operations_after_session_ended(
+    client: Client, case: str
+):
+    servers: list[Any] = []
+    call_cancelled = asyncio.Event()
+
+    def factory(_: Any) -> MCPServer:
+        server = get_tracking_server("HelloServer")
+        if case == "operation_cancelled":
+            connect = server.connect
+
+            async def slow_connect() -> None:
+                # The session's worker polls only after the call is cancelled.
+                await call_cancelled.wait()
+                await connect()
+
+            server.connect = slow_connect  # type: ignore[method-assign]
+        servers.append(server)
+        return server
+
+    provider = StatefulMCPServerProvider("HelloServer", factory)
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        task_queue = str(uuid.uuid4())
+        host_task_queue = f"{task_queue}-host"
+
+        def operations() -> list[str]:
+            return [
+                event.activity_task_scheduled_event_attributes.activity_type.name
+                for event in events
+                if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
+                and "-server-session"
+                not in (
+                    event.activity_task_scheduled_event_attributes.activity_type.name
+                )
+            ]
+
+        async with new_worker(
+            client, McpServerStatefulSessionEndedWorkflow, task_queue=task_queue
+        ):
+            async with new_worker(client, task_queue=host_task_queue):
+                handle = await client.start_workflow(
+                    McpServerStatefulSessionEndedWorkflow.run,
+                    _SessionEndedInput(case, host_task_queue),
+                    id=f"mcp-server-session-ended-{uuid.uuid4()}",
+                    task_queue=task_queue,
+                    execution_timeout=timedelta(seconds=80),
+                )
+                if case == "operation_waiting_after_cancel":
+                    await handle.cancel()
+                if case == "operation_cancelled":
+
+                    async def cancelled() -> None:
+                        history = [e async for e in handle.fetch_history_events()]
+                        assert any(
+                            e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_CANCELED
+                            for e in history
+                        )
+
+                    try:
+                        await assert_eventually(
+                            cancelled, timeout=timedelta(seconds=20)
+                        )
+                    finally:
+                        call_cancelled.set()
+                    assert await handle.result() == ["CancelledError", "Say-Hello"]
+                    # The cancelled call never ran once the session's worker polled.
+                    assert "call_tool" not in servers[0].calls
+                    return
+                if case == "numeric_session_id":
+                    assert await handle.result() == ["Say-Hello"]
+                    assert "call_tool" in servers[0].calls
+                    return
+                assert await handle.execute_update(
+                    McpServerStatefulSessionEndedWorkflow.wait_listed
+                ) == ["Say-Hello"]
+            # The session's host shut down gracefully after the session opened.
+
+            if case.startswith(("operation_waiting", "next_block")):
+                await handle.signal(McpServerStatefulSessionEndedWorkflow.resume)
+
+                # Wait until the operation waits beside the retried session.
+                async def operation_pending() -> None:
+                    description = await handle.describe()
+                    assert len(description.raw_description.pending_activities) >= 2
+
+                await assert_eventually(
+                    operation_pending,
+                    timeout=timedelta(seconds=20),
+                    interval=timedelta(milliseconds=100),
+                )
+
+            # The retried session activity is refused on the next host.
+            async with new_worker(client, task_queue=host_task_queue):
+                if case in ("operation_after_refusal", "schedule_to_close"):
+
+                    async def session_failed() -> None:
+                        assert await _session_failed(handle)
+
+                    await assert_eventually(
+                        session_failed, timeout=timedelta(seconds=30)
+                    )
+                    await handle.signal(McpServerStatefulSessionEndedWorkflow.resume)
+                result: list[str] | None = None
+                failure: WorkflowFailureError | None = None
+                try:
+                    result = await asyncio.wait_for(handle.result(), timeout=30)
+                except WorkflowFailureError as e:
+                    failure = e
+                causes: list[str] = []
+                if case.startswith("operation_waiting"):
+                    causes = await handle.query(
+                        McpServerStatefulSessionEndedWorkflow.failure
+                    )
+
+    events = [event async for event in handle.fetch_history_events()]
+    if case.startswith("next_block"):
+        # The second block's server got its own session; the first block's call
+        # did not run against it.
+        assert result == ["Say-Hello"]
+        assert len(servers) == 2
+        assert "call_tool" not in servers[1].calls
+        return
+    assert len(servers) == 1
+    assert failure
+    _assert_session_refused(failure)
+    if case.startswith("operation_waiting"):
+        # The operation's own error names the session's refusal as its cause,
+        # in every cancellation mode.
+        assert any("An earlier attempt" in cause for cause in causes), causes
+    # The waiting operation was cancelled (ABANDON and WAIT_CANCELLATION_COMPLETED
+    # request no cancel); none was scheduled after the session ended. An
+    # operation with a schedule-to-close timeout is scheduled as before the fix,
+    # and that timeout ends it.
+    assert operations() == ["HelloServer-stateful-list-tools"] * (
+        2 if case.startswith(("operation_waiting", "schedule_to_close")) else 1
+    )
+    assert any(
+        event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED
+        for event in events
+    ) == (case in ("operation_waiting", "operation_waiting_after_cancel"))
+
+
+@workflow.defn
+class McpServerStatefulOneTaskWorkflow:
+    """A block whose session's end reaches the workflow with another event."""
+
+    def __init__(self) -> None:
+        self._listed = False
+        self._resume = False
+
+    @workflow.run
+    async def run(self, input: _SessionEndedInput) -> str:
+        # No schedule-to-start timeout: the waiting operation follows the session.
+        config = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=20),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        try:
+            async with openai_agents.workflow.stateful_mcp_server(
+                "HelloServer",
+                config=config,
+                server_session_config=ActivityConfig(
+                    start_to_close_timeout=timedelta(hours=1),
+                    task_queue=input.session_task_queue,
+                ),
+            ) as server:
+                await server.list_tools()
+                self._listed = True
+                if input.case == "timer_first":
+                    await workflow.sleep(10)
+                else:
+                    await workflow.wait_condition(lambda: self._resume)
+                    if input.case == "cancel_with_refusal":
+                        await server.list_tools()
+        except ApplicationError as err:
+            # The README's recovery.
+            if err.type != "DedicatedWorkerFailure":
+                raise
+            return "recovered"
+        return "completed"
+
+    @workflow.query
+    def listed(self) -> bool:
+        return self._listed
+
+    @workflow.signal
+    def resume(self) -> None:
+        self._resume = True
+
+
+@pytest.mark.timeout(90)
+@pytest.mark.parametrize(
+    "case", ["timer_first", "cancel_with_refusal", "signal_with_refusal"]
+)
+async def test_stateful_mcp_server_session_end_with_other_events(
+    client: Client, case: str
+):
+    # The workflow worker is stopped until the session's refusal and other
+    # events, the block's last timer, a workflow cancel, or a Signal that ends
+    # the block and a workflow cancel, are all in history, so that one workflow
+    # task brings them.
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        task_queue = str(uuid.uuid4())
+        host_task_queue = f"{task_queue}-host"
+
+        def workflow_worker() -> Any:
+            return new_worker(
+                client,
+                McpServerStatefulOneTaskWorkflow,
+                task_queue=task_queue,
+                max_cached_workflows=0,
+            )
+
+        async with workflow_worker():
+            async with new_worker(client, task_queue=host_task_queue):
+                handle = await client.start_workflow(
+                    McpServerStatefulOneTaskWorkflow.run,
+                    _SessionEndedInput(case, host_task_queue),
+                    id=f"mcp-server-one-task-{uuid.uuid4()}",
+                    task_queue=task_queue,
+                    execution_timeout=timedelta(seconds=80),
+                )
+
+                async def listed() -> None:
+                    assert await handle.query(McpServerStatefulOneTaskWorkflow.listed)
+
+                await assert_eventually(listed, timeout=timedelta(seconds=20))
+            # The session's host shut down gracefully, so its retry waits.
+            if case == "cancel_with_refusal":
+                await handle.signal(McpServerStatefulOneTaskWorkflow.resume)
+
+                async def operation_pending() -> None:
+                    description = await handle.describe()
+                    assert len(description.raw_description.pending_activities) >= 2
+
+                await assert_eventually(
+                    operation_pending, timeout=timedelta(seconds=20)
+                )
+
+        if case == "signal_with_refusal":
+            await handle.signal(McpServerStatefulOneTaskWorkflow.resume)
+        if case == "timer_first":
+
+            async def timer_fired() -> None:
+                events = [e async for e in handle.fetch_history_events()]
+                assert any(
+                    e.event_type == EventType.EVENT_TYPE_TIMER_FIRED for e in events
+                )
+
+            await assert_eventually(timer_fired, timeout=timedelta(seconds=30))
+        # The next host refuses the retried session.
+        async with new_worker(client, task_queue=host_task_queue):
+
+            async def session_failed() -> None:
+                assert await _session_failed(handle)
+
+            await assert_eventually(session_failed, timeout=timedelta(seconds=30))
+            if case != "timer_first":
+                await handle.cancel()
+            async with workflow_worker():
+                if case == "timer_first":
+                    # The block raises the documented error, so the recovery runs.
+                    assert await handle.result() == "recovered"
+                elif not hasattr(asyncio.Task, "cancelling"):
+                    # Python 3.10 can't tell the workflow's cancellation from the
+                    # session's end, as the README says.
+                    assert await handle.result() == "recovered"
+                else:
+                    # The workflow's cancellation wins over the session's end.
+                    with pytest.raises(WorkflowFailureError) as err:
+                        await handle.result()
+                    assert isinstance(err.value.cause, CancelledError)
+
+
+@workflow.defn
+class McpServerStatefulEmptyBlockWorkflow:
+    @workflow.run
+    async def run(self) -> None:
+        async with openai_agents.workflow.stateful_mcp_server("HelloServer"):
+            pass
+
+
+async def test_stateful_mcp_server_empty_block(client: Client):
+    # The session activity never started, so leaving the block raises the bare
+    # CancelledError that earlier versions raise (#391), not a
+    # DedicatedWorkerFailure for a session that ended.
+    provider = StatefulMCPServerProvider(
+        "HelloServer", lambda _: get_tracking_server("HelloServer")
+    )
+    async with AgentEnvironment(
+        model=tracking_mcp_mock_model(), mcp_server_providers=[provider]
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(client, McpServerStatefulEmptyBlockWorkflow) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulEmptyBlockWorkflow.run,
+                id=f"mcp-server-empty-block-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            with pytest.raises(WorkflowFailureError) as err:
+                await handle.result()
+            assert isinstance(err.value.cause, CancelledError)
 
 
 async def test_model_conversion_loops():
