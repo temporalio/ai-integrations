@@ -9,6 +9,7 @@ Temporal activities.
 import asyncio
 import contextvars
 import gc
+import itertools
 import json
 import uuid
 import weakref
@@ -183,6 +184,33 @@ def _triage_reply(
     return _banker_reply(instructions, input)
 
 
+def _fresh_call_id_reply() -> Callable[
+    [str | None, str | list[TResponseInputItem]], ModelResponse
+]:
+    """Like ``_triage_reply``, but every tool call has a new call ID, as a real model's."""
+    call_ids = itertools.count()
+
+    def reply(
+        instructions: str | None, input: str | list[TResponseInputItem]
+    ) -> ModelResponse:
+        if instructions == "Hand off to the Banker.":
+            return ResponseBuilders.tool_call(
+                "{}", "transfer_to_banker", call_id=f"call-handoff-{next(call_ids)}"
+            )
+        if isinstance(input, list) and any(
+            isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and str(item.get("call_id")).startswith("call-transfer")
+            for item in input[-1:]
+        ):
+            return ResponseBuilders.output_message("Transfer complete.")
+        return ResponseBuilders.tool_call(
+            '{"amount": 5}', "transfer_funds", call_id=f"call-transfer-{next(call_ids)}"
+        )
+
+    return reply
+
+
 def _make_banker() -> Agent[None]:
     return Agent[None](
         name="Banker",
@@ -220,10 +248,17 @@ async def _run(
     streamed: bool,
     run_config: RunConfig | None = None,
     hooks: RunHooks[None] | None = None,
+    # The SDK also takes the ``RunContextWrapper`` of an earlier run, to keep its
+    # approvals.
+    context: Any = None,
 ) -> RunResult | RunResultStreaming:
     if not streamed:
-        return await Runner.run(agent, input, run_config=run_config, hooks=hooks)
-    result = Runner.run_streamed(agent, input, run_config=run_config, hooks=hooks)
+        return await Runner.run(
+            agent, input, run_config=run_config, hooks=hooks, context=context
+        )
+    result = Runner.run_streamed(
+        agent, input, run_config=run_config, hooks=hooks, context=context
+    )
     async for _ in result.stream_events():
         pass
     return result
@@ -443,6 +478,62 @@ class ResumeRunStateWorkflow:
         assert result.last_agent.name == "Banker"
         state = await RunState.from_string(agent, result.to_state().to_string())
         return await _approve_and_resume(agent, state, streamed=streamed)
+
+
+async def _approve_always_then_run_again(
+    streamed: bool,
+    use_handoff: str,
+    next_agent: str,
+    run_config: RunConfig | None = None,
+) -> dict[str, Any]:
+    """Approve ``transfer_funds`` permanently, then run again with the same context.
+
+    ``next_agent`` is ``"same"`` to run the same agent again, or ``"other"`` to run
+    an equal but separate one.
+    """
+
+    def make_agent() -> Agent[None]:
+        return (
+            _make_banker()
+            if use_handoff == "none"
+            else _make_triage(use_handoff == "object")
+        )
+
+    agent = make_agent()
+    context = RunContextWrapper[None](context=None)
+    result = await _run(
+        agent,
+        "Move 5 dollars.",
+        streamed=streamed,
+        run_config=run_config,
+        context=context,
+    )
+    assert len(result.interruptions) == 1
+    state = result.to_state()
+    state.approve(result.interruptions[0], always_approve=True)
+    resumed = await _run(agent, state, streamed=streamed, run_config=run_config)
+    assert resumed.final_output == "Transfer complete."
+    again = await _run(
+        agent if next_agent == "same" else make_agent(),
+        "Move 5 dollars.",
+        streamed=streamed,
+        run_config=run_config,
+        context=resumed.context_wrapper,
+    )
+    return {"interruptions": len(again.interruptions), "final": again.final_output}
+
+
+@workflow.defn
+class ApproveAlwaysThenRunAgainWorkflow:
+    @workflow.init
+    def __init__(self, streamed: bool, use_handoff: str, next_agent: str) -> None:
+        self.stream = WorkflowStream()
+
+    @workflow.run
+    async def run(
+        self, streamed: bool, use_handoff: str, next_agent: str
+    ) -> dict[str, Any]:
+        return await _approve_always_then_run_again(streamed, use_handoff, next_agent)
 
 
 @workflow.defn
@@ -697,6 +788,7 @@ class RepeatedRunsWorkflow:
 
 ALL_WORKFLOWS = [
     ResumeRunStateWorkflow,
+    ApproveAlwaysThenRunAgainWorkflow,
     ResumeAcrossContinueAsNewWorkflow,
     ResumeWithInputFilterWorkflow,
     ConcurrentNestedResumeWorkflow,
@@ -774,6 +866,39 @@ async def test_resume_run_state_after_handoff(
         use_handoff,
     )
     assert result == ["Transfer complete.", "transferred 5"]
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("use_handoff", ["none", "object"])
+@pytest.mark.parametrize("next_agent", ["same", "other"])
+async def test_always_approve_applies_to_later_runs_like_the_sdk(
+    client: Client, streamed: bool, use_handoff: str, next_agent: str
+):
+    """A permanent approval binds to the user's agent, not the plugin's copy of it.
+
+    The plugin converts the agent again on every run, so the next run must still
+    find the approval. From openai-agents 0.23, a separate agent must not.
+    """
+    expected = await _approve_always_then_run_again(
+        streamed,
+        use_handoff,
+        next_agent,
+        RunConfig(model=ScriptedModel(_fresh_call_id_reply())),
+    )
+    if next_agent == "same":
+        assert expected == {"interruptions": 0, "final": "Transfer complete."}
+    elif hasattr(RunContextWrapper, "_resolve_function_approval_owners"):
+        # openai-agents 0.23 binds a permanent approval to the agent that got it.
+        assert expected == {"interruptions": 1, "final": None}
+    result, _ = await _execute(
+        client,
+        ScriptedModel(_fresh_call_id_reply()),
+        ApproveAlwaysThenRunAgainWorkflow.run,
+        streamed,
+        use_handoff,
+        next_agent,
+    )
+    assert result == expected
 
 
 async def test_resume_run_state_across_continue_as_new(client: Client):

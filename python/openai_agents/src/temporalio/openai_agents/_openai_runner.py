@@ -23,6 +23,7 @@ from agents import (
     TContext,
     TResponseInputItem,
 )
+from agents._public_agent import get_public_agent, set_public_agent
 from agents.run import DEFAULT_AGENT_RUNNER, AgentRunner, RunOptions
 from agents.sandbox import SandboxAgent
 from typing_extensions import Unpack
@@ -71,6 +72,9 @@ def _convert_agent(
     visited.add(id(agent))
     if new_agent is None:
         new_agent = dataclasses.replace(agent)
+        # Every run makes a new copy, so the SDK must see the caller's agent as the
+        # copy's identity, for example to own an approval given with always_approve.
+        set_public_agent(new_agent, get_public_agent(agent))
         seen[id(agent)] = new_agent
     else:
         for field in dataclasses.fields(agent):
