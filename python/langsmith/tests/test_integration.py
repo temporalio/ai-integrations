@@ -35,6 +35,7 @@ from temporalio.client import (
     WorkflowExecutionStatus,
     WorkflowFailureError,
     WorkflowHandle,
+    WorkflowUpdateStage,
 )
 from temporalio.converter import DataConverter, PayloadCodec
 from temporalio.exceptions import ApplicationError
@@ -252,19 +253,27 @@ class LangChainSignalWorkflow:
     """Runs a LangChain runnable whose step waits for a signal.
 
     With ``shared_tracer``, the runnable gets the tracer in
-    ``_shared_tracers``, so run it unsandboxed.
+    ``_shared_tracers``, so run it unsandboxed.  The ``step`` update's step
+    can wait for ``release_step``.
     """
 
     def __init__(self) -> None:
         self._released = False
+        self._step_released = False
 
     @workflow.signal
     def release(self) -> None:
         self._released = True
 
+    @workflow.signal
+    def release_step(self) -> None:
+        self._step_released = True
+
     @workflow.update
-    async def step(self) -> str:
+    async def step(self, wait: bool = False) -> str:
         async def step(text: str) -> str:
+            if wait:
+                await workflow.wait_condition(lambda: self._step_released)
             return text
 
         return await RunnableLambda(step, name="step").ainvoke("update")
@@ -1742,16 +1751,20 @@ class TestReplay:
             "post",
         ]
 
+    @pytest.mark.parametrize("wait", [False, True])
     async def test_update_runs_keep_their_own_ids(
         self,
         client: Client,
         env: WorkflowEnvironment,  # type:ignore[reportUnusedParameter]
+        wait: bool,
     ) -> None:
         """An update's runs don't take the IDs of the run method's runs.
 
         On a worker without the workflow cached, an update right after a first
         workflow task with no commands runs its handler, then the run method
-        again, live in one task.  A replay runs the run method first.
+        again, live in one task.  A replay runs the run method first.  With
+        ``wait``, the update's run stays open into a later task, whose replay
+        must make it again under its own ID for its end to reach it.
         """
         get_runtime_environment()
         langsmith.env.get_langchain_env_var_metadata()
@@ -1791,7 +1804,16 @@ class TestReplay:
                 ):
                     break
                 await asyncio.sleep(0.1)
-            assert await handle.execute_update(LangChainSignalWorkflow.step) == "update"
+            update = await handle.start_update(
+                LangChainSignalWorkflow.step,
+                wait,
+                wait_for_stage=WorkflowUpdateStage.ACCEPTED
+                if wait
+                else WorkflowUpdateStage.COMPLETED,
+            )
+            if wait:
+                await handle.signal(LangChainSignalWorkflow.release_step)
+            assert await update.result() == "update"
             await handle.signal(LangChainSignalWorkflow.release)
             assert await handle.result() == "secret"
 
@@ -1806,6 +1828,20 @@ class TestReplay:
             for name in ("wait", "step")
         }
         assert traces["step"] and not traces["step"] & traces["wait"], traces
+        # Each end goes to a run posted with the same name, trace and parent,
+        # and the update's run gets its end.  Start times, and so dotted
+        # orders, still come from one chain for the workflow.
+        posted = {str(run["id"]): run for run in posts}
+        patches = [run for op, run in writes if op == "patch"]
+        for run in patches:
+            post = posted.get(str(run["id"]))
+            assert post is not None, run
+            for key in ("name", "trace_id", "parent_run_id"):
+                if run.get(key) is not None:
+                    assert str(run[key]) == str(post.get(key)), (key, run, post)
+        steps = {key for key, run in posted.items() if run["name"] == "step"}
+        ended = {str(run["id"]) for run in patches if run.get("end_time")}
+        assert steps and steps <= ended, (steps, writes)
 
     async def test_run_under_header_parent_keeps_start_time(
         self,

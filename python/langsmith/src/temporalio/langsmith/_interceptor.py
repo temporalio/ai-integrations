@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import random
@@ -306,6 +307,17 @@ def _uuid7_from_random(rng: random.Random) -> uuid.UUID:
 # ---------------------------------------------------------------------------
 
 
+# The ID of the update whose handler is running, set by
+# _LangSmithWorkflowInboundInterceptor.  On a worker without the workflow
+# cached, an update right after a first workflow task with no commands runs
+# its handler, then the run method, live in one task, while a replay runs
+# the run method first (temporalio/sdk-python#2080).  An update's runs draw
+# their IDs from generators of its own, which don't depend on that order.
+_update_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "temporal_langsmith_update_id", default=None
+)
+
+
 class _LangChainRuns:
     """Stable IDs for the runs LangChain's tracer makes in one workflow.
 
@@ -317,17 +329,21 @@ class _LangChainRuns:
     ``workflow.now()`` of the task that makes them, so code that Temporal runs
     again live in a later task, such as the run method after an update's
     handler on a worker without the workflow cached, gets new IDs instead of
-    those of other runs.  A run ID the caller chose, such as
-    ``config["run_id"]``, is kept.  Every run's start time comes from
-    ``workflow.now()`` when the run starts, at least 1 microsecond after the
-    run before it, so runs keep the order they started in.  The generator is
-    separate from ``_get_workflow_random`` so the plugin's own run IDs do
-    not change.
+    those of other runs.  Each update handler call draws its IDs from
+    generators of its own, seeded with its update ID (see ``_update_id``).
+    A run ID the caller chose, such as ``config["run_id"]``, is kept.  Every
+    run's start time comes from ``workflow.now()`` when the run starts, at
+    least 1 microsecond after the run before it in the workflow, so runs
+    keep the order they started in.  The generators are separate from
+    ``_get_workflow_random`` so the plugin's own run IDs do not change.
     """
 
     def __init__(self) -> None:
         self._rng = random.Random()
         self._root_rng = random.Random()
+        self._seed = 0
+        # The generators of each update handler call, by update ID.
+        self._update_rngs: dict[str, tuple[random.Random, random.Random]] = {}
         self._ids: dict[str, tuple[uuid.UUID, datetime]] = {}
         self._last_start: datetime | None = None
         # Writes held back during replay, for runs that are still open, with
@@ -339,15 +355,31 @@ class _LangChainRuns:
         ] = {}
 
         def reseed(seed: int) -> None:
+            self._seed = seed
             self._rng.seed(f"temporal-langsmith-langchain-{seed}")
             self._root_rng.seed(f"temporal-langsmith-root-{seed}")
+            self._update_rngs.clear()
 
         reseed(temporalio.workflow.random_seed())
         temporalio.workflow.register_random_seed_callback(reseed)
 
+    def _rngs(self) -> tuple[random.Random, random.Random]:
+        """Get the LangChain and root factory generators to draw from."""
+        update_id = _update_id.get()
+        if update_id is None:
+            return self._rng, self._root_rng
+        rngs = self._update_rngs.get(update_id)
+        if rngs is None:
+            rngs = (
+                random.Random(f"temporal-langsmith-langchain-{self._seed}-{update_id}"),
+                random.Random(f"temporal-langsmith-root-{self._seed}-{update_id}"),
+            )
+            self._update_rngs[update_id] = rngs
+        return rngs
+
     def new_id(self) -> uuid.UUID:
         """Generate a run ID."""
-        return _uuid7_from_random(self._rng)
+        return _uuid7_from_random(self._rngs()[0])
 
     def add(self, run_id: Any, *, start: Any = None) -> uuid.UUID:
         """Give a run, which keeps its ID, a stable start time, once.
@@ -372,7 +404,7 @@ class _LangChainRuns:
         The ID comes from a generator of its own, so ``add_temporal_runs``
         does not change the IDs of LangChain's runs.
         """
-        run_id = self.add(_uuid7_from_random(self._root_rng))
+        run_id = self.add(_uuid7_from_random(self._rngs()[1]))
         return run_id, self._ids[str(run_id)][1]
 
     def start_time(self, run_id: Any) -> datetime:
@@ -1783,8 +1815,19 @@ class _LangSmithWorkflowInboundInterceptor(
     async def handle_update_handler(
         self, input: temporalio.worker.HandleUpdateInput
     ) -> Any:
-        with self._workflow_maybe_run(f"HandleUpdate:{input.update}", input.headers):
-            return await super().handle_update_handler(input)
+        # Before the root factory, whose ID comes from the update's generator.
+        token = _update_id.set(input.id)
+        try:
+            with self._workflow_maybe_run(
+                f"HandleUpdate:{input.update}", input.headers
+            ):
+                return await super().handle_update_handler(input)
+        finally:
+            try:
+                _update_id.reset(token)
+            except ValueError:
+                # A coroutine closed from another context, as at eviction.
+                pass
 
 
 # ---------------------------------------------------------------------------
