@@ -4387,6 +4387,7 @@ class _DelayMayBeOpenCodec(PayloadCodec):
         "session_timed_out",
         "first_connect_fails",
         "first_connect_fails_delayed_heartbeats",
+        "first_connect_fails_close_wait_ends_delayed_heartbeats",
         "shutdown_before_connect_delayed_heartbeats",
         "shutdown_before_connect_ignored",
         "short_heartbeat_timeout",
@@ -4399,6 +4400,10 @@ async def test_stateful_mcp_server_session_retried(
     shutdown_before_connect = case.startswith("shutdown_before_connect")
     delayed_heartbeats = case.endswith("delayed_heartbeats")
     codec = _DelayMayBeOpenCodec()
+    if "close_wait_ends" in case:
+        # The attempt stops waiting for a heartbeat still being encoded before
+        # it finishes, and the failure is encoded after it would.
+        monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 0.5)
     if delayed_heartbeats:
         monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 1.0)
         # Each heartbeat takes longer to encode than the interval, so one is
@@ -4662,13 +4667,19 @@ class _StallReadBackCodec(PayloadCodec):
 
 
 class _StallMayBeOpenCodec(PayloadCodec):
-    """Never finishes encoding the worker's "may be open" heartbeats."""
+    """Never finishes encoding "may be open" heartbeats after the first ``passed``."""
+
+    def __init__(self, passed: int = 0) -> None:
+        self.passed = passed
 
     async def encode(self, payloads: Sequence[Payload]) -> list[Payload]:
         if _encoding_in("_heartbeat_async") and any(
             _mcp._SESSION_MAY_BE_OPEN.encode() in p.data for p in payloads
         ):
-            await asyncio.Event().wait()
+            if self.passed:
+                self.passed -= 1
+            else:
+                await asyncio.Event().wait()
         return list(payloads)
 
     async def decode(self, payloads: Sequence[Payload]) -> list[Payload]:
@@ -4784,11 +4795,24 @@ async def test_stateful_mcp_server_without_describe_permission(
 async def test_stateful_mcp_server_worker_shutdown_while_closing(
     client: Client, monkeypatch: pytest.MonkeyPatch
 ):
-    # Every "may be open" heartbeat hangs in encoding, so the read-back fails at
-    # its deadline and the attempt then waits in close() for those heartbeats.
-    # A worker shutdown during that wait must still let the attempt end.
+    # The first "may be open" heartbeat reaches the server, the later ones hang
+    # in encoding, and the read-back hangs, so the attempt fails at its deadline
+    # and then waits in close() for those heartbeats. A worker shutdown during
+    # that wait must still let the attempt end, with the clear as its last
+    # heartbeat details.
     monkeypatch.setattr(_mcp, "_STORE_TIMEOUT", 2.0)
     monkeypatch.setattr(_mcp, "_CLOSE_TIMEOUT", 60.0)
+    monkeypatch.setattr(_mcp, "_HEARTBEAT_INTERVAL", 0.5)
+    closing = asyncio.Event()
+    close = _mcp._SessionHeartbeats.close
+
+    async def close_and_flag(self: _mcp._SessionHeartbeats) -> None:
+        # close() does not await before its wait, so once this is set, the
+        # attempt waits there.
+        closing.set()
+        await close(self)
+
+    monkeypatch.setattr(_mcp._SessionHeartbeats, "close", close_and_flag)
     provider = StatefulMCPServerProvider(
         "HelloServer", lambda _: get_tracking_server("HelloServer")
     )
@@ -4797,29 +4821,38 @@ async def test_stateful_mcp_server_worker_shutdown_while_closing(
     ) as env:
         config = client.config()
         config["data_converter"] = dataclasses.replace(
-            client.data_converter, payload_codec=_StallMayBeOpenCodec()
+            client.data_converter, payload_codec=_StallMayBeOpenCodec(passed=1)
         )
+        config["interceptors"] = [*config["interceptors"], _StallDescribe()]
         worker_client = env.applied_on_client(Client(**config))
         client = env.applied_on_client(client)
-        worker = new_worker(
+        async with new_worker(
             worker_client, McpServerStatefulRetriedWorkflow, max_cached_workflows=0
-        )
-        worker_task = asyncio.create_task(worker.run())
-        handle = await client.start_workflow(
-            McpServerStatefulRetriedWorkflow.run,
-            args=[timedelta(hours=1), timedelta(seconds=5), None],
-            id=f"mcp-server-shutdown-closing-{uuid.uuid4()}",
-            task_queue=worker.task_queue,
-            execution_timeout=timedelta(seconds=60),
-        )
-        # Past the 2-second deadline, the attempt waits in close().
-        await asyncio.sleep(5)
+        ) as worker:
+            handle = await client.start_workflow(
+                McpServerStatefulRetriedWorkflow.run,
+                args=[timedelta(hours=1), timedelta(seconds=5), None],
+                id=f"mcp-server-shutdown-closing-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=60),
+            )
+            await asyncio.wait_for(closing.wait(), timeout=20)
+            await asyncio.wait_for(worker.shutdown(), timeout=20)
 
-        async def shut_down() -> None:
-            await worker.shutdown()
-            await worker_task
+        # The attempt's failure carried the clear over the first heartbeat, so
+        # its retry may connect.
+        async def retried() -> Any:
+            description = await handle.describe()
+            sessions = [
+                pending
+                for pending in description.raw_description.pending_activities
+                if pending.activity_type.name.endswith("-server-session")
+            ]
+            assert sessions and sessions[0].attempt == 2
+            return sessions[0]
 
-        await asyncio.wait_for(shut_down(), timeout=20)
+        session = await assert_eventually(retried, timeout=timedelta(seconds=20))
+        assert not session.heartbeat_details.payloads
         await handle.terminate()
 
 
