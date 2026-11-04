@@ -247,27 +247,37 @@ export class TemporalMCPClient extends McpClient {
     for (const tool of registry.list()) {
       if (!freed.has(tool.name)) taken.set(normalized(tool.name), tool);
     }
-    const seen = new Map<string, { name: string; server: string }>();
+    const seen = new Map<string, TemporalMCPTool>();
     for (const { client, tools } of listings) {
-      const own = new Map<string, string>();
-      for (const { name } of tools) {
+      const own = new Map<string, TemporalMCPTool>();
+      for (const tool of tools) {
+        const { name } = tool;
         const rejected = rejection(name);
         if (rejected !== undefined) {
-          throw new ToolValidationError(`${rejected}. MCP server '${client.server}' lists '${name}'.`);
+          throw new ToolValidationError(
+            `${rejected}. MCP server ${listedAs(tool)} lists '${name}'. Drop it with the toolFilters of the ` +
+              `server's TemporalMCPClient.`
+          );
         }
         const first = own.get(normalized(name));
         if (first !== undefined) {
-          throw duplicateToolName(name, first, `MCP server '${client.server}' lists ${first === name ? 'it twice' : 'both names'}.`);
+          const both = first.name === name ? 'it twice' : 'both names';
+          throw duplicateToolName(name, first.name, `MCP server '${client.server}' lists ${both}.`);
         }
-        own.set(normalized(name), name);
+        own.set(normalized(name), tool);
         const earlier = seen.get(normalized(name));
-        if (earlier !== undefined) throw duplicateToolName(name, earlier.name, clash(earlier.server, client.server));
+        if (earlier !== undefined) throw duplicateToolName(name, earlier.name, clash(earlier, tool));
         const other = taken.get(normalized(name));
         if (other !== undefined) {
-          throw duplicateToolName(name, other.name, clash(other instanceof TemporalMCPTool ? other.server : undefined, client.server));
+          const source =
+            other instanceof TemporalMCPTool && !client.listed.has(other)
+              ? clash(other, tool)
+              : `MCP server ${listedAs(tool)} lists it, and another tool of the agent has it. Set a prefix (or a ` +
+                `different one) on the server's TemporalMCPClient, or drop '${tool.serverToolName}' with its toolFilters.`;
+          throw duplicateToolName(name, other.name, source);
         }
       }
-      for (const [key, name] of own) seen.set(key, { name, server: client.server });
+      for (const [key, tool] of own) seen.set(key, tool);
     }
     for (const { client, tools } of listings) {
       const names = new Set(tools.map((t) => t.name));
@@ -320,12 +330,18 @@ function normalized(name: string): string {
   return name.replaceAll('-', '_');
 }
 
-// Where two clashing tools come from: `server` lists the new one, and `other` the one the agent has,
-// when another server's.
-function clash(other: string | undefined, server: string): string {
-  return other !== undefined && other !== server
-    ? `MCP servers '${other}' and '${server}' both list it.`
-    : `MCP server '${server}' lists it, and another tool of the agent has it.`;
+// The server that lists `tool`, with the server's own name for it when a prefix renames it.
+function listedAs(tool: TemporalMCPTool): string {
+  return tool.serverToolName === tool.name ? `'${tool.server}'` : `'${tool.server}' (as '${tool.serverToolName}')`;
+}
+
+// Where two clashing MCP tools of two clients come from: `held` is the agent's, and `tool` the new one.
+function clash(held: TemporalMCPTool, tool: TemporalMCPTool): string {
+  return held.server === tool.server
+    ? `The agent has two TemporalMCPClient handles for MCP server '${tool.server}'. Give one a different ` +
+        `prefix, narrow one's toolFilters, or pass only one.`
+    : `MCP servers ${listedAs(held)} and ${listedAs(tool)} both list it. Set a prefix (or a different one) on ` +
+        `one server's TemporalMCPClient, or drop the tool from one with its toolFilters.`;
 }
 
 // Strands' words when its ToolRegistry refuses a name, then where the two tools come from.
