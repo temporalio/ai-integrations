@@ -1829,7 +1829,7 @@ class TestReplay:
             if case != "two":
                 update = await handle.start_update(
                     LangChainSignalWorkflow.step,
-                    case == "open",
+                    args=[case == "open"],
                     wait_for_stage=WorkflowUpdateStage.ACCEPTED
                     if case == "open"
                     else WorkflowUpdateStage.COMPLETED,
