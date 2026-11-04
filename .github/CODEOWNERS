@@ -11,7 +11,7 @@
 /python/mcp/ @brianstrauch @DABH
 /python/openai_agents/ @xumaple @DABH @brianstrauch
 /python/strands_agents/ @brianstrauch @DABH
-/python/typesafe/ @patbeqo @brianstrauch
+/python/typesafe/ @brianstrauch
 
 /typescript/google-adk/ @xumaple @DABH
 /typescript/langsmith/ @xumaple @brianstrauch @patbeqo
