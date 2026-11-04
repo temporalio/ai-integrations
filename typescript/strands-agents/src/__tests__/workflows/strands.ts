@@ -255,11 +255,16 @@ export async function mcpServersAgent(
   prompt: string,
   servers: string[],
   local = false,
-  replace?: [string, number]
+  replace?: [string, number],
+  prefix?: string
 ): Promise<string> {
   const clients = servers.map(
     (server) =>
-      new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds', retry: { maximumAttempts: 1 } } })
+      new TemporalMCPClient({
+        server,
+        prefix,
+        activityOptions: { startToCloseTimeout: '10 seconds', retry: { maximumAttempts: 1 } },
+      })
   );
   const agent = new TemporalAgent({
     model: 'test',
@@ -278,8 +283,32 @@ export async function mcpServersAgent(
   try {
     result = (await agent.invoke(prompt)).toString();
   } catch (err) {
-    result = `refused: ${(err as Error).message}`;
+    const cause = (err as Error).cause as Error | undefined;
+    result = `refused: ${(err as Error).message}${cause ? ` (${cause.message})` : ''}`;
   }
+  const names = agent.toolRegistry
+    .list()
+    .map((t) => t.name)
+    .sort();
+  return `${result} Tools: ${names.join(', ')}.`;
+}
+
+/**
+ * Servers `a` and `b`, told apart with `prefix`. `a` rejects tools whose server name starts with
+ * `cho`; `b` lets through `other` and tools whose server name starts with `ec`, except the one the
+ * agent sees as `b_echo`.
+ */
+export async function mcpPrefixedServersAgent(prompt: string): Promise<string> {
+  const activityOptions = { startToCloseTimeout: '10 seconds' } as const;
+  const a = new TemporalMCPClient({ server: 'a', prefix: 'a', activityOptions, toolFilters: { rejected: [/cho/] } });
+  const b = new TemporalMCPClient({
+    server: 'b',
+    prefix: 'b',
+    activityOptions,
+    toolFilters: { allowed: ['other', /ec/], rejected: [(tool) => tool.name === 'b_echo'] },
+  });
+  const agent = new TemporalAgent({ model: 'test', printer: false, tools: [a, b] });
+  const result = (await agent.invoke(prompt)).toString();
   const names = agent.toolRegistry
     .list()
     .map((t) => t.name)
