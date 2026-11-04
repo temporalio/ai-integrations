@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langsmith import traceable, tracing_context
 
+from temporalio import workflow
 from temporalio.bridge.proto.workflow_activation import (
     RemoveFromCache,
     WorkflowActivation,
@@ -30,7 +31,6 @@ from temporalio.bridge.proto.workflow_completion import (
     Success,
     WorkflowActivationCompletion,
 )
-from temporalio import workflow
 from temporalio.client import Client, WorkflowHandle
 from temporalio.langsmith import LangSmithInterceptor, LangSmithPlugin
 from temporalio.langsmith._interceptor import _activation
