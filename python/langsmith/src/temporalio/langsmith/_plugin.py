@@ -119,11 +119,12 @@ def _mark_ending_evictions(runner: WorkflowRunner) -> WorkflowRunner:
     in ``create_instance`` is set on the copy, while an object it changes in
     place, such as a list it appends to, stays shared with the runner passed
     in.  ``copy.copy`` recurses on a runner that delegates through
-    ``__getattr__``; such a runner that is a dataclass, as a
-    ``SandboxedWorkflowRunner`` subclass is, is rebuilt with
-    ``dataclasses.replace``, which runs its ``__init__``.  A runner whose
-    class can't be subclassed, or that can't be copied otherwise, is wrapped
-    instead.
+    ``__getattr__``.  Such a ``SandboxedWorkflowRunner`` is rebuilt with
+    ``dataclasses.replace``, as the plugin's own restriction change rebuilds
+    it, so it stays one; the rebuilt runner shares only its ``__init__``
+    fields' values, and what its ``__post_init__`` or ``init=False`` fields
+    make is new.  A runner whose class can't be subclassed, or that can't be
+    copied otherwise, is wrapped instead.
     """
     if isinstance(runner, (_MarkingRunner, _Runner)):
         return runner
@@ -131,7 +132,7 @@ def _mark_ending_evictions(runner: WorkflowRunner) -> WorkflowRunner:
         try:
             marked = copy.copy(runner)
         except Exception:
-            if not dataclasses.is_dataclass(runner):
+            if not isinstance(runner, SandboxedWorkflowRunner):
                 raise
             marked = dataclasses.replace(runner)
         object.__setattr__(marked, "__class__", _marking_class(type(runner)))

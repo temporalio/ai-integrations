@@ -357,16 +357,20 @@ class TestEndingEvictions:
             # Marking again changes nothing.
             assert _mark_ending_evictions(runner) is runner
 
-    @pytest.mark.parametrize("kind", ["final", "delegating", "sandboxed_delegating"])
+    @pytest.mark.parametrize(
+        "kind",
+        ["final", "delegating", "dataclass_delegating", "sandboxed_delegating"],
+    )
     def test_runner_that_cannot_be_copied_marked(self, kind: str) -> None:
-        """A runner that ``copy.copy`` can't copy is still marked.
+        """A runner that can't be copied with a subclass is still marked.
 
         A runner whose class can't be subclassed (``final``), or that
-        delegates through ``__getattr__``, on which ``copy.copy`` recurses
-        (``delegating``), is wrapped.  A ``SandboxedWorkflowRunner`` subclass
-        that delegates is a dataclass, rebuilt with ``dataclasses.replace``,
-        so it stays one, and a plugin after this one can still change its
-        restrictions.
+        delegates through ``__getattr__``, on which ``copy.copy`` recurses,
+        even as a dataclass (``delegating``, ``dataclass_delegating``), is
+        wrapped, so the worker uses the runner passed in.  A
+        ``SandboxedWorkflowRunner`` subclass that delegates is rebuilt with
+        ``dataclasses.replace``, so it stays one, and a plugin after this one
+        can still change its restrictions.
         """
 
         class _Final(UnsandboxedWorkflowRunner):
@@ -386,6 +390,14 @@ class TestEndingEvictions:
             def create_instance(self, det: Any) -> WorkflowInstance:
                 return self._inner.create_instance(det)
 
+        @dataclasses.dataclass
+        class _DataclassDelegating(UnsandboxedWorkflowRunner):
+            def __post_init__(self) -> None:
+                self._metrics = types.SimpleNamespace()
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._metrics, name)
+
         @dataclasses.dataclass(frozen=True)
         class _SandboxedDelegating(SandboxedWorkflowRunner):
             def __post_init__(self) -> None:
@@ -394,15 +406,17 @@ class TestEndingEvictions:
             def __getattr__(self, name: str) -> Any:
                 return getattr(self._metrics, name)
 
-        runner = _mark_ending_evictions(
-            {
-                "final": _Final,
-                "delegating": _Delegating,
-                "sandboxed_delegating": _SandboxedDelegating,
-            }[kind]()
-        )
+        given = {
+            "final": _Final,
+            "delegating": _Delegating,
+            "dataclass_delegating": _DataclassDelegating,
+            "sandboxed_delegating": _SandboxedDelegating,
+        }[kind]()
+        runner = _mark_ending_evictions(given)
         base: type[WorkflowRunner] = UnsandboxedWorkflowRunner
-        if kind == "sandboxed_delegating":
+        if kind != "sandboxed_delegating":
+            assert isinstance(runner, _Runner) and runner._runner is given
+        else:
             assert isinstance(runner, _SandboxedDelegating)
             runner = dataclasses.replace(
                 runner,
