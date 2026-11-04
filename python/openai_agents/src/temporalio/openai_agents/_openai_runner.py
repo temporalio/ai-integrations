@@ -3,19 +3,15 @@ import contextlib
 import contextvars
 import dataclasses
 import sys
-import weakref
-from collections.abc import AsyncIterator, Awaitable, Generator
+from collections.abc import AsyncIterator, Generator
 from typing import Any, Callable
 
 from agents import (
     Agent,
     AgentsException,
-    FunctionTool,
-    Handoff,
     ModelProvider,
     MultiProvider,
     RunConfig,
-    RunContextWrapper,
     RunResult,
     RunResultStreaming,
     RunState,
@@ -35,7 +31,6 @@ from temporalio.openai_agents._errors import (
 )
 from temporalio.openai_agents._model_parameters import ModelActivityParameters
 from temporalio.openai_agents._temporal_model_provider import (
-    _current_run_model_settings,
     _TemporalModelProvider,
     capture_scope,
     install_model_provider,
@@ -45,92 +40,6 @@ from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
-
-
-# Recursively replace models in all agents
-def _convert_agent(
-    model_params: ModelActivityParameters,
-    agent: Agent[Any],
-    seen: dict[int, Agent] | None,
-    *,
-    visited: set[int] | None = None,
-) -> Agent[Any]:
-    if seen is None:
-        seen = dict()
-    if visited is None:
-        visited = set()
-
-    new_agent = seen.get(id(agent))
-    if new_agent is not None and id(agent) in visited:
-        return new_agent
-
-    # This agent has already been processed in some other run
-    if isinstance(agent.model, _TemporalModelStub):
-        return agent
-
-    visited.add(id(agent))
-    if new_agent is None:
-        new_agent = dataclasses.replace(agent)
-        seen[id(agent)] = new_agent
-    else:
-        for field in dataclasses.fields(agent):
-            if field.init:
-                setattr(new_agent, field.name, getattr(agent, field.name))
-
-    name = _model_name(agent)
-
-    new_handoffs: list[Agent | Handoff] = []
-    for handoff in agent.handoffs:
-        if isinstance(handoff, Agent):
-            new_handoffs.append(
-                _convert_agent(model_params, handoff, seen, visited=visited)
-            )
-        elif isinstance(handoff, Handoff):
-            original_invoke = handoff.on_invoke_handoff
-
-            # Use default parameter to capture original_invoke by value, not reference
-            async def on_invoke(
-                context: RunContextWrapper[Any],
-                args: str,
-                invoke_func: Callable[
-                    [RunContextWrapper[Any], str], Awaitable[Any]
-                ] = original_invoke,
-            ) -> Agent:
-                handoff_agent = await invoke_func(context, args)
-                return _convert_agent(model_params, handoff_agent, seen)
-
-            new_handoff = dataclasses.replace(handoff, on_invoke_handoff=on_invoke)
-            handoff_agent = (
-                handoff._agent_ref() if handoff._agent_ref is not None else None
-            )
-            if isinstance(handoff_agent, Agent):
-                new_handoff._agent_ref = weakref.ref(
-                    _convert_agent(model_params, handoff_agent, seen, visited=visited)
-                )
-            new_handoffs.append(new_handoff)
-        else:
-            raise TypeError(f"Unknown handoff type: {type(handoff)}")
-
-    new_agent.model = _TemporalModelStub(
-        model_name=name,
-        model_params=model_params,
-        agent=agent,
-        current_run_model_settings=_current_run_model_settings.get,
-    )
-    new_agent.handoffs = new_handoffs
-    new_agent.tools = [
-        dataclasses.replace(
-            tool,
-            _agent_instance=_convert_agent(
-                model_params, tool._agent_instance, seen, visited=visited
-            ),
-        )
-        if isinstance(tool, FunctionTool) and isinstance(tool._agent_instance, Agent)
-        else tool
-        for tool in agent.tools
-    ]
-    return new_agent
-
 
 # True during an agent run, so the Workflow loop runs sync function tools inline.
 _in_agent_run: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -276,7 +185,7 @@ class TemporalOpenAIRunner(AgentRunner):
         self,
         starting_agent: Agent[TContext],
         kwargs: RunOptions[TContext],
-    ) -> tuple[Agent[Any], RunConfig]:
+    ) -> RunConfig:
         """Workflow-only validation and ``kwargs`` rewrite shared by ``run()`` and ``run_streamed()``."""
         for t in starting_agent.tools:
             if callable(t):
@@ -382,7 +291,7 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         kwargs["run_config"] = run_config
-        return _convert_agent(self.model_params, starting_agent, None), run_config
+        return run_config
 
     async def run(
         self,
@@ -398,12 +307,12 @@ class TemporalOpenAIRunner(AgentRunner):
                 **kwargs,
             )
 
-        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
         with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             try:
                 return await self._runner.run(
-                    starting_agent=converted_agent,
+                    starting_agent=starting_agent,
                     input=input,
                     **kwargs,
                 )
@@ -470,13 +379,13 @@ class TemporalOpenAIRunner(AgentRunner):
                 "heartbeats or the workflow stream signal channel)."
             )
 
-        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
         with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             streamed_result = self._runner.run_streamed(
-                starting_agent=converted_agent,
+                starting_agent=starting_agent,
                 input=input,
                 **kwargs,
             )
@@ -539,12 +448,3 @@ def _reraise_workflow_failure(e: AgentsException) -> None:
         )
         reraise.__traceback__ = e.__traceback__
         raise reraise from e.__cause__
-
-
-def _model_name(agent: Agent[Any]) -> str | None:
-    name = agent.model
-    if name is not None and not isinstance(name, str):
-        raise ValueError(
-            "Temporal workflows require a model name to be a string in the agent."
-        )
-    return name
