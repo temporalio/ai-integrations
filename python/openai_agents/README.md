@@ -376,6 +376,7 @@ class WeatherAgent:
         return result.final_output
 ```
 
+When a tool's activity fails, the `AgentsWorkflowError`'s `__cause__` is that tool's `ActivityError`.
 `RetryState.NON_RETRYABLE_FAILURE` covers an error raised with `non_retryable=True` and one whose type is in the activity retry policy's `non_retryable_error_types`.
 The `failure_error_function` of `activity_as_tool()` does not change any of this: it only formats the error returned to the model when the tool's arguments are invalid.
 
