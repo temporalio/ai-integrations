@@ -671,7 +671,8 @@ Some consequences:
   the queue with its server until its worker cancels it, so the refused block's
   own operations, and a recovery block's, can still reach that server. Don't
   open two blocks with the same name at the same time: one block's operations
-  can then fail with `DedicatedWorkerFailure`, or both blocks use one server.
+  can then fail with an `ActivityError` whose cause is `DedicatedWorkerFailure`,
+  or both blocks use one server.
 
 Only the session activity's worker serves the server's operations. An operation
 whose `config` has a `schedule_to_start_timeout`, as the default `config` does,
