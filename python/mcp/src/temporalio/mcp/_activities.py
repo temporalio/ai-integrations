@@ -2,10 +2,11 @@
 
 import asyncio
 import logging
+import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from mcp import MCPError
 from mcp.types import (
@@ -35,6 +36,9 @@ from temporalio.mcp._activity import (
 )
 from temporalio.mcp._backend import _MCPBackend, _MCPBackendFactory
 from temporalio.mcp._pool import _MCPConnectionPool
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup  # type: ignore[reportUnreachable]
 
 _Result = TypeVar("_Result")
 _ListResult = TypeVar("_ListResult", bound=BaseModel)
@@ -72,6 +76,29 @@ def _session_lost(err: MCPError) -> bool:
         err.code == INVALID_REQUEST
         and err.data is None
         and err.message in _SESSION_LOST_MESSAGES
+    )
+
+
+def _lone_mcp_error(group: BaseExceptionGroup[Any]) -> MCPError | None:
+    """The MCPError that a nest of ExceptionGroups carries alone, if it does."""
+    while len(group.exceptions) == 1:
+        (inner,) = group.exceptions
+        if isinstance(inner, MCPError):
+            return inner
+        if not isinstance(inner, BaseExceptionGroup):
+            return None
+        group = cast(BaseExceptionGroup[Any], inner)
+    return None
+
+
+def _protocol_error(err: MCPError, has_session: bool) -> ApplicationError:
+    details = (err.code,) if err.data is None else (err.code, err.data)
+    session_lost = has_session and _session_lost(err)
+    return ApplicationError(
+        err.message,
+        *details,
+        type="MCPProtocolError",
+        non_retryable=err.code in _NON_RETRYABLE_PROTOCOL_ERRORS and not session_lost,
     )
 
 
@@ -123,15 +150,15 @@ class _MCPActivities:
                 has_session = not backend.cacheable
                 return await operation(backend)
         except MCPError as err:
-            details = (err.code,) if err.data is None else (err.code, err.data)
-            session_lost = has_session and _session_lost(err)
-            raise ApplicationError(
-                err.message,
-                *details,
-                type="MCPProtocolError",
-                non_retryable=err.code in _NON_RETRYABLE_PROTOCOL_ERRORS
-                and not session_lost,
-            ) from err
+            raise _protocol_error(err, has_session) from err
+        except BaseExceptionGroup as group:
+            # ``Client.__aexit__`` re-raises an error from the ``async with`` body
+            # wrapped in task-group ExceptionGroups, which a factory argument or a
+            # failed connect lets through.
+            mcp_error = _lone_mcp_error(group)
+            if mcp_error is None:
+                raise
+            raise _protocol_error(mcp_error, has_session) from mcp_error
         except ValidationError as err:
             raise ApplicationError(
                 "MCP server returned an invalid response",

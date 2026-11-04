@@ -203,6 +203,34 @@ async def test_repeated_pagination_cursor_fails_without_retry() -> None:
     assert err.value.non_retryable is True
 
 
+async def test_protocol_error_wrapped_in_exception_group_fails_without_retry() -> None:
+    # A client built from a factory argument is closed inside the operation, and
+    # Client.__aexit__ re-raises the MCPError wrapped in ExceptionGroups.
+    server = MCPServer("resources")
+
+    @server.resource("test://known", name="known")
+    def known_resource() -> str:  # type: ignore[reportUnusedFunction]
+        return "known"
+
+    support = _MCPActivities(
+        {"test": lambda argument: _MCPClientBackend(Client(server))},
+        idle_timeout=timedelta(minutes=5),
+    )
+    read_resource = _activity_by_name(
+        support,
+        "temporalio.mcp.test.read-resource",
+    )
+    try:
+        with pytest.raises(ApplicationError, match="Unknown resource") as err:
+            await read_resource({"factory_argument": "acme", "uri": "test://unknown"})
+    finally:
+        await support._pool.close()
+
+    assert err.value.type == "MCPProtocolError"
+    assert err.value.non_retryable is True
+    assert err.value.details == (INVALID_PARAMS, {"uri": "test://unknown"})
+
+
 async def test_unknown_resource_protocol_error_fails_without_retry() -> None:
     server = MCPServer("resources")
 
