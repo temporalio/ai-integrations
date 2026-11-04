@@ -2,17 +2,52 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.metadata
+import threading
+import types
 import uuid
-from typing import Any
-from unittest.mock import MagicMock
+from collections.abc import Callable
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
 
 import pytest
 from langsmith import traceable, tracing_context
 
+from temporalio import workflow
+from temporalio.bridge.proto.workflow_activation import (
+    RemoveFromCache,
+    WorkflowActivation,
+    WorkflowActivationJob,
+)
+from temporalio.bridge.proto.workflow_commands import (
+    CancelWorkflowExecution,
+    CompleteWorkflowExecution,
+    ContinueAsNewWorkflowExecution,
+    FailWorkflowExecution,
+    WorkflowCommand,
+)
+from temporalio.bridge.proto.workflow_completion import (
+    Failure,
+    Success,
+    WorkflowActivationCompletion,
+)
 from temporalio.client import Client, WorkflowHandle
 from temporalio.langsmith import LangSmithInterceptor, LangSmithPlugin
+from temporalio.langsmith._interceptor import _activation
+from temporalio.langsmith._plugin import (
+    _EndingEvictionInstance,
+    _mark_ending_evictions,
+    _Runner,
+)
 from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import (
+    UnsandboxedWorkflowRunner,
+    WorkerConfig,
+    WorkflowInstance,
+    WorkflowRunner,
+)
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 from tests.helpers import new_worker
 from tests.helpers.langsmith import (
     build_trace_trees,
@@ -56,6 +91,388 @@ class TestPluginConstruction:
     def test_reports_package_version(self) -> None:
         plugin = LangSmithPlugin(client=MagicMock())
         assert plugin.version() == importlib.metadata.version("temporalio-langsmith")
+
+
+@workflow.defn(sandboxed=False)
+class _UnsandboxedMarkWorkflow:
+    """Returns whether its first activation was marked.
+
+    A runner of the plugin's marks every activation.  Without one,
+    ``_watch_activations`` marks them from the second on.
+    """
+
+    @workflow.run
+    async def run(self) -> bool:
+        return _activation.marked
+
+
+class TestEndingEvictions:
+    """The eviction after a workflow ends is marked, and no other."""
+
+    def test_marked_after_workflow_ends(self) -> None:
+        """Only an eviction after an accepted, not replayed, ending task is marked."""
+        marked: list[bool] = []
+        completions: list[WorkflowActivationCompletion] = []
+
+        def activate(act: WorkflowActivation) -> WorkflowActivationCompletion:
+            assert _activation.marked
+            marked.append(_activation.ending_run_id == act.run_id)
+            return completions.pop(0)
+
+        # Completions are made per case: the worker can change one after
+        # ``activate`` returns it.
+        def ends() -> WorkflowActivationCompletion:
+            return ends_with(
+                WorkflowCommand(complete_workflow_execution=CompleteWorkflowExecution())
+            )()
+
+        def ends_with(
+            command: WorkflowCommand,
+        ) -> Callable[[], WorkflowActivationCompletion]:
+            return lambda: WorkflowActivationCompletion(
+                successful=Success(commands=[command])
+            )
+
+        def waits() -> WorkflowActivationCompletion:
+            return WorkflowActivationCompletion(successful=Success())
+
+        def fails() -> WorkflowActivationCompletion:
+            return WorkflowActivationCompletion(failed=Failure())
+
+        # What the worker does with a completion once ``activate`` has
+        # returned it: it sends it, or fails it there if encoding its payloads
+        # fails.  After a deadlock it sends another completion instead.
+        def sent(completion: WorkflowActivationCompletion) -> None:
+            completion.run_id = "run"
+
+        def encoding_fails(completion: WorkflowActivationCompletion) -> None:
+            sent(completion)
+            completion.failed.failure.message = "Failed encoding completion"
+
+        def not_sent(_: WorkflowActivationCompletion) -> None:
+            pass
+
+        def task(replaying: bool = False) -> WorkflowActivation:
+            return WorkflowActivation(run_id="run", is_replaying=replaying)
+
+        def eviction(reason: Any) -> WorkflowActivation:
+            job = WorkflowActivationJob(
+                remove_from_cache=RemoveFromCache(reason=reason)
+            )
+            return WorkflowActivation(run_id="run", is_replaying=True, jobs=[job])
+
+        reasons = RemoveFromCache.EvictionReason
+        fail = WorkflowCommand(fail_workflow_execution=FailWorkflowExecution())
+        cancel = WorkflowCommand(cancel_workflow_execution=CancelWorkflowExecution())
+        continue_as_new = WorkflowCommand(
+            continue_as_new_workflow_execution=ContinueAsNewWorkflowExecution()
+        )
+        cases: list[
+            tuple[
+                list[
+                    tuple[
+                        WorkflowActivation,
+                        Callable[[], WorkflowActivationCompletion],
+                        Callable[[WorkflowActivationCompletion], None],
+                    ]
+                ],
+                Any,
+                bool,
+            ]
+        ] = [
+            # The workflow ends; Core evicts it, from a full cache or not.
+            ([(task(), ends, sent)], reasons.WORKFLOW_EXECUTION_ENDING, True),
+            ([(task(), ends, sent)], reasons.CACHE_FULL, True),
+            # It fails, is cancelled or continues as new.
+            ([(task(), ends_with(fail), sent)], reasons.CACHE_FULL, True),
+            ([(task(), ends_with(cancel), sent)], reasons.CACHE_FULL, True),
+            ([(task(), ends_with(continue_as_new), sent)], reasons.CACHE_FULL, True),
+            # The task that would end it fails, as when its result can't be
+            # serialized, or after a signal handler failed the workflow.  With
+            # no room in the cache, Core gives the eviction after it as full.
+            ([(task(), fails, sent)], reasons.LANG_FAIL, False),
+            ([(task(), fails, sent)], reasons.CACHE_FULL, False),
+            (
+                [(task(), ends, sent), (task(), fails, sent)],
+                reasons.CACHE_FULL,
+                False,
+            ),
+            # Encoding the completion fails, as when a payload codec raises,
+            # after the instance returned it: the ending one, or a later one.
+            ([(task(), ends, encoding_fails)], reasons.CACHE_FULL, False),
+            ([(task(), ends, encoding_fails)], reasons.LANG_FAIL, False),
+            (
+                [(task(), ends, sent), (task(), waits, encoding_fails)],
+                reasons.CACHE_FULL,
+                False,
+            ),
+            (
+                [(task(), ends, sent), (task(), waits, sent)],
+                reasons.CACHE_FULL,
+                True,
+            ),
+            # The activation that would end it deadlocks, and returns later,
+            # or a later one does.
+            ([(task(), ends, not_sent)], reasons.CACHE_FULL, False),
+            (
+                [(task(), ends, sent), (task(), waits, not_sent)],
+                reasons.CACHE_FULL,
+                False,
+            ),
+            # The server rejects the completion.
+            ([(task(), ends, sent)], reasons.UNHANDLED_COMMAND, False),
+            # A replayed end, as in the replayer, and no end.
+            ([(task(replaying=True), ends, sent)], reasons.CACHE_FULL, False),
+            ([(task(), waits, sent)], reasons.CACHE_FULL, False),
+        ]
+        for tasks, reason, expected in cases:
+            inner = MagicMock(spec=WorkflowInstance)
+            inner.activate.side_effect = activate
+            instance = _EndingEvictionInstance(inner)
+            completions[:] = [make() for _, make, _ in tasks] + [waits()]
+            del marked[:]
+            for act, _, change in tasks:
+                change(instance.activate(act))
+            instance.activate(eviction(reason))
+            assert marked == [False] * len(tasks) + [expected], (tasks, reason)
+            assert not _activation.marked and _activation.ending_run_id is None
+
+    def test_mark_is_the_activations_own(self) -> None:
+        """Another activation of the same workflow doesn't change the mark.
+
+        While the eviction after the workflow ended is between end writes,
+        another activation of the same run, as in a replay with the plugin,
+        starts and returns in another thread.
+        """
+        evicting, replayed = threading.Event(), threading.Event()
+        seen: list[str | None] = []
+
+        def ends() -> WorkflowActivationCompletion:
+            return WorkflowActivationCompletion(
+                successful=Success(
+                    commands=[
+                        WorkflowCommand(
+                            complete_workflow_execution=CompleteWorkflowExecution()
+                        )
+                    ]
+                )
+            )
+
+        def activate_live(act: WorkflowActivation) -> WorkflowActivationCompletion:
+            if not act.jobs:
+                return ends()
+            seen.append(_activation.ending_run_id)
+            evicting.set()
+            assert replayed.wait(10)
+            seen.append(_activation.ending_run_id)
+            return WorkflowActivationCompletion(successful=Success())
+
+        live_inner = MagicMock(spec=WorkflowInstance)
+        live_inner.activate.side_effect = activate_live
+        live = _EndingEvictionInstance(live_inner)
+        replay_inner = MagicMock(spec=WorkflowInstance)
+        replay_inner.activate.side_effect = lambda _: ends()
+        replay = _EndingEvictionInstance(replay_inner)
+
+        live.activate(WorkflowActivation(run_id="run")).run_id = "run"
+        job = WorkflowActivationJob(
+            remove_from_cache=RemoveFromCache(
+                reason=RemoveFromCache.EvictionReason.CACHE_FULL
+            )
+        )
+        eviction = threading.Thread(
+            target=live.activate,
+            args=(WorkflowActivation(run_id="run", is_replaying=True, jobs=[job]),),
+        )
+        eviction.start()
+        try:
+            assert evicting.wait(10)
+            replay.activate(WorkflowActivation(run_id="run", is_replaying=True))
+        finally:
+            replayed.set()
+            eviction.join(10)
+        assert seen == ["run", "run"]
+        assert not _activation.marked and _activation.ending_run_id is None
+
+    @pytest.mark.parametrize("subclassed", [False, True])
+    def test_runners_marked(self, subclassed: bool) -> None:
+        """Both of a worker's runners mark ending evictions.
+
+        Each keeps its class's behavior and stays an instance of it, so a
+        plugin after this one can still change a ``SandboxedWorkflowRunner``'s
+        restrictions.  With ``subclassed``, the runners are subclasses that
+        make their own instances.
+        """
+        made: list[WorkflowInstance] = []
+
+        class _Sandboxed(SandboxedWorkflowRunner):
+            def create_instance(self, det: Any) -> WorkflowInstance:
+                made.append(MagicMock(spec=WorkflowInstance))
+                return made[-1]
+
+        class _Unsandboxed(UnsandboxedWorkflowRunner):
+            def create_instance(self, det: Any) -> WorkflowInstance:
+                made.append(MagicMock(spec=WorkflowInstance))
+                return made[-1]
+
+        client = MagicMock()
+        client.config.return_value = {}
+        config = LangSmithPlugin(client=MagicMock()).configure_worker(
+            WorkerConfig(
+                client=cast(Client, client),
+                workflow_runner=_Sandboxed()
+                if subclassed
+                else SandboxedWorkflowRunner(),
+                unsandboxed_workflow_runner=(
+                    _Unsandboxed() if subclassed else UnsandboxedWorkflowRunner()
+                ),
+            )
+        )
+        sandboxed = config.get("workflow_runner")
+        assert isinstance(
+            sandboxed, _Sandboxed if subclassed else SandboxedWorkflowRunner
+        )
+        assert "langsmith" in sandboxed.restrictions.passthrough_modules
+        sandboxed = dataclasses.replace(
+            sandboxed,
+            restrictions=sandboxed.restrictions.with_passthrough_modules("other"),
+        )
+        unsandboxed = config.get("unsandboxed_workflow_runner")
+        assert isinstance(
+            unsandboxed, _Unsandboxed if subclassed else UnsandboxedWorkflowRunner
+        )
+        for runner, base in (
+            (sandboxed, SandboxedWorkflowRunner),
+            (unsandboxed, UnsandboxedWorkflowRunner),
+        ):
+            if subclassed:
+                instance = runner.create_instance(MagicMock())
+                inner = made[-1]
+            else:
+                with patch.object(base, "create_instance") as create_instance:
+                    instance = runner.create_instance(MagicMock())
+                inner = create_instance.return_value
+            assert isinstance(instance, _EndingEvictionInstance), runner
+            assert instance._instance is inner, runner
+            # Marking again changes nothing.
+            assert _mark_ending_evictions(runner) is runner
+
+    @pytest.mark.parametrize(
+        "kind",
+        ["final", "delegating", "dataclass_delegating", "sandboxed_delegating"],
+    )
+    def test_runner_that_cannot_be_copied_marked(self, kind: str) -> None:
+        """A runner that can't be copied with a subclass is still marked.
+
+        A runner whose class can't be subclassed (``final``), or that
+        delegates through ``__getattr__``, on which ``copy.copy`` recurses,
+        even as a dataclass (``delegating``, ``dataclass_delegating``), is
+        wrapped, so the worker uses the runner passed in.  A
+        ``SandboxedWorkflowRunner`` subclass that delegates is rebuilt with
+        ``dataclasses.replace``, so it stays one, and a plugin after this one
+        can still change its restrictions.
+        """
+
+        class _Final(UnsandboxedWorkflowRunner):
+            def __init_subclass__(cls, **kwargs: Any) -> None:
+                raise TypeError("final")
+
+        class _Delegating(WorkflowRunner):
+            def __init__(self) -> None:
+                self._inner = UnsandboxedWorkflowRunner()
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            def prepare_workflow(self, defn: Any) -> None:
+                self._inner.prepare_workflow(defn)
+
+            def create_instance(self, det: Any) -> WorkflowInstance:
+                return self._inner.create_instance(det)
+
+        @dataclasses.dataclass
+        class _DataclassDelegating(UnsandboxedWorkflowRunner):
+            def __post_init__(self) -> None:
+                self._metrics = types.SimpleNamespace()
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._metrics, name)
+
+        @dataclasses.dataclass(frozen=True)
+        class _SandboxedDelegating(SandboxedWorkflowRunner):
+            def __post_init__(self) -> None:
+                object.__setattr__(self, "_metrics", types.SimpleNamespace())
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._metrics, name)
+
+        makers: dict[str, Callable[[], WorkflowRunner]] = {
+            "final": _Final,
+            "delegating": _Delegating,
+            "dataclass_delegating": _DataclassDelegating,
+            "sandboxed_delegating": _SandboxedDelegating,
+        }
+        given = makers[kind]()
+        runner = _mark_ending_evictions(given)
+        base: type[WorkflowRunner] = UnsandboxedWorkflowRunner
+        if kind != "sandboxed_delegating":
+            assert isinstance(runner, _Runner) and runner._runner is given
+        else:
+            assert isinstance(runner, _SandboxedDelegating)
+            runner = dataclasses.replace(
+                runner,
+                restrictions=runner.restrictions.with_passthrough_modules("other"),
+            )
+            assert "other" in runner.restrictions.passthrough_modules
+            base = SandboxedWorkflowRunner
+        with patch.object(base, "create_instance") as create_instance:
+            instance = runner.create_instance(MagicMock())
+        assert isinstance(instance, _EndingEvictionInstance)
+        assert instance._instance is create_instance.return_value
+
+    def test_wrappers_forward(self) -> None:
+        """The wrapping runner and instance pass every call to what they wrap."""
+        inner_runner = MagicMock(spec=WorkflowRunner)
+        runner = _Runner(inner_runner)
+        defn, det, failure_types = MagicMock(), MagicMock(), [ValueError]
+        runner.prepare_workflow(defn)
+        inner_runner.prepare_workflow.assert_called_once_with(defn)
+        runner.set_worker_level_failure_exception_types(failure_types)
+        inner_runner.set_worker_level_failure_exception_types.assert_called_once_with(
+            failure_types
+        )
+        instance = runner.create_instance(det)
+        inner_runner.create_instance.assert_called_once_with(det)
+        assert isinstance(instance, _EndingEvictionInstance)
+        assert instance._instance is inner_runner.create_instance.return_value
+
+        inner = MagicMock(spec=WorkflowInstance)
+        instance = _EndingEvictionInstance(inner)
+        command_info = MagicMock()
+        assert (
+            instance.get_serialization_context(command_info)
+            is inner.get_serialization_context.return_value
+        )
+        inner.get_serialization_context.assert_called_once_with(command_info)
+        assert (
+            instance.get_external_store_context(command_info)
+            is inner.get_external_store_context.return_value
+        )
+        inner.get_external_store_context.assert_called_once_with(command_info)
+        assert instance.get_info() is inner.get_info.return_value
+        assert instance.get_thread_id() is inner.get_thread_id.return_value
+
+    async def test_unsandboxed_workflow_marked(self, client: Client) -> None:
+        """A workflow not sandboxed runs on the plugin's runner from the start."""
+        config = client.config()
+        config["plugins"] = [LangSmithPlugin(client=MagicMock())]
+        temporal_client = Client(**config)
+        async with new_worker(temporal_client, _UnsandboxedMarkWorkflow) as worker:
+            assert await temporal_client.execute_workflow(
+                _UnsandboxedMarkWorkflow.run,
+                id=f"marked-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+            )
 
 
 class TestPluginIntegration:
