@@ -1,5 +1,5 @@
 from collections.abc import AsyncGenerator, Callable, Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
@@ -16,6 +16,7 @@ import temporalio.workflow
 from temporalio import activity, workflow
 from temporalio.contrib.workflow_streams import WorkflowStreamClient
 from temporalio.exceptions import ApplicationError
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.workflow import ActivityConfig
 
 
@@ -49,6 +50,35 @@ def _classify_model_errors() -> Generator[None, None, None]:
             type=type(err).__name__,
             non_retryable=not _is_retryable_status(status),
         ) from err
+
+
+def _stream_publish_error(err: Exception, model: str, topic: str) -> ApplicationError:
+    """Fail a streaming call whose responses did not all reach the topic.
+
+    A retry calls the model again, so the error is non-retryable when the retry
+    would fail the same way: the server refused the batch as invalid (over the
+    payload size limit, or past the run's Signal limit), or the batch is over the
+    server's gRPC message limit. Other failures, such as a server outage, stay
+    retryable. The Go and Java Google ADK plugins use the same type.
+
+    Unlike Go and TypeScript, the stream client's ``TimeoutError`` after its max
+    retry duration stays retryable: the Python client stops at a refused batch
+    at once and raises its ``RPCError``, so a ``TimeoutError`` means the server
+    was down or rate limiting for that long. Revisit this if a later client
+    retries refused batches too.
+    """
+    non_retryable = isinstance(err, RPCError) and (
+        err.status == RPCStatusCode.INVALID_ARGUMENT
+        or (
+            err.status == RPCStatusCode.RESOURCE_EXHAUSTED
+            and "larger than max" in err.message
+        )
+    )
+    return ApplicationError(
+        f"model {model!r}: publish streamed responses to topic {topic!r}: {err}",
+        type="googleadk.StreamError",
+        non_retryable=non_retryable,
+    )
 
 
 def _new_llm(llm_request: LlmRequest, model_name: str | None) -> BaseLlm:
@@ -155,6 +185,10 @@ async def invoke_model_streaming(
     Each response is also published to the workflow's stream on
     ``streaming_topic`` so external consumers (UIs, tracing, etc.)
     can observe responses as they arrive.
+
+    Raises:
+        ApplicationError: Of type ``googleadk.StreamError``, if the responses
+            could not all be published.
     """
     llm_request = input.llm_request
     llm = _new_llm(llm_request, input.model_name)
@@ -165,14 +199,27 @@ async def invoke_model_streaming(
         batch_interval=input.streaming_batch_interval,
     )
     events = stream.topic(input.streaming_topic, type=LlmResponse)
-    with _classify_model_errors():
-        async with stream:
+    # The stream's exit sends the last batch, and raises the error of a batch the
+    # background flush failed to send. Either way subscribers did not get every
+    # response, so the call fails instead of returning as if they had.
+    # A model error, or the Activity's cancellation, stays the call's error.
+    await stream.__aenter__()
+    try:
+        with _classify_model_errors():
             async for response in llm.generate_content_async(
                 llm_request=llm_request, stream=True
             ):
                 activity.heartbeat()
                 responses.append(response)
                 events.publish(response)
+    except BaseException:
+        with suppress(Exception):
+            await stream.__aexit__(None, None, None)
+        raise
+    try:
+        await stream.__aexit__(None, None, None)
+    except Exception as err:
+        raise _stream_publish_error(err, llm.model, input.streaming_topic) from err
 
     return responses
 
@@ -249,8 +296,27 @@ class TemporalModel(BaseLlm):
                 an activity. The workflow must host a
                 :class:`temporalio.contrib.workflow_streams.WorkflowStream`
                 to receive the publishes; otherwise the signals are
-                unhandled and dropped. Streaming support is
-                experimental and may change in future versions.
+                unhandled and dropped. If the chunks cannot all be
+                published, the model activity fails with a
+                ``googleadk.StreamError`` ``ApplicationError``. In the
+                Workflow, ``runner.run_async`` raises it as an
+                ``ActivityError`` caused by that ``ApplicationError``,
+                so ``try``/``except`` around the run catches it. It is
+                non-retryable when a retry would call the model again
+                and fail the same way: for a batch over the server's
+                size limits (2 MiB per payload and 4 MiB per gRPC
+                message by default), configure external storage on the
+                Worker's Client and on every subscriber's Client, or
+                keep responses smaller. For a run past its Signal limit
+                (each batch is one Signal; a run accepts 10,000 by
+                default, counting the Workflow's other Signals),
+                continue-as-new well before that, or use a longer
+                ``streaming_batch_interval``. Other failures, such as a
+                server outage, are retried, even one that outlasts the
+                stream client's 10-minute retry limit; the retry calls
+                the model again and publishes its stream again.
+                Streaming support is experimental and may change in
+                future versions.
             streaming_batch_interval: Interval between automatic
                 flushes for the stream publisher used by the streaming
                 activity. Streaming support is experimental and may
