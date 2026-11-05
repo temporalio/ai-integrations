@@ -42,8 +42,8 @@ from temporalio.exceptions import ApplicationError, ApplicationErrorCategory
 def _env_destination(client: langsmith.Client) -> dict[str, Any] | None:
     """Return the destination LangSmith's env defaults name, or None.
 
-    The env defaults are ``LANGSMITH_PROJECT``, and on LangSmith versions with
-    agent addresses, ``LANGSMITH_AGENT_ID`` and ``LANGSMITH_AGENT_ENVIRONMENT``.
+    The env defaults are ``LANGSMITH_PROJECT``, ``LANGSMITH_AGENT_ID`` and
+    ``LANGSMITH_AGENT_ENVIRONMENT``.
     The probe is a LangSmith ``RunTree`` that names no destination, so the
     installed version's own rules pick one; it is never posted. LangSmith
     raises ``EnvAddressError``, a ``LangSmithUserError``, for an env it can't
@@ -55,8 +55,7 @@ def _env_destination(client: langsmith.Client) -> dict[str, Any] | None:
         return None
     if probe.session_name:
         return {"project_name": probe.session_name}
-    address = getattr(probe, "address", None)
-    return {"address": address} if address is not None else None
+    return {"address": probe.address} if probe.address is not None else None
 
 
 # Used by _log_future_exception, which runs on the executor thread, and by
@@ -779,6 +778,11 @@ def _replay_safe_tracer(start_trace: Callable[..., Any]) -> Callable[..., Any]:
         if runs is not None:
             run.ls_client = _replay_safe_client(self.client)
             run.start_time = runs.start_time(run.id)
+            # Honor explicit context replicas before wrapping their clients;
+            # LangChain may have copied the parent's replicas instead.
+            replicas = get_tracing_context()["replicas"]
+            if replicas is not None:
+                run.replicas = replicas
             _replay_safe_replicas(run)
         start_trace(self, run)
 
@@ -945,7 +949,7 @@ def _write_held(client: Any, write: _HeldWrite) -> None:
     op, run, auth = write
     if op not in ("post", "patch"):
         getattr(client, op)(**run)
-    elif getattr(client, "_process_buffered_run_ops", None):
+    elif client._process_buffered_run_ops:
         with client._run_ops_buffer_lock:
             client._run_ops_buffer.append(write)
             if client._should_flush_run_ops_buffer():
@@ -1254,9 +1258,8 @@ class _ReplaySafeRunTree(RunTree):
     def patch(self, *, exclude_inputs: bool | None = None) -> None:
         """Patch the run to LangSmith, skipping during replay.
 
-        ``exclude_inputs`` is forwarded untouched so LangSmith's own default
-        applies (a plain ``False`` before 0.11; the
-        ``LANGSMITH_EXCLUDE_INPUTS_ON_PATCH`` setting from 0.11 on).
+        ``exclude_inputs`` is forwarded untouched so LangSmith's
+        ``LANGSMITH_EXCLUDE_INPUTS_ON_PATCH`` default applies.
         """
         if temporalio.workflow.in_workflow():
             if _is_replaying():
@@ -1345,7 +1348,7 @@ class _RootReplaySafeRunTreeFactory(_ReplaySafeRunTree):
         # Inherit ls_client and the destination from factory; both must be
         # passed at construction time.
         kwargs.setdefault("ls_client", self._run.ls_client)
-        address = getattr(self._run, "address", None)
+        address = self._run.address
         if address is not None:
             kwargs.setdefault("address", address)
         else:
@@ -1458,7 +1461,7 @@ def _maybe_run(
     if parent is not None:
         # RunTree(parent_run=...) inherits IDs but not the destination.
         run_tree_args["project_name"] = parent.session_name
-        run_tree_args["address"] = getattr(parent, "address", None)
+        run_tree_args["address"] = parent.address
         run_tree_args["parent_run"] = parent
     elif destination is not None:
         run_tree_args.update(destination)

@@ -13,10 +13,9 @@ from collections import Counter
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timedelta
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import langsmith
-import langsmith._internal._uuid as ls_uuid
 import langsmith.env
 import nexusrpc.handler
 import pytest
@@ -26,7 +25,6 @@ from langchain_core.runnables import RunnableGenerator, RunnableLambda
 from langchain_core.tracers.langchain import LangChainTracer
 from langsmith import traceable, tracing_context
 from langsmith.run_helpers import get_tracing_context
-from langsmith.run_trees import WriteReplica
 
 from temporalio import activity, common, nexus, workflow
 from temporalio.api.common.v1 import Payload
@@ -765,22 +763,6 @@ def _make_client_and_collector(
     return Client(**config), collector, mock_ls_client
 
 
-def _replica_ids_are_pure() -> bool:
-    """Whether LangSmith derives a replica's run IDs from the run's alone.
-
-    Earlier releases add the clock to an ID derived from one that is not a
-    UUIDv7, so a run's post and patch to a replica name different runs, with
-    or without a replay.
-    """
-    clock = MagicMock()
-    clock.time_ns.side_effect = [1_000_000_000, 2_000_000_000]
-    run_id = uuid.uuid4()
-    with patch.object(ls_uuid, "time", clock, create=True):
-        return ls_uuid.uuid7_deterministic(
-            run_id, "copy"
-        ) == ls_uuid.uuid7_deterministic(run_id, "copy")
-
-
 def _make_temporal_client(
     client: Client, mock_ls_client: MagicMock, **kwargs: Any
 ) -> Client:
@@ -970,10 +952,6 @@ class TestReplay:
         So does a write replica with a client of its own, and a client that
         cannot be hashed, through a tracer of the workflow's own.
         """
-        if variant == "replica" and "client" not in WriteReplica.__annotations__:
-            pytest.skip("This LangSmith has no write replicas with a client")
-        if variant.endswith("replica") and not _replica_ids_are_pure():
-            pytest.skip("This LangSmith derives replica run IDs from the clock")
         get_runtime_environment()
         # The client's first post reads git metadata in a subprocess; read it
         # here so it does not stall the workflow past the deadlock timeout.

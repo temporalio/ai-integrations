@@ -15,6 +15,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.runnables import RunnableLambda
+from langsmith import tracing_context
+from langsmith.run_trees import RunTree, WriteReplica
 
 from temporalio.api.common.v1 import Payload
 from temporalio.bridge.proto.workflow_activation import (
@@ -44,6 +46,7 @@ from temporalio.langsmith._interceptor import (
     _maybe_run,
     _open_runs,
     _post_pending,
+    _replay_safe_tracer,
     _ReplaySafeClient,
     _ReplaySafeRunTree,
     _watch_activations,
@@ -315,6 +318,38 @@ class TestReplaySafety:
         }
         _post_pending(runs)
         mock_client.create_run.assert_called_once_with(id=run_ids[0])
+
+    @pytest.mark.parametrize("in_workflow", [False, True])
+    @pytest.mark.parametrize(
+        "replicas",
+        [None, [], [{"project_name": "context"}]],
+        ids=["inherited", "cleared", "overridden"],
+    )
+    def test_tracer_replica_context_precedence(
+        self, in_workflow: bool, replicas: list[WriteReplica] | None
+    ) -> None:
+        """Workflow runs honor explicit context replicas, including an empty list."""
+        client = MagicMock()
+        run = RunTree(
+            name="run",
+            ls_client=client,
+            replicas=[{"project_name": "inherited"}],
+        )
+        runs = MagicMock(spec=_LangChainRuns)
+        runs.start_time.return_value = run.start_time
+        with (
+            tracing_context(replicas=replicas),
+            patch(
+                f"{_MOD}._plugin_langchain_runs",
+                return_value=runs if in_workflow else None,
+            ),
+        ):
+            _replay_safe_tracer(MagicMock())(MagicMock(client=client), run)
+        run.post()
+        expected: str | None = "inherited"
+        if in_workflow and replicas is not None:
+            expected = "context" if replicas else run.session_name
+        assert client.create_run.call_args.kwargs["session_name"] == expected
 
     def test_client_record_outlives_its_wrapper(self) -> None:
         """A client's record of its open runs lasts as long as the client."""
