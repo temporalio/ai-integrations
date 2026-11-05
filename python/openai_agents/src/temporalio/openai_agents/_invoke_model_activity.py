@@ -45,7 +45,11 @@ from openai import (
     APIStatusError,
     AsyncOpenAI,
 )
-from openai.types.responses import CustomToolParam, ResponseErrorEvent
+from openai.types.responses import (
+    CustomToolParam,
+    ResponseCreatedEvent,
+    ResponseErrorEvent,
+)
 from openai.types.responses.tool_param import Mcp
 from typing_extensions import Required, TypedDict
 
@@ -485,9 +489,10 @@ class ModelActivity:
         When the workflow cancels it, for example for a tripped input
         guardrail, ``RunResultStreaming.cancel()`` or a
         ``ModelSettings.timeout``, it publishes a ``ResponseErrorEvent``
-        with the code ``cancelled`` after its events and stops. That event
-        ends this model call, not the run: a ``ModelSettings.retry`` or the
-        next model call can publish after it.
+        with the code ``cancelled`` after its events and stops. Its
+        ``param`` is the ID from the call's ``response.created`` event, if
+        the model sent one. That event ends this model call, not the run: a
+        ``ModelSettings.retry`` or the next model call can publish after it.
 
         Heartbeats run on a background task via ``heartbeating`` so
         long initial-token latency or long pauses between chunks do not
@@ -502,6 +507,8 @@ class ModelActivity:
             "streaming_batch_interval", timedelta(milliseconds=100)
         )
         events: list[TResponseStreamEvent] = []
+        # From the call's response.created event, to name the response a cancel ends.
+        response_id: str | None = None
 
         stream = WorkflowStreamClient.from_within_activity(
             batch_interval=batch_interval
@@ -531,6 +538,8 @@ class ModelActivity:
                             # OpenAI models set defer_build=True, so an event's pydantic
                             # schema may still be an unbuilt placeholder.
                             type(event).model_rebuild()
+                            if isinstance(event, ResponseCreatedEvent):
+                                response_id = event.response.id
                             events.append(event)
                             events_topic.publish(event)
                     except APIStatusError as e:
@@ -556,6 +565,7 @@ class ModelActivity:
                                 type="error",
                                 code="cancelled",
                                 message="The model call was cancelled.",
+                                param=response_id,
                                 sequence_number=len(events),
                             )
                         )

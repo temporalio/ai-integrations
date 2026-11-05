@@ -45,6 +45,7 @@ from agents.models import get_default_model_settings
 from openai.types.responses import (
     Response,
     ResponseCompletedEvent,
+    ResponseCreatedEvent,
     ResponseErrorEvent,
     ResponseFunctionToolCall,
     ResponseOutputMessage,
@@ -544,13 +545,15 @@ async def test_streamed_run_runs_sync_function_tools(client: Client):
 
 class HoldingStreamingModel(StreamingTestModel):
     """Streaming test model that sends its first delta, then, on the activity's first
-    attempt, waits up to ``hold`` seconds (10 by default) before the rest.
+    attempt, waits up to ``hold`` seconds (10 by default) before the rest. With a
+    ``response_id``, it starts with a ``response.created`` event for that response.
 
     Records the attempts and whether its stream was cancelled during the wait.
     """
 
-    def __init__(self, hold: float = 10) -> None:
+    def __init__(self, hold: float = 10, response_id: str | None = None) -> None:
         self.hold = hold
+        self.response_id = response_id
         self.cancelled = False
         self.attempts: list[int] = []
 
@@ -577,6 +580,22 @@ class HoldingStreamingModel(StreamingTestModel):
         )
         attempt = activity.info().attempt
         self.attempts.append(attempt)
+        if self.response_id is not None:
+            yield ResponseCreatedEvent(
+                response=Response(
+                    id=self.response_id,
+                    created_at=0,
+                    model="test",
+                    object="response",
+                    output=[],
+                    parallel_tool_calls=True,
+                    tool_choice="auto",
+                    tools=[],
+                    status="in_progress",
+                ),
+                sequence_number=0,
+                type="response.created",
+            )
         yield await anext(events)
         if attempt == 1:
             try:
@@ -719,15 +738,15 @@ async def test_streaming_input_guardrail_trip_stops_the_topic(
     client: Client, sibling: bool
 ):
     """A parallel input guardrail that trips while the model is streaming cancels the
-    streaming activity: topic subscribers get an error event, not the rest of the answer
-    and ``response.completed``. The cancel does not wait for the other parallel
-    guardrails to finish cleaning up."""
+    streaming activity: topic subscribers get an error event that names the response,
+    not the rest of the answer and ``response.completed``. The cancel does not wait for
+    the other parallel guardrails to finish cleaning up."""
     # The model stub reads these private fields, and stops watching the guardrails
     # if they are renamed.
     assert {"_input_guardrails_task", "_triggered_input_guardrail_result"} <= {
         f.name for f in fields(RunResultStreaming)
     }
-    model = HoldingStreamingModel()
+    model = HoldingStreamingModel(response_id="resp_held")
     async with AgentEnvironment(
         model=model,
         model_params=ModelActivityParameters(
@@ -761,6 +780,7 @@ async def test_streaming_input_guardrail_trip_stops_the_topic(
     last = published[-1]
     assert isinstance(last, ResponseErrorEvent)
     assert last.code == "cancelled"
+    assert last.param == "resp_held"
     assert model.cancelled
     assert model.attempts == [1]
 
