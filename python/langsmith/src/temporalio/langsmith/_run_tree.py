@@ -34,7 +34,7 @@ def _get_workflow_random() -> random.Random | None:
     instance = temporalio.workflow.instance()
     rng = getattr(instance, "__temporal_langsmith_random", None)
     if rng is None:
-        rng = temporalio.workflow.new_random()
+        rng = temporalio.workflow.new_random("temporalio.langsmith")
         setattr(instance, "__temporal_langsmith_random", rng)
     return rng
 

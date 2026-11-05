@@ -49,6 +49,9 @@ class NativeRunTreeWorkflow:
 
     @workflow.run
     async def run(self) -> list[dict[str, str]]:
+        app_random_state = workflow.random().getstate()
+        other_plugin_random = workflow.new_random("tests.langsmith.other-plugin")
+        other_plugin_random_state = other_plugin_random.getstate()
         self.snapshots = await _native_root()
         with trace("trace-root") as root:
             await workflow.sleep(timedelta(milliseconds=1))
@@ -67,6 +70,14 @@ class NativeRunTreeWorkflow:
         root.end(outputs={"direct": "root"})
         root.patch()
         self.snapshots.extend([_snapshot(root), _snapshot(child)])
+        assert workflow.random().getstate() == app_random_state
+        assert other_plugin_random.getstate() == other_plugin_random_state
+        run_ids = {run["id"] for run in self.snapshots}
+        assert str(workflow.uuid4()) not in run_ids
+        assert (
+            str(uuid.UUID(int=other_plugin_random.getrandbits(128), version=4))
+            not in run_ids
+        )
         return self.snapshots
 
     @workflow.query
@@ -78,7 +89,7 @@ async def test_native_runs_are_stable_after_worker_replay(
     client: Client,
     env: WorkflowEnvironment,  # type: ignore[reportUnusedParameter]
 ) -> None:
-    """A fresh worker rebuilds every native run identically and sends no duplicate I/O."""
+    """Native runs preserve other random streams and replay without duplicate I/O."""
     temporal_client, _, mock = _make_client_and_collector(
         client, add_temporal_runs=False
     )

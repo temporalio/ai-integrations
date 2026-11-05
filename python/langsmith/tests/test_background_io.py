@@ -38,7 +38,7 @@ def workflow_runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[ThreadPoolExec
     rng = random.Random(42)
     instance = SimpleNamespace()
     monkeypatch.setattr(workflow, "instance", lambda: instance)
-    monkeypatch.setattr(workflow, "new_random", lambda: rng)
+    monkeypatch.setattr(workflow, "new_random", lambda name: rng)
     with ThreadPoolExecutor(max_workers=1) as executor:
         with _run_tree.workflow_run_tree_context(executor):
             yield executor
