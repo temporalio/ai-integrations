@@ -34,7 +34,6 @@ from temporalio.exceptions import (  # noqa: E402
     ActivityError,
     ApplicationError,
     CancelledError,
-    RetryState,
 )
 from temporalio.worker import Replayer, Worker  # noqa: E402
 from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
@@ -766,8 +765,48 @@ async def test_repeated_tool_calls_with_same_args_both_run(
 
 
 # ---------------------------------------------------------------------------
-# Terminal tool failures: opt in to handing the error text to the model
+# Terminal tool failures returned to the model through tool-call middleware
 # ---------------------------------------------------------------------------
+#
+# Neither helper converts failures itself. An application that wants a failed
+# tool handed to the model adds an ``AgentMiddleware.awrap_tool_call`` hook to
+# ``create_deep_agent(middleware=[...])``: by the time the ActivityError reaches
+# the hook, Temporal's retry policy has already finished, so the hook only
+# decides what the model sees. These tests pin that the hook works for both
+# seams, keeps the structured ``status="error"``, replays, can be selective,
+# and leaves cancellation alone.
+
+with workflow.unsafe.imports_passed_through():
+    from langchain.agents.middleware import AgentMiddleware  # noqa: E402
+
+from temporalio.exceptions import is_cancelled_exception  # noqa: E402
+
+
+class ReturnToolFailuresToModel(AgentMiddleware):
+    """Hand terminal failures of the named tools to the model as error results.
+
+    The same shape as the README example: await the tool, re-raise
+    cancellation and failures of tools not listed, and answer the model's own
+    tool call with a ``ToolMessage(status="error")`` otherwise.
+    """
+
+    def __init__(self, tool_names: Sequence[str]) -> None:
+        super().__init__()
+        self.tool_names = frozenset(tool_names)
+
+    async def awrap_tool_call(self, request: Any, handler: Any) -> Any:
+        try:
+            return await handler(request)
+        except ActivityError as err:
+            name = request.tool_call["name"]
+            if is_cancelled_exception(err) or name not in self.tool_names:
+                raise
+            return ToolMessage(
+                content=f"{name} is unavailable ({err.cause}); try another source.",
+                name=name,
+                tool_call_id=request.tool_call["id"],
+                status="error",
+            )
 
 
 @activity.defn
@@ -806,70 +845,65 @@ _FAST_RETRY = RetryPolicy(
 )
 
 
-async def _agent_final_message(tool: Any) -> str:
+async def _agent_final_message(tool: Any, middleware: Sequence[Any] = ()) -> str:
     """Run a one-tool agent on the fixed prompt, return its final message."""
-    agent = create_deep_agent(model="fake:model", tools=[tool])
+    agent = create_deep_agent(
+        model="fake:model", tools=[tool], middleware=list(middleware)
+    )
     result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": "search for arXiv:2601.00001"}]}
     )
     return str(result["messages"][-1].content)
 
 
-@workflow.defn
-class FailingToolAgentWorkflow:
-    @workflow.run
-    async def run(self, seam: str, mode: str) -> str:
-        """One-tool agent whose tool always fails, with the error-to-model opt-in.
+def _failing_tool(seam: str, mode: str) -> Any:
+    """The failing search tool on ``seam`` (``activity`` / ``tool``), failing
+    ``non_retryable`` or after ``exhausted`` retries."""
+    body = rejected_search if mode == "non_retryable" else down_search
+    retry = None if mode == "non_retryable" else _FAST_RETRY
+    if seam == "activity":
+        return activity_as_tool(
+            body,
+            start_to_close_timeout=timedelta(seconds=20),
+            retry_policy=retry,
+        )
+    return tool_as_activity(
+        body,
+        start_to_close_timeout=timedelta(seconds=20),
+        activity_options={"retry_policy": retry},
+    )
 
-        ``seam`` picks the wrapper (``activity`` / ``tool``) and ``mode`` how the
-        tool fails (``non_retryable`` / ``exhausted`` retries).
-        """
-        body = rejected_search if mode == "non_retryable" else down_search
-        retry = None if mode == "non_retryable" else _FAST_RETRY
-        if seam == "activity":
-            tool = activity_as_tool(
-                body,
-                start_to_close_timeout=timedelta(seconds=20),
-                retry_policy=retry,
-                return_error_to_model=True,
-            )
-        else:
-            tool = tool_as_activity(
-                body,
-                start_to_close_timeout=timedelta(seconds=20),
-                activity_options={"retry_policy": retry},
-                return_error_to_model=True,
-            )
-        return await _agent_final_message(tool)
+
+@workflow.defn
+class FailingToolMiddlewareWorkflow:
+    @workflow.run
+    async def run(self, seam: str, mode: str, recovered: list[str]) -> str:
+        """One-tool agent whose tool always fails; the middleware recovers the
+        tool names in ``recovered`` and lets every other failure propagate."""
+        return await _agent_final_message(
+            _failing_tool(seam, mode), [ReturnToolFailuresToModel(recovered)]
+        )
 
 
 @workflow.defn
 class FailingToolDefaultWorkflow:
-    """Same failing tool, constructed with no ``return_error_to_model`` at all."""
+    """Same failing tool with no middleware at all."""
 
     @workflow.run
     async def run(self, seam: str) -> str:
-        if seam == "activity":
-            tool = activity_as_tool(
-                rejected_search, start_to_close_timeout=timedelta(seconds=20)
-            )
-        else:
-            tool = tool_as_activity(
-                rejected_search, start_to_close_timeout=timedelta(seconds=20)
-            )
-        return await _agent_final_message(tool)
+        return await _agent_final_message(_failing_tool(seam, "non_retryable"))
 
 
 @workflow.defn
-class StalledToolAgentWorkflow:
+class StalledToolMiddlewareWorkflow:
     @workflow.run
     async def run(self) -> str:
         tool = activity_as_tool(
-            stalled_search,
-            start_to_close_timeout=timedelta(seconds=120),
-            return_error_to_model=True,
+            stalled_search, start_to_close_timeout=timedelta(seconds=120)
         )
-        return await _agent_final_message(tool)
+        return await _agent_final_message(
+            tool, [ReturnToolFailuresToModel(["stalled_search"])]
+        )
 
 
 def _search_tool_call(tool_name: str) -> AIMessage:
@@ -891,18 +925,28 @@ def _search_tool_call(tool_name: str) -> AIMessage:
 _UNREACHED = AIMessage(content="unreached")
 
 
+def _error_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    err: BaseException | None = exc
+    while err is not None:
+        chain.append(err)
+        err = err.__cause__
+    return chain
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("seam", ["activity", "tool"])
 @pytest.mark.parametrize("mode", ["non_retryable", "exhausted"])
-async def test_failed_tool_reaches_the_model(
+async def test_middleware_hands_failed_tool_to_the_model(
     env: WorkflowEnvironment, seam: str, mode: str
 ) -> None:
-    """A tool activity that failed for good can be handed to the model.
+    """A tool activity that failed for good reaches the model as an error result.
 
-    LangGraph's ToolNode re-raises every error but an argument error, so
-    without the opt-in the ActivityError fails the whole run (asserted below).
-    With ``return_error_to_model`` the run completes and the model's next turn
-    carries the failure as the tool's result.
+    LangGraph's ToolNode re-raises every error but an argument error, so without
+    the hook the ActivityError fails the whole run (see the next test). With an
+    ``awrap_tool_call`` middleware the run completes, the model's next turn
+    carries a ``status="error"`` ToolMessage paired with its own tool call id,
+    and the history replays.
     """
     _captured_requests.clear()
     tool_name = (
@@ -920,46 +964,44 @@ async def test_failed_tool_reaches_the_model(
     async with Worker(
         env.client,
         task_queue=queue,
-        workflows=[FailingToolAgentWorkflow],
+        workflows=[FailingToolMiddlewareWorkflow],
         activities=[rejected_search, down_search],
         plugins=[plugin],
     ):
         handle = await env.client.start_workflow(
-            FailingToolAgentWorkflow.run,
-            args=[seam, mode],
+            FailingToolMiddlewareWorkflow.run,
+            args=[seam, mode, [tool_name]],
             id=f"da-tool-failure-{uuid.uuid4()}",
             task_queue=queue,
         )
         out = await handle.result()
 
     assert "could not search" in out, out
-    # The model's next turn saw the failure as the tool's content — literal
-    # prefixed text (the helpers return content, not a status-marked message).
     tool_messages = [m for m in _captured_requests[1] if isinstance(m, ToolMessage)]
-    assert tool_messages, _captured_requests[1]
-    text = str(tool_messages[0].content)
-    assert text.startswith(f"[tool error] {tool_name} "), text
-    assert "not evidence" in text, text
+    assert len(tool_messages) == 1, _captured_requests[1]
+    message = tool_messages[0]
+    assert message.status == "error", message
+    assert message.tool_call_id == "call_search", message
+    text = str(message.content)
+    assert text.startswith(f"{tool_name} is unavailable ("), text
     if mode == "non_retryable":
-        assert "non-retryable error" in text and "source rejected" in text, text
+        assert "source rejected" in text, text
     else:
-        assert "exhausting its retries" in text and "search backend down" in text, text
-    # The failure text is rebuilt from the recorded ActivityError, so replaying
-    # the same history must reproduce it without a nondeterminism error.
+        assert "search backend down" in text, text
+    # The middleware rebuilds its message from the recorded ActivityError, so
+    # replaying the same history must reproduce it without nondeterminism.
     history = await handle.fetch_history()
     await Replayer(
-        workflows=[FailingToolAgentWorkflow], plugins=[DeepAgentsPlugin()]
+        workflows=[FailingToolMiddlewareWorkflow], plugins=[DeepAgentsPlugin()]
     ).replay_workflow(history)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("seam", ["activity", "tool"])
-async def test_failed_tool_without_opt_in_fails_the_run(
+async def test_failed_tool_without_middleware_fails_the_run(
     env: WorkflowEnvironment, seam: str
 ) -> None:
-    """Default behaviour is unchanged: the ActivityError propagates and the run
-    fails. This workflow constructs its tool without the option entirely, so it
-    is also a default-behaviour regression test for unchanged code."""
+    """With no hook, the ActivityError propagates and the run fails."""
     plugin = DeepAgentsPlugin(
         model_provider=mock_model_provider(
             [_search_tool_call("rejected_search"), _UNREACHED]
@@ -982,18 +1024,47 @@ async def test_failed_tool_without_opt_in_fails_the_run(
         with pytest.raises(WorkflowFailureError) as excinfo:
             await handle.result()
 
-    chain: list[BaseException] = []
-    err: BaseException | None = excinfo.value
-    while err is not None:
-        chain.append(err)
-        err = err.__cause__
     assert any(
-        isinstance(e, ApplicationError) and e.type == "SourceRejected" for e in chain
-    ), [f"{type(e).__name__}: {e}" for e in chain]
+        isinstance(e, ApplicationError) and e.type == "SourceRejected"
+        for e in _error_chain(excinfo.value)
+    ), [f"{type(e).__name__}: {e}" for e in _error_chain(excinfo.value)]
 
 
 @pytest.mark.asyncio
-async def test_failed_tool_opt_in_does_not_swallow_cancellation(
+async def test_middleware_propagates_failures_of_tools_it_does_not_recover(
+    env: WorkflowEnvironment,
+) -> None:
+    """The hook chooses per tool: a failure of a tool it does not list still
+    fails the run, exactly as with no middleware."""
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(
+            [_search_tool_call("rejected_search"), _UNREACHED]
+        )
+    )
+    async with Worker(
+        env.client,
+        task_queue="da-tool-failure-unlisted",
+        workflows=[FailingToolMiddlewareWorkflow],
+        activities=[rejected_search, down_search],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            FailingToolMiddlewareWorkflow.run,
+            args=["activity", "non_retryable", ["some_other_tool"]],
+            id=f"da-tool-failure-unlisted-{uuid.uuid4()}",
+            task_queue="da-tool-failure-unlisted",
+        )
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+
+    assert any(
+        isinstance(e, ApplicationError) and e.type == "SourceRejected"
+        for e in _error_chain(excinfo.value)
+    ), [f"{type(e).__name__}: {e}" for e in _error_chain(excinfo.value)]
+
+
+@pytest.mark.asyncio
+async def test_middleware_does_not_swallow_cancellation(
     env: WorkflowEnvironment,
 ) -> None:
     """Cancelling the run mid-tool must cancel the workflow, not feed the
@@ -1007,197 +1078,20 @@ async def test_failed_tool_opt_in_does_not_swallow_cancellation(
     async with Worker(
         env.client,
         task_queue="da-tool-failure-cancel",
-        workflows=[StalledToolAgentWorkflow],
+        workflows=[StalledToolMiddlewareWorkflow],
         activities=[stalled_search],
         plugins=[plugin],
     ):
         handle = await env.client.start_workflow(
-            StalledToolAgentWorkflow.run,
+            StalledToolMiddlewareWorkflow.run,
             id=f"da-tool-failure-cancel-{uuid.uuid4()}",
             task_queue="da-tool-failure-cancel",
         )
         # Cancel only once the activity body is provably running: the pending
-        # dispatch must then re-raise, not convert.
+        # dispatch must then re-raise through the hook.
         await asyncio.wait_for(_stalled_started.wait(), timeout=30)
         await handle.cancel()
         with pytest.raises(WorkflowFailureError) as excinfo:
             await handle.result()
 
     assert isinstance(excinfo.value.cause, CancelledError), excinfo.value.cause
-
-
-# Success with the opt-in must still unwrap the activity output to plain
-# content — the conversion only applies to failures. Covers the regression
-# where ``tool_as_activity(..., return_error_to_model=True)`` returned the raw
-# activity output object on success.
-@activity.defn
-async def ok_search(query: str) -> str:
-    """Search a source that answers."""
-    return f"found:{query}"
-
-
-@workflow.defn
-class OptInSuccessWorkflow:
-    @workflow.run
-    async def run(self, seam: str) -> str:
-        if seam == "activity":
-            tool = activity_as_tool(
-                ok_search,
-                start_to_close_timeout=timedelta(seconds=20),
-                return_error_to_model=True,
-            )
-        else:
-            tool = tool_as_activity(
-                ok_search,
-                start_to_close_timeout=timedelta(seconds=20),
-                return_error_to_model=True,
-            )
-        return await _agent_final_message(tool)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("seam", ["activity", "tool"])
-async def test_successful_tool_with_opt_in_returns_content(
-    env: WorkflowEnvironment, seam: str
-) -> None:
-    """The opt-in converts failures only; a successful call returns the same
-    content as without it."""
-    _captured_requests.clear()
-    plugin = DeepAgentsPlugin(
-        model_provider=_recording_provider(
-            [_search_tool_call("ok_search"), AIMessage(content="done searching")]
-        )
-    )
-    queue = f"da-tool-ok-{seam}"
-    async with Worker(
-        env.client,
-        task_queue=queue,
-        workflows=[OptInSuccessWorkflow],
-        activities=[ok_search],
-        plugins=[plugin],
-    ):
-        handle = await env.client.start_workflow(
-            OptInSuccessWorkflow.run,
-            args=[seam],
-            id=f"da-tool-ok-{uuid.uuid4()}",
-            task_queue=queue,
-        )
-        out = await handle.result()
-
-    assert "done searching" in out, out
-    tool_messages = [m for m in _captured_requests[1] if isinstance(m, ToolMessage)]
-    assert tool_messages, _captured_requests[1]
-    # Plain content, not the serialized activity output envelope.
-    assert str(tool_messages[0].content) == "found:arXiv:2601.00001", tool_messages[0]
-
-
-@activity.defn
-async def rejected_forecast(city: str, days: int, units: str = "C") -> str:
-    """Forecast source that rejects every request for good (non-retryable)."""
-    raise ApplicationError(
-        f"no forecast for {city}:{days}:{units}",
-        type="SourceRejected",
-        non_retryable=True,
-    )
-
-
-@workflow.defn
-class FailingMultiParameterToolWorkflow:
-    @workflow.run
-    async def run(self) -> str:
-        tool = activity_as_tool(
-            rejected_forecast,
-            start_to_close_timeout=timedelta(seconds=10),
-            return_error_to_model=True,
-        )
-        return str(await tool.ainvoke({"city": "Paris", "days": 3}))
-
-
-@pytest.mark.asyncio
-async def test_failed_multi_parameter_tool_reaches_the_model(
-    env: WorkflowEnvironment,
-) -> None:
-    """The opt-in composes with the per-parameter argument mapping: a
-    multi-parameter activity called without its defaulted parameter fails for
-    good, and the failure text the model gets shows the default reached the
-    activity."""
-    async with Worker(
-        env.client,
-        task_queue="da-tool-fail-params",
-        workflows=[FailingMultiParameterToolWorkflow],
-        activities=[rejected_forecast],
-        plugins=[DeepAgentsPlugin()],
-    ):
-        out = await env.client.execute_workflow(
-            FailingMultiParameterToolWorkflow.run,
-            id=f"da-tool-fail-params-{uuid.uuid4()}",
-            task_queue="da-tool-fail-params",
-            execution_timeout=timedelta(seconds=30),
-        )
-    assert out.startswith("[tool error] rejected_forecast "), out
-    assert "SourceRejected: no forecast for Paris:3:C" in out, out
-
-
-def _activity_error(retry_state: RetryState, cause: BaseException) -> ActivityError:
-    """An ActivityError as workflow code sees it: retry state plus inner cause."""
-    err = ActivityError(
-        "Activity task failed",
-        scheduled_event_id=1,
-        started_event_id=2,
-        identity="test",
-        activity_type="tool",
-        activity_id="1",
-        retry_state=retry_state,
-    )
-    err.__cause__ = cause
-    return err
-
-
-def test_failure_reason_names_every_terminal_retry_state() -> None:
-    """The timeout and fallback wordings exist only here, so they are tested
-    here rather than through full agent runs."""
-    from temporalio.deepagents._tools import _failure_reason
-
-    def reason(state: RetryState) -> str:
-        return _failure_reason(_activity_error(state, RuntimeError("boom")))
-
-    assert "non-retryable" in reason(RetryState.NON_RETRYABLE_FAILURE)
-    assert "exhausting its retries" in reason(RetryState.MAXIMUM_ATTEMPTS_REACHED)
-    assert "timed out" in reason(RetryState.TIMEOUT)
-    assert "will not retry" in reason(RetryState.RETRY_POLICY_NOT_SET)
-
-
-@pytest.mark.asyncio
-async def test_as_tool_result_converts_only_terminal_failures() -> None:
-    """Unit view of the shared conversion both seams dispatch through: success
-    and cancellation pass through, a terminal failure becomes text."""
-    from temporalio.deepagents._tools import _as_tool_result
-
-    async def _ok(value: Any) -> Any:
-        return value
-
-    async def _raise(err: BaseException) -> Any:
-        raise err
-
-    assert await _as_tool_result(_ok("result"), "tool") == "result"
-    cancelled = _activity_error(
-        RetryState.CANCEL_REQUESTED, CancelledError("workflow cancelled")
-    )
-    with pytest.raises(ActivityError):
-        await _as_tool_result(_raise(cancelled), "tool")
-    exhausted = _activity_error(
-        RetryState.MAXIMUM_ATTEMPTS_REACHED, ApplicationError("backend down")
-    )
-    text = await _as_tool_result(_raise(exhausted), "tool")
-    assert text.startswith("[tool error] tool failed after exhausting its retries"), (
-        text
-    )
-    assert "backend down" in text, text
-    # The carried failure message is bounded (it is recorded in history and
-    # repeated into the next model prompt).
-    verbose = _activity_error(
-        RetryState.NON_RETRYABLE_FAILURE, ApplicationError("x" * 500)
-    )
-    text = await _as_tool_result(_raise(verbose), "tool")
-    assert "x" * 300 in text, len(text)
-    assert "x" * 301 not in text, len(text)

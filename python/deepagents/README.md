@@ -174,36 +174,43 @@ artifact, keep their JSON form, so a `Document` artifact arrives as a dict.
 Update activity workers before or together with workflow workers: an older
 activity worker still passes the messages to the tool as dicts.
 
-A tool activity that Temporal gives up on — a non-retryable error, or a retry
-policy that ran out — raises `ActivityError` out of the agent loop and fails the
-whole run. Both helpers accept `return_error_to_model=True` to hand that failure
-to the model as text instead, so one dead search does not discard the rest of
-the run:
+A tool activity that Temporal gives up on (a non-retryable error, or a retry
+policy that ran out) raises `ActivityError` out of the tool node and fails the
+whole agent run. To let the model handle the failure instead, add a tool-call
+middleware to `create_deep_agent`. By the time the error reaches it, Temporal's
+retry policy has already finished, so the middleware only decides what the
+model sees: which tools and failure types to recover, and with what wording.
+Re-raise cancellation so cancelling the workflow still cancels the run:
 
 ```python
-from datetime import timedelta
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import ToolMessage
+from temporalio.exceptions import ActivityError, is_cancelled_exception
 
-from temporalio.deepagents import activity_as_tool
+
+class ReturnSearchFailuresToModel(AgentMiddleware):
+    async def awrap_tool_call(self, request, handler):
+        try:
+            return await handler(request)
+        except ActivityError as err:
+            if is_cancelled_exception(err) or request.tool_call["name"] != "search":
+                raise
+            return ToolMessage(
+                content="Search is unavailable; try another source.",
+                tool_call_id=request.tool_call["id"],
+                status="error",
+            )
 
 
-weather_tool = activity_as_tool(
-    get_weather,
-    start_to_close_timeout=timedelta(seconds=30),
-    return_error_to_model=True,
+agent = create_deep_agent(
+    model="anthropic:claude-sonnet-4-5",
+    tools=[search_tool],
+    middleware=[ReturnSearchFailuresToModel()],
 )
 ```
 
-`tool_as_activity` takes the same flag; its remaining options are its own. The
-model's next turn then carries a tool result like
-
-```text
-[tool error] get_weather failed after exhausting its retries (HttpError: upstream 503). This is a tool failure, not evidence about the task: do not invent a result from it. Try a different tool or arguments, or report the failure.
-```
-
-The text carries the underlying failure's type and message — text produced by
-the activity and whatever it called — truncated to 300 characters, so opting in
-sends error details to the model; make sure yours carry nothing sensitive.
-Cancellation is never converted: cancelling the workflow still cancels the run.
+The middleware runs as workflow code, so keep it deterministic: build the
+message from the error and the request, not from the clock or random values.
 
 ## Durable file and shell backends
 
