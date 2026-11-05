@@ -72,10 +72,20 @@ def _parallel_input_guardrails() -> tuple[RunResultStreaming, asyncio.Task[Any]]
     """Return the streamed run in progress and its parallel input guardrails task, if any."""
     streamed_run = _current_streamed_run.get()
     result = streamed_run.result if streamed_run is not None else None
-    task = result._input_guardrails_task if result is not None else None
+    # This and _triggered_input_guardrail read private RunResultStreaming fields with
+    # getattr: if an openai-agents release renames them, the stub stops watching the
+    # guardrails instead of failing every streamed run.
+    task = getattr(result, "_input_guardrails_task", None)
     if result is None or task is None:
         return None
     return result, task
+
+
+def _triggered_input_guardrail(
+    result: RunResultStreaming,
+) -> InputGuardrailResult | None:
+    """Return the parallel input guardrail result that tripped, if any."""
+    return getattr(result, "_triggered_input_guardrail_result", None)
 
 
 class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
@@ -354,7 +364,7 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
         # record without waiting for the guardrails task to finish.
         guardrails = _parallel_input_guardrails()
         if guardrails is not None:
-            triggered = guardrails[0]._triggered_input_guardrail_result
+            triggered = _triggered_input_guardrail(guardrails[0])
             if triggered is not None:
                 raise InputGuardrailTripwireTriggered(triggered)
 
@@ -381,11 +391,10 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             async def cancel_on_tripwire() -> None:
                 await workflow.wait_condition(
                     lambda: (
-                        result._triggered_input_guardrail_result is not None
-                        or task.done()
+                        _triggered_input_guardrail(result) is not None or task.done()
                     )
                 )
-                triggered = result._triggered_input_guardrail_result
+                triggered = _triggered_input_guardrail(result)
                 if triggered is not None and not handle.done():
                     cancelled_for.append(triggered)
                     handle.cancel()

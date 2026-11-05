@@ -10,7 +10,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import timedelta
 from typing import Any
 
@@ -30,6 +30,7 @@ from agents import (
     RunConfig,
     RunContextWrapper,
     Runner,
+    RunResultStreaming,
     Tool,
     ToolCallOutputItem,
     TResponseInputItem,
@@ -704,6 +705,11 @@ async def test_streaming_input_guardrail_trip_stops_the_topic(
     streaming activity: topic subscribers get an error event, not the rest of the answer
     and ``response.completed``. The cancel does not wait for the other parallel
     guardrails to finish cleaning up."""
+    # The model stub reads these private fields, and stops watching the guardrails
+    # if they are renamed.
+    assert {"_input_guardrails_task", "_triggered_input_guardrail_result"} <= {
+        f.name for f in fields(RunResultStreaming)
+    }
     model = HoldingStreamingModel()
     async with AgentEnvironment(
         model=model,
