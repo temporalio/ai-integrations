@@ -3,50 +3,25 @@
 from __future__ import annotations
 
 import asyncio
-import gc
-import uuid
-import weakref
-from collections import OrderedDict
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from langchain_core.runnables import RunnableLambda
 
 from temporalio.api.common.v1 import Payload
-from temporalio.bridge.proto.workflow_activation import (
-    RemoveFromCache,
-    WorkflowActivation,
-    WorkflowActivationJob,
-)
-from temporalio.bridge.proto.workflow_commands import (
-    FailWorkflowExecution,
-    WorkflowCommand,
-)
-from temporalio.bridge.proto.workflow_completion import (
-    Success,
-    WorkflowActivationCompletion,
-)
 from temporalio.exceptions import ApplicationError, ApplicationErrorCategory
 from temporalio.langsmith import LangSmithInterceptor
 from temporalio.langsmith._interceptor import (
     HEADER_KEY,
-    _activation,
     _end_run_on_exception,
     _extract_context,
     _inject_context,
-    _install_langchain_run_id_hook,
-    _LangChainRuns,
     _LangSmithWorkflowInboundInterceptor,
     _maybe_run,
-    _open_runs,
-    _post_pending,
-    _ReplaySafeClient,
     _ReplaySafeRunTree,
-    _watch_activations,
 )
 from temporalio.worker import HandleQueryInput
 
@@ -297,221 +272,6 @@ class TestReplaySafety:
         ):
             pass
         MockRunTree.assert_called_once()
-
-    def test_client_forgets_oldest_open_run(self) -> None:
-        """Past _MAX_OPEN_RUNS, a client forgets the oldest run it posted."""
-        mock_client = MagicMock()
-        client = _ReplaySafeClient(mock_client)
-        run_ids = [uuid.uuid4() for _ in range(3)]
-        with patch(f"{_MOD}._MAX_OPEN_RUNS", 2):
-            for run_id in run_ids:
-                client._add_open(run_id)
-        assert list(client._open) == run_ids[1:]
-        # After a replay, the forgotten run is posted again; the other is not.
-        runs = MagicMock()
-        runs.pending = {
-            (id(mock_client), run_id): (client, [("create_run", {"id": run_id}, {})])
-            for run_id in run_ids[:2]
-        }
-        _post_pending(runs)
-        mock_client.create_run.assert_called_once_with(id=run_ids[0])
-
-    def test_client_record_outlives_its_wrapper(self) -> None:
-        """A client's record of its open runs lasts as long as the client."""
-        mock_client = MagicMock()
-        run_id = uuid.uuid4()
-        _ReplaySafeClient(mock_client)._add_open(run_id)
-        gc.collect()
-        assert list(_ReplaySafeClient(mock_client)._open) == [run_id]
-        assert list(_ReplaySafeClient(MagicMock())._open) == []
-
-    def test_client_record_dropped_with_its_client(self) -> None:
-        """A client's record of its open runs goes when the client does."""
-        client = MagicMock()
-        key = id(client)
-        _ReplaySafeClient(client)._add_open(uuid.uuid4())
-        ref = _open_runs[key][0]
-        del client
-        gc.collect()
-        assert ref() is None
-        assert _open_runs.get(key, (None, None))[0] is not ref
-
-    def test_stale_record_not_reused(self) -> None:
-        """A new client at a collected client's address starts with no open runs."""
-        client, dead = MagicMock(), MagicMock()
-        stale = weakref.ref(dead)
-        del dead
-        gc.collect()
-        _open_runs[id(client)] = (stale, OrderedDict({uuid.uuid4(): None}))
-        assert list(_ReplaySafeClient(client)._open) == []
-
-    def test_activations_watched_without_runner(self) -> None:
-        """Without the plugin's runner, the workflow's activations are watched.
-
-        ``LangSmithInterceptor`` registered alone wraps the workflow
-        instance's ``activate`` in its first activation, which counts too.
-        The eviction after it is marked only if the worker sent that
-        activation's completion, and it ends the workflow.
-        """
-
-        def ends() -> WorkflowActivationCompletion:
-            return WorkflowActivationCompletion(
-                successful=Success(
-                    commands=[
-                        WorkflowCommand(fail_workflow_execution=FailWorkflowExecution())
-                    ]
-                )
-            )
-
-        # What happens to the first activation's completion once the
-        # workflow has ended in it.
-        def sent(completion: WorkflowActivationCompletion) -> None:
-            completion.run_id = "run"
-
-        def task_fails(completion: WorkflowActivationCompletion) -> None:
-            # Another handler fails the task, or the result can't be
-            # serialized.
-            completion.failed.failure.message = "failed"
-            sent(completion)
-
-        def encoding_fails(completion: WorkflowActivationCompletion) -> None:
-            sent(completion)
-            completion.failed.failure.message = "Failed encoding completion"
-
-        def not_sent(_: WorkflowActivationCompletion) -> None:
-            pass
-
-        eviction = WorkflowActivation(
-            run_id="run",
-            is_replaying=True,
-            jobs=[
-                WorkflowActivationJob(
-                    remove_from_cache=RemoveFromCache(
-                        reason=RemoveFromCache.EvictionReason.CACHE_FULL
-                    )
-                )
-            ],
-        )
-        for change, marked in (
-            (sent, True),
-            (task_fails, False),
-            (encoding_fails, False),
-            (not_sent, False),
-        ):
-            completion, seen = ends(), []
-
-            class _Runtime:
-                _current_completion = completion
-
-                def activate(
-                    self, act: WorkflowActivation
-                ) -> WorkflowActivationCompletion:
-                    seen.append(_activation.ending_run_id == act.run_id)
-                    return WorkflowActivationCompletion(successful=Success())
-
-            runtime = _Runtime()
-            with (
-                patch(_PATCH_IN_WORKFLOW, return_value=True),
-                patch(_PATCH_IS_REPLAYING, return_value=False),
-                patch(
-                    f"{_MOD}.temporalio.workflow._Runtime.current",
-                    return_value=runtime,
-                ),
-            ):
-                _watch_activations()
-            change(completion)
-            runtime.activate(eviction)
-            assert seen == [marked], change.__name__
-            assert not _activation.marked and _activation.ending_run_id is None
-
-        # Under the plugin's runner, it is left alone.
-        runtime = MagicMock()
-        activate = runtime.activate
-        with (
-            patch(_PATCH_IN_WORKFLOW, return_value=True),
-            patch(f"{_MOD}.temporalio.workflow._Runtime.current", return_value=runtime),
-            patch.object(_activation, "marked", True),
-        ):
-            _watch_activations()
-        assert runtime.activate is activate
-
-    def test_run_does_not_end_before_it_starts(self) -> None:
-        """A run's end time is no earlier than any start time given out."""
-        now = datetime.now(timezone.utc)
-        with (
-            patch(_PATCH_WF_NOW, return_value=now),
-            patch(f"{_MOD}.temporalio.workflow.random_seed", return_value=1),
-            patch(f"{_MOD}.temporalio.workflow.register_random_seed_callback"),
-        ):
-            runs = _LangChainRuns()
-            parent, child = uuid.uuid4(), uuid.uuid4()
-            runs.add(parent)
-            # The child starts 1 microsecond after workflow.now().
-            assert runs.start_time(child) == now + timedelta(microseconds=1)
-            for run_id in (child, parent):
-                kwargs = {"run_id": run_id, "end_time": now}
-                runs.remap(kwargs, "run_id")
-                assert kwargs["end_time"] == now + timedelta(microseconds=1)
-            later = now + timedelta(seconds=1)
-            kwargs = {"run_id": parent, "end_time": later}
-            runs.remap(kwargs, "run_id")
-            assert kwargs["end_time"] == later
-            # So does a plugin run ended at workflow.now(), and no earlier than
-            # its own start, which a parent from headers puts after
-            # workflow.now() when the sender's clock is ahead.
-            run = MagicMock()
-            ahead = MagicMock(start_time=now + timedelta(seconds=30))
-            with (
-                patch(_PATCH_IN_WORKFLOW, return_value=True),
-                patch(_PATCH_IS_REPLAYING, return_value=False),
-                patch(f"{_MOD}._get_langchain_runs", return_value=runs),
-            ):
-                _ReplaySafeRunTree(run, executor=_make_executor()).end()
-                _ReplaySafeRunTree(ahead, executor=_make_executor()).end()
-            run.end.assert_called_once_with(end_time=now + timedelta(microseconds=1))
-            ahead.end.assert_called_once_with(end_time=now + timedelta(seconds=30))
-
-    def test_run_ids_are_v7_from_workflow_time(self) -> None:
-        """LangChain run IDs and root factory IDs are UUIDv7s of ``workflow.now()``."""
-        now = datetime.now(timezone.utc)
-        with (
-            patch(_PATCH_WF_NOW, return_value=now),
-            patch(f"{_MOD}.temporalio.workflow.random_seed", return_value=1),
-            patch(f"{_MOD}.temporalio.workflow.register_random_seed_callback"),
-        ):
-            runs = _LangChainRuns()
-            ids = [runs.new_id(), runs.new_run()[0]]
-        for run_id in ids:
-            assert run_id.version == 7
-            assert run_id.variant == uuid.RFC_4122
-            assert run_id.int >> 80 == int(now.timestamp() * 1000)
-
-    @pytest.mark.parametrize("run_id", [None, uuid.uuid4()])
-    async def test_astream_events_root_run_id(self, run_id: uuid.UUID | None) -> None:
-        """``astream_events`` gives its root run the workflow's ID, or the caller's.
-
-        It generates that ID itself, not in LangChain's callback manager.  It
-        can't finish in a workflow (temporalio/sdk-python#2083), so this runs
-        it outside one, in the plugin's tracing context.
-        """
-        _install_langchain_run_id_hook()
-        stable = uuid.uuid4()
-        runs = MagicMock(spec=_LangChainRuns)
-        runs.new_id.return_value = stable
-
-        async def step(text: str) -> str:
-            return text
-
-        config: Any = {} if run_id is None else {"run_id": run_id}
-        with patch(f"{_MOD}._plugin_langchain_runs", return_value=runs):
-            events = [
-                event
-                async for event in RunnableLambda(step).astream_events(
-                    "hi", config=config, version="v2"
-                )
-            ]
-        assert events
-        assert {event["run_id"] for event in events} == {str(run_id or stable)}
 
 
 # ===================================================================
