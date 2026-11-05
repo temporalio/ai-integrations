@@ -134,6 +134,7 @@ from temporalio.exceptions import (
 )
 from temporalio.openai_agents import (
     ModelActivityParameters,
+    ModelSummaryProvider,
     OpenAIPayloadConverter,
     StatefulMCPServerProvider,
     StatelessMCPServerProvider,
@@ -143,7 +144,6 @@ from temporalio.openai_agents._invoke_model_activity import (
     _build_tool,
     _raise_for_openai_status,
 )
-from temporalio.openai_agents._model_parameters import ModelSummaryProvider
 from temporalio.openai_agents._openai_runner import (
     _coerce_run_config,
 )

@@ -238,9 +238,12 @@ async def test_stateful_no_cross_run_sharing(client: Client):
 
 
 _MCP_SERVER = """
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # MCP 1.x
+    from mcp.server.fastmcp import FastMCP as MCPServer
 
-server = FastMCP("echo")
+server = MCPServer("echo")
 
 
 @server.tool()
@@ -1440,9 +1443,12 @@ async def test_stateful_session_marker_kept_by_worker_heartbeats(
 _STATE_MCP_SERVER = """
 import asyncio
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # MCP 1.x
+    from mcp.server.fastmcp import FastMCP as MCPServer
 
-server = FastMCP("state")
+server = MCPServer("state")
 value = "EMPTY"
 
 
