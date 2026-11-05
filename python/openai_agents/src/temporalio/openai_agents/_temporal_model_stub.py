@@ -19,6 +19,9 @@ from agents import (
     InputGuardrailTripwireTriggered,
     Model,
     ModelResponse,
+    ModelRetryAdvice,
+    ModelRetryAdviceRequest,
+    ModelRetryNormalizedError,
     ModelSettings,
     ModelTracing,
     RunResultStreaming,
@@ -303,6 +306,19 @@ class _TemporalModelStub(Model):  # type:ignore[reportUnusedClass]
             versioning_intent=self.model_params.versioning_intent,
             priority=self.model_params.priority,
         )
+
+    def get_retry_advice(
+        self, request: ModelRetryAdviceRequest
+    ) -> ModelRetryAdvice | None:
+        """Mark a guardrail trip that ``stream_response`` raises as an abort.
+
+        The framework runs ``stream_response`` inside its model retry loop, but raises
+        a native trip outside it, so a ``ModelSettings.retry`` policy is never asked
+        about a trip.
+        """
+        if isinstance(request.error, InputGuardrailTripwireTriggered):
+            return ModelRetryAdvice(normalized=ModelRetryNormalizedError(is_abort=True))
+        return None
 
     async def stream_response(
         self,

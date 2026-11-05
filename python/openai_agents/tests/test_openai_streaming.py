@@ -25,8 +25,10 @@ from agents import (
     InputGuardrailTripwireTriggered,
     Model,
     ModelResponse,
+    ModelRetrySettings,
     ModelSettings,
     ModelTracing,
+    RetryPolicyContext,
     RunConfig,
     RunContextWrapper,
     Runner,
@@ -624,6 +626,8 @@ class GuardrailRun:
     trip: bool = True
     sibling: bool = False
     delay_model: bool = False
+    # Give the agent a ModelSettings.retry policy that retries every error.
+    retry: bool = False
     # Stay open until the subscriber has read the activity's last event.
     hold_open: bool = True
 
@@ -644,12 +648,23 @@ class StreamingInputGuardrailWorkflow:
         guardrails = [refuse_after_a_second] if run.trip else []
         if run.sibling:
             guardrails.append(clean_up_slowly)
+        retries_asked = 0
+
+        def retry_every_error(_context: RetryPolicyContext) -> bool:
+            nonlocal retries_asked
+            retries_asked += 1
+            return True
+
         agent = Agent[None](
             name="Assistant",
             instructions="You are a test agent.",
             input_guardrails=guardrails,
             hooks=DelayModelCall() if run.delay_model else None,
         )
+        if run.retry:
+            agent.model_settings = ModelSettings(
+                retry=ModelRetrySettings(max_retries=3, policy=retry_every_error)
+            )
         result = Runner.run_streamed(starting_agent=agent, input="Hello")
         try:
             async for _ in result.stream_events():
@@ -658,6 +673,8 @@ class StreamingInputGuardrailWorkflow:
             output = "refused"
         else:
             output = str(result.final_output)
+        if retries_asked:
+            output += f" after asking to retry {retries_asked} times"
         if run.hold_open:
             await workflow.wait_condition(lambda: self.subscriber_done)
         return output
@@ -755,7 +772,7 @@ async def test_streaming_input_guardrail_known_trip_skips_the_model(
 ):
     """When a parallel input guardrail has already tripped as the model is called, the
     streaming activity is not scheduled, even while other guardrails are still cleaning
-    up."""
+    up, and a ``ModelSettings.retry`` policy is not asked about the trip."""
     model = HoldingStreamingModel()
     async with AgentEnvironment(
         model=model,
@@ -771,7 +788,9 @@ async def test_streaming_input_guardrail_known_trip_skips_the_model(
         ) as worker:
             handle = await client.start_workflow(
                 StreamingInputGuardrailWorkflow.run,
-                GuardrailRun(sibling=sibling, delay_model=True, hold_open=False),
+                GuardrailRun(
+                    sibling=sibling, delay_model=True, retry=True, hold_open=False
+                ),
                 id=f"openai-streaming-known-trip-{uuid.uuid4()}",
                 task_queue=worker.task_queue,
                 execution_timeout=timedelta(seconds=50),
