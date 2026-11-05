@@ -28,15 +28,16 @@ worker = Worker(
 Use the upstream async API in the Workflow:
 
 ```python
-from openai_codex import AsyncCodex, CodexConfig, Sandbox
+from openai_codex import AsyncCodex, Sandbox
 from temporalio import workflow
+from temporalio.openai_codex import TemporalCodexConfig
 
 
 @workflow.defn
 class CodingWorkflow:
     @workflow.run
     async def run(self, prompt: str) -> str:
-        async with AsyncCodex(CodexConfig(cwd="/workspace")) as codex:
+        async with AsyncCodex(TemporalCodexConfig(cwd="/workspace")) as codex:
             thread = await codex.thread_start(sandbox=Sandbox.read_only)
             result = await thread.run(prompt)
             return result.final_response or ""
@@ -186,9 +187,9 @@ resetting its history can create new sessions and repeat application side effect
 
 Configure credentials on Workers, such as an authenticated `CODEX_HOME` or an
 appropriate model provider. Avoid passing secrets through Workflow inputs,
-`CodexConfig.env`, or login API-key calls: Activity inputs/results and notification
-content are recorded in Temporal history. Use an appropriate payload codec if
-sensitive content must pass through history. Tests require no real credentials.
+`TemporalCodexConfig.env`, or login API-key calls: Activity inputs/results and
+notification content are recorded in Temporal history. Use an appropriate payload
+codec if sensitive content must pass through history. Tests require no real credentials.
 
 Each protocol write and output batch adds Activity events to Workflow history.
 Long streams and long-lived sessions grow history; bound conversations and close

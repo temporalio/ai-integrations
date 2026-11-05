@@ -87,6 +87,42 @@ async def test_cancelled_read_and_lost_result_are_retained() -> None:
         await run(activities.read, request)
 
 
+@pytest.mark.parametrize("worker_shutdown", [False, True])
+async def test_close_unblocks_retained_io_without_cancelling(
+    worker_shutdown: bool,
+) -> None:
+    connector = ProtocolConnector()
+    activities = ConnectionActivities(connector, "private")
+    run = ActivityEnvironment().run
+    connection = await run(activities.connect, ConnectActivityInput())
+    process = connector.processes[0]
+    process.gate = asyncio.Event()
+    reading = asyncio.create_task(
+        run(activities.read, ReadActivityInput(connection.handle, 0))
+    )
+    writing = asyncio.create_task(
+        run(activities.write, WriteActivityInput(connection.handle, 1, {}))
+    )
+    while not process.reads or not process.writes:
+        await asyncio.sleep(0)
+    reading.cancel()
+    writing.cancel()
+    await asyncio.gather(reading, writing, return_exceptions=True)
+    retained = activities._connections[connection.handle]
+    assert retained.reading is not None
+    pending: list[asyncio.Future[Any]] = [retained.reading, *retained.writes.values()]
+
+    if worker_shutdown:
+        await activities.shut_down()
+    else:
+        await run(activities.close, CloseActivityInput(connection.handle))
+
+    assert process.closed
+    assert not activities._connections
+    assert all(task.done() and not task.cancelled() for task in pending)
+    assert [task.result() for task in pending] == [[], None]
+
+
 @pytest.mark.parametrize(
     "script, error",
     [

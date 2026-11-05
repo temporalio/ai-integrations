@@ -50,14 +50,11 @@ class _Connection:
             await self.process.write(message)
 
     async def close(self) -> None:
-        """Close the process and release retained read and write tasks."""
+        """Close the process and collect pending I/O results."""
         await self.process.close()
         pending: list[asyncio.Future[Any]] = list(self.writes.values())
         if self.reading is not None:
             pending.append(self.reading)
-        for task in pending:
-            if not task.done():
-                task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
 
     async def read_process(self) -> list[Message]:

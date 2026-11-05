@@ -106,6 +106,8 @@ class ProtocolProcess:
     async def close(self) -> None:
         self.closed = True
         self.output.put_nowait([])
+        if self.gate is not None:
+            self.gate.set()
 
 
 class ProtocolConnector:
