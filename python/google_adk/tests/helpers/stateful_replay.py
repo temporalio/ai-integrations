@@ -23,9 +23,12 @@ with workflow.unsafe.imports_passed_through():
 MCP_SERVER = """
 import asyncio
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # MCP 1.x
+    from mcp.server.fastmcp import FastMCP as MCPServer
 
-server = FastMCP("replay")
+server = MCPServer("replay")
 
 
 @server.tool()

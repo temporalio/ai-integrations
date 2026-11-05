@@ -84,8 +84,7 @@ def _stream_publish_error(err: Exception, model: str, topic: str) -> Application
 def _new_llm(llm_request: LlmRequest, model_name: str | None) -> BaseLlm:
     """Build the Worker model for the agent's ``TemporalModel`` name.
 
-    The request keeps its own model name, which a ``before_model_callback``
-    may have changed; the model sends it, as it does outside Temporal.
+    See :func:`_request_for_llm` for the model name the request carries.
     ``model_name`` is ``None`` for an Activity scheduled before
     ``TemporalModel`` sent its name, which then uses the request's model name.
     A name the Worker cannot build fails the Activity without retries, since
@@ -104,6 +103,25 @@ def _new_llm(llm_request: LlmRequest, model_name: str | None) -> BaseLlm:
             type=type(err).__name__,
             non_retryable=True,
         ) from err
+
+
+def _request_for_llm(
+    llm_request: LlmRequest, llm: BaseLlm, model_name: str | None
+) -> LlmRequest:
+    """Return the request the Worker model receives.
+
+    ADK puts the agent's model name in the request, and through this plugin
+    that is the ``TemporalModel``'s name, which can differ from the name of
+    the model the Worker builds for it (for example ``gemini:gemini-2.5-flash``
+    builds a model named ``gemini-2.5-flash``). Outside Temporal the model is
+    asked for its own name, so when the request still carries the
+    ``TemporalModel``'s name, replace it with the Worker model's name. A name a
+    ``before_model_callback`` set is different, so it passes through.
+    """
+    name = model_name if model_name is not None else llm_request.model
+    if llm_request.model != name or llm.model == name:
+        return llm_request
+    return llm_request.model_copy(update={"model": llm.model})
 
 
 class TemporalLlmRequest(LlmRequest):
@@ -150,6 +168,7 @@ async def invoke_model(llm_request: TemporalLlmRequest) -> list[LlmResponse]:
     """
     request = llm_request.unwrap()
     llm = _new_llm(request, llm_request.temporal_model_name)
+    request = _request_for_llm(request, llm, llm_request.temporal_model_name)
 
     with _classify_model_errors():
         return [
@@ -192,6 +211,7 @@ async def invoke_model_streaming(
     """
     llm_request = input.llm_request
     llm = _new_llm(llm_request, input.model_name)
+    llm_request = _request_for_llm(llm_request, llm, input.model_name)
 
     responses: list[LlmResponse] = []
 
@@ -280,9 +300,10 @@ class TemporalModel(BaseLlm):
                 model registered for this name. A ``before_model_callback``
                 that changes ``llm_request.model`` does not pick another
                 model: this model receives the changed name, as it does
-                outside Temporal. The request carries this name as is, so a
-                registry name with a class prefix, such as
-                ``gemini:gemini-2.5-flash``, reaches the model with the prefix.
+                outside Temporal. When the request still carries this name,
+                the Worker model receives its own name instead, so a registry
+                name with a class prefix, such as ``gemini:gemini-2.5-flash``,
+                reaches the model as ``gemini-2.5-flash``.
             activity_config: Configuration options for the activity execution.
             summary_fn: Optional callable that receives the LlmRequest and
                 returns a summary string (or None) for the activity. Must be

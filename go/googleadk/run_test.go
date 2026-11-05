@@ -204,9 +204,10 @@ func (i bearerInterceptor) Before(ctx context.Context, req *a2aclient.Request) (
 }
 
 // TestRemoteSubAgentErrorNotRetried proves an A2A call the remote agent
-// refuses, or a client the card cannot make, fails the SendA2AMessage Activity
-// once, without retries, and the turn ends as it would without Temporal: ADK
-// turns the error into an event.
+// refuses, or a client the card cannot make, fails without retries, and the
+// turn ends as it would without Temporal: ADK turns the error into an event.
+// Malformed network cards fail in ResolveA2AAgentCard; client and remote-call
+// errors fail in SendA2AMessage.
 // The last case is the control for the HTTP 401 ones: the caller's
 // A2AClientFactory adds the right credentials and the remote agent answers.
 func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
@@ -215,6 +216,7 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 		server    a2aServer
 		factory   *a2aclient.Factory
 		sse       bool
+		cardFails bool
 		wantError string
 		wantText  string
 	}{
@@ -280,17 +282,19 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 		{
 			name:      "card with an interface URL that does not parse",
 			server:    a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), REST: true, Path: "/%zz"},
+			cardFails: true,
 			wantError: "invalid URL escape",
 		},
 		{
-			// JSON-RPC parses the URL on each call, not when the client is made.
 			name:      "card with a JSON-RPC interface URL that does not parse",
 			server:    a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), Path: "/%zz"},
+			cardFails: true,
 			wantError: "invalid URL escape",
 		},
 		{
 			name:      "card whose interface URLs all do not parse",
 			server:    a2aServer{Reply: a2aReply(a2a.NewMessage(a2a.MessageRoleAgent, a2a.NewTextPart("remote answer")), nil), REST: true, Path: "/%zz", AlsoRESTPath: "/%zy"},
+			cardFails: true,
 			wantError: "invalid URL escape",
 		},
 		{
@@ -334,7 +338,12 @@ func TestRemoteSubAgentErrorNotRetried(t *testing.T) {
 			require.NoError(t, env.GetWorkflowError())
 			var res runResult
 			require.NoError(t, env.GetWorkflowResult(&res))
-			assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName), "a refused A2A call must not be retried")
+			assert.Equal(t, 1, counter.get(googleadk.ResolveA2AAgentCardActivityName), "card resolution must not be retried")
+			if tc.cardFails {
+				assert.Zero(t, counter.get(googleadk.SendA2AMessageActivityName), "a rejected card must not reach SendA2AMessage")
+			} else {
+				assert.Equal(t, 1, counter.get(googleadk.SendA2AMessageActivityName), "a refused A2A call must not be retried")
+			}
 			if tc.wantError != "" {
 				require.Len(t, res.Errors, 1, "ADK turns the failed call into an error event")
 				assert.Contains(t, res.Errors[0], tc.wantError)
@@ -411,13 +420,13 @@ func TestRemoteSubAgentHTTPDelivered(t *testing.T) {
 		},
 		{
 			name:      "A2AClientFactory transport that fails to open once, other interface URL does not parse",
-			server:    a2aServer{Reply: answer, AlsoRESTPath: "/%zz"},
+			server:    a2aServer{Reply: answer, AlsoRESTPath: "/%zz", CardFile: true},
 			factory:   flakyA2AFactory(1),
 			wantSends: 2,
 		},
 		{
 			name:      "A2AClientFactory transport that opens, other interface URL does not parse",
-			server:    a2aServer{Reply: answer, AlsoRESTPath: "/%zz"},
+			server:    a2aServer{Reply: answer, AlsoRESTPath: "/%zz", CardFile: true},
 			factory:   flakyA2AFactory(),
 			wantSends: 1,
 		},
