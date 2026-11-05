@@ -541,16 +541,22 @@ class ModelActivity:
             # still buffered. Other cancels, such as a Worker shutdown or a heartbeat
             # timeout, can be retried, so publish nothing and let the retry answer.
             if _cancel_requested():
-                async with heartbeating():
-                    events_topic.publish(
-                        ResponseErrorEvent(
-                            type="error",
-                            code="cancelled",
-                            message="The model call was cancelled.",
-                            sequence_number=len(events),
+                # Best effort: if the publish fails, still report the cancel.
+                try:
+                    async with heartbeating():
+                        events_topic.publish(
+                            ResponseErrorEvent(
+                                type="error",
+                                code="cancelled",
+                                message="The model call was cancelled.",
+                                sequence_number=len(events),
+                            )
                         )
+                        await stream.flush()
+                except Exception:
+                    activity.logger.debug(
+                        "Could not publish the cancelled event", exc_info=True
                     )
-                    await stream.flush()
             raise
 
         return events
