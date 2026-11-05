@@ -54,8 +54,7 @@ from openai.types.responses.response_usage import (
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib.workflow_streams import WorkflowStream
-from temporalio.openai_agents import ModelActivityParameters
-from temporalio.openai_agents._model_parameters import ModelSummaryProvider
+from temporalio.openai_agents import ModelActivityParameters, ModelSummaryProvider
 from temporalio.openai_agents._openai_runner import _convert_agent
 from temporalio.openai_agents._temporal_model_provider import (
     _CaptureAgentFilter,  # pyright: ignore[reportPrivateUsage]
