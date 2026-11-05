@@ -482,6 +482,13 @@ class ModelActivity:
         ``streaming_topic`` so external consumers (UIs, tracing,
         etc.) can observe events as they arrive.
 
+        When the workflow cancels it, for example for a tripped input
+        guardrail, ``RunResultStreaming.cancel()`` or a
+        ``ModelSettings.timeout``, it publishes a ``ResponseErrorEvent``
+        with the code ``cancelled`` after its events and stops. That event
+        ends this model call, not the run: a ``ModelSettings.retry`` or the
+        next model call can publish after it.
+
         Heartbeats run on a background task via ``heartbeating`` so
         long initial-token latency or long pauses between chunks do not
         trip ``heartbeat_timeout``.
