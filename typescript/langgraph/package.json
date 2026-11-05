@@ -1,0 +1,111 @@
+{
+  "name": "@temporalio/langgraph",
+  "version": "0.0.0",
+  "description": "Temporal plugin for LangGraph.js: run LangGraph nodes and tasks as durable Temporal Activities.",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "workflow": [
+        "./lib/workflow.d.ts"
+      ]
+    }
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "import": "./lib/index.js",
+      "require": "./lib/index.js",
+      "default": "./lib/index.js"
+    },
+    "./workflow": {
+      "types": "./lib/workflow.d.ts",
+      "import": "./lib/workflow.js",
+      "require": "./lib/workflow.js",
+      "default": "./lib/workflow.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "lint": "pnpm run build && eslint --config ../_shared/eslint.config.mjs src",
+    "test": "ava",
+    "pack": "pnpm pack --pack-destination dist"
+  },
+  "ava": {
+    "files": [
+      "./lib/__tests__/**/*.test.js"
+    ],
+    "timeout": "120s",
+    "concurrency": 4,
+    "workerThreads": false
+  },
+  "keywords": [
+    "temporal",
+    "workflow",
+    "langgraph",
+    "langchain",
+    "agents",
+    "ai",
+    "llm",
+    "durable"
+  ],
+  "author": "Temporal Technologies Inc. <sdk@temporal.io>",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@temporalio/activity": "^1.24.0",
+    "@temporalio/common": "^1.24.0",
+    "@temporalio/plugin": "^1.24.0",
+    "@temporalio/workflow": "^1.24.0",
+    "@temporalio/workflow-streams": "^1.24.0",
+    "web-streams-polyfill": "^4.3.0"
+  },
+  "peerDependencies": {
+    "@langchain/core": "^1.1.0",
+    "@langchain/langgraph": "^1.5.0",
+    "long": "^5.3.2",
+    "protobufjs": "^8.7.1"
+  },
+  "devDependencies": {
+    "@langchain/core": "^1.1.0",
+    "@langchain/langgraph": "^1.5.0",
+    "@temporalio/client": "^1.24.0",
+    "@temporalio/testing": "^1.24.0",
+    "@temporalio/worker": "^1.24.0",
+    "ava": "^5.3.1",
+    "long": "^5.3.2",
+    "protobufjs": "^8.7.1",
+    "zod": "^4.2.1",
+    "@tsconfig/node20": "^20.1.4",
+    "@types/node": "^20.19.39",
+    "typescript": "^5.9.3",
+    "eslint": "^9.26.0",
+    "@eslint/js": "^9.26.0",
+    "typescript-eslint": "^8.10.0",
+    "eslint-plugin-import": "^2.31.0",
+    "eslint-import-resolver-typescript": "^3.6.1",
+    "eslint-config-prettier": "^9.1.0"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "bugs": {
+    "url": "https://github.com/temporalio/ai-integrations/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/temporalio/ai-integrations.git",
+    "directory": "typescript/langgraph"
+  },
+  "homepage": "https://github.com/temporalio/ai-integrations/tree/main/typescript/langgraph",
+  "files": [
+    "src",
+    "lib",
+    "!src/__tests__",
+    "!lib/__tests__",
+    "LICENSE"
+  ],
+  "packageManager": "pnpm@10.27.0"
+}

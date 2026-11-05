@@ -1,0 +1,33 @@
+onlyBuiltDependencies:
+  - "@temporalio/core-bridge"
+  - esbuild
+  - protobufjs
+
+# Minimum release age, in minutes (2 weeks)
+minimumReleaseAge: 20160
+
+# Allow depending on just published Temporal packages
+minimumReleaseAgeExclude:
+  - '@temporalio/*'
+  - nexus-rpc
+
+  # These AI SDK releases share provider-utils 5.0.53. The packages pin exact
+  # versions of each other, so the whole family has to be allowed together.
+  - ai@7.0.124
+  - '@ai-sdk/gateway@4.0.102'
+  - '@ai-sdk/mcp@2.0.64'
+  - '@ai-sdk/openai@4.0.83'
+  - '@ai-sdk/otel@1.0.124'
+  - '@ai-sdk/provider@4.0.21'
+  - '@ai-sdk/provider-utils@5.0.53'
+
+peerDependencyRules:
+  ignoreMissing:
+    # Peer of json-joy@9.9.1, missing in memfs@4.6.0
+    # No apparent issue at runtime if not present
+    - quill-delta
+
+overrides:
+  'minimatch@>=7.0.0 <7.4.8': '>=7.4.8'
+  serialize-javascript: '>=7.0.3'
+  handlebars: '>=4.7.9'

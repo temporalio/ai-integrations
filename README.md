@@ -26,6 +26,7 @@ cadence.
 | [`python/strands_agents`](python/strands_agents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-strands-agents.svg)](https://pypi.org/project/temporalio-strands-agents/) (Public Preview) |
 | [`python/typesafe`](python/typesafe) | [![PyPI](https://img.shields.io/pypi/v/temporalio-typesafe.svg)](https://pypi.org/project/temporalio-typesafe/) (Pre-release) |
 | [`typescript/google-adk`](typescript/google-adk) | [![npm](https://img.shields.io/npm/v/@temporalio/google-adk.svg)](https://www.npmjs.com/package/@temporalio/google-adk) (Public Preview) |
+| [`typescript/langgraph`](typescript/langgraph) | [![npm](https://img.shields.io/npm/v/@temporalio/langgraph.svg)](https://www.npmjs.com/package/@temporalio/langgraph) (Pre-release) |
 | [`typescript/langsmith`](typescript/langsmith) | [![npm](https://img.shields.io/npm/v/@temporalio/langsmith.svg)](https://www.npmjs.com/package/@temporalio/langsmith) (Public Preview) |
 | [`typescript/openai-agents`](typescript/openai-agents) | [![npm](https://img.shields.io/npm/v/@temporalio/openai-agents.svg)](https://www.npmjs.com/package/@temporalio/openai-agents) |
 | [`typescript/strands-agents`](typescript/strands-agents) | [![npm](https://img.shields.io/npm/v/@temporalio/strands-agents.svg)](https://www.npmjs.com/package/@temporalio/strands-agents) (Pre-release) |
