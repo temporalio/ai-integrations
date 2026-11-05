@@ -35,7 +35,6 @@ from temporalio.openai_agents._temporal_model_provider import (
     capture_scope,
     install_model_provider,
 )
-from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
 from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
@@ -228,16 +227,11 @@ class TemporalOpenAIRunner(AgentRunner):
             RunConfig() if run_config is None else _coerce_run_config(run_config)
         )
 
-        if run_config.model and not isinstance(run_config.model, _TemporalModelStub):
-            if not isinstance(run_config.model, str):
-                raise ValueError(
-                    "Temporal workflows require a model name to be a string in the run config."
-                )
-            run_config = dataclasses.replace(
-                run_config,
-                model=_TemporalModelStub(
-                    run_config.model, model_params=self.model_params, agent=None
-                ),
+        # The plugin's model provider turns the name into the model Activity. Keeping the
+        # name lets the SDK apply that model's default settings, as it does natively.
+        if run_config.model and not isinstance(run_config.model, str):
+            raise ValueError(
+                "Temporal workflows require a model name to be a string in the run config."
             )
 
         # Model calls run in an Activity on the Worker's provider, so a provider set on the

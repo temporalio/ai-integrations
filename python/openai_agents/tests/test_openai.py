@@ -141,6 +141,9 @@ from temporalio.openai_agents import (
     _mcp,
 )
 from temporalio.openai_agents._invoke_model_activity import (
+    ActivityModelInput,
+    ModelTracingInput,
+    _align_implicit_model_settings,
     _build_tool,
     _raise_for_openai_status,
 )
@@ -5677,6 +5680,26 @@ async def test_explicit_model_settings_reach_the_provider_model_unchanged(
 
 
 @workflow.defn
+class RunModelAgent:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        # Names no model, but the run does.
+        agent = Agent(name="Assistant", instructions="Reply briefly.")
+        result = await Runner.run(
+            agent, input=prompt, run_config=RunConfig(model="gpt-5.4-pro")
+        )
+        return result.final_output
+
+
+async def test_run_model_gets_its_own_default_settings(client: Client):
+    # As natively, the run's model replaces the agent's implicit defaults with its own.
+    model = RecordingNamedModel("gpt-5.4-pro")
+    await _run_with_model(client, model, RunModelAgent)
+    assert model.settings == [get_default_model_settings("gpt-5.4-pro")]
+    assert model.settings[0].reasoning == Reasoning(effort="medium")
+
+
+@workflow.defn
 class RunOverrideSettingsAgent:
     @workflow.run
     async def run(self, prompt: str) -> str:
@@ -5751,6 +5774,28 @@ async def test_alignment_uses_the_workflow_workers_defaults(
                 result_type=str,
             )
     assert model.settings == [ModelSettings()]
+
+
+def test_alignment_keeps_extra_args():
+    # A SandboxAgent's capabilities add extra_args, such as the compaction threshold,
+    # to an agent's implicit default settings in the Workflow.
+    extra_args = {
+        "context_management": [{"type": "compaction", "compact_threshold": 942818}]
+    }
+    activity_input: ActivityModelInput = {
+        "model_name": None,
+        "input": "Hello",
+        "model_settings": get_default_model_settings().resolve(
+            ModelSettings(extra_args=extra_args)
+        ),
+        "tracing": ModelTracingInput.DISABLED,
+        "implicit_model_settings": True,
+        "run_model_settings": None,
+    }
+    settings = _align_implicit_model_settings(
+        activity_input, RecordingNamedModel("gpt-oss-120b")
+    )
+    assert settings == ModelSettings(extra_args=extra_args)
 
 
 def test_plugin_reports_package_version() -> None:
