@@ -367,22 +367,30 @@ the turn ends before its next model step with every tool result in, and the
 fresh run continues the turn from the carried transcript; calls made before the
 cut are not run again, though the agent may choose to repeat one. The cut ends
 the loop like a finished turn, so other middleware's `after_agent` hooks run at
-each cut. Only messages cross the cut, as between turns: state-backed files,
-todo state and custom middleware state do not cross as state, and each run
-starts with a fresh recursion limit. The middleware does nothing under a plain
-`ainvoke(...)`. Sub-agents started by the `task` tool are not cut: a
-sub-agent's calls stay in the parent's history until its `task` call returns. Adding the middleware to an agent with runs in flight changes
-what those runs do next, so ship it with Worker Versioning or after they
-finish.
+each cut. The same state crosses the cut as between turns (messages and state
+files, below): todo state and custom middleware state do not cross as state,
+and each run starts with a fresh recursion limit. The middleware does nothing
+under a plain `ainvoke(...)`. Sub-agents started by the `task` tool are not
+cut: a sub-agent's calls stay in the parent's history until its `task` call
+returns. Adding the middleware to an agent with runs in flight changes what
+those runs do next, so ship it with Worker Versioning or after they finish.
 
-- **Carries forward:** the accumulated messages. Messages of the classes in
-  `langchain_core.messages` come back in the next run as the same class (a
-  `ToolMessage` stays a `ToolMessage`). Repeated identical calls are
+- **Carries forward:** the accumulated messages and the agent's state files
+  (the graph's `files` state, where the default `StateBackend` keeps what
+  `write_file` writes). Messages of the classes in `langchain_core.messages`
+  come back in the next run as the same class (a `ToolMessage` stays a
+  `ToolMessage`). Both ride in the continue-as-new input, so large files count
+  toward its payload size limit; keep large files in a durable backend such as
+  `TemporalBackend`. Repeated identical calls are
   NOT deduplicated: a call the agent re-issues after the boundary runs its own
   Activity, so a genuinely new identical request is never served a stale prior
   result. Your `@workflow.run` must accept `state_snapshot=None` as shown.
-- **Does not carry forward:** anything held only in an in-memory checkpointer's
-  own structures beyond the messages/todos snapshot. The default in-workflow
+- **Does not carry forward:** todos as state. `TodoListMiddleware` marks
+  `todos` as `OmitFromInput`, so the graph drops it from input and the next
+  run starts with none; the agent's earlier `write_todos` calls are still in
+  the carried messages. Nor does anything
+  held only in an in-memory checkpointer's own structures beyond the messages
+  and files snapshot. The default in-workflow
   `InMemorySaver` is rehydrated for free by deterministic replay; a durable
   checkpointer that does its own I/O is not replay-safe from inside a workflow,
   and the plugin warns if you pass one — prefer the snapshot + continue-as-new

@@ -60,9 +60,9 @@ class ContinueAsNewMiddleware(AgentMiddleware):
     in the turn (an agent called from a tool) are not supported: they share
     the turn's step count.
 
-    Only messages cross the cut, as with between-turn continue-as-new:
-    state-backed files, todo state and custom middleware state do not cross as
-    state, and each run starts with a fresh recursion limit.
+    The same state crosses the cut as with between-turn continue-as-new:
+    messages and state-backed files. Todo state and custom middleware state do
+    not cross as state, and each run starts with a fresh recursion limit.
     """
 
     @hook_config(can_jump_to=["end"])
