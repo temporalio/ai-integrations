@@ -21,6 +21,10 @@ import temporalio.converter
 import temporalio.worker
 import temporalio.workflow
 from temporalio import activity
+from temporalio.openai_agents._temporal_trace_provider import (
+    _report_nothing,
+    _reports_nothing,
+)
 
 HEADER_KEY = "__openai_span"
 
@@ -182,11 +186,16 @@ class OpenAIAgentsContextPropagationInterceptor(
         """Gets the OpenAI Agents trace/span data for the input header."""
         current = get_current_span()
         trace = get_trace_provider().get_current_trace()
-        return {
+        contents: dict[str, Any] = {
             "traceName": trace.name if trace else "Unknown Workflow",
             "spanId": current.span_id if current else None,
             "traceId": trace.trace_id if trace else None,
         }
+        # Spans under a trace or span that reports nothing report nothing too, also where
+        # the context is rebuilt. Other contexts keep the headers they had.
+        if _reports_nothing(current) or _reports_nothing(trace):
+            contents["disabled"] = True
+        return contents
 
     def get_header_contents(self, input: _InputWithHeaders) -> dict[str, Any] | None:
         """Extract trace context information from input headers.
@@ -212,6 +221,8 @@ class OpenAIAgentsContextPropagationInterceptor(
                 span_info["traceName"],
                 trace_id=span_info["traceId"],
             )
+            if span_info.get("disabled"):
+                _report_nothing(current_trace)
 
             if self._start_traces:
                 current_trace.start(mark_as_current=True)
@@ -229,6 +240,8 @@ class OpenAIAgentsContextPropagationInterceptor(
             current_span = get_trace_provider().create_span(
                 span_data=CustomSpanData(name="", data={}), span_id=span_info["spanId"]
             )
+            if span_info.get("disabled"):
+                _report_nothing(current_span)
             if self._start_traces:
                 current_span.start(mark_as_current=True)
             else:
