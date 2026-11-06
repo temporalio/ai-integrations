@@ -346,6 +346,65 @@ def load_messages(dumped: list[Any]) -> list[Any]:
     return [load(d) for d in dumped]
 
 
+def dump_carried_messages(messages: Any) -> list[Any]:
+    """Serialize the transcript ``run_deep_agent`` carries across continue-as-new.
+
+    The plugin's payload converter writes a LangChain message as a dict of the
+    fields that were set, which leaves out its ``type``, so the continued run
+    cannot rebuild it. Each message of a class from ``langchain_core.messages``
+    goes in its ``dumpd`` form instead. Any other value, such as a string, a
+    ``{"role": ..., "content": ...}`` dict or a message subclass defined
+    elsewhere (which ``load`` could not rebuild), is kept as is.
+    """
+    from langchain_core.load import dumpd
+
+    return [dumpd(m) if _is_core_message(m) else m for m in messages]
+
+
+def _is_core_message(value: Any) -> bool:
+    from langchain_core.messages import BaseMessage
+
+    return isinstance(value, BaseMessage) and type(value).__module__.startswith(
+        "langchain_core.messages."
+    )
+
+
+def load_carried_messages(carried: Any) -> list[Any]:
+    """Rehydrate a transcript written by :func:`dump_carried_messages`.
+
+    Only serialized LangChain messages are loaded. Any other value, including
+    a snapshot written before this form was used or one a caller built by
+    hand, is returned unchanged.
+    """
+    from langchain_core.load import load
+
+    return [load(m) if _is_dumped_message(m) else m for m in carried]
+
+
+# The ``id`` prefix ``dumpd`` writes for every class in ``langchain_core.messages``.
+_DUMPED_MESSAGE_ID_PREFIX = ["langchain", "schema", "messages"]
+
+
+def _is_dumped_message(value: Any) -> bool:
+    """Whether ``value`` is a message in LangChain's ``dumpd`` form.
+
+    The check is on the whole envelope and the message namespace, so ``load``
+    never sees other serialized objects or a dict that only looks similar.
+    """
+    if not isinstance(value, dict):
+        return False
+    dumped: dict[str, Any] = cast(dict[str, Any], value)
+    ident: Any = dumped.get("id")
+    return (
+        dumped.get("lc") == 1
+        and dumped.get("type") == "constructor"
+        and isinstance(dumped.get("kwargs"), dict)
+        and isinstance(ident, list)
+        and len(ident) == len(_DUMPED_MESSAGE_ID_PREFIX) + 1
+        and ident[:-1] == _DUMPED_MESSAGE_ID_PREFIX
+    )
+
+
 def tool_to_schema(tool: Any) -> dict[str, Any]:
     """Advertise a tool to the model as a full OpenAI tool schema.
 

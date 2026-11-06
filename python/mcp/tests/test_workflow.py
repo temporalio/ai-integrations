@@ -1,4 +1,5 @@
 import asyncio
+import importlib.metadata
 import socket
 import sys
 from collections.abc import AsyncGenerator, Callable
@@ -280,3 +281,7 @@ async def streamable_http_server() -> AsyncGenerator[str, None]:
 async def test_streamable_http_transport(client: TemporalClient) -> None:
     async with streamable_http_server() as url:
         await run_transport_workflow(client, "http", lambda: Client(url))
+
+
+def test_plugin_reports_package_version() -> None:
+    assert MCPPlugin({}).version() == importlib.metadata.version("temporalio-mcp")
