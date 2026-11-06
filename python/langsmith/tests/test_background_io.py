@@ -78,13 +78,18 @@ def test_native_root_and_child_defaults(
 
     expected = random.Random(42)
     ms = int(NOW.timestamp() * 1000)
+    rand_bits = (1 << 62) - 1  # The last 62 bits come straight from the stream.
     assert type(root) is RunTree
-    assert root.id == uuid.UUID(int=ms << 80 | expected.getrandbits(80), version=7)
+    assert (root.id.version, root.id.int >> 80) == (7, ms)
+    expected.getrandbits(12)
+    assert root.id.int & rand_bits == expected.getrandbits(62)
     assert root.parent_run_id is None
     assert root.trace_id == root.id
     assert root.start_time > NOW  # Live runs use wall-clock time.
     assert type(child) is RunTree
-    assert child.id == uuid.UUID(int=ms << 80 | expected.getrandbits(80), version=7)
+    assert (child.id.version, child.id.int >> 80) == (7, ms)
+    expected.getrandbits(12)
+    assert child.id.int & rand_bits == expected.getrandbits(62)
     assert child.parent_run_id == root.id
     assert child.trace_id == root.id
     assert child.start_time >= root.start_time

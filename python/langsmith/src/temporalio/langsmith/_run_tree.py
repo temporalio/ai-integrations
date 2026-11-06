@@ -70,9 +70,16 @@ def run_id() -> uuid.UUID:
         rng = temporalio.workflow.new_random("temporalio.langsmith")
         setattr(instance, "__temporal_langsmith_random", rng)
 
-    # v7: a 48-bit millisecond timestamp, then random bits.
+    # v7 layout: 48-bit time, version 7, 12 random bits, variant 0b10, 62 random bits.
+    # Built by hand because uuid.UUID(version=7) needs Python 3.14.
     ms = int(temporalio.workflow.now().timestamp() * 1000)
-    return uuid.UUID(int=ms << 80 | rng.getrandbits(80), version=7)
+    return uuid.UUID(
+        int=ms << 80
+        | 0x7 << 76
+        | rng.getrandbits(12) << 64
+        | 0x2 << 62
+        | rng.getrandbits(62)
+    )
 
 
 def now(tz: tzinfo | None = timezone.utc) -> datetime:

@@ -74,9 +74,10 @@ class NativeRunTreeWorkflow:
         assert other_plugin_random.getstate() == other_plugin_random_state
         run_ids = {run["id"] for run in self.snapshots}
         assert str(workflow.uuid4()) not in run_ids
-        # The last 48 bits of a v7 ID come straight from the random stream.
-        random_bits = {uuid.UUID(run_id).int & (1 << 48) - 1 for run_id in run_ids}
-        assert other_plugin_random.getrandbits(80) & (1 << 48) - 1 not in random_bits
+        # The last 62 bits of a v7 ID come straight from the random stream.
+        random_bits = {uuid.UUID(run_id).int & (1 << 62) - 1 for run_id in run_ids}
+        other_plugin_random.getrandbits(12)
+        assert other_plugin_random.getrandbits(62) not in random_bits
         return self.snapshots
 
     @workflow.query
