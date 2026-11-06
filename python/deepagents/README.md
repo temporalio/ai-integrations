@@ -174,6 +174,44 @@ artifact, keep their JSON form, so a `Document` artifact arrives as a dict.
 Update activity workers before or together with workflow workers: an older
 activity worker still passes the messages to the tool as dicts.
 
+A tool activity that Temporal gives up on (a non-retryable error, or a retry
+policy that ran out) raises `ActivityError` out of the tool node and fails the
+whole agent run. To let the model handle the failure instead, add a tool-call
+middleware to `create_deep_agent`. By the time the error reaches it, Temporal's
+retry policy has already finished, so the middleware only decides what the
+model sees: which tools and failure types to recover, and with what wording.
+Re-raise cancellation so cancelling the workflow still cancels the run:
+
+```python
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import ToolMessage
+from temporalio.exceptions import ActivityError, is_cancelled_exception
+
+
+class ReturnSearchFailuresToModel(AgentMiddleware):
+    async def awrap_tool_call(self, request, handler):
+        try:
+            return await handler(request)
+        except ActivityError as err:
+            if is_cancelled_exception(err) or request.tool_call["name"] != "search":
+                raise
+            return ToolMessage(
+                content="Search is unavailable; try another source.",
+                tool_call_id=request.tool_call["id"],
+                status="error",
+            )
+
+
+agent = create_deep_agent(
+    model="anthropic:claude-sonnet-4-5",
+    tools=[search_tool],
+    middleware=[ReturnSearchFailuresToModel()],
+)
+```
+
+The middleware runs as workflow code, so keep it deterministic: build the
+message from the error and the request, not from the clock or random values.
+
 ## Durable file and shell backends
 
 Use `TemporalBackend("name", ...)` for a real-I/O backend
