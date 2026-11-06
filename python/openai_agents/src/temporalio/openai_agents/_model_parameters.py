@@ -52,13 +52,21 @@ class ModelActivityParameters:
     """Maximum time between heartbeats. For streaming
     (``Runner.run_streamed``), set this lower than
     ``start_to_close_timeout`` so a stuck model call is detected before the
-    overall activity timeout fires."""
+    overall activity timeout fires. Streaming also needs it to stop the model
+    call when the workflow cancels it, for example when a parallel input
+    guardrail trips: without it, the activity is not told about the cancel and
+    keeps publishing to ``streaming_topic``."""
 
     retry_policy: RetryPolicy | None = None
     """Policy for retrying failed activities."""
 
     cancellation_type: ActivityCancellationType = ActivityCancellationType.TRY_CANCEL
-    """How the activity handles cancellation."""
+    """How the activity handles cancellation. For streaming, ``TRY_CANCEL``
+    lets the run go on while the activity stops, so the ``error`` event it
+    publishes can come after the workflow closes or among later events on
+    ``streaming_topic``. ``WAIT_CANCELLATION_COMPLETED`` waits until the
+    activity has published it. ``ABANDON`` sends no cancel, so the activity
+    keeps publishing."""
 
     versioning_intent: VersioningIntent | None = None
     """Versioning intent for the activity."""

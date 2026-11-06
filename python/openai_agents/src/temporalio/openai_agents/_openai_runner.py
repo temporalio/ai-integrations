@@ -40,7 +40,11 @@ from temporalio.openai_agents._temporal_model_provider import (
     capture_scope,
     install_model_provider,
 )
-from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
+from temporalio.openai_agents._temporal_model_stub import (
+    _current_streamed_run,
+    _StreamedRun,
+    _TemporalModelStub,
+)
 from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
@@ -474,12 +478,22 @@ class TemporalOpenAIRunner(AgentRunner):
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
-        with capture_scope(run_config.model_settings), _inline_sync_function_tools():
-            streamed_result = self._runner.run_streamed(
-                starting_agent=converted_agent,
-                input=input,
-                **kwargs,
-            )
+        streamed_run = _StreamedRun()
+        token = _current_streamed_run.set(streamed_run)
+        try:
+            with (
+                capture_scope(run_config.model_settings),
+                _inline_sync_function_tools(),
+            ):
+                streamed_result = self._runner.run_streamed(
+                    starting_agent=converted_agent,
+                    input=input,
+                    **kwargs,
+                )
+        finally:
+            _current_streamed_run.reset(token)
+        # The model stub reads it to watch the run's parallel input guardrails.
+        streamed_run.result = streamed_result
 
         # Mirror the AgentsException -> AgentsWorkflowError rewrap done
         # in run() above. The streaming runner attaches the actual run
