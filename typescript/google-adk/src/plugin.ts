@@ -4,10 +4,10 @@ import path from 'node:path';
 
 import type { BaseLlm } from '@google/adk';
 import { SimplePlugin } from '@temporalio/plugin';
-import type { BundleOptions, WorkerOptions } from '@temporalio/worker';
+import type { BundleOptions, Worker, WorkerOptions } from '@temporalio/worker';
 
 import { createModelActivities, createMCPActivities } from './activities';
-import { refuseReplacedActivities } from './activity-sources';
+import { refuseLaterReplacement, refuseReplacedActivities } from './activity-sources';
 import { type MCPToolsetFactory } from './mcp';
 
 /** The webpack `Configuration` object the bundler hands to `webpackConfigHook`. */
@@ -656,6 +656,16 @@ export interface GoogleAdkPluginOptions {
   autoRouteModels?: boolean;
 }
 
+/** Reads this package's version, which worker heartbeats report. Empty if it can't be read. */
+function packageVersion(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require('../package.json') as { version?: string }).version ?? '';
+  } catch {
+    return '';
+  }
+}
+
 /**
  * The Temporal plugin for the Google Agent Development Kit (`@google/adk`).
  *
@@ -669,6 +679,9 @@ export interface GoogleAdkPluginOptions {
  * @experimental
  */
 export class GoogleAdkPlugin extends SimplePlugin {
+  /** The package version, reported in worker heartbeats. */
+  readonly version = packageVersion();
+
   private readonly autoRouteModels: boolean;
 
   /**
@@ -699,6 +712,22 @@ export class GoogleAdkPlugin extends SimplePlugin {
   override configureWorker(options: WorkerOptions): WorkerOptions {
     refuseReplacedActivities('GoogleAdkPlugin', options.activities, this.options.activities as object);
     return super.configureWorker(options);
+  }
+
+  /**
+   * Runs the Worker.
+   *
+   * @throws TypeError, before the Worker polls, if a plugin applied after this
+   * one replaced one of its Activities with a different one. `Worker.create`
+   * applies the Worker's plugins in order, then the `NativeConnection`'s.
+   */
+  override runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    // Not async: when the check passes, the Worker starts in this tick, as
+    // `Worker.runUntil` needs (see `refuseLaterReplacement`).
+    return (
+      refuseLaterReplacement('GoogleAdkPlugin', worker, this.options.activities as object, next) ??
+      super.runWorker(worker, next)
+    );
   }
 
   /**

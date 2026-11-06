@@ -1,6 +1,7 @@
 """Initialize Temporal OpenAI Agents overrides."""
 
 import dataclasses
+import importlib.metadata
 import json
 import threading
 import typing
@@ -10,6 +11,7 @@ from collections.abc import (
     Callable,
     Collection,
     Generator,
+    Iterable,
     Mapping,
     Sequence,
 )
@@ -244,6 +246,45 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
     return construct_type(type_=type_, value=value)
 
 
+# The iterator type pydantic decodes ``Iterable`` fields to. It cannot be
+# copied, and pydantic_core does not export it.
+_DecodedIterator: type[Iterable[typing.Any]] = type(
+    pydantic.TypeAdapter(Iterable[typing.Any]).validate_python(())
+)
+
+
+_UNSET = object()
+
+
+def _list_decoded_iterators(value: typing.Any) -> typing.Any:
+    """Replace decoded iterators in ``value`` with lists, in place, and return it."""
+    if isinstance(value, _DecodedIterator):
+        return [_list_decoded_iterators(item) for item in value]
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = _list_decoded_iterators(item)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _list_decoded_iterators(item)
+    elif isinstance(value, pydantic.BaseModel):
+        for name in type(value).model_fields:
+            # Skip validate_assignment, which would decode the list again.
+            object.__setattr__(
+                value, name, _list_decoded_iterators(getattr(value, name))
+            )
+        if value.__pydantic_extra__:
+            _list_decoded_iterators(value.__pydantic_extra__)
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        for field in dataclasses.fields(value):
+            # Pydantic leaves an init=False field unset.
+            item = getattr(value, field.name, _UNSET)
+            if item is _UNSET:
+                continue
+            # Also works for frozen dataclasses.
+            object.__setattr__(value, field.name, _list_decoded_iterators(item))
+    return value
+
+
 class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
     """Strict pydantic deserialization with a lenient fallback.
 
@@ -251,6 +292,13 @@ class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
     deprecated-but-required field the API has stopped sending). The SDK tolerates
     this when parsing responses, but strict ``validate_json`` on the workflow
     side does not, so fall back to lenient construction when validation fails.
+
+    Pydantic decodes ``Iterable`` fields, such as an assistant message's
+    ``content``, as one-shot iterators. The Agents SDK deep-copies run input
+    and cannot copy them, and reading one empties it, so they are decoded as
+    lists instead. ``_openai_types`` changes the openai item types so that
+    pydantic builds lists itself; this walk covers the types it does not
+    reach, such as classes built before the plugin was imported.
     """
 
     def from_payload(
@@ -260,11 +308,37 @@ class _OpenAIJSONPlainPayloadConverter(PydanticJSONPlainPayloadConverter):
     ) -> typing.Any:
         """See base class."""
         try:
-            return super().from_payload(payload, type_hint)
+            value = super().from_payload(payload, type_hint)
+            try:
+                return _list_decoded_iterators(value)
+            except pydantic.ValidationError:
+                # In JSON mode, pydantic decodes a string for
+                # ``Union[str, Iterable[...]]``, such as a custom tool's output,
+                # as an iterator over its characters. Python mode keeps the string.
+                # JSON mode accepted everything else, so don't apply strict mode,
+                # which rejects JSON strings for types such as datetime.
+                value = self._adapter(type_hint).validate_python(
+                    json.loads(payload.data), strict=False
+                )
+                return _list_decoded_iterators(value)
         except pydantic.ValidationError:
             if type_hint is None:
                 raise
-            return _lenient_construct(type_hint, json.loads(payload.data))
+            return _list_decoded_iterators(
+                _lenient_construct(type_hint, json.loads(payload.data))
+            )
+
+    def _adapter(self, type_hint: typing.Any) -> pydantic.TypeAdapter[typing.Any]:
+        """Return the cached type adapter, as the base class does."""
+        try:
+            return self._type_adapter(type_hint)
+        except TypeError:
+            # An unhashable hint bypasses the cache; any other TypeError is real.
+            try:
+                hash(type_hint)
+            except TypeError:
+                return pydantic.TypeAdapter(type_hint)
+            raise
 
 
 class OpenAIPayloadConverter(CompositePayloadConverter):
@@ -371,14 +445,21 @@ class OpenAIAgentsPlugin(SimplePlugin):
                 Useful for testing or custom model integrations.
             mcp_server_providers: Legacy MCP server providers to register with the
                 worker. Deprecated; use ``mcp_servers`` for new MCP v2
-                integrations.
+                integrations. A provider's server with a callable
+                ``tool_filter``, a ``require_approval`` policy that can ask for
+                approval, a ``tool_meta_resolver``, or a tool guardrail is
+                rejected in every MCP operation; a static filter is applied.
             mcp_servers: Named OpenAI MCP server factories to register on the worker.
                 Each factory may declare at most one positional parameter, which
                 receives the workflow's ``factory_argument`` (``None`` when the
                 workflow supplied none); a factory declaring more raises here. A
                 parameterless factory's modern connection is cached between
                 Activities. A factory called with a workflow ``factory_argument``
-                always creates a fresh server for that Activity.
+                always creates a fresh server for that Activity. A factory's server
+                with a callable ``tool_filter``, a ``require_approval`` policy
+                that can ask for approval, a ``tool_meta_resolver``, or a tool
+                guardrail is rejected; pass those to
+                ``workflow.temporal_mcp_server()``.
             mcp_connection_idle_timeout: How long an idle modern MCP connection
                 remains cached. Defaults to five minutes. None disables idle
                 eviction, and zero disables reuse.
@@ -557,6 +638,13 @@ class OpenAIAgentsPlugin(SimplePlugin):
             workflow_failure_exception_types=[AgentsWorkflowError],
             run_context=lambda: run_context(),
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-openai-agents")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
 
     @contextmanager
     def tracing_context(self) -> Generator[None, None, None]:

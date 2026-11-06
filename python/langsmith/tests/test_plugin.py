@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import uuid
 from typing import Any
 from unittest.mock import MagicMock
@@ -51,6 +52,10 @@ class TestPluginConstruction:
         assert interceptor._add_temporal_runs is False
         assert interceptor._default_metadata == {"env": "prod"}
         assert interceptor._default_tags == ["v1"]
+
+    def test_reports_package_version(self) -> None:
+        plugin = LangSmithPlugin(client=MagicMock())
+        assert plugin.version() == importlib.metadata.version("temporalio-langsmith")
 
 
 class TestPluginIntegration:

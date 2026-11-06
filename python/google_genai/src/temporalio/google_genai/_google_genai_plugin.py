@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib.metadata
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -157,3 +158,10 @@ class GoogleGenAIPlugin(SimplePlugin):
             workflow_runner=workflow_runner,
             workflow_failure_exception_types=[GoogleGenAIError],
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-google-genai")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
