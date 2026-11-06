@@ -9,7 +9,9 @@ attached to each model / tool call. LangChain messages are polymorphic
 references, so neither survives a naive round-trip. This module owns:
 
 * message (de)serialization via ``langchain_core.load.dumpd`` / ``load`` — the
-  round-trip that preserves message subtype and tool-call structure;
+  round-trip that preserves message subtype and tool-call structure, with
+  ``load``'s allowlist pinned to today's default so the announced narrowing of
+  that default cannot change what a recorded payload revives;
 * the strip → ship → rebuild dance for ``RunnableConfig``;
 * tool → JSON-schema advertisement (full name + description + argument schema,
   never ``{name, description}`` alone — without the argument schema the model
@@ -35,7 +37,7 @@ import copy
 import dataclasses
 import hashlib
 import json
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
     from langchain_core.messages import BaseMessage
@@ -146,11 +148,22 @@ def dump_object(obj: Any) -> Any:
     return dumpd(obj)
 
 
+# ``load`` warns on every call that its default ``allowed_objects`` (``"core"``)
+# will change. Pass today's default explicitly: the set of classes a payload can
+# revive stays exactly what it is on main, so histories already recorded keep
+# loading. That matters because the narrower ``"messages"`` spelling drops the
+# legacy-only message classes (``ChatMessage``, ``FunctionMessage``,
+# ``BaseMessage``, …) that ``"core"`` revives, and a message from caller state
+# can embed any other core serializable in ``additional_kwargs``. Narrowing the
+# allowlist would be a separate, deliberate change.
+_ALLOWED_OBJECTS: Literal["core"] = "core"
+
+
 def load_object(data: Any) -> Any:
     """Rehydrate a value produced by :func:`dump_object`, preserving subtype."""
     from langchain_core.load import load
 
-    return load(data)
+    return load(data, allowed_objects=_ALLOWED_OBJECTS)
 
 
 def _tool_arg_message_classes() -> tuple[type[BaseMessage], ...]:
@@ -343,7 +356,7 @@ def load_messages(dumped: list[Any]) -> list[Any]:
     """Rehydrate messages serialized by :func:`dump_messages`."""
     from langchain_core.load import load
 
-    return [load(d) for d in dumped]
+    return [load(d, allowed_objects=_ALLOWED_OBJECTS) for d in dumped]
 
 
 def tool_to_schema(tool: Any) -> dict[str, Any]:
