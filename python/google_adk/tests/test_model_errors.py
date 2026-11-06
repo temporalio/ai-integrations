@@ -12,17 +12,22 @@ A local HTTP server stands in for the Gemini API, so the real ADK ``Gemini``
 model and ``google-genai`` client run end to end without credentials. A fake
 model that raises errors directly covers SDKs that report the status as
 ``status_code``, and errors without an HTTP status.
+
+A streamed call whose responses cannot all be published fails with
+``googleadk.StreamError``, as in the Go and Java plugins. It is non-retryable
+when a retry would call the model again and fail the same way.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from collections.abc import AsyncGenerator, Iterator
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import ClassVar
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from google.adk.models import BaseLlm, LLMRegistry
@@ -35,9 +40,11 @@ from temporalio.api.failure.v1 import Failure
 from temporalio.converter import DataConverter
 from temporalio.google_adk._model import (
     StreamingInvokeInput,
+    TemporalLlmRequest,
     invoke_model,
     invoke_model_streaming,
 )
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.testing import ActivityEnvironment
 
 _STATUS_NAMES = {
@@ -129,8 +136,30 @@ class _FailingModel(BaseLlm):
         raise self.error
 
 
-def _request(model: str) -> LlmRequest:
-    return LlmRequest(
+class _StreamingModel(BaseLlm):
+    """Streams one response, then raises ``error``, waits, or ends."""
+
+    error: ClassVar[Exception | None] = None
+    wait: ClassVar[bool] = False
+    streamed: ClassVar[asyncio.Event]
+
+    @classmethod
+    def supported_models(cls) -> list[str]:
+        return ["streaming-model"]
+
+    async def generate_content_async(
+        self, llm_request: LlmRequest, stream: bool = False
+    ) -> AsyncGenerator[LlmResponse, None]:
+        yield LlmResponse(content=Content(role="model", parts=[Part(text="hello")]))
+        self.streamed.set()
+        if self.wait:
+            await asyncio.Event().wait()
+        if self.error is not None:
+            raise self.error
+
+
+def _request(model: str) -> TemporalLlmRequest:
+    return TemporalLlmRequest(
         model=model,
         contents=[Content(role="user", parts=[Part(text="hi")])],
     )
@@ -158,6 +187,45 @@ async def _run_failing(error: Exception, streaming: bool) -> BaseException:
     _FailingModel.error = error
     LLMRegistry.register(_FailingModel)
     return await _run(streaming, model="failing-model")
+
+
+async def _run_refused_stream(
+    publish_error: Exception,
+    model_error: Exception | None = None,
+    cancel: bool = False,
+) -> BaseException:
+    """Stream one response while publishing it fails with ``publish_error``.
+
+    The model then raises ``model_error``, or waits for the activity to be
+    cancelled when ``cancel`` is set, or ends.
+    """
+    _StreamingModel.error = model_error
+    _StreamingModel.wait = cancel
+    _StreamingModel.streamed = asyncio.Event()
+    LLMRegistry.register(_StreamingModel)
+    client = MagicMock()
+    client.data_converter = DataConverter.default
+    signal = AsyncMock(side_effect=publish_error)
+    client.get_workflow_handle.return_value.signal = signal
+    env = ActivityEnvironment(client=client)
+    call = asyncio.ensure_future(
+        env.run(
+            invoke_model_streaming,
+            StreamingInvokeInput(
+                llm_request=_request("streaming-model"),
+                streaming_topic="events",
+                # Only the stream's exit sends the batch.
+                streaming_batch_interval=timedelta(hours=1),
+            ),
+        )
+    )
+    if cancel:
+        await _StreamingModel.streamed.wait()
+        env.cancel()
+    with pytest.raises(BaseException) as raised:
+        await call
+    signal.assert_awaited_once()
+    return raised.value
 
 
 def _recorded(exc: BaseException) -> Failure:
@@ -217,6 +285,14 @@ async def test_status_code_attribute_is_classified(
 
 
 @pytest.mark.parametrize("streaming", [False, True], ids=["invoke", "streaming"])
+async def test_unknown_model_is_non_retryable(streaming: bool) -> None:
+    exc = await _run(streaming, model="no-such-model")
+    failure = _recorded(exc)
+    assert "no-such-model" in failure.message, failure
+    assert failure.application_failure_info.non_retryable, failure
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["invoke", "streaming"])
 async def test_error_without_status_stays_retryable(streaming: bool) -> None:
     error = ConnectionError("connection reset by the fake provider")
     exc = await _run_failing(error, streaming)
@@ -224,3 +300,89 @@ async def test_error_without_status_stays_retryable(streaming: bool) -> None:
     failure = _recorded(exc)
     assert failure.application_failure_info.type == "ConnectionError", failure
     assert not failure.application_failure_info.non_retryable, failure
+
+
+_BATCH_REFUSED = RPCError(
+    "Blob data size exceeds limit.", RPCStatusCode.INVALID_ARGUMENT, b""
+)
+
+
+@pytest.mark.parametrize(
+    ("publish_error", "non_retryable"),
+    [
+        (_BATCH_REFUSED, True),
+        (
+            RPCError(
+                "grpc: received message after decompression larger than max 4194304",
+                RPCStatusCode.RESOURCE_EXHAUSTED,
+                b"",
+            ),
+            True,
+        ),
+        # Python's stream client gives up only after retryable failures.
+        (TimeoutError("Flush retry exceeded max_retry_duration (0:10:00)."), False),
+        (
+            RPCError(
+                "namespace rate limit exceeded", RPCStatusCode.RESOURCE_EXHAUSTED, b""
+            ),
+            False,
+        ),
+        (RPCError("connection refused", RPCStatusCode.UNAVAILABLE, b""), False),
+    ],
+    ids=["refused", "too-large", "gave-up", "rate-limited", "unavailable"],
+)
+async def test_failed_stream_publish_fails_the_call(
+    publish_error: Exception, non_retryable: bool
+) -> None:
+    exc = await _run_refused_stream(publish_error)
+    assert exc.__cause__ is publish_error
+    failure = _recorded(exc)
+    assert failure.application_failure_info.type == "googleadk.StreamError", failure
+    assert failure.application_failure_info.non_retryable == non_retryable, failure
+    assert "'streaming-model'" in failure.message, failure
+    assert "'events'" in failure.message, failure
+
+
+async def test_model_error_wins_over_failed_stream_publish() -> None:
+    error = _StatusCodeError(404)
+    exc = await _run_refused_stream(_BATCH_REFUSED, model_error=error)
+    assert exc.__cause__ is error
+    failure = _recorded(exc)
+    assert failure.application_failure_info.type == "_StatusCodeError", failure
+    assert failure.application_failure_info.non_retryable, failure
+
+
+async def test_cancellation_wins_over_failed_stream_publish() -> None:
+    exc = await _run_refused_stream(_BATCH_REFUSED, cancel=True)
+    assert isinstance(exc, asyncio.CancelledError), exc
+
+
+async def test_cancellation_during_last_publish_stays_cancelled() -> None:
+    _StreamingModel.error = None
+    _StreamingModel.wait = False
+    _StreamingModel.streamed = asyncio.Event()
+    LLMRegistry.register(_StreamingModel)
+    sending = asyncio.Event()
+
+    async def slow_signal(*_args: object, **_kwargs: object) -> None:
+        sending.set()
+        await asyncio.Event().wait()
+
+    client = MagicMock()
+    client.data_converter = DataConverter.default
+    client.get_workflow_handle.return_value.signal = AsyncMock(side_effect=slow_signal)
+    env = ActivityEnvironment(client=client)
+    call = asyncio.ensure_future(
+        env.run(
+            invoke_model_streaming,
+            StreamingInvokeInput(
+                llm_request=_request("streaming-model"),
+                streaming_topic="events",
+                streaming_batch_interval=timedelta(hours=1),
+            ),
+        )
+    )
+    await sending.wait()
+    env.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call

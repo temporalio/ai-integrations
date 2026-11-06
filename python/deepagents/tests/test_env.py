@@ -14,12 +14,20 @@ STARTUP_TIMEOUT = (
     STARTUP_PREFIX + "ephemeral server at 127.0.0.1:60249 did not start within 5s. "
     "Make sure another download isn't stuck and delete the temp file."
 )
+# SDKs before 1.33 report the startup timeout this way, with the last
+# connection error in Rust's Option form.
+LEGACY_STARTUP_TIMEOUT = (
+    STARTUP_PREFIX + "Failed connecting to test server after 5 seconds, last error: "
+)
 DOWNLOAD_FAILURE = (
     STARTUP_PREFIX
     + "failed to download ephemeral server executable: error sending request"
 )
 RETRYABLE_ERRORS = [
     STARTUP_TIMEOUT,
+    LEGACY_STARTUP_TIMEOUT + "None",
+    LEGACY_STARTUP_TIMEOUT
+    + 'Some(Status { code: Unavailable, message: "tcp connect error" })',
     DOWNLOAD_FAILURE,
     *[
         STARTUP_PREFIX + "invalid ephemeral server download: " + message
@@ -107,6 +115,7 @@ async def test_different_startup_errors_share_retry_limit() -> None:
             + "invalid ephemeral server download: archive URL has unsupported format"
         ),
         RuntimeError(STARTUP_PREFIX + "invalid configuration"),
+        RuntimeError(STARTUP_PREFIX + "Failed connecting to test server: invalid URL"),
         RuntimeError("Failed client connect: connection refused"),
         RuntimeError("request did not start within 5s."),
         TypeError("start_local() got an unexpected keyword argument 'invalid'"),

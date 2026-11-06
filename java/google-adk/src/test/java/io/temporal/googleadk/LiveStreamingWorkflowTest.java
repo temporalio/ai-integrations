@@ -11,15 +11,19 @@ import com.google.adk.models.LlmResponse;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
 import com.google.protobuf.ByteString;
+import io.grpc.Status;
 import io.reactivex.rxjava3.core.BackpressureStrategy;
 import io.reactivex.rxjava3.core.Flowable;
 import io.temporal.activity.ActivityCancellationType;
 import io.temporal.activity.ActivityOptions;
 import io.temporal.api.common.v1.Payload;
+import io.temporal.api.common.v1.WorkflowExecution;
+import io.temporal.api.failure.v1.Failure;
 import io.temporal.api.history.v1.HistoryEvent;
 import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowClientOptions;
 import io.temporal.client.WorkflowOptions;
+import io.temporal.client.WorkflowServiceException;
 import io.temporal.client.WorkflowStub;
 import io.temporal.common.RetryOptions;
 import io.temporal.common.WorkflowExecutionHistory;
@@ -46,6 +50,7 @@ import io.temporal.workflow.Workflow;
 import io.temporal.workflow.WorkflowInit;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
+import io.temporal.workflowstreams.FlushTimeoutException;
 import io.temporal.workflowstreams.SubscribeOptions;
 import io.temporal.workflowstreams.WorkflowStream;
 import io.temporal.workflowstreams.WorkflowStreamClient;
@@ -63,8 +68,12 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 @Timeout(45)
 class LiveStreamingWorkflowTest {
@@ -272,6 +281,154 @@ class LiveStreamingWorkflowTest {
     }
   }
 
+  /** A batch the server refuses fails the same way on a retry, so the Activity is not retried. */
+  @ParameterizedTest
+  @MethodSource("refusals")
+  void refusedBatchesFailTheActivityWithoutARetry(Status refusal) throws Exception {
+    assertEquals(1, streamErrorAttempts(refusal, true), refusal.toString());
+  }
+
+  /** A server that is down or rate limiting may accept the batch on a retry. */
+  @ParameterizedTest
+  @MethodSource("transientFailures")
+  void transientPublishFailuresAreRetried(Status failure) throws Exception {
+    assertEquals(2, streamErrorAttempts(failure, false), failure.toString());
+  }
+
+  @ParameterizedTest
+  @MethodSource("transientFailures")
+  void transientBackgroundFailuresAreRetriedAfterTheWindow(Status status) throws Exception {
+    AtomicReference<Status> failure = new AtomicReference<>(status);
+    CountDownLatch rejected = new CountDownLatch(1);
+    RejectingPublishInterceptor publishes = recoveringPublisher(failure, rejected);
+    try (Fixture fixture = new Fixture(LiveWorkflowImpl.class, null, publishes)) {
+      fixture.start(true, false);
+      assertTrue(rejected.await(5, TimeUnit.SECONDS));
+      // The pending batch is dropped before the server recovers and the model finishes.
+      TimeUnit.SECONDS.sleep(6);
+      failure.set(null);
+      fixture.model.release.countDown();
+      assertEquals("Hello", fixture.result().get(30, TimeUnit.SECONDS));
+      assertEquals(2, fixture.model.calls.get(), "the dropped batch must retry the model call");
+      fixture.replay();
+    }
+  }
+
+  @ParameterizedTest
+  @MethodSource("refusals")
+  void refusedBackgroundBatchesDoNotRetryAfterTheWindow(Status status) throws Exception {
+    AtomicReference<Status> failure = new AtomicReference<>(status);
+    CountDownLatch rejected = new CountDownLatch(1);
+    RejectingPublishInterceptor publishes = recoveringPublisher(failure, rejected);
+    try (Fixture fixture = new Fixture(LiveWorkflowImpl.class, null, publishes)) {
+      fixture.start(true, false);
+      assertTrue(rejected.await(5, TimeUnit.SECONDS));
+      TimeUnit.SECONDS.sleep(6);
+      failure.set(null);
+      fixture.model.release.countDown();
+      Failure result = assertStreamFailure(fixture, true);
+      assertEquals(
+          FlushTimeoutException.class.getName(),
+          result.getCause().getApplicationFailureInfo().getType());
+      assertEquals(1, fixture.model.calls.get());
+    }
+  }
+
+  private static RejectingPublishInterceptor recoveringPublisher(
+      AtomicReference<Status> failure, CountDownLatch rejected) {
+    return new RejectingPublishInterceptor(
+        () -> {
+          Status status = failure.get();
+          if (status == null) return null;
+          rejected.countDown();
+          return new WorkflowServiceException(
+              WorkflowExecution.getDefaultInstance(), null, status.asRuntimeException());
+        });
+  }
+
+  @ParameterizedTest
+  @MethodSource("refusals")
+  void refusedBatchesDoNotReplaceCancellation(Status refusal) throws Exception {
+    CountDownLatch rejected = new CountDownLatch(1);
+    RejectingPublishInterceptor publishes =
+        recoveringPublisher(new AtomicReference<>(refusal), rejected);
+    try (Fixture fixture = new Fixture(LiveWorkflowImpl.class, null, publishes)) {
+      fixture.start(true, false);
+      assertTrue(rejected.await(5, TimeUnit.SECONDS));
+      WorkflowStub.fromTyped(fixture.workflow).cancel();
+      var failure =
+          assertThrows(
+              java.util.concurrent.ExecutionException.class,
+              () -> fixture.result().get(10, TimeUnit.SECONDS));
+      assertInstanceOf(CanceledFailure.class, failure.getCause().getCause());
+      assertEquals(1, fixture.model.calls.get());
+      assertEquals(1, fixture.model.finished.getCount(), "provider is still blocked");
+    }
+  }
+
+  @ParameterizedTest
+  @MethodSource("refusals")
+  void refusedBatchesDoNotReplaceTheModelFailure(Status refusal) throws Exception {
+    RejectingPublishInterceptor publishes =
+        new RejectingPublishInterceptor(refusal::asRuntimeException);
+    try (Fixture fixture = new Fixture(LiveWorkflowImpl.class, null, publishes)) {
+      fixture.model.failPermanently = true;
+      fixture.model.release.countDown();
+      fixture.start(true, false);
+      assertEquals("failed:test", fixture.result().get(30, TimeUnit.SECONDS));
+      assertEquals(1, fixture.model.calls.get());
+      assertTrue(publishes.rejected.get() > 0);
+    }
+  }
+
+  static Stream<Status> refusals() {
+    return Stream.of(
+        Status.INVALID_ARGUMENT.withDescription("payload size exceeds limit"),
+        Status.RESOURCE_EXHAUSTED.withDescription(
+            "grpc: received message after decompression larger than max 4194304"));
+  }
+
+  static Stream<Status> transientFailures() {
+    return Stream.of(
+        Status.UNAVAILABLE.withDescription("connection refused"),
+        Status.RESOURCE_EXHAUSTED.withDescription("namespace rate limit exceeded"),
+        Status.RESOURCE_EXHAUSTED);
+  }
+
+  /** Runs a streamed call whose publishes fail with the status; returns the model calls made. */
+  private static int streamErrorAttempts(Status status, boolean nonRetryable) throws Exception {
+    RejectingPublishInterceptor publishes =
+        new RejectingPublishInterceptor(
+            () ->
+                new WorkflowServiceException(
+                    WorkflowExecution.getDefaultInstance(), null, status.asRuntimeException()));
+    try (Fixture fixture = new Fixture(LiveWorkflowImpl.class, null, publishes)) {
+      fixture.model.release.countDown();
+      fixture.start(true, false);
+      assertStreamFailure(fixture, nonRetryable);
+      assertTrue(publishes.rejected.get() > 0);
+      return fixture.model.calls.get();
+    }
+  }
+
+  private static Failure assertStreamFailure(Fixture fixture, boolean nonRetryable)
+      throws Exception {
+    assertEquals("failed:" + FailureTypes.STREAM_ERROR, fixture.result().get(30, TimeUnit.SECONDS));
+    var failure =
+        fixture.client.fetchHistory(fixture.id).getEvents().stream()
+            .filter(HistoryEvent::hasActivityTaskFailedEventAttributes)
+            .findFirst()
+            .orElseThrow()
+            .getActivityTaskFailedEventAttributes()
+            .getFailure();
+    assertEquals(FailureTypes.STREAM_ERROR, failure.getApplicationFailureInfo().getType());
+    assertEquals(nonRetryable, failure.getApplicationFailureInfo().getNonRetryable());
+    assertTrue(failure.getMessage().contains("model " + MODEL), failure.getMessage());
+    assertTrue(failure.getMessage().contains("topic '" + TOPIC + "'"), failure.getMessage());
+    assertTrue(failure.hasCause(), "the publishing failure keeps its original cause");
+    return failure;
+  }
+
   private record LegacyInput(String model, LlmRequest request, boolean stream) {}
 
   @WorkflowInterface
@@ -435,9 +592,18 @@ class LiveStreamingWorkflowTest {
     }
   }
 
-  /** Rejects every Workflow Streams publish Signal, as an unreachable service would. */
+  /** Injects failures into Workflow Streams publish Signals. */
   private static final class RejectingPublishInterceptor extends WorkflowClientInterceptorBase {
     final AtomicInteger rejected = new AtomicInteger();
+    private final Supplier<RuntimeException> failure;
+
+    RejectingPublishInterceptor() {
+      this(() -> new IllegalStateException("publish rejected"));
+    }
+
+    RejectingPublishInterceptor(Supplier<RuntimeException> failure) {
+      this.failure = failure;
+    }
 
     @Override
     public WorkflowClientCallsInterceptor workflowClientCallsInterceptor(
@@ -446,8 +612,11 @@ class LiveStreamingWorkflowTest {
         @Override
         public WorkflowSignalOutput signal(WorkflowSignalInput input) {
           if (input.getSignalName().equals(WorkflowStreamConstants.PUBLISH_SIGNAL_NAME)) {
-            rejected.incrementAndGet();
-            throw new IllegalStateException("publish rejected");
+            RuntimeException error = failure.get();
+            if (error != null) {
+              rejected.incrementAndGet();
+              throw error;
+            }
           }
           return super.signal(input);
         }

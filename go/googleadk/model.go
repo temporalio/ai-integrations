@@ -5,17 +5,23 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/contrib/workflowstreams"
 	"go.temporal.io/sdk/workflow"
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/tool"
 	"google.golang.org/genai"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // StreamServer installs the workflow-side stream server that streamed model
@@ -89,8 +95,10 @@ func NewModel(name string, opts ...ModelOption) *TemporalModel {
 	return m
 }
 
-// Name reports the model name. ADK copies it into LLMRequest.Model, which the
-// InvokeModel Activity uses to resolve the worker-side model.
+// Name reports the model name. The InvokeModel Activity uses it to resolve the
+// worker-side model. ADK also copies it into LLMRequest.Model, which a
+// BeforeModelCallback may change; the worker-side model then receives the
+// changed name, as it would outside Temporal.
 func (m *TemporalModel) Name() string { return m.name }
 
 // GenerateContent dispatches the model call to the InvokeModel Activity and
@@ -106,7 +114,7 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 			yield(nil, errMissingContext)
 			return
 		}
-		if err := rejectRemoteAgents(ctx); err != nil {
+		if err := rejectRemoteAgents(ctx, req); err != nil {
 			yield(nil, err)
 			return
 		}
@@ -126,6 +134,7 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 		actx := workflow.WithActivityOptions(wfCtx, ao)
 
 		in := invokeModelInput{
+			Model:                  &m.name,
 			Request:                req,
 			Stream:                 m.streamingTopic != "",
 			StreamingTopic:         m.streamingTopic,
@@ -141,53 +150,83 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 }
 
 // rejectRemoteAgents returns an error when an agent below the agent making
-// this model call is a remote A2A agent that sends from Workflow code. History
+// this model call, a sub-agent or an agent that one of the call's tools wraps
+// with agenttool, is a remote A2A agent that sends from Workflow code. History
 // does not record those requests, so a replay sends them again.
-func rejectRemoteAgents(ctx context.Context) error {
-	ic, ok := ctx.(agent.InvocationContext)
-	if !ok {
-		return nil
-	}
-	remote := findRemoteAgent(ic.Agent())
-	if remote == nil {
-		return nil
-	}
-	return remoteAgentError(remote)
-}
-
-// remoteAgentError is the error that refuses remote, a remote A2A agent that
-// sends from Workflow code.
-func remoteAgentError(remote agent.Agent) error {
-	return fmt.Errorf("googleadk: agent %q is a remote A2A agent that sends its requests from "+
-		"Workflow code, and they repeat on replay. Set its ClientProvider to "+
-		"googleadk.NewA2AClientProvider and its AgentCardProvider to "+
-		"googleadk.NewA2AAgentCardProvider (or set a static AgentCard)", remote.Name())
-}
-
-// findRemoteAgent returns the first remote A2A agent below a that sends from
-// Workflow code, or nil.
-func findRemoteAgent(a agent.Agent) agent.Agent {
-	if a == nil {
-		return nil
-	}
-	for _, sub := range a.SubAgents() {
-		if remoteAgentSendsFromWorkflow(sub) {
-			return sub
+func rejectRemoteAgents(ctx context.Context, req *model.LLMRequest) error {
+	if ic, ok := ctx.(agent.InvocationContext); ok && ic.Agent() != nil {
+		if name := findRemoteAgent(ic.Agent().SubAgents()...); name != "" {
+			return remoteAgentError(name)
 		}
-		if found := findRemoteAgent(sub); found != nil {
-			return found
+	}
+	// In name order, so the error names the same agent on every replay.
+	for _, name := range slices.Sorted(maps.Keys(req.Tools)) {
+		if wrapsRemoteAgent(req.Tools[name]) {
+			return remoteAgentError(name)
 		}
 	}
 	return nil
 }
 
-// remoteAgentSendsFromWorkflow reports whether a was built by
+// remoteAgentError is the error that refuses the remote A2A agent named name,
+// which sends from Workflow code.
+func remoteAgentError(name string) error {
+	return fmt.Errorf("googleadk: agent %q is a remote A2A agent that sends its requests from "+
+		"Workflow code, and they repeat on replay. Set its ClientProvider to "+
+		"googleadk.NewA2AClientProvider and its AgentCardProvider to "+
+		"googleadk.NewA2AAgentCardProvider (or set a static AgentCard)", name)
+}
+
+// findRemoteAgent returns the name of the first of agents, or of the agents
+// below them, that is a remote A2A agent sending from Workflow code, or "".
+// Below an agent are its sub-agents and the agents that the tools in its Tools
+// wrap with agenttool, but not the agents below a wrapped agent: see
+// wrapsRemoteAgent.
+func findRemoteAgent(agents ...agent.Agent) string {
+	for _, a := range agents {
+		if a == nil {
+			continue
+		}
+		if remoteAgentSendsFromWorkflow(reflect.ValueOf(a)) {
+			return a.Name()
+		}
+		// llmagent keeps its tools in internal state, read with reflection.
+		if f := reflectField(reflect.ValueOf(a), "Tools"); f.IsValid() && f.CanInterface() {
+			tools, _ := f.Interface().([]tool.Tool)
+			for _, t := range tools {
+				if wrapsRemoteAgent(t) {
+					return t.Name()
+				}
+			}
+		}
+		if name := findRemoteAgent(a.SubAgents()...); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// wrapsRemoteAgent reports whether t was built by ADK's agenttool.New around a
+// remote A2A agent that sends from Workflow code. agenttool keeps the agent in
+// an unexported field. Reflection can read its fields but not call its
+// methods, so the agents below it are not seen, such as a remote agent under a
+// sequential, loop or parallel agent that agenttool wraps. An agent on
+// NewModel below it checks its own sub-agents and tools at its model calls.
+func wrapsRemoteAgent(t any) bool {
+	v := reflect.ValueOf(t)
+	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct ||
+		v.Elem().Type().PkgPath() != "google.golang.org/adk/v2/tool/agenttool" {
+		return false
+	}
+	return remoteAgentSendsFromWorkflow(v.Elem().FieldByName("agent"))
+}
+
+// remoteAgentSendsFromWorkflow reports whether v holds an agent built by
 // remoteagent.NewA2A, which the deprecated agent/remoteagent package also
 // calls, without NewA2AClientProvider, or with a card it fetches without
 // NewA2AAgentCardProvider. ADK keeps the agent type and its A2A config in
 // internal state, so they are read with reflection.
-func remoteAgentSendsFromWorkflow(a agent.Agent) bool {
-	v := reflect.ValueOf(a)
+func remoteAgentSendsFromWorkflow(v reflect.Value) bool {
 	t := reflectField(v, "AgentType")
 	if !t.IsValid() || t.Kind() != reflect.String || t.String() != "RemoteAgent" {
 		return false
@@ -244,8 +283,12 @@ func (m *TemporalModel) modelSummary(req *model.LLMRequest) string {
 // dropped automatically; only the model name and serialized tool declarations
 // cross the wire.
 type invokeModelInput struct {
-	// Request is the ADK LLM request. Request.Model selects the worker-side
-	// ModelFactory; Request.Config carries the tool declarations the model needs.
+	// Model is the TemporalModel's name. It selects the worker-side model. It is
+	// nil in inputs scheduled before this field existed; Request.Model is used
+	// then.
+	Model *string
+	// Request is the ADK LLM request, passed to the worker-side model as is.
+	// Request.Config carries the tool declarations the model needs.
 	Request *model.LLMRequest
 	// Stream selects streaming mode (model called with stream=true, chunks
 	// published to StreamingTopic). The aggregated final response is still
@@ -258,12 +301,23 @@ type invokeModelInput struct {
 	StreamingBatchInterval time.Duration
 }
 
+// modelName is the name that selects the worker-side model: the
+// TemporalModel's name, or Request.Model in an input scheduled before Model
+// existed.
+func (in invokeModelInput) modelName() string {
+	if in.Model != nil {
+		return *in.Model
+	}
+	return in.Request.Model
+}
+
 // InvokeModel runs a single LLM round-trip worker-side. It reconstructs the
-// model from the registered ModelFactory keyed by Request.Model, calls it, and
-// returns the (aggregated) response. The user's model.LLM is therefore never
-// invoked inside the workflow. Underlying model-SDK retries should be disabled
-// in the factory so Temporal's retry policy is the single source of truth;
-// transient failures are surfaced as retryable ApplicationErrors.
+// model from the registered ModelFactory keyed by the TemporalModel's name,
+// calls it with the request as is, and returns the (aggregated) response. The
+// user's model.LLM is therefore never invoked inside the workflow. Underlying
+// model-SDK retries should be disabled in the factory so Temporal's retry
+// policy is the single source of truth; transient failures are surfaced as
+// retryable ApplicationErrors.
 func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*model.LLMResponse, error) {
 	log := activity.GetLogger(ctx)
 	if in.Request == nil {
@@ -282,18 +336,19 @@ func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*mod
 	// disabled SDK retries, etc.) wins; otherwise the application-owned ADK model
 	// registry, then the built-in zero-config gemini-* fallback (see
 	// resolveModel). Mirrors adk-python's LLMRegistry.
-	llm, err := a.resolveModel(ctx, in.Request.Model)
+	name := in.modelName()
+	llm, err := a.resolveModel(ctx, name)
 	if err != nil {
 		return nil, newApplicationError(ErrorTypeModel, false, err,
-			"resolve model %q (add it to Config.Models or register its provider): %v", in.Request.Model, err)
+			"resolve model %q (add it to Config.Models or register its provider): %v", name, err)
 	}
 
 	if in.Stream && in.StreamingTopic != "" {
-		log.Debug("invoking model in streaming mode", "model", in.Request.Model, "topic", in.StreamingTopic)
+		log.Debug("invoking model in streaming mode", "model", name, "request_model", in.Request.Model, "topic", in.StreamingTopic)
 		return a.invokeModelStreaming(ctx, llm, in)
 	}
 
-	log.Debug("invoking model", "model", in.Request.Model)
+	log.Debug("invoking model", "model", name, "request_model", in.Request.Model)
 	var agg *model.LLMResponse
 	for resp, gerr := range llm.GenerateContent(ctx, in.Request, false) {
 		if gerr != nil {
@@ -303,7 +358,7 @@ func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*mod
 	}
 	if agg == nil {
 		return nil, newApplicationError(ErrorTypeModel, true, nil,
-			"model %q returned no response", in.Request.Model)
+			"model %q returned no response", name)
 	}
 	return agg, nil
 }
@@ -352,7 +407,7 @@ func startPeriodicHeartbeats(ctx context.Context) (stop func()) {
 // the workflowstreams topic for external (UI) consumers, and returns the
 // aggregated final response into the workflow. Liveness heartbeating is handled
 // by the caller's periodic heartbeater (see InvokeModel), not per chunk.
-func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in invokeModelInput) (*model.LLMResponse, error) {
+func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in invokeModelInput) (result *model.LLMResponse, err error) {
 	log := activity.GetLogger(ctx)
 	opts := workflowstreams.Options{}
 	if in.StreamingBatchInterval > 0 {
@@ -367,7 +422,20 @@ func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in
 	if wsc, cerr := workflowstreams.NewClientFromActivity(ctx, opts); cerr != nil {
 		log.Warn("streaming client unavailable; not publishing chunks", "error", cerr)
 	} else {
-		defer func() { _ = wsc.Close(ctx) }()
+		// Close sends the last batch. If it fails, subscribers did not get every
+		// chunk, so the call fails instead of returning as if they had. A model
+		// error stays the call's error, and a cancelled or timed-out Activity
+		// reports that instead. The result is dropped with it, so the SDK does
+		// not encode a reply it then discards.
+		defer func() {
+			if cerr := wsc.Close(ctx); cerr != nil && err == nil {
+				if ctx.Err() != nil {
+					result, err = nil, ctx.Err()
+				} else {
+					result, err = nil, streamPublishError(in, cerr)
+				}
+			}
+		}()
 		topic = wsc.Topic(in.StreamingTopic)
 	}
 
@@ -383,7 +451,7 @@ func (a *Activities) invokeModelStreaming(ctx context.Context, llm model.LLM, in
 	}
 	if agg == nil {
 		return nil, newApplicationError(ErrorTypeModel, true, nil,
-			"model %q returned no streamed response", in.Request.Model)
+			"model %q returned no streamed response", in.modelName())
 	}
 	// Mark the aggregate complete: it is the single response handed back into the
 	// workflow regardless of how many chunks were streamed to the topic.
@@ -556,21 +624,49 @@ func appendText(c *genai.Content, text string) {
 	c.Parts = append(c.Parts, &genai.Part{Text: text})
 }
 
-// classifyModelError maps a model-call failure to Temporal's retry contract. A
-// genai.APIError is classified by HTTP status (408/409/429 and 5xx retryable,
+// classifyModelError maps a model-call failure to Temporal's retry contract. An
+// error with an HTTP status is classified by it (408/409/429 and 5xx retryable,
 // other 4xx non-retryable); anything without a status is treated as a
-// retryable transient fault.
+// retryable transient fault, except ADK's "empty response".
 func classifyModelError(err error) error {
 	code := apiErrorCode(err)
 	retryable := true
 	if code != 0 {
 		retryable = retryableHTTPStatus(code)
+	} else {
+		// ADK's Gemini model returns this untyped error for a reply with no
+		// candidates, as for a blocked prompt. Natively the agent gets it
+		// once; a retry would send the same request again.
+		retryable = !isEmptyResponse(err)
 	}
 	return newApplicationError(ErrorTypeModel, retryable, err, "model call failed: %v", err)
 }
 
+// streamPublishError fails a streaming call whose chunks did not all reach the
+// topic. A retry calls the model again, so the error is non-retryable when the
+// retry would fail the same way: the server refused the batch as invalid (over
+// the payload size limit, or past the run's Signal limit), the batch is over
+// the server's gRPC message limit, or the stream client gave up on it after
+// retrying for its MaxRetryDuration. Other failures, such as a server outage,
+// stay retryable.
+func streamPublishError(in invokeModelInput, err error) error {
+	var invalid *serviceerror.InvalidArgument
+	var timeout *workflowstreams.FlushTimeoutError
+	retryable := !errors.As(err, &invalid) && !errors.As(err, &timeout) && !isMessageTooLarge(err)
+	return newApplicationError(ErrorTypeStream, retryable, err,
+		"model %q: publish streamed responses to topic %q: %v", in.modelName(), in.StreamingTopic, err)
+}
+
+// isMessageTooLarge reports a request the server refused as larger than its
+// gRPC message limit, the check the Go SDK's own retry interceptor uses to stop
+// retrying. Rate limiting uses the same code with other messages.
+func isMessageTooLarge(err error) bool {
+	return status.Code(err) == codes.ResourceExhausted && strings.Contains(status.Convert(err).Message(), "larger than max")
+}
+
 // apiErrorCode extracts the HTTP status from a genai.APIError, which the SDK
-// returns sometimes by value and sometimes by pointer.
+// returns sometimes by value and sometimes by pointer, or else from another
+// provider SDK's error (see statusCodeField).
 func apiErrorCode(err error) int {
 	var ptr *genai.APIError
 	if errors.As(err, &ptr) && ptr != nil {
@@ -579,6 +675,38 @@ func apiErrorCode(err error) int {
 	var val genai.APIError
 	if errors.As(err, &val) {
 		return val.Code
+	}
+	if code := statusCodeField(err); code >= 400 {
+		return code
+	}
+	return 0
+}
+
+// statusCodeField returns the first non-zero int StatusCode field in err's
+// tree, as openai-go's *openai.Error has (ADK's OpenAI model wraps it), or 0
+// if there is none. It follows both Unwrap forms (errors.Join and multiple %w
+// produce the second), depth first, as errors.As does. Reading the field by
+// name avoids importing each provider's SDK.
+func statusCodeField(err error) int {
+	if err == nil {
+		return 0
+	}
+	if v := reflect.Indirect(reflect.ValueOf(err)); v.Kind() == reflect.Struct {
+		if sf, ok := v.Type().FieldByName("StatusCode"); ok {
+			if f, ferr := v.FieldByIndexErr(sf.Index); ferr == nil && f.CanInt() && f.Int() != 0 {
+				return int(f.Int())
+			}
+		}
+	}
+	switch u := err.(type) {
+	case interface{ Unwrap() error }:
+		return statusCodeField(u.Unwrap())
+	case interface{ Unwrap() []error }:
+		for _, e := range u.Unwrap() {
+			if code := statusCodeField(e); code != 0 {
+				return code
+			}
+		}
 	}
 	return 0
 }
