@@ -5,13 +5,16 @@ bloating workflow history: once the current turn finishes past the threshold and
 there is still pending work, it snapshots the accumulated messages and continues
 into a fresh run. (The legacy result cache is retired for new executions —
 see ``deepagents.retire-result-cache``; ``test_state_snapshot_roundtrip`` below
-covers the _serde plumbing that only the legacy replay branch still uses.) These tests use a plain
+covers the _serde plumbing that only the legacy replay branch still uses.) Most tests use a plain
 fake agent (no LangChain needed) so they boot a real Temporal server and exercise
-the continue-as-new machinery end to end.
+the continue-as-new machinery end to end. One drives a real Deep Agent with a
+scripted model, because its transcript holds LangChain message objects that must
+cross the boundary as messages.
 """
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import uuid
 from datetime import timedelta
@@ -21,7 +24,7 @@ from unittest.mock import patch
 
 import pytest
 
-from temporalio.client import WorkflowExecutionStatus
+from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.common import RetryPolicy
 from temporalio.testing import WorkflowEnvironment
 
@@ -453,3 +456,148 @@ async def test_identical_op_reruns_across_continue_as_new(
     )
     desc = await first.describe()
     assert desc.status == WorkflowExecutionStatus.CONTINUED_AS_NEW, desc.status
+
+
+# The tests above drive fake agents whose "messages" are strings. A real Deep
+# Agent returns LangChain message objects, and those must survive the plugin's
+# payload converter on their way into the next run.
+create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
+
+with workflow.unsafe.imports_passed_through():
+    from langchain.agents.middleware import TodoListMiddleware
+    from langchain_core.messages import AIMessage
+
+from temporalio.deepagents.testing import mock_model_provider
+
+
+def _write_todos(status: str, call_id: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "write_todos",
+                "args": {"todos": [{"content": "research", "status": status}]},
+                "id": call_id,
+            }
+        ],
+    )
+
+
+# Run 1 leaves its todo pending, so the driver continues-as-new; run 2 completes
+# it. mock_model_provider hands these out one model call at a time.
+REAL_AGENT_RESPONSES: list[Any] = [
+    _write_todos("pending", "todos-1"),
+    "first turn",
+    _write_todos("completed", "todos-2"),
+    "done",
+]
+
+
+@workflow.defn
+class RealAgentCanWorkflow:
+    @workflow.run
+    async def run(
+        self, input: dict, state_snapshot: dict | None = None
+    ) -> list[list[Any]]:
+        # deepagents 0.7 leaves todos out of the default stack; add them so the
+        # driver sees pending work.
+        agent = create_deep_agent(model="fake:model", middleware=[TodoListMiddleware()])
+        result = await run_deep_agent(
+            agent,
+            input,
+            continue_as_new_after=1,
+            state_snapshot=state_snapshot,
+        )
+        return [
+            [
+                m.type,
+                m.content,
+                [c["id"] for c in getattr(m, "tool_calls", [])],
+                getattr(m, "tool_call_id", None),
+            ]
+            for m in result["messages"]
+        ]
+
+
+@pytest.mark.asyncio
+async def test_real_agent_messages_survive_continue_as_new(
+    env: WorkflowEnvironment,
+) -> None:
+    """The continued run gets the transcript back as LangChain messages.
+
+    The plugin is on the client, as in the README, so the snapshot crosses the
+    boundary through the plugin's payload converter. A message that loses its
+    ``type`` there makes the continued run fail every workflow task, so wait a
+    bounded time and report that failure.
+    """
+    plugin = DeepAgentsPlugin(model_provider=mock_model_provider(REAL_AGENT_RESPONSES))
+    config = env.client.config()
+    config["plugins"] = [plugin]
+    client = Client(**config)
+    async with Worker(
+        client,
+        task_queue="da-can-real",
+        workflows=[RealAgentCanWorkflow],
+    ):
+        handle = await client.start_workflow(
+            RealAgentCanWorkflow.run,
+            {"messages": [{"role": "user", "content": "Research."}]},
+            id=f"da-can-real-{uuid.uuid4()}",
+            task_queue="da-can-real",
+        )
+        try:
+            result = await asyncio.wait_for(handle.result(), timeout=30)
+        except asyncio.TimeoutError:
+            async for e in handle.fetch_history_events():
+                if e.HasField("workflow_task_failed_event_attributes"):
+                    failure = e.workflow_task_failed_event_attributes.failure
+                    pytest.fail(f"continued run is failing: {failure.message}")
+            raise
+        first = client.get_workflow_handle(
+            handle.id, run_id=handle.first_execution_run_id
+        )
+        desc = await first.describe()
+        first_history = await first.fetch_history()
+        last_history = await handle.fetch_history()
+
+    assert desc.status == WorkflowExecutionStatus.CONTINUED_AS_NEW, desc.status
+    assert [m[0] for m in result] == ["human", "ai", "tool", "ai", "ai", "tool", "ai"]
+    assert result[0][1] == "Research."
+    # The first run's tool call and its result keep their ids across the boundary.
+    assert result[1][2] == ["todos-1"]
+    assert result[2][3] == "todos-1"
+    assert result[-1][1] == "done"
+
+    replayer = Replayer(
+        workflows=[RealAgentCanWorkflow],
+        plugins=[DeepAgentsPlugin(model_provider=mock_model_provider(["unused"]))],
+    )
+    await replayer.replay_workflow(first_history)
+    await replayer.replay_workflow(last_history)
+
+
+def test_carried_messages_round_trip_and_other_values_pass_through() -> None:
+    """Only serialized messages are loaded back; other values are left as is."""
+    from langchain_core.documents import Document
+    from langchain_core.load import dumpd
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    class OwnMessage(HumanMessage):
+        """A subclass ``load`` cannot rebuild, so it is not serialized."""
+
+    tool_message = ToolMessage("ok", tool_call_id="t1")
+    other = [
+        OwnMessage(content="mine"),
+        "a string",
+        {"role": "user", "content": "q"},
+        # What older code wrote: a message dict without its type.
+        {"content": "Research.", "id": "m1"},
+        dumpd(Document(page_content="not a message")),
+        {"lc": 1, "type": "constructor", "id": ["x"], "kwargs": {}},
+    ]
+    dumped = _serde.dump_carried_messages([tool_message, *other])
+    assert dumped[1:] == other
+    loaded = _serde.load_carried_messages(dumped)
+    assert isinstance(loaded[0], ToolMessage)
+    assert loaded[0].tool_call_id == "t1"
+    assert loaded[1:] == other

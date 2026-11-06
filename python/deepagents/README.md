@@ -360,7 +360,9 @@ class LongResearchAgent:
 Pass `continue_as_new_after=N` instead to trigger on a fixed history-event
 count.
 
-- **Carries forward:** the accumulated messages. Repeated identical calls are
+- **Carries forward:** the accumulated messages. Messages of the classes in
+  `langchain_core.messages` come back in the next run as the same class (a
+  `ToolMessage` stays a `ToolMessage`). Repeated identical calls are
   NOT deduplicated: a call the agent re-issues after the boundary runs its own
   Activity, so a genuinely new identical request is never served a stale prior
   result. Your `@workflow.run` must accept `state_snapshot=None` as shown.
