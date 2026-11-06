@@ -21,12 +21,16 @@ from datetime import timedelta
 from typing import Any
 
 from mcp import ClientSession
-from mcp.shared.session import ProgressFnT
 from mcp.types import CallToolResult, ListToolsResult, PaginatedRequestParams
 
 from temporalio import workflow as temporal_workflow
 from temporalio.google_genai._models import _McpCallToolRequest
 from temporalio.workflow import ActivityConfig
+
+try:
+    from mcp.shared.dispatcher import ProgressFnT  # type: ignore[import-not-found]
+except ImportError:  # MCP 1.x
+    from mcp.shared.session import ProgressFnT  # type: ignore[no-redef]
 
 _DEFAULT_MCP_TIMEOUT = timedelta(seconds=60)
 
@@ -98,11 +102,11 @@ class TemporalMcpClientSession(ClientSession):
             self._cached_tools = result
         return result
 
-    async def call_tool(  # pyright: ignore[reportIncompatibleMethodOverride]
+    async def call_tool(  # type: ignore[override]  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         name: str,
         arguments: dict[str, Any] | None = None,
-        read_timeout_seconds: timedelta | None = None,
+        read_timeout_seconds: float | timedelta | None = None,
         progress_callback: ProgressFnT | None = None,
         *,
         meta: dict[str, Any] | None = None,

@@ -4,12 +4,17 @@ Run as a script it serves over stdio; imported, ``mcp`` can be connected to
 in-memory via ``mcp.shared.memory``.
 """
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.mcpserver import MCPServer  # type: ignore[import-not-found]
+except ImportError:  # MCP 1.x
+    from mcp.server.fastmcp import (  # type: ignore[attr-defined, no-redef]
+        FastMCP as MCPServer,  # pyright: ignore[reportAttributeAccessIssue]
+    )
 
-mcp = FastMCP("echo-server")
+mcp = MCPServer("echo-server")
 
 
-@mcp.tool()
+@mcp.tool()  # pyright: ignore[reportUntypedFunctionDecorator]
 def echo(message: str) -> str:
     """Return the input message unchanged."""
     return message
