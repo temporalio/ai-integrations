@@ -17,7 +17,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import warnings
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from temporalio import workflow
@@ -27,6 +27,43 @@ from temporalio.exceptions import ApplicationError
 # Reserved key under which the CAN result cache rides inside a state snapshot.
 _CACHE_KEY = "__temporal_cache__"
 _INPUT_CARRIED_KEY = "__temporal_input_in_transcript__"
+
+# Patch id for naming overlapping model Activities by the call they answer (see
+# _model_activity_id). Runs recorded before it use the SDK's sequence ids.
+_CALL_IDENTITY_PATCH = "deepagents.parallel-model-call-ids"
+
+
+@dataclasses.dataclass
+class _ModelDispatches:
+    """One run's model dispatch state, for naming overlapping model Activities."""
+
+    in_flight: int = 0
+    named: bool | None = None
+    """The patch answer, asked once, at the first overlapping dispatch."""
+    issued: dict[str, int] = dataclasses.field(default_factory=dict)
+
+
+# Per-run state lives on the workflow instance itself: it is created and
+# dropped with the run (an evicted run replays on a new instance with fresh
+# state), and the SDK runs one activation of a run at a time, so it needs no
+# lock. A workflow class whose instances take no new attributes (custom
+# ``__slots__``) keeps the SDK's sequence ids.
+_DISPATCHES_ATTR = "_temporal_deepagents_model_dispatches"
+
+
+def _run_dispatches() -> _ModelDispatches | None:
+    """This run's dispatch state, or None if the instance cannot hold it."""
+    instance = workflow.instance()
+    state = getattr(instance, _DISPATCHES_ATTR, None)
+    if isinstance(state, _ModelDispatches):
+        return state
+    state = _ModelDispatches()
+    try:
+        setattr(instance, _DISPATCHES_ATTR, state)
+    except (AttributeError, TypeError):
+        return None
+    return state
+
 
 # Checkpointer classes that keep their state in the workflow's own memory and are
 # therefore rehydrated for free by deterministic replay. Anything else does its
@@ -108,14 +145,59 @@ def _legacy_result_cache() -> bool:
     return not workflow.patched("deepagents.retire-result-cache")
 
 
+def _model_activity_id(
+    state: _ModelDispatches | None,
+    call_identity: Callable[[], str | None] | None,
+    opts: Mapping[str, Any],
+) -> str | None:
+    """Name a model Activity by the call it answers when it overlaps another one.
+
+    Every model call is the same Activity type, and Temporal does not compare
+    Activity inputs on replay, so with the SDK's sequence ids a recorded result
+    is delivered by position. Sequential calls cannot change places, but two
+    concurrent ones can: when a change in scheduling order (a library upgrade,
+    an ``await`` added in middleware) makes two parallel sub-agents schedule in
+    the other order, each would silently get the other's result. The SDK does
+    compare Activity ids on replay, so an id derived from the call itself
+    turns that into a nondeterminism error.
+
+    Only a call dispatched while another model call of the run is in flight is
+    named, and the patch is asked at the first such call, so runs that never
+    overlap model calls keep sequence ids and record no marker. A run recorded
+    before the patch replays it as unset and keeps sequence ids from then on.
+    Returns None (keep the SDK default) when the caller set its own
+    ``activity_id``.
+    """
+    if state is None or call_identity is None or "activity_id" in opts:
+        return None
+    if state.in_flight == 0:
+        return None
+    if state.named is None:
+        state.named = workflow.patched(_CALL_IDENTITY_PATCH)
+    if not state.named:
+        return None
+    identity = call_identity()
+    if identity is None:
+        return None
+    count = state.issued.get(identity, 0)
+    state.issued[identity] = count + 1
+    return identity if count == 0 else f"{identity}#{count + 1}"
+
+
 async def call_model(
     activity_name: str,
     activity_input: _activity.ModelActivityInput,
     *,
     summary: str,
+    call_identity: Callable[[], str | None] | None = None,
     **opts: Any,
 ) -> _activity.ModelActivityOutput:
-    """Dispatch one model call as its own Activity."""
+    """Dispatch one model call as its own Activity.
+
+    ``call_identity`` returns a replay-stable name for the call (see
+    :meth:`TemporalModel._call_identity`); it is only computed when the call
+    overlaps another model call of the run (see :func:`_model_activity_id`).
+    """
     legacy_key, hit, cached = _legacy_lookup(
         "model",
         activity_input.model_name,
@@ -123,13 +205,23 @@ async def call_model(
     )
     if hit:
         return _activity.ModelActivityOutput(message=cached)
-    output = await workflow.execute_activity(
-        activity_name,
-        activity_input,
-        result_type=_activity.ModelActivityOutput,
-        summary=summary,
-        **opts,
-    )
+    state = _run_dispatches()
+    activity_id = _model_activity_id(state, call_identity, opts)
+    if activity_id is not None:
+        opts = {**opts, "activity_id": activity_id}
+    if state is not None:
+        state.in_flight += 1
+    try:
+        output = await workflow.execute_activity(
+            activity_name,
+            activity_input,
+            result_type=_activity.ModelActivityOutput,
+            summary=summary,
+            **opts,
+        )
+    finally:
+        if state is not None:
+            state.in_flight -= 1
     if legacy_key is not None:
         _serde.cache_put(legacy_key, output.message)
     return output
