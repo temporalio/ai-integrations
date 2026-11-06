@@ -77,16 +77,17 @@ def test_native_root_and_child_defaults(
             root, child = root_call()
 
     expected = random.Random(42)
+    ms = int(NOW.timestamp() * 1000)
     assert type(root) is RunTree
-    assert root.id == uuid.UUID(int=expected.getrandbits(128), version=4)
+    assert root.id == uuid.UUID(int=ms << 80 | expected.getrandbits(80), version=7)
     assert root.parent_run_id is None
     assert root.trace_id == root.id
-    assert root.start_time == NOW
+    assert root.start_time > NOW  # Live runs use wall-clock time.
     assert type(child) is RunTree
-    assert child.id == uuid.UUID(int=expected.getrandbits(128), version=4)
+    assert child.id == uuid.UUID(int=ms << 80 | expected.getrandbits(80), version=7)
     assert child.parent_run_id == root.id
     assert child.trace_id == root.id
-    assert child.start_time == NOW
+    assert child.start_time >= root.start_time
     assert child.dotted_order.startswith(root.dotted_order + ".")
     workflow_runtime.submit(lambda: None).result()
     assert client.create_run.call_count == 2
@@ -127,7 +128,8 @@ def test_end_keeps_in_memory_state_on_replay(
     run.patch()
     workflow_runtime.submit(lambda: None).result()
 
-    assert run.end_time == NOW
+    # Workflow time on replay, wall-clock time live.
+    assert (run.end_time == NOW) is replaying
     assert run.outputs == {"result": "done"}
     assert client.create_run.call_count == (0 if replaying else 1)
     assert client.update_run.call_count == (0 if replaying else 1)
@@ -164,7 +166,7 @@ def test_delayed_post_and_patch_use_executor_in_order(
     assert all(thread is not threading.current_thread() for thread in threads)
     for call in (client.create_run.call_args, client.update_run.call_args):
         assert call.kwargs["outputs"] == {"result": "done"}
-        assert call.kwargs["end_time"] == NOW
+        assert call.kwargs["end_time"] == run.end_time
 
 
 @pytest.mark.parametrize("operation", ["post", "patch"])
@@ -222,8 +224,7 @@ def test_read_only_runs_do_not_consume_workflow_random(
     monkeypatch.setattr(workflow.unsafe, "is_read_only", lambda: True)
     monkeypatch.setattr(workflow, "new_random", random_source)
     run = RunTree(name="query")
-    child = run.create_child(name="child")
-    assert run.start_time == child.start_time == NOW
+    run.create_child(name="child")
     random_source.assert_not_called()
 
 

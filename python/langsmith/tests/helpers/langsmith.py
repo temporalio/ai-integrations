@@ -138,3 +138,12 @@ def make_mock_ls_client(collector: InMemoryRunCollector) -> MagicMock:
     client.session = MagicMock()
     client.tracing_queue = MagicMock()
     return client
+
+
+def id_path(dotted_order: str) -> list[str]:
+    """Return the run IDs in a dotted order, root first, without start times.
+
+    Start times in a dotted order can differ across replay: live runs use wall-clock
+    time and replayed runs use workflow time. IDs and ancestry stay the same.
+    """
+    return [segment[-36:] for segment in dotted_order.split(".")]

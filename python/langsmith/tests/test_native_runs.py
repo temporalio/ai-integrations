@@ -1,4 +1,4 @@
-"""Native LangSmith roots retain IDs, timestamps, and routing across replay."""
+"""Native LangSmith roots retain IDs, ancestry, and routing across replay."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from temporalio.langsmith import LangSmithPlugin
 from temporalio.langsmith._interceptor import LangSmithInterceptor
 from temporalio.testing import WorkflowEnvironment
 from tests.helpers import new_worker
+from tests.helpers.langsmith import id_path
 from tests.test_integration import _make_client_and_collector
 
 
@@ -22,8 +23,7 @@ def _snapshot(run: RunTree) -> dict[str, str]:
         "id": str(run.id),
         "parent_id": str(run.parent_run_id or ""),
         "trace_id": str(run.trace_id),
-        "dotted_order": run.dotted_order,
-        "start_time": run.start_time.isoformat(),
+        "id_path": ".".join(id_path(run.dotted_order)),
     }
 
 
@@ -74,10 +74,9 @@ class NativeRunTreeWorkflow:
         assert other_plugin_random.getstate() == other_plugin_random_state
         run_ids = {run["id"] for run in self.snapshots}
         assert str(workflow.uuid4()) not in run_ids
-        assert (
-            str(uuid.UUID(int=other_plugin_random.getrandbits(128), version=4))
-            not in run_ids
-        )
+        # The last 48 bits of a v7 ID come straight from the random stream.
+        random_bits = {uuid.UUID(run_id).int & (1 << 48) - 1 for run_id in run_ids}
+        assert other_plugin_random.getrandbits(80) & (1 << 48) - 1 not in random_bits
         return self.snapshots
 
     @workflow.query
@@ -121,7 +120,7 @@ async def test_native_runs_are_stable_after_worker_replay(
         assert root["trace_id"] == root["id"]
         assert child["parent_id"] == root["id"]
         assert child["trace_id"] == root["id"]
-        assert child["dotted_order"].startswith(root["dotted_order"] + ".")
+        assert child["id_path"] == f"{root['id_path']}.{child['id']}"
 
     async with new_worker(
         temporal_client, NativeRunTreeWorkflow, task_queue=task_queue
