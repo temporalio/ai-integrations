@@ -1433,7 +1433,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=2,<3" },
     { name = "mcp-types", specifier = ">=2,<3" },
     { name = "pydantic", specifier = ">=2,<3" },
-    { name = "temporalio", specifier = ">=1.34.0,<2" },
+    { name = "temporalio", specifier = ">=1.32.0,<2" },
 ]
 
 [package.metadata.requires-dev]
