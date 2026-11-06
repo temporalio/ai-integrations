@@ -1,0 +1,14 @@
+[plugin]
+name = "langgraph"
+language = "typescript"
+coordinate = "@temporalio/langgraph"
+registry = "npm"
+root-api = "@temporalio/langgraph"
+maturity = "pre-release"
+docs = "https://docs.temporal.io/develop/typescript/integrations/langgraph"
+
+[ci]
+runtime-versions = ["22", "24"]
+
+[smoke]
+imports = ["@temporalio/langgraph"]
