@@ -2,10 +2,11 @@
 
 import asyncio
 import logging
+import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from mcp import MCPError
 from mcp.types import (
@@ -36,6 +37,9 @@ from temporalio.mcp._activity import (
 from temporalio.mcp._backend import _MCPBackend, _MCPBackendFactory
 from temporalio.mcp._pool import _MCPConnectionPool
 
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup  # type: ignore[reportUnreachable]
+
 _Result = TypeVar("_Result")
 _ListResult = TypeVar("_ListResult", bound=BaseModel)
 
@@ -44,7 +48,8 @@ logger = logging.getLogger(__name__)
 # Upper bound on how long worker shutdown waits for MCP transports to close.
 _CLOSE_TIMEOUT_SECONDS = 10.0
 # JSON-RPC errors that a retry of the same request cannot fix. INTERNAL_ERROR,
-# CONNECTION_CLOSED, REQUEST_TIMEOUT and unknown codes stay retryable.
+# CONNECTION_CLOSED, REQUEST_TIMEOUT, unknown codes and a lost session (see
+# _session_lost) stay retryable.
 _NON_RETRYABLE_PROTOCOL_ERRORS = {
     PARSE_ERROR,
     INVALID_REQUEST,
@@ -55,6 +60,46 @@ _NON_RETRYABLE_PROTOCOL_ERRORS = {
     UNSUPPORTED_PROTOCOL_VERSION,
     URL_ELICITATION_REQUIRED,
 }
+
+
+# A server answers HTTP 404 for a session it no longer knows, for example after a
+# restart, and the client must start a new session. MCP reports it only as
+# INVALID_REQUEST with no data and one of these messages: mcp's streamable HTTP
+# client uses "Session terminated" when the 404 body is not a JSON-RPC error,
+# and the MCP Python SDK server's body says "Session not found".
+_SESSION_LOST_MESSAGES = frozenset({"Session terminated", "Session not found"})
+
+
+def _session_lost(err: MCPError) -> bool:
+    """Whether the server no longer knows the connection's MCP session."""
+    return (
+        err.code == INVALID_REQUEST
+        and err.data is None
+        and err.message in _SESSION_LOST_MESSAGES
+    )
+
+
+def _lone_mcp_error(group: BaseExceptionGroup[Any]) -> MCPError | None:
+    """The MCPError that a nest of ExceptionGroups carries alone, if it does."""
+    while len(group.exceptions) == 1:
+        (inner,) = group.exceptions
+        if isinstance(inner, MCPError):
+            return inner
+        if not isinstance(inner, BaseExceptionGroup):
+            return None
+        group = cast(BaseExceptionGroup[Any], inner)
+    return None
+
+
+def _protocol_error(err: MCPError, has_session: bool) -> ApplicationError:
+    details = (err.code,) if err.data is None else (err.code, err.data)
+    session_lost = has_session and _session_lost(err)
+    return ApplicationError(
+        err.message,
+        *details,
+        type="MCPProtocolError",
+        non_retryable=err.code in _NON_RETRYABLE_PROTOCOL_ERRORS and not session_lost,
+    )
 
 
 def _dump(model: BaseModel) -> dict[str, Any]:
@@ -94,20 +139,26 @@ class _MCPActivities:
         request: _MCPRequest,
         operation: Callable[[_MCPBackend], Awaitable[_Result]],
     ) -> _Result:
+        has_session = False
         try:
             async with self._pool.backend(
                 server,
                 factory_argument=request.factory_argument,
             ) as backend:
+                # Only older-protocol connections have MCP sessions. Each
+                # Activity attempt opens its own, so a retry starts a new one.
+                has_session = not backend.cacheable
                 return await operation(backend)
         except MCPError as err:
-            details = (err.code,) if err.data is None else (err.code, err.data)
-            raise ApplicationError(
-                err.message,
-                *details,
-                type="MCPProtocolError",
-                non_retryable=err.code in _NON_RETRYABLE_PROTOCOL_ERRORS,
-            ) from err
+            raise _protocol_error(err, has_session) from err
+        except BaseExceptionGroup as group:
+            # ``Client.__aexit__`` re-raises an error from the ``async with`` body
+            # wrapped in task-group ExceptionGroups, which a factory argument or a
+            # failed connect lets through.
+            mcp_error = _lone_mcp_error(group)
+            if mcp_error is None:
+                raise
+            raise _protocol_error(mcp_error, has_session) from mcp_error
         except ValidationError as err:
             raise ApplicationError(
                 "MCP server returned an invalid response",
