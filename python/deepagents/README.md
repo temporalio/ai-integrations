@@ -46,7 +46,7 @@ class ResearchAgent:
         # create_temporal_deep_agent wraps deepagents' create_deep_agent and
         # scopes this agent's model-call activity options explicitly.
         agent = create_temporal_deep_agent(
-            model="anthropic:claude-sonnet-4-5",
+            model="anthropic:claude-sonnet-5-5",
             system_prompt="You are a careful research assistant.",
             activity_options={"start_to_close_timeout": timedelta(minutes=5)},
         )
@@ -219,7 +219,7 @@ class FilesystemAgent:
             ),
         )
         agent = create_temporal_deep_agent(
-            model="anthropic:claude-sonnet-4-5",
+            model="anthropic:claude-sonnet-5-5",
             backend=backend,
         )
         result = await agent.ainvoke(
@@ -285,7 +285,7 @@ class ApprovalAgent:
     @workflow.run
     async def run(self, request: str) -> str:
         agent = create_temporal_deep_agent(
-            model="anthropic:claude-sonnet-4-5",
+            model="anthropic:claude-sonnet-5-5",
             interrupt_on={"book_trip": True},
             checkpointer=InMemorySaver(),
         )
@@ -349,7 +349,7 @@ from temporalio.deepagents import run_deep_agent
 class LongResearchAgent:
     @workflow.run
     async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
-        agent = create_deep_agent(model="anthropic:claude-sonnet-4-5")
+        agent = create_deep_agent(model="anthropic:claude-sonnet-5-5")
         return await run_deep_agent(
             agent,
             input,
