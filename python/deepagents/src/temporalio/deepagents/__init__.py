@@ -27,9 +27,11 @@ __all__ = [
     "run_deep_agent",
     "create_temporal_deep_agent",
     "DeepAgentsWorkflowError",
+    "ToolApprovals",
 ]
 
 if TYPE_CHECKING:
+    from temporalio.deepagents._approvals import ToolApprovals
     from temporalio.deepagents._model import TemporalModel
     from temporalio.deepagents._plugin import DeepAgentsPlugin
     from temporalio.deepagents._tools import (
@@ -49,6 +51,10 @@ def __getattr__(name: str) -> object:
         from temporalio.deepagents._plugin import DeepAgentsPlugin
 
         return DeepAgentsPlugin
+    if name == "ToolApprovals":
+        from temporalio.deepagents._approvals import ToolApprovals
+
+        return ToolApprovals
     if name == "TemporalModel":
         from temporalio.deepagents._model import TemporalModel
 

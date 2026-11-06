@@ -314,6 +314,57 @@ class ApprovalAgent:
 A client polls `pending_approval`, shows it to a person, and calls the
 `resume` update with `"approve"` / `"reject"`.
 
+`interrupt_on` pauses the whole graph, and LangGraph raises the interrupt at the
+end of a step. When sub-agents run in parallel (several `task` calls in one
+model message), a sub-agent's approval request is not visible until every
+sibling has finished, and the resume waits for all decisions. To hold single
+tool calls instead, use `ToolApprovals`: its middleware, added to the agent or
+sub-agent that calls the tool, waits in the workflow for a decision while the
+rest of the agent keeps running, and needs no checkpointer.
+
+```python
+from datetime import timedelta
+
+from temporalio import workflow
+from temporalio.deepagents import ToolApprovals, activity_as_tool, create_temporal_deep_agent
+
+
+@workflow.defn
+class RefundAgent:
+    def __init__(self) -> None:
+        self.approvals = ToolApprovals()
+
+    @workflow.run
+    async def run(self, request: str) -> str:
+        agent = create_temporal_deep_agent(
+            model="anthropic:claude-sonnet-4-5",
+            tools=[activity_as_tool(issue_refund, start_to_close_timeout=timedelta(minutes=1))],
+            middleware=[self.approvals.middleware(["issue_refund"])],
+        )
+        result = await agent.ainvoke({"messages": [{"role": "user", "content": request}]})
+        return result["messages"][-1].content
+
+    @workflow.query
+    def pending_approvals(self) -> list[dict]:
+        return self.approvals.pending_approvals()
+
+    @workflow.update
+    def decide(self, request_id: str, approved: bool) -> None:
+        self.approvals.decide(request_id, approved)
+
+    @decide.validator
+    def check_decide(self, request_id: str, approved: bool) -> None:
+        self.approvals.validate_decision(request_id)
+```
+
+`issue_refund` stands for your own Activity. `pending_approvals()` lists each
+waiting call by the model's tool call id, with the tool name and arguments. An approved call runs; a rejected one returns an
+error result to the model, and the tool does not run. Only the tools you name
+are held, and only in the agents you add the middleware to: add it to each
+sub-agent whose tools need approval. Adding it to an agent with runs in flight
+changes what those runs do next, so ship it with Worker Versioning or after
+they finish.
+
 ## Streaming
 
 Set `streaming_topic=` on the plugin and model dispatch switches to a streaming
