@@ -1,6 +1,7 @@
 # pyright: reportUnusedClass=false
 
 import asyncio
+import json
 import logging
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
@@ -79,11 +80,13 @@ def _session_lost(err: MCPError) -> bool:
     )
 
 
-def _lone_mcp_error(group: BaseExceptionGroup[Any]) -> MCPError | None:
-    """The MCPError that a nest of ExceptionGroups carries alone, if it does."""
+def _lone_error(
+    group: BaseExceptionGroup[Any],
+) -> MCPError | ValidationError | None:
+    """The MCPError or ValidationError that a nest of ExceptionGroups carries alone, if it does."""
     while len(group.exceptions) == 1:
         (inner,) = group.exceptions
-        if isinstance(inner, MCPError):
+        if isinstance(inner, (MCPError, ValidationError)):
             return inner
         if not isinstance(inner, BaseExceptionGroup):
             return None
@@ -99,6 +102,17 @@ def _protocol_error(err: MCPError, has_session: bool) -> ApplicationError:
         *details,
         type="MCPProtocolError",
         non_retryable=err.code in _NON_RETRYABLE_PROTOCOL_ERRORS and not session_lost,
+    )
+
+
+def _invalid_response(err: ValidationError) -> ApplicationError:
+    # A validator's ctx can hold the exception it raised, which the payload
+    # converter cannot serialize; pydantic's JSON form renders it as a string.
+    return ApplicationError(
+        "MCP server returned an invalid response",
+        json.loads(err.json(include_url=False, include_input=False)),
+        type="MCPProtocolError",
+        non_retryable=True,
     )
 
 
@@ -155,17 +169,14 @@ class _MCPActivities:
             # ``Client.__aexit__`` re-raises an error from the ``async with`` body
             # wrapped in task-group ExceptionGroups, which a factory argument or a
             # failed connect lets through.
-            mcp_error = _lone_mcp_error(group)
-            if mcp_error is None:
-                raise
-            raise _protocol_error(mcp_error, has_session) from mcp_error
+            inner = _lone_error(group)
+            if isinstance(inner, MCPError):
+                raise _protocol_error(inner, has_session) from inner
+            if isinstance(inner, ValidationError):
+                raise _invalid_response(inner) from inner
+            raise
         except ValidationError as err:
-            raise ApplicationError(
-                "MCP server returned an invalid response",
-                err.errors(include_url=False, include_input=False),
-                type="MCPProtocolError",
-                non_retryable=True,
-            ) from err
+            raise _invalid_response(err) from err
 
     def _build_activities(self) -> Sequence[Callable[..., Any]]:
         activities: list[Callable[..., Any]] = []
