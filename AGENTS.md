@@ -31,6 +31,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `python/google_genai` | `temporalio-google-genai` | 0.1.0 | Public Preview | `temporalio.google_genai` |
 | `python/langgraph` | `temporalio-langgraph` | 0.1.0 | Public Preview | `temporalio.langgraph` |
 | `python/langsmith` | `temporalio-langsmith` | 0.1.0 | Public Preview | `temporalio.langsmith` |
+| `python/openai_codex` | `temporalio-openai-codex` | 0.0.1 | Pre-release | `temporalio.openai_codex` |
 | `python/openai_agents` | `temporalio-openai-agents` | 1.0.0 | Generally Available | `temporalio.openai_agents` |
 | `python/strands_agents` | `temporalio-strands-agents` | 0.1.0 | Public Preview | `temporalio.strands_agents` |
 | `python/typesafe` | `temporalio-typesafe` | 0.0.1 | Pre-release | `temporalio.typesafe` |
@@ -47,7 +48,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 version policy (below). Go plugins use `go.temporal.io/<name>` module paths and live under
 `go/<name>/`. Before publishing, the vanity site must route each module to this repository's
 subdirectory. The [Go module reference](https://go.dev/ref/mod#vcs-find) documents the fourth
-`go-import` field for subdirectories, supported since Go 1.25. Google ADK requires Go 1.26.6,
+`go-import` field for subdirectories, supported since Go 1.25. Google ADK requires Go 1.26.10,
 so its mapping can be:
 
 ```html

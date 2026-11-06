@@ -3,6 +3,7 @@ package io.temporal.googleadk.internal;
 import com.google.adk.models.LlmResponse;
 import io.grpc.Context;
 import io.grpc.ManagedChannel;
+import io.grpc.Status;
 import io.grpc.health.v1.HealthCheckResponse;
 import io.temporal.activity.ActivityExecutionContext;
 import io.temporal.activity.ActivityInfo;
@@ -18,6 +19,8 @@ import io.temporal.googleadk.converter.GoogleAdkPayloadConverter;
 import io.temporal.googleadk.model.ModelStreamEvent;
 import io.temporal.serviceclient.WorkflowServiceStubs;
 import io.temporal.serviceclient.WorkflowServiceStubsOptions;
+import io.temporal.workflowstreams.FlushTimeoutException;
+import io.temporal.workflowstreams.PublishInput;
 import io.temporal.workflowstreams.TopicHandle;
 import io.temporal.workflowstreams.WorkflowStreamClient;
 import io.temporal.workflowstreams.WorkflowStreamClientOptions;
@@ -44,6 +47,7 @@ public final class ModelStreamPublisher implements AutoCloseable {
             thread.setDaemon(true);
             return thread;
           });
+  private final PublishFailures publishFailures = new PublishFailures();
   private final WorkflowStreamClient client;
   private final TopicHandle topic;
   private final ActivityInfo info;
@@ -80,7 +84,7 @@ public final class ModelStreamPublisher implements AutoCloseable {
    * service stub's plugins again to any client built from it, so the clone borrows the stubs
    * without their plugins.
    */
-  private static WorkflowClient boundedClient(WorkflowClient source, Duration timeout) {
+  private WorkflowClient boundedClient(WorkflowClient source, Duration timeout) {
     Objects.requireNonNull(
         source.getWorkflowServiceStubs().getRawChannel(), "Workflow Service channel");
     WorkflowClientInterceptor[] interceptors = source.getOptions().getInterceptors();
@@ -93,14 +97,20 @@ public final class ModelStreamPublisher implements AutoCloseable {
             return new WorkflowClientCallsInterceptorBase(next) {
               @Override
               public WorkflowSignalOutput signal(WorkflowSignalInput input) {
+                PublishInput batch = (PublishInput) input.getArguments()[0];
                 try (Context.CancellableContext deadline =
                     Context.current()
                         .withDeadlineAfter(timeout.toNanos(), TimeUnit.NANOSECONDS, DEADLINES)) {
-                  return deadline.call(() -> super.signal(input));
-                } catch (RuntimeException e) {
-                  throw e;
+                  WorkflowSignalOutput output = deadline.call(() -> super.signal(input));
+                  publishFailures.record(batch.sequence, null);
+                  return output;
                 } catch (Exception e) {
-                  throw new IllegalStateException(e);
+                  RuntimeException failure =
+                      e instanceof RuntimeException
+                          ? (RuntimeException) e
+                          : new IllegalStateException(e);
+                  publishFailures.record(batch.sequence, failure);
+                  throw failure;
                 }
               }
             };
@@ -173,18 +183,58 @@ public final class ModelStreamPublisher implements AutoCloseable {
     transport(client::close);
   }
 
-  private static void transport(Runnable action) {
+  private void transport(Runnable action) {
     try {
       action.run();
     } catch (RuntimeException e) {
-      throw new PublishFailure(e);
+      throw new PublishFailure(
+          e, e instanceof FlushTimeoutException ? publishFailures.forDroppedBatch() : e);
+    }
+  }
+
+  /** Tracks the cause that Workflow Streams omits from a dropped batch's timeout. */
+  private static final class PublishFailures {
+    private long sequence;
+    private RuntimeException pending;
+    private RuntimeException dropped;
+
+    // Workflow Streams serializes sends, but a foreground flush can observe a background failure.
+    synchronized void record(long batchSequence, @Nullable RuntimeException failure) {
+      if (batchSequence != sequence) {
+        // A new sequence without a successful send means the previous batch was dropped.
+        // Keep its failure even if close() drains a later batch before surfacing the timeout.
+        if (pending != null && dropped == null) dropped = pending;
+        sequence = batchSequence;
+      }
+      pending = failure;
+    }
+
+    @Nullable
+    synchronized RuntimeException forDroppedBatch() {
+      return dropped != null ? dropped : pending;
     }
   }
 
   /** A Workflow Streams transport or encoding failure, as opposed to a model failure. */
   public static final class PublishFailure extends RuntimeException {
-    PublishFailure(RuntimeException cause) {
+    private final boolean nonRetryable;
+
+    PublishFailure(RuntimeException cause, @Nullable RuntimeException publishCause) {
       super(cause.getMessage() != null ? cause.getMessage() : cause.toString(), cause);
+      Status status = publishCause == null ? Status.UNKNOWN : Status.fromThrowable(publishCause);
+      nonRetryable =
+          status.getCode() == Status.Code.INVALID_ARGUMENT
+              || (status.getCode() == Status.Code.RESOURCE_EXHAUSTED
+                  && status.getDescription() != null
+                  && status.getDescription().contains("larger than max"));
+    }
+
+    /**
+     * Returns whether the server refused the failed batch, including one dropped after the stream
+     * retry window. Outages and rate limiting remain retryable after that window expires.
+     */
+    public boolean isNonRetryable() {
+      return nonRetryable;
     }
   }
 
