@@ -27,9 +27,11 @@ __all__ = [
     "run_deep_agent",
     "create_temporal_deep_agent",
     "DeepAgentsWorkflowError",
+    "ContinueAsNewMiddleware",
 ]
 
 if TYPE_CHECKING:
+    from temporalio.deepagents._middleware import ContinueAsNewMiddleware
     from temporalio.deepagents._model import TemporalModel
     from temporalio.deepagents._plugin import DeepAgentsPlugin
     from temporalio.deepagents._tools import (
@@ -49,6 +51,10 @@ def __getattr__(name: str) -> object:
         from temporalio.deepagents._plugin import DeepAgentsPlugin
 
         return DeepAgentsPlugin
+    if name == "ContinueAsNewMiddleware":
+        from temporalio.deepagents._middleware import ContinueAsNewMiddleware
+
+        return ContinueAsNewMiddleware
     if name == "TemporalModel":
         from temporalio.deepagents._model import TemporalModel
 
