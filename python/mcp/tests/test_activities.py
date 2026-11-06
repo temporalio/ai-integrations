@@ -6,7 +6,9 @@ from typing import Any, cast
 import httpx2
 import pytest
 from mcp import Client, MCPError
+from mcp.client import InputRequiredRoundsExceededError
 from mcp.client.streamable_http import streamable_http_client
+from mcp.server.lowlevel import Server
 from mcp.server.mcpserver import MCPServer
 from mcp.types import (
     INTERNAL_ERROR,
@@ -541,6 +543,74 @@ async def test_invalid_server_response_fails_without_retry(
     assert validation_errors[0]["loc"] == loc
     # Unserializable details would replace this failure with a retryable one.
     DataConverter.default.payload_converter.to_payloads(err.value.details)
+
+
+class RoundsExceededClient(Client):
+    async def call_tool(self, *args: Any, **kwargs: Any) -> CallToolResult:
+        raise InputRequiredRoundsExceededError(3)
+
+
+# mcp's real Client checks the result against the tool's output schema.
+@pytest.mark.parametrize("factory_argument", [None, "acme"])
+@pytest.mark.parametrize(
+    ("client_type", "result", "message"),
+    [
+        (
+            Client,
+            CallToolResult(content=[TextContent(text="text only")]),
+            "did not return structured content",
+        ),
+        (
+            Client,
+            CallToolResult(content=[], structured_content={"value": 1}),
+            "Invalid structured content",
+        ),
+        (
+            RoundsExceededClient,
+            CallToolResult(content=[]),
+            "more than 3 rounds",
+        ),
+    ],
+)
+async def test_rejected_tool_result_fails_without_retry(
+    factory_argument: str | None,
+    client_type: type[Client],
+    result: CallToolResult,
+    message: str,
+) -> None:
+    tool = Tool(
+        name="structured",
+        input_schema={"type": "object"},
+        output_schema={"type": "object", "properties": {"value": {"type": "string"}}},
+    )
+
+    async def list_tools(_ctx: Any, _params: Any) -> ListToolsResult:
+        return ListToolsResult(tools=[tool])
+
+    async def call_tool(_ctx: Any, _params: Any) -> CallToolResult:
+        return result
+
+    server = Server("structured", on_list_tools=list_tools, on_call_tool=call_tool)
+    support = _MCPActivities(
+        {"test": lambda *_argument: _MCPClientBackend(client_type(server))},
+        idle_timeout=timedelta(minutes=5),
+    )
+    call = _activity_by_name(support, "temporalio.mcp.test.call-tool")
+    try:
+        with pytest.raises(ApplicationError, match=message) as err:
+            await call(
+                {
+                    "factory_argument": factory_argument,
+                    "meta": None,
+                    "name": "structured",
+                    "arguments": {},
+                }
+            )
+    finally:
+        await support._pool.close()
+
+    assert err.value.type == "MCPProtocolError"
+    assert err.value.non_retryable is True
 
 
 async def test_worker_reentry_before_close_starts_keeps_connection_open() -> None:
