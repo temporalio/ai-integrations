@@ -1,6 +1,7 @@
 # pyright: reportUnusedClass=false
 
 import asyncio
+import json
 import logging
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
@@ -105,9 +106,11 @@ def _protocol_error(err: MCPError, has_session: bool) -> ApplicationError:
 
 
 def _invalid_response(err: ValidationError) -> ApplicationError:
+    # A validator's ctx can hold the exception it raised, which the payload
+    # converter cannot serialize; pydantic's JSON form renders it as a string.
     return ApplicationError(
         "MCP server returned an invalid response",
-        err.errors(include_url=False, include_input=False),
+        json.loads(err.json(include_url=False, include_input=False)),
         type="MCPProtocolError",
         non_retryable=True,
     )

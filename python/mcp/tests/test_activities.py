@@ -16,6 +16,7 @@ from mcp.types import (
     URL_ELICITATION_REQUIRED,
     CallToolResult,
     GetPromptResult,
+    InputRequiredResult,
     ListPromptsResult,
     ListResourcesResult,
     ListResourceTemplatesResult,
@@ -29,8 +30,10 @@ from mcp.types import (
     TextResourceContents,
     Tool,
 )
+from pydantic import BaseModel
 
 from temporalio import activity
+from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
 from temporalio.mcp import _activities
 from temporalio.mcp._activities import _MCPActivities
@@ -492,12 +495,24 @@ async def test_permanent_protocol_error_fails_without_retry() -> None:
 # mcp's real Client: with a factory argument, its __aexit__ wraps the error in
 # ExceptionGroups.
 @pytest.mark.parametrize("factory_argument", [None, "acme"])
+@pytest.mark.parametrize(
+    ("result_type", "response", "loc"),
+    [
+        (GetPromptResult, {"messages": "not-a-list"}, ["messages"]),
+        # The validator's ValueError lands in the error's ctx.
+        (InputRequiredResult, {"resultType": "input_required"}, []),
+    ],
+)
 async def test_invalid_server_response_fails_without_retry(
     factory_argument: str | None,
+    result_type: type[BaseModel],
+    response: dict[str, Any],
+    loc: list[str],
 ) -> None:
     class InvalidResponseClient(Client):
         async def get_prompt(self, *args: Any, **kwargs: Any) -> GetPromptResult:
-            return GetPromptResult.model_validate({"messages": "not-a-list"})
+            result_type.model_validate(response)
+            raise AssertionError("response should be invalid")
 
     server = MCPServer("prompts")
     support = _MCPActivities(
@@ -523,7 +538,9 @@ async def test_invalid_server_response_fails_without_retry(
     assert err.value.type == "MCPProtocolError"
     assert err.value.non_retryable is True
     [validation_errors] = err.value.details
-    assert validation_errors[0]["loc"] == ("messages",)
+    assert validation_errors[0]["loc"] == loc
+    # Unserializable details would replace this failure with a retryable one.
+    DataConverter.default.payload_converter.to_payloads(err.value.details)
 
 
 async def test_worker_reentry_before_close_starts_keeps_connection_open() -> None:
