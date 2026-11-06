@@ -22,7 +22,7 @@ from typing import Any
 
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, is_cancelled_exception
 
 # Reserved key under which the CAN result cache rides inside a state snapshot.
 _CACHE_KEY = "__temporal_cache__"
@@ -282,6 +282,9 @@ async def run_deep_agent(
         # workflow-failure type rather than the framework's generic exception.
         cause = exc.__cause__
         if cause is not None and workflow.is_failure_exception(cause):
+            # Re-raise a cancellation so the Workflow closes as cancelled.
+            if is_cancelled_exception(cause):
+                raise cause
             raise DeepAgentsWorkflowError(f"Deep Agents run failed: {exc}") from cause
         raise
 
