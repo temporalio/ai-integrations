@@ -29,7 +29,11 @@ pytest.importorskip("langchain_core")
 from temporalio import activity, workflow  # noqa: E402
 from temporalio.common import RetryPolicy  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
-from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
+from tests.helpers.deepagents import (  # noqa: E402
+    all_scheduled_attributes,
+    count_scheduled_activities,
+    scheduled_attributes,
+)
 
 with workflow.unsafe.imports_passed_through():
     from temporalio.deepagents import (  # noqa: E402
@@ -434,6 +438,124 @@ async def test_tool_as_activity(env: WorkflowEnvironment) -> None:
     assert "sunny in Paris" in out
     counts = await count_scheduled_activities(handle)
     assert counts[INVOKE_TOOL] == 1, counts
+    # Tools are opt-in for heartbeats: no default timeout.
+    attrs = await scheduled_attributes(handle, INVOKE_TOOL)
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(0)
+    assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
+
+
+@workflow.defn
+class SlowToolHeartbeatWorkflow:
+    @workflow.run
+    async def run(self, city: str) -> str:
+        def get_weather(city: str) -> str:
+            """Look up the weather for a city."""
+            return f"sunny in {city}"
+
+        tool = tool_as_activity(
+            get_weather, start_to_close_timeout=timedelta(minutes=2)
+        )
+        return str(await tool.ainvoke({"city": city}))
+
+
+@workflow.defn
+class ToolHeartbeatOptionsWorkflow:
+    @workflow.run
+    async def run(self, city: str) -> str:
+        def ping_a(city: str) -> str:
+            """Echo a city."""
+            return f"a:{city}"
+
+        def ping_b(city: str) -> str:
+            """Echo a city."""
+            return f"b:{city}"
+
+        # Both tools inherit the plugin's 7 s default; ping_b additionally
+        # opts itself out per-tool.
+        inherited = tool_as_activity(
+            ping_a, start_to_close_timeout=timedelta(minutes=2)
+        )
+        opted_out = tool_as_activity(
+            ping_b,
+            start_to_close_timeout=timedelta(minutes=2),
+            activity_options={"heartbeat_timeout": None},
+        )
+        a = await inherited.ainvoke({"city": city})
+        b = await opted_out.ainvoke({"city": city})
+        return f"{a}|{b}"
+
+
+@pytest.mark.asyncio
+async def test_plugin_tool_activity_heartbeat_boundary(
+    env: WorkflowEnvironment,
+) -> None:
+    """Neither tool path gets a default heartbeat timeout: tools run
+    arbitrary application code, so heartbeats are opt-in. The plugin's
+    ``invoke_tool`` schedule and a user activity exposed with
+    ``activity_as_tool`` both stay untouched."""
+    plugin = DeepAgentsPlugin()
+    async with Worker(
+        env.client,
+        task_queue="da-tool-hb",
+        workflows=[ActivityAsToolWorkflow, SlowToolHeartbeatWorkflow],
+        activities=[
+            echo_activity,
+            echo_twice,
+            EchoActivities().echo_method,
+            EchoClass("worker"),
+        ],
+        plugins=[plugin],
+    ):
+        tool_handle = await env.client.start_workflow(
+            SlowToolHeartbeatWorkflow.run,
+            "Paris",
+            id=f"da-tool-hb-tool-{uuid.uuid4()}",
+            task_queue="da-tool-hb",
+        )
+        assert "sunny in Paris" in await tool_handle.result()
+        activity_handle = await env.client.start_workflow(
+            ActivityAsToolWorkflow.run,
+            "hi",
+            id=f"da-tool-hb-act-{uuid.uuid4()}",
+            task_queue="da-tool-hb",
+        )
+        assert "echo:hi" in await activity_handle.result()
+
+    tool_attrs = await scheduled_attributes(tool_handle, INVOKE_TOOL)
+    assert tool_attrs.heartbeat_timeout.ToTimedelta() == timedelta(0)
+    # The user's own activity keeps whatever schedule the caller asked for.
+    user_attrs = await scheduled_attributes(activity_handle, "echo_activity")
+    assert user_attrs.heartbeat_timeout.ToTimedelta() == timedelta(0)
+
+
+@pytest.mark.asyncio
+async def test_tool_activity_heartbeat_user_options_win(
+    env: WorkflowEnvironment,
+) -> None:
+    """A plugin-wide ``tool_activity_options`` heartbeat opts tools in, and a
+    per-tool ``heartbeat_timeout=None`` opts back out."""
+    plugin = DeepAgentsPlugin(
+        tool_activity_options={"heartbeat_timeout": timedelta(seconds=7)},
+    )
+    async with Worker(
+        env.client,
+        task_queue="da-tool-hb-opts",
+        workflows=[ToolHeartbeatOptionsWorkflow],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            ToolHeartbeatOptionsWorkflow.run,
+            "Paris",
+            id=f"da-tool-hb-opts-{uuid.uuid4()}",
+            task_queue="da-tool-hb-opts",
+        )
+        assert "a:Paris|b:Paris" in await handle.result()
+
+    heartbeats = [
+        attrs.heartbeat_timeout.ToTimedelta()
+        for attrs in await all_scheduled_attributes(handle, INVOKE_TOOL)
+    ]
+    assert heartbeats == [timedelta(seconds=7), timedelta(0)]
 
 
 def test_builtin_tool_in_workflow(recwarn: pytest.WarningsRecorder) -> None:

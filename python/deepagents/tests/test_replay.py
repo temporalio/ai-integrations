@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -21,8 +22,12 @@ pytestmark = pytest.mark.skipif(
     sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
 )
 from temporalio import workflow
-from temporalio.deepagents import DeepAgentsPlugin, run_deep_agent
+from temporalio.client import WorkflowHistory
+from temporalio.deepagents import DeepAgentsPlugin, TemporalModel, run_deep_agent
 from temporalio.worker import Replayer, Worker
+
+with workflow.unsafe.imports_passed_through():
+    from langchain_core.messages import HumanMessage
 
 
 class FakeAgent:
@@ -61,5 +66,40 @@ async def test_replay_with_plugin(env: WorkflowEnvironment) -> None:
     replayer = Replayer(
         workflows=[ReplayWorkflow],
         plugins=[DeepAgentsPlugin()],
+    )
+    await replayer.replay_workflow(history)
+
+
+# A history recorded on upstream main (63d7aec), before the default heartbeat
+# timeout existed: deepagents.invoke_model scheduled with
+# start_to_close=300s and heartbeat_timeout=0. To regenerate it, check out a
+# pre-default commit, run DefaultHeartbeatModelWorkflow through a worker built
+# from it (DeepAgentsPlugin(model_provider=mock_model_provider(["ok"]))), dump
+# the finished run's history with handle.fetch_history(), and scrub the
+# run-identifying identity / request IDs (as this copy has been).
+_PRE_HEARTBEAT_HISTORY = (
+    Path(__file__).parent / "histories" / "model_call_without_heartbeat.json"
+)
+
+
+@workflow.defn(name="DefaultHeartbeatModelWorkflow")
+class DefaultHeartbeatModelWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        model = TemporalModel(model="fake:model")
+        message = await model.ainvoke([HumanMessage(content=prompt)])
+        return str(message.content)
+
+
+@pytest.mark.asyncio
+async def test_pre_heartbeat_history_replays() -> None:
+    """A history recorded without the default heartbeat timeout replays
+    unchanged: activity options such as ``heartbeat_timeout`` are not part of
+    command matching, so adding the default is replay-safe for workflows still
+    in flight when a worker is upgraded."""
+    plugin = DeepAgentsPlugin()
+    replayer = Replayer(workflows=[DefaultHeartbeatModelWorkflow], plugins=[plugin])
+    history = WorkflowHistory.from_json(
+        "pre-heartbeat-replay", _PRE_HEARTBEAT_HISTORY.read_text()
     )
     await replayer.replay_workflow(history)

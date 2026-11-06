@@ -25,7 +25,10 @@ pytest.importorskip("langchain_core")
 
 from temporalio import workflow  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
-from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
+from tests.helpers.deepagents import (  # noqa: E402
+    count_scheduled_activities,
+    scheduled_attributes,
+)
 
 with workflow.unsafe.imports_passed_through():
     from langchain_core.messages import HumanMessage
@@ -210,6 +213,128 @@ async def test_temporal_model_explicit(env: WorkflowEnvironment) -> None:
     assert out == "Bonjour."
     counts = await count_scheduled_activities(handle)
     assert counts[INVOKE_MODEL] == 1, counts
+
+
+@workflow.defn
+class HeartbeatOverrideWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        model = TemporalModel(
+            model="fake:model",
+            activity_options={"heartbeat_timeout": timedelta(seconds=7)},
+        )
+        message = await model.ainvoke([HumanMessage(content=prompt)])
+        return str(message.content)
+
+
+@pytest.mark.asyncio
+async def test_model_activity_heartbeats_by_default(
+    env: WorkflowEnvironment,
+) -> None:
+    """The model activity is scheduled with a default heartbeat timeout.
+
+    Without one the plugin's auto-heartbeater never beats, so the server can
+    only detect a crashed worker at start-to-close (five minutes), and a
+    cancelled workflow's model call never learns it was cancelled — a Python
+    activity observes cancellation solely through a heartbeat response.
+    """
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(["Still there."]),
+    )
+    async with Worker(
+        env.client,
+        task_queue="da-model-heartbeat",
+        workflows=[ModelWorkflow],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            ModelWorkflow.run,
+            "Are you there?",
+            id=f"da-model-hb-{uuid.uuid4()}",
+            task_queue="da-model-heartbeat",
+        )
+        await handle.result()
+    # The literal 30 s (not the source constant) so this test speaks against
+    # any code that resolves the schedule, main's included.
+    attrs = await scheduled_attributes(handle, INVOKE_MODEL)
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=30)
+    assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(minutes=5)
+
+
+@pytest.mark.asyncio
+async def test_model_activity_heartbeat_caps_to_start_to_close(
+    env: WorkflowEnvironment,
+) -> None:
+    """The default never outlives the schedule's own close timeout: a plugin
+    ``start_to_close_timeout`` shorter than 30 s caps the heartbeat timeout
+    with it, in plugin code rather than by platform normalization."""
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(["Brief."]),
+        model_activity_options={"start_to_close_timeout": timedelta(seconds=10)},
+    )
+    async with Worker(
+        env.client,
+        task_queue="da-model-hb-cap",
+        workflows=[ModelWorkflow],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            ModelWorkflow.run,
+            "hi",
+            id=f"da-model-hb-cap-{uuid.uuid4()}",
+            task_queue="da-model-hb-cap",
+        )
+        await handle.result()
+    attrs = await scheduled_attributes(handle, INVOKE_MODEL)
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=10)
+    assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
+
+
+@pytest.mark.asyncio
+async def test_model_activity_heartbeat_override_wins(env: WorkflowEnvironment) -> None:
+    """A per-model ``heartbeat_timeout`` replaces the default."""
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(["Punctual."]),
+    )
+    async with Worker(
+        env.client,
+        task_queue="da-model-heartbeat-override",
+        workflows=[HeartbeatOverrideWorkflow],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            HeartbeatOverrideWorkflow.run,
+            "hi",
+            id=f"da-model-hb-ov-{uuid.uuid4()}",
+            task_queue="da-model-heartbeat-override",
+        )
+        await handle.result()
+    attrs = await scheduled_attributes(handle, INVOKE_MODEL)
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=7)
+
+
+@pytest.mark.asyncio
+async def test_model_activity_heartbeat_opt_out(env: WorkflowEnvironment) -> None:
+    """A plugin-wide ``heartbeat_timeout=None`` opts out of the default."""
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(["Unhurried."]),
+        model_activity_options={"heartbeat_timeout": None},
+    )
+    async with Worker(
+        env.client,
+        task_queue="da-model-heartbeat-optout",
+        workflows=[ModelWorkflow],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            ModelWorkflow.run,
+            "hi",
+            id=f"da-model-hb-out-{uuid.uuid4()}",
+            task_queue="da-model-heartbeat-optout",
+        )
+        await handle.result()
+    attrs = await scheduled_attributes(handle, INVOKE_MODEL)
+    assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(0)
 
 
 class _ResampleAgent:
