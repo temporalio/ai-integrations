@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
@@ -10,6 +11,7 @@ from datetime import timedelta
 from typing import Any, TypeVar, cast
 
 from mcp import MCPError
+from mcp.client import InputRequiredRoundsExceededError
 from mcp.types import (
     HEADER_MISMATCH,
     INVALID_PARAMS,
@@ -80,13 +82,38 @@ def _session_lost(err: MCPError) -> bool:
     )
 
 
+# The MCP client checks a tool's result against the tool's output schema and
+# raises RuntimeError with one of these messages (mcp/client/session.py). It
+# also raises InputRequiredRoundsExceededError when a call runs past its round
+# limit. A retry of the same request can't fix either.
+_REJECTED_RESULT = re.compile(
+    r"Tool .+ has an output schema but did not return structured content$"
+    r"|Invalid structured content returned by tool "
+    r"|Invalid schema for tool ",
+    re.DOTALL,
+)
+
+
+def _rejected_result(err: RuntimeError) -> bool:
+    """Whether the MCP client rejected a result that the server returned."""
+    return isinstance(err, InputRequiredRoundsExceededError) or bool(
+        _REJECTED_RESULT.match(str(err))
+    )
+
+
+def _rejected(err: RuntimeError) -> ApplicationError:
+    return ApplicationError(str(err), type="MCPProtocolError", non_retryable=True)
+
+
 def _lone_error(
     group: BaseExceptionGroup[Any],
-) -> MCPError | ValidationError | None:
-    """The MCPError or ValidationError that a nest of ExceptionGroups carries alone, if it does."""
+) -> MCPError | ValidationError | RuntimeError | None:
+    """The error we classify that a nest of ExceptionGroups carries alone, if it does."""
     while len(group.exceptions) == 1:
         (inner,) = group.exceptions
         if isinstance(inner, (MCPError, ValidationError)):
+            return inner
+        if isinstance(inner, RuntimeError) and _rejected_result(inner):
             return inner
         if not isinstance(inner, BaseExceptionGroup):
             return None
@@ -174,9 +201,15 @@ class _MCPActivities:
                 raise _protocol_error(inner, has_session) from inner
             if isinstance(inner, ValidationError):
                 raise _invalid_response(inner) from inner
+            if isinstance(inner, RuntimeError):
+                raise _rejected(inner) from inner
             raise
         except ValidationError as err:
             raise _invalid_response(err) from err
+        except RuntimeError as err:
+            if _rejected_result(err):
+                raise _rejected(err) from err
+            raise
 
     def _build_activities(self) -> Sequence[Callable[..., Any]]:
         activities: list[Callable[..., Any]] = []
