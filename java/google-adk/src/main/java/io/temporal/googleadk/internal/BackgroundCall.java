@@ -1,5 +1,7 @@
 package io.temporal.googleadk.internal;
 
+import io.opentelemetry.context.Context;
+import io.opentelemetry.context.Scope;
 import io.reactivex.rxjava3.core.Flowable;
 import io.reactivex.rxjava3.schedulers.Schedulers;
 import java.util.ArrayList;
@@ -45,6 +47,7 @@ public final class BackgroundCall {
     List<T> items = new CopyOnWriteArrayList<>();
     CompletableFuture<List<T>> result = new CompletableFuture<>();
     AtomicBoolean finished = new AtomicBoolean();
+    Context context = Context.current();
     // Subscribed before the flow, so that an abandonment that already happened completes the
     // result before the I/O thread can start the call.
     abandon.subscribe(ignored -> {}, ignored -> {}, () -> result.complete(snapshot(items)));
@@ -54,7 +57,9 @@ public final class BackgroundCall {
                 // Abandoned before the I/O thread picked the call up: do not start it at all.
                 return Flowable.<T>empty();
               }
-              return flow.get();
+              try (Scope scope = context.makeCurrent()) {
+                return withContext(flow.get(), context);
+              }
             })
         .subscribeOn(Schedulers.io())
         .doOnTerminate(
@@ -92,6 +97,20 @@ public final class BackgroundCall {
       Thread.currentThread().interrupt();
       throw new IllegalStateException("Interrupted while waiting for a background call", e);
     }
+  }
+
+  /**
+   * Subscribes with the caller's trace context current, so work a provider starts on subscription
+   * is parented correctly. ADK's own transformer would initialize its tracer and lock the global
+   * OpenTelemetry instance on every Activity, so it is not used here.
+   */
+  private static <T> Flowable<T> withContext(Flowable<T> flow, Context context) {
+    return Flowable.unsafeCreate(
+        subscriber -> {
+          try (Scope scope = context.makeCurrent()) {
+            flow.subscribe(subscriber);
+          }
+        });
   }
 
   private static <T> List<T> snapshot(List<T> items) {
