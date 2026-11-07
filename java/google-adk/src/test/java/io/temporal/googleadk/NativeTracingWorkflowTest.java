@@ -10,6 +10,7 @@ import com.google.adk.agents.ParallelAgent;
 import com.google.adk.models.LlmRequest;
 import com.google.adk.models.LlmResponse;
 import com.google.adk.runner.Runner;
+import com.google.adk.telemetry.Tracing;
 import com.google.adk.tools.Annotations.Schema;
 import com.google.adk.tools.FunctionTool;
 import com.google.genai.types.Content;
@@ -56,6 +57,7 @@ import io.temporal.workflow.Promise;
 import io.temporal.workflow.QueryMethod;
 import io.temporal.workflow.SignalMethod;
 import io.temporal.workflow.UpdateMethod;
+import io.temporal.workflow.UpdateValidatorMethod;
 import io.temporal.workflow.Workflow;
 import io.temporal.workflow.WorkflowInterface;
 import io.temporal.workflow.WorkflowMethod;
@@ -66,6 +68,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -115,6 +118,17 @@ class NativeTracingWorkflowTest {
     /** The turn starts inside a timer callback, which enters through the SDK's callback thread. */
     CALLBACK(false, false, false),
     /**
+     * A tool starts the nested turn inside a timer callback, which must keep the enclosing turn and
+     * parent span across an eviction.
+     */
+    NESTED_CALLBACK(true, true, false),
+    /**
+     * An Update validator creates a native span, then the Workflow is evicted while its model
+     * Activity is pending. Validators are skipped on replay, so they must not consume the
+     * deterministic identifier sequence.
+     */
+    VALIDATOR(true, true, false),
+    /**
      * The Worker factory is replaced while a model Activity is pending. Needs a real Temporal
      * service ({@code -Dgoogleadk.test.target=host:port}), so CI excludes it.
      */
@@ -138,6 +152,11 @@ class NativeTracingWorkflowTest {
     /** The Workflow input that selects this scenario's agent. */
     String mode() {
       return name().toLowerCase(Locale.ROOT);
+    }
+
+    /** The agent's tool starts a nested turn. */
+    boolean nested() {
+      return this == NESTED || this == NESTED_CALLBACK;
     }
   }
 
@@ -281,6 +300,8 @@ class NativeTracingWorkflowTest {
         }
         if (scenario == Scenario.UPDATE) assertEquals("done", workflow.ask());
         if (scenario == Scenario.SIGNAL) workflow.askSignal();
+        CompletableFuture<String> validated =
+            scenario == Scenario.VALIDATOR ? CompletableFuture.supplyAsync(workflow::ask) : null;
         assertTrue(entered.await(10, TimeUnit.SECONDS));
         if (scenario.gated) {
           disturb(scenario, fixture, tracing, model);
@@ -304,6 +325,7 @@ class NativeTracingWorkflowTest {
         } else if (scenario != Scenario.CANCEL) {
           assertEquals("done", WorkflowStub.fromTyped(workflow).getResult(String.class));
         }
+        if (validated != null) assertEquals("done", validated.get(30, TimeUnit.SECONDS));
         flush(tracing);
         List<SpanData> spans = nativeExporter.getFinishedSpanItems();
         List<SpanData> appSpans = appExporter.getFinishedSpanItems();
@@ -317,6 +339,11 @@ class NativeTracingWorkflowTest {
           assertTrue(
               fixture.executions.get() >= 3,
               "a parked second Workflow must force the first to replay");
+        }
+        if (scenario == Scenario.VALIDATOR) {
+          assertTrue(
+              appSpans.stream().anyMatch(span -> span.getName().equals("validation")),
+              "a validator's span uses the application's provider");
         }
         assertFreshWorkerReplayExportsNothing(
             fixture, tracing, model, nativeExporter, spans.size(), requests);
@@ -340,7 +367,7 @@ class NativeTracingWorkflowTest {
               .spanBuilder("provider-call")
               .startSpan();
       try (Scope scope = span.makeCurrent()) {
-        if (scenario != Scenario.NESTED || call == 3) {
+        if (!scenario.nested() || call == 3) {
           entered.countDown();
           if (!release.await(25, TimeUnit.SECONDS)) {
             throw new IllegalStateException("provider gate timed out");
@@ -354,7 +381,7 @@ class NativeTracingWorkflowTest {
           throw ApplicationFailure.newFailure("temporary provider failure", "Transient");
         }
         if (scenario.tools) return response(request);
-        if (scenario == Scenario.NESTED
+        if (scenario.nested()
             && request.tools().containsKey("nestedTurn")
             && TestSupport.functionResponse(request, "nestedTurn").isEmpty()) {
           return ScriptedModel.functionCall("nestedTurn", Map.of());
@@ -376,7 +403,7 @@ class NativeTracingWorkflowTest {
         Scenario scenario, Fixture fixture, GoogleAdkTracing tracing, ScriptedModel model)
         throws Exception {
       switch (scenario) {
-        case EVICTION, NESTED -> fixture.evict();
+        case EVICTION, NESTED, NESTED_CALLBACK, VALIDATOR -> fixture.evict();
         case RESTART -> fixture.restart();
         case UNFINISHED -> {
           WorkflowExecutionHistory partial = fixture.history();
@@ -451,8 +478,7 @@ class NativeTracingWorkflowTest {
           spans.stream().map(SpanData::getSpanId).distinct().count(),
           "each native operation exports once");
       assertTrue(
-          appSpans.stream()
-              .noneMatch(s -> "gcp.vertex.agent".equals(s.getInstrumentationScopeInfo().getName())),
+          appSpans.stream().noneMatch(Bootstrap::nativeOperation),
           "native spans of an opted-in Worker must not reach the application provider");
       if (scenario != Scenario.OVERLAP) {
         assertEquals(1, spans.stream().map(SpanData::getTraceId).distinct().count());
@@ -618,6 +644,15 @@ class NativeTracingWorkflowTest {
       assertTrue(tracing.forceFlush().join(10, TimeUnit.SECONDS).isSuccess());
     }
 
+    /** A native ADK operation span, as opposed to a span a test creates with ADK's tracer. */
+    static boolean nativeOperation(SpanData span) {
+      String name = span.getName();
+      return "gcp.vertex.agent".equals(span.getInstrumentationScopeInfo().getName())
+          && (name.startsWith("invoke_agent")
+              || name.startsWith("call_llm")
+              || name.startsWith("execute_tool"));
+    }
+
     private static String attribute(SpanData span, String key) {
       return span.getAttributes().get(AttributeKey.stringKey(key));
     }
@@ -646,6 +681,9 @@ class NativeTracingWorkflowTest {
 
     @UpdateMethod
     String ask();
+
+    @UpdateValidatorMethod(updateName = "ask")
+    void validateAsk();
 
     @SignalMethod
     void askSignal();
@@ -693,6 +731,15 @@ class NativeTracingWorkflowTest {
     }
   }
 
+  public static final class NestedCallbackTool {
+    @Schema(description = "Run another native ADK turn after a timer")
+    public String nestedTurn() {
+      return Workflow.newTimer(Duration.ofMillis(10))
+          .thenApply(ignored -> TracedWorkflowImpl.turn("inner", false))
+          .get();
+    }
+  }
+
   public static final class TracedWorkflowImpl implements TracedWorkflow {
     private boolean finished;
 
@@ -709,6 +756,11 @@ class NativeTracingWorkflowTest {
     }
 
     @Override
+    public void validateAsk() {
+      Tracing.getTracer().spanBuilder("validation").startSpan().end();
+    }
+
+    @Override
     public void askSignal() {
       turn("signal", false);
       finished = true;
@@ -721,7 +773,7 @@ class NativeTracingWorkflowTest {
           Workflow.await(() -> false);
           return "parked";
         }
-        case "update", "signal" -> {
+        case "update", "signal", "validator" -> {
           Workflow.await(() -> finished);
           return "done";
         }
@@ -744,19 +796,10 @@ class NativeTracingWorkflowTest {
                   runner, "user", "session", Content.fromParts(Part.fromText("hello"))));
         }
         case "nested" -> {
-          Runner runner =
-              TemporalAdk.runnerBuilder()
-                  .appName("native-tracing")
-                  .agent(
-                      LlmAgent.builder()
-                          .name("outer")
-                          .model(TemporalModel.create(MODEL))
-                          .tools(FunctionTool.create(new NestedTool(), "nestedTurn"))
-                          .build())
-                  .build();
-          return TestSupport.lastText(
-              TemporalAdk.run(
-                  runner, "user", "session", Content.fromParts(Part.fromText("hello"))));
+          return nested(new NestedTool());
+        }
+        case "nested_callback" -> {
+          return nested(new NestedCallbackTool());
         }
         case "overlap" -> {
           Promise<String> first = Async.function(() -> turn("first", false));
@@ -784,6 +827,21 @@ class NativeTracingWorkflowTest {
           return turn("assistant", mode.equals("tools") || mode.equals("retry"));
         }
       }
+    }
+
+    private static String nested(Object tool) {
+      Runner runner =
+          TemporalAdk.runnerBuilder()
+              .appName("native-tracing")
+              .agent(
+                  LlmAgent.builder()
+                      .name("outer")
+                      .model(TemporalModel.create(MODEL))
+                      .tools(FunctionTool.create(tool, "nestedTurn"))
+                      .build())
+              .build();
+      return TestSupport.lastText(
+          TemporalAdk.run(runner, "user", "session", Content.fromParts(Part.fromText("hello"))));
     }
 
     private static LlmAgent agent(String name, boolean tools) {

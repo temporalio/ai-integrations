@@ -431,8 +431,11 @@ code runs, because ADK captures its tracer once in a static initializer; do not 
 only native spans from Workflows are exported. Native ADK spans on the Workflow threads of
 Workers whose plugin set `tracing(...)` go to that instance; other instrumentation, ADK calls
 outside Workflows, metrics, logs, and Workers without it keep the application's configuration.
-The plugin propagates W3C trace context into model and tool Activities and across Workflow
-threads, including timer and Activity completion callbacks, and model-provider RxJava threads.
+The plugin propagates W3C trace context into model and tool Activities and across Workflow and
+model-provider RxJava threads. Callbacks on timers, Activities, child Workflows, and Nexus
+operations run in the context that registered them, so a turn started from a callback keeps its
+enclosing span and turn. Query handlers and Update validators are not replayed, so native spans
+created there use the application's provider.
 
 Drive agents through `TemporalAdk.run` or `TemporalAdk.await`. Workflow spans stay in memory
 until the outer turn completes, fails, or is canceled, then export once; spans ended outside such
