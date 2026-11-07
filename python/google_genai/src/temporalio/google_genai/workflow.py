@@ -244,6 +244,23 @@ def activity_as_tool(
         sig = inspect.signature(schema_fn)
         annotations = getattr(schema_fn, "__annotations__", {})
         doc = schema_fn.__doc__
+        # A quoted annotation (or `from __future__ import annotations`) can
+        # only be resolved in the function's own module: the wrapper has other
+        # globals, so Gemini would leave it a string and fail on it.
+        try:
+            hints = typing.get_type_hints(fn, include_extras=True)
+        except Exception as e:
+            raise ValueError(
+                f"Cannot read the parameters of {getattr(fn, '__name__', fn)}: {e}"
+            ) from e
+        sig = sig.replace(
+            parameters=[
+                p.replace(annotation=hints.get(p.name, p.annotation))
+                for p in sig.parameters.values()
+            ],
+            return_annotation=hints.get("return", sig.return_annotation),
+        )
+        annotations = {**annotations, **hints}
 
     activity_name: str = ret.name
 
