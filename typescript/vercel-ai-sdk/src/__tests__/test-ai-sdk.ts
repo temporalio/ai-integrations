@@ -424,7 +424,7 @@ test('Streaming text, finish and response metadata survive activity execution an
 
     t.deepEqual(parts, [
       { type: 'stream-start', warnings: [] },
-      { type: 'response-metadata', ...responseMetadata },
+      { type: 'response-metadata', ...responseMetadata, timestamp: responseMetadata.timestamp.toISOString() },
       { type: 'text-start', id: 'part-0', providerMetadata },
       { type: 'text-delta', id: 'part-0', delta: 'hello' },
       { type: 'text-end', id: 'part-0' },
