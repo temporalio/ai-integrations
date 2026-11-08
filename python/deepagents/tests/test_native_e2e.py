@@ -38,11 +38,10 @@ from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
 # the name against this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
-with workflow.unsafe.imports_passed_through():
-    from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage
 
-    from temporalio.deepagents import DeepAgentsPlugin, tool_as_activity
-    from temporalio.deepagents.testing import mock_model_provider
+from temporalio.deepagents import DeepAgentsPlugin, tool_as_activity
+from temporalio.deepagents.testing import mock_model_provider
 
 INVOKE_MODEL = "deepagents.invoke_model"
 INVOKE_TOOL = "deepagents.invoke_tool"

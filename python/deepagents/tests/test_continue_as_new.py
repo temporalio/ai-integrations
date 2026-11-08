@@ -1,4 +1,7 @@
-"""Continue-as-new state carry for long-running Deep Agents.
+"""Legacy transcript-based continue-as-new state carry.
+
+These regression tests exercise the retained replay implementation directly.
+New executions use the graph-checkpoint driver in test_checkpoint_continue_as_new.
 
 ``run_deep_agent(continue_as_new_after=...)`` keeps a long conversation from
 bloating workflow history: once the current turn finishes past the threshold and
@@ -33,8 +36,12 @@ pytestmark = pytest.mark.skipif(
     sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
 )
 from temporalio import workflow
-from temporalio.deepagents import DeepAgentsPlugin, _serde, run_deep_agent
-from temporalio.deepagents.workflow import _CACHE_KEY, _merge_snapshot
+from temporalio.deepagents import DeepAgentsPlugin, _serde
+from temporalio.deepagents.workflow import (
+    _CACHE_KEY,
+    _merge_snapshot,
+)
+from temporalio.deepagents.workflow import _run_deep_agent_legacy as run_deep_agent
 from temporalio.worker import Replayer, Worker
 
 
@@ -465,9 +472,8 @@ async def test_identical_op_reruns_across_continue_as_new(
 # also keeps the agent's files in graph state.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
-with workflow.unsafe.imports_passed_through():
-    from langchain.agents.middleware import TodoListMiddleware
-    from langchain_core.messages import AIMessage
+from langchain.agents.middleware import TodoListMiddleware
+from langchain_core.messages import AIMessage
 
 from temporalio.deepagents.testing import mock_model_provider
 

@@ -28,18 +28,16 @@ pytest.importorskip("langchain_core")
 
 from temporalio import activity, workflow  # noqa: E402
 from temporalio.common import RetryPolicy  # noqa: E402
+from temporalio.deepagents import (  # noqa: E402
+    DeepAgentsPlugin,
+    activity_as_tool,
+    run_deep_agent,
+    tool_as_activity,
+)
+from temporalio.deepagents._tools import warn_unwrapped_tools  # noqa: E402
+from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
 from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
-
-with workflow.unsafe.imports_passed_through():
-    from temporalio.deepagents import (  # noqa: E402
-        DeepAgentsPlugin,
-        activity_as_tool,
-        run_deep_agent,
-        tool_as_activity,
-    )
-    from temporalio.deepagents._tools import warn_unwrapped_tools  # noqa: E402
-    from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
 
 INVOKE_TOOL = "deepagents.invoke_tool"
 
@@ -490,9 +488,8 @@ class RepeatedToolCallWorkflow:
 class InjectedStateToolWorkflow:
     @workflow.run
     async def run(self, question: str) -> list[str]:
-        with workflow.unsafe.imports_passed_through():
-            from langchain_core.documents import Document
-            from langchain_core.messages import AIMessage, ChatMessage, FunctionMessage
+        from langchain_core.documents import Document
+        from langchain_core.messages import AIMessage, ChatMessage, FunctionMessage
 
         wrapped = (
             last_user_message,

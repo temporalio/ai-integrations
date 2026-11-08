@@ -384,8 +384,7 @@ def activity_as_tool(
             can use, or takes arguments the tool can't pass: ``*args``,
             keyword-only arguments or ``**kwargs``.
     """
-    with workflow.unsafe.imports_passed_through():
-        from langchain_core.tools import StructuredTool
+    from langchain_core.tools import StructuredTool
 
     defn = activity_mod._Definition.from_callable(activity)
     if defn is None:
@@ -459,8 +458,7 @@ def tool_as_activity(
     execute tool activities. Registration inside a workflow alone does not
     make the tool available in another worker process.
     """
-    with workflow.unsafe.imports_passed_through():
-        from langchain_core.tools import BaseTool, StructuredTool
+    from langchain_core.tools import BaseTool, StructuredTool
 
     base_tool: BaseTool
     if isinstance(tool, BaseTool):
@@ -496,8 +494,7 @@ def tool_as_activity(
         # carries a generated id that a real provider rejects as an unpaired
         # tool_result. Given plain content, the tool node stamps the model's
         # own id — exactly as it does for unwrapped tools.
-        with workflow.unsafe.imports_passed_through():
-            from langchain_core.messages import ToolMessage
+        from langchain_core.messages import ToolMessage
 
         if isinstance(message, ToolMessage):
             return message.content

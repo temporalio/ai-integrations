@@ -44,14 +44,13 @@ from temporalio.worker import Worker  # noqa: E402
 # the name against this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
-with workflow.unsafe.imports_passed_through():
-    from langchain_core.messages import AIMessage
-    from langchain_core.runnables import RunnableConfig
-    from langgraph.checkpoint.memory import InMemorySaver
-    from langgraph.types import Command
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
-    from temporalio.deepagents import DeepAgentsPlugin, tool_as_activity
-    from temporalio.deepagents.testing import mock_model_provider
+from temporalio.deepagents import DeepAgentsPlugin, tool_as_activity
+from temporalio.deepagents.testing import mock_model_provider
 
 
 @workflow.defn

@@ -31,19 +31,18 @@ from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from datetime import timedelta
 from typing import Any
 
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForLLMRun,
+    CallbackManagerForLLMRun,
+)
+from langchain_core.exceptions import ContextOverflowError
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessageChunk, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+
 from temporalio import workflow
 from temporalio.deepagents import _activity, _serde
 from temporalio.exceptions import ActivityError, ApplicationError
-
-with workflow.unsafe.imports_passed_through():
-    from langchain_core.callbacks import (
-        AsyncCallbackManagerForLLMRun,
-        CallbackManagerForLLMRun,
-    )
-    from langchain_core.exceptions import ContextOverflowError
-    from langchain_core.language_models import BaseChatModel
-    from langchain_core.messages import AIMessageChunk, BaseMessage
-    from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
 
 def _as_message_chunk(message: Any) -> Any:
