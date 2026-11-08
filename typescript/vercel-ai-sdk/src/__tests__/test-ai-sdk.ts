@@ -402,14 +402,17 @@ test('Image tool results are converted inside the workflow sandbox', async (t) =
   });
 });
 
-test('Streaming text provider metadata survives activity execution and workflow replay', async (t) => {
+test('Streaming text, finish and response metadata survive activity execution and workflow replay', async (t) => {
   const providerMetadata = { test: { source: 'delta' } };
+  const finishMetadata = { test: { cachedTokens: 7 } };
+  const responseMetadata = { id: 'response-1', modelId: 'test-model', timestamp: new Date('2026-01-01T00:00:00Z') };
   const provider = new StreamingTestProvider([
     { type: 'stream-start', warnings: [] },
+    { type: 'response-metadata', ...responseMetadata },
     { type: 'text-start', id: 'provider-part' },
     { type: 'text-delta', id: 'provider-part', delta: 'hello', providerMetadata },
     { type: 'text-end', id: 'provider-part' },
-    { type: 'finish', finishReason: createFinishReason('stop'), usage: createUsage() },
+    { type: 'finish', finishReason: createFinishReason('stop'), usage: createUsage(), providerMetadata: finishMetadata },
   ]);
   const { createWorker, executeWorkflow } = helpers(t);
   const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
@@ -421,11 +424,13 @@ test('Streaming text provider metadata survives activity execution and workflow 
 
     t.deepEqual(parts, [
       { type: 'stream-start', warnings: [] },
+      { type: 'response-metadata', ...responseMetadata, timestamp: responseMetadata.timestamp.toISOString() },
       { type: 'text-start', id: 'part-0', providerMetadata },
       { type: 'text-delta', id: 'part-0', delta: 'hello' },
       { type: 'text-end', id: 'part-0' },
       {
         type: 'finish',
+        providerMetadata: finishMetadata,
         finishReason: { unified: 'stop' },
         usage: { inputTokens: { total: 10 }, outputTokens: { total: 20 } },
       },
