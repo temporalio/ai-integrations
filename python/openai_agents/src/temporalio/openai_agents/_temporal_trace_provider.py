@@ -1,6 +1,7 @@
 """Provides support for integration with OpenAI Agents SDK tracing across workflows"""
 
 import uuid
+from _thread import LockType
 from types import TracebackType
 from typing import Any, cast
 
@@ -80,14 +81,32 @@ def activity_span(
 
 
 class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
-    def __init__(
+    # The base initializer would replace the wrapped processor tuple and lock.
+    def __init__(  # pyright: ignore[reportMissingSuperCall]
         self,
         impl: SynchronousMultiTracingProcessor,
         start_spans_in_replay: bool,
     ):
-        super().__init__()
         self._impl = impl
         self._emit_spans_in_replay = start_spans_in_replay
+
+    # OpenInference updates the SDK's processor tuple under its lock. Delegate
+    # that state too, so direct updates reach the same processors as callbacks.
+    @property
+    def _processors(self) -> tuple[TracingProcessor, ...]:
+        return self._impl._processors
+
+    @_processors.setter
+    def _processors(self, processors: tuple[TracingProcessor, ...]) -> None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        self._impl._processors = processors
+
+    @property
+    def _lock(self) -> LockType:
+        return self._impl._lock
+
+    @_lock.setter
+    def _lock(self, lock: LockType) -> None:
+        self._impl._lock = lock
 
     def add_tracing_processor(self, tracing_processor: TracingProcessor):
         self._impl.add_tracing_processor(tracing_processor)

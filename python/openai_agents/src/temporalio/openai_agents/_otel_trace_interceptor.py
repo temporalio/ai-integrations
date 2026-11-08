@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import opentelemetry.trace
@@ -13,6 +14,10 @@ import temporalio.converter
 from ._trace_interceptor import (
     OpenAIAgentsContextPropagationInterceptor,
     _InputWithHeaders,
+)
+
+_propagated_trace_id: ContextVar[str | None] = ContextVar(
+    "temporal_openai_agents_propagated_trace_id", default=None
 )
 
 
@@ -91,6 +96,10 @@ class OTelOpenAIAgentsContextPropagationInterceptor(
                     opentelemetry.trace.NonRecordingSpan(span_context),
                     end_on_exit=False,
                 ):
-                    yield
+                    token = _propagated_trace_id.set(span_info.get("traceId"))
+                    try:
+                        yield
+                    finally:
+                        _propagated_trace_id.reset(token)
             else:
                 yield
