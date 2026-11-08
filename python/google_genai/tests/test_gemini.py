@@ -1849,7 +1849,7 @@ class _StatefulTool:
 @activity.defn
 async def quoted_parcel_status(parcel_id: "str", note: "list[str]") -> "str":
     """Report a parcel's status."""
-    return parcel_id
+    return f"{parcel_id}: {', '.join(note)}"
 
 
 def test_activity_as_tool_resolves_quoted_annotations():
