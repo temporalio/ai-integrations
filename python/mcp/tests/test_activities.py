@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 from datetime import timedelta
 from typing import Any, cast
 
@@ -40,6 +41,9 @@ from temporalio.exceptions import ApplicationError
 from temporalio.mcp import _activities
 from temporalio.mcp._activities import _MCPActivities
 from temporalio.mcp._client import _MCPClientBackend
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup  # type: ignore[reportUnreachable]
 
 
 class FakeClient:
@@ -269,6 +273,37 @@ async def test_protocol_error_wrapped_in_exception_group_fails_without_retry() -
     assert err.value.type == "MCPProtocolError"
     assert err.value.non_retryable is True
     assert err.value.details == (INVALID_PARAMS, {"uri": "test://unknown"})
+
+
+# A group carrying more than one error is not a single failure we can classify.
+@pytest.mark.parametrize(
+    "other", [ConnectionError("connection lost"), asyncio.CancelledError()]
+)
+async def test_group_of_several_errors_is_left_alone(other: BaseException) -> None:
+    group = BaseExceptionGroup(
+        "errors", [MCPError(INVALID_PARAMS, "Invalid params"), other]
+    )
+
+    class GroupClient(FakeClient):
+        async def get_prompt(
+            self, name: str, _arguments: dict[str, str] | None
+        ) -> GetPromptResult:
+            raise group
+
+    support = _MCPActivities(
+        {"test": lambda: _MCPClientBackend(cast(Any, GroupClient()))},
+        idle_timeout=timedelta(minutes=5),
+    )
+    get_prompt = _activity_by_name(support, "temporalio.mcp.test.get-prompt")
+    try:
+        with pytest.raises(BaseExceptionGroup) as err:
+            await get_prompt(
+                {"factory_argument": None, "name": "prompt", "arguments": {}}
+            )
+    finally:
+        await support._pool.close()
+
+    assert err.value is group
 
 
 async def test_unknown_resource_protocol_error_fails_without_retry() -> None:
