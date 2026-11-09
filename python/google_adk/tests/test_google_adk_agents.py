@@ -1593,6 +1593,49 @@ def test_explicitly_set_none_preserved() -> None:
     assert serialized["cache_config"] is None
 
 
+@activity.defn
+async def tag_city(city: str, *tags: str) -> str:
+    return f"{city}:{','.join(tags)}"
+
+
+@activity.defn
+class TagCity:
+    async def __call__(self, city: str, *tags: str) -> str:
+        return f"{city}:{','.join(tags)}"
+
+
+@pytest.mark.parametrize("activity_def", [tag_city, TagCity])
+@pytest.mark.asyncio
+async def test_activity_as_tool_spreads_var_positional(
+    activity_def: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADK leaves *tags out of the declaration, so the tool offers it as a list
+    # and spreads it into the activity's arguments.
+    tool = temporalio.google_adk.workflow.activity_as_tool(
+        activity_def, start_to_close_timeout=timedelta(seconds=30)
+    )
+    declaration = FunctionTool(tool)._get_declaration()
+    assert declaration is not None
+    assert declaration.parameters_json_schema is not None
+    tags = declaration.parameters_json_schema["properties"]["tags"]
+    assert (tags["type"], tags["items"]) == ("array", {"type": "string"})
+    if activity_def is tag_city:
+        # Outside a Workflow the tool calls the activity itself.
+        assert await tool(city="Rome", tags=["sunny", "windy"]) == "Rome:sunny,windy"
+
+    calls: list[list[Any]] = []
+
+    async def execute_activity(_: Any, *args: Any, **kwargs: Any) -> str:
+        calls.append(list(args) or list(kwargs.get("args", [])))
+        return "ok"
+
+    monkeypatch.setattr(workflow, "in_workflow", lambda: True)
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    await tool(city="Rome", tags=["sunny", "windy"])
+    await tool(city="Rome")
+    assert calls == [["Rome", "sunny", "windy"], ["Rome"]]
+
+
 def test_activity_as_tool_preserves_metadata() -> None:
     """activity_as_tool wrapper preserves the original function's metadata.
 

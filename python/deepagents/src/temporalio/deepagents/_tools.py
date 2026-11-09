@@ -39,7 +39,7 @@ import weakref
 from collections.abc import Mapping
 from dataclasses import is_dataclass
 from datetime import timedelta
-from types import SimpleNamespace
+from types import GenericAlias, SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable
 
 if sys.version_info >= (3, 14):
@@ -285,8 +285,12 @@ def _class_doc(cls: type) -> str | None:
 
 def _tool_signature(
     activity: Callable,
-) -> tuple[inspect.Signature, dict[str, Any], str | None]:
-    """Return the parameters the model fills, their types, and the tool's docstring."""
+) -> tuple[inspect.Signature, dict[str, Any], str | None, bool]:
+    """Return the parameters the model fills, their types, and the tool's docstring.
+
+    The fourth item is True when the last parameter is the activity's ``*args``,
+    offered as a list.
+    """
     if inspect.isclass(activity):
         # Workflow code references a callable-class activity by its class, but the
         # worker's registered instance runs __call__, so take __call__'s parameters
@@ -329,14 +333,18 @@ def _tool_signature(
         params = list(signature.parameters.values())
         if params and params[0].name == "self":
             signature = signature.replace(parameters=params[1:])
-    # The tool passes the model's arguments to the activity by position, one per
-    # parameter, so it can't pass *args, keyword-only arguments or **kwargs. The
-    # model names every argument, positional-only ones included.
+    # The tool passes the model's arguments to the activity by position, so it
+    # can't pass keyword-only arguments or **kwargs. *args is offered as a list,
+    # spread into the call. The model names every argument, positional-only ones
+    # included.
     parameters = []
+    star = False
     for p in signature.parameters.values():
         if p.kind is inspect.Parameter.VAR_POSITIONAL:
-            raise ValueError(f"activity_as_tool cannot pass *{p.name}.")
-        if p.kind is inspect.Parameter.KEYWORD_ONLY:
+            hints = {**hints, p.name: GenericAlias(list, (hints.get(p.name, Any),))}
+            p = p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD, default=[])
+            star = True
+        elif p.kind is inspect.Parameter.KEYWORD_ONLY:
             message = f"activity_as_tool cannot pass keyword-only argument {p.name!r}."
             if bound_by_keyword:
                 message += (
@@ -349,7 +357,7 @@ def _tool_signature(
         if p.kind is inspect.Parameter.POSITIONAL_ONLY:
             p = p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD)
         parameters.append(p)
-    return signature.replace(parameters=parameters), hints, doc
+    return signature.replace(parameters=parameters), hints, doc, star
 
 
 def activity_as_tool(
@@ -367,6 +375,10 @@ def activity_as_tool(
     when called in-workflow, dispatches to the activity via
     ``workflow.execute_activity`` — Temporal owns its retries and timeout.
 
+    An activity's ``*args`` is offered as a list, spread into the call. The SDK
+    reads no argument types for an activity with ``*args``, so the Worker decodes
+    its arguments without them: a dataclass parameter arrives as a ``dict``.
+
     Args:
         activity: A function decorated with ``@activity.defn``, a method passed
             as ``Class.method``, or a callable-class activity passed as its class.
@@ -381,8 +393,8 @@ def activity_as_tool(
     Raises:
         ValueError: If ``activity`` is not a named activity, is an instance of a
             callable-class activity, is a class without a ``__call__`` the tool
-            can use, or takes arguments the tool can't pass: ``*args``,
-            keyword-only arguments or ``**kwargs``.
+            can use, or takes arguments the tool can't pass: keyword-only
+            arguments or ``**kwargs``.
     """
     with workflow.unsafe.imports_passed_through():
         from langchain_core.tools import StructuredTool
@@ -406,7 +418,7 @@ def activity_as_tool(
             f"activity_as_tool requires the activity class {type(activity).__name__}, "
             "not an instance of it."
         )
-    signature, hints, doc = _tool_signature(activity)
+    signature, hints, doc, star = _tool_signature(activity)
     tool_desc = description or (doc or f"Temporal activity {tool_name}.")
     act_summary = summary or f"tool:{tool_name}"
 
@@ -416,9 +428,12 @@ def activity_as_tool(
         # activity's type hints only when every parameter has a value.
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
+        activity_args = list(bound.args)
+        if star:
+            activity_args.extend(activity_args.pop())
         return await workflow.execute_activity(
             activity,
-            args=bound.args,
+            args=activity_args,
             start_to_close_timeout=start_to_close_timeout,
             retry_policy=retry_policy,
             summary=act_summary,
