@@ -146,6 +146,7 @@ from temporalio.openai_agents._invoke_model_activity import (
 )
 from temporalio.openai_agents._openai_runner import (
     _coerce_run_config,
+    _convert_agent,
 )
 from temporalio.openai_agents._temporal_model_stub import (
     _TemporalModelStub,
@@ -194,6 +195,21 @@ class HelloWorldAgent:
             instructions="You only respond in haikus.",
         )
         result = await Runner.run(starting_agent=agent, input=prompt)
+        return result.final_output
+
+
+@workflow.defn
+class CallerAgentWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        agent = Agent[None](
+            name="Assistant",
+            instructions="You only respond in haikus.",
+        )
+        result = await Runner.run(starting_agent=agent, input=prompt)
+        # A command that depends on getting the caller's agent back, not a copy.
+        if result.last_agent is agent:
+            await workflow.sleep(timedelta(milliseconds=100))
         return result.final_output
 
 
@@ -5312,6 +5328,28 @@ async def test_stateful_mcp_server_empty_block(client: Client):
             with pytest.raises(WorkflowFailureError) as err:
                 await handle.result()
             assert isinstance(err.value.cause, CancelledError)
+
+
+async def test_model_conversion_loops():
+    agent = init_agents()
+    converted = _convert_agent(ModelActivityParameters(), agent, None)
+    seat_booking_handoff = converted.handoffs[1]
+    assert isinstance(seat_booking_handoff, Handoff)
+    context: RunContextWrapper[AirlineAgentContext] = RunContextWrapper(
+        context=AirlineAgentContext()  # type: ignore
+    )
+    seat_booking_agent = await seat_booking_handoff.on_invoke_handoff(context, "")
+    triage_agent = seat_booking_agent.handoffs[0]
+    assert isinstance(triage_agent, Agent)
+    assert isinstance(triage_agent.model, _TemporalModelStub)
+    seat_booking_agent = await seat_booking_handoff.on_invoke_handoff(context, "")
+    triage_agent = seat_booking_agent.handoffs[0]
+    assert isinstance(triage_agent, Agent)
+    assert isinstance(triage_agent.model, _TemporalModelStub)
+    seat_booking_agent = await seat_booking_handoff.on_invoke_handoff(context, "")
+    triage_agent = seat_booking_agent.handoffs[0]
+    assert isinstance(triage_agent, Agent)
+    assert isinstance(triage_agent.model, _TemporalModelStub)
 
 
 def test_sandbox_apply_patch_tool_round_trips_through_activity_input():

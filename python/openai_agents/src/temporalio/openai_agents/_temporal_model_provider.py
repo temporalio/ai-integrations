@@ -55,9 +55,12 @@ class _CaptureAgentFilter:
 
         Raises:
             ValueError: If the agent's model is a ``Model`` object. The SDK would call it
-                in the Workflow, so only names that the provider resolves are allowed.
+                in the Workflow, so only names that the provider resolves are allowed,
+                and the stubs of runs that started on copies of the agents.
         """
-        if data.agent.model is not None and not isinstance(data.agent.model, str):
+        if data.agent.model is not None and not isinstance(
+            data.agent.model, (str, _TemporalModelStub)
+        ):
             raise ValueError(
                 "Temporal workflows require a model name to be a string in the agent."
             )
