@@ -22,6 +22,7 @@ from langsmith.run_trees import RunTree
 from langsmith.uuid import uuid7
 
 import temporalio.workflow
+from temporalio.langsmith._signature import bind
 
 logger = logging.getLogger(__name__)
 _executor: ContextVar[ThreadPoolExecutor | None] = ContextVar(
@@ -109,7 +110,7 @@ def _deterministic_defaults(kwargs: dict[str, Any], id_key: str) -> None:
 
 
 def _submit(
-    executor: ThreadPoolExecutor, fn: Callable[..., None], *args: Any, **kwargs: Any
+    executor: ThreadPoolExecutor, fn: Callable[..., None], /, *args: Any, **kwargs: Any
 ) -> None:
     """Keep LangSmith I/O off the workflow thread, in submission order."""
 
@@ -140,7 +141,7 @@ def install_run_tree_overrides() -> None:
     original_ensure_uuid = langsmith.client._ensure_uuid
 
     @functools.wraps(original_init)
-    def init(self: RunTree, **kwargs: Any) -> None:
+    def init(*args: Any, **kwargs: Any) -> None:
         if _workflow_executor() is not None:
             _deterministic_defaults(kwargs, "id")
             # A nested tracing_context() may clear its ambient client. Keep
@@ -149,46 +150,55 @@ def install_run_tree_overrides() -> None:
                 kwargs.get(key) is None for key in ("client", "ls_client", "_client")
             ):
                 kwargs["client"] = _client.get()
-        original_init(self, **kwargs)
+        original_init(*args, **kwargs)
 
     @functools.wraps(original_create_child)
-    def create_child(self: RunTree, *args: Any, **kwargs: Any) -> RunTree:
-        if _workflow_executor() is not None:
+    def create_child(*args: Any, **kwargs: Any) -> RunTree:
+        if _workflow_executor() is not None and (
+            call := bind(original_create_child, args, kwargs, "run_id", "start_time")
+        ):
             # LangSmith resolves child defaults before constructing RunTree.
-            _deterministic_defaults(kwargs, "run_id")
-        return original_create_child(self, *args, **kwargs)
+            _deterministic_defaults(call.arguments, "run_id")
+            args, kwargs = call.args, call.kwargs
+        return original_create_child(*args, **kwargs)
 
     @functools.wraps(original_post)
-    def post(self: RunTree, exclude_child_runs: bool = True) -> None:
+    def post(*args: Any, **kwargs: Any) -> None:
         executor = _workflow_executor()
         if executor is None:
-            original_post(self, exclude_child_runs=exclude_child_runs)
+            original_post(*args, **kwargs)
         elif not temporalio.workflow.unsafe.is_replaying_history_events():
-            _submit(
-                executor, original_post, self, exclude_child_runs=exclude_child_runs
-            )
+            _submit(executor, original_post, *args, **kwargs)
 
     @functools.wraps(original_end)
-    def end(self: RunTree, **kwargs: Any) -> None:
-        if _workflow_executor() is not None and kwargs.get("end_time") is None:
-            kwargs["end_time"] = worker_or_server_time()
+    def end(*args: Any, **kwargs: Any) -> None:
+        if _workflow_executor() is not None and (
+            call := bind(original_end, args, kwargs, "end_time")
+        ):
+            if call.arguments["end_time"] is None:
+                call.arguments["end_time"] = worker_or_server_time()
+            args, kwargs = call.args, call.kwargs
         # Ending only changes the in-memory tree, including on replay.
-        original_end(self, **kwargs)
+        original_end(*args, **kwargs)
 
     @functools.wraps(original_patch)
-    def patch(self: RunTree, *, exclude_inputs: bool | None = None) -> None:
+    def patch(*args: Any, **kwargs: Any) -> None:
         executor = _workflow_executor()
         if executor is None:
-            original_patch(self, exclude_inputs=exclude_inputs)
+            original_patch(*args, **kwargs)
         elif not temporalio.workflow.unsafe.is_replaying_history_events():
-            _submit(executor, original_patch, self, exclude_inputs=exclude_inputs)
+            _submit(executor, original_patch, *args, **kwargs)
 
     @functools.wraps(original_ensure_uuid)
-    def ensure_uuid(value: Any, *, accept_null: bool = False) -> Any:
+    def ensure_uuid(*args: Any, **kwargs: Any) -> Any:
         # The trace() context manager generates its root ID before RunTree.__init__.
-        if value is None and not accept_null:
+        if (
+            (call := bind(original_ensure_uuid, args, kwargs, "value", "accept_null"))
+            and call.arguments["value"] is None
+            and not call.arguments["accept_null"]
+        ):
             return run_id()
-        return original_ensure_uuid(value, accept_null=accept_null)
+        return original_ensure_uuid(*args, **kwargs)
 
     # LangChain passes its own run IDs and times into RunTree, so they must come
     # from the workflow where LangChain makes them.

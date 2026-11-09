@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
 from langsmith import run_helpers
+
+from temporalio.langsmith._signature import bind
 
 _destination: ContextVar[dict[str, Any] | None] = ContextVar(
     "temporal_langsmith_destination", default=None
@@ -38,6 +40,22 @@ def _with_defaults(container: Any) -> Any:
     return container
 
 
+def _with_container_defaults(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a LangSmith function to apply plugin defaults to its container input."""
+
+    @functools.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if _destination.get() and (
+            call := bind(original, args, kwargs, "container_input")
+        ):
+            container = call.arguments["container_input"]
+            call.arguments["container_input"] = _with_defaults(container)
+            args, kwargs = call.args, call.kwargs
+        return original(*args, **kwargs)
+
+    return wrapper
+
+
 def install_addressing_override() -> None:
     """Insert plugin defaults after explicit addressing, before configure/env."""
     global _installed  # noqa: PLW0603
@@ -46,28 +64,13 @@ def install_addressing_override() -> None:
 
     original_resolve = getattr(run_helpers, "_resolve_traceable_addressing", None)
     if original_resolve is not None:
-
-        @functools.wraps(original_resolve)
-        def resolve(
-            parent_run_: Any, langsmith_extra: Any, container_input: Any
-        ) -> Any:
-            return original_resolve(
-                parent_run_, langsmith_extra, _with_defaults(container_input)
-            )
-
-        run_helpers._resolve_traceable_addressing = resolve
+        run_helpers._resolve_traceable_addressing = _with_container_defaults(
+            original_resolve
+        )
     else:
         # Older LangSmith releases resolve project precedence inline. Only
         # supply the decorator fallback; leave run selection and setup native.
-        original_setup = run_helpers._setup_run
-
-        @functools.wraps(original_setup)
-        def setup(func: Any, container_input: Any, *args: Any, **kwargs: Any) -> Any:
-            return original_setup(
-                func, _with_defaults(container_input), *args, **kwargs
-            )
-
-        run_helpers._setup_run = setup
+        run_helpers._setup_run = _with_container_defaults(run_helpers._setup_run)
 
     original_tiers = getattr(run_helpers, "_addressing_tiers", None)
     if original_tiers is not None:
@@ -91,17 +94,20 @@ def install_addressing_override() -> None:
         original_project = run_helpers._get_project_name
 
         @functools.wraps(original_project)
-        def project(project_name: str | None) -> str | None:
-            context = run_helpers.get_tracing_context()
+        def project(*args: Any, **kwargs: Any) -> str | None:
             destination = _destination.get()
-            if (
-                destination
-                and not project_name
-                and not context.get("project_name")
-                and context.get("parent") is None
+            if destination and (
+                call := bind(original_project, args, kwargs, "project_name")
             ):
-                project_name = destination.get("project_name")
-            return original_project(project_name)
+                context = run_helpers.get_tracing_context()
+                if (
+                    not call.arguments["project_name"]
+                    and not context.get("project_name")
+                    and context.get("parent") is None
+                ):
+                    call.arguments["project_name"] = destination.get("project_name")
+                    args, kwargs = call.args, call.kwargs
+            return original_project(*args, **kwargs)
 
         run_helpers._get_project_name = project
 

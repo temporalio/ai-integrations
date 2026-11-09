@@ -3,19 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
+from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import langsmith
 import pytest
-from langsmith import get_current_run_tree, trace, traceable, tracing_context
+from langsmith import (
+    get_current_run_tree,
+    run_helpers,
+    trace,
+    traceable,
+    tracing_context,
+)
 from langsmith.run_trees import RunTree
 
-from temporalio.langsmith import LangSmithInterceptor
+from temporalio.langsmith import LangSmithInterceptor, _tracing
 from temporalio.langsmith._tracing import destination_context
+from tests.helpers.langsmith import langsmith_release
 
 ADDRESS = "lrn:agents/support/environments/staging"
 OTHER_ADDRESS = "lrn:agents/support/environments/production"
+_DESTINATION = {"project_name": "plugin-project"}
 _ADDRESS_DEFAULT = pytest.param(
     {"address": ADDRESS},
     id="address",
@@ -165,3 +176,120 @@ async def test_concurrent_destination_defaults() -> None:
             assert await call() == "default"
     finally:
         config._executor.shutdown(wait=True)
+
+
+@pytest.fixture
+def originals(monkeypatch: pytest.MonkeyPatch) -> dict[str, Callable[..., Any]]:
+    """Remove the addressing override for one test, returning LangSmith's originals."""
+    monkeypatch.setattr(_tracing, "_installed", False)
+    found: dict[str, Callable[..., Any]] = {}
+    for name in (
+        "_resolve_traceable_addressing",
+        "_addressing_tiers",
+        "_setup_run",
+        "_get_project_name",
+    ):
+        found[name] = inspect.unwrap(getattr(run_helpers, name))
+        monkeypatch.setattr(run_helpers, name, found[name])
+    return found
+
+
+def _install_over(
+    monkeypatch: pytest.MonkeyPatch, name: str, release: Callable[..., Any]
+) -> None:
+    if name != "_resolve_traceable_addressing":
+        # LangSmith before 0.14.2 resolves addressing in _setup_run instead.
+        monkeypatch.delattr(run_helpers, "_resolve_traceable_addressing")
+        monkeypatch.delattr(run_helpers, "_addressing_tiers")
+    monkeypatch.setattr(run_helpers, name, release)
+    _tracing.install_addressing_override()
+
+
+@pytest.mark.parametrize("in_context", [False, True])
+@pytest.mark.parametrize(
+    ("name", "args", "kwargs", "read", "default"),
+    [
+        pytest.param(
+            "_resolve_traceable_addressing",
+            (None, {}, {}),
+            {},
+            "container_input",
+            _DESTINATION,
+            id="_resolve_traceable_addressing",
+        ),
+        pytest.param(
+            "_setup_run",
+            (len,),
+            {"container_input": {}},
+            "container_input",
+            _DESTINATION,
+            id="_setup_run",
+        ),
+        pytest.param(
+            "_get_project_name",
+            (None,),
+            {},
+            "project_name",
+            "plugin-project",
+            id="_get_project_name",
+        ),
+    ],
+)
+def test_addressing_override_forwards_unknown_arguments(
+    originals: dict[str, Callable[..., Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    in_context: bool,
+    name: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    read: str,
+    default: Any,
+) -> None:
+    """A keyword from a newer LangSmith reaches the original through each override."""
+    calls: list[inspect.BoundArguments] = []
+    release = langsmith_release(originals[name], calls)
+    _install_over(monkeypatch, name, release)
+
+    with destination_context(_DESTINATION) if in_context else contextlib.nullcontext():
+        getattr(run_helpers, name)(*args, **kwargs, added=1)
+
+    if not in_context:
+        assert calls == [inspect.signature(release).bind(*args, **kwargs, added=1)]
+    else:
+        assert [call.arguments["added"] for call in calls] == [1]
+        assert calls[0].arguments[read] == default
+
+
+@pytest.mark.parametrize("in_context", [False, True])
+@pytest.mark.parametrize(
+    ("name", "args", "renamed"),
+    [
+        pytest.param(
+            "_resolve_traceable_addressing",
+            (None, {}, {}),
+            "container_input",
+            id="_resolve_traceable_addressing",
+        ),
+        pytest.param("_setup_run", (len, {}), "container_input", id="_setup_run"),
+        pytest.param(
+            "_get_project_name", (None,), "project_name", id="_get_project_name"
+        ),
+    ],
+)
+def test_addressing_override_calls_original_unchanged_after_renames(
+    originals: dict[str, Callable[..., Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    in_context: bool,
+    name: str,
+    args: tuple[Any, ...],
+    renamed: str,
+) -> None:
+    """An override that can't find the parameter it reads leaves the call alone."""
+    calls: list[inspect.BoundArguments] = []
+    release = langsmith_release(originals[name], calls, renamed=(renamed,))
+    _install_over(monkeypatch, name, release)
+
+    with destination_context(_DESTINATION) if in_context else contextlib.nullcontext():
+        getattr(run_helpers, name)(*args)
+
+    assert calls == [inspect.signature(release).bind(*args)]
