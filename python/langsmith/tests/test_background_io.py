@@ -316,39 +316,37 @@ def test_overrides_forward_unknown_arguments(
             assert calls[0].kwargs[supplied] > NOW  # Live runs use wall-clock time.
 
 
-@pytest.mark.parametrize("in_workflow", [False, True])
 @pytest.mark.parametrize(
-    ("name", "args", "renamed"),
+    ("name", "missing"),
     [
-        pytest.param(
-            "create_child",
-            (_RUN, "child"),
-            ("run_id", "start_time"),
-            id="create_child",
-        ),
-        pytest.param("post", (_RUN,), ("exclude_child_runs",), id="post"),
-        pytest.param("end", (_RUN,), ("end_time",), id="end"),
-        pytest.param("patch", (_RUN,), ("exclude_inputs",), id="patch"),
-        pytest.param("_ensure_uuid", (None,), ("accept_null",), id="_ensure_uuid"),
+        ("__init__", "id"),
+        ("__init__", "start_time"),
+        ("__init__", "ls_client"),
+        ("create_child", "run_id"),
+        ("create_child", "start_time"),
+        ("end", "end_time"),
+        ("_ensure_uuid", "value"),
+        ("_ensure_uuid", "accept_null"),
     ],
 )
-def test_overrides_call_original_unchanged_after_renames(
-    workflow_runtime: ThreadPoolExecutor,
+def test_install_rejects_release_missing_needed_parameter(
     originals: dict[str, Callable[..., Any]],
     monkeypatch: pytest.MonkeyPatch,
-    in_workflow: bool,
     name: str,
-    args: tuple[Any, ...],
-    renamed: tuple[str, ...],
+    missing: str,
 ) -> None:
-    """An override that can't find the parameters it reads leaves the call alone."""
-    calls: list[inspect.BoundArguments] = []
-    release = langsmith_release(originals[name], calls, renamed=renamed)
-    monkeypatch.setattr(_OVERRIDDEN[name], name, release)
-    _run_tree.install_run_tree_overrides()
-    monkeypatch.setattr(workflow, "in_workflow", lambda: in_workflow)
+    """A release without a parameter an override relies on fails the install unpatched."""
+    if name == "__init__":
+        fields = {k: v for k, v in RunTree.model_fields.items() if k != missing}
+        monkeypatch.setattr(RunTree, "model_fields", fields)
+        message = f"RunTree has no field '{missing}'"
+    else:
+        release = langsmith_release(originals[name], [], renamed=(missing,))
+        monkeypatch.setattr(_OVERRIDDEN[name], name, release)
+        message = f"{name} has no parameter '{missing}'"
+    unpatched = {n: getattr(owner, n) for n, owner in _OVERRIDDEN.items()}
 
-    getattr(_OVERRIDDEN[name], name)(*args)
-    workflow_runtime.submit(lambda: None).result()
+    with pytest.raises(RuntimeError, match=message):
+        _run_tree.install_run_tree_overrides()
 
-    assert calls == [inspect.signature(release).bind(*args)]
+    assert {n: getattr(owner, n) for n, owner in _OVERRIDDEN.items()} == unpatched

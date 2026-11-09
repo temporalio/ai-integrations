@@ -194,7 +194,7 @@ def originals(monkeypatch: pytest.MonkeyPatch) -> dict[str, Callable[..., Any]]:
     return found
 
 
-def _install_over(
+def _use_release(
     monkeypatch: pytest.MonkeyPatch, name: str, release: Callable[..., Any]
 ) -> None:
     if name != "_resolve_traceable_addressing":
@@ -202,7 +202,6 @@ def _install_over(
         monkeypatch.delattr(run_helpers, "_resolve_traceable_addressing")
         monkeypatch.delattr(run_helpers, "_addressing_tiers")
     monkeypatch.setattr(run_helpers, name, release)
-    _tracing.install_addressing_override()
 
 
 @pytest.mark.parametrize("in_context", [False, True])
@@ -248,7 +247,8 @@ def test_addressing_override_forwards_unknown_arguments(
     """A keyword from a newer LangSmith reaches the original through each override."""
     calls: list[inspect.BoundArguments] = []
     release = langsmith_release(originals[name], calls)
-    _install_over(monkeypatch, name, release)
+    _use_release(monkeypatch, name, release)
+    _tracing.install_addressing_override()
 
     with destination_context(_DESTINATION) if in_context else contextlib.nullcontext():
         getattr(run_helpers, name)(*args, **kwargs, added=1)
@@ -260,36 +260,26 @@ def test_addressing_override_forwards_unknown_arguments(
         assert calls[0].arguments[read] == default
 
 
-@pytest.mark.parametrize("in_context", [False, True])
 @pytest.mark.parametrize(
-    ("name", "args", "renamed"),
+    ("name", "missing"),
     [
-        pytest.param(
-            "_resolve_traceable_addressing",
-            (None, {}, {}),
-            "container_input",
-            id="_resolve_traceable_addressing",
-        ),
-        pytest.param("_setup_run", (len, {}), "container_input", id="_setup_run"),
-        pytest.param(
-            "_get_project_name", (None,), "project_name", id="_get_project_name"
-        ),
+        ("_resolve_traceable_addressing", "container_input"),
+        ("_setup_run", "container_input"),
+        ("_get_project_name", "project_name"),
     ],
 )
-def test_addressing_override_calls_original_unchanged_after_renames(
+def test_addressing_install_rejects_release_missing_needed_parameter(
     originals: dict[str, Callable[..., Any]],
     monkeypatch: pytest.MonkeyPatch,
-    in_context: bool,
     name: str,
-    args: tuple[Any, ...],
-    renamed: str,
+    missing: str,
 ) -> None:
-    """An override that can't find the parameter it reads leaves the call alone."""
-    calls: list[inspect.BoundArguments] = []
-    release = langsmith_release(originals[name], calls, renamed=(renamed,))
-    _install_over(monkeypatch, name, release)
+    """A release without a parameter an override relies on fails the install unpatched."""
+    release = langsmith_release(originals[name], [], renamed=(missing,))
+    _use_release(monkeypatch, name, release)
+    unpatched = {n: getattr(run_helpers, n, None) for n in originals}
 
-    with destination_context(_DESTINATION) if in_context else contextlib.nullcontext():
-        getattr(run_helpers, name)(*args)
+    with pytest.raises(RuntimeError, match=f"{name} has no parameter '{missing}'"):
+        _tracing.install_addressing_override()
 
-    assert calls == [inspect.signature(release).bind(*args)]
+    assert {n: getattr(run_helpers, n, None) for n in originals} == unpatched

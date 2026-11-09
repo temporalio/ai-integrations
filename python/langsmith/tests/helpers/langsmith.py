@@ -175,4 +175,6 @@ def langsmith_release(
         calls.append(signature.bind(*args, **kwargs))
 
     release.__signature__ = signature  # type: ignore[attr-defined]
+    release.__module__ = original.__module__
+    release.__qualname__ = original.__qualname__
     return release

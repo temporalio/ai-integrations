@@ -10,7 +10,7 @@ from typing import Any
 
 from langsmith import run_helpers
 
-from temporalio.langsmith._signature import bind
+from temporalio.langsmith._signature import bind, signature
 
 _destination: ContextVar[dict[str, Any] | None] = ContextVar(
     "temporal_langsmith_destination", default=None
@@ -42,12 +42,11 @@ def _with_defaults(container: Any) -> Any:
 
 def _with_container_defaults(original: Callable[..., Any]) -> Callable[..., Any]:
     """Wrap a LangSmith function to apply plugin defaults to its container input."""
+    original_signature = signature(original, "container_input")
 
     @functools.wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        if _destination.get() and (
-            call := bind(original, args, kwargs, "container_input")
-        ):
+        if _destination.get() and (call := bind(original_signature, args, kwargs)):
             container = call.arguments["container_input"]
             call.arguments["container_input"] = _with_defaults(container)
             args, kwargs = call.args, call.kwargs
@@ -62,15 +61,16 @@ def install_addressing_override() -> None:
     if _installed:
         return
 
+    overrides: dict[str, Callable[..., Any]] = {}
     original_resolve = getattr(run_helpers, "_resolve_traceable_addressing", None)
     if original_resolve is not None:
-        run_helpers._resolve_traceable_addressing = _with_container_defaults(
+        overrides["_resolve_traceable_addressing"] = _with_container_defaults(
             original_resolve
         )
     else:
         # Older LangSmith releases resolve project precedence inline. Only
         # supply the decorator fallback; leave run selection and setup native.
-        run_helpers._setup_run = _with_container_defaults(run_helpers._setup_run)
+        overrides["_setup_run"] = _with_container_defaults(run_helpers._setup_run)
 
     original_tiers = getattr(run_helpers, "_addressing_tiers", None)
     if original_tiers is not None:
@@ -89,16 +89,15 @@ def install_addressing_override() -> None:
                 levels[-1],
             )
 
-        run_helpers._addressing_tiers = tiers
+        overrides["_addressing_tiers"] = tiers
     else:
         original_project = run_helpers._get_project_name
+        project_signature = signature(original_project, "project_name")
 
         @functools.wraps(original_project)
         def project(*args: Any, **kwargs: Any) -> str | None:
             destination = _destination.get()
-            if destination and (
-                call := bind(original_project, args, kwargs, "project_name")
-            ):
+            if destination and (call := bind(project_signature, args, kwargs)):
                 context = run_helpers.get_tracing_context()
                 if (
                     not call.arguments["project_name"]
@@ -109,6 +108,9 @@ def install_addressing_override() -> None:
                     args, kwargs = call.args, call.kwargs
             return original_project(*args, **kwargs)
 
-        run_helpers._get_project_name = project
+        overrides["_get_project_name"] = project
 
+    # Patch nothing until every signature check has passed.
+    for name, override in overrides.items():
+        setattr(run_helpers, name, override)
     _installed = True

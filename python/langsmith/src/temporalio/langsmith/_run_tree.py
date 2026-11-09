@@ -22,7 +22,7 @@ from langsmith.run_trees import RunTree
 from langsmith.uuid import uuid7
 
 import temporalio.workflow
-from temporalio.langsmith._signature import bind
+from temporalio.langsmith._signature import bind, require, signature
 
 logger = logging.getLogger(__name__)
 _executor: ContextVar[ThreadPoolExecutor | None] = ContextVar(
@@ -139,6 +139,10 @@ def install_run_tree_overrides() -> None:
     original_end = RunTree.end
     original_patch = RunTree.patch
     original_ensure_uuid = langsmith.client._ensure_uuid
+    require(RunTree, "field", RunTree.model_fields, "id", "start_time", "ls_client")
+    create_child_signature = signature(original_create_child, "run_id", "start_time")
+    end_signature = signature(original_end, "end_time")
+    ensure_uuid_signature = signature(original_ensure_uuid, "value", "accept_null")
 
     @functools.wraps(original_init)
     def init(*args: Any, **kwargs: Any) -> None:
@@ -155,7 +159,7 @@ def install_run_tree_overrides() -> None:
     @functools.wraps(original_create_child)
     def create_child(*args: Any, **kwargs: Any) -> RunTree:
         if _workflow_executor() is not None and (
-            call := bind(original_create_child, args, kwargs, "run_id", "start_time")
+            call := bind(create_child_signature, args, kwargs)
         ):
             # LangSmith resolves child defaults before constructing RunTree.
             _deterministic_defaults(call.arguments, "run_id")
@@ -173,7 +177,7 @@ def install_run_tree_overrides() -> None:
     @functools.wraps(original_end)
     def end(*args: Any, **kwargs: Any) -> None:
         if _workflow_executor() is not None and (
-            call := bind(original_end, args, kwargs, "end_time")
+            call := bind(end_signature, args, kwargs)
         ):
             if call.arguments["end_time"] is None:
                 call.arguments["end_time"] = worker_or_server_time()
@@ -193,7 +197,7 @@ def install_run_tree_overrides() -> None:
     def ensure_uuid(*args: Any, **kwargs: Any) -> Any:
         # The trace() context manager generates its root ID before RunTree.__init__.
         if (
-            (call := bind(original_ensure_uuid, args, kwargs, "value", "accept_null"))
+            (call := bind(ensure_uuid_signature, args, kwargs))
             and call.arguments["value"] is None
             and not call.arguments["accept_null"]
         ):
