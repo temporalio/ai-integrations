@@ -13,8 +13,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from langchain_core.runnables import RunnableLambda
 from langsmith import get_current_run_tree, trace, traceable, tracing_context
-from langsmith.run_trees import RunTree
+from langsmith.run_trees import RunTree, WriteReplica
 
 from temporalio import workflow
 from temporalio.langsmith import _run_tree
@@ -248,3 +249,24 @@ def test_nested_context_retains_worker_client_fallback(
     workflow_runtime.submit(lambda: None).result()
     fallback.create_run.assert_called_once()
     explicit.create_run.assert_called_once()
+
+
+@pytest.mark.parametrize("replicas", [[], [{"project_name": "context"}]])
+def test_langchain_context_overrides_parent_replicas(
+    workflow_runtime: ThreadPoolExecutor,  # type: ignore[reportUnusedParameter]
+    replicas: list[WriteReplica],
+) -> None:
+    """LangChain honors explicit context replicas, including an empty list."""
+    client = make_mock_ls_client(InMemoryRunCollector())
+    parent = RunTree(
+        name="parent", ls_client=client, replicas=[{"project_name": "inherited"}]
+    )
+
+    def read_replicas(_: str) -> list[WriteReplica]:
+        run = get_current_run_tree()
+        assert run is not None
+        return list(run.replicas or [])
+
+    with tracing_context(parent=parent, client=client, enabled=True):
+        with tracing_context(replicas=replicas):
+            assert RunnableLambda(read_replicas).invoke("hello") == replicas
