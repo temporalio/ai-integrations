@@ -187,9 +187,16 @@ best effort: they can be missing after a Worker or transport failure, and `COMPL
 commit the Activity result. Treat the Workflow result or your own marker as the final outcome.
 
 Each publish Signal waits at most five seconds. A publishing failure fails the attempt with
-`googleadk.StreamError` under the Activity's retry policy, unless a provider or cancellation
-failure came first. Publication targets the current Run of the Workflow ID, so check Run IDs
-across Continue-As-New, and truncate the stream periodically for long or high-volume agents.
+`googleadk.StreamError`, unless a provider or cancellation failure came first. A batch the server
+refuses as invalid (`INVALID_ARGUMENT`) or too large (`RESOURCE_EXHAUSTED` with "larger than max")
+fails without retrying the model, including when Workflow Streams drops the refused batch after
+its five-second retry window. Other transport failures, including rate limiting and outages,
+follow the Activity's retry policy even after that window expires.
+
+Keep batches under the server's payload and gRPC message limits, for example with external storage
+on the Worker's Client and every subscriber's Client. Continue-As-New before reaching the server's
+Signal limit. Publication targets the current Run of the Workflow ID, so check Run IDs across
+Continue-As-New, and truncate the stream periodically for long or high-volume agents.
 
 ### Running the agent
 
@@ -370,9 +377,10 @@ example a safety block) is not a failure: ADK emits it as a final event with an 
 text, exactly as outside Temporal. MCP failures use `googleadk.McpError`: an unknown toolset or tool
 is non-retryable, a failing server call is retried, while a call the tool rejects outright (for
 example because of a null argument value) is not. Live-output publishing failures use
-`googleadk.StreamError`: a missing or mismatched Workflow Streams artifact is non-retryable, and
-transport failures are retried. Model and MCP calls run on a background thread, including the work a
-model does before it returns a flow (ADK's Claude model and its non-streaming LangChain4j model
+`googleadk.StreamError`: a missing or mismatched Workflow Streams artifact or a refused batch is
+non-retryable; outages and rate limiting remain retryable after the stream retry window (see
+[Live model output](#live-model-output)). Model and MCP calls run on a background thread, including
+the work a model does before it returns a flow (ADK's Claude model and its non-streaming LangChain4j model
 block there), a toolset factory, and the session start `McpToolset` performs on subscription, so
 with a heartbeat timeout on the activity options the activities heartbeat while they run and return
 as soon as the server cancels them. The background call is left to finish on its own and its result

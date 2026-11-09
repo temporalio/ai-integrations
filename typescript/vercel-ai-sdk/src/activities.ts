@@ -18,6 +18,7 @@ import { Context } from '@temporalio/activity';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { msOptionalToNumber, type Duration } from '@temporalio/common/lib/time';
 import type { McpClientFactories, McpClientFactory } from './mcp';
+import { withSources } from './activity-sources';
 
 const encoder = new TextEncoder();
 
@@ -81,8 +82,6 @@ export interface CallToolArgs {
 
 /**
  * Options controlling MCP connection reuse for {@link createActivities}.
- *
- * @experimental The AI SDK integration is an experimental feature; APIs may change without notice.
  */
 export interface CreateActivitiesOptions {
   /**
@@ -228,8 +227,6 @@ function releaseMcpConnection(key: string, entry: McpConnectionEntry, idleMs: nu
  * @param mcpClientFactories A mapping of server names to functions to create mcp clients
  * @param options Options controlling MCP connection reuse (see {@link CreateActivitiesOptions})
  * @returns An object containing the activity functions
- *
- * @experimental The AI SDK integration is an experimental feature; APIs may change without notice.
  */
 export function createActivities(
   provider: ProviderV4,
@@ -269,6 +266,7 @@ export function createActivities(
       };
       const warnings: SharedV4Warning[] = [];
       let responseMetadata: Record<string, unknown> | undefined;
+      let providerMetadata: SharedV4ProviderMetadata | undefined;
       let sawFinish = false;
       let sawError = false;
       let streamError: unknown;
@@ -337,6 +335,7 @@ export function createActivities(
           case 'finish':
             finishReason = part.finishReason;
             usage = part.usage;
+            providerMetadata = part.providerMetadata;
             sawFinish = true;
             break;
           case 'raw':
@@ -382,6 +381,7 @@ export function createActivities(
         finishReason,
         usage,
         warnings,
+        providerMetadata,
         request: streamResult.request,
         response: responseMetadata ? { ...responseMetadata, ...streamResult.response } : streamResult.response,
       };
@@ -396,12 +396,13 @@ export function createActivities(
       });
     },
   };
+  withSources(activities, [provider]);
   if (mcpClientFactories !== undefined) {
     const idleMs = msOptionalToNumber(options?.mcpConnectionIdleTimeout) ?? MCP_CONNECTION_IDLE_MS;
     Object.entries(mcpClientFactories).forEach(([name, func]) => {
       activities = {
         ...activities,
-        ...activitiesForName(name, func, idleMs),
+        ...withSources(activitiesForName(name, func, idleMs), [func, idleMs]),
       };
     });
   }

@@ -11,7 +11,9 @@ package googleadk_test
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
 	"github.com/stretchr/testify/assert"
@@ -19,10 +21,12 @@ import (
 
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/contrib/workflowstreams"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
 	sdkworkflow "go.temporal.io/sdk/workflow"
 
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/genai"
 
 	"go.temporal.io/googleadk"
 )
@@ -54,9 +58,22 @@ func TestStreamingIntegration(t *testing.T) {
 	taskQueue := testTaskQueue(t)
 
 	cm := &chunkedModel{name: "stream-model", chunks: []string{"Hello", ", ", "world"}}
+	// Three 600,000-character chunks fit the Activity result, but their publish
+	// batch is over the server's 2 MiB payload limit. With the 1,800,000-character
+	// aggregate after them, the result still fits but the batch (about 4.8 MB)
+	// is over the server's 4 MiB gRPC message limit.
+	big := strings.Repeat("x", 600_000)
+	oversized := &chunkedModel{name: "oversized-stream-model", chunks: []string{big, big, big}}
+	tooLarge := &chunkedModel{name: "too-large-stream-model", chunks: []string{big, big, big}, final: big + big + big}
+	// The same refused batch, but the model then fails: its error wins.
+	failing := &chunkedModel{name: "failing-stream-model", chunks: []string{big, big, big},
+		fail: &genai.APIError{Code: 400, Message: "bad request"}}
 	startWorker(t, c, taskQueue, googleadk.Config{
 		Models: map[string]googleadk.ModelFactory{
-			"stream-model": func(context.Context, string) (model.LLM, error) { return cm, nil },
+			"stream-model":           func(context.Context, string) (model.LLM, error) { return cm, nil },
+			"oversized-stream-model": func(context.Context, string) (model.LLM, error) { return oversized, nil },
+			"too-large-stream-model": func(context.Context, string) (model.LLM, error) { return tooLarge, nil },
+			"failing-stream-model":   func(context.Context, string) (model.LLM, error) { return failing, nil },
 		},
 	})
 	ctx := context.Background()
@@ -81,6 +98,33 @@ func TestStreamingIntegration(t *testing.T) {
 	var offset int64
 	require.NoError(t, val.Get(&offset))
 	assert.GreaterOrEqual(t, offset, int64(len(cm.chunks)), "every streamed chunk must be published to the topic")
+
+	// A batch the server refuses fails the model call instead of returning the
+	// reply as if subscribers had every chunk. A retry would call the model again
+	// and send the same batch, so the failure is non-retryable. A model error
+	// stays the call's error.
+	for _, tc := range []struct{ name, errType string }{
+		{"oversized-stream-model", googleadk.ErrorTypeStream},
+		{"too-large-stream-model", googleadk.ErrorTypeStream},
+		{"failing-stream-model", googleadk.ErrorTypeModel},
+	} {
+		run = startTestWorkflow(t, c, ctx, client.StartWorkflowOptions{
+			ID:        taskQueue + "-refused-" + tc.name,
+			TaskQueue: taskQueue,
+		}, agentRunWorkflow, runInput{
+			ModelName:      tc.name,
+			UserMessage:    "greet",
+			StreamingTopic: "run-stream",
+		})
+		getCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err = run.Get(getCtx, nil)
+		cancel()
+		require.Error(t, err, "%s: a refused publish batch must fail the model call", tc.name)
+		var appErr *temporal.ApplicationError
+		require.ErrorAs(t, err, &appErr, tc.name)
+		assert.Equal(t, tc.errType, appErr.Type(), tc.name)
+		assert.True(t, appErr.NonRetryable(), "%s: must not be retried: %v", tc.name, err)
+	}
 }
 
 // TestReplaySingleAndMultiAgent runs real single-agent, multi-agent, remote

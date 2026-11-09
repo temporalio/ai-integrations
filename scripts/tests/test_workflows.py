@@ -123,6 +123,15 @@ def test_ci_status_is_the_fan_in() -> None:
         assert f"needs.changes.outputs.{language} != '[]'" in job["if"]
 
 
+def test_tooling_installs_pnpm_for_cooldown_regressions() -> None:
+    workflow = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
+    steps = workflow["jobs"]["conventions"]["steps"]
+    setup = next(step for step in steps if step.get("uses", "").startswith("pnpm/action-setup@"))
+    tests = next(step for step in steps if step.get("name") == "Tooling unit tests")
+    assert setup["with"]["version"] == "10.27.0"
+    assert steps.index(setup) < steps.index(tests)
+
+
 def test_typescript_checks_tarball_and_clean_consumer_after_testing() -> None:
     workflow = yaml.safe_load((REPO / ".github/workflows/_typescript-plugin.yml").read_text())
     steps = workflow["jobs"]["test"]["steps"]
@@ -136,6 +145,19 @@ def test_typescript_checks_tarball_and_clean_consumer_after_testing() -> None:
     assert build["if"] == "matrix.dist"
     sync = next(step for step in steps if step.get("name") == "Sync dependencies")
     assert "make sync-latest" in sync["run"] and "make sync" in sync["run"]
+
+
+@pytest.mark.parametrize("language,sync_name", [("python", "Sync environment"), ("typescript", "Sync dependencies")])
+def test_cooldown_is_checked_before_installing_the_committed_lock(language: str, sync_name: str) -> None:
+    workflow = yaml.safe_load((REPO / f".github/workflows/_{language}-plugin.yml").read_text())
+    steps = workflow["jobs"]["test"]["steps"]
+    check = next(step for step in steps if step.get("name") == "Check dependency resolution under the cooldown")
+    sync = next(step for step in steps if step.get("name") == sync_name)
+    assert check["if"] == "matrix.dist && inputs.deps == 'locked'"
+    assert check["run"] == 'cd "$PLUGIN_DIR" && make check-deps'
+    assert steps.index(check) < steps.index(sync)
+    assert "locked) make sync ;;" in sync["run"]
+    assert "latest) make sync-latest ;;" in sync["run"]
 
 
 def test_go_release_reuses_the_full_matrix_and_verifies_the_same_commit() -> None:

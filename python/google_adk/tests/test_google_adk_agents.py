@@ -14,7 +14,9 @@
 
 """Integration tests for ADK Temporal support."""
 
+import asyncio
 import functools
+import importlib.metadata
 import inspect
 import json
 import logging
@@ -40,6 +42,8 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
 from google.adk.sessions import InMemorySessionService
+from google.adk.telemetry._schema_version import resolve_schema_version
+from google.adk.telemetry.context import TelemetryConfig
 from google.adk.tools.function_tool import FunctionTool
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
@@ -69,7 +73,7 @@ from temporalio.google_adk._model import (
 )
 from temporalio.worker import Worker
 from temporalio.workflow import ActivityConfig
-from tests.helpers.decorators import passthrough, unwrapped
+from tests.helpers.decorators import WrapOnAccess, passthrough, unwrapped
 from tests.helpers.opentelemetry import dump_spans
 from tests.helpers.postponed_annotations import PostponedHolder
 
@@ -605,7 +609,7 @@ async def test_single_agent_telemetry(
 
     spans = dump_spans(exporter.get_finished_spans(), with_attributes=False)
     print("\n".join(spans))
-    assert spans == [
+    expected_spans = [
         "StartWorkflow:WeatherAgent",
         "  RunWorkflow:WeatherAgent",
         "    invocation [test_app]",
@@ -622,6 +626,28 @@ async def test_single_agent_telemetry(
         "              StartActivity:invoke_model",
         "                RunActivity:invoke_model",
     ]
+    # ADK 2.12 introduces workflow spans before the inference format migrates.
+    # ADK 2.13 enables both changes by default.
+    schema_v2 = resolve_schema_version() >= 2
+    if schema_v2:
+        expected_spans[3] = "      invoke_workflow test_agent"
+    if schema_v2 and TelemetryConfig().should_use_experimental_genai_semconv:
+        expected_spans = [
+            "StartWorkflow:WeatherAgent",
+            "  RunWorkflow:WeatherAgent",
+            "    invocation [test_app]",
+            "      invoke_workflow test_agent",
+            "        agent_run [test_agent]",
+            "          invoke_agent test_agent",
+            "            StartActivity:invoke_model",
+            "              RunActivity:invoke_model",
+            "            execute_tool get_weather",
+            "              StartActivity:get_weather",
+            "                RunActivity:get_weather",
+            "            StartActivity:invoke_model",
+            "              RunActivity:invoke_model",
+        ]
+    assert spans == expected_spans
 
 
 async def test_unsetting_timeout():
@@ -1002,6 +1028,12 @@ class ComplexActivityMethodHolder:
     @passthrough
     async def count_decorated(self, passengers: int) -> str:
         """Method wrapped by a decorator from another module."""
+        return f"{self.prefix}:{passengers}"
+
+    @WrapOnAccess
+    @activity.defn
+    async def count_wrapped_on_access(self, passengers: int) -> str:
+        """Method whose decorator wraps it again on each access."""
         return f"{self.prefix}:{passengers}"
 
     class __Private:
@@ -1627,6 +1659,15 @@ def test_activity_as_tool_preserves_metadata() -> None:
         == "Number of passengers."
     )
 
+    # A callable-class instance has no __name__: its tool gets the class's, the
+    # name ADK gives the instance, so two instance tools don't share a name.
+    instance_tool = temporalio.google_adk.workflow.activity_as_tool(
+        QuoteTrip("USD"), start_to_close_timeout=timedelta(seconds=30)
+    )
+    assert instance_tool.__name__ == "QuoteTrip"
+    assert instance_tool.__qualname__ == "QuoteTrip"
+    assert FunctionTool(instance_tool).name == FunctionTool(QuoteTrip("USD")).name
+
     # __call__ as an instance binds it: a staticmethod keeps every parameter;
     # a classmethod and a partialmethod drop their receiver.
     for cls, params in [
@@ -1679,14 +1720,31 @@ def test_activity_as_tool_preserves_metadata() -> None:
         (ComplexActivityMethodHolder.private_count, ["passengers"]),
         (PostponedHolder.track, ["parcel_id"]),
         (nested_echo, ["self"]),
+        # A decorator applied to Class.method wraps the class's own function.
+        (passthrough(ComplexActivityMethodHolder.echo_static), ["self"]),
+        (passthrough(ComplexActivityMethodHolder.count_passengers), ["passengers"]),
+        (passthrough(ComplexActivityMethodHolder.echo_decorated), ["self"]),
+        (ComplexActivityMethodHolder.count_wrapped_on_access, ["passengers"]),
     ]:
         tool = temporalio.google_adk.workflow.activity_as_tool(
             fn, start_to_close_timeout=timedelta(seconds=30)
         )
         assert list(inspect.signature(tool).parameters) == params, fn.__qualname__
 
+    wrapped_static_tool = temporalio.google_adk.workflow.activity_as_tool(
+        passthrough(ComplexActivityMethodHolder.echo_static),
+        start_to_close_timeout=timedelta(seconds=30),
+    )
+    declaration = FunctionTool(wrapped_static_tool)._get_declaration()
+    assert declaration is not None
+    assert declaration.parameters_json_schema is not None
+    assert list(declaration.parameters_json_schema["properties"]) == ["self"]
+    assert asyncio.run(wrapped_static_tool(self="model-self")) == "static:model-self"
 
-def test_activity_as_tool_rejects_method_of_unreachable_class() -> None:
+
+def test_activity_as_tool_rejects_method_of_unreachable_class(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A method whose class can't be found can't be told from a staticmethod."""
 
     class LocalHolder:
@@ -1705,6 +1763,40 @@ def test_activity_as_tool_rejects_method_of_unreachable_class() -> None:
         temporalio.google_adk.workflow.activity_as_tool(
             UnwrappedHolder.echo, start_to_close_timeout=timedelta(seconds=30)
         )
+
+    # A reference kept after its class's name is rebound: the class now found
+    # holds another object under that name, so the reference is refused rather
+    # than given that object's binding.
+    echo_static = ComplexActivityMethodHolder.echo_static
+    count_passengers = ComplexActivityMethodHolder.count_passengers
+    monkeypatch.setitem(globals(), "ComplexActivityMethodHolder", ReboundMethodHolder)
+    with pytest.raises(ValueError, match="is another object"):
+        temporalio.google_adk.workflow.activity_as_tool(
+            echo_static, start_to_close_timeout=timedelta(seconds=30)
+        )
+    with pytest.raises(ValueError, match="is another object"):
+        temporalio.google_adk.workflow.activity_as_tool(
+            count_passengers, start_to_close_timeout=timedelta(seconds=30)
+        )
+    # Wrapping a kept reference doesn't make it the rebound attribute.
+    for fn in (echo_static, count_passengers):
+        with pytest.raises(ValueError, match="is another object"):
+            temporalio.google_adk.workflow.activity_as_tool(
+                passthrough(fn), start_to_close_timeout=timedelta(seconds=30)
+            )
+
+
+class ReboundMethodHolder:
+    """Takes ComplexActivityMethodHolder's name, with the opposite bindings."""
+
+    @activity.defn
+    async def echo_static(self) -> str:
+        return "rebound"
+
+    @staticmethod
+    @activity.defn
+    async def count_passengers(self, passengers: int) -> str:  # type: ignore[no-untyped-def] # pyright: ignore[reportMissingParameterType, reportSelfClsParameterName]
+        return str(passengers)
 
 
 class UnwrappedHolder:
@@ -1944,3 +2036,9 @@ def test_json_output_schema_left_unchanged() -> None:
     request.set_output_schema(CityWeather.model_json_schema())
 
     assert _with_serializable_response_schema(request) is request
+
+
+def test_plugin_reports_package_version() -> None:
+    assert GoogleAdkPlugin().version() == importlib.metadata.version(
+        "temporalio-google-adk"
+    )

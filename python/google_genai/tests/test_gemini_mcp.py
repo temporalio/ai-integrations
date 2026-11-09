@@ -449,3 +449,79 @@ def test_interactions_mcp_steps_rehydrate():
     )
     assert result_event.step.type == "mcp_server_tool_result"
     assert result_event.step.call_id == "call-1"
+
+
+# ---------------------------------------------------------------------------
+# MCP protocol errors: retryability
+# ---------------------------------------------------------------------------
+
+
+def _failing_factory(error: Exception):
+    class _FailingSession:
+        async def list_tools(self) -> Any:
+            raise error
+
+        async def call_tool(self, name: str, arguments: Any = None) -> Any:  # pyright: ignore[reportUnusedParameter]
+            raise error
+
+    @asynccontextmanager
+    async def factory() -> AsyncGenerator[Any, None]:
+        yield _FailingSession()
+
+    return factory
+
+
+@pytest.mark.parametrize("operation", ["list-tools", "call-tool"])
+@pytest.mark.parametrize(
+    ("code", "message", "data", "non_retryable"),
+    [
+        (-32602, "Invalid params", None, True),
+        (-32601, "Method not found", None, True),
+        (-32700, "Parse error", None, True),
+        (-32600, "Invalid request", {"why": "bad"}, True),
+        # Transient or unknown: stay retryable.
+        (-32603, "Internal error", None, False),
+        (-32001, "Request timed out", None, False),
+        # A server that lost our session: a retry reconnects, so keep retrying.
+        (-32600, "Session terminated", None, False),
+        (-32600, "Session not found", None, False),
+    ],
+)
+async def test_mcp_protocol_error_retryability(
+    operation: str,
+    code: int,
+    message: str,
+    data: Any,
+    non_retryable: bool,
+):
+    from mcp.types import ErrorData
+
+    from temporalio.exceptions import ApplicationError
+    from temporalio.google_genai import _mcp
+
+    server = f"proto-err-{uuid4()}"
+    try:
+        from mcp import (  # type: ignore[attr-defined]  # mcp>=2
+            MCPError,  # pyright: ignore[reportAttributeAccessIssue]
+        )
+
+        err: Exception = MCPError(code, message, data)
+    except ImportError:  # mcp<2
+        from mcp.shared.exceptions import McpError
+
+        err = McpError(ErrorData(code=code, message=message, data=data))
+    factory = _failing_factory(err)
+    if operation == "list-tools":
+        act = _mcp.build_list_tools_activity(server, factory)
+        call = act()
+    else:
+        from temporalio.google_genai._models import _McpCallToolRequest
+
+        act = _mcp.build_call_tool_activity(server, factory)
+        call = act(_McpCallToolRequest(name="echo", arguments={}))
+    with pytest.raises(ApplicationError) as exc_info:
+        await call
+    assert exc_info.value.non_retryable is non_retryable
+    assert exc_info.value.type == "MCPProtocolError"
+    # The broken session is still evicted so the next call reconnects.
+    assert server not in _mcp._CONNECTIONS

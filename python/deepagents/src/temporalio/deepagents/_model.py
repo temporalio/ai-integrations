@@ -147,7 +147,7 @@ class TemporalModel(BaseChatModel):
 
     Args:
         model: The provider model name resolved worker-side by the plugin's
-            ``model_provider`` (e.g. ``"anthropic:claude-sonnet-4-5"``). Only the
+            ``model_provider`` (e.g. ``"anthropic:claude-sonnet-5-5"``). Only the
             name crosses the workflow boundary; credentials stay on the worker.
         activity_options: Optional per-model ``execute_activity`` overrides
             (timeouts, retry policy). Falls back to the plugin's

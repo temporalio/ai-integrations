@@ -202,3 +202,12 @@ test('invokeModelStreaming throws when the stream emits an error even if a finis
   t.regex(err!.message, /mid-stream provider failure/);
   t.notRegex(err!.message, /without a finish part/);
 });
+
+test('invokeModelStreaming retains finish provider metadata', async (t) => {
+  const providerMetadata = { test: { cachedTokens: 7 } };
+  const { result } = await runStreamingActivity([
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage, providerMetadata },
+  ]);
+
+  t.deepEqual(result.providerMetadata, providerMetadata);
+});

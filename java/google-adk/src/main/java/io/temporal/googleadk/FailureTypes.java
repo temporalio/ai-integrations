@@ -13,8 +13,10 @@ public final class FailureTypes {
   public static final String MCP_ERROR = "googleadk.McpError";
 
   /**
-   * Live delivery of model output to a Workflow Stream failed. A blank topic or a missing Workflow
-   * Streams artifact is non-retryable; transport failures are retried.
+   * Live delivery of model output to a Workflow Stream failed. A blank topic, a missing Workflow
+   * Streams artifact, and a batch the server refused ({@code INVALID_ARGUMENT}, or {@code
+   * RESOURCE_EXHAUSTED} "larger than max") are non-retryable. Other transport failures are
+   * retryable, including outages and rate limiting that exhaust the stream retry window.
    */
   public static final String STREAM_ERROR = "googleadk.StreamError";
 

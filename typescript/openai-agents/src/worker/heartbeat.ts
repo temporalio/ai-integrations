@@ -7,12 +7,13 @@ import { heartbeat, activityInfo } from '@temporalio/activity';
  *
  * Returns a `stop` function that cancels the loop. If the Activity has no
  * `heartbeatTimeoutMs` configured, no heartbeats are sent and `stop` is a no-op.
+ * Each heartbeat sends what `details` returns.
  *
  * Heartbeat errors are swallowed: the Activity may already be cancelled, in
  * which case the next `heartbeat()` call would throw and we don't want that
  * to mask the Activity's primary work.
  */
-export function startAdaptiveHeartbeat(): () => void {
+export function startAdaptiveHeartbeat(details?: () => unknown): () => void {
   const info = activityInfo();
   if (!info.heartbeatTimeoutMs || info.heartbeatTimeoutMs <= 0) {
     return () => {};
@@ -25,7 +26,7 @@ export function startAdaptiveHeartbeat(): () => void {
   const tick = () => {
     if (stopped) return;
     try {
-      heartbeat();
+      heartbeat(details?.());
     } catch {
       // Activity might be cancelled — ignore heartbeat errors
     }

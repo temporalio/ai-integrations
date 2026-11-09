@@ -1,6 +1,7 @@
 import test from 'ava';
 import type { MCPServer } from '@openai/agents-core';
 import { ApplicationFailure } from '@temporalio/common';
+import { TOOL_META_RESOLVER_UNSUPPORTED_TYPE } from '..';
 import { TOOL_FILTER_UNSUPPORTED_TYPE } from '../common/mcp-types';
 import { StatelessMCPServerProvider, filterListedTools } from '../worker/mcp-provider';
 import { statelessMcpServer } from '../workflow/mcp-client';
@@ -70,4 +71,40 @@ test('statelessMcpServer keeps cacheToolsList assignable and reports false with 
   t.false(filtered.cacheToolsList);
   filtered.cacheToolsList = true;
   t.false(filtered.cacheToolsList);
+});
+
+function serverWithResolver(onConnect: () => void): MCPServer {
+  return {
+    cacheToolsList: false,
+    name: 'tickets',
+    toolMetaResolver: () => ({ tenant: 'tenant-7' }),
+    async connect() {
+      onConnect();
+      throw new Error('connection refused');
+    },
+    async close() {},
+    async listTools() {
+      return [];
+    },
+    async callTool() {
+      return [];
+    },
+    async invalidateToolsCache() {},
+  };
+}
+
+test('StatelessMCPServerProvider refuses a toolMetaResolver without connecting', async (t) => {
+  let connects = 0;
+  const activities = new StatelessMCPServerProvider('tickets', () =>
+    serverWithResolver(() => connects++)
+  )._getActivities();
+
+  for (const name of ['tickets-stateless-list-tools', 'tickets-stateless-call-tool']) {
+    const err = await t.throwsAsync(activities[name]!({ toolName: 'echo', args: {} }), {
+      instanceOf: ApplicationFailure,
+    });
+    t.is(err?.type, TOOL_META_RESOLVER_UNSUPPORTED_TYPE);
+    t.true(err?.nonRetryable);
+  }
+  t.is(connects, 0);
 });
