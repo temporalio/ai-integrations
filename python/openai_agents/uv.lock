@@ -2973,17 +2973,18 @@ pydantic = [
 
 [[package]]
 name = "temporalio-mcp"
-version = "0.2.0"
+version = "0.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
+    { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
     { name = "mcp" },
     { name = "mcp-types" },
     { name = "pydantic" },
     { name = "temporalio" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d0/bf/b7f69dccca2485fd6496137211d7a24773937678cf148d895ffd57ceddbf/temporalio_mcp-0.2.0.tar.gz", hash = "sha256:0217f581cd8937231290a9f0fcc0e415dbb0ba71e5b8bfd0e4fdcf4b7eb28450", size = 16157, upload-time = "2026-09-16T19:05:58.145Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/46/d2/6b1a7cfc08b6554862e241526cee3ad5a91bfe14baa854b6cf20c9885781/temporalio_mcp-0.3.0.tar.gz", hash = "sha256:c42ab0ab878fb2b4105822b28b199a438c1c8c9f81051a847234eb517b4ce408", size = 17497, upload-time = "2026-11-09T20:32:26.624Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a8/ae/2d549e97113b8c3fe361029cd9f9acee0abb5fd3151f3f4c73f80c3ae3d0/temporalio_mcp-0.2.0-py3-none-any.whl", hash = "sha256:b2986c373d94d4063eb9aea516660d93f09011acae1205b2c3971e6962614847", size = 19639, upload-time = "2026-09-16T19:05:56.857Z" },
+    { url = "https://files.pythonhosted.org/packages/75/26/22398c7a39f43999167e8800f1860b867b014fea3903c8d6c2109cbc5a82/temporalio_mcp-0.3.0-py3-none-any.whl", hash = "sha256:90b030e50382a246546528dcf85557b3428837dd28e6f13675fa72ade021777b", size = 21388, upload-time = "2026-11-09T20:32:25.297Z" },
 ]
 
 [[package]]
