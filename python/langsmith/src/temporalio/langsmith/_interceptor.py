@@ -8,7 +8,7 @@ import logging
 from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, ClassVar, NoReturn, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, NoReturn, Protocol, cast
 from urllib.parse import quote
 
 import langsmith
@@ -33,6 +33,9 @@ from temporalio.langsmith._tracing import (
     destination_context,
     install_addressing_override,
 )
+
+if TYPE_CHECKING:
+    from langsmith.address import AgentAddress
 
 
 def _env_destination(client: langsmith.Client) -> dict[str, Any] | None:
@@ -98,7 +101,16 @@ def _trace_headers(run_tree: RunTree) -> dict[str, str]:
         # and ingestion URLs must never enter persisted Temporal headers.
         filter_replica = getattr(run_trees, "_filter_replica_for_headers", None)
         if filter_replica is not None:
-            safe = [filter_replica(replica) for replica in replicas]
+            safe: list[dict[str, Any]] = [
+                dict(filter_replica(replica)) for replica in replicas
+            ]
+            for replica in safe:
+                if isinstance(replica.get("address"), dict):
+                    from langsmith._internal import _addressing
+
+                    # LangSmith reads a replica address from headers only in
+                    # its lrn: wire form.
+                    replica["address"] = _addressing.address_to_lrn(replica["address"])
             encoded = quote(json.dumps(safe, separators=(",", ":"), default=str))
             headers["baggage"] = ",".join(
                 part for part in (baggage, f"langsmith-replicas={encoded}") if part
@@ -235,7 +247,7 @@ def _install_aio_to_thread_override() -> None:
 
 def _destination(
     project_name: str | None,
-    address: str | None,
+    address: AgentAddress | None,
 ) -> dict[str, Any]:
     """Name the plugin's default destination, without consulting the environment."""
     if address is not None:
@@ -406,7 +418,7 @@ class LangSmithInterceptor(
         *,
         client: langsmith.Client | None = None,
         project_name: str | None = None,
-        address: str | None = None,
+        address: AgentAddress | None = None,
         add_temporal_runs: bool = False,
         default_metadata: dict[str, Any] | None = None,
         default_tags: list[str] | None = None,
@@ -417,10 +429,10 @@ class LangSmithInterceptor(
             raise ValueError("project_name and address are mutually exclusive")
         if address is not None:
             address_api = getattr(langsmith, "address", None)
-            parse_address = getattr(address_api, "parse", None)
-            if not callable(parse_address):
-                raise ValueError("Agent addressing requires langsmith>=0.14.4")
-            address = str(parse_address(address))
+            ensure_agent = getattr(address_api, "ensure_agent", None)
+            if not callable(ensure_agent):
+                raise ValueError("Agent addressing requires langsmith>=0.14.10")
+            address = cast("AgentAddress", ensure_agent(address))
         if client is None:
             client = langsmith.Client()
         self._client = client

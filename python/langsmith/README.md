@@ -216,7 +216,7 @@ my_step
 
 ## Agent and Environment Destinations
 
-With LangSmith 0.14.4 or later, an agent/environment address can select where
+With LangSmith 0.14.10 or later, an agent/environment address can select where
 traces are sent:
 
 ```python
@@ -224,7 +224,7 @@ import langsmith
 from temporalio.langsmith import LangSmithPlugin
 
 plugin = LangSmithPlugin(
-    address=langsmith.address.agent("support", "staging"),
+    address=langsmith.agent_address("support", "staging"),
 )
 ```
 

@@ -6,7 +6,7 @@ import dataclasses
 import importlib.metadata
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import langsmith
 
@@ -23,6 +23,9 @@ from temporalio.langsmith._interceptor import LangSmithInterceptor
 from temporalio.plugin import SimplePlugin
 from temporalio.worker import WorkflowRunner
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
+
+if TYPE_CHECKING:
+    from langsmith.address import AgentAddress
 
 
 class LangSmithPlugin(SimplePlugin):
@@ -41,7 +44,7 @@ class LangSmithPlugin(SimplePlugin):
         *,
         client: langsmith.Client | None = None,
         project_name: str | None = None,
-        address: str | None = None,
+        address: AgentAddress | None = None,
         add_temporal_runs: bool = False,
         default_metadata: dict[str, Any] | None = None,
         default_tags: list[str] | None = None,
@@ -55,8 +58,9 @@ class LangSmithPlugin(SimplePlugin):
                 parent. Temporal runs inherit their parent's destination when
                 present. When unset, root runs use LangSmith's environment defaults.
             address: Fallback LangSmith agent/environment address for traces with
-                no parent, mutually exclusive with project_name. Requires LangSmith
-                0.14.4 or later.
+                no parent, such as ``langsmith.agent_address("support", "staging")``.
+                Mutually exclusive with project_name. Requires LangSmith 0.14.10
+                or later.
             add_temporal_runs: Whether to create LangSmith runs for Temporal
                 operations. Defaults to False.
             default_metadata: Default metadata to attach to all runs.

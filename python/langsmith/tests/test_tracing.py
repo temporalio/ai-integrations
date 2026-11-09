@@ -6,23 +6,22 @@ import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import langsmith
 import pytest
-from langsmith import get_current_run_tree, trace, traceable, tracing_context
+from langsmith import (
+    agent_address,
+    get_current_run_tree,
+    trace,
+    traceable,
+    tracing_context,
+)
 from langsmith.run_trees import RunTree
 
 from temporalio.langsmith import LangSmithInterceptor
 from temporalio.langsmith._tracing import destination_context
 
-ADDRESS = "lrn:agents/support/environments/staging"
-OTHER_ADDRESS = "lrn:agents/support/environments/production"
-_ADDRESS_DEFAULT = pytest.param(
-    {"address": ADDRESS},
-    id="address",
-    marks=pytest.mark.skipif(
-        not hasattr(langsmith, "address"), reason="Agent addressing requires 0.14.4"
-    ),
-)
+ADDRESS = agent_address("support", "staging")
+OTHER_ADDRESS = agent_address("support", "production")
+_ADDRESS_DEFAULT = pytest.param({"address": ADDRESS}, id="address")
 
 
 def _destination(run: RunTree | None) -> dict[str, str]:
@@ -110,7 +109,7 @@ def test_traceable_destination_precedence(
     # Cross destination modes where supported, including address over project.
     explicit: dict[str, Any] = (
         {"address": OTHER_ADDRESS}
-        if hasattr(langsmith, "address") and "project_name" in fallback
+        if "project_name" in fallback
         else {"project_name": "explicit-project"}
     )
     monkeypatch.setenv("LANGSMITH_PROJECT", "env-project")
