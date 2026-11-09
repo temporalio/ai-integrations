@@ -107,11 +107,11 @@ def _rejected(err: RuntimeError) -> ApplicationError:
 
 def _lone_error(
     group: BaseExceptionGroup[Any],
-) -> MCPError | ValidationError | RuntimeError | None:
+) -> MCPError | ValidationError | RuntimeError | ApplicationError | None:
     """The error we classify that a nest of ExceptionGroups carries alone, if it does."""
     while len(group.exceptions) == 1:
         (inner,) = group.exceptions
-        if isinstance(inner, (MCPError, ValidationError)):
+        if isinstance(inner, (MCPError, ValidationError, ApplicationError)):
             return inner
         if isinstance(inner, RuntimeError) and _rejected_result(inner):
             return inner
@@ -197,6 +197,9 @@ class _MCPActivities:
             # wrapped in task-group ExceptionGroups, which a factory argument or a
             # failed connect lets through.
             inner = _lone_error(group)
+            if isinstance(inner, ApplicationError):
+                # Already classified, such as a repeated pagination cursor.
+                raise inner
             if isinstance(inner, MCPError):
                 raise _protocol_error(inner, has_session) from inner
             if isinstance(inner, ValidationError):
