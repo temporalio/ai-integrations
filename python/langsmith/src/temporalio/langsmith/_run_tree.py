@@ -5,15 +5,21 @@ from __future__ import annotations
 import functools
 import logging
 import random
+import types
 import uuid
 from collections.abc import Callable, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime, timezone, tzinfo
 from typing import Any
 
+import langchain_core.callbacks.manager
+import langchain_core.tracers.core
+import langchain_core.tracers.langchain
 import langsmith.client
 from langsmith.run_trees import RunTree
+from langsmith.uuid import uuid7
 
 import temporalio.workflow
 
@@ -28,8 +34,11 @@ _installed = False
 
 
 def _get_workflow_random() -> random.Random | None:
-    """Return this workflow's independent random stream, except in read-only code."""
-    if temporalio.workflow.unsafe.is_read_only():
+    """Return this workflow's independent random stream, or None in read-only or non-workflow code."""
+    if (
+        not temporalio.workflow.in_workflow()
+        or temporalio.workflow.unsafe.is_read_only()
+    ):
         return None
     instance = temporalio.workflow.instance()
     rng = getattr(instance, "__temporal_langsmith_random", None)
@@ -62,14 +71,41 @@ def workflow_run_tree_context(
         _executor.reset(token)
 
 
+def run_id() -> uuid.UUID:
+    """Deterministic IDs in workflow code, and LangSmith's random IDs everywhere else."""
+    rng = _get_workflow_random()
+    if rng is None:
+        return uuid7()
+
+    # v7 layout: 48-bit time, version 7, 12 random bits, variant 0b10, 62 random bits.
+    # Built by hand because uuid.UUID(version=7) needs Python 3.14.
+    ms = int(temporalio.workflow.now().timestamp() * 1000)
+    return uuid.UUID(
+        int=ms << 80
+        | 0x7 << 76
+        | rng.getrandbits(12) << 64
+        | 0x2 << 62
+        | rng.getrandbits(62)
+    )
+
+
+def worker_or_server_time(tz: tzinfo | None = timezone.utc) -> datetime:
+    """Worker clock live, and the Server's clock during replays."""
+    if (
+        temporalio.workflow.in_workflow()
+        and temporalio.workflow.unsafe.is_replaying_history_events()
+    ):
+        return temporalio.workflow.now()
+
+    return datetime.now(tz)
+
+
 def _deterministic_defaults(kwargs: dict[str, Any], id_key: str) -> None:
     """Supply workflow IDs and time without changing explicit caller values."""
     if kwargs.get(id_key) is None:
-        rng = _get_workflow_random()
-        if rng is not None:
-            kwargs[id_key] = uuid.UUID(int=rng.getrandbits(128), version=4)
+        kwargs[id_key] = run_id()
     if kwargs.get("start_time") is None:
-        kwargs["start_time"] = temporalio.workflow.now()
+        kwargs["start_time"] = worker_or_server_time()
 
 
 def _submit(
@@ -135,7 +171,7 @@ def install_run_tree_overrides() -> None:
     @functools.wraps(original_end)
     def end(self: RunTree, **kwargs: Any) -> None:
         if _workflow_executor() is not None and kwargs.get("end_time") is None:
-            kwargs["end_time"] = temporalio.workflow.now()
+            kwargs["end_time"] = worker_or_server_time()
         # Ending only changes the in-memory tree, including on replay.
         original_end(self, **kwargs)
 
@@ -150,11 +186,17 @@ def install_run_tree_overrides() -> None:
     @functools.wraps(original_ensure_uuid)
     def ensure_uuid(value: Any, *, accept_null: bool = False) -> Any:
         # The trace() context manager generates its root ID before RunTree.__init__.
-        if value is None and not accept_null and _workflow_executor() is not None:
-            rng = _get_workflow_random()
-            if rng is not None:
-                return uuid.UUID(int=rng.getrandbits(128), version=4)
+        if value is None and not accept_null:
+            return run_id()
         return original_ensure_uuid(value, accept_null=accept_null)
+
+    # LangChain passes its own run IDs and times into RunTree, so they must come
+    # from the workflow where LangChain makes them.
+    manager: Any = langchain_core.callbacks.manager
+    if hasattr(manager, "uuid7"):  # langchain-core 0.3.83+ and 1.1.1+
+        manager.uuid7 = run_id
+    else:  # Older releases call uuid.uuid4() through the module.
+        manager.uuid = types.SimpleNamespace(uuid4=run_id)
 
     RunTree.__init__ = init  # type: ignore[method-assign]
     RunTree.create_child = create_child  # type: ignore[method-assign]
@@ -162,4 +204,8 @@ def install_run_tree_overrides() -> None:
     RunTree.end = end  # type: ignore[method-assign]
     RunTree.patch = patch  # type: ignore[method-assign]
     langsmith.client._ensure_uuid = ensure_uuid
+    # LangChain's tracer modules only call datetime.now().
+    clock = types.SimpleNamespace(now=worker_or_server_time)
+    langchain_core.tracers.core.datetime = clock  # type: ignore[misc,assignment]
+    langchain_core.tracers.langchain.datetime = clock  # type: ignore[misc,assignment]
     _installed = True
