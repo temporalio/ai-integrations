@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import random
 import types
 import uuid
 from collections.abc import Callable, Generator
@@ -32,6 +33,21 @@ _client: ContextVar[langsmith.Client | None] = ContextVar(
 _installed = False
 
 
+def _get_workflow_random() -> random.Random | None:
+    """Return this workflow's independent random stream, or None in read-only or non-workflow code."""
+    if (
+        not temporalio.workflow.in_workflow()
+        or temporalio.workflow.unsafe.is_read_only()
+    ):
+        return None
+    instance = temporalio.workflow.instance()
+    rng = getattr(instance, "__temporal_langsmith_random", None)
+    if rng is None:
+        rng = temporalio.workflow.new_random("temporalio.langsmith")
+        setattr(instance, "__temporal_langsmith_random", rng)
+    return rng
+
+
 def _workflow_executor() -> ThreadPoolExecutor | None:
     """Limit runtime changes to workflow code running under this plugin."""
     executor = _executor.get()
@@ -57,18 +73,9 @@ def workflow_run_tree_context(
 
 def run_id() -> uuid.UUID:
     """Deterministic IDs in workflow code, and LangSmith's random IDs everywhere else."""
-    if (
-        not temporalio.workflow.in_workflow()
-        or temporalio.workflow.unsafe.is_read_only()
-    ):
-        return uuid7()
-
-    # new_random() makes a new stream each call, so keep one per workflow.
-    instance = temporalio.workflow.instance()
-    rng = getattr(instance, "__temporal_langsmith_random", None)
+    rng = _get_workflow_random()
     if rng is None:
-        rng = temporalio.workflow.new_random("temporalio.langsmith")
-        setattr(instance, "__temporal_langsmith_random", rng)
+        return uuid7()
 
     # v7 layout: 48-bit time, version 7, 12 random bits, variant 0b10, 62 random bits.
     # Built by hand because uuid.UUID(version=7) needs Python 3.14.
@@ -82,8 +89,8 @@ def run_id() -> uuid.UUID:
     )
 
 
-def now(tz: tzinfo | None = timezone.utc) -> datetime:
-    """Wall-clock time live, and workflow time during replays."""
+def worker_or_server_time(tz: tzinfo | None = timezone.utc) -> datetime:
+    """Worker clock live, and the Server's clock during replays."""
     if (
         temporalio.workflow.in_workflow()
         and temporalio.workflow.unsafe.is_replaying_history_events()
@@ -98,7 +105,7 @@ def _deterministic_defaults(kwargs: dict[str, Any], id_key: str) -> None:
     if kwargs.get(id_key) is None:
         kwargs[id_key] = run_id()
     if kwargs.get("start_time") is None:
-        kwargs["start_time"] = now()
+        kwargs["start_time"] = worker_or_server_time()
 
 
 def _submit(
@@ -164,7 +171,7 @@ def install_run_tree_overrides() -> None:
     @functools.wraps(original_end)
     def end(self: RunTree, **kwargs: Any) -> None:
         if _workflow_executor() is not None and kwargs.get("end_time") is None:
-            kwargs["end_time"] = now()
+            kwargs["end_time"] = worker_or_server_time()
         # Ending only changes the in-memory tree, including on replay.
         original_end(self, **kwargs)
 
@@ -198,7 +205,7 @@ def install_run_tree_overrides() -> None:
     RunTree.patch = patch  # type: ignore[method-assign]
     langsmith.client._ensure_uuid = ensure_uuid
     # LangChain's tracer modules only call datetime.now().
-    clock = types.SimpleNamespace(now=now)
+    clock = types.SimpleNamespace(now=worker_or_server_time)
     langchain_core.tracers.core.datetime = clock  # type: ignore[misc,assignment]
     langchain_core.tracers.langchain.datetime = clock  # type: ignore[misc,assignment]
     _installed = True
