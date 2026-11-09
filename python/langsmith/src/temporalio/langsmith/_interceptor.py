@@ -105,12 +105,14 @@ def _trace_headers(run_tree: RunTree) -> dict[str, str]:
                 dict(filter_replica(replica)) for replica in replicas
             ]
             for replica in safe:
-                if isinstance(replica.get("address"), dict):
-                    from langsmith._internal import _addressing
-
-                    # LangSmith reads a replica address from headers only in
-                    # its lrn: wire form.
-                    replica["address"] = _addressing.address_to_lrn(replica["address"])
+                address = replica.get("address")
+                if isinstance(address, dict):
+                    # RunTree.from_headers reads a replica address only in the
+                    # lrn: form LangSmith writes for its langsmith-address entry.
+                    replica["address"] = (
+                        f"lrn:agents/{address['id']}"
+                        f"/environments/{address['environment'].lower()}"
+                    )
             encoded = quote(json.dumps(safe, separators=(",", ":"), default=str))
             headers["baggage"] = ",".join(
                 part for part in (baggage, f"langsmith-replicas={encoded}") if part
