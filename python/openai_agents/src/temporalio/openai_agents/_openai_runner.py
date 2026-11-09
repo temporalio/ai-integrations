@@ -40,6 +40,7 @@ from temporalio.openai_agents._temporal_model_provider import (
     capture_scope,
     install_model_provider,
 )
+from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
 from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
