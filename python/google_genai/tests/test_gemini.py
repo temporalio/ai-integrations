@@ -1846,6 +1846,26 @@ class _StatefulTool:
         return f"{city} is great"
 
 
+@activity.defn
+async def quoted_parcel_status(parcel_id: "str", note: "list[str]") -> "str":
+    """Report a parcel's status."""
+    return f"{parcel_id}: {', '.join(note)}"
+
+
+def test_activity_as_tool_resolves_quoted_annotations():
+    """A quoted annotation on a function activity is resolved in its own module."""
+    from google.genai._extra_utils import convert_argument_from_function
+
+    tool = activity_as_tool(
+        quoted_parcel_status,
+        activity_config=ActivityConfig(start_to_close_timeout=timedelta(seconds=5)),
+    )
+    args = convert_argument_from_function(
+        {"parcel_id": "P-1", "note": ["a", "b"]}, tool
+    )
+    assert args == {"parcel_id": "P-1", "note": ["a", "b"]}
+
+
 async def test_closure_if_bound_method_unbinds_and_mutates_original():
     """A bound method becomes a plain function that still mutates the real instance."""
     obj = _StatefulTool()

@@ -266,6 +266,7 @@ export function createActivities(
       };
       const warnings: SharedV4Warning[] = [];
       let responseMetadata: Record<string, unknown> | undefined;
+      let providerMetadata: SharedV4ProviderMetadata | undefined;
       let sawFinish = false;
       let sawError = false;
       let streamError: unknown;
@@ -334,6 +335,7 @@ export function createActivities(
           case 'finish':
             finishReason = part.finishReason;
             usage = part.usage;
+            providerMetadata = part.providerMetadata;
             sawFinish = true;
             break;
           case 'raw':
@@ -379,6 +381,7 @@ export function createActivities(
         finishReason,
         usage,
         warnings,
+        providerMetadata,
         request: streamResult.request,
         response: responseMetadata ? { ...responseMetadata, ...streamResult.response } : streamResult.response,
       };
