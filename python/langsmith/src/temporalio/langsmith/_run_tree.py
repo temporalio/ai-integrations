@@ -17,7 +17,6 @@ import langchain_core.callbacks.manager
 import langchain_core.tracers.core
 import langchain_core.tracers.langchain
 import langsmith.client
-from langsmith.run_helpers import get_tracing_context
 from langsmith.run_trees import RunTree
 from langsmith.uuid import uuid7
 
@@ -191,24 +190,6 @@ def install_run_tree_overrides() -> None:
         manager.uuid7 = run_id
     else:  # Older releases call uuid.uuid4() through the module.
         manager.uuid = types.SimpleNamespace(uuid4=run_id)
-
-    tracer: Any = langchain_core.tracers.langchain.LangChainTracer
-    if hasattr(tracer, "_get_run_kwargs"):
-        original_run_kwargs = tracer._get_run_kwargs
-
-        @functools.wraps(original_run_kwargs)
-        def get_run_kwargs(
-            self: Any, parent_run_id: uuid.UUID | None, extra: dict[str, Any]
-        ) -> dict[str, Any]:
-            kwargs: dict[str, Any] = original_run_kwargs(self, parent_run_id, extra)
-            if _workflow_executor() is not None:
-                # LangChain copies the parent's replicas before reading context.
-                replicas = get_tracing_context()["replicas"]
-                if replicas is not None:
-                    kwargs["replicas"] = replicas
-            return kwargs
-
-        tracer._get_run_kwargs = get_run_kwargs
 
     RunTree.__init__ = init  # type: ignore[method-assign]
     RunTree.create_child = create_child  # type: ignore[method-assign]
