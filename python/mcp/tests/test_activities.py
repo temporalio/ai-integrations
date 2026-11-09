@@ -40,7 +40,7 @@ from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
 from temporalio.mcp import _activities
 from temporalio.mcp._activities import _MCPActivities
-from temporalio.mcp._client import _MCPClientBackend
+from temporalio.mcp._client import _mcp_client_backend_factory, _MCPClientBackend
 
 if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup  # type: ignore[reportUnreachable]
@@ -681,6 +681,27 @@ async def test_rejected_tool_result_fails_without_retry(
 
     assert err.value.type == "MCPProtocolError"
     assert err.value.non_retryable is True
+
+
+async def test_factory_that_does_not_return_a_client_fails_with_retry() -> None:
+    support = _MCPActivities(
+        {
+            "weather": _mcp_client_backend_factory(
+                "weather", lambda: cast(Client, object())
+            )
+        }
+    )
+    list_tools = _activity_by_name(support, "temporalio.mcp.weather.list-tools")
+    try:
+        with pytest.raises(ApplicationError) as err:
+            await list_tools({})
+    finally:
+        await support._pool.close()
+
+    assert err.value.message == (
+        "MCP server factory 'weather' returned builtins.object, not mcp.Client"
+    )
+    assert err.value.non_retryable is False
 
 
 async def test_worker_reentry_before_close_starts_keeps_connection_open() -> None:
