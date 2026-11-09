@@ -142,7 +142,9 @@ Activity with an `ApplicationError` of type `MCPProtocolError` whose
 `details[0]` is the JSON-RPC error code. When the response includes JSON-RPC
 error data, `details[1]` preserves it. Schema-invalid server responses use the
 same error type, include Pydantic validation errors in `details[0]`, and are
-non-retryable. Errors a retry cannot fix (parse and invalid-request errors,
+non-retryable. So is a result the MCP client rejects: a tool result that doesn't
+match the tool's output schema, or a call that runs past its input round limit.
+Errors a retry cannot fix (parse and invalid-request errors,
 unknown methods, invalid params, protocol-version, header and capability
 mismatches, and URL elicitation) are also non-retryable.
 

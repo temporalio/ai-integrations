@@ -126,6 +126,14 @@ export class TemporalLanguageModel implements LanguageModelV4 {
     const stream = new ReadableStream({
       start(controller: ReadableStreamDefaultController) {
         controller.enqueue({ type: 'stream-start', warnings: result.warnings ?? [] });
+        if (result.response !== undefined) {
+          controller.enqueue({
+            type: 'response-metadata',
+            id: result.response.id,
+            modelId: result.response.modelId,
+            timestamp: result.response.timestamp ? new Date(result.response.timestamp) : undefined,
+          });
+        }
         let partIndex = 0;
         for (const item of result.content ?? []) {
           const id = `part-${partIndex++}`;
@@ -145,6 +153,7 @@ export class TemporalLanguageModel implements LanguageModelV4 {
           type: 'finish',
           finishReason: result.finishReason,
           usage: result.usage,
+          providerMetadata: result.providerMetadata,
         });
         controller.close();
       },
