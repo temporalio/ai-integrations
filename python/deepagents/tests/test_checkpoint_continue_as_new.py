@@ -10,9 +10,14 @@ import pytest
 from typing_extensions import NotRequired
 
 from temporalio import workflow
-from temporalio.client import Client, WorkflowHistory
-from temporalio.deepagents import DeepAgentsPlugin, run_deep_agent
+from temporalio.client import Client, WorkflowFailureError, WorkflowHistory
+from temporalio.deepagents import (
+    DeepAgentsPlugin,
+    DeepAgentsWorkflowError,
+    run_deep_agent,
+)
 from temporalio.deepagents.testing import mock_model_provider
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
@@ -26,7 +31,7 @@ from langchain.agents.middleware import (
 from langchain.agents.middleware.types import OmitFromInput
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.errors import GraphRecursionError
+from langgraph.types import Command
 from pydantic import BaseModel
 
 
@@ -251,7 +256,7 @@ async def test_checkpoint_driver_follows_server_suggestion(
 @workflow.defn
 class InterruptedAgentWorkflow:
     @workflow.run
-    async def run(self) -> dict:
+    async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
         agent = create_deep_agent(
             model="fake:model",
             middleware=[LifecycleMiddleware()],
@@ -260,8 +265,9 @@ class InterruptedAgentWorkflow:
         ).with_config({"configurable": {"thread_id": "approval"}})
         result = await run_deep_agent(
             agent,
-            {"messages": [{"role": "user", "content": "Read."}]},
+            input,
             continue_as_new_after=1,
+            state_snapshot=state_snapshot,
         )
         return {
             "interrupted": bool(result.get("__interrupt__")),
@@ -289,6 +295,7 @@ async def test_application_interrupt_is_returned_to_caller(
     ):
         handle = await env.client.start_workflow(
             InterruptedAgentWorkflow.run,
+            {"messages": [{"role": "user", "content": "Read."}]},
             id=f"checkpoint-interrupt-{uuid.uuid4()}",
             task_queue="checkpoint-interrupt",
         )
@@ -309,7 +316,7 @@ class RecursionBudgetWorkflow:
             await run_deep_agent(
                 agent, input, continue_as_new_after=1, state_snapshot=state_snapshot
             )
-        except GraphRecursionError:
+        except DeepAgentsWorkflowError:
             return "limited"
         return "unexpected completion"
 
@@ -529,18 +536,141 @@ async def test_caller_breakpoint_is_not_automatically_resumed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "snapshot",
+    "snapshot, message",
     [
-        {"version": 2},
-        {"version": 1, "graph": {"nodes": [], "channels": []}},
+        ({"version": 2}, "Unsupported Deep Agents checkpoint snapshot"),
+        (
+            {"version": 1, "graph": {"nodes": [], "channels": []}},
+            "The graph's nodes or state channels changed since its checkpoint",
+        ),
     ],
 )
-async def test_incompatible_checkpoint_is_rejected(snapshot: dict) -> None:
+async def test_incompatible_checkpoint_is_rejected(
+    snapshot: dict, message: str
+) -> None:
     from temporalio.deepagents._checkpoint import SNAPSHOT_KEY, run
     from temporalio.deepagents.testing import FakeModel
 
     agent = create_deep_agent(model=FakeModel(["unused"]))
-    with pytest.raises(ValueError, match="checkpoint|Checkpoint"):
+    with pytest.raises(DeepAgentsWorkflowError, match=message):
         await run(
             agent, {}, continue_as_new_after=1, state_snapshot={SNAPSHOT_KEY: snapshot}
         )
+
+
+@workflow.defn
+class ApprovalAfterRolloverWorkflow:
+    @workflow.run
+    async def run(self, input: dict, state_snapshot: dict | None = None) -> str:
+        agent = create_deep_agent(
+            model="fake:model",
+            checkpointer=InMemorySaver(),
+            interrupt_on={"read_file": True},
+        ).with_config({"configurable": {"thread_id": "approval"}})
+        result = await run_deep_agent(
+            agent, input, continue_as_new_after=1, state_snapshot=state_snapshot
+        )
+        if result.get("__interrupt__"):
+            result = await run_deep_agent(
+                agent,
+                Command(resume={"decisions": [{"type": "approve"}]}),
+                continue_as_new_after=1,
+            )
+        return result["messages"][-1].content
+
+
+@pytest.mark.asyncio
+async def test_approval_after_rollover_resumes_and_continues_again(
+    env: WorkflowEnvironment,
+) -> None:
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(
+            [
+                _call("ls", {"path": "/"}, "ls-1"),
+                _call("read_file", {"file_path": "/notes.md"}, "read-1"),
+                _call("ls", {"path": "/"}, "ls-2"),
+                "Approved.",
+            ]
+        )
+    )
+    async with Worker(
+        env.client,
+        task_queue="checkpoint-approval-resume",
+        workflows=[ApprovalAfterRolloverWorkflow],
+        plugins=[plugin],
+        max_cached_workflows=0,
+    ):
+        handle = await env.client.start_workflow(
+            ApprovalAfterRolloverWorkflow.run,
+            {"messages": [{"role": "user", "content": "Read."}]},
+            id=f"checkpoint-approval-{uuid.uuid4()}",
+            task_queue="checkpoint-approval-resume",
+        )
+        assert await handle.result() == "Approved."
+    histories = await _histories(env.client, handle.id, handle.first_execution_run_id)
+    assert len(histories) == 3
+    for history in histories:
+        await Replayer(
+            workflows=[ApprovalAfterRolloverWorkflow], plugins=[DeepAgentsPlugin()]
+        ).replay_workflow(history)
+
+
+@workflow.defn
+class InvalidSignatureWorkflow:
+    @workflow.run
+    async def run(self, input: dict) -> Any:
+        return await run_deep_agent(create_deep_agent(model="fake:model"), input)
+
+
+@workflow.defn
+class InvalidConfigurationWorkflow:
+    @workflow.run
+    async def run(self, input: dict, state_snapshot: dict | None = None) -> Any:
+        mode = input["mode"]
+        agent = create_deep_agent(
+            model="fake:model", checkpointer=False if mode == "saver" else None
+        ).with_config({"recursion_limit": 8})
+        return await run_deep_agent(
+            agent,
+            {**input, "messages": [{"role": "user", "content": "Go."}]},
+            continue_as_new_after=0 if mode == "threshold" else 1,
+            state_snapshot=state_snapshot,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["signature", "saver", "threshold", "recursion"])
+async def test_driver_errors_fail_workflow_execution(
+    env: WorkflowEnvironment, mode: str
+) -> None:
+    calls = []
+    looping_provider = mock_model_provider([_call("ls", {"path": "/"}, "loop")])
+
+    def provider(name: str) -> Any:
+        calls.append(name)
+        return looping_provider(name)
+
+    workflow_class = (
+        InvalidSignatureWorkflow
+        if mode == "signature"
+        else InvalidConfigurationWorkflow
+    )
+    async with Worker(
+        env.client,
+        task_queue=f"checkpoint-invalid-{mode}",
+        workflows=[workflow_class],
+        plugins=[DeepAgentsPlugin(model_provider=provider)],
+    ):
+        handle = await env.client.start_workflow(
+            workflow_class.run,
+            {"mode": mode},
+            id=f"checkpoint-invalid-{mode}-{uuid.uuid4()}",
+            task_queue=f"checkpoint-invalid-{mode}",
+        )
+        with pytest.raises(WorkflowFailureError) as caught:
+            await handle.result()
+    cause = caught.value.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == DeepAgentsWorkflowError.TYPE
+    assert cause.non_retryable
+    assert bool(calls) == (mode == "recursion")

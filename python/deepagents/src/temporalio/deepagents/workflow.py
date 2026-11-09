@@ -39,8 +39,8 @@ def warn_durable_checkpointer(checkpointer: Any) -> None:
 
     The Deep Agents loop runs inside the workflow, so a checkpointer that does
     its own database / disk I/O would run that I/O from workflow code — not
-    replay-safe. We respect the user's choice (a warning, not a hard failure),
-    and point them at the durability path that *is* safe: the default in-workflow
+    replay-safe. Direct ``agent.ainvoke`` emits this warning;
+    :func:`run_deep_agent` rejects durable checkpointers. Prefer an in-workflow
     ``InMemorySaver`` rehydrated by replay, plus
     :func:`run_deep_agent` with ``continue_as_new_after`` for long conversations.
     """
@@ -54,7 +54,8 @@ def warn_durable_checkpointer(checkpointer: Any) -> None:
         f"workflow, so this checkpointer's I/O would run from workflow code, "
         f"which is not replay-safe. Prefer the default in-workflow InMemorySaver "
         f"(rehydrated by replay) plus run_deep_agent(continue_as_new_after=...) "
-        f"for long-conversation durability.",
+        f"for long-conversation durability. run_deep_agent rejects durable "
+        f"checkpointers.",
         stacklevel=3,
     )
 
@@ -296,7 +297,7 @@ async def run_deep_agent(
             state_snapshot=state_snapshot,
         )
     if continue_as_new_after is not None and continue_as_new_after <= 0:
-        raise ValueError("continue_as_new_after must be positive or None.")
+        raise DeepAgentsWorkflowError("continue_as_new_after must be positive or None.")
     from temporalio.deepagents._checkpoint import run
 
     _serde.set_result_cache({})

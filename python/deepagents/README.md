@@ -363,12 +363,18 @@ count.
 
 - **Carries forward:** messages, state-backed files, todos (if present), and
   serializable middleware state, including fields marked `OmitFromInput`.
+  Invocation-local `UntrackedValue` fields, such as model-call counters and
+  filesystem caches, remain live between model steps and are restored when that
+  same invocation continues in a new run. A new invocation resets them normally.
   The snapshot retains the graph's execution position and remaining recursion
   budget. Agent lifecycle hooks therefore run once per logical invocation;
   `after_agent` runs when the agent finishes, rather than at every rollover.
   Checkpoint values are materialized, including delta-backed messages and files,
   so earlier checkpoint history is unnecessary. Message classes and types
-  declared in the graph's state schema are preserved.
+  declared in the graph's state schema are preserved, including nested types.
+  Types used in a snapshot must be importable from their defining module;
+  classes defined inside a workflow method cannot be restored. Unsupported
+  state fails checkpoint creation explicitly instead of silently changing type.
 - **Checkpoint storage:** the driver uses an in-workflow `InMemorySaver`, creating
   one when the agent has none. An existing saver must also be an `InMemorySaver`.
   Temporal replay reconstructs it within a run; the checkpoint snapshot crosses
@@ -376,6 +382,9 @@ count.
   large files in a durable backend such as `TemporalBackend`. The snapshot uses
   LangGraph's typed serialization with types allowed by the graph's schema and
   must be resumed with the same graph and middleware definitions.
+  Mapping inputs omit `messages` and `files` on rollover because the checkpoint
+  already contains them; other input fields remain available to reconstruct the
+  agent. The driver does not mutate the caller's original input.
 - **Completion and interrupts:** completed invocations return their result.
   Application interrupts, including human approvals, return to the caller.
   For these flows, supply `checkpointer=InMemorySaver()` and configure a stable
@@ -385,6 +394,12 @@ count.
   they are not split. The snapshot covers the parent graph's channels, including
   completed sub-agent results in its transcript. Sub-agent-local checkpoint
   history and objects held outside the parent graph state are not carried.
+- **Recursion limits:** the remaining budget applies to the entire unfinished
+  invocation, across all continued runs. Continue-as-new does not reset it.
+  Deep Agents defaults to 9,999 graph steps; configure a larger budget with
+  `agent.with_config({"recursion_limit": 50_000})` for longer invocations.
+  Exhaustion and invalid driver configuration raise `DeepAgentsWorkflowError`
+  and fail the workflow instead of repeatedly failing Workflow Tasks.
 - **Conversation workflows:** your workflow owns its input queue and between-turn
   rollover policy. This helper resumes an unfinished invocation and expects the
   workflow signature `(input, state_snapshot=None)` shown above. It does not
@@ -398,6 +413,57 @@ count.
   memoized across calls.
   Use Worker Versioning when changing graph or middleware definitions for
   chains that will resume saved checkpoints.
+
+The approval example above uses direct `ainvoke`. To combine approvals with
+automatic rollover, use a workflow with the `(input, state_snapshot=None)`
+signature and route both the initial call and the approval through the driver:
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+
+@workflow.run
+async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
+    agent = create_deep_agent(
+        model="anthropic:claude-sonnet-5-5",
+        checkpointer=InMemorySaver(),
+        interrupt_on={"write_file": True},
+    ).with_config({"configurable": {"thread_id": workflow.info().workflow_id}})
+
+    result = await run_deep_agent(agent, input, state_snapshot=state_snapshot)
+    if result.get("__interrupt__"):
+        # Expose the pending approval and wait for the caller's decision, as above.
+        await workflow.wait_condition(lambda: self._decision is not None)
+        result = await run_deep_agent(
+            agent,
+            Command(resume={"decisions": [{"type": self._decision}]}),
+        )
+    return result
+```
+
+After rollover the driver restores the checkpoint into the supplied saver under
+the same thread ID, so the caller can resume the interrupt through that agent.
+Known human-in-the-loop middleware is validated before the first model call;
+custom dynamic interrupts are checked when they occur.
+
+For between-turn rollover, a completed result can seed the next invocation as a
+transcript/files snapshot. Serialize messages with public LangChain `dumpd` to
+preserve their classes through the payload converter:
+
+```python
+from langchain_core.load import dumpd
+
+snapshot = {
+    "messages": [dumpd(message) for message in result["messages"]],
+    "files": result.get("files", {}),
+}
+workflow.continue_as_new(args=[{"messages": []}, snapshot])
+```
+
+The workflow must pass that snapshot into `run_deep_agent` on its next run.
+This starts a new invocation with the carried transcript and files; it does not
+restore other middleware fields or an unfinished graph's execution position.
 
 ## Runtime behavior
 
