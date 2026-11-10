@@ -1,5 +1,6 @@
 import abc
 import asyncio
+import contextlib
 import copy
 import dataclasses
 import functools
@@ -108,7 +109,7 @@ from openai.types.shared_params import CompoundFilter
 from pydantic import ConfigDict, Field, TypeAdapter
 
 import temporalio.openai_agents as openai_agents
-from temporalio import activity, workflow
+from temporalio import activity, nexus, workflow
 from temporalio.api.common.v1 import Payload
 from temporalio.api.enums.v1 import EventType
 from temporalio.client import (
@@ -116,6 +117,7 @@ from temporalio.client import (
     DescribeWorkflowInput,
     Interceptor,
     OutboundInterceptor,
+    WorkflowExecutionStatus,
     WorkflowFailureError,
     WorkflowHandle,
 )
@@ -129,6 +131,7 @@ from temporalio.exceptions import (
     ActivityError,
     ApplicationError,
     CancelledError,
+    NexusOperationError,
     TemporalError,
 )
 from temporalio.openai_agents import (
@@ -161,6 +164,7 @@ from temporalio.openai_agents.testing import (
 )
 from temporalio.service import RPCError, RPCStatusCode
 from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import Replayer
 from temporalio.workflow import ActivityConfig
 from tests.helpers import assert_eventually, new_worker
 from tests.helpers.nexus import make_nexus_endpoint_name
@@ -425,6 +429,150 @@ class NexusToolsWorkflow:
             starting_agent=agent, input=question, context="Stormy"
         )
         return result.final_output
+
+
+@nexusrpc.service
+class HeldService:
+    hold: nexusrpc.Operation[str, str]
+
+
+@workflow.defn
+class HeldWorkflow:
+    """Backs the held operation and runs until it is cancelled.
+
+    When its name ends in ``-slow``, a cancelled run ends only after the ``release`` Signal.
+    """
+
+    def __init__(self) -> None:
+        self.released = False
+
+    @workflow.signal
+    def release(self) -> None:
+        self.released = True
+
+    @workflow.run
+    async def run(self, name: str) -> str:
+        try:
+            await workflow.wait_condition(lambda: False)
+        except asyncio.CancelledError:
+            if name.endswith("-slow"):
+                await workflow.wait_condition(lambda: self.released)
+            raise
+        return name
+
+
+@nexusrpc.handler.service_handler(service=HeldService)
+class HeldServiceHandler:
+    """Starts the held operation, acknowledging the start once ``acknowledge`` is set."""
+
+    def __init__(self) -> None:
+        self.acknowledge = asyncio.Event()
+        self.acknowledge.set()
+
+    @nexus.workflow_run_operation
+    async def hold(
+        self, ctx: nexus.WorkflowRunOperationContext, name: str
+    ) -> nexus.WorkflowHandle[str]:
+        handle = await ctx.start_workflow(HeldWorkflow.run, name, id=name)
+        await self.acknowledge.wait()
+        return handle
+
+
+@workflow.defn
+class NexusToolCancelWorkflow:
+    def __init__(self) -> None:
+        self.run_task: asyncio.Task[Any] | None = None
+        self.tool_fails = False
+
+    @workflow.signal
+    def cancel_run(self) -> None:
+        assert self.run_task
+        self.run_task.cancel()
+
+    @workflow.signal
+    def fail_tool(self) -> None:
+        self.tool_fails = True
+
+    async def fail(self) -> str:
+        await workflow.wait_condition(lambda: self.tool_fails)
+        raise ApplicationError("Tool failed", non_retryable=True)
+
+    async def bug(self) -> str:
+        await workflow.wait_condition(lambda: self.tool_fails)
+        raise RuntimeError("Tool bug")
+
+    @workflow.run
+    async def run(self, case: str) -> str:
+        tools: list[Tool] = [
+            openai_agents.workflow.nexus_operation_as_tool(
+                HeldService.hold,
+                service=HeldService,
+                endpoint=make_nexus_endpoint_name(workflow.info().task_queue),
+                cancellation_type=(
+                    workflow.NexusOperationCancellationType.WAIT_REQUESTED
+                    if case == "wait_requested"
+                    else workflow.NexusOperationCancellationType.WAIT_COMPLETED
+                ),
+            ),
+        ]
+        if case in ("tool_fails", "nested_tool_fails", "workflow_during_failure"):
+            tools.append(function_tool(self.fail, failure_error_function=None))
+        elif case == "tool_bug":
+            tools.append(function_tool(self.bug, failure_error_function=None))
+        if case in ("nested", "nested_tool_fails"):
+            inner = Agent[str](
+                name="Inner", instructions="You are a helpful agent.", tools=tools
+            )
+            tools = [
+                inner.as_tool(
+                    tool_name="inner",
+                    tool_description="Runs an agent.",
+                    failure_error_function=None,
+                )
+            ]
+        elif case == "spawned":
+            inner = Agent[str](
+                name="Inner", instructions="You are a helpful agent.", tools=tools
+            )
+
+            async def spawn() -> str:
+                """Runs an agent in a new task."""
+                task = asyncio.create_task(
+                    Runner.run(starting_agent=inner, input="Hold")
+                )
+                # Waiting does not cancel the task, so the inner run does not stop.
+                await asyncio.wait([task])
+                return task.result().final_output
+
+            tools = [function_tool(spawn)]
+        agent = Agent[str](
+            name="Nexus Tool Cancel Workflow",
+            instructions="You are a helpful agent.",
+            tools=tools,
+        )
+        self.run_task = asyncio.create_task(
+            Runner.run(starting_agent=agent, input="Hold")
+        )
+        try:
+            result = await self.run_task
+        except Exception:
+            if case != "workflow_during_failure":
+                raise
+            # Workflow code handles the failure, so only a cancellation ends the Workflow.
+            return "Handled"
+        return result.final_output
+
+
+@workflow.defn(name="NexusToolCancelWorkflow")
+class FixedNexusToolCancelWorkflow(NexusToolCancelWorkflow):
+    """NexusToolCancelWorkflow with its bug tool fixed, to replay a History of the bug."""
+
+    async def bug(self) -> str:
+        return "Fixed"
+
+    @workflow.run
+    async def run(self, case: str) -> str:
+        return await super().run(case)
 
 
 async def test_tool_workflow(client: Client):
@@ -1219,6 +1367,266 @@ async def test_nexus_tool_workflow(client: Client, env: WorkflowEnvironment):
                 .activity_task_completed_event_attributes.result.payloads[0]
                 .data.decode()
             )
+
+
+@pytest.mark.requires_local_server
+@pytest.mark.parametrize(
+    "case",
+    [
+        "workflow",
+        "run_first",
+        "run_during_start",
+        "workflow_during_start",
+        "nested",
+        "nested_tool_fails",
+        "spawned",
+        "tool_fails",
+        "workflow_during_failure",
+        "tool_bug",
+        "external_cancel",
+        "wait_requested",
+    ],
+)
+async def test_nexus_tool_cancel_workflow(
+    client: Client,
+    env: WorkflowEnvironment,
+    case: str,
+    caplog: pytest.LogCaptureFixture,
+):
+    if env.supports_time_skipping:
+        pytest.skip("Nexus tests don't work with time-skipping server")
+
+    # With run_first, the Workflow cancels its run, and is itself cancelled while the
+    # operation delays its cancellation until released. With run_during_start, the Workflow
+    # cancels its run before the operation's start is acknowledged; with
+    # workflow_during_start, the Workflow is then cancelled too. With nested, the tool
+    # belongs to an agent that runs as a tool; with nested_tool_fails, that agent's other
+    # tool fails. With spawned, the tool belongs to an agent that a tool runs in a new task.
+    # With tool_fails, another tool fails instead; with workflow_during_failure, the Workflow
+    # is then cancelled while the operation delays its cancellation until released, and
+    # Workflow code handles the failure. With tool_bug, another tool raises an error that
+    # fails the Workflow Task. With external_cancel, a client cancels the operation. With
+    # wait_requested, the tool cancels with WAIT_REQUESTED and the operation delays its
+    # cancellation until released.
+    slow = case in ("run_first", "workflow_during_failure", "wait_requested")
+    during_start = case in ("run_during_start", "workflow_during_start")
+    held_id = f"held-{uuid.uuid4()}" + ("-slow" if slow else "")
+    handler = HeldServiceHandler()
+    if during_start:
+        handler.acknowledge.clear()
+    hold_call = ResponseBuilders.tool_call(json.dumps({"input": held_id}), "hold")
+    responses = [hold_call]
+    if case in (
+        "tool_fails",
+        "nested_tool_fails",
+        "workflow_during_failure",
+        "tool_bug",
+    ):
+        other_tool = "bug" if case == "tool_bug" else "fail"
+        other_call = ResponseBuilders.tool_call(
+            "{}", other_tool, call_id=other_tool, item_id=other_tool
+        )
+        responses = [
+            ModelResponse(
+                output=[*hold_call.output, *other_call.output],
+                usage=Usage(),
+                response_id=None,
+            )
+        ]
+    elif case == "external_cancel":
+        responses.append(ResponseBuilders.output_message("Done"))
+    if case in ("nested", "nested_tool_fails"):
+        responses.insert(
+            0, ResponseBuilders.tool_call(json.dumps({"input": "Hold"}), "inner")
+        )
+    elif case == "spawned":
+        responses.insert(0, ResponseBuilders.tool_call("{}", "spawn"))
+    async with AgentEnvironment(
+        model=TestModel.returning_responses(responses),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+        ),
+    ) as agent_env:
+        client = agent_env.applied_on_client(client)
+
+        async with new_worker(
+            client,
+            NexusToolCancelWorkflow,
+            HeldWorkflow,
+            nexus_service_handlers=[handler],
+        ) as worker:
+            await env.create_nexus_endpoint(
+                make_nexus_endpoint_name(worker.task_queue), worker.task_queue
+            )
+
+            workflow_handle = await client.start_workflow(
+                NexusToolCancelWorkflow.run,
+                case,
+                id=f"nexus-tool-cancel-workflow-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            held_handle = client.get_workflow_handle(held_id)
+
+            async def history_has(field: str) -> list[Any]:
+                events: list[Any] = [
+                    e async for e in workflow_handle.fetch_history_events()
+                ]
+                found = [i for i, e in enumerate(events) if e.HasField(field)]
+                # The Workflow has handled the event.
+                assert found and any(
+                    e.HasField("workflow_task_completed_event_attributes")
+                    for e in events[found[0] :]
+                )
+                return events
+
+            async def held_started() -> None:
+                try:
+                    await held_handle.describe()
+                except RPCError as err:
+                    raise AssertionError(err) from err
+
+            try:
+                if during_start:
+                    # The handler started the operation's Workflow and withholds the start.
+                    await assert_eventually(held_started)
+                    await workflow_handle.signal(NexusToolCancelWorkflow.cancel_run)
+                    events = await assert_eventually(
+                        lambda: history_has(
+                            "workflow_execution_signaled_event_attributes"
+                        )
+                    )
+                    assert not any(
+                        e.HasField("nexus_operation_started_event_attributes")
+                        for e in events
+                    )
+                    # The run waits for the operation's start, as a direct call does.
+                    assert (await workflow_handle.describe()).status == (
+                        WorkflowExecutionStatus.RUNNING
+                    )
+                    if case == "run_during_start":
+                        handler.acknowledge.set()
+                    else:
+                        # A Workflow cancellation ends the start, as with a direct call.
+                        await workflow_handle.cancel()
+                else:
+                    await assert_eventually(
+                        lambda: history_has("nexus_operation_started_event_attributes")
+                    )
+                if case in ("workflow", "nested", "spawned", "wait_requested"):
+                    await workflow_handle.cancel()
+                elif case in ("tool_fails", "nested_tool_fails"):
+                    await workflow_handle.signal(NexusToolCancelWorkflow.fail_tool)
+                elif case == "external_cancel":
+                    await held_handle.cancel()
+                elif case == "tool_bug":
+                    await workflow_handle.signal(NexusToolCancelWorkflow.fail_tool)
+
+                    async def task_failed() -> list[Any]:
+                        events: list[Any] = [
+                            e async for e in workflow_handle.fetch_history_events()
+                        ]
+                        assert any(
+                            e.HasField("workflow_task_failed_event_attributes")
+                            for e in events
+                        )
+                        return events
+
+                    # The tool's error fails the Workflow Task before the operation is
+                    # cancelled, so a Worker with the tool fixed replays the History.
+                    events = await assert_eventually(task_failed)
+                    assert not any(
+                        e.HasField("nexus_operation_cancel_requested_event_attributes")
+                        for e in events
+                    )
+                    await workflow_handle.terminate()
+                    await Replayer(
+                        workflows=[FixedNexusToolCancelWorkflow],
+                        plugins=[agent_env.openai_agents_plugin],
+                    ).replay_workflow(await workflow_handle.fetch_history())
+                    assert (await held_handle.describe()).status == (
+                        WorkflowExecutionStatus.RUNNING
+                    )
+                    return
+                elif case in ("run_first", "workflow_during_failure"):
+                    await workflow_handle.signal(
+                        NexusToolCancelWorkflow.cancel_run
+                        if case == "run_first"
+                        else NexusToolCancelWorkflow.fail_tool
+                    )
+                    await assert_eventually(
+                        lambda: history_has(
+                            "nexus_operation_cancel_request_completed_event_attributes"
+                        )
+                    )
+                    await workflow_handle.cancel()
+                    await assert_eventually(
+                        lambda: history_has(
+                            "workflow_execution_cancel_requested_event_attributes"
+                        )
+                    )
+                    # The second cancellation does not end the wait for the operation, which
+                    # has not finished cancelling.
+                    assert (await workflow_handle.describe()).status == (
+                        WorkflowExecutionStatus.RUNNING
+                    )
+                    await held_handle.signal(HeldWorkflow.release)
+                with pytest.raises(WorkflowFailureError) as err:
+                    await workflow_handle.result()
+                if case in ("tool_fails", "nested_tool_fails"):
+                    assert "Tool failed" in str(err.value.cause)
+                elif case == "external_cancel":
+                    # The tool's error fails the run, as on main.
+                    assert "Error running tool hold" in str(err.value.cause)
+                    assert isinstance(err.value.cause.__cause__, NexusOperationError)
+                    assert isinstance(
+                        err.value.cause.__cause__.__cause__, CancelledError
+                    )
+                else:
+                    assert isinstance(err.value.cause, CancelledError)
+
+                if case in ("workflow_during_start", "spawned"):
+                    # The operation's Workflow keeps running, as with a direct call. With
+                    # spawned, nothing cancels the inner run, as on main.
+                    assert (await held_handle.describe()).status == (
+                        WorkflowExecutionStatus.RUNNING
+                    )
+                elif case == "wait_requested":
+                    # The agent Workflow closes once the cancel request is delivered.
+                    await history_has(
+                        "nexus_operation_cancel_request_completed_event_attributes"
+                    )
+                    assert (await held_handle.describe()).status == (
+                        WorkflowExecutionStatus.RUNNING
+                    )
+                    await held_handle.signal(HeldWorkflow.release)
+                    with pytest.raises(WorkflowFailureError) as held_err:
+                        await held_handle.result()
+                    assert isinstance(held_err.value.cause, CancelledError)
+                else:
+                    # The agent Workflow closes only once the operation's cancel request
+                    # is delivered, as with a direct execute_operation call.
+                    assert (await held_handle.describe()).status == (
+                        WorkflowExecutionStatus.CANCELED
+                    )
+                # The tool's cancelled call ends as cancelled, so the Workflow logs no error.
+                # A Workflow that closed with a pending task, as with spawned, logs when the
+                # task is destroyed, which can happen during a later test.
+                assert not [
+                    r
+                    for r in caplog.records
+                    if r.levelname == "ERROR"
+                    and not r.getMessage().startswith(
+                        "Task was destroyed but it is pending"
+                    )
+                ]
+            finally:
+                handler.acknowledge.set()
+                with contextlib.suppress(RPCError):
+                    if (await held_handle.describe()).status == (
+                        WorkflowExecutionStatus.RUNNING
+                    ):
+                        await held_handle.terminate()
 
 
 def research_mock_model():
