@@ -78,6 +78,29 @@ test.serial('LANGSMITH_TRACING=false suppresses all emission', async (t) => {
   }
 });
 
+test.serial('LANGSMITH_TRACING=false suppresses children built from an untraced run', async (t) => {
+  const snapshot = snapshotTracingEnv();
+  process.env.LANGSMITH_TRACING = 'false';
+  try {
+    const collector = new InMemoryRunCollector();
+    await withTracingWorker({
+      collector,
+      options: { projectName: 'project' },
+      activities: {},
+      body: async ({ client, taskQueue }) => {
+        await client.workflow.execute(workflows.ManualChildrenWorkflow, {
+          taskQueue,
+          workflowId: `env-children-${Date.now()}`,
+          workflowExecutionTimeout: '30s',
+        });
+      },
+    });
+    t.deepEqual(collector.records, []);
+  } finally {
+    restoreTracingEnv(snapshot);
+  }
+});
+
 test.serial('LANGSMITH_TRACING=false still traces under a parent propagated in headers', async (t) => {
   const snapshot = snapshotTracingEnv();
   process.env.LANGSMITH_TRACING = 'false';

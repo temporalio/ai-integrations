@@ -84,12 +84,8 @@ export const WORKFLOW_RUN_TREE_OVERRIDES: RunTreeOverrides = {
         if (!selected.project_name && !selected.address) suppressRun(this);
         // A run with no parent and no propagated trace starts a new trace, which LangSmith's env gates.
         if (!config.parent_run && !config.trace_id && active.config.tracingEnabled === false) suppressRun(this);
-      },
-    createChild: (original) =>
-      function (this: RunTree, ...args: unknown[]): RunTree {
-        const child: RunTree = original.apply(this, args);
-        if (context.getStore() && isUntraced(this)) suppressRun(child);
-        return child;
+        // A child of an untraced run stays untraced, whether built by createChild or `new RunTree({ parent_run })`.
+        if (config.parent_run && isUntraced(config.parent_run)) suppressRun(this);
       },
     end: (original) =>
       async function (this: RunTree, outputs?: KVMap, error?: string, endTime?: number, ...args: unknown[]): Promise<void> {

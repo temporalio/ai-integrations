@@ -5,7 +5,7 @@
  */
 
 import { RunTree } from 'langsmith/run_trees';
-import { traceable } from 'langsmith/traceable';
+import { getCurrentRunTree, traceable } from 'langsmith/traceable';
 import {
   ApplicationFailure,
   condition,
@@ -241,6 +241,21 @@ export async function ReadonlyDeterminismWorkflow(): Promise<string> {
   });
   await child.result();
   return id;
+}
+
+/** Builds children of the current `traceable` run both ways LangSmith allows, and writes them. */
+export async function ManualChildrenWorkflow(): Promise<void> {
+  await traceable(async () => {
+    const parent = getCurrentRunTree();
+    for (const child of [
+      parent.createChild({ name: 'created-child' }),
+      new RunTree({ name: 'constructed-child', parent_run: parent }),
+    ]) {
+      await child.postRun();
+      await child.end({});
+      await child.patchRun();
+    }
+  }, { name: 'manual-children-root' })();
 }
 
 /** Fails directly with a BENIGN failure. */

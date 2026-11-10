@@ -83,7 +83,6 @@ test.serial('overrides forward extra arguments to LangSmith inside and outside p
     [WORKFLOW_RUN_TREE_OVERRIDES, 'statics', 'getDefaultConfig', RunTree],
     [WORKFLOW_RUN_TREE_OVERRIDES, 'statics', 'getSharedClient', RunTree],
     [WORKFLOW_RUN_TREE_OVERRIDES, 'methods', '_resolveAddressing', run, { project_name: 'project' }],
-    [WORKFLOW_RUN_TREE_OVERRIDES, 'methods', 'createChild', run, { name: 'child' }],
     [WORKFLOW_RUN_TREE_OVERRIDES, 'methods', 'end', run, {}, undefined, 1, {}],
     [WORKFLOW_RUN_TREE_OVERRIDES, 'methods', 'postRun', run, true],
     [WORKFLOW_RUN_TREE_OVERRIDES, 'methods', 'patchRun', run, { excludeInputs: false }],
@@ -95,16 +94,13 @@ test.serial('overrides forward extra arguments to LangSmith inside and outside p
   }
 
   const workflowConfig = { addTemporalRuns: false, destination: { project_name: 'workflow-project' } };
-  for (const [kind, name, ...args] of [
-    ['methods', '_resolveAddressing', {}],
-    ['methods', 'createChild', { name: 'child' }],
-  ] as const) {
-    const self = new RunTree({ name: 'workflow', project_name: 'project', client });
-    const forwarded = await workflowRunTreeContext(workflowConfig, () =>
-      forwards(WORKFLOW_RUN_TREE_OVERRIDES, kind, name, self, ...args)
-    );
-    t.true(forwarded, `workflow: ${name}`);
-  }
+  const self = new RunTree({ name: 'workflow', project_name: 'project', client });
+  t.true(
+    await workflowRunTreeContext(workflowConfig, () =>
+      forwards(WORKFLOW_RUN_TREE_OVERRIDES, 'methods', '_resolveAddressing', self, {})
+    ),
+    'workflow: _resolveAddressing'
+  );
 
   const workerConfig = { client, addTemporalRuns: false, projectName: 'p' };
   const forwarded = await withRunTreeDefaults(workerConfig, () =>

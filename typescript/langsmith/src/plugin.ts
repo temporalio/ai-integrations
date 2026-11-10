@@ -112,6 +112,7 @@ export class LangSmithPlugin extends SimplePlugin {
   private readonly client: Client;
   private readonly emitter: EmitterConfig;
   private readonly workflowConfig: WorkflowLangSmithConfig;
+  private readonly drains: (() => Promise<void>)[] = [];
   // Absolute paths so the workflow bundler resolves them under strict pnpm.
   private readonly workflowInterceptorModule = require.resolve('./workflow-interceptors');
   // Target of the `node:async_hooks` rewrite; re-exports the runtime-injected ALS.
@@ -194,8 +195,10 @@ export class LangSmithPlugin extends SimplePlugin {
       );
     }
 
+    const { sinks: langsmithSinks, drain } = createLangSmithSinks(this.client, this.emitter.replicas, logger);
+    this.drains.push(drain);
     // The user's own Worker sinks take precedence on any key collision.
-    const sinks = { ...createLangSmithSinks(this.client, this.emitter.replicas, logger), ...(options.sinks ?? {}) };
+    const sinks = { ...langsmithSinks, ...(options.sinks ?? {}) };
 
     return {
       ...options,
@@ -242,6 +245,8 @@ export class LangSmithPlugin extends SimplePlugin {
 
   private async flush(): Promise<void> {
     try {
+      // Sink writes reach the client one at a time, so hand them all over before flushing it.
+      await Promise.all(this.drains.map((drain) => drain()));
       await this.client.awaitPendingTraceBatches();
     } catch {
       /* swallow: telemetry flush must never fail worker shutdown */

@@ -25,7 +25,7 @@ const RUN: SerializedRun = {
 
 function sinks(client: Partial<Client>, errors: string[] = [], replicas?: WriteReplica[]) {
   const logger = { error: (message: string) => errors.push(message) } as unknown as Logger;
-  return createLangSmithSinks(client as Client, replicas, logger)[LANGSMITH_SINK_NAME];
+  return createLangSmithSinks(client as Client, replicas, logger).sinks[LANGSMITH_SINK_NAME];
 }
 
 test('an update does not start before its create finishes', async (t) => {

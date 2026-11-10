@@ -77,12 +77,15 @@ function emissionRun(run: SerializedRun, client: Client, replicas: WriteReplica[
   return tree;
 }
 
-/** Build the worker-side {@link InjectedSinks} routing serialized runs to a real LangSmith client. */
+/**
+ * Build the worker-side {@link InjectedSinks} routing serialized runs to a real LangSmith client, and a `drain` that
+ * resolves once every queued write has reached the client.
+ */
 export function createLangSmithSinks(
   client: Client,
   replicas: WriteReplica[] | undefined,
   logger: Logger
-): InjectedSinks<LangSmithSinks> {
+): { sinks: InjectedSinks<LangSmithSinks>; drain: () => Promise<void> } {
   // Writes run one at a time in call order, so an update never overtakes its create.
   let writes = Promise.resolve();
   // The Workflow already decided whether to trace each run, so the env isn't checked again here.
@@ -93,15 +96,18 @@ export function createLangSmithSinks(
     });
   };
   return {
-    [LANGSMITH_SINK_NAME]: {
-      createRun: {
-        fn: (_info, run) => enqueue(() => emissionRun(run, client, replicas).postRun()),
-        callDuringReplay: false,
-      },
-      updateRun: {
-        fn: (_info, run, options) => enqueue(() => emissionRun(run, client, replicas).patchRun(options)),
-        callDuringReplay: false,
+    sinks: {
+      [LANGSMITH_SINK_NAME]: {
+        createRun: {
+          fn: (_info, run) => enqueue(() => emissionRun(run, client, replicas).postRun()),
+          callDuringReplay: false,
+        },
+        updateRun: {
+          fn: (_info, run, options) => enqueue(() => emissionRun(run, client, replicas).patchRun(options)),
+          callDuringReplay: false,
+        },
       },
     },
+    drain: () => writes,
   };
 }
