@@ -453,10 +453,13 @@ def nexus_operation_as_tool(
     during workflow execution. The tool will automatically handle the conversion
     of inputs and outputs between the agent and the operation.
 
-    When the agent run is cancelled, or stops because another tool failed, it
-    cancels the operation and waits as ``cancellation_type`` says before it
-    raises. With the default, ``WAIT_COMPLETED``, the Workflow closes only after
-    the operation has ended.
+    When a ``Runner.run`` agent run is cancelled, or stops because another tool
+    failed with an error that fails the Workflow, the tool cancels the operation
+    as ``cancellation_type`` says (``ABANDON`` sends no cancel request; with
+    ``TRY_CANCEL`` the request may not be delivered), and the run waits for it
+    before it raises. With the default, ``WAIT_COMPLETED``, the Workflow closes
+    only after the operation has ended, unless the Workflow itself is cancelled
+    before the operation has started. ``Runner.run_streamed`` does not wait.
 
     Args:
         operation: A Nexus operation to convert into a tool.
@@ -513,10 +516,11 @@ def nexus_operation_as_tool(
         args, _ = schema.to_call_args(params)
         assert len(args) == 1, "Nexus operations must have exactly one argument"
         [arg] = args
-        # If the agent run is cancelled, its runner waits for this operation, so Temporal
-        # delivers the operation's cancel request before the Workflow closes. Tracking starts
-        # before the start request: a cancelled task keeps waiting for the start to resolve,
-        # unless the Workflow itself is cancelled.
+        # If a Runner.run agent run is cancelled, or fails with an error that fails the
+        # Workflow, the runner waits for this operation, so Temporal delivers the operation's
+        # cancel request before the Workflow closes. Tracking starts before the start
+        # request: a cancelled task keeps waiting for the start to resolve, unless the
+        # Workflow itself is cancelled.
         with _track_tool_operation() as tracked:
             try:
                 handle = await nexus_client.start_operation(

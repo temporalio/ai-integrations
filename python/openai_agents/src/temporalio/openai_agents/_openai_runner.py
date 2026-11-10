@@ -52,57 +52,87 @@ class _ToolOperation:
     """A Nexus operation started by a tool, pending until the tool's call ends."""
 
     task: asyncio.Task[Any] | None
-    done: asyncio.Future[None]
     cancelled: bool = False
     """Set when the run has stopped and waits for the tool, whose task the Agents SDK cancelled."""
 
 
-# Pending Nexus operations started by tools, one set per active agent run in a Workflow,
-# outermost first. A tool adds its operation to every set, so an outer run also waits for the
-# operations of an agent that runs as a tool.
-_tool_operations: contextvars.ContextVar[tuple[set[_ToolOperation], ...]] = (
-    contextvars.ContextVar("_tool_operations", default=())
+@dataclasses.dataclass(eq=False)
+class _AgentRun:
+    """An agent run in a Workflow, with its tools' pending Nexus operations.
+
+    Also keeps the agent runs started in its tools.
+    """
+
+    operations: set[_ToolOperation] = dataclasses.field(default_factory=set)
+    nested: set["_AgentRun"] = dataclasses.field(default_factory=set)
+    stopping: bool = False
+    """Set when the run was cancelled or failed and waits for its operations."""
+
+    def pending(self, *, all_nested: bool) -> list[_ToolOperation]:
+        """The pending operations of this run and of its nested runs.
+
+        Only nested runs that are stopping count, unless ``all_nested`` is set.
+        """
+        pending = list(self.operations)
+        for run in self.nested:
+            if all_nested or run.stopping:
+                pending.extend(run.pending(all_nested=all_nested))
+        return pending
+
+
+# The innermost active agent run in a Workflow. Tasks copy it, so an agent run started in a
+# tool, or in a task that a tool starts, is nested in the run of that tool.
+_current_agent_run: contextvars.ContextVar[_AgentRun | None] = contextvars.ContextVar(
+    "_current_agent_run", default=None
 )
 
 
 @contextlib.contextmanager
 def _track_tool_operation() -> Generator[_ToolOperation, None, None]:
-    """Keep a tool's Nexus operation pending in the runs until the block exits."""
-    runs = _tool_operations.get()
-    operation = _ToolOperation(
-        task=asyncio.current_task(),
-        done=asyncio.get_running_loop().create_future(),
-    )
-    for operations in runs:
-        operations.add(operation)
+    """Keep a tool's Nexus operation pending in its run until the block exits."""
+    run = _current_agent_run.get()
+    operation = _ToolOperation(task=asyncio.current_task())
+    if run is not None:
+        run.operations.add(operation)
     try:
         yield operation
     finally:
-        operation.done.set_result(None)
-        for operations in runs:
-            operations.discard(operation)
+        if run is not None:
+            run.operations.discard(operation)
 
 
-async def _wait_for_tool_operations(operations: set[_ToolOperation]) -> None:
+async def _wait_for_tool_operations(run: _AgentRun) -> bool:
     """Wait for the run's pending Nexus operations after it was cancelled or failed.
 
     The Agents SDK cancels a run's tool tasks and raises without waiting for them. The
     Workflow would then close in the same Workflow Task, before Temporal delivers the cancel
     requests of the tools' Nexus operations. Waiting keeps their cancellation type, as when
     Workflow code calls ``execute_operation`` itself.
+    The run also waits for the operations of its nested runs that stop with it, such as an
+    agent that runs as a tool. It checks which ones stop once the cancellation has reached
+    them, so an agent run in a task that a tool started, and that nothing cancels, does not
+    delay it.
     A further cancel request, such as the Workflow's after Workflow code cancelled the run,
     goes to the tools' tasks, as it would to a direct call: a Workflow cancellation ends an
     operation that is still starting, and a started one keeps its cancellation type. The
-    wait goes on until every tool's call has ended; the caller then re-raises.
+    wait goes on until every tool's call has ended. Returns whether a cancel request arrived
+    during the wait; the caller then raises.
     """
-    pending = list(operations)
-    for operation in pending:
+    run.stopping = True
+    for operation in run.operations:
         operation.cancelled = True
-    while not all(operation.done.done() for operation in pending):
+    if not run.pending(all_nested=True):
+        return False
+    cancel_requested = False
+    while True:
         try:
-            await asyncio.wait([operation.done for operation in pending])
+            # The condition is checked once no task is ready to run, so the cancellation has
+            # reached every nested run that stops with this one.
+            await workflow.wait_condition(lambda: not run.pending(all_nested=False))
+            return cancel_requested
         except asyncio.CancelledError:
-            for operation in pending:
+            cancel_requested = True
+            for operation in run.pending(all_nested=False):
                 if operation.task is not None:
                     operation.task.cancel()
 
@@ -460,8 +490,11 @@ class TemporalOpenAIRunner(AgentRunner):
 
         converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
-        operations: set[_ToolOperation] = set()
-        token = _tool_operations.set((*_tool_operations.get(), operations))
+        run = _AgentRun()
+        parent = _current_agent_run.get()
+        if parent is not None:
+            parent.nested.add(run)
+        token = _current_agent_run.set(run)
         with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             try:
                 return await self._runner.run(
@@ -470,17 +503,27 @@ class TemporalOpenAIRunner(AgentRunner):
                     **kwargs,
                 )
             except asyncio.CancelledError:
-                await _wait_for_tool_operations(operations)
+                await _wait_for_tool_operations(run)
                 raise
             except AgentsException as e:
-                # When a tool fails, the Agents SDK also cancels the run's other tools.
-                await _wait_for_tool_operations(operations)
+                # When a tool fails, the Agents SDK also cancels the run's other tools. Wait
+                # only when the error fails the Workflow: an error that fails the Workflow
+                # Task must leave no new commands, so that a fixed Worker can replay it.
+                if (
+                    e.__cause__ is not None
+                    and workflow.is_failure_exception(e.__cause__)
+                ) or workflow.is_failure_exception(e):
+                    if await _wait_for_tool_operations(run):
+                        # The Workflow was cancelled during the wait.
+                        raise asyncio.CancelledError() from e
                 # In order for workflow failures to properly fail the workflow, we need to rewrap them in
                 # a Temporal error
                 _reraise_workflow_failure(e)
                 raise e
             finally:
-                _tool_operations.reset(token)
+                _current_agent_run.reset(token)
+                if parent is not None:
+                    parent.nested.discard(run)
 
     def run_sync(
         self,
