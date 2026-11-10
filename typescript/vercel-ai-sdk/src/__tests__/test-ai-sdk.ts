@@ -71,6 +71,7 @@ import {
   mcpSchemaTestWorkflow,
   mcpWorkflow,
   middlewareWorkflow,
+  slowModelWorkflow,
   streamingMetadataWorkflow,
   telemetryWorkflow,
   toolsWorkflow,
@@ -437,6 +438,80 @@ test('Streaming text, finish and response metadata survive activity execution an
     ]);
   });
 });
+
+// Each call waits longer than the `heartbeatTimeout` of `slowModelWorkflow` before it answers.
+const slowModelDelayMs = 2000;
+
+class SlowTestProvider implements ProviderV4 {
+  readonly specificationVersion = 'v4';
+
+  languageModel(_modelId: string): LanguageModelV4 {
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'slow-model',
+      supportedUrls: {},
+      async doGenerate(): Promise<LanguageModelV4GenerateResult> {
+        await new Promise((resolve) => setTimeout(resolve, slowModelDelayMs));
+        return textResponse('slow');
+      },
+      async doStream(): Promise<LanguageModelV4StreamResult> {
+        return {
+          stream: new ReadableStream({
+            async start(controller) {
+              await new Promise((resolve) => setTimeout(resolve, slowModelDelayMs));
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({
+                type: 'finish',
+                finishReason: createFinishReason('stop'),
+                usage: createUsage(),
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    };
+  }
+
+  embeddingModel(_modelId: string): EmbeddingModelV4 {
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'slow-model',
+      maxEmbeddingsPerCall: undefined,
+      supportsParallelCalls: true,
+      async doEmbed(): Promise<EmbeddingModelV4Result> {
+        await new Promise((resolve) => setTimeout(resolve, slowModelDelayMs));
+        return embeddingResponse(['test']);
+      },
+    };
+  }
+
+  imageModel(_modelId: string): ImageModelV4 {
+    throw new Error('Not implemented.');
+  }
+}
+
+for (const [call, expected] of [
+  ['stream', 2],
+  ['generate', 1],
+  ['embed', 1],
+] as const) {
+  test(`Model activity (${call}) heartbeats while the provider is slow`, async (t) => {
+    const { createWorker, executeWorkflow } = helpers(t);
+    const plugin = new AiSdkPlugin({ modelProvider: new SlowTestProvider() });
+    const worker = await createWorker({ plugins: [plugin] });
+
+    await worker.runUntil(async () => {
+      const result = await executeWorkflow(slowModelWorkflow, {
+        args: [call],
+        workflowExecutionTimeout: '10 seconds',
+      });
+      t.is(result, expected);
+    });
+  });
+}
 
 function* generateObjectWorkflowGenerator(): Generator<ModelResponse> {
   yield textResponse(

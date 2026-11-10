@@ -55,4 +55,19 @@ even when its settings are equal, for example `createOpenAI({ apiKey })` called
 once per plugin, or an `async () => ...` factory written inline in each options
 object.
 
+## Heartbeats and streaming
+
+When you set a `heartbeatTimeout` in the provider options, the model and
+embedding Activities heartbeat at half that timeout while they wait on the
+provider. Without a `heartbeatTimeout` they send no heartbeat, so a lost Worker
+is noticed only at `startToCloseTimeout` and a cancellation request does not
+reach the Activity.
+
+When `invokeModelStreaming` is retried, the new attempt publishes all of its
+stream parts to the topic again, after the parts the failed attempt published.
+A subscriber that wants only the last attempt can discard what it has when a
+`stream-start` part arrives. The `@ai-sdk/openai` models send `stream-start` as
+the first part of every call, but the provider specification does not require
+it, so a custom provider may not send it.
+
 Development details are in [typescript/README.md](../README.md).
