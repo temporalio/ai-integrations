@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any, Callable, NamedTuple, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -47,7 +48,7 @@ from google.genai.interactions import (
 from google.genai.types import HttpResponse as SdkHttpResponse
 
 from temporalio import activity, workflow
-from temporalio.client import Client, WorkflowFailureError
+from temporalio.client import Client, WorkflowFailureError, WorkflowHistory
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.google_genai import (
@@ -2477,6 +2478,11 @@ async def test_replay_tool_loop(client: Client):
     formatting.  That makes it the replay path most likely to surface
     nondeterminism, so the recorded history is replayed under the real
     plugin to prove the loop is replay-safe.
+
+    Besides a history recorded here, this replays ``genai_v2_tool_loop.json``,
+    recorded by this test with google-genai 2.24.0. A run with google-genai 3
+    installed (the nightly run, once the cooldown allows 3.x) checks that a
+    google-genai 3 worker replays a google-genai 2 worker's history.
     """
     tool_tracker = ToolCallTracker()
     new_client, _ = apply_plugin(
@@ -2504,10 +2510,15 @@ async def test_replay_tool_loop(client: Client):
         await handle.result()
         history = await handle.fetch_history()
 
-    await Replayer(
+    replayer = Replayer(
         workflows=[MultipleToolsWorkflow],
         plugins=[_replay_plugin()],
-    ).replay_workflow(history)
+    )
+    await replayer.replay_workflow(history)
+    v2_history = Path(__file__).parent / "histories" / "genai_v2_tool_loop.json"
+    await replayer.replay_workflow(
+        WorkflowHistory.from_json("genai-v2", v2_history.read_text())
+    )
 
 
 async def test_side_effects_activity_scheduling(client: Client):
