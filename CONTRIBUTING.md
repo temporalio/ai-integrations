@@ -16,6 +16,8 @@ workflow.
 - CI runs only the plugins whose files changed (`.github/workflows/ci.yml`); `ci-status`,
   `Check for CODEOWNERS` and `opengrep/scan` are the required checks, plus one code-owner
   approval. No secrets are needed: provider behavior uses deterministic local test doubles.
+- Plugins match their framework's behavior (see "Plugin behavior" in `AGENTS.md`). Say in the PR
+  when the framework's docs contradict its code, and when a change can alter recorded histories.
 
 ## Adding a Python plugin
 
