@@ -14,12 +14,29 @@ STARTUP_TIMEOUT = (
     STARTUP_PREFIX + "ephemeral server at 127.0.0.1:60249 did not start within 5s. "
     "Make sure another download isn't stuck and delete the temp file."
 )
+# SDK 1.35 appends the last connection error after a semicolon.
+STARTUP_TIMEOUT_WITH_CONNECTION_ERROR = (
+    STARTUP_PREFIX + "ephemeral server at 127.0.0.1:54380 did not start within 5s; "
+    "last connection error: Server connection error: "
+    'tonic::transport::Error(Transport, ConnectError(ConnectError("tcp connect error", '
+    "127.0.0.1:54380, Os { code: 10061, kind: ConnectionRefused, message: "
+    '"No connection could be made because the target machine actively refused it." })))'
+)
+# SDKs before 1.33 report the startup timeout this way, with the last
+# connection error in Rust's Option form.
+LEGACY_STARTUP_TIMEOUT = (
+    STARTUP_PREFIX + "Failed connecting to test server after 5 seconds, last error: "
+)
 DOWNLOAD_FAILURE = (
     STARTUP_PREFIX
     + "failed to download ephemeral server executable: error sending request"
 )
 RETRYABLE_ERRORS = [
     STARTUP_TIMEOUT,
+    STARTUP_TIMEOUT_WITH_CONNECTION_ERROR,
+    LEGACY_STARTUP_TIMEOUT + "None",
+    LEGACY_STARTUP_TIMEOUT
+    + 'Some(Status { code: Unavailable, message: "tcp connect error" })',
     DOWNLOAD_FAILURE,
     *[
         STARTUP_PREFIX + "invalid ephemeral server download: " + message
@@ -107,8 +124,17 @@ async def test_different_startup_errors_share_retry_limit() -> None:
             + "invalid ephemeral server download: archive URL has unsupported format"
         ),
         RuntimeError(STARTUP_PREFIX + "invalid configuration"),
+        RuntimeError(STARTUP_PREFIX + "Failed connecting to test server: invalid URL"),
         RuntimeError("Failed client connect: connection refused"),
         RuntimeError("request did not start within 5s."),
+        RuntimeError(
+            STARTUP_PREFIX
+            + "ephemeral server at 127.0.0.1:54380 did not start within 5s"
+        ),
+        RuntimeError(
+            STARTUP_PREFIX
+            + "ephemeral server at 127.0.0.1:54380 did not start within 5s; invalid URL"
+        ),
         TypeError("start_local() got an unexpected keyword argument 'invalid'"),
         ValueError(STARTUP_TIMEOUT),
         OSError(DOWNLOAD_FAILURE),

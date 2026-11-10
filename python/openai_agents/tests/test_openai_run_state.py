@@ -1,9 +1,8 @@
 """Resuming a serialized ``RunState`` inside a workflow.
 
 The Agents SDK resumes a ``RunState`` with the agent objects stored in the state, which are
-the caller's own agents rather than the plugin's converted copies. The plugin routes model
-resolution through ``RunConfig.model_provider`` so those agents still call the model as
-Temporal activities.
+the caller's own agents. The plugin routes model resolution through
+``RunConfig.model_provider`` so those agents still call the model as Temporal activities.
 """
 
 import asyncio
@@ -54,9 +53,11 @@ from openai.types.responses.response_usage import (
 from temporalio import workflow
 from temporalio.client import Client
 from temporalio.contrib.workflow_streams import WorkflowStream
-from temporalio.openai_agents import ModelActivityParameters
-from temporalio.openai_agents._model_parameters import ModelSummaryProvider
-from temporalio.openai_agents._openai_runner import _convert_agent
+from temporalio.openai_agents import ModelActivityParameters, ModelSummaryProvider
+from temporalio.openai_agents._openai_runner import (
+    TemporalOpenAIRunner,
+    _convert_agent,
+)
 from temporalio.openai_agents._temporal_model_provider import (
     _CaptureAgentFilter,  # pyright: ignore[reportPrivateUsage]
     _TemporalModelProvider,  # pyright: ignore[reportPrivateUsage]
@@ -183,6 +184,25 @@ def _triage_reply(
     return _banker_reply(instructions, input)
 
 
+def _run_again_reply(
+    instructions: str | None, input: str | list[TResponseInputItem]
+) -> ModelResponse:
+    """Like ``_triage_reply``, but a request with "again" gets new tool call IDs.
+
+    A real model gives every call its own ID, so only a permanent approval covers it.
+    """
+    suffix = "-again" if "again" in json.dumps(input) else ""
+    if instructions == "Hand off to the Banker.":
+        return ResponseBuilders.tool_call(
+            "{}", "transfer_to_banker", call_id=f"call-handoff{suffix}"
+        )
+    if _has_tool_output(input, f"call-transfer{suffix}"):
+        return ResponseBuilders.output_message("Transfer complete.")
+    return ResponseBuilders.tool_call(
+        '{"amount": 5}', "transfer_funds", call_id=f"call-transfer{suffix}"
+    )
+
+
 def _make_banker() -> Agent[None]:
     return Agent[None](
         name="Banker",
@@ -220,10 +240,17 @@ async def _run(
     streamed: bool,
     run_config: RunConfig | None = None,
     hooks: RunHooks[None] | None = None,
+    # The SDK also accepts a run's RunContextWrapper here, which keeps its approvals,
+    # but the parameter is typed as the user's context.
+    context: Any = None,
 ) -> RunResult | RunResultStreaming:
     if not streamed:
-        return await Runner.run(agent, input, run_config=run_config, hooks=hooks)
-    result = Runner.run_streamed(agent, input, run_config=run_config, hooks=hooks)
+        return await Runner.run(
+            agent, input, run_config=run_config, hooks=hooks, context=context
+        )
+    result = Runner.run_streamed(
+        agent, input, run_config=run_config, hooks=hooks, context=context
+    )
     async for _ in result.stream_events():
         pass
     return result
@@ -428,11 +455,15 @@ class ResumeRunStateWorkflow:
     """Interrupt for approval, restore the state from its string, approve and resume."""
 
     @workflow.init
-    def __init__(self, streamed: bool, use_handoff: str) -> None:
+    def __init__(
+        self, streamed: bool, use_handoff: str, run_again: bool = False
+    ) -> None:
         self.stream = WorkflowStream()
 
     @workflow.run
-    async def run(self, streamed: bool, use_handoff: str) -> list[str]:
+    async def run(
+        self, streamed: bool, use_handoff: str, run_again: bool = False
+    ) -> list[str]:
         agent = (
             _make_banker()
             if use_handoff == "none"
@@ -442,7 +473,21 @@ class ResumeRunStateWorkflow:
         assert len(result.interruptions) == 1
         assert result.last_agent.name == "Banker"
         state = await RunState.from_string(agent, result.to_state().to_string())
-        return await _approve_and_resume(agent, state, streamed=streamed)
+        if not run_again:
+            return await _approve_and_resume(agent, state, streamed=streamed)
+        # Approve for good, then run the same agent again with the same context.
+        state.approve(state.get_interruptions()[0], always_approve=True)
+        resumed = await _run(agent, state, streamed=streamed)
+        again = await _run(
+            agent,
+            "Move 5 dollars again.",
+            streamed=streamed,
+            context=resumed.context_wrapper,
+        )
+        return [
+            str(again.final_output),
+            *[str(item.output) for item in again.new_items if hasattr(item, "output")],
+        ]
 
 
 @workflow.defn
@@ -776,6 +821,24 @@ async def test_resume_run_state_after_handoff(
     assert result == ["Transfer complete.", "transferred 5"]
 
 
+@pytest.mark.parametrize("streamed", [False, True])
+@pytest.mark.parametrize("use_handoff", ["none", "agent", "object"])
+async def test_always_approve_covers_later_runs_of_the_same_agent(
+    client: Client, streamed: bool, use_handoff: str
+):
+    # The SDK keeps a permanent approval on the agent that owns the tool, so the
+    # plugin must run the caller's agent, not a copy of it.
+    result, _ = await _execute(
+        client,
+        ScriptedModel(_run_again_reply),
+        ResumeRunStateWorkflow.run,
+        streamed,
+        use_handoff,
+        True,
+    )
+    assert result == ["Transfer complete.", "transferred 5"]
+
+
 async def test_resume_run_state_across_continue_as_new(client: Client):
     result, _ = await _execute(
         client,
@@ -879,6 +942,21 @@ async def test_capture_filter_returns_user_result_unchanged():
     no_filter = provider.install(RunConfig())
     assert no_filter.call_model_input_filter is not None
     assert no_filter.call_model_input_filter(data) is data.model_data
+
+    # A Model object would run in the Workflow, so it is refused before the call.
+    agent.model = ScriptedModel(_banker_reply)
+    with pytest.raises(ValueError, match="model name to be a string"):
+        no_filter.call_model_input_filter(_call_data(agent))
+
+
+def test_prepare_workflow_run_refuses_model_objects_reachable_through_handoffs():
+    target = Agent(name="target", model=ScriptedModel(_banker_reply))
+    middle = Agent(name="middle", handoffs=[target])
+    starting = Agent(name="starting", handoffs=[middle])
+    middle.handoffs.append(starting)  # a loop must not recurse forever
+    runner = TemporalOpenAIRunner(ModelActivityParameters())
+    with pytest.raises(ValueError, match="model name to be a string"):
+        runner._prepare_workflow_run(starting, {})
 
 
 async def test_capture_filter_resolves_agent_lazily_and_is_installed_once():

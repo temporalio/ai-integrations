@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
+import importlib.metadata
 import inspect
 import random
 import time
@@ -219,7 +220,7 @@ class GoogleAdkPlugin(SimplePlugin):
                         "google.adk",
                         "google.genai",
                         "mcp",
-                        # ADK imports OpenTelemetry context lazily for graph workflows.
+                        # ADK 2.9+ imports OpenTelemetry context on every agent turn.
                         "opentelemetry",
                         # ADK probes these optional model SDKs lazily on each LLM turn.
                         "anthropic",
@@ -247,6 +248,13 @@ class GoogleAdkPlugin(SimplePlugin):
             run_context=lambda: run_context(),
             workflow_runner=workflow_runner,
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-google-adk")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
 
     def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
         """See base class. Also warns when the global OpenTelemetry meter or

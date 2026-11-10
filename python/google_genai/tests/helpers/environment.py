@@ -11,9 +11,11 @@ from temporalio.testing import WorkflowEnvironment
 
 logger = logging.getLogger(__name__)
 
+# SDK 1.35 appends the last connection error to startup timeouts after a semicolon.
 _RETRYABLE_STARTUP_ERROR = re.compile(
     r"^Failed starting Temporal dev server: (?:"
-    r"ephemeral server at \S+ did not start within \d+s\."
+    r"ephemeral server at \S+ did not start within \d+s(?:\.|; last connection error:)"
+    r"|Failed connecting to test server after \d+ seconds, last error: "
     r"|failed to download ephemeral server executable:"
     r"|invalid ephemeral server download: could not (?:read|extract) "
     r"(?:tar|ZIP) archive(?: entry)?(?:$|:)"

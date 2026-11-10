@@ -1,4 +1,4 @@
-import type { MCPServer } from '@openai/agents-core';
+import type { MCPServer, MCPToolFilterCallable, MCPToolFilterStatic, MCPToolMetaResolver } from '@openai/agents-core';
 
 export const MCP_LIST_TOOLS_SUFFIX = '-list-tools';
 export const MCP_CALL_TOOL_SUFFIX = '-call-tool';
@@ -9,12 +9,45 @@ export const MCP_STATELESS_SUFFIX = '-stateless';
 /** Error type for dedicated-Worker scheduling and heartbeat failures. */
 export const DEDICATED_WORKER_FAILURE_TYPE = 'DedicatedWorkerFailure';
 
+/** Error type for a callable `toolFilter` on the server the factory returns, which the Worker refuses. */
+export const TOOL_FILTER_UNSUPPORTED_TYPE = 'MCPToolFilterUnsupported';
+
+/** Error type for a `toolMetaResolver` on the server the factory returns, which the Worker refuses. */
+export const TOOL_META_RESOLVER_UNSUPPORTED_TYPE = 'MCPToolMetaResolverUnsupported';
+
 /**
  * Stateful variant of `MCPServer`. Adds `cleanup()` — the documented
  * lifecycle method users invoke from `finally` blocks after `connect()`.
  */
 export interface StatefulTemporalMCPServer extends MCPServer {
+  /**
+   * Ends the server's session. Throws an `ApplicationFailure` of type
+   * `DedicatedWorkerFailure` if the session was refused, unless the caller's
+   * scope, a scope around `cleanup()` but not around `connect()`, or the scope
+   * that connected the server is cancelled. After a Workflow catches a
+   * cancellation, its root scope stays cancelled, so it gets no such failure
+   * for a server connected outside `CancellationScope.nonCancellable()`. A
+   * session that failed for another reason throws its `ActivityFailure`.
+   */
   cleanup(): Promise<void>;
+}
+
+/** Options both MCP handles take. The agent reads them from the handle in the Workflow, as from a native MCP server. */
+export interface McpServerHandleOptions {
+  /**
+   * Tool filter the agent applies in the Workflow each time it lists tools, as for a native MCP
+   * server. A callable filter gets the agent, the run context and the name the server was
+   * registered with, and must be deterministic.
+   */
+  toolFilter?: MCPToolFilterCallable | MCPToolFilterStatic;
+  /**
+   * Builds each tool call's MCP `_meta` in the Workflow, as for a native MCP server. It gets the
+   * run context and must be deterministic. Older plugin versions ignore this option and may not
+   * replay a History in which it ran, because running it can change the Workflow's commands or
+   * their order. Its result is recorded in Workflow History as part of the call-tool Activity
+   * input, so it must not hold secrets.
+   */
+  toolMetaResolver?: MCPToolMetaResolver;
 }
 
 // Forwarded per-call (not stored on the provider) so different plugins sharing

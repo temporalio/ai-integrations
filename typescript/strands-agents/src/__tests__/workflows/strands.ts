@@ -3,28 +3,55 @@ import '../../load-polyfills';
 import { z } from 'zod';
 import {
   AfterToolCallEvent,
+  AfterToolsEvent,
   SlidingWindowConversationManager,
   tool,
   type BaseModelConfig,
   type InterruptResponseContent,
   type InterruptResponseContentData,
+  type JSONValue,
+  type Message,
 } from '@strands-agents/sdk';
 import {
+  ActivityCancellationType,
   ActivityFailure,
   allHandlersFinished,
   ApplicationFailure,
+  continueAsNew,
   defineSignal,
   defineUpdate,
   proxyActivities,
   setHandler,
   condition,
+  workflowInfo,
+  type ActivityOptions,
 } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
-import { TemporalAgent, TemporalMCPClient, type TemporalAgentOptions, workflow as strandsWorkflow } from '../..';
+import {
+  TemporalAgent,
+  TemporalMCPClient,
+  TemporalModel,
+  type TemporalAgentOptions,
+  workflow as strandsWorkflow,
+} from '../..';
 
 export async function helloAgent(prompt: string): Promise<string> {
   const agent = new TemporalAgent({ model: 'test', printer: false });
   const result = await agent.invoke(prompt);
+  return result.toString();
+}
+
+/**
+ * Runs one agent turn whose model activity heartbeats, with the given cancellation type, so a
+ * workflow cancel during the model call reaches the model.
+ */
+export async function cancellableAgent(cancellationType: ActivityCancellationType): Promise<string> {
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    activityOptions: { startToCloseTimeout: '30 seconds', heartbeatTimeout: '5 seconds', cancellationType },
+  });
+  const result = await agent.invoke('hello');
   return result.toString();
 }
 
@@ -59,6 +86,76 @@ export async function retryConfigAgent(prompt: string): Promise<{ turns: string[
     }
   }
   return { turns, config: agent.model.getConfig() };
+}
+
+// Retry a failed model activity quickly, and not forever.
+const STATEFUL_ACTIVITY_OPTIONS: ActivityOptions = {
+  startToCloseTimeout: '15 seconds',
+  retry: { initialInterval: '100 milliseconds', backoffCoefficient: 1, maximumAttempts: 50 },
+};
+
+/**
+ * Runs two turns on one agent with the `stateful` worker model and returns the agent's message
+ * count after each turn, or the error that ended the run. `models-queue` runs the model activities
+ * on the `-models` task queue.
+ */
+export async function statefulAgent(
+  mode: 'plain' | 'streaming' | 'manager' | 'models-queue'
+): Promise<number[] | string> {
+  void new WorkflowStream();
+  const agent = new TemporalAgent({
+    model: 'stateful',
+    printer: false,
+    activityOptions: {
+      ...STATEFUL_ACTIVITY_OPTIONS,
+      ...(mode === 'models-queue' ? { taskQueue: `${workflowInfo().taskQueue}-models` } : {}),
+    },
+    ...(mode === 'streaming' ? { streamingTopic: 'model' } : {}),
+    ...(mode === 'manager' ? { conversationManager: new SlidingWindowConversationManager() } : {}),
+  });
+  const messagesAfterTurn: number[] = [];
+  try {
+    for (const prompt of ['turn one', 'turn two']) {
+      await agent.invoke(prompt);
+      messagesAfterTurn.push(agent.messages.length);
+    }
+  } catch (err) {
+    return (err as Error).message;
+  }
+  return messagesAfterTurn;
+}
+
+export interface StatefulChatInput {
+  prompts: string[];
+  messages?: Message[];
+  modelState?: Record<string, JSONValue>;
+}
+
+/**
+ * The README's continue-as-new handoff with the `stateful` worker model: one turn per run. Returns
+ * the last run's message count, or the error that ended the turn.
+ */
+export async function statefulChatAgent(input: StatefulChatInput): Promise<number | string> {
+  const agent = new TemporalAgent({
+    model: 'stateful',
+    printer: false,
+    activityOptions: STATEFUL_ACTIVITY_OPTIONS,
+    messages: input.messages,
+    modelState: input.modelState,
+  });
+  try {
+    await agent.invoke(input.prompts[0]!);
+  } catch (err) {
+    return (err as Error).message;
+  }
+  if (input.prompts.length > 1) {
+    await continueAsNew<typeof statefulChatAgent>({
+      prompts: input.prompts.slice(1),
+      messages: agent.messages,
+      modelState: agent.modelState.getAll(),
+    });
+  }
+  return agent.messages.length;
 }
 
 /**
@@ -147,6 +244,128 @@ export async function mcpAgent(prompt: string, server = 'testServer', cacheTools
   const result = await agent.invoke(prompt);
   return result.toString();
 }
+
+/**
+ * An agent with one `TemporalMCPClient` per server, and the `echo` and `take_note` tools when `local`
+ * is set. With `replace` set to `[name, round]`, an `AfterToolsEvent` hook puts a local tool under
+ * `name` after that tool round. Each MCP activity is tried once. Returns the agent's answer, or a
+ * refusal's message, and then the agent's tool names.
+ */
+export async function mcpServersAgent(
+  prompt: string,
+  servers: string[],
+  local = false,
+  replace?: [string, number],
+  prefix?: string
+): Promise<string> {
+  const clients = servers.map(
+    (server) =>
+      new TemporalMCPClient({
+        server,
+        prefix,
+        activityOptions: { startToCloseTimeout: '10 seconds', retry: { maximumAttempts: 1 } },
+      })
+  );
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    tools: local ? [echoTool, noteTool, ...clients] : clients,
+  });
+  if (replace) {
+    const [name, round] = replace;
+    const standIn = tool({ name, description: name, inputSchema: z.object({}), callback: () => 'local' });
+    let rounds = 0;
+    agent.addHook(AfterToolsEvent, (event) => {
+      if (++rounds === round) event.agent.toolRegistry.addOrReplace([standIn]);
+    });
+  }
+  let result: string;
+  try {
+    result = (await agent.invoke(prompt)).toString();
+  } catch (err) {
+    const cause = (err as Error).cause as Error | undefined;
+    result = `refused: ${(err as Error).message}${cause ? ` (${cause.message})` : ''}`;
+  }
+  const names = agent.toolRegistry
+    .list()
+    .map((t) => t.name)
+    .sort();
+  return `${result} Tools: ${names.join(', ')}.`;
+}
+
+/**
+ * Servers `a` and `b`, told apart with `prefix`. `a` rejects tools whose server name starts with
+ * `cho`; `b` lets through `other` and tools whose server name starts with `ec`, except the one the
+ * agent sees as `b_echo`.
+ */
+export async function mcpPrefixedServersAgent(prompt: string): Promise<string> {
+  const activityOptions = { startToCloseTimeout: '10 seconds' } as const;
+  const a = new TemporalMCPClient({ server: 'a', prefix: 'a', activityOptions, toolFilters: { rejected: [/cho/] } });
+  const b = new TemporalMCPClient({
+    server: 'b',
+    prefix: 'b',
+    activityOptions,
+    toolFilters: { allowed: ['other', /ec/], rejected: [(tool) => tool.name === 'b_echo'] },
+  });
+  const agent = new TemporalAgent({ model: 'test', printer: false, tools: [a, b] });
+  const result = (await agent.invoke(prompt)).toString();
+  const names = agent.toolRegistry
+    .list()
+    .map((t) => t.name)
+    .sort();
+  return `${result} Tools: ${names.join(', ')}.`;
+}
+
+/**
+ * Two agents at once: `first` with the servers `a` and `b`, and `second` with the server `c` and an
+ * `auditHook` activity after each tool round. Its histories recorded on main pin when each
+ * re-listing is scheduled against the other agent's activities.
+ */
+export async function mcpAgentsSideBySide(prompt: string): Promise<string> {
+  const client = (server: string): TemporalMCPClient =>
+    new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } });
+  const first = new TemporalAgent({ model: 'first', printer: false, tools: [client('a'), client('b')] });
+  const second = new TemporalAgent({ model: 'second', printer: false, tools: [client('c')] });
+  second.addHook(
+    AfterToolsEvent,
+    strandsWorkflow.activityAsHook('auditHook', {
+      activityInput: () => 'after tools',
+      activityOptions: { startToCloseTimeout: '10 seconds' },
+    })
+  );
+  const results = await Promise.all([first.invoke(prompt), second.invoke(prompt)]);
+  return results.map(String).join(', ');
+}
+
+/**
+ * An agent with the servers `a` and `b`, and a hook added after construction that, at the first tool
+ * round, starts a coroutine beside the re-listing: it lists `z`, awaits `null` twice and lists `y`.
+ * Its history recorded on main pins when the re-listing of `a` is scheduled against `y`'s listing.
+ */
+export async function mcpAgentBesideCoroutine(prompt: string): Promise<string> {
+  const client = (server: string): TemporalMCPClient =>
+    new TemporalMCPClient({ server, activityOptions: { startToCloseTimeout: '10 seconds' } });
+  const agent = new TemporalAgent({ model: 'first', printer: false, tools: [client('a'), client('b')] });
+  let side: Promise<void> | undefined;
+  agent.addHook(AfterToolsEvent, () => {
+    side ??= (async () => {
+      await client('z').listTools();
+      await null;
+      await null;
+      await client('y').listTools();
+    })();
+  });
+  const result = await agent.invoke(prompt);
+  await side;
+  return String(result);
+}
+
+const noteTool = tool({
+  name: 'take_note',
+  description: 'Take a note',
+  inputSchema: z.object({}),
+  callback: () => 'noted',
+});
 
 const echoTool = tool({
   name: 'echo',
@@ -324,4 +543,26 @@ export async function streamingAgent(prompt: string): Promise<string> {
   });
   const result = await agent.invoke(prompt);
   return result.toString();
+}
+
+/**
+ * Streams one model call whose activity heartbeats and waits for its cancellation to complete, so
+ * a workflow cancel reaches the model call and the workflow ends with the activity's result.
+ */
+export async function cancellableModelCall(streaming: boolean): Promise<string[]> {
+  if (streaming) void new WorkflowStream();
+  const model = new TemporalModel({
+    modelName: 'test',
+    streamingTopic: streaming ? 'model' : undefined,
+    activityOptions: {
+      startToCloseTimeout: '30 seconds',
+      heartbeatTimeout: '5 seconds',
+      cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+    },
+  });
+  const types: string[] = [];
+  for await (const event of model.stream([])) {
+    types.push(event.type);
+  }
+  return types;
 }

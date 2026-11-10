@@ -10,4 +10,4 @@ maturity = "generally-available"
 docs = "https://github.com/temporalio/ai-integrations/blob/main/go/googleadk/README.md"
 
 [ci]
-runtime-versions = ["1.26.6", "1.27"]
+runtime-versions = ["1.26.10", "1.27"]

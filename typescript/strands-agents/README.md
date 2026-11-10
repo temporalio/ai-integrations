@@ -93,6 +93,14 @@ Each `TemporalAgent` carries its own activity options (timeouts, retry policy, t
 
 Before its first model call, each `TemporalAgent` reads the model's `modelId` and `contextWindowLimit` from its `getConfig()` through the `strandsGetModelConfig` activity, with the agent's activity options. Strands' traces and [proactive compression](https://strandsagents.com/docs/user-guide/sdk/agents/conversation-management/#proactive-context-compression) then use the real model's values, as they do outside Temporal. If you scaled `compressionThreshold` by the model's window divided by 200,000 to make up for the missing limit, remove that scaling.
 
+A worker model that keeps the conversation server-side, such as `OpenAIModel` with `stateful: true`, gets the agent's `modelState`, such as the last response id, on each model call through `TemporalAgent`, and the agent clears its messages after each turn, as natively. As in Strands, such an agent cannot use a `conversationManager` or `contextManager`; because `TemporalAgent` learns that the model is stateful when it reads the config, it throws at the agent's first invocation instead of at construction. Catch that error, or the workflow task fails and is retried until you remove the manager and redeploy the worker. With no manager given, such an agent keeps Strands' default sliding window manager, which Strands picks before the agent reads the config, where natively it would use `NullConversationManager`. Through the plugin that manager has nothing to trim: the agent clears its messages after each turn, before the manager runs, and a context window overflow reaches the agent as a model error. A custom model that reports `stateful` but does not use `modelState` ran statelessly through earlier versions, with the agent keeping its messages; it now gets only each turn's new message, and an agent that gives it a manager now throws. Report `stateful` as false for such a model to keep the earlier behavior.
+
+`OpenAIModel` calls through `TemporalAgent`, stateful or not, work with current `@strands-agents/sdk` releases because the model activities give the model their own cancellation signal (see [Cancellation](#cancellation)). Earlier versions of this plugin passed the agent's signal, which reached the model activity as a plain object, so from `@strands-agents/sdk` 1.15.0 the OpenAI client failed with `signal.addEventListener is not a function` before it sent a request. During a rollout, such calls on a worker without this change fail and are retried until an upgraded worker takes them.
+
+Stateful model calls run as their own activities, `strandsInvokeStatefulModel` and `strandsInvokeStatefulModelStreaming`, chosen from the stateful flag that `strandsGetModelConfig` returns, so a run that uses a stateful model needs the workflow and the config activity from the same version. An earlier workflow that reads this version's config schedules `invokeModel`, and this version then fails to replay the run with a nondeterminism error. This version's workflow that reads an earlier config, which has no flag, keeps the stateless path for the rest of the run, and an upgraded worker fails each of its model calls with a non-retryable `StatefulModelOnStatelessPath` error. Changing a worker model between stateful and stateless, such as adding `stateful: true` to a deployed `OpenAIModel`, also applies only to new runs: an open run keeps the mode its config read recorded, and its model calls fail with `StatefulModelOnStatelessPath`, or with `StatelessModelOnStatefulPath` when the model became stateless. None of these runs recovers. The agent's `invoke()` throws an `ActivityFailure` whose cause has that type, so unless the workflow catches it, the run fails; reset a run you want to continue. Roll out with Worker Versioning, keeping each run's workflow and activity workers on one version, including any task queue set in `activityOptions`. Without it, stop the runs that use a stateful model, replace every worker on those task queues, and then start new runs.
+
+The plugin's activities are named `invokeModel`, `invokeModelStreaming`, `strandsGetModelConfig`, `strandsInvokeStatefulModel`, `strandsInvokeStatefulModelStreaming`, and `{name}-listTools` and `{name}-callTool` for each MCP client. A different activity with one of these names (your own activity, another integration's activity, or one from another `StrandsPlugin` that is not the same) fails with `Duplicate registration of Activity '<name>'`. If it is registered before `StrandsPlugin` (in the worker's `activities` or by an earlier plugin), creating the worker fails. If a plugin applied after `StrandsPlugin` replaces one, `worker.run()` fails before the worker polls. `Worker.create` applies the worker's `plugins` in order, then the `NativeConnection`'s. Rename your activity, run the other integration on its own worker and task queue, or put every model and MCP client in one `StrandsPlugin`. The same instance on the `NativeConnection` and the worker still works. Two instances count as the same only when they share the `models` object (or both omit it) and, for each MCP server name they share, the same factory function and idle timeout, as when both are built from one options object. Two equal object literals are refused.
+
 ## Retries
 
 `TemporalAgent` disables Strands' built-in `ModelRetryStrategy` so retries are handled exclusively by Temporal. Configure retries via `activityOptions.retry` on `TemporalAgent`, and on the activity options accepted by `workflow.activityAsTool`, `workflow.activityAsHook`, and `TemporalMCPClient`:
@@ -119,6 +127,24 @@ A model activity that fails for good, times out or is cancelled ends the turn wi
 Workflow code that catches these errors around `invoke()` by class sees the `ApplicationFailure` or `ActivityFailure` instead: match on the failure's `type`, or read the original error from its `cause`. Your own activity interceptors, and those of plugins listed before `StrandsPlugin`, run outside the plugin's and see the `ApplicationFailure`; those of plugins listed after it run inside and see the original error.
 
 If your worker lists one of these errors in `workflowFailureErrorTypes`, the run used to fail with a retryable failure, so a workflow retry policy started another run. The plugin's failure is non-retryable, so that run is no longer retried.
+
+## Cancellation
+
+The model gets the model activity's cancellation signal as `cancelSignal`. Once the worker learns that the activity was cancelled, the signal is aborted. Only a model that passes `cancelSignal` to its client stops the call; the model activity then ends as cancelled. In `@strands-agents/sdk` 1.19.0, `OpenAIModel` and `BedrockModel` do this, but `AnthropicModel`, `GoogleModel` and `VercelModel` ignore `cancelSignal`. With a model that ignores it, the provider call keeps running after cancellation, and the activity can still complete with the model's result. The worker learns of the cancellation through the activity's heartbeats, which the model activities send only when `activityOptions.heartbeatTimeout` is set. Without a `heartbeatTimeout`, the model call runs to completion after its activity is cancelled. `agent.cancel()` in workflow code does not cancel the model activity.
+
+Through `TemporalAgent`, cancelling the workflow during a model call cancels the model activity. With the default `TRY_CANCEL` cancellation type, the workflow does not wait for the activity: the run is cancelled at once (see [Retries](#retries)), and the model call is aborted once the worker learns of the cancellation. With `WAIT_CANCELLATION_COMPLETED`, the workflow waits for the model activity to end. If it ends as cancelled, so does the run. If it completes instead, as it can with a model that ignores `cancelSignal` or without a `heartbeatTimeout`, the agent gets the model's result and the turn carries on, so the run can complete normally rather than as cancelled:
+
+```ts
+import { ActivityCancellationType } from '@temporalio/workflow';
+
+new TemporalAgent({
+  activityOptions: {
+    startToCloseTimeout: '60 seconds',
+    heartbeatTimeout: '10 seconds',
+    cancellationType: ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+  },
+});
+```
 
 ## Snapshots
 
@@ -242,24 +268,26 @@ The plugin keeps the failure converter your client and worker set with `dataConv
 
 ## Continue-as-new
 
-A chat-style workflow accumulates history with every turn and will eventually hit Temporal's per-workflow history limit. `workflowInfo().continueAsNewSuggested` flips true once the server decides history has grown large enough; check it after each turn and hand off to a fresh run, carrying `agent.messages` as input:
+A chat-style workflow accumulates history with every turn and will eventually hit Temporal's per-workflow history limit. `workflowInfo().continueAsNewSuggested` flips true once the server decides history has grown large enough; check it after each turn and hand off to a fresh run, carrying `agent.messages` and `agent.modelState` as input. A stateful model clears the messages after each turn and keeps its context in the model state, such as the last response id; a run that carries only the messages starts the model's conversation over:
 
 ```ts
 import { defineSignal, setHandler, condition, continueAsNew, workflowInfo } from '@temporalio/workflow';
 import { TemporalAgent } from '@temporalio/strands-agents';
-import type { Message } from '@strands-agents/sdk';
+import type { JSONValue, Message } from '@strands-agents/sdk';
 
 export const userSays = defineSignal<[string]>('userSays');
 export const endChat = defineSignal('endChat');
 
 export interface ChatInput {
   messages?: Message[];
+  modelState?: Record<string, JSONValue>;
 }
 
 export async function chatWorkflow(input: ChatInput = {}): Promise<void> {
   const agent = new TemporalAgent({
     activityOptions: { startToCloseTimeout: '60 seconds' },
     messages: input.messages,
+    modelState: input.modelState,
   });
 
   const pending: string[] = [];
@@ -272,7 +300,7 @@ export async function chatWorkflow(input: ChatInput = {}): Promise<void> {
     if (done) return;
     await agent.invoke(pending.shift()!);
     if (workflowInfo().continueAsNewSuggested) {
-      await continueAsNew<typeof chatWorkflow>({ messages: agent.messages });
+      await continueAsNew<typeof chatWorkflow>({ messages: agent.messages, modelState: agent.modelState.getAll() });
     }
   }
 }
@@ -314,6 +342,17 @@ new Worker({
 
 Each factory returns a fully configured `McpClient`. The connection is opened lazily on first use rather than at worker startup.
 
+`TemporalMCPClient` takes `prefix` and `toolFilters`, which work as on Strands' `McpClient`: the agent sees `{prefix}_{name}`, and string and `RegExp` filters match the server's tool name. A callback filter receives the workflow-side `TemporalMCPTool` and runs in the workflow, so it must be deterministic. Tool calls send the server's own name. Set `prefix` here, not on the factory's `McpClient`: a factory `McpClient` with a `prefix` fails the `{name}-listTools` activity, which is retried until the worker is fixed. The factory's `toolFilters` still apply on the worker, before these. Each listing records the tools that the factory's `McpClient` returns in the workflow history, before these filters apply; for a server with many tools, filter on the factory or set `cacheTools: true`.
+
+```ts
+const github = new TemporalMCPClient({
+  server: 'github',
+  prefix: 'gh',
+  toolFilters: { allowed: ['search_issues', /get_/] },
+  activityOptions: { startToCloseTimeout: '30 seconds' },
+});
+```
+
 By default, `TemporalMCPClient` re-lists the server's tools (via `{name}-listTools`) on every agent turn, so an MCP server that is restarted or redeployed mid-workflow — with tools added, removed, or renamed — is picked up. To list the tools just once at the beginning of the workflow and reuse that schema for the workflow's lifetime (one fewer activity per turn), set `cacheTools: true`:
 
 ```ts
@@ -324,7 +363,9 @@ const echo = new TemporalMCPClient({
 });
 ```
 
-To amortize connection setup, the `{name}-listTools` and `{name}-callTool` activities share one worker-process MCP connection and reuse it across calls. The connection is disconnected after it sits idle for `mcpConnectionIdleTimeout` (default 5 minutes); the timer resets on every reuse. `mcpConnectionIdleTimeout` accepts a millisecond number or a duration string (e.g. `'30 seconds'`), like `startToCloseTimeout`:
+Tool names must be unique on one agent, as in Strands: two tools may not have the same name, or names that differ only by `-` or `_`. Strands refuses such a name when the agent first lists its MCP servers. After each tool round, the agent re-lists its `cacheTools: false` servers, checks their new listings against each other and against its other tools, and then applies them together, so a name can move from one server to another. When a re-listed server starts listing a name that another tool of the agent has, such as a tool of another server or a tool in `tools`, or lists a name twice or one that Strands rejects, the listing throws Strands' `ToolValidationError` and leaves the agent's tools as they were. Like other errors thrown in workflow code, it fails the workflow task on every attempt, until the run is reset or terminated. To fix it, set a `prefix` (or a different one) on one server's `TemporalMCPClient`, or drop the tool with its `toolFilters`. Both are workflow code, and they rename or drop that server's tools in every replay: an open run fails to replay if its model called such a tool, if its workflow code acted on one among the agent's tools, or if it met the error and went on. So deploy such a change with Worker Versioning, and reset a run that met the error to before the first listing that returned a tool the change renames or drops. Or, without changing workflow code, stop the server from listing the name, or drop the tool with the `toolFilters` of the `McpClient` that the server's factory returns. The round's listings are in the run's history, and the agent checks them only after the last one, so then reset the run to before that tool round's first `{name}-listTools` activity, or, if you changed a `cacheTools: true` server, to before its only listing. For a `cacheTools: false` server, a name is the server's from the listing that added its tool under it until a re-listing of that server drops the name: a tool you put under it is replaced at the next listing, and removed by the listing that drops the name. A `cacheTools: true` server is not listed again, so a tool you put under one of its names stays for the run.
+
+To amortize connection setup, the `{name}-listTools` and `{name}-callTool` activities share one MCP connection per server and reuse it across calls. Each `StrandsPlugin` instance has its own connections: workers that use the same instance (for example through the `NativeConnection`) share them, and another `StrandsPlugin` opens its own through its own factory, even for the same server name. The connection is disconnected after it sits idle for `mcpConnectionIdleTimeout` (default 5 minutes), and when the last worker using the plugin stops; a call still running keeps it open until it finishes. The idle timer resets on every reuse. `mcpConnectionIdleTimeout` accepts a millisecond number or a duration string (e.g. `'30 seconds'`), like `startToCloseTimeout`:
 
 ```ts
 new StrandsPlugin({
@@ -386,6 +427,7 @@ This version changes what workflow code does in the cases below, with no version
 - **Your failure converter.** Earlier versions replaced the failure converter your client and worker set with the plugin's, so workflow code now decodes the failures of earlier runs with yours. If yours decodes a failure into another error than the SDK's default converter and that changes which commands the workflow issues, the run fails to replay. If it only changes a value the workflow keeps or returns, the run replays without error and continues with the new value, so replay tests do not catch it.
 - **Errors from a turn.** Workflow code that catches errors from `invoke()` by class now gets an `ApplicationFailure` or `ActivityFailure` instead of the Strands error. If it acts on the difference, the run fails to replay.
 - **Context overflow.** A run whose workflow code caught a context overflow from the agent now trims and calls the model again on replay instead, and fails to replay.
+- **Duplicate MCP tool names.** When a re-listed server starts listing a name that another tool of the agent has, the listing now throws Strands' `ToolValidationError`, where earlier versions let the new tool replace the other one. A run in which that happened fails to replay after that tool round's last listing. A re-listed server that lists one name twice is now refused too, where earlier versions kept the later copy. For a name that differs from another tool's only by `-` or `_`, or that Strands rejects, earlier versions threw Strands' own error from that server's hook, after applying part of its listing and before listing the servers whose hooks came after it. Now every re-listed server lists first, and the refusal applies nothing; a `-`/`_` name that moves from one server to another is now accepted. So a run whose workflow code caught such an error and went on can fail to replay. The new tools of the re-listed servers are now applied together, once all of them have listed, and not at all if a listing fails; earlier versions applied each server's tools as soon as it listed. So workflow code that reads the agent's tools in between, or after catching a failed listing, can take another path. And a tool that workflow code put under the name of a server's tool is now removed by the listing in which that server drops the name, where earlier versions kept it. A run whose model or workflow code used that tool after that listing can fail to replay, though no names clashed.
 
 Let those runs finish before you upgrade, or keep them on the earlier version with Worker Versioning. The same applies to rolling back: a run that started on this version can fail to replay on an earlier one, so let it finish before you roll back.
 
@@ -395,3 +437,4 @@ Other changes when you upgrade:
 - Rebuild [pre-built workflow bundles](#pre-built-workflow-bundles) with this version.
 - `StrandsFailureConverter` is removed. Remove imports of it, and any `failureConverterPath` that points at `@temporalio/strands-agents/lib/failure-converter`.
 - The plugin no longer needs to be on the client, where it now does nothing, so you can remove it there.
+- A `prefix` on the `McpClient` that an `mcpClients` factory returns now fails the `{name}-listTools` activity, which is retried until it's removed. Set `prefix` on `TemporalMCPClient` instead. Earlier versions listed the prefixed names, but every call of those tools failed. A run that listed through such a factory has the prefixed names in its history, so it can fail to replay once the prefix moves to `TemporalMCPClient`.

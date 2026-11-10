@@ -16,20 +16,13 @@ reads the model's config with an activity before its first model call.
 """
 
 from datetime import timedelta
-from pathlib import Path
 
 from strands.types.exceptions import ContextWindowOverflowException
 
 from temporalio import workflow
-from temporalio.client import WorkflowHistory
 from temporalio.strands_agents import StrandsPlugin
 from temporalio.worker import Replayer
-
-_ESCAPING_HISTORY = (
-    Path(__file__).parent
-    / "histories"
-    / "legacy_overflow_escaping_workflow_task_failure.json"
-)
+from tests.common import load_history
 
 
 @workflow.defn(name="EscapingOverflowWorkflow")
@@ -45,8 +38,8 @@ class EscapingOverflowWorkflow:
 async def test_replays_history_of_overflow_escaping_workflow_code():
     # Recorded on 5e91c26, where the escaped exception failed the Workflow Task in a
     # loop. Registering it as a Workflow failure type does not change the commands.
-    history = WorkflowHistory.from_json(
-        "escaping-overflow", _ESCAPING_HISTORY.read_text()
+    history = load_history(
+        "legacy_overflow_escaping_workflow_task_failure", "escaping-overflow"
     )
     await Replayer(
         workflows=[EscapingOverflowWorkflow],

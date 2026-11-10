@@ -1,4 +1,5 @@
 import asyncio
+import importlib.metadata
 import socket
 import sys
 from collections.abc import AsyncGenerator, Callable
@@ -12,6 +13,7 @@ from uuid import uuid4
 # mcp_types through the sandbox, or this becomes a sandbox-local copy of the
 # class and the isinstance check in NativeMCPWorkflow fails.
 import mcp_types
+import pytest
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -19,11 +21,22 @@ from temporalio.mcp import TemporalMCPClient
 
 with workflow.unsafe.imports_passed_through():
     import uvicorn
-    from mcp import Client, StdioServerParameters, stdio_client
+    from mcp import Client, MCPError, StdioServerParameters, stdio_client
+    from mcp.server.lowlevel import Server
     from mcp.server.mcpserver import MCPServer
-    from mcp.types import TextContent, TextResourceContents
+    from mcp.types import (
+        INTERNAL_ERROR,
+        CallToolRequestParams,
+        CallToolResult,
+        ListToolsResult,
+        TextContent,
+        TextResourceContents,
+        Tool,
+    )
 
     from temporalio.client import Client as TemporalClient
+    from temporalio.client import WorkflowFailureError
+    from temporalio.exceptions import ActivityError, ApplicationError, RetryState
     from temporalio.mcp import MCPPlugin
     from temporalio.worker import Replayer
     from tests.helpers import new_worker
@@ -109,6 +122,23 @@ class TransportMCPWorkflow:
         return cast(TextContent, result.content[0]).text
 
 
+@workflow.defn
+class RetriedToolWorkflow:
+    @workflow.run
+    async def run(self, tool: str, factory_argument: str | None) -> str:
+        client = TemporalMCPClient(
+            "retries",
+            activity_config={
+                "retry_policy": RetryPolicy(
+                    initial_interval=timedelta(milliseconds=1), maximum_attempts=2
+                )
+            },
+            factory_argument=factory_argument,
+        )
+        result = await client.call_tool(tool, {})
+        return cast(TextContent, result.content[0]).text
+
+
 async def activity_names(handle: Any) -> list[str]:
     names: list[str] = []
     async for event in handle.fetch_history_events():
@@ -185,6 +215,61 @@ async def test_activity_config_keeps_default_timeout_only_when_needed(
                 # from schedule-to-close when the command leaves it unset).
                 assert schedule_to_close == timedelta(hours=1)
                 assert start_to_close != timedelta(minutes=1)
+
+
+# A retry can't fix a result the client rejects, so it gets one attempt. A
+# server error gets another.
+@pytest.mark.parametrize("factory_argument", [None, "acme"])
+async def test_only_errors_a_retry_can_fix_are_retried(
+    client: TemporalClient, factory_argument: str | None
+) -> None:
+    calls: list[str] = []
+
+    async def list_tools(_ctx: Any, _params: Any) -> ListToolsResult:
+        return ListToolsResult(
+            tools=[
+                Tool(
+                    name="rejected",
+                    input_schema={"type": "object"},
+                    output_schema={"type": "object"},
+                ),
+                Tool(name="flaky", input_schema={"type": "object"}),
+            ]
+        )
+
+    async def call_tool(_ctx: Any, params: CallToolRequestParams) -> CallToolResult:
+        calls.append(params.name)
+        if calls == ["rejected", "flaky"]:
+            raise MCPError(INTERNAL_ERROR, "try again")
+        # No structured content, so the client rejects "rejected"'s result.
+        return CallToolResult(content=[TextContent(text=params.name)])
+
+    server = Server("retries", on_list_tools=list_tools, on_call_tool=call_tool)
+    plugin = MCPPlugin({"retries": lambda _argument: Client(server)})
+    async with new_worker(client, RetriedToolWorkflow, plugins=[plugin]) as worker:
+        with pytest.raises(WorkflowFailureError) as err:
+            await client.execute_workflow(
+                RetriedToolWorkflow.run,
+                args=["rejected", factory_argument],
+                id=f"mcp-rejected-{uuid4()}",
+                task_queue=worker.task_queue,
+            )
+        assert (
+            await client.execute_workflow(
+                RetriedToolWorkflow.run,
+                args=["flaky", factory_argument],
+                id=f"mcp-flaky-{uuid4()}",
+                task_queue=worker.task_queue,
+            )
+            == "flaky"
+        )
+
+    assert calls == ["rejected", "flaky", "flaky"]
+    activity_error = err.value.cause
+    assert isinstance(activity_error, ActivityError)
+    assert activity_error.retry_state == RetryState.NON_RETRYABLE_FAILURE
+    assert isinstance(activity_error.cause, ApplicationError)
+    assert activity_error.cause.type == "MCPProtocolError"
 
 
 async def activity_timeouts(
@@ -280,3 +365,7 @@ async def streamable_http_server() -> AsyncGenerator[str, None]:
 async def test_streamable_http_transport(client: TemporalClient) -> None:
     async with streamable_http_server() as url:
         await run_transport_workflow(client, "http", lambda: Client(url))
+
+
+def test_plugin_reports_package_version() -> None:
+    assert MCPPlugin({}).version() == importlib.metadata.version("temporalio-mcp")

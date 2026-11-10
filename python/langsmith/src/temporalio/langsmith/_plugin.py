@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib.metadata
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import langchain_core.env
 import langsmith
 
 # langsmith conditionally imports langchain_core when it is installed.
@@ -36,6 +38,7 @@ class LangSmithPlugin(SimplePlugin):
         *,
         client: langsmith.Client | None = None,
         project_name: str | None = None,
+        address: str | None = None,
         add_temporal_runs: bool = False,
         default_metadata: dict[str, Any] | None = None,
         default_tags: list[str] | None = None,
@@ -48,6 +51,9 @@ class LangSmithPlugin(SimplePlugin):
             project_name: Fallback LangSmith project name for traces with no
                 parent. Temporal runs inherit their parent's destination when
                 present. When unset, root runs use LangSmith's environment defaults.
+            address: Fallback LangSmith agent/environment address for traces with
+                no parent, mutually exclusive with project_name. Requires LangSmith
+                0.14.4 or later.
             add_temporal_runs: Whether to create LangSmith runs for Temporal
                 operations. Defaults to False.
             default_metadata: Default metadata to attach to all runs.
@@ -56,6 +62,7 @@ class LangSmithPlugin(SimplePlugin):
         interceptor = LangSmithInterceptor(
             client=client,
             project_name=project_name,
+            address=address,
             add_temporal_runs=add_temporal_runs,
             default_metadata=default_metadata,
             default_tags=default_tags,
@@ -66,6 +73,9 @@ class LangSmithPlugin(SimplePlugin):
             if not runner:
                 raise ValueError("No WorkflowRunner provided to the LangSmith plugin.")
             if isinstance(runner, SandboxedWorkflowRunner):
+                # LangChain's first trace reads the platform, which can start a
+                # subprocess the sandbox blocks. Read and cache it now.
+                langchain_core.env.get_runtime_environment()
                 return dataclasses.replace(
                     runner,
                     restrictions=runner.restrictions.with_passthrough_modules(
@@ -89,3 +99,10 @@ class LangSmithPlugin(SimplePlugin):
             workflow_runner=workflow_runner,
             run_context=run_context,
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-langsmith")
+        except importlib.metadata.PackageNotFoundError:
+            return ""

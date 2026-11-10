@@ -1,5 +1,6 @@
 import zlib
 from collections.abc import Sequence
+from pathlib import Path
 
 from temporalio.api.common.v1 import Payload
 from temporalio.api.enums.v1 import EventType
@@ -13,6 +14,12 @@ def get_activities(history: WorkflowHistory) -> list[str]:
         for event in history.events
         if event.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED
     ]
+
+
+def load_history(name: str, workflow_id: str = "legacy-replay") -> WorkflowHistory:
+    """Load the recorded history ``tests/histories/<name>.json``."""
+    path = Path(__file__).parent / "histories" / f"{name}.json"
+    return WorkflowHistory.from_json(workflow_id, path.read_text())
 
 
 class CompressionCodec(PayloadCodec):
