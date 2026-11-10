@@ -2,12 +2,20 @@
 // `ai` is deliberately imported before the workflow entry point: the bundle for these tests is
 // built through AiSdkPlugin, whose `configureBundler` prepends the polyfill installer to the
 // webpack entry, so import order must not matter.
-import { embedMany, generateText, isStepCount, Output, tool, wrapLanguageModel } from 'ai';
+import {
+  embedMany,
+  generateText,
+  isStepCount,
+  Output,
+  streamText,
+  tool,
+  wrapLanguageModel,
+} from 'ai';
 import type { LanguageModelMiddleware } from 'ai';
 import type { LanguageModelV4StreamPart } from '@ai-sdk/provider';
 import { OpenTelemetry } from '@ai-sdk/otel';
 import { z } from 'zod/v3';
-import { proxyActivities } from '@temporalio/workflow';
+import { defineSignal, proxyActivities, setHandler } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import {
   TemporalEmbeddingModel,
@@ -338,4 +346,58 @@ export async function slowModelWorkflow(
   let count = 0;
   while (!(await reader.read()).done) count++;
   return count;
+}
+
+export const abortRequest = defineSignal('abortRequest');
+
+function describeError(err: unknown): string {
+  return `${(err as Error).name}|${err instanceof Error}`;
+}
+
+// A short heartbeat timeout lets the Activity learn about cancellation quickly.
+const abortTestProvider = new TemporalProvider({
+  languageModel: { heartbeatTimeout: '2 seconds' },
+  embeddingModel: { heartbeatTimeout: '2 seconds' },
+});
+
+export async function abortableGenerateWorkflow(abortFirst: boolean): Promise<string> {
+  const controller = new AbortController();
+  if (abortFirst) controller.abort();
+  setHandler(abortRequest, () => controller.abort());
+  try {
+    const result = await generateText({
+      model: abortTestProvider.languageModel('gpt-4o-mini'),
+      prompt: 'hi',
+      abortSignal: controller.signal,
+    });
+    return `text:${result.text}`;
+  } catch (err) {
+    return `error:${describeError(err)}`;
+  }
+}
+
+export async function abortableEmbedWorkflow(): Promise<number> {
+  const result = await embedMany({
+    model: abortTestProvider.embeddingModel('text-embedding-3-small'),
+    values: ['a', 'b'],
+    abortSignal: new AbortController().signal,
+  });
+  return result.embeddings.length;
+}
+
+export async function abortableStreamWorkflow(): Promise<string[]> {
+  new WorkflowStream();
+  const controller = new AbortController();
+  setHandler(abortRequest, () => controller.abort());
+  const result = streamText({
+    model: new TemporalLanguageModel('streaming-test-model', {
+      streamingTopic: 'ai-sdk-abort-stream',
+      heartbeatTimeout: '2 seconds',
+    }),
+    prompt: 'hi',
+    abortSignal: controller.signal,
+  });
+  const types: string[] = [];
+  for await (const part of result.stream) types.push(part.type);
+  return types;
 }

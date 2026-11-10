@@ -296,7 +296,9 @@ export function createActivities(
       using _heartbeat = heartbeatUntilDisposed();
       const model = provider.languageModel(args.modelId);
       await prepareFileUrls(args.options, model, download);
-      const result = await callProvider(() => model.doGenerate(args.options));
+      const result = await callProvider(() =>
+        model.doGenerate({ ...args.options, abortSignal: Context.current().cancellationSignal })
+      );
       return encodeResultFileData({
         ...result,
         request: withoutBody(result.request),
@@ -324,7 +326,9 @@ export function createActivities(
 
       const model = provider.languageModel(args.modelId);
       await prepareFileUrls(args.options, model, download);
-      const streamResult = await callProvider(() => model.doStream(args.options));
+      const streamResult = await callProvider(() =>
+        model.doStream({ ...args.options, abortSignal: Context.current().cancellationSignal })
+      );
 
       const content: LanguageModelV4Content[] = [];
       let finishReason: LanguageModelV4FinishReason = { unified: 'other', raw: undefined };
@@ -474,6 +478,7 @@ export function createActivities(
           values: args.values,
           providerOptions: args.providerOptions,
           headers: args.headers,
+          abortSignal: Context.current().cancellationSignal,
         })
       );
       return { ...result, response: withoutBody(result.response) };

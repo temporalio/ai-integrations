@@ -142,4 +142,16 @@ counts do not match. For those calls, split the values in the Workflow and call
 const provider = new TemporalProvider({ embeddingModel: { maxEmbeddingsPerCall: 32 } });
 ```
 
+## Abort signals and timeouts
+
+An `abortSignal` passed to `generateText`, `streamText` or `embedMany` stays in
+the Workflow. When it aborts, the plugin cancels the model Activity and the call
+rejects with the signal's reason. An already aborted signal schedules no
+Activity. The Activity passes its own cancellation signal to the model, but a
+running Activity learns about cancellation only through heartbeats. The AI SDK
+`timeout` option does not work in the Workflow sandbox. A number or `totalMs`
+fails with `AbortSignal is not defined`, and `stepMs` fails with
+`DOMException is not defined` when its timer fires. Use the Activity
+`startToCloseTimeout` instead.
+
 Development details are in [typescript/README.md](../README.md).
