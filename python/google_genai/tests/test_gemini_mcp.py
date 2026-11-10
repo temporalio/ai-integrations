@@ -535,7 +535,9 @@ async def test_mcp_protocol_error_retryability(
 
         err: Exception = MCPError(code, message, data)
     except ImportError:  # mcp<2
-        from mcp.shared.exceptions import McpError
+        from mcp.shared.exceptions import (  # type: ignore[attr-defined]
+            McpError,  # pyright: ignore[reportAttributeAccessIssue]
+        )
 
         err = McpError(ErrorData(code=code, message=message, data=data))
     factory = _failing_factory(err)
@@ -551,5 +553,27 @@ async def test_mcp_protocol_error_retryability(
         await call
     assert exc_info.value.non_retryable is non_retryable
     assert exc_info.value.type == "MCPProtocolError"
+    assert exc_info.value.details == ((code,) if data is None else (code, data))
+    assert exc_info.value.__cause__ is err
     # The broken session is still evicted so the next call reconnects.
+    assert server not in _mcp._CONNECTIONS
+
+
+@pytest.mark.parametrize("operation", ["list-tools", "call-tool"])
+async def test_mcp_transport_error_evicts_connection(operation: str):
+    from temporalio.google_genai import _mcp
+    from temporalio.google_genai._models import _McpCallToolRequest
+
+    server = f"transport-err-{uuid4()}"
+    err = RuntimeError("Connection closed")
+    factory = _failing_factory(err)
+    if operation == "list-tools":
+        call = _mcp.build_list_tools_activity(server, factory)()
+    else:
+        call = _mcp.build_call_tool_activity(server, factory)(
+            _McpCallToolRequest(name="echo", arguments={})
+        )
+    with pytest.raises(RuntimeError) as exc_info:
+        await call
+    assert exc_info.value is err
     assert server not in _mcp._CONNECTIONS
