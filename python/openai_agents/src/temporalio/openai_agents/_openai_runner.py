@@ -296,6 +296,8 @@ def _has_sandbox_agent(agent: Agent[Any], seen: set[int] | None = None) -> bool:
 # ``RunConfig.model_provider``. They keep the old behavior, the Worker's provider, so that
 # they replay.
 _REFUSE_RUN_MODEL_PROVIDER_PATCH = "openai_agents.refuse-run-model-provider"
+# Runs started without it keep running on copies of the agents, so their histories replay.
+_RUN_CALLER_AGENTS_PATCH = "openai_agents.run-caller-agents"
 
 
 def _is_default_model_provider(provider: ModelProvider) -> bool:
@@ -368,6 +370,25 @@ class TemporalOpenAIRunner(AgentRunner):
         kwargs: RunOptions[TContext],
     ) -> tuple[Agent[Any], RunConfig]:
         """Workflow-only validation and ``kwargs`` rewrite shared by ``run()`` and ``run_streamed()``."""
+        # Refuse a Model object up front for every agent reachable through public fields.
+        # Agents behind handoff(), as_tool() or a custom on_invoke_handoff are only
+        # reachable through private SDK fields, so the call_model_input_filter refuses
+        # them just before their model call instead.
+        pending: list[Agent[Any]] = [starting_agent]
+        checked: set[int] = set()
+        while pending:
+            agent = pending.pop()
+            if id(agent) in checked:
+                continue
+            checked.add(id(agent))
+            if agent.model is not None and not isinstance(
+                agent.model, (str, _TemporalModelStub)
+            ):
+                raise ValueError(
+                    "Temporal workflows require a model name to be a string in the agent."
+                )
+            pending.extend(h for h in agent.handoffs if isinstance(h, Agent))
+
         for t in starting_agent.tools:
             if callable(t):
                 raise ValueError(
@@ -409,16 +430,11 @@ class TemporalOpenAIRunner(AgentRunner):
             RunConfig() if run_config is None else _coerce_run_config(run_config)
         )
 
-        if run_config.model and not isinstance(run_config.model, _TemporalModelStub):
-            if not isinstance(run_config.model, str):
-                raise ValueError(
-                    "Temporal workflows require a model name to be a string in the run config."
-                )
-            run_config = dataclasses.replace(
-                run_config,
-                model=_TemporalModelStub(
-                    run_config.model, model_params=self.model_params, agent=None
-                ),
+        # The plugin's model provider turns the name into the model Activity. Keeping the
+        # name lets the SDK apply that model's default settings, as it does natively.
+        if run_config.model and not isinstance(run_config.model, str):
+            raise ValueError(
+                "Temporal workflows require a model name to be a string in the run config."
             )
 
         # Model calls run in an Activity on the Worker's provider, so a provider set on the
@@ -472,7 +488,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         kwargs["run_config"] = run_config
-        return _convert_agent(self.model_params, starting_agent, None), run_config
+        if not workflow.patched(_RUN_CALLER_AGENTS_PATCH):
+            return _convert_agent(self.model_params, starting_agent, None), run_config
+        return starting_agent, run_config
 
     async def run(
         self,
@@ -488,7 +506,7 @@ class TemporalOpenAIRunner(AgentRunner):
                 **kwargs,
             )
 
-        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        starting_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
         run = _AgentRun()
         parent = _current_agent_run.get()
@@ -498,7 +516,7 @@ class TemporalOpenAIRunner(AgentRunner):
         with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             try:
                 return await self._runner.run(
-                    starting_agent=converted_agent,
+                    starting_agent=starting_agent,
                     input=input,
                     **kwargs,
                 )
@@ -582,13 +600,13 @@ class TemporalOpenAIRunner(AgentRunner):
                 "heartbeats or the workflow stream signal channel)."
             )
 
-        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        starting_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
         with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             streamed_result = self._runner.run_streamed(
-                starting_agent=converted_agent,
+                starting_agent=starting_agent,
                 input=input,
                 **kwargs,
             )
