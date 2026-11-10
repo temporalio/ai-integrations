@@ -85,7 +85,11 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 
 ## Plugin behavior
 
-- Match the upstream framework's behavior wherever Temporal allows it: what its code does and its tests pin, even where its docs say otherwise. Don't keep or add a plugin-specific rule that departs from it, and say in the PR when upstream's docs contradict its code.
+- Match the behavior of the framework a plugin is named for, in existing plugin code as well as new. Each plugin follows its own framework, so sibling plugins in other languages may differ. "Behavior" means what the framework's code does at run time in the releases the plugin supports, not upstream `main`; its tests are evidence of that behavior. Where its docs or type comments say otherwise, follow the code, link or open an upstream issue, and say so in the PR.
+- Depart from the framework only where Temporal requires it: replay must be deterministic, Temporal owns retries, and Event History is the only state store and must hold no secrets. Refusing an upstream option for one of these reasons is not a departure. When a plugin can't support an upstream behavior, fail with a clear error when the run starts instead of ignoring it, unless the README documents a replay-safe substitute.
+- A workaround for a linked upstream bug is not a departure. Remove it once the fix is in the supported release range.
+- Run the framework's own code and hook in through its extension points. Don't copy its objects or depend on their private fields; copies drift from upstream.
+- A behavior change that can alter recorded histories must be gated with a patch, or called out as breaking in the PR with guidance for in-flight runs. This takes precedence over the rules above.
 
 ## Python conventions
 
