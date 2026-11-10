@@ -13,6 +13,7 @@ import {
   TemporalEmbeddingModel,
   TemporalLanguageModel,
   TemporalMCPClient,
+  TemporalProvider,
   temporalProvider,
 } from '../../workflow';
 import type * as activities from '../activities/ai-sdk';
@@ -281,6 +282,15 @@ export async function embeddingWorkflow(
     dimensions: result.embeddings[0]?.length ?? 0,
     totalTokens: result.usage?.tokens,
   };
+}
+
+export async function chunkedEmbeddingWorkflow(
+  values: string[],
+  maxEmbeddingsPerCall?: number
+): Promise<number[][]> {
+  const provider = new TemporalProvider({ embeddingModel: { maxEmbeddingsPerCall } });
+  const result = await embedMany({ model: provider.embeddingModel('echo'), values });
+  return result.embeddings;
 }
 
 export async function streamingMetadataWorkflow(): Promise<LanguageModelV4StreamPart[]> {

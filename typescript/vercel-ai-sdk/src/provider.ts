@@ -59,7 +59,15 @@ export interface TemporalProviderOptions {
    * Activity options specific to embedding model calls.
    * Merged with default options, with these taking precedence.
    */
-  embeddingModel?: ActivityOptions;
+  embeddingModel?: ActivityOptions & {
+    /**
+     * Largest number of values that `embedMany` sends to one `invokeEmbeddingModel` Activity.
+     * When set, `embedMany` splits the values into chunks of this size and runs one Activity per
+     * chunk, in parallel up to its `maxParallelCalls`. Unset sends all values to one Activity.
+     * Changing it in a deployed Workflow needs Workflow versioning.
+     */
+    maxEmbeddingsPerCall?: number;
+  };
 }
 
 /**
@@ -183,9 +191,10 @@ export class TemporalEmbeddingModel implements EmbeddingModelV4 {
   readonly specificationVersion = 'v4';
   readonly provider = 'temporal';
   /**
-   * Undefined to let the underlying provider handle chunking, as it knows its own limits.
+   * The `maxEmbeddingsPerCall` provider option. Undefined unless set, so `embedMany` sends all
+   * values to one Activity.
    */
-  readonly maxEmbeddingsPerCall = undefined;
+  readonly maxEmbeddingsPerCall: number | undefined;
   /**
    * Indicates the underlying embedding model API can handle concurrent requests.
    * Set to true since we delegate to the actual provider which manages its own concurrency.
@@ -194,14 +203,17 @@ export class TemporalEmbeddingModel implements EmbeddingModelV4 {
 
   constructor(
     readonly modelId: string,
-    readonly options?: ActivityOptions
-  ) {}
+    readonly options?: ActivityOptions & { maxEmbeddingsPerCall?: number }
+  ) {
+    this.maxEmbeddingsPerCall = options?.maxEmbeddingsPerCall;
+  }
 
   async doEmbed(options: EmbeddingModelV4CallOptions): Promise<EmbeddingModelV4Result> {
+    const { maxEmbeddingsPerCall: _maxEmbeddingsPerCall, ...activityOptions } = this.options ?? {};
     const activities = workflow.proxyActivities({
       startToCloseTimeout: '10 minutes',
-      ...this.options,
-      heartbeatTimeout: this.options?.heartbeatTimeout ?? '10 seconds',
+      ...activityOptions,
+      heartbeatTimeout: activityOptions.heartbeatTimeout ?? '10 seconds',
     });
     const result = await activities.invokeEmbeddingModel!({
       modelId: this.modelId,

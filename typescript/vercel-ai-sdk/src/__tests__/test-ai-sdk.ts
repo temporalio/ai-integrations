@@ -71,6 +71,7 @@ import { AiSdkPlugin, createActivities } from '..';
 import { startLocalWithRetry } from './helpers/environment';
 import {
   binaryFileWorkflow,
+  chunkedEmbeddingWorkflow,
   embeddingWorkflow,
   experimentalDownloadWorkflow,
   fileUrlWorkflow,
@@ -998,6 +999,137 @@ test('invokeEmbeddingModel fails without retry on a non-retryable provider error
   t.true(err!.nonRetryable);
   t.is(err!.type, 'APICallError');
   t.true(APICallError.isInstance(err!.cause));
+});
+
+function activityResults(events: temporal.api.history.v1.IHistoryEvent[]): any[] {
+  return events
+    .filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED)
+    .map((e) => {
+      const data = e.activityTaskCompletedEventAttributes!.result!.payloads![0]!.data!;
+      return JSON.parse(Buffer.from(data).toString());
+    });
+}
+
+function* bodiesGenerator(prompt: string): Generator<ModelResponse> {
+  yield {
+    ...textResponse('Test Haiku'),
+    request: { body: { messages: [{ role: 'user', content: prompt }] } },
+    response: {
+      id: 'resp-1',
+      modelId: 'gpt-4o-mini',
+      timestamp: new Date('2026-01-01T00:00:00Z'),
+      headers: { 'x-request-id': 'req-1' },
+      body: { choices: [{ message: { content: 'Test Haiku' } }] },
+    },
+  };
+}
+
+test('invokeModel result in history has no request or response body', async (t) => {
+  const prompt = 'Tell me about recursion in programming.';
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: new TestProvider(bodiesGenerator(prompt)) })],
+  });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(helloWorldAgent, { args: [prompt] });
+    t.is(await handle.result(), 'Test Haiku');
+    const { events } = await handle.fetchHistory();
+    const [result] = activityResults(events!);
+
+    t.deepEqual(result.request, {});
+    t.deepEqual(result.response, {
+      id: 'resp-1',
+      modelId: 'gpt-4o-mini',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      headers: { 'x-request-id': 'req-1' },
+    });
+  });
+});
+
+function* embeddingBodyGenerator(): Generator<EmbeddingResponse> {
+  yield {
+    ...embeddingResponse(['Hello, world!', 'How are you?']),
+    response: { headers: { 'x-request-id': 'req-1' }, body: { data: 'raw embeddings' } },
+  };
+}
+
+test('invokeEmbeddingModel result in history has no response body', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [
+      new AiSdkPlugin({
+        modelProvider: new TestProvider(helloWorkflowGenerator(), embeddingBodyGenerator()),
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(embeddingWorkflow, {
+      args: [['Hello, world!', 'How are you?']],
+    });
+    t.is((await handle.result()).count, 2);
+    const { events } = await handle.fetchHistory();
+    const results = activityResults(events!);
+
+    // Without `maxEmbeddingsPerCall`, `embedMany` sends all values to one Activity.
+    t.is(results.length, 1);
+    t.deepEqual(results[0].response, { headers: { 'x-request-id': 'req-1' } });
+    t.is(results[0].embeddings.length, 2);
+  });
+});
+
+class EchoEmbeddingProvider implements ProviderV4 {
+  readonly specificationVersion = 'v4';
+
+  languageModel(_modelId: string): LanguageModelV4 {
+    throw new Error('Not implemented.');
+  }
+
+  embeddingModel(_modelId: string): EmbeddingModelV4 {
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'echo',
+      maxEmbeddingsPerCall: undefined,
+      supportsParallelCalls: true,
+      async doEmbed({ values }) {
+        return { embeddings: values.map((value) => [Number(value)]), warnings: [] };
+      },
+    };
+  }
+
+  imageModel(_modelId: string): ImageModelV4 {
+    throw new Error('Not implemented.');
+  }
+}
+
+function embeddingActivityInputs(events: temporal.api.history.v1.IHistoryEvent[]): string[][] {
+  return events
+    .filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED)
+    .map((e) => {
+      const data = e.activityTaskScheduledEventAttributes!.input!.payloads![0]!.data!;
+      return JSON.parse(Buffer.from(data).toString()).values;
+    });
+}
+
+test('maxEmbeddingsPerCall splits embedMany into one Activity per chunk', async (t) => {
+  const values = ['0', '1', '2', '3', '4'];
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: new EchoEmbeddingProvider() })],
+  });
+
+  await worker.runUntil(async () => {
+    const chunked = await startWorkflow(chunkedEmbeddingWorkflow, { args: [values, 2] });
+    t.deepEqual(await chunked.result(), [[0], [1], [2], [3], [4]]);
+    const chunkedInputs = embeddingActivityInputs((await chunked.fetchHistory()).events!);
+    t.deepEqual(chunkedInputs, [['0', '1'], ['2', '3'], ['4']]);
+
+    const unset = await startWorkflow(chunkedEmbeddingWorkflow, { args: [values] });
+    t.deepEqual(await unset.result(), [[0], [1], [2], [3], [4]]);
+    t.deepEqual(embeddingActivityInputs((await unset.fetchHistory()).events!), [values]);
+  });
 });
 
 test.serial('Telemetry', async (t) => {
