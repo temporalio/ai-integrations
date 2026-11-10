@@ -34,6 +34,14 @@ for model, tool, streaming and MCP configuration. That guide currently uses the
 SDK-owned `@temporalio/ai-sdk` name; this repository owns the new
 `@temporalio/vercel-ai-sdk` coordinate.
 
+Provider errors follow the AI SDK's own retry verdict. An `APICallError` with
+`isRetryable: false`, for example a 400 or 401 response, fails the model
+Activity with a non-retryable `ApplicationFailure` of type `AI_APICallError`,
+and Temporal does not retry it. The same applies to such an error in a streamed
+`error` part. The Workflow receives an `ActivityFailure` whose `cause` is that
+`ApplicationFailure`. Other errors, such as a 408, 409, 429 or 5xx response or
+a lost connection, are retried under the Activity's retry policy.
+
 The plugin registers Activities named `invokeModel`, `invokeModelStreaming` and
 `invokeEmbeddingModel`, plus `<server>-listTools` and `<server>-callTool` for
 each MCP server. A different Activity with one of these names now fails with

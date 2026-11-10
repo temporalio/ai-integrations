@@ -19,6 +19,7 @@ import type {
   LanguageModelV4Usage,
   ProviderV4,
 } from '@ai-sdk/provider';
+import { APICallError } from '@ai-sdk/provider';
 import { openai } from '@ai-sdk/openai';
 import type { TestFn } from 'ava';
 import { context, propagation, trace } from '@opentelemetry/api';
@@ -39,7 +40,8 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { createMCPClient } from '@ai-sdk/mcp';
 import { jsonSchema } from 'ai';
 import { temporal } from '@temporalio/proto';
-import { WorkflowClient } from '@temporalio/client';
+import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
+import { ActivityFailure, ApplicationFailure, TemporalFailure } from '@temporalio/common';
 import type { OpenTelemetrySinks } from '@temporalio/interceptors-opentelemetry';
 import {
   makeWorkflowExporter,
@@ -48,7 +50,7 @@ import {
   OpenTelemetryWorkflowClientCallsInterceptor,
   OpenTelemetryWorkflowClientInterceptor,
 } from '@temporalio/interceptors-opentelemetry';
-import { workflowInterceptorModules } from '@temporalio/testing';
+import { MockActivityEnvironment, workflowInterceptorModules } from '@temporalio/testing';
 import { SimplePlugin } from '@temporalio/plugin';
 import { bundleWorkflowCode, DefaultLogger, NativeConnection, Worker as CoreWorker } from '@temporalio/worker';
 import type { InjectedSinks, WorkerOptions } from '@temporalio/worker';
@@ -616,6 +618,138 @@ test('Embedding model generates embeddings', async (t) => {
     );
     t.assert(activityTypes.includes('invokeEmbeddingModel'), 'invokeEmbeddingModel activity should have been called');
   });
+});
+
+function apiCallError(statusCode: number, isRetryable: boolean): APICallError {
+  return new APICallError({
+    message: `Provider returned ${statusCode}`,
+    url: 'https://provider.invalid/v1/chat',
+    requestBodyValues: {},
+    statusCode,
+    isRetryable,
+  });
+}
+
+/** Throws the scripted errors in order, then answers with `response`. */
+class FailingProvider implements ProviderV4 {
+  readonly specificationVersion = 'v4';
+  calls = 0;
+
+  constructor(
+    private readonly errors: unknown[],
+    private readonly response: ModelResponse = textResponse('Recovered')
+  ) {}
+
+  private next(): void {
+    const error = this.errors[this.calls++];
+    if (error !== undefined) throw error;
+  }
+
+  languageModel(_modelId: string): LanguageModelV4 {
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'failing-test-model',
+      supportedUrls: {},
+      doGenerate: async (): Promise<LanguageModelV4GenerateResult> => {
+        this.next();
+        return this.response;
+      },
+      doStream: async (): Promise<LanguageModelV4StreamResult> => {
+        throw new Error('Streaming not supported.');
+      },
+    };
+  }
+
+  embeddingModel(_modelId: string): EmbeddingModelV4 {
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'failing-test-embedding-model',
+      maxEmbeddingsPerCall: undefined,
+      supportsParallelCalls: true,
+      doEmbed: async (): Promise<EmbeddingModelV4Result> => {
+        this.next();
+        return embeddingResponse(['unused']);
+      },
+    };
+  }
+
+  imageModel(_modelId: string): ImageModelV4 {
+    throw new Error('Not implemented.');
+  }
+}
+
+test('A non-retryable provider error fails the Workflow after one Activity attempt', async (t) => {
+  const provider = new FailingProvider([apiCallError(401, false)]);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(helloWorldAgent, {
+      args: ['hi'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    const activityFailure = err!.cause;
+    t.true(activityFailure instanceof ActivityFailure);
+    const failure = activityFailure!.cause;
+    if (!(failure instanceof ApplicationFailure)) {
+      t.fail(`Expected an ApplicationFailure, got ${failure}`);
+      return;
+    }
+    t.true(failure.nonRetryable);
+    t.is(failure.type, 'AI_APICallError');
+    t.is(failure.message, 'Provider returned 401');
+    t.true(failure.cause instanceof TemporalFailure);
+    t.is(failure.cause?.message, 'Provider returned 401');
+
+    const { events } = await handle.fetchHistory();
+    const failed = events?.filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED);
+    t.is(failed?.length, 1);
+  });
+  t.is(provider.calls, 1);
+});
+
+test('A retryable provider error is retried by the Activity retry policy', async (t) => {
+  const provider = new FailingProvider([apiCallError(503, true)]);
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(helloWorldAgent, {
+      args: ['hi'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    t.is(result, 'Recovered');
+  });
+  t.is(provider.calls, 2);
+});
+
+test('invokeEmbeddingModel fails without retry on a non-retryable provider error', async (t) => {
+  const activities = createActivities(new FailingProvider([apiCallError(400, false)])) as {
+    invokeEmbeddingModel: (args: { modelId: string; values: string[] }) => Promise<unknown>;
+  };
+  const env = new MockActivityEnvironment();
+  const err = await t.throwsAsync(
+    env.run(activities.invokeEmbeddingModel, { modelId: 'm', values: ['a'] }),
+    { instanceOf: ApplicationFailure }
+  );
+  t.true(err!.nonRetryable);
+  t.is(err!.type, 'AI_APICallError');
+  t.true(APICallError.isInstance(err!.cause));
+});
+
+test('invokeEmbeddingModel leaves a retryable provider error to the retry policy', async (t) => {
+  const error = apiCallError(429, true);
+  const activities = createActivities(new FailingProvider([error])) as {
+    invokeEmbeddingModel: (args: { modelId: string; values: string[] }) => Promise<unknown>;
+  };
+  const env = new MockActivityEnvironment();
+  const err = await t.throwsAsync(
+    env.run(activities.invokeEmbeddingModel, { modelId: 'm', values: ['a'] })
+  );
+  t.is(err, error);
 });
 
 test.serial('Telemetry', async (t) => {
