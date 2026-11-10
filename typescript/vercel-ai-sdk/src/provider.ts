@@ -76,8 +76,10 @@ export class TemporalLanguageModel implements LanguageModelV4 {
     this.streamingBatchInterval = options?.streamingBatchInterval;
   }
 
+  // The Workflow sandbox has no network. URL parts go to the model Activity, which downloads
+  // the ones the real model does not support.
   get supportedUrls(): Record<string, RegExp[]> {
-    return {};
+    return { '*': [/.*/] };
   }
 
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {

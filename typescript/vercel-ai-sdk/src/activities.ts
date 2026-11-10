@@ -4,7 +4,9 @@ import type {
   LanguageModelV4FinishReason,
   LanguageModelV4GenerateResult,
   LanguageModelV4Usage,
+  LanguageModelV4,
   EmbeddingModelV4Result,
+  SharedV4FileData,
   SharedV4ProviderMetadata,
   SharedV4ProviderOptions,
   SharedV4Headers,
@@ -12,7 +14,7 @@ import type {
   ProviderV4,
 } from '@ai-sdk/provider';
 import { APICallError, getErrorMessage } from '@ai-sdk/provider';
-import { asSchema, type Schema, type ToolExecutionOptions } from 'ai';
+import { asSchema, createDownload, type Schema, type ToolExecutionOptions } from 'ai';
 import type { MCPClient } from '@ai-sdk/mcp';
 import { ApplicationFailure } from '@temporalio/common';
 import { Context } from '@temporalio/activity';
@@ -133,6 +135,15 @@ export interface CreateActivitiesOptions {
    * don't tolerate a reused or concurrent session.
    */
   mcpConnectionIdleTimeout?: Duration;
+
+  /**
+   * Downloads a prompt file or image URL that the model does not support, before the
+   * model activity calls the model. Defaults to `createDownload()` from `ai`.
+   */
+  download?: (options: {
+    url: URL;
+    abortSignal?: AbortSignal;
+  }) => PromiseLike<{ data: Uint8Array; mediaType: string | undefined }>;
 }
 
 /**
@@ -270,10 +281,12 @@ export function createActivities(
   mcpClientFactories?: McpClientFactories,
   options?: CreateActivitiesOptions
 ): object {
+  const download = options?.download ?? createDownload();
   let activities = {
     async invokeModel(args: InvokeModelArgs): Promise<InvokeModelResult> {
       using _heartbeat = heartbeatUntilDisposed();
       const model = provider.languageModel(args.modelId);
+      await prepareFileUrls(args.options, model, download);
       return encodeResultFileData(await callProvider(() => model.doGenerate(args.options)));
     },
 
@@ -296,6 +309,7 @@ export function createActivities(
       const events = stream.topic(args.streamingTopic);
 
       const model = provider.languageModel(args.modelId);
+      await prepareFileUrls(args.options, model, download);
       const streamResult = await callProvider(() => model.doStream(args.options));
 
       const content: LanguageModelV4Content[] = [];
@@ -446,7 +460,7 @@ export function createActivities(
       );
     },
   };
-  withSources(activities, [provider]);
+  withSources(activities, [provider, options?.download]);
   if (mcpClientFactories !== undefined) {
     const idleMs = msOptionalToNumber(options?.mcpConnectionIdleTimeout) ?? MCP_CONNECTION_IDLE_MS;
     Object.entries(mcpClientFactories).forEach(([name, func]) => {
@@ -457,6 +471,89 @@ export function createActivities(
     });
   }
   return activities;
+}
+
+type PromptFilePart = { data: SharedV4FileData; mediaType: string };
+
+/**
+ * Restores `URL` objects in prompt file data, then downloads each URL the model does not
+ * support, in the prompt locations `generateText` downloads from.
+ */
+async function prepareFileUrls(
+  options: LanguageModelV4CallOptions,
+  model: LanguageModelV4,
+  download: NonNullable<CreateActivitiesOptions['download']>
+): Promise<void> {
+  const downloadable: { part: PromptFilePart; url: URL }[] = [];
+  const visit = (part: PromptFilePart, canDownload: boolean): void => {
+    if (part.data.type !== 'url') return;
+    // The JSON payload converter turns a `URL` into its `href` string.
+    const url = (part.data.url = new URL(part.data.url));
+    if (canDownload) downloadable.push({ part, url });
+  };
+  for (const message of options.prompt) {
+    if (message.role === 'system') continue;
+    for (const part of message.content) {
+      if (part.type === 'file') visit(part, message.role === 'user');
+      else if (part.type === 'reasoning-file') visit(part, false);
+      else if (part.type === 'tool-result' && part.output.type === 'content') {
+        for (const item of part.output.value) if (item.type === 'file') visit(item, true);
+      }
+    }
+  }
+  if (downloadable.length === 0) return;
+  const supportedUrls = await model.supportedUrls;
+  const abortSignal = Context.current().cancellationSignal;
+  await Promise.all(
+    downloadable
+      .filter(({ part, url }) => !isUrlSupported(part.mediaType, url.toString(), supportedUrls))
+      .map(async ({ part, url }) => {
+        const file = await download({ url, abortSignal });
+        part.data = { type: 'data', data: file.data };
+        if (file.mediaType != null && !isFullMediaType(part.mediaType)) {
+          part.mediaType = file.mediaType;
+        }
+      })
+  );
+}
+
+// Matches `isUrlSupported` in `@ai-sdk/provider-utils`, which this package does not depend on.
+function isUrlSupported(
+  mediaType: string,
+  url: string,
+  supportedUrls: Record<string, RegExp[]>
+): boolean {
+  const lowerUrl = url.toLowerCase();
+  const lowerMediaType = mediaType.toLowerCase();
+  const isTopLevelOnly = !lowerMediaType.includes('/');
+  return Object.entries(supportedUrls)
+    .filter(([key]) => {
+      const lowerKey = key.toLowerCase();
+      const prefix = lowerKey === '*' || lowerKey === '*/*' ? '' : lowerKey.replace(/\*/, '');
+      if (prefix === '') return true;
+      if (isTopLevelOnly) return `${lowerMediaType}/` === prefix;
+      return prefix.endsWith('/') ? lowerMediaType.startsWith(prefix) : lowerMediaType === prefix;
+    })
+    .flatMap(([, patterns]) => patterns)
+    .some((pattern) => testRegExpFromStart(pattern, lowerUrl));
+}
+
+function testRegExpFromStart(pattern: RegExp, value: string): boolean {
+  if (!pattern.global && !pattern.sticky) return pattern.test(value);
+  const lastIndex = pattern.lastIndex;
+  pattern.lastIndex = 0;
+  try {
+    return pattern.test(value);
+  } finally {
+    pattern.lastIndex = lastIndex;
+  }
+}
+
+function isFullMediaType(mediaType: string): boolean {
+  const slashIndex = mediaType.indexOf('/');
+  if (slashIndex === -1) return false;
+  const subtype = mediaType.substring(slashIndex + 1);
+  return subtype.length > 0 && subtype !== '*';
 }
 
 async function extractTools(mcpClient: MCPClient): Promise<Record<string, ListToolResult>> {

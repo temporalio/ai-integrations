@@ -102,6 +102,23 @@ export async function binaryFileWorkflow(bytes: number[]): Promise<number[]> {
   return Array.from(result.files[0]!.uint8Array);
 }
 
+export async function fileUrlWorkflow(baseUrl: string): Promise<string> {
+  const result = await generateText({
+    model: temporalProvider.languageModel('gpt-4o-mini'),
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Describe the image and the notes.' },
+          { type: 'image', image: new URL(`${baseUrl}/image`) },
+          { type: 'file', data: new URL(`${baseUrl}/notes`), mediaType: 'text/plain' },
+        ],
+      },
+    ],
+  });
+  return result.text;
+}
+
 export async function generateObjectWorkflow(): Promise<string> {
   const { output } = await generateText({
     model: temporalProvider.languageModel('gpt-4o-mini'),

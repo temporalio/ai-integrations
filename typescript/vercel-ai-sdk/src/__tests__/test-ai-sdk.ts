@@ -3,6 +3,8 @@
  */
 import { randomUUID } from 'crypto';
 import { readFileSync } from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import type {
   EmbeddingModelV4,
@@ -21,7 +23,7 @@ import type {
 } from '@ai-sdk/provider';
 import { APICallError } from '@ai-sdk/provider';
 import { openai } from '@ai-sdk/openai';
-import type { TestFn } from 'ava';
+import type { ExecutionContext, TestFn } from 'ava';
 import { context, propagation, trace } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { Resource } from '@opentelemetry/resources';
@@ -65,10 +67,12 @@ import {
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
 import { AiSdkPlugin, createActivities } from '..';
+import type { InvokeModelArgs, InvokeModelResult } from '..';
 import { startLocalWithRetry } from './helpers/environment';
 import {
   binaryFileWorkflow,
   embeddingWorkflow,
+  fileUrlWorkflow,
   generateObjectWorkflow,
   helloWorldAgent,
   imageToolWorkflow,
@@ -447,6 +451,134 @@ test('Binary file data reaches the model and the workflow as the same bytes', as
   const data = file?.data.type === 'data' ? file.data.data : undefined;
   t.is(typeof data, 'string');
   t.deepEqual([...Buffer.from(data as string, 'base64')], promptBytes);
+class RecordingProvider implements ProviderV4 {
+  readonly specificationVersion = 'v4';
+  readonly calls: LanguageModelV4CallOptions[] = [];
+
+  constructor(private readonly supportedUrls: Record<string, RegExp[]>) {}
+
+  languageModel(_modelId: string): LanguageModelV4 {
+    const { calls, supportedUrls } = this;
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'recording-test-model',
+      supportedUrls,
+      async doGenerate(options): Promise<LanguageModelV4GenerateResult> {
+        calls.push(options);
+        return textResponse('seen');
+      },
+      async doStream(): Promise<LanguageModelV4StreamResult> {
+        throw new Error('Streaming not supported.');
+      },
+    };
+  }
+
+  embeddingModel(_modelId: string): EmbeddingModelV4 {
+    throw new Error('Not implemented.');
+  }
+
+  imageModel(_modelId: string): ImageModelV4 {
+    throw new Error('Not implemented.');
+  }
+}
+
+const pngBytes = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5E' +
+    'rkJggg==',
+  'base64'
+);
+
+async function serveFiles(t: { teardown(fn: () => Promise<void>): void }) {
+  const requested: string[] = [];
+  const server = http.createServer((req, res) => {
+    requested.push(req.url ?? '');
+    if (req.url === '/image') {
+      res.writeHead(200, { 'content-type': 'image/png' }).end(pngBytes);
+    } else if (req.url === '/notes') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('some notes');
+    } else {
+      res.writeHead(404).end();
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.teardown(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  return { baseUrl, requested };
+}
+
+// The default `createDownload()` refuses private addresses such as 127.0.0.1.
+async function localDownload({ url, abortSignal }: { url: URL; abortSignal?: AbortSignal }) {
+  const response = await fetch(url, { signal: abortSignal });
+  const data = new Uint8Array(await response.arrayBuffer());
+  return { data, mediaType: response.headers.get('content-type') ?? undefined };
+}
+
+async function runFileUrlWorkflow(t: ExecutionContext<BaseContext>, provider: RecordingProvider) {
+  const server = await serveFiles(t);
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: provider, download: localDownload })],
+  });
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(fileUrlWorkflow, {
+      args: [server.baseUrl],
+      workflowExecutionTimeout: '10 seconds',
+    });
+    t.is(result, 'seen');
+  });
+  t.is(provider.calls.length, 1);
+  const [message] = provider.calls[0]!.prompt;
+  if (message?.role !== 'user') throw new Error('Expected a user message');
+  return { ...server, content: message.content };
+}
+
+test('Prompt file URLs the model does not support are downloaded in the activity', async (t) => {
+  const { content, requested } = await runFileUrlWorkflow(t, new RecordingProvider({}));
+
+  t.deepEqual(content.slice(1), [
+    {
+      type: 'file',
+      mediaType: 'image/png',
+      data: { type: 'data', data: new Uint8Array(pngBytes) },
+    },
+    {
+      type: 'file',
+      mediaType: 'text/plain',
+      data: { type: 'data', data: new TextEncoder().encode('some notes') },
+    },
+  ]);
+  t.deepEqual(requested.sort(), ['/image', '/notes']);
+});
+
+test('Prompt file URLs the model supports reach the model as URL objects', async (t) => {
+  const provider = new RecordingProvider({ 'image/*': [/^http:\/\/127\.0\.0\.1:/] });
+  const { content, requested, baseUrl } = await runFileUrlWorkflow(t, provider);
+
+  const [, image, notes] = content;
+  if (image?.type !== 'file' || image.data.type !== 'url') throw new Error('Expected a URL part');
+  t.true(image.data.url instanceof URL);
+  t.is(image.data.url.href, `${baseUrl}/image`);
+  t.is(image.mediaType, 'image');
+  t.like(notes, { mediaType: 'text/plain', data: { type: 'data' } });
+  t.deepEqual(requested, ['/notes']);
+});
+
+test('invokeModel downloads with createDownload by default', async (t) => {
+  const activities = createActivities(new RecordingProvider({})) as {
+    invokeModel: (args: InvokeModelArgs) => Promise<InvokeModelResult>;
+  };
+  const url = 'http://127.0.0.1:1/image';
+  const prompt = [
+    { role: 'user', content: [{ type: 'file', mediaType: 'image', data: { type: 'url', url } }] },
+  ];
+  await t.throwsAsync(
+    new MockActivityEnvironment().run(activities.invokeModel, {
+      modelId: 'recording-test-model',
+      options: { prompt } as unknown as LanguageModelV4CallOptions,
+    }),
+    { message: /127\.0\.0\.1 is not allowed/ }
+  );
 });
 
 test('Streaming text, finish and response metadata survive activity execution and workflow replay', async (t) => {
@@ -1241,6 +1373,8 @@ test('configureWorker refuses to replace a different Activity with the same name
   t.throws(() => otherProvider.configureWorker(withMcp), duplicate('invokeModel'));
   const otherFactory = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files: async () => ({}) as any } });
   t.throws(() => otherFactory.configureWorker(withMcp), duplicate('files-listTools'));
+  const otherDownload = new AiSdkPlugin({ modelProvider: provider, download: localDownload });
+  t.throws(() => otherDownload.configureWorker(withMcp), duplicate('invokeModel'));
   // Another operation built from the same provider, registered under this name.
   const aliased = { ...base, activities: { invokeModel: (createActivities(provider) as any).invokeEmbeddingModel } };
   t.throws(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(aliased), duplicate('invokeModel'));

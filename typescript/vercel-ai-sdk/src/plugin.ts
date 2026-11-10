@@ -3,6 +3,7 @@ import { SimplePlugin } from '@temporalio/plugin';
 import type { BundleOptions, Worker, WorkerOptions } from '@temporalio/worker';
 import type { Duration } from '@temporalio/common/lib/time';
 import { createActivities, _evictMcpConnectionsForServer } from './activities';
+import type { CreateActivitiesOptions } from './activities';
 import { refuseLaterReplacement, refuseReplacedActivities } from './activity-sources';
 import type { McpClientFactories } from './mcp';
 
@@ -27,6 +28,12 @@ export interface AiSdkPluginOptions {
    * for MCP servers/transports that don't tolerate a reused or concurrent session.
    */
   mcpConnectionIdleTimeout?: Duration;
+
+  /**
+   * Downloads a prompt file or image URL that the model does not support, before the
+   * model activity calls the model. Defaults to `createDownload()` from `ai`.
+   */
+  download?: CreateActivitiesOptions['download'];
 }
 
 /** Reads this package's version, which worker heartbeats report. Empty if it can't be read. */
@@ -56,6 +63,7 @@ export class AiSdkPlugin extends SimplePlugin {
       name: 'AiSDKPlugin',
       activities: createActivities(options.modelProvider, options.mcpClientFactories, {
         mcpConnectionIdleTimeout: options.mcpConnectionIdleTimeout,
+        download: options.download,
       }),
       runContext: async (next) => {
         try {
@@ -75,8 +83,8 @@ export class AiSdkPlugin extends SimplePlugin {
    *
    * @throws TypeError if the Worker already has a different Activity with one
    * of these names: a caller Activity, another integration's Activity, or an
-   * `AiSdkPlugin` with a different `modelProvider`, MCP client factory or
-   * `mcpConnectionIdleTimeout`.
+   * `AiSdkPlugin` with a different `modelProvider`, `download`, MCP client
+   * factory or `mcpConnectionIdleTimeout`.
    */
   override configureWorker(options: WorkerOptions): WorkerOptions {
     refuseReplacedActivities('AiSdkPlugin', options.activities, this.options.activities as object);
