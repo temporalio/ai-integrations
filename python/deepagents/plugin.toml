@@ -6,7 +6,7 @@ language = "python"
 coordinate = "temporalio-deepagents"
 registry = "pypi"
 root-api = "temporalio.deepagents"
-maturity = "pre-release"
+maturity = "public-preview"
 docs = "https://docs.temporal.io/develop/python/integrations/deepagents"
 
 [ci]

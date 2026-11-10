@@ -50,8 +50,6 @@ const ASYNC_HOOKS_MODULE = 'async_hooks';
  * never cross a Temporal boundary — supply a pre-constructed {@link Client}
  * (which reads `LANGSMITH_API_KEY` from the worker/client process env) or let
  * the plugin construct a default client from the environment.
- *
- * @experimental Plugins is an experimental feature; APIs may change without notice.
  */
 export interface LangSmithPluginOptions {
   /**
@@ -99,8 +97,6 @@ function packageVersion(): string {
  * const plugin = new LangSmithPlugin({ addTemporalRuns: true });
  * const worker = await Worker.create({ workflowsPath, taskQueue: 'tq', plugins: [plugin] });
  * ```
- *
- * @experimental Plugins is an experimental feature; APIs may change without notice.
  */
 export class LangSmithPlugin extends SimplePlugin {
   /** The package version, reported in worker heartbeats. */

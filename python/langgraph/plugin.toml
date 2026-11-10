@@ -6,7 +6,7 @@ language = "python"
 coordinate = "temporalio-langgraph"
 registry = "pypi"
 root-api = "temporalio.langgraph"
-maturity = "public-preview"
+maturity = "generally-available"
 docs = "https://docs.temporal.io/develop/python/integrations/langgraph"
 
 [ci]
