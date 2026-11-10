@@ -73,6 +73,7 @@ from agents import (
     trace,
 )
 from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
+from agents.function_schema import function_schema
 from agents.items import (
     HandoffOutputItem,
     ToolCallItem,
@@ -1009,6 +1010,17 @@ class ActivityWeatherReturnsOnlyClassDoc:
         return Weather(city=city, temperature_range="14-20C", conditions="Sunny")
 
 
+def _sdk_city_description(fn: Any) -> str | None:
+    """The description the Agents SDK reads for the ``city`` parameter of ``fn``.
+
+    openai-agents 0.24 reads an ``Args:``-only docstring as parameter descriptions.
+    Earlier versions read it as text and give none.
+    """
+    return (
+        function_schema(fn).params_json_schema["properties"]["city"].get("description")
+    )
+
+
 @pytest.mark.parametrize(
     "cls, description, city_description",
     [
@@ -1018,12 +1030,20 @@ class ActivityWeatherReturnsOnlyClassDoc:
             "Get the weather for a given city.",
             "Name of the city.",
         ),
-        # The Agents SDK reads a leading Google Args: section as text, not a summary.
-        (ActivityWeatherGoogleArgsCall, "Get the weather for a given city.", None),
+        # A __call__ docstring with only a Google Args: section has no summary either.
+        (
+            ActivityWeatherGoogleArgsCall,
+            "Get the weather for a given city.",
+            _sdk_city_description(ActivityWeatherGoogleArgsCall.__call__),
+        ),
         # A class docstring with only Args: has no summary either.
         (ActivityWeatherArgsOnlyClassDoc, "", "Name of the city."),
         # With no class summary to use instead, a section is no description.
-        (ActivityWeatherArgsOnlyCall, "", None),
+        (
+            ActivityWeatherArgsOnlyCall,
+            "",
+            _sdk_city_description(ActivityWeatherArgsOnlyCall.__call__),
+        ),
         (ActivityWeatherReturnsOnlyClassDoc, "", None),
         # A class docstring with only a section gives way to an inherited __call__ docstring.
         (
