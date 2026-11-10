@@ -189,6 +189,12 @@ _value_graph.add_edge(START, "fetch")
 
 
 @task
+async def take_then_fail(job_id: str) -> list[str]:
+    """Take a new value, then make a call that fails the first time."""
+    return [await _next(job_id), await _fail_first(f"{job_id}-f")]
+
+
+@task
 async def wait_then_subgraph(job_id: str, wait: bool) -> str:
     """Like ``wait_then_call``, but make the call through a subgraph."""
     await _wait(job_id, wait)
@@ -225,6 +231,13 @@ def _callers_plugin() -> LangGraphPlugin:
         return [first, await wait_then_call(request["job_id"], False)]
 
     @lg_entrypoint()
+    async def retry_task(request: dict[str, Any]) -> list[str]:
+        try:
+            return await take_then_fail(request["job_id"])
+        except ActivityError:
+            return await take_then_fail(request["job_id"])
+
+    @lg_entrypoint()
     async def two_subgraphs(request: dict[str, Any]) -> dict[str, str]:
         a = wait_then_subgraph(request["job_id"], True)
         b = wait_then_subgraph(request["job_id"], False)
@@ -236,14 +249,23 @@ def _callers_plugin() -> LangGraphPlugin:
             "two-branches": two_branches,
             "retry-on-failure": retry_on_failure,
             "retry-then-task": retry_then_task,
+            "retry-task": retry_task,
             "two-subgraphs": two_subgraphs,
         },
-        tasks=[_wait, _next, _fail_first, wait_then_call, wait_then_subgraph],
+        tasks=[
+            _wait,
+            _next,
+            _fail_first,
+            wait_then_call,
+            take_then_fail,
+            wait_then_subgraph,
+        ],
         activity_options={
             "wait_for_value": {"execute_in": "activity"},
             "next_value": {"execute_in": "activity"},
             "fail_first_call": {"execute_in": "activity"},
             "wait_then_call": {"execute_in": "workflow"},
+            "take_then_fail": {"execute_in": "workflow"},
             "wait_then_subgraph": {"execute_in": "workflow"},
         },
         default_activity_options=_ACTIVITY_OPTIONS,
@@ -601,6 +623,24 @@ async def test_task_after_retry_restored_after_continue_as_new(client: Client):
     )
 
     first = [f"{job_id}:2", f"{job_id}:3"]
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+@_needs_functional_api
+async def test_retried_task_restored_after_continue_as_new(client: Client):
+    """A retried workflow-side task gets its retry's results after continue-as-new.
+
+    The task's first call succeeds and its second fails, so the entrypoint
+    calls the task again. The next run's task call must get the retry's
+    results, not the failed attempt's first value.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client, "retry-task", job_id, runs=2, plugin=_callers_plugin()
+    )
+
+    first = [f"{job_id}:2", f"{job_id}-f:2"]
     assert seen == [first, first]
     assert [len(_scheduled(h)) for h in histories] == [4, 0]
 

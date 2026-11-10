@@ -19,6 +19,7 @@ from heapq import heappop, heappush
 from json import dumps
 from typing import Any
 
+from langgraph.errors import GraphBubbleUp
 from pydantic import BaseModel
 
 _task_cache: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -36,6 +37,8 @@ _free_places: ContextVar[dict[str, list[int]] | None] = ContextVar(
 # The call of a workflow-side node or task that the current code runs in (see
 # call_scope()), or "" outside one.
 _scope: ContextVar[str] = ContextVar("_temporal_task_scope", default="")
+# The keys that the calls made in that call took, its nested calls' included.
+_taken: ContextVar[list[str] | None] = ContextVar("_temporal_task_taken", default=None)
 
 
 def set_task_cache(cache: dict[str, Any] | None) -> None:
@@ -67,7 +70,11 @@ def occurrence_key(key: str) -> str:
     else:
         n = uses.get(base, 0)
         uses[base] = n + 1
-    return base if n == 0 else f"{base}#{n}"
+    key = base if n == 0 else f"{base}#{n}"
+    taken = _taken.get()
+    if taken is not None:
+        taken.append(key)
+    return key
 
 
 def release(key: str) -> None:
@@ -91,18 +98,44 @@ def call_scope(name: str) -> Generator[None, None, None]:
     the enclosing scope's calls of ``name``, taken before the call awaits
     anything. So it is the same in every run that makes the same calls in the
     same order, whatever order parallel calls finish in. If the block raises,
-    its place is given back, as a failed call's is.
+    its place is given back, as a failed call's is. If it fails, rather than
+    being interrupted, the results and places of the calls made in it are
+    dropped too, so a retry makes them again under the same keys and, after
+    continue-as-new, the first call gets the retry's results.
     """
     # Hex, like a cache key, so release() can split off the place.
     key = occurrence_key(sha256(name.encode()).hexdigest()[:32])
+    taken: list[str] = []
     token = _scope.set(sha256(key.encode()).hexdigest()[:16])
+    taken_token = _taken.set(taken)
     try:
         yield
-    except BaseException:
+    except BaseException as err:
+        if isinstance(err, Exception) and not isinstance(err, GraphBubbleUp):
+            _forget(taken)
         release(key)
         raise
     finally:
+        _taken.reset(taken_token)
         _scope.reset(token)
+        outer = _taken.get()
+        if outer is not None:
+            outer.extend(taken)
+
+
+def _forget(keys: list[str]) -> None:
+    """Drop the cached results and the places of the calls under ``keys``."""
+    cache, uses, free = _task_cache.get(), _key_uses.get(), _free_places.get()
+    for key in keys:
+        base, sep, _ = key.rpartition("#")
+        base = base if sep else key
+        if uses is not None:
+            uses.pop(base, None)
+        if free is not None:
+            free.pop(base, None)
+        if cache is not None:
+            for entry in (key, f"{key}:command", f"{key}:types"):
+                cache.pop(entry, None)
 
 
 def get_task_cache() -> dict[str, Any] | None:

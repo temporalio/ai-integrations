@@ -12,6 +12,7 @@ from typing import Annotated, Any
 from uuid import uuid4
 
 import pytest
+from langgraph.errors import GraphInterrupt
 from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
     END,
     START,
@@ -26,6 +27,8 @@ from temporalio.common import RetryPolicy
 from temporalio.langgraph import LangGraphPlugin, cache, graph
 from temporalio.langgraph._task_cache import (
     cache_key,
+    cache_lookup,
+    cache_put,
     call_scope,
     occurrence_key,
     release,
@@ -455,14 +458,23 @@ def _occurrence_keys() -> None:
     release(calls[1])
     release(calls[0])
     assert [occurrence_key(key) for _ in range(3)] == [key, f"{key}#1", f"{key}#3"]
-    # A node or task call that raised gives its place back too, so its retry
-    # counts on in the same scope.
+    # A node or task call that failed gives its place back too and drops the
+    # results and places of its calls, so its retry makes them under the
+    # same keys.
     inner: list[str] = []
     with pytest.raises(ValueError), call_scope("node"):
         inner.append(occurrence_key(key))
+        cache_put(inner[0], "failed attempt")
         raise ValueError
+    assert cache_lookup(inner[0]) == (False, None)
     with call_scope("node"):
-        assert occurrence_key(key) == f"{inner[0]}#1"
+        assert occurrence_key(key) == inner[0]
+    # An interrupted one keeps them: the resumed call counts on.
+    with pytest.raises(GraphInterrupt), call_scope("node"):
+        inner.append(occurrence_key(key))
+        raise GraphInterrupt
+    with call_scope("node"):
+        assert occurrence_key(key) == f"{inner[1]}#1"
 
 
 def test_repeated_calls_get_their_own_keys():
