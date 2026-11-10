@@ -81,13 +81,17 @@ def activity_span(
 
 
 class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
-    # The base initializer would replace the wrapped processor tuple and lock.
-    def __init__(  # pyright: ignore[reportMissingSuperCall]
+    def __init__(
         self,
         impl: SynchronousMultiTracingProcessor,
         start_spans_in_replay: bool,
     ):
         self._impl = impl
+        # Preserve future base-class initialization without replacing the
+        # wrapped processor tuple or lock through the delegating setters.
+        self._initializing = True
+        super().__init__()
+        self._initializing = False
         self._emit_spans_in_replay = start_spans_in_replay
 
     # OpenInference updates the SDK's processor tuple under its lock. Delegate
@@ -98,7 +102,8 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
 
     @_processors.setter
     def _processors(self, processors: tuple[TracingProcessor, ...]) -> None:  # pyright: ignore[reportIncompatibleVariableOverride]
-        self._impl._processors = processors
+        if not self._initializing:
+            self._impl._processors = processors
 
     @property
     def _lock(self) -> LockType:
@@ -106,7 +111,8 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
 
     @_lock.setter
     def _lock(self, lock: LockType) -> None:
-        self._impl._lock = lock
+        if not self._initializing:
+            self._impl._lock = lock
 
     def add_tracing_processor(self, tracing_processor: TracingProcessor):
         self._impl.add_tracing_processor(tracing_processor)

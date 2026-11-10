@@ -111,7 +111,7 @@ def _install_otel_instrumentation(tracer_provider: typing.Any) -> None:
                     for processor in processors
                     if not getattr(processor, "draining", False)
                 )
-                _otel_trace_processor_adapter = OTelTracingProcessorAdapter(
+                _otel_trace_processor_adapter = OTelTracingProcessorAdapter.install(
                     processor, [other for other in processors if other is not processor]
                 )
             except BaseException:

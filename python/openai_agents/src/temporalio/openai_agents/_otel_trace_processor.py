@@ -31,7 +31,16 @@ class OTelTracingProcessorAdapter:
         other_processors: list[OpenInferenceTracingProcessor],
     ) -> None:
         """Install callbacks while preserving OpenInference's span conversion."""
+        for name in ("_root_spans", "_otel_spans"):
+            if not isinstance(getattr(processor, name, None), dict):
+                raise RuntimeError(
+                    "OpenInferenceTracingProcessor internal API changed: expected "
+                    f"{name} to be a dict. Update temporalio-openai-agents before "
+                    "enabling OpenInference instrumentation."
+                )
         self._processor = processor
+        # OpenInference keeps draining processors registered until their last
+        # trace/span ends. Weak references avoid retaining them after removal.
         self._other_processors = WeakSet(other_processors)
         self._lock = threading.RLock()
         self._active = True
@@ -46,6 +55,21 @@ class OTelTracingProcessorAdapter:
         setattr(processor, "on_trace_end", self.on_trace_end)
         setattr(processor, "on_span_start", self.on_span_start)
         setattr(processor, "on_span_end", self.on_span_end)
+
+    @classmethod
+    def install(
+        cls,
+        processor: OpenInferenceTracingProcessor,
+        other_processors: list[OpenInferenceTracingProcessor],
+    ) -> OTelTracingProcessorAdapter:
+        """Reuse callbacks and in-flight state if uninstrumentation failed."""
+        existing = getattr(processor.on_trace_start, "__self__", None)
+        if isinstance(existing, cls):
+            with existing._lock:
+                existing._other_processors = WeakSet(other_processors)
+                existing._active = True
+            return existing
+        return cls(processor, other_processors)
 
     def deactivate(self) -> None:
         """Stop accepting new traces while existing spans finish."""
@@ -70,7 +94,10 @@ class OTelTracingProcessorAdapter:
         """End the local root and restore its caller's OpenTelemetry context."""
         with self._lock:
             try:
-                self._on_trace_end(trace)
+                # The processor's registries also include starts delivered
+                # before the adapter was installed on this instance.
+                if trace.trace_id in self._processor._root_spans:
+                    self._on_trace_end(trace)
             finally:
                 token = self._trace_tokens.pop(trace, None)
                 if token is not None:
@@ -115,4 +142,6 @@ class OTelTracingProcessorAdapter:
     def on_span_end(self, span: Span[Any]) -> None:
         """Finish owned spans, including those left in a draining processor."""
         with self._lock:
+            if span.span_id not in self._processor._otel_spans:
+                return
             self._on_span_end(span)
