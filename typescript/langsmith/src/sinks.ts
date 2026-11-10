@@ -4,7 +4,7 @@
  * @module
  */
 
-import { isTracingEnabled, type Client } from 'langsmith';
+import type { Client } from 'langsmith';
 import { RunTree, type RunTreeConfig, type WriteReplica } from 'langsmith/run_trees';
 import type { Logger } from '@temporalio/common';
 import type { Sinks } from '@temporalio/workflow';
@@ -85,11 +85,8 @@ export function createLangSmithSinks(
 ): InjectedSinks<LangSmithSinks> {
   // Writes run one at a time in call order, so an update never overtakes its create.
   let writes = Promise.resolve();
+  // The Workflow already decided whether to trace each run, so the env isn't checked again here.
   const enqueue = (write: () => Promise<void>): void => {
-    // Honor the LangSmith tracing gate at the real-env emission point.
-    if (!isTracingEnabled()) {
-      return;
-    }
     // Emission must never fail the workflow.
     writes = writes.then(write).catch((err: unknown) => {
       logger.error(`LangSmith background I/O error: ${String(err)}`);

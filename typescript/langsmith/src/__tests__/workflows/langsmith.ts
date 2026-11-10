@@ -13,6 +13,7 @@ import {
   defineQuery,
   defineSignal,
   defineUpdate,
+  getExternalWorkflowHandle,
   proxyActivities,
   proxyLocalActivities,
   setHandler,
@@ -147,6 +148,20 @@ export async function SignalChildWorkflow(input: string): Promise<string> {
   });
   await child.signal(mySignal, input);
   return child.result();
+}
+
+/** Starts a child and signals it through an external handle. */
+export async function SignalExternalWorkflow(input: string): Promise<string> {
+  const child = await startChild(SignalReceiverWorkflow, {
+    workflowId: `${workflowInfo().workflowId}-signal-external`,
+  });
+  await getExternalWorkflowHandle(child.workflowId).signal(mySignal, input);
+  return child.result();
+}
+
+/** Waits until cancelled. */
+export async function WaitForeverWorkflow(): Promise<void> {
+  await condition(() => false);
 }
 
 /** Start-with-signal ordering reproducer for async signal inbound interceptors. */

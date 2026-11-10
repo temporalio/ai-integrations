@@ -203,13 +203,17 @@ export function useSharedEnv(test: TestFn<unknown>): void {
 
 const bundleCache = new Map<string, Promise<WorkflowBundle>>();
 
-/** The env vars LangSmith's default destination reads; the bundle bakes in what they name, so they key the cache. */
+/** The env vars LangSmith's default destination and tracing gate read; the bundle bakes them in, so they key the cache. */
 const DESTINATION_ENV_VARS = [
   'LANGSMITH_PROJECT',
   'LANGCHAIN_PROJECT',
   'LANGCHAIN_SESSION',
   'LANGSMITH_AGENT_ID',
   'LANGSMITH_AGENT_ENVIRONMENT',
+  'LANGSMITH_TRACING',
+  'LANGSMITH_TRACING_V2',
+  'LANGCHAIN_TRACING_V2',
+  'LANGCHAIN_TRACING',
 ];
 
 function getBundle(plugin: LangSmithPlugin, workflowsPath: string, optionsKey: string): Promise<WorkflowBundle> {

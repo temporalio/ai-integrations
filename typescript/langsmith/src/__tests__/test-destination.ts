@@ -416,16 +416,8 @@ async function markerCallHeaders(
       sent[method] = (input.headers ?? input.workflowStartHeaders)!;
     }) as never;
   await interceptor.signal!({ signalName: 'sig', args: [], headers: {} } as never, next('signal'));
-  await interceptor.signalWithStart!(
-    { workflowType: 'Wf', signalArgs: [], headers: {} } as never,
-    next('signalWithStart')
-  );
   await interceptor.query!({ queryType: 'q', args: [], headers: {} } as never, next('query'));
   await interceptor.startUpdate!({ updateName: 'u', args: [], headers: {} } as never, next('startUpdate'));
-  await interceptor.startUpdateWithStart!(
-    { updateName: 'uws', updateArgs: [], workflowStartHeaders: {} } as never,
-    next('startUpdateWithStart')
-  );
   return sent;
 }
 
@@ -433,13 +425,7 @@ test.serial('misconfigured agent env vars: a client marker LangSmith left untrac
   await withDestinationEnv(HALF_AGENT_ENV, async () => {
     const interceptor = createClientInterceptor({ client: capturingClient(CJS_BUILD, [], []), addTemporalRuns: true });
     const sent = await markerCallHeaders(interceptor);
-    t.deepEqual(Object.keys(sent).sort(), [
-      'query',
-      'signal',
-      'signalWithStart',
-      'startUpdate',
-      'startUpdateWithStart',
-    ]);
+    t.deepEqual(Object.keys(sent).sort(), ['query', 'signal', 'startUpdate']);
     for (const [method, headers] of Object.entries(sent)) {
       t.is(readContextHeader(headers), undefined, method);
     }
@@ -617,9 +603,12 @@ const CLIENT_METHOD_CALLS: Record<
     call: (interceptor) => interceptor.startUpdate!({ updateName: 'u', args: [], headers: {} } as never, NEXT),
   },
   startUpdateWithStart: {
-    marker: 'StartUpdateWithStartWorkflow:uws',
+    marker: 'StartUpdateWithStartWorkflow:UwsWf',
     call: (interceptor) =>
-      interceptor.startUpdateWithStart!({ updateName: 'uws', updateArgs: [], workflowStartHeaders: {} } as never, NEXT),
+      interceptor.startUpdateWithStart!(
+        { workflowType: 'UwsWf', updateName: 'uws', updateArgs: [], workflowStartHeaders: {}, updateHeaders: {} } as never,
+        NEXT
+      ),
   },
 };
 

@@ -19,7 +19,7 @@
  * @module
  */
 
-import { Client, type AgentAddress } from 'langsmith';
+import { Client, isTracingEnabled, type AgentAddress } from 'langsmith';
 import { RunTree } from 'langsmith/run_trees';
 
 import type * as nexus from 'nexus-rpc';
@@ -147,6 +147,7 @@ export class LangSmithPlugin extends SimplePlugin {
       addTemporalRuns,
       // Resolved here, where LangSmith can read env; inside the isolate it can only fall back to `"default"`.
       destination: pluginDestination(this.client, address, this.emitter.projectName),
+      tracingEnabled: isTracingEnabled(),
       replicas: replicaRouting(replicas),
       tags: options.tags,
       metadata: options.metadata,

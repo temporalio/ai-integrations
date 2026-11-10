@@ -43,7 +43,7 @@ test('headers preserve addresses and replica routing without credentials', (t) =
     start_time: time,
     address: ROUTING_ADDRESS,
     client: collector.asClient(),
-    extra: { metadata: { team: 'sdk', api_key: 'metadata-secret' } },
+    extra: { metadata: { team: 'sdk', api_key: 'run-metadata' } },
     replicas: [{
       address: SECONDARY_ADDRESS,
       primary: true,
@@ -60,9 +60,11 @@ test('headers preserve addresses and replica routing without credentials', (t) =
   const headers = runHeaders(parent)!;
   const encoded = decodeURIComponent(headers.baggage);
   t.true(encoded.includes('"address":"lrn:agents/support/environments/production"'));
-  for (const secret of ['metadata-secret', 'replica-secret', 'private-ingestion', 'private-workspace', 'nested-secret']) {
+  for (const secret of ['replica-secret', 'private-ingestion', 'private-workspace', 'nested-secret']) {
     t.false(encoded.includes(secret));
   }
+  // Run metadata travels unchanged, as LangSmith's own headers carry it.
+  t.true(encoded.includes('"api_key":"run-metadata"'));
   t.false(encoded.includes('untrusted-id'));
   t.false(encoded.includes('untrusted-destination'));
   const before = Date.now();

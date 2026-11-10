@@ -82,6 +82,8 @@ export const WORKFLOW_RUN_TREE_OVERRIDES: RunTreeOverrides = {
         const selected = config.project_name || config.address ? config : { ...config, ...active.config.destination };
         original.call(this, selected, ...args);
         if (!selected.project_name && !selected.address) suppressRun(this);
+        // A run with no parent and no propagated trace starts a new trace, which LangSmith's env gates.
+        if (!config.parent_run && !config.trace_id && active.config.tracingEnabled === false) suppressRun(this);
       },
     createChild: (original) =>
       function (this: RunTree, ...args: unknown[]): RunTree {

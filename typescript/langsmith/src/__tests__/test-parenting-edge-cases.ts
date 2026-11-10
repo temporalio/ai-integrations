@@ -57,55 +57,44 @@ test('root workflow-body traceable (no propagated parent) does not crash and emi
   t.deepEqual(dumpTraces(collector.records), WORKFLOW_BODY_ROOT_TREE);
 });
 
-test('plugin options are carried onto emitted runs: applies projectName, tags, and (scrubbed) metadata', async (t) => {
+test('plugin options and Temporal IDs are carried onto plugin runs, which record no args or results', async (t) => {
   const collector = new InMemoryRunCollector();
-  await withTracingWorker({
+  const workflowId = `options-${Date.now()}`;
+  const runId = await withTracingWorker({
     collector,
     options: {
       addTemporalRuns: true,
       projectName: 'my-project',
       tags: ['env:test'],
-      // The api_key entry must be scrubbed before it reaches the backend.
-      metadata: { team: 'platform', api_key: 'should-be-removed' },
+      // Sent unchanged, as the Python plugin does.
+      metadata: { team: 'platform', api_key: 'kept' },
     },
     activities: ALL_ACTIVITIES,
     body: async ({ client, taskQueue }) => {
-      await client.workflow.execute(workflows.SimpleWorkflow, {
-        taskQueue,
-        workflowId: `options-${Date.now()}`,
-        args: ['hi'],
-      });
+      const handle = await client.workflow.start(workflows.SimpleWorkflow, { taskQueue, workflowId, args: ['hi'] });
+      await handle.result();
+      return handle.firstExecutionRunId;
     },
   });
 
   const runWorkflow = collector.byName('RunWorkflow:SimpleWorkflow');
   t.is(runWorkflow?.project_name, 'my-project');
   t.deepEqual(runWorkflow?.tags, ['env:test']);
-  const metadata = runWorkflow?.extra?.metadata as Record<string, unknown> | undefined;
-  t.deepEqual(metadata, { team: 'platform' });
-  t.false('api_key' in (metadata ?? {}));
-});
-
-test('emitter-side activity run scrubs credential-looking metadata (path that never hits serializeRun)', async (t) => {
-  const collector = new InMemoryRunCollector();
-  await withTracingWorker({
-    collector,
-    options: {
-      addTemporalRuns: true,
-      metadata: { team: 'platform', api_key: 'should-be-removed' },
-    },
-    activities: ALL_ACTIVITIES,
-    body: async ({ client, taskQueue }) => {
-      await client.workflow.execute(workflows.SimpleWorkflow, {
-        taskQueue,
-        workflowId: `activity-scrub-${Date.now()}`,
-        args: ['hi'],
-      });
-    },
+  t.deepEqual(runWorkflow?.extra?.metadata, {
+    team: 'platform', api_key: 'kept', temporalWorkflowID: workflowId, temporalRunID: runId,
   });
 
   const runActivity = collector.byName('RunActivity:simpleActivity');
-  const metadata = runActivity?.extra?.metadata as Record<string, unknown> | undefined;
-  t.deepEqual(metadata, { team: 'platform' });
-  t.false('api_key' in (metadata ?? {}));
+  t.deepEqual(runActivity?.extra?.metadata, {
+    team: 'platform', api_key: 'kept', temporalWorkflowID: workflowId, temporalRunID: runId, temporalActivityID: '1',
+  });
+
+  const marker = collector.byName('StartActivity:simpleActivity');
+  t.deepEqual(marker?.tags, ['env:test']);
+  t.like(marker?.extra?.metadata, { team: 'platform', api_key: 'kept' });
+
+  for (const run of [runWorkflow, runActivity, marker]) {
+    t.deepEqual(run?.inputs, {}, run?.name);
+    t.deepEqual(run?.outputs, { status: 'ok' }, run?.name);
+  }
 });

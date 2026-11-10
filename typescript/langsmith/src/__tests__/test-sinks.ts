@@ -56,6 +56,19 @@ test('an update does not start before its create finishes', async (t) => {
   t.deepEqual(order, ['create started', 'create finished', 'update started']);
 });
 
+test.serial('writes whatever the Workflow traced, even with LANGSMITH_TRACING=false', async (t) => {
+  const written: unknown[] = [];
+  const { createRun } = sinks({ createRun: async (run) => { written.push(run.name); } });
+  process.env.LANGSMITH_TRACING = 'false';
+  try {
+    void createRun.fn({} as never, RUN);
+  } finally {
+    process.env.LANGSMITH_TRACING = 'true';
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  t.deepEqual(written, ['run']);
+});
+
 test('a failed write is logged and later writes still run', async (t) => {
   const errors: string[] = [];
   let created!: () => void;

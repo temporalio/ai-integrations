@@ -42,7 +42,8 @@ export LANGSMITH_API_KEY="<your key>"
 
 The plugin reads the same flags LangSmith itself uses (`LANGSMITH_TRACING` /
 `LANGSMITH_TRACING_V2` and their `LANGCHAIN_` aliases); with none set to `true`,
-tracing stays off and the plugin is a no-op.
+the plugin starts no new traces. As in LangSmith, a trace that arrives in
+Temporal headers from a traced caller continues either way.
 
 ## Hello world
 
@@ -155,7 +156,7 @@ user_pipeline
 | `projectName`     | LangSmith default | Default LangSmith project for new root traces. An inherited destination takes precedence.                                                       |
 | `address`         | —                 | Agent/environment destination, mutually exclusive with `projectName`. Requires LangSmith's workspace-enabled beta feature.                    |
 | `tags`            | —                 | Tags attached to every run the plugin emits.                                                                                                   |
-| `metadata`        | —                 | Metadata merged into every run the plugin emits. Credential-looking keys are scrubbed before emission.                                         |
+| `metadata`        | —                 | Metadata merged into every run the plugin emits. It is sent unchanged and travels in Temporal headers, so keep secrets out of it.              |
 
 The LangSmith API key is never accepted as a plugin option and never crosses a
 Temporal boundary. Supply a pre-constructed `Client` (which reads
