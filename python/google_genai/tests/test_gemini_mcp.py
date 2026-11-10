@@ -34,7 +34,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from temporalio import workflow
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowHistory
 from temporalio.google_genai import (
     GoogleGenAIPlugin,
     TemporalAsyncClient,
@@ -56,18 +56,27 @@ from tests.test_gemini import (
 )
 
 _ECHO_SERVER = str(Path(__file__).parent / "echo_mcp_server.py")
+_HISTORIES = Path(__file__).parent / "histories"
 
 
 @asynccontextmanager
 async def _echo_session() -> AsyncGenerator[ClientSession, None]:
     """Yield an initialized session to the echo MCP server over in-memory streams."""
-    from mcp.shared.memory import create_connected_server_and_client_session
-
     # Imported here so the sandbox's re-import of this module stays side-effect free.
     from tests.echo_mcp_server import mcp as echo_server
 
-    async with create_connected_server_and_client_session(echo_server) as session:
-        yield session
+    try:
+        from mcp import Client  # type: ignore[attr-defined]
+    except ImportError:  # MCP 1.x
+        from mcp.shared.memory import (  # type: ignore[attr-defined]
+            create_connected_server_and_client_session,  # pyright: ignore[reportAttributeAccessIssue]
+        )
+
+        async with create_connected_server_and_client_session(echo_server) as session:
+            yield session
+        return
+    async with Client(echo_server) as client:
+        yield client.session
 
 
 @asynccontextmanager
@@ -282,7 +291,13 @@ async def test_mcp_full_schema_propagation(client: Client):
 
 
 async def test_mcp_replay(client: Client):
-    """A recorded MCP tool-loop history replays deterministically."""
+    """A recorded MCP tool-loop history replays deterministically.
+
+    Besides a history recorded here, this replays ``mcp_v1_tool_calls.json``:
+    one ``echo`` call and one failing ``fail`` call, recorded on ``3363a79``
+    (main before MCP v2 support) with mcp 1.30.0. The nightly run installs MCP
+    v2, so there it checks that a v2 worker replays a v1 worker's history.
+    """
     server = "echo_replay"
     new_client, _ = _apply_mcp_plugin(
         client,
@@ -303,10 +318,16 @@ async def test_mcp_replay(client: Client):
         await handle.result()
         history = await handle.fetch_history()
 
-    await Replayer(
+    replayer = Replayer(
         workflows=[McpToolWorkflow],
         plugins=[_replay_plugin({server: _echo_session})],
-    ).replay_workflow(history)
+    )
+    await replayer.replay_workflow(history)
+    await replayer.replay_workflow(
+        WorkflowHistory.from_json(
+            "mcp-v1", (_HISTORIES / "mcp_v1_tool_calls.json").read_text()
+        )
+    )
 
 
 async def test_mcp_side_effects(client: Client):
@@ -354,6 +375,7 @@ async def test_mcp_via_gemini_test_server(client: Client):
     test_server = GeminiTestServer(
         [
             function_call_response("echo", {"message": "durable execution"}),
+            function_call_response("fail", {"message": "durable execution"}),
             text_response("The echo tool returned: durable execution"),
         ]
     )
@@ -379,12 +401,18 @@ async def test_mcp_via_gemini_test_server(client: Client):
         "gemini_api_client_async_request",
         f"{server}-call-tool",
         "gemini_api_client_async_request",
+        f"{server}-call-tool",
+        "gemini_api_client_async_request",
     ]
-    # The echoed message reached the model as a function response.
-    assert any(
-        "durable execution" in json.dumps(request)
+    # Each tool result reached the model as a function response: the echo as a
+    # result, the failing call as an error. google-genai reads the MCP error
+    # flag as ``isError`` on MCP v1 and as ``is_error`` on MCP v2.
+    echoed, failed = (
+        request["contents"][-1]["parts"][0]["functionResponse"]["response"]
         for request in test_server.requests[1:]
     )
+    assert "durable execution" in json.dumps(echoed["result"])
+    assert "error" in failed
 
 
 # ---------------------------------------------------------------------------
