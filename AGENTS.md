@@ -23,30 +23,9 @@ independently installable, dependency-isolated, tested, versioned and released. 
 `<language>/<integration>/`; directories under a language root that start with `_` are shared
 resources (`python/_shared/`, `python/_template/`) and are ignored by CI discovery.
 
-| Folder | Coordinate | First version here | Maturity | Root API |
-|---|---|---|---|---|
-| `python/mcp` | `temporalio-mcp` | 0.1.0 | Pre-release | `temporalio.mcp` |
-| `python/deepagents` | `temporalio-deepagents` | 0.0.1 | Pre-release | `temporalio.deepagents` |
-| `python/google_adk` | `temporalio-google-adk` | 0.0.1 | Pre-release | `temporalio.google_adk` |
-| `python/google_genai` | `temporalio-google-genai` | 0.1.0 | Generally Available | `temporalio.google_genai` |
-| `python/langgraph` | `temporalio-langgraph` | 0.1.0 | Public Preview | `temporalio.langgraph` |
-| `python/langsmith` | `temporalio-langsmith` | 0.1.0 | Public Preview | `temporalio.langsmith` |
-| `python/openai_codex` | `temporalio-openai-codex` | 0.0.1 | Pre-release | `temporalio.openai_codex` |
-| `python/openai_agents` | `temporalio-openai-agents` | 1.0.0 | Generally Available | `temporalio.openai_agents` |
-| `python/strands_agents` | `temporalio-strands-agents` | 0.1.0 | Public Preview | `temporalio.strands_agents` |
-| `python/typesafe` | `temporalio-typesafe` | 0.0.1 | Pre-release | `temporalio.typesafe` |
-| `typescript/vercel-ai-sdk` | `@temporalio/vercel-ai-sdk` | 1.0.0 | Generally Available | `@temporalio/vercel-ai-sdk` |
-| `typescript/google-adk` | `@temporalio/google-adk` | 0.1.0 | Public Preview | `@temporalio/google-adk` |
-| `typescript/langsmith` | `@temporalio/langsmith` | continues (1.24.0 next) | Public Preview | `@temporalio/langsmith` |
-| `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
-| `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
-| `java/spring-ai` | `io.temporal:spring-ai` | 0.1.0 | Public Preview | `io.temporal.springai` |
-| `java/google-adk` | `io.temporal:google-adk` | 0.1.0 | Public Preview | `io.temporal.googleadk` |
-| `go/googleadk` | `go.temporal.io/googleadk` | 0.1.0 (new coordinate) | Public Preview | `googleadk` |
+Each plugin's `plugin.toml` records its coordinate, registry, root API and maturity.
 
-"First version here" values are informational; the registry is the source of truth for the
-version policy (below). Go plugins use `go.temporal.io/<name>` module paths and live under
-`go/<name>/`. Before publishing, the vanity site must route each module to this repository's
+Go plugins use `go.temporal.io/<name>` module paths and live under `go/<name>/`. Before publishing, the vanity site must route each module to this repository's
 subdirectory. The [Go module reference](https://go.dev/ref/mod#vcs-find) documents the fourth
 `go-import` field for subdirectories, supported since Go 1.25. Google ADK requires Go 1.26.10,
 so its mapping can be:
@@ -69,8 +48,8 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
 `pre-release` = `Development Status :: 3 - Alpha`; `public-preview` =
 `Development Status :: 4 - Beta`; `generally-available` =
 `Development Status :: 5 - Production/Stable`.
-Use each plugin's public Temporal documentation for its release stage. In READMEs and
-this table's Maturity column, use the three release-stage labels: Pre-release maps to
+Use each plugin's public Temporal documentation for its release stage. In READMEs, use the
+three release-stage labels: Pre-release maps to
 `pre-release`, Public Preview to `public-preview`, and Generally Available to
 `generally-available`. Feature-specific stages do not change a plugin's
 overall maturity (for example, OpenAI Agents is Generally Available with preview or experimental features).
