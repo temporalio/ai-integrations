@@ -28,7 +28,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `python/mcp` | `temporalio-mcp` | 0.1.0 | Pre-release | `temporalio.mcp` |
 | `python/deepagents` | `temporalio-deepagents` | 0.0.1 | Pre-release | `temporalio.deepagents` |
 | `python/google_adk` | `temporalio-google-adk` | 0.0.1 | Pre-release | `temporalio.google_adk` |
-| `python/google_genai` | `temporalio-google-genai` | 0.1.0 | Public Preview | `temporalio.google_genai` |
+| `python/google_genai` | `temporalio-google-genai` | 0.1.0 | Generally Available | `temporalio.google_genai` |
 | `python/langgraph` | `temporalio-langgraph` | 0.1.0 | Public Preview | `temporalio.langgraph` |
 | `python/langsmith` | `temporalio-langsmith` | 0.1.0 | Public Preview | `temporalio.langsmith` |
 | `python/openai_codex` | `temporalio-openai-codex` | 0.0.1 | Pre-release | `temporalio.openai_codex` |

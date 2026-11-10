@@ -18,7 +18,7 @@ cadence.
 | [`python/claude_agent_sdk`](python/claude_agent_sdk) | [![PyPI](https://img.shields.io/pypi/v/temporalio-claude-agent-sdk.svg)](https://pypi.org/project/temporalio-claude-agent-sdk/) (Pre-release) |
 | [`python/deepagents`](python/deepagents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-deepagents.svg)](https://pypi.org/project/temporalio-deepagents/) (Pre-release, Python 3.11+) |
 | [`python/google_adk`](python/google_adk) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-adk.svg)](https://pypi.org/project/temporalio-google-adk/) (Pre-release, Python 3.11+) |
-| [`python/google_genai`](python/google_genai) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-genai.svg)](https://pypi.org/project/temporalio-google-genai/) (Public Preview) |
+| [`python/google_genai`](python/google_genai) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-genai.svg)](https://pypi.org/project/temporalio-google-genai/) |
 | [`python/langgraph`](python/langgraph) | [![PyPI](https://img.shields.io/pypi/v/temporalio-langgraph.svg)](https://pypi.org/project/temporalio-langgraph/) (Public Preview) |
 | [`python/langsmith`](python/langsmith) | [![PyPI](https://img.shields.io/pypi/v/temporalio-langsmith.svg)](https://pypi.org/project/temporalio-langsmith/) (Public Preview) |
 | [`python/mcp`](python/mcp) | [![PyPI](https://img.shields.io/pypi/v/temporalio-mcp.svg)](https://pypi.org/project/temporalio-mcp/) (Public Preview) |
