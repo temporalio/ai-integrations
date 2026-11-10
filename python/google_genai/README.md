@@ -145,12 +145,13 @@ require MCP. Server-side MCP on Vertex AI
 and the Interactions API do not require this extra.
 
 Workflow histories replay across MCP v1 and v2 workers in both directions, with
-one exception. MCP v2 lets a tool return `structuredContent` that is an array or
-a scalar, but MCP v1 accepts only an object there. Once a history records such a
-result, only v2 workers can replay it: a v1 worker fails the Workflow Task with
-"Failed decoding arguments". If your MCP servers return non-object structured
-results, keep v1 off the Task Queue while you upgrade, and don't roll back to
-v1 while those Workflows are running.
+one exception: tool results that MCP v2 accepts but MCP v1 rejects. MCP v2 lets
+a tool return `structuredContent` that is an array or a scalar, and resource
+URIs that aren't full URLs, such as `notes.txt`. MCP v1 accepts only an object
+and a full URL there. Once a history records such a result, only v2 workers can
+replay it: a v1 worker fails the Workflow Task with "Failed decoding arguments".
+If your MCP servers return such results, keep v1 off the Task Queue while you
+upgrade, and don't roll back to v1 while those Workflows are running.
 
 Client-side MCP (Gemini Developer API) is wired through the plugin: register the
 server on the worker and reference it by name in the workflow.
