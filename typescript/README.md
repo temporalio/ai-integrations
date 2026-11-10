@@ -29,6 +29,7 @@ directory. The smoke runner copies them into the clean consumer, installs the
 declared Temporal Worker and testing versions, and runs the entrypoint. Strands
 uses this to bundle and execute a workflow with a local model against the provider
 version npm selects from its peer range, independently of the development lockfile.
+LangGraph does the same with the LangGraph.js and LangChain versions npm selects.
 
 The SDK's unpublished `@temporalio/test-helpers` sources are copied into
 `tests/helpers/` in Vercel AI SDK, OpenAI Agents and Strands Agents.

@@ -37,6 +37,7 @@ resources (`python/_shared/`, `python/_template/`) and are ignored by CI discove
 | `python/typesafe` | `temporalio-typesafe` | 0.0.1 | Pre-release | `temporalio.typesafe` |
 | `typescript/vercel-ai-sdk` | `@temporalio/vercel-ai-sdk` | 1.0.0 | Generally Available | `@temporalio/vercel-ai-sdk` |
 | `typescript/google-adk` | `@temporalio/google-adk` | 0.1.0 | Public Preview | `@temporalio/google-adk` |
+| `typescript/langgraph` | `@temporalio/langgraph` | 0.0.1 | Pre-release | `@temporalio/langgraph` |
 | `typescript/langsmith` | `@temporalio/langsmith` | continues (1.24.0 next) | Public Preview | `@temporalio/langsmith` |
 | `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
 | `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
@@ -163,7 +164,7 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   `make check-deps` checks fresh resolution with a temporary lockfile and scripts
   disabled, preserving the committed lockfile and installed dependencies.
 - Activity names remain stable for workflow replay compatibility.
-- All five TypeScript integrations are enabled for release
+- All six TypeScript integrations are enabled for release
   through the shared `release-typescript.yml` workflow. New coordinates require one
   interactive publication of the tested tarball before npm permits configuring their trusted
   publisher, as described below. No per-plugin workflows or secrets. CI checks
