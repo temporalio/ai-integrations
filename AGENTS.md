@@ -192,6 +192,15 @@ version is a prerelease. Keep automated validation, immutable tags, tested-artif
 verification, and final-release eligibility checks. GA plugins retain any existing
 approval policy.
 
+A plugin with an open nightly issue doesn't release. Releases test the committed lock,
+while the nightly run tests the newest versions our ranges allow, which is what users
+install. Each release workflow's `prepare` job runs `release_tool.py check-nightly`, which
+fails while the plugin's `nightly: <plugin> failing (latest)` issue is open. Fix the
+plugin and wait for a green nightly, which closes the issue. Recovery dispatches
+(`recover-run`, Java's `deployment-id`) skip the check: they publish bytes an earlier run
+already tested. A Go tag is public as soon as it exists, so Go checks only in the branch
+dry run before tagging.
+
 Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
 
 After a successful dry run, use its full commit SHA as `<tested-sha>` when generating

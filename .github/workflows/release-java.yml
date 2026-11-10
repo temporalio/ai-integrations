@@ -38,6 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      issues: read
     outputs:
       plugin: ${{ steps.tag.outputs.plugin }}
       plugin_dir: ${{ steps.tag.outputs.plugin_dir }}
@@ -103,6 +104,14 @@ jobs:
           PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
           VERSION: ${{ steps.tag.outputs.version }}
         run: uv run --project scripts --locked python scripts/release/release_tool.py check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
+      - name: Nightly run is green
+        # Releases test the committed lock; the nightly run tests the newest versions users can install.
+        # Deployment recovery publishes bytes an earlier run already staged, so it skips this.
+        if: github.event_name != 'workflow_dispatch' || inputs.deployment-id == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py check-nightly --tag "$TAG"
       - name: Decide whether publication is allowed
         id: gate
         env:
