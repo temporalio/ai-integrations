@@ -130,10 +130,10 @@ const sharedStore = AsyncLocalStorageProviderSingleton.getInstance() as RunTreeS
 function reconstructParent(
   headers: Record<string, unknown> | undefined,
   config: WorkflowLangSmithConfig,
-  generateNewUuid4?: () => string
+  readOnly = false
 ): RunTree | undefined {
   const context = readContextHeader(headers as Record<string, never> | undefined);
-  return workflowRunTreeContext(config, () => runTreeFromContext(context, config.destination), generateNewUuid4);
+  return workflowRunTreeContext(config, () => runTreeFromContext(context, config.destination), readOnly);
 }
 
 /** Keep the incoming parent ambient when a Temporal run has no destination. */
@@ -183,7 +183,7 @@ function buildWorkflowRunTree(
 }
 
 class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
-  constructor(private readonly config: WorkflowLangSmithConfig) {}
+  constructor(private readonly config: WorkflowLangSmithConfig) { }
 
   async execute(input: WorkflowExecuteInput, next: Next<WorkflowInboundCallsInterceptor, 'execute'>): Promise<unknown> {
     const parent = reconstructParent(input.headers, this.config);
@@ -207,16 +207,14 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
     if (isInternalQuery(input.queryName)) {
       return next(input);
     }
-    const parent = reconstructParent(input.headers, this.config, workflowInfo().unsafe.random.uuid4);
+    const parent = reconstructParent(input.headers, this.config, true);
     return this.runInbound(
       handleQueryRunName(input.queryName),
       RUN_TYPE.CHAIN,
       parent,
       { args: input.args },
       () => next(input),
-      // Read-only: mint run ids from the nondeterministic unsafe random source so the
-      // handler never draws from the Workflow main PRNG (which a clean replay would not advance).
-      workflowInfo().unsafe.random.uuid4
+      true
     );
   }
 
@@ -231,11 +229,8 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
   }
 
   validateUpdate(input: UpdateInput, next: Next<WorkflowInboundCallsInterceptor, 'validateUpdate'>): void {
-    // Read-only: mint run ids from the nondeterministic unsafe random source so the validator
-    // never draws from the Workflow main PRNG (which a clean replay would not advance).
-    const generateNewUuid4 = workflowInfo().unsafe.random.uuid4;
+    const parent = reconstructParent(input.headers, this.config, true);
     workflowRunTreeContext(this.config, () => {
-      const parent = reconstructParent(input.headers, this.config);
       if (!this.config.addTemporalRuns) {
         sharedStore.run(parent, () => next(input));
         return;
@@ -256,7 +251,7 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
         throw err;
       }
       void run.patchRun();
-    }, generateNewUuid4);
+    }, true);
   }
 
   /**
@@ -271,7 +266,7 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
     parent: RunTree | undefined,
     inputs: Record<string, unknown>,
     next: () => Promise<unknown>,
-    generateNewUuid4?: () => string
+    readOnly = false
   ): Promise<unknown> {
     return workflowRunTreeContext(this.config, () => {
       if (!this.config.addTemporalRuns) {
@@ -292,12 +287,12 @@ class LangSmithWorkflowInbound implements WorkflowInboundCallsInterceptor {
         }
       };
       return sharedStore.run(bodyAmbient(run, parent), body);
-    }, generateNewUuid4);
+    }, readOnly);
   }
 }
 
 class LangSmithWorkflowOutbound implements WorkflowOutboundCallsInterceptor {
-  constructor(private readonly config: WorkflowLangSmithConfig) {}
+  constructor(private readonly config: WorkflowLangSmithConfig) { }
 
   async scheduleActivity(
     input: ActivityInput,

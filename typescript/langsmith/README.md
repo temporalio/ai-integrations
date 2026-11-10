@@ -238,12 +238,12 @@ the worker injects onto the workflow-sandbox global, so context propagates
 across `await` boundaries and `Promise.all(...)` fan-out exactly as it does
 outside the isolate — the same deterministic run tree replays identically.
 
-Native `RunTree` instances are replay-safe too. The plugin adapts LangSmith's
-constructor defaults and write methods within Workflow handlers: IDs use an
-independent deterministic random stream, timestamps use Workflow time, and
-writes go through the Worker sink and are suppressed during replay. Root runs
-remain real roots; LangSmith controls child creation and replica inheritance.
-Activities use LangSmith's native IDs and write methods.
+Native `RunTree` instances work in Workflow code too:
+
+- Run IDs are the same on replay.
+- End times come from the Worker's clock. Start times do too, unless the run
+  was rebuilt by a replay before it ended; then they come from Workflow time.
+- A run's end is never sent twice.
 
 ## Process-wide effects to be aware of
 

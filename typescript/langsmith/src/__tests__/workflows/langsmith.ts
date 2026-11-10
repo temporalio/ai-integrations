@@ -187,12 +187,16 @@ export async function ContinueAsNewTraceableWorkflow(iteration: number): Promise
 }
 
 export const readonlyUpdate = defineUpdate<string, [string]>('readonly_update');
+export const readonlyQuery = defineQuery<string>('readonly_query');
 export const releaseSignal = defineSignal('release');
 
 /** Child target of {@link ReadonlyDeterminismWorkflow}. */
 export async function ReadonlyDeterminismChildWorkflow(): Promise<void> {}
 
-/** Draws `uuid4()` post-validator and embeds it in a child `workflowId`, so any PRNG perturbation surfaces on replay. */
+/**
+ * Draws `uuid4()` and a run id post-validator and embeds both in a child `workflowId`, so any perturbation of the
+ * main PRNG or the run-id stream surfaces on replay.
+ */
 export async function ReadonlyDeterminismWorkflow(): Promise<string> {
   let released = false;
   setHandler(readonlyUpdate, (value: string) => `updated:${value}`, {
@@ -208,6 +212,7 @@ export async function ReadonlyDeterminismWorkflow(): Promise<string> {
       throw new Error('always rejected');
     },
   });
+  setHandler(readonlyQuery, () => 'queried');
   setHandler(releaseSignal, () => {
     released = true;
   });
@@ -215,8 +220,9 @@ export async function ReadonlyDeterminismWorkflow(): Promise<string> {
   await condition(() => released);
 
   const id = uuid4();
+  const runId = new RunTree({ name: 'post-readonly' }).id;
   const child = await startChild(ReadonlyDeterminismChildWorkflow, {
-    workflowId: `rod-child-${id}`,
+    workflowId: `rod-child-${id}-${runId}`,
   });
   await child.result();
   return id;

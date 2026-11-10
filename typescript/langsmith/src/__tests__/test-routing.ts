@@ -9,7 +9,7 @@ import { runHeaders, runTreeFromContext } from '../run-tree';
 import { bindReplicaCredentials } from '../routing';
 import { HEADER_KEY } from '../propagation';
 import * as activities from './activities/routing';
-import { InMemoryRunCollector, useSharedEnv, withTracingWorker } from './helpers';
+import { idPath, InMemoryRunCollector, useSharedEnv, withTracingWorker } from './helpers';
 import { comprehensiveNexusServiceHandler } from './stubs/nexus';
 import { ROUTING_ADDRESS, ROUTING_ENDPOINT, RoutingWorkflow } from './workflows/routing';
 
@@ -229,7 +229,7 @@ for (const addTemporalRuns of [false, true]) {
           for (const run of collector.records.filter((item) => item.parent_run_id)) {
             const parent = collector.byId.get(run.parent_run_id!);
             t.truthy(parent, `${run.name} has a real parent`);
-            t.true(run.dotted_order!.startsWith(`${parent!.dotted_order}.`));
+            t.deepEqual(idPath(run.dotted_order!), [...idPath(parent!.dotted_order!), run.id]);
           }
         },
       });

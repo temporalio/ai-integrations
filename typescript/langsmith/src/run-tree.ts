@@ -17,6 +17,7 @@
  * @internal
  */
 
+import { __version__ } from 'langsmith';
 import { RunTree, type RunTreeConfig } from 'langsmith/run_trees';
 import { ApplicationFailure, ApplicationFailureCategory } from '@temporalio/common';
 
@@ -73,6 +74,49 @@ export const queryWorkflowRunName = (queryName: string): string => `QueryWorkflo
 export const startWorkflowUpdateRunName = (updateName: string): string => `StartWorkflowUpdate:${updateName}`;
 /** `StartUpdateWithStartWorkflow:<name>` — client update-with-start marker. */
 export const startUpdateWithStartRunName = (updateName: string): string => `StartUpdateWithStartWorkflow:${updateName}`;
+
+type RunTreeMember = (this: any, ...args: any[]) => any;
+
+/** RunTree members to replace, each mapped to a function that builds the replacement from LangSmith's original. */
+export interface RunTreeOverrides {
+  statics: Record<string, (original: RunTreeMember) => RunTreeMember>;
+  methods: Record<string, (original: RunTreeMember) => RunTreeMember>;
+}
+
+const runTreeOwners = (overrides: RunTreeOverrides) =>
+  [
+    ['RunTree.', RunTree as unknown as Record<string, RunTreeMember>, overrides.statics],
+    ['RunTree.prototype.', RunTree.prototype as unknown as Record<string, RunTreeMember>, overrides.methods],
+  ] as const;
+
+/**
+ * Throw, naming each one, unless every member the overrides replace is a function. The Workflow bundle may carry a
+ * different LangSmith copy than the Worker, so both check.
+ */
+export function requireRunTreeMembers(...overrides: RunTreeOverrides[]): void {
+  const missing = new Set(
+    overrides.flatMap((override) =>
+      runTreeOwners(override).flatMap(([label, owner, members]) =>
+        Object.keys(members)
+          .filter((name) => typeof owner[name] !== 'function')
+          .map((name) => `${label}${name}`)
+      )
+    )
+  );
+  if (missing.size > 0) {
+    throw new Error(`@temporalio/langsmith does not support LangSmith ${__version__}: missing ${[...missing].join(', ')}`);
+  }
+}
+
+/** Replace the overridden RunTree members, or none if any is missing. */
+export function patchRunTree(overrides: RunTreeOverrides): void {
+  requireRunTreeMembers(overrides);
+  for (const [, owner, members] of runTreeOwners(overrides)) {
+    for (const [name, override] of Object.entries(members)) {
+      owner[name] = override(owner[name]!);
+    }
+  }
+}
 
 /** Flatten a {@link RunTree} into the plain wire shape consumed by the Sink. */
 export function serializeRun(run: RunTree): SerializedRun {
