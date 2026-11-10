@@ -1045,6 +1045,9 @@ Certain tools are not suitable for a distributed computing environment, so these
 | LiteLLM                                                     |    Yes    |
 | Any OpenAI-compatible API, through a custom `ModelProvider` |    Yes    |
 
+`RunConfig.model` overrides every agent's own model, as in the Python Agents SDK. The
+TypeScript plugin follows the JS SDK, where an agent's own model wins.
+
 Pass a custom provider with `OpenAIAgentsPlugin(model_provider=...)`. When an agent names no
 model, the provider's `get_model(None)` chooses it. The Agents SDK gives such an agent the
 default settings for the SDK's own default model, which include a reasoning effort and
