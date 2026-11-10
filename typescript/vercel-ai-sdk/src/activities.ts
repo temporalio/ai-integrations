@@ -20,6 +20,7 @@ import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { msOptionalToNumber, type Duration } from '@temporalio/common/lib/time';
 import type { McpClientFactories, McpClientFactory } from './mcp';
 import { withSources } from './activity-sources';
+import { encodeContentFileData, encodeResultFileData } from './file-data';
 
 const encoder = new TextEncoder();
 
@@ -273,7 +274,7 @@ export function createActivities(
     async invokeModel(args: InvokeModelArgs): Promise<InvokeModelResult> {
       using _heartbeat = heartbeatUntilDisposed();
       const model = provider.languageModel(args.modelId);
-      return await callProvider(() => model.doGenerate(args.options));
+      return encodeResultFileData(await callProvider(() => model.doGenerate(args.options)));
     },
 
     /**
@@ -316,8 +317,9 @@ export function createActivities(
       const reader = streamResult.stream.getReader();
 
       while (true) {
-        const { done, value: part } = await callProvider(() => reader.read());
+        const { done, value } = await callProvider(() => reader.read());
         if (done) break;
+        const part = encodeContentFileData(value);
 
         Context.current().heartbeat();
 

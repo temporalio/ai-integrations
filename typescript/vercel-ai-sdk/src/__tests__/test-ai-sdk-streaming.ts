@@ -19,7 +19,8 @@ import type {
 } from '@ai-sdk/provider';
 import { APICallError } from '@ai-sdk/provider';
 import type { Client } from '@temporalio/client';
-import { ApplicationFailure } from '@temporalio/common';
+import { ApplicationFailure, defaultPayloadConverter } from '@temporalio/common';
+import { decodePayloadWire } from '@temporalio/workflow-streams/workflow';
 import { MockActivityEnvironment } from '@temporalio/testing';
 import { createActivities } from '../activities';
 import type { InvokeModelResult, InvokeModelStreamingArgs } from '../activities';
@@ -263,4 +264,25 @@ test('invokeModelStreaming retains finish provider metadata', async (t) => {
   ]);
 
   t.deepEqual(result.providerMetadata, providerMetadata);
+});
+
+test('invokeModelStreaming publishes and returns binary file data as base64', async (t) => {
+  const bytes = new Uint8Array([137, 80, 78, 71, 0, 255]);
+  const encoded = { type: 'data', data: Buffer.from(bytes).toString('base64') } as const;
+  const { result, published } = await runStreamingActivity([
+    { type: 'file', mediaType: 'image/png', data: { type: 'data', data: bytes } },
+    { type: 'reasoning-file', mediaType: 'image/png', data: { type: 'data', data: bytes } },
+    { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage },
+  ]);
+
+  t.deepEqual(result.content, [
+    { type: 'file', mediaType: 'image/png', data: encoded },
+    { type: 'reasoning-file', mediaType: 'image/png', data: encoded },
+  ]);
+  const decoder = new TextDecoder();
+  const parts = published.flat().map((item) => {
+    const payload = decodePayloadWire((item as { data: string }).data);
+    return JSON.parse(decoder.decode(defaultPayloadConverter.fromPayload<Uint8Array>(payload)));
+  });
+  t.deepEqual(parts.slice(0, 2), result.content);
 });

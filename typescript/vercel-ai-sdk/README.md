@@ -43,6 +43,12 @@ streamed `error` part. The Workflow receives an `ActivityFailure` whose `cause`
 is that `ApplicationFailure`. Other errors, such as a 408, 409, 429 or 5xx response or
 a lost connection, are retried under the Activity's retry policy.
 
+File data given as a `Uint8Array` crosses the Activity boundary as a base64
+string, because Temporal's JSON payload converter does not keep `Uint8Array`
+values. This applies to prompt file parts and to files the model generates. A
+provider receives `{ type: 'data', data: '<base64>' }` in place of the bytes, and
+`result.files` gives the same bytes back through `uint8Array`.
+
 The plugin registers Activities named `invokeModel`, `invokeModelStreaming` and
 `invokeEmbeddingModel`, plus `<server>-listTools` and `<server>-callTool` for
 each MCP server. A different Activity with one of these names now fails with

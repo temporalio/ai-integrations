@@ -67,6 +67,7 @@ import {
 import { AiSdkPlugin, createActivities } from '..';
 import { startLocalWithRetry } from './helpers/environment';
 import {
+  binaryFileWorkflow,
   embeddingWorkflow,
   generateObjectWorkflow,
   helloWorldAgent,
@@ -404,6 +405,48 @@ test('Image tool results are converted inside the workflow sandbox', async (t) =
     });
     t.is(result, 'A transparent image');
   });
+});
+
+test('Binary file data reaches the model and the workflow as the same bytes', async (t) => {
+  const promptBytes = [137, 80, 78, 71, 0, 255];
+  const generatedBytes = [0, 1, 2, 254, 255];
+  const received: LanguageModelV4CallOptions[] = [];
+  function* generator(): Generator<ModelResponse> {
+    yield contentResponse([
+      {
+        type: 'file',
+        mediaType: 'application/octet-stream',
+        data: { type: 'data', data: new Uint8Array(generatedBytes) },
+      },
+    ]);
+  }
+  const provider = new TestProvider(generator());
+  const languageModel = provider.languageModel.bind(provider);
+  provider.languageModel = (modelId) => {
+    const model = languageModel(modelId);
+    const doGenerate = model.doGenerate.bind(model);
+    model.doGenerate = (options) => {
+      received.push(options);
+      return doGenerate(options);
+    };
+    return model;
+  };
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(binaryFileWorkflow, {
+      args: [promptBytes],
+      workflowExecutionTimeout: '10 seconds',
+    });
+    t.deepEqual(result, generatedBytes);
+  });
+
+  const userParts = received[0]!.prompt.flatMap((m) => (m.role === 'user' ? m.content : []));
+  const file = userParts.find((p) => p.type === 'file');
+  const data = file?.data.type === 'data' ? file.data.data : undefined;
+  t.is(typeof data, 'string');
+  t.deepEqual([...Buffer.from(data as string, 'base64')], promptBytes);
 });
 
 test('Streaming text, finish and response metadata survive activity execution and workflow replay', async (t) => {

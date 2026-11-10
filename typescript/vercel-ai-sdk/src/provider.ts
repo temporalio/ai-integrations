@@ -14,6 +14,7 @@ import * as workflow from '@temporalio/workflow';
 import type { ActivityOptions } from '@temporalio/workflow';
 import { ApplicationFailure } from '@temporalio/common';
 import type { Duration } from '@temporalio/common/lib/time';
+import { encodeCallOptionsFileData } from './file-data';
 
 // `ReadableStream` is a sandbox global; type-only import keeps `node:stream/web`
 // out of the workflow bundle (es2023 lib has no DOM types).
@@ -85,7 +86,10 @@ export class TemporalLanguageModel implements LanguageModelV4 {
       ...this.options,
       heartbeatTimeout: this.options?.heartbeatTimeout ?? '10 seconds',
     });
-    const result = await activities.invokeModel!({ modelId: this.modelId, options });
+    const result = await activities.invokeModel!({
+      modelId: this.modelId,
+      options: encodeCallOptionsFileData(options),
+    });
     if (result === undefined) {
       throw ApplicationFailure.nonRetryable('Received undefined response from model activity.');
     }
@@ -115,7 +119,7 @@ export class TemporalLanguageModel implements LanguageModelV4 {
     });
     const result = await activities.invokeModelStreaming!({
       modelId: this.modelId,
-      options,
+      options: encodeCallOptionsFileData(options),
       streamingTopic: this.streamingTopic,
       streamingBatchInterval: this.streamingBatchInterval,
     });
