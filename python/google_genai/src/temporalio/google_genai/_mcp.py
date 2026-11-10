@@ -38,7 +38,9 @@ try:
         MCPError as McpError,  # pyright: ignore[reportAttributeAccessIssue]
     )
 except ImportError:  # mcp<2
-    from mcp.shared.exceptions import McpError  # type: ignore[assignment,no-redef]
+    from mcp.shared.exceptions import (  # type: ignore[attr-defined,assignment,no-redef]
+        McpError,  # pyright: ignore[reportAttributeAccessIssue]
+    )
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -224,11 +226,12 @@ def build_list_tools_activity(
         session, record = await get_connection(server, factory, idle)
         try:
             return await session.list_tools()
-        except Exception as err:
+        except McpError as err:
+            await _evict_connection(server)
+            raise _protocol_error(err) from err
+        except Exception:
             # The session may be broken; drop it so the next call reconnects.
             await _evict_connection(server)
-            if isinstance(err, McpError):
-                raise _protocol_error(err) from err
             raise
         finally:
             record.release()
@@ -255,11 +258,12 @@ def build_call_tool_activity(
         session, record = await get_connection(server, factory, idle)
         try:
             return await session.call_tool(name=req.name, arguments=req.arguments)
-        except Exception as err:
+        except McpError as err:
+            await _evict_connection(server)
+            raise _protocol_error(err) from err
+        except Exception:
             # The session may be broken; drop it so the next call reconnects.
             await _evict_connection(server)
-            if isinstance(err, McpError):
-                raise _protocol_error(err) from err
             raise
         finally:
             record.release()
