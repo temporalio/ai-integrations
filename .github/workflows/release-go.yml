@@ -36,6 +36,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      issues: read
     outputs:
       plugin: ${{ steps.tag.outputs.plugin }}
       plugin_dir: ${{ steps.tag.outputs.plugin_dir }}
@@ -91,6 +92,14 @@ jobs:
           PLUGIN_DIR: ${{ steps.tag.outputs.plugin_dir }}
           VERSION: ${{ steps.tag.outputs.version }}
         run: uv run --project scripts --locked python scripts/release/release_tool.py check-version-policy --plugin-dir "$PLUGIN_DIR" --version "$VERSION"
+      - name: Nightly run is green
+        # Releases test the committed lock; the nightly run tests the newest versions users can install.
+        # A Go tag is public as soon as it exists, so only the branch dry run before tagging can stop a release.
+        if: github.ref_type != 'tag' && github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: uv run --project scripts --locked python scripts/release/release_tool.py check-nightly --tag "$TAG"
       - name: Decide whether to verify the public module
         id: gate
         env:
