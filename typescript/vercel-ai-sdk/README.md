@@ -98,12 +98,6 @@ object. To use models from more than one provider, give one `AiSdkPlugin` a
 `modelProvider` that combines them, for example
 `customProvider({ languageModels, fallbackProvider })` from `ai`.
 
-The plugin reports its package version in Worker heartbeats. Only a TypeScript
-SDK release that includes
-[temporalio/sdk-typescript#2637](https://github.com/temporalio/sdk-typescript/pull/2637)
-sends this version. `1.25.0` and earlier do not include it, so their heartbeats
-show an empty plugin version.
-
 ## Heartbeats and streaming
 
 The model and embedding Activities get a 10-second `heartbeatTimeout` unless you

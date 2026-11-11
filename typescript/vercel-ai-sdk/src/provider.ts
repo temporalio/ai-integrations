@@ -200,8 +200,10 @@ export class TemporalLanguageModel implements LanguageModelV4 {
     const stream = new ReadableStream({
       start(controller: ReadableStreamDefaultController) {
         controller.enqueue({ type: 'stream-start', warnings: result.warnings ?? [] });
-        const { id, modelId } = result.response ?? {};
-        if (id !== undefined || modelId !== undefined || timestamp !== undefined) {
+        // A Workflow can schedule a command for each stream part. So this part is sent for
+        // every response, also when all its fields are empty, to keep replay the same.
+        if (result.response !== undefined) {
+          const { id, modelId } = result.response;
           controller.enqueue({ type: 'response-metadata', id, modelId, timestamp });
         }
         let partIndex = 0;
