@@ -24,6 +24,20 @@ g.add_node("my_node", my_node, metadata={"execute_in": "activity"})
 plugin = LangGraphPlugin(graphs={"my-graph": g})
 ```
 
+Graph API node functions may be closures or local functions — e.g. built by a node factory as the worker constructs the graph — because each node's activity is named `<graph>.<node>`:
+
+```python
+def make_adder(step: int):
+    def add(state: State) -> dict[str, int]:
+        return {"value": state["value"] + step}
+
+    return add
+
+g.add_node("add_one", make_adder(1), metadata={"execute_in": "activity"})
+```
+
+Functional API `@task` functions must be defined at module level — their `module.qualname` is the activity name registered with the worker — so a task defined inside a function raises `ValueError` when the plugin is created. Node functions defined at module level in `__main__` are likewise rejected; put the graph in an importable module. A closure from `__main__` is accepted like any other closure.
+
 ### Functional API
 
 ```python
