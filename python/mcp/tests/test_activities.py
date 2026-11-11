@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 from datetime import timedelta
 from typing import Any, cast
 
@@ -39,7 +40,10 @@ from temporalio.converter import DataConverter
 from temporalio.exceptions import ApplicationError
 from temporalio.mcp import _activities
 from temporalio.mcp._activities import _MCPActivities
-from temporalio.mcp._client import _MCPClientBackend
+from temporalio.mcp._client import _mcp_client_backend_factory, _MCPClientBackend
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup  # type: ignore[reportUnreachable]
 
 
 class FakeClient:
@@ -195,15 +199,50 @@ async def test_operations_are_plain_json_and_lists_are_fully_paginated() -> None
         await support._pool.close()
 
 
-async def test_repeated_pagination_cursor_fails_without_retry() -> None:
-    class RepeatingCursorClient(FakeClient):
-        def _page(self, cursor: str | None) -> tuple[str, str | None]:
-            return "item", "repeated"
+# mcp's real Client: with a factory argument, its __aexit__ wraps the error in
+# ExceptionGroups.
+@pytest.mark.parametrize("factory_argument", [None, "acme"])
+@pytest.mark.parametrize(
+    "operation",
+    ["list-tools", "list-prompts", "list-resources", "list-resource-templates"],
+)
+async def test_repeated_pagination_cursor_fails_without_retry(
+    factory_argument: str | None, operation: str
+) -> None:
+    async def list_tools(_ctx: Any, _params: Any) -> ListToolsResult:
+        return ListToolsResult(tools=[], next_cursor="repeated")
 
-    backend = _MCPClientBackend(cast(Any, RepeatingCursorClient()))
-    async with backend:
+    async def list_prompts(_ctx: Any, _params: Any) -> ListPromptsResult:
+        return ListPromptsResult(prompts=[], next_cursor="repeated")
+
+    async def list_resources(_ctx: Any, _params: Any) -> ListResourcesResult:
+        return ListResourcesResult(resources=[], next_cursor="repeated")
+
+    async def list_resource_templates(
+        _ctx: Any, _params: Any
+    ) -> ListResourceTemplatesResult:
+        return ListResourceTemplatesResult(
+            resource_templates=[], next_cursor="repeated"
+        )
+
+    server = Server(
+        "repeats",
+        on_list_tools=list_tools,
+        on_list_prompts=list_prompts,
+        on_list_resources=list_resources,
+        on_list_resource_templates=list_resource_templates,
+    )
+    support = _MCPActivities(
+        {"test": lambda *_argument: _MCPClientBackend(Client(server))},
+        idle_timeout=timedelta(minutes=5),
+    )
+    list_activity = _activity_by_name(support, f"temporalio.mcp.test.{operation}")
+    try:
         with pytest.raises(ApplicationError, match="repeated pagination cursor") as err:
-            await backend.list_tools()
+            await list_activity({"factory_argument": factory_argument})
+    finally:
+        await support._pool.close()
+
     assert err.value.type == "MCPProtocolError"
     assert err.value.non_retryable is True
 
@@ -234,6 +273,37 @@ async def test_protocol_error_wrapped_in_exception_group_fails_without_retry() -
     assert err.value.type == "MCPProtocolError"
     assert err.value.non_retryable is True
     assert err.value.details == (INVALID_PARAMS, {"uri": "test://unknown"})
+
+
+# A group carrying more than one error is not a single failure we can classify.
+@pytest.mark.parametrize(
+    "other", [ConnectionError("connection lost"), asyncio.CancelledError()]
+)
+async def test_group_of_several_errors_is_left_alone(other: BaseException) -> None:
+    group = BaseExceptionGroup(
+        "errors", [MCPError(INVALID_PARAMS, "Invalid params"), other]
+    )
+
+    class GroupClient(FakeClient):
+        async def get_prompt(
+            self, name: str, _arguments: dict[str, str] | None
+        ) -> GetPromptResult:
+            raise group
+
+    support = _MCPActivities(
+        {"test": lambda: _MCPClientBackend(cast(Any, GroupClient()))},
+        idle_timeout=timedelta(minutes=5),
+    )
+    get_prompt = _activity_by_name(support, "temporalio.mcp.test.get-prompt")
+    try:
+        with pytest.raises(BaseExceptionGroup) as err:
+            await get_prompt(
+                {"factory_argument": None, "name": "prompt", "arguments": {}}
+            )
+    finally:
+        await support._pool.close()
+
+    assert err.value is group
 
 
 async def test_unknown_resource_protocol_error_fails_without_retry() -> None:
@@ -611,6 +681,27 @@ async def test_rejected_tool_result_fails_without_retry(
 
     assert err.value.type == "MCPProtocolError"
     assert err.value.non_retryable is True
+
+
+async def test_factory_that_does_not_return_a_client_fails_with_retry() -> None:
+    support = _MCPActivities(
+        {
+            "weather": _mcp_client_backend_factory(
+                "weather", lambda: cast(Client, object())
+            )
+        }
+    )
+    list_tools = _activity_by_name(support, "temporalio.mcp.weather.list-tools")
+    try:
+        with pytest.raises(ApplicationError) as err:
+            await list_tools({})
+    finally:
+        await support._pool.close()
+
+    assert err.value.message == (
+        "MCP server factory 'weather' returned builtins.object, not mcp.Client"
+    )
+    assert err.value.non_retryable is False
 
 
 async def test_worker_reentry_before_close_starts_keeps_connection_open() -> None:

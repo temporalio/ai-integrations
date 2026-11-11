@@ -165,10 +165,6 @@ def activity_as_tool(
 ) -> Callable:
     """Convert a Temporal activity into a Gemini-compatible async tool callable.
 
-    .. warning::
-        This API is experimental and may change in future versions.
-        Use with caution in production environments.
-
     Returns an async callable with the activity's name, and the parameters and
     docstring it is called with (``__call__``'s for a class). When Gemini's automatic function calling (AFC) invokes the returned
     callable from within a Temporal workflow, the call is executed as a Temporal

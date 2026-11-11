@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +22,7 @@ from temporalio.langsmith._interceptor import (
     _LangSmithWorkflowInboundInterceptor,
     _maybe_run,
 )
+from temporalio.langsmith._run_tree import workflow_run_tree_context
 from temporalio.worker import HandleQueryInput
 
 # ---------------------------------------------------------------------------
@@ -148,9 +150,11 @@ class TestBuiltinQueryFiltering:
 class TestContextPropagation:
     """Tests for _inject_context / _extract_context roundtrip."""
 
-    @pytest.mark.parametrize("in_workflow", [False, True])
-    def test_restored_parent_uses_workflow_time_only_in_workflows(
-        self, in_workflow: bool
+    @pytest.mark.parametrize(
+        "in_workflow,replaying", [(False, False), (True, False), (True, True)]
+    )
+    def test_restored_parent_uses_workflow_time_only_on_replay(
+        self, in_workflow: bool, replaying: bool
     ) -> None:
         native_time = datetime(2025, 1, 1, tzinfo=timezone.utc)
         workflow_time = datetime(2025, 1, 2, tzinfo=timezone.utc)
@@ -160,11 +164,19 @@ class TestContextPropagation:
         with (
             patch(_PATCH_RUNTREE) as run_tree,
             patch(_PATCH_IN_WORKFLOW, return_value=in_workflow),
+            patch(_PATCH_IS_REPLAYING, return_value=replaying),
             patch(_PATCH_WF_NOW, return_value=workflow_time),
+            ThreadPoolExecutor(max_workers=1) as executor,
+            workflow_run_tree_context(executor),
         ):
             run_tree.from_headers.return_value = parent
             assert _extract_context(headers, client) is parent
-        assert parent.start_time == (workflow_time if in_workflow else native_time)
+        if not in_workflow:
+            assert parent.start_time == native_time
+        elif replaying:
+            assert parent.start_time == workflow_time
+        else:
+            assert parent.start_time > workflow_time  # Wall-clock time live.
         assert parent.ls_client is client
 
     @patch(_PATCH_RUNTREE)

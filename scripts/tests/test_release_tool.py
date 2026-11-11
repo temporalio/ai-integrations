@@ -303,6 +303,36 @@ def test_published_release_check_rejects_unreviewed_or_misclassified_release(
     assert not output.exists()
 
 
+NIGHTLY_ISSUES = [
+    {"number": 444, "title": "nightly: openai_agents failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/444"},
+    {"number": 500, "title": "nightly: typescript/langsmith failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/500"},
+    {"number": 501, "title": "nightly: go/googleadk failing (latest)", "url": "https://github.com/temporalio/ai-integrations/issues/501"},
+]
+
+
+@pytest.mark.parametrize("tag,blocked_by", [
+    ("python/openai_agents/v2.0.0", 444),
+    ("typescript/langsmith/v1.24.0", 500),
+    ("go/googleadk/v0.1.0", 501),
+    ("python/langsmith/v0.2.0", None),  # the TypeScript plugin's issue doesn't block the Python one
+    ("typescript/openai-agents/v1.24.0", None),
+    ("java/spring-ai/v0.1.0", None),
+])
+def test_nightly_check_blocks_only_a_plugin_with_an_open_nightly_issue(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tag: str, blocked_by: int | None,
+) -> None:
+    calls = []
+    monkeypatch.setattr(release_tool, "_gh", lambda *args: calls.append(args) or json.dumps(NIGHTLY_ISSUES))
+    code = release_tool.main(["check-nightly", "--repo", "temporalio/ai-integrations", "--tag", tag])
+    out = capsys.readouterr().out
+    assert calls == [("issue", "list", "--repo", "temporalio/ai-integrations", "--label", "nightly", "--state", "open",
+                      "--limit", "200", "--json", "number,title,url")]
+    if blocked_by is None:
+        assert code == 0 and "OK: no open nightly issue" in out
+    else:
+        assert code == 1 and f"#{blocked_by} is open" in out
+
+
 @pytest.mark.parametrize("name", ["Validate tag and version policy", "Test / fakeplug (macos-latest, py3.14)"])
 @pytest.mark.parametrize("state", ["missing", "failure", "in_progress"])
 def test_recovery_requires_the_complete_successful_matrix(recovery_source: tuple, name: str, state: str) -> None:

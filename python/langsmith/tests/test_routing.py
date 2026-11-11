@@ -25,7 +25,11 @@ from temporalio.langsmith._interceptor import (
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer
 from tests.helpers import new_worker
-from tests.helpers.langsmith import InMemoryRunCollector, make_mock_ls_client
+from tests.helpers.langsmith import (
+    InMemoryRunCollector,
+    id_path,
+    make_mock_ls_client,
+)
 from tests.helpers.nexus import make_nexus_endpoint_name
 from tests.test_integration import (
     DirectTraceableNexusService,
@@ -351,7 +355,10 @@ async def test_replica_ids_and_updates_across_temporal(
             if parent_id:
                 parent = runs[str(parent_id)]
                 assert run["trace_id"] == parent["trace_id"]
-                assert run["dotted_order"].startswith(parent["dotted_order"] + ".")
+                assert id_path(run["dotted_order"]) == [
+                    *id_path(parent["dotted_order"]),
+                    run_id,
+                ]
             else:
                 assert str(run["trace_id"]) == run_id
             matching = [

@@ -168,10 +168,12 @@ The Plugin allows `@traceable` to work inside Temporal's deterministic Workflow 
 Temporal Workflows are deterministic and get replayed from event history on recovery. The Plugin accounts for this by injecting replay-safe data into your traceable runs:
 
 - **No duplicate traces on replay.** Run IDs are deterministic, and the Plugin skips LangSmith writes while replaying history.
-- **No non-deterministic calls.** The Plugin uses `workflow.now()` for timestamps and an independent `workflow.new_random()` stream for UUIDs instead of wall-clock time and random UUIDs.
+- **No non-deterministic calls.** Run IDs come from `workflow.now()` and an independent `workflow.new_random()` stream. Timestamps use wall-clock time when live, so they stay accurate, and `workflow.now()` while replaying.
 - **Background I/O stays outside the sandbox.** LangSmith HTTP calls to the server are submitted to a background thread pool that doesn't interfere with the deterministic Workflow execution.
 
-This applies to native `RunTree` instances, `@traceable` functions, and sync or async `langsmith.trace()` blocks inside Workflows. Root runs remain real roots, so LangSmith applies its own destination and replica rules. Activities and code outside Workflows retain LangSmith's normal runtime behavior.
+This applies to native `RunTree` instances, `@traceable` functions, sync or async `langsmith.trace()` blocks, and LangChain runs, including LangGraph graphs, inside Workflows. Root runs remain real roots, so LangSmith applies its own destination and replica rules. Activities and code outside Workflows retain LangSmith's normal runtime behavior.
+
+A failed Workflow Task runs again live, not as a replay. Runs it starts are posted again under new IDs, and the failed attempt's runs stay open.
 
 ### Example: Worker Crash Mid-Workflow
 

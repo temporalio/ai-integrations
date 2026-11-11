@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import nightly_report
+import release_tool
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -58,6 +59,9 @@ def test_report_matches_ci_workflow_job_names() -> None:
         match = nightly_report.JOB_RE.match(f"{expected_name} (fakeplug) / matrix")
         assert match is not None and match.group("plugin") == "fakeplug"
         assert match.group("language") == expected_name
+        # The release workflows' check-nightly looks the issue up by the title this report gives it.
+        (key,), _ = nightly_report.classify([_job(f"{expected_name} (fakeplug) / matrix", "failure")])
+        assert nightly_report.title_for(key) == release_tool.nightly_issue_title(language, "fakeplug")
     assert {"python", "java", "go", "typescript"}.issubset(
         workflow["jobs"]["nightly-report"]["needs"]
     )
