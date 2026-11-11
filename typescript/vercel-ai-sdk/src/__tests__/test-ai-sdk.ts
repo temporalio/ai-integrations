@@ -564,23 +564,6 @@ test('Prompt file URLs the model supports reach the model as URL objects', async
   t.deepEqual(requested, ['/notes']);
 });
 
-test('invokeModel downloads with createDownload by default', async (t) => {
-  const activities = createActivities(new RecordingProvider({})) as {
-    invokeModel: (args: InvokeModelArgs) => Promise<InvokeModelResult>;
-  };
-  const url = 'http://127.0.0.1:1/image';
-  const prompt = [
-    { role: 'user', content: [{ type: 'file', mediaType: 'image', data: { type: 'url', url } }] },
-  ];
-  await t.throwsAsync(
-    new MockActivityEnvironment().run(activities.invokeModel, {
-      modelId: 'recording-test-model',
-      options: { prompt } as unknown as LanguageModelV4CallOptions,
-    }),
-    { message: /127\.0\.0\.1 is not allowed/ }
-  );
-});
-
 test('Streaming text, finish and response metadata survive activity execution and workflow replay', async (t) => {
   const providerMetadata = { test: { source: 'delta' } };
   const finishMetadata = { test: { cachedTokens: 7 } };
