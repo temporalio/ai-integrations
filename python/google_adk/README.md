@@ -8,6 +8,10 @@ This package provides the integration layer between the Google ADK and Temporal.
 
 Requires Python 3.11+ and Google ADK 2.12.0+.
 
+LiteLLM models require Python 3.11 through 3.14: LiteLLM's
+[`fastuuid`](https://pypi.org/project/fastuuid/) dependency does not yet support
+Python 3.15. Other ADK model providers can use Python 3.15.
+
 ```bash
 uv add temporalio-google-adk
 ```

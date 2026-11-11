@@ -6,7 +6,6 @@ needed), so they depend only on LangChain, not on deepagents.
 
 from __future__ import annotations
 
-import sys
 import uuid
 from collections.abc import Sequence
 from datetime import timedelta
@@ -16,10 +15,6 @@ from unittest.mock import Mock
 import pytest
 
 from temporalio.testing import WorkflowEnvironment
-
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 
 pytest.importorskip("langchain_core")
 
