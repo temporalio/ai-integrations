@@ -57,14 +57,17 @@ export class AiSdkPlugin extends SimplePlugin {
   /** The package version, reported in worker heartbeats. */
   readonly version = packageVersion();
 
+  private readonly activities: object;
+
   constructor(options: AiSdkPluginOptions) {
     const mcpServerNames = Object.keys(options.mcpClientFactories ?? {});
+    const activities = createActivities(options.modelProvider, options.mcpClientFactories, {
+      mcpConnectionIdleTimeout: options.mcpConnectionIdleTimeout,
+      download: options.download,
+    });
     super({
       name: 'AiSDKPlugin',
-      activities: createActivities(options.modelProvider, options.mcpClientFactories, {
-        mcpConnectionIdleTimeout: options.mcpConnectionIdleTimeout,
-        download: options.download,
-      }),
+      activities,
       runContext: async (next) => {
         try {
           await next();
@@ -76,6 +79,7 @@ export class AiSdkPlugin extends SimplePlugin {
         }
       },
     });
+    this.activities = activities;
   }
 
   /**
@@ -87,7 +91,7 @@ export class AiSdkPlugin extends SimplePlugin {
    * factory or `mcpConnectionIdleTimeout`.
    */
   override configureWorker(options: WorkerOptions): WorkerOptions {
-    refuseReplacedActivities('AiSdkPlugin', options.activities, this.options.activities as object);
+    refuseReplacedActivities('AiSdkPlugin', options.activities, this.activities);
     return super.configureWorker(options);
   }
 
@@ -102,7 +106,7 @@ export class AiSdkPlugin extends SimplePlugin {
     // Not async: when the check passes, the Worker starts in this tick, as
     // `Worker.runUntil` needs (see `refuseLaterReplacement`).
     return (
-      refuseLaterReplacement('AiSdkPlugin', worker, this.options.activities as object, next) ??
+      refuseLaterReplacement('AiSdkPlugin', worker, this.activities, next) ??
       super.runWorker(worker, next)
     );
   }
@@ -128,6 +132,8 @@ export class AiSdkPlugin extends SimplePlugin {
           : existingEntry !== undefined
             ? [existingEntry as string]
             : [];
+        // Webpack refuses a repeated entry, and another AiSdkPlugin may have added it.
+        if (entries.includes(polyfillPath)) return cfg;
         return { ...cfg, entry: [polyfillPath, ...entries] };
       },
     };

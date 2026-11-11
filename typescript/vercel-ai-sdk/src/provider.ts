@@ -190,18 +190,19 @@ export class TemporalLanguageModel implements LanguageModelV4 {
       throw ApplicationFailure.nonRetryable('Received undefined response from streaming model activity.');
     }
 
+    let timestamp = result.response?.timestamp ? new Date(result.response.timestamp) : undefined;
+    if (timestamp !== undefined && isNaN(timestamp.getTime())) {
+      timestamp = undefined;
+    }
+
     // Wrap the accumulated result as a ReadableStream that replays the content.
     // Real-time token streaming already happened via stream in the activity.
     const stream = new ReadableStream({
       start(controller: ReadableStreamDefaultController) {
         controller.enqueue({ type: 'stream-start', warnings: result.warnings ?? [] });
-        if (result.response !== undefined) {
-          controller.enqueue({
-            type: 'response-metadata',
-            id: result.response.id,
-            modelId: result.response.modelId,
-            timestamp: result.response.timestamp ? new Date(result.response.timestamp) : undefined,
-          });
+        const { id, modelId } = result.response ?? {};
+        if (id !== undefined || modelId !== undefined || timestamp !== undefined) {
+          controller.enqueue({ type: 'response-metadata', id, modelId, timestamp });
         }
         let partIndex = 0;
         for (const item of result.content ?? []) {
