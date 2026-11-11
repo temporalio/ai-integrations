@@ -195,6 +195,28 @@ async def take_then_fail(job_id: str) -> list[str]:
 
 
 @task
+async def take_unless(job_id: str, fail: bool) -> str:
+    """Take a new value, then raise if ``fail``."""
+    value = await _next(job_id)
+    if fail:
+        raise ValueError(f"failed after {value}")
+    return value
+
+
+async def take_then_fail_node(state: ValueState) -> dict[str, str]:
+    """Like ``take_then_fail``, as a node."""
+    first = await _next(state["job_id"])
+    return {"value": f"{first} {await _fail_first(state['job_id'] + '-f')}"}
+
+
+_recover_graph = StateGraph(ValueState)
+_recover_graph.add_node(
+    "take", take_then_fail_node, metadata={"execute_in": "workflow"}
+)
+_recover_graph.add_edge(START, "take")
+
+
+@task
 async def wait_then_subgraph(job_id: str, wait: bool) -> str:
     """Like ``wait_then_call``, but make the call through a subgraph."""
     await _wait(job_id, wait)
@@ -238,19 +260,27 @@ def _callers_plugin() -> LangGraphPlugin:
             return await take_then_fail(request["job_id"])
 
     @lg_entrypoint()
+    async def other_input_after_failure(request: dict[str, Any]) -> str:
+        try:
+            return await take_unless(request["job_id"], True)
+        except ValueError:
+            return await take_unless(request["job_id"], False)
+
+    @lg_entrypoint()
     async def two_subgraphs(request: dict[str, Any]) -> dict[str, str]:
         a = wait_then_subgraph(request["job_id"], True)
         b = wait_then_subgraph(request["job_id"], False)
         return {"a": await a, "b": await b}
 
     return LangGraphPlugin(
-        graphs={"value": _value_graph},
+        graphs={"value": _value_graph, "recover": _recover_graph},
         entrypoints={
             "two-branches": two_branches,
             "retry-on-failure": retry_on_failure,
             "retry-then-task": retry_then_task,
             "retry-task": retry_task,
             "two-subgraphs": two_subgraphs,
+            "other-input-after-failure": other_input_after_failure,
         },
         tasks=[
             _wait,
@@ -258,6 +288,7 @@ def _callers_plugin() -> LangGraphPlugin:
             _fail_first,
             wait_then_call,
             take_then_fail,
+            take_unless,
             wait_then_subgraph,
         ],
         activity_options={
@@ -266,6 +297,7 @@ def _callers_plugin() -> LangGraphPlugin:
             "fail_first_call": {"execute_in": "activity"},
             "wait_then_call": {"execute_in": "workflow"},
             "take_then_fail": {"execute_in": "workflow"},
+            "take_unless": {"execute_in": "workflow"},
             "wait_then_subgraph": {"execute_in": "workflow"},
         },
         default_activity_options=_ACTIVITY_OPTIONS,
@@ -324,6 +356,36 @@ class ApproveAcrossContinueAsNewWorkflow:
         if interrupted:
             result = await app.ainvoke(Command(resume="yes"), config)
         seen = [*input.seen, [interrupted, result["answer"]]]
+        if len(seen) < input.runs:
+            workflow.continue_as_new(
+                RepeatAcrossContinueAsNewInput(
+                    name=input.name,
+                    job_id=input.job_id,
+                    runs=input.runs,
+                    cache=cache(),
+                    seen=seen,
+                )
+            )
+        return seen
+
+
+@workflow.defn
+class RecoverAcrossContinueAsNewWorkflow:
+    """Runs graph ``name``, resuming it from its checkpoint if it fails.
+
+    Then continues-as-new with the cache until it has run ``runs`` times.
+    Returns each run's value.
+    """
+
+    @workflow.run
+    async def run(self, input: RepeatAcrossContinueAsNewInput) -> list[Any]:
+        app = graph(input.name, cache=input.cache).compile(checkpointer=InMemorySaver())
+        config = RunnableConfig({"configurable": {"thread_id": "1"}})
+        try:
+            result = await app.ainvoke({"job_id": input.job_id}, config)
+        except ActivityError:
+            result = await app.ainvoke(None, config)
+        seen = [*input.seen, result["value"]]
         if len(seen) < input.runs:
             workflow.continue_as_new(
                 RepeatAcrossContinueAsNewInput(
@@ -643,6 +705,58 @@ async def test_retried_task_restored_after_continue_as_new(client: Client):
     first = [f"{job_id}:2", f"{job_id}-f:2"]
     assert seen == [first, first]
     assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+@_needs_functional_api
+async def test_failed_task_with_other_input_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """A failed task call called again with other input keeps its own results.
+
+    The first call takes a value and raises; the entrypoint then calls the
+    task with other input. After continue-as-new the failed call must not
+    take the second call's result, so the second call gets its value back
+    from the cache and nothing runs.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "other-input-after-failure",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+    )
+
+    assert seen == [f"{job_id}:2", f"{job_id}:2"]
+    assert [len(_scheduled(h)) for h in histories] == [2, 0]
+    assert _calls[job_id] == 2
+
+
+@_needs_functional_api
+async def test_node_resumed_from_checkpoint_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """A failed node resumed from its checkpoint keeps its first call's result.
+
+    The node's first call succeeds and its second fails. Resuming the graph
+    from its checkpoint gets the first call's result from the checkpoint,
+    without calling it, and runs the second again. After continue-as-new
+    both come from the cache and nothing runs.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "recover",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+        workflow_cls=RecoverAcrossContinueAsNewWorkflow,
+    )
+
+    first = f"{job_id}:1 {job_id}-f:2"
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [3, 0]
+    assert _calls[job_id] == 1
 
 
 @_needs_functional_api

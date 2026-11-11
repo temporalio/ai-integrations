@@ -39,6 +39,12 @@ _free_places: ContextVar[dict[str, list[int]] | None] = ContextVar(
 _scope: ContextVar[str] = ContextVar("_temporal_task_scope", default="")
 # The keys that the calls made in that call took, its nested calls' included.
 _taken: ContextVar[list[str] | None] = ContextVar("_temporal_task_taken", default=None)
+# Cache entries written in this run by calls made in a node or task call that
+# then failed (see call_scope()). Not part of the cache either.
+_stale: ContextVar[set[str] | None] = ContextVar("_temporal_task_stale", default=None)
+# Keyword arguments LangGraph injects into a node function: the plugin keeps
+# these two (see _plugin.py). They are not the caller's input.
+_INJECTED_KWARGS = frozenset({"config", "runtime"})
 
 
 def set_task_cache(cache: dict[str, Any] | None) -> None:
@@ -46,6 +52,7 @@ def set_task_cache(cache: dict[str, Any] | None) -> None:
     _task_cache.set(cache)
     _key_uses.set({})
     _free_places.set({})
+    _stale.set(set())
 
 
 def occurrence_key(key: str) -> str:
@@ -91,20 +98,30 @@ def release(key: str) -> None:
 
 
 @contextmanager
-def call_scope(name: str) -> Generator[None, None, None]:
+def call_scope(
+    name: str,
+    args: tuple[Any, ...] = (),
+    kwargs: dict[str, Any] | None = None,
+) -> Generator[None, None, None]:
     """Count the calls made in this block per call of the workflow-side ``name``.
 
-    The scope is a hash of the enclosing scope, ``name`` and its place among
-    the enclosing scope's calls of ``name``, taken before the call awaits
-    anything. So it is the same in every run that makes the same calls in the
-    same order, whatever order parallel calls finish in. If the block raises,
-    its place is given back, as a failed call's is. If it fails, rather than
-    being interrupted, the results and places of the calls made in it are
-    dropped too, so a retry makes them again under the same keys and, after
-    continue-as-new, the first call gets the retry's results.
+    The scope is a hash of the enclosing scope, ``name`` with the caller's
+    ``args`` and ``kwargs``, and its place among the enclosing scope's
+    identical calls, taken before the call awaits anything. So it is the same
+    in every run that makes the same calls in the same order, whatever order
+    parallel calls finish in, and calls with other input never share one. If
+    the block raises, its place is given back, as a failed call's is. If it
+    fails, rather than being interrupted, the places of the calls made in it
+    are given back too and their results become stale: a call made again
+    under the same key, such as the retry's, runs again and replaces its
+    result, while a call that is not made again keeps it. LangGraph can
+    resume a failed node from its checkpoint without making the calls that
+    finished, and the next run still needs their results.
     """
-    # Hex, like a cache key, so release() can split off the place.
-    key = occurrence_key(sha256(name.encode()).hexdigest()[:32])
+    caller = {k: v for k, v in (kwargs or {}).items() if k not in _INJECTED_KWARGS}
+    # Hex, like a cache key, so release() can split off the place. The prefix
+    # keeps scopes apart from Activity calls, which use the task ID.
+    key = occurrence_key(cache_key(f"call_scope:{name}", args, caller))
     taken: list[str] = []
     token = _scope.set(sha256(key.encode()).hexdigest()[:16])
     taken_token = _taken.set(taken)
@@ -112,7 +129,7 @@ def call_scope(name: str) -> Generator[None, None, None]:
         yield
     except BaseException as err:
         if isinstance(err, Exception) and not isinstance(err, GraphBubbleUp):
-            _forget(taken)
+            _retire(taken)
         release(key)
         raise
     finally:
@@ -123,9 +140,15 @@ def call_scope(name: str) -> Generator[None, None, None]:
             outer.extend(taken)
 
 
-def _forget(keys: list[str]) -> None:
-    """Drop the cached results and the places of the calls under ``keys``."""
+def _entries(key: str) -> tuple[str, str, str]:
+    """Return the cache entries a call under ``key`` can write."""
+    return key, f"{key}:command", f"{key}:types"
+
+
+def _retire(keys: list[str]) -> None:
+    """Restart the places of the calls under ``keys`` and mark their results stale."""
     cache, uses, free = _task_cache.get(), _key_uses.get(), _free_places.get()
+    stale = _stale.get()
     for key in keys:
         base, sep, _ = key.rpartition("#")
         base = base if sep else key
@@ -133,9 +156,8 @@ def _forget(keys: list[str]) -> None:
             uses.pop(base, None)
         if free is not None:
             free.pop(base, None)
-        if cache is not None:
-            for entry in (key, f"{key}:command", f"{key}:types"):
-                cache.pop(entry, None)
+        if cache is not None and stale is not None:
+            stale.update(entry for entry in _entries(key) if entry in cache)
 
 
 def get_task_cache() -> dict[str, Any] | None:
@@ -213,11 +235,21 @@ def cache_key(
 
 
 def cache_lookup(key: str) -> tuple[bool, Any]:
-    """Return (True, value) if cached, (False, None) otherwise."""
+    """Return (True, value) if cached, (False, None) otherwise.
+
+    A stale entry (see :func:`call_scope`) misses: the call is being made
+    again, so its old entries are dropped and it runs.
+    """
     cache = _task_cache.get()
-    if cache is not None and key in cache:
-        return True, cache[key]
-    return False, None
+    if cache is None or key not in cache:
+        return False, None
+    stale = _stale.get()
+    if stale and key in stale:
+        for entry in _entries(key.split(":", 1)[0]):
+            cache.pop(entry, None)
+            stale.discard(entry)
+        return False, None
+    return True, cache[key]
 
 
 def cache_put(key: str, value: Any) -> None:

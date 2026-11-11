@@ -37,7 +37,7 @@ def wrap_workflow(
     :func:`temporalio.workflow.set_current_details` (last-writer-wins);
     an empty result clears it.
 
-    The calls it makes are counted per call of ``name`` (see
+    The calls it makes are counted per call of ``name`` with its input (see
     :func:`call_scope`).
     """
 
@@ -61,7 +61,7 @@ def wrap_workflow(
                         {**config, "configurable": configurable}
                     )
             try:
-                with call_scope(name):
+                with call_scope(name, args, kwargs):
                     if iscoroutinefunction(func):
                         return await func(*args, **kwargs)
                     return func(*args, **kwargs)

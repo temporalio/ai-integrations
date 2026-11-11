@@ -30,6 +30,7 @@ from temporalio.langgraph._task_cache import (
     cache_lookup,
     cache_put,
     call_scope,
+    get_task_cache,
     occurrence_key,
     release,
     set_task_cache,
@@ -458,23 +459,56 @@ def _occurrence_keys() -> None:
     release(calls[1])
     release(calls[0])
     assert [occurrence_key(key) for _ in range(3)] == [key, f"{key}#1", f"{key}#3"]
-    # A node or task call that failed gives its place back too and drops the
-    # results and places of its calls, so its retry makes them under the
-    # same keys.
+    # A node or task call that failed gives its place back too, and the
+    # places of its calls, so its retry makes them under the same keys.
+    # Their results stay in the cache but are stale: the retry's call runs.
     inner: list[str] = []
     with pytest.raises(ValueError), call_scope("node"):
         inner.append(occurrence_key(key))
         cache_put(inner[0], "failed attempt")
         raise ValueError
-    assert cache_lookup(inner[0]) == (False, None)
+    assert get_task_cache() == {inner[0]: "failed attempt"}
     with call_scope("node"):
         assert occurrence_key(key) == inner[0]
+        assert cache_lookup(inner[0]) == (False, None)
+    assert get_task_cache() == {}
     # An interrupted one keeps them: the resumed call counts on.
     with pytest.raises(GraphInterrupt), call_scope("node"):
         inner.append(occurrence_key(key))
         raise GraphInterrupt
     with call_scope("node"):
         assert occurrence_key(key) == f"{inner[1]}#1"
+    # A call that the failed call's retry doesn't make, because LangGraph
+    # got its result from a checkpoint, keeps the result for the next run.
+    set_task_cache({})
+    kept: list[str] = []
+    with pytest.raises(ValueError), call_scope("node"):
+        kept.append(occurrence_key(other))
+        cache_put(kept[0], "finished")
+        raise ValueError
+    with call_scope("node"):
+        pass
+    set_task_cache(get_task_cache())
+    with call_scope("node"):
+        assert occurrence_key(other) == kept[0]
+    assert cache_lookup(kept[0]) == (True, "finished")
+    # Calls with other input count apart, so a failed call never shares a
+    # scope with a call that has other input. The config and runtime that
+    # LangGraph injects are not input.
+    set_task_cache({})
+    with call_scope("node", ("a",), {"config": {"run_id": 1}}):
+        first = [occurrence_key(key)]
+    set_task_cache({})
+    with call_scope("node", ("a",), {"config": {"run_id": 2}, "runtime": object()}):
+        assert occurrence_key(key) == first[0]
+    with call_scope("node", ("b",)):
+        assert occurrence_key(key) != first[0]
+    # A scope's place is not a place of an Activity call with the same name
+    # and input.
+    set_task_cache({})
+    with call_scope("task", ("job-42",)):
+        pass
+    assert occurrence_key(key) == key
 
 
 def test_repeated_calls_get_their_own_keys():
