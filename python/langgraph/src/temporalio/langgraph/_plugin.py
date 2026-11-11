@@ -379,7 +379,10 @@ class LangGraphPlugin(SimplePlugin):
             )
         elif execute_in == "workflow":
             return wrap_workflow(
-                func, streaming_topic=self._streaming_topic, summary_fn=summary_fn
+                activity_name,
+                func,
+                streaming_topic=self._streaming_topic,
+                summary_fn=summary_fn,
             )
         else:
             raise ValueError(f"Invalid execute_in value: {execute_in}")
@@ -393,8 +396,9 @@ def graph(
     Args:
         name: Graph name as registered with LangGraphPlugin.
         cache: Optional task result cache from a previous cache() call.
-            Restores cached results so previously-completed nodes are
-            not re-executed after continue-as-new.
+            Restores cached results so that node calls completed before
+            continue-as-new are not re-executed when the run makes them
+            again, in the same order.
     """
     set_task_cache(cache or {})
     graphs = _workflow_graphs.get(workflow.info().run_id)
@@ -415,8 +419,9 @@ def entrypoint(
     Args:
         name: Entrypoint name as registered with Plugin.
         cache: Optional task result cache from a previous cache() call.
-            Restores cached results so previously-completed tasks are
-            not re-executed after continue-as-new.
+            Restores cached results so that task calls completed before
+            continue-as-new are not re-executed when the run makes them
+            again, in the same order.
     """
     set_task_cache(cache or {})
     entrypoints = _workflow_entrypoints.get(workflow.info().run_id)

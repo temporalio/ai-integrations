@@ -14,9 +14,11 @@ from langgraph._internal._constants import CONFIG_KEY_RUNTIME
 
 from temporalio import workflow
 from temporalio.contrib.workflow_streams._stream import _PUBLISH_SIGNAL
+from temporalio.langgraph._task_cache import call_scope
 
 
 def wrap_workflow(
+    name: str,
     func: Callable[..., Any],
     *,
     streaming_topic: str | None = None,
@@ -34,6 +36,9 @@ def wrap_workflow(
     ``summary_fn`` result updates the workflow's current details via
     :func:`temporalio.workflow.set_current_details` (last-writer-wins);
     an empty result clears it.
+
+    The calls it makes are counted per call of ``name`` (see
+    :func:`call_scope`).
     """
 
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -56,9 +61,10 @@ def wrap_workflow(
                         {**config, "configurable": configurable}
                     )
             try:
-                if iscoroutinefunction(func):
-                    return await func(*args, **kwargs)
-                return func(*args, **kwargs)
+                with call_scope(name):
+                    if iscoroutinefunction(func):
+                        return await func(*args, **kwargs)
+                    return func(*args, **kwargs)
             finally:
                 if token is not None:
                     var_child_runnable_config.reset(token)

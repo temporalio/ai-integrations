@@ -5,12 +5,14 @@ so nodes don't re-execute when the graph is re-invoked with the same state.
 """
 
 import operator
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Annotated, Any
 from uuid import uuid4
 
 import pytest
+from langgraph.errors import GraphInterrupt
 from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
     END,
     START,
@@ -23,7 +25,15 @@ from temporalio import workflow
 from temporalio.client import Client
 from temporalio.common import RetryPolicy
 from temporalio.langgraph import LangGraphPlugin, cache, graph
-from temporalio.langgraph._task_cache import cache_key
+from temporalio.langgraph._task_cache import (
+    cache_key,
+    cache_lookup,
+    cache_put,
+    call_scope,
+    occurrence_key,
+    release,
+    set_task_cache,
+)
 from temporalio.worker import Worker
 
 # Track execution counts to verify caching
@@ -420,3 +430,52 @@ def test_cache_key_reads_values():
         "task", ({"names": ["a"]},), {}
     )
     assert cache_key("task", ({"a"},), {}) != cache_key("task", (["a"],), {})
+
+
+def _occurrence_keys() -> None:
+    key = cache_key("task", ("job-42",), {})
+    other = cache_key("task", ("job-43",), {})
+    set_task_cache({})
+    # The first call keeps the key earlier versions wrote, so caches they
+    # carried through continue-as-new still hit; each repeat gets its own.
+    assert [occurrence_key(key) for _ in range(3)] == [key, f"{key}#1", f"{key}#2"]
+    assert occurrence_key(other) == other
+    # Each call of a workflow-side node or task counts its own calls under
+    # its own keys.
+    with call_scope("node"):
+        first = [occurrence_key(key) for _ in range(2)]
+    with call_scope("node"):
+        second = occurrence_key(key)
+    assert first[0].startswith(f"{key}@") and first[1] == f"{first[0]}#1"
+    assert second not in (key, first[0])
+    # graph() and entrypoint() start counting again.
+    set_task_cache({})
+    assert occurrence_key(key) == key
+    # A call that failed or was interrupted stored no result, so the next
+    # identical call takes its place. Places go back lowest first.
+    set_task_cache({})
+    calls = [occurrence_key(key) for _ in range(3)]
+    release(calls[1])
+    release(calls[0])
+    assert [occurrence_key(key) for _ in range(3)] == [key, f"{key}#1", f"{key}#3"]
+    # A node or task call that failed gives its place back too and drops the
+    # results and places of its calls, so its retry makes them under the
+    # same keys.
+    inner: list[str] = []
+    with pytest.raises(ValueError), call_scope("node"):
+        inner.append(occurrence_key(key))
+        cache_put(inner[0], "failed attempt")
+        raise ValueError
+    assert cache_lookup(inner[0]) == (False, None)
+    with call_scope("node"):
+        assert occurrence_key(key) == inner[0]
+    # An interrupted one keeps them: the resumed call counts on.
+    with pytest.raises(GraphInterrupt), call_scope("node"):
+        inner.append(occurrence_key(key))
+        raise GraphInterrupt
+    with call_scope("node"):
+        assert occurrence_key(key) == f"{inner[1]}#1"
+
+
+def test_repeated_calls_get_their_own_keys():
+    copy_context().run(_occurrence_keys)
