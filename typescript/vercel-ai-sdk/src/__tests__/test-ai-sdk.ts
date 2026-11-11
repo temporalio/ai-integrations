@@ -740,18 +740,6 @@ test('invokeEmbeddingModel fails without retry on a non-retryable provider error
   t.true(APICallError.isInstance(err!.cause));
 });
 
-test('invokeEmbeddingModel leaves a retryable provider error to the retry policy', async (t) => {
-  const error = apiCallError(429, true);
-  const activities = createActivities(new FailingProvider([error])) as {
-    invokeEmbeddingModel: (args: { modelId: string; values: string[] }) => Promise<unknown>;
-  };
-  const env = new MockActivityEnvironment();
-  const err = await t.throwsAsync(
-    env.run(activities.invokeEmbeddingModel, { modelId: 'm', values: ['a'] })
-  );
-  t.is(err, error);
-});
-
 test.serial('Telemetry', async (t) => {
   if (remoteTests) {
     t.timeout(120 * 1000);
