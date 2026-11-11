@@ -230,6 +230,21 @@ test('invokeModelStreaming fails without retry on a non-retryable APICallError p
   t.regex(err!.message, /Invalid API key/);
 });
 
+test('A retryable APICallError stream part keeps the failure type Error', async (t) => {
+  const error = new APICallError({
+    message: 'Overloaded',
+    url: 'https://provider.invalid/v1/chat',
+    requestBodyValues: {},
+    statusCode: 529,
+  });
+
+  const err = await t.throwsAsync(runStreamingActivity(errorPartStream(error)), {
+    instanceOf: ApplicationFailure,
+  });
+  t.false(err!.nonRetryable);
+  t.is(err!.type, 'Error');
+});
+
 test('invokeModelStreaming reports a plain object error part as JSON', async (t) => {
   const error = { type: 'overloaded_error', message: 'Overloaded' };
   const err = await t.throwsAsync(runStreamingActivity(errorPartStream(error)), {

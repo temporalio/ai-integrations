@@ -411,7 +411,9 @@ export function createActivities(
         // other value is left to the activity retry policy, as in `invokeModel`.
         throw ApplicationFailure.create({
           message: `Model stream emitted an error part${ending}: ${getErrorMessage(streamError)}`,
-          type: APICallError.isInstance(streamError) ? streamError.name : 'Error',
+          // A retryable failure keeps the type `Error`, so that a retry policy with `Error` in
+          // `nonRetryableErrorTypes` continues to stop it.
+          type: isFinalProviderError(streamError) ? streamError.name : 'Error',
           nonRetryable: isFinalProviderError(streamError),
           cause: streamError instanceof Error ? streamError : undefined,
         });
