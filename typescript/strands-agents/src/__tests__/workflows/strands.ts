@@ -31,6 +31,7 @@ import {
   TemporalAgent,
   TemporalMCPClient,
   TemporalModel,
+  type ActivityAsToolOptions,
   type TemporalAgentOptions,
   workflow as strandsWorkflow,
 } from '../..';
@@ -169,13 +170,16 @@ export async function defaultModelAgent(prompt: string): Promise<string> {
   return result.toString();
 }
 
-export async function activityToolAgent(prompt: string): Promise<string> {
+export async function activityToolAgent(
+  prompt: string,
+  toolOptions: ActivityAsToolOptions = { description: 'Get the weather for a city' }
+): Promise<string> {
   const agent = new TemporalAgent({
     model: 'test',
     printer: false,
     tools: [
       strandsWorkflow.activityAsTool('getWeather', {
-        description: 'Get the weather for a city',
+        ...toolOptions,
         inputSchema: {
           type: 'object',
           properties: {

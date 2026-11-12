@@ -196,7 +196,9 @@ for await (const item of stream.subscribe(['events'])) {
 
 ## Tools
 
-Wrap an activity registered on the worker with `workflow.activityAsTool(name, options)`:
+Wrap an activity registered on the worker with `workflow.activityAsTool(name, options)`.
+
+`description` is optional and is omitted from the tool specification when not supplied. Supply a description to help the model decide when to call the tool. An explicitly empty description is rejected by Strands.
 
 ```ts
 // activities/index.ts
@@ -427,6 +429,7 @@ This version changes what workflow code does in the cases below, with no version
 - **Your failure converter.** Earlier versions replaced the failure converter your client and worker set with the plugin's, so workflow code now decodes the failures of earlier runs with yours. If yours decodes a failure into another error than the SDK's default converter and that changes which commands the workflow issues, the run fails to replay. If it only changes a value the workflow keeps or returns, the run replays without error and continues with the new value, so replay tests do not catch it.
 - **Errors from a turn.** Workflow code that catches errors from `invoke()` by class now gets an `ApplicationFailure` or `ActivityFailure` instead of the Strands error. If it acts on the difference, the run fails to replay.
 - **Context overflow.** A run whose workflow code caught a context overflow from the agent now trims and calls the model again on replay instead, and fails to replay.
+- **Activity tools without descriptions.** An unspecified description is now omitted instead of defaulting to an empty string, so agent construction succeeds. A run whose workflow caught the earlier tool-registration `ToolValidationError` can take a different path on replay and fail to replay.
 - **Duplicate MCP tool names.** When a re-listed server starts listing a name that another tool of the agent has, the listing now throws Strands' `ToolValidationError`, where earlier versions let the new tool replace the other one. A run in which that happened fails to replay after that tool round's last listing. A re-listed server that lists one name twice is now refused too, where earlier versions kept the later copy. For a name that differs from another tool's only by `-` or `_`, or that Strands rejects, earlier versions threw Strands' own error from that server's hook, after applying part of its listing and before listing the servers whose hooks came after it. Now every re-listed server lists first, and the refusal applies nothing; a `-`/`_` name that moves from one server to another is now accepted. So a run whose workflow code caught such an error and went on can fail to replay. The new tools of the re-listed servers are now applied together, once all of them have listed, and not at all if a listing fails; earlier versions applied each server's tools as soon as it listed. So workflow code that reads the agent's tools in between, or after catching a failed listing, can take another path. And a tool that workflow code put under the name of a server's tool is now removed by the listing in which that server drops the name, where earlier versions kept it. A run whose model or workflow code used that tool after that listing can fail to replay, though no names clashed.
 
 Let those runs finish before you upgrade, or keep them on the earlier version with Worker Versioning. The same applies to rolling back: a run that started on this version can fail to replay on an earlier one, so let it finish before you roll back.
