@@ -135,7 +135,8 @@ class TemporalAgent(Agent):
 
     ``model`` is the name of a factory registered in
     ``StrandsPlugin(models={...})``. The activity options apply to every model
-    invocation this agent makes. ``sandbox`` is a workflow-side
+    invocation this agent makes; ``heartbeat_timeout`` defaults to 10 seconds
+    (see ``TemporalModel``). ``sandbox`` is a workflow-side
     ``TemporalSandbox`` whose name selects a worker-side factory. All other
     keyword arguments are forwarded to Strands' ``Agent`` (``tools``, ``hooks``, ``system_prompt``,
     ``structured_output_model``, ``messages``, etc.).
@@ -153,7 +154,7 @@ class TemporalAgent(Agent):
         schedule_to_close_timeout: timedelta | None = None,
         schedule_to_start_timeout: timedelta | None = None,
         start_to_close_timeout: timedelta | None = None,
-        heartbeat_timeout: timedelta | None = None,
+        heartbeat_timeout: timedelta | None = timedelta(seconds=10),
         retry_policy: RetryPolicy | None = None,
         cancellation_type: ActivityCancellationType = ActivityCancellationType.TRY_CANCEL,
         versioning_intent: VersioningIntent | None = None,

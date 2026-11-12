@@ -28,7 +28,7 @@ from temporalio.strands_agents._sync_calls import _MESSAGE
 from temporalio.worker import Replayer, Worker
 from temporalio.worker.workflow_sandbox import RestrictedWorkflowAccessError
 from temporalio.workflow import NondeterminismError
-from tests.common import get_activities
+from tests.common import get_activities, get_heartbeat_timeouts
 from tests.mock_model import MockModel
 
 # The dotted name passes through the sandbox, so the Workflow gets the binding
@@ -72,6 +72,9 @@ async def test_model(client: Client):
 
     history = await handle.fetch_history()
     assert get_activities(history) == ["strands_get_model_config", "invoke_model"]
+    # The model call heartbeats by default. The config read runs synchronously,
+    # so it can't heartbeat and gets no heartbeat timeout.
+    assert get_heartbeat_timeouts(history) == [None, timedelta(seconds=10)]
 
     await Replayer(
         workflows=[ModelWorkflow],
