@@ -426,9 +426,11 @@ the activity's error message, and `AfterToolCallEvent.exception` contains the
 underlying exception. This also applies when an MCP tool's call-tool activity
 fails.
 
-Cancellation of an activity or MCP tool propagates as `asyncio.CancelledError`
-instead of a failed tool result, so cancelling the workflow ends it as `CANCELED`.
-The tool's `cancellation_type` controls whether it waits for activity cleanup.
+When a workflow or tool task is cancelled, cancellation of its activity or MCP
+call propagates as `asyncio.CancelledError` instead of a failed tool result, so
+cancelling the workflow ends it as `CANCELED`. The tool's `cancellation_type`
+controls whether it waits for activity cleanup. An activity that reports
+cancellation independently still produces a failed tool result for the agent.
 
 **Breaking change:** histories that previously processed a cancelled tool as an
 error result can fail replay on this version. Keep those runs on their original
