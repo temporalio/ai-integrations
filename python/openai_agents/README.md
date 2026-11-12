@@ -1028,6 +1028,18 @@ retries the same way as any other workflow_streams publisher — see
 the conventional `RETRY` event pattern for surfacing the transition to
 consumers.
 
+Streamed results are decoded with the full `TResponseStreamEvent` type,
+so an event that fails the openai SDK's strict validation keeps its
+class in every Worker process. Earlier versions decoded such an event
+as another class in a process that had not parsed one itself. A
+streamed run recorded on an earlier version that decoded a result that
+way can take another path on replay, whether or not it raised: it may
+have caught `ModelBehaviorError`, dropped an output item, or checked an
+event's class. Let such runs finish on the earlier version, or use
+Worker Versioning. Their closed Histories, also of runs that failed
+with `ModelBehaviorError`, no longer replay. Runs that were stuck on
+that decode continue after the upgrade.
+
 ## Feature Support
 
 This integration is presently subject to certain limitations.
