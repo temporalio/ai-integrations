@@ -12,6 +12,11 @@ import {
   type JSONValue,
   type Message,
 } from '@strands-agents/sdk';
+import { InMemoryStorage } from '@strands-agents/sdk/storage';
+import {
+  ContextOffloader,
+  InMemoryStorage as LegacyInMemoryStorage,
+} from '@strands-agents/sdk/vended-plugins/context-offloader';
 import {
   ActivityCancellationType,
   ActivityFailure,
@@ -39,6 +44,38 @@ export async function helloAgent(prompt: string): Promise<string> {
   const agent = new TemporalAgent({ model: 'test', printer: false });
   const result = await agent.invoke(prompt);
   return result.toString();
+}
+
+/** Exercise Strands' own offloader and storage inside the Workflow isolate. */
+export async function contextOffloaderAgent(
+  storageKind: 'memory' | 'default' | 'legacy',
+  evictAfterCycles: number | null
+): Promise<{ replies: string[]; keys?: string[]; error?: { name: string; message: string } }> {
+  const storage = storageKind === 'memory' ? new InMemoryStorage() : undefined;
+  const agent = new TemporalAgent({
+    model: 'test',
+    printer: false,
+    activityOptions: { startToCloseTimeout: '10 seconds', retry: { maximumAttempts: 1 } },
+    tools: [strandsWorkflow.activityAsTool('loadDocument', { description: 'Load a large document' })],
+    plugins: [
+      new ContextOffloader({
+        // eslint-disable-next-line @typescript-eslint/no-deprecated -- Exercise the unsupported legacy backend.
+        ...(storageKind === 'legacy' ? { storage: new LegacyInMemoryStorage() } : storage ? { storage } : {}),
+        maxResultTokens: 100,
+        previewTokens: 10,
+        evictAfterCycles,
+      }),
+    ],
+  });
+  const replies: string[] = [];
+  try {
+    replies.push((await agent.invoke('load the document and retrieve its full content')).toString());
+    replies.push((await agent.invoke('next turn')).toString());
+  } catch (err) {
+    const { name, message } = err as Error;
+    return { replies, error: { name, message } };
+  }
+  return { replies, ...(storage ? { keys: await storage.list('') } : {}) };
 }
 
 /**
