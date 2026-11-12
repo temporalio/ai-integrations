@@ -148,8 +148,8 @@ async def _heartbeating() -> AsyncGenerator[None, None]:
     """Heartbeat at half the Activity's heartbeat timeout while the block runs.
 
     A cancel reaches a running Activity only in a heartbeat's response. The
-    beats come from a timer, not from the server, so a slow request isn't
-    mistaken for a lost worker.
+    beats come from a timer, not from the request's progress, so a slow request
+    isn't mistaken for a lost worker.
     """
     timeout = activity.info().heartbeat_timeout if activity.in_activity() else None
     if not timeout:
