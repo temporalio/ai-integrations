@@ -332,6 +332,34 @@ outside Temporal. To use another model, build the agent with
 > goroutines. Anything that isn't belongs in an `ActivityAsTool` (or an MCP tool),
 > where it runs worker-side under Temporal's retry/timeout policy.
 
+## Heartbeats
+
+The plugin's own Activities heartbeat while they run: `InvokeModel`,
+`ListMcpTools`, `CallMcpTool`, `ResolveA2AAgentCard`, `SendA2AMessage` and
+`CancelA2ATask`. That's how a cancel reaches a running call, and how a lost
+Worker is noticed within about 10 seconds instead of at the
+`StartToCloseTimeout`.
+
+- A zero `HeartbeatTimeout` in their Activity options defaults to 10 seconds:
+  `WithModelActivityOptions`, `MCPToolsetOptions.ActivityOptions`,
+  `NewA2AAgentCardProvider` and `NewA2AClientProvider`. A timeout you set wins.
+- A negative `HeartbeatTimeout` turns heartbeats off. A cancel then doesn't
+  reach a running call.
+- They heartbeat on a timer, a third of the timeout apart, not on progress. So
+  a slow model or MCP server isn't mistaken for a lost Worker, and a stuck one
+  still runs until the `StartToCloseTimeout`.
+- In Temporal Cloud, each heartbeat that reaches the server is an
+  [Action](https://docs.temporal.io/cloud/actions). The first one comes a third
+  of the timeout into a call, so a call shorter than that, about 3 seconds by
+  default, sends none. After that, the SDK sends at most one every 8 seconds:
+  four for a 30-second call.
+- `CancelA2ATask` gets the same default, but the server caps its heartbeat
+  timeout at the cancellation's 5-second `StartToCloseTimeout`. Nothing cancels
+  a cancellation, so its heartbeats only notice a lost Worker, and only a
+  cancellation slower than about 1.7 seconds sends one.
+- `ActivityAsTool` runs your own Activity with the options you give it, so it
+  gets no default.
+
 ## Human-in-the-loop (HITL) tool confirmation
 
 A tool that needs approval calls ADK's `ctx.RequestConfirmation(hint, payload)`.

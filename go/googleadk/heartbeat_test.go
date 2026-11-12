@@ -149,6 +149,40 @@ func TestModelHeartbeatsWhileAwaitingSlowResponse(t *testing.T) {
 		"a healthy slow call must not be retried")
 }
 
+// TestShortModelCallSendsNoHeartbeat proves a model call shorter than a third
+// of its heartbeat timeout sends no heartbeat with the 10-second default, and
+// that a negative HeartbeatTimeout turns heartbeats off.
+func TestShortModelCallSendsNoHeartbeat(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		set      time.Duration
+		expected time.Duration
+	}{
+		{"default", 0, 10 * time.Second},
+		{"off", -1, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sm := &slowModel{name: "slow-model", text: "done", chunks: 1}
+			env, _, heartbeats := newSlowModelEnv(t, sm)
+			var heartbeatTimeout atomic.Int64
+			env.SetOnActivityStartedListener(func(info *activity.Info, _ context.Context, _ converter.EncodedValues) {
+				heartbeatTimeout.Store(int64(info.HeartbeatTimeout))
+			})
+
+			env.ExecuteWorkflow(slowModelWorkflow, slowModelInput{
+				ModelName:        "slow-model",
+				UserMessage:      "hi",
+				HeartbeatTimeout: tc.set,
+			})
+
+			require.True(t, env.IsWorkflowCompleted())
+			require.NoError(t, env.GetWorkflowError())
+			assert.Equal(t, tc.expected, time.Duration(heartbeatTimeout.Load()))
+			assert.Zero(t, heartbeats.Load())
+		})
+	}
+}
+
 // TestStreamingModelHeartbeatsBeforeFirstChunk proves the streaming branch
 // stays alive through the window between Activity start and the model's first
 // chunk, where the old per-chunk heartbeat never fired: the model stays silent

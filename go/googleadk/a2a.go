@@ -51,7 +51,9 @@ const a2aCancelTimeout = 5 * time.Second
 //
 // A zero StartToCloseTimeout in ao falls back to one minute, and with no
 // RetryPolicy Temporal retries a failed fetch without limit, including a card
-// file missing on the worker, which another worker or a redeploy can supply.
+// file missing on the worker, which another worker or a redeploy can supply. A
+// zero HeartbeatTimeout falls back to 10 seconds, and a negative one turns
+// heartbeats off.
 func NewA2AAgentCardProvider(source string, ao workflow.ActivityOptions) remoteagent.AgentCardProvider {
 	// A method value, not a func literal, so remoteAgentSendsFromWorkflow can
 	// recognize it: a func literal gets a new code pointer when inlined.
@@ -69,7 +71,7 @@ func (p a2aCardProvider) resolve(ctx context.Context) (*a2a.AgentCard, error) {
 		return nil, errMissingContext
 	}
 	var card a2a.AgentCard
-	if err := executeA2AActivity(wfCtx, p.activityOptions, ResolveA2AAgentCardActivityName, invocationAgentName(ctx), p.source, &card); err != nil {
+	if err := executeA2AActivity(wfCtx, resolveHeartbeatTimeout(p.activityOptions), ResolveA2AAgentCardActivityName, invocationAgentName(ctx), p.source, &card); err != nil {
 		return nil, err
 	}
 	return &card, nil
@@ -82,8 +84,12 @@ func (p a2aCardProvider) resolve(ctx context.Context) (*a2a.AgentCard, error) {
 // A zero StartToCloseTimeout in ao falls back to one minute, and with no
 // RetryPolicy Temporal retries without limit. A send that times out is sent
 // again and starts another remote task, so set a StartToCloseTimeout longer
-// than the remote agent takes to answer. A cancellation gets a single
-// 5-second attempt, as in ADK; the rest of ao applies to it.
+// than the remote agent takes to answer. A zero HeartbeatTimeout falls back to
+// 10 seconds, and a negative one turns heartbeats off. A cancellation gets a
+// single 5-second attempt, as in ADK; the rest of ao applies to it. The server
+// caps its HeartbeatTimeout at those 5 seconds. Nothing cancels a
+// cancellation, so its heartbeats only notice a lost worker, and only a
+// cancellation slower than a third of its HeartbeatTimeout sends one.
 //
 // The client sets the message ID from the workflow's random stream when it
 // sends. ADK's BeforeRequestCallbacks run earlier and see the random ID a2a-go
@@ -154,7 +160,7 @@ func (c *a2aClient) send(ctx context.Context, req *a2a.SendMessageRequest, strea
 	}
 	var res a2aSendResult
 	in := a2aSendInput{Card: c.card, Request: req, Stream: stream}
-	err := executeA2AActivity(wfCtx, c.activityOptions, SendA2AMessageActivityName, c.agentName, in, &res)
+	err := executeA2AActivity(wfCtx, resolveHeartbeatTimeout(c.activityOptions), SendA2AMessageActivityName, c.agentName, in, &res)
 	return res, err
 }
 
@@ -166,7 +172,7 @@ func (c *a2aClient) CancelTask(ctx context.Context, req *a2a.CancelTaskRequest) 
 		return nil, errMissingContext
 	}
 	wfCtx, _ = workflow.NewDisconnectedContext(wfCtx)
-	ao := c.activityOptions
+	ao := resolveHeartbeatTimeout(c.activityOptions)
 	ao.StartToCloseTimeout = a2aCancelTimeout
 	ao.RetryPolicy = &temporal.RetryPolicy{MaximumAttempts: 1}
 	var task a2a.Task
