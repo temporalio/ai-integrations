@@ -42,6 +42,7 @@ import { jsonSchema } from 'ai';
 import { temporal } from '@temporalio/proto';
 import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
 import { ActivityFailure, ApplicationFailure, TemporalFailure } from '@temporalio/common';
+import { optionalTsToMs } from '@temporalio/common/lib/time';
 import type { OpenTelemetrySinks } from '@temporalio/interceptors-opentelemetry';
 import {
   makeWorkflowExporter,
@@ -441,7 +442,7 @@ test('Streaming text, finish and response metadata survive activity execution an
   });
 });
 
-// Each call waits longer than the `heartbeatTimeout` of `slowModelWorkflow` before it answers.
+// Each call waits longer than the 1-second `heartbeatTimeout` the test below sets first.
 const slowModelDelayMs = 2000;
 
 class SlowTestProvider implements ProviderV4 {
@@ -501,16 +502,28 @@ for (const [call, expected] of [
   ['embed', 1],
 ] as const) {
   test(`Model activity (${call}) heartbeats while the provider is slow`, async (t) => {
-    const { createWorker, executeWorkflow } = helpers(t);
+    const { createWorker, startWorkflow } = helpers(t);
     const plugin = new AiSdkPlugin({ modelProvider: new SlowTestProvider() });
     const worker = await createWorker({ plugins: [plugin] });
 
     await worker.runUntil(async () => {
-      const result = await executeWorkflow(slowModelWorkflow, {
-        args: [call],
-        workflowExecutionTimeout: '10 seconds',
-      });
-      t.is(result, expected);
+      // A timeout you set wins, none gives the 10-second default, and 0 turns it off.
+      for (const [heartbeatTimeout, expectedMs] of [
+        [1000, 1000],
+        [undefined, 10_000],
+        [0, undefined],
+      ] as const) {
+        const handle = await startWorkflow(slowModelWorkflow, {
+          args: [call, heartbeatTimeout],
+          workflowExecutionTimeout: '10 seconds',
+        });
+        t.is(await handle.result(), expected);
+        const { events } = await handle.fetchHistory();
+        const heartbeatTimeouts = events
+          ?.filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED)
+          .map((e) => optionalTsToMs(e.activityTaskScheduledEventAttributes?.heartbeatTimeout) || undefined);
+        t.deepEqual(heartbeatTimeouts, [expectedMs]);
+      }
     });
   });
 }

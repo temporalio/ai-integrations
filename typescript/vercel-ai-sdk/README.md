@@ -66,11 +66,12 @@ object.
 
 ## Heartbeats and streaming
 
-When you set a `heartbeatTimeout` in the provider options, the model and
-embedding Activities heartbeat at half that timeout while they wait on the
-provider. Without a `heartbeatTimeout` they send no heartbeat, so a lost Worker
-is noticed only at `startToCloseTimeout` and a cancellation request does not
-reach the Activity.
+The model and embedding Activities get a 10-second `heartbeatTimeout` unless you
+set one in the provider options. While they wait on the provider, they heartbeat
+at half that timeout, so a lost Worker is noticed, and a cancellation request
+reaches the Activity, within about that time. Set `heartbeatTimeout: 0` to turn
+this off. Then a lost Worker is noticed only at `startToCloseTimeout`, and a
+cancellation request does not reach a call that is waiting on the provider.
 
 When `invokeModelStreaming` is retried, the new attempt publishes all of its
 stream parts to the topic again, after the parts the failed attempt published.
