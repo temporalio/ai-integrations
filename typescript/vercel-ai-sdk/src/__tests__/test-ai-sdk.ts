@@ -67,7 +67,6 @@ import {
   TestWorkflowEnvironment,
 } from '@temporalio/test-helpers';
 import { AiSdkPlugin, createActivities } from '..';
-import type { InvokeModelArgs, InvokeModelResult } from '..';
 import { startLocalWithRetry } from './helpers/environment';
 import {
   binaryFileWorkflow,
