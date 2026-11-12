@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import re
-import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -39,9 +38,6 @@ from temporalio.mcp._activity import (
 )
 from temporalio.mcp._backend import _MCPBackend, _MCPBackendFactory
 from temporalio.mcp._pool import _MCPConnectionPool
-
-if sys.version_info < (3, 11):
-    from exceptiongroup import BaseExceptionGroup  # type: ignore[reportUnreachable]
 
 _Result = TypeVar("_Result")
 _ListResult = TypeVar("_ListResult", bound=BaseModel)
@@ -107,11 +103,11 @@ def _rejected(err: RuntimeError) -> ApplicationError:
 
 def _lone_error(
     group: BaseExceptionGroup[Any],
-) -> MCPError | ValidationError | RuntimeError | None:
+) -> MCPError | ValidationError | RuntimeError | ApplicationError | None:
     """The error we classify that a nest of ExceptionGroups carries alone, if it does."""
     while len(group.exceptions) == 1:
         (inner,) = group.exceptions
-        if isinstance(inner, (MCPError, ValidationError)):
+        if isinstance(inner, (MCPError, ValidationError, ApplicationError)):
             return inner
         if isinstance(inner, RuntimeError) and _rejected_result(inner):
             return inner
@@ -197,6 +193,9 @@ class _MCPActivities:
             # wrapped in task-group ExceptionGroups, which a factory argument or a
             # failed connect lets through.
             inner = _lone_error(group)
+            if isinstance(inner, ApplicationError):
+                # Already classified, such as a repeated pagination cursor.
+                raise inner
             if isinstance(inner, MCPError):
                 raise _protocol_error(inner, has_session) from inner
             if isinstance(inner, ValidationError):

@@ -145,7 +145,7 @@ Passing `retry_strategy=...` to `TemporalAgent(...)` raises `ValueError`; remove
 
 ## Structured Output
 
-Like Strands `Agent`, `TemporalAgent` supports structured output with `structured_output_model`. The plugin defaults to [`pydantic_data_converter`](https://github.com/temporalio/sdk-python/tree/6adc0d84290a79952dee3ef02c36f6ed9334874a/temporalio/contrib/pydantic), so Pydantic types easily serialize across the activity and workflow boundary.
+Like Strands `Agent`, `TemporalAgent` supports structured output with `structured_output_model`. The plugin defaults to [`pydantic_data_converter`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/pydantic.py), so Pydantic types easily serialize across the activity and workflow boundary.
 
 ```python
 from pydantic import BaseModel
@@ -704,7 +704,7 @@ Earlier versions used Strands' `MCPClient` factories and the `{name}-list-tools`
 
 ## Observability
 
-`StrandsPlugin` composes cleanly with [`OpenTelemetryPlugin`](https://github.com/temporalio/sdk-python/tree/6adc0d84290a79952dee3ef02c36f6ed9334874a/temporalio/contrib/opentelemetry). Register `OpenTelemetryPlugin` on the client (workers built from that client pick it up automatically) and `StrandsPlugin` on the worker. You'll get OTel spans around the model, tool, and MCP activities the plugin schedules, plus any spans Strands itself emits inside `invoke_async`:
+`StrandsPlugin` composes cleanly with [`OpenTelemetryPlugin`](https://github.com/temporalio/sdk-python/tree/1.36.0/temporalio/contrib/opentelemetry). Register `OpenTelemetryPlugin` on the client (workers built from that client pick it up automatically) and `StrandsPlugin` on the worker. You'll get OTel spans around the model, tool, and MCP activities the plugin schedules, plus any spans Strands itself emits inside `invoke_async`:
 
 ```python
 import opentelemetry.trace
@@ -722,4 +722,4 @@ Worker(
 )
 ```
 
-Set the tracer provider before connecting the client. See the [OpenTelemetry plugin README](https://github.com/temporalio/sdk-python/tree/6adc0d84290a79952dee3ef02c36f6ed9334874a/temporalio/contrib/opentelemetry) for exporter setup.
+Set the tracer provider before connecting the client. See the [OpenTelemetry plugin README](https://github.com/temporalio/sdk-python/tree/1.36.0/temporalio/contrib/opentelemetry) for exporter setup.

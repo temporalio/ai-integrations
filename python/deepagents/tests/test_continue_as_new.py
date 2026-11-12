@@ -19,7 +19,6 @@ does not have.
 from __future__ import annotations
 
 import asyncio
-import sys
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -28,20 +27,13 @@ from unittest.mock import patch
 
 import pytest
 
+from temporalio import workflow
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.common import RetryPolicy
-from temporalio.testing import WorkflowEnvironment
-
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
-from temporalio import workflow
 from temporalio.deepagents import DeepAgentsPlugin, _serde
-from temporalio.deepagents.workflow import (
-    _CACHE_KEY,
-    _merge_snapshot,
-)
+from temporalio.deepagents.workflow import _CACHE_KEY, _merge_snapshot
 from temporalio.deepagents.workflow import _run_deep_agent_legacy as run_deep_agent
+from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
 

@@ -18,7 +18,6 @@ Delete these tests and the fixtures together when the patch id goes through
 
 from __future__ import annotations
 
-import sys
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from pathlib import Path
@@ -26,9 +25,6 @@ from typing import Any
 
 import pytest
 
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 pytest.importorskip("deepagents")
 pytest.importorskip("langchain_core")
 
@@ -45,10 +41,8 @@ from temporalio.deepagents import (
 from temporalio.deepagents.testing import mock_model_provider
 from temporalio.worker import Replayer
 
-# Bind deepagents symbols off the module importorskip returns: a static
-# `from deepagents import ...` cannot resolve on Python 3.10 (deepagents
-# needs >= 3.11), and with the package absent the type checkers mis-resolve
-# the name against this same-named test directory.
+# Resolve framework symbols through the imported module to avoid confusing
+# the top-level package with this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
 _HISTORY = Path(__file__).parent / "histories" / "legacy_dedup_repeated_tool_calls.json"

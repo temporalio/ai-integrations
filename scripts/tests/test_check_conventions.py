@@ -86,7 +86,7 @@ def test_plugin_folder_suffix_and_language_lockfile(plugin_repo: Path) -> None:
 def test_python_code_is_forbidden_in_shared(plugin_repo: Path) -> None:
     shared = plugin_repo / "python/_shared"
     shared.mkdir()
-    (shared / "ruff.toml").write_text('target-version = "py310"\n')
+    (shared / "ruff.toml").write_text('target-version = "py311"\n')
     assert run(plugin_repo) == []
     (shared / "fixtures.py").write_text("VALUE = 1\n")
     assert run(plugin_repo) == []

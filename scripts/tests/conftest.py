@@ -59,14 +59,14 @@ def make_python_plugin(
     (pkg / "__init__.py").write_text('"""Fake plugin."""\n\n__all__ = ["hello"]\n\n\ndef hello() -> str:\n    return "hi"\n')
     (pkg / "_impl.py").write_text("VALUE = 1\n")
     (pkg / "py.typed").write_text("")
-    deps = dependencies if dependencies is not None else ["temporalio>=1.32.0,<2"]
+    deps = dependencies if dependencies is not None else ["temporalio>=1.36.0,<2"]
     deps_toml = ", ".join(f'"{x}"' for x in deps)
     (d / "pyproject.toml").write_text(textwrap.dedent(f'''
         [project]
         name = "{coordinate}"
         version = "{version}"
         description = "fake"
-        requires-python = ">=3.10"
+        requires-python = ">=3.11"
         readme = "README.md"
         license = "MIT"
         license-files = ["LICENSE"]
@@ -96,7 +96,7 @@ def make_python_plugin(
         docs = "https://docs.temporal.io/"
 
         [ci]
-        runtime-versions = ["3.10", "3.14"]
+        runtime-versions = ["3.11", "3.15"]
 
         [smoke]
         imports = ["temporalio.{name}._impl"]

@@ -9,7 +9,8 @@ Subcommands:
   check-recovery-run            validate tested artifacts for publication recovery of an existing tag
   check-java-stage-recovery      prevent another upload when a prior staging attempt may have uploaded
   check-published-release       verify the published GitHub release and emit its deployment URL
-  check-go-vanity               verify the Go vanity path routes to this plugin's subdirectory
+  check-nightly                 fail while the plugin has an open nightly issue (latest dependencies)
+  check-go-vanity              verify the Go vanity path routes to this plugin's subdirectory
   verify-go-module              compare public Go module bytes and build a clean consumer
   npm-registry-state           verify existing npm bytes before skipping an upload
   release-notes                 generate release notes from commits touching the plugin dir
@@ -21,6 +22,7 @@ Policy (AGENTS.md, "Release runbook"):
     0.1.0 (public-preview), or 0.0.1 (pre-release); pre-releases of that version are allowed
   * an existing coordinate only ever moves strictly forward (max published incl. yanked)
   * TestPyPI versions move forward too, except that its newest version may be re-run
+  * a plugin with an open nightly issue does not release until the nightly run is green again
   * Python versions are canonical PEP 440; Java versions are X.Y.Z[-RCN];
     Go and TypeScript versions are canonical SemVer; local versions and build metadata (+...) are forbidden
 """
@@ -636,6 +638,29 @@ def cmd_check_published_release(args: argparse.Namespace) -> int:
     return 0
 
 
+def nightly_issue_title(language: str, plugin: str) -> str:
+    """Title scripts/ci/nightly_report.py gives the plugin's issue; Python and Java names are unqualified."""
+    key = plugin if language in ("python", "java") else f"{language}/{plugin}"
+    return f"nightly: {key} failing (latest)"
+
+
+def cmd_check_nightly(args: argparse.Namespace) -> int:
+    # Releases test the committed lock; the nightly run tests the newest versions users can install.
+    repo = args.repo or _repo()
+    parsed = parse_tag(args.tag)
+    title = nightly_issue_title(parsed["language"], parsed["plugin"])
+    issues = json.loads(_gh("issue", "list", "--repo", repo, "--label", "nightly", "--state", "open",
+                            "--limit", "200", "--json", "number,title,url") or "[]")
+    for issue in issues:
+        if issue.get("title") == title:
+            raise PolicyError(
+                f"#{issue['number']} is open: {parsed['plugin']} fails the nightly run with the newest dependencies "
+                f"its ranges allow ({issue['url']}). Fix it and wait for a green nightly before releasing."
+            )
+    print(f"OK: no open nightly issue for {parsed['language']}/{parsed['plugin']}")
+    return 0
+
+
 # --------------------------------------------------------------------------- draft release
 
 
@@ -849,6 +874,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--repo", default=None)
     p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     p.set_defaults(func=cmd_check_published_release)
+
+    p = sub.add_parser("check-nightly", help="fail while the plugin has an open nightly issue")
+    p.add_argument("--tag", required=True)
+    p.add_argument("--repo", default=None)
+    p.set_defaults(func=cmd_check_nightly)
 
     p = sub.add_parser("release-notes", help="generate release notes from history")
     p.add_argument("--plugin-dir", required=True)
