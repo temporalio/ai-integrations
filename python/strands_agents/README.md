@@ -704,6 +704,22 @@ Earlier versions used Strands' `MCPClient` factories and the `{name}-list-tools`
 
 ## Observability
 
+Strands' agent cycle, tool, and trace durations use Temporal's Workflow
+clock inside Workflows, so replay reconstructs the original elapsed time. These
+durations include Activity scheduling, retries, and waits; provider-reported
+latency and token usage still come from the recorded model response. Activities
+and ordinary Strands calls outside Workflows keep their native clocks.
+
+Graph and Swarm orchestration-level `execution_time` and `execution_timeout`
+still use native wall clocks and are not replay-safe. Their agents' cycle and
+tool metrics use the Workflow clock as described above.
+
+This changes the values returned by earlier versions, which measured replay
+execution time after a cache eviction or Worker restart. It can break replay if
+Workflow code uses those durations to choose what to do next. Let existing runs
+finish on their original Workers, or use Worker Versioning to keep them there
+before deploying this change.
+
 `StrandsPlugin` composes cleanly with [`OpenTelemetryPlugin`](https://github.com/temporalio/sdk-python/tree/1.36.0/temporalio/contrib/opentelemetry). Register `OpenTelemetryPlugin` on the client (workers built from that client pick it up automatically) and `StrandsPlugin` on the worker. You'll get OTel spans around the model, tool, and MCP activities the plugin schedules, plus any spans Strands itself emits inside `invoke_async`:
 
 ```python
