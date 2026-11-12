@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import inspect
 import json
@@ -16,7 +17,12 @@ from strands.types._events import ToolInterruptEvent, ToolResultEvent
 from strands.types.tools import AgentTool, ToolGenerator, ToolResult, ToolSpec, ToolUse
 
 from temporalio import activity, workflow
-from temporalio.exceptions import ActivityError, ApplicationError, FailureError
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+    FailureError,
+    is_cancelled_exception,
+)
 
 from ._failure_converter import STRANDS_INTERRUPT_TYPE
 
@@ -275,6 +281,11 @@ def _call_stand_in(cls: type) -> Callable:
 
 
 def _activity_error_event(tool_use_id: str, error: ActivityError) -> ToolResultEvent:
+    if is_cancelled_exception(error):
+        # Strands catches Exception as a tool failure. Its concurrent executor
+        # stops reading tool events on cancellation, so yielding a result here
+        # would leave the tool task waiting forever for an acknowledgment.
+        raise asyncio.CancelledError() from error
     # ActivityError reports a generic message; its cause holds the activity's failure.
     cause = error.__cause__
     exception = cause if isinstance(cause, Exception) else error
