@@ -11,6 +11,7 @@ import type {
   SharedV4Warning,
   ProviderV4,
 } from '@ai-sdk/provider';
+import { APICallError, getErrorMessage } from '@ai-sdk/provider';
 import { asSchema, type Schema, type ToolExecutionOptions } from 'ai';
 import type { MCPClient } from '@ai-sdk/mcp';
 import { ApplicationFailure } from '@temporalio/common';
@@ -31,6 +32,30 @@ function heartbeatUntilDisposed(): Disposable {
   const timer = setInterval(() => ctx.heartbeat(), timeoutMs / 2);
   timer.unref();
   return { [Symbol.dispose]: () => clearInterval(timer) };
+}
+
+// The AI SDK marks provider errors that fail the same way on retry with `isRetryable: false`.
+// Temporal owns the retries, so the Activity takes the same verdict.
+function isFinalProviderError(error: unknown): error is APICallError {
+  return APICallError.isInstance(error) && !error.isRetryable;
+}
+
+async function callProvider<T>(call: () => PromiseLike<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error) {
+    if (isFinalProviderError(error)) {
+      throw ApplicationFailure.create({
+        message: error.message,
+        // The type the Worker gives a thrown error, so that failure handlers and
+        // `nonRetryableErrorTypes` in use today continue to match.
+        type: error.constructor.name,
+        nonRetryable: true,
+        cause: error,
+      });
+    }
+    throw error;
+  }
 }
 
 /**
@@ -248,7 +273,7 @@ export function createActivities(
     async invokeModel(args: InvokeModelArgs): Promise<InvokeModelResult> {
       using _heartbeat = heartbeatUntilDisposed();
       const model = provider.languageModel(args.modelId);
-      return await model.doGenerate(args.options);
+      return await callProvider(() => model.doGenerate(args.options));
     },
 
     /**
@@ -270,7 +295,7 @@ export function createActivities(
       const events = stream.topic(args.streamingTopic);
 
       const model = provider.languageModel(args.modelId);
-      const streamResult = await model.doStream(args.options);
+      const streamResult = await callProvider(() => model.doStream(args.options));
 
       const content: LanguageModelV4Content[] = [];
       let finishReason: LanguageModelV4FinishReason = { unified: 'other', raw: undefined };
@@ -291,7 +316,7 @@ export function createActivities(
       const reader = streamResult.stream.getReader();
 
       while (true) {
-        const { done, value: part } = await reader.read();
+        const { done, value: part } = await callProvider(() => reader.read());
         if (done) break;
 
         Context.current().heartbeat();
@@ -381,13 +406,19 @@ export function createActivities(
 
       // An `error` part signals a provider failure even when the stream still delivers a
       // `finish` part afterwards — fail the activity rather than return a partial result as
-      // success. `part.error` is untyped, so it cannot be classified as deterministic here;
-      // surface it as retryable and let the activity retry policy govern, matching how a
-      // provider error thrown from `doGenerate` behaves in the non-streaming activity.
+      // success.
       if (sawError) {
-        throw ApplicationFailure.retryable(
-          `Model stream emitted an error part${sawFinish ? '' : ' and ended without a finish part'}: ${streamError}`
-        );
+        const ending = sawFinish ? '' : ' and ended without a finish part';
+        // `part.error` is untyped. Only an `APICallError` says whether a retry can help, so any
+        // other value is left to the activity retry policy, as in `invokeModel`.
+        throw ApplicationFailure.create({
+          message: `Model stream emitted an error part${ending}: ${getErrorMessage(streamError)}`,
+          // Every stream failure keeps the type `Error`, so that failure handlers and
+          // `nonRetryableErrorTypes` in use today continue to match. The `cause` has the detail.
+          type: 'Error',
+          nonRetryable: isFinalProviderError(streamError),
+          cause: streamError instanceof Error ? streamError : undefined,
+        });
       }
 
       return {
@@ -404,11 +435,13 @@ export function createActivities(
     async invokeEmbeddingModel(args: InvokeEmbeddingModelArgs): Promise<InvokeEmbeddingModelResult> {
       using _heartbeat = heartbeatUntilDisposed();
       const model = provider.embeddingModel(args.modelId);
-      return await model.doEmbed({
-        values: args.values,
-        providerOptions: args.providerOptions,
-        headers: args.headers,
-      });
+      return await callProvider(() =>
+        model.doEmbed({
+          values: args.values,
+          providerOptions: args.providerOptions,
+          headers: args.headers,
+        })
+      );
     },
   };
   withSources(activities, [provider]);
