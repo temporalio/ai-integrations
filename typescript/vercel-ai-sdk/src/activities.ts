@@ -47,7 +47,9 @@ async function callProvider<T>(call: () => PromiseLike<T>): Promise<T> {
     if (isFinalProviderError(error)) {
       throw ApplicationFailure.create({
         message: error.message,
-        type: error.name,
+        // The type the Worker gives a thrown error, so that failure handlers and
+        // `nonRetryableErrorTypes` in use today continue to match.
+        type: error.constructor.name,
         nonRetryable: true,
         cause: error,
       });
@@ -411,9 +413,9 @@ export function createActivities(
         // other value is left to the activity retry policy, as in `invokeModel`.
         throw ApplicationFailure.create({
           message: `Model stream emitted an error part${ending}: ${getErrorMessage(streamError)}`,
-          // A retryable failure keeps the type `Error`, so that a retry policy with `Error` in
-          // `nonRetryableErrorTypes` continues to stop it.
-          type: isFinalProviderError(streamError) ? streamError.name : 'Error',
+          // Every stream failure keeps the type `Error`, so that failure handlers and
+          // `nonRetryableErrorTypes` in use today continue to match. The `cause` has the detail.
+          type: 'Error',
           nonRetryable: isFinalProviderError(streamError),
           cause: streamError instanceof Error ? streamError : undefined,
         });

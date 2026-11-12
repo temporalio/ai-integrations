@@ -699,7 +699,7 @@ test('A non-retryable provider error fails the Workflow after one Activity attem
       return;
     }
     t.true(failure.nonRetryable);
-    t.is(failure.type, 'AI_APICallError');
+    t.is(failure.type, 'APICallError');
     t.is(failure.message, 'Provider returned 401');
     t.true(failure.cause instanceof TemporalFailure);
     t.is(failure.cause?.message, 'Provider returned 401');
@@ -736,7 +736,7 @@ test('invokeEmbeddingModel fails without retry on a non-retryable provider error
     { instanceOf: ApplicationFailure }
   );
   t.true(err!.nonRetryable);
-  t.is(err!.type, 'AI_APICallError');
+  t.is(err!.type, 'APICallError');
   t.true(APICallError.isInstance(err!.cause));
 });
 

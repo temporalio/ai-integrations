@@ -225,7 +225,7 @@ test('invokeModelStreaming fails without retry on a non-retryable APICallError p
     instanceOf: ApplicationFailure,
   });
   t.true(err!.nonRetryable);
-  t.is(err!.type, 'AI_APICallError');
+  t.is(err!.type, 'Error');
   t.is(err!.cause, error);
   t.regex(err!.message, /Invalid API key/);
 });
