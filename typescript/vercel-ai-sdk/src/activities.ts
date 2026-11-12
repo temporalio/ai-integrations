@@ -22,6 +22,17 @@ import { withSources } from './activity-sources';
 
 const encoder = new TextEncoder();
 
+// A slow provider call must not look like a lost Worker, and a cancellation request
+// reaches the Activity only through heartbeats.
+function heartbeatUntilDisposed(): Disposable {
+  const ctx = Context.current();
+  const timeoutMs = ctx.info.heartbeatTimeoutMs;
+  if (!timeoutMs) return { [Symbol.dispose]: () => {} };
+  const timer = setInterval(() => ctx.heartbeat(), timeoutMs / 2);
+  timer.unref();
+  return { [Symbol.dispose]: () => clearInterval(timer) };
+}
+
 /**
  * Arguments for invoking a language model activity.
  */
@@ -235,6 +246,7 @@ export function createActivities(
 ): object {
   let activities = {
     async invokeModel(args: InvokeModelArgs): Promise<InvokeModelResult> {
+      using _heartbeat = heartbeatUntilDisposed();
       const model = provider.languageModel(args.modelId);
       return await model.doGenerate(args.options);
     },
@@ -250,6 +262,8 @@ export function createActivities(
      * don't recognize; no normalization happens here.
      */
     async invokeModelStreaming(args: InvokeModelStreamingArgs): Promise<InvokeModelResult> {
+      // Declared first so it is disposed last, after the stream flush.
+      using _heartbeat = heartbeatUntilDisposed();
       await using stream = WorkflowStreamClient.fromWithinActivity({
         batchInterval: args.streamingBatchInterval ?? '100 milliseconds',
       });
@@ -388,6 +402,7 @@ export function createActivities(
     },
 
     async invokeEmbeddingModel(args: InvokeEmbeddingModelArgs): Promise<InvokeEmbeddingModelResult> {
+      using _heartbeat = heartbeatUntilDisposed();
       const model = provider.embeddingModel(args.modelId);
       return await model.doEmbed({
         values: args.values,
