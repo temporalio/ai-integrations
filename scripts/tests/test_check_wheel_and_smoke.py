@@ -68,7 +68,7 @@ def test_smoke_uses_the_running_interpreter(tmp_path: Path) -> None:
     plugin = make_python_plugin(root, "fakeplug", dependencies=[])
     manifest = plugin / "pyproject.toml"
     floor = f">={sys.version_info.major}.{sys.version_info.minor}"
-    manifest.write_text(manifest.read_text().replace(">=3.10", floor))
+    manifest.write_text(manifest.read_text().replace(">=3.11", floor))
     assert smoke.main(["--plugin", str(plugin), "--dist", str(build_plugin(plugin))]) == 0
 
 
@@ -129,6 +129,6 @@ def test_normalize_version() -> None:
 
 
 def test_requirement_name_is_exact_not_prefix() -> None:
-    assert check_wheel._requirement_name("temporalio[opentelemetry,pydantic]>=1.32.0,<2; python_version >= '3.10'") == "temporalio"
+    assert check_wheel._requirement_name("temporalio[opentelemetry,pydantic]>=1.36.0,<2; python_version >= '3.11'") == "temporalio"
     assert check_wheel._requirement_name("temporalio-mcp>=0.1,<0.2") == "temporalio-mcp"
     assert check_wheel._requirement_name("not a requirement !!") == ""

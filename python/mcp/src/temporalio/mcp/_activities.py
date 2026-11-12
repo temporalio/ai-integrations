@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import re
-import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -39,9 +38,6 @@ from temporalio.mcp._activity import (
 )
 from temporalio.mcp._backend import _MCPBackend, _MCPBackendFactory
 from temporalio.mcp._pool import _MCPConnectionPool
-
-if sys.version_info < (3, 11):
-    from exceptiongroup import BaseExceptionGroup  # type: ignore[reportUnreachable]
 
 _Result = TypeVar("_Result")
 _ListResult = TypeVar("_ListResult", bound=BaseModel)

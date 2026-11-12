@@ -353,8 +353,7 @@ def install_model_patch() -> None:
     outside workflows. Idempotent.
     """
     global _original_create_deep_agent, _original_resolve_model
-    # importlib: `deepagents` is absent on Python 3.10 environments (its floor
-    # is 3.11), so static imports here fail type-checking there.
+    # Resolve the framework's top-level package explicitly.
     deepagents = importlib.import_module("deepagents")
     _graph = importlib.import_module("deepagents.graph")
     _models = importlib.import_module("deepagents._models")

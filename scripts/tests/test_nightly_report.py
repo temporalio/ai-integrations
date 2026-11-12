@@ -19,16 +19,16 @@ def test_classify_aggregates_results_by_plugin() -> None:
     failing, passing = nightly_report.classify(
         [
             _job(
-                "Python (openai_agents) / openai_agents (ubuntu-latest, py3.14)",
+                "Python (openai_agents) / openai_agents (ubuntu-latest, py3.15)",
                 "success",
             ),
             _job(
-                "Python (openai_agents) / openai_agents (ubuntu-latest, py3.10)",
+                "Python (openai_agents) / openai_agents (ubuntu-latest, py3.11)",
                 "failure",
             ),
-            _job("Python (mcp) / mcp (macos-latest, py3.14)", "success"),
+            _job("Python (mcp) / mcp (macos-latest, py3.15)", "success"),
             _job("Python (mcp) / matrix", "success"),
-            _job("Python (mcp) / mcp (windows-latest, py3.14)", None),
+            _job("Python (mcp) / mcp (windows-latest, py3.15)", None),
             _job("Conventions and tooling tests", "failure"),
             _job("ci-status", "failure"),
         ]
@@ -73,7 +73,7 @@ def test_typescript_and_python_langsmith_have_separate_nightly_issues() -> None:
             _job(
                 "TypeScript (langsmith) / langsmith (ubuntu-latest, node24)", "failure"
             ),
-            _job("Python (langsmith) / langsmith (ubuntu-latest, py3.14)", "success"),
+            _job("Python (langsmith) / langsmith (ubuntu-latest, py3.15)", "success"),
         ]
     )
     assert failing == {"typescript/langsmith"}
@@ -83,7 +83,7 @@ def test_typescript_and_python_langsmith_have_separate_nightly_issues() -> None:
 def test_classify_go_failures_and_keep_language_identities_separate() -> None:
     failing, passing = nightly_report.classify(
         [
-            _job("Python (shared) / shared (ubuntu-latest, py3.14)", "success"),
+            _job("Python (shared) / shared (ubuntu-latest, py3.15)", "success"),
             _job("Go (shared) / matrix", "success"),
             _job("Go (shared) / shared (ubuntu-latest, go1.26.6)", "failure"),
             _job("Go (shared) / shared (windows-latest, go1.27)", "success"),

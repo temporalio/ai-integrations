@@ -21,6 +21,7 @@ import inspect
 import json
 import logging
 import os
+import sys
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
@@ -1484,14 +1485,18 @@ class LiteLlmWorkflow:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.version_info >= (3, 15),
+    reason="LiteLLM's fastuuid dependency does not support Python 3.15",
+)
 async def test_litellm_model(client: Client):
     """Test that a litellm-backed model works with TemporalModel through a full Temporal workflow."""
-    import litellm as litellm_module
+    import litellm as litellm_module  # type: ignore[import-not-found]
     from google.adk.models.lite_llm import LiteLlm
-    from litellm import ModelResponse
-    from litellm.llms.custom_llm import CustomLLM
+    from litellm import ModelResponse  # type: ignore[import-not-found]
+    from litellm.llms.custom_llm import CustomLLM  # type: ignore[import-not-found]
 
-    class FakeLiteLlmProvider(CustomLLM):
+    class FakeLiteLlmProvider(CustomLLM):  # pyright: ignore[reportUntypedBaseClass]
         """A fake litellm provider that returns canned responses locally."""
 
         def _make_response(self, model: str) -> ModelResponse:
@@ -1970,7 +1975,7 @@ def test_output_schema_type_sent_as_json_schema(schema: Any) -> None:
     converter = GoogleAdkPlugin()._configure_data_converter(None)
     payloads = converter.payload_converter.to_payloads([converted])
     serialized = json.loads(payloads[0].data)
-    assert serialized["config"]["response_schema"] == TypeAdapter(schema).json_schema()
+    assert serialized["config"]["responseSchema"] == TypeAdapter(schema).json_schema()
 
 
 def test_output_schema_preserves_custom_model_json_schema() -> None:
