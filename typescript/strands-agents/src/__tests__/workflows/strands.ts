@@ -4,6 +4,7 @@ import { z } from 'zod';
 import {
   AfterToolCallEvent,
   AfterToolsEvent,
+  BeforeInvocationEvent,
   SlidingWindowConversationManager,
   tool,
   type BaseModelConfig,
@@ -189,6 +190,46 @@ export async function activityToolAgent(prompt: string): Promise<string> {
   });
   const result = await agent.invoke(prompt);
   return result.toString();
+}
+
+/** Run two calls of one subagent, exposing its state before each call and its actual tool results. */
+export async function agentToolAgent(mode: 'default' | 'reset' | 'preserve' | 'implicit'): Promise<{
+  reply: string;
+  appStates: Record<string, JSONValue>[];
+  toolResults: Array<{ status: string; text: string }>;
+}> {
+  const subagent = new TemporalAgent({
+    name: 'specialist',
+    model: 'specialist',
+    printer: false,
+    appState: { calls: 0 },
+    messages: [
+      { role: 'user', content: [{ text: 'baseline prompt' }] },
+      { role: 'assistant', content: [{ text: 'baseline reply' }] },
+    ],
+  });
+  const appStates: Record<string, JSONValue>[] = [];
+  subagent.addHook(BeforeInvocationEvent, () => {
+    appStates.push(subagent.appState.getAll());
+    subagent.appState.set('calls', Number(subagent.appState.get('calls')) + 1);
+    subagent.appState.set('duringCall', 'added');
+  });
+  const wrapped =
+    mode === 'implicit'
+      ? subagent
+      : mode === 'default'
+        ? subagent.asTool()
+        : subagent.asTool({ preserveContext: mode === 'preserve' });
+  const agent = new TemporalAgent({ model: 'parent', printer: false, tools: [wrapped] });
+  const toolResults: Array<{ status: string; text: string }> = [];
+  agent.addHook(AfterToolCallEvent, (event) => {
+    toolResults.push({
+      status: event.result.status,
+      text: event.result.content.map((block) => (block.type === 'textBlock' ? block.text : '')).join(''),
+    });
+  });
+  const result = await agent.invoke('ask the specialist twice');
+  return { reply: result.toString(), appStates, toolResults };
 }
 
 /**

@@ -2,6 +2,12 @@ import { Headers } from 'headers-polyfill';
 import { inWorkflowContext, uuid4 } from '@temporalio/workflow';
 
 if (inWorkflowContext()) {
+  // Strands composes the parent's cancellation signal with the subagent's via AbortSignal.any().
+  // The sandbox exposes AbortController but not AbortSignal; use its existing signal constructor.
+  if (typeof globalThis.AbortSignal === 'undefined') {
+    globalThis.AbortSignal = new AbortController().signal.constructor as typeof AbortSignal;
+  }
+
   if (typeof globalThis.Headers === 'undefined') {
     globalThis.Headers = Headers;
   }
