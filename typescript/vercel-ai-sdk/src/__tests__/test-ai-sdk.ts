@@ -53,7 +53,7 @@ import {
   OpenTelemetryWorkflowClientCallsInterceptor,
   OpenTelemetryWorkflowClientInterceptor,
 } from '@temporalio/interceptors-opentelemetry';
-import { MockActivityEnvironment, workflowInterceptorModules } from '@temporalio/testing';
+import { workflowInterceptorModules } from '@temporalio/testing';
 import { SimplePlugin } from '@temporalio/plugin';
 import { bundleWorkflowCode, DefaultLogger, NativeConnection, Worker as CoreWorker } from '@temporalio/worker';
 import type { InjectedSinks, WorkerOptions } from '@temporalio/worker';
