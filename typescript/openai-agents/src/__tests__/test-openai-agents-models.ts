@@ -136,6 +136,41 @@ test('summary string is passed through to model activity', async (t) => {
   });
 });
 
+test('A model call slower than its heartbeat timeout completes on its first attempt', async (t) => {
+  const { createWorker, taskQueue } = helpers(t);
+  const provider = {
+    getModel() {
+      return {
+        async getResponse() {
+          await new Promise((resolve) => setTimeout(resolve, 2_500));
+          return textResponse('slow answer');
+        },
+      } as unknown as FakeModel;
+    },
+  };
+  const worker = await createWorker({ plugins: [new OpenAIAgentsPlugin({ modelProvider: provider })] });
+  const wfClient = new WorkflowClient({
+    connection: (t.context as any).env.connection,
+    interceptors: [new OpenAIAgentsTraceClientInterceptor({ modelParams: { heartbeatTimeout: '1s' } })],
+  });
+
+  await worker.runUntil(async () => {
+    const handle = await wfClient.start(summaryOverrideStringWorkflow, {
+      taskQueue,
+      workflowId: `slow-model-call-${Date.now()}`,
+      args: ['Hello'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    t.is(await handle.result(), 'slow answer');
+
+    const { events } = await handle.fetchHistory();
+    const attempts = (events ?? [])
+      .filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED)
+      .map((e) => e.activityTaskStartedEventAttributes?.attempt);
+    t.deepEqual(attempts, [1]);
+  });
+});
+
 test('A ModelSummaryProvider gets the agent of each model call, in nested and resumed runs too', async (t) => {
   const { createWorker, startWorkflow } = helpers(t);
   const modelProvider = new FakeModelProvider([

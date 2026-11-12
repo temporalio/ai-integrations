@@ -179,8 +179,8 @@ export function createModelActivity(
 } {
   return {
     async invokeModelActivity(input: InvokeModelActivityInput): Promise<SerializedModelResponse> {
-      // Heartbeat before anything that waits: credential injection awaits the
-      // user's callback, and getModel() can do I/O (e.g. a token fetch).
+      // Start heartbeating before anything that waits: credential injection awaits
+      // the user's callback, and getModel() can do I/O (e.g. a token fetch).
       const stopHeartbeat = startAdaptiveHeartbeat();
 
       try {

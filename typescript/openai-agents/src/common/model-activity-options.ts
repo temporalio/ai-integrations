@@ -17,6 +17,13 @@ export interface ModelSummaryProvider {
 export interface ModelActivityOptions extends Omit<ActivityOptions, 'summary'> {
   /** Use local Activities instead of regular Activities. @default false */
   useLocalActivity?: boolean;
+  /**
+   * Maximum time between heartbeats. The model Activities heartbeat at half this timeout, so they
+   * hear a cancel, and a lost Worker is noticed, within about this long. Set it to `0` to turn
+   * heartbeats off. Local Activities don't heartbeat, so they ignore it.
+   * @default '10s'
+   */
+  heartbeatTimeout?: Duration;
   /** Activity summary shown in the Temporal UI. String for static text, ModelSummaryProvider for dynamic. */
   summary?: string | ModelSummaryProvider;
   /**
@@ -49,6 +56,7 @@ export type SerializableModelActivityOptions = Omit<ModelActivityOptions, 'summa
 
 export const DEFAULT_MODEL_ACTIVITY_OPTIONS: SerializableModelActivityOptions = {
   startToCloseTimeout: '60s',
+  heartbeatTimeout: '10s',
   useLocalActivity: false,
 };
 

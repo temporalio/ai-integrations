@@ -2,8 +2,9 @@ import { heartbeat, activityInfo } from '@temporalio/activity';
 
 /**
  * Starts a recurring heartbeat loop driven by the active Activity's
- * `heartbeatTimeoutMs`. The loop fires immediately, then re-schedules
- * itself at `heartbeatTimeoutMs / 2` to keep well clear of the timeout.
+ * `heartbeatTimeoutMs`. The loop heartbeats every `heartbeatTimeoutMs / 2`,
+ * starting half the timeout in, so each heartbeat lands well inside the
+ * timeout. A call that ends sooner sends none.
  *
  * Returns a `stop` function that cancels the loop. If the Activity has no
  * `heartbeatTimeoutMs` configured, no heartbeats are sent and `stop` is a no-op.
@@ -33,8 +34,7 @@ export function startAdaptiveHeartbeat(details?: () => unknown): () => void {
     timer = setTimeout(tick, interval);
   };
 
-  // Fire immediately so slow startup doesn't blow the timeout, then loop.
-  tick();
+  timer = setTimeout(tick, interval);
 
   return () => {
     stopped = true;
