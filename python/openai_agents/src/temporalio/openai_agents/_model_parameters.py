@@ -48,11 +48,12 @@ class ModelActivityParameters:
     start_to_close_timeout: timedelta | None = timedelta(seconds=60)
     """Maximum time for the activity to complete."""
 
-    heartbeat_timeout: timedelta | None = None
-    """Maximum time between heartbeats. For streaming
-    (``Runner.run_streamed``), set this lower than
-    ``start_to_close_timeout`` so a stuck model call is detected before the
-    overall activity timeout fires."""
+    heartbeat_timeout: timedelta | None = timedelta(seconds=10)
+    """Maximum time between heartbeats. The model activities heartbeat on a
+    timer at half this timeout, so a cancel reaches a running model call, and a
+    lost worker is noticed, within about this long. It doesn't catch a slow
+    model call. Set it to ``None`` to turn heartbeats off; a cancel then doesn't
+    reach a running model call."""
 
     retry_policy: RetryPolicy | None = None
     """Policy for retrying failed activities."""
