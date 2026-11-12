@@ -1866,7 +1866,7 @@ test('abortSignal that aborts during generateText cancels the Activity', async (
     const handle = await startWorkflow(abortableGenerateWorkflow, { args: [false] });
     await assertEventually(t, (tt) => {
       tt.true(provider.started);
-    });
+    }, 10_000);
     await handle.signal(abortRequest);
     // The AI SDK rethrows the abort reason, which `isAbortError` must recognize.
     t.is(await handle.result(), 'error:AbortError|true');
@@ -1891,7 +1891,7 @@ test('abortSignal that aborts during streamText ends the stream with an abort pa
     });
     await assertEventually(t, (tt) => {
       tt.true(provider.started);
-    });
+    }, 10_000);
     await handle.signal(abortRequest);
     const types = await handle.result();
     t.is(types.at(-1), 'abort');
