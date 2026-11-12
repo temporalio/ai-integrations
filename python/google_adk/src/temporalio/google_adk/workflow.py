@@ -18,6 +18,9 @@ if TYPE_CHECKING:
     from google.adk.workflow import FunctionNode
 
 _TOOL_CONTEXT_PARAM = "tool_context"
+# Workflows started before this patch pass an activity's empty *args as one
+# extra argument; keep that on replay.
+_VAR_ARGS_PATCH = "google_adk.activity-as-tool-var-args"
 
 
 @dataclass(frozen=True)
@@ -430,10 +433,10 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     ``activity_def`` can be an activity function, a bound method, a
     callable-class instance, a method passed as ``Class.method``, or a
     callable-class activity passed as its class. The tool offers the parameters
-    the activity is called with: without a method's ``self``, from ``__call__``
-    for a class, and ``*args`` as a list, spread into the call. The SDK reads no
-    argument types for an activity with ``*args``, so the Worker decodes its
-    arguments without them. A class whose ``__call__`` is not a function,
+    the activity is called with: without a method's ``self``, and from
+    ``__call__`` for a class. ADK leaves ``*args`` out of the declaration, as
+    it does for a plain function, so the model can't fill it and the activity
+    gets an empty ``*args``. A class whose ``__call__`` is not a function,
     staticmethod, classmethod or ``functools.partialmethod``, can't be read, or
     takes keyword-only arguments or ``**kwargs`` raises ``ValueError``. So does
     a method taking ``self`` whose class can't be reached from the function's
@@ -456,21 +459,10 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     """
     signature, hints, doc = _tool_signature(activity_def)
     tool_context_param = _tool_context_parameter(activity_def, signature, hints)
-    # ADK leaves *args out of the tool's schema, so offer it as a list, spread
-    # into the call.
-    star = None
-    parameters = []
-    for p in signature.parameters.values():
-        if p.kind is inspect.Parameter.VAR_POSITIONAL:
-            star = p.name
-            hints = {**hints, star: types.GenericAlias(list, (hints.get(star, Any),))}
-            p = p.replace(
-                kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                default=[],
-                annotation=hints[star],
-            )
-        parameters.append(p)
-    signature = signature.replace(parameters=parameters)
+    has_var_args = any(
+        p.kind is inspect.Parameter.VAR_POSITIONAL
+        for p in signature.parameters.values()
+    )
     # ADK passes every argument by name, and the activity gets them by
     # position, so bind positional-only parameters by name too.
     binding = signature.replace(
@@ -493,26 +485,23 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
         bound = binding.bind(*args, **kw)
         bound.apply_defaults()
 
-        # Convert to positional args for Temporal, spreading *args
-        activity_args = []
-        for name, value in bound.arguments.items():
-            if name == star:
-                activity_args.extend(value)
-            else:
-                activity_args.append(value)
+        # Convert to positional args for Temporal
+        activity_args = list(bound.arguments.values())
 
         # Decorator kwargs are defaults.
         options = kwargs.copy()
 
         if not temporalio.workflow.in_workflow():
             # If executed outside a workflow, like when doing local adk runs, use the function directly
-            # *args is the last positional argument.
-            call_args = [*bound.args[:-1], *bound.args[-1]] if star else bound.args
-            result = activity_def(*call_args, **bound.kwargs)
+            result = activity_def(*bound.args, **bound.kwargs)
             if inspect.isawaitable(result):
                 return await result
             else:
                 return result
+
+        if has_var_args and workflow.patched(_VAR_ARGS_PATCH):
+            # bound.args spreads *args; bound.arguments holds it as one tuple.
+            activity_args = list(bound.args)
 
         if not activity_args:
             return await workflow.execute_activity(activity_def, **options)
@@ -527,9 +516,6 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     # functools.wraps copies name/doc/module/annotations/qualname/dict.
     # Signature must be set explicitly since the wrapper uses *args/**kw.
     setattr(wrapper, "__signature__", signature)
-    if star is not None and not inspect.isclass(activity_def):
-        # ADK reads the tool's types from __annotations__.
-        wrapper.__annotations__ = {**wrapper.__annotations__, star: hints[star]}
     if inspect.isclass(activity_def):
         # ADK reads the tool's types and description from the wrapper, so give
         # it __call__'s instead of the class's.

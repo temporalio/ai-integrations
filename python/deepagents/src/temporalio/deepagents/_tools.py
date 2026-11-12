@@ -342,7 +342,8 @@ def _tool_signature(
     for p in signature.parameters.values():
         if p.kind is inspect.Parameter.VAR_POSITIONAL:
             hints = {**hints, p.name: GenericAlias(list, (hints.get(p.name, Any),))}
-            p = p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD, default=[])
+            # Defaults to None, as in LangChain's own schema for *args.
+            p = p.replace(kind=inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None)
             star = True
         elif p.kind is inspect.Parameter.KEYWORD_ONLY:
             message = f"activity_as_tool cannot pass keyword-only argument {p.name!r}."
@@ -430,7 +431,7 @@ def activity_as_tool(
         bound.apply_defaults()
         activity_args = list(bound.args)
         if star:
-            activity_args.extend(activity_args.pop())
+            activity_args.extend(activity_args.pop() or ())
         return await workflow.execute_activity(
             activity,
             args=activity_args,

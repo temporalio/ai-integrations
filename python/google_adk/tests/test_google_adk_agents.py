@@ -71,7 +71,7 @@ from temporalio.google_adk import (
 from temporalio.google_adk._model import (
     _with_serializable_response_schema,
 )
-from temporalio.worker import Worker
+from temporalio.worker import Replayer, Worker
 from temporalio.workflow import ActivityConfig
 from tests.helpers.decorators import WrapOnAccess, passthrough, unwrapped
 from tests.helpers.opentelemetry import dump_spans
@@ -1604,26 +1604,67 @@ class TagCity:
         return f"{city}:{','.join(tags)}"
 
 
+@pytest.mark.parametrize("patched", [True, False])
 @pytest.mark.parametrize("activity_def", [tag_city, TagCity])
 @pytest.mark.asyncio
-async def test_activity_as_tool_spreads_var_positional(
-    activity_def: Any, monkeypatch: pytest.MonkeyPatch
+async def test_activity_as_tool_passes_empty_var_positional(
+    activity_def: Any, patched: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # ADK leaves *tags out of the declaration, so the tool offers it as a list
-    # and spreads it into the activity's arguments.
+    # ADK leaves *tags out of the declaration, as it does for the plain
+    # function, so the model can't fill it and the activity gets no tags.
     tool = temporalio.google_adk.workflow.activity_as_tool(
         activity_def, start_to_close_timeout=timedelta(seconds=30)
     )
+    native = tag_city if activity_def is tag_city else TagCity().__call__
     declaration = FunctionTool(tool)._get_declaration()
-    assert declaration is not None
-    assert declaration.parameters_json_schema is not None
-    tags = declaration.parameters_json_schema["properties"]["tags"]
-    assert (tags["type"], tags["items"]) == ("array", {"type": "string"})
+    native_declaration = FunctionTool(native)._get_declaration()
+    assert declaration is not None and native_declaration is not None
+    schema = declaration.parameters_json_schema
+    native_schema = native_declaration.parameters_json_schema
+    assert schema is not None and native_schema is not None
+    assert (schema["properties"], schema["required"]) == (
+        native_schema["properties"],
+        native_schema["required"],
+    )
+    assert list(schema["properties"]) == ["city"]
     if activity_def is tag_city:
         # Outside a Workflow the tool calls the activity itself.
-        assert await tool(city="Rome", tags=["sunny", "windy"]) == "Rome:sunny,windy"
+        assert await tool(city="Rome") == "Rome:"
 
     calls: list[list[Any]] = []
+    patch_ids: list[str] = []
+
+    async def execute_activity(_: Any, *args: Any, **kwargs: Any) -> str:
+        calls.append(list(args) or list(kwargs.get("args", [])))
+        return "ok"
+
+    def fake_patched(patch_id: str) -> bool:
+        patch_ids.append(patch_id)
+        return patched
+
+    monkeypatch.setattr(workflow, "in_workflow", lambda: True)
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    monkeypatch.setattr(workflow, "patched", fake_patched)
+    await tool(city="Rome")
+    # A Workflow started before the patch keeps passing the empty tuple as one
+    # more argument.
+    assert calls == [["Rome"] if patched else ["Rome", ()]]
+    assert patch_ids == ["google_adk.activity-as-tool-var-args"]
+
+
+@pytest.mark.asyncio
+async def test_activity_as_tool_without_var_positional_checks_no_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @activity.defn
+    async def name_city(city: str) -> str:
+        return city
+
+    tool = temporalio.google_adk.workflow.activity_as_tool(
+        name_city, start_to_close_timeout=timedelta(seconds=30)
+    )
+    calls: list[list[Any]] = []
+    patch_ids: list[str] = []
 
     async def execute_activity(_: Any, *args: Any, **kwargs: Any) -> str:
         calls.append(list(args) or list(kwargs.get("args", [])))
@@ -1631,9 +1672,64 @@ async def test_activity_as_tool_spreads_var_positional(
 
     monkeypatch.setattr(workflow, "in_workflow", lambda: True)
     monkeypatch.setattr(workflow, "execute_activity", execute_activity)
-    await tool(city="Rome", tags=["sunny", "windy"])
+    monkeypatch.setattr(workflow, "patched", patch_ids.append)
     await tool(city="Rome")
-    assert calls == [["Rome", "sunny", "windy"], ["Rome"]]
+    assert calls == [["Rome"]]
+    assert patch_ids == []
+
+
+@activity.defn
+async def count_tags(city: str, *tags: str) -> str:
+    return f"{city}:{len(tags)}"
+
+
+@workflow.defn
+class CountTagsWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        tool = temporalio.google_adk.workflow.activity_as_tool(
+            count_tags, start_to_close_timeout=timedelta(seconds=30)
+        )
+        return await tool(city="Rome")
+
+
+@pytest.mark.parametrize("patched", [True, False])
+@pytest.mark.asyncio
+async def test_activity_as_tool_var_positional_replays(
+    client: Client, patched: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A run recorded before the patch (no marker) passes the empty tuple as one
+    # argument, so the activity sees one tag; a run after it passes none. Both
+    # histories replay with this code.
+    if not patched:
+        monkeypatch.setattr(workflow, "patched", lambda _: False)
+    new_config = client.config()
+    new_config["plugins"] = [GoogleAdkPlugin()]
+    client = Client(**new_config)
+    task_queue = f"adk-var-args-{uuid.uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[CountTagsWorkflow],
+        activities=[count_tags],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            CountTagsWorkflow.run,
+            id=f"adk-var-args-{uuid.uuid4()}",
+            task_queue=task_queue,
+            execution_timeout=timedelta(seconds=60),
+        )
+        assert await handle.result() == ("Rome:0" if patched else "Rome:1")
+        history = await handle.fetch_history()
+    monkeypatch.undo()
+    markers = [
+        e for e in history.events if e.HasField("marker_recorded_event_attributes")
+    ]
+    assert len(markers) == (1 if patched else 0)
+    await Replayer(
+        workflows=[CountTagsWorkflow], plugins=[GoogleAdkPlugin()]
+    ).replay_workflow(history)
 
 
 def test_activity_as_tool_preserves_metadata() -> None:

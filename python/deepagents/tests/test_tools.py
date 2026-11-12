@@ -50,7 +50,7 @@ INVOKE_TOOL = "deepagents.invoke_tool"
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
 from langchain_core.messages import HumanMessage, ToolMessage  # noqa: E402
-from langchain_core.tools import tool  # noqa: E402
+from langchain_core.tools import StructuredTool, tool  # noqa: E402
 from langgraph.prebuilt import InjectedState  # noqa: E402
 from pydantic import BaseModel, ConfigDict  # noqa: E402
 
@@ -404,7 +404,8 @@ class VarargsClass:
 async def test_activity_as_tool_spreads_var_positional(
     activity_ref: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # *more is offered as a list and spread into the activity's arguments.
+    # *more is offered as a list, as LangChain's own schema for the function
+    # offers it, and spread into the activity's arguments.
     calls: list[Any] = []
 
     async def execute_activity(_: Any, **kwargs: Any) -> str:
@@ -413,8 +414,10 @@ async def test_activity_as_tool_spreads_var_positional(
 
     monkeypatch.setattr(workflow, "execute_activity", execute_activity)
     tool = activity_as_tool(activity_ref, start_to_close_timeout=timedelta(seconds=10))
-    assert tool.args["more"]["type"] == "array"
-    assert tool.args["more"]["items"] == {"type": "string"}
+    native = StructuredTool.from_function(
+        coroutine=varargs_activity, description="LangChain's schema"
+    )
+    assert tool.args == native.args
     await tool.ainvoke({"text": "a", "more": ["b", "c"]})
     await tool.ainvoke({"text": "a"})
     assert calls == [["a", "b", "c"], ["a"]]
