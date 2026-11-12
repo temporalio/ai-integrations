@@ -7,10 +7,15 @@ const STARTUP_TIMEOUT =
   STARTUP_PREFIX +
   'ephemeral server at 127.0.0.1:49225 did not start within 5s. ' +
   "Make sure another download isn't stuck and delete the temp file.: Server connection error: Connection refused";
+const STARTUP_TIMEOUT_WITH_CONNECTION_ERROR =
+  STARTUP_PREFIX +
+  'ephemeral server at 127.0.0.1:49225 did not start within 5s; last connection error: ' +
+  'Server connection error: Connection refused';
 const DOWNLOAD_FAILURE =
   STARTUP_PREFIX + 'failed to download ephemeral server executable: error sending request';
 const RETRYABLE_ERRORS = [
   ['startup timeout', STARTUP_TIMEOUT],
+  ['startup timeout with last connection error', STARTUP_TIMEOUT_WITH_CONNECTION_ERROR],
   ['download failure', DOWNLOAD_FAILURE],
   ...[
     'could not read tar archive',
@@ -99,6 +104,10 @@ for (const [name, error] of [
   ['programming error', new TypeError('invalid startup configuration')],
   ['DOM cancellation', new DOMException('Cancelled', 'AbortError')],
   ['Error cancellation', Object.assign(new Error(STARTUP_TIMEOUT), { name: 'AbortError' })],
+  [
+    'Error cancellation with last connection error',
+    Object.assign(new Error(STARTUP_TIMEOUT_WITH_CONNECTION_ERROR), { name: 'AbortError' }),
+  ],
   ['non-Error rejection', { message: DOWNLOAD_FAILURE }],
 ] as const) {
   test.serial(`local server startup does not retry ${name}`, async (t) => {

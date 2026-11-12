@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.metadata
+
 import pytest
 from typesafe_sdk import RetryPolicy, SystemOneResponse, TypeSafeError
 
@@ -106,3 +108,8 @@ def test_custom_payload_converter_is_preserved(
         failure_converter_class=DefaultFailureConverterWithEncodedAttributes,
     )
     assert _data_converter(custom) is custom
+
+
+def test_plugin_reports_package_version() -> None:
+    plugin = TypeSafePlugin(mock_client(retry=RetryPolicy(max_retries=0)))
+    assert plugin.version() == importlib.metadata.version("temporalio-typesafe")

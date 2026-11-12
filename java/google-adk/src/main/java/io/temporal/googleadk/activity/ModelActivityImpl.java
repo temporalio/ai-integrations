@@ -103,15 +103,18 @@ public final class ModelActivityImpl implements ModelActivity {
     } catch (ApplicationFailure | ActivityCompletionException e) {
       throw e;
     } catch (ModelStreamPublisher.PublishFailure e) {
-      throw ApplicationFailure.newFailureWithCause(
+      String message =
           "Live delivery of model "
               + input.model()
               + " output to topic '"
               + input.streamingTopic()
               + "' failed: "
-              + e.getMessage(),
-          FailureTypes.STREAM_ERROR,
-          e.getCause());
+              + e.getMessage();
+      throw e.isNonRetryable()
+          ? ApplicationFailure.newNonRetryableFailureWithCause(
+              message, FailureTypes.STREAM_ERROR, e.getCause())
+          : ApplicationFailure.newFailureWithCause(
+              message, FailureTypes.STREAM_ERROR, e.getCause());
     } catch (RuntimeException e) {
       throw Failures.modelFailure(input.model(), e);
     }

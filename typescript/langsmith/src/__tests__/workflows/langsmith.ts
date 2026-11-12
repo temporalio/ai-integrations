@@ -4,6 +4,7 @@
  * @module
  */
 
+import { RunTree } from 'langsmith/run_trees';
 import { traceable } from 'langsmith/traceable';
 import {
   ApplicationFailure,
@@ -196,6 +197,14 @@ export async function ReadonlyDeterminismWorkflow(): Promise<string> {
   let released = false;
   setHandler(readonlyUpdate, (value: string) => `updated:${value}`, {
     validator: (_value: string) => {
+      const run = new RunTree({ name: 'readonly-native-root' });
+      const child = run.createChild({ name: 'readonly-native-child' });
+      void run.postRun();
+      void child.postRun();
+      void child.end({});
+      void child.patchRun();
+      void run.end({});
+      void run.patchRun();
       throw new Error('always rejected');
     },
   });

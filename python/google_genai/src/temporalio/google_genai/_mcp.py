@@ -24,9 +24,26 @@ from contextlib import AbstractAsyncContextManager
 from datetime import timedelta
 
 from mcp import ClientSession
-from mcp.types import CallToolResult, ListToolsResult
+from mcp.types import (
+    INVALID_PARAMS,
+    INVALID_REQUEST,
+    METHOD_NOT_FOUND,
+    PARSE_ERROR,
+    CallToolResult,
+    ListToolsResult,
+)
+
+try:
+    from mcp import (  # type: ignore[attr-defined]  # mcp>=2
+        MCPError as McpError,  # pyright: ignore[reportAttributeAccessIssue]
+    )
+except ImportError:  # mcp<2
+    from mcp.shared.exceptions import (  # type: ignore[attr-defined,assignment,no-redef]
+        McpError,  # pyright: ignore[reportAttributeAccessIssue]
+    )
 
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 from temporalio.google_genai._models import _McpCallToolRequest
 
 # A factory yields a ready-to-use (connected and ``initialize()``-d)
@@ -40,6 +57,40 @@ McpSessionFactory = Callable[[], AbstractAsyncContextManager[ClientSession]]
 # The timer resets on every call that reuses the connection.  Override per
 # worker via ``GoogleGenAIPlugin(mcp_connection_idle_timeout=...)``.
 _MCP_CONNECTION_IDLE = timedelta(minutes=5)
+
+# JSON-RPC errors that a retry of the same request cannot fix.  INTERNAL_ERROR,
+# timeouts, unknown codes and a lost session (see ``_protocol_error``) stay
+# retryable.
+_NON_RETRYABLE_PROTOCOL_ERRORS = frozenset(
+    {PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS}
+)
+
+# A server answers HTTP 404 for a session it no longer knows (for example after
+# a restart); MCP reports it only as INVALID_REQUEST with no data and one of
+# these messages.  Reconnecting fixes it, so it must stay retryable.
+_SESSION_LOST_MESSAGES = frozenset({"Session terminated", "Session not found"})
+
+
+def _protocol_error(err: McpError) -> ApplicationError:
+    """Convert an MCP protocol error to an ``ApplicationError``.
+
+    Errors a retry cannot fix (invalid request/params, unknown method, parse
+    error) are non-retryable so the activity does not keep retrying them.
+    """
+    error = err.error
+    session_lost = (
+        error.code == INVALID_REQUEST
+        and error.data is None
+        and error.message in _SESSION_LOST_MESSAGES
+    )
+    details = (error.code,) if error.data is None else (error.code, error.data)
+    return ApplicationError(
+        error.message,
+        *details,
+        type="MCPProtocolError",
+        non_retryable=error.code in _NON_RETRYABLE_PROTOCOL_ERRORS and not session_lost,
+    )
+
 
 # Server name -> live connection held open in the activity worker process.
 # Activities run in the worker process, so this module state is shared across
@@ -175,6 +226,9 @@ def build_list_tools_activity(
         session, record = await get_connection(server, factory, idle)
         try:
             return await session.list_tools()
+        except McpError as err:
+            await _evict_connection(server)
+            raise _protocol_error(err) from err
         except Exception:
             # The session may be broken; drop it so the next call reconnects.
             await _evict_connection(server)
@@ -204,6 +258,9 @@ def build_call_tool_activity(
         session, record = await get_connection(server, factory, idle)
         try:
             return await session.call_tool(name=req.name, arguments=req.arguments)
+        except McpError as err:
+            await _evict_connection(server)
+            raise _protocol_error(err) from err
         except Exception:
             # The session may be broken; drop it so the next call reconnects.
             await _evict_connection(server)

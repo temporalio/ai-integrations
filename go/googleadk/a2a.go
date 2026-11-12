@@ -374,8 +374,8 @@ func appendA2APart(parts a2a.ContentParts, p *a2a.Part) a2a.ContentParts {
 //   - an A2A error the remote agent answers with is not: sending again would
 //     start another task, and ADK turns the failed call into an error event,
 //     as without Temporal;
-//   - a card source ADK cannot read, an interface URL that does not parse, or
-//     a reply that is not valid JSON, is not;
+//   - a card source ADK cannot read, an interface URL that does not parse or
+//     is untrusted, or a reply that is not valid JSON, is not;
 //   - anything else, such as a network error or a card file missing on this
 //     worker, is.
 func a2aError(op string, err error) error {
@@ -397,6 +397,7 @@ func a2aRetryable(err error) bool {
 	case errors.As(err, &cardStatus):
 		retryable = retryableHTTPStatus(cardStatus.StatusCode)
 	case errors.As(err, &remote), errors.Is(err, remoteagent.ErrUnsupportedCardSource),
+		errors.Is(err, remoteagent.ErrUntrustedCardInterface),
 		errors.As(err, &syntaxErr), errors.As(err, &typeErr),
 		errors.As(err, &urlErr) && urlErr.Op == "parse":
 		retryable = false
@@ -519,20 +520,20 @@ func (e *a2aHTTPStatusError) Error() string { return "unexpected HTTP status: " 
 //	})
 //
 // Without it, only model calls check, and only the agents below the agent that
-// makes the call. The runner plugin also catches a remote root agent, one
-// under a sequential, loop or parallel agent, and one reached by transfer. It
-// does not see a remote agent wrapped as a tool with agenttool, which is not
-// part of the tree.
+// makes the call: its sub-agents and the agents its tools wrap with agenttool.
+// The runner plugin also catches a remote root agent, one under a sequential,
+// loop or parallel agent, one reached by transfer, and one reached through a
+// model callback that gets past the model-call check: a BeforeModelCallbacks
+// entry that answers instead of the model, or an OnModelErrorCallbacks entry
+// that turns the refusal into a transfer. It sees the agent that an agenttool
+// in an agent's Tools wraps, but not one in its Toolsets, and not the agents
+// below a wrapped agent.
 func NewRunnerPlugin(root agent.Agent) (*plugin.Plugin, error) {
 	return plugin.New(plugin.Config{
 		Name: "googleadk",
 		BeforeRunCallback: func(agent.InvocationContext) (*genai.Content, error) {
-			remote := root
-			if !remoteAgentSendsFromWorkflow(root) {
-				remote = findRemoteAgent(root)
-			}
-			if remote != nil {
-				return nil, remoteAgentError(remote)
+			if name := findRemoteAgent(root); name != "" {
+				return nil, remoteAgentError(name)
 			}
 			return nil, nil
 		},

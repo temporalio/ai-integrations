@@ -80,6 +80,9 @@ jobs:
           cache-dependency-glob: scripts/uv.lock
       - name: Check repository conventions
         run: uv run --project scripts --locked python scripts/ci/check_conventions.py
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.27.0
       - name: Tooling unit tests
         run: uv run --project scripts --locked pytest scripts/tests -q
 

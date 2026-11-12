@@ -123,6 +123,15 @@ def test_ci_status_is_the_fan_in() -> None:
         assert f"needs.changes.outputs.{language} != '[]'" in job["if"]
 
 
+def test_tooling_installs_pnpm_for_cooldown_regressions() -> None:
+    workflow = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
+    steps = workflow["jobs"]["conventions"]["steps"]
+    setup = next(step for step in steps if step.get("uses", "").startswith("pnpm/action-setup@"))
+    tests = next(step for step in steps if step.get("name") == "Tooling unit tests")
+    assert setup["with"]["version"] == "10.27.0"
+    assert steps.index(setup) < steps.index(tests)
+
+
 def test_typescript_checks_tarball_and_clean_consumer_after_testing() -> None:
     workflow = yaml.safe_load((REPO / ".github/workflows/_typescript-plugin.yml").read_text())
     steps = workflow["jobs"]["test"]["steps"]
@@ -138,12 +147,27 @@ def test_typescript_checks_tarball_and_clean_consumer_after_testing() -> None:
     assert "make sync-latest" in sync["run"] and "make sync" in sync["run"]
 
 
+@pytest.mark.parametrize("language,sync_name", [("python", "Sync environment"), ("typescript", "Sync dependencies")])
+def test_cooldown_is_checked_before_installing_the_committed_lock(language: str, sync_name: str) -> None:
+    workflow = yaml.safe_load((REPO / f".github/workflows/_{language}-plugin.yml").read_text())
+    steps = workflow["jobs"]["test"]["steps"]
+    check = next(step for step in steps if step.get("name") == "Check dependency resolution under the cooldown")
+    sync = next(step for step in steps if step.get("name") == sync_name)
+    assert check["if"] == "matrix.dist && inputs.deps == 'locked'"
+    assert check["run"] == 'cd "$PLUGIN_DIR" && make check-deps'
+    assert steps.index(check) < steps.index(sync)
+    assert "locked) make sync ;;" in sync["run"]
+    assert "latest) make sync-latest ;;" in sync["run"]
+
+
 def test_go_release_reuses_the_full_matrix_and_verifies_the_same_commit() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())
     assert doc[True]["push"]["tags"] == ["go/*/v*"]
     assert doc[True]["release"]["types"] == ["published"]
     assert doc["permissions"] == {}
-    assert all(job["permissions"] == {"contents": "read"} for job in doc["jobs"].values())
+    # prepare also reads the plugin's nightly issue; nothing else in a Go release needs more than contents.
+    assert all(job["permissions"] == ({"contents": "read", "issues": "read"} if name == "prepare" else {"contents": "read"})
+               for name, job in doc["jobs"].items())
     test = doc["jobs"]["test"]
     assert test["uses"] == "./.github/workflows/_go-plugin.yml"
     assert test["with"] == {"plugin": "${{ needs.prepare.outputs.plugin }}", "deps": "locked", "ref": "${{ needs.prepare.outputs.sha }}"}
@@ -203,6 +227,24 @@ def test_go_release_source_must_be_main_reachable_for_tag_runs(plugin_repo: Path
     assert (result.returncode == 0) == allowed, result.stdout + result.stderr
     if allowed:
         assert output.read_text() == f"sha={git(plugin_repo, 'rev-parse', 'HEAD')}\n"
+
+
+@pytest.mark.parametrize("language,skip_when", [
+    ("python", "github.event_name != 'workflow_dispatch' || inputs.recover-run == ''"),
+    ("typescript", "github.event_name != 'workflow_dispatch' || inputs.recover-run == ''"),
+    ("java", "github.event_name != 'workflow_dispatch' || inputs.deployment-id == ''"),
+    # A Go tag is public once it exists, so only the branch dry run before tagging can stop it.
+    ("go", "github.ref_type != 'tag' && github.event_name == 'workflow_dispatch'"),
+])
+def test_releases_check_the_nightly_run_after_the_version_policy(language: str, skip_when: str) -> None:
+    prepare = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())["jobs"]["prepare"]
+    assert prepare["permissions"]["issues"] == "read"
+    names = [step.get("name", "") for step in prepare["steps"]]
+    assert names.index("Nightly run is green") == names.index("Version policy") + 1
+    step = prepare["steps"][names.index("Nightly run is green")]
+    assert step["if"] == skip_when
+    assert step["env"] == {"GH_TOKEN": "${{ github.token }}", "TAG": "${{ steps.tag.outputs.tag }}"}
+    assert step["run"].endswith('release_tool.py check-nightly --tag "$TAG"')
 
 
 def test_release_publish_jobs_are_inline_and_oidc_only() -> None:

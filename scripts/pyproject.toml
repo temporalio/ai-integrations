@@ -6,9 +6,8 @@
 # Run the tests with:   uv run --project scripts --locked pytest scripts/tests -q
 #
 # requires-python is 3.11+ because the scripts rely on `tomllib`; GitHub-hosted
-# runners always provide a newer interpreter. The one exception is
-# scripts/ci/smoke.py --in-env, which is stdlib-only and runs inside the
-# plugin's own (possibly 3.10) environment.
+# runners always provide a newer interpreter. scripts/ci/smoke.py --in-env is
+# stdlib-only and runs inside the plugin's own Python 3.11+ environment.
 [project]
 name = "ai-integrations-scripts"
 version = "0"

@@ -60,8 +60,6 @@ export interface TemporalProviderOptions {
 /**
  * A language model implementation that delegates AI model calls to Temporal activities.
  * This allows workflows to invoke AI models through the Temporal execution model.
- *
- * @experimental The AI SDK integration is an experimental feature; APIs may change without notice.
  */
 export class TemporalLanguageModel implements LanguageModelV4 {
   readonly specificationVersion = 'v4';
@@ -128,6 +126,14 @@ export class TemporalLanguageModel implements LanguageModelV4 {
     const stream = new ReadableStream({
       start(controller: ReadableStreamDefaultController) {
         controller.enqueue({ type: 'stream-start', warnings: result.warnings ?? [] });
+        if (result.response !== undefined) {
+          controller.enqueue({
+            type: 'response-metadata',
+            id: result.response.id,
+            modelId: result.response.modelId,
+            timestamp: result.response.timestamp ? new Date(result.response.timestamp) : undefined,
+          });
+        }
         let partIndex = 0;
         for (const item of result.content ?? []) {
           const id = `part-${partIndex++}`;
@@ -147,6 +153,7 @@ export class TemporalLanguageModel implements LanguageModelV4 {
           type: 'finish',
           finishReason: result.finishReason,
           usage: result.usage,
+          providerMetadata: result.providerMetadata,
         });
         controller.close();
       },
@@ -159,8 +166,6 @@ export class TemporalLanguageModel implements LanguageModelV4 {
 /**
  * An embedding model implementation that delegates embedding generation to Temporal activities.
  * This allows workflows to generate embeddings through the Temporal execution model.
- *
- * @experimental The AI SDK integration is an experimental feature; APIs may change without notice.
  */
 export class TemporalEmbeddingModel implements EmbeddingModelV4 {
   readonly specificationVersion = 'v4';
@@ -203,8 +208,6 @@ export class TemporalEmbeddingModel implements EmbeddingModelV4 {
  * A Temporal-specific provider implementation that creates AI models which execute
  * through Temporal activities. This provider integrates AI SDK models with Temporal's
  * execution model to ensure reliable, durable AI model invocations.
- *
- * @experimental The AI SDK integration is an experimental feature; APIs may change without notice.
  */
 export class TemporalProvider implements ProviderV4 {
   readonly specificationVersion = 'v4';
@@ -232,7 +235,5 @@ export class TemporalProvider implements ProviderV4 {
 
 /**
  * A singleton instance of TemporalProvider for convenient use in applications.
- *
- * @experimental The AI SDK integration is an experimental feature; APIs may change without notice.
  */
 export const temporalProvider: TemporalProvider = new TemporalProvider();

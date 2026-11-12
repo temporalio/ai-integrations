@@ -2,6 +2,7 @@
 
 import functools
 import inspect
+import types
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -26,3 +27,18 @@ def unwrapped(
     delattr(wrapper, "__wrapped__")
     setattr(wrapper, "__signature__", inspect.signature(fn))
     return wrapper
+
+
+class WrapOnAccess:
+    """Stays in the class; each access returns a new ``functools.wraps`` wrapper, as wrapt does."""
+
+    __wrapped__: Callable[..., Awaitable[Any]]
+
+    def __init__(self, fn: Callable[..., Awaitable[Any]]) -> None:
+        self.__wrapped__ = fn
+
+    def __get__(
+        self, obj: object, cls: type | None = None
+    ) -> Callable[..., Awaitable[Any]]:
+        fn = self.__wrapped__
+        return passthrough(fn if obj is None else types.MethodType(fn, obj))

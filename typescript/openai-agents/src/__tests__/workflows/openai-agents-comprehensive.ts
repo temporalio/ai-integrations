@@ -22,7 +22,6 @@ import {
 } from '@temporalio/workflow';
 import {
   activityAsTool,
-  agentAsTool,
   nexusOperationAsTool,
   TemporalOpenAIRunner,
   WorkflowSafeMemorySession,
@@ -414,7 +413,7 @@ function buildAgentSetup(nexusEndpoint: string): AgentSetup {
     model: 'gpt-4o-mini',
     tools: [weatherTool, addNumbersTool, lookupCityBareTool],
   });
-  const assistantSpecialistTool = agentAsTool(assistantAgent, {
+  const assistantSpecialistTool = assistantAgent.asTool({
     toolName: 'delegate_task',
     toolDescription: 'Delegate a task to a general assistant that can look things up, get weather, and do math',
   });

@@ -42,9 +42,7 @@ test('continue-as-new: keeps the successor on the same trace with a distinct run
   t.falsy(collector.byName('ContinueAsNew:ContinueAsNewWorkflow'));
 });
 
-// When no parent is propagated, the successor must install its own fresh placeholder
-// root so its user `traceable` run stays a proper root, not dangling under the
-// predecessor's never-emitted parent.
+// Without a propagated parent, the successor's traceable creates a fresh native root.
 test('continue-as-new: successor user runs stay roots when no parent was propagated', async (t) => {
   const collector = new InMemoryRunCollector();
   await withTracingWorker({

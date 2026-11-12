@@ -9,19 +9,14 @@ replay; a clean pass proves the in-workflow dispatch is deterministic.
 
 from __future__ import annotations
 
-import sys
 import uuid
 from typing import Any
 
 import pytest
 
-from temporalio.testing import WorkflowEnvironment
-
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 from temporalio import workflow
 from temporalio.deepagents import DeepAgentsPlugin, run_deep_agent
+from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import importlib
+import importlib.metadata
 import uuid
 from collections.abc import Awaitable, Callable
 
@@ -70,6 +71,13 @@ class ClaudeAgentSDKPlugin(SimplePlugin):
             # Task forever.
             workflow_failure_exception_types=[ClaudeSDKError],
         )
+
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-claude-agent-sdk")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
 
     def configure_worker(self, config: WorkerConfig) -> WorkerConfig:
         """Configure the Worker, except the one :meth:`run_worker` starts.

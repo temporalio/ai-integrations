@@ -182,9 +182,9 @@ export class TemporalModel extends BaseLlm {
       }
     } catch (err) {
       // A call cancelled by ADK's abort (`underAbortSignal`) lands here like any model
-      // error, and ADK absorbs it. The run then fails with the sibling's failure that
-      // caused the abort: the execution itself was not cancelled, so the recorded
-      // cancellation does not decide its outcome (`absorbed-failure.ts`).
+      // error, and ADK absorbs it. That cancel is not the execution's, so it is not
+      // recorded (`absorbed-failure.ts`), and the run fails with the sibling's failure
+      // that caused the abort.
       if (call !== undefined) recordAbsorbedFailure(err, call);
       throw err;
     }

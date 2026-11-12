@@ -2,6 +2,8 @@
  * Test AI SDK integration with Temporal workflows
  */
 import { randomUUID } from 'crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import type {
   EmbeddingModelV4,
   EmbeddingModelV4CallOptions,
@@ -17,6 +19,7 @@ import type {
   LanguageModelV4Usage,
   ProviderV4,
 } from '@ai-sdk/provider';
+import { APICallError } from '@ai-sdk/provider';
 import { openai } from '@ai-sdk/openai';
 import type { TestFn } from 'ava';
 import { context, propagation, trace } from '@opentelemetry/api';
@@ -37,7 +40,8 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { createMCPClient } from '@ai-sdk/mcp';
 import { jsonSchema } from 'ai';
 import { temporal } from '@temporalio/proto';
-import { WorkflowClient } from '@temporalio/client';
+import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
+import { ActivityFailure, ApplicationFailure, TemporalFailure } from '@temporalio/common';
 import type { OpenTelemetrySinks } from '@temporalio/interceptors-opentelemetry';
 import {
   makeWorkflowExporter,
@@ -46,9 +50,10 @@ import {
   OpenTelemetryWorkflowClientCallsInterceptor,
   OpenTelemetryWorkflowClientInterceptor,
 } from '@temporalio/interceptors-opentelemetry';
-import { workflowInterceptorModules } from '@temporalio/testing';
-import { bundleWorkflowCode, DefaultLogger, Worker as CoreWorker } from '@temporalio/worker';
-import type { InjectedSinks } from '@temporalio/worker';
+import { MockActivityEnvironment, workflowInterceptorModules } from '@temporalio/testing';
+import { SimplePlugin } from '@temporalio/plugin';
+import { bundleWorkflowCode, DefaultLogger, NativeConnection, Worker as CoreWorker } from '@temporalio/worker';
+import type { InjectedSinks, WorkerOptions } from '@temporalio/worker';
 import type { BaseContext } from '@temporalio/test-helpers';
 import {
   test as anyTest,
@@ -68,6 +73,7 @@ import {
   mcpSchemaTestWorkflow,
   mcpWorkflow,
   middlewareWorkflow,
+  slowModelWorkflow,
   streamingMetadataWorkflow,
   telemetryWorkflow,
   toolsWorkflow,
@@ -399,14 +405,17 @@ test('Image tool results are converted inside the workflow sandbox', async (t) =
   });
 });
 
-test('Streaming text provider metadata survives activity execution and workflow replay', async (t) => {
+test('Streaming text, finish and response metadata survive activity execution and workflow replay', async (t) => {
   const providerMetadata = { test: { source: 'delta' } };
+  const finishMetadata = { test: { cachedTokens: 7 } };
+  const responseMetadata = { id: 'response-1', modelId: 'test-model', timestamp: new Date('2026-01-01T00:00:00Z') };
   const provider = new StreamingTestProvider([
     { type: 'stream-start', warnings: [] },
+    { type: 'response-metadata', ...responseMetadata },
     { type: 'text-start', id: 'provider-part' },
     { type: 'text-delta', id: 'provider-part', delta: 'hello', providerMetadata },
     { type: 'text-end', id: 'provider-part' },
-    { type: 'finish', finishReason: createFinishReason('stop'), usage: createUsage() },
+    { type: 'finish', finishReason: createFinishReason('stop'), usage: createUsage(), providerMetadata: finishMetadata },
   ]);
   const { createWorker, executeWorkflow } = helpers(t);
   const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
@@ -418,17 +427,93 @@ test('Streaming text provider metadata survives activity execution and workflow 
 
     t.deepEqual(parts, [
       { type: 'stream-start', warnings: [] },
+      { type: 'response-metadata', ...responseMetadata, timestamp: responseMetadata.timestamp.toISOString() },
       { type: 'text-start', id: 'part-0', providerMetadata },
       { type: 'text-delta', id: 'part-0', delta: 'hello' },
       { type: 'text-end', id: 'part-0' },
       {
         type: 'finish',
+        providerMetadata: finishMetadata,
         finishReason: { unified: 'stop' },
         usage: { inputTokens: { total: 10 }, outputTokens: { total: 20 } },
       },
     ]);
   });
 });
+
+// Each call waits longer than the `heartbeatTimeout` of `slowModelWorkflow` before it answers.
+const slowModelDelayMs = 2000;
+
+class SlowTestProvider implements ProviderV4 {
+  readonly specificationVersion = 'v4';
+
+  languageModel(_modelId: string): LanguageModelV4 {
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'slow-model',
+      supportedUrls: {},
+      async doGenerate(): Promise<LanguageModelV4GenerateResult> {
+        await new Promise((resolve) => setTimeout(resolve, slowModelDelayMs));
+        return textResponse('slow');
+      },
+      async doStream(): Promise<LanguageModelV4StreamResult> {
+        return {
+          stream: new ReadableStream({
+            async start(controller) {
+              await new Promise((resolve) => setTimeout(resolve, slowModelDelayMs));
+              controller.enqueue({ type: 'stream-start', warnings: [] });
+              controller.enqueue({
+                type: 'finish',
+                finishReason: createFinishReason('stop'),
+                usage: createUsage(),
+              });
+              controller.close();
+            },
+          }),
+        };
+      },
+    };
+  }
+
+  embeddingModel(_modelId: string): EmbeddingModelV4 {
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'slow-model',
+      maxEmbeddingsPerCall: undefined,
+      supportsParallelCalls: true,
+      async doEmbed(): Promise<EmbeddingModelV4Result> {
+        await new Promise((resolve) => setTimeout(resolve, slowModelDelayMs));
+        return embeddingResponse(['test']);
+      },
+    };
+  }
+
+  imageModel(_modelId: string): ImageModelV4 {
+    throw new Error('Not implemented.');
+  }
+}
+
+for (const [call, expected] of [
+  ['stream', 2],
+  ['generate', 1],
+  ['embed', 1],
+] as const) {
+  test(`Model activity (${call}) heartbeats while the provider is slow`, async (t) => {
+    const { createWorker, executeWorkflow } = helpers(t);
+    const plugin = new AiSdkPlugin({ modelProvider: new SlowTestProvider() });
+    const worker = await createWorker({ plugins: [plugin] });
+
+    await worker.runUntil(async () => {
+      const result = await executeWorkflow(slowModelWorkflow, {
+        args: [call],
+        workflowExecutionTimeout: '10 seconds',
+      });
+      t.is(result, expected);
+    });
+  });
+}
 
 function* generateObjectWorkflowGenerator(): Generator<ModelResponse> {
   yield textResponse(
@@ -533,6 +618,126 @@ test('Embedding model generates embeddings', async (t) => {
     );
     t.assert(activityTypes.includes('invokeEmbeddingModel'), 'invokeEmbeddingModel activity should have been called');
   });
+});
+
+function apiCallError(statusCode: number, isRetryable: boolean): APICallError {
+  return new APICallError({
+    message: `Provider returned ${statusCode}`,
+    url: 'https://provider.invalid/v1/chat',
+    requestBodyValues: {},
+    statusCode,
+    isRetryable,
+  });
+}
+
+/** Throws the scripted errors in order, then answers with `response`. */
+class FailingProvider implements ProviderV4 {
+  readonly specificationVersion = 'v4';
+  calls = 0;
+
+  constructor(
+    private readonly errors: unknown[],
+    private readonly response: ModelResponse = textResponse('Recovered')
+  ) {}
+
+  private next(): void {
+    const error = this.errors[this.calls++];
+    if (error !== undefined) throw error;
+  }
+
+  languageModel(_modelId: string): LanguageModelV4 {
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'failing-test-model',
+      supportedUrls: {},
+      doGenerate: async (): Promise<LanguageModelV4GenerateResult> => {
+        this.next();
+        return this.response;
+      },
+      doStream: async (): Promise<LanguageModelV4StreamResult> => {
+        throw new Error('Streaming not supported.');
+      },
+    };
+  }
+
+  embeddingModel(_modelId: string): EmbeddingModelV4 {
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'failing-test-embedding-model',
+      maxEmbeddingsPerCall: undefined,
+      supportsParallelCalls: true,
+      doEmbed: async (): Promise<EmbeddingModelV4Result> => {
+        this.next();
+        return embeddingResponse(['unused']);
+      },
+    };
+  }
+
+  imageModel(_modelId: string): ImageModelV4 {
+    throw new Error('Not implemented.');
+  }
+}
+
+test('A non-retryable provider error fails the Workflow after one Activity attempt', async (t) => {
+  const provider = new FailingProvider([apiCallError(401, false)]);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(helloWorldAgent, {
+      args: ['hi'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+    const activityFailure = err!.cause;
+    t.true(activityFailure instanceof ActivityFailure);
+    const failure = activityFailure!.cause;
+    if (!(failure instanceof ApplicationFailure)) {
+      t.fail(`Expected an ApplicationFailure, got ${failure}`);
+      return;
+    }
+    t.true(failure.nonRetryable);
+    t.is(failure.type, 'APICallError');
+    t.is(failure.message, 'Provider returned 401');
+    t.true(failure.cause instanceof TemporalFailure);
+    t.is(failure.cause?.message, 'Provider returned 401');
+
+    const { events } = await handle.fetchHistory();
+    const failed = events?.filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED);
+    t.is(failed?.length, 1);
+  });
+  t.is(provider.calls, 1);
+});
+
+test('A retryable provider error is retried by the Activity retry policy', async (t) => {
+  const provider = new FailingProvider([apiCallError(503, true)]);
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(helloWorldAgent, {
+      args: ['hi'],
+      workflowExecutionTimeout: '30 seconds',
+    });
+    t.is(result, 'Recovered');
+  });
+  t.is(provider.calls, 2);
+});
+
+test('invokeEmbeddingModel fails without retry on a non-retryable provider error', async (t) => {
+  const activities = createActivities(new FailingProvider([apiCallError(400, false)])) as {
+    invokeEmbeddingModel: (args: { modelId: string; values: string[] }) => Promise<unknown>;
+  };
+  const env = new MockActivityEnvironment();
+  const err = await t.throwsAsync(
+    env.run(activities.invokeEmbeddingModel, { modelId: 'm', values: ['a'] }),
+    { instanceOf: ApplicationFailure }
+  );
+  t.true(err!.nonRetryable);
+  t.is(err!.type, 'APICallError');
+  t.true(APICallError.isInstance(err!.cause));
 });
 
 test.serial('Telemetry', async (t) => {
@@ -961,6 +1166,93 @@ const createTestMcpClient = async () => {
   // Return real AI SDK MCP client connected to in-memory server
   return createMCPClient({ transport: clientTransport });
 };
+
+test('configureWorker refuses to replace a different Activity with the same name', (t) => {
+  const provider = new TestProvider(helloWorkflowGenerator());
+  const files = async () => ({}) as any;
+  const base = { taskQueue: 'tq' } as WorkerOptions;
+  const duplicate = (name: string) => ({
+    instanceOf: TypeError,
+    message: new RegExp(`^Duplicate registration of Activity '${name}': AiSdkPlugin would replace`),
+  });
+
+  // A caller Activity, another instance's provider, or another instance's MCP
+  // client factory under the same server name is refused.
+  const callerActivities = { ...base, activities: { invokeModel: async () => 'caller' } };
+  t.throws(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(callerActivities), duplicate('invokeModel'));
+  const withMcp = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } }).configureWorker(base);
+  const otherProvider = new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) });
+  t.throws(() => otherProvider.configureWorker(withMcp), duplicate('invokeModel'));
+  const otherFactory = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files: async () => ({}) as any } });
+  t.throws(() => otherFactory.configureWorker(withMcp), duplicate('files-listTools'));
+  // Another operation built from the same provider, registered under this name.
+  const aliased = { ...base, activities: { invokeModel: (createActivities(provider) as any).invokeEmbeddingModel } };
+  t.throws(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(aliased), duplicate('invokeModel'));
+
+  // configureWorker accepts the same instance twice (NativeConnection and
+  // Worker), the same options twice, and createActivities with the same
+  // provider. With workflowsPath, Worker.create still rejects a repeated
+  // AiSdkPlugin in the bundler: each one prepends its polyfill entry.
+  const plugin = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } });
+  t.notThrows(() => plugin.configureWorker(plugin.configureWorker(base)));
+  t.notThrows(() => new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files } }).configureWorker(withMcp));
+  const callerSet = { ...base, activities: createActivities(provider) };
+  t.notThrows(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(callerSet));
+});
+
+test('AiSdkPlugin reports the package version for worker heartbeats', (t) => {
+  const plugin = new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) });
+  t.is(plugin.version, JSON.parse(readFileSync(path.join(__dirname, '../../package.json'), 'utf8')).version);
+});
+
+test('runWorker refuses an Activity that a later plugin replaced, before polling', async (t) => {
+  const connection = await NativeConnection.connect({ address: t.context.env.address });
+  // StrandsPlugin also registers invokeModel; this plugin stands in for it.
+  const later = new SimplePlugin({ name: 'later', activities: { invokeModel: async () => 'other' } });
+  const worker = await Worker.create({
+    connection,
+    namespace: t.context.env.namespace,
+    taskQueue: 'test-ai-later-plugin',
+    plugins: [new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) }), later],
+  });
+  await t.throwsAsync(worker.run(), {
+    instanceOf: TypeError,
+    message: /^Duplicate registration of Activity 'invokeModel': a plugin applied after AiSdkPlugin replaced/,
+  });
+  t.is(worker.getState(), 'STOPPED');
+  // Throws if the Worker still holds the connection.
+  await connection.close();
+});
+
+test('runWorker starts the Worker at once, so runUntil stops it after its callback', async (t) => {
+  const connection = await NativeConnection.connect({ address: t.context.env.address });
+  // runUntil stops the Worker after its callback only if the Worker is already
+  // running. A callback that throws synchronously finishes before run() yields.
+  const alone = await Worker.create({
+    connection,
+    namespace: t.context.env.namespace,
+    taskQueue: 'test-ai-run-until-throws',
+    plugins: [new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) })],
+  });
+  await t.throwsAsync(
+    alone.runUntil(() => {
+      throw new Error('boom');
+    }),
+    { message: 'boom' }
+  );
+  t.is(alone.getState(), 'STOPPED');
+  // Each plugin's check runs before the Worker starts; none may yield.
+  const options = { modelProvider: new TestProvider(helloWorkflowGenerator()) };
+  const two = await Worker.create({
+    connection,
+    namespace: t.context.env.namespace,
+    taskQueue: 'test-ai-run-until-two',
+    plugins: [new AiSdkPlugin(options), new AiSdkPlugin(options)],
+  });
+  t.is(await two.runUntil(() => Promise.resolve('done')), 'done');
+  t.is(two.getState(), 'STOPPED');
+  await connection.close();
+});
 
 test('MCP tool schema survives activity serialization', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);

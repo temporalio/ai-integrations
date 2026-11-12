@@ -62,7 +62,11 @@ type ModelFactory func(ctx context.Context, modelName string) (model.LLM, error)
 // inside a factory. ctx is only valid for the duration of the constructing
 // call; mcptoolset.New ignores it — its MCP session opens lazily with each
 // request's own context. If the returned toolset implements `Close() error`,
-// Activities.Close closes it at worker shutdown.
+// Activities.Close closes it at worker shutdown. An error a toolset's tool
+// returns that wraps no other error and is not an ApplicationError is the
+// tool's own answer: CallMcpTool hands it to the model and does not retry it.
+// To have a failure retried, wrap its cause with %w or return a retryable
+// temporal.ApplicationError.
 type MCPFactory func(ctx context.Context) (tool.Toolset, error)
 
 // Config declares the worker-side registries the Activities consult when a

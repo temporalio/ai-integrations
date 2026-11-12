@@ -7,14 +7,14 @@
 
 import test from 'ava';
 import { BaseLlm, type BaseLlmConnection, type LlmRequest, type LlmResponse } from '@google/adk';
-import { ApplicationFailure } from '@temporalio/common';
+import { ApplicationFailure, CancelledFailure } from '@temporalio/common';
 import { MockActivityEnvironment } from '@temporalio/testing';
-import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
+import { FlushTimeoutError, WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 
 import { createModelActivities } from '../activities';
 import { GoogleAdkPlugin } from '../index';
 import { fakeModelProvider } from '../testing';
-import { setupTestEnv, uid, withWorker } from './helpers';
+import { findInCauseChain, setupTestEnv, uid, withWorker } from './helpers';
 import { closeStream, streamingModelCall, streamingModelCallSubscribed } from './workflows';
 
 const chunks: LlmResponse[] = [
@@ -77,6 +77,57 @@ test.serial('publishesChunksToStreamTopic', async (t) => {
   });
 });
 
+// E2E: the chunks arrive back to back, so they share one publish batch. With
+// 300,000-character chunks the batch (about 2.4 MB) is over the dev server's 2 MiB
+// payload limit; with 600,000-character chunks (about 4.8 MB) it is over the 4 MiB
+// gRPC message limit. The server refuses the batch, so the Workflow must fail with a
+// non-retryable stream error, not complete while subscribers get nothing, and the
+// model must not be called again.
+test.serial('refusedStreamPublishFailsTheModelCall', async (t) => {
+  const env = getEnv();
+  for (const [size, refusal] of [
+    [300_000, /Blob data size exceeds limit/],
+    [600_000, /larger than max/],
+  ] as const) {
+    const taskQueue = uid('adk-stream-refused');
+    const third = 'x'.repeat(size);
+    const responses: LlmResponse[] = [
+      { content: { role: 'model', parts: [{ text: third }] }, partial: true },
+      { content: { role: 'model', parts: [{ text: third }] }, partial: true },
+      { content: { role: 'model', parts: [{ text: third }] }, partial: true },
+      { content: { role: 'model', parts: [{ text: third.repeat(3) }] }, turnComplete: true },
+    ];
+    const provider = fakeModelProvider(responses);
+    let modelCalls = 0;
+    const plugin = new GoogleAdkPlugin({
+      modelProvider: (model) => {
+        modelCalls++;
+        return provider(model);
+      },
+    });
+    await withWorker(env, { taskQueue, plugins: [plugin] }, async () => {
+      let caught: unknown;
+      try {
+        await env.client.workflow.execute(streamingModelCall, {
+          taskQueue,
+          workflowId: uid('wf-stream-refused'),
+          workflowExecutionTimeout: '1 minute',
+        });
+      } catch (err) {
+        caught = err;
+      }
+      const appFailure = findInCauseChain(caught, ApplicationFailure);
+      t.not(appFailure, undefined, `chunk ${size}`);
+      t.is(appFailure?.type, 'GoogleAdkStreamError');
+      t.is(appFailure?.nonRetryable, true);
+      t.regex(appFailure?.message ?? '', /'fake-model'.*'adk-test-stream'/);
+      t.regex(appFailure?.message ?? '', refusal);
+      t.not(appFailure?.cause, undefined);
+      t.is(modelCalls, 1);
+    });
+  }
+});
+
 /** A model that yields one chunk, then raises a retryable (HTTP 503) error. */
 class MidStreamThrowingLlm extends BaseLlm {
   override async *generateContentAsync(
@@ -127,6 +178,50 @@ test.serial('midStreamModelErrorIsClassifiedAndStreamDisposed', async (t) => {
     t.is((err as ApplicationFailure).type, 'GoogleAdkModelError.503');
     t.true(disposed);
     t.is(published, 1);
+  } finally {
+    WorkflowStreamClient.fromWithinActivity = original;
+  }
+});
+
+// Unit test (MockActivityEnvironment): the model call succeeds and the stream's
+// dispose rejects. Rate limiting stays retryable, a batch Workflow Streams gave up
+// on is final, and a cancel before a refused dispose is reported as a cancel.
+test.serial('streamDisposeFailureIsClassified', async (t) => {
+  const original = WorkflowStreamClient.fromWithinActivity;
+  const stubDispose = (dispose: () => Promise<void>) => {
+    WorkflowStreamClient.fromWithinActivity = (() => ({
+      topic: () => ({ publish: () => {} }),
+      [Symbol.asyncDispose]: dispose,
+    })) as unknown as typeof WorkflowStreamClient.fromWithinActivity;
+  };
+  const run = (mockEnv: MockActivityEnvironment) =>
+    t.throwsAsync(
+      mockEnv.run(createModelActivities({ modelProvider: fakeModelProvider(chunks) })['adk-invokeModelStreaming'], {
+        model: 'fake-model',
+        request: {} as never,
+        streamingTopic: 'adk-test-stream',
+      })
+    );
+  try {
+    for (const [name, disposeError, nonRetryable] of [
+      ['rate limited', Object.assign(new Error('namespace rate limit exceeded'), { code: 8 }), false],
+      ['gave up', new FlushTimeoutError('gave up'), true],
+    ] as const) {
+      stubDispose(async () => {
+        throw disposeError;
+      });
+      const err = await run(new MockActivityEnvironment());
+      t.true(err instanceof ApplicationFailure, `${name}: ${err}`);
+      t.is((err as ApplicationFailure).type, 'GoogleAdkStreamError', name);
+      t.is((err as ApplicationFailure).nonRetryable, nonRetryable, name);
+    }
+    const mockEnv = new MockActivityEnvironment();
+    stubDispose(async () => {
+      mockEnv.cancel();
+      throw Object.assign(new Error('Blob data size exceeds limit.'), { code: 3 });
+    });
+    const err = await run(mockEnv);
+    t.true(err instanceof CancelledFailure, `cancelled: ${err}`);
   } finally {
     WorkflowStreamClient.fromWithinActivity = original;
   }

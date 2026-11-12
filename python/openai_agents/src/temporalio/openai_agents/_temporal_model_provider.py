@@ -51,7 +51,19 @@ class _CaptureAgentFilter:
     def __call__(
         self, data: CallModelData[Any]
     ) -> ModelInputData | Awaitable[ModelInputData]:
-        """Record ``data.agent`` and return the wrapped filter's result unchanged."""
+        """Record ``data.agent`` and return the wrapped filter's result unchanged.
+
+        Raises:
+            ValueError: If the agent's model is a ``Model`` object. The SDK would call it
+                in the Workflow, so only names that the provider resolves are allowed,
+                and the stubs of runs that started on copies of the agents.
+        """
+        if data.agent.model is not None and not isinstance(
+            data.agent.model, (str, _TemporalModelStub)
+        ):
+            raise ValueError(
+                "Temporal workflows require a model name to be a string in the agent."
+            )
         _current_agent.set(data.agent)
         if self.wrapped is None:
             return data.model_data

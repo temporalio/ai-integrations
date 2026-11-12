@@ -74,18 +74,10 @@ class TemporalTransport(Transport):
         Args:
             options: The same options passed to ``ClaudeSDKClient``.
             activity_options: Options for each Activity.
-            stream: A topic of the Workflow's ``WorkflowStream``.
-
-        Raises:
-            ValueError: If ``options.include_partial_messages`` is set without
-                ``stream``, or ``stream`` without it.
+            stream: A topic of the Workflow's ``WorkflowStream``. With
+                ``options.include_partial_messages``, each ``StreamEvent`` is
+                published to it as well as passed to the Workflow.
         """
-        if options.include_partial_messages != (stream is not None):
-            raise ValueError(
-                f"{type(self).__name__} needs a stream if and only if "
-                "options.include_partial_messages is set"
-            )
-
         if not _is_json_object(options.settings):
             raise ValueError(
                 f"{type(self).__name__} needs options.settings to be a JSON "
@@ -272,8 +264,10 @@ class TemporalTransport(Transport):
                 continue
 
             kind = output.get("type")
-            if kind == "stream_event" and self._stream is not None:
-                self._stream.publish(output)
+            if kind == "stream_event":
+                if self._stream is not None:
+                    self._stream.publish(output)
+                yield output
                 continue
 
             if kind != "control_response":

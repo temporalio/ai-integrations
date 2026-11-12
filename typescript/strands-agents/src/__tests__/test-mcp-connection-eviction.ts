@@ -1,5 +1,6 @@
 /**
- * Unit tests for how the per-server MCP activities evict their pooled connection after a failed call.
+ * Unit tests for how the per-server MCP activities evict their pooled connection after a failed call
+ * and when the last Worker stops.
  *
  * Runs the real `{server}-callTool` / `{server}-listTools` activities in a MockActivityEnvironment against a
  * fake `McpClient`, so no Temporal server or workflow is needed.
@@ -7,7 +8,7 @@
 import test from 'ava';
 import type { McpClient } from '@strands-agents/sdk';
 import { MockActivityEnvironment } from '@temporalio/testing';
-import { _evictConnection, buildCallToolActivity, buildListToolsActivity } from '../temporal-mcp-client';
+import { buildCallToolActivity, buildListToolsActivity, McpConnections } from '../temporal-mcp-client';
 import type { CallToolInput } from '../temporal-mcp-client';
 
 /**
@@ -56,7 +57,7 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
-/** Let fire-and-forget disconnects scheduled by `releaseConnection` run. */
+/** Let fire-and-forget disconnects scheduled by `McpConnections.release` run. */
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 const input = (toolName: string): CallToolInput => ({ toolName, args: {} });
@@ -79,7 +80,8 @@ test('a failed callTool does not close the shared connection under an in-flight 
       return { handledBy: clientId };
     },
   });
-  const callTool = buildCallToolActivity(server, factory);
+  const connections = new McpConnections();
+  const callTool = buildCallToolActivity(server, factory, connections);
 
   const slowCall = new MockActivityEnvironment().run(callTool, input('slow'));
   const failingCall = new MockActivityEnvironment().run(callTool, input('fail'));
@@ -99,7 +101,7 @@ test('a failed callTool does not close the shared connection under an in-flight 
   await flush();
   t.deepEqual(state.disconnects, ['client-1'], 'the broken connection is closed once its last call finishes');
 
-  await _evictConnection(server);
+  await connections.evict(server);
   t.deepEqual(state.disconnects, ['client-1', 'client-2']);
 });
 
@@ -118,8 +120,9 @@ test('a failed listTools does not close the shared connection under an in-flight
       throw new Error('list failed');
     },
   });
-  const callTool = buildCallToolActivity(server, factory);
-  const listTools = buildListToolsActivity(server, factory);
+  const connections = new McpConnections();
+  const callTool = buildCallToolActivity(server, factory, connections);
+  const listTools = buildListToolsActivity(server, factory, connections);
 
   const slowCall = new MockActivityEnvironment().run(callTool, input('slow'));
   await t.throwsAsync(new MockActivityEnvironment().run(listTools, { server }), { message: 'list failed' });
@@ -141,7 +144,8 @@ test('a failed callTool with nothing else in flight closes the connection and th
       return { handledBy: clientId };
     },
   });
-  const callTool = buildCallToolActivity(server, factory);
+  const connections = new McpConnections();
+  const callTool = buildCallToolActivity(server, factory, connections);
 
   await t.throwsAsync(new MockActivityEnvironment().run(callTool, input('fail')), { message: 'tool failed' });
   await flush();
@@ -150,6 +154,34 @@ test('a failed callTool with nothing else in flight closes the connection and th
   t.deepEqual(await new MockActivityEnvironment().run(callTool, input('ok')), { handledBy: 'client-2' });
   t.is(state.factoryCalls, 2);
 
-  await _evictConnection(server);
+  await connections.evict(server);
   t.deepEqual(state.disconnects, ['client-1', 'client-2']);
+});
+
+test('the last Worker to stop closes a connection only after its in-flight call finishes', async (t) => {
+  const server = 'lastWorkerServer';
+  const slowStarted = deferred();
+  const releaseSlow = deferred();
+  const { factory, state } = fakeMcpClients({
+    callTool: async (clientId) => {
+      slowStarted.resolve();
+      await releaseSlow.promise;
+      return { handledBy: clientId };
+    },
+  });
+  const connections = new McpConnections();
+  const callTool = buildCallToolActivity(server, factory, connections);
+  const workerStopped = deferred();
+  const worker = connections.use(() => workerStopped.promise);
+
+  const slowCall = new MockActivityEnvironment().run(callTool, input('slow'));
+  await slowStarted.promise;
+  workerStopped.resolve();
+  await worker;
+  t.deepEqual(state.disconnects, [], 'the connection must stay open while its call is in flight');
+
+  releaseSlow.resolve();
+  t.deepEqual(await slowCall, { handledBy: 'client-1' });
+  await flush();
+  t.deepEqual(state.disconnects, ['client-1'], 'the connection is closed once its call finishes');
 });

@@ -12,7 +12,7 @@ test('EventTargetPolyfill: dispatchEvent invokes registered listeners with the e
   t.is(received?.payload, 42);
 });
 
-test('EventTargetPolyfill: one throwing listener does not block subsequent listeners', (t) => {
+test("EventTargetPolyfill: a throwing listener stops the dispatch, and its error reaches the caller, as in Node's EventEmitter", (t) => {
   const et = new EventTargetPolyfill();
   const calls: string[] = [];
   et.addEventListener('boom', () => {
@@ -22,8 +22,8 @@ test('EventTargetPolyfill: one throwing listener does not block subsequent liste
   et.addEventListener('boom', () => {
     calls.push('second');
   });
-  t.notThrows(() => et.dispatchEvent({ type: 'boom' } as any));
-  t.deepEqual(calls, ['first', 'second']);
+  t.throws(() => et.dispatchEvent({ type: 'boom' } as any), { message: 'listener bug' });
+  t.deepEqual(calls, ['first']);
 });
 
 test('EventTargetPolyfill: dispatchEvent sets event.target and event.currentTarget', (t) => {

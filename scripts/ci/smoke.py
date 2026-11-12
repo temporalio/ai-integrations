@@ -10,7 +10,7 @@ Orchestrator (default; needs uv on PATH and the scripts project's Python 3.11+):
   so our files are written last, then run this script in `--in-env` mode inside
   that venv.
 
-In-env (stdlib only; runs inside the target environment, Python 3.10+):
+In-env (stdlib only; runs inside the target environment, Python 3.11+):
     smoke.py --in-env --coordinate C --root-api M [--imports a,b,c]
   Imports the root API (and extra modules), checks the installed version equals
   $EXPECTED_VERSION (PEP 440 comparison via `packaging` when available, else a
