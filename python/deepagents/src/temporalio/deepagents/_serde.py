@@ -9,7 +9,9 @@ attached to each model / tool call. LangChain messages are polymorphic
 references, so neither survives a naive round-trip. This module owns:
 
 * message (de)serialization via ``langchain_core.load.dumpd`` / ``load`` — the
-  round-trip that preserves message subtype and tool-call structure;
+  round-trip that preserves message subtype and tool-call structure, with
+  ``load``'s allowlist pinned to today's default so the announced narrowing of
+  that default cannot change what a recorded payload revives;
 * the strip → ship → rebuild dance for ``RunnableConfig``;
 * tool → JSON-schema advertisement (full name + description + argument schema,
   never ``{name, description}`` alone — without the argument schema the model
@@ -31,12 +33,14 @@ from __future__ import annotations
 
 import base64
 import contextvars
+import copy
 import dataclasses
 import hashlib
 import json
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
+    from langchain_core.messages import BaseMessage
     from langchain_core.runnables import RunnableConfig
 
 from temporalio.contrib.pydantic import PydanticPayloadConverter, ToJsonOptions
@@ -144,11 +148,109 @@ def dump_object(obj: Any) -> Any:
     return dumpd(obj)
 
 
+# ``load`` warns on every call that its default ``allowed_objects`` (``"core"``)
+# will change. Pass today's default explicitly: the set of classes a payload can
+# revive stays exactly what it is on main, so histories already recorded keep
+# loading. That matters because the narrower ``"messages"`` spelling drops the
+# legacy-only message classes (``ChatMessage``, ``FunctionMessage``,
+# ``BaseMessage``, …) that ``"core"`` revives, and a message from caller state
+# can embed any other core serializable in ``additional_kwargs``. Narrowing the
+# allowlist would be a separate, deliberate change.
+_ALLOWED_OBJECTS: Literal["core"] = "core"
+
+
 def load_object(data: Any) -> Any:
     """Rehydrate a value produced by :func:`dump_object`, preserving subtype."""
     from langchain_core.load import load
 
-    return load(data)
+    return load(data, allowed_objects=_ALLOWED_OBJECTS)
+
+
+def _tool_arg_message_classes() -> tuple[type[BaseMessage], ...]:
+    """The message classes :func:`find_tool_arg_messages` records.
+
+    Every class in ``langchain_core.messages``, including ``ChatMessage``,
+    ``FunctionMessage`` and the chunks. Subclasses outside this list keep
+    today's encoding.
+    """
+    from langchain_core.messages import (
+        AIMessage,
+        AIMessageChunk,
+        ChatMessage,
+        ChatMessageChunk,
+        FunctionMessage,
+        FunctionMessageChunk,
+        HumanMessage,
+        HumanMessageChunk,
+        RemoveMessage,
+        SystemMessage,
+        SystemMessageChunk,
+        ToolMessage,
+        ToolMessageChunk,
+    )
+
+    return (
+        AIMessage,
+        AIMessageChunk,
+        ChatMessage,
+        ChatMessageChunk,
+        FunctionMessage,
+        FunctionMessageChunk,
+        HumanMessage,
+        HumanMessageChunk,
+        RemoveMessage,
+        SystemMessage,
+        SystemMessageChunk,
+        ToolMessage,
+        ToolMessageChunk,
+    )
+
+
+def find_tool_arg_messages(
+    value: Any, path: tuple[str | int, ...] = ()
+) -> list[tuple[list[str | int], str]]:
+    """Find the LangChain messages in a wrapped tool's arguments.
+
+    A tool can read the conversation from injected state, so its arguments can
+    hold messages. The Pydantic converter writes each one as a plain dict, so
+    the activity cannot tell it was a message. This returns the path and class
+    name of each message in nested lists, tuples and string-keyed dicts, for
+    :func:`load_tool_arg_messages` to rebuild. The arguments themselves are sent
+    unchanged.
+    """
+    if type(value) in _tool_arg_message_classes():
+        return [(list(path), type(value).__name__)]
+    found: list[tuple[list[str | int], str]] = []
+    if isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            found.extend(find_tool_arg_messages(item, (*path, i)))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                found.extend(find_tool_arg_messages(item, (*path, key)))
+    return found
+
+
+def load_tool_arg_messages(
+    args: dict[str, Any], messages: list[tuple[list[str | int], str]]
+) -> dict[str, Any]:
+    """Rebuild the messages :func:`find_tool_arg_messages` found in ``args``.
+
+    Each recorded value is validated as its message class, so its other fields,
+    such as a ``ToolMessage`` artifact, keep the converter's form. Every other
+    value is returned unchanged.
+    """
+    classes = {cls.__name__: cls for cls in _tool_arg_message_classes()}
+    args = copy.deepcopy(args)
+    for path, name in messages:
+        cls = classes.get(name)
+        if cls is None:
+            raise ValueError(f"Unknown tool argument message class {name!r}")
+        parent: Any = args
+        for key in path[:-1]:
+            parent = parent[key]
+        parent[path[-1]] = cls.model_validate(parent[path[-1]])
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +356,66 @@ def load_messages(dumped: list[Any]) -> list[Any]:
     """Rehydrate messages serialized by :func:`dump_messages`."""
     from langchain_core.load import load
 
-    return [load(d) for d in dumped]
+    return [load(d, allowed_objects=_ALLOWED_OBJECTS) for d in dumped]
+
+
+def dump_carried_messages(messages: Any) -> list[Any]:
+    """Serialize the transcript ``run_deep_agent`` carries across continue-as-new.
+
+    The plugin's payload converter writes a LangChain message as a dict of the
+    fields that were set, which leaves out its ``type``, so the continued run
+    cannot rebuild it. Each message of a class from ``langchain_core.messages``
+    goes in its ``dumpd`` form instead. Any other value, such as a string, a
+    ``{"role": ..., "content": ...}`` dict or a message subclass defined
+    elsewhere (which ``load`` could not rebuild), is kept as is.
+    """
+    from langchain_core.load import dumpd
+
+    return [dumpd(m) if _is_core_message(m) else m for m in messages]
+
+
+def _is_core_message(value: Any) -> bool:
+    from langchain_core.messages import BaseMessage
+
+    return isinstance(value, BaseMessage) and type(value).__module__.startswith(
+        "langchain_core.messages."
+    )
+
+
+def load_carried_messages(carried: Any) -> list[Any]:
+    """Rehydrate a transcript written by :func:`dump_carried_messages`.
+
+    Only serialized LangChain messages are loaded. Any other value, including
+    a snapshot written before this form was used or one a caller built by
+    hand, is returned unchanged.
+    """
+    from langchain_core.load import load
+
+    return [load(m) if _is_dumped_message(m) else m for m in carried]
+
+
+# The ``id`` prefix ``dumpd`` writes for every class in ``langchain_core.messages``.
+_DUMPED_MESSAGE_ID_PREFIX = ["langchain", "schema", "messages"]
+
+
+def _is_dumped_message(value: Any) -> bool:
+    """Whether ``value`` is a message in LangChain's ``dumpd`` form.
+
+    The check is on the whole envelope and the message namespace, so ``load``
+    never sees other serialized objects or a dict that only looks similar.
+    """
+    if not isinstance(value, dict):
+        return False
+    dumped: dict[str, Any] = cast(dict[str, Any], value)
+    ident: Any = dumped.get("id")
+    return (
+        dumped.get("lc") == 1
+        and dumped.get("type") == "constructor"
+        and isinstance(dumped.get("kwargs"), dict)
+        and isinstance(ident, list)
+        and len(ident) == len(_DUMPED_MESSAGE_ID_PREFIX) + 1
+        and ident[:-1] == _DUMPED_MESSAGE_ID_PREFIX
+    )
 
 
 def tool_to_schema(tool: Any) -> dict[str, Any]:

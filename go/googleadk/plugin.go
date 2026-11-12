@@ -3,6 +3,8 @@ package googleadk
 import (
 	"context"
 	"log/slog"
+	"runtime/debug"
+	"strings"
 	"sync"
 
 	"go.opentelemetry.io/otel"
@@ -14,9 +16,8 @@ import (
 )
 
 // NewPlugin wires the integration as a Temporal worker plugin: it builds the
-// worker-side Activities from cfg, registers InvokeModel, ListMcpTools and
-// CallMcpTool at worker start, and closes the cached MCP toolsets at worker
-// stop. Add it to worker.Options.Plugins:
+// worker-side Activities from cfg, registers them at worker start, and closes
+// the cached MCP toolsets at worker stop. Add it to worker.Options.Plugins:
 //
 //	adkPlugin, err := googleadk.NewPlugin(googleadk.Config{
 //		Models:      map[string]googleadk.ModelFactory{ /* ... */ },
@@ -63,7 +64,7 @@ func NewPlugin(cfg Config) (worker.Plugin, error) {
 		warnOnNonReplaySafeTelemetryProviders(log.NewStructuredLogger(slog.Default()),
 			otel.GetTracerProvider(), otelloglobal.GetLoggerProvider(), otel.GetMeterProvider())
 	}
-	return temporal.NewSimplePlugin(temporal.SimplePluginOptions{
+	p, err := temporal.NewSimplePlugin(temporal.SimplePluginOptions{
 		Name: "go.temporal.io/googleadk",
 		// Once per replayer construction — the replayer-side counterpart of
 		// the worker-start warning; RunContextBefore would repeat it per
@@ -100,4 +101,38 @@ func NewPlugin(cfg Config) (worker.Plugin, error) {
 			_ = acts.Close()
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
+	return versionedPlugin{p}, nil
+}
+
+// versionedPlugin adds Version, which SDKs that report plugin versions in
+// worker heartbeats call. Older SDKs ignore it.
+type versionedPlugin struct{ *temporal.SimplePlugin }
+
+// Version returns this module's version without the leading "v", or "" when
+// the build has no version for it.
+func (versionedPlugin) Version() string {
+	return moduleVersion(debug.ReadBuildInfo())
+}
+
+// moduleVersion finds this module's version in the build info. A directory
+// replace has no version, which the build info records as "(devel)".
+func moduleVersion(info *debug.BuildInfo, ok bool) string {
+	if !ok {
+		return ""
+	}
+	for _, dep := range info.Deps {
+		if dep.Path == "go.temporal.io/googleadk" {
+			if dep.Replace != nil {
+				dep = dep.Replace
+			}
+			if dep.Version == "(devel)" {
+				return ""
+			}
+			return strings.TrimPrefix(dep.Version, "v")
+		}
+	}
+	return ""
 }

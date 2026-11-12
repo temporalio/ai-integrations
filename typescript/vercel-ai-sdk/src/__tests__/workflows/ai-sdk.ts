@@ -9,7 +9,12 @@ import { OpenTelemetry } from '@ai-sdk/otel';
 import { z } from 'zod/v3';
 import { proxyActivities } from '@temporalio/workflow';
 import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
-import { TemporalLanguageModel, TemporalMCPClient, temporalProvider } from '../../workflow';
+import {
+  TemporalEmbeddingModel,
+  TemporalLanguageModel,
+  TemporalMCPClient,
+  temporalProvider,
+} from '../../workflow';
 import type * as activities from '../activities/ai-sdk';
 
 const { getWeather } = proxyActivities<typeof activities>({
@@ -212,4 +217,29 @@ export async function streamingMetadataWorkflow(): Promise<LanguageModelV4Stream
     if (done) return parts;
     parts.push(value);
   }
+}
+
+export async function slowModelWorkflow(call: 'stream' | 'generate' | 'embed'): Promise<number> {
+  new WorkflowStream();
+  const activityOptions = { heartbeatTimeout: '1 second', retry: { maximumAttempts: 1 } } as const;
+  if (call === 'embed') {
+    const model = new TemporalEmbeddingModel('slow-model', activityOptions);
+    const result = await model.doEmbed({ values: ['test'] });
+    return result.embeddings.length;
+  }
+  const model = new TemporalLanguageModel('slow-model', {
+    ...activityOptions,
+    streamingTopic: 'ai-sdk-test-stream',
+    streamingBatchInterval: '1 millisecond',
+  });
+  const prompt = [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'test' }] }];
+  if (call === 'generate') {
+    const result = await model.doGenerate({ prompt });
+    return result.content.length;
+  }
+  const result = await model.doStream({ prompt });
+  const reader = result.stream.getReader();
+  let count = 0;
+  while (!(await reader.read()).done) count++;
+  return count;
 }

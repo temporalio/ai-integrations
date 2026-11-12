@@ -72,6 +72,10 @@ jobs:
       - name: Install GNU make (Windows)
         if: runner.os == 'Windows'
         run: choco install make -y --no-progress
+      - name: Check dependency resolution under the cooldown
+        # Resolve once without changing the lock used by the test/build matrix.
+        if: matrix.dist && inputs.deps == 'locked'
+        run: cd "$PLUGIN_DIR" && make check-deps
       - name: Sync dependencies
         env:
           DEPS: ${{ inputs.deps }}

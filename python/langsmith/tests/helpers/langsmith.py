@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
@@ -13,17 +15,20 @@ from tests.helpers.trace import TraceNode
 
 @pytest.fixture(autouse=True)
 def clear_langsmith_env_cache() -> Any:
-    """Clear langsmith's lru_cache before and after each test.
+    """Clear langsmith's lru_caches before and after each test.
 
-    Tests manipulate LANGSMITH_TRACING / LANGCHAIN_TRACING_V2 env vars.
-    langsmith.utils.get_env_var caches results, so stale values would
-    leak across tests (or into other test modules in the same session).
+    Tests manipulate LANGSMITH_TRACING / LANGCHAIN_TRACING_V2 / LANGSMITH_PROJECT
+    env vars. langsmith.utils.get_env_var and get_tracer_project cache results,
+    so stale values would leak across tests (or into other test modules in the
+    same session).
     """
     import langsmith.utils
 
     langsmith.utils.get_env_var.cache_clear()  # type: ignore[attr-defined]
+    langsmith.utils.get_tracer_project.cache_clear()
     yield
     langsmith.utils.get_env_var.cache_clear()  # type: ignore[attr-defined]
+    langsmith.utils.get_tracer_project.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -135,3 +140,41 @@ def make_mock_ls_client(collector: InMemoryRunCollector) -> MagicMock:
     client.session = MagicMock()
     client.tracing_queue = MagicMock()
     return client
+
+
+def id_path(dotted_order: str) -> list[str]:
+    """Return the run IDs in a dotted order, root first, without start times.
+
+    Start times in a dotted order can differ across replay: live runs use wall-clock
+    time and replayed runs use workflow time. IDs and ancestry stay the same.
+    """
+    return [segment[-36:] for segment in dotted_order.split(".")]
+
+
+def langsmith_release(
+    original: Callable[..., Any],
+    calls: list[inspect.BoundArguments],
+    *,
+    renamed: Collection[str] = (),
+) -> Callable[..., Any]:
+    """Stand in for a LangSmith release that changes ``original``'s signature.
+
+    The release adds an ``added`` keyword and renames each parameter in
+    ``renamed``. It records each call it can bind and, like the real function,
+    raises ``TypeError`` for any other call.
+    """
+    parameters = [
+        p.replace(name=f"renamed_{p.name}") if p.name in renamed else p
+        for p in inspect.signature(original).parameters.values()
+    ]
+    at = -1 if parameters[-1].kind is inspect.Parameter.VAR_KEYWORD else len(parameters)
+    added = inspect.Parameter("added", inspect.Parameter.KEYWORD_ONLY, default=None)
+    signature = inspect.Signature([*parameters[:at], added, *parameters[at:]])
+
+    def release(*args: Any, **kwargs: Any) -> None:
+        calls.append(signature.bind(*args, **kwargs))
+
+    release.__signature__ = signature  # type: ignore[attr-defined]
+    release.__module__ = original.__module__
+    release.__qualname__ = original.__qualname__
+    return release

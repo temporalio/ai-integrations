@@ -2,7 +2,7 @@
 
 from collections.abc import Callable
 from types import TracebackType
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
 
 from mcp import Client
 from mcp.types import (
@@ -150,6 +150,14 @@ def _mcp_client_backend_factory(
     invoke = _FactoryInvoker(name, factory)
 
     def create(argument: Any = _NOT_SUPPLIED) -> _MCPClientBackend:
-        return _MCPClientBackend(cast(Client, invoke(argument)))
+        client = invoke(argument)
+        if not isinstance(client, Client):
+            # Retryable, so a run waits for the worker to be fixed instead of failing.
+            kind = type(client)
+            raise ApplicationError(
+                f"MCP server factory {name!r} returned "
+                f"{kind.__module__}.{kind.__qualname__}, not mcp.Client"
+            )
+        return _MCPClientBackend(client)
 
     return create

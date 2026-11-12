@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
@@ -20,8 +21,8 @@ from temporalio.langsmith._interceptor import (
     _inject_context,
     _LangSmithWorkflowInboundInterceptor,
     _maybe_run,
-    _ReplaySafeRunTree,
 )
+from temporalio.langsmith._run_tree import workflow_run_tree_context
 from temporalio.worker import HandleQueryInput
 
 # ---------------------------------------------------------------------------
@@ -39,6 +40,18 @@ _PATCH_TRACING_CTX = f"{_MOD}.tracing_context"
 _PATCH_EXTRACT_NEXUS = f"{_MOD}._extract_nexus_context"
 _PATCH_INJECT_NEXUS = f"{_MOD}._inject_nexus_context"
 _PATCH_GET_CURRENT_RUN = f"{_MOD}.get_current_run_tree"
+
+_DESTINATION = {"project_name": "test-project"}
+
+
+@pytest.fixture(autouse=True)
+def stub_env_destination() -> Iterator[None]:
+    """Stub the interceptor's startup destination probe.
+
+    The probe builds a ``RunTree``, which these tests patch and count.
+    """
+    with patch(f"{_MOD}._env_destination", return_value=_DESTINATION):
+        yield
 
 
 def _make_mock_run() -> MagicMock:
@@ -65,11 +78,6 @@ def _mock_activity_info(**overrides: Any) -> MagicMock:
     info.activity_id = overrides.get("activity_id", "test-activity-id")
     info.activity_type = overrides.get("activity_type", "test_activity")
     return info
-
-
-def _make_executor() -> ThreadPoolExecutor:
-    """Create a single-worker executor for tests."""
-    return ThreadPoolExecutor(max_workers=1)
 
 
 def _get_runtree_name(MockRunTree: MagicMock) -> str:
@@ -142,6 +150,35 @@ class TestBuiltinQueryFiltering:
 class TestContextPropagation:
     """Tests for _inject_context / _extract_context roundtrip."""
 
+    @pytest.mark.parametrize(
+        "in_workflow,replaying", [(False, False), (True, False), (True, True)]
+    )
+    def test_restored_parent_uses_workflow_time_only_on_replay(
+        self, in_workflow: bool, replaying: bool
+    ) -> None:
+        native_time = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        workflow_time = datetime(2025, 1, 2, tzinfo=timezone.utc)
+        parent = MagicMock(start_time=native_time)
+        client = MagicMock()
+        headers = _inject_context({}, _make_mock_run())
+        with (
+            patch(_PATCH_RUNTREE) as run_tree,
+            patch(_PATCH_IN_WORKFLOW, return_value=in_workflow),
+            patch(_PATCH_IS_REPLAYING, return_value=replaying),
+            patch(_PATCH_WF_NOW, return_value=workflow_time),
+            ThreadPoolExecutor(max_workers=1) as executor,
+            workflow_run_tree_context(executor),
+        ):
+            run_tree.from_headers.return_value = parent
+            assert _extract_context(headers, client) is parent
+        if not in_workflow:
+            assert parent.start_time == native_time
+        elif replaying:
+            assert parent.start_time == workflow_time
+        else:
+            assert parent.start_time > workflow_time  # Wall-clock time live.
+        assert parent.ls_client is client
+
     @patch(_PATCH_RUNTREE)
     def test_inject_extract_roundtrip(self, MockRunTree: Any) -> None:
         """Inject a mock run tree's headers, then extract. Verify roundtrip."""
@@ -160,16 +197,14 @@ class TestContextPropagation:
         mock_extracted = MagicMock()
         MockRunTree.from_headers.return_value = mock_extracted
 
-        extracted = _extract_context(result, _make_executor(), MagicMock())
-        # extracted should be a _ReplaySafeRunTree wrapping the reconstructed run
-        assert isinstance(extracted, _ReplaySafeRunTree)
-        assert extracted._run is mock_extracted
+        extracted = _extract_context(result, MagicMock())
+        assert extracted is mock_extracted
         MockRunTree.from_headers.assert_called_once()
 
     def test_extract_missing_header(self) -> None:
         """When the _temporal-langsmith-context header is absent, returns None."""
         headers: dict[str, Payload] = {}
-        result = _extract_context(headers, _make_executor(), MagicMock())
+        result = _extract_context(headers, MagicMock())
         assert result is None
 
     def test_inject_preserves_existing_headers(self) -> None:
@@ -184,78 +219,6 @@ class TestContextPropagation:
         assert "my-header" in result
         assert result["my-header"] is existing_payload
         assert HEADER_KEY in result
-
-
-# ===================================================================
-# TestReplaySafety
-# ===================================================================
-
-
-class TestReplaySafety:
-    """Tests for replay-safe tracing behavior."""
-
-    @patch(_PATCH_RUNTREE)
-    @patch(_PATCH_IS_REPLAYING, return_value=True)
-    @patch(_PATCH_IN_WORKFLOW, return_value=True)
-    def test_replay_noop_post_end_patch(
-        self, _mock_in_wf: Any, _mock_replaying: Any, MockRunTree: Any
-    ) -> None:
-        """During replay, RunTree is created but post/end/patch are no-ops."""
-        mock_run = _make_mock_run()
-        MockRunTree.return_value = mock_run
-        mock_client = MagicMock()
-        with _maybe_run(
-            mock_client,
-            "TestRun",
-            add_temporal_runs=True,
-            executor=_make_executor(),
-        ):
-            pass
-        # RunTree IS created (wrapped in _ReplaySafeRunTree)
-        MockRunTree.assert_called_once()
-        # But post/end/patch are no-ops during replay
-        mock_run.post.assert_not_called()
-        mock_run.end.assert_not_called()
-        mock_run.patch.assert_not_called()
-
-    @patch(_PATCH_WF_NOW, return_value=datetime.now(timezone.utc))
-    @patch(_PATCH_RUNTREE)
-    @patch(_PATCH_IS_REPLAYING, return_value=False)
-    @patch(_PATCH_IN_WORKFLOW, return_value=True)
-    def test_create_trace_when_not_replaying(
-        self, _mock_in_wf: Any, _mock_replaying: Any, MockRunTree: Any, _mock_now: Any
-    ) -> None:
-        """When not replaying (but in workflow), _maybe_run creates a _ReplaySafeRunTree."""
-        mock_run = _make_mock_run()
-        MockRunTree.return_value = mock_run
-        mock_client = MagicMock()
-        with _maybe_run(
-            mock_client,
-            "TestRun",
-            add_temporal_runs=True,
-            executor=_make_executor(),
-        ):
-            pass
-        MockRunTree.assert_called_once()
-        assert MockRunTree.call_args.kwargs["name"] == "TestRun"
-
-    @patch(_PATCH_RUNTREE)
-    @patch(_PATCH_IN_WORKFLOW, return_value=False)
-    def test_create_trace_outside_workflow(
-        self, _mock_in_wf: Any, MockRunTree: Any
-    ) -> None:
-        """Outside workflow (client/activity), RunTree IS created."""
-        mock_run = _make_mock_run()
-        MockRunTree.return_value = mock_run
-        mock_client = MagicMock()
-        with _maybe_run(
-            mock_client,
-            "TestRun",
-            add_temporal_runs=True,
-            executor=_make_executor(),
-        ):
-            pass
-        MockRunTree.assert_called_once()
 
 
 # ===================================================================
@@ -280,7 +243,7 @@ class TestErrorHandling:
                 mock_client,
                 "TestRun",
                 add_temporal_runs=True,
-                executor=_make_executor(),
+                destination=_DESTINATION,
             ):
                 raise RuntimeError("boom")
         # run.end should have been called with error containing "boom"
@@ -305,7 +268,7 @@ class TestErrorHandling:
                 mock_client,
                 "TestRun",
                 add_temporal_runs=True,
-                executor=_make_executor(),
+                destination=_DESTINATION,
             ):
                 raise ApplicationError(
                     "benign",
@@ -330,7 +293,7 @@ class TestErrorHandling:
                 mock_client,
                 "TestRun",
                 add_temporal_runs=True,
-                executor=_make_executor(),
+                destination=_DESTINATION,
             ):
                 raise ApplicationError("bad", non_retryable=True)
         mock_run.end.assert_called()
@@ -351,7 +314,7 @@ class TestErrorHandling:
             mock_client,
             "TestRun",
             add_temporal_runs=True,
-            executor=_make_executor(),
+            destination=_DESTINATION,
         ):
             pass
         mock_run.end.assert_called_once()
@@ -373,7 +336,7 @@ class TestErrorHandling:
                 mock_client,
                 "TestRun",
                 add_temporal_runs=True,
-                executor=_make_executor(),
+                destination=_DESTINATION,
             ):
                 raise asyncio.CancelledError()
         mock_run.end.assert_called_once_with(outputs={"status": "cancelled"})
@@ -395,7 +358,7 @@ class TestErrorHandling:
                 MagicMock(),
                 "TestRun",
                 add_temporal_runs=True,
-                executor=_make_executor(),
+                destination=_DESTINATION,
             ):
                 raise _ContinueAsNew()
         mock_run.end.assert_called_once_with(outputs={"status": "continued_as_new"})
@@ -429,7 +392,7 @@ class TestErrorHandling:
                 MagicMock(),
                 "TestRun",
                 add_temporal_runs=True,
-                executor=_make_executor(),
+                destination=_DESTINATION,
             ):
                 raise raised
         assert exc_info.value is raised
@@ -651,12 +614,11 @@ class TestActivityInboundInterceptor:
         assert metadata["temporalWorkflowID"] == "wf-123"
         assert metadata["temporalRunID"] == "run-456"
         assert metadata["temporalActivityID"] == "act-789"
-        # Verify tracing_context sets parent (wrapped in _ReplaySafeRunTree)
+        # Verify tracing_context sets the native run as parent
         mock_tracing_ctx.assert_called()
         ctx_kwargs = mock_tracing_ctx.call_args.kwargs
         parent = ctx_kwargs.get("parent")
-        assert isinstance(parent, _ReplaySafeRunTree)
-        assert parent._run is mock_run
+        assert parent is mock_run
         # Verify super() called and result passed through
         mock_next.execute_activity.assert_called_once()
         assert result == "activity_result"
@@ -1098,7 +1060,7 @@ class TestLazyClientPrevention:
             mock_client,
             "TestRun",
             add_temporal_runs=True,
-            executor=_make_executor(),
+            destination=_DESTINATION,
         ):
             pass
 
@@ -1129,7 +1091,7 @@ class TestAddTemporalRunsToggle:
             mock_client,
             "TestRun",
             add_temporal_runs=False,
-            executor=_make_executor(),
+            destination=_DESTINATION,
         ) as run:
             assert run is None
         MockRunTree.assert_not_called()
@@ -1217,7 +1179,6 @@ class TestAddTemporalRunsToggle:
         # (unconditionally, before _maybe_run)
         mock_tracing_ctx.assert_called_once_with(
             client=config._client,
-            project_name=None,
             parent=mock_extracted_parent,
         )
         mock_act_next.execute_activity.assert_called_once()
@@ -1249,7 +1210,5 @@ class TestAddTemporalRunsToggle:
 
         MockRunTree.assert_not_called()
         # tracing_context called with client (no parent)
-        mock_tracing_ctx.assert_called_once_with(
-            client=config._client, project_name=None, parent=None
-        )
+        mock_tracing_ctx.assert_called_once_with(client=config._client, parent=None)
         mock_act_next.execute_activity.assert_called_once()

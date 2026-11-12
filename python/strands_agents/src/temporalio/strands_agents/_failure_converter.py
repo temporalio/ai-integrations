@@ -9,7 +9,12 @@ from strands.types.exceptions import (
 )
 
 import temporalio.api.failure.v1
-from temporalio.converter import DefaultFailureConverter, PayloadConverter
+from temporalio.converter import (
+    DefaultFailureConverter,
+    DefaultFailureConverterWithEncodedAttributes,
+    FailureConverter,
+    PayloadConverter,
+)
 from temporalio.exceptions import ApplicationError
 
 # Activity-side: when a Strands ``InterruptException`` would otherwise be
@@ -68,3 +73,60 @@ class StrandsFailureConverter(DefaultFailureConverter):
             )
             return
         super().to_failure(exception, payload_converter, failure)
+
+
+# StrandsFailureConverter has no __init__, so the one from
+# DefaultFailureConverterWithEncodedAttributes runs and turns on the encoding.
+class StrandsFailureConverterWithEncodedAttributes(  # pyright: ignore[reportUnsafeMultipleInheritance]
+    StrandsFailureConverter, DefaultFailureConverterWithEncodedAttributes
+):
+    """``StrandsFailureConverter`` that moves message and stack trace to encoded attributes.
+
+    Both Strands converters decode with ``DefaultFailureConverter.from_failure``, which
+    reads encoded and plain attributes, so a Replayer with ``StrandsFailureConverter``
+    still reads the failures this class writes.
+    """
+
+
+def strands_failure_converter_class(
+    base: type[FailureConverter],
+) -> type[StrandsFailureConverter]:
+    """Return the Strands failure converter class to use in place of ``base``.
+
+    A subclass of ``DefaultFailureConverterWithEncodedAttributes`` becomes
+    ``StrandsFailureConverterWithEncodedAttributes``, so failure messages and stack
+    traces stay encoded. Every other class is replaced with
+    ``StrandsFailureConverter``, including one that sets ``encode_common_attributes``
+    in its own ``__init__``. The caller's own ``to_failure`` and ``from_failure``
+    never run, so the failures that Workflow code reads stay the same.
+    """
+    if isinstance(base, type) and issubclass(
+        base, DefaultFailureConverterWithEncodedAttributes
+    ):
+        return StrandsFailureConverterWithEncodedAttributes
+    return StrandsFailureConverter
+
+
+def strands_failure_converter_class_keeping_caller(
+    base: type[FailureConverter],
+) -> type[StrandsFailureConverter]:
+    """Return a converter class that adds the Strands handling on top of ``base``.
+
+    Used when the caller supplied their own payload converter, where their failure
+    converter was always kept. The caller's ``from_failure`` (and ``to_failure`` for
+    every other exception) still runs, so recorded failures decode as before. A
+    converter that is not a ``DefaultFailureConverter`` subclass is returned
+    unchanged, without the Strands handling.
+    """
+    if isinstance(base, type) and issubclass(base, StrandsFailureConverter):
+        # Already wrapped by an earlier run of the plugin.
+        return base
+    if not isinstance(base, type) or not issubclass(base, DefaultFailureConverter):
+        # A failure converter that does not build on the default one cannot take
+        # the Strands handling; keep it exactly as the caller supplied it.
+        return base  # type: ignore[return-value]
+    if base in (DefaultFailureConverter, DefaultFailureConverterWithEncodedAttributes):
+        return strands_failure_converter_class(base)
+    return type(  # type: ignore[return-value]
+        f"Strands{base.__name__}", (StrandsFailureConverter, base), {}
+    )

@@ -2,6 +2,8 @@ package googleadk
 
 import (
 	"context"
+	"net/http/httptrace"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -53,8 +55,16 @@ func WithSequentialToolFanout() ContextOption {
 //     fan-out never spawns real goroutines inside the workflow.
 //
 // The workflow.Context itself is also stashed on the returned context so
-// adapter components can inspect workflow state and dispatch commands. Pass
-// the result straight to Run:
+// adapter components can inspect workflow state and dispatch commands.
+//
+// The first time an HTTP request made with net/http carries the returned
+// context, outside replay, the workflow's logger warns, naming the host. Such
+// a request runs in Workflow code, and History does not record it, so every
+// replay sends it again; an ADK remote A2A agent built with ADK's own
+// providers sends this way. The warning changes nothing else: the request
+// still goes out.
+//
+// Pass the result straight to Run:
 //
 //	for ev, err := range r.Run(googleadk.NewContext(ctx), userID, sessionID, msg, cfg) {
 //	    // ...
@@ -69,6 +79,18 @@ func NewContext(ctx workflow.Context, opts ...ContextOption) context.Context {
 	base = platform.WithTimeProvider(base, func() time.Time { return workflow.Now(ctx) })
 	base = platform.WithUUIDProvider(base, newDeterministicUUIDProvider(ctx))
 	base = platform.WithTaskRunner(base, newWorkflowTaskRunner(ctx, cfg.sequentialToolFanout))
+	// Lets each MCP toolset list its tools once per model step.
+	base = context.WithValue(base, mcpListingsKey{}, &mcpListings{})
+	var warned atomic.Bool
+	base = httptrace.WithClientTrace(base, &httptrace.ClientTrace{
+		GetConn: func(hostPort string) {
+			if workflow.IsReplaying(ctx) || warned.Swap(true) {
+				return
+			}
+			workflow.GetLogger(ctx).Warn("HTTP request sent from Workflow code: History does not record it, "+
+				"so every replay sends it again. Send it from an Activity", "host", hostPort)
+		},
+	})
 	return base
 }
 

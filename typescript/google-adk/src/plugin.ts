@@ -4,9 +4,10 @@ import path from 'node:path';
 
 import type { BaseLlm } from '@google/adk';
 import { SimplePlugin } from '@temporalio/plugin';
-import type { BundleOptions } from '@temporalio/worker';
+import type { BundleOptions, Worker, WorkerOptions } from '@temporalio/worker';
 
 import { createModelActivities, createMCPActivities } from './activities';
+import { refuseLaterReplacement, refuseReplacedActivities } from './activity-sources';
 import { type MCPToolsetFactory } from './mcp';
 
 /** The webpack `Configuration` object the bundler hands to `webpackConfigHook`. */
@@ -655,6 +656,16 @@ export interface GoogleAdkPluginOptions {
   autoRouteModels?: boolean;
 }
 
+/** Reads this package's version, which worker heartbeats report. Empty if it can't be read. */
+function packageVersion(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return (require('../package.json') as { version?: string }).version ?? '';
+  } catch {
+    return '';
+  }
+}
+
 /**
  * The Temporal plugin for the Google Agent Development Kit (`@google/adk`).
  *
@@ -668,6 +679,9 @@ export interface GoogleAdkPluginOptions {
  * @experimental
  */
 export class GoogleAdkPlugin extends SimplePlugin {
+  /** The package version, reported in worker heartbeats. */
+  readonly version = packageVersion();
+
   private readonly autoRouteModels: boolean;
 
   /**
@@ -676,15 +690,44 @@ export class GoogleAdkPlugin extends SimplePlugin {
   constructor(options: GoogleAdkPluginOptions = {}) {
     super({
       name: 'google.AdkPlugin',
-      // Object-keyed activities dedupe by name in the TS SDK's plugin merge
-      // (`{...existing, ...param}`), so double-registration (e.g. the plugin
-      // passed to both Client and Worker) is tolerated rather than a crash.
+      // `configureWorker` refuses to let these replace a different Activity
+      // with the same name (see `refuseReplacedActivities`).
       activities: {
         ...createModelActivities(options),
         ...createMCPActivities(options.mcpToolsets),
       },
     });
     this.autoRouteModels = options.autoRouteModels ?? true;
+  }
+
+  /**
+   * Adds the model and MCP Activities to the Worker.
+   *
+   * @throws TypeError if the Worker already has a different Activity with one
+   * of these names: a caller Activity, another integration's Activity, or a
+   * `GoogleAdkPlugin` with a different `modelProvider` (or the same one in a
+   * different options object) or MCP toolset factory, or with different
+   * `setActivityOptions` metadata.
+   */
+  override configureWorker(options: WorkerOptions): WorkerOptions {
+    refuseReplacedActivities('GoogleAdkPlugin', options.activities, this.options.activities as object);
+    return super.configureWorker(options);
+  }
+
+  /**
+   * Runs the Worker.
+   *
+   * @throws TypeError, before the Worker polls, if a plugin applied after this
+   * one replaced one of its Activities with a different one. `Worker.create`
+   * applies the Worker's plugins in order, then the `NativeConnection`'s.
+   */
+  override runWorker(worker: Worker, next: (worker: Worker) => Promise<void>): Promise<void> {
+    // Not async: when the check passes, the Worker starts in this tick, as
+    // `Worker.runUntil` needs (see `refuseLaterReplacement`).
+    return (
+      refuseLaterReplacement('GoogleAdkPlugin', worker, this.options.activities as object, next) ??
+      super.runWorker(worker, next)
+    );
   }
 
   /**

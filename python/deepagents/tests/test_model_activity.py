@@ -6,19 +6,16 @@ needed), so they depend only on LangChain, not on deepagents.
 
 from __future__ import annotations
 
-import sys
 import uuid
+import warnings
 from collections.abc import Sequence
 from datetime import timedelta
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
 from temporalio.testing import WorkflowEnvironment
-
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 
 pytest.importorskip("langchain_core")
 
@@ -74,6 +71,73 @@ def test_model_binding_preserves_kwargs_with_tools(bind_kwargs: dict[str, Any]) 
     assert bound.kwargs == {"tools": tool_schemas, **bind_kwargs}
 
 
+@pytest.mark.parametrize(
+    "tool_kwargs",
+    [
+        {"tool_choice": "any"},
+        {"parallel_tool_calls": False},
+        {"tool_choice": "any", "parallel_tool_calls": False},
+    ],
+)
+def test_tool_options_go_to_bind_tools(tool_kwargs: dict[str, Any]) -> None:
+    # Providers convert these options only inside bind_tools, so the activity
+    # must pass them there; other options still go through .bind().
+    tool_schemas = [
+        {
+            "type": "function",
+            "function": {"name": "lookup", "parameters": {"type": "object"}},
+        }
+    ]
+    other_kwargs = {"stop": ["Observation:"]}
+    model = Mock(wraps=_ToolBindingModel(responses=["answer"]))
+    activities = DeepAgentActivities(model_provider=lambda _: model)
+
+    bound = activities._build_bound_model(
+        ModelActivityInput(
+            model_name="fake:model",
+            messages=[],
+            tool_schemas=tool_schemas,
+            bind_kwargs={**tool_kwargs, **other_kwargs},
+        )
+    )
+
+    model.bind_tools.assert_called_once_with(tool_schemas, **tool_kwargs)
+    assert bound.kwargs == {"tools": tool_schemas, **tool_kwargs, **other_kwargs}
+
+
+@pytest.mark.parametrize(
+    ("tool_kwargs", "expected"),
+    [
+        ({"tool_choice": "any"}, {"tool_choice": {"type": "any"}}),
+        (
+            {"parallel_tool_calls": False},
+            {"tool_choice": {"type": "auto", "disable_parallel_tool_use": True}},
+        ),
+    ],
+)
+def test_tool_options_use_provider_format(
+    tool_kwargs: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    # create_agent binds tool_choice="any" for structured output; the provider's
+    # bind_tools must convert it, as it does without Temporal.
+    langchain_anthropic = pytest.importorskip("langchain_anthropic")
+    chat_model = langchain_anthropic.ChatAnthropic(model="test-model", api_key="test")
+    tool = {
+        "type": "function",
+        "function": {"name": "lookup", "parameters": {"type": "object"}},
+    }
+    messages = [HumanMessage(content="hi")]
+    binding = TemporalModel(model="provider:model").bind_tools([tool], **tool_kwargs)
+    activity_input = binding.bound._build_input(messages, None, **binding.kwargs)
+    activities = DeepAgentActivities(model_provider=lambda _: chat_model)
+
+    model = activities._build_bound_model(activity_input)
+    payload = model.bound._get_request_payload(messages, **model.kwargs)
+
+    keys = ("tool_choice", "parallel_tool_calls")
+    assert {k: payload[k] for k in keys if k in payload} == expected
+
+
 @workflow.defn
 class ModelWorkflow:
     @workflow.run
@@ -117,6 +181,46 @@ async def test_model_call_is_activity(env: WorkflowEnvironment) -> None:
     assert "Paris" in out
     counts = await count_scheduled_activities(handle)
     assert counts[INVOKE_MODEL] == 1, counts
+
+
+@pytest.mark.asyncio
+async def test_model_call_warns_nothing_about_allowed_objects(
+    env: WorkflowEnvironment,
+) -> None:
+    """Neither side of the seam relies on ``load``'s default ``allowed_objects``.
+
+    One model call loads its input messages in the activity and its reply in
+    the workflow; ``langchain_core.load.load`` warns on each such call that
+    relies on the default (scheduled to narrow, which would change what the
+    plugin's own payloads revive). Assert neither warning fires.
+    """
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(["The capital of France is Paris."]),
+        model_activity_options={"start_to_close_timeout": timedelta(seconds=30)},
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        async with Worker(
+            env.client,
+            task_queue="da-model-warn",
+            workflows=[ModelWorkflow],
+            plugins=[plugin],
+        ):
+            handle = await env.client.start_workflow(
+                ModelWorkflow.run,
+                "What is the capital of France?",
+                id=f"da-model-warn-{uuid.uuid4()}",
+                task_queue="da-model-warn",
+            )
+            out = await handle.result()
+    assert "Paris" in out
+    offenders = [
+        w
+        for w in caught
+        if issubclass(w.category, PendingDeprecationWarning)
+        and "allowed_objects" in str(w.message)
+    ]
+    assert not offenders, [f"{w.filename}: {w.message}" for w in offenders]
 
 
 @pytest.mark.asyncio

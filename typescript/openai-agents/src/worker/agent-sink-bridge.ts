@@ -9,7 +9,9 @@ import {
   type TracingProcessor,
 } from '@openai/agents-core';
 import type { InjectedSink } from '@temporalio/worker';
+import type { WorkflowInfo } from '@temporalio/workflow';
 import type { AgentTracingSink, AgentTracingSinkEvent } from '../common/agent-sink-types';
+import type { TracingApiKeyResolver } from './trace-interceptor';
 
 const SUPPRESS_OTEL_BRIDGE = Symbol('@temporalio/openai-agents/suppress-otel-bridge');
 
@@ -110,12 +112,30 @@ async function dispatchToHostProcessors(event: AgentTracingSinkEvent): Promise<v
   }
 }
 
-export function makeAgentTracingSink(): InjectedSink<AgentTracingSink> {
+// Gives a trace or span that has no key of its own the key the Worker resolves for it.
+function withResolvedTracingApiKey(
+  event: AgentTracingSinkEvent,
+  info: WorkflowInfo,
+  resolve: TracingApiKeyResolver | undefined
+): AgentTracingSinkEvent {
+  if (!resolve) return event;
+  const workflow = { workflowId: info.workflowId, workflowType: info.workflowType };
+  if (event.kind === 'trace_start' || event.kind === 'trace_end') {
+    if (event.trace.tracingApiKey != null) return event;
+    const key = resolve({ traceId: event.trace.traceId, traceName: event.trace.name, ...workflow });
+    return key == null ? event : { ...event, trace: { ...event.trace, tracingApiKey: key } };
+  }
+  if (event.span.tracingApiKey != null) return event;
+  const key = resolve({ traceId: event.span.traceId, ...workflow });
+  return key == null ? event : { ...event, span: { ...event.span, tracingApiKey: key } };
+}
+
+export function makeAgentTracingSink(tracingApiKey?: TracingApiKeyResolver): InjectedSink<AgentTracingSink> {
   return {
     dispatch: {
-      fn: async (_info, event) => {
+      fn: async (info, event) => {
         try {
-          await dispatchToHostProcessors(event);
+          await dispatchToHostProcessors(withResolvedTracingApiKey(event, info, tracingApiKey));
         } catch (err) {
           console.warn('[temporal-openai-agents] sink dispatch threw:', err);
         }

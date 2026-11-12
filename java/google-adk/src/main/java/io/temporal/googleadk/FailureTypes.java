@@ -12,5 +12,13 @@ public final class FailureTypes {
   /** An MCP toolset operation failed; unknown toolsets and tools are non-retryable. */
   public static final String MCP_ERROR = "googleadk.McpError";
 
+  /**
+   * Live delivery of model output to a Workflow Stream failed. A blank topic, a missing Workflow
+   * Streams artifact, and a batch the server refused ({@code INVALID_ARGUMENT}, or {@code
+   * RESOURCE_EXHAUSTED} "larger than max") are non-retryable. Other transport failures are
+   * retryable, including outages and rate limiting that exhaust the stream retry window.
+   */
+  public static final String STREAM_ERROR = "googleadk.StreamError";
+
   private FailureTypes() {}
 }

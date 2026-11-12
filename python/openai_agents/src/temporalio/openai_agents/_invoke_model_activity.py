@@ -5,7 +5,7 @@ Implements mapping of OpenAI datastructures to Pydantic friendly types.
 
 import enum
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any, NoReturn
 
@@ -32,7 +32,7 @@ from agents import (
     tool_namespace,
 )
 from agents.items import TResponseStreamEvent
-from agents.models import get_default_model_settings
+from agents.models import _openai_shared, get_default_model_settings
 from agents.tool import (
     ApplyPatchTool,
     CustomTool,
@@ -353,9 +353,12 @@ def _align_implicit_model_settings(
     resolved_name = getattr(model, "model", None)
     if not isinstance(resolved_name, str):
         return model_settings
-    return get_default_model_settings(resolved_name).resolve(
+    aligned = get_default_model_settings(resolved_name).resolve(
         input.get("run_model_settings")
     )
+    # Keep the extra arguments a SandboxAgent's capabilities add in the Workflow, such as
+    # the compaction threshold.
+    return replace(aligned, extra_args=model_settings.extra_args)
 
 
 def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
@@ -400,6 +403,18 @@ def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
     ) from e
 
 
+def _default_openai_client() -> AsyncOpenAI:
+    """Return the framework's default client as it is, or a client on its default key.
+
+    A client the application set keeps its own settings, retries included, as in native
+    runs. Otherwise the client has retries off, so that Temporal retries model calls.
+    """
+    client = _openai_shared.get_default_openai_client()
+    if client is not None:
+        return client
+    return AsyncOpenAI(api_key=_openai_shared.get_default_openai_key(), max_retries=0)
+
+
 class ModelActivity:
     """Class wrapper for model invocation activities to allow model customization. By default, we use an OpenAIProvider with retries disabled.
     Disabling retries in your model of choice is recommended to allow activity retries to define the retry model.
@@ -412,7 +427,7 @@ class ModelActivity:
     ):
         """Initialize the activity with a model provider."""
         self._model_provider = model_provider or OpenAIProvider(
-            openai_client=AsyncOpenAI(max_retries=0)
+            openai_client=_default_openai_client()
         )
         self._env_refs = _WorkerEnvRefResolver(resolvable_worker_env_vars)
 

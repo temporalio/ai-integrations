@@ -142,16 +142,23 @@ Activity with an `ApplicationError` of type `MCPProtocolError` whose
 `details[0]` is the JSON-RPC error code. When the response includes JSON-RPC
 error data, `details[1]` preserves it. Schema-invalid server responses use the
 same error type, include Pydantic validation errors in `details[0]`, and are
-non-retryable. Errors a retry cannot fix (parse and invalid-request errors,
+non-retryable. So is a result the MCP client rejects: a tool result that doesn't
+match the tool's output schema, or a call that runs past its input round limit.
+Errors a retry cannot fix (parse and invalid-request errors,
 unknown methods, invalid params, protocol-version, header and capability
 mismatches, and URL elicitation) are also non-retryable.
 
 Internal server errors, closed connections, request timeouts and transport
-exceptions stay retryable. The default start-to-close timeout limits each
-attempt, not the complete series of retries; with Temporal's default retry
-policy and no schedule-to-close timeout, retryable failures can retry
-indefinitely. Set `schedule_to_close_timeout` to bound the total time including
-retries, and/or set a `retry_policy` to bound the number of attempts:
+exceptions stay retryable. So does a lost session: when a server on an older MCP
+protocol answers HTTP 404 for a session it no longer knows (for example after a
+restart), the attempt fails with an invalid-request error (`Session terminated`
+from the MCP client, or `Session not found` from an MCP Python SDK server), and
+the retry opens a new connection and session. The default start-to-close
+timeout limits each attempt, not the complete series of retries; with
+Temporal's default retry policy and no schedule-to-close timeout, retryable
+failures can retry indefinitely. Set `schedule_to_close_timeout` to bound the
+total time including retries, and/or set a `retry_policy` to bound the number of
+attempts:
 
 ```python
 from datetime import timedelta

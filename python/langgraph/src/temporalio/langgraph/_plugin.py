@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import inspect
 import sys
 import warnings
@@ -16,7 +17,11 @@ from langgraph.graph import StateGraph
 from langgraph.pregel import Pregel
 
 from temporalio import activity, workflow
-from temporalio.langgraph._activity import wrap_activity, wrap_execute_activity
+from temporalio.langgraph._activity import (
+    ValueTypes,
+    wrap_activity,
+    wrap_execute_activity,
+)
 from temporalio.langgraph._interceptor import (
     LangGraphInterceptor,
     _workflow_entrypoints,
@@ -49,6 +54,39 @@ def _constant_summary_fn(
 ) -> Callable[[tuple[Any, ...], dict[str, Any]], str]:
     """Adapt a static summary string to the summary_fn interface."""
     return lambda args, kwargs: value
+
+
+def _task_cache_id(func: Callable, activity_name: str) -> str:
+    """Return the continue-as-new cache id for an activity-bound node or task.
+
+    Node factories return closures, and ``task_id`` rejects those: every
+    closure from one factory shares a qualname, so it cannot identify a
+    node. A Graph API node's Temporal identity is its ``<graph>.<node>``
+    activity name regardless of its function, so that name — prefixed to
+    keep it out of the ``module.qualname`` id space — identifies the
+    node's cached results just as well. Only closures and local functions
+    fall back; every other ``task_id`` rejection (``__main__`` functions,
+    callables without a qualname) still propagates. Functions with a
+    stable ``module.qualname`` keep it, so caches written by earlier
+    versions (and the histories carrying them) stay valid.
+
+    Args:
+        func: Activity-bound node or task function.
+        activity_name: Activity name whose results are cached when ``func``
+            is a closure or local function.
+
+    Returns:
+        The id the continue-as-new result cache keys ``func``'s entries by.
+    """
+    try:
+        return task_id(func)
+    except ValueError:
+        qualname = (
+            getattr(func, "__qualname__", None) or getattr(func, "__name__", None) or ""
+        )
+        if "<locals>" not in qualname:
+            raise
+        return f"graph-node:{activity_name}"
 
 
 def _merge_activity_opts(
@@ -188,6 +226,20 @@ class LangGraphPlugin(SimplePlugin):
                 if previous is not None and previous is not schema:
                     raise ValueError(f"Conflicting context schema ID: {schema_id!r}")
                 self._context_schemas[schema_id] = schema
+        self._value_types = ValueTypes(
+            schemas=[
+                schema for graph in (graphs or {}).values() for schema in graph.schemas
+            ],
+            functions=[
+                *(
+                    getattr(node.runnable, "func", None)
+                    or getattr(node.runnable, "afunc", None)
+                    for graph in (graphs or {}).values()
+                    for node in graph.nodes.values()
+                ),
+                *(task.func for task in tasks or []),
+            ],
+        )
 
         # Graph API: Wrap graph nodes as Temporal Activities.
         if graphs:
@@ -308,6 +360,13 @@ class LangGraphPlugin(SimplePlugin):
             ],
         )
 
+    def version(self) -> str:
+        """Return this package's version, which worker heartbeats report."""
+        try:
+            return importlib.metadata.version("temporalio-langgraph")
+        except importlib.metadata.PackageNotFoundError:
+            return ""
+
     def execute(
         self,
         activity_name: str,
@@ -337,6 +396,7 @@ class LangGraphPlugin(SimplePlugin):
                 func,
                 context_schema=context_schema,
                 context_schemas=self._context_schemas,
+                value_types=self._value_types,
                 streaming_topic=self._streaming_topic,
                 streaming_batch_interval=self._streaming_batch_interval,
             )
@@ -344,9 +404,10 @@ class LangGraphPlugin(SimplePlugin):
             self.activities.append(a)
             return wrap_execute_activity(
                 a,
-                task_id=task_id(func),
+                task_id=_task_cache_id(func, activity_name),
                 summary_fn=summary_fn,
                 context_schemas=self._context_schemas,
+                value_types=self._value_types,
                 **opts,
             )
         elif execute_in == "workflow":

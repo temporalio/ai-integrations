@@ -11,6 +11,7 @@ import type {
   SharedV4Warning,
   ProviderV4,
 } from '@ai-sdk/provider';
+import { APICallError, getErrorMessage } from '@ai-sdk/provider';
 import { asSchema, type Schema, type ToolExecutionOptions } from 'ai';
 import type { MCPClient } from '@ai-sdk/mcp';
 import { ApplicationFailure } from '@temporalio/common';
@@ -18,8 +19,44 @@ import { Context } from '@temporalio/activity';
 import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { msOptionalToNumber, type Duration } from '@temporalio/common/lib/time';
 import type { McpClientFactories, McpClientFactory } from './mcp';
+import { withSources } from './activity-sources';
 
 const encoder = new TextEncoder();
+
+// A slow provider call must not look like a lost Worker, and a cancellation request
+// reaches the Activity only through heartbeats.
+function heartbeatUntilDisposed(): Disposable {
+  const ctx = Context.current();
+  const timeoutMs = ctx.info.heartbeatTimeoutMs;
+  if (!timeoutMs) return { [Symbol.dispose]: () => {} };
+  const timer = setInterval(() => ctx.heartbeat(), timeoutMs / 2);
+  timer.unref();
+  return { [Symbol.dispose]: () => clearInterval(timer) };
+}
+
+// The AI SDK marks provider errors that fail the same way on retry with `isRetryable: false`.
+// Temporal owns the retries, so the Activity takes the same verdict.
+function isFinalProviderError(error: unknown): error is APICallError {
+  return APICallError.isInstance(error) && !error.isRetryable;
+}
+
+async function callProvider<T>(call: () => PromiseLike<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error) {
+    if (isFinalProviderError(error)) {
+      throw ApplicationFailure.create({
+        message: error.message,
+        // The type the Worker gives a thrown error, so that failure handlers and
+        // `nonRetryableErrorTypes` in use today continue to match.
+        type: error.constructor.name,
+        nonRetryable: true,
+        cause: error,
+      });
+    }
+    throw error;
+  }
+}
 
 /**
  * Arguments for invoking a language model activity.
@@ -81,8 +118,6 @@ export interface CallToolArgs {
 
 /**
  * Options controlling MCP connection reuse for {@link createActivities}.
- *
- * @experimental The AI SDK integration is an experimental feature; APIs may change without notice.
  */
 export interface CreateActivitiesOptions {
   /**
@@ -228,8 +263,6 @@ function releaseMcpConnection(key: string, entry: McpConnectionEntry, idleMs: nu
  * @param mcpClientFactories A mapping of server names to functions to create mcp clients
  * @param options Options controlling MCP connection reuse (see {@link CreateActivitiesOptions})
  * @returns An object containing the activity functions
- *
- * @experimental The AI SDK integration is an experimental feature; APIs may change without notice.
  */
 export function createActivities(
   provider: ProviderV4,
@@ -238,8 +271,9 @@ export function createActivities(
 ): object {
   let activities = {
     async invokeModel(args: InvokeModelArgs): Promise<InvokeModelResult> {
+      using _heartbeat = heartbeatUntilDisposed();
       const model = provider.languageModel(args.modelId);
-      return await model.doGenerate(args.options);
+      return await callProvider(() => model.doGenerate(args.options));
     },
 
     /**
@@ -253,13 +287,15 @@ export function createActivities(
      * don't recognize; no normalization happens here.
      */
     async invokeModelStreaming(args: InvokeModelStreamingArgs): Promise<InvokeModelResult> {
+      // Declared first so it is disposed last, after the stream flush.
+      using _heartbeat = heartbeatUntilDisposed();
       await using stream = WorkflowStreamClient.fromWithinActivity({
         batchInterval: args.streamingBatchInterval ?? '100 milliseconds',
       });
       const events = stream.topic(args.streamingTopic);
 
       const model = provider.languageModel(args.modelId);
-      const streamResult = await model.doStream(args.options);
+      const streamResult = await callProvider(() => model.doStream(args.options));
 
       const content: LanguageModelV4Content[] = [];
       let finishReason: LanguageModelV4FinishReason = { unified: 'other', raw: undefined };
@@ -269,6 +305,7 @@ export function createActivities(
       };
       const warnings: SharedV4Warning[] = [];
       let responseMetadata: Record<string, unknown> | undefined;
+      let providerMetadata: SharedV4ProviderMetadata | undefined;
       let sawFinish = false;
       let sawError = false;
       let streamError: unknown;
@@ -279,7 +316,7 @@ export function createActivities(
       const reader = streamResult.stream.getReader();
 
       while (true) {
-        const { done, value: part } = await reader.read();
+        const { done, value: part } = await callProvider(() => reader.read());
         if (done) break;
 
         Context.current().heartbeat();
@@ -337,6 +374,7 @@ export function createActivities(
           case 'finish':
             finishReason = part.finishReason;
             usage = part.usage;
+            providerMetadata = part.providerMetadata;
             sawFinish = true;
             break;
           case 'raw':
@@ -368,13 +406,19 @@ export function createActivities(
 
       // An `error` part signals a provider failure even when the stream still delivers a
       // `finish` part afterwards — fail the activity rather than return a partial result as
-      // success. `part.error` is untyped, so it cannot be classified as deterministic here;
-      // surface it as retryable and let the activity retry policy govern, matching how a
-      // provider error thrown from `doGenerate` behaves in the non-streaming activity.
+      // success.
       if (sawError) {
-        throw ApplicationFailure.retryable(
-          `Model stream emitted an error part${sawFinish ? '' : ' and ended without a finish part'}: ${streamError}`
-        );
+        const ending = sawFinish ? '' : ' and ended without a finish part';
+        // `part.error` is untyped. Only an `APICallError` says whether a retry can help, so any
+        // other value is left to the activity retry policy, as in `invokeModel`.
+        throw ApplicationFailure.create({
+          message: `Model stream emitted an error part${ending}: ${getErrorMessage(streamError)}`,
+          // Every stream failure keeps the type `Error`, so that failure handlers and
+          // `nonRetryableErrorTypes` in use today continue to match. The `cause` has the detail.
+          type: 'Error',
+          nonRetryable: isFinalProviderError(streamError),
+          cause: streamError instanceof Error ? streamError : undefined,
+        });
       }
 
       return {
@@ -382,26 +426,31 @@ export function createActivities(
         finishReason,
         usage,
         warnings,
+        providerMetadata,
         request: streamResult.request,
         response: responseMetadata ? { ...responseMetadata, ...streamResult.response } : streamResult.response,
       };
     },
 
     async invokeEmbeddingModel(args: InvokeEmbeddingModelArgs): Promise<InvokeEmbeddingModelResult> {
+      using _heartbeat = heartbeatUntilDisposed();
       const model = provider.embeddingModel(args.modelId);
-      return await model.doEmbed({
-        values: args.values,
-        providerOptions: args.providerOptions,
-        headers: args.headers,
-      });
+      return await callProvider(() =>
+        model.doEmbed({
+          values: args.values,
+          providerOptions: args.providerOptions,
+          headers: args.headers,
+        })
+      );
     },
   };
+  withSources(activities, [provider]);
   if (mcpClientFactories !== undefined) {
     const idleMs = msOptionalToNumber(options?.mcpConnectionIdleTimeout) ?? MCP_CONNECTION_IDLE_MS;
     Object.entries(mcpClientFactories).forEach(([name, func]) => {
       activities = {
         ...activities,
-        ...activitiesForName(name, func, idleMs),
+        ...withSources(activitiesForName(name, func, idleMs), [func, idleMs]),
       };
     });
   }

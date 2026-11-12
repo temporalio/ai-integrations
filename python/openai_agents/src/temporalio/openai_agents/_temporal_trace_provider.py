@@ -1,11 +1,13 @@
 """Provides support for integration with OpenAI Agents SDK tracing across workflows"""
 
 import uuid
+from _thread import LockType
 from types import TracebackType
 from typing import Any, cast
 
 from agents import SpanData, Trace, TracingProcessor
 from agents.tracing import (
+    TracingConfig,
     get_trace_provider,
 )
 from agents.tracing.provider import (
@@ -16,6 +18,7 @@ from agents.tracing.spans import Span
 
 import temporalio.workflow
 from temporalio import workflow
+from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.workflow import ReadOnlyContextError
 
 
@@ -83,9 +86,33 @@ class _TemporalTracingProcessor(SynchronousMultiTracingProcessor):
         impl: SynchronousMultiTracingProcessor,
         start_spans_in_replay: bool,
     ):
-        super().__init__()
         self._impl = impl
+        # Preserve future base-class initialization without replacing the
+        # wrapped processor tuple or lock through the delegating setters.
+        self._initializing = True
+        super().__init__()
+        self._initializing = False
         self._emit_spans_in_replay = start_spans_in_replay
+
+    # OpenInference updates the SDK's processor tuple under its lock. Delegate
+    # that state too, so direct updates reach the same processors as callbacks.
+    @property
+    def _processors(self) -> tuple[TracingProcessor, ...]:
+        return self._impl._processors
+
+    @_processors.setter
+    def _processors(self, processors: tuple[TracingProcessor, ...]) -> None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        if not self._initializing:
+            self._impl._processors = processors
+
+    @property
+    def _lock(self) -> LockType:
+        return self._impl._lock
+
+    @_lock.setter
+    def _lock(self, lock: LockType) -> None:
+        if not self._initializing:
+            self._impl._lock = lock
 
     def add_tracing_processor(self, tracing_processor: TracingProcessor):
         self._impl.add_tracing_processor(tracing_processor)
@@ -196,6 +223,27 @@ class TemporalTraceProvider(DefaultTraceProvider):
             except ReadOnlyContextError:
                 return f"group_{uuid.uuid4().hex[:24]}"
         return super().gen_group_id()
+
+    def create_trace(
+        self,
+        name: str,
+        trace_id: str | None = None,
+        group_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        disabled: bool = False,
+        tracing: TracingConfig | None = None,
+    ) -> Trace:
+        """Create a new trace, refusing its own tracing key in workflow code."""
+        if workflow.in_workflow() and tracing is not None:
+            _refuse_tracing_key(tracing.get("api_key"))
+        return super().create_trace(
+            name,
+            trace_id=trace_id,
+            group_id=group_id,
+            metadata=metadata,
+            disabled=disabled,
+            tracing=tracing,
+        )
 
     def __enter__(self):
         """Enter the context of the Temporal trace provider."""

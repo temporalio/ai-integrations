@@ -87,7 +87,7 @@ class WorkerState(TypedDict):
     item: str
 
 
-def dispatch(state: FanOutState) -> Command:
+def dispatch(state: FanOutState) -> Command | list[Command]:
     mode = state["mode"]
     if mode == "single":
         return Command(goto=Send("worker", {"item": "a"}))
@@ -104,6 +104,10 @@ def dispatch(state: FanOutState) -> Command:
         )
     if mode == "timeout":
         return Command(goto=Send("worker", {"item": "a"}, timeout=30))
+    if mode == "command_list":
+        return [
+            Command(update={"results": ["listed"]}, goto=Send("worker", {"item": "a"}))
+        ]
     raise ValueError(mode)
 
 
@@ -133,6 +137,7 @@ class CommandSendWorkflow:
         ("mixed", ["A", "mixed"]),
         ("update", ["A", "dispatched"]),
         ("timeout", ["A"]),
+        ("command_list", ["A", "listed"]),
     ],
 )
 async def test_command_goto_send(client: Client, mode: str, expected: list[str]):

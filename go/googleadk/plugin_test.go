@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
@@ -158,9 +159,18 @@ func TestNewPluginRejectsInvalidConfig(t *testing.T) {
 	assert.ErrorContains(t, err, "broken-model")
 }
 
+// TestNewPluginHasVersion proves the plugin has the Version method that SDKs
+// find by name and signature, and is still a client plugin too.
+func TestNewPluginHasVersion(t *testing.T) {
+	plugin, err := googleadk.NewPlugin(googleadk.Config{})
+	require.NoError(t, err)
+	assert.Implements(t, (*interface{ Version() string })(nil), plugin)
+	assert.Implements(t, (*client.Plugin)(nil), plugin)
+}
+
 // TestPluginRegistersActivitiesOnWorkerStart proves the plugin's StartWorker
-// hook registers exactly the three integration Activities under their stable
-// names and passes control on to next.
+// hook registers exactly the integration Activities under their stable names
+// and passes control on to next.
 func TestPluginRegistersActivitiesOnWorkerStart(t *testing.T) {
 	plugin, err := googleadk.NewPlugin(googleadk.Config{
 		Models: map[string]googleadk.ModelFactory{
@@ -176,6 +186,9 @@ func TestPluginRegistersActivitiesOnWorkerStart(t *testing.T) {
 		googleadk.InvokeModelActivityName,
 		googleadk.ListMcpToolsActivityName,
 		googleadk.CallMcpToolActivityName,
+		googleadk.ResolveA2AAgentCardActivityName,
+		googleadk.SendA2AMessageActivityName,
+		googleadk.CancelA2ATaskActivityName,
 	}, reg.activityNames)
 }
 

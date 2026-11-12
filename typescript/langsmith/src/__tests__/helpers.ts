@@ -34,6 +34,7 @@ export interface CollectedRun {
   parent_run_id?: string;
   trace_id?: string;
   dotted_order?: string;
+  start_time?: number | string;
   inputs?: Record<string, unknown>;
   outputs?: Record<string, unknown>;
   end_time?: number | string;
@@ -41,6 +42,8 @@ export interface CollectedRun {
   tags?: string[];
   extra?: Record<string, unknown>;
   project_name?: string;
+  session_name?: string;
+  address?: string;
   events?: unknown[];
 }
 
@@ -59,7 +62,12 @@ export class InMemoryRunCollector {
       this.createOrder.push(id);
       this.byId.set(id, { id, name: String(run.name) });
     }
-    this.byId.set(id, { ...this.byId.get(id)!, ...(run as Partial<CollectedRun>), id });
+    this.byId.set(id, {
+      ...this.byId.get(id)!,
+      ...(run as Partial<CollectedRun>),
+      project_name: (run.project_name ?? run.session_name) as string | undefined,
+      id,
+    });
   };
 
   updateRun = async (id: string, update: Record<string, unknown>): Promise<void> => {
@@ -158,7 +166,7 @@ export function dumpTraces(records: CollectedRun[]): string {
 /** Options for {@link withTracingWorker}. */
 export interface HarnessArgs<T> {
   /** Collector to use as the plugin's LangSmith client. */
-  collector: InMemoryRunCollector;
+  collector: Pick<InMemoryRunCollector, 'asClient'>;
   /** Plugin options other than `client` (which is the collector). */
   options?: Omit<LangSmithPluginOptions, 'client'>;
   /** Activity implementations to register on the worker. */
@@ -187,8 +195,18 @@ export function useSharedEnv(test: TestFn<unknown>): void {
 
 const bundleCache = new Map<string, Promise<WorkflowBundle>>();
 
+/** The env vars LangSmith's default destination reads; the bundle bakes in what they name, so they key the cache. */
+const DESTINATION_ENV_VARS = [
+  'LANGSMITH_PROJECT',
+  'LANGCHAIN_PROJECT',
+  'LANGCHAIN_SESSION',
+  'LANGSMITH_AGENT_ID',
+  'LANGSMITH_AGENT_ENVIRONMENT',
+];
+
 function getBundle(plugin: LangSmithPlugin, workflowsPath: string, optionsKey: string): Promise<WorkflowBundle> {
-  const key = `${workflowsPath}\n${optionsKey}`;
+  const envKey = DESTINATION_ENV_VARS.map((name) => process.env[name] ?? '').join('\n');
+  const key = `${workflowsPath}\n${optionsKey}\n${envKey}`;
   let bundle = bundleCache.get(key);
   if (!bundle) {
     // Route through the plugin so the bundle carries its workflow interceptor
