@@ -1,6 +1,6 @@
 import test from 'ava';
-import type { LanguageModelV4CallOptions, LanguageModelV4GenerateResult } from '@ai-sdk/provider';
-import { encodeCallOptionsFileData, encodeResultFileData } from '../file-data';
+import type { LanguageModelV4CallOptions } from '@ai-sdk/provider';
+import { encodeCallOptionsFileData } from '../file-data';
 
 const bytes = new Uint8Array([137, 80, 78, 71, 0, 255]);
 const base64 = Buffer.from(bytes).toString('base64');
