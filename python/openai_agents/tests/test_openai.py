@@ -808,7 +808,6 @@ class Unprintable:
 @activity.defn
 @dataclass
 class ActivityWeatherUnprintableDefault:
-    # Documented, or Python 3.10's dataclasses fails to write its docstring.
     """
     Weather tools.
     """
@@ -1151,8 +1150,7 @@ class WeatherDefaultsService:
     ],
 )
 def test_method_tool_with_none_defaults(target: Any, parameters: list[str]):
-    # Python 3.10's typing.get_type_hints would wrap these in Optional, hiding the context type
-    # and the alias.
+    # A None default preserves the declared context type and alias metadata.
     tool = openai_agents.workflow.activity_as_tool(
         target, start_to_close_timeout=timedelta(seconds=10)
     )
@@ -3493,6 +3491,10 @@ class LiteLlmAgent:
         return result.final_output
 
 
+@pytest.mark.skipif(
+    sys.version_info >= (3, 15),
+    reason="LiteLLM's fastuuid dependency does not support Python 3.15",
+)
 async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
     # LiteLLM fetches its model cost map at import time unless explicitly told to
     # use the copy bundled in the package.
@@ -3515,8 +3517,8 @@ async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
         Message as LiteLlmMessage,
     )
 
-    # LiteLLM 1.97 leaves this Pydantic model's nested forward reference
-    # unresolved on Python 3.10, before a custom provider can handle the call.
+    # Resolve this Pydantic model's nested forward reference before the custom
+    # provider handles the call.
     if not LiteLlmMessage.__pydantic_complete__:
         LiteLlmMessage.model_rebuild(
             _types_namespace={
@@ -3526,7 +3528,7 @@ async def test_lite_llm(client: Client, monkeypatch: pytest.MonkeyPatch):
 
     requested_models: list[str] = []
 
-    class FakeLiteLlmProvider(CustomLLM):
+    class FakeLiteLlmProvider(CustomLLM):  # pyright: ignore[reportUntypedBaseClass]
         def completion(self, *args: Any, **kwargs: Any) -> LiteLlmResponse:
             model = args[0] if args else kwargs.get("model", "unknown")
             requested_models.append(model)
@@ -5698,10 +5700,6 @@ async def test_stateful_mcp_server_session_end_with_other_events(
             async with workflow_worker():
                 if case == "timer_first":
                     # The block raises the documented error, so the recovery runs.
-                    assert await handle.result() == "recovered"
-                elif not hasattr(asyncio.Task, "cancelling"):
-                    # Python 3.10 can't tell the workflow's cancellation from the
-                    # session's end, as the README says.
                     assert await handle.result() == "recovered"
                 else:
                     # The workflow's cancellation wins over the session's end.
