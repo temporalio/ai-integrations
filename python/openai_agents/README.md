@@ -1418,6 +1418,10 @@ with plugin.tracing_context():
 
 The `plugin.tracing_context()` is required when starting traces outside of a worker context. This ensures proper instrumentation setup and trace propagation into the workflow execution.
 
+Headers containing only OpenTelemetry IDs preserve the remote OTel parent without
+reconstructing an Agents SDK trace. Start an Agents SDK `trace()` in the worker
+before creating Agents SDK spans when the caller supplies no Agents trace ID.
+
 If OTEL instrumentation is not enabled, the integration works normally without any OTEL setup.
 
 ### Voice
