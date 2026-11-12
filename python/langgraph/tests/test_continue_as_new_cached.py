@@ -4,7 +4,11 @@ Verifies that node results are cached across continue-as-new boundaries,
 so nodes don't re-execute when the graph is re-invoked with the same state.
 """
 
+import asyncio
 import operator
+import os
+import subprocess
+import sys
 from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import timedelta
@@ -12,6 +16,12 @@ from typing import Annotated, Any
 from uuid import uuid4
 
 import pytest
+from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables.config import var_child_runnable_config
+from langgraph._internal._runnable import (  # pyright: ignore[reportMissingTypeStubs]
+    RunnableCallable,
+)
 from langgraph.errors import GraphInterrupt
 from langgraph.graph import (  # pyright: ignore[reportMissingTypeStubs]
     END,
@@ -35,6 +45,7 @@ from temporalio.langgraph._task_cache import (
     release,
     set_task_cache,
 )
+from temporalio.langgraph._workflow import scope_router
 from temporalio.worker import Worker
 
 # Track execution counts to verify caching
@@ -492,6 +503,25 @@ def _occurrence_keys() -> None:
     with call_scope("node"):
         assert occurrence_key(other) == kept[0]
     assert cache_lookup(kept[0]) == (True, "finished")
+    # When LangGraph runs a failed call again from its checkpoint, as the
+    # same task, the calls made in it keep their places: one it restores
+    # from the checkpoint is not made again, and the one that failed takes
+    # the place it gave back.
+    set_task_cache({})
+    token = var_child_runnable_config.set(
+        RunnableConfig(metadata={"langgraph_checkpoint_ns": "node:1"})
+    )
+    done: list[str] = []
+    with pytest.raises(ValueError), call_scope("node"):
+        done.append(occurrence_key(key))
+        cache_put(done[0], "finished")
+        release(occurrence_key(key))
+        raise ValueError
+    with call_scope("node"):
+        assert occurrence_key(key) == f"{done[0]}#1"
+    var_child_runnable_config.reset(token)
+    set_task_cache(get_task_cache())
+    assert cache_lookup(done[0]) == (True, "finished")
     # Calls with other input count apart, so a failed call never shares a
     # scope with a call that has other input. The config and runtime that
     # LangGraph injects are not input.
@@ -513,6 +543,67 @@ def _occurrence_keys() -> None:
 
 def test_repeated_calls_get_their_own_keys():
     copy_context().run(_occurrence_keys)
+
+
+def _scope(*args: Any) -> str:
+    """Return the key of a call made in a ``call_scope()`` with ``args``."""
+    set_task_cache({})
+    with call_scope("node", args):
+        return occurrence_key("key")
+
+
+def _scopes_read_values() -> None:
+    # str() of these shows an address or an order, so a scope reads their
+    # values or, for an object without one, its class. Both helpers stay
+    # alive, so their addresses differ, as on two Workers.
+    helpers = [object(), object()]
+    assert _scope(helpers[0], {"a", "b"}) == _scope(helpers[1], {"b", "a"})
+    assert _scope({(1, 2): Tags({"a", "b"}), "n": 1}) == _scope(
+        {"n": 1, (1, 2): Tags({"b", "a"})}
+    )
+    assert _scope(HumanMessage("hi")) == _scope(HumanMessage("hi"))
+    assert _scope(HumanMessage("hi")) != _scope(HumanMessage("bye"))
+    assert _scope(Tags({"a"})) != _scope(Tags({"b"}))
+    assert _scope(Tags({"a"})) != _scope({"names": ["a"]})
+    assert _scope("a") != _scope("b")
+
+
+def test_scopes_read_values():
+    copy_context().run(_scopes_read_values)
+
+
+_SCOPE_IN_NEW_PROCESS = """
+import json
+from contextvars import copy_context
+from temporalio.langgraph._task_cache import call_scope, occurrence_key, set_task_cache
+
+def scope():
+    set_task_cache({})
+    state = {"tags": {"a", "b", "c"}, frozenset({"x", "y"}): json.dumps, "client": object()}
+    with call_scope("node", (state,)):
+        return occurrence_key("key")
+
+print(copy_context().run(scope))
+"""
+
+
+def test_scopes_match_across_processes():
+    """A scope is the same on every Worker, though str() of its input is not.
+
+    Each process has its own hash seed, so its own set order, and its own
+    object addresses.
+    """
+    keys = {
+        subprocess.run(
+            [sys.executable, "-c", _SCOPE_IN_NEW_PROCESS],
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for seed in ("0", "1", "2")
+    }
+    assert len(keys) == 1
 
 
 class FactoryState(TypedDict):
@@ -666,3 +757,34 @@ async def test_graph_continue_as_new_cached_module_qualname_key(client: Client):
     assert result["state"] == {"value": 41}
     assert result["cache"] == seeded
     assert _execution_counts == {}
+
+
+async def _route_twice(order: list[int]) -> dict[int, str]:
+    """Run a router in two ``Send`` tasks of one node, in ``order``.
+
+    Return the key of the call each task's router made.
+    """
+    keys: dict[int, str] = {}
+
+    async def route(state: dict[str, Any], config: RunnableConfig) -> str:
+        index = config.get("metadata", {})["langgraph_path"][1]
+        keys[index] = occurrence_key(cache_key("task", (state["job_id"],), {}))
+        return END
+
+    router = scope_router("graph.node.route", RunnableCallable(None, route))
+    set_task_cache({})
+    for index in order:
+        config = RunnableConfig(metadata={"langgraph_path": ("__pregel_push", index)})
+        await router.ainvoke({"job_id": "job-42"}, config)
+    return keys
+
+
+def test_router_calls_count_per_task():
+    """The routers of two tasks with the same input keep their own keys.
+
+    LangGraph runs a router once its node finishes, so the order changes
+    after continue-as-new, when the nodes' results come from the cache.
+    """
+    first = asyncio.run(_route_twice([1, 0]))
+    assert asyncio.run(_route_twice([0, 1])) == first
+    assert first[0] != first[1]

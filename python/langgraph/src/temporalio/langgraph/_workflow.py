@@ -9,8 +9,10 @@ from collections.abc import Awaitable
 from inspect import iscoroutinefunction
 from typing import Any, Callable
 
+from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.runnables.config import var_child_runnable_config
 from langgraph._internal._constants import CONFIG_KEY_RUNTIME
+from langgraph._internal._runnable import RunnableCallable
 
 from temporalio import workflow
 from temporalio.contrib.workflow_streams._stream import _PUBLISH_SIGNAL
@@ -77,3 +79,33 @@ def wrap_workflow(
         return await run(stream_writer=topic.publish)
 
     return wrapper
+
+
+def scope_router(name: str, path: Runnable[Any, Any]) -> Runnable[Any, Any]:
+    """Wrap a conditional edge's router so its calls are counted per router call.
+
+    LangGraph runs a router in its source node's task once the node
+    finishes, so the routers of parallel nodes would otherwise make their
+    calls in the order the nodes finish, which changes after continue-as-new
+    when the nodes' results come from the cache. Like a workflow-side node,
+    a router counts its calls per call of ``name`` with its input (see
+    :func:`call_scope`), and per LangGraph task, which tells apart the
+    tasks that ``Send`` makes for one node.
+    """
+
+    async def aroute(value: Any, config: RunnableConfig) -> Any:
+        with call_scope(name, (_task_path(config), value)):
+            return await path.ainvoke(value, config)
+
+    def route(value: Any, config: RunnableConfig) -> Any:
+        with call_scope(name, (_task_path(config), value)):
+            return path.invoke(value, config)
+
+    return RunnableCallable(
+        route, aroute, name=path.get_name(), trace=False, recurse=False
+    )
+
+
+def _task_path(config: RunnableConfig) -> Any:
+    """Return the path of the LangGraph task that ``config`` belongs to."""
+    return (config.get("metadata") or {}).get("langgraph_path")

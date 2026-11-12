@@ -5,12 +5,13 @@ node that routes back to itself, with the same input until a job is done must
 see the job finish under the plugin too.
 """
 
+import operator
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import cache as once
-from typing import Any
+from typing import Annotated, Any
 from uuid import uuid4
 
 import pytest
@@ -162,9 +163,18 @@ def fail_first_call(job_id: str) -> str:
     return value
 
 
+def fail_second_call(job_id: str) -> str:
+    """Fail the second call for ``job_id``; other calls return a new value."""
+    value = next_value(job_id)
+    if value.endswith(":2"):
+        raise ApplicationError("second call fails", non_retryable=True)
+    return value
+
+
 _wait = task(wait_for_value)
 _next = task(next_value)
 _fail_first = task(fail_first_call)
+_fail_second = task(fail_second_call)
 
 
 @task
@@ -214,6 +224,85 @@ _recover_graph.add_node(
     "take", take_then_fail_node, metadata={"execute_in": "workflow"}
 )
 _recover_graph.add_edge(START, "take")
+
+
+async def take_twice_node(state: ValueState) -> dict[str, str]:
+    """Make the same call twice; the second fails the first time it runs."""
+    first = await _fail_second(state["job_id"])
+    return {"value": f"{first} {await _fail_second(state['job_id'])}"}
+
+
+_recover_twice_graph = StateGraph(ValueState)
+_recover_twice_graph.add_node(
+    "take", take_twice_node, metadata={"execute_in": "workflow"}
+)
+_recover_twice_graph.add_edge(START, "take")
+
+
+class RouteState(TypedDict):
+    job_id: str
+    routes: Annotated[list[str], operator.add]
+
+
+def wait_for_router(state: RouteState) -> dict[str, list[str]]:
+    """Return once a router has made its call for the job."""
+    wait_for_value(state["job_id"], True)
+    return {"routes": []}
+
+
+def no_wait(state: RouteState) -> dict[str, list[str]]:  # pyright: ignore[reportUnusedParameter]
+    return {"routes": []}
+
+
+def _route_by_value(source: str):
+    async def route(state: RouteState) -> str:
+        """Route to ``<source><n>``, where ``<n>`` is the call's count for the job."""
+        value = await _next(state["job_id"])
+        return f"{source}{value.rsplit(':', 1)[1]}"
+
+    return route
+
+
+def _record(name: str):
+    def record(state: RouteState) -> dict[str, list[str]]:  # pyright: ignore[reportUnusedParameter]
+        return {"routes": [name]}
+
+    return record
+
+
+_routes_graph = StateGraph(RouteState)
+_routes_graph.add_node("a", wait_for_router, metadata={"execute_in": "activity"})
+_routes_graph.add_node("b", no_wait, metadata={"execute_in": "activity"})
+for _source in ("a", "b"):
+    _routes_graph.add_edge(START, _source)
+    _routes_graph.add_conditional_edges(
+        _source, _route_by_value(_source), [f"{_source}1", f"{_source}2"]
+    )
+    for _target in (f"{_source}1", f"{_source}2"):
+        _routes_graph.add_node(
+            _target, _record(_target), metadata={"execute_in": "workflow"}
+        )
+
+
+class ValueClient:
+    """A helper object made in the workflow; its ``str()`` shows its address."""
+
+    def __init__(self) -> None:
+        # Keep each client alive so that no later one gets its address, as
+        # on another Worker.
+        _clients.append(self)
+
+    async def fetch(self, job_id: str) -> str:
+        return await _next(job_id)
+
+
+_clients: list[ValueClient] = []
+
+
+@task
+async def fetch_with(job_id: str, client: ValueClient) -> str:
+    """Fetch a value through ``client``."""
+    return await client.fetch(job_id)
 
 
 @task
@@ -272,8 +361,17 @@ def _callers_plugin() -> LangGraphPlugin:
         b = wait_then_subgraph(request["job_id"], False)
         return {"a": await a, "b": await b}
 
+    @lg_entrypoint()
+    async def fetch_with_client(request: dict[str, Any]) -> str:
+        return await fetch_with(request["job_id"], ValueClient())
+
     return LangGraphPlugin(
-        graphs={"value": _value_graph, "recover": _recover_graph},
+        graphs={
+            "value": _value_graph,
+            "recover": _recover_graph,
+            "recover-twice": _recover_twice_graph,
+            "routes": _routes_graph,
+        },
         entrypoints={
             "two-branches": two_branches,
             "retry-on-failure": retry_on_failure,
@@ -281,24 +379,29 @@ def _callers_plugin() -> LangGraphPlugin:
             "retry-task": retry_task,
             "two-subgraphs": two_subgraphs,
             "other-input-after-failure": other_input_after_failure,
+            "fetch-with-client": fetch_with_client,
         },
         tasks=[
             _wait,
             _next,
             _fail_first,
+            _fail_second,
             wait_then_call,
             take_then_fail,
             take_unless,
             wait_then_subgraph,
+            fetch_with,
         ],
         activity_options={
             "wait_for_value": {"execute_in": "activity"},
             "next_value": {"execute_in": "activity"},
             "fail_first_call": {"execute_in": "activity"},
+            "fail_second_call": {"execute_in": "activity"},
             "wait_then_call": {"execute_in": "workflow"},
             "take_then_fail": {"execute_in": "workflow"},
             "take_unless": {"execute_in": "workflow"},
             "wait_then_subgraph": {"execute_in": "workflow"},
+            "fetch_with": {"execute_in": "workflow"},
         },
         default_activity_options=_ACTIVITY_OPTIONS,
     )
@@ -386,6 +489,32 @@ class RecoverAcrossContinueAsNewWorkflow:
         except ActivityError:
             result = await app.ainvoke(None, config)
         seen = [*input.seen, result["value"]]
+        if len(seen) < input.runs:
+            workflow.continue_as_new(
+                RepeatAcrossContinueAsNewInput(
+                    name=input.name,
+                    job_id=input.job_id,
+                    runs=input.runs,
+                    cache=cache(),
+                    seen=seen,
+                )
+            )
+        return seen
+
+
+@workflow.defn
+class RouteAcrossContinueAsNewWorkflow:
+    """Runs graph ``name`` and records the nodes its routers chose.
+
+    Then continues-as-new with the cache until it has run ``runs`` times.
+    Returns each run's routes.
+    """
+
+    @workflow.run
+    async def run(self, input: RepeatAcrossContinueAsNewInput) -> list[Any]:
+        app = graph(input.name, cache=input.cache).compile()
+        result = await app.ainvoke({"job_id": input.job_id, "routes": []})
+        seen = [*input.seen, result["routes"]]
         if len(seen) < input.runs:
             workflow.continue_as_new(
                 RepeatAcrossContinueAsNewInput(
@@ -777,6 +906,78 @@ async def test_parallel_subgraph_calls_keep_their_results_after_continue_as_new(
     first = {"a": f"{job_id}:2", "b": f"{job_id}:1"}
     assert seen == [first, first]
     assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+@_needs_functional_api
+async def test_node_resumed_with_repeated_call_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """A node resumed from its checkpoint keeps the places of its identical calls.
+
+    The node makes the same call twice and the second fails. Resuming the
+    graph from its checkpoint gets the first call's result from the
+    checkpoint and runs the second again, which must take the second place,
+    not the first. After continue-as-new both come from the cache and
+    nothing runs.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "recover-twice",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+        workflow_cls=RecoverAcrossContinueAsNewWorkflow,
+    )
+
+    first = f"{job_id}:1 {job_id}:3"
+    assert seen == [first, first]
+    assert [len(_scheduled(h)) for h in histories] == [3, 0]
+    assert _calls[job_id] == 3
+
+
+@_needs_functional_api
+async def test_parallel_routers_keep_their_results_after_continue_as_new(
+    client: Client,
+):
+    """Routers of parallel nodes that make the same call keep their own results.
+
+    Node "a"'s Activity returns only after "b"'s router has made the call, so
+    in the first run "b" routes to "b1" and "a" to "a2". After
+    continue-as-new both nodes come from the cache and "a"'s router reaches
+    the call first, but must still get its own earlier result.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client,
+        "routes",
+        job_id,
+        runs=2,
+        plugin=_callers_plugin(),
+        workflow_cls=RouteAcrossContinueAsNewWorkflow,
+    )
+
+    assert seen == [["a2", "b1"], ["a2", "b1"]]
+    assert [len(_scheduled(h)) for h in histories] == [4, 0]
+
+
+@_needs_functional_api
+async def test_task_given_a_helper_keeps_results_after_continue_as_new(
+    client: Client,
+):
+    """A workflow-side task given a helper object finds its results after continue-as-new.
+
+    Each run makes a new helper, whose ``str()`` shows its address. That
+    differs in every run and on every Worker, so it must not decide which
+    results the task's calls get.
+    """
+    job_id = f"job-{uuid4()}"
+    seen, histories = await _repeat_across_continue_as_new(
+        client, "fetch-with-client", job_id, runs=2, plugin=_callers_plugin()
+    )
+
+    assert seen == [f"{job_id}:1", f"{job_id}:1"]
+    assert [len(_scheduled(h)) for h in histories] == [1, 0]
 
 
 class ApproveState(TypedDict):

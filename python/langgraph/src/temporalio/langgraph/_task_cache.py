@@ -11,14 +11,21 @@ workflow.continue_as_new().
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Generator
+from collections import deque
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import date, time, timedelta
+from enum import Enum
 from hashlib import sha256
 from heapq import heappop, heappush
 from json import dumps
+from numbers import Number
+from pathlib import PurePath
 from typing import Any
+from uuid import UUID
 
+from langchain_core.runnables.config import var_child_runnable_config
 from langgraph.errors import GraphBubbleUp
 from pydantic import BaseModel
 
@@ -42,6 +49,12 @@ _taken: ContextVar[list[str] | None] = ContextVar("_temporal_task_taken", defaul
 # Cache entries written in this run by calls made in a node or task call that
 # then failed (see call_scope()). Not part of the cache either.
 _stale: ContextVar[set[str] | None] = ContextVar("_temporal_task_stale", default=None)
+# Per scope whose last call failed: the LangGraph task that call ran as, and
+# the keys the calls made in it took (see call_scope()). Not part of the
+# cache either.
+_failed: ContextVar[dict[str, tuple[str | None, list[str]]] | None] = ContextVar(
+    "_temporal_task_failed", default=None
+)
 # Keyword arguments LangGraph injects into a node function: the plugin keeps
 # these two (see _plugin.py). They are not the caller's input.
 _INJECTED_KWARGS = frozenset({"config", "runtime"})
@@ -53,6 +66,7 @@ def set_task_cache(cache: dict[str, Any] | None) -> None:
     _key_uses.set({})
     _free_places.set({})
     _stale.set(set())
+    _failed.set({})
 
 
 def occurrence_key(key: str) -> str:
@@ -106,30 +120,41 @@ def call_scope(
     """Count the calls made in this block per call of the workflow-side ``name``.
 
     The scope is a hash of the enclosing scope, ``name`` with the caller's
-    ``args`` and ``kwargs``, and its place among the enclosing scope's
-    identical calls, taken before the call awaits anything. So it is the same
-    in every run that makes the same calls in the same order, whatever order
-    parallel calls finish in, and calls with other input never share one. If
-    the block raises, its place is given back, as a failed call's is. If it
-    fails, rather than being interrupted, the places of the calls made in it
-    are given back too and their results become stale: a call made again
-    under the same key, such as the retry's, runs again and replaces its
-    result, while a call that is not made again keeps it. LangGraph can
-    resume a failed node from its checkpoint without making the calls that
-    finished, and the next run still needs their results.
+    ``args`` and ``kwargs`` (see :func:`_stable`), and its place among the
+    enclosing scope's identical calls, taken before the call awaits
+    anything. So it is the same in every run and on every Worker that makes
+    the same calls in the same order, whatever order parallel calls finish
+    in, and calls with other input never share one. If the block raises,
+    its place is given back, as a failed call's is.
+
+    If it fails, rather than being interrupted, the results of the calls
+    made in it become stale. When LangGraph runs it again from its
+    checkpoint, as the same task, those calls keep their places: one
+    LangGraph restores from the checkpoint is not made again and keeps its
+    result for the next run, and the one that failed takes the place it gave
+    back. When it is called again as another task, such as by a retry, its
+    calls count from the first place again, so they are made under the same
+    keys, run again and replace their results.
     """
     caller = {k: v for k, v in (kwargs or {}).items() if k not in _INJECTED_KWARGS}
-    # Hex, like a cache key, so release() can split off the place. The prefix
-    # keeps scopes apart from Activity calls, which use the task ID.
-    key = occurrence_key(cache_key(f"call_scope:{name}", args, caller))
+    key = occurrence_key(_scope_key(name, args, caller))
+    scope = sha256(key.encode()).hexdigest()[:16]
+    task = _langgraph_task()
+    failed = _failed.get()
+    if failed is not None and scope in failed:
+        failed_task, failed_keys = failed.pop(scope)
+        if task is None or task != failed_task:
+            _restart(failed_keys)
     taken: list[str] = []
-    token = _scope.set(sha256(key.encode()).hexdigest()[:16])
+    token = _scope.set(scope)
     taken_token = _taken.set(taken)
     try:
         yield
     except BaseException as err:
         if isinstance(err, Exception) and not isinstance(err, GraphBubbleUp):
             _retire(taken)
+            if failed is not None:
+                failed[scope] = (task, taken)
         release(key)
         raise
     finally:
@@ -140,15 +165,32 @@ def call_scope(
             outer.extend(taken)
 
 
+def _langgraph_task() -> str | None:
+    """Return the checkpoint namespace of the LangGraph task the code runs in.
+
+    It names the task's ID, which LangGraph keeps when it runs the task again
+    from its checkpoint.
+    """
+    config = var_child_runnable_config.get() or {}
+    return (config.get("metadata") or {}).get("langgraph_checkpoint_ns")
+
+
 def _entries(key: str) -> tuple[str, str, str]:
     """Return the cache entries a call under ``key`` can write."""
     return key, f"{key}:command", f"{key}:types"
 
 
 def _retire(keys: list[str]) -> None:
-    """Restart the places of the calls under ``keys`` and mark their results stale."""
-    cache, uses, free = _task_cache.get(), _key_uses.get(), _free_places.get()
-    stale = _stale.get()
+    """Mark the results of the calls under ``keys`` stale."""
+    cache, stale = _task_cache.get(), _stale.get()
+    if cache is not None and stale is not None:
+        for key in keys:
+            stale.update(entry for entry in _entries(key) if entry in cache)
+
+
+def _restart(keys: list[str]) -> None:
+    """Count the calls under ``keys`` from their first place again."""
+    uses, free = _key_uses.get(), _free_places.get()
     for key in keys:
         base, sep, _ = key.rpartition("#")
         base = base if sep else key
@@ -156,8 +198,6 @@ def _retire(keys: list[str]) -> None:
             uses.pop(base, None)
         if free is not None:
             free.pop(base, None)
-        if cache is not None and stale is not None:
-            stale.update(entry for entry in _entries(key) if entry in cache)
 
 
 def get_task_cache() -> dict[str, Any] | None:
@@ -216,6 +256,64 @@ def _canonical(value: Any) -> Any:
     except Exception:
         return str(value)
     return {"__class__": f"{cls.__module__}.{cls.__qualname__}", "__value__": contents}
+
+
+def _stable(value: Any, enclosing: frozenset[int] = frozenset()) -> Any:
+    """Return a JSON form of ``value`` that is the same in every process.
+
+    Containers, enums, dataclasses and Pydantic models give their class and
+    contents; numbers, dates, UUIDs and paths their class and string form;
+    functions and classes their qualified name. Any other object gives its
+    class alone, since its ``str()`` can show its address, which differs on
+    another Worker: calls that differ only in such values are told apart by
+    their order. Unlike :func:`cache_key`, which keeps the form earlier
+    versions wrote, this never falls back to ``str()``.
+    """
+    if value is None or (
+        isinstance(value, (bool, int, float, str)) and not isinstance(value, Enum)
+    ):
+        return value
+    cls = type(value)
+    name = f"{cls.__module__}.{cls.__qualname__}"
+    if isinstance(value, Enum):
+        return [name, _stable(value.value, enclosing)]
+    if isinstance(value, (bytes, bytearray)):
+        return [name, value.hex()]
+    if isinstance(value, (Number, date, time, timedelta, UUID, PurePath)):
+        return [name, str(value)]
+    if callable(value) and hasattr(value, "__qualname__"):
+        return [name, f"{getattr(value, '__module__', None)}.{value.__qualname__}"]
+    if id(value) in enclosing:
+        return [name]
+    enclosing |= {id(value)}
+    if isinstance(value, BaseModel):
+        return [name, [[k, _stable(v, enclosing)] for k, v in value]]
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return [
+            name,
+            [
+                [f.name, _stable(getattr(value, f.name, None), enclosing)]
+                for f in dataclasses.fields(value)
+            ],
+        ]
+    if isinstance(value, Mapping):
+        items = [
+            [_stable(k, enclosing), _stable(v, enclosing)] for k, v in value.items()
+        ]
+        return [name, sorted(items, key=dumps)]
+    if isinstance(value, (list, tuple, deque)):
+        return [name, [_stable(item, enclosing) for item in value]]
+    if isinstance(value, (set, frozenset)):
+        return [name, sorted((_stable(item, enclosing) for item in value), key=dumps)]
+    return [name]
+
+
+def _scope_key(name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    """Return the key that calls of the workflow-side ``name`` with this input share."""
+    form = dumps(["call_scope", name, _stable(args), _stable(kwargs)])
+    # Hex, like a cache key, so release() can split off the place. The form
+    # never matches the one cache_key() hashes for an Activity call.
+    return sha256(form.encode()).hexdigest()[:32]
 
 
 def cache_key(
