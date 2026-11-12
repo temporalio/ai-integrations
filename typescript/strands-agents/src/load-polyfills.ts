@@ -1,11 +1,24 @@
 import { Headers } from 'headers-polyfill';
-import { inWorkflowContext, uuid4 } from '@temporalio/workflow';
+import { DeterminismViolationError, inWorkflowContext, uuid4 } from '@temporalio/workflow';
 
 if (inWorkflowContext()) {
   // Strands composes the parent's cancellation signal with the subagent's via AbortSignal.any().
-  // The sandbox exposes AbortController but not AbortSignal; use its existing signal constructor.
+  // Keep native signal composition, but refuse timeout's timer outside Temporal history.
+  // Subclass instead of changing the constructor shared with the worker and other workflows.
   if (typeof globalThis.AbortSignal === 'undefined') {
-    globalThis.AbortSignal = new AbortController().signal.constructor as typeof AbortSignal;
+    const NativeAbortSignal = new AbortController().signal.constructor as typeof AbortSignal;
+    globalThis.AbortSignal = class extends NativeAbortSignal {
+      static override timeout(_milliseconds: number): never {
+        throw new DeterminismViolationError(
+          'AbortSignal.timeout() is not supported in workflows. Use Temporal sleep() and AbortController instead.'
+        );
+      }
+
+      // AbortController and the inherited helpers still return native signals.
+      static override [Symbol.hasInstance](value: unknown): boolean {
+        return value instanceof NativeAbortSignal;
+      }
+    };
   }
 
   if (typeof globalThis.Headers === 'undefined') {
