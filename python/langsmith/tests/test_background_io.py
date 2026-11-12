@@ -2,25 +2,41 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import random
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
+import langsmith.client
 import pytest
 from langsmith import get_current_run_tree, trace, traceable, tracing_context
 from langsmith.run_trees import RunTree
 
 from temporalio import workflow
 from temporalio.langsmith import _run_tree
-from tests.helpers.langsmith import InMemoryRunCollector, make_mock_ls_client
+from tests.helpers.langsmith import (
+    InMemoryRunCollector,
+    langsmith_release,
+    make_mock_ls_client,
+)
 
 NOW = datetime(2025, 1, 1, tzinfo=timezone.utc)
+_RUN = object()
+_OVERRIDDEN: dict[str, Any] = {
+    "__init__": RunTree,
+    "create_child": RunTree,
+    "post": RunTree,
+    "end": RunTree,
+    "patch": RunTree,
+    "_ensure_uuid": langsmith.client,
+}
 
 
 @pytest.fixture
@@ -77,16 +93,22 @@ def test_native_root_and_child_defaults(
             root, child = root_call()
 
     expected = random.Random(42)
+    ms = int(NOW.timestamp() * 1000)
+    rand_bits = (1 << 62) - 1  # The last 62 bits come straight from the stream.
     assert type(root) is RunTree
-    assert root.id == uuid.UUID(int=expected.getrandbits(128), version=4)
+    assert (root.id.version, root.id.int >> 80) == (7, ms)
+    expected.getrandbits(12)
+    assert root.id.int & rand_bits == expected.getrandbits(62)
     assert root.parent_run_id is None
     assert root.trace_id == root.id
-    assert root.start_time == NOW
+    assert root.start_time > NOW  # Live runs use wall-clock time.
     assert type(child) is RunTree
-    assert child.id == uuid.UUID(int=expected.getrandbits(128), version=4)
+    assert (child.id.version, child.id.int >> 80) == (7, ms)
+    expected.getrandbits(12)
+    assert child.id.int & rand_bits == expected.getrandbits(62)
     assert child.parent_run_id == root.id
     assert child.trace_id == root.id
-    assert child.start_time == NOW
+    assert child.start_time >= root.start_time
     assert child.dotted_order.startswith(root.dotted_order + ".")
     workflow_runtime.submit(lambda: None).result()
     assert client.create_run.call_count == 2
@@ -127,7 +149,8 @@ def test_end_keeps_in_memory_state_on_replay(
     run.patch()
     workflow_runtime.submit(lambda: None).result()
 
-    assert run.end_time == NOW
+    # Workflow time on replay, wall-clock time live.
+    assert (run.end_time == NOW) is replaying
     assert run.outputs == {"result": "done"}
     assert client.create_run.call_count == (0 if replaying else 1)
     assert client.update_run.call_count == (0 if replaying else 1)
@@ -164,7 +187,7 @@ def test_delayed_post_and_patch_use_executor_in_order(
     assert all(thread is not threading.current_thread() for thread in threads)
     for call in (client.create_run.call_args, client.update_run.call_args):
         assert call.kwargs["outputs"] == {"result": "done"}
-        assert call.kwargs["end_time"] == NOW
+        assert call.kwargs["end_time"] == run.end_time
 
 
 @pytest.mark.parametrize("operation", ["post", "patch"])
@@ -222,8 +245,7 @@ def test_read_only_runs_do_not_consume_workflow_random(
     monkeypatch.setattr(workflow.unsafe, "is_read_only", lambda: True)
     monkeypatch.setattr(workflow, "new_random", random_source)
     run = RunTree(name="query")
-    child = run.create_child(name="child")
-    assert run.start_time == child.start_time == NOW
+    run.create_child(name="child")
     random_source.assert_not_called()
 
 
@@ -242,3 +264,89 @@ def test_nested_context_retains_worker_client_fallback(
     workflow_runtime.submit(lambda: None).result()
     fallback.create_run.assert_called_once()
     explicit.create_run.assert_called_once()
+
+
+@pytest.fixture
+def originals(monkeypatch: pytest.MonkeyPatch) -> dict[str, Callable[..., Any]]:
+    """Remove the run tree overrides for one test, returning LangSmith's originals."""
+    monkeypatch.setattr(_run_tree, "_installed", False)
+    found: dict[str, Callable[..., Any]] = {}
+    for name, owner in _OVERRIDDEN.items():
+        found[name] = inspect.unwrap(getattr(owner, name))
+        monkeypatch.setattr(owner, name, found[name])
+    return found
+
+
+@pytest.mark.parametrize("in_workflow", [False, True])
+@pytest.mark.parametrize(
+    ("name", "args", "supplied"),
+    [
+        pytest.param("__init__", (_RUN,), "start_time", id="__init__"),
+        pytest.param("create_child", (_RUN, "child"), "start_time", id="create_child"),
+        pytest.param("post", (_RUN,), None, id="post"),
+        pytest.param("end", (_RUN,), "end_time", id="end"),
+        pytest.param("patch", (_RUN,), None, id="patch"),
+        pytest.param("_ensure_uuid", (uuid.UUID(int=1),), None, id="_ensure_uuid"),
+    ],
+)
+def test_overrides_forward_unknown_arguments(
+    workflow_runtime: ThreadPoolExecutor,
+    originals: dict[str, Callable[..., Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    in_workflow: bool,
+    name: str,
+    args: tuple[Any, ...],
+    supplied: str | None,
+) -> None:
+    """A keyword from a newer LangSmith reaches the original through each override."""
+    calls: list[inspect.BoundArguments] = []
+    release = langsmith_release(originals[name], calls)
+    monkeypatch.setattr(_OVERRIDDEN[name], name, release)
+    _run_tree.install_run_tree_overrides()
+    monkeypatch.setattr(workflow, "in_workflow", lambda: in_workflow)
+
+    getattr(_OVERRIDDEN[name], name)(*args, added=1)
+    workflow_runtime.submit(lambda: None).result()
+
+    if not in_workflow:
+        assert calls == [inspect.signature(release).bind(*args, added=1)]
+    else:
+        assert [call.arguments["added"] for call in calls] == [1]
+        if supplied is not None:
+            assert calls[0].kwargs[supplied] > NOW  # Live runs use wall-clock time.
+
+
+@pytest.mark.parametrize(
+    ("name", "missing"),
+    [
+        ("__init__", "id"),
+        ("__init__", "start_time"),
+        ("__init__", "ls_client"),
+        ("create_child", "run_id"),
+        ("create_child", "start_time"),
+        ("end", "end_time"),
+        ("_ensure_uuid", "value"),
+        ("_ensure_uuid", "accept_null"),
+    ],
+)
+def test_install_rejects_release_missing_needed_parameter(
+    originals: dict[str, Callable[..., Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    missing: str,
+) -> None:
+    """A release without a parameter an override relies on fails the install unpatched."""
+    if name == "__init__":
+        fields = {k: v for k, v in RunTree.model_fields.items() if k != missing}
+        monkeypatch.setattr(RunTree, "model_fields", fields)
+        message = f"RunTree has no field '{missing}'"
+    else:
+        release = langsmith_release(originals[name], [], renamed=(missing,))
+        monkeypatch.setattr(_OVERRIDDEN[name], name, release)
+        message = f"{name} has no parameter '{missing}'"
+    unpatched = {n: getattr(owner, n) for n, owner in _OVERRIDDEN.items()}
+
+    with pytest.raises(RuntimeError, match=message):
+        _run_tree.install_run_tree_overrides()
+
+    assert {n: getattr(owner, n) for n, owner in _OVERRIDDEN.items()} == unpatched

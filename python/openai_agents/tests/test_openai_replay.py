@@ -14,6 +14,7 @@ from tests.helpers.stateful_replay import (
 )
 from tests.test_openai import (
     AgentsAsToolsWorkflow,
+    CallerAgentWorkflow,
     CustomerServiceWorkflow,
     HelloWorldAgent,
     InputGuardrailWorkflow,
@@ -28,6 +29,11 @@ from tests.test_openai import (
     "file_name",
     [
         "agents-as-tools-workflow-history.json",
+        # Recorded on main at 9b6b4c4, which runs copies of the agents: no timer. Without
+        # the openai_agents.run-caller-agents patch, it fails replay.
+        "caller-agent-workflow-history.json",
+        # Recorded on this version, with the patch marker: the run gets its own agent back.
+        "caller-agent-marker-workflow-history.json",
         "customer-service-workflow-history.json",
         "hello-workflow-history.json",
         "input-guardrail-workflow-history.json",
@@ -61,6 +67,7 @@ async def test_replay(file_name: str) -> None:
                 ToolsWorkflow,
                 CustomerServiceWorkflow,
                 AgentsAsToolsWorkflow,
+                CallerAgentWorkflow,
                 HelloWorldAgent,
                 InputGuardrailWorkflow,
                 OutputGuardrailWorkflow,

@@ -23,30 +23,9 @@ independently installable, dependency-isolated, tested, versioned and released. 
 `<language>/<integration>/`; directories under a language root that start with `_` are shared
 resources (`python/_shared/`, `python/_template/`) and are ignored by CI discovery.
 
-| Folder | Coordinate | First version here | Maturity | Root API |
-|---|---|---|---|---|
-| `python/mcp` | `temporalio-mcp` | 0.1.0 | Pre-release | `temporalio.mcp` |
-| `python/deepagents` | `temporalio-deepagents` | 0.0.1 | Pre-release | `temporalio.deepagents` |
-| `python/google_adk` | `temporalio-google-adk` | 0.0.1 | Pre-release | `temporalio.google_adk` |
-| `python/google_genai` | `temporalio-google-genai` | 0.1.0 | Public Preview | `temporalio.google_genai` |
-| `python/langgraph` | `temporalio-langgraph` | 0.1.0 | Public Preview | `temporalio.langgraph` |
-| `python/langsmith` | `temporalio-langsmith` | 0.1.0 | Public Preview | `temporalio.langsmith` |
-| `python/openai_codex` | `temporalio-openai-codex` | 0.0.1 | Pre-release | `temporalio.openai_codex` |
-| `python/openai_agents` | `temporalio-openai-agents` | 1.0.0 | Generally Available | `temporalio.openai_agents` |
-| `python/strands_agents` | `temporalio-strands-agents` | 0.1.0 | Public Preview | `temporalio.strands_agents` |
-| `python/typesafe` | `temporalio-typesafe` | 0.0.1 | Pre-release | `temporalio.typesafe` |
-| `typescript/vercel-ai-sdk` | `@temporalio/vercel-ai-sdk` | 1.0.0 | Generally Available | `@temporalio/vercel-ai-sdk` |
-| `typescript/google-adk` | `@temporalio/google-adk` | 0.1.0 | Public Preview | `@temporalio/google-adk` |
-| `typescript/langsmith` | `@temporalio/langsmith` | continues (1.24.0 next) | Public Preview | `@temporalio/langsmith` |
-| `typescript/openai-agents` | `@temporalio/openai-agents` | continues (1.24.0 next) | Generally Available | `@temporalio/openai-agents` |
-| `typescript/strands-agents` | `@temporalio/strands-agents` | continues (1.24.0 next) | Pre-release | `@temporalio/strands-agents` |
-| `java/spring-ai` | `io.temporal:spring-ai` | 0.1.0 | Public Preview | `io.temporal.springai` |
-| `java/google-adk` | `io.temporal:google-adk` | 0.1.0 | Public Preview | `io.temporal.googleadk` |
-| `go/googleadk` | `go.temporal.io/googleadk` | 0.1.0 (new coordinate) | Public Preview | `googleadk` |
+Each plugin's `plugin.toml` records its coordinate, registry, root API and maturity.
 
-"First version here" values are informational; the registry is the source of truth for the
-version policy (below). Go plugins use `go.temporal.io/<name>` module paths and live under
-`go/<name>/`. Before publishing, the vanity site must route each module to this repository's
+Go plugins use `go.temporal.io/<name>` module paths and live under `go/<name>/`. Before publishing, the vanity site must route each module to this repository's
 subdirectory. The [Go module reference](https://go.dev/ref/mod#vcs-find) documents the fourth
 `go-import` field for subdirectories, supported since Go 1.25. Google ADK requires Go 1.26.10,
 so its mapping can be:
@@ -69,8 +48,8 @@ Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree)
 `pre-release` = `Development Status :: 3 - Alpha`; `public-preview` =
 `Development Status :: 4 - Beta`; `generally-available` =
 `Development Status :: 5 - Production/Stable`.
-Use each plugin's public Temporal documentation for its release stage. In READMEs and
-this table's Maturity column, use the three release-stage labels: Pre-release maps to
+Use each plugin's public Temporal documentation for its release stage. In READMEs, use the
+three release-stage labels: Pre-release maps to
 `pre-release`, Public Preview to `public-preview`, and Generally Available to
 `generally-available`. Feature-specific stages do not change a plugin's
 overall maturity (for example, OpenAI Agents is Generally Available with preview or experimental features).
@@ -84,8 +63,17 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - No changelog files. `scripts/release/release_tool.py release-notes` derives notes from commit subjects touching the plugin directory since its previous tag.
 - Every GitHub Action is pinned to a full commit SHA with a `# vN` comment (org opengrep rule).
 
+## Plugin behavior
+
+- Match the behavior of the framework a plugin is named for, in existing plugin code as well as new. Each plugin follows its own framework, so sibling plugins in other languages may differ. "Behavior" means what the framework's code does at run time in the releases the plugin supports, not upstream `main`; its tests are evidence of that behavior. Where its docs or type comments say otherwise, follow the code, link or open an upstream issue, and say so in the PR.
+- Depart from the framework only where Temporal requires it: replay must be deterministic, Temporal owns retries, and Event History is the only state store and must hold no secrets. Refusing an upstream option for one of these reasons is not a departure. When a plugin can't support an upstream behavior, fail with a clear error when the run starts instead of ignoring it, unless the README documents a replay-safe substitute.
+- If something doesn't work in the framework itself, because it's unsupported or because of a framework bug, the plugin doesn't have to make it work either. Document the limit in the README. Fix framework bugs upstream, not with a plugin workaround, and raise the dependency floor once the fix ships.
+- Run the framework's own code and hook in through its extension points. Don't copy its objects or depend on their private fields; copies drift from upstream.
+- A behavior change that can alter recorded histories must be gated with a patch, or called out as breaking in the PR with guidance for in-flight runs. This takes precedence over the rules above.
+
 ## Python conventions
 
+- All Python plugins require Python 3.11+ and Temporal SDK 1.36.0+. CI tests Python 3.11 and 3.15.
 - Layout: `python/<name>/{pyproject.toml, uv.lock, plugin.toml, Makefile, README.md, LICENSE, src/temporalio/<name>/, tests/}`.
 - Build backend `uv_build` with `module-name = "temporalio.<name>"`. `py.typed` ships in the leaf package (redundant with the SDK's marker, kept on purpose).
 - Installs are non-editable. `temporalio` is a regular package owned by the SDK wheel, so an editable install of a plugin can resolve incorrectly unless the SDK extends its package path. `python/_shared/python.mk` exports `UV_NO_EDITABLE=1`; `[tool.uv] cache-keys` includes `src/**/*` so edits trigger a rebuild; `link-mode = "copy"` keeps overwrites deterministic.
@@ -183,6 +171,15 @@ gate in every language. Use the plugin's `maturity`, independently of whether it
 version is a prerelease. Keep automated validation, immutable tags, tested-artifact
 verification, and final-release eligibility checks. GA plugins retain any existing
 approval policy.
+
+A plugin with an open nightly issue doesn't release. Releases test the committed lock,
+while the nightly run tests the newest versions our ranges allow, which is what users
+install. Each release workflow's `prepare` job runs `release_tool.py check-nightly`, which
+fails while the plugin's `nightly: <plugin> failing (latest)` issue is open. Fix the
+plugin and wait for a green nightly, which closes the issue. Recovery dispatches
+(`recover-run`, Java's `deployment-id`) skip the check: they publish bytes an earlier run
+already tested. A Go tag is public as soon as it exists, so Go checks only in the branch
+dry run before tagging.
 
 Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
 

@@ -6,7 +6,7 @@ Implements mapping of OpenAI datastructures to Pydantic friendly types.
 import asyncio
 import enum
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import Any, NoReturn
 
@@ -361,9 +361,12 @@ def _align_implicit_model_settings(
     resolved_name = getattr(model, "model", None)
     if not isinstance(resolved_name, str):
         return model_settings
-    return get_default_model_settings(resolved_name).resolve(
+    aligned = get_default_model_settings(resolved_name).resolve(
         input.get("run_model_settings")
     )
+    # Keep the extra arguments a SandboxAgent's capabilities add in the Workflow, such as
+    # the compaction threshold.
+    return replace(aligned, extra_args=model_settings.extra_args)
 
 
 def _raise_for_openai_status(e: APIStatusError) -> NoReturn:
