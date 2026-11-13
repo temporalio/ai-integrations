@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import threading
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from datetime import timedelta
 from typing import Any, ClassVar
 
@@ -15,9 +14,7 @@ from agent_framework import (
     ChatResponseUpdate,
     CompactionStrategy,
     FunctionInvocationConfiguration,
-    FunctionInvocationContext,
     FunctionInvocationLayer,
-    FunctionMiddleware,
     Message,
     ResponseStream,
     TokenizerProtocol,
@@ -41,51 +38,6 @@ from temporalio.workflow import (
     VersioningIntent,
 )
 
-# Tools with an invocation in flight through _SyncToolsOnWorkflowLoop, by id:
-# how many, and the flag value to put back when the last one finishes. Workflow
-# tasks run on a thread pool and a tool object can be shared by workflows on
-# different threads, so the counter is guarded; the lock is never held across
-# an await.
-_inline_invocations: dict[int, tuple[int, Any]] = {}
-_inline_lock = threading.Lock()
-
-
-class _SyncToolsOnWorkflowLoop(FunctionMiddleware):
-    """Run synchronous tools on the workflow event loop.
-
-    Agent Framework runs a ``def`` tool with ``asyncio.to_thread``, which the
-    workflow event loop does not implement, so the tool would fail with
-    ``NotImplementedError``. ``_invoke_sync_on_event_loop`` is the framework's
-    own switch for running it inline; its harness sets it the same way. The
-    switch is set for the duration of the call and restored once no call of
-    the tool is in flight, so a tool object shared with code outside workflows
-    keeps its normal behavior there.
-    """
-
-    async def process(
-        self,
-        context: FunctionInvocationContext,
-        call_next: Callable[[], Awaitable[None]],
-    ) -> None:
-        tool = context.function
-        key = id(tool)
-        with _inline_lock:
-            count, original = _inline_invocations.get(
-                key, (0, getattr(tool, "_invoke_sync_on_event_loop", False))
-            )
-            _inline_invocations[key] = (count + 1, original)
-            tool._invoke_sync_on_event_loop = True
-        try:
-            await call_next()
-        finally:
-            with _inline_lock:
-                count, original = _inline_invocations[key]
-                if count == 1:
-                    del _inline_invocations[key]
-                    tool._invoke_sync_on_event_loop = original
-                else:
-                    _inline_invocations[key] = (count - 1, original)
-
 
 class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatClient):  # type: ignore[type-arg]
     """An Agent Framework chat client that runs each model call as a Temporal Activity.
@@ -108,7 +60,9 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
     dict form) to that topic on the workflow's ``WorkflowStream``, batched at
     ``streaming_batch_interval``. ``middleware``,
     ``function_invocation_configuration``, ``compaction_strategy`` and
-    ``tokenizer`` are the framework's own client options.
+    ``tokenizer`` are the framework's own client options. A synchronous
+    ``def`` tool runs inline on the workflow task (the plugin's worker
+    runtime stands in for the thread hand-off the framework would use).
 
     The client only works inside a workflow; calling it elsewhere raises
     ``RuntimeError``. Construction itself does no I/O.
@@ -151,7 +105,7 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
                 "provider clients live in the worker's factories, not in workflow code."
             )
         super().__init__(
-            middleware=[_SyncToolsOnWorkflowLoop(), *(middleware or ())],
+            middleware=middleware,
             function_invocation_configuration=function_invocation_configuration,
             compaction_strategy=compaction_strategy,
             tokenizer=tokenizer,

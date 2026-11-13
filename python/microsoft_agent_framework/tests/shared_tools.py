@@ -5,6 +5,8 @@ here and imported under ``workflow.unsafe.imports_passed_through()`` is one
 object shared by every workflow instance in the worker.
 """
 
+import threading
+
 from agent_framework import tool
 
 
@@ -12,3 +14,9 @@ from agent_framework import tool
 def shared_sync_weather(city: str) -> str:
     """Report the weather for a city from a synchronous tool."""
     return f"sunny in {city}"
+
+
+@tool
+def shared_sync_thread(label: str) -> str:
+    """Report the thread a synchronous tool ran on."""
+    return f"{label}:{threading.get_ident()}"

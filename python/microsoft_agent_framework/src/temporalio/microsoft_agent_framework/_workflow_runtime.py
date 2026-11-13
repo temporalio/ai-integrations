@@ -1,11 +1,12 @@
-"""Workflow-aware stand-ins for the clocks and id generators Agent Framework reads in agent code.
+"""Workflow-aware stand-ins for what Agent Framework reads from the stdlib in agent code.
 
-Agent Framework has no time or id provider hook. Its modules import
-``uuid4``, ``perf_counter`` and ``time`` as module-local names, and those
-modules pass through the workflow sandbox, so the plugin rebinds the names on
-the module objects. Every stand-in checks ``workflow.in_workflow()`` and falls
-through to the stdlib elsewhere, so Activities and plain Agent Framework code
-in the same worker keep their normal clocks and ids.
+Agent Framework has no time, id or thread provider hook. Its modules import
+``uuid4``, ``perf_counter``, ``time`` and ``asyncio`` as module-local names,
+and those modules pass through the workflow sandbox, so the plugin rebinds
+the names on the module objects. Every stand-in checks
+``workflow.in_workflow()`` and falls through to the stdlib elsewhere, so
+Activities and plain Agent Framework code in the same worker keep their
+normal clocks, ids and threads.
 
 What each seam feeds:
 
@@ -16,6 +17,10 @@ What each seam feeds:
 - ``_tools.perf_counter`` and ``_tools.time``: the ``max_duration_seconds``
   budget of the function-invocation loop, which decides whether the loop
   keeps calling tools.
+- ``_tools.asyncio``: ``to_thread``, which runs a synchronous tool. The
+  workflow event loop has no executor, so in a workflow the tool runs inline
+  on the workflow task; the tool object is not changed, so one shared with an
+  Activity or a plain agent in the same process still runs on a thread there.
 - ``observability.perf_counter``: span durations of the agent telemetry layer.
 
 ``time_ns`` in the same modules only timestamps exceptions on spans, which
@@ -24,12 +29,14 @@ the tracer records in wall time anyway, so it is left alone.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import importlib.metadata
 import inspect
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from temporalio import workflow
@@ -49,6 +56,12 @@ def _time() -> float:
     return workflow.time() if workflow.in_workflow() else time.time()
 
 
+async def _to_thread(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+    if workflow.in_workflow():
+        return func(*args, **kwargs)
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
 class _UuidModule:
     """Stands in for the ``uuid`` module where a module imported it whole."""
 
@@ -58,7 +71,17 @@ class _UuidModule:
         return getattr(uuid, name)
 
 
+class _AsyncioModule:
+    """Stands in for the ``asyncio`` module in the framework's tool module."""
+
+    to_thread = staticmethod(_to_thread)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(asyncio, name)
+
+
 _uuid_module = _UuidModule()
+_asyncio_module = _AsyncioModule()
 
 # (module, attribute, the stdlib object the attribute holds, the stand-in)
 _SEAMS: tuple[tuple[str, str, Any, Any], ...] = (
@@ -67,6 +90,7 @@ _SEAMS: tuple[tuple[str, str, Any, Any], ...] = (
     ("agent_framework._sessions", "uuid", uuid, _uuid_module),
     ("agent_framework._tools", "perf_counter", time.perf_counter, _perf_counter),
     ("agent_framework._tools", "time", time.time, _time),
+    ("agent_framework._tools", "asyncio", asyncio, _asyncio_module),
     ("agent_framework.observability", "perf_counter", time.perf_counter, _perf_counter),
 )
 
@@ -90,34 +114,29 @@ def _unsupported(seam: str, detail: str) -> RuntimeError:
 
 
 def check_sync_tool_seam() -> None:
-    """Fail unless ``FunctionTool`` still has the switch that runs sync tools inline.
+    """Fail unless ``FunctionTool`` still hands a synchronous tool to ``asyncio.to_thread``.
 
-    Agent Framework runs a synchronous tool through ``asyncio.to_thread``,
-    which the workflow event loop does not implement. Its own harness sets
-    ``_invoke_sync_on_event_loop`` on a tool to run it inline instead, and the
-    plugin's function middleware sets the same flag.
+    That call, through the tool module's ``asyncio`` name, is what the
+    ``_tools.asyncio`` stand-in intercepts. The framework's own harness flips
+    the private ``_invoke_sync_on_event_loop`` switch on the tool instead; the
+    plugin leaves that switch alone because a tool object can be shared with
+    code outside workflows.
     """
     from agent_framework import FunctionTool
 
-    probe = FunctionTool(name="temporal_probe", func=None)
-    if getattr(probe, "_invoke_sync_on_event_loop", None) is not False:
-        raise _unsupported(
-            "FunctionTool._invoke_sync_on_event_loop",
-            "the attribute is missing or no longer defaults to False",
-        )
     try:
         source = inspect.getsource(FunctionTool._invoke_function)
     except (OSError, TypeError):
         return
-    if "_invoke_sync_on_event_loop" not in source:
+    if "asyncio.to_thread(" not in source:
         raise _unsupported(
             "FunctionTool._invoke_function",
-            "it no longer reads _invoke_sync_on_event_loop",
+            "it no longer runs synchronous tools through asyncio.to_thread",
         )
 
 
 def install_workflow_runtime() -> None:
-    """Rebind Agent Framework's clock and id seams for Workers and Replayers.
+    """Rebind Agent Framework's clock, id and thread seams for Workers and Replayers.
 
     Checks every seam before changing any of them, so a worker fails to start
     with one error naming the seam and the installed version instead of

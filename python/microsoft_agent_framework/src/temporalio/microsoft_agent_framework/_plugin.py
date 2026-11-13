@@ -81,8 +81,8 @@ class MicrosoftAgentFrameworkPlugin(SimplePlugin):
 
     The plugin also sets the Pydantic data converter unless the client has its
     own payload converter, passes the framework's modules through the workflow
-    sandbox, installs workflow-aware clocks and id generators for the
-    framework's agent code, and registers ``MicrosoftAgentFrameworkWorkflowError`` and
+    sandbox, installs workflow-aware clocks and id generators and the inline
+    run of synchronous tools for the framework's agent code, and registers ``MicrosoftAgentFrameworkWorkflowError`` and
     the framework's ``AgentFrameworkException`` as workflow failure types.
     """
 

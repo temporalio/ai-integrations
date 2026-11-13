@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -44,7 +47,7 @@ from tests.helpers.microsoft_agent_framework import (
 
 # Imported through the passthrough so both workflows below share one tool object.
 with workflow.unsafe.imports_passed_through():
-    from tests.shared_tools import shared_sync_weather
+    from tests.shared_tools import shared_sync_thread, shared_sync_weather
 
 
 @activity.defn
@@ -459,12 +462,12 @@ async def test_sync_tool_switch_is_restored(client: Client) -> None:
             id=workflow_id("sync-flag"),
             task_queue=worker.task_queue,
         )
-    # The middleware sets the framework's inline switch for the call only.
+    # The plugin leaves the framework's own inline switch on the tool alone.
     assert result == {"text": "Sunny.", "inline_after_run": False}
 
 
 class _PauseBeforeTool(FunctionMiddleware):
-    """Widens the window between the plugin's inline switch and the tool body."""
+    """Keeps the run inside the tool call for a while before the tool body runs."""
 
     async def process(
         self,
@@ -526,5 +529,87 @@ async def test_shared_sync_tool_across_workflows(client: Client) -> None:
     assert results[0]["contents"][1] == "result:sunny in Rome"
     assert results[1]["contents"][1] == "result:sunny in Oslo"
     assert [r["text"] for r in results] == ["Sunny in Rome.", "Sunny in Oslo."]
-    # The shared object is back to its default once both calls finished.
+    # The shared object's own switch was never touched.
     assert shared_sync_weather._invoke_sync_on_event_loop is False
+
+
+class _HoldInTool(FunctionMiddleware):
+    """Keeps the run inside a tool call until the workflow is released."""
+
+    def __init__(self, wf: SharedWindowWorkflow) -> None:
+        self._wf = wf
+
+    async def process(
+        self,
+        context: FunctionInvocationContext,
+        call_next: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._wf.in_tool_call = True
+        await workflow.wait_condition(lambda: self._wf.released)
+        await call_next()
+
+
+@workflow.defn
+class SharedWindowWorkflow:
+    def __init__(self) -> None:
+        self.in_tool_call = False
+        self.released = False
+
+    @workflow.run
+    async def run(self) -> dict[str, Any]:
+        agent = Agent(
+            client=TemporalChatClient("model"),
+            tools=[shared_sync_thread],
+            middleware=[_HoldInTool(self)],
+        )
+        response = await agent.run("which thread?")
+        return {"text": response.text, "contents": contents_summary(response)}
+
+    @workflow.query
+    def holding(self) -> bool:
+        return self.in_tool_call
+
+    @workflow.signal
+    def release(self) -> None:
+        self.released = True
+
+
+async def test_sync_tool_outside_workflow(client: Client) -> None:
+    plugin = MicrosoftAgentFrameworkPlugin(
+        chat_clients={
+            "model": fake_chat_client(
+                [
+                    function_call_response(
+                        "shared_sync_thread", {"label": "inside"}, call_id="call-1"
+                    ),
+                    text_response("Done."),
+                ]
+            )
+        }
+    )
+    # A caching worker keeps the workflow suspended inside the tool call, as a
+    # production worker would, instead of evicting it between tasks.
+    async with new_worker(
+        client, SharedWindowWorkflow, plugin=plugin, max_cached_workflows=100
+    ) as worker:
+        handle = await client.start_workflow(
+            SharedWindowWorkflow.run,
+            id=workflow_id("shared-window"),
+            task_queue=worker.task_queue,
+        )
+        deadline = time.monotonic() + 20
+        while not await handle.query(SharedWindowWorkflow.holding):
+            assert time.monotonic() < deadline, "the workflow never reached the tool"
+            await asyncio.sleep(0.05)
+        # The same tool object, called from outside any workflow in the same
+        # process while the workflow sits inside its own call of it: Agent
+        # Framework still hands it to a thread here.
+        (outside,) = await shared_sync_thread.invoke(arguments={"label": "outside"})
+        await handle.signal(SharedWindowWorkflow.release)
+        result = await handle.result()
+    label, _, thread = (outside.text or "").partition(":")
+    assert label == "outside"
+    assert int(thread) != threading.get_ident()
+    # Inside the workflow the same tool ran inline, on the workflow task.
+    assert result["contents"][1].startswith("result:inside:")
+    assert result["text"] == "Done."

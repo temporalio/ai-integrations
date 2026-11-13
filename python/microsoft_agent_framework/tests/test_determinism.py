@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
+import threading
 import time
 import uuid
 from typing import Any
@@ -182,6 +184,12 @@ def test_shims_installed_and_inert_outside_workflows() -> None:
     before = time.perf_counter()
     assert tools.perf_counter() >= before
     assert abs(tools.time() - time.time()) < 5
+    # Outside a workflow the stand-in still hands the function to a thread,
+    # and the rest of the module resolves to the real asyncio.
+    assert asyncio.run(tools.asyncio.to_thread(threading.get_ident)) != (
+        threading.get_ident()
+    )
+    assert tools.asyncio.CancelledError is asyncio.CancelledError
     # Installing again is a no-op.
     _workflow_runtime.install_workflow_runtime()
 
@@ -207,9 +215,9 @@ def test_seam_guard(
 
 
 def test_sync_tool_seam_guard(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def without_flag(_self: Any, _call_kwargs: Any) -> Any:
+    async def without_to_thread(_self: Any, _call_kwargs: Any) -> Any:
         return None
 
-    monkeypatch.setattr(FunctionTool, "_invoke_function", without_flag)
-    with pytest.raises(RuntimeError, match="_invoke_sync_on_event_loop"):
+    monkeypatch.setattr(FunctionTool, "_invoke_function", without_to_thread)
+    with pytest.raises(RuntimeError, match="asyncio.to_thread"):
         _workflow_runtime.check_sync_tool_seam()

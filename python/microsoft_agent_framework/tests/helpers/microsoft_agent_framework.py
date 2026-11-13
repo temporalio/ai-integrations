@@ -37,16 +37,22 @@ def new_worker(
     plugin: MicrosoftAgentFrameworkPlugin,
     activities: Sequence[Any] = (),
     task_queue: str | None = None,
+    max_cached_workflows: int = 0,
     **kwargs: Any,
 ) -> Worker:
-    """Return a worker on a fresh task queue that replays every workflow task from history."""
+    """Return a worker on a fresh task queue.
+
+    By default it replays every workflow task from history; pass
+    ``max_cached_workflows`` to keep workflows suspended between tasks like a
+    production worker.
+    """
     return Worker(
         client,
         task_queue=task_queue or f"agent-framework-{uuid.uuid4()}",
         workflows=list(workflows),
         activities=list(activities),
         plugins=[plugin],
-        max_cached_workflows=0,
+        max_cached_workflows=max_cached_workflows,
         **kwargs,
     )
 
