@@ -87,11 +87,10 @@ async def test_tool_filters_still_match_the_server_name_when_prefixed(
     client = TemporalMCPClient("gh", prefix="gh", tool_filters=filters)
     client._client = cast(Any, ListingServer())
 
-    # The listing the agent gets, as TemporalAgent's hook refreshes it.
+    # The listing TemporalAgent's hook refreshes and gives the agent.
     await client._refresh()
-    tools = await client.load_tools()
 
-    assert [t.tool_name for t in tools] == [f"gh_{name}" for name in included]
+    assert [t.tool_name for t in client._tools] == [f"gh_{name}" for name in included]
 
 
 def test_tools_carry_annotations() -> None:

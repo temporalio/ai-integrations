@@ -191,15 +191,15 @@ def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], 
 
     def create() -> Client:
         client = factory()
-        # Both errors stay retryable, so a run waits for the worker to be fixed
-        # instead of failing.
         if not isinstance(client, mcp.Client):
             kind = type(client)
             raise ApplicationError(
                 f"MCP server factory {server!r} returned "
                 f"{kind.__module__}.{kind.__qualname__}, not mcp.Client; "
                 "mcp_clients factories must return an mcp.Client "
-                "(see the upgrade notes in the plugin README)"
+                "(see the upgrade notes in the plugin README)",
+                type="MCPServerFactoryTypeError",
+                non_retryable=True,
             )
         transport = client.server
         if callable(transport) and not hasattr(transport, "__aenter__"):
@@ -209,7 +209,9 @@ def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], 
                 f"MCP server factory {server!r} returned an mcp.Client whose server "
                 "is a function; pass the transport itself, a StdioServerParameters "
                 "or a URL, not a function that returns the transport "
-                "(see the upgrade notes in the plugin README)"
+                "(see the upgrade notes in the plugin README)",
+                type="MCPServerFactoryTransportError",
+                non_retryable=True,
             )
         return client
 

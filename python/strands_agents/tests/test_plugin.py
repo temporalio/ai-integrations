@@ -313,13 +313,14 @@ def _client_on_a_function() -> mcp.Client:
 
 
 @pytest.mark.parametrize(
-    ("factory", "message"),
+    ("factory", "message", "error_type"),
     [
         (
             _old_strands_client,
             "MCP server factory 'old' returned strands.tools.mcp.mcp_client.MCPClient, "
             "not mcp.Client; mcp_clients factories must return an mcp.Client "
             "(see the upgrade notes in the plugin README)",
+            "MCPServerFactoryTypeError",
         ),
         (
             _client_on_a_function,
@@ -327,11 +328,12 @@ def _client_on_a_function() -> mcp.Client:
             "function; pass the transport itself, a StdioServerParameters or a URL, "
             "not a function that returns the transport "
             "(see the upgrade notes in the plugin README)",
+            "MCPServerFactoryTransportError",
         ),
     ],
 )
-async def test_mcp_factory_that_returns_the_wrong_client_fails_retryably(
-    factory: typing.Callable[[], typing.Any], message: str
+async def test_mcp_factory_that_returns_the_wrong_client_is_non_retryable(
+    factory: typing.Callable[[], typing.Any], message: str, error_type: str
 ) -> None:
     plugin = StrandsPlugin(models={}, mcp_clients={"old": factory})
     activities = typing.cast(list[typing.Any], plugin.activities)
@@ -345,8 +347,8 @@ async def test_mcp_factory_that_returns_the_wrong_client_fails_retryably(
         await ActivityEnvironment().run(list_tools, {"factory_argument": None})
 
     assert error.value.message == message
-    # Retryable: the run waits for a fixed worker instead of failing.
-    assert not error.value.non_retryable
+    assert error.value.type == error_type
+    assert error.value.non_retryable
 
 
 def test_plugin_reports_package_version() -> None:
