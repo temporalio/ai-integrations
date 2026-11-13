@@ -9,6 +9,7 @@ public class ApprovalWorkflow
     private readonly Dictionary<string, ToolApprovalResponseContent> decisions = new(StringComparer.Ordinal);
     private ToolApprovalRequestContent? pending;
     private int workflowToolInvocations;
+    private int plainToolInvocations;
 
     [WorkflowSignal]
     public Task DecideAsync(ToolApprovalResponseContent decision)
@@ -22,6 +23,9 @@ public class ApprovalWorkflow
 
     [WorkflowQuery]
     public int WorkflowToolInvocations() => workflowToolInvocations;
+
+    [WorkflowQuery]
+    public int PlainToolInvocations() => plainToolInvocations;
 
     [WorkflowRun]
     public async Task<string> RunAsync(ApprovalInput input)
@@ -59,7 +63,14 @@ public class ApprovalWorkflow
         var tools = new List<AITool> { new ApprovalRequiredAIFunction(sendEmail) };
         if (input.WithPlainTool)
         {
-            tools.Add(AIFunctionFactory.Create((string city) => $"sunny in {city}", "get_weather", "Gets the weather for a city"));
+            tools.Add(AIFunctionFactory.Create(
+                (string city) =>
+                {
+                    plainToolInvocations++;
+                    return $"sunny in {city}";
+                },
+                "get_weather",
+                "Gets the weather for a city"));
         }
 
         return tools;

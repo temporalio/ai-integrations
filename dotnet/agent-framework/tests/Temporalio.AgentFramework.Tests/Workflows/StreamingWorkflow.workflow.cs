@@ -1,4 +1,5 @@
 using System.Text;
+using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using Temporalio.Extensions.WorkflowStreams;
 using Temporalio.Workflows;
@@ -30,11 +31,13 @@ public class StreamingWorkflow
             },
         });
         var texts = new List<string>();
+        var updates = new List<AgentResponseUpdate>();
         var builder = new StringBuilder();
         var count = 0;
         var toolUpdates = 0;
         await foreach (var update in agent.RunStreamingAsync(input.Prompt))
         {
+            updates.Add(update);
             count++;
             if (update.Role == ChatRole.Tool)
             {
@@ -57,6 +60,6 @@ public class StreamingWorkflow
             await Workflow.DelayAsync(TimeSpan.FromMilliseconds(500));
         }
 
-        return new StreamingResult(texts, count, builder.ToString(), toolUpdates);
+        return new StreamingResult(texts, count, builder.ToString(), toolUpdates, updates.ToAgentResponse().Usage?.TotalTokenCount);
     }
 }

@@ -112,7 +112,7 @@ public class ApprovalTests : WorkflowTestBase
     }
 
     [Fact]
-    public async Task MixedResponse_PlainToolRunsNow_ApprovalToolWaits()
+    public async Task MixedResponse_NothingRunsUntilTheDecision()
     {
         var fake = new FakeChatClient(
             ScriptedResponse.ToolCalls(
@@ -127,12 +127,24 @@ public class ApprovalTests : WorkflowTestBase
             var pending = await WaitForPendingAsync(handle);
             Assert.Equal("send_email", ((FunctionCallContent)pending.ToolCall).Name);
             Assert.Equal(1, fake.CallCount);
+            Assert.Equal(0, await handle.QueryAsync(wf => wf.PlainToolInvocations()));
+            Assert.Equal(0, await handle.QueryAsync(wf => wf.WorkflowToolInvocations()));
+
             await handle.SignalAsync(wf => wf.DecideAsync(pending.CreateResponse(true)));
             Assert.Equal("Done", await handle.GetResultAsync());
-            var results = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().ToList();
-            Assert.Equal(["call_1_0", "call_1_1"], results.Select(r => r.CallId));
-            Assert.Equal("sunny in Kingston", results[0].Result?.ToString());
-            Assert.Equal("email sent to ops@example.com", results[1].Result?.ToString());
+            Assert.Equal(1, await handle.QueryAsync(wf => wf.PlainToolInvocations()));
+            Assert.Equal(1, await handle.QueryAsync(wf => wf.WorkflowToolInvocations()));
+
+            // The provider sees one tool round with both calls, as it does under ChatClientAgent.
+            var providerView = fake.Calls[1].Messages.ToList();
+            var callMessage = providerView.Single(m => m.Contents.OfType<FunctionCallContent>().Any());
+            Assert.Equal(["send_email", "get_weather"], callMessage.Contents.OfType<FunctionCallContent>().Select(c => c.Name));
+            var resultMessage = providerView[providerView.IndexOf(callMessage) + 1];
+            var results = resultMessage.Contents.OfType<FunctionResultContent>().ToList();
+            Assert.Equal(["call_1_1", "call_1_0"], results.Select(r => r.CallId));
+            Assert.Equal("email sent to ops@example.com", results[0].Result?.ToString());
+            Assert.Equal("sunny in Kingston", results[1].Result?.ToString());
+            Assert.DoesNotContain(providerView, m => m.Contents.Any(c => c is ToolApprovalRequestContent or ToolApprovalResponseContent));
         });
     }
 

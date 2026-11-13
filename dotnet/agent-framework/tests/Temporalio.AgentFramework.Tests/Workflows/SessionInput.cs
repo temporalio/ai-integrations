@@ -9,4 +9,4 @@ public sealed record SessionInput(
     IList<string>? Replies = null,
     bool ContinueAsNew = false,
     string HistoryProvider = "memory",
-    bool WithContextProvider = false);
+    string? ContextProvider = null);

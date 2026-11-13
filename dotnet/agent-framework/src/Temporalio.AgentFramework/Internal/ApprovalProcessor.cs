@@ -10,10 +10,10 @@ namespace Temporalio.AgentFramework.Internal;
 /// </summary>
 internal static class ApprovalProcessor
 {
-    /// <summary>Prefix of the approval request ids, the one <c>FunctionInvokingChatClient</c> uses.</summary>
+    /// <summary>Prefix of the approval request ids, the one <c>FunctionInvokingChatClient</c> composes.</summary>
     public const string RequestIdPrefix = "ficc_";
 
-    /// <summary>Result text for a rejected call, the one <c>FunctionInvokingChatClient</c> uses.</summary>
+    /// <summary>The plugin's result text for a rejected call; the reason, when given, follows it.</summary>
     public const string RejectedResultText = "Tool call invocation was rejected by the approver and must not be retried.";
 
     /// <summary>
@@ -93,29 +93,32 @@ internal static class ApprovalProcessor
             (response.Approved ? approved : rejected).Add(response);
         }
 
+        // Rebuild the assistant tool-call messages: a response whose request message is in the
+        // history gets a clone of that message; a response without one (an auto-approved call
+        // carried in the session) joins the message being built, as FunctionInvokingChatClient does.
         var reconstructed = new List<ChatMessage>();
         var callMessages = new Dictionary<ChatMessage, ChatMessage>(ReferenceEqualityComparer.Instance);
+        ChatMessage? current = null;
         foreach (var response in rejected.Concat(approved))
         {
             var requestMessage = requests.TryGetValue(response.RequestId, out var found) ? found.Message : null;
-            ChatMessage? target = null;
-            if (requestMessage is not null && callMessages.TryGetValue(requestMessage, out var existing))
+            if (requestMessage is null)
             {
-                target = existing;
-            }
-
-            if (target is null)
-            {
-                target = requestMessage?.Clone() ?? new ChatMessage { Role = ChatRole.Assistant };
-                target.Contents = [];
-                reconstructed.Add(target);
-                if (requestMessage is not null)
+                if (current is null)
                 {
-                    callMessages[requestMessage] = target;
+                    current = new ChatMessage { Role = ChatRole.Assistant, Contents = [] };
+                    reconstructed.Add(current);
                 }
             }
+            else if (!callMessages.TryGetValue(requestMessage, out current))
+            {
+                current = requestMessage.Clone();
+                current.Contents = [];
+                callMessages[requestMessage] = current;
+                reconstructed.Add(current);
+            }
 
-            target.Contents.Add(response.ToolCall);
+            current.Contents.Add(response.ToolCall);
         }
 
         if (rejected.Count > 0)
@@ -126,11 +129,7 @@ internal static class ApprovalProcessor
                 var call = (FunctionCallContent)response.ToolCall;
                 var text = string.IsNullOrWhiteSpace(response.Reason) ? RejectedResultText : $"{RejectedResultText} {response.Reason}";
                 call.InformationalOnly = true;
-                if (requests.TryGetValue(response.RequestId, out var found) && found.Request.ToolCall is FunctionCallContent requestCall)
-                {
-                    requestCall.InformationalOnly = true;
-                }
-
+                MarkRequestInformational(requests, response.RequestId);
                 results.Add(new FunctionResultContent(call.CallId, text));
             }
 
@@ -141,48 +140,80 @@ internal static class ApprovalProcessor
         var approvedCalls = approved.Select(response => (FunctionCallContent)response.ToolCall).ToList();
         foreach (var response in approved)
         {
-            if (requests.TryGetValue(response.RequestId, out var found) && found.Request.ToolCall is FunctionCallContent requestCall)
-            {
-                requestCall.InformationalOnly = true;
-            }
+            MarkRequestInformational(requests, response.RequestId);
         }
 
         return new ApprovalOutcome(reconstructed, approvedCalls, insertIndex + reconstructed.Count);
     }
 
     /// <summary>
-    /// Replaces the calls to approval-required tools in <paramref name="response"/> with
-    /// <see cref="ToolApprovalRequestContent"/>s.
+    /// When any call in <paramref name="response"/> targets an approval-required tool, replaces
+    /// every pending call: calls that need a decision become <see cref="ToolApprovalRequestContent"/>s
+    /// in the response, the others are removed from it and returned in <paramref name="deferred"/>
+    /// so the next run can approve them itself. Nothing runs until the human has answered, which is
+    /// what <c>FunctionInvokingChatClient</c> with Agent Framework's default middleware does.
     /// </summary>
-    /// <param name="response">The model response; its messages are cloned when changed.</param>
+    /// <param name="response">The model response; changed messages are cloned.</param>
     /// <param name="approvalRequiredNames">Names of the tools that need approval.</param>
-    /// <returns>True when at least one call was replaced.</returns>
-    public static bool ReplaceWithApprovalRequests(ChatResponse response, HashSet<string> approvalRequiredNames)
+    /// <param name="deferred">Receives the requests for the calls that need no decision.</param>
+    /// <returns>True when the response now carries approval requests.</returns>
+    public static bool ReplaceWithApprovalRequests(ChatResponse response, HashSet<string> approvalRequiredNames, List<ToolApprovalRequestContent> deferred)
     {
-        var replaced = false;
-        for (var i = 0; i < response.Messages.Count; i++)
+        var pending = response.Messages.SelectMany(message => message.Contents).OfType<FunctionCallContent>().Where(call => !call.InformationalOnly).ToList();
+        if (!pending.Exists(call => approvalRequiredNames.Contains(call.Name)))
+        {
+            return false;
+        }
+
+        for (var i = response.Messages.Count - 1; i >= 0; i--)
         {
             var message = response.Messages[i];
-            List<AIContent>? contents = null;
-            for (var j = 0; j < message.Contents.Count; j++)
+            if (!message.Contents.OfType<FunctionCallContent>().Any(call => !call.InformationalOnly))
             {
-                if (message.Contents[j] is FunctionCallContent { InformationalOnly: false } call && approvalRequiredNames.Contains(call.Name))
+                continue;
+            }
+
+            var contents = new List<AIContent>(message.Contents.Count);
+            foreach (var content in message.Contents)
+            {
+                if (content is FunctionCallContent { InformationalOnly: false } call)
                 {
-                    contents ??= [.. message.Contents];
-                    contents[j] = new ToolApprovalRequestContent(RequestIdPrefix + call.CallId, call);
-                    replaced = true;
+                    var request = new ToolApprovalRequestContent(RequestIdPrefix + call.CallId, call);
+                    if (approvalRequiredNames.Contains(call.Name))
+                    {
+                        contents.Add(request);
+                    }
+                    else
+                    {
+                        deferred.Add(request);
+                    }
+                }
+                else
+                {
+                    contents.Add(content);
                 }
             }
 
-            if (contents is not null)
+            if (contents.Count == 0)
             {
-                var clone = message.Clone();
-                clone.Contents = contents;
-                response.Messages[i] = clone;
+                response.Messages.RemoveAt(i);
+                continue;
             }
+
+            var clone = message.Clone();
+            clone.Contents = contents;
+            response.Messages[i] = clone;
         }
 
-        return replaced;
+        return true;
+    }
+
+    private static void MarkRequestInformational(Dictionary<string, (ChatMessage Message, ToolApprovalRequestContent Request)> requests, string requestId)
+    {
+        if (requests.TryGetValue(requestId, out var found) && found.Request.ToolCall is FunctionCallContent call)
+        {
+            call.InformationalOnly = true;
+        }
     }
 
     private static void RemoveApprovalContents(List<ChatMessage> messages)

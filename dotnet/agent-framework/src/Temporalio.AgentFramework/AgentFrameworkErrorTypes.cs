@@ -25,8 +25,9 @@ public static class AgentFrameworkErrorTypes
 
     /// <summary>
     /// <see cref="TemporalAgent"/> found a problem on the Workflow side: an unanswered approval
-    /// request, unsupported run options, a session of another type, a provider that did not
-    /// complete synchronously, too many consecutive tool failures, or a call through the
+    /// request, unsupported run options, a session of another type, a chat history or context
+    /// provider whose <c>InvokingAsync</c> or <c>InvokedAsync</c> returned an incomplete
+    /// <c>ValueTask</c>, a fourth consecutive round of failing tools, or a call through the
     /// <see cref="Microsoft.Agents.AI.AIAgent"/> base entry points. Fails the Workflow.
     /// </summary>
     public const string WorkflowError = "AgentFrameworkWorkflowError";

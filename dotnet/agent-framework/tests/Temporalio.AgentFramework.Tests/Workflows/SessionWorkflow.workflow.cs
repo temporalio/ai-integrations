@@ -20,15 +20,18 @@ public class SessionWorkflow
     public async Task<IList<string>> RunAsync(SessionInput input)
     {
         var options = new TemporalAgentOptions { ChatOptions = new ChatOptions { Instructions = "Be brief." } };
-        if (input.HistoryProvider == "custom")
+        options.ChatHistoryProvider = input.HistoryProvider switch
         {
-            options.ChatHistoryProvider = new RecordingChatHistoryProvider();
-        }
-
-        if (input.WithContextProvider)
+            "custom" => new RecordingChatHistoryProvider(),
+            "delaying" => new DelayingChatHistoryProvider(),
+            _ => null,
+        };
+        options.AIContextProviders = input.ContextProvider switch
         {
-            options.AIContextProviders = [new PrefixContextProvider()];
-        }
+            "prefix" => [new PrefixContextProvider()],
+            "delaying" => [new DelayingContextProvider()],
+            _ => null,
+        };
 
         agent = new TemporalAgent(TestPlugin.Model, options);
         session = input.Session is { } serialized ? await agent.DeserializeSessionAsync(serialized) : await agent.CreateSessionAsync();

@@ -16,6 +16,9 @@ namespace Temporalio.AgentFramework.Internal;
 /// </summary>
 internal sealed class AgentLoop
 {
+    /// <summary>Session state key under which calls approved without a human wait for the next run.</summary>
+    internal const string DeferredApprovalsKey = "TemporalAgent.DeferredApprovalRequests";
+
     private const int MaximumConsecutiveToolErrors = 3;
     private const string ToolFailedText = "Error: Function failed.";
     private const string ToolSucceededText = "Success: Function completed.";
@@ -64,13 +67,36 @@ internal sealed class AgentLoop
     /// <returns>The steps.</returns>
     public async IAsyncEnumerable<LoopStep> RunAsync([EnumeratorCancellation] CancellationToken enumerationToken = default)
     {
+        if (!Workflow.InWorkflow)
+        {
+            throw new InvalidOperationException(
+                "TemporalAgent runs its model calls as Temporal Activities and must be called inside a Workflow. " +
+                "Outside a Workflow, use ChatClientAgent over the provider client your AgentFrameworkPluginOptions.ChatClients factory builds.");
+        }
+
         var token = cancellationToken.CanBeCanceled ? cancellationToken : enumerationToken;
         var chatOptions = MergeChatOptions();
         var messages = LoadHistory();
         chatOptions = ApplyContextProviders(chatOptions, ref messages);
 
+        // The providers hear about this list at the end of the run, as they do under ChatClientAgent:
+        // history, the input and anything the context providers added. Their base classes filter it.
+        var requestMessages = messages.ToList();
+        var approvalNames = ApprovalRequiredNames(chatOptions?.Tools);
+        var injectedDeferred = InjectDeferredApprovals(messages, chatOptions?.Tools, approvalNames);
+
         var responseMessages = new List<ChatMessage>();
-        var approvals = ApprovalProcessor.Process(messages);
+        ApprovalOutcome approvals;
+        try
+        {
+            approvals = ApprovalProcessor.Process(messages);
+        }
+        catch (AgentFrameworkWorkflowException exception)
+        {
+            NotifyFailure(requestMessages, exception);
+            throw;
+        }
+
         if (approvals.ReconstructedMessages.Count > 0)
         {
             responseMessages.AddRange(approvals.ReconstructedMessages);
@@ -79,7 +105,7 @@ internal sealed class AgentLoop
 
         if (approvals.ApprovedCalls.Count > 0)
         {
-            var approvedResults = await InvokeToolsAsync(approvals.ApprovedCalls, chatOptions?.Tools, token).ConfigureAwait(true);
+            var approvedResults = await InvokeToolsAsync(approvals.ApprovedCalls, chatOptions?.Tools, requestMessages, token).ConfigureAwait(true);
             messages.Insert(approvals.ResultInsertIndex, approvedResults);
             responseMessages.Add(approvedResults);
             yield return new LoopStep(null, [approvedResults]);
@@ -87,6 +113,7 @@ internal sealed class AgentLoop
 
         ChatResponse? last = null;
         UsageDetails? totalUsage = null;
+        var deferred = new List<ToolApprovalRequestContent>();
         for (var iteration = 0; ; iteration++)
         {
             var callOptions = chatOptions;
@@ -105,7 +132,7 @@ internal sealed class AgentLoop
             }
             catch (Exception exception) when (exception is not ContinueAsNewException)
             {
-                NotifyFailure(exception);
+                NotifyFailure(requestMessages, exception);
                 throw;
             }
 
@@ -116,15 +143,21 @@ internal sealed class AgentLoop
 
             MarkServerHandledFunctionCalls(response.Messages);
             var approvalRequested = false;
-            if (iteration < options.MaximumIterationsPerRun && ApprovalRequiredNames(callOptions?.Tools) is { Count: > 0 } approvalNames)
+            if (iteration < options.MaximumIterationsPerRun && approvalNames.Count > 0)
             {
-                approvalRequested = ApprovalProcessor.ReplaceWithApprovalRequests(response, approvalNames);
+                approvalRequested = ApprovalProcessor.ReplaceWithApprovalRequests(response, approvalNames, deferred);
             }
 
             last = response;
             responseMessages.AddRange(response.Messages);
             totalUsage = Add(totalUsage, response.Usage);
             yield return new LoopStep(response, [.. response.Messages]);
+
+            if (approvalRequested)
+            {
+                // Every call of this response waits for the decision; the next run executes them.
+                break;
+            }
 
             var calls = iteration < options.MaximumIterationsPerRun ? PendingCalls(response.Messages) : [];
             if (calls.Count == 0 || HasDeclarationOnlyTarget(calls, callOptions?.Tools))
@@ -133,15 +166,10 @@ internal sealed class AgentLoop
             }
 
             messages.AddMessages(response);
-            var results = await InvokeToolsAsync(calls, callOptions?.Tools, token).ConfigureAwait(true);
+            var results = await InvokeToolsAsync(calls, callOptions?.Tools, requestMessages, token).ConfigureAwait(true);
             messages.Add(results);
             responseMessages.Add(results);
             yield return new LoopStep(null, [results]);
-            if (approvalRequested)
-            {
-                // The pending approval has to be answered before the next model call.
-                break;
-            }
         }
 
         var result = new AgentResponse(last!)
@@ -150,31 +178,48 @@ internal sealed class AgentLoop
             Messages = responseMessages,
             Usage = totalUsage,
         };
-        NotifySuccess(responseMessages);
+        NotifySuccess(requestMessages, responseMessages);
+        if (injectedDeferred)
+        {
+            session.StateBag.TryRemoveValue(DeferredApprovalsKey);
+        }
+
+        if (deferred.Count > 0)
+        {
+            session.StateBag.SetValue(DeferredApprovalsKey, deferred, AgentAbstractionsJsonUtilities.DefaultOptions);
+        }
+
         Result = result;
     }
 
-    private static T Sync<T>(ValueTask<T> task, string what)
+    private static T RunSynchronously<T>(Func<ValueTask<T>> start, string what)
     {
+        // Scheduler tracing is off while the provider's synchronous part runs, so an incomplete
+        // ValueTask is reported here as a Workflow failure instead of the SDK failing the Workflow
+        // Task on the first timer the provider arms. Nothing is awaited in between, and the SDK still
+        // checks that the provider created no commands.
+        var task = Workflow.Unsafe.WithTracingEventListenerDisabled(start);
         if (!task.IsCompleted)
         {
-            throw new AgentFrameworkWorkflowException(
-                $"{what} did not complete synchronously. Chat history and context providers run inside the Workflow; move I/O into an Activity.");
+            throw new AgentFrameworkWorkflowException(SynchronousRule(what));
         }
 
         return task.GetAwaiter().GetResult();
     }
 
-    private static void Sync(ValueTask task, string what)
+    private static void RunSynchronously(Func<ValueTask> start, string what)
     {
+        var task = Workflow.Unsafe.WithTracingEventListenerDisabled(start);
         if (!task.IsCompleted)
         {
-            throw new AgentFrameworkWorkflowException(
-                $"{what} did not complete synchronously. Chat history and context providers run inside the Workflow; move I/O into an Activity.");
+            throw new AgentFrameworkWorkflowException(SynchronousRule(what));
         }
 
         task.GetAwaiter().GetResult();
     }
+
+    private static string SynchronousRule(string what) =>
+        $"{what} did not complete synchronously. Chat history and context providers run inside the Workflow and must return a completed ValueTask: no I/O, timers or thread hops. Move that work into an Activity and add its result to the prompt.";
 
     private static UsageDetails? Add(UsageDetails? total, UsageDetails? usage)
     {
@@ -183,11 +228,9 @@ internal sealed class AgentLoop
             return total;
         }
 
-        if (total is null)
-        {
-            return usage;
-        }
-
+        // Sum into a fresh object: the response's own UsageDetails was already handed out in a
+        // UsageContent update and must not change afterwards.
+        total ??= new UsageDetails();
         total.Add(usage);
         return total;
     }
@@ -393,10 +436,11 @@ internal sealed class AgentLoop
 
     private List<ChatMessage> LoadHistory()
     {
-#pragma warning disable MAAI001 // The provider contexts are experimental in Microsoft.Agents.AI 1.28; the package floor pins that line.
+#pragma warning disable MAAI001 // The provider contexts are experimental in Microsoft.Agents.AI 1.26; the package floor is that line.
         var context = new ChatHistoryProvider.InvokingContext(agent, session, input);
 #pragma warning restore MAAI001
-        var merged = Sync(agent.ChatHistoryProvider.InvokingAsync(context, cancellationToken), $"{agent.ChatHistoryProvider.GetType().Name}.InvokingAsync");
+        var provider = agent.ChatHistoryProvider;
+        var merged = RunSynchronously(() => provider.InvokingAsync(context, cancellationToken), $"{provider.GetType().Name}.InvokingAsync");
         return merged.ToList();
     }
 
@@ -418,7 +462,7 @@ internal sealed class AgentLoop
 #pragma warning disable MAAI001 // See LoadHistory.
             var context = new AIContextProvider.InvokingContext(agent, session, aiContext);
 #pragma warning restore MAAI001
-            aiContext = Sync(provider.InvokingAsync(context, cancellationToken), $"{provider.GetType().Name}.InvokingAsync");
+            aiContext = RunSynchronously(() => provider.InvokingAsync(context, cancellationToken), $"{provider.GetType().Name}.InvokingAsync");
         }
 
         messages = aiContext.Messages?.ToList() ?? [];
@@ -438,31 +482,61 @@ internal sealed class AgentLoop
         return chatOptions;
     }
 
-    private void NotifySuccess(IReadOnlyList<ChatMessage> responseMessages)
+    private bool InjectDeferredApprovals(List<ChatMessage> messages, IList<AITool>? tools, HashSet<string> approvalNames)
+    {
+        if (!session.StateBag.TryGetValue(DeferredApprovalsKey, out List<ToolApprovalRequestContent>? pending, AgentAbstractionsJsonUtilities.DefaultOptions) ||
+            pending is not { Count: > 0 })
+        {
+            return false;
+        }
+
+        // The previous response mixed these calls with ones that needed a decision. Approve them
+        // now, unless the tool has since gone or started to need approval, as Agent Framework does.
+        var responses = new List<AIContent>(pending.Count);
+        foreach (var request in pending)
+        {
+            var name = (request.ToolCall as FunctionCallContent)?.Name;
+            var stillPlain = name is not null && FindTool(name, tools) is AIFunction && !approvalNames.Contains(name);
+            if (!stillPlain)
+            {
+                Workflow.Logger.LogWarning("A call to '{Tool}' was held back on the previous run; the tool now needs approval or is gone, so it is rejected instead of run.", name);
+            }
+
+            responses.Add(request.CreateResponse(stillPlain));
+        }
+
+        messages.Add(new ChatMessage(ChatRole.User, responses));
+        return true;
+    }
+
+    private void NotifySuccess(IReadOnlyList<ChatMessage> requestMessages, IReadOnlyList<ChatMessage> responseMessages)
     {
 #pragma warning disable MAAI001 // See LoadHistory.
-        var historyContext = new ChatHistoryProvider.InvokedContext(agent, session, input, responseMessages);
-        Sync(agent.ChatHistoryProvider.InvokedAsync(historyContext, cancellationToken), $"{agent.ChatHistoryProvider.GetType().Name}.InvokedAsync");
+        var history = agent.ChatHistoryProvider;
+        var historyContext = new ChatHistoryProvider.InvokedContext(agent, session, requestMessages, responseMessages);
+        RunSynchronously(() => history.InvokedAsync(historyContext, cancellationToken), $"{history.GetType().Name}.InvokedAsync");
         foreach (var provider in agent.AIContextProviders)
         {
-            var context = new AIContextProvider.InvokedContext(agent, session, input, responseMessages);
-            Sync(provider.InvokedAsync(context, cancellationToken), $"{provider.GetType().Name}.InvokedAsync");
+            var context = new AIContextProvider.InvokedContext(agent, session, requestMessages, responseMessages);
+            RunSynchronously(() => provider.InvokedAsync(context, cancellationToken), $"{provider.GetType().Name}.InvokedAsync");
         }
 #pragma warning restore MAAI001
     }
 
-    private void NotifyFailure(Exception exception)
+    private void NotifyFailure(IReadOnlyList<ChatMessage> requestMessages, Exception exception)
     {
-        var historyContext = new ChatHistoryProvider.InvokedContext(agent, session, input, exception);
-        Sync(agent.ChatHistoryProvider.InvokedAsync(historyContext, cancellationToken), $"{agent.ChatHistoryProvider.GetType().Name}.InvokedAsync");
+        var history = agent.ChatHistoryProvider;
+        var historyContext = new ChatHistoryProvider.InvokedContext(agent, session, requestMessages, exception);
+        RunSynchronously(() => history.InvokedAsync(historyContext, cancellationToken), $"{history.GetType().Name}.InvokedAsync");
         foreach (var provider in agent.AIContextProviders)
         {
-            var context = new AIContextProvider.InvokedContext(agent, session, input, exception);
-            Sync(provider.InvokedAsync(context, cancellationToken), $"{provider.GetType().Name}.InvokedAsync");
+            var context = new AIContextProvider.InvokedContext(agent, session, requestMessages, exception);
+            RunSynchronously(() => provider.InvokedAsync(context, cancellationToken), $"{provider.GetType().Name}.InvokedAsync");
         }
     }
 
-    private async Task<ChatMessage> InvokeToolsAsync(IReadOnlyList<FunctionCallContent> calls, IList<AITool>? tools, CancellationToken token)
+    private async Task<ChatMessage> InvokeToolsAsync(
+        IReadOnlyList<FunctionCallContent> calls, IList<AITool>? tools, IReadOnlyList<ChatMessage> requestMessages, CancellationToken token)
     {
         FunctionResultContent[] results;
         if (options.AllowConcurrentInvocation && calls.Count > 1)
@@ -490,9 +564,11 @@ internal sealed class AgentLoop
             if (consecutiveToolErrors > MaximumConsecutiveToolErrors)
             {
                 var failures = results.Where(result => result.Exception is not null).Select(result => result.Exception!).ToArray();
-                throw new AgentFrameworkWorkflowException(
+                var exception = new AgentFrameworkWorkflowException(
                     $"Tools failed on {consecutiveToolErrors} consecutive rounds; the last failure came from '{string.Join(", ", calls.Select(call => call.Name))}'.",
                     failures.Length == 1 ? failures[0] : new AggregateException(failures));
+                NotifyFailure(requestMessages, exception);
+                throw exception;
             }
         }
         else

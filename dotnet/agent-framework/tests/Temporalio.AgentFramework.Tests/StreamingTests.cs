@@ -37,6 +37,18 @@ public class StreamingTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task RunStreamingAsync_UsageSummedOnceAcrossRounds()
+    {
+        var call = ("get_weather", (IDictionary<string, object?>)new Dictionary<string, object?> { ["city"] = "Kingston" });
+        var fake = new FakeChatClient(ScriptedResponse.ToolCalls(call), ScriptedResponse.ToolCalls(call), ScriptedResponse.Text("Final"));
+        var input = new StreamingInput("Weather?", WithTool: true);
+        var (result, _) = await RunAsync(TestPlugin.For(fake), (StreamingWorkflow wf) => wf.RunAsync(input));
+        Assert.Equal("Final", result.FinalText);
+        Assert.Equal(3, fake.CallCount);
+        Assert.Equal(45, result.TotalTokens);
+    }
+
+    [Fact]
     public async Task StreamingTopic_PublishesUpdatesFromActivity()
     {
         const string text = "The quick brown fox jumps over the lazy dog";

@@ -2,6 +2,7 @@ using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Temporalio.AgentFramework.Testing;
 using Temporalio.AgentFramework.Tests.Workflows;
+using Temporalio.Api.Enums.V1;
 
 namespace Temporalio.AgentFramework.Tests;
 
@@ -58,12 +59,54 @@ public class SessionTests : WorkflowTestBase
     public async Task ContextProvider_AddsInstructionsAndMessages()
     {
         var fake = EchoFake();
-        var input = new SessionInput(["first"], WithContextProvider: true);
+        var input = new SessionInput(["first"], ContextProvider: "prefix");
         var (replies, _) = await RunAsync(TestPlugin.For(fake), (SessionWorkflow wf) => wf.RunAsync(input));
         Assert.Equal(["echo[1]: first"], replies);
         var call = fake.Calls[0];
         Assert.Equal($"Be brief.\n{PrefixContextProvider.Instruction}", call.Options!.Instructions);
         Assert.Equal(["first", PrefixContextProvider.ContextMessage], call.Messages.Select(m => m.Text));
+    }
+
+    [Fact]
+    public async Task ContextProviderMessages_PersistedLikeChatClientAgent()
+    {
+        var fake = EchoFake();
+        using var worker = Fixture.NewWorker(TestPlugin.For(fake));
+        await WithWorkerAsync(worker, async () =>
+        {
+            var input = new SessionInput(["first", "second"], ContextProvider: "prefix");
+            var handle = await Client.StartWorkflowAsync((SessionWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(worker, "session-context"));
+            Assert.Equal(["echo[1]: first", "echo[2]: second"], await handle.GetResultAsync());
+            Assert.Equal(
+                ["first", PrefixContextProvider.ContextMessage, "echo[1]: first", "second", PrefixContextProvider.ContextMessage],
+                fake.Calls[1].Messages.Select(m => m.Text));
+            Assert.Equal(
+                [
+                    "user:first",
+                    $"user:{PrefixContextProvider.ContextMessage}",
+                    "assistant:echo[1]: first",
+                    "user:second",
+                    $"user:{PrefixContextProvider.ContextMessage}",
+                    "assistant:echo[2]: second",
+                ],
+                await handle.QueryAsync(wf => wf.Transcript()));
+        });
+    }
+
+    [Theory]
+    [InlineData("delaying", null, nameof(DelayingChatHistoryProvider))]
+    [InlineData("memory", "delaying", nameof(DelayingContextProvider))]
+    public async Task ProviderThatAwaitsTimer_FailsRunWithWorkflowError(string historyProvider, string? contextProvider, string providerName)
+    {
+        var fake = EchoFake();
+        var input = new SessionInput(["first"], HistoryProvider: historyProvider, ContextProvider: contextProvider);
+        var (error, handle) = await RunFailingAsync(TestPlugin.For(fake), (SessionWorkflow wf) => wf.RunAsync(input));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal(AgentFrameworkErrorTypes.WorkflowError, failure.ErrorType);
+        Assert.Contains($"{providerName}.InvokingAsync did not complete synchronously", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(0, fake.CallCount);
+        Assert.Equal(0, HistoryAssert.Count(await handle.FetchHistoryAsync(), EventType.WorkflowTaskFailed));
     }
 
     [Fact]
