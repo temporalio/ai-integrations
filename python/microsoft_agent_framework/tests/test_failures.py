@@ -28,6 +28,7 @@ from temporalio.microsoft_agent_framework import (
     TemporalChatClient,
 )
 from temporalio.microsoft_agent_framework._activities import (
+    MAX_RETRY_AFTER,
     ChatClientActivities,
     InvokeModelInput,
     InvokeModelStreamingInput,
@@ -109,6 +110,27 @@ def test_retry_hints() -> None:
     assert stale is not None and stale.next_retry_delay is None
     junk = classify_provider_error(_wrapped(StatusError(503, {"Retry-After": "soon"})))
     assert junk is not None and junk.next_retry_delay is None
+    # Fractions parse, a bad retry-after-ms falls through to retry-after, and
+    # a long hint is capped.
+    fraction = classify_provider_error(
+        _wrapped(StatusError(429, {"retry-after": "1.5"}))
+    )
+    assert fraction is not None
+    assert fraction.next_retry_delay == timedelta(seconds=1.5)
+    fallthrough = classify_provider_error(
+        _wrapped(StatusError(429, {"retry-after-ms": "soon", "retry-after": "7"}))
+    )
+    assert fallthrough is not None
+    assert fallthrough.next_retry_delay == timedelta(seconds=7)
+    assert MAX_RETRY_AFTER == timedelta(seconds=60)
+    capped = classify_provider_error(
+        _wrapped(StatusError(429, {"retry-after": "3600"}))
+    )
+    assert capped is not None and capped.next_retry_delay == MAX_RETRY_AFTER
+    capped_ms = classify_provider_error(
+        _wrapped(StatusError(429, {"retry-after-ms": "90000"}))
+    )
+    assert capped_ms is not None and capped_ms.next_retry_delay == MAX_RETRY_AFTER
 
 
 @pytest.mark.parametrize("streaming", [False, True], ids=["invoke", "streaming"])

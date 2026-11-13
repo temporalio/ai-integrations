@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -117,28 +118,50 @@ def _headers(exc: BaseException) -> dict[str, str]:
         return {}
 
 
+MAX_RETRY_AFTER = timedelta(seconds=60)
+"""The longest retry delay taken from a ``Retry-After`` hint; a longer hint is capped here."""
+
+
 def _retry_after(headers: Mapping[str, str]) -> timedelta | None:
+    """Read the retry hint: ``retry-after-ms``, else ``retry-after`` as seconds or an HTTP-date.
+
+    Both forms parse as floats; a value that does not parse falls through to
+    the next form. A past date or a non-positive value is no hint, so the
+    retry policy's own backoff applies, and the delay is capped at
+    ``MAX_RETRY_AFTER`` so a server's hint cannot hold a retry for hours.
+    """
+    seconds = _seconds(headers.get("retry-after-ms"))
+    if seconds is not None:
+        seconds /= 1000
+    else:
+        value = headers.get("retry-after")
+        seconds = _seconds(value)
+        if seconds is None and value is not None:
+            seconds = _seconds_until(value)
+    if seconds is None or seconds <= 0:
+        return None
+    return min(timedelta(seconds=seconds), MAX_RETRY_AFTER)
+
+
+def _seconds(value: str | None) -> float | None:
+    if value is None:
+        return None
     try:
-        if "retry-after-ms" in headers:
-            return timedelta(milliseconds=int(headers["retry-after-ms"]))
-        if "retry-after" in headers:
-            return _retry_after_delay(headers["retry-after"])
+        parsed = float(value)
+    except ValueError:
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _seconds_until(value: str) -> float | None:
+    """Return the seconds until an HTTP-date, or ``None`` when ``value`` is not one."""
+    try:
+        when = parsedate_to_datetime(value)
     except (TypeError, ValueError):
         return None
-    return None
-
-
-def _retry_after_delay(value: str) -> timedelta | None:
-    """Read ``Retry-After`` in either of its forms: seconds, or an HTTP-date."""
-    value = value.strip()
-    if value.isdigit():
-        return timedelta(seconds=int(value))
-    when = parsedate_to_datetime(value)
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
-    delay = when - datetime.now(timezone.utc)
-    # A date already past means "now"; the retry policy's own backoff covers it.
-    return delay if delay > timedelta(0) else None
+    return (when - datetime.now(timezone.utc)).total_seconds()
 
 
 def classify_provider_error(exc: Exception) -> ApplicationError | None:
@@ -147,7 +170,8 @@ def classify_provider_error(exc: Exception) -> ApplicationError | None:
     Agent Framework wraps provider SDK errors in ``ChatClientException`` with
     the SDK error as ``__cause__``, so the chain is walked for a
     ``status_code``. 408, 409, 429 and 5xx stay retryable, with
-    ``next_retry_delay`` from ``retry-after-ms`` or ``retry-after`` and
+    ``next_retry_delay`` from ``retry-after-ms`` or ``retry-after`` (seconds,
+    including fractions, or an HTTP-date; capped at ``MAX_RETRY_AFTER``) and
     ``x-should-retry`` honored; other 4xx are non-retryable. Returns ``None``
     for an error without a status, which stays retryable as it is.
     """
