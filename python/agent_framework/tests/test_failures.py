@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import Any
@@ -249,3 +250,25 @@ async def test_framework_exception_fails_workflow(client: Client) -> None:
     # Registered through the AgentFrameworkException base, the framework's own
     # error fails the workflow instead of retrying the workflow task forever.
     assert cause.type == "MiddlewareFailure"
+
+
+@pytest.mark.parametrize(
+    ("status", "level"), [(401, logging.ERROR), (429, logging.WARNING)]
+)
+async def test_provider_error_log_level(
+    caplog: pytest.LogCaptureFixture, status: int, level: int
+) -> None:
+    activities = ChatClientActivities(
+        {"model": lambda: FakeChatClient([StatusError(status)])}
+    )
+    with caplog.at_level(logging.WARNING), pytest.raises(ApplicationError):
+        await ActivityEnvironment().run(
+            activities.invoke_model,
+            InvokeModelInput(
+                model="model",
+                messages=[Message(role="user", contents=["hi"]).to_dict()],
+            ),
+        )
+    records = [r for r in caplog.records if "StatusError" in r.getMessage()]
+    # A failure that is not retried logs at ERROR; one that is retried at WARNING.
+    assert records and records[-1].levelno == level

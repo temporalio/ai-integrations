@@ -359,8 +359,9 @@ async def test_activity_summary(
 
 
 async def test_activity_options_applied(client: Client) -> None:
-    slow = SlowFakeChatClient(["Slow answer."], delay=5)
-    plugin = AgentFrameworkPlugin(chat_clients={"model": lambda: slow})
+    plugin = AgentFrameworkPlugin(
+        chat_clients={"model": fake_chat_client(["Slow answer."])}
+    )
     async with new_worker(client, ToolLoopWorkflow, plugin=plugin) as worker:
         handle = await client.start_workflow(
             ToolLoopWorkflow.run,
@@ -373,10 +374,7 @@ async def test_activity_options_applied(client: Client) -> None:
     (scheduled,) = await scheduled_activities(handle)
     assert scheduled.start_to_close_timeout.ToTimedelta() == timedelta(seconds=42)
     assert scheduled.heartbeat_timeout.ToTimedelta() == timedelta(seconds=4)
-    # A 5 second call under a 4 second heartbeat timeout only completes on its
-    # first attempt when the Activity heartbeats on its own (first at 2 seconds).
-    (started,) = await started_activities(handle)
-    assert started.attempt == 1
+    # test_model_activity_heartbeats covers the heartbeater itself, without a clock.
 
 
 async def test_model_task_queue(client: Client) -> None:

@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
 import pytest
-from agent_framework import Agent, ChatResponseUpdate, Message, tool
+from agent_framework import (
+    Agent,
+    BaseChatClient,
+    ChatResponse,
+    ChatResponseUpdate,
+    Content,
+    Message,
+    ResponseStream,
+    tool,
+)
 
 from temporalio import workflow
 from temporalio.agent_framework import (
@@ -20,6 +30,7 @@ from temporalio.agent_framework._activities import (
     ChatClientActivities,
     InvokeModelStreamingInput,
 )
+from temporalio.agent_framework._serde import load_update
 from temporalio.agent_framework.testing import (
     FakeChatClient,
     fake_chat_client,
@@ -106,7 +117,9 @@ async def test_run_stream(client: Client) -> None:
     assert result["log"] == ["Oslo"]
     # The same sequence a native run yields: the call once, the result the
     # workflow produced, then the text, which the Activity records as one run.
-    assert result["updates"] == [
+    # Newer framework releases add one empty update after a tool round, so
+    # only updates with contents are compared.
+    assert [u for u in result["updates"] if u[0]] == [
         [["function_call"], ""],
         [["function_result"], ""],
         [["text"], _TEXT],
@@ -303,3 +316,136 @@ async def test_stream_publish_failure_types(
     assert "'model'" in excinfo.value.message and "'events'" in excinfo.value.message
     assert excinfo.value.__cause__ is publish_error
     assert fake.published
+
+
+class _DeltaClient(BaseChatClient):
+    """Streams prepared updates, with no function-invocation layer in between."""
+
+    OTEL_PROVIDER_NAME = "delta"
+
+    def __init__(self, updates: list[ChatResponseUpdate]) -> None:
+        super().__init__()
+        self._updates = updates
+
+    def _inner_get_response(
+        self,
+        *,
+        messages: Sequence[Message],
+        stream: bool,
+        options: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> Awaitable[ChatResponse] | ResponseStream[ChatResponseUpdate, ChatResponse]:
+        async def updates() -> AsyncIterator[ChatResponseUpdate]:
+            for update in self._updates:
+                yield update
+
+        return ResponseStream(updates(), finalizer=ChatResponse.from_updates)
+
+
+def _responses_style_deltas(full: str, chunk: int) -> list[ChatResponseUpdate]:
+    # The OpenAI Responses client: one append delta per argument token, then
+    # one replace update carrying the full arguments.
+    extra = {"output_index": 1, "fc_id": "fc_1"}
+    parts = [full[i : i + chunk] for i in range(0, len(full), chunk)]
+    updates = [
+        ChatResponseUpdate(
+            role="assistant",
+            response_id="resp_1",
+            message_id="msg_1",
+            contents=[
+                Content.from_function_call(
+                    "call_1",
+                    "write_file",
+                    arguments=part,
+                    merge_mode="append",
+                    additional_properties=dict(extra),
+                )
+            ],
+        )
+        for part in parts
+    ]
+    updates.append(
+        ChatResponseUpdate(
+            role="assistant",
+            response_id="resp_1",
+            message_id="msg_1",
+            contents=[
+                Content.from_function_call(
+                    "call_1",
+                    "write_file",
+                    arguments=full,
+                    merge_mode="replace",
+                    additional_properties=dict(extra),
+                )
+            ],
+        )
+    )
+    return updates
+
+
+def _completions_style_deltas(full: str, chunk: int) -> list[ChatResponseUpdate]:
+    # The Chat Completions client: the first chunk names the call, the
+    # continuation chunks carry an empty id and the call's index.
+    parts = [full[i : i + chunk] for i in range(0, len(full), chunk)]
+    return [
+        ChatResponseUpdate(
+            role="assistant",
+            response_id="chatcmpl_1",
+            message_id="chatcmpl_1",
+            contents=[
+                Content.from_function_call(
+                    "call_1" if index == 0 else "",
+                    "write_file" if index == 0 else "",
+                    arguments=part,
+                    merge_mode="append",
+                    additional_properties={"tool_call_index": 0},
+                )
+            ],
+        )
+        for index, part in enumerate(parts)
+    ]
+
+
+def _calls(response: ChatResponse) -> list[tuple[str | None, str | None, Any]]:
+    return [
+        (c.call_id, c.name, c.arguments)
+        for m in response.messages
+        for c in m.contents
+        if c.type == "function_call"
+    ]
+
+
+@pytest.mark.parametrize(("style", "entries"), [("responses", 2), ("completions", 1)])
+async def test_stream_record_merges_argument_deltas(
+    monkeypatch: pytest.MonkeyPatch, style: str, entries: int
+) -> None:
+    # 100k characters of arguments in 25k deltas of 4 characters.
+    full = json.dumps({"path": "a.py", "content": "x" * 99_960})
+    build = (
+        _responses_style_deltas if style == "responses" else _completions_style_deltas
+    )
+    updates = build(full, 4)
+    assert len(updates) >= 24_000
+    fake = _FakeStream()
+    _install_fake_stream(monkeypatch, fake)
+    activities = ChatClientActivities({"model": lambda: _DeltaClient(updates)})
+    record = await ActivityEnvironment().run(
+        activities.invoke_model_streaming,
+        InvokeModelStreamingInput(
+            model="model", messages=_messages(), streaming_topic="events"
+        ),
+    )
+    # One merged append entry per call (plus the Responses client's replace
+    # entry): the record is the arguments plus envelopes, where one entry per
+    # delta would be over 2 MiB.
+    assert len(record) == entries
+    assert len(json.dumps(record)) < entries * len(full) + 1024
+    assert sum(len(json.dumps(item)) for item in fake.published) > 2 * 1024 * 1024
+    assert len(fake.published) == len(updates)
+    # The workflow rebuilds the same call from the record as from the raw deltas.
+    rebuilt = ChatResponse.from_updates([load_update(entry) for entry in record])
+    assert _calls(rebuilt) == _calls(ChatResponse.from_updates(updates))
+    (call,) = _calls(rebuilt)
+    assert call[:2] == ("call_1", "write_file")
+    arguments = call[2]
+    assert json.loads(arguments) if isinstance(arguments, str) else arguments

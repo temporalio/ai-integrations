@@ -12,15 +12,10 @@ from pathlib import Path
 import pytest
 
 from temporalio.agent_framework import AgentFrameworkPlugin
-from temporalio.agent_framework.testing import (
-    fake_chat_client,
-    function_call_response,
-    text_response,
-)
 from temporalio.client import Client, WorkflowHistory
 from temporalio.worker import Replayer
-from tests.helpers.agent_framework import new_worker, workflow_id
-from tests.test_agent import RunInput, ToolLoopWorkflow
+from tests.record_histories import RECORDERS
+from tests.test_agent import ToolLoopWorkflow
 from tests.test_approval import ApprovalWorkflow
 from tests.test_mcp import MCPWorkflow
 from tests.test_streaming import StreamingWorkflow
@@ -30,7 +25,17 @@ WORKFLOWS = [ToolLoopWorkflow, ApprovalWorkflow, StreamingWorkflow, MCPWorkflow]
 
 
 @pytest.mark.parametrize(
-    "file_name", ["tool_loop.json", "approval.json", "streaming.json", "mcp.json"]
+    "file_name",
+    [
+        "tool_loop.json",
+        "approval.json",
+        "streaming.json",
+        # Recorded when the streaming Activity returned one entry per provider
+        # update, including the provider layer's duplicate of each call and
+        # one entry per text chunk. The workflow code must keep replaying it.
+        "streaming_unmerged_record.json",
+        "mcp.json",
+    ],
 )
 async def test_replay_recorded_histories(file_name: str) -> None:
     history = (HISTORIES / file_name).read_text(encoding="utf-8")
@@ -39,29 +44,12 @@ async def test_replay_recorded_histories(file_name: str) -> None:
     ).replay_workflow(WorkflowHistory.from_json("recorded", history))
 
 
-async def test_replay_fresh_history(client: Client) -> None:
-    plugin = AgentFrameworkPlugin(
-        chat_clients={
-            "model": fake_chat_client(
-                [
-                    function_call_response(
-                        "get_weather", {"city": "Paris"}, call_id="call-1"
-                    ),
-                    text_response("Rainy in Paris."),
-                ]
-            )
-        }
-    )
-    async with new_worker(client, ToolLoopWorkflow, plugin=plugin) as worker:
-        handle = await client.start_workflow(
-            ToolLoopWorkflow.run,
-            RunInput(),
-            id=workflow_id("replay-fresh"),
-            task_queue=worker.task_queue,
-        )
-        await handle.result()
-        history = await handle.fetch_history()
-    # A fresh Replayer, with no factories, replays the recorded run.
+@pytest.mark.parametrize("file_name", sorted(RECORDERS))
+async def test_replay_fresh_history(client: Client, file_name: str) -> None:
+    # Record each scenario now and replay it with a fresh Replayer that has no
+    # factories, so a change in the Activity result shape is exercised against
+    # a history of the current code, not only the committed files.
+    history = await RECORDERS[file_name](client)
     await Replayer(
-        workflows=[ToolLoopWorkflow], plugins=[AgentFrameworkPlugin()]
+        workflows=WORKFLOWS, plugins=[AgentFrameworkPlugin()]
     ).replay_workflow(history)

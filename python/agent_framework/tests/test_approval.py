@@ -18,6 +18,7 @@ from temporalio.agent_framework.testing import (
     text_response,
 )
 from temporalio.client import Client, WorkflowHandle, WorkflowUpdateFailedError
+from temporalio.exceptions import ApplicationError
 from tests.helpers.agent_framework import (
     INVOKE_MODEL,
     contents_summary,
@@ -45,13 +46,20 @@ class ApprovalWorkflow:
 
     @workflow.update
     async def decide(self, decision: Decision) -> str:
+        if decision.request_id not in {request["id"] for request in self._pending}:
+            raise ApplicationError(
+                f"unknown or stale approval request {decision.request_id!r}",
+                non_retryable=True,
+            )
         self._decisions[decision.request_id] = decision.approved
         return "recorded"
 
     @decide.validator
     def validate_decide(self, decision: Decision) -> None:
-        if decision.request_id not in {request["id"] for request in self._pending}:
-            raise ValueError(f"unknown approval request {decision.request_id!r}")
+        # Shape only: the handler checks the id against workflow state, which a
+        # validator cannot rely on under the time-skipping test server.
+        if not decision.request_id:
+            raise ValueError("request_id is required")
 
     @workflow.query
     def pending_requests(self) -> list[dict[str, Any]]:
@@ -149,10 +157,11 @@ async def test_approval_via_update(client: Client) -> None:
             task_queue=worker.task_queue,
         )
         (pending,) = await _pending(handle)
-        with pytest.raises(WorkflowUpdateFailedError):
+        with pytest.raises(WorkflowUpdateFailedError) as failed:
             await handle.execute_update(
                 ApprovalWorkflow.decide, Decision("bogus", True)
             )
+        assert isinstance(failed.value.cause, ApplicationError)
         outcome = await handle.execute_update(
             ApprovalWorkflow.decide, Decision(pending["id"], True)
         )

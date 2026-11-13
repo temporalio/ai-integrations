@@ -39,6 +39,10 @@ from tests.helpers.agent_framework import (
     workflow_id,
 )
 
+# Imported through the passthrough so both workflows below share one tool object.
+with workflow.unsafe.imports_passed_through():
+    from tests.shared_tools import shared_sync_weather
+
 
 @activity.defn
 async def fetch_user(user_id: str) -> dict[str, Any]:
@@ -452,3 +456,70 @@ async def test_sync_tool_switch_is_restored(client: Client) -> None:
         )
     # The middleware sets the framework's inline switch for the call only.
     assert result == {"text": "Sunny.", "inline_after_run": False}
+
+
+class _PauseBeforeTool(FunctionMiddleware):
+    """Widens the window between the plugin's inline switch and the tool body."""
+
+    async def process(
+        self,
+        context: FunctionInvocationContext,
+        call_next: Callable[[], Awaitable[None]],
+    ) -> None:
+        await workflow.sleep(0.5)
+        await call_next()
+
+
+@workflow.defn
+class SharedToolWorkflow:
+    @workflow.run
+    async def run(self, city: str) -> dict[str, Any]:
+        agent = Agent(
+            client=TemporalChatClient("model"),
+            tools=[shared_sync_weather],
+            middleware=[_PauseBeforeTool()],
+        )
+        response = await agent.run(f"weather in {city}?")
+        return {"text": response.text, "contents": contents_summary(response)}
+
+
+async def test_shared_sync_tool_across_workflows(client: Client) -> None:
+    def plugin_for(city: str) -> AgentFrameworkPlugin:
+        return AgentFrameworkPlugin(
+            chat_clients={
+                "model": fake_chat_client(
+                    [
+                        function_call_response(
+                            "shared_sync_weather", {"city": city}, call_id="call-1"
+                        ),
+                        text_response(f"Sunny in {city}."),
+                    ]
+                )
+            }
+        )
+
+    # Two workers, two workflow task threads, one tool object between them.
+    async with (
+        new_worker(client, SharedToolWorkflow, plugin=plugin_for("Rome")) as rome,
+        new_worker(client, SharedToolWorkflow, plugin=plugin_for("Oslo")) as oslo,
+    ):
+        handles = [
+            await client.start_workflow(
+                SharedToolWorkflow.run,
+                "Rome",
+                id=workflow_id("shared-tool-rome"),
+                task_queue=rome.task_queue,
+            ),
+            await client.start_workflow(
+                SharedToolWorkflow.run,
+                "Oslo",
+                id=workflow_id("shared-tool-oslo"),
+                task_queue=oslo.task_queue,
+            ),
+        ]
+        results = [await handle.result() for handle in handles]
+    assert results[0]["contents"][1] == "result:sunny in Rome"
+    assert results[1]["contents"][1] == "result:sunny in Oslo"
+    assert [r["text"] for r in results] == ["Sunny in Rome.", "Sunny in Oslo."]
+    # The shared object is back to its default once both calls finished.
+    assert shared_sync_weather._invoke_sync_on_event_loop is False
