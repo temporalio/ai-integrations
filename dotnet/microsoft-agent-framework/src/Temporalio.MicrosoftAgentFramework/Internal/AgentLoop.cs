@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
@@ -320,6 +321,21 @@ internal sealed class AgentLoop
         return clone;
     }
 
+    // FunctionInvokingChatClient keeps the result object and the provider client serializes it with
+    // AIJsonUtilities when it builds the request. Here the result crosses the Activity boundary first,
+    // in the data converter's shape, so the same serialization happens in the Workflow and the model
+    // reads the text it would have read natively: a string as is, an AIContent with its $type, any
+    // other object as camel-cased JSON. The caller sees the JSON in FunctionResultContent.Result.
+    private static object? ToTransportable(object? result) => result switch
+    {
+        null => null,
+        string text => text,
+        JsonElement element => element,
+        AIContent content => JsonSerializer.SerializeToElement(content, AIJsonUtilities.DefaultOptions.GetTypeInfo(typeof(AIContent))),
+        IEnumerable<AIContent> contents => JsonSerializer.SerializeToElement(contents.ToList(), AIJsonUtilities.DefaultOptions.GetTypeInfo(typeof(IList<AIContent>))),
+        _ => JsonSerializer.SerializeToElement(result, result.GetType(), AIJsonUtilities.DefaultOptions),
+    };
+
     private static bool IsCancellation(Exception exception) =>
         exception is OperationCanceledException || TemporalException.IsCanceledException(exception);
 
@@ -336,7 +352,7 @@ internal sealed class AgentLoop
         {
             var arguments = new AIFunctionArguments(call.Arguments);
             var result = await function.InvokeAsync(arguments, token).ConfigureAwait(true);
-            return new FunctionResultContent(call.CallId, result ?? ToolSucceededText);
+            return new FunctionResultContent(call.CallId, ToTransportable(result) ?? ToolSucceededText);
         }
 #pragma warning disable CA1031 // The model is told that the tool failed; FunctionInvokingChatClient does the same.
         catch (Exception exception) when (!IsCancellation(exception) && exception is not ContinueAsNewException)

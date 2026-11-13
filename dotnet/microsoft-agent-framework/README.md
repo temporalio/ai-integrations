@@ -211,7 +211,7 @@ public class ToolsWorkflow
 
 The loop follows `FunctionInvokingChatClient`. With `AllowConcurrentInvocation = true` the tool calls of one response run at the same time through `Workflow.WhenAllAsync`, with results in call order; the default runs them one after the other. A tool that throws gives the model the result `Error: Function failed.`; three consecutive failing rounds are tolerated and the fourth fails the run with `MicrosoftAgentFrameworkWorkflowError`. A call to a name that is not in `ChatOptions.Tools` gives the model `Error: Requested function "name" not found.` `MaximumIterationsPerRun` (default 40) caps the model calls of one run; at the cap the agent makes one more call without function tools and returns that answer.
 
-A call that leaves out a required argument of an `ActivityAsTool` fails before any Activity is scheduled, with the message `AIFunctionFactory` gives, so the model reads `Error: Function failed.` and can call again.
+A call that leaves out a required argument of an `ActivityAsTool` fails before any Activity is scheduled, with the message `AIFunctionFactory` gives, so the model reads `Error: Function failed.` and can call again. Tool results cross the Activity boundary as the JSON the provider client would have sent: a string as is, an `AIContent` with its type, any other object as camel-cased JSON, and `FunctionResultContent.Result` in the response messages holds that JSON.
 
 Tool arguments and results travel inside the model Activity's input, so a tool result of several megabytes belongs in a blob store with a reference in the result.
 

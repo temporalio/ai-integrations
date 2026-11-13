@@ -141,6 +141,35 @@ internal static class ChatOptionsTransport
         return options;
     }
 
+    /// <summary>
+    /// Turns the tool results the Workflow serialized with <c>AIJsonUtilities</c> back into
+    /// <see cref="AIContent"/> objects, so the provider client applies its own handling of text,
+    /// image and file results. Runs on the worker; anything else stays as it arrived.
+    /// </summary>
+    /// <param name="messages">The Activity input's messages; changed in place.</param>
+    public static void RehydrateToolResults(IEnumerable<ChatMessage> messages)
+    {
+        foreach (var result in messages.SelectMany(message => message.Contents).OfType<FunctionResultContent>())
+        {
+            try
+            {
+                result.Result = result.Result switch
+                {
+                    JsonElement { ValueKind: JsonValueKind.Object } element when element.TryGetProperty("$type", out _) =>
+                        element.Deserialize(AIJsonUtilities.DefaultOptions.GetTypeInfo(typeof(AIContent))) ?? result.Result,
+                    JsonElement { ValueKind: JsonValueKind.Array } element when element.GetArrayLength() > 0 &&
+                        element.EnumerateArray().All(item => item.ValueKind == JsonValueKind.Object && item.TryGetProperty("$type", out _)) =>
+                        element.Deserialize(AIJsonUtilities.DefaultOptions.GetTypeInfo(typeof(IList<AIContent>))) ?? result.Result,
+                    _ => result.Result,
+                };
+            }
+            catch (JsonException)
+            {
+                // A $type this version of Microsoft.Extensions.AI does not know stays JSON; the model reads the text either way.
+            }
+        }
+    }
+
     /// <summary>Turns a JSON primitive back into the CLR value a provider client checks for; other kinds stay <see cref="JsonElement"/>.</summary>
     /// <param name="element">The element.</param>
     /// <returns>The value.</returns>

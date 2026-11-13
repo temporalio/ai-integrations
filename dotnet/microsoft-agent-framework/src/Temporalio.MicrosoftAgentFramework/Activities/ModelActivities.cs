@@ -60,6 +60,7 @@ public sealed class ModelActivities
         var context = ActivityExecutionContext.Current;
         var client = ResolveClient(input.Model, context.Logger);
         var options = ChatOptionsTransport.Rebuild(input, hostedMcpServerHeaders);
+        ChatOptionsTransport.RehydrateToolResults(input.Messages);
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(context.CancellationToken);
         var pump = HeartbeatAsync(context, stop.Token);
         try
