@@ -19,6 +19,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.converter import DataConverter, DefaultPayloadConverter
 from temporalio.exceptions import ApplicationError
 from temporalio.microsoft_agent_framework._activities import (
+    MCP_CLIENT_FACTORY_ERROR_TYPE,
     ChatClientActivities,
     ChatClientFactory,
 )
@@ -173,14 +174,25 @@ def _mcp_client_factory(
     import mcp
 
     def create() -> Client:
-        client = factory()
+        # A factory that cannot build its client fails the same way on every
+        # attempt; fail the Activity now instead of retrying without limit.
+        try:
+            client = factory()
+        except Exception as err:
+            raise ApplicationError(
+                f"The MCP client factory for {server!r} raised "
+                f"{type(err).__name__}: {err}",
+                type=MCP_CLIENT_FACTORY_ERROR_TYPE,
+                non_retryable=True,
+            ) from err
         if not isinstance(client, mcp.Client):
-            # Retryable, so a run waits for the worker to be fixed instead of failing.
             kind = type(client)
             raise ApplicationError(
-                f"MCP server factory {server!r} returned "
+                f"The MCP client factory for {server!r} returned "
                 f"{kind.__module__}.{kind.__qualname__}, not mcp.Client; "
-                "mcp_clients factories must return an mcp.Client"
+                "mcp_clients factories must return an mcp.Client",
+                type=MCP_CLIENT_FACTORY_ERROR_TYPE,
+                non_retryable=True,
             )
         return client
 

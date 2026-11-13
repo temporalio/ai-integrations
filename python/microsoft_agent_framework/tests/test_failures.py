@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from typing import Any
 
 import pytest
@@ -94,6 +95,20 @@ def test_retry_hints() -> None:
     )
     assert forced_on is not None and not forced_on.non_retryable
     assert classify_provider_error(ConnectionError("reset")) is None
+    # The HTTP-date form of Retry-After becomes the delay until that time.
+    future = format_datetime(
+        datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True
+    )
+    dated = classify_provider_error(_wrapped(StatusError(503, {"Retry-After": future})))
+    assert dated is not None and dated.next_retry_delay is not None
+    assert timedelta(seconds=20) < dated.next_retry_delay <= timedelta(seconds=30)
+    past = format_datetime(
+        datetime.now(timezone.utc) - timedelta(seconds=30), usegmt=True
+    )
+    stale = classify_provider_error(_wrapped(StatusError(503, {"Retry-After": past})))
+    assert stale is not None and stale.next_retry_delay is None
+    junk = classify_provider_error(_wrapped(StatusError(503, {"Retry-After": "soon"})))
+    assert junk is not None and junk.next_retry_delay is None
 
 
 @pytest.mark.parametrize("streaming", [False, True], ids=["invoke", "streaming"])

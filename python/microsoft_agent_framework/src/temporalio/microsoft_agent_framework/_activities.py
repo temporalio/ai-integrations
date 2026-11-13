@@ -6,7 +6,8 @@ import asyncio
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from functools import wraps
 from typing import Any, TypeVar, cast
 
@@ -25,7 +26,9 @@ STREAM_ERROR_TYPE = "microsoft_agent_framework.StreamError"
 UNKNOWN_CHAT_CLIENT_TYPE = "MicrosoftAgentFrameworkUnknownChatClient"
 """``ApplicationError.type`` of a call for a model name the worker does not know."""
 CHAT_CLIENT_FACTORY_ERROR_TYPE = "MicrosoftAgentFrameworkChatClientFactoryError"
-"""``ApplicationError.type`` of a call whose chat client factory raised."""
+"""``ApplicationError.type`` of a call whose chat client factory raised or returned ``None``."""
+MCP_CLIENT_FACTORY_ERROR_TYPE = "MicrosoftAgentFrameworkMCPClientFactoryError"
+"""``ApplicationError.type`` of an MCP Activity whose client factory raised or returned no ``mcp.Client``."""
 """``ApplicationError.type`` of a call for a model name the worker does not know."""
 
 ChatClientFactory = Callable[[], SupportsChatGetResponse[Any]]
@@ -119,10 +122,23 @@ def _retry_after(headers: Mapping[str, str]) -> timedelta | None:
         if "retry-after-ms" in headers:
             return timedelta(milliseconds=int(headers["retry-after-ms"]))
         if "retry-after" in headers:
-            return timedelta(seconds=int(headers["retry-after"]))
-    except ValueError:
+            return _retry_after_delay(headers["retry-after"])
+    except (TypeError, ValueError):
         return None
     return None
+
+
+def _retry_after_delay(value: str) -> timedelta | None:
+    """Read ``Retry-After`` in either of its forms: seconds, or an HTTP-date."""
+    value = value.strip()
+    if value.isdigit():
+        return timedelta(seconds=int(value))
+    when = parsedate_to_datetime(value)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delay = when - datetime.now(timezone.utc)
+    # A date already past means "now"; the retry policy's own backoff covers it.
+    return delay if delay > timedelta(0) else None
 
 
 def classify_provider_error(exc: Exception) -> ApplicationError | None:
@@ -252,7 +268,8 @@ class ChatClientActivities:
                 non_retryable=True,
             )
         try:
-            client = factory()
+            # Typed as Any: a factory can return None, which is checked below.
+            built: Any = factory()
         except Exception as err:
             # A factory that cannot build its client (a missing API key, a bad
             # endpoint) fails the same way on every attempt; fail the run now
@@ -266,6 +283,14 @@ class ChatClientActivities:
                 type=CHAT_CLIENT_FACTORY_ERROR_TYPE,
                 non_retryable=True,
             ) from err
+        if built is None:
+            raise ApplicationError(
+                f"The chat client factory for {model!r} returned None instead of a "
+                "chat client.",
+                type=CHAT_CLIENT_FACTORY_ERROR_TYPE,
+                non_retryable=True,
+            )
+        client = built
         self._clients[model] = client
         retries = _max_retries(client)
         if retries > 0:
@@ -322,8 +347,11 @@ class ChatClientActivities:
             await consume(None)
             return recorder.updates
 
+        # A batch goes out on the interval or at 256 updates, whichever comes
+        # first, so a burst of token deltas stays under the payload limit.
         stream = WorkflowStreamClient.from_within_activity(
-            batch_interval=timedelta(seconds=input.streaming_batch_interval_seconds)
+            batch_interval=timedelta(seconds=input.streaming_batch_interval_seconds),
+            max_batch_size=256,
         )
         topic = stream.topic(input.streaming_topic)
         # The stream's exit sends the last batch and raises the error of a

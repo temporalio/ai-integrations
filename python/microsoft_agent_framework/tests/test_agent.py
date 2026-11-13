@@ -507,3 +507,28 @@ async def test_non_json_client_kwarg_fails_workflow(client: Client) -> None:
     assert cause.type == "MicrosoftAgentFrameworkWorkflowError"
     assert "client_kwargs" in cause.message
     assert await count_scheduled_activities(handle) == {}
+
+
+async def test_chat_client_factory_returns_none(client: Client) -> None:
+    def empty_factory() -> Any:
+        return None
+
+    plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"model": empty_factory})
+    async with new_worker(client, ToolLoopWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            ToolLoopWorkflow.run,
+            RunInput(),
+            id=workflow_id("factory-none"),
+            task_queue=worker.task_queue,
+        )
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+    cause = excinfo.value.cause
+    assert isinstance(cause, ActivityError)
+    failure = cause.__cause__
+    assert isinstance(failure, ApplicationError)
+    assert failure.type == "MicrosoftAgentFrameworkChatClientFactoryError"
+    assert failure.non_retryable
+    assert "'model'" in failure.message and "None" in failure.message
+    (started,) = await started_activities(handle)
+    assert started.attempt == 1

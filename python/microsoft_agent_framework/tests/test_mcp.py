@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -9,11 +10,12 @@ from typing import Any
 import pytest
 from agent_framework import Agent, tool
 from mcp import Client as MCPClient
+from mcp import StdioServerParameters, stdio_client
 
 from temporalio import workflow
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.microsoft_agent_framework import (
     MicrosoftAgentFrameworkPlugin,
     TemporalChatClient,
@@ -258,10 +260,16 @@ async def test_mcp_error_result_becomes_tool_error(client: Client) -> None:
 async def test_mcp_retry_then_tool_error(client: Client) -> None:
     connections: list[int] = []
 
+    # After the first connection the server is gone: the next client's
+    # process exits at once, so connecting fails and temporalio-mcp retries.
+    dead = StdioServerParameters(
+        command=sys.executable, args=["-c", "import sys; sys.exit(3)"]
+    )
+
     def flaky() -> MCPClient:
         connections.append(len(connections) + 1)
         if len(connections) > 1:
-            raise ConnectionError("MCP server is down")
+            return MCPClient(stdio_client(dead))
         return MCPClient(server)
 
     plugin = MicrosoftAgentFrameworkPlugin(
@@ -318,3 +326,36 @@ def test_provider_requires_mcp_extra(monkeypatch: pytest.MonkeyPatch) -> None:
         RuntimeError, match=r"temporalio-microsoft-agent-framework\[mcp\]"
     ):
         MicrosoftAgentFrameworkPlugin(mcp_clients={"echo": lambda: MCPClient(server)})
+
+
+@pytest.mark.parametrize("kind", ["raises", "wrong_type"])
+async def test_mcp_factory_failure_fails_once(client: Client, kind: str) -> None:
+    def factory() -> Any:
+        if kind == "raises":
+            raise KeyError("MCP_TOKEN")
+        return object()
+
+    plugin = MicrosoftAgentFrameworkPlugin(
+        chat_clients={"model": fake_chat_client(["unused"])},
+        mcp_clients={"echo": factory},
+    )
+    async with new_worker(client, MCPWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            MCPWorkflow.run,
+            MCPInput(),
+            id=workflow_id("mcp-factory"),
+            task_queue=worker.task_queue,
+        )
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+    cause = excinfo.value.cause
+    assert isinstance(cause, ActivityError)
+    failure = cause.__cause__
+    assert isinstance(failure, ApplicationError)
+    # The listing fails once, before any model call, instead of retrying forever.
+    assert failure.type == "MicrosoftAgentFrameworkMCPClientFactoryError"
+    assert failure.non_retryable
+    assert "'echo'" in failure.message
+    assert await count_scheduled_activities(handle) == {LIST_TOOLS: 1}
+    (started,) = await started_activities(handle)
+    assert started.attempt == 1
