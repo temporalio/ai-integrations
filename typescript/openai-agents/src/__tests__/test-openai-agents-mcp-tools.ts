@@ -12,6 +12,7 @@ import {
 } from '..';
 import {
   mcpFactoryArgWorkflow,
+  mcpFactoryValidationWorkflow,
   mcpToolFilterResumeWorkflow,
   mcpToolFilterWorkflow,
   mcpToolMetaWorkflow,
@@ -175,6 +176,57 @@ test('a callable toolFilter on the factory server fails the run', async (t) => {
       t.is((err?.cause?.cause as ApplicationFailure | undefined)?.type, TOOL_FILTER_UNSUPPORTED_TYPE);
     }
   });
+});
+
+test('an invalid factory server fails stateless and stateful Activities without retries', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const factoryCalls = { stateless: 0, stateful: 0 };
+  let connects = 0;
+  let closes = 0;
+  const invalidServer = {
+    async connect() {
+      connects++;
+    },
+    async close() {
+      closes++;
+    },
+  } as MCPServer;
+  const worker = await createWorker({
+    plugins: [
+      new OpenAIAgentsPlugin({
+        modelProvider: new FakeModelProvider([]),
+        mcpServerProviders: [
+          new StatelessMCPServerProvider('factoryStateless', () => {
+            factoryCalls.stateless++;
+            return invalidServer;
+          }),
+          new StatefulMCPServerProvider(
+            'factoryStateful',
+            () => {
+              factoryCalls.stateful++;
+              return invalidServer;
+            },
+            t.context.env.nativeConnection
+          ),
+        ],
+      }),
+    ],
+  });
+  await worker.runUntil(async () => {
+    for (const activityName of ['factoryStateless-stateless-list-tools', 'factoryStateful-stateful-server-session']) {
+      const handle = await startWorkflow(mcpFactoryValidationWorkflow, {
+        args: [activityName],
+        workflowExecutionTimeout: '15 seconds',
+      });
+      const err = await t.throwsAsync(handle.result(), { instanceOf: WorkflowFailedError });
+      const failure = err?.cause?.cause as ApplicationFailure | undefined;
+      t.is(failure?.type, 'MCPServerFactoryTypeError');
+      t.true(failure?.nonRetryable);
+    }
+  });
+  t.deepEqual(factoryCalls, { stateless: 1, stateful: 1 });
+  t.is(connects, 0);
+  t.is(closes, 0);
 });
 
 test('a tool filter that throws while resuming from a RunState fails the run', async (t) => {

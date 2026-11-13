@@ -9,7 +9,7 @@ import { runHeaders, runTreeFromContext } from '../run-tree';
 import { bindReplicaCredentials } from '../routing';
 import { HEADER_KEY } from '../propagation';
 import * as activities from './activities/routing';
-import { InMemoryRunCollector, useSharedEnv, withTracingWorker } from './helpers';
+import { idPath, InMemoryRunCollector, useSharedEnv, withTracingWorker } from './helpers';
 import { comprehensiveNexusServiceHandler } from './stubs/nexus';
 import { ROUTING_ADDRESS, ROUTING_ENDPOINT, RoutingWorkflow } from './workflows/routing';
 
@@ -43,7 +43,7 @@ test('headers preserve addresses and replica routing without credentials', (t) =
     start_time: time,
     address: ROUTING_ADDRESS,
     client: collector.asClient(),
-    extra: { metadata: { team: 'sdk', api_key: 'metadata-secret' } },
+    extra: { metadata: { team: 'sdk', api_key: 'run-metadata' } },
     replicas: [{
       address: SECONDARY_ADDRESS,
       primary: true,
@@ -60,9 +60,11 @@ test('headers preserve addresses and replica routing without credentials', (t) =
   const headers = runHeaders(parent)!;
   const encoded = decodeURIComponent(headers.baggage);
   t.true(encoded.includes('"address":"lrn:agents/support/environments/production"'));
-  for (const secret of ['metadata-secret', 'replica-secret', 'private-ingestion', 'private-workspace', 'nested-secret']) {
+  for (const secret of ['replica-secret', 'private-ingestion', 'private-workspace', 'nested-secret']) {
     t.false(encoded.includes(secret));
   }
+  // Run metadata travels unchanged, as LangSmith's own headers carry it.
+  t.true(encoded.includes('"api_key":"run-metadata"'));
   t.false(encoded.includes('untrusted-id'));
   t.false(encoded.includes('untrusted-destination'));
   const before = Date.now();
@@ -229,7 +231,7 @@ for (const addTemporalRuns of [false, true]) {
           for (const run of collector.records.filter((item) => item.parent_run_id)) {
             const parent = collector.byId.get(run.parent_run_id!);
             t.truthy(parent, `${run.name} has a real parent`);
-            t.true(run.dotted_order!.startsWith(`${parent!.dotted_order}.`));
+            t.deepEqual(idPath(run.dotted_order!), [...idPath(parent!.dotted_order!), run.id]);
           }
         },
       });

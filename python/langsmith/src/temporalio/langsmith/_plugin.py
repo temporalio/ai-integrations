@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import importlib.metadata
 from collections.abc import AsyncGenerator
@@ -95,7 +96,10 @@ class LangSmithPlugin(SimplePlugin):
             try:
                 yield
             finally:
-                interceptor._client.flush()
+                # Queued on the write thread, so it runs after every pending write.
+                await asyncio.wrap_future(
+                    interceptor._executor.submit(interceptor._client.flush)
+                )
 
         super().__init__(
             "langchain.LangSmithPlugin",
