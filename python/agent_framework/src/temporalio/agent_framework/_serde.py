@@ -110,12 +110,15 @@ class StreamRecorder:
     invocation layer, which sees every tool as declaration-only, follows each
     function call with a marked copy of it (the framework's pause for caller
     input); the copy repeats a call already streamed, so it is dropped. Text
-    arrives one token per update, and a long answer would put megabytes of
-    update envelopes into history, so adjacent text-only updates that share
-    their envelope are merged into one entry, which is how
-    ``ChatResponse.from_updates`` merges them anyway. ``add`` returns the
-    serialized update to publish, before merging, or ``None`` for a dropped
-    copy.
+    and tool-call arguments arrive one token per update, and a long answer or
+    a large argument would put megabytes of update envelopes into history, so
+    adjacent text-only updates that share their envelope are merged into one
+    entry, and so are adjacent ``merge_mode="append"`` argument deltas of one
+    call (matched by ``call_id``, or by the provider's ``tool_call_index`` when
+    a continuation chunk carries no id). A ``replace`` update with the full
+    arguments stays its own entry. ``ChatResponse.from_updates`` rebuilds the
+    same response either way. ``add`` returns the serialized update to publish,
+    before merging, or ``None`` for a dropped copy.
     """
 
     def __init__(self) -> None:
@@ -132,20 +135,23 @@ class StreamRecorder:
                 self._streamed_calls.add(content.call_id)
         serialized = dump_update(update)
         previous = self.updates[-1] if self.updates else None
-        if not _mergeable_text(serialized):
-            self.updates.append(serialized)
-        elif (
-            previous is not None
-            and _mergeable_text(previous)
-            and same_envelope(previous, serialized)
-        ):
-            previous["contents"][0]["text"] += serialized["contents"][0]["text"]
-        else:
+        delta = _argument_delta(serialized)
+        if previous is not None and same_envelope(previous, serialized):
+            if _mergeable_text(serialized) and _mergeable_text(previous):
+                previous["contents"][0]["text"] += serialized["contents"][0]["text"]
+                return serialized
+            earlier = _argument_delta(previous)
+            if delta is not None and earlier is not None and _same_call(earlier, delta):
+                earlier["arguments"] += delta["arguments"]
+                return serialized
+        if _mergeable_text(serialized) or delta is not None:
             # The caller publishes ``serialized`` as is; the record gets its own
-            # copy, which later text may be merged into.
+            # copy, which later deltas may be merged into.
             self.updates.append(
                 {**serialized, "contents": [dict(c) for c in serialized["contents"]]}
             )
+        else:
+            self.updates.append(serialized)
         return serialized
 
     def _is_pause_copy(self, update: ChatResponseUpdate) -> bool:
@@ -173,6 +179,34 @@ def _mergeable_text(update: dict[str, Any]) -> bool:
         and isinstance(content.get("text"), str)
         and set(content) <= _TEXT_CONTENT_KEYS
         and not content.get("additional_properties")
+    )
+
+
+def _argument_delta(update: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the content of a single append-mode tool-call argument delta, or ``None``."""
+    contents = update.get("contents") or []
+    if len(contents) != 1 or update.get("finish_reason") is not None:
+        return None
+    (content,) = contents
+    if (
+        content.get("type") == "function_call"
+        and content.get("merge_mode") == "append"
+        and isinstance(content.get("arguments"), str)
+    ):
+        return content
+    return None
+
+
+def _same_call(earlier: dict[str, Any], delta: dict[str, Any]) -> bool:
+    """Whether ``delta`` continues the call ``earlier`` started."""
+    call_id = delta.get("call_id")
+    if call_id:
+        return earlier.get("call_id") == call_id
+    # The Chat Completions client leaves the id off continuation chunks and
+    # numbers the call instead.
+    index = (delta.get("additional_properties") or {}).get("tool_call_index")
+    return index is not None and (
+        (earlier.get("additional_properties") or {}).get("tool_call_index") == index
     )
 
 
