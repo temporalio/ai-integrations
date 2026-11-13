@@ -24,12 +24,21 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/release-dotn
 
 @pytest.mark.parametrize("version", [
     "0.0.1rc1", "01.0.0", "1.0.0+build", "1.0.0.0", "0.0.1-rc.01", "v0.0.1", "0.1", "0.1.0-", "0.1.0\n", " 0.1.0", "0.1.0 ",
+    "0.0.1-RC.1", "0.0.1-Rc.1", "0.0.1-rc.1+SHA",
 ])
 def test_nuget_rejects_noncanonical_versions(version: str) -> None:
     with pytest.raises(nuget_release.NuGetReleaseError, match="NuGet version"):
         nuget_release.NuGetVersion(version)
     with pytest.raises(release_tool.PolicyError):
         release_tool.parse_tag(f"dotnet/agent-framework/v{version}")
+
+
+def test_uppercase_labels_never_reach_nuget_org() -> None:
+    # nuget.org would serve 0.0.1-rc.1 for an uploaded 0.0.1-RC.1 and the flat container membership test would
+    # never succeed; rejecting the tag keeps the policy and the verification in one case.
+    with pytest.raises(nuget_release.NuGetReleaseError, match="must be lowercase"):
+        nuget_release.NuGetVersion("0.0.1-RC.1")
+    assert nuget_release.NuGetVersion("0.0.1-rc.1") in [nuget_release.NuGetVersion("0.0.1-rc.1")]
 
 
 def test_dotnet_tags_parse_with_the_prerelease_flag() -> None:
