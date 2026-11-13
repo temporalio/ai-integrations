@@ -387,14 +387,21 @@ gallery.
 1. Configure the shared GitHub environment `nuget` to accept only `dotnet/*/v*`
    tags, with the environment variable `NUGET_USER` set to the nuget.org profile
    name that owns the trusted publishing policy, and include the pattern in the
-   immutable release-tag ruleset. On nuget.org, the account that owns the
-   `Temporalio.` prefix registers one trusted publishing policy for repository
-   owner `temporalio`, repository `ai-integrations`, workflow file
-   `release-dotnet.yml`, environment `nuget`, scoped to push new packages and
-   versions matching `Temporalio.*`. The policy covers coordinates that do not
-   exist yet, so no interactive first publish is needed. Reuse the profile that
-   sdk-dotnet's `nugetprod` environment uses, confirmed with the SDK team; the
-   policy deactivates if that profile leaves the organization. No stored tokens.
+   "Release tags" ruleset. Neither of those limits what a tag can publish: the
+   ruleset only makes tags immutable (update, deletion and non-fast-forward rules,
+   no creation restriction, no bypass actors), and the `nuget` environment has no
+   reviewers, like `pypi`, `testpypi` and `npm`. The limit is the nuget.org policy
+   itself. The account that owns the `Temporalio.` prefix registers one trusted
+   publishing policy per .NET plugin, for repository owner `temporalio`, repository
+   `ai-integrations`, workflow file `release-dotnet.yml`, environment `nuget`,
+   scoped to push new versions of the exact package id
+   (`Temporalio.MicrosoftAgentFramework` today; the SDK team adds one per new
+   package). A policy on `Temporalio.*` would also cover the SDK's own packages,
+   such as `Temporalio.Extensions.WorkflowStreams`, which this repository must
+   never be able to publish. An exact id covers a package that does not exist yet,
+   so no interactive first publish is needed. Reuse the profile that sdk-dotnet's
+   `nugetprod` environment uses, confirmed with the SDK team; the policy
+   deactivates if that profile leaves the organization. No stored tokens.
 2. Merge release changes to main. Dry-run with
    `gh workflow run release-dotnet.yml --ref main -f tag=dotnet/<name>/v<version>`.
    The full channel/platform matrix tests the injected version at one pinned
