@@ -229,6 +229,13 @@ class TemporalAsyncClient(AsyncClient):
                 When not provided, every operation (model calls, files,
                 interactions, managed agents) defaults to a 60-second
                 ``start_to_close_timeout`` and Temporal's default retry policy.
+                ``heartbeat_timeout`` defaults to 10 seconds, also in a config
+                that leaves it out. These activities heartbeat on a timer at
+                half of it, so a cancel reaches a running call, and a lost
+                worker is noticed, within about 10 seconds. In Temporal Cloud
+                each heartbeat that reaches the service is an Action; a call
+                shorter than 5 seconds sends none. Set ``heartbeat_timeout`` to
+                ``None`` to turn heartbeats off.
             streaming_topic: When set, ``generate_content_stream`` publishes each
                 streamed ``GenerateContentResponse`` to this
                 :class:`temporalio.contrib.workflow_streams.WorkflowStream`

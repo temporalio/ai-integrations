@@ -257,6 +257,17 @@ raises `GoogleGenAIError`. Tune flush cadence with
 `TemporalAsyncClient(streaming_topic=..., streaming_batch_interval=...)`
 (default 100ms).
 
+## Heartbeats
+
+The Gemini activities (all but `activity_as_tool` and MCP) heartbeat on a timer
+at half their `heartbeat_timeout`, which defaults to 10 seconds, also in an
+`activity_config` that leaves it out. So a cancel reaches a running call, and a
+lost worker is noticed, within about 10 seconds. Streams heartbeat on the same
+timer, not per chunk. In Temporal Cloud each heartbeat that reaches the service
+is an Action: at most one every 8 seconds of a running call, and none for a call
+shorter than 5 seconds. Set `heartbeat_timeout` to `None` in `activity_config`
+to turn heartbeats off.
+
 ## Retries & errors
 
 Temporal owns retries. Configure them with the activity `retry_policy` via

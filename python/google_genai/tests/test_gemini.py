@@ -21,6 +21,7 @@ Tests cover:
 - Error classification: permanent 4xx fails fast, transient statuses stay retryable
 """
 
+import asyncio
 import base64
 import functools
 import importlib.metadata
@@ -28,10 +29,11 @@ import inspect
 import io
 import json
 import threading
+import time
 import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Callable, NamedTuple, cast
@@ -643,6 +645,23 @@ class HttpOptionsWorkflow:
         return response.text or ""
 
 
+# FullIntegrationWorkflow's TemporalAsyncClient activity_config, by name.
+_FULL_INTEGRATION_CONFIGS: dict[str, ActivityConfig | None] = {
+    "none": None,
+    "no-heartbeat-timeout": ActivityConfig(
+        start_to_close_timeout=timedelta(seconds=60)
+    ),
+    "heartbeat-off": ActivityConfig(
+        start_to_close_timeout=timedelta(seconds=60), heartbeat_timeout=None
+    ),
+    "heartbeat-1s": ActivityConfig(
+        start_to_close_timeout=timedelta(seconds=60),
+        heartbeat_timeout=timedelta(seconds=1),
+        retry_policy=RetryPolicy(maximum_attempts=1),
+    ),
+}
+
+
 @workflow.defn
 class FullIntegrationWorkflow:
     """Exercises every activity path in a single workflow run.
@@ -653,8 +672,10 @@ class FullIntegrationWorkflow:
     """
 
     @workflow.run
-    async def run(self, prompt: str) -> dict[str, Any]:
-        client = TemporalAsyncClient()
+    async def run(self, prompt: str, activity_config: str = "none") -> dict[str, Any]:
+        client = TemporalAsyncClient(
+            activity_config=_FULL_INTEGRATION_CONFIGS[activity_config]
+        )
         results: dict[str, Any] = {}
 
         # 1. generate_content (async_request activity)
@@ -1449,13 +1470,28 @@ class _FakeAsyncStream:
 # ===========================================================================
 
 
-def _apply_plugin_with_mock_client(client: Client, mock_responses: list[str]) -> Client:
+def _apply_plugin_with_mock_client(
+    client: Client, mock_responses: list[str], model_call_seconds: float = 0
+) -> Client:
     """Create a real GoogleGenAIPlugin with real activities but a mocked client.
 
     Unlike ``apply_plugin``, this does NOT replace the activities.  The
     real ``GeminiApiCaller.activities()`` are registered, exercising the
-    full activity code path.  The underlying ``genai.Client`` HTTP layer
-    and high-level file methods are mocked so no network calls are made.
+    full activity code path.
+    """
+    plugin = GoogleGenAIPlugin(_mock_gemini_client(mock_responses, model_call_seconds))
+    config = client.config()
+    config["plugins"] = [plugin]
+    return Client(**config)
+
+
+def _mock_gemini_client(
+    mock_responses: list[str], model_call_seconds: float = 0
+) -> GeminiClient:
+    """Build a ``genai.Client`` whose HTTP layer and file methods are mocked.
+
+    No network calls are made. Each non-streamed API call takes
+    ``model_call_seconds``.
     """
     gemini = GeminiClient(api_key="fake-test-key")
 
@@ -1469,6 +1505,7 @@ def _apply_plugin_with_mock_client(client: Client, mock_responses: list[str]) ->
                 f"No more mock responses (called {idx + 1} times, "
                 f"have {len(mock_responses)})"
             )
+        await asyncio.sleep(model_call_seconds)
         return SdkHttpResponse(
             headers={"content-type": "application/json"},
             body=mock_responses[idx],
@@ -1532,19 +1569,34 @@ def _apply_plugin_with_mock_client(client: Client, mock_responses: list[str]) ->
     # mocks instead of the network.
     gemini.aio._interactions = mock_interactions  # type: ignore[assignment]
     gemini.aio._agents = mock_agents  # type: ignore[assignment]
-
-    plugin = GoogleGenAIPlugin(gemini)
-    config = client.config()
-    config["plugins"] = [plugin]
-    return Client(**config)
+    return gemini
 
 
-async def test_full_integration_with_mock_client(client: Client):
+@pytest.mark.parametrize(
+    ("activity_config", "model_call_seconds", "heartbeat_timeout"),
+    [
+        ("none", 0, timedelta(seconds=10)),
+        ("no-heartbeat-timeout", 0, timedelta(seconds=10)),
+        ("heartbeat-off", 0, None),
+        ("heartbeat-1s", 1.5, timedelta(seconds=1)),
+    ],
+    ids=["none", "no-heartbeat-timeout", "heartbeat-off", "heartbeat-1s"],
+)
+async def test_full_integration_with_mock_client(
+    client: Client,
+    activity_config: str,
+    model_call_seconds: float,
+    heartbeat_timeout: timedelta | None,
+):
     """Run a workflow through real activities with a mocked genai.Client.
 
     This is the only test that exercises the actual activity implementations
     in _gemini_activity.py.  Every other test uses the GeminiApiCallTracker
     which replaces the activities entirely.
+
+    Every activity gets a 10-second heartbeat timeout unless the
+    activity_config sets one, even to None. "heartbeat-1s" passes only if the
+    activities heartbeat: its API calls take 1.5 seconds and it doesn't retry.
     """
     # Mock responses are consumed in order by the async_request and
     # async_request_streamed mocks.  Steps 3-5 (file upload, download,
@@ -1558,16 +1610,25 @@ async def test_full_integration_with_mock_client(client: Client):
             make_text_response("Grounded RAG answer"),  # RAG query with file_search
             make_text_response(""),  # file_search_stores.delete
         ],
+        model_call_seconds,
     )
 
     async with new_worker(new_client, FullIntegrationWorkflow) as worker:
-        result = await new_client.execute_workflow(
+        handle = await new_client.start_workflow(
             FullIntegrationWorkflow.run,
-            "test prompt",
+            args=["test prompt", activity_config],
             id=f"gemini-full-integration-{uuid.uuid4()}",
             task_queue=worker.task_queue,
         )
+        result = await handle.result()
 
+    heartbeat_timeouts = [
+        e.activity_task_scheduled_event_attributes.heartbeat_timeout.ToTimedelta()
+        or None
+        async for e in handle.fetch_history_events()
+        if e.HasField("activity_task_scheduled_event_attributes")
+    ]
+    assert heartbeat_timeouts == [heartbeat_timeout] * 10
     assert result["generate"] == "Real activity response"
     assert len(result["stream_chunks"]) > 0
     assert "Streamed" in " ".join(result["stream_chunks"])
@@ -2210,9 +2271,12 @@ def test_classify_status_error_ignores_errors_without_an_error_status(
 
 
 class _FakeGeminiHttpServer:
-    """Local HTTP server that answers every request with one error status."""
+    """Local HTTP server that answers every request with one error status.
 
-    def __init__(self, status: int) -> None:
+    Each answer takes ``seconds``.
+    """
+
+    def __init__(self, status: int, seconds: float = 0) -> None:
         self.hits: list[str] = []
         hits = self.hits
         body = json.dumps(
@@ -2225,6 +2289,7 @@ class _FakeGeminiHttpServer:
                 if length:
                     self.rfile.read(length)
                 hits.append(f"{self.command} {self.path}")
+                time.sleep(seconds)
                 self.send_response(status)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(body)))
@@ -2249,10 +2314,13 @@ class _FakeGeminiHttpServer:
 
 @contextmanager
 def _gemini_client_failing_with(
-    status: int,
+    status: int, seconds: float = 0
 ) -> Generator[tuple[GeminiClient, list[str]], None, None]:
-    """Yield a real ``genai.Client`` whose every HTTP request answers ``status``."""
-    server = _FakeGeminiHttpServer(status)
+    """Yield a real ``genai.Client`` whose every HTTP request answers ``status``.
+
+    Each answer takes ``seconds``.
+    """
+    server = _FakeGeminiHttpServer(status, seconds)
     server.start()
     try:
         yield (
@@ -2306,8 +2374,11 @@ _DIRECT_CALL_ACTIVITIES: list[tuple[str, Any]] = [
 
 
 async def _run_real_activity(
-    gemini: GeminiClient, activity_name: str, req: Any
-) -> None:
+    gemini: GeminiClient,
+    activity_name: str,
+    req: Any,
+    env: ActivityEnvironment | None = None,
+) -> Any:
     """Run one real ``GeminiApiCaller`` activity against ``gemini``."""
     from google.auth.credentials import Credentials
 
@@ -2319,7 +2390,77 @@ async def _run_real_activity(
 
     caller = GeminiApiCaller(gemini, credentials=StaticCredentials())
     fn = next(a for a in caller.activities() if a.__name__ == activity_name)
-    await ActivityEnvironment().run(fn, req)
+    return await (env or ActivityEnvironment()).run(fn, req)
+
+
+def _heartbeat_counting_env(
+    heartbeat_timeout: timedelta,
+) -> tuple[ActivityEnvironment, list[Any]]:
+    """Return an ``ActivityEnvironment`` and the list its heartbeats go to."""
+    env = ActivityEnvironment()
+    env.info = replace(env.info, heartbeat_timeout=heartbeat_timeout)
+    heartbeats: list[Any] = []
+    env.on_heartbeat = lambda *details: heartbeats.append(details)
+    return env, heartbeats
+
+
+_API_REQ = _GeminiApiRequest(
+    http_method="post",
+    path="models/gemini-2.5-flash:generateContent",
+    request_dict={},
+)
+_ALL_ACTIVITIES: list[tuple[str, Any]] = [
+    ("gemini_api_client_async_request", _API_REQ),
+    ("gemini_api_client_async_request_streamed", _API_REQ),
+    *_DIRECT_CALL_ACTIVITIES,
+]
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_timeout", "server_seconds", "heartbeats"),
+    [
+        (timedelta(milliseconds=200), 0.5, True),
+        (timedelta(seconds=10), 0, False),
+    ],
+    ids=["slow-call", "short-call"],
+)
+@pytest.mark.parametrize(
+    ("activity_name", "req"),
+    _ALL_ACTIVITIES,
+    ids=[name for name, _ in _ALL_ACTIVITIES],
+)
+async def test_activity_heartbeats_on_a_timer(
+    activity_name: str,
+    req: Any,
+    heartbeat_timeout: timedelta,
+    server_seconds: float,
+    heartbeats: bool,
+):
+    """Every activity heartbeats on a timer at half the heartbeat timeout.
+
+    The first beat waits that long, so a short call sends none. The fake server
+    answers 400 after ``server_seconds``; only the heartbeats matter here.
+    """
+    env, sent = _heartbeat_counting_env(heartbeat_timeout)
+    with _gemini_client_failing_with(400, server_seconds) as (gemini, _hits):
+        with pytest.raises(ApplicationError):
+            await _run_real_activity(gemini, activity_name, req, env)
+
+    assert bool(sent) == heartbeats
+
+
+async def test_interaction_stream_does_not_heartbeat_per_event():
+    """A stream heartbeats on the timer only, not once per event."""
+    env, sent = _heartbeat_counting_env(timedelta(seconds=10))
+    result = await _run_real_activity(
+        _mock_gemini_client([]),
+        "gemini_interactions_create_streamed",
+        _INTERACTION_REQ,
+        env,
+    )
+
+    assert len(result.events) == 4
+    assert sent == []
 
 
 @pytest.mark.parametrize(

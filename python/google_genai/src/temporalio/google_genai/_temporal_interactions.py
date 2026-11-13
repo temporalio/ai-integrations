@@ -29,6 +29,7 @@ from temporalio.google_genai._models import (
     _GeminiInteractionRequest,
     _GeminiInteractionStreamedResponse,
 )
+from temporalio.google_genai._temporal_api_client import _with_default_heartbeat
 from temporalio.workflow import ActivityConfig
 
 _DEFAULT_INTERACTION_TIMEOUT = timedelta(seconds=60)
@@ -133,7 +134,7 @@ class TemporalAsyncInteractions:
         activity_config: ActivityConfig | None = None,
     ) -> None:
         """Initialize with activity config for interaction operation timeouts."""
-        self._activity_config = (
+        self._activity_config = _with_default_heartbeat(
             ActivityConfig(start_to_close_timeout=_DEFAULT_INTERACTION_TIMEOUT)
             if activity_config is None
             else activity_config
