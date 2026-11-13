@@ -409,19 +409,26 @@ gallery.
 4. Publish the reviewed draft with
    `gh release edit dotnet/<name>/v<version> --draft=false`. GitHub creates the
    tag on the tested commit and starts the workflow. After the full matrix
-   succeeds, the inline OIDC job requests a one-hour API key, pushes the tested
-   `.nupkg` and `.snupkg` with `--skip-duplicate`, waits up to 30 minutes for
-   nuget.org validation, proves the served entries are the tested bytes and the
-   version is listed, and restores that public version in a clean consumer with an
-   isolated packages folder, checking the restored package the same way and
-   loading the `[smoke] imports` types. It leaves the reviewed GitHub Release
-   unchanged.
-5. Re-run failed jobs after an upload: the job first proves that an existing
-   version serves the tested entries, then repeats both pushes with
-   `--skip-duplicate`, so a run that uploaded the package but not the symbols
-   completes on re-run. A fresh dispatch on the tag rebuilds; one commit packs to
-   identical bytes on one SDK version, so that also passes while the SDK patch is
-   unchanged. If the SDK moved, dispatch on the tag with
+   succeeds, a job without a token checks nuget.org for an earlier upload of these
+   bytes; the OIDC job then downloads the tested artifact, requests a one-hour API
+   key and pushes the `.nupkg` and `.snupkg` with `--skip-duplicate`, and nothing
+   else runs with that token; a third job, again without a token, waits up to 30
+   minutes for nuget.org validation, proves the served entries are the tested bytes
+   and the version is listed, and restores that public version in a clean consumer
+   with an isolated packages folder, checking the restored package the same way
+   and loading the `[smoke] imports` types. The consumer runs code from every
+   package it restores, which is why it holds no token. The workflow leaves the
+   reviewed GitHub Release unchanged.
+5. After an upload, use "Re-run failed jobs", never "Re-run all jobs": the check
+   job proves that an existing version serves the tested entries, then the publish
+   job repeats both pushes with `--skip-duplicate`, so a run that uploaded the
+   package but not the symbols completes on re-run. A full re-run rebuilds the
+   package and, with `overwrite: true` on the artifact, replaces the saved bytes;
+   they match nuget.org only while the SDK patch is unchanged, so keep a
+   downloaded copy of `dist-dotnet-<name>` before any re-run, as the npm runbook
+   says for `npm-dist-<name>`. A fresh dispatch on the tag rebuilds; one commit
+   packs to identical bytes on one SDK version, so that also passes while the SDK
+   patch is unchanged. If the SDK moved, dispatch on the tag with
    `-f recover-run=<original-run-id>` to reuse the tested artifact without
    rebuilding. Recovery requires a completed release or dispatch run at the tag's
    exact main-reachable commit with every matrix job green and an unexpired

@@ -424,22 +424,29 @@ def test_nuget_publishes_only_the_full_matrix_artifact_with_oidc() -> None:
     assert test["with"] == {"plugin": "${{ needs.prepare.outputs.plugin }}", "deps": "locked",
                             "ref": "${{ needs.prepare.outputs.sha }}", "version": "${{ needs.prepare.outputs.version }}"}
     assert test["if"] == "needs.prepare.outputs.recovery != 'true'"
+    # Three jobs: the registry check and the consumer smoke run without a token; only the push job has one.
+    existing = workflow["jobs"]["existing"]
+    assert existing["needs"] == ["prepare", "test"]
+    assert "!cancelled() && needs.prepare.result == 'success'" in existing["if"]
+    assert "needs.prepare.outputs.publish == 'true'" in existing["if"]
+    assert "needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true'" in existing["if"]
+    assert existing["permissions"] == {"contents": "read", "actions": "read"}
+    check = next(step for step in existing["steps"] if "nuget-registry-state" in step.get("run", ""))
+    assert "--require-present" not in check["run"]
     publish = workflow["jobs"]["publish"]
-    assert publish["needs"] == ["prepare", "test"]
-    assert "!cancelled() && needs.prepare.result == 'success'" in publish["if"]
-    assert "needs.prepare.outputs.publish == 'true'" in publish["if"]
-    assert "needs.test.result == 'success' || needs.prepare.outputs.recovery == 'true'" in publish["if"]
-    assert publish["permissions"] == {"contents": "read", "actions": "read", "id-token": "write"}
+    assert publish["needs"] == ["prepare", "test", "existing"]
+    assert "needs.existing.result == 'success'" in publish["if"] and "needs.prepare.outputs.publish == 'true'" in publish["if"]
+    assert publish["permissions"] == {"id-token": "write", "actions": "read"}
     assert publish["environment"] == {"name": "nuget", "url": "${{ needs.prepare.outputs.release_url }}"}
     steps = publish["steps"]
+    assert not any("checkout" in step.get("uses", "") for step in steps), "the OIDC job downloads the artifact only"
+    assert not any(step.get("run") for step in steps if "dotnet nuget push" not in step.get("run", "")), "the OIDC job runs nothing but the push"
     setup = next(step for step in steps if "setup-dotnet@" in step.get("uses", ""))
     assert setup["with"] == {"dotnet-version": "${{ needs.prepare.outputs.dotnet_runtime }}.x"}
     download = next(step for step in steps if "download-artifact@" in step.get("uses", ""))
     assert download["with"]["name"] == "dist-dotnet-${{ needs.prepare.outputs.plugin }}"
     assert download["with"]["run-id"] == "${{ needs.prepare.outputs.artifact_run_id }}"
     assert download["with"]["github-token"] == "${{ github.token }}"
-    existing = next(step for step in steps if step.get("id") == "existing")
-    assert "nuget-registry-state" in existing["run"] and '--github-output "$GITHUB_OUTPUT"' in existing["run"]
     login = next(step for step in steps if "NuGet/login@" in step.get("uses", ""))
     # Both pushes run on every attempt (--skip-duplicate), so a re-run after a partial upload completes the symbols.
     assert login["id"] == "login" and "if" not in login
@@ -449,12 +456,19 @@ def test_nuget_publishes_only_the_full_matrix_artifact_with_oidc() -> None:
     assert push["env"] == {"NUGET_API_KEY": "${{ steps.login.outputs.NUGET_API_KEY }}"}
     assert '"$PLUGIN_DIR"/dist/*.nupkg' in push["run"] and '"$PLUGIN_DIR"/dist/*.snupkg' in push["run"]
     assert push["run"].count("--skip-duplicate") == 2 and "--no-symbols" in push["run"]
-    assert steps.index(download) < steps.index(existing) < steps.index(login) < steps.index(push)
-    commands = "\n".join(step.get("run", "") for step in steps)
-    assert "make build" not in commands and "dotnet pack" not in commands, "publish never rebuilds"
+    assert steps.index(download) < steps.index(login) < steps.index(push)
+    verify = workflow["jobs"]["verify"]
+    assert verify["needs"] == ["prepare", "publish"]
+    assert "needs.publish.result == 'success'" in verify["if"] and "needs.prepare.outputs.publish == 'true'" in verify["if"]
+    assert verify["permissions"] == {"contents": "read", "actions": "read"}
+    commands = "\n".join(step.get("run", "") for job in (existing, publish, verify) for step in job["steps"])
+    assert "make build" not in commands and "dotnet pack" not in commands, "publication never rebuilds"
     assert "--require-present --attempts 60 --delay 30" in commands
     assert "smoke_dotnet.py" in commands and "--source https://api.nuget.org/v3/index.json" in commands
     assert commands.index("--require-present") < commands.index("smoke_dotnet.py")
+    for job in (existing, publish, verify):
+        download = next(step for step in job["steps"] if "download-artifact@" in step.get("uses", ""))
+        assert download["with"]["run-id"] == "${{ needs.prepare.outputs.artifact_run_id }}", "every job uses the tested artifact"
 
 
 def test_nuget_recovery_requires_a_tag_ref(tmp_path: Path) -> None:
