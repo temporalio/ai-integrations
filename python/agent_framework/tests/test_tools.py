@@ -412,3 +412,43 @@ def test_activity_as_tool_method_drops_self() -> None:
     assert spec["description"] == "Look a city up."
     assert list(spec["parameters"]["properties"]) == ["city", "verbose"]
     assert spec["parameters"]["required"] == ["city"]
+
+
+@workflow.defn
+class SyncFlagWorkflow:
+    @workflow.run
+    async def run(self) -> dict[str, Any]:
+        @tool
+        def sync_weather(city: str) -> str:
+            """Sync weather."""
+            return f"sunny in {city}"
+
+        agent = Agent(client=TemporalChatClient("model"), tools=[sync_weather])
+        response = await agent.run("weather in Rome?")
+        return {
+            "text": response.text,
+            "inline_after_run": sync_weather._invoke_sync_on_event_loop,
+        }
+
+
+async def test_sync_tool_switch_is_restored(client: Client) -> None:
+    plugin = AgentFrameworkPlugin(
+        chat_clients={
+            "model": fake_chat_client(
+                [
+                    function_call_response(
+                        "sync_weather", {"city": "Rome"}, call_id="call-1"
+                    ),
+                    text_response("Sunny."),
+                ]
+            )
+        }
+    )
+    async with new_worker(client, SyncFlagWorkflow, plugin=plugin) as worker:
+        result = await client.execute_workflow(
+            SyncFlagWorkflow.run,
+            id=workflow_id("sync-flag"),
+            task_queue=worker.task_queue,
+        )
+    # The middleware sets the framework's inline switch for the call only.
+    assert result == {"text": "Sunny.", "inline_after_run": False}

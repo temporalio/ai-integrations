@@ -4,27 +4,41 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import pytest
 from agent_framework import (
     Agent,
     AgentSession,
     ChatResponse,
     Content,
     FileHistoryProvider,
+    FunctionInvocationContext,
+    FunctionMiddleware,
     Message,
+    SummarizationStrategy,
+    TruncationStrategy,
+    tool,
 )
 
 from temporalio import workflow
 from temporalio.agent_framework import AgentFrameworkPlugin, TemporalChatClient
-from temporalio.agent_framework.testing import fake_chat_client
+from temporalio.agent_framework.testing import (
+    fake_chat_client,
+    function_call_response,
+    text_response,
+)
 from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHandle
 from tests.helpers.agent_framework import (
+    INVOKE_MODEL,
     count_scheduled_activities,
     new_worker,
     role_of,
+    scheduled_activity_events,
+    summary_of,
     workflow_id,
 )
 
@@ -190,3 +204,155 @@ async def test_file_history_provider_fails_clearly(
     # model call. A future release that made this work would double-persist.
     assert result == "NotImplementedError"
     assert await count_scheduled_activities(handle) == {}
+
+
+class _HistoryProbe(FunctionMiddleware):
+    """Records how many messages the session had persisted when a tool ran."""
+
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+
+    async def process(
+        self,
+        context: FunctionInvocationContext,
+        call_next: Callable[[], Awaitable[None]],
+    ) -> None:
+        session = context.session
+        state = session.state.get("in_memory", {}) if session is not None else {}
+        self.log.append(f"persisted_before_tool:{len(state.get('messages', []))}")
+        await call_next()
+
+
+@workflow.defn
+class PerCallPersistenceWorkflow:
+    @workflow.run
+    async def run(self, persist_per_call: bool) -> dict[str, Any]:
+        log: list[str] = []
+
+        @tool
+        async def get_weather(city: str) -> str:
+            """Get the weather for a city."""
+            return f"rainy in {city}"
+
+        agent = Agent(
+            client=TemporalChatClient("model"),
+            tools=[get_weather],
+            middleware=[_HistoryProbe(log)],
+            require_per_service_call_history_persistence=persist_per_call,
+        )
+        session = agent.create_session()
+        response = await agent.run("weather in Oslo?", session=session)
+        return {
+            "text": response.text,
+            "log": log,
+            "messages": len(session.state["in_memory"]["messages"]),
+        }
+
+
+@workflow.defn
+class CompactionWorkflow:
+    @workflow.run
+    async def run(self, turns: int) -> dict[str, Any]:
+        agent = Agent(
+            client=TemporalChatClient("model"),
+            instructions="Chat.",
+            compaction_strategy=TruncationStrategy(max_n=3, compact_to=1),
+        )
+        session = agent.create_session()
+        texts = [
+            (await agent.run(f"turn {i}", session=session)).text for i in range(turns)
+        ]
+        return {"texts": texts, "messages": len(session.state["in_memory"]["messages"])}
+
+
+@workflow.defn
+class SummarizationWorkflow:
+    @workflow.run
+    async def run(self, turns: int) -> dict[str, Any]:
+        strategy = SummarizationStrategy(
+            client=TemporalChatClient("summarizer", summary="summarizer"),
+            target_count=2,
+            threshold=0,
+        )
+        agent = Agent(
+            client=TemporalChatClient("model"),
+            instructions="Chat.",
+            compaction_strategy=strategy,
+        )
+        session = agent.create_session()
+        texts = [
+            (await agent.run(f"turn {i}", session=session)).text for i in range(turns)
+        ]
+        return {"texts": texts, "messages": len(session.state["in_memory"]["messages"])}
+
+
+@pytest.mark.parametrize(
+    ("persist_per_call", "persisted_before_tool"), [(True, 2), (False, 0)]
+)
+async def test_require_per_service_call_history_persistence(
+    client: Client, persist_per_call: bool, persisted_before_tool: int
+) -> None:
+    factory = fake_chat_client(
+        [
+            function_call_response("get_weather", {"city": "Oslo"}, call_id="call-1"),
+            text_response("Rainy."),
+        ]
+    )
+    plugin = AgentFrameworkPlugin(chat_clients={"model": factory})
+    async with new_worker(client, PerCallPersistenceWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            PerCallPersistenceWorkflow.run,
+            persist_per_call,
+            id=workflow_id("per-call"),
+            task_queue=worker.task_queue,
+        )
+        result = await handle.result()
+    assert result["text"] == "Rainy."
+    assert result["messages"] == 4
+    # With per-service-call persistence the first model call's messages are in
+    # the session before the tool runs; otherwise they land after the run.
+    assert result["log"] == [f"persisted_before_tool:{persisted_before_tool}"]
+    assert await count_scheduled_activities(handle) == {INVOKE_MODEL: 2}
+
+
+async def test_truncation_compaction_runs_in_workflow(client: Client) -> None:
+    factory = fake_chat_client(["r1", "r2", "r3"])
+    plugin = AgentFrameworkPlugin(chat_clients={"model": factory})
+    async with new_worker(client, CompactionWorkflow, plugin=plugin) as worker:
+        result = await client.execute_workflow(
+            CompactionWorkflow.run,
+            3,
+            id=workflow_id("compaction"),
+            task_queue=worker.task_queue,
+        )
+    assert result == {"texts": ["r1", "r2", "r3"], "messages": 6}
+    # The session keeps the whole transcript; the strategy trims what the
+    # model sees once it passes max_n messages.
+    seen = [len(call["messages"]) for call in factory().calls]
+    assert seen == [1, 3, 1]
+
+
+async def test_summarization_strategy_calls_the_summarizer(client: Client) -> None:
+    main = fake_chat_client(["r1", "r2", "r3", "r4"])
+    summarizer = fake_chat_client(["Summary of the earlier turns."])
+    plugin = AgentFrameworkPlugin(
+        chat_clients={"model": main, "summarizer": summarizer}
+    )
+    async with new_worker(client, SummarizationWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            SummarizationWorkflow.run,
+            4,
+            id=workflow_id("summarization"),
+            task_queue=worker.task_queue,
+        )
+        result = await handle.result()
+    assert result["texts"] == ["r1", "r2", "r3", "r4"]
+    # The summary call ran as its own Activity on the summarizer client.
+    summaries = [summary_of(e) for e in await scheduled_activity_events(handle)]
+    assert "summarizer" in summaries
+    assert summarizer().calls
+    assert any(
+        "Summary of the earlier turns." in m.text
+        for call in main().calls
+        for m in call["messages"]
+    )

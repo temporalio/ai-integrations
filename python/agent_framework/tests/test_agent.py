@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
 import pytest
-from agent_framework import Agent, tool
+from agent_framework import Agent, Message, tool
 from pydantic import BaseModel
 
 from temporalio import workflow
 from temporalio.agent_framework import AgentFrameworkPlugin, TemporalChatClient
+from temporalio.agent_framework._activities import (
+    ChatClientActivities,
+    InvokeModelInput,
+)
 from temporalio.agent_framework.testing import (
     FakeChatClient,
     fake_chat_client,
@@ -21,6 +26,7 @@ from temporalio.agent_framework.testing import (
 )
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Worker
 from tests.helpers.agent_framework import (
     INVOKE_MODEL,
@@ -353,12 +359,12 @@ async def test_activity_summary(
 
 
 async def test_activity_options_applied(client: Client) -> None:
-    slow = SlowFakeChatClient(["Slow answer."], delay=1.6)
+    slow = SlowFakeChatClient(["Slow answer."], delay=5)
     plugin = AgentFrameworkPlugin(chat_clients={"model": lambda: slow})
     async with new_worker(client, ToolLoopWorkflow, plugin=plugin) as worker:
         handle = await client.start_workflow(
             ToolLoopWorkflow.run,
-            RunInput(start_to_close_seconds=42, heartbeat_seconds=1),
+            RunInput(start_to_close_seconds=42, heartbeat_seconds=4),
             id=workflow_id("options"),
             task_queue=worker.task_queue,
         )
@@ -366,9 +372,9 @@ async def test_activity_options_applied(client: Client) -> None:
     assert result["text"] == "Slow answer."
     (scheduled,) = await scheduled_activities(handle)
     assert scheduled.start_to_close_timeout.ToTimedelta() == timedelta(seconds=42)
-    assert scheduled.heartbeat_timeout.ToTimedelta() == timedelta(seconds=1)
-    # A 1.6 second call under a 1 second heartbeat timeout only completes on
-    # its first attempt when the Activity heartbeats on its own.
+    assert scheduled.heartbeat_timeout.ToTimedelta() == timedelta(seconds=4)
+    # A 5 second call under a 4 second heartbeat timeout only completes on its
+    # first attempt when the Activity heartbeats on its own (first at 2 seconds).
     (started,) = await started_activities(handle)
     assert started.attempt == 1
 
@@ -392,3 +398,76 @@ async def test_model_task_queue(client: Client) -> None:
     assert result["text"] == "From afar."
     (scheduled,) = await scheduled_activities(handle)
     assert scheduled.task_queue.name == model_queue
+
+
+async def test_model_activity_heartbeats() -> None:
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(env.info, heartbeat_timeout=timedelta(seconds=0.4))
+    beats: list[tuple[Any, ...]] = []
+    env.on_heartbeat = lambda *details: beats.append(details)
+    activities = ChatClientActivities(
+        {"model": lambda: SlowFakeChatClient(["Slow answer."], delay=1.0)}
+    )
+    result = await env.run(
+        activities.invoke_model,
+        InvokeModelInput(
+            model="model", messages=[Message(role="user", contents=["hi"]).to_dict()]
+        ),
+    )
+    assert result["messages"][0]["contents"][0]["text"] == "Slow answer."
+    # Half the heartbeat timeout is 0.2 seconds, so a 1 second call heartbeats
+    # several times; the exact count depends on scheduling.
+    assert len(beats) >= 2
+
+
+@workflow.defn
+class ClientKwargsWorkflow:
+    @workflow.run
+    async def run(self, kind: str) -> str:
+        agent = Agent(client=TemporalChatClient("model"))
+        kwargs: dict[str, Any] = (
+            {"callback": print}
+            if kind == "not_json"
+            else {"extra_headers": {"x-tenant": "acme"}}
+        )
+        if kind == "stream":
+            stream = agent.run("hello", stream=True, client_kwargs=kwargs)
+            async for _ in stream:
+                pass
+            return (await stream.get_final_response()).text
+        return (await agent.run("hello", client_kwargs=kwargs)).text
+
+
+@pytest.mark.parametrize("kind", ["plain", "stream"])
+async def test_client_kwargs_reach_the_provider(client: Client, kind: str) -> None:
+    factory = fake_chat_client(["Hello."])
+    plugin = AgentFrameworkPlugin(chat_clients={"model": factory})
+    async with new_worker(client, ClientKwargsWorkflow, plugin=plugin) as worker:
+        result = await client.execute_workflow(
+            ClientKwargsWorkflow.run,
+            kind,
+            id=workflow_id("client-kwargs"),
+            task_queue=worker.task_queue,
+        )
+    assert result == "Hello."
+    (call,) = factory().calls
+    assert call["kwargs"] == {"extra_headers": {"x-tenant": "acme"}}
+    assert call["stream"] is (kind == "stream")
+
+
+async def test_non_json_client_kwarg_fails_workflow(client: Client) -> None:
+    plugin = AgentFrameworkPlugin(chat_clients={"model": fake_chat_client(["unused"])})
+    async with new_worker(client, ClientKwargsWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            ClientKwargsWorkflow.run,
+            "not_json",
+            id=workflow_id("client-kwargs-bad"),
+            task_queue=worker.task_queue,
+        )
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+    cause = excinfo.value.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "AgentFrameworkWorkflowError"
+    assert "client_kwargs" in cause.message
+    assert await count_scheduled_activities(handle) == {}

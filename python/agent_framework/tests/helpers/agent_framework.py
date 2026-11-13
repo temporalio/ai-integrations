@@ -183,7 +183,15 @@ class SlowFakeChatClient(FakeChatClient):
             )
 
         async def slow() -> ChatResponse:
-            await asyncio.sleep(self.delay)
+            try:
+                await asyncio.sleep(self.delay)
+            except BaseException:
+                # A cancelled call never awaits the scripted response; close it
+                # so Python does not warn about an un-awaited coroutine.
+                close = getattr(inner, "close", None)
+                if close is not None:
+                    close()
+                raise
             return await inner
 
         return slow()
