@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import inspect
 import json
@@ -16,7 +17,12 @@ from strands.types._events import ToolInterruptEvent, ToolResultEvent
 from strands.types.tools import AgentTool, ToolGenerator, ToolResult, ToolSpec, ToolUse
 
 from temporalio import activity, workflow
-from temporalio.exceptions import ActivityError, ApplicationError, FailureError
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+    FailureError,
+    is_cancelled_exception,
+)
 
 from ._failure_converter import STRANDS_INTERRUPT_TYPE
 
@@ -88,6 +94,7 @@ class TemporalActivityTool(AgentTool):
         bound = self._signature.bind(**tool_use["input"])
         bound.apply_defaults()
         positional = list(bound.arguments.values())
+        cancel_requests = _cancel_requests()
         try:
             if not positional:
                 result = await workflow.execute_activity(
@@ -109,7 +116,9 @@ class TemporalActivityTool(AgentTool):
             ):
                 yield ToolInterruptEvent(tool_use, [Interrupt(**cause.details[0])])
                 return
-            yield _activity_error_event(tool_use["toolUseId"], e)
+            yield _activity_error_event(
+                tool_use["toolUseId"], e, cancel_requests=cancel_requests
+            )
             return
         yield ToolResultEvent(
             ToolResult(
@@ -164,7 +173,10 @@ def _generated_class_doc(cls: type) -> str | None:
                 # generated unevaluated, and the field keeps the reference from
                 # that time.
                 annotate = getattr(cls.__init__, "__annotate__", None)
-                if getattr(annotate, "__generated_by_dataclasses__", False):
+                # Python 3.15 generates the docstring lazily from the current signature.
+                if sys.version_info[:2] == (3, 14) and getattr(
+                    annotate, "__generated_by_dataclasses__", False
+                ):
                     field_types = {
                         n: f.type for n, f in cls.__dataclass_fields__.items()
                     }
@@ -271,7 +283,21 @@ def _call_stand_in(cls: type) -> Callable:
     return stand_in
 
 
-def _activity_error_event(tool_use_id: str, error: ActivityError) -> ToolResultEvent:
+def _cancel_requests() -> int:
+    task = asyncio.current_task()
+    return task.cancelling() if task is not None else 0
+
+
+def _activity_error_event(
+    tool_use_id: str, error: ActivityError, *, cancel_requests: int
+) -> ToolResultEvent:
+    if is_cancelled_exception(error) and _cancel_requests() > cancel_requests:
+        # Strands catches Exception as a tool failure. Its concurrent executor
+        # stops reading tool events on cancellation, so yielding a result here
+        # would leave the tool task waiting forever for an acknowledgment.
+        # Only translate a new cancellation of this task: an Activity can report
+        # cancellation independently, and previously caught cancels stay counted.
+        raise asyncio.CancelledError() from error
     # ActivityError reports a generic message; its cause holds the activity's failure.
     cause = error.__cause__
     exception = cause if isinstance(cause, Exception) else error

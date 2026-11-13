@@ -25,6 +25,8 @@ from google.adk.models import BaseLlm, LLMRegistry
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.runners import InMemoryRunner
+from google.adk.telemetry._schema_version import resolve_schema_version
+from google.adk.telemetry.context import TelemetryConfig
 from google.adk.utils.context_utils import Aclosing
 from google.genai import types
 from opentelemetry._logs import LoggerProvider as ApiLoggerProvider
@@ -68,15 +70,20 @@ EXPECTED_BASELINE = {
     "gen_ai.client.operation.duration": 2,
     "gen_ai.client.token.usage": 4,
 }
+if resolve_schema_version() >= 2:
+    EXPECTED_BASELINE["gen_ai.invoke_workflow.duration"] = 1
 
-# Log events per model call: one gen_ai.system.message, one
-# gen_ai.user.message per request content (1 for the first call; 3 for the
-# second: prompt + tool call + tool response), one gen_ai.choice per result.
-EXPECTED_LOG_BASELINE = {
-    "gen_ai.system.message": 2,
-    "gen_ai.user.message": 4,
-    "gen_ai.choice": 2,
-}
+# Legacy telemetry emits separate system, user, and choice events. The
+# experimental GenAI format consolidates them into one event per model call.
+EXPECTED_LOG_BASELINE = (
+    {"gen_ai.client.inference.operation.details": 2}
+    if TelemetryConfig().should_use_experimental_genai_semconv
+    else {
+        "gen_ai.system.message": 2,
+        "gen_ai.user.message": 4,
+        "gen_ai.choice": 2,
+    }
+)
 
 # The OTel globals are set-once per process and these tests share xdist
 # workers with arbitrary sibling tests, so every install asserts it took

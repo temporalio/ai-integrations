@@ -10,14 +10,17 @@ from temporalio.testing import WorkflowEnvironment
 from tests.helpers.environment import start_local_with_retry
 
 STARTUP_PREFIX = "Failed starting Temporal dev server: "
+# SDK 1.36 supports custom startup timeouts, formatted as Rust durations.
 STARTUP_TIMEOUT = (
-    STARTUP_PREFIX + "ephemeral server at 127.0.0.1:60249 did not start within 5s. "
-    "Make sure another download isn't stuck and delete the temp file."
+    STARTUP_PREFIX + "ephemeral server at 127.0.0.1:60249 did not start within 5s; "
+    "last connection error: no connection attempt completed before the deadline"
 )
-# SDKs before 1.33 report the startup timeout this way, with the last
-# connection error in Rust's Option form.
-LEGACY_STARTUP_TIMEOUT = (
-    STARTUP_PREFIX + "Failed connecting to test server after 5 seconds, last error: "
+STARTUP_TIMEOUT_WITH_CONNECTION_ERROR = (
+    STARTUP_PREFIX + "ephemeral server at 127.0.0.1:54380 did not start within 200ms; "
+    "last connection error: Server connection error: "
+    'tonic::transport::Error(Transport, ConnectError(ConnectError("tcp connect error", '
+    "127.0.0.1:54380, Os { code: 61, kind: ConnectionRefused, message: "
+    '"Connection refused" })))'
 )
 DOWNLOAD_FAILURE = (
     STARTUP_PREFIX
@@ -25,10 +28,12 @@ DOWNLOAD_FAILURE = (
 )
 RETRYABLE_ERRORS = [
     STARTUP_TIMEOUT,
-    LEGACY_STARTUP_TIMEOUT + "None",
-    LEGACY_STARTUP_TIMEOUT
-    + 'Some(Status { code: Unavailable, message: "tcp connect error" })',
+    STARTUP_TIMEOUT_WITH_CONNECTION_ERROR,
     DOWNLOAD_FAILURE,
+    *[
+        STARTUP_TIMEOUT.replace("5s;", f"{duration};")
+        for duration in ["1.5s", "1.25ms", "3µs", "0ns"]
+    ],
     *[
         STARTUP_PREFIX + "invalid ephemeral server download: " + message
         for message in [
@@ -118,6 +123,14 @@ async def test_different_startup_errors_share_retry_limit() -> None:
         RuntimeError(STARTUP_PREFIX + "Failed connecting to test server: invalid URL"),
         RuntimeError("Failed client connect: connection refused"),
         RuntimeError("request did not start within 5s."),
+        RuntimeError(
+            STARTUP_PREFIX
+            + "ephemeral server at 127.0.0.1:54380 did not start within 5s"
+        ),
+        RuntimeError(
+            STARTUP_PREFIX
+            + "ephemeral server at 127.0.0.1:54380 did not start within 5s; invalid URL"
+        ),
         TypeError("start_local() got an unexpected keyword argument 'invalid'"),
         ValueError(STARTUP_TIMEOUT),
         OSError(DOWNLOAD_FAILURE),

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import importlib.metadata
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import langchain_core.env
 import langsmith
 
 # langsmith conditionally imports langchain_core when it is installed.
@@ -76,6 +78,9 @@ class LangSmithPlugin(SimplePlugin):
             if not runner:
                 raise ValueError("No WorkflowRunner provided to the LangSmith plugin.")
             if isinstance(runner, SandboxedWorkflowRunner):
+                # LangChain's first trace reads the platform, which can start a
+                # subprocess the sandbox blocks. Read and cache it now.
+                langchain_core.env.get_runtime_environment()
                 return dataclasses.replace(
                     runner,
                     restrictions=runner.restrictions.with_passthrough_modules(
@@ -91,7 +96,10 @@ class LangSmithPlugin(SimplePlugin):
             try:
                 yield
             finally:
-                interceptor._client.flush()
+                # Queued on the write thread, so it runs after every pending write.
+                await asyncio.wrap_future(
+                    interceptor._executor.submit(interceptor._client.flush)
+                )
 
         super().__init__(
             "langchain.LangSmithPlugin",

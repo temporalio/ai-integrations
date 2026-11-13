@@ -16,6 +16,7 @@ import {
   echoDef,
   findInCauseChain,
   getScheduledActivitySummary,
+  getScheduledHeartbeatTimeouts,
   reverseDef,
   setupTestEnv,
   uid,
@@ -98,14 +99,20 @@ test.serial('listToolsReturnsFullSchema', async (t) => {
 test.serial('callToolRoutesToActivity', async (t) => {
   const env = getEnv();
   const taskQueue = uid('adk-mcp-call');
+  const workflowId = uid('wf-mcp-call');
   const result = await withWorker(env, { taskQueue, plugins: [makePlugin()] }, () =>
     env.client.workflow.execute(mcpCallTool, {
       taskQueue,
-      workflowId: uid('wf-mcp-call'),
+      workflowId,
       args: ['hello'],
     })
   );
   t.deepEqual(result, { echoed: 'hello' });
+
+  // Both MCP Activities get the plugin's default heartbeat timeout.
+  const { events } = await env.client.workflow.getHandle(workflowId).fetchHistory();
+  t.deepEqual(getScheduledHeartbeatTimeouts(events ?? [], 'testServer-listTools'), [10]);
+  t.deepEqual(getScheduledHeartbeatTimeouts(events ?? [], 'testServer-callTool'), [10]);
 });
 
 test.serial('doesNotCloseFactorySuppliedToolset', async (t) => {
