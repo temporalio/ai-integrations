@@ -10,6 +10,9 @@ import { fromByteArray } from 'base64-js';
 
 // Temporal's JSON payload converter turns a `Uint8Array` into a plain object. The v4 spec
 // accepts a base64 string wherever it accepts bytes, so file bytes cross the boundary as base64.
+//
+// No patch gate is necessary. Only Activity payloads change, and replay does not compare
+// them. A gate would also keep the corrupted bytes for executions that are in flight.
 
 type PromptPart = Exclude<LanguageModelV4Message, { role: 'system' }>['content'][number];
 
