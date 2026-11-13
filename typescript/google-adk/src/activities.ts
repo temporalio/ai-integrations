@@ -131,8 +131,6 @@ export function createModelActivities(options: ModelActivitiesOptions = {}): Mod
         const model = resolveModel(args.model);
         const request = fromWireRequest(args.request);
         for await (const response of model.generateContentAsync(request, true, abortSignal)) {
-          // Heartbeat per chunk so a slow stream isn't mistaken for a stuck worker.
-          ActivityContext.current().heartbeat();
           events.publish(response);
           responses.push(response);
         }
@@ -431,6 +429,9 @@ function disableSdkRetries(request: LlmRequest): void {
  * Starts an auto-heartbeat at ~half the Activity's `heartbeatTimeout` so a slow
  * (thinking-mode) model call is not mistaken for a stuck worker. Returns a stop
  * function; a no-op when no heartbeat timeout is configured.
+ *
+ * These are the plugin's only heartbeats. The first goes out half the timeout
+ * into the call, so a shorter call sends none and costs no Temporal Cloud Action.
  */
 function startAdaptiveHeartbeat(): () => void {
   const heartbeatTimeoutMs = ActivityContext.current().info.heartbeatTimeoutMs;

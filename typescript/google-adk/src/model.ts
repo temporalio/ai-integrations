@@ -29,14 +29,14 @@ export interface TemporalModelOptions {
    * Per-call Temporal Activity configuration (timeouts, retry, task queue).
    * `heartbeatTimeout` defaults to 10 seconds. The model Activities heartbeat on
    * a timer at half of it, so a cancel reaches a running call and a lost worker
-   * is noticed. Set it to `0` to turn the timer off.
+   * is noticed. Set it to `0` to turn heartbeats off.
    *
    * When ADK aborts the invocation a call belongs to (in a graph, when a sibling
    * node fails), the call's Activity cancellation is requested, and
    * `cancellationType` decides what the agent then waits for. Unset means
    * `TRY_CANCEL`: the call ends at once and the Activity winds down on its own.
    * `WAIT_CANCELLATION_COMPLETED` waits for the Activity to acknowledge, which it
-   * does at its next heartbeat: on that timer, or after a streamed chunk.
+   * does at its next heartbeat on that timer.
    *
    * A `timeout` on the agent's graph node is not such an abort. ADK runs the agent
    * with the run's signal, not the node's deadline (`runLlmAgentAsNode`), so a

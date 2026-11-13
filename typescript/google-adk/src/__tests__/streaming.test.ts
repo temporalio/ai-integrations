@@ -226,3 +226,27 @@ test.serial('streamDisposeFailureIsClassified', async (t) => {
     WorkflowStreamClient.fromWithinActivity = original;
   }
 });
+
+// Unit test (MockActivityEnvironment): the model Activities heartbeat only on their
+// timer, the first time half the heartbeat timeout into the call. A streamed call
+// shorter than that sends no heartbeat, however many chunks it has.
+test.serial('shortStreamedCallSendsNoHeartbeat', async (t) => {
+  const original = WorkflowStreamClient.fromWithinActivity;
+  WorkflowStreamClient.fromWithinActivity = (() => ({
+    topic: () => ({ publish: () => {} }),
+    [Symbol.asyncDispose]: async () => {},
+  })) as unknown as typeof WorkflowStreamClient.fromWithinActivity;
+  try {
+    const mockEnv = new MockActivityEnvironment({ heartbeatTimeoutMs: 10_000 });
+    let heartbeats = 0;
+    mockEnv.on('heartbeat', () => heartbeats++);
+    const responses: LlmResponse[] = await mockEnv.run(
+      createModelActivities({ modelProvider: fakeModelProvider(chunks) })['adk-invokeModelStreaming'],
+      { model: 'fake-model', request: {} as never, streamingTopic: 'adk-test-stream' }
+    );
+    t.is(responses.length, 3);
+    t.is(heartbeats, 0);
+  } finally {
+    WorkflowStreamClient.fromWithinActivity = original;
+  }
+});
