@@ -16,7 +16,7 @@ import re
 import subprocess
 import sys
 
-# Job names come from ci.yml (`name: Python`, `name: Java`, `name: Go`) joined with the reusable workflow's
+# Job names come from ci.yml (`name: Python`, `name: Java`, `name: Go`, `name: TypeScript`) joined with the reusable workflow's
 # job name; test_nightly_report.py asserts the two stay in step.
 JOB_RE = re.compile(r"^(?P<language>Python|Java|Go|TypeScript) \((?P<plugin>[^)]+)\) / ")
 LABEL = "nightly"
@@ -49,10 +49,7 @@ def classify(jobs: list[dict]) -> tuple[set[str], set[str]]:
         m = JOB_RE.match(job.get("name", ""))
         if not m or not job.get("conclusion"):
             continue
-        plugin = m.group("plugin")
-        # Preserve Python and Java issue titles; qualify newer languages to avoid collisions.
-        if m.group("language") in {"Go", "TypeScript"}:
-            plugin = f"{m.group('language').lower()}/{plugin}"
+        plugin = f"{m.group('language').lower()}/{m.group('plugin')}"
         seen.add(plugin)
         if job["conclusion"] in FAILED:
             failing.add(plugin)
