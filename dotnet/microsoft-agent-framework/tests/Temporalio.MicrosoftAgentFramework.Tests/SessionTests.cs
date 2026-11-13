@@ -1,6 +1,7 @@
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Logging;
 using Temporalio.Api.Enums.V1;
+using Temporalio.Exceptions;
 using Temporalio.MicrosoftAgentFramework.Testing;
 using Temporalio.MicrosoftAgentFramework.Tests.Workflows;
 
@@ -94,13 +95,11 @@ public class SessionTests : WorkflowTestBase
     }
 
     [Theory]
-    [InlineData("delaying", null, ProviderWaits.TaskDelay, nameof(DelayingChatHistoryProvider), "did not complete synchronously")]
-    [InlineData("memory", "delaying", ProviderWaits.TaskDelay, nameof(DelayingContextProvider), "did not complete synchronously")]
-    [InlineData("delaying", null, ProviderWaits.WorkflowTimer, nameof(DelayingChatHistoryProvider), "scheduled Workflow work")]
-    [InlineData("memory", "delaying", ProviderWaits.WorkflowTimer, nameof(DelayingContextProvider), "scheduled Workflow work")]
-    [InlineData("delaying", null, ProviderWaits.WorkflowActivity, nameof(DelayingChatHistoryProvider), "scheduled Workflow work")]
-    [InlineData("memory", "delaying", ProviderWaits.WorkflowActivity, nameof(DelayingContextProvider), "scheduled Workflow work")]
-    public async Task ProviderThatWaits_FailsRunWithWorkflowError(string historyProvider, string? contextProvider, string wait, string providerName, string expectedPhrase)
+    [InlineData("delaying", null, ProviderWaits.WorkflowTimer, nameof(DelayingChatHistoryProvider))]
+    [InlineData("memory", "delaying", ProviderWaits.WorkflowTimer, nameof(DelayingContextProvider))]
+    [InlineData("delaying", null, ProviderWaits.WorkflowActivity, nameof(DelayingChatHistoryProvider))]
+    [InlineData("memory", "delaying", ProviderWaits.WorkflowActivity, nameof(DelayingContextProvider))]
+    public async Task ProviderThatAwaitsWorkflowWork_FailsRunWithWorkflowError(string historyProvider, string? contextProvider, string wait, string providerName)
     {
         var fake = EchoFake();
         var input = new SessionInput(["first"], HistoryProvider: historyProvider, ContextProvider: contextProvider, ProviderWait: wait);
@@ -108,12 +107,34 @@ public class SessionTests : WorkflowTestBase
         var failure = AppFailure(error);
         Assert.NotNull(failure);
         Assert.Equal(MicrosoftAgentFrameworkErrorTypes.WorkflowError, failure.ErrorType);
-        Assert.StartsWith($"{providerName}.InvokingAsync", failure.Message, StringComparison.Ordinal);
-        Assert.Contains(expectedPhrase, failure.Message, StringComparison.Ordinal);
+        Assert.StartsWith($"{providerName}.InvokingAsync did not complete synchronously", failure.Message, StringComparison.Ordinal);
         Assert.Equal(0, fake.CallCount);
         var history = await handle.FetchHistoryAsync();
         Assert.Equal(0, HistoryAssert.Count(history, EventType.WorkflowTaskFailed));
         Assert.Equal(1, HistoryAssert.Count(history, EventType.WorkflowExecutionFailed));
+    }
+
+    [Theory]
+    [InlineData(ProviderWaits.TaskDelay, "thread transfer")]
+    [InlineData(ProviderWaits.ThreadHop, "workflow scheduler")]
+    public async Task ProviderThatLeavesTheWorkflowScheduler_FailsTheWorkflowTask(string wait, string sdkMessagePart)
+    {
+        // The SDK's scheduler listener stays on for providers, as for any Workflow code: a .NET timer or
+        // a blocking wait on thread-pool work fails the Workflow Task, and the run never reaches the model.
+        var fake = EchoFake();
+        using var worker = Fixture.NewWorker(TestPlugin.For(fake));
+        await WithWorkerAsync(worker, async () =>
+        {
+            var input = new SessionInput(["first"], ContextProvider: "delaying", ProviderWait: wait);
+            var handle = await Client.StartWorkflowAsync((SessionWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(worker, "session-scheduler", TimeSpan.FromSeconds(6)));
+            var error = await Assert.ThrowsAsync<WorkflowFailedException>(() => handle.GetResultAsync());
+            Assert.IsType<TimeoutFailureException>(error.InnerException);
+            var history = await handle.FetchHistoryAsync();
+            var failed = history.Events.Where(e => e.WorkflowTaskFailedEventAttributes is not null).ToList();
+            Assert.NotEmpty(failed);
+            Assert.Contains(sdkMessagePart, failed[0].WorkflowTaskFailedEventAttributes!.Failure.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(0, fake.CallCount);
+        });
     }
 
     [Fact]
