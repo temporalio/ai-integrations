@@ -22,9 +22,10 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import AsyncGenerator
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -484,7 +485,7 @@ def test_interactions_mcp_steps_rehydrate():
 # ---------------------------------------------------------------------------
 
 
-def _failing_factory(error: Exception):
+def _failing_factory(error: Exception, phase: str = "operation"):
     class _FailingSession:
         async def list_tools(self) -> Any:
             raise error
@@ -493,10 +494,61 @@ def _failing_factory(error: Exception):
             raise error
 
     @asynccontextmanager
-    async def factory() -> AsyncGenerator[Any, None]:
+    async def context() -> AsyncGenerator[Any, None]:
+        if phase == "enter":
+            raise error
         yield _FailingSession()
 
+    def factory():
+        if phase == "factory":
+            raise error
+        return context()
+
     return factory
+
+
+@pytest.mark.parametrize("operation", ["list-tools", "call-tool"])
+@pytest.mark.parametrize("phase", ["returned", "yielded"])
+@pytest.mark.parametrize(
+    "value", [None, object(), SimpleNamespace(list_tools=lambda: None)]
+)
+async def test_mcp_invalid_factory_result_is_non_retryable(
+    operation: str, phase: str, value: Any
+):
+    from temporalio.exceptions import ApplicationError
+    from temporalio.google_genai import _mcp
+    from temporalio.google_genai._models import _McpCallToolRequest
+
+    exited = False
+
+    @asynccontextmanager
+    async def context() -> AsyncGenerator[Any, None]:
+        nonlocal exited
+        try:
+            # The validation error must survive a factory that suppresses exceptions.
+            with suppress(ApplicationError):
+                yield value
+        finally:
+            exited = True
+
+    server = "invalid-factory"
+
+    def factory() -> Any:
+        return value if phase == "returned" else context()
+
+    if operation == "list-tools":
+        call = _mcp.build_list_tools_activity(server, factory)()
+    else:
+        call = _mcp.build_call_tool_activity(server, factory)(
+            _McpCallToolRequest(name="echo", arguments={})
+        )
+    with pytest.raises(ApplicationError) as exc_info:
+        await call
+    assert exc_info.value.type == "MCPServerFactoryTypeError"
+    assert exc_info.value.non_retryable
+    assert f"MCP server factory {server!r} {phase}" in exc_info.value.message
+    assert exited is (phase == "yielded")
+    assert server not in _mcp._CONNECTIONS
 
 
 @pytest.mark.parametrize("operation", ["list-tools", "call-tool"])
@@ -560,20 +612,24 @@ async def test_mcp_protocol_error_retryability(
 
 
 @pytest.mark.parametrize("operation", ["list-tools", "call-tool"])
-async def test_mcp_transport_error_evicts_connection(operation: str):
+@pytest.mark.parametrize("phase", ["factory", "enter", "operation"])
+@pytest.mark.parametrize("error_type", [RuntimeError, TypeError])
+async def test_mcp_transport_error_evicts_connection(
+    operation: str, phase: str, error_type: type[Exception]
+):
     from temporalio.google_genai import _mcp
     from temporalio.google_genai._models import _McpCallToolRequest
 
     server = f"transport-err-{uuid4()}"
-    err = RuntimeError("Connection closed")
-    factory = _failing_factory(err)
+    err = error_type("Connection closed")
+    factory = _failing_factory(err, phase)
     if operation == "list-tools":
         call = _mcp.build_list_tools_activity(server, factory)()
     else:
         call = _mcp.build_call_tool_activity(server, factory)(
             _McpCallToolRequest(name="echo", arguments={})
         )
-    with pytest.raises(RuntimeError) as exc_info:
+    with pytest.raises(error_type) as exc_info:
         await call
     assert exc_info.value is err
     assert server not in _mcp._CONNECTIONS

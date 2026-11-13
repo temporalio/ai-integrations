@@ -123,16 +123,47 @@ class _ConnectionRecord:
         self._owner = asyncio.create_task(self._run(factory))
 
     async def _run(self, factory: McpSessionFactory) -> None:
+        factory_error: ApplicationError | None = None
         try:
-            async with factory() as session:
-                self._ready.set_result(session)
-                await self._stop.wait()
+            context = factory()
+            if not all(
+                callable(getattr(type(context), method, None))
+                for method in ("__aenter__", "__aexit__")
+            ):
+                kind = type(context)
+                raise ApplicationError(
+                    f"MCP server factory {self._server!r} returned "
+                    f"{kind.__module__}.{kind.__qualname__}, not an async context manager",
+                    type="MCPServerFactoryTypeError",
+                    non_retryable=True,
+                )
+            async with context as session:
+                if not all(
+                    callable(getattr(session, method, None))
+                    for method in ("list_tools", "call_tool")
+                ):
+                    kind = type(session)
+                    factory_error = ApplicationError(
+                        f"MCP server factory {self._server!r} yielded "
+                        f"{kind.__module__}.{kind.__qualname__}, not a session with "
+                        "callable list_tools() and call_tool() methods",
+                        type="MCPServerFactoryTypeError",
+                        non_retryable=True,
+                    )
+                else:
+                    self._ready.set_result(session)
+                    await self._stop.wait()
+            # Raise after cleanup so the factory cannot suppress or wrap this error.
+            if factory_error is not None:
+                raise factory_error
         except BaseException as err:
             # A failed connect should not be cached; drop it so the next call
             # retries instead of awaiting a permanently rejected future.
-            if not self._ready.done():
-                self._ready.set_exception(err)
             _CONNECTIONS.pop(self._server, None)
+            if not self._ready.done():
+                self._ready.set_exception(factory_error or err)
+                # The waiting Activity receives this failure through _ready.
+                return
             raise
 
     def acquire(self) -> None:
