@@ -15,6 +15,7 @@ cadence.
 | [`go/googleadk`](go/googleadk) | [![Go Reference](https://pkg.go.dev/badge/go.temporal.io/googleadk.svg)](https://pkg.go.dev/go.temporal.io/googleadk) (Public Preview) |
 | [`java/google-adk`](java/google-adk) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/google-adk.svg)](https://central.sonatype.com/artifact/io.temporal/google-adk) (Public Preview) |
 | [`java/spring-ai`](java/spring-ai) | [![Maven Central](https://img.shields.io/maven-central/v/io.temporal/spring-ai.svg)](https://central.sonatype.com/artifact/io.temporal/spring-ai) (Public Preview) |
+| [`python/agent_framework`](python/agent_framework) | [![PyPI](https://img.shields.io/pypi/v/temporalio-agent-framework.svg)](https://pypi.org/project/temporalio-agent-framework/) (Pre-release) |
 | [`python/claude_agent_sdk`](python/claude_agent_sdk) | [![PyPI](https://img.shields.io/pypi/v/temporalio-claude-agent-sdk.svg)](https://pypi.org/project/temporalio-claude-agent-sdk/) (Pre-release) |
 | [`python/deepagents`](python/deepagents) | [![PyPI](https://img.shields.io/pypi/v/temporalio-deepagents.svg)](https://pypi.org/project/temporalio-deepagents/) (Pre-release) |
 | [`python/google_adk`](python/google_adk) | [![PyPI](https://img.shields.io/pypi/v/temporalio-google-adk.svg)](https://pypi.org/project/temporalio-google-adk/) (Pre-release) |
