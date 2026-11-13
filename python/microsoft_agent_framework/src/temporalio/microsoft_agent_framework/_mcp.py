@@ -67,10 +67,8 @@ class TemporalMCPToolProvider(ContextProvider):
     The activity options apply to every MCP Activity of this provider;
     ``summary`` defaults to the server name. Without ``start_to_close_timeout``
     or ``schedule_to_close_timeout`` the ``temporalio-mcp`` default of one
-    minute applies. The provider sets no ``heartbeat_timeout``:
-    ``temporalio-mcp`` 0.3 does not heartbeat its Activities, and its next
-    release gives them a 10-second default heartbeat timeout with heartbeats
-    at half that.
+    minute applies. The provider sets no ``heartbeat_timeout``;
+    ``temporalio-mcp`` 0.3 does not heartbeat its Activities.
     """
 
     def __init__(
