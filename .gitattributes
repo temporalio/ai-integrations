@@ -11,6 +11,12 @@
 Makefile text eol=lf
 *.sh text eol=lf
 *.txt text eol=lf
+*.cs text eol=lf
+*.csproj text eol=lf
+*.props text eol=lf
+*.targets text eol=lf
+*.slnx text eol=lf
+*.globalconfig text eol=lf
 
 # Binary assets
 *.png binary
@@ -21,3 +27,5 @@ Makefile text eol=lf
 *.pdf binary
 *.whl binary
 *.tar.gz binary
+*.nupkg binary
+*.snupkg binary

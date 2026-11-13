@@ -1,0 +1,64 @@
+# Project-wide analyzer severities for every project under dotnet/, imported through
+# GlobalAnalyzerConfigFiles in dotnet.props. Path-scoped rules (such as workflow files) live in the
+# plugin's .editorconfig, which is kept byte-identical to dotnet/_template/.editorconfig.
+# Seeded from sdk-dotnet's .editorconfig so plugin code reads like SDK code. Keep in order by rule id.
+is_global = true
+
+# We cannot reasonably mark ourselves CLSCompliant one way or another if
+# libraries we rely on like Microsoft.Extensions.Logging.Abstractions don't
+dotnet_diagnostic.CA1014.severity = none
+
+# We have exceptions we don't want all constructors on
+dotnet_diagnostic.CA1032.severity = none
+
+# We allow nested classes e.g. in cases of sum types
+dotnet_diagnostic.CA1034.severity = none
+
+# We use nullable types instead of checking params are non-null, even in public methods
+dotnet_diagnostic.CA1062.severity = none
+
+# We are not concerned with globalization. The category-wide option does not work
+# in our analyzers, so we disable each rule.
+dotnet_diagnostic.CA1303.severity = none
+dotnet_diagnostic.CA1304.severity = none
+dotnet_diagnostic.CA1305.severity = none
+dotnet_diagnostic.CA1307.severity = none
+dotnet_diagnostic.CA1310.severity = none
+dotnet_diagnostic.CA1311.severity = none
+
+# For many of our properties like task tokens, we're ok returning byte arrays
+dotnet_diagnostic.CA1819.severity = none
+
+# ReadOnlySpan conversion errors when using string.Concat
+dotnet_diagnostic.CA1845.severity = none
+
+# String.Contains(Char) doesn't exist in older .NET
+dotnet_diagnostic.CA1847.severity = none
+
+# We accept logging performance can improve later
+dotnet_diagnostic.CA1848.severity = none
+dotnet_diagnostic.CA1873.severity = none
+
+# Do not want to make all exceptions [Serializable], we don't support cross-AppDomain currently
+dotnet_diagnostic.CA2237.severity = none
+
+# Warn on unused imports
+dotnet_diagnostic.IDE0005.severity = warning
+
+# Do not require "this." prefix, devs are smart enough to know when to qualify
+dotnet_diagnostic.SA1101.severity = none
+
+# Allow using directives outside of the namespace
+dotnet_diagnostic.SA1200.severity = none
+
+# Don't require a blank line after every closing brace
+dotnet_diagnostic.SA1513.severity = none
+
+# Don't require a blank line before single line comments
+dotnet_diagnostic.SA1515.severity = none
+
+# Do not require partial class documentation
+dotnet_diagnostic.SA1601.severity = none
+
+# Do not require file header
+dotnet_diagnostic.SA1633.severity = none

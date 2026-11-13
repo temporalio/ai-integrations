@@ -1,0 +1,35 @@
+// Rendered by scripts/ci/smoke_dotnet.py. Every [smoke] imports type must load from the package
+// assembly that NuGet restored into the isolated packages folder, at the version under test.
+using System.Reflection;
+
+var coordinate = "__COORDINATE__";
+var version = "__VERSION__";
+var packages = Environment.GetEnvironmentVariable("NUGET_PACKAGES")
+    ?? throw new InvalidOperationException("NUGET_PACKAGES must point at the isolated packages folder");
+var packaged = Path.Combine(
+    packages, coordinate.ToLowerInvariant(), version.ToLowerInvariant(), "lib", "__TFM__", coordinate + ".dll");
+var packagedBytes = File.ReadAllBytes(packaged);
+foreach (var name in new[] { __TYPES__ })
+{
+    var type = Type.GetType(name + ", " + coordinate, throwOnError: true)!;
+    var assembly = type.Assembly;
+    if (assembly.GetName().Name != coordinate)
+    {
+        throw new InvalidOperationException($"{name} is defined in {assembly.GetName().Name}, not {coordinate}");
+    }
+
+    if (!File.ReadAllBytes(assembly.Location).AsSpan().SequenceEqual(packagedBytes))
+    {
+        throw new InvalidOperationException($"{assembly.Location} differs from the restored package assembly {packaged}");
+    }
+
+    var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "";
+    if (informational != version && !informational.StartsWith(version + "+", StringComparison.Ordinal))
+    {
+        throw new InvalidOperationException($"{coordinate} informational version '{informational}' is not {version}");
+    }
+
+    Console.WriteLine($"Loaded {name} from {coordinate} {informational}");
+}
+
+Console.WriteLine($"OK: clean consumer loaded {coordinate} {version}");
