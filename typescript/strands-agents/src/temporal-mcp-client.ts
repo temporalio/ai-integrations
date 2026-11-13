@@ -1,6 +1,7 @@
 import { McpClient, ToolValidationError } from '@strands-agents/sdk';
 import type { JSONSchema, JSONValue } from '@strands-agents/sdk';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { ApplicationFailure } from '@temporalio/common';
 import * as workflow from '@temporalio/workflow';
 import type { ActivityOptions } from '@temporalio/workflow';
 import { activityInfo, Context as ActivityContext } from '@temporalio/activity';
@@ -518,6 +519,18 @@ export class McpConnections {
         retired: false,
         client: (async () => {
           const client = factory();
+          if (
+            client == null ||
+            typeof client.connect !== 'function' ||
+            typeof client.disconnect !== 'function' ||
+            typeof client.listTools !== 'function' ||
+            typeof client.callTool !== 'function'
+          ) {
+            throw ApplicationFailure.nonRetryable(
+              `MCP client factory '${server}' must return a client with connect(), disconnect(), listTools() and callTool() methods.`,
+              'MCPClientFactoryTypeError'
+            );
+          }
           await client.connect();
           return client;
         })(),
