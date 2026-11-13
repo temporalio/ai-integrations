@@ -45,6 +45,7 @@ from temporalio.testing import ActivityEnvironment
 from tests.helpers.microsoft_agent_framework import (
     INVOKE_MODEL_STREAMING,
     SlowFakeChatClient,
+    StatusError,
     contents_summary,
     count_scheduled_activities,
     count_signals,
@@ -226,6 +227,7 @@ class _FakeStream:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.published: list[Any] = []
+        self.exits = 0
 
     def topic(self, _name: str) -> _FakeStream:
         return self
@@ -237,6 +239,7 @@ class _FakeStream:
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
+        self.exits += 1
         if self.error is not None:
             raise self.error
 
@@ -334,8 +337,10 @@ async def test_stream_record_keeps_calls_and_boundaries(
         ),
         (TimeoutError("Flush retry exceeded max_retry_duration (0:10:00)."), False),
         (RPCError("connection refused", RPCStatusCode.UNAVAILABLE, b""), False),
+        # RESOURCE_EXHAUSTED without the message-size text is rate limiting.
+        (RPCError("rate limit exceeded", RPCStatusCode.RESOURCE_EXHAUSTED, b""), False),
     ],
-    ids=["refused", "too-large", "gave-up", "unavailable"],
+    ids=["refused", "too-large", "gave-up", "unavailable", "rate-limited"],
 )
 async def test_stream_publish_failure_types(
     monkeypatch: pytest.MonkeyPatch, publish_error: Exception, non_retryable: bool
@@ -357,6 +362,28 @@ async def test_stream_publish_failure_types(
     assert "'model'" in excinfo.value.message and "'events'" in excinfo.value.message
     assert excinfo.value.__cause__ is publish_error
     assert fake.published
+
+
+async def test_model_error_with_topic_stays_the_model_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeStream()
+    _install_fake_stream(monkeypatch, fake)
+    error = StatusError(401)
+    activities = ChatClientActivities({"model": lambda: FakeChatClient([error])})
+    with pytest.raises(ApplicationError) as excinfo:
+        await ActivityEnvironment().run(
+            activities.invoke_model_streaming,
+            InvokeModelStreamingInput(
+                model="model", messages=_messages(), streaming_topic="events"
+            ),
+        )
+    # The provider error is classified as without a topic; the stream was
+    # closed on the way out and nothing was published.
+    assert excinfo.value.type == "StatusError" and excinfo.value.non_retryable
+    assert excinfo.value.__cause__ is error
+    assert fake.exits == 1
+    assert fake.published == []
 
 
 class _DeltaClient(BaseChatClient):
