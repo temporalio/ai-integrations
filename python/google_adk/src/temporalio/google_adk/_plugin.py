@@ -15,14 +15,9 @@ from typing import TYPE_CHECKING, Any
 
 import opentelemetry.metrics
 import opentelemetry.trace
-from pydantic import ConfigDict, TypeAdapter
 
 from temporalio import workflow
-from temporalio.api.common.v1 import Payload
-from temporalio.contrib.pydantic import (
-    PydanticJSONPlainPayloadConverter,
-    PydanticPayloadConverter,
-)
+from temporalio.contrib.pydantic import PydanticPayloadConverter
 from temporalio.converter import DataConverter, DefaultPayloadConverter
 from temporalio.google_adk._model import (
     invoke_model,
@@ -286,31 +281,9 @@ class GoogleAdkPlugin(SimplePlugin):
         self, converter: DataConverter | None
     ) -> DataConverter:
         if converter is None:
-            return DataConverter(payload_converter_class=_AdkPayloadConverter)
+            return DataConverter(payload_converter_class=PydanticPayloadConverter)
         elif converter.payload_converter_class is DefaultPayloadConverter:
             return dataclasses.replace(
-                converter, payload_converter_class=_AdkPayloadConverter
+                converter, payload_converter_class=PydanticPayloadConverter
             )
         return converter
-
-
-class _AdkJSONPayloadConverter(PydanticJSONPlainPayloadConverter):
-    """Omit None fields while preserving populated defaults."""
-
-    _serializer: TypeAdapter[Any] = TypeAdapter(
-        Any, config=ConfigDict(ser_json_inf_nan="constants")
-    )
-
-    def to_payload(self, value: Any) -> Payload:
-        return Payload(
-            metadata={"encoding": self.encoding.encode()},
-            data=self._serializer.dump_json(value, by_alias=True, exclude_none=True),
-        )
-
-
-class _AdkPayloadConverter(PydanticPayloadConverter):
-    """Use compact ADK JSON encoding with the SDK's standard decoders."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.converters = {**self.converters, b"json/plain": _AdkJSONPayloadConverter()}

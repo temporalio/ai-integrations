@@ -100,6 +100,8 @@ class _OptionalFields(BaseModel):
 
     unset_none: str | None = Field(default=None, alias="optionalUnsetNone")
     explicit_none: str | None = Field(default=None, alias="explicitNone")
+    required_nullable: str | None
+    nullable_default: str | None = "fallback"
     default_value: str = Field(default="kept", alias="defaultValue")
     values: list[str] = Field(default_factory=list)
 
@@ -111,10 +113,12 @@ class _NestedValues:
     plain: dict[str, Any]
 
 
-async def test_nested_none_fields_are_omitted_without_losing_defaults_or_dict_entries(
+async def test_nested_fields_survive_roundtrip(
     converter: DataConverter,
 ):
-    model = _OptionalFields(explicitNone=None)
+    model = _OptionalFields(
+        explicitNone=None, required_nullable=None, nullable_default=None
+    )
     model.values.append("in-place")
     value = _NestedValues(
         items=[model], mapping={"model": model}, plain={"keep_none": None}
@@ -127,8 +131,10 @@ async def test_nested_none_fields_are_omitted_without_losing_defaults_or_dict_en
     wire = json.loads(payloads[0].data)
 
     for nested in (wire["items"][0], wire["mapping"]["model"]):
-        assert "optionalUnsetNone" not in nested
-        assert "explicitNone" not in nested
+        assert nested["optionalUnsetNone"] is None
+        assert nested["explicitNone"] is None
+        assert nested["required_nullable"] is None
+        assert nested["nullable_default"] is None
         assert nested["defaultValue"] == "kept"
         assert nested["values"] == ["in-place"]
     assert wire["plain"] == {"keep_none": None}
