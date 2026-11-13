@@ -29,7 +29,7 @@ public sealed class TemporalChatClient : IChatClient
     /// <param name="model">Model name, a key of <see cref="MicrosoftAgentFrameworkPluginOptions.ChatClients"/> on the worker.</param>
     /// <param name="activityOptions">
     /// Options for the model Activity. Fields left null get the defaults: 5-minute start-to-close
-    /// timeout, 10-second heartbeat timeout, summary <c>microsoft-agent-framework model call: {model}</c>.
+    /// timeout, 10-second heartbeat timeout, the model name as the summary.
     /// </param>
     /// <param name="streamingTopic">
     /// Workflow Stream topic that receives each <see cref="ChatResponseUpdate"/> from inside the
@@ -170,7 +170,7 @@ public sealed class TemporalChatClient : IChatClient
         }
 
         result.HeartbeatTimeout ??= DefaultHeartbeatTimeout;
-        result.Summary ??= $"microsoft-agent-framework model call: {model}";
+        result.Summary ??= model;
         return result;
     }
 }

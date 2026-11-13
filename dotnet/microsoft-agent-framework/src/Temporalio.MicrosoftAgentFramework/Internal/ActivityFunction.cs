@@ -48,7 +48,7 @@ internal sealed class ActivityFunction : AIFunction
         argumentCount = CountArguments(parameters, Name);
         JsonSchema = AIJsonUtilities.CreateFunctionJsonSchema(method, title: null, description: Description, AIJsonUtilities.DefaultOptions);
         this.options = (ActivityOptions)options.Clone();
-        this.options.Summary ??= $"microsoft-agent-framework tool call: {Name}";
+        this.options.Summary ??= Name;
         resultType = UnwrapResultType(method.ReturnType);
         runWithResult = resultType is null ? null : RunWithResultMethod.MakeGenericMethod(resultType);
     }

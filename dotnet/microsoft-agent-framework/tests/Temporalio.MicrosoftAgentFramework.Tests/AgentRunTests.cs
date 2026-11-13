@@ -46,7 +46,7 @@ public class AgentRunTests : WorkflowTestBase
         Assert.Equal(2, counts[ModelActivityNames.InvokeModel]);
         Assert.Equal(1, counts["GetWeather"]);
         var scheduled = Assert.Single(HistoryAssert.Scheduled(history, "GetWeather"));
-        Assert.Equal("microsoft-agent-framework tool call: get_weather", HistoryAssert.Summary(scheduled, Client));
+        Assert.Equal("get_weather", HistoryAssert.Summary(scheduled, Client));
         Assert.Equal(TimeSpan.FromSeconds(30), scheduled.ActivityTaskScheduledEventAttributes!.StartToCloseTimeout.ToTimeSpan());
         var toolResult = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
         Assert.Equal("sunny in Kingston (activity)", toolResult.Result?.ToString());
@@ -163,7 +163,7 @@ public class AgentRunTests : WorkflowTestBase
         Assert.Equal(1, alpha.CallCount);
         Assert.Equal(1, beta.CallCount);
         var summaries = HistoryAssert.Scheduled(await handle.FetchHistoryAsync()).Select(e => HistoryAssert.Summary(e, Client)).ToList();
-        Assert.Equal(["microsoft-agent-framework model call: alpha", "microsoft-agent-framework model call: beta"], summaries);
+        Assert.Equal(["alpha", "beta"], summaries);
     }
 
     [Theory]
@@ -199,7 +199,7 @@ public class AgentRunTests : WorkflowTestBase
         var attributes = scheduled.ActivityTaskScheduledEventAttributes!;
         Assert.Equal(TimeSpan.FromMinutes(5), attributes.StartToCloseTimeout.ToTimeSpan());
         Assert.Equal(TimeSpan.FromSeconds(10), attributes.HeartbeatTimeout.ToTimeSpan());
-        Assert.Equal("microsoft-agent-framework model call: fake", HistoryAssert.Summary(scheduled, Client));
+        Assert.Equal("fake", HistoryAssert.Summary(scheduled, Client));
         Assert.Equal(0, HistoryAssert.Count(await handle.FetchHistoryAsync(), EventType.WorkflowTaskFailed));
     }
 

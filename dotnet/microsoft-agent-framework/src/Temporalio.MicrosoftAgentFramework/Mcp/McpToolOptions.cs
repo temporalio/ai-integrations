@@ -15,13 +15,13 @@ public sealed class McpToolOptions
 
     /// <summary>
     /// Gets or sets the options of the list-tools Activity. Null fields get the defaults: 30-second
-    /// start-to-close timeout and summary <c>microsoft-agent-framework mcp list tools: {server}</c>.
+    /// start-to-close timeout and the server name as the summary.
     /// </summary>
     public ActivityOptions? ListToolsActivityOptions { get; set; }
 
     /// <summary>
     /// Gets or sets the options of the call-tool Activity. Null fields get the defaults: 60-second
-    /// start-to-close timeout and summary <c>microsoft-agent-framework mcp call tool: {server}/{tool}</c>.
+    /// start-to-close timeout and <c>{server}/{tool}</c> as the summary.
     /// </summary>
     public ActivityOptions? CallToolActivityOptions { get; set; }
 
@@ -57,7 +57,7 @@ public sealed class McpToolOptions
             options.StartToCloseTimeout = DefaultListToolsTimeout;
         }
 
-        options.Summary ??= $"microsoft-agent-framework mcp list tools: {server}";
+        options.Summary ??= server;
         return options;
     }
 
@@ -75,7 +75,7 @@ public sealed class McpToolOptions
             options.StartToCloseTimeout = DefaultCallToolTimeout;
         }
 
-        options.Summary ??= $"microsoft-agent-framework mcp call tool: {server}/{tool}";
+        options.Summary ??= $"{server}/{tool}";
         return options;
     }
 }
