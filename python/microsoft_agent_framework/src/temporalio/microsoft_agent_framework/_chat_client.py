@@ -56,9 +56,10 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
     its own at half the heartbeat timeout. A run's ``client_kwargs`` (such as
     ``extra_headers``) cross to the Activity and reach the provider client.
 
-    With ``streaming_topic`` set, a streamed call publishes each update (as its
-    dict form) to that topic on the workflow's ``WorkflowStream``, batched at
-    ``streaming_batch_interval``. ``middleware``,
+    With ``streaming_topic`` set, every call of this client runs as the
+    streaming Activity, with or without ``stream=True``, and publishes each
+    update (as its dict form) to that topic on the workflow's
+    ``WorkflowStream``, batched at ``streaming_batch_interval`` or 256 updates. ``middleware``,
     ``function_invocation_configuration``, ``compaction_strategy`` and
     ``tokenizer`` are the framework's own client options. A synchronous
     ``def`` tool runs inline on the workflow task (the plugin's worker
@@ -149,7 +150,7 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
         dumped_kwargs = _serde.dump_kwargs(kwargs)
         dumped_messages = _serde.dump_messages(messages)
         dumped_options = _serde.dump_options(options)
-        if stream:
+        if stream or self._streaming_topic is not None:
             streaming_input = InvokeModelStreamingInput(
                 model=self._model,
                 messages=dumped_messages,
@@ -158,11 +159,17 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
                 streaming_topic=self._streaming_topic,
                 streaming_batch_interval_seconds=self._streaming_batch_interval.total_seconds(),
             )
-            return ResponseStream(
-                self._stream_updates(streaming_input),
-                finalizer=lambda updates: ChatResponse.from_updates(
-                    updates, output_format_type=options.get("response_format")
-                ),
+            if stream:
+                return ResponseStream(
+                    self._stream_updates(streaming_input),
+                    finalizer=lambda updates: ChatResponse.from_updates(
+                        updates, output_format_type=options.get("response_format")
+                    ),
+                )
+            # A topic publishes on every call of this client, so a call without
+            # stream=True runs the streaming Activity too and is finalized here.
+            return self._get_response_from_stream(
+                streaming_input, options.get("response_format")
             )
         return self._get_response(
             InvokeModelInput(
@@ -181,6 +188,12 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
             **self._activity_options,
         )
         return _serde.load_response(raw)
+
+    async def _get_response_from_stream(
+        self, input: InvokeModelStreamingInput, response_format: Any
+    ) -> ChatResponse:
+        updates = [update async for update in self._stream_updates(input)]
+        return ChatResponse.from_updates(updates, output_format_type=response_format)
 
     async def _stream_updates(
         self, input: InvokeModelStreamingInput

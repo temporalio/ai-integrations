@@ -58,6 +58,7 @@ class StreamInput:
     prompt: str = "weather in Oslo?"
     topic: str | None = None
     batch_interval_ms: float = 100
+    stream: bool = True
 
 
 def _kinds(update: Any) -> list[str]:
@@ -85,9 +86,13 @@ class StreamingWorkflow:
             streaming_batch_interval=timedelta(milliseconds=input.batch_interval_ms),
         )
         agent = Agent(client=client, tools=[get_weather])
-        stream = agent.run(input.prompt, stream=True)
-        updates = [(_kinds(update), update.text) async for update in stream]
-        final = await stream.get_final_response()
+        updates: list[Any] = []
+        if input.stream:
+            stream = agent.run(input.prompt, stream=True)
+            updates = [(_kinds(update), update.text) async for update in stream]
+            final = await stream.get_final_response()
+        else:
+            final = await agent.run(input.prompt)
         return {
             "updates": updates,
             "text": final.text,
@@ -158,6 +163,38 @@ async def test_streaming_topic(client: Client) -> None:
         *[(["text"], chunk) for chunk in chunks],
     ]
     assert "".join(u.text for u in updates) == result["text"]
+
+
+async def test_streaming_topic_without_stream(client: Client) -> None:
+    plugin = MicrosoftAgentFrameworkPlugin(
+        chat_clients={"model": fake_chat_client(_SCRIPT)}
+    )
+    async with new_worker(client, StreamingWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            StreamingWorkflow.run,
+            StreamInput(topic="events", stream=False),
+            id=workflow_id("stream-topic-no-stream"),
+            task_queue=worker.task_queue,
+        )
+        stream_client = WorkflowStreamClient.create(client, handle.id)
+        items = [item async for item in stream_client.subscribe(["events"])]
+        result = await handle.result()
+    assert result["text"] == _TEXT
+    assert result["log"] == ["Oslo"]
+    assert result["contents"] == [
+        "call:get_weather",
+        "result:rainy in Oslo",
+        f"text:{_TEXT}",
+    ]
+    # A topic makes every call of the client a streaming Activity, so a run
+    # without stream=True publishes too and no invoke_model Activity runs.
+    assert await count_scheduled_activities(handle) == {INVOKE_MODEL_STREAMING: 2}
+    updates = [ChatResponseUpdate.from_dict(item.data) for item in items]
+    chunks = [_TEXT[i : i + 12] for i in range(0, len(_TEXT), 12)]
+    assert [(_kinds(u), u.text) for u in updates] == [
+        (["function_call"], ""),
+        *[(["text"], chunk) for chunk in chunks],
+    ]
 
 
 @pytest.mark.parametrize(
