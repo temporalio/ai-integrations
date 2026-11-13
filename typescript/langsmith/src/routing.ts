@@ -1,5 +1,6 @@
 /** Destination and credential-free replica routing shared across Temporal boundaries. */
 
+import { AgentAddress } from 'langsmith';
 import type { RunTreeConfig, WriteReplica } from 'langsmith/run_trees';
 import { scrubSensitive } from './propagation';
 
@@ -34,11 +35,9 @@ function safeUpdates(value: unknown): unknown {
   return undefined;
 }
 
-/** Follow LangSmith's header allowlist; clients, credentials and ingestion URLs stay local. */
-export function replicaRouting(replicas: readonly WriteReplica[] | undefined): ReplicaRouting[] | undefined {
-  return replicas?.map((replica) => ({
+function replicaFields(replica: WriteReplica): Omit<ReplicaRouting, 'address'> {
+  return {
     ...(typeof replica.projectName === 'string' ? { projectName: replica.projectName } : {}),
-    ...(typeof replica.address === 'string' ? { address: replica.address } : {}),
     ...(typeof replica.primary === 'boolean' ? { primary: replica.primary } : {}),
     ...(typeof replica.reroot === 'boolean' ? { reroot: replica.reroot } : {}),
     ...(replica.updates ? {
@@ -46,14 +45,24 @@ export function replicaRouting(replicas: readonly WriteReplica[] | undefined): R
         Object.entries(replica.updates).filter(([key]) => SAFE_UPDATE_FIELDS.has(key))
       )) as WriteReplica['updates'],
     } : {}),
+  };
+}
+
+/** Follow LangSmith's header allowlist; clients, credentials and ingestion URLs stay local. */
+export function replicaRouting(replicas: readonly WriteReplica[] | undefined): ReplicaRouting[] | undefined {
+  return replicas?.map((replica) => ({
+    ...replicaFields(replica),
+    ...(replica.address ? { address: { ...new AgentAddress(replica.address.id, replica.address.environment) } } : {}),
   }));
 }
 
 /** The Temporal wire format uses Python's spelling; accept native JS headers too. */
 export function replicaHeaders(replicas: readonly WriteReplica[]): unknown[] {
-  return replicaRouting(replicas)!.map(({ projectName, ...replica }) => ({
+  return replicaRouting(replicas)!.map(({ projectName, address, ...replica }) => ({
     ...replica,
     ...(projectName === undefined ? {} : { project_name: projectName }),
+    // LangSmith and Python use LRN strings on the wire, including older histories.
+    ...(address ? { address: `lrn:agents/${address.id}/environments/${address.environment.toLowerCase()}` } : {}),
   }));
 }
 
@@ -69,7 +78,12 @@ export function normalizeReplicaHeaders(baggage: string): string {
       const record = replica as Record<string, unknown>;
       return { ...record, projectName: record.project_name ?? record.projectName } as WriteReplica;
     });
-    return `${prefix}${encodeURIComponent(JSON.stringify(replicaRouting(normalized)))}`;
+    // Leave wire addresses for RunTree.fromHeaders to parse and validate.
+    const sanitized = normalized.map((replica) => ({
+      ...replicaFields(replica),
+      ...(replica.address === undefined ? {} : { address: replica.address }),
+    }));
+    return `${prefix}${encodeURIComponent(JSON.stringify(sanitized))}`;
   }).join(',');
 }
 
@@ -81,7 +95,9 @@ export function bindReplicaCredentials(
   if (replicas === undefined) return localReplicas ? [...localReplicas] : undefined;
   return replicas.map((replica) => {
     const local = localReplicas?.find(
-      (candidate) => candidate.projectName === replica.projectName && candidate.address === replica.address
+      (candidate) => candidate.projectName === replica.projectName &&
+        candidate.address?.kind === replica.address?.kind && candidate.address?.id === replica.address?.id &&
+        candidate.address?.environment === replica.address?.environment
     );
     return {
       ...replica,
