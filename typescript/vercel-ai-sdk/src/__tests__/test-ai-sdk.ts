@@ -1827,7 +1827,9 @@ class AbortRecordingProvider implements ProviderV4 {
   }
 }
 
-test('abortSignal that never aborts does not reach the Activity payload', async (t) => {
+// Serial, because these Workers hold a model call open, and that slows the tests that
+// run at the same time until their Workflows time out.
+test.serial('abortSignal that never aborts does not reach the Activity payload', async (t) => {
   const provider = new AbortRecordingProvider(false);
   const { createWorker, executeWorkflow } = helpers(t);
   const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
@@ -1844,7 +1846,7 @@ test('abortSignal that never aborts does not reach the Activity payload', async 
   }
 });
 
-test('abortSignal that is already aborted does not schedule the Activity', async (t) => {
+test.serial('abortSignal that is already aborted does not schedule the Activity', async (t) => {
   const provider = new AbortRecordingProvider(false);
   const { createWorker, startWorkflow } = helpers(t);
   const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
@@ -1858,7 +1860,7 @@ test('abortSignal that is already aborted does not schedule the Activity', async
   t.is(provider.signals.length, 0);
 });
 
-test('abortSignal that aborts during generateText cancels the Activity', async (t) => {
+test.serial('abortSignal that aborts during generateText cancels the Activity', async (t) => {
   const provider = new AbortRecordingProvider(true);
   const { createWorker, startWorkflow } = helpers(t);
   const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
@@ -1881,7 +1883,7 @@ test('abortSignal that aborts during generateText cancels the Activity', async (
   });
 });
 
-test('abortSignal that aborts during streamText ends the stream with an abort part', async (t) => {
+test.serial('abortSignal that aborts during streamText ends the stream with an abort part', async (t) => {
   const provider = new AbortRecordingProvider(true);
   const { createWorker, startWorkflow } = helpers(t);
   const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
@@ -1921,7 +1923,7 @@ test('A history where an abort during embedMany cancelled nothing still replays'
   t.pass();
 });
 
-test('An abort during embedMany cancels the Activity in a new execution', async (t) => {
+test.serial('An abort during embedMany cancels the Activity in a new execution', async (t) => {
   const provider = new AbortRecordingProvider(true);
   const { createWorker, startWorkflow } = helpers(t);
   const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
