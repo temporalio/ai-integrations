@@ -49,14 +49,27 @@ test('normalizeAgentsRunError: plain Error becomes AgentsWorkflowError Applicati
 });
 
 test('normalizeAgentsRunError: a tool or guardrail TemporalFailure becomes the cause of AgentsWorkflowError', (t) => {
-  const tf = new ActivityFailure('Activity task failed', 'someActivity', undefined, undefined, undefined);
-  for (const original of [new ToolCallError('tool failed', tf), new GuardrailExecutionError('guardrail failed', tf)]) {
-    const fail = normalizeAgentsRunError(original) as ApplicationFailure;
-    t.true(fail instanceof ApplicationFailure);
-    t.is(fail.type, 'AgentsWorkflowError');
-    t.true(fail.nonRetryable);
-    t.is(fail.message, `Agent workflow failed: ${original.message}`);
-    t.is(fail.cause, tf);
+  const cases: [Error, boolean][] = [
+    [new ActivityFailure('Activity task failed', 'someActivity', undefined, undefined, undefined), false],
+    [ApplicationFailure.retryable('tool failed', 'TryAgain'), false],
+    [ApplicationFailure.nonRetryable('tool rejected', 'ToolRejected'), true],
+  ];
+  for (const [tf, nonRetryable] of cases) {
+    for (const original of [
+      new ToolCallError('tool failed', tf),
+      new GuardrailExecutionError('guardrail failed', tf),
+    ]) {
+      const fail = normalizeAgentsRunError(original) as ApplicationFailure;
+      t.true(fail instanceof ApplicationFailure);
+      t.is(fail.type, 'AgentsWorkflowError');
+      if (nonRetryable) {
+        t.true(fail.nonRetryable);
+      } else {
+        t.false(fail.nonRetryable);
+      }
+      t.is(fail.message, `Agent workflow failed: ${original.message}`);
+      t.is(fail.cause, tf);
+    }
   }
 });
 

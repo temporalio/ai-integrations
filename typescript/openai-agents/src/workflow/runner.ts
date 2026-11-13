@@ -379,19 +379,22 @@ async function prepareRunState<TContext, TAgent extends Agent<any, any>>(
 
 /**
  * Returns the value the caller should throw: unwrapped TemporalFailure if
- * reachable via `cause` / `AggregateError.errors`, else for a plain Error a non-retryable
- * `AgentsWorkflowError` ApplicationFailure whose cause is the TemporalFailure a tool or
- * guardrail failed with, or else the Error itself, else the original non-Error.
+ * reachable via `cause` / `AggregateError.errors`, else for a plain Error an `AgentsWorkflowError`
+ * ApplicationFailure whose cause is the TemporalFailure a tool or guardrail failed with,
+ * non-retryable only if that is a non-retryable ApplicationFailure, or else a non-retryable
+ * one whose cause is the Error itself, else the original non-Error.
  */
 export function normalizeAgentsRunError(error: unknown): unknown {
   const temporalFailure = unwrapTemporalFailure(error);
   if (temporalFailure) return temporalFailure;
   if (error instanceof Error) {
+    const toolFailure = unwrapTemporalFailure(error, true);
     return ApplicationFailure.create({
       message: `Agent workflow failed: ${error.message}`,
       type: 'AgentsWorkflowError',
-      nonRetryable: true,
-      cause: unwrapTemporalFailure(error, true) ?? error,
+      nonRetryable:
+        toolFailure === undefined || (toolFailure instanceof ApplicationFailure && toolFailure.nonRetryable === true),
+      cause: toolFailure ?? error,
     });
   }
   return error;
