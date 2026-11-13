@@ -46,6 +46,7 @@ def test_report_matches_ci_workflow_job_names() -> None:
         ("java", "Java"),
         ("go", "Go"),
         ("typescript", "TypeScript"),
+        ("dotnet", ".NET"),
     ):
         names = {
             job["name"]
@@ -62,7 +63,7 @@ def test_report_matches_ci_workflow_job_names() -> None:
         # The release workflows' check-nightly looks the issue up by the title this report gives it.
         (key,), _ = nightly_report.classify([_job(f"{expected_name} (fakeplug) / matrix", "failure")])
         assert nightly_report.title_for(key) == release_tool.nightly_issue_title(language, "fakeplug")
-    assert {"python", "java", "go", "typescript"}.issubset(
+    assert {"python", "java", "go", "typescript", "dotnet"}.issubset(
         workflow["jobs"]["nightly-report"]["needs"]
     )
 
@@ -104,3 +105,16 @@ def test_java_failures_are_aggregated_by_plugin() -> None:
     )
     assert failing == {"spring-ai"}
     assert not passing
+
+
+def test_dotnet_failures_use_the_language_root_key() -> None:
+    failing, passing = nightly_report.classify(
+        [
+            _job(".NET (agent-framework) / agent-framework (windows-latest, dotnet10.0)", "failure"),
+            _job(".NET (agent-framework) / matrix", "success"),
+            _job(".NET (other) / other (ubuntu-latest, dotnet10.0)", "success"),
+        ]
+    )
+    assert failing == {"dotnet/agent-framework"}
+    assert passing == {"dotnet/other"}
+    assert nightly_report.title_for("dotnet/agent-framework") == release_tool.nightly_issue_title("dotnet", "agent-framework")

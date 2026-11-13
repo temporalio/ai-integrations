@@ -13,6 +13,7 @@ Subcommands:
   check-go-vanity              verify the Go vanity path routes to this plugin's subdirectory
   verify-go-module              compare public Go module bytes and build a clean consumer
   npm-registry-state           verify existing npm bytes before skipping an upload
+  nuget-registry-state         verify existing NuGet package entries before skipping an upload
   release-notes                 generate release notes from commits touching the plugin dir
   draft-release                 create/update an idempotent draft GitHub Release with assets
   publish-release               publish the reviewed draft after registry verification
@@ -24,7 +25,7 @@ Policy (AGENTS.md, "Release runbook"):
   * TestPyPI versions move forward too, except that its newest version may be re-run
   * a plugin with an open nightly issue does not release until the nightly run is green again
   * Python versions are canonical PEP 440; Java versions are X.Y.Z[-RCN];
-    Go and TypeScript versions are canonical SemVer; local versions and build metadata (+...) are forbidden
+    Go, TypeScript and .NET versions are canonical SemVer; local versions and build metadata (+...) are forbidden
 """
 
 from __future__ import annotations
@@ -53,10 +54,13 @@ from go_release import (
 )
 from npm_release import NpmReleaseError, NpmVersion, registry_state
 from npm_release import fetch_versions as fetch_npm_versions
+from nuget_release import NuGetMismatchError, NuGetReleaseError, NuGetVersion
+from nuget_release import fetch_versions as fetch_nuget_versions
+from nuget_release import registry_state as nuget_registry_state
 from packaging.version import InvalidVersion, Version
 
 # \Z (not $) so a trailing newline cannot ride along into GITHUB_OUTPUT.
-TAG_RE = re.compile(r"^(?P<language>python|typescript|java|go)/(?P<plugin>[a-z0-9][a-z0-9_.-]*)/v(?P<version>.+)\Z")
+TAG_RE = re.compile(r"^(?P<language>python|typescript|java|go|dotnet)/(?P<plugin>[a-z0-9][a-z0-9_.-]*)/v(?P<version>.+)\Z")
 JAVA_VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-RC[1-9][0-9]*)?\Z")
 MAVEN_CENTRAL = "https://repo.maven.apache.org/maven2"
 REGISTRY_JSON = {
@@ -116,6 +120,11 @@ def release_version(language: str, raw: str) -> Version | GoVersion:
             return GoVersion(raw)
         except GoReleaseError as exc:
             raise PolicyError(str(exc)) from exc
+    if language == "dotnet":
+        try:
+            return NuGetVersion(raw)
+        except NuGetReleaseError as exc:
+            raise PolicyError(str(exc)) from exc
     try:
         version = Version(raw)
     except InvalidVersion as exc:
@@ -151,8 +160,8 @@ def parse_tag(tag: str) -> dict[str, str]:
 def cmd_parse_tag(args: argparse.Namespace) -> int:
     out = parse_tag(args.tag)
     plugin_toml = Path(args.repo_root) / out["plugin_dir"] / "plugin.toml"
-    if out["language"] in ("go", "typescript") and not plugin_toml.is_file():
-        label = "Go" if out["language"] == "go" else "TypeScript"
+    if out["language"] in ("go", "typescript", "dotnet") and not plugin_toml.is_file():
+        label = {"go": "Go", "typescript": "TypeScript", "dotnet": ".NET"}[out["language"]]
         raise PolicyError(f"unknown {label} plugin: {out['plugin_dir']}")
     if plugin_toml.is_file():
         meta = _load(plugin_toml)
@@ -183,6 +192,14 @@ def cmd_parse_tag(args: argparse.Namespace) -> int:
             if GoVersion(out["version"]).release[0] >= 2:
                 raise PolicyError("Go v2+ releases require a /vN module-path cutover before release")
             out["go_runtime"] = str(meta["ci"]["runtime-versions"][-1])
+        elif out["language"] == "dotnet":
+            plugin = meta["plugin"]
+            expected = "Temporalio." + out["plugin"].replace("-", "")
+            if (plugin.get("language") != "dotnet" or plugin.get("name") != out["plugin"] or plugin.get("registry") != "nuget"
+                    or str(out["coordinate"]).lower() != expected.lower() or out["root_api"] != out["coordinate"]):
+                raise PolicyError(".NET tag, plugin metadata, coordinate and root API must match")
+            # The publish job installs this SDK channel and the clean consumer targets its framework.
+            out["dotnet_runtime"] = str(meta["ci"]["runtime-versions"][-1])
     _write_outputs(args.github_output, out)
     return 0
 
@@ -220,6 +237,11 @@ def fetch_published_versions(coordinate: str, registry: str, registry_json: Path
         try:
             return fetch_npm_versions(coordinate, registry_json)
         except NpmReleaseError as exc:
+            raise PolicyError(str(exc)) from exc
+    if registry == "nuget":
+        try:
+            return fetch_nuget_versions(coordinate, registry_json)
+        except NuGetReleaseError as exc:
             raise PolicyError(str(exc)) from exc
     if registry == "maven":
         return fetch_maven_versions(coordinate, registry_json)
@@ -309,7 +331,7 @@ def cmd_check_version_policy(args: argparse.Namespace) -> int:
     registry = meta["plugin"].get("registry", "pypi")
     if registry == "maven" and not JAVA_VERSION_RE.fullmatch(args.version):
         raise PolicyError("Maven release versions must be X.Y.Z or X.Y.Z-RCN")
-    language = {"goproxy": "go", "maven": "java", "npm": "typescript"}.get(registry, "python")
+    language = {"goproxy": "go", "maven": "java", "npm": "typescript", "nuget": "dotnet"}.get(registry, "python")
     version = release_version(language, args.version)
     published = fetch_published_versions(coordinate, registry, Path(args.registry_json) if args.registry_json else None)
     # A Go tag is already public when this job starts. A proxy listing containing
@@ -489,6 +511,10 @@ def release_notes(repo_root: Path, plugin_dir: str, tag: str, repo: str, *, ref:
         lines += ["## Pre-release notes", "", f"Install this Go pre-release with `go get {coordinate}@v{version}`.", ""]
     elif version.is_prerelease and parts["language"] == "typescript":
         lines += ["## Pre-release notes", "", f"Install this npm pre-release with `npm install {coordinate}@{version}`.", ""]
+    elif version.is_prerelease and parts["language"] == "dotnet":
+        # NuGet resolves to stable versions unless the pre-release version is named or --prerelease is passed.
+        lines += ["## Pre-release notes", "",
+                  f"Install this NuGet pre-release with `dotnet add package {coordinate} --version {version}`.", ""]
     elif version.is_prerelease:
         lines += [
             "## Pre-release notes",
@@ -558,8 +584,8 @@ def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> Non
     """Require an existing main-reachable tag and a completed run with its full matrix tested."""
     parsed = parse_tag(tag)
     language = parsed["language"]
-    if language not in {"python", "typescript"} or run_id <= 0:
-        raise PolicyError("recovery requires a Python or TypeScript release tag and a positive run ID")
+    if language not in {"python", "typescript", "dotnet"} or run_id <= 0:
+        raise PolicyError("recovery requires a Python, TypeScript or .NET release tag and a positive run ID")
     ref = f"refs/tags/{tag}"
     sha = _git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=repo_root).strip()
     if subprocess.run(["git", "merge-base", "--is-ancestor", sha, "origin/main"], cwd=repo_root).returncode != 0:
@@ -567,8 +593,16 @@ def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> Non
     plugin_dir = parsed["plugin_dir"]
     # The caller's metadata controls publication gates and smoke imports. It must describe the
     # original package, even though repaired workflow/tooling code comes from main.
-    filenames = (("plugin.toml", "pyproject.toml") if language == "python" else
-                 ("plugin.toml", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"))
+    if language == "python":
+        filenames: tuple[str, ...] = ("plugin.toml", "pyproject.toml")
+    elif language == "typescript":
+        filenames = ("plugin.toml", "package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml")
+    else:
+        # Everything that shapes a NuGet package: the plugin manifests plus every csproj and lock the tag committed.
+        tagged = _git("ls-tree", "-r", "--name-only", ref, "--", plugin_dir, cwd=repo_root).split()
+        shaping = {"plugin.toml", "global.json", "Directory.Build.props", "nuget.config", "packages.lock.json"}
+        filenames = tuple(sorted(path[len(plugin_dir) + 1:] for path in tagged
+                                 if path.rsplit("/", 1)[-1] in shaping or path.endswith(".csproj")))
     for filename in filenames:
         relative = f"{plugin_dir}/{filename}"
         tagged = _git("show", f"{ref}:{relative}", cwd=repo_root)
@@ -585,7 +619,7 @@ def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> Non
             (run.get("event") == "release" and run.get("head_branch") == tag)
             or (run.get("event") == "workflow_dispatch" and run.get("head_branch") in {"main", tag})
         )
-        source_description = "release-typescript.yml release or main/tag dispatch run"
+        source_description = f"release-{language}.yml release or main/tag dispatch run"
     if (
         run.get("repository", {}).get("full_name") != repo
         or run.get("path") != f".github/workflows/release-{language}.yml"
@@ -601,15 +635,17 @@ def check_recovery_run(repo_root: Path, repo: str, tag: str, run_id: int) -> Non
         ("ubuntu-latest", versions[0]), ("ubuntu-latest", versions[-1]),
         ("macos-latest", versions[-1]), ("windows-latest", versions[-1]),
     }
-    validation_job = "Validate tag and version policy" if language == "python" else "Validate TypeScript tag and version policy"
-    runtime = "py" if language == "python" else "node"
+    validation_job = {"python": "Validate tag and version policy", "typescript": "Validate TypeScript tag and version policy",
+                      "dotnet": "Validate .NET tag and version policy"}[language]
+    runtime = {"python": "py", "typescript": "node", "dotnet": "dotnet"}[language]
     required = {validation_job, "Test / matrix"}
     required.update(f"Test / {parsed['plugin']} ({runner}, {runtime}{version})" for runner, version in cells)
     for name in sorted(required):
         job = jobs.get(name, {})
         if job.get("status") != "completed" or job.get("conclusion") != "success":
             raise PolicyError(f"recovery source has no successful completed job: {name}")
-    artifact_name = f"dist-{parsed['plugin']}-locked" if language == "python" else f"npm-dist-{parsed['plugin']}"
+    artifact_name = {"python": f"dist-{parsed['plugin']}-locked", "typescript": f"npm-dist-{parsed['plugin']}",
+                     "dotnet": f"dist-dotnet-{parsed['plugin']}"}[language]
     artifacts = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}/artifacts?name={artifact_name}&per_page=100"))
     matching = [item for item in artifacts["artifacts"] if item["name"] == artifact_name and not item["expired"]]
     if len(matching) != 1:
@@ -800,6 +836,28 @@ def cmd_npm_registry_state(args: argparse.Namespace) -> int:
     raise PolicyError(error)
 
 
+def cmd_nuget_registry_state(args: argparse.Namespace) -> int:
+    """Skip an existing upload only after proving its entries match; retry propagation, never a mismatch."""
+    release_version("dotnet", args.version)
+    if args.attempts < 1 or args.delay < 0:
+        raise PolicyError("NuGet verification needs positive attempts and nonnegative delay")
+    for attempt in range(args.attempts):
+        try:
+            exists = nuget_registry_state(args.coordinate, args.version, Path(args.dist))
+            if exists or not args.require_present:
+                _write_outputs(args.github_output, {"exists": "true" if exists else "false"})
+                return 0
+            error = f"nuget.org does not yet serve {args.coordinate} {args.version}"
+        except NuGetMismatchError as exc:
+            raise PolicyError(str(exc)) from exc
+        except (NuGetReleaseError, urllib.error.URLError, TimeoutError) as exc:
+            error = str(exc)
+        if attempt + 1 < args.attempts:
+            print(f"NuGet verification attempt {attempt + 1}: {error}")
+            time.sleep(args.delay)
+    raise PolicyError(error)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo-root", default=os.environ.get("GITHUB_WORKSPACE", "."))
@@ -843,6 +901,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--delay", type=float, default=10)
     p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     p.set_defaults(func=cmd_npm_registry_state)
+
+    p = sub.add_parser("nuget-registry-state", help="verify existing NuGet package entries before skipping an upload")
+    p.add_argument("--coordinate", required=True)
+    p.add_argument("--version", required=True)
+    p.add_argument("--dist", required=True)
+    p.add_argument("--require-present", action="store_true")
+    p.add_argument("--attempts", type=int, default=1)
+    p.add_argument("--delay", type=float, default=30)
+    p.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
+    p.set_defaults(func=cmd_nuget_registry_state)
 
     p = sub.add_parser("verify-index-files", help="fail unless the index serves exactly the local distribution files")
     p.add_argument("--coordinate", required=True)

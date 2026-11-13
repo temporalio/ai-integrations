@@ -15,6 +15,7 @@ link here. Design source: the
 6. Do not hand-edit the committed `0.0.0` development version. Protected release tags are the published version source; never move or delete a tag. A failed pre-release gets the next `rcN`.
 7. Do not write `CHANGELOG.md` files. Release notes are generated from commit messages.
 8. Do not put Python source or stub files in `python/_shared/`. Python test support is duplicated into each plugin (and its source template) so every file resolves against that plugin's environment. Non-Python make logic and tool configuration may be shared there when the format supports composition.
+9. Do not add `Directory.Build.props`, `Directory.Build.targets`, `Directory.Packages.props`, `global.json`, `nuget.config` or a lock at `dotnet/`. MSBuild imports the nearest `Directory.Build.props` above a project, so a language-root file would apply to every plugin silently; each plugin owns these files and imports `dotnet/_shared/dotnet.props` explicitly.
 
 ## Purpose and layout
 
@@ -41,8 +42,10 @@ workflow verifies vanity routing before accepting a published module.
 
 Naming derivation, enforced by `scripts/ci/check_conventions.py`: folder name = `plugin.toml`
 `name`; Python coordinate = `temporalio-` + name with `_` replaced by `-`; Python root API =
-`temporalio.<name>`; release tag = `<language>/<name>/v<version>`. Folders never end in `-plugin`
-or `_plugin`.
+`temporalio.<name>`; .NET coordinate = `Temporalio.` + folder name with hyphens removed, compared
+case-insensitively, where the casing in `plugin.toml` is canonical and must equal the csproj
+`PackageId`; .NET root API = the coordinate; release tag = `<language>/<name>/v<version>`.
+Folders never end in `-plugin` or `_plugin`.
 
 Maturity mapping (`plugin.toml` `maturity` and the Python classifier must agree):
 `pre-release` = `Development Status :: 3 - Alpha`; `public-preview` =
@@ -56,10 +59,10 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 
 ## Repository invariants
 
-- Each plugin owns its manifest and lockfile (`pyproject.toml` + `uv.lock`); no lockfile at a language root, no root Python project. `scripts/` is a separate tooling project, not a root project.
+- Each plugin owns its manifest and lockfile (`pyproject.toml` + `uv.lock`; `Directory.Build.props` plus per-project `packages.lock.json` for .NET); no lockfile at a language root, no root Python project. `scripts/` is a separate tooling project, not a root project.
 - Each plugin carries `plugin.toml` (metadata only: name, language, coordinate, registry, root API, maturity, docs, `[ci] runtime-versions`, `[smoke] imports`). It holds no secrets and no owners; `.github/CODEOWNERS` is `* @temporalio/ai-sdk`.
 - The root `LICENSE` is the source of truth and every plugin directory carries a committed regular-file copy of it, because each wheel and sdist must ship the license text. The conventions check fails unless the plugin copy is committed and byte-identical to the root file (`cp LICENSE python/<name>/LICENSE` to refresh); `pyproject.toml` declares `license = "MIT"` and `license-files = ["LICENSE"]`; `check_wheel.py` verifies the packaged text equals the root file.
-- Python manifests and lockfiles carry the static `0.0.0` development placeholder. A protected release tag is the published version source; the release matrix runs `uv version <tag-version>` before sync, test and build, and only those tested artifacts are published. Ordinary CI and local development keep `0.0.0`.
+- Python manifests and lockfiles, `package.json`, Gradle projects and .NET csproj files carry the static `0.0.0` development placeholder. A protected release tag is the published version source; the release matrix runs `uv version <tag-version>` before sync, test and build, and only those tested artifacts are published. .NET releases pass the tag version as `-p:Version` to build, test and pack instead of editing a file. Ordinary CI and local development keep `0.0.0`.
 - No changelog files. `scripts/release/release_tool.py release-notes` derives notes from commit subjects touching the plugin directory since its previous tag.
 - Every GitHub Action is pinned to a full commit SHA with a `# vN` comment (org opengrep rule).
 
@@ -149,17 +152,67 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   publisher, as described below. No per-plugin workflows or secrets. CI checks
   tarball contents and a clean consumer import.
 
+## .NET conventions
+
+- Layout: `dotnet/<name>/{plugin.toml, Directory.Build.props, <Coordinate>.slnx, global.json,
+  nuget.config, .editorconfig, Makefile, README.md, LICENSE, src/<Coordinate>/<Coordinate>.csproj,
+  tests/<Coordinate>.Tests/<Coordinate>.Tests.csproj}` with a committed `packages.lock.json` beside
+  each csproj. `Directory.Build.props` is the discovery manifest and starts by importing
+  `dotnet/_shared/dotnet.props`, which holds the shared build policy (warnings as errors, nullable,
+  analyzers, lock files, audit, Source Link, `snupkg` symbols, icon, authors and repository
+  metadata). Dependencies, target frameworks and package identity stay in the plugin's csproj.
+- Coordinates are `Temporalio.<Name>` and the root namespace is the coordinate. The first release
+  targets `net10.0` only; .NET 8 and 9 left support on 2026-11-10.
+- The csproj `Version` is `0.0.0`. The release workflow passes `-p:Version=<tag version>` to build,
+  test and pack; the tested assembly is the packed assembly (`dotnet pack --no-build`). Never commit a
+  real version.
+- Each project opts into `RestorePackagesWithLockFile`; `dotnet/_shared/dotnet.mk` exports
+  `RestoreLockedMode=true`, so every restore fails with NU1004 when a csproj drifts from its lock. Edit
+  dependencies, then run `make lock`. `global.json` pins the SDK channel floor with
+  `rollForward: latestFeature` and `allowPrerelease: false`; `IsAotCompatible`, `PublishAot`,
+  `PublishTrimmed` and `IsTrimmable` are not allowed because they add SDK-pinned implicit package
+  references that break locked restores across SDK patches.
+- Dependency cooldown: `nuget.config` sets `minPublishAgeHours="336"` on the nuget.org source and
+  exempts `Temporalio*` in `<minPublishAgeExceptions>`, the syntax NuGet's accepted cooldown spec
+  (NuGet/Home#14983) defines. NuGet does not enforce it yet; `make check-deps`
+  (`scripts/ci/check_dotnet_deps.py`) fails when any version in a committed lock was published less
+  than 336 hours ago or is unlisted. `make sync-latest` (nightly) updates every direct dependency to
+  its newest version with `dotnet package update` and re-locks in the CI checkout only; until NuGet
+  reads the cooldown that lane tests versions younger than the window. Known-vulnerability advisories
+  (`NuGetAuditMode=all`) are warnings, not errors; fix them with `dotnet package update --vulnerable`.
+- The package ships `LICENSE` (`PackageLicenseFile`, a committed copy byte-identical to the root
+  file), `README.md` (`PackageReadmeFile`; absolute links only, nuget.org renders it), `icon.png`
+  from `dotnet/_shared/`, XML docs, Source Link metadata and a `.snupkg`.
+  `ContinuousIntegrationBuild=true` is set on CI only; `DeterministicTimestamp` is the commit time, so
+  one commit packs to identical bytes on one SDK feature band.
+- Tests use xunit.net v3 under Microsoft.Testing.Platform (`global.json` `test.runner`,
+  `UseMicrosoftTestingPlatformRunner`), with `Microsoft.Testing.Extensions.TrxReport` for reports.
+  VSTest packages (`Microsoft.NET.Test.Sdk`, `xunit.runner.visualstudio`, xunit 2) are not allowed;
+  MTP mode rejects them. The runner's switches differ from VSTest: `make test` passes `--report-trx`,
+  and `make test TEST_ARGS='--filter-class Temporalio.AgentFramework.Tests.ReplayTests'` selects a
+  class. Tests self-provision the Temporal dev server with the repository's retry policy and need no
+  provider credentials.
+- Tooling: `make sync`, `make lint` (`dotnet format --verify-no-changes` on the solution; analyzers run
+  in the build), `make test`, `make build`, `make lock`, `make check-deps`. Formatting rules live in the
+  plugin's `.editorconfig`, kept byte-identical to `dotnet/_template/.editorconfig`; project-wide
+  analyzer severities live in `dotnet/_shared/analyzers.globalconfig` (imported through
+  `GlobalAnalyzerConfigFiles`). `StyleCop.Analyzers` is referenced by each project with
+  `PrivateAssets="all"`.
+- CI uses `plugin.toml` `[ci] runtime-versions` as SDK channels: Ubuntu at the minimum and maximum
+  channel, macOS and Windows at the maximum; a cell fails if `dotnet --version` is not in its channel.
+
 ## CI
 
 One entry workflow, one reusable workflow per language, plugin as a parameter, no secrets.
 
-- `.github/workflows/ci.yml` (`pull_request`, `merge_group`, push to `main`, nightly, dispatch). Job `changes` runs `scripts/ci/detect_changes.py`: plugins are discovered from `<language>/*/<manifest>` (ignoring `_*`); a changed file under a plugin selects that plugin; a non-plugin file under a language root selects every plugin of that language; `.github/**` and `scripts/ci/**` select everything; `scripts/release/**` select only the script tests; push to `main`, nightly and dispatch select everything. Job `conventions` checks repository invariants and runs the script tests. Jobs `python`, `typescript`, `java`, and `go` call their per-language reusable workflows once per selected plugin. Job `ci-status` fans in and is the only required check (skipped upstream jobs count as success).
+- `.github/workflows/ci.yml` (`pull_request`, `merge_group`, push to `main`, nightly, dispatch). Job `changes` runs `scripts/ci/detect_changes.py`: plugins are discovered from `<language>/*/<manifest>` (ignoring `_*`); a changed file under a plugin selects that plugin; a non-plugin file under a language root selects every plugin of that language; `.github/**` and `scripts/ci/**` select everything; `scripts/release/**` select only the script tests; push to `main`, nightly and dispatch select everything. Job `conventions` checks repository invariants and runs the script tests. Jobs `python`, `typescript`, `java`, `go` and `dotnet` call their per-language reusable workflows once per selected plugin. Job `ci-status` fans in and is the only required check (skipped upstream jobs count as success).
 - `.github/workflows/_typescript-plugin.yml`: uses the shared runtime/platform matrix and independent pnpm lockfile for each plugin. Locked runs first use `make check-deps` on ubuntu/max to verify fresh resolution under the dependency cooldown without changing the committed lock. Every cell runs sync, lint and tests; ubuntu/max also packs, verifies contents and smoke-installs the tarball in a clean consumer. Nightly selects compatible latest dependencies. TypeScript nightly issues use `typescript/<plugin>` keys to avoid collisions with Python.
 - `.github/workflows/_python-plugin.yml`: job `matrix` reads `plugin.toml` `runtime-versions` and emits the same matrix for every run, pull requests included (ubuntu at the min and max versions, macOS and Windows at max); locked runs first use `make check-deps` (`uv lock --upgrade --dry-run`) on ubuntu/max to verify fresh resolution under the dependency cooldown without changing the committed lock. Job `test` runs `make sync` (or `sync-latest` on nightly runs), `make lint`, `make test`, then, on the ubuntu/max cell only, the `python-build-check` composite action (`make build`, `check_wheel.py`, isolated `smoke.py` on wheel and sdist). Windows runners install GNU make with choco.
 - `.github/workflows/_go-plugin.yml`: uses the same matrix generator and platform layout with each plugin's Go `runtime-versions`. Every cell runs `make sync` (or `sync-latest`), `make lint`, `make test`, and `make build`; the ubuntu/max cell enables `-race`. `GOTOOLCHAIN=local` prevents dependencies from silently replacing the runtime under test. Windows runners install GNU make with choco. Go action caching keys include the plugin's `go.mod` and `go.sum`.
-- Dependencies: ordinary CI uses the committed lockfile (`go.mod`/`go.sum` for Go); local `make sync` uses the existing versions. Nightly runs every plugin with the newest allowed dependencies (`sync-latest`) without committing the updated lock; manual dispatch can select that mode too. Python make targets use `uv run --locked`; Go lint, test and build use `-mod=readonly` to preserve the versions selected during sync. Go `sync-latest` runs `go get -u -t ./...`, tidies the module and verifies its checksums.
+- `.github/workflows/_dotnet-plugin.yml`: same matrix generator and platform layout with each plugin's SDK channels (`actions/setup-dotnet` installs `<channel>.x`; the plugin's `global.json` selects it, and a cell fails if `dotnet --version` is outside its channel). Locked runs first use `make check-deps` on ubuntu/max to enforce the dependency cooldown on the committed locks. Every cell runs `make sync` (or `sync-latest`), `make lint`, `make test`; the ubuntu/max cell also runs `make build`, `check_dotnet_dist.py` and `smoke_dotnet.py` (a clean consumer restores the packed `.nupkg` from a local feed with an isolated packages folder) and uploads `dist-dotnet-<plugin>`. Windows runners install GNU make with choco. .NET nightly issues use `dotnet/<plugin>` keys.
+- Dependencies: ordinary CI uses the committed lockfile (`go.mod`/`go.sum` for Go); local `make sync` uses the existing versions. Nightly runs every plugin with the newest allowed dependencies (`sync-latest`) without committing the updated lock; manual dispatch can select that mode too. Python make targets use `uv run --locked`; Go lint, test and build use `-mod=readonly` to preserve the versions selected during sync. Go `sync-latest` runs `go get -u -t ./...`, tidies the module and verifies its checksums. .NET make targets export `RestoreLockedMode=true`; .NET `sync-latest` runs `dotnet package update` on the solution and `dotnet restore --force-evaluate`.
 - Required checks on `main`: `ci-status`, `Check for CODEOWNERS` and `opengrep/scan` (the last two are org-enforced workflows that run automatically on every PR), plus one approving review from a code owner; `license/cla` joins once the CLA app is installed. Do not add a local opengrep caller; the org one already runs. Repository setup: branch protection, the `testpypi`/`pypi` environments (tag policy `python/*/v*`) and the release-tag ruleset were configured by hand on 2026-09-09. The `pypi` required-reviewer gate was removed on 2026-10-07.
-- Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing plugin from the job names `Python (<plugin>) / ...`, `Java (<plugin>) / ...`, and `Go (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs. Existing Python and Java issue titles stay unchanged; Go keys use `go/<plugin>` so plugins in different languages cannot share an issue.
+- Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing plugin from the job names `Python (<plugin>) / ...`, `Java (<plugin>) / ...`, `Go (<plugin>) / ...`, `TypeScript (<plugin>) / ...` and `.NET (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs. Existing Python and Java issue titles stay unchanged; Go, TypeScript and .NET keys use `go/<plugin>`, `typescript/<plugin>` and `dotnet/<plugin>` so plugins in different languages cannot share an issue.
 
 ## Releases
 
@@ -181,7 +234,7 @@ plugin and wait for a green nightly, which closes the issue. Recovery dispatches
 already tested. A Go tag is public as soon as it exists, so Go checks only in the branch
 dry run before tagging.
 
-Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
+Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). nuget.org supports OIDC trusted publishing (`NuGet/login` exchanges the job's OIDC token for a one-hour, single-use API key; the policy binds repository owner, repository, the workflow file name and the `nuget` environment, and is owned by the nuget.org account that owns the `Temporalio.` prefix). No stored NuGet tokens; `NUGET_USER` is an environment variable holding a public profile name. Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
 
 After a successful dry run, use its full commit SHA as `<tested-sha>` when generating
 notes with `release-notes --ref` and creating the draft with `gh release create
@@ -300,6 +353,68 @@ committed development version `0.0.0`.
    artifact is unavailable or its bytes differ from npm, fix forward with a new
    version; never move a tag or replace an uploaded artifact.
 
+### .NET releases
+
+`.github/workflows/release-dotnet.yml` handles every NuGet plugin. Published GitHub
+Releases trigger publication; tag pushes alone do not. Branch dispatches always run
+a dry run. NuGet versions are canonical SemVer without build metadata, such as
+`0.0.1` or `0.0.1-rc.1`; nuget.org normalises and lowercases versions, so dotted
+pre-release labels are the only form used. Registry ordering reads the V3 flat
+container index, which includes unlisted versions; the newest exact version may be
+verified again. Keep the committed development version `0.0.0`.
+
+nuget.org appends a repository signature (`.signature.p7s`) to every upload, so the
+served file is not the tested file byte for byte. The workflow proves instead that
+every entry of the served package, in order and with the same bytes, equals the
+tested package and that the signature is the only addition; an unlisted version is
+treated as yanked. Pre-release versions publish to nuget.org as pre-releases
+(consumers opt in with an explicit version or `--prerelease`); there is no staging
+gallery.
+
+1. Configure the shared GitHub environment `nuget` to accept only `dotnet/*/v*`
+   tags, with the environment variable `NUGET_USER` set to the nuget.org profile
+   name that owns the trusted publishing policy, and include the pattern in the
+   immutable release-tag ruleset. On nuget.org, the account that owns the
+   `Temporalio.` prefix registers one trusted publishing policy for repository
+   owner `temporalio`, repository `ai-integrations`, workflow file
+   `release-dotnet.yml`, environment `nuget`, scoped to push new packages and
+   versions matching `Temporalio.*`. The policy covers coordinates that do not
+   exist yet, so no interactive first publish is needed. Reuse the profile that
+   sdk-dotnet's `nugetprod` environment uses, confirmed with the SDK team; the
+   policy deactivates if that profile leaves the organization. No stored tokens.
+2. Merge release changes to main. Dry-run with
+   `gh workflow run release-dotnet.yml --ref main -f tag=dotnet/<name>/v<version>`.
+   The full channel/platform matrix tests the injected version at one pinned
+   commit; Ubuntu/max packs, checks and smoke-restores the package and saves
+   `dist-dotnet-<name>` as an Actions artifact.
+3. Generate notes with `uv run --project scripts --locked python
+   scripts/release/release_tool.py release-notes --plugin-dir dotnet/<name>
+   --tag dotnet/<name>/v<version> --ref <tested-sha> --output /tmp/release-notes.md`.
+   Create the draft with `gh release create dotnet/<name>/v<version>
+   --target <tested-sha> --draft --notes-file /tmp/release-notes.md`, adding
+   `--prerelease` when required.
+4. Publish the reviewed draft with
+   `gh release edit dotnet/<name>/v<version> --draft=false`. GitHub creates the
+   tag on the tested commit and starts the workflow. After the full matrix
+   succeeds, the inline OIDC job requests a one-hour API key, pushes the tested
+   `.nupkg` and `.snupkg` with `--skip-duplicate`, waits up to 30 minutes for
+   nuget.org validation, proves the served entries are the tested bytes and the
+   version is listed, and restores that public version in a clean consumer with an
+   isolated packages folder, checking the restored package the same way and
+   loading the `[smoke] imports` types. It leaves the reviewed GitHub Release
+   unchanged.
+5. Re-run failed jobs after an upload: an existing version is skipped only when
+   its served entries match the tested package. A fresh dispatch on the tag
+   rebuilds; one commit packs to identical bytes on one SDK feature band, so that
+   also passes. If the SDK moved, dispatch on the tag with
+   `-f recover-run=<original-run-id>` to reuse the tested artifact without
+   rebuilding. Recovery requires a completed release or dispatch run at the tag's
+   exact main-reachable commit with every matrix job green and an unexpired
+   `dist-dotnet-<name>` artifact, and the plugin's manifests, csproj files and
+   locks must still match the tag. If the artifact is unavailable or its bytes
+   differ from nuget.org, fix forward with the next version; nuget.org never
+   deletes a version and tags never move.
+
 ### Python releases
 
 Every Python plugin uses the `testpypi` and `pypi` GitHub environments without required reviewers, regardless of maturity. Both environments allow the `python/*/v*` tag pattern and `main` for validated publication recovery. Publishing the GitHub Release starts the release pipeline; eligible versions upload to PyPI automatically after the full test matrix and TestPyPI verification succeed. Trusted publishers remain bound to their existing environment names.
@@ -400,8 +515,10 @@ directly. Maven Central remains the public host. Snapshot publishing is not conf
 
 ```bash
 cd python/<name> && make sync && make lint && make test && make build
+cd dotnet/<name> && make sync && make lint && make test && make build
 uv run --project scripts --locked pytest scripts/tests -q # tooling script tests
 uv run --project scripts python scripts/ci/check_conventions.py
 uv run --project scripts python scripts/ci/detect_changes.py --dry-run --base origin/main
 uv run --project scripts python scripts/ci/check_wheel.py --plugin-dir python/<name> --dist python/<name>/dist
+uv run --project scripts python scripts/ci/check_dotnet_dist.py --plugin-dir dotnet/<name> --version 0.0.0
 ```

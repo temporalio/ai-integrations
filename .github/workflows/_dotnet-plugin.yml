@@ -1,0 +1,138 @@
+# Reusable per-language workflow for one .NET plugin. Plugin-specific settings belong in
+# dotnet/<plugin>/plugin.toml, the csproj files, global.json and the shared make targets.
+name: .NET plugin
+
+on:
+  workflow_call:
+    inputs:
+      plugin:
+        description: Plugin folder name under dotnet/
+        type: string
+        required: true
+      deps:
+        description: "locked: committed packages.lock.json; latest: newest versions of every dependency"
+        type: string
+        default: locked
+      ref:
+        description: Exact source commit to validate (release runs pin the prepared commit)
+        type: string
+        default: ""
+      version:
+        description: Validated release version passed as -p:Version; empty for development builds
+        type: string
+        default: ""
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  matrix:
+    name: matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - id: matrix
+        env:
+          PLUGIN: ${{ inputs.plugin }}
+        run: uv run --project scripts --locked python scripts/ci/matrix.py --plugin-dir "dotnet/$PLUGIN" --github-output "$GITHUB_OUTPUT"
+
+  test:
+    name: ${{ inputs.plugin }} (${{ matrix.os }}, dotnet${{ matrix.runtime }})
+    needs: matrix
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.matrix.outputs.matrix) }}
+    env:
+      PLUGIN_DIR: dotnet/${{ inputs.plugin }} # run steps `cd` here; never interpolate inputs into run blocks
+      RELEASE_VERSION: ${{ inputs.version || '0.0.0' }} # dotnet.mk turns this into -p:Version for build, test and pack
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+      DOTNET_GENERATE_ASPNET_CERTIFICATE: "false"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: ${{ matrix.runtime }}.x
+          cache: true
+          cache-dependency-path: dotnet/${{ inputs.plugin }}/**/packages.lock.json
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version-file: scripts/pyproject.toml
+      - name: Install GNU make (Windows)
+        if: runner.os == 'Windows'
+        run: choco install make -y --no-progress
+      - name: SDK under test is the matrix channel
+        # global.json's latestFeature policy must have selected this cell's channel, not a preinstalled SDK.
+        env:
+          CHANNEL: ${{ matrix.runtime }}
+        run: |
+          cd "$PLUGIN_DIR"
+          actual="$(dotnet --version)"
+          case "$actual" in
+            "$CHANNEL".*) echo "SDK $actual" ;;
+            *) echo "::error::global.json selected SDK $actual, not the $CHANNEL channel under test"; exit 1 ;;
+          esac
+      - name: Check dependency resolution under the cooldown
+        # Every version in the committed locks must be older than nuget.config's minPublishAgeHours.
+        if: matrix.dist && inputs.deps == 'locked'
+        run: cd "$PLUGIN_DIR" && make check-deps
+      - name: Sync dependencies
+        env:
+          DEPS: ${{ inputs.deps }}
+        run: |
+          cd "$PLUGIN_DIR"
+          case "$DEPS" in
+            locked) make sync ;;
+            latest) make sync-latest ;;
+            *) echo "::error::unknown deps mode '$DEPS'"; exit 1 ;;
+          esac
+      - name: Lint
+        run: cd "$PLUGIN_DIR" && make lint
+      - name: Test
+        run: cd "$PLUGIN_DIR" && make test
+      - name: Build and verify NuGet package
+        # Only on the designated dist cell: the release pipeline publishes the ubuntu-built package.
+        if: matrix.dist
+        run: |
+          cd "$PLUGIN_DIR"
+          make build
+          cd ../..
+          uv run --project scripts --locked python scripts/ci/check_dotnet_dist.py --plugin-dir "$PLUGIN_DIR" --version "$RELEASE_VERSION" --commit "$(git rev-parse HEAD)"
+          uv run --project scripts --locked python scripts/ci/smoke_dotnet.py --plugin-dir "$PLUGIN_DIR" --version "$RELEASE_VERSION" --dist "$PLUGIN_DIR/dist"
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trx-dotnet-${{ inputs.plugin }}-${{ inputs.deps }}-${{ matrix.os }}-dotnet${{ matrix.runtime }}
+          path: dotnet/${{ inputs.plugin }}/TestResults
+          if-no-files-found: ignore
+      - name: Upload tested package
+        if: matrix.dist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-dotnet-${{ inputs.plugin }}
+          path: dotnet/${{ inputs.plugin }}/dist
+          if-no-files-found: error
+          overwrite: true # a re-run of this job replaces the artifact instead of leaving two behind
+          retention-days: 30

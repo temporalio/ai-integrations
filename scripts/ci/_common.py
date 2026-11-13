@@ -18,6 +18,7 @@ LANGUAGE_MANIFESTS: dict[str, tuple[str, ...]] = {
     "typescript": ("package.json",),
     "java": ("build.gradle", "build.gradle.kts"),
     "go": ("go.mod",),
+    "dotnet": ("Directory.Build.props",),
 }
 LANGUAGES: tuple[str, ...] = tuple(LANGUAGE_MANIFESTS)
 
