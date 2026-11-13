@@ -21,7 +21,7 @@ public sealed class AgentFrameworkPlugin : SimplePlugin
     /// </summary>
     /// <param name="options">Chat client factories, MCP transports and connection settings.</param>
     public AgentFrameworkPlugin(AgentFrameworkPluginOptions options)
-        : base(PluginName, BuildOptions(options ?? throw new ArgumentNullException(nameof(options))))
+        : base(PluginName, BuildOptions(Validate(options)))
     {
     }
 
@@ -50,6 +50,45 @@ public sealed class AgentFrameworkPlugin : SimplePlugin
         {
             options.WorkflowFailureExceptionTypes = types.Distinct().ToList();
         }
+    }
+
+    private static AgentFrameworkPluginOptions Validate(AgentFrameworkPluginOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(options.ChatClients, nameof(options.ChatClients));
+        ArgumentNullException.ThrowIfNull(options.McpServers, nameof(options.McpServers));
+        foreach (var (name, factory) in options.ChatClients)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new ArgumentException("ChatClients has an empty model name.", nameof(options));
+            }
+
+            if (factory is null)
+            {
+                throw new ArgumentException($"ChatClients['{name}'] has no factory.", nameof(options));
+            }
+        }
+
+        foreach (var (name, factory) in options.McpServers)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new ArgumentException("McpServers has an empty server name.", nameof(options));
+            }
+
+            if (factory is null)
+            {
+                throw new ArgumentException($"McpServers['{name}'] has no factory.", nameof(options));
+            }
+        }
+
+        if (options.McpConnectionIdleTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentException("McpConnectionIdleTimeout must be positive.", nameof(options));
+        }
+
+        return options;
     }
 
     private static SimplePluginOptions BuildOptions(AgentFrameworkPluginOptions options)

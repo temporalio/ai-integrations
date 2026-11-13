@@ -155,7 +155,12 @@ internal sealed class ActivityFunction : AIFunction
         for (var i = 0; i < parameters.Length; i++)
         {
             var parameter = parameters[i];
-            if (TryGetArgument(arguments, parameter.Name!, out var value))
+            if (parameter.ParameterType == typeof(CancellationToken))
+            {
+                // Not part of the schema; the Activity gets cancellation through its own context.
+                args[i] = CancellationToken.None;
+            }
+            else if (TryGetArgument(arguments, parameter.Name!, out var value))
             {
                 args[i] = Convert(value, parameter.ParameterType);
             }

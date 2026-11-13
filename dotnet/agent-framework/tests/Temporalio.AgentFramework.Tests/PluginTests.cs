@@ -56,6 +56,31 @@ public class PluginTests : WorkflowTestBase
         Assert.Equal("microsoft.AgentFrameworkPlugin", plugin.Name);
     }
 
+    [Theory]
+    [InlineData("", true)]
+    [InlineData("  ", true)]
+    [InlineData("gpt", false)]
+    public void Options_WithEmptyNameOrNullFactory_AreRejected(string name, bool withFactory)
+    {
+        var options = new AgentFrameworkPluginOptions
+        {
+            ChatClients = new Dictionary<string, Func<Microsoft.Extensions.AI.IChatClient>> { [name] = withFactory ? () => new FakeChatClient(ScriptedResponse.Text("x")) : null! },
+        };
+        var error = Assert.Throws<ArgumentException>(() => new AgentFrameworkPlugin(options));
+        Assert.Contains(withFactory ? "empty model name" : "no factory", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Options_WithEmptyServerName_AreRejected()
+    {
+        var options = new AgentFrameworkPluginOptions
+        {
+            McpServers = new Dictionary<string, Func<ModelContextProtocol.Client.IClientTransport>> { [string.Empty] = () => null! },
+        };
+        var error = Assert.Throws<ArgumentException>(() => new AgentFrameworkPlugin(options));
+        Assert.Contains("empty server name", error.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Replayer_ConfiguredByPlugin_HasFailureTypes()
     {

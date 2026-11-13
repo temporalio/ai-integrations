@@ -84,7 +84,10 @@ public static class ActivityAsTool
 
         if (body is not MethodCallExpression call)
         {
-            throw new ArgumentException("The expression must be a single method call, for example (MyActivities a) => a.GetWeather(default!).", nameof(expression));
+            throw new ArgumentException(
+                "The expression must be a single call to a method that carries [Activity], for example (MyActivities a) => a.GetWeather(default!). " +
+                "To wrap a lambda body, make it an Activity method first.",
+                nameof(expression));
         }
 
         return call.Method;

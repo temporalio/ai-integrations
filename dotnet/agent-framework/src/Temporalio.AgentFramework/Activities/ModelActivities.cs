@@ -17,6 +17,9 @@ public sealed class ModelActivities
     /// <summary>Name of the model Activity.</summary>
     public const string InvokeModelActivityName = "AgentFramework.InvokeModel";
 
+    /// <summary>Updates per publish Signal before the batch is flushed early, whatever the interval.</summary>
+    public const int MaxStreamingBatchSize = 256;
+
     private static readonly TimeSpan MaxHeartbeatInterval = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan MinHeartbeatInterval = TimeSpan.FromMilliseconds(100);
 
@@ -79,6 +82,7 @@ public sealed class ModelActivities
             streamClient = WorkflowStreamClient.FromActivity(new WorkflowStreamClientOptions
             {
                 BatchInterval = input.StreamingBatchInterval ?? TemporalChatClient.DefaultStreamingBatchInterval,
+                MaxBatchSize = MaxStreamingBatchSize,
             });
         }
 

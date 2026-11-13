@@ -76,9 +76,11 @@ internal static class ModelErrorClassifier
 
         // System.ClientModel.ClientResultException is the OpenAI and Azure OpenAI error type. It is
         // read by reflection so the plugin does not depend on the OpenAI package.
+        // Status is 0 when the exception carries no response (a transport failure); that is not a status.
         if (exception.GetType().FullName == "System.ClientModel.ClientResultException" &&
             exception.GetType().GetProperty("Status") is { PropertyType.FullName: "System.Int32" } statusProperty &&
-            statusProperty.GetValue(exception) is int clientModelStatus)
+            statusProperty.GetValue(exception) is int clientModelStatus &&
+            clientModelStatus > 0)
         {
             status = clientModelStatus;
             return true;

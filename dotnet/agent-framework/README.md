@@ -175,7 +175,7 @@ public class ToolsWorkflow
 
 `ActivityAsTool.Create` also takes a static call expression (`() => Activities.Fetch(default!)`), a delegate or a `MethodInfo`. The argument values in the expression are placeholders; the model supplies the real ones.
 
-The loop follows `FunctionInvokingChatClient`. With `AllowConcurrentInvocation = true` the tool calls of one response run at the same time through `Workflow.WhenAllAsync`, with results in call order; the default runs them one after the other. A tool that throws gives the model the result `Error: Function failed.`; after 3 consecutive rounds of failures the run fails with `AgentFrameworkWorkflowError`. A call to a name that is not in `ChatOptions.Tools` gives the model `Error: Requested function "name" not found.` `MaximumIterationsPerRun` (default 40) caps the model calls of one run; at the cap the agent makes one more call without function tools and returns that answer.
+The loop follows `FunctionInvokingChatClient`. With `AllowConcurrentInvocation = true` the tool calls of one response run at the same time through `Workflow.WhenAllAsync`, with results in call order; the default runs them one after the other. A tool that throws gives the model the result `Error: Function failed.`; three consecutive failing rounds are tolerated and the fourth fails the run with `AgentFrameworkWorkflowError`. A call to a name that is not in `ChatOptions.Tools` gives the model `Error: Requested function "name" not found.` `MaximumIterationsPerRun` (default 40) caps the model calls of one run; at the cap the agent makes one more call without function tools and returns that answer.
 
 Tool arguments and results travel inside the model Activity's input, so a tool result of several megabytes belongs in a blob store with a reference in the result.
 
@@ -299,13 +299,13 @@ public class ApprovalWorkflow
 
 The client reads `PendingApproval`, shows the `FunctionCallContent` in `request.ToolCall`, and sends `request.CreateResponse(approved: true)` or `request.CreateResponse(false, "reason")` through the Update. A Signal works the same way when no validation or return value is needed. The next run on the same session executes approved calls, gives the model `Tool call invocation was rejected by the approver and must not be retried.` plus your reason for rejected ones, and never sends the approval contents to the provider. A run that starts with an unanswered request on the session fails with `AgentFrameworkWorkflowError`.
 
-While the Workflow waits, no Activity is open: the wait costs nothing and survives worker restarts. When one response mixes approval-required calls with plain ones, the plain calls run immediately and the response carries the requests for the rest.
+While the Workflow waits, no Activity is open: the wait costs nothing and survives worker restarts. When one response mixes approval-required calls with plain ones, nothing runs until the human answers: the response carries the requests that need a decision, the plain calls are held in the session, and the next run executes both groups in one tool round, which is what Agent Framework's default middleware does.
 
 ## Streaming
 
-`RunStreamingAsync` works in a Workflow. The model Activity consumes the provider's stream, heartbeats on every update, and returns the whole response; the Workflow then yields that response as `AgentResponseUpdate`s, one per message, plus one per tool result. One model call is still one Activity.
+`RunStreamingAsync` works in a Workflow. The model Activity consumes the provider's stream, heartbeats on every update, and returns the whole response; the Workflow then yields that response as `AgentResponseUpdate`s: for each model call, one per response message and one carrying its usage, plus one per tool result message. One model call is still one Activity.
 
-To get the updates as the provider produces them, name a Workflow Stream topic. The Activity publishes each `ChatResponseUpdate` through `Temporalio.Extensions.WorkflowStreams`, batched every `StreamingBatchInterval` (default 100 milliseconds), and the Workflow hosts the stream:
+To get the updates as the provider produces them, name a Workflow Stream topic. The Activity publishes each `ChatResponseUpdate` through `Temporalio.Extensions.WorkflowStreams`, batched every `StreamingBatchInterval` (default 100 milliseconds) or every 256 updates, whichever comes first, and the Workflow hosts the stream:
 
 ```csharp
 using Microsoft.Extensions.AI;
@@ -347,7 +347,7 @@ public static class StreamReader
 }
 ```
 
-The delay before returning gives subscribers time to poll the last batch; a closed Workflow cannot be polled. Workflow Streams is an experimental package and its wire format may change.
+The delay before returning gives subscribers time to poll the last batch; a closed Workflow cannot be polled. Each batch is one Signal and one Workflow Task in Event History, so a long stream at the default interval adds several hundred events. A model Activity that retries starts a new publisher, and subscribers see the first attempt's updates again; key your display on `ResponseId` or clear it when a new attempt begins. Workflow Streams is an experimental package and its wire format may change.
 
 ## Sessions and continue-as-new
 
@@ -411,7 +411,7 @@ The schema comes from `AgentAbstractionsJsonUtilities.DefaultOptions` (camelCase
 
 ## Context and history providers
 
-`TemporalAgentOptions.ChatHistoryProvider` and `AIContextProviders` run inside the Workflow around each run, through the same `InvokingAsync` and `InvokedAsync` calls `ChatClientAgent` makes. They must complete synchronously and deterministically; a provider that returns an incomplete `ValueTask` fails the run with `AgentFrameworkWorkflowError` before it can leave the Workflow scheduler. Providers that read a database or a memory service belong in an Activity whose result you add to the prompt.
+`TemporalAgentOptions.ChatHistoryProvider` and `AIContextProviders` run inside the Workflow around each run, through the same `InvokingAsync` and `InvokedAsync` calls `ChatClientAgent` makes, with the same request list: history, your input and the messages the context providers added, so their messages are stored the way `ChatClientAgent` stores them. Providers must complete synchronously and deterministically. The plugin calls them with the SDK's scheduler tracing off and checks the `ValueTask` they return: one that is not complete (the provider awaited I/O, a timer or another thread) fails the run with `AgentFrameworkWorkflowError` naming the provider, and whatever the provider started in the background is abandoned. Providers that read a database or a memory service belong in an Activity whose result you add to the prompt.
 
 The default history provider is `InMemoryChatHistoryProvider`. Setting another one logs a warning and runs, because it persists the conversation next to Event History, which already holds it. Two providers that share a state key are rejected at construction.
 
@@ -430,6 +430,8 @@ Two things follow for you. Call `RunAsync`, `RunAsync<T>` and `RunStreamingAsync
 - `AIAgent` generates a random id on construction. `TemporalAgent` never reads it: `Id` is `TemporalAgentOptions.Id`, then `Name`, then `temporal-agent`, so `AgentResponse.AgentId` is the same on every replay.
 - The plugin calls Agent Framework members marked experimental (`MAAI001`): the `ChatHistoryProvider.InvokingContext`, `ChatHistoryProvider.InvokedContext`, `AIContextProvider.InvokingContext` and `AIContextProvider.InvokedContext` constructors. The dependency floor is `Microsoft.Agents.AI` 1.26.0; a release that changes them shows up in this repository's nightly build.
 - The whole conversation is the input of every model Activity. Long transcripts cost history size on every call; summarize or continue-as-new before Temporal's payload limits are near.
+- Values in `AdditionalProperties` cross the Activity boundary as JSON. The plugin turns JSON primitives in `ChatOptions.AdditionalProperties` back into `bool`, `long`, `double` and `string` before the provider client sees them; nested objects there, and the `AdditionalProperties` of messages and responses, arrive as `JsonElement`.
+- Only the `AIContent` types Microsoft.Extensions.AI declares serialize. A custom `AIContent` subclass in a message or a provider response fails serialization at the Activity boundary.
 
 ## Composing with other plugins
 

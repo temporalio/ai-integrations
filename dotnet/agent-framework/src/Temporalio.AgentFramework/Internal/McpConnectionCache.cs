@@ -43,7 +43,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
     public async Task<IReadOnlyList<ToolDeclaration>> ListToolsAsync(string server, bool useCache, CancellationToken cancellationToken)
     {
         var entry = GetEntry(server);
-        await entry.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await entry.Lock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             entry.Touch();
@@ -63,7 +63,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
         }
         finally
         {
-            entry.Gate.Release();
+            entry.Lock.Release();
         }
     }
 
@@ -79,7 +79,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
     {
         var entry = GetEntry(server);
         McpClient client;
-        await entry.Gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await entry.Lock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             entry.Touch();
@@ -88,7 +88,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
         }
         finally
         {
-            entry.Gate.Release();
+            entry.Lock.Release();
         }
 
         try
@@ -97,10 +97,10 @@ internal sealed class McpConnectionCache : IAsyncDisposable
         }
         finally
         {
-            await entry.Gate.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+            await entry.Lock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
             entry.InFlight--;
             entry.Touch();
-            entry.Gate.Release();
+            entry.Lock.Release();
         }
     }
 
@@ -213,8 +213,8 @@ internal sealed class McpConnectionCache : IAsyncDisposable
     {
         private long lastUsed = Stopwatch.GetTimestamp();
 
-        /// <summary>Gets the gate that serializes connect, list and close.</summary>
-        public SemaphoreSlim Gate { get; } = new(1, 1);
+        /// <summary>Gets the lock that serializes connect, list and close.</summary>
+        public SemaphoreSlim Lock { get; } = new(1, 1);
 
         /// <summary>Gets or sets the connected client, or null.</summary>
         public McpClient? Client { get; set; }
@@ -257,7 +257,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
         /// <returns>A task that completes when the check, and any close, is done.</returns>
         public async Task CloseIfIdleAsync(TimeSpan idleTimeout)
         {
-            if (!await Gate.WaitAsync(0).ConfigureAwait(false))
+            if (!await Lock.WaitAsync(0).ConfigureAwait(false))
             {
                 return;
             }
@@ -271,7 +271,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
             }
             finally
             {
-                Gate.Release();
+                Lock.Release();
             }
         }
 
@@ -281,14 +281,14 @@ internal sealed class McpConnectionCache : IAsyncDisposable
         /// <returns>A task that completes when the client is disposed.</returns>
         public async Task CloseAsync()
         {
-            await Gate.WaitAsync().ConfigureAwait(false);
+            await Lock.WaitAsync().ConfigureAwait(false);
             try
             {
                 await CloseLockedAsync().ConfigureAwait(false);
             }
             finally
             {
-                Gate.Release();
+                Lock.Release();
             }
         }
 

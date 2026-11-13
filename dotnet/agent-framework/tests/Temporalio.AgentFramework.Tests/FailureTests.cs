@@ -63,6 +63,32 @@ public class FailureTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task Model429WithRetryAfterDate_SetsNextRetryDelay()
+    {
+        var retryAt = DateTimeOffset.UtcNow.AddSeconds(90).ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+        var fake = new FakeChatClient(_ => throw new System.ClientModel.ClientResultException("rate limited", new FakePipelineResponse(429, retryAt)));
+        var input = new FailureInput("model", MaxAttempts: 1);
+        var (error, _) = await RunFailingAsync(TestPlugin.For(fake), (FailureWorkflow wf) => wf.RunAsync(input));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal(AgentFrameworkErrorTypes.ModelError, failure.ErrorType);
+        Assert.NotNull(failure.NextRetryDelay);
+        Assert.InRange(failure.NextRetryDelay.Value, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(90));
+    }
+
+    [Fact]
+    public async Task ClientResultExceptionWithoutResponse_PropagatesUnchanged()
+    {
+        var fake = new FakeChatClient(_ => throw new System.ClientModel.ClientResultException("transport failure"));
+        var input = new FailureInput("model", MaxAttempts: 1);
+        var (error, _) = await RunFailingAsync(TestPlugin.For(fake), (FailureWorkflow wf) => wf.RunAsync(input));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal("ClientResultException", failure.ErrorType);
+        Assert.False(failure.NonRetryable);
+    }
+
+    [Fact]
     public async Task UnknownModel_ConfigurationError()
     {
         var fake = new FakeChatClient(ScriptedResponse.Text("never"));
@@ -121,6 +147,7 @@ public class FailureTests : WorkflowTestBase
     {
         var fake = new FakeChatClient(ScriptedResponse.Text("never"));
         var (error, handle) = await RunFailingAsync(TestPlugin.For(fake), (FailureWorkflow wf) => wf.RunAsync(new FailureInput("base-entry")));
+        await HistoryRecorder.SaveAsync(handle, "failure-base-entry");
         var failure = AppFailure(error);
         Assert.NotNull(failure);
         Assert.Equal(AgentFrameworkErrorTypes.WorkflowError, failure.ErrorType);

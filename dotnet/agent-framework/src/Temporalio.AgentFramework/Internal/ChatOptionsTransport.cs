@@ -76,6 +76,19 @@ internal static class ChatOptionsTransport
     public static ChatOptions? Rebuild(ModelCallInput input)
     {
         var options = input.Options?.Clone();
+        if (options?.AdditionalProperties is { Count: > 0 } properties)
+        {
+            // The converter delivers object-typed values as JsonElement; provider clients read these
+            // entries with typed checks (bool, string, numbers), so JSON primitives go back to CLR values.
+            foreach (var key in properties.Keys.ToList())
+            {
+                if (properties[key] is JsonElement element)
+                {
+                    properties[key] = FromJson(element);
+                }
+            }
+        }
+
         List<AITool>? tools = null;
         foreach (var declaration in input.Tools ?? [])
         {
@@ -96,6 +109,17 @@ internal static class ChatOptionsTransport
 
         return options;
     }
+
+    private static object? FromJson(JsonElement element) => element.ValueKind switch
+    {
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        JsonValueKind.Null or JsonValueKind.Undefined => null,
+        JsonValueKind.String => element.GetString(),
+        JsonValueKind.Number when element.TryGetInt64(out var integer) => integer,
+        JsonValueKind.Number => element.GetDouble(),
+        _ => element,
+    };
 
     private static HostedToolDeclaration ToDeclaration(AITool tool)
     {

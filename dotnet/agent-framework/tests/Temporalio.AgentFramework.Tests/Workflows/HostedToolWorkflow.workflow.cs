@@ -13,6 +13,7 @@ public class HostedToolWorkflow
         {
             ChatOptions = new ChatOptions
             {
+                AdditionalProperties = new() { ["strict"] = true, ["seed"] = 7, ["user"] = "ops" },
                 Tools =
                 [
                     new HostedWebSearchTool(),

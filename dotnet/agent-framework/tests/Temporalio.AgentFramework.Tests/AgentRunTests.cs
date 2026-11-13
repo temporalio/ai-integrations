@@ -188,11 +188,15 @@ public class AgentRunTests : WorkflowTestBase
     }
 
     [Fact]
-    public async Task HostedTools_ReachProviderClient()
+    public async Task HostedToolsAndAdditionalProperties_ReachProviderClient()
     {
         var fake = new FakeChatClient(ScriptedResponse.Text("searched"));
         var (result, _) = await RunAsync(TestPlugin.For(fake), (HostedToolWorkflow wf) => wf.RunAsync("search the docs"));
         Assert.Equal("searched", result);
+        var properties = fake.Calls[0].Options!.AdditionalProperties!;
+        Assert.Equal(true, properties["strict"]);
+        Assert.Equal(7L, properties["seed"]);
+        Assert.Equal("ops", properties["user"]);
         var tools = fake.Calls[0].Options!.Tools!;
         Assert.Contains(tools, tool => tool is HostedWebSearchTool);
         var mcp = Assert.IsType<HostedMcpServerTool>(tools.Single(tool => tool is HostedMcpServerTool));

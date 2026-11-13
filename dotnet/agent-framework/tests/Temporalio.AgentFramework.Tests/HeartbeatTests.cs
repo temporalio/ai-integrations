@@ -26,8 +26,8 @@ public class HeartbeatTests : WorkflowTestBase
     [Fact]
     public async Task ModelActivity_HeartbeatsDuringLongCall_WithShortTimeout()
     {
-        var fake = new FakeChatClient(ScriptedResponse.Text("slow answer").WithDelay(TimeSpan.FromSeconds(3)));
-        var input = new ModelOptionsInput("hi", HeartbeatSeconds: 1);
+        var fake = new FakeChatClient(ScriptedResponse.Text("slow answer").WithDelay(TimeSpan.FromSeconds(5)));
+        var input = new ModelOptionsInput("hi", HeartbeatSeconds: 3);
         var (result, handle) = await RunAsync(TestPlugin.For(fake), (ModelOptionsWorkflow wf) => wf.RunAsync(input));
         Assert.Equal("slow answer", result);
         var history = await handle.FetchHistoryAsync();
