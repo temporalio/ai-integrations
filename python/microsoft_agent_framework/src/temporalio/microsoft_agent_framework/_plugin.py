@@ -22,6 +22,7 @@ from temporalio.microsoft_agent_framework._activities import (
     ChatClientActivities,
     ChatClientFactory,
 )
+from temporalio.microsoft_agent_framework._serde import HostedMCPHeaders
 from temporalio.microsoft_agent_framework._workflow_runtime import (
     install_workflow_runtime,
 )
@@ -79,6 +80,14 @@ class MicrosoftAgentFrameworkPlugin(SimplePlugin):
     connection stays open between Activities (default 5 minutes; ``None``
     keeps it until shutdown, zero closes it after each Activity).
 
+    ``hosted_mcp_headers`` keeps the headers of hosted MCP tools (the
+    provider's ``get_mcp_tool(...)`` mappings) on the worker: a mapping from
+    the server's label or URL to its headers, or to a callable returning them,
+    which the model Activity adds to the tool before the provider call. A
+    hosted MCP tool that carries ``headers`` or ``authorization`` in workflow
+    code fails the run with ``MicrosoftAgentFrameworkWorkflowError``, because
+    the tool mapping is recorded in workflow history.
+
     The plugin also sets the Pydantic data converter unless the client has its
     own payload converter, passes the framework's modules through the workflow
     sandbox, installs workflow-aware clocks and id generators and the inline
@@ -92,13 +101,16 @@ class MicrosoftAgentFrameworkPlugin(SimplePlugin):
         chat_clients: Mapping[str, ChatClientFactory] | None = None,
         mcp_clients: Mapping[str, Callable[[], Client]] | None = None,
         mcp_connection_idle_timeout: timedelta | None = timedelta(minutes=5),
+        hosted_mcp_headers: Mapping[str, HostedMCPHeaders] | None = None,
     ) -> None:
         """Build the plugin from the chat client and MCP client factories.
 
         Raises:
             RuntimeError: If ``mcp_clients`` is given without the ``mcp`` extra.
         """
-        model_activities = ChatClientActivities(chat_clients or {})
+        model_activities = ChatClientActivities(
+            chat_clients or {}, hosted_mcp_headers=hosted_mcp_headers
+        )
         activities: list[Callable[..., Any]] = [
             model_activities.invoke_model,
             model_activities.invoke_model_streaming,

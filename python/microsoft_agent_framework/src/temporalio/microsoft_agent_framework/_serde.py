@@ -11,7 +11,7 @@ them and returns the model's calls without executing anything. A Pydantic
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from agent_framework import ChatResponse, ChatResponseUpdate, FunctionTool, Message
@@ -50,12 +50,30 @@ def dump_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return dumped
 
 
-def load_options(options: Mapping[str, Any]) -> dict[str, Any]:
-    """Rebuild the chat options of one model call for the provider client."""
+HostedMCPHeaders = Mapping[str, str] | Callable[[], Mapping[str, str]]
+"""Headers for one hosted MCP server: a mapping, or a callable that returns one per call."""
+
+# Keys of a hosted MCP tool mapping that carry credentials for the provider's
+# calls to the MCP server. Workflow code must not set them: the mapping is
+# recorded in workflow history.
+_HOSTED_MCP_CREDENTIAL_KEYS = ("headers", "authorization")
+# Where a hosted MCP mapping names its server, in the shapes the providers build.
+_HOSTED_MCP_NAME_KEYS = ("server_label", "name", "server_url", "url")
+
+
+def load_options(
+    options: Mapping[str, Any],
+    hosted_mcp_headers: Mapping[str, HostedMCPHeaders] | None = None,
+) -> dict[str, Any]:
+    """Rebuild the chat options of one model call for the provider client.
+
+    ``hosted_mcp_headers`` supplies the headers of hosted MCP tools, keyed by
+    the server's label or URL; they are added to the tool here, on the worker.
+    """
     loaded = dict(options)
     tools = loaded.get("tools")
     if tools is not None:
-        loaded["tools"] = [_load_tool(tool) for tool in tools]
+        loaded["tools"] = [_load_tool(tool, hosted_mcp_headers) for tool in tools]
     return loaded
 
 
@@ -253,6 +271,16 @@ def _dump_tool(tool: Any) -> dict[str, Any]:
     if isinstance(tool, FunctionTool):
         return tool.to_json_schema_spec()
     if isinstance(tool, Mapping):
+        if tool.get("type") == "mcp":
+            present = [key for key in _HOSTED_MCP_CREDENTIAL_KEYS if tool.get(key)]
+            if present:
+                raise MicrosoftAgentFrameworkWorkflowError(
+                    f"Hosted MCP tool {_hosted_mcp_name(tool)!r} sets {', '.join(present)} "
+                    "in workflow code, which would record the credentials in workflow "
+                    "history; credentials stay on the worker. Remove them from the tool "
+                    "and pass them with MicrosoftAgentFrameworkPlugin(hosted_mcp_headers=...) "
+                    "keyed by the server label or URL."
+                )
         return dict(tool)
     raise MicrosoftAgentFrameworkWorkflowError(
         f"Tool {tool!r} of type {type(tool).__qualname__} cannot be sent to the "
@@ -261,8 +289,37 @@ def _dump_tool(tool: Any) -> dict[str, Any]:
     )
 
 
-def _load_tool(spec: Any) -> Any:
-    if not isinstance(spec, Mapping) or spec.get("type") != "function":
+def _hosted_mcp_name(tool: Mapping[str, Any]) -> str | None:
+    for key in _HOSTED_MCP_NAME_KEYS:
+        value = tool.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _with_hosted_mcp_headers(
+    spec: Mapping[str, Any], hosted_mcp_headers: Mapping[str, HostedMCPHeaders] | None
+) -> dict[str, Any]:
+    tool = dict(spec)
+    if not hosted_mcp_headers:
+        return tool
+    for key in _HOSTED_MCP_NAME_KEYS:
+        value = spec.get(key)
+        if isinstance(value, str) and value in hosted_mcp_headers:
+            headers = hosted_mcp_headers[value]
+            tool["headers"] = dict(headers() if callable(headers) else headers)
+            return tool
+    return tool
+
+
+def _load_tool(
+    spec: Any, hosted_mcp_headers: Mapping[str, HostedMCPHeaders] | None = None
+) -> Any:
+    if not isinstance(spec, Mapping):
+        return spec
+    if spec.get("type") == "mcp":
+        return _with_hosted_mcp_headers(spec, hosted_mcp_headers)
+    if spec.get("type") != "function":
         return spec
     function = spec.get("function")
     if not isinstance(function, Mapping):

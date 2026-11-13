@@ -103,6 +103,14 @@ class ToolsInput:
     prompt: str = "do the thing"
 
 
+# The mapping OpenAIChatClient.get_mcp_tool(name="github", url=...) builds.
+HOSTED_MCP = {
+    "type": "mcp",
+    "server_label": "github",
+    "server_url": "https://mcp.example.com",
+}
+
+
 @workflow.defn
 class ToolsWorkflow:
     @workflow.run
@@ -156,6 +164,12 @@ class ToolsWorkflow:
             tools = [declared]
         elif input.scenario == "hosted":
             tools = [{"type": "web_search"}]
+        elif input.scenario == "hosted_mcp":
+            tools = [HOSTED_MCP]
+        elif input.scenario == "hosted_mcp_secret":
+            tools = [
+                {**HOSTED_MCP, "headers": {"Authorization": "Bearer workflow-secret"}}
+            ]
         elif input.scenario == "middleware":
             tools = [async_weather]
             middleware = [_FunctionRecorder(log), _ChatRecorder(log)]
@@ -613,3 +627,61 @@ async def test_sync_tool_outside_workflow(client: Client) -> None:
     # Inside the workflow the same tool ran inline, on the workflow task.
     assert result["contents"][1].startswith("result:inside:")
     assert result["text"] == "Done."
+
+
+def _worker_headers() -> dict[str, str]:
+    return {"Authorization": "Bearer worker-secret"}
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("github", {"Authorization": "Bearer worker-secret"}),
+        ("https://mcp.example.com", _worker_headers),
+    ],
+    ids=["label-mapping", "url-callable"],
+)
+async def test_hosted_mcp_headers_from_worker(
+    client: Client, key: str, value: Any
+) -> None:
+    factory = fake_chat_client(["Done."])
+    plugin = MicrosoftAgentFrameworkPlugin(
+        chat_clients={"model": factory}, hosted_mcp_headers={key: value}
+    )
+    async with new_worker(client, ToolsWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            ToolsWorkflow.run,
+            ToolsInput("hosted_mcp"),
+            id=workflow_id("hosted-mcp"),
+            task_queue=worker.task_queue,
+        )
+        result = await handle.result()
+    assert result["text"] == "Done."
+    # The provider call carries the worker's headers, history does not.
+    assert factory().calls[0]["options"]["tools"] == [
+        {**HOSTED_MCP, "headers": {"Authorization": "Bearer worker-secret"}}
+    ]
+    assert "worker-secret" not in (await handle.fetch_history()).to_json()
+
+
+async def test_hosted_mcp_headers_in_workflow_refused(client: Client) -> None:
+    plugin = MicrosoftAgentFrameworkPlugin(
+        chat_clients={"model": fake_chat_client(["unused"])}
+    )
+    async with new_worker(client, ToolsWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            ToolsWorkflow.run,
+            ToolsInput("hosted_mcp_secret"),
+            id=workflow_id("hosted-mcp-secret"),
+            task_queue=worker.task_queue,
+        )
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+    cause = excinfo.value.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "MicrosoftAgentFrameworkWorkflowError"
+    assert "'github'" in cause.message and "headers" in cause.message
+    assert "hosted_mcp_headers" in cause.message
+    # Refused before any Activity: the secret never reached history.
+    assert await count_scheduled_activities(handle) == {}
+    assert "workflow-secret" not in (await handle.fetch_history()).to_json()

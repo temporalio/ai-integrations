@@ -222,10 +222,21 @@ class ChatClientActivities:
     credentials and connections never enter workflow history.
     """
 
-    def __init__(self, factories: Mapping[str, ChatClientFactory]) -> None:
-        """Store the factories keyed by the model names workflows use."""
+    def __init__(
+        self,
+        factories: Mapping[str, ChatClientFactory],
+        *,
+        hosted_mcp_headers: Mapping[str, _serde.HostedMCPHeaders] | None = None,
+    ) -> None:
+        """Store the factories keyed by the model names workflows use.
+
+        ``hosted_mcp_headers`` holds the headers of hosted MCP tools, keyed by
+        the server's label or URL, which the Activities add to the tool before
+        the provider call so they never leave the worker.
+        """
         self._factories = dict(factories)
         self._clients: dict[str, SupportsChatGetResponse[Any]] = {}
+        self._hosted_mcp_headers = dict(hosted_mcp_headers or {})
 
     def _client(self, model: str) -> SupportsChatGetResponse[Any]:
         client = self._clients.get(model)
@@ -273,7 +284,7 @@ class ChatClientActivities:
         """Run one model round trip and return the serialized ``ChatResponse``."""
         client = self._client(input.model)
         messages = _serde.load_messages(input.messages)
-        options = _serde.load_options(input.options)
+        options = _serde.load_options(input.options, self._hosted_mcp_headers)
         with _classify_provider_errors(input.model):
             response = await client.get_response(
                 messages, options=options, client_kwargs=input.kwargs
@@ -295,7 +306,7 @@ class ChatClientActivities:
         """
         client = self._client(input.model)
         messages = _serde.load_messages(input.messages)
-        options = _serde.load_options(input.options)
+        options = _serde.load_options(input.options, self._hosted_mcp_headers)
         recorder = _serde.StreamRecorder()
 
         async def consume(publish: Callable[[dict[str, Any]], None] | None) -> None:
