@@ -149,8 +149,9 @@ These rules apply to every plugin that runs model or tool calls in Activities.
   `typescript/_template/src/__tests__/`; the conventions check keeps each
   plugin's copies byte-identical to the templates.
 - `make sync` preserves the committed lock. `make sync-latest` updates compatible
-  ranges under the two-week pnpm release-age policy. Preserve first-party and
-  exact AI SDK dependency-family cooldown exceptions inherited from the SDK.
+  ranges under the two-week pnpm release-age policy. Preserve the `@temporalio/*`
+  cooldown exception. Temporary security exceptions name exact patched versions;
+  remove them after those versions pass the cooldown.
   `make check-deps` checks fresh resolution with a temporary lockfile and scripts
   disabled, preserving the committed lockfile and installed dependencies.
 - Activity names remain stable for workflow replay compatibility.
@@ -171,6 +172,7 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 - Dependencies: ordinary CI uses the committed lockfile (`go.mod`/`go.sum` for Go); local `make sync` uses the existing versions. Nightly runs every plugin with the newest allowed dependencies (`sync-latest`) without committing the updated lock; manual dispatch can select that mode too. Python make targets use `uv run --locked`; Go lint, test and build use `-mod=readonly` to preserve the versions selected during sync. Go `sync-latest` runs `go get -u -t ./...`, tidies the module and verifies its checksums.
 - Required checks on `main`: `ci-status`, `Check for CODEOWNERS` and `opengrep/scan` (the last two are org-enforced workflows that run automatically on every PR), plus one approving review from a code owner; `license/cla` joins once the CLA app is installed. Do not add a local opengrep caller; the org one already runs. Repository setup: branch protection, the `testpypi`/`pypi` environments (tag policy `python/*/v*`) and the release-tag ruleset were configured by hand on 2026-09-09. The `pypi` required-reviewer gate was removed on 2026-10-07.
 - Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing plugin from the job names `Python (<plugin>) / ...`, `Java (<plugin>) / ...`, `Go (<plugin>) / ...`, and `TypeScript (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs. All plugin keys use `<language>/<plugin>` so plugins in different languages cannot share an issue.
+- The same nightly reporter checks Dependabot update jobs with `--dependabot`, using `actions: read` and `vulnerability-alerts: read`. It keeps separate `dependabot-failure` issues per plugin, links the latest failed update for each dependency and directory, and comments only when the failed dependencies or conclusions change. Successful updates or resolved security alerts clear the failures; queued/cancelled retries and expired Actions history do not imply recovery. Repository-wide and tooling failures use `repository` and `scripts` keys. These issues do not change the release workflows' existing nightly-test gate.
 
 ## Releases
 

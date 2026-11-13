@@ -67,6 +67,9 @@ def test_report_matches_ci_workflow_job_names() -> None:
     assert {"python", "java", "go", "typescript"}.issubset(
         workflow["jobs"]["nightly-report"]["needs"]
     )
+    report = workflow["jobs"]["nightly-report"]
+    assert report["permissions"]["vulnerability-alerts"] == "read"
+    assert any(step.get("run") == "python3 scripts/ci/nightly_report.py --dependabot" for step in report["steps"])
 
 
 def test_typescript_and_python_langsmith_have_separate_nightly_issues() -> None:
