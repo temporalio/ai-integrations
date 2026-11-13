@@ -1046,19 +1046,19 @@ activity, and the run raises `InputGuardrailTripwireTriggered` as
 `stream_events()` does. When the guardrail has already tripped, the
 plugin does not start the model call.
 
-The cancel reaches the activity through its heartbeat, so set
-`heartbeat_timeout`. The activity then stops and publishes an `error`
-event with the code `cancelled` to the topic. Subscribers can still get
-the events the model sent before that, as a native `stream_events()`
-consumer can. If the model has already finished but the activity is
-still publishing its events when the cancel arrives, the `error` event
-comes after `response.completed`.
+The cancel reaches the activity through its heartbeat, so it needs a
+`heartbeat_timeout`, which is 10 seconds by default. The activity then
+stops and publishes an `error` event with the code `cancelled` to the
+topic. Subscribers can still get the events the model sent before that,
+as a native `stream_events()` consumer can. If the model has already
+finished but the activity is still publishing its events when the cancel
+arrives, the `error` event comes after `response.completed`.
 
 Subscribers still get the whole answer and `response.completed`, with no
 `error` event, when:
 
-- `heartbeat_timeout` is not set (the default): the activity is not told
-  about the cancel;
+- `heartbeat_timeout` is `None`: the activity is not told about the
+  cancel;
 - `cancellation_type` is `ABANDON`: no cancel is sent;
 - the activity has already returned.
 
