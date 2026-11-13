@@ -21,6 +21,12 @@ export interface ModelActivityOptions extends Omit<ActivityOptions, 'summary'> {
    * Maximum time between heartbeats. The model Activities heartbeat at half this timeout, so they
    * hear a cancel, and a lost Worker is noticed, within about this long. Set it to `0` to turn
    * heartbeats off. Local Activities don't heartbeat, so they ignore it.
+   *
+   * The first heartbeat comes half this timeout after the attempt was scheduled, and goes through
+   * your payload codecs, so encoding a heartbeat must comfortably fit in the other half (under 5
+   * seconds with the default). For a slower codec, set this to more than twice its slowest
+   * encoding, or to `0`; otherwise model calls longer than half this timeout fail with a heartbeat
+   * timeout on every attempt.
    * @default '10s'
    */
   heartbeatTimeout?: Duration;

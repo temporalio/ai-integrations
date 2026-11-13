@@ -312,6 +312,10 @@ const plugin = new OpenAIAgentsPlugin({
 
 See `ModelActivityOptions` for the public field list. `summary` can be a string in plugin config; `ModelSummaryProvider` functions are intentionally not serialized into Workflow headers.
 
+The model Activities get a 10-second `heartbeatTimeout` by default. They heartbeat every half timeout, starting half the timeout after the attempt was scheduled, so a call that ends sooner sends no heartbeat. Set `heartbeatTimeout` in `modelParams` or the runner's `defaultModelParams` to change it, or set it to `0` to turn heartbeats off. Local Activities don't heartbeat.
+
+Heartbeats go through your payload codecs, and the Worker encodes them asynchronously. The first heartbeat starts encoding half the timeout into the attempt, so encoding must comfortably fit in the other half: under 5 seconds with the default. If your codec can take longer, such as one that calls a remote key service, raise `heartbeatTimeout` to more than twice its slowest encoding, or set it to `0`. Otherwise a healthy model call longer than half the timeout fails with a heartbeat timeout on every attempt.
+
 ## Tools
 
 Inline function tools, hosted tools, Activity-backed tools, Nexus operation tools, nested agent tools, and MCP tools can all be used from a Temporal-backed agent. Any tool that does I/O must run outside the Workflow sandbox, usually through an Activity or Nexus Operation.
