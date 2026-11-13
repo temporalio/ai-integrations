@@ -317,53 +317,74 @@ A client polls `pending_approval`, shows it to a person, and calls the
 `interrupt_on` pauses the whole graph, and LangGraph raises the interrupt at the
 end of a step. When sub-agents run in parallel (several `task` calls in one
 model message), a sub-agent's approval request is not visible until every
-sibling has finished, and the resume waits for all decisions. To hold single
-tool calls instead, use `ToolApprovals`: its middleware, added to the agent or
-sub-agent that calls the tool, waits in the workflow for a decision while the
-rest of the agent keeps running, and needs no checkpointer.
+sibling has finished, and the resume waits for all decisions. To have each
+guarded call wait on its own, pass `approval_handler=`: `interrupt_on` stays
+the policy, and each call it guards awaits `approval_handler(request_id,
+request)` instead of interrupting the graph, while sibling sub-agents keep
+running. `request_id` is the model's tool call id, `request` a native
+`HITLRequest` with one action, and the handler returns a native `HITLResponse`
+with one decision. No checkpointer is needed.
 
 ```python
-from datetime import timedelta
-
+from langchain.agents.middleware.human_in_the_loop import HITLRequest, HITLResponse
 from temporalio import workflow
-from temporalio.deepagents import ToolApprovals, activity_as_tool, create_temporal_deep_agent
+from temporalio.deepagents import create_temporal_deep_agent
 
 
 @workflow.defn
 class RefundAgent:
     def __init__(self) -> None:
-        self.approvals = ToolApprovals()
+        self.pending: dict[str, HITLRequest] = {}
+        self.responses: dict[str, HITLResponse] = {}
 
     @workflow.run
     async def run(self, request: str) -> str:
         agent = create_temporal_deep_agent(
-            model="anthropic:claude-sonnet-4-5",
-            tools=[activity_as_tool(issue_refund, start_to_close_timeout=timedelta(minutes=1))],
-            middleware=[self.approvals.middleware(["issue_refund"])],
+            model="anthropic:claude-sonnet-5-5",
+            tools=[refund_tool],
+            interrupt_on={"issue_refund": {"allowed_decisions": ["approve", "reject"]}},
+            approval_handler=self.review_tool_call,
         )
         result = await agent.ainvoke({"messages": [{"role": "user", "content": request}]})
         return result["messages"][-1].content
 
+    async def review_tool_call(self, request_id: str, request: HITLRequest) -> HITLResponse:
+        self.pending[request_id] = request
+        try:
+            await workflow.wait_condition(lambda: request_id in self.responses)
+            return self.responses.pop(request_id)
+        finally:
+            self.pending.pop(request_id, None)
+
     @workflow.query
-    def pending_approvals(self) -> list[dict]:
-        return self.approvals.pending_approvals()
+    def pending_approvals(self) -> dict[str, HITLRequest]:
+        return self.pending
 
     @workflow.update
-    def decide(self, request_id: str, approved: bool) -> None:
-        self.approvals.decide(request_id, approved)
+    def decide(self, request_id: str, response: HITLResponse) -> None:
+        self.responses[request_id] = response
 
     @decide.validator
-    def check_decide(self, request_id: str, approved: bool) -> None:
-        self.approvals.validate_decision(request_id)
+    def check_decide(self, request_id: str, response: HITLResponse) -> None:
+        if request_id not in self.pending or request_id in self.responses:
+            raise ValueError(f"No pending tool call {request_id!r}.")
 ```
 
-`issue_refund` stands for your own Activity. `pending_approvals()` lists each
-waiting call by the model's tool call id, with the tool name and arguments. An approved call runs; a rejected one returns an
-error result to the model, and the tool does not run. Only the tools you name
-are held, and only in the agents you add the middleware to: add it to each
-sub-agent whose tools need approval. Adding it to an agent with runs in flight
-changes what those runs do next, so ship it with Worker Versioning or after
-they finish.
+`refund_tool` stands for your own tool, for example an Activity wrapped with
+`activity_as_tool`. A client queries `pending_approvals` and calls `decide`
+with, for example, `{"decisions": [{"type": "approve"}]}` or
+`{"decisions": [{"type": "reject", "message": "Refund exceeds the limit"}]}`.
+Decisions are applied as `interrupt_on` applies them: `allowed_decisions`,
+`description` and `when` hold, sub-agents inherit or override `interrupt_on`,
+a rejected or answered (`respond`) call does not run, and an edited one runs
+with the reviewer's arguments (the model's message keeps its own). Validate the
+decision type in the validator: one the tool does not allow fails the workflow
+task. The agent still collects every result of a message before its next model
+call. The handler needs `ainvoke`, and cannot be combined with a
+`HumanInTheLoopMiddleware` passed in `middleware=`; that, or a langchain too
+old to apply decisions per call, fails when the agent is built. Adding or
+removing `approval_handler` changes what open runs do next, so ship it with
+Worker Versioning or after they finish.
 
 ## Streaming
 
