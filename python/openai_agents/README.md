@@ -1040,6 +1040,53 @@ Worker Versioning. Their closed Histories, also of runs that failed
 with `ModelBehaviorError`, no longer replay. Runs that were stuck on
 that decode continue after the upgrade.
 
+Input guardrails run in parallel with the model call by default. When one
+trips while the model is streaming, the plugin cancels the streaming
+activity, and the run raises `InputGuardrailTripwireTriggered` as
+`stream_events()` does. When the guardrail has already tripped, the
+plugin does not start the model call.
+
+The cancel reaches the activity through its heartbeat, so set
+`heartbeat_timeout`. The activity then stops and publishes an `error`
+event with the code `cancelled` to the topic. Subscribers can still get
+the events the model sent before that, as a native `stream_events()`
+consumer can. If the model has already finished but the activity is
+still publishing its events when the cancel arrives, the `error` event
+comes after `response.completed`.
+
+Subscribers still get the whole answer and `response.completed`, with no
+`error` event, when:
+
+- `heartbeat_timeout` is not set (the default): the activity is not told
+  about the cancel;
+- `cancellation_type` is `ABANDON`: no cancel is sent;
+- the activity has already returned.
+
+If the guardrail trips while the activity waits to retry a failed
+attempt, Temporal cancels it without another attempt. The topic then
+ends with the failed attempt's events and no `error` event.
+
+The `error` event ends one model call, not the run. The activity
+publishes it for any cancel the workflow requests while the call runs: a
+guardrail trip, `RunResultStreaming.cancel()`, or a
+`ModelSettings.timeout`. So more events can follow it, from a
+`ModelSettings.retry` or from the run's next model call. Its `param` is
+the ID from that call's `response.created` event, so subscribers can
+tell which response it ends. `param` is empty if the cancel came before
+`response.created`, and Chat Completions and LiteLLM models send the same
+placeholder ID, `__fake_id__`, for every call. Cancels that Temporal
+makes on its own, such as a Worker shutdown or a heartbeat timeout,
+publish no `error` event, because the activity's retry can still answer.
+
+With the default `cancellation_type` (`TRY_CANCEL`), the run raises
+without waiting for the activity to stop. A workflow that completes
+right after the trip can close before the activity publishes the event,
+and the stream then ends without it. If the workflow streams more on
+the same topic, the event can land among those events. Set
+`cancellation_type=ActivityCancellationType.WAIT_CANCELLATION_COMPLETED`
+to make the run raise only after the activity has published it, which
+keeps the event ahead of the next model call's events.
+
 ## Feature Support
 
 This integration is presently subject to certain limitations.
