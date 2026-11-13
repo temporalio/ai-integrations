@@ -26,7 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Lazily imported when StrandsPlugin(mcp_clients=...) or TemporalMCPClient is used.
-mcp = ["mcp>=2,<3", "mcp-types>=2,<3", "temporalio-mcp>=0.2.0,<0.3"]
+mcp = ["mcp>=2,<3", "mcp-types>=2,<3", "temporalio-mcp>=0.4.0,<0.5"]
 
 [project.urls]
 Homepage = "https://github.com/temporalio/ai-integrations/tree/main/python/strands_agents"
@@ -59,7 +59,7 @@ dev = [
   # Used by the test suite.
   "mcp>=2,<3",
   "mcp-types>=2,<3",
-  "temporalio-mcp>=0.2.0,<0.3",
+  "temporalio-mcp>=0.4.0,<0.5",
 ]
 
 [tool.uv]
