@@ -205,10 +205,12 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   analyzer severities live in `dotnet/_shared/analyzers.globalconfig` (imported through
   `GlobalAnalyzerConfigFiles`). `StyleCop.Analyzers` is referenced by each project with
   `PrivateAssets="all"`.
-- CI uses `plugin.toml` `[ci] runtime-versions` as the SDK channel. Exactly one channel is allowed until
-  the workflow can inject an SDK above the `global.json` floor (plan review decision 7 deferred that);
-  the matrix tests it on Ubuntu (the dist cell), macOS and Windows, and a cell fails if
-  `dotnet --version` is not in that channel.
+- CI uses `plugin.toml` `[ci] runtime-versions` as the SDK channel. Exactly one channel is allowed:
+  `global.json` resolves the floor channel with `latestFeature` in every cell, so a second channel in
+  the matrix would build with the floor SDK and test nothing new, and a multi-channel matrix needs the
+  workflow to inject an SDK above the floor, which waits for a plugin that needs one. The matrix tests
+  the channel on Ubuntu (the dist cell), macOS and Windows, and a cell fails if `dotnet --version` is
+  not in that channel.
 
 ## CI
 

@@ -488,8 +488,9 @@ class Checker:
             self.fail(f"{rel}: runtime-versions must list .NET SDK channels as major.minor strings")
             runtimes = []
         elif len(runtimes) != 1:
-            # global.json's latestFeature policy resolves the floor channel in every cell; cells above it
-            # cannot pass until the workflow injects their SDK (plan review decision 7 deferred that).
+            # global.json resolves the floor channel with latestFeature in every cell, so a second channel would
+            # build with the floor SDK and test nothing new; a multi-channel matrix needs the workflow to inject an
+            # SDK above the floor, which waits for a plugin that needs one.
             self.fail(f"{rel}: runtime-versions must name exactly one SDK channel until the workflow can inject "
                       "an SDK above the global.json floor")
         imports = meta.get("smoke", {}).get("imports", [])
