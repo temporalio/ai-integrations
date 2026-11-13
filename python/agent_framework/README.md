@@ -89,7 +89,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-`OpenAIChatClient` reads `OPENAI_API_KEY` on the worker. The workflow only carries the name `"gpt-4o"`.
+The `AsyncOpenAI` client built in the factory reads `OPENAI_API_KEY` on the worker. The workflow only carries the name `"gpt-4o"`.
 
 What runs where: the `Agent`, its loop, your tools, middleware, context providers and approval handling run in the Workflow. Each provider round trip runs as the `agent_framework.invoke_model` Activity (`agent_framework.invoke_model_streaming` when you stream). The messages and chat options cross to the Activity in their `to_dict()` form, tools cross as their JSON schema specs, and the `ChatResponse` comes back the same way; provider SDK objects (`raw_representation`) never enter history.
 
@@ -256,6 +256,7 @@ Approvals are Agent Framework's own: a tool with `approval_mode="always_require"
 from dataclasses import dataclass
 
 from agent_framework import Agent, tool
+from temporalio.exceptions import ApplicationError
 
 
 @dataclass
@@ -282,13 +283,17 @@ class ApprovalWorkflow:
 
     @workflow.update
     async def decide(self, decision: Decision) -> str:
+        if decision.request_id not in {request["id"] for request in self._pending}:
+            raise ApplicationError(
+                f"unknown or stale request {decision.request_id!r}", non_retryable=True
+            )
         self._decisions[decision.request_id] = decision.approved
         return "recorded"
 
     @decide.validator
     def validate_decide(self, decision: Decision) -> None:
-        if decision.request_id not in {request["id"] for request in self._pending}:
-            raise ValueError(f"unknown request {decision.request_id!r}")
+        if not decision.request_id:
+            raise ValueError("request_id is required")
 
     @workflow.query
     def pending_requests(self) -> list[dict]:
@@ -316,7 +321,7 @@ class ApprovalWorkflow:
         return response.text
 ```
 
-Agent Framework keys approvals by the function call's id and binds the response to the request recorded in the session, so pass the same session to the second run. When a provider omits the id, the provider's client assigns one on the worker side before the response enters history, so the id in a pending request stays the same after a worker restart or a replay. A rejected approval sends the model a rejection result and the tool does not run.
+The Update's validator checks only the argument's shape; the handler checks the id against the pending requests and raises `ApplicationError` for an unknown or stale one. Validators run before the handler, and under the time-skipping test server the workflow state a validator reads can lag behind, so a state check there fails runs that pass on a real server. Agent Framework keys approvals by the function call's id and binds the response to the request recorded in the session, so pass the same session to the second run. When a provider omits the id, the provider's client assigns one on the worker side before the response enters history, so the id in a pending request stays the same after a worker restart or a replay. A rejected approval sends the model a rejection result and the tool does not run.
 
 ## Streaming
 
@@ -346,9 +351,9 @@ async def follow(client: Client, workflow_id: str) -> None:
         print(ChatResponseUpdate.from_dict(item.data).text, end="", flush=True)
 ```
 
-One streamed call records, as its Activity result, one entry per function call, usage or finish update and one entry per run of text, so a long answer does not add one history entry per token; the topic still receives every update. The workflow iterator yields the recorded entries once the Activity completes.
+One streamed call records, as its Activity result, one entry per run of text, one entry per streamed function call with its argument deltas merged (the provider's final full-arguments update stays its own entry), and one entry per usage or finish update, so a long answer or a large tool argument does not add one history entry per token; the topic still receives every update. The workflow iterator yields the recorded entries once the Activity completes, plus whatever the framework's own loop adds (releases from 1.25 add one empty update after a tool round).
 
-If the updates cannot all be published, the Activity fails with an `ApplicationError` of type `agent_framework.StreamError`. It is non-retryable when a retry would fail the same way: a batch over the server's payload size limit (2 MiB per payload by default) or past the run's Signal limit (each batch is one Signal; a run accepts 10,000 by default). Other publish failures, such as a server outage, are retried, and the retry calls the model again.
+If the updates cannot all be published, the Activity fails with an `ApplicationError` of type `agent_framework.StreamError`. It is non-retryable when a retry would fail the same way: a batch over the server's payload size limit (2 MiB per payload by default) or past the run's Signal limit (each batch is one Signal; a run accepts 10,000 by default). Other publish failures, such as a server outage, are retried, and the retry calls the model again. A retried streamed call publishes from its first update again, so a subscriber sees the earlier attempt's updates followed by the whole retry; a consumer that must not repeat output keys on `response_id` (a new provider response carries a new id) or on the call ids.
 
 ## Sessions and continue-as-new
 
