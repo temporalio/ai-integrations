@@ -385,6 +385,27 @@ export async function abortableEmbedWorkflow(): Promise<number> {
   return result.embeddings.length;
 }
 
+// A model call next to a plain Activity. Each branch schedules one more Activity when its
+// first one completes, so the order of those two commands shows which branch ran first.
+export async function modelNextToPlainActivityWorkflow(activityTaskQueue: string): Promise<void> {
+  const plain = proxyActivities<typeof activities>({
+    startToCloseTimeout: '1 minute',
+    taskQueue: activityTaskQueue,
+  });
+  const model = new TemporalEmbeddingModel('text-embedding-3-small', {
+    taskQueue: activityTaskQueue,
+  });
+  const afterModel = async (): Promise<void> => {
+    await model.doEmbed({ values: ['a'] });
+    await plain.getWeather({ location: 'after the model call' });
+  };
+  const afterPlain = async (): Promise<void> => {
+    await Promise.all([plain.getWeather({ location: 'plain' })]);
+    await plain.downloadNotes('after the plain Activity');
+  };
+  await Promise.all([afterModel(), afterPlain()]);
+}
+
 export async function abortDuringEmbedWorkflow(): Promise<string> {
   const controller = new AbortController();
   setHandler(abortRequest, () => controller.abort());

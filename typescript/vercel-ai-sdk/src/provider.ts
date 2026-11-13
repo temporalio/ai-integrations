@@ -40,8 +40,15 @@ const ABORT_CANCELS_ACTIVITY_PATCH = 'vercel-ai-sdk-abort-signal-cancels-model-a
 
 // An `AbortSignal` can't cross the payload converter, so the caller's signal cancels the
 // Activity from the Workflow instead.
-async function runAbortable<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
-  if (signal === undefined || !workflow.patched(ABORT_CANCELS_ACTIVITY_PATCH)) return await fn();
+//
+// Not an `async` function. A call that cancels nothing must resume the Workflow at the
+// same point as a direct Activity call, or its commands can change order on replay.
+function runAbortable<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+  if (signal === undefined || !workflow.patched(ABORT_CANCELS_ACTIVITY_PATCH)) return fn();
+  return cancelOnAbort(signal, fn);
+}
+
+async function cancelOnAbort<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
   if (signal.aborted) throw abortReason(signal);
   const scope = new workflow.CancellationScope();
   const onAbort = (): void => scope.cancel();

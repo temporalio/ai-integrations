@@ -1923,6 +1923,24 @@ test('A history where an abort during embedMany cancelled nothing still replays'
   t.pass();
 });
 
+test('A history with a model call next to a plain Activity still replays', async (t) => {
+  // Recorded before a model call accepted an `abortSignal`. Both first Activities
+  // completed before one Workflow Task, so the two branches resumed in the same task.
+  const histories = path.join(__dirname, '../../src/__tests__/histories');
+  const recorded = readFileSync(
+    path.join(histories, 'model-next-to-plain-activity.json'),
+    'utf8'
+  );
+  await CoreWorker.runReplayHistory(
+    {
+      workflowBundle: t.context.workflowBundle,
+      plugins: [new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) })],
+    },
+    historyFromJSON(JSON.parse(recorded))
+  );
+  t.pass();
+});
+
 test.serial('An abort during embedMany cancels the Activity in a new execution', async (t) => {
   const provider = new AbortRecordingProvider(true);
   const { createWorker, startWorkflow } = helpers(t);
