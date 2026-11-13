@@ -115,8 +115,8 @@ def test_ci_status_is_the_fan_in() -> None:
     doc = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     status = doc["jobs"]["ci-status"]
     assert status["if"] == "always()"
-    assert set(status["needs"]) == {"changes", "conventions", "python", "java", "go", "typescript"}
-    for language in ("python", "java", "go", "typescript"):
+    assert set(status["needs"]) == {"changes", "conventions", "python", "java", "go", "typescript", "dotnet"}
+    for language in ("python", "java", "go", "typescript", "dotnet"):
         job = doc["jobs"][language]
         assert job["uses"] == f"./.github/workflows/_{language}-plugin.yml"
         assert "needs.changes.result == 'success'" in job["if"]
@@ -147,7 +147,48 @@ def test_typescript_checks_tarball_and_clean_consumer_after_testing() -> None:
     assert "make sync-latest" in sync["run"] and "make sync" in sync["run"]
 
 
-@pytest.mark.parametrize("language,sync_name", [("python", "Sync environment"), ("typescript", "Sync dependencies")])
+def test_dotnet_checks_package_and_clean_consumer_after_testing() -> None:
+    ci = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
+    assert ci["jobs"]["dotnet"]["with"]["deps"] == ci["jobs"]["python"]["with"]["deps"]
+    workflow = yaml.safe_load((REPO / ".github/workflows/_dotnet-plugin.yml").read_text())
+    assert workflow[True]["workflow_call"]["inputs"]["version"]["default"] == ""
+    for job in workflow["jobs"].values():
+        checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+        assert checkout["with"] == {"ref": "${{ inputs.ref || github.sha }}", "persist-credentials": False}
+    test = workflow["jobs"]["test"]
+    # The version reaches build, test and pack through dotnet.mk's RELEASE_VERSION; no checkout file changes.
+    assert test["env"]["RELEASE_VERSION"] == "${{ inputs.version || '0.0.0' }}"
+    steps = test["steps"]
+    names = [step.get("name", "") for step in steps]
+    assert not any("version" in name.lower() for name in names), "the plugin tree is never modified for a release"
+    setup = next(step for step in steps if step.get("uses", "").startswith("actions/setup-dotnet@"))
+    assert setup["with"]["dotnet-version"] == "${{ matrix.runtime }}.x"
+    assert setup["with"]["cache"] is True and setup["with"]["cache-dependency-path"].endswith("/**/packages.lock.json")
+    sdk = names.index("SDK under test is the matrix channel")
+    check = names.index("Check dependency resolution under the cooldown")
+    sync = names.index("Sync dependencies")
+    lint = names.index("Lint")
+    run_tests = names.index("Test")
+    build = names.index("Build and verify NuGet package")
+    reports = names.index("Upload test reports")
+    upload = names.index("Upload tested package")
+    assert sdk < check < sync < lint < run_tests < build < reports < upload
+    assert steps[lint]["run"] == 'cd "$PLUGIN_DIR" && make lint'
+    assert steps[run_tests]["run"] == 'cd "$PLUGIN_DIR" && make test'
+    assert steps[build]["if"] == "matrix.dist"
+    assert "make build" in steps[build]["run"]
+    assert "check_dotnet_dist.py" in steps[build]["run"] and '--commit "$(git rev-parse HEAD)"' in steps[build]["run"]
+    assert "smoke_dotnet.py" in steps[build]["run"] and '--dist "$PLUGIN_DIR/dist"' in steps[build]["run"]
+    assert steps[reports]["if"] == "always()"
+    assert "${{ inputs.deps }}" in steps[reports]["with"]["name"], "ci.yml runs two lanes for one plugin in one run"
+    assert steps[upload]["if"] == "matrix.dist"
+    assert steps[upload]["with"]["name"] == "dist-dotnet-${{ inputs.plugin }}"
+    assert steps[upload]["with"]["if-no-files-found"] == "error" and steps[upload]["with"]["overwrite"] is True
+
+
+@pytest.mark.parametrize("language,sync_name", [
+    ("python", "Sync environment"), ("typescript", "Sync dependencies"), ("dotnet", "Sync dependencies"),
+])
 def test_cooldown_is_checked_before_installing_the_committed_lock(language: str, sync_name: str) -> None:
     workflow = yaml.safe_load((REPO / f".github/workflows/_{language}-plugin.yml").read_text())
     steps = workflow["jobs"]["test"]["steps"]
