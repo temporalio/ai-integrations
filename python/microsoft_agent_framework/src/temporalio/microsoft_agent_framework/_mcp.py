@@ -20,6 +20,7 @@ from temporalio.common import Priority, RetryPolicy
 from temporalio.microsoft_agent_framework.workflow import (
     ApprovalMode,
     MicrosoftAgentFrameworkWorkflowError,
+    _propagate_workflow_cancellation,
 )
 from temporalio.workflow import (
     ActivityCancellationType,
@@ -44,7 +45,9 @@ class TemporalMCPToolProvider(ContextProvider):
     contributes one ``FunctionTool`` per tool, with the server's full input
     schema, whose call runs the ``temporalio.mcp.{server}.call-tool`` Activity.
     Agent Framework's own loop decides when to call them, so middleware and
-    approvals apply as they do to any tool.
+    approvals apply as they do to any tool. A workflow cancelled during a call
+    stops: the cancelled Activity reaches the tool as ``asyncio.CancelledError``,
+    as with ``activity_as_tool``.
 
     ``cache_tools=False`` (the default) lists on every run, so a server
     restarted with different tools is picked up; ``True`` lists once per
@@ -174,7 +177,8 @@ class TemporalMCPToolProvider(ContextProvider):
         )
 
         async def call(**arguments: Any) -> str | list[Content]:
-            result = await self._client.call_tool(server_tool_name, arguments)
+            with _propagate_workflow_cancellation():
+                result = await self._client.call_tool(server_tool_name, arguments)
             return self._parse(result)
 
         return FunctionTool(

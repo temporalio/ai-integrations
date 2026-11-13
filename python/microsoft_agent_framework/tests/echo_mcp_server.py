@@ -1,5 +1,7 @@
 """In-process MCP server (MCP Python SDK v2) for the tests."""
 
+import asyncio
+
 from mcp.server.mcpserver import MCPServer
 
 server = MCPServer("echo")
@@ -21,6 +23,13 @@ def shout(value: str) -> str:
 def fail(reason: str) -> str:
     """Fail with the given reason."""
     raise RuntimeError(reason)
+
+
+@server.tool()
+async def wait(seconds: float) -> str:
+    """Wait for the given number of seconds."""
+    await asyncio.sleep(seconds)
+    return f"waited {seconds}"
 
 
 if __name__ == "__main__":

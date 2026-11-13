@@ -166,7 +166,7 @@ async def test_mcp_list_and_call(client: Client) -> None:
     }
     # The model received the server's full input schema, not just the names.
     tools = {t.name: t for t in chat().calls[0]["options"]["tools"]}
-    assert set(tools) == {"echo", "shout", "fail"}
+    assert set(tools) == {"echo", "shout", "fail", "wait"}
     echo = tools["echo"].parameters()
     assert echo["required"] == ["value"]
     assert echo["properties"]["times"] == {

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from datetime import timedelta
 from typing import Any, ClassVar, Literal
 
@@ -143,24 +144,20 @@ def activity_as_tool(
         bound = call_signature.bind(**arguments)
         bound.apply_defaults()
         positional = list(bound.arguments.values())
-        cancel_requests = _cancel_requests()
         try:
-            if not positional:
+            with _propagate_workflow_cancellation():
+                if not positional:
+                    return await workflow.execute_activity(
+                        activity_name, result_type=result_type, **options
+                    )
+                if len(positional) == 1:
+                    return await workflow.execute_activity(
+                        activity_name, positional[0], result_type=result_type, **options
+                    )
                 return await workflow.execute_activity(
-                    activity_name, result_type=result_type, **options
+                    activity_name, args=positional, result_type=result_type, **options
                 )
-            if len(positional) == 1:
-                return await workflow.execute_activity(
-                    activity_name, positional[0], result_type=result_type, **options
-                )
-            return await workflow.execute_activity(
-                activity_name, args=positional, result_type=result_type, **options
-            )
         except ActivityError as error:
-            if is_cancelled_exception(error) and _cancel_requests() > cancel_requests:
-                # Agent Framework catches Exception as a tool failure and would
-                # keep the run going; a cancelled workflow has to stop instead.
-                raise asyncio.CancelledError() from error
             cause = error.__cause__
             # The ActivityError says "Activity task failed"; its cause carries
             # the activity's own message, which is what the model should read.
@@ -184,6 +181,25 @@ def activity_as_tool(
         func=dispatch,
         approval_mode=approval_mode,
     )
+
+
+@contextmanager
+def _propagate_workflow_cancellation() -> Generator[None, None, None]:
+    """Raise ``asyncio.CancelledError`` from a tool whose Activity the workflow's cancel ended.
+
+    Agent Framework catches ``Exception`` around a tool and would keep the run
+    going on an ``ActivityError``; a cancelled workflow has to stop instead.
+    After the task's cancellation the SDK keeps waiting for the Activity's own
+    resolution, so the cancelled Activity arrives as an ``ActivityError`` with
+    a ``CancelledError`` cause while the task's cancel count has gone up.
+    """
+    cancel_requests = _cancel_requests()
+    try:
+        yield
+    except ActivityError as error:
+        if is_cancelled_exception(error) and _cancel_requests() > cancel_requests:
+            raise asyncio.CancelledError() from error
+        raise
 
 
 def _cancel_requests() -> int:
