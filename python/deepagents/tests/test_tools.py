@@ -7,6 +7,7 @@ expected activity.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import uuid
 from collections.abc import Callable, Sequence
@@ -22,11 +23,19 @@ from temporalio.testing import WorkflowEnvironment
 pytest.importorskip("langchain_core")
 
 from temporalio import activity, workflow  # noqa: E402
+from temporalio.client import WorkflowFailureError  # noqa: E402
 from temporalio.common import RetryPolicy  # noqa: E402
-from temporalio.worker import Worker  # noqa: E402
+from temporalio.exceptions import (  # noqa: E402
+    ActivityError,
+    ApplicationError,
+    CancelledError,
+)
+from temporalio.worker import Replayer, Worker  # noqa: E402
 from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
 
 with workflow.unsafe.imports_passed_through():
+    from langchain_core.messages import AIMessage, ToolMessage  # noqa: E402
+
     from temporalio.deepagents import (  # noqa: E402
         DeepAgentsPlugin,
         activity_as_tool,
@@ -34,7 +43,10 @@ with workflow.unsafe.imports_passed_through():
         tool_as_activity,
     )
     from temporalio.deepagents._tools import warn_unwrapped_tools  # noqa: E402
-    from temporalio.deepagents.testing import mock_model_provider  # noqa: E402
+    from temporalio.deepagents.testing import (  # noqa: E402
+        FakeModel,
+        mock_model_provider,
+    )
 
 INVOKE_TOOL = "deepagents.invoke_tool"
 
@@ -439,9 +451,41 @@ def test_builtin_tool_in_workflow(recwarn: pytest.WarningsRecorder) -> None:
     assert any("scrape_website" in str(w.message) for w in recwarn)
 
 
-# Turn-2 requests observed by the fake model, captured activity-side. Module
-# state is shared with the in-process worker, same as the tool registries.
+# Requests each model turn saw, captured activity-side. Module state is shared
+# with the in-process worker, same as the tool registries.
 _captured_requests: list[list] = []
+
+
+class _RecordingModel(FakeModel):
+    """A fake model that records every request, so a test can assert what the
+    model was actually shown on a later turn."""
+
+    def __init__(self, responses: Sequence[Any]) -> None:
+        super().__init__(responses)
+
+    async def _agenerate(
+        self,
+        messages: list[Any],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        _captured_requests.append(list(messages))
+        return await super()._agenerate(
+            messages, stop=stop, run_manager=run_manager, **kwargs
+        )
+
+
+def _recording_provider(script: Sequence[Any]) -> Callable[[str], _RecordingModel]:
+    """A ``model_provider`` serving ``script`` one scripted turn per model call."""
+    cursor = {"i": 0}
+
+    def provider(_model_name: str) -> _RecordingModel:
+        reply = script[cursor["i"] % len(script)]
+        cursor["i"] += 1
+        return _RecordingModel([reply])
+
+    return provider
 
 
 @workflow.defn
@@ -625,27 +669,7 @@ async def test_wrapped_tool_result_pairs_with_model_tool_call_id(
     pairing, so only a live-model run surfaced it. The wrapper now returns
     plain content and the tool node stamps the correct id.
     """
-    from langchain_core.messages import AIMessage, ToolMessage
-
-    from temporalio.deepagents.testing import FakeModel
-
     _captured_requests.clear()
-
-    class RecordingModel(FakeModel):
-        def __init__(self, responses: Sequence[Any]) -> None:
-            super().__init__(responses)
-
-        async def _agenerate(
-            self,
-            messages: list[Any],
-            stop: list[str] | None = None,
-            run_manager: Any = None,
-            **kwargs: Any,
-        ) -> Any:
-            _captured_requests.append(list(messages))
-            return await super()._agenerate(
-                messages, stop=stop, run_manager=run_manager, **kwargs
-            )
 
     tool_turn = AIMessage(
         content="",
@@ -658,15 +682,7 @@ async def test_wrapped_tool_result_pairs_with_model_tool_call_id(
         ],
     )
     final = AIMessage(content="It is sunny in Paris.")
-    responses = [tool_turn, final]
-    cursor = {"i": 0}
-
-    def provider(_model_name: str) -> RecordingModel:
-        reply = responses[cursor["i"] % len(responses)]
-        cursor["i"] += 1
-        return RecordingModel([reply])
-
-    plugin = DeepAgentsPlugin(model_provider=provider)
+    plugin = DeepAgentsPlugin(model_provider=_recording_provider([tool_turn, final]))
     async with Worker(
         env.client,
         task_queue="da-toolcall-pairing",
@@ -739,3 +755,336 @@ async def test_repeated_tool_calls_with_same_args_both_run(
 
     counts = await count_scheduled_activities(handle)
     assert counts[INVOKE_TOOL] == 2, counts
+
+
+# ---------------------------------------------------------------------------
+# Terminal tool failures returned to the model through tool-call middleware
+# ---------------------------------------------------------------------------
+#
+# Neither helper converts failures itself. An application that wants a failed
+# tool handed to the model adds an ``AgentMiddleware.awrap_tool_call`` hook to
+# ``create_deep_agent(middleware=[...])``: by the time the ActivityError reaches
+# the hook, Temporal's retry policy has already finished, so the hook only
+# decides what the model sees. These tests pin that the hook works for both
+# seams, keeps the structured ``status="error"``, replays, can be selective,
+# and leaves cancellation alone.
+
+with workflow.unsafe.imports_passed_through():
+    from langchain.agents.middleware import AgentMiddleware  # noqa: E402
+
+from temporalio.exceptions import is_cancelled_exception  # noqa: E402
+
+
+class ReturnToolFailuresToModel(AgentMiddleware):
+    """Hand terminal failures of the named tools to the model as error results.
+
+    The same shape as the README example: await the tool, re-raise
+    cancellation and failures of tools not listed, and answer the model's own
+    tool call with a ``ToolMessage(status="error")`` otherwise.
+    """
+
+    def __init__(self, tool_names: Sequence[str]) -> None:
+        super().__init__()
+        self.tool_names = frozenset(tool_names)
+
+    async def awrap_tool_call(self, request: Any, handler: Any) -> Any:
+        try:
+            return await handler(request)
+        except ActivityError as err:
+            name = request.tool_call["name"]
+            if is_cancelled_exception(err) or name not in self.tool_names:
+                raise
+            return ToolMessage(
+                content=f"{name} is unavailable ({err.cause}); try another source.",
+                name=name,
+                tool_call_id=request.tool_call["id"],
+                status="error",
+            )
+
+
+@activity.defn
+async def rejected_search(query: str) -> str:
+    """Search a source that rejects the query for good (non-retryable)."""
+    raise ApplicationError(
+        f"source rejected {query!r}", type="SourceRejected", non_retryable=True
+    )
+
+
+@activity.defn
+async def down_search(query: str) -> str:
+    """Search a source that is down (retryable, never recovers)."""
+    raise RuntimeError(f"search backend down for {query!r}")
+
+
+# Set once the stalled_search body has started, so the cancellation test
+# cancels a provably running activity instead of racing a fixed sleep.
+_stalled_started = asyncio.Event()
+
+
+@activity.defn
+async def stalled_search(query: str) -> str:
+    """Search a source that never answers (outlives this test's cancel)."""
+    _stalled_started.set()
+    await asyncio.sleep(120)
+    return f"never answered {query!r}"
+
+
+# Bounded, fast retries: an exhausted policy costs the test a fraction of a
+# second instead of Temporal's default backoff.
+_FAST_RETRY = RetryPolicy(
+    initial_interval=timedelta(milliseconds=20),
+    maximum_interval=timedelta(milliseconds=20),
+    maximum_attempts=2,
+)
+
+
+async def _agent_final_message(tool: Any, middleware: Sequence[Any] = ()) -> str:
+    """Run a one-tool agent on the fixed prompt, return its final message."""
+    agent = create_deep_agent(
+        model="fake:model", tools=[tool], middleware=list(middleware)
+    )
+    result = await agent.ainvoke(
+        {"messages": [{"role": "user", "content": "search for arXiv:2601.00001"}]}
+    )
+    return str(result["messages"][-1].content)
+
+
+def _failing_tool(seam: str, mode: str) -> Any:
+    """The failing search tool on ``seam`` (``activity`` / ``tool``), failing
+    ``non_retryable`` or after ``exhausted`` retries."""
+    body = rejected_search if mode == "non_retryable" else down_search
+    retry = None if mode == "non_retryable" else _FAST_RETRY
+    if seam == "activity":
+        return activity_as_tool(
+            body,
+            start_to_close_timeout=timedelta(seconds=20),
+            retry_policy=retry,
+        )
+    return tool_as_activity(
+        body,
+        start_to_close_timeout=timedelta(seconds=20),
+        activity_options={"retry_policy": retry},
+    )
+
+
+@workflow.defn
+class FailingToolMiddlewareWorkflow:
+    @workflow.run
+    async def run(self, seam: str, mode: str, recovered: list[str]) -> str:
+        """One-tool agent whose tool always fails; the middleware recovers the
+        tool names in ``recovered`` and lets every other failure propagate."""
+        return await _agent_final_message(
+            _failing_tool(seam, mode), [ReturnToolFailuresToModel(recovered)]
+        )
+
+
+@workflow.defn
+class FailingToolDefaultWorkflow:
+    """Same failing tool with no middleware at all."""
+
+    @workflow.run
+    async def run(self, seam: str) -> str:
+        return await _agent_final_message(_failing_tool(seam, "non_retryable"))
+
+
+@workflow.defn
+class StalledToolMiddlewareWorkflow:
+    @workflow.run
+    async def run(self) -> str:
+        tool = activity_as_tool(
+            stalled_search, start_to_close_timeout=timedelta(seconds=120)
+        )
+        return await _agent_final_message(
+            tool, [ReturnToolFailuresToModel(["stalled_search"])]
+        )
+
+
+def _search_tool_call(tool_name: str) -> AIMessage:
+    """A scripted model turn that calls the failing search tool."""
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": tool_name,
+                "args": {"query": "arXiv:2601.00001"},
+                "id": "call_search",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+# Turn the model never reaches when the tool failure fails the run instead.
+_UNREACHED = AIMessage(content="unreached")
+
+
+def _error_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    err: BaseException | None = exc
+    while err is not None:
+        chain.append(err)
+        err = err.__cause__
+    return chain
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seam", ["activity", "tool"])
+@pytest.mark.parametrize("mode", ["non_retryable", "exhausted"])
+async def test_middleware_hands_failed_tool_to_the_model(
+    env: WorkflowEnvironment, seam: str, mode: str
+) -> None:
+    """A tool activity that failed for good reaches the model as an error result.
+
+    LangGraph's ToolNode re-raises every error but an argument error, so without
+    the hook the ActivityError fails the whole run (see the next test). With an
+    ``awrap_tool_call`` middleware the run completes, the model's next turn
+    carries a ``status="error"`` ToolMessage paired with its own tool call id,
+    and the history replays.
+    """
+    _captured_requests.clear()
+    tool_name = (
+        rejected_search.__name__ if mode == "non_retryable" else down_search.__name__
+    )
+    plugin = DeepAgentsPlugin(
+        model_provider=_recording_provider(
+            [
+                _search_tool_call(tool_name),
+                AIMessage(content="I could not search, so I am reporting the failure."),
+            ]
+        )
+    )
+    queue = f"da-tool-failure-{seam}-{mode}"
+    async with Worker(
+        env.client,
+        task_queue=queue,
+        workflows=[FailingToolMiddlewareWorkflow],
+        activities=[rejected_search, down_search],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            FailingToolMiddlewareWorkflow.run,
+            args=[seam, mode, [tool_name]],
+            id=f"da-tool-failure-{uuid.uuid4()}",
+            task_queue=queue,
+        )
+        out = await handle.result()
+
+    assert "could not search" in out, out
+    tool_messages = [m for m in _captured_requests[1] if isinstance(m, ToolMessage)]
+    assert len(tool_messages) == 1, _captured_requests[1]
+    message = tool_messages[0]
+    assert message.status == "error", message
+    assert message.tool_call_id == "call_search", message
+    text = str(message.content)
+    assert text.startswith(f"{tool_name} is unavailable ("), text
+    if mode == "non_retryable":
+        assert "source rejected" in text, text
+    else:
+        assert "search backend down" in text, text
+    # The middleware rebuilds its message from the recorded ActivityError, so
+    # replaying the same history must reproduce it without nondeterminism.
+    history = await handle.fetch_history()
+    await Replayer(
+        workflows=[FailingToolMiddlewareWorkflow], plugins=[DeepAgentsPlugin()]
+    ).replay_workflow(history)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seam", ["activity", "tool"])
+async def test_failed_tool_without_middleware_fails_the_run(
+    env: WorkflowEnvironment, seam: str
+) -> None:
+    """With no hook, the ActivityError propagates and the run fails."""
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(
+            [_search_tool_call("rejected_search"), _UNREACHED]
+        )
+    )
+    queue = f"da-tool-failure-default-{seam}"
+    async with Worker(
+        env.client,
+        task_queue=queue,
+        workflows=[FailingToolDefaultWorkflow],
+        activities=[rejected_search, down_search],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            FailingToolDefaultWorkflow.run,
+            args=[seam],
+            id=f"da-tool-failure-default-{uuid.uuid4()}",
+            task_queue=queue,
+        )
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+
+    assert any(
+        isinstance(e, ApplicationError) and e.type == "SourceRejected"
+        for e in _error_chain(excinfo.value)
+    ), [f"{type(e).__name__}: {e}" for e in _error_chain(excinfo.value)]
+
+
+@pytest.mark.asyncio
+async def test_middleware_propagates_failures_of_tools_it_does_not_recover(
+    env: WorkflowEnvironment,
+) -> None:
+    """The hook chooses per tool: a failure of a tool it does not list still
+    fails the run, exactly as with no middleware."""
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(
+            [_search_tool_call("rejected_search"), _UNREACHED]
+        )
+    )
+    async with Worker(
+        env.client,
+        task_queue="da-tool-failure-unlisted",
+        workflows=[FailingToolMiddlewareWorkflow],
+        activities=[rejected_search, down_search],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            FailingToolMiddlewareWorkflow.run,
+            args=["activity", "non_retryable", ["some_other_tool"]],
+            id=f"da-tool-failure-unlisted-{uuid.uuid4()}",
+            task_queue="da-tool-failure-unlisted",
+        )
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+
+    assert any(
+        isinstance(e, ApplicationError) and e.type == "SourceRejected"
+        for e in _error_chain(excinfo.value)
+    ), [f"{type(e).__name__}: {e}" for e in _error_chain(excinfo.value)]
+
+
+@pytest.mark.asyncio
+async def test_middleware_does_not_swallow_cancellation(
+    env: WorkflowEnvironment,
+) -> None:
+    """Cancelling the run mid-tool must cancel the workflow, not feed the
+    cancellation to the model as a tool result."""
+    _stalled_started.clear()
+    plugin = DeepAgentsPlugin(
+        model_provider=mock_model_provider(
+            [_search_tool_call("stalled_search"), _UNREACHED]
+        )
+    )
+    async with Worker(
+        env.client,
+        task_queue="da-tool-failure-cancel",
+        workflows=[StalledToolMiddlewareWorkflow],
+        activities=[stalled_search],
+        plugins=[plugin],
+    ):
+        handle = await env.client.start_workflow(
+            StalledToolMiddlewareWorkflow.run,
+            id=f"da-tool-failure-cancel-{uuid.uuid4()}",
+            task_queue="da-tool-failure-cancel",
+        )
+        # Cancel only once the activity body is provably running: the pending
+        # dispatch must then re-raise through the hook.
+        await asyncio.wait_for(_stalled_started.wait(), timeout=30)
+        await handle.cancel()
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+
+    assert isinstance(excinfo.value.cause, CancelledError), excinfo.value.cause
