@@ -345,23 +345,21 @@ Worker is noticed within about 10 seconds instead of at the
   `NewA2AAgentCardProvider` and `NewA2AClientProvider`. A timeout you set wins.
 - A negative `HeartbeatTimeout` turns heartbeats off. A cancel then doesn't
   reach a running call.
-- They heartbeat on a timer, a third of the timeout apart, not on progress. So
+- They heartbeat on a timer, half the timeout apart, not on progress. So
   a slow model or MCP server isn't mistaken for a lost Worker, and a stuck one
   still runs until the `StartToCloseTimeout`.
 - In Temporal Cloud, each heartbeat that reaches the server is an
-  [Action](https://docs.temporal.io/cloud/actions). The first one comes a third
-  of the timeout into a call, so a call shorter than that, about 3 seconds by
-  default, sends none. After that, the SDK holds heartbeats back to one every
-  0.8 times the timeout (8 seconds by default), or every
-  `MaxHeartbeatThrottleInterval` of the Worker if that's shorter. So with the
-  default Worker options, a 30-second call that succeeds sends four. A call
-  that fails or is canceled also sends the one the SDK was holding back as it
-  ends: a 30-second call that fails sends five, the last two under 3 seconds
-  apart. Each retry is a new attempt, and heartbeats again.
+  [Action](https://docs.temporal.io/cloud/actions). The first one comes half
+  the timeout into a call, so a call shorter than that, 5 seconds by default,
+  sends none. After that, the SDK holds heartbeats back to one every 0.8 times
+  the timeout (8 seconds by default), or every `MaxHeartbeatThrottleInterval`
+  of the Worker if that's shorter. So with the default Worker options, a
+  30-second call sends four. Each retry is a new attempt, and heartbeats
+  again.
 - `CancelA2ATask` gets the same default, but the server caps its heartbeat
   timeout at the cancellation's 5-second `StartToCloseTimeout`. Nothing cancels
   a cancellation, so its heartbeats only notice a lost Worker, and only a
-  cancellation slower than about 1.7 seconds sends one.
+  cancellation slower than about 2.5 seconds sends one.
 - `ActivityAsTool` runs your own Activity with the options you give it, so it
   gets no default.
 

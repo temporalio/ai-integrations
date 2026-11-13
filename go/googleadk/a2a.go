@@ -91,7 +91,7 @@ func (p a2aCardProvider) resolve(ctx context.Context) (*a2a.AgentCard, error) {
 // A cancellation gets a single 5-second attempt, as in ADK. The server caps its
 // heartbeat timeout at those 5 seconds, and nothing cancels a cancellation, so
 // its heartbeats only tell the server the worker is still there. Only a
-// cancellation slower than about 1.7 seconds sends one.
+// cancellation slower than about 2.5 seconds sends one.
 //
 // The client sets the message ID from the workflow's random stream when it
 // sends. ADK's BeforeRequestCallbacks run earlier and see the random ID a2a-go

@@ -357,21 +357,21 @@ func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*mod
 }
 
 // startPeriodicHeartbeats records Activity heartbeats on a fixed interval until
-// the returned stop function is called. The interval is a third of the
-// Activity's HeartbeatTimeout; when no heartbeat timeout is set it does
+// the returned stop function is called. The interval is half the Activity's
+// HeartbeatTimeout; when no heartbeat timeout is set it does
 // nothing. A model can legitimately take longer than the heartbeat timeout to
 // produce its first output (thinking models, large-context prefill), so
 // heartbeating only on chunk arrival would let the server time out and retry a
 // healthy — and paid — model call. The SDK throttles outgoing heartbeats to
 // 80% of the heartbeat timeout, so the short interval does not spam the server.
-// The first heartbeat comes a third of the timeout in, still well inside it, so
-// a call shorter than that sends none.
+// The first heartbeat comes half the timeout in, still inside it, so a call
+// shorter than that sends none.
 func startPeriodicHeartbeats(ctx context.Context) (stop func()) {
 	timeout := activity.GetInfo(ctx).HeartbeatTimeout
 	if timeout <= 0 {
 		return func() {}
 	}
-	interval := timeout / 3
+	interval := timeout / 2
 	if interval < time.Millisecond {
 		interval = time.Millisecond
 	}
