@@ -56,6 +56,13 @@ class TemporalModel(Model):
     ``TemporalModel`` itself does no I/O, so it is safe to instantiate at
     module level.
 
+    ``heartbeat_timeout`` defaults to 10 seconds. The model activities heartbeat
+    on a timer at half of it, so a cancel reaches a running model call and a lost
+    worker is noticed. Pass ``heartbeat_timeout=None`` to turn heartbeats off.
+    The timer runs on the worker's event loop, so a model factory or model call
+    that blocks the loop for longer than the timeout fails with a heartbeat
+    timeout (see the README).
+
     When ``streaming_topic`` is set, each ``StreamEvent`` is also published to
     the named topic on the workflow's
     :class:`temporalio.contrib.workflow_streams.WorkflowStream` for external
@@ -70,7 +77,7 @@ class TemporalModel(Model):
         schedule_to_close_timeout: timedelta | None = None,
         schedule_to_start_timeout: timedelta | None = None,
         start_to_close_timeout: timedelta | None = None,
-        heartbeat_timeout: timedelta | None = None,
+        heartbeat_timeout: timedelta | None = timedelta(seconds=10),
         retry_policy: RetryPolicy | None = None,
         cancellation_type: ActivityCancellationType = ActivityCancellationType.TRY_CANCEL,
         versioning_intent: VersioningIntent | None = None,
@@ -137,11 +144,14 @@ class TemporalModel(Model):
         await asyncio.shield(self._config_load)
 
     async def _read_config(self) -> None:
+        # The config read runs synchronously, so it can't heartbeat.
+        options = dict(self._options)
+        options["heartbeat_timeout"] = None
         try:
             result: _ModelConfig = await workflow.execute_activity_method(
                 ModelActivity.get_model_config,
                 _ModelConfigInput(model_name=self._model_name),
-                **self._options,
+                **options,
             )
         except BaseException:
             self._config_load = None
