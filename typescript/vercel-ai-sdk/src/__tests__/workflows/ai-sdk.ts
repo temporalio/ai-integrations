@@ -82,6 +82,26 @@ export async function imageToolWorkflow(): Promise<string> {
   return result.text;
 }
 
+export async function binaryFileWorkflow(bytes: number[]): Promise<number[]> {
+  const result = await generateText({
+    model: temporalProvider.languageModel('gpt-4o-mini'),
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Edit this file.' },
+          {
+            type: 'file',
+            data: { type: 'data', data: new Uint8Array(bytes) },
+            mediaType: 'application/octet-stream',
+          },
+        ],
+      },
+    ],
+  });
+  return Array.from(result.files[0]!.uint8Array);
+}
+
 export async function generateObjectWorkflow(): Promise<string> {
   const { output } = await generateText({
     model: temporalProvider.languageModel('gpt-4o-mini'),

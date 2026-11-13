@@ -43,6 +43,22 @@ streamed `error` part. The Workflow receives an `ActivityFailure` whose `cause`
 is that `ApplicationFailure`. Other errors, such as a 408, 409, 429 or 5xx response or
 a lost connection, are retried under the Activity's retry policy.
 
+File data given as a `Uint8Array` crosses the Activity boundary as a base64
+string, because Temporal's JSON payload converter does not keep `Uint8Array`
+values. This applies to prompt file parts and to files the model generates. A
+provider receives `{ type: 'data', data: '<base64>' }` in place of the bytes, and
+`result.files` gives the same bytes back through `uint8Array`.
+
+This applies to model Activities that a Workflow schedules after the upgrade. The
+commands a Workflow sends do not change, so an execution that is in flight replays
+as before. An execution that sent or received `Uint8Array` file data before the
+upgrade keeps the corrupted bytes in its Event History. To repair it, reset it to
+the `WorkflowTaskCompleted` event immediately before the `ActivityTaskScheduled`
+event of the affected model Activity, for example with
+`temporal workflow reset --event-id <id>`. The Workflow then schedules that
+Activity again, with the bytes intact. A restart of the Workflow has the same
+effect. Other executions need no action.
+
 The plugin registers Activities named `invokeModel`, `invokeModelStreaming` and
 `invokeEmbeddingModel`, plus `<server>-listTools` and `<server>-callTool` for
 each MCP server. A different Activity with one of these names now fails with
