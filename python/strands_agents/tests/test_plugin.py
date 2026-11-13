@@ -1,5 +1,7 @@
 import contextlib
+import functools
 import importlib.metadata
+import sys
 import typing
 from collections.abc import AsyncGenerator
 from dataclasses import replace
@@ -456,16 +458,79 @@ async def test_mcp_rejected_results(
     assert error.value.non_retryable
 
 
-def test_mcp_factory_that_needs_arguments_fails_when_the_plugin_is_built() -> None:
-    def tenant_factory(tenant: str) -> mcp.Client:
-        return mcp.Client(f"https://{tenant}.example.com/mcp")
+def _tenant_factory(tenant: str) -> mcp.Client:
+    return mcp.Client(f"https://{tenant}.example.com/mcp")
 
+
+def _keyword_tenant_factory(*, tenant: str) -> mcp.Client:
+    return mcp.Client(f"https://{tenant}.example.com/mcp")
+
+
+@pytest.mark.parametrize(
+    "tenant_factory",
+    [_tenant_factory, _keyword_tenant_factory],
+    ids=["positional", "keyword-only"],
+)
+def test_mcp_factory_that_needs_arguments_fails_when_the_plugin_is_built(
+    tenant_factory: typing.Callable[..., mcp.Client],
+) -> None:
     with pytest.raises(
         TypeError, match="MCP server factory 'weather' must take no arguments"
     ):
         StrandsPlugin(
             models={}, mcp_clients={"weather": typing.cast(typing.Any, tenant_factory)}
         )
+
+
+def _weather_client(temp: object = 21) -> mcp.Client:
+    return mcp.Client(_wire(_weather_server(temp), []))
+
+
+class _WeatherFactory:
+    def __call__(self) -> mcp.Client:
+        return _weather_client()
+
+
+def _factory_annotated_with_a_type_checking_import() -> typing.Callable[[], typing.Any]:
+    # Written in exec so the unquoted annotation stays deferred: Python 3.14+ only
+    # evaluates it on request, and Client exists only under TYPE_CHECKING.
+    namespace: dict[str, typing.Any] = {"_weather_client": _weather_client}
+    exec("def factory() -> Client:\n    return _weather_client()\n", namespace)
+    return namespace["factory"]
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: _weather_client(),
+        _weather_client,
+        _WeatherFactory(),
+        functools.partial(_weather_client, 21),
+        pytest.param(
+            "deferred",
+            marks=pytest.mark.skipif(
+                sys.version_info < (3, 14), reason="deferred annotations need 3.14"
+            ),
+        ),
+    ],
+    ids=["lambda", "defaulted", "callable-object", "partial", "deferred-annotation"],
+)
+async def test_mcp_factory_that_takes_no_arguments_lists_tools(
+    factory: typing.Any,
+) -> None:
+    if factory == "deferred":
+        factory = _factory_annotated_with_a_type_checking_import()
+    plugin = StrandsPlugin(models={}, mcp_clients={"weather": factory})
+    activities = typing.cast(list[typing.Any], plugin.activities)
+    list_tools = next(
+        a
+        for a in activities
+        if a.__temporal_activity_definition.name == "temporalio.mcp.weather.list-tools"
+    )
+
+    result = await ActivityEnvironment().run(list_tools, {"factory_argument": None})
+
+    assert [tool["name"] for tool in result["tools"]] == ["weather"]
 
 
 @pytest.mark.parametrize(

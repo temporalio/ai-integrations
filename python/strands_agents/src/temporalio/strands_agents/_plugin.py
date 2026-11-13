@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import inspect
+import sys
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import replace
 from datetime import timedelta
@@ -175,7 +176,16 @@ def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], 
     import mcp
 
     try:
-        signature = inspect.signature(factory)
+        if sys.version_info >= (3, 14):
+            import annotationlib  # type: ignore[reportUnreachable]
+
+            # Only the parameters matter; don't evaluate deferred annotations, which
+            # may name imports that exist only under TYPE_CHECKING.
+            signature = inspect.signature(
+                factory, annotation_format=annotationlib.Format.STRING
+            )
+        else:
+            signature = inspect.signature(factory)
     except (TypeError, ValueError):
         signature = (
             None  # Some callables have no signature; the call reports a mismatch.
