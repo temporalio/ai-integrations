@@ -207,7 +207,11 @@ def make_dotnet_plugin(
           </ItemGroup>
         </Project>
     ''').lstrip())
-    (lib / "FakedotnetPlugin.cs").write_text(f"namespace {coordinate};\n\npublic sealed class FakedotnetPlugin\n{{\n}}\n")
+    (lib / "FakedotnetPlugin.cs").write_text(
+        f"namespace {coordinate};\n\n/// <summary>Fixture plugin used to exercise the shared .NET build logic.</summary>\n"
+        f"public sealed class FakedotnetPlugin\n{{\n    /// <summary>Gets the plugin name.</summary>\n"
+        f"    public string Name {{ get; }} = \"{coordinate}\";\n}}\n"
+    )
     (lib / "packages.lock.json").write_text(dotnet_lock({"Temporalio": "1.22.0", "StyleCop.Analyzers": "1.3.180"}))
     (tests / f"{coordinate}.Tests.csproj").write_text(textwrap.dedent(f'''
         <Project Sdk="Microsoft.NET.Sdk">
@@ -226,7 +230,10 @@ def make_dotnet_plugin(
           </ItemGroup>
         </Project>
     ''').lstrip())
-    (tests / "FakedotnetPluginTests.cs").write_text(f"namespace {coordinate}.Tests;\n\npublic class FakedotnetPluginTests\n{{\n}}\n")
+    (tests / "FakedotnetPluginTests.cs").write_text(
+        f"namespace {coordinate}.Tests;\n\npublic class FakedotnetPluginTests\n{{\n    [Fact]\n"
+        f"    public void Plugin_Has_Name()\n    {{\n        Assert.Equal(\"{coordinate}\", new FakedotnetPlugin().Name);\n    }}\n}}\n"
+    )
     (tests / "packages.lock.json").write_text(dotnet_lock({
         "xunit.v3": "4.0.3", "Microsoft.Testing.Extensions.TrxReport": "2.5.3", "StyleCop.Analyzers": "1.3.180",
     }))

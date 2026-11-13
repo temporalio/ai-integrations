@@ -183,7 +183,7 @@ def test_dotnet_checks_package_and_clean_consumer_after_testing() -> None:
     assert "check_dotnet_dist.py" in steps[build]["run"] and '--commit "$(git rev-parse HEAD)"' in steps[build]["run"]
     assert "smoke_dotnet.py" in steps[build]["run"] and '--dist "$PLUGIN_DIR/dist"' in steps[build]["run"]
     assert steps[reports]["if"] == "always()"
-    assert "${{ inputs.deps }}" in steps[reports]["with"]["name"], "ci.yml runs two lanes for one plugin in one run"
+    assert "${{ inputs.deps }}" in steps[reports]["with"]["name"], "nightly and release runs of one plugin differ in deps"
     assert steps[upload]["if"] == "matrix.dist"
     assert steps[upload]["with"]["name"] == "dist-dotnet-${{ inputs.plugin }}"
     assert steps[upload]["with"]["if-no-files-found"] == "error" and steps[upload]["with"]["overwrite"] is True
