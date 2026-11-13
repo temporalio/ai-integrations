@@ -40,11 +40,105 @@ from temporalio.openai_agents._temporal_model_provider import (
     capture_scope,
     install_model_provider,
 )
-from temporalio.openai_agents._temporal_model_stub import _TemporalModelStub
+from temporalio.openai_agents._temporal_model_stub import (
+    _current_streamed_run,
+    _StreamedRun,
+    _TemporalModelStub,
+)
 from temporalio.openai_agents._trace_interceptor import _refuse_tracing_key
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
+
+
+@dataclasses.dataclass(eq=False)
+class _ToolOperation:
+    """A Nexus operation started by a tool, pending until the tool's call ends."""
+
+    task: asyncio.Task[Any] | None
+    cancelled: bool = False
+    """Set when the run has stopped and waits for the tool, whose task the Agents SDK cancelled."""
+
+
+@dataclasses.dataclass(eq=False)
+class _AgentRun:
+    """An agent run in a Workflow, with its tools' pending Nexus operations.
+
+    Also keeps the agent runs started in its tools.
+    """
+
+    operations: set[_ToolOperation] = dataclasses.field(default_factory=set)
+    nested: set["_AgentRun"] = dataclasses.field(default_factory=set)
+    stopping: bool = False
+    """Set when the run was cancelled or failed and waits for its operations."""
+
+    def pending(self, *, all_nested: bool) -> list[_ToolOperation]:
+        """The pending operations of this run and of its nested runs.
+
+        Only nested runs that are stopping count, unless ``all_nested`` is set.
+        """
+        pending = list(self.operations)
+        for run in self.nested:
+            if all_nested or run.stopping:
+                pending.extend(run.pending(all_nested=all_nested))
+        return pending
+
+
+# The innermost active agent run in a Workflow. Tasks copy it, so an agent run started in a
+# tool, or in a task that a tool starts, is nested in the run of that tool.
+_current_agent_run: contextvars.ContextVar[_AgentRun | None] = contextvars.ContextVar(
+    "_current_agent_run", default=None
+)
+
+
+@contextlib.contextmanager
+def _track_tool_operation() -> Generator[_ToolOperation, None, None]:
+    """Keep a tool's Nexus operation pending in its run until the block exits."""
+    run = _current_agent_run.get()
+    operation = _ToolOperation(task=asyncio.current_task())
+    if run is not None:
+        run.operations.add(operation)
+    try:
+        yield operation
+    finally:
+        if run is not None:
+            run.operations.discard(operation)
+
+
+async def _wait_for_tool_operations(run: _AgentRun) -> bool:
+    """Wait for the run's pending Nexus operations after it was cancelled or failed.
+
+    The Agents SDK cancels a run's tool tasks and raises without waiting for them. The
+    Workflow would then close in the same Workflow Task, before Temporal delivers the cancel
+    requests of the tools' Nexus operations. Waiting keeps their cancellation type, as when
+    Workflow code calls ``execute_operation`` itself.
+    The run also waits for the operations of its nested runs that stop with it, such as an
+    agent that runs as a tool. It checks which ones stop once the cancellation has reached
+    them, so an agent run in a task that a tool started, and that nothing cancels, does not
+    delay it.
+    A further cancel request, such as the Workflow's after Workflow code cancelled the run,
+    goes to the tools' tasks, as it would to a direct call: a Workflow cancellation ends an
+    operation that is still starting, and a started one keeps its cancellation type. The
+    wait goes on until every tool's call has ended. Returns whether a cancel request arrived
+    during the wait; the caller then raises.
+    """
+    run.stopping = True
+    for operation in run.operations:
+        operation.cancelled = True
+    if not run.pending(all_nested=True):
+        return False
+    cancel_requested = False
+    while True:
+        try:
+            # The condition is checked once no task is ready to run, so the cancellation has
+            # reached every nested run that stops with this one.
+            await workflow.wait_condition(lambda: not run.pending(all_nested=False))
+            return cancel_requested
+        except asyncio.CancelledError:
+            cancel_requested = True
+            for operation in run.pending(all_nested=False):
+                if operation.task is not None:
+                    operation.task.cancel()
 
 
 # Recursively replace models in all agents
@@ -206,6 +300,8 @@ def _has_sandbox_agent(agent: Agent[Any], seen: set[int] | None = None) -> bool:
 # ``RunConfig.model_provider``. They keep the old behavior, the Worker's provider, so that
 # they replay.
 _REFUSE_RUN_MODEL_PROVIDER_PATCH = "openai_agents.refuse-run-model-provider"
+# Runs started without it keep running on copies of the agents, so their histories replay.
+_RUN_CALLER_AGENTS_PATCH = "openai_agents.run-caller-agents"
 
 
 def _is_default_model_provider(provider: ModelProvider) -> bool:
@@ -278,6 +374,25 @@ class TemporalOpenAIRunner(AgentRunner):
         kwargs: RunOptions[TContext],
     ) -> tuple[Agent[Any], RunConfig]:
         """Workflow-only validation and ``kwargs`` rewrite shared by ``run()`` and ``run_streamed()``."""
+        # Refuse a Model object up front for every agent reachable through public fields.
+        # Agents behind handoff(), as_tool() or a custom on_invoke_handoff are only
+        # reachable through private SDK fields, so the call_model_input_filter refuses
+        # them just before their model call instead.
+        pending: list[Agent[Any]] = [starting_agent]
+        checked: set[int] = set()
+        while pending:
+            agent = pending.pop()
+            if id(agent) in checked:
+                continue
+            checked.add(id(agent))
+            if agent.model is not None and not isinstance(
+                agent.model, (str, _TemporalModelStub)
+            ):
+                raise ValueError(
+                    "Temporal workflows require a model name to be a string in the agent."
+                )
+            pending.extend(h for h in agent.handoffs if isinstance(h, Agent))
+
         for t in starting_agent.tools:
             if callable(t):
                 raise ValueError(
@@ -319,16 +434,11 @@ class TemporalOpenAIRunner(AgentRunner):
             RunConfig() if run_config is None else _coerce_run_config(run_config)
         )
 
-        if run_config.model and not isinstance(run_config.model, _TemporalModelStub):
-            if not isinstance(run_config.model, str):
-                raise ValueError(
-                    "Temporal workflows require a model name to be a string in the run config."
-                )
-            run_config = dataclasses.replace(
-                run_config,
-                model=_TemporalModelStub(
-                    run_config.model, model_params=self.model_params, agent=None
-                ),
+        # The plugin's model provider turns the name into the model Activity. Keeping the
+        # name lets the SDK apply that model's default settings, as it does natively.
+        if run_config.model and not isinstance(run_config.model, str):
+            raise ValueError(
+                "Temporal workflows require a model name to be a string in the run config."
             )
 
         # Model calls run in an Activity on the Worker's provider, so a provider set on the
@@ -382,7 +492,9 @@ class TemporalOpenAIRunner(AgentRunner):
                 )
 
         kwargs["run_config"] = run_config
-        return _convert_agent(self.model_params, starting_agent, None), run_config
+        if not workflow.patched(_RUN_CALLER_AGENTS_PATCH):
+            return _convert_agent(self.model_params, starting_agent, None), run_config
+        return starting_agent, run_config
 
     async def run(
         self,
@@ -398,20 +510,42 @@ class TemporalOpenAIRunner(AgentRunner):
                 **kwargs,
             )
 
-        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        starting_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
+        run = _AgentRun()
+        parent = _current_agent_run.get()
+        if parent is not None:
+            parent.nested.add(run)
+        token = _current_agent_run.set(run)
         with capture_scope(run_config.model_settings), _inline_sync_function_tools():
             try:
                 return await self._runner.run(
-                    starting_agent=converted_agent,
+                    starting_agent=starting_agent,
                     input=input,
                     **kwargs,
                 )
+            except asyncio.CancelledError:
+                await _wait_for_tool_operations(run)
+                raise
             except AgentsException as e:
+                # When a tool fails, the Agents SDK also cancels the run's other tools. Wait
+                # only when the error fails the Workflow: an error that fails the Workflow
+                # Task must leave no new commands, so that a fixed Worker can replay it.
+                if (
+                    e.__cause__ is not None
+                    and workflow.is_failure_exception(e.__cause__)
+                ) or workflow.is_failure_exception(e):
+                    if await _wait_for_tool_operations(run):
+                        # The Workflow was cancelled during the wait.
+                        raise asyncio.CancelledError() from e
                 # In order for workflow failures to properly fail the workflow, we need to rewrap them in
                 # a Temporal error
                 _reraise_workflow_failure(e)
                 raise e
+            finally:
+                _current_agent_run.reset(token)
+                if parent is not None:
+                    parent.nested.discard(run)
 
     def run_sync(
         self,
@@ -470,16 +604,26 @@ class TemporalOpenAIRunner(AgentRunner):
                 "heartbeats or the workflow stream signal channel)."
             )
 
-        converted_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
+        starting_agent, run_config = self._prepare_workflow_run(starting_agent, kwargs)
 
         # The streaming loop runs in a task created inside run_streamed, which copies
         # this context, so the scope only needs to cover the call itself.
-        with capture_scope(run_config.model_settings), _inline_sync_function_tools():
-            streamed_result = self._runner.run_streamed(
-                starting_agent=converted_agent,
-                input=input,
-                **kwargs,
-            )
+        streamed_run = _StreamedRun()
+        token = _current_streamed_run.set(streamed_run)
+        try:
+            with (
+                capture_scope(run_config.model_settings),
+                _inline_sync_function_tools(),
+            ):
+                streamed_result = self._runner.run_streamed(
+                    starting_agent=starting_agent,
+                    input=input,
+                    **kwargs,
+                )
+        finally:
+            _current_streamed_run.reset(token)
+        # The model stub reads it to watch the run's parallel input guardrails.
+        streamed_run.result = streamed_result
 
         # Mirror the AgentsException -> AgentsWorkflowError rewrap done
         # in run() above. The streaming runner attaches the actual run

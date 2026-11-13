@@ -444,7 +444,7 @@ def create_temporal_deep_agent(
     with workflow.unsafe.imports_passed_through():
         # importlib keeps this resolution absolute: a static
         # `import deepagents` from inside this same-named package directory
-        # is flagged (and on 3.10, mis-resolved) as implicitly relative.
+        # is flagged as implicitly relative.
         deepagents_mod: Any = importlib.import_module("deepagents")
 
     from temporalio.deepagents._model import TemporalModel

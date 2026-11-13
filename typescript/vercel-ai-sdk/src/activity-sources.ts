@@ -36,9 +36,12 @@ export function refuseReplacedActivities(plugin: string, existing: object | unde
   for (const [name, fn] of Object.entries(added)) {
     const other = registered.get(name);
     if (other === undefined || other === fn || sameSources(other, fn)) continue;
+    const origin = activitySources.has(other)
+      ? ''
+      : "The other Activity is in the Worker's `activities` or from an earlier plugin. ";
     throw new TypeError(
-      `Duplicate registration of Activity '${name}': ${plugin} would replace a different Activity with this name. ` +
-        remedy(plugin)
+      `Duplicate registration of Activity '${name}': ${plugin} would replace a different ` +
+        `Activity with this name. ${origin}${remedy(name, other)}`
     );
   }
 }
@@ -65,11 +68,14 @@ export function refuseLaterReplacement(
     const kept = worker.options.activities.get(name);
     if (kept === undefined || kept === fn || sameSources(kept, fn)) continue;
     const error = new TypeError(
-      `Duplicate registration of Activity '${name}': a plugin applied after ${plugin} replaced its Activity with this name. ` +
-        remedy(plugin)
+      `Duplicate registration of Activity '${name}': a plugin applied after ${plugin} replaced ` +
+        `its Activity with this name. ${remedy(name, kept)}`
     );
     // There is no public way to stop a Worker that has not run yet.
-    (worker as unknown as { nativeWorker: { initiateShutdown(): void } }).nativeWorker.initiateShutdown();
+    type Internal = { nativeWorker?: { initiateShutdown?: unknown } };
+    const native = (worker as unknown as Internal).nativeWorker;
+    if (typeof native?.initiateShutdown !== 'function') return Promise.reject(error);
+    native.initiateShutdown();
     const fail = (): never => {
       throw error;
     };
@@ -78,11 +84,18 @@ export function refuseLaterReplacement(
   return undefined;
 }
 
-function remedy(plugin: string): string {
-  return (
-    'Rename or remove the other Activity, run the other integration on its own Worker and task queue, ' +
-    `or use one ${plugin} instance on this Worker.`
-  );
+function remedy(name: string, other: object): string {
+  const mcp = /-(listTools|callTool)$/.test(name);
+  if (activitySources.has(other)) {
+    const from = 'The other Activity is from another `AiSdkPlugin` or `createActivities` call. ';
+    return mcp
+      ? `${from}Use the same factory function and \`mcpConnectionIdleTimeout\` for this MCP ` +
+          'server in both, or give the servers different names.'
+      : `${from}Use one \`AiSdkPlugin\` with one \`modelProvider\` that combines the providers, ` +
+          'for example `customProvider({ languageModels, fallbackProvider })` from `ai`.';
+  }
+  const rename = mcp ? 'the MCP server or the other Activity' : 'or remove the other Activity';
+  return `Rename ${rename}, or run the other integration on its own Worker and task queue.`;
 }
 
 function sameSources(a: object, b: object): boolean {

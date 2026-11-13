@@ -144,6 +144,11 @@ export async function mcpFactoryArgWorkflow(prompt: string): Promise<string> {
   return result.finalOutput ?? '';
 }
 
+export async function mcpFactoryValidationWorkflow(activityName: string): Promise<void> {
+  const activities = proxyActivities<Record<string, () => Promise<void>>>({ startToCloseTimeout: '10 seconds' });
+  await activities[activityName]!();
+}
+
 export async function mcpToolFilterWorkflow(stateful: boolean): Promise<string[]> {
   const name = stateful ? 'filterStateful' : 'filterStateless';
   // The factory's server blocks `danger_tool` with a static filter; this filter blocks `extra_tool`

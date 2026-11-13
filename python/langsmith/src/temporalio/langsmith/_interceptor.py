@@ -27,6 +27,7 @@ from temporalio.api.common.v1 import Payload
 from temporalio.exceptions import ApplicationError, ApplicationErrorCategory
 from temporalio.langsmith._run_tree import (
     install_run_tree_overrides,
+    worker_or_server_time,
     workflow_run_tree_context,
 )
 from temporalio.langsmith._tracing import (
@@ -154,10 +155,10 @@ def _extract_context(
     run = RunTree.from_headers(ls_headers)
     if run is None:
         return None
-    # This parent is never posted. Match LangSmith's "now" default using
-    # workflow time so child timestamp clamping stays deterministic.
+    # This parent is never posted. Match LangSmith's "now" default with the
+    # same clock as the plugin's runs.
     if temporalio.workflow.in_workflow():
-        run.start_time = temporalio.workflow.now()
+        run.start_time = worker_or_server_time()
     run.ls_client = ls_client
     return run
 

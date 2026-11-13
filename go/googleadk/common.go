@@ -39,9 +39,9 @@ const (
 )
 
 const (
-	defaultModelTimeout    = 2 * time.Minute
-	defaultToolTimeout     = 1 * time.Minute
-	defaultStreamHeartbeat = 30 * time.Second
+	defaultModelTimeout     = 2 * time.Minute
+	defaultToolTimeout      = 1 * time.Minute
+	defaultHeartbeatTimeout = 10 * time.Second
 )
 
 // errMissingContext is returned on the workflow side when the run context was
@@ -59,6 +59,20 @@ func resolveToolActivityOptions(ao workflow.ActivityOptions, taskQueue string) w
 	}
 	if ao.TaskQueue == "" {
 		ao.TaskQueue = taskQueue
+	}
+	return ao
+}
+
+// resolveHeartbeatTimeout gives one of the plugin's own Activities a 10-second
+// HeartbeatTimeout when unset. They heartbeat on a timer while they run, so a
+// cancel reaches a running call, and a lost worker is noticed, within about
+// that long. A negative HeartbeatTimeout turns heartbeats off.
+func resolveHeartbeatTimeout(ao workflow.ActivityOptions) workflow.ActivityOptions {
+	switch {
+	case ao.HeartbeatTimeout == 0:
+		ao.HeartbeatTimeout = defaultHeartbeatTimeout
+	case ao.HeartbeatTimeout < 0:
+		ao.HeartbeatTimeout = 0
 	}
 	return ao
 }

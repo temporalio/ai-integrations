@@ -7,34 +7,52 @@ via the configured stream topic.
 """
 
 import asyncio
+import base64
+import json
 import logging
 import uuid
+import weakref
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, fields
 from datetime import timedelta
 from typing import Any
 
+import openai._models
+import pydantic
 import pytest
 from agents import (
     Agent,
+    AgentHookContext,
+    AgentHooks,
     AgentOutputSchemaBase,
+    GuardrailFunctionOutput,
     Handoff,
+    InputGuardrailTripwireTriggered,
     Model,
     ModelResponse,
+    ModelRetrySettings,
     ModelSettings,
     ModelTracing,
+    RetryPolicyContext,
     RunConfig,
+    RunContextWrapper,
     Runner,
+    RunResultStreaming,
     Tool,
     ToolCallOutputItem,
     TResponseInputItem,
     Usage,
     function_tool,
+    input_guardrail,
 )
+from agents.exceptions import ModelBehaviorError
 from agents.items import TResponseStreamEvent
 from agents.models import get_default_model_settings
 from openai.types.responses import (
     Response,
     ResponseCompletedEvent,
+    ResponseCreatedEvent,
+    ResponseErrorEvent,
     ResponseFunctionToolCall,
     ResponseOutputMessage,
     ResponseOutputText,
@@ -49,12 +67,28 @@ from openai.types.responses.response_usage import (
 from openai.types.shared import Reasoning
 from openai.types.shared.response_format_text import ResponseFormatText
 
-from temporalio import workflow
-from temporalio.client import Client, WorkflowFailureError
+from temporalio import activity, workflow
+from temporalio.api.common.v1 import Payload
+from temporalio.api.enums.v1 import EventType
+from temporalio.client import Client, WorkflowFailureError, WorkflowHandle
 from temporalio.contrib.workflow_streams import WorkflowStream, WorkflowStreamClient
-from temporalio.openai_agents import ModelActivityParameters
+from temporalio.converter import (
+    ActivitySerializationContext,
+    DataConverter,
+    EncodingPayloadConverter,
+    SerializationContext,
+    WithSerializationContext,
+)
+from temporalio.openai_agents import (
+    ModelActivityParameters,
+    OpenAIAgentsPlugin,
+    OpenAIPayloadConverter,
+    _heartbeat_decorator,
+)
 from temporalio.openai_agents.testing import AgentEnvironment
-from tests.helpers import new_worker
+from temporalio.worker import Replayer
+from temporalio.workflow import ActivityCancellationType
+from tests.helpers import assert_eventually, new_worker
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +207,126 @@ class StreamingTestModel(Model):
         )
         yield ResponseCompletedEvent(
             response=response, sequence_number=2, type="response.completed"
+        )
+
+
+class DriftedStreamingTestModel(StreamingTestModel):
+    """Streams a final event that fails the openai SDK's strict validation.
+
+    Its usage has no ``cache_write_tokens``, which the SDK requires, as when the
+    API stops sending a field.
+    """
+
+    __test__ = False
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        async for event in super().stream_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            **kwargs,
+        ):
+            if isinstance(event, ResponseCompletedEvent) and event.response.usage:
+                event.response.usage.input_tokens_details = (
+                    InputTokensDetails.model_construct(cached_tokens=0)
+                )
+            yield event
+
+
+def empty_openai_discriminator_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start from the openai discriminator cache of a fresh process.
+
+    The openai SDK fills this cache when it parses an event that fails strict
+    validation, so a Worker process that did not run the model Activity has it
+    empty.
+    """
+    monkeypatch.setattr(
+        openai._models, "DISCRIMINATOR_CACHE", weakref.WeakKeyDictionary()
+    )
+
+
+class Base64TextJSONConverter(EncodingPayloadConverter, WithSerializationContext):
+    """JSON with ``text`` and ``delta`` strings base64-encoded on the wire.
+
+    It records the context it decoded each streamed result in.
+    """
+
+    contexts: list[SerializationContext | None] = []
+
+    def __init__(self, context: SerializationContext | None = None) -> None:
+        self._json = OpenAIPayloadConverter().converters[b"json/plain"]
+        self._context = context
+
+    @property
+    def encoding(self) -> str:
+        return "json/x-base64-text"
+
+    def with_context(self, context: SerializationContext) -> "Base64TextJSONConverter":
+        return Base64TextJSONConverter(context)
+
+    @staticmethod
+    def _map_text(value: Any, convert: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: convert(item)
+                if key in ("text", "delta") and isinstance(item, str)
+                else Base64TextJSONConverter._map_text(item, convert)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [Base64TextJSONConverter._map_text(item, convert) for item in value]
+        return value
+
+    def to_payload(self, value: Any) -> Payload | None:
+        payload = self._json.to_payload(value)
+        if payload is None:
+            return None
+        data = self._map_text(
+            json.loads(payload.data), lambda s: base64.b64encode(s.encode()).decode()
+        )
+        return Payload(
+            metadata={"encoding": self.encoding.encode()},
+            data=json.dumps(data).encode(),
+        )
+
+    def from_payload(self, payload: Payload, type_hint: type | None = None) -> Any:
+        if b"response.completed" in payload.data:
+            Base64TextJSONConverter.contexts.append(self._context)
+        data = self._map_text(
+            json.loads(payload.data), lambda s: base64.b64decode(s).decode()
+        )
+        return self._json.from_payload(
+            Payload(
+                metadata={"encoding": b"json/plain"}, data=json.dumps(data).encode()
+            ),
+            type_hint,
+        )
+
+
+class Base64TextPayloadConverter(OpenAIPayloadConverter):
+    """An accepted OpenAIPayloadConverter with its own JSON wire form."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._set_converters(
+            *(
+                Base64TextJSONConverter() if c.encoding == "json/plain" else c
+                for c in self.converters.values()
+            )
         )
 
 
@@ -297,6 +451,107 @@ async def test_streaming_publishes_raw_events(client: Client):
 
     # Workflow-side iteration sees the same model events in the same order.
     assert workflow_event_types == published_types
+
+
+@pytest.mark.asyncio
+async def test_streaming_drifted_event_in_fresh_process(
+    client: Client, monkeypatch: pytest.MonkeyPatch
+):
+    """A final event that fails strict validation decodes as itself in every process.
+
+    The live run's process has the openai discriminator cache filled, as the
+    process whose model Activity parsed the event would. The history then
+    replays in a process with the cache empty, as another Worker process.
+    """
+    with pytest.raises(pydantic.ValidationError):
+        InputTokensDetails.model_validate({"cached_tokens": 0})
+    empty_openai_discriminator_cache(monkeypatch)
+    # openai's stream parser fills the cache when it parses such an event.
+    openai._models.construct_type(
+        type_=TResponseStreamEvent, value={"type": "response.completed"}
+    )
+    async with AgentEnvironment(
+        model=DriftedStreamingTestModel(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            streaming_topic="events",
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client,
+            StreamingOpenAIWorkflow,
+            max_cached_workflows=0,
+            workflow_failure_exception_types=[ModelBehaviorError],
+        ) as worker:
+            handle = await client.start_workflow(
+                StreamingOpenAIWorkflow.run,
+                "Hello",
+                id=f"openai-streaming-drifted-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            assert await handle.result() == "Hello world!"
+            history = await handle.fetch_history()
+
+    empty_openai_discriminator_cache(monkeypatch)
+    await Replayer(
+        workflows=[StreamingOpenAIWorkflow],
+        plugins=[
+            OpenAIAgentsPlugin(
+                model_params=ModelActivityParameters(streaming_topic="events")
+            )
+        ],
+    ).replay_workflow(history)
+
+
+@pytest.mark.asyncio
+async def test_streaming_uses_configured_payload_converter(client: Client):
+    """Streamed results decode with an accepted OpenAIPayloadConverter subclass.
+
+    Its wire form differs from plain JSON, and it gets the Activity's
+    serialization context, as before the fix.
+    """
+    Base64TextJSONConverter.contexts.clear()
+    config = client.config()
+    config["data_converter"] = DataConverter(
+        payload_converter_class=Base64TextPayloadConverter
+    )
+    client = Client(**config)
+    async with AgentEnvironment(
+        model=StreamingTestModel(),
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            streaming_topic="events",
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, StreamingOpenAIWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await client.start_workflow(
+                StreamingOpenAIWorkflow.run,
+                "Hello",
+                id=f"openai-streaming-converter-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            assert await handle.result() == "Hello world!"
+            history = await handle.fetch_history()
+
+    (completed,) = (
+        e
+        for e in history.events
+        if e.event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED
+    )
+    (result,) = completed.activity_task_completed_event_attributes.result.payloads
+    assert result.metadata["encoding"] == b"json/x-base64-text"
+    assert b"Hello world!" not in result.data
+    assert any(
+        isinstance(c, ActivitySerializationContext)
+        and c.activity_type == "invoke_model_activity_streaming"
+        for c in Base64TextJSONConverter.contexts
+    ), Base64TextJSONConverter.contexts
 
 
 @pytest.mark.asyncio
@@ -528,3 +783,495 @@ async def test_streamed_run_runs_sync_function_tools(client: Client):
             )
     # The sync tool ran in the streamed run, so the model got its result.
     assert outputs == [5]
+
+
+class HoldingStreamingModel(StreamingTestModel):
+    """Streaming test model that sends its first delta, then, on the activity's first
+    attempt, waits up to ``hold`` seconds (10 by default) before the rest. With a
+    ``response_id``, it starts with a ``response.created`` event for that response.
+
+    Records the attempts and whether its stream was cancelled during the wait.
+    """
+
+    def __init__(self, hold: float = 10, response_id: str | None = None) -> None:
+        self.hold = hold
+        self.response_id = response_id
+        self.cancelled = False
+        self.attempts: list[int] = []
+
+    async def stream_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        **kwargs: Any,
+    ) -> AsyncIterator[TResponseStreamEvent]:
+        events = super().stream_response(
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            **kwargs,
+        )
+        attempt = activity.info().attempt
+        self.attempts.append(attempt)
+        if self.response_id is not None:
+            yield ResponseCreatedEvent(
+                response=Response(
+                    id=self.response_id,
+                    created_at=0,
+                    model="test",
+                    object="response",
+                    output=[],
+                    parallel_tool_calls=True,
+                    tool_choice="auto",
+                    tools=[],
+                    status="in_progress",
+                ),
+                sequence_number=0,
+                type="response.created",
+            )
+        yield await anext(events)
+        if attempt == 1:
+            try:
+                await asyncio.sleep(self.hold)
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+        async for event in events:
+            yield event
+
+
+@input_guardrail
+async def refuse_after_a_second(
+    _context: RunContextWrapper[None],
+    _agent: Agent,
+    _input: str | list[TResponseInputItem],
+) -> GuardrailFunctionOutput:
+    """Runs in parallel with the model call (the default) and trips after one second."""
+    await workflow.sleep(1)
+    return GuardrailFunctionOutput(output_info=None, tripwire_triggered=True)
+
+
+@input_guardrail
+async def clean_up_slowly(
+    _context: RunContextWrapper[None],
+    _agent: Agent,
+    _input: str | list[TResponseInputItem],
+) -> GuardrailFunctionOutput:
+    """A parallel guardrail that takes 12 s to clean up when the framework cancels it."""
+    try:
+        await workflow.sleep(60)
+    except asyncio.CancelledError:
+        await workflow.sleep(12)
+        raise
+    return GuardrailFunctionOutput(output_info=None, tripwire_triggered=False)
+
+
+class DelayModelCall(AgentHooks[None]):
+    """Delays the model call by two seconds, so the guardrail trips before it."""
+
+    async def on_start(self, context: AgentHookContext[None], agent: Agent) -> None:
+        await workflow.sleep(2)
+
+
+@dataclass
+class GuardrailRun:
+    trip: bool = True
+    sibling: bool = False
+    delay_model: bool = False
+    # Give the agent a ModelSettings.retry policy that retries every error.
+    retry: bool = False
+    # Stay open until the subscriber has read the activity's last event.
+    hold_open: bool = True
+
+
+@workflow.defn
+class StreamingInputGuardrailWorkflow:
+    @workflow.init
+    def __init__(self, run: GuardrailRun) -> None:
+        self.stream = WorkflowStream()
+        self.subscriber_done = False
+
+    @workflow.signal
+    def finish(self) -> None:
+        self.subscriber_done = True
+
+    @workflow.run
+    async def run(self, run: GuardrailRun) -> str:
+        guardrails = [refuse_after_a_second] if run.trip else []
+        if run.sibling:
+            guardrails.append(clean_up_slowly)
+        retries_asked = 0
+
+        def retry_every_error(_context: RetryPolicyContext) -> bool:
+            nonlocal retries_asked
+            retries_asked += 1
+            return True
+
+        agent = Agent[None](
+            name="Assistant",
+            instructions="You are a test agent.",
+            input_guardrails=guardrails,
+            hooks=DelayModelCall() if run.delay_model else None,
+        )
+        if run.retry:
+            agent.model_settings = ModelSettings(
+                retry=ModelRetrySettings(max_retries=3, policy=retry_every_error)
+            )
+        result = Runner.run_streamed(starting_agent=agent, input="Hello")
+        try:
+            async for _ in result.stream_events():
+                pass
+        except InputGuardrailTripwireTriggered:
+            output = "refused"
+        else:
+            output = str(result.final_output)
+        if retries_asked:
+            output += f" after asking to retry {retries_asked} times"
+        if run.hold_open:
+            await workflow.wait_condition(lambda: self.subscriber_done)
+        return output
+
+
+async def collect_until_the_end(
+    client: Client,
+    workflow_id: str,
+    published: list[TResponseStreamEvent] | None = None,
+) -> list[TResponseStreamEvent]:
+    """Read the topic into ``published`` until an ``error`` or ``response.completed`` event."""
+    stream = WorkflowStreamClient.create(client, workflow_id)
+    if published is None:
+        published = []
+    async for item in stream.subscribe(
+        ["events"],
+        from_offset=0,
+        result_type=TResponseStreamEvent,  # type: ignore[arg-type,call-overload]
+        poll_cooldown=timedelta(milliseconds=50),
+    ):
+        published.append(item.data)
+        if item.data.type in ("error", "response.completed"):
+            break
+    return published
+
+
+async def streaming_activity_count(handle: WorkflowHandle[Any, Any]) -> int:
+    count = 0
+    async for event in handle.fetch_history_events():
+        if (
+            event.HasField("activity_task_scheduled_event_attributes")
+            and event.activity_task_scheduled_event_attributes.activity_type.name
+            == "invoke_model_activity_streaming"
+        ):
+            count += 1
+    return count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sibling", [False, True], ids=["alone", "sibling-cleaning-up"])
+async def test_streaming_input_guardrail_trip_stops_the_topic(
+    client: Client, sibling: bool
+):
+    """A parallel input guardrail that trips while the model is streaming cancels the
+    streaming activity: topic subscribers get an error event that names the response,
+    not the rest of the answer and ``response.completed``. The cancel does not wait for
+    the other parallel guardrails to finish cleaning up."""
+    # The model stub reads these private fields, and stops watching the guardrails
+    # if they are renamed.
+    assert {"_input_guardrails_task", "_triggered_input_guardrail_result"} <= {
+        f.name for f in fields(RunResultStreaming)
+    }
+    model = HoldingStreamingModel(response_id="resp_held")
+    async with AgentEnvironment(
+        model=model,
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            heartbeat_timeout=timedelta(seconds=3),
+            streaming_topic="events",
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        workflow_id = f"openai-streaming-guardrail-{uuid.uuid4()}"
+
+        async with new_worker(
+            client, StreamingInputGuardrailWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await client.start_workflow(
+                StreamingInputGuardrailWorkflow.run,
+                GuardrailRun(sibling=sibling),
+                id=workflow_id,
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=50),
+            )
+            published = await asyncio.wait_for(
+                collect_until_the_end(client, workflow_id), timeout=20.0
+            )
+            await handle.signal(StreamingInputGuardrailWorkflow.finish)
+            result = await handle.result()
+
+    assert result == "refused"
+    published_types = [e.type for e in published]
+    assert "response.completed" not in published_types, published_types
+    last = published[-1]
+    assert isinstance(last, ResponseErrorEvent)
+    assert last.code == "cancelled"
+    assert last.param == "resp_held"
+    assert model.cancelled
+    assert model.attempts == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sibling", [False, True], ids=["alone", "sibling-cleaning-up"])
+async def test_streaming_input_guardrail_known_trip_skips_the_model(
+    client: Client, sibling: bool
+):
+    """When a parallel input guardrail has already tripped as the model is called, the
+    streaming activity is not scheduled, even while other guardrails are still cleaning
+    up, and a ``ModelSettings.retry`` policy is not asked about the trip."""
+    model = HoldingStreamingModel()
+    async with AgentEnvironment(
+        model=model,
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            heartbeat_timeout=timedelta(seconds=3),
+            streaming_topic="events",
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        async with new_worker(
+            client, StreamingInputGuardrailWorkflow, max_cached_workflows=0
+        ) as worker:
+            handle = await client.start_workflow(
+                StreamingInputGuardrailWorkflow.run,
+                GuardrailRun(
+                    sibling=sibling, delay_model=True, retry=True, hold_open=False
+                ),
+                id=f"openai-streaming-known-trip-{uuid.uuid4()}",
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=50),
+            )
+            result = await handle.result()
+            scheduled = await streaming_activity_count(handle)
+
+    assert result == "refused"
+    assert scheduled == 0
+    assert model.attempts == []
+
+
+def delay_stream_publishing(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Hold every stream publish signal until ``seconds`` after the first one is sent."""
+    signal = WorkflowHandle.signal
+    deadline: float | None = None
+
+    async def delayed_signal(
+        self: WorkflowHandle[Any, Any], name: Any, *args: Any, **kwargs: Any
+    ) -> None:
+        nonlocal deadline
+        if name == "__temporal_workflow_stream_publish":
+            loop = asyncio.get_running_loop()
+            if deadline is None:
+                deadline = loop.time() + seconds
+            await asyncio.sleep(max(0.0, deadline - loop.time()))
+        await signal(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(WorkflowHandle, "signal", delayed_signal)
+
+
+def clean_up_first_publish_slowly(
+    monkeypatch: pytest.MonkeyPatch, seconds: float
+) -> None:
+    """Hold the first stream publish signal until it is cancelled, then take ``seconds``
+    to clean up before it raises."""
+    signal = WorkflowHandle.signal
+    first = True
+
+    async def slow_cleanup_signal(
+        self: WorkflowHandle[Any, Any], name: Any, *args: Any, **kwargs: Any
+    ) -> None:
+        nonlocal first
+        if name == "__temporal_workflow_stream_publish" and first:
+            first = False
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                await asyncio.sleep(seconds)
+                raise
+        await signal(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(WorkflowHandle, "signal", slow_cleanup_signal)
+
+
+def stop_heartbeats_slowly(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Make stopping the activity's heartbeats take ``seconds``, still heartbeating
+    meanwhile so that a cancel reaches the activity."""
+    heartbeat_every = _heartbeat_decorator._heartbeat_every
+
+    async def slow_to_stop(delay: float) -> None:
+        try:
+            await heartbeat_every(delay)
+        except asyncio.CancelledError:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + seconds
+            while loop.time() < deadline:
+                activity.heartbeat()
+                await asyncio.sleep(0.5)
+            raise
+
+    monkeypatch.setattr(_heartbeat_decorator, "_heartbeat_every", slow_to_stop)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_cached_workflows", [1000, 0], ids=["cached", "uncached"])
+@pytest.mark.parametrize(
+    "cancelled_while",
+    ["streaming", "publishing", "stopping-the-flusher", "stopping-the-heartbeats"],
+    ids=["streaming", "publishing", "stopping-the-flusher", "stopping-the-heartbeats"],
+)
+async def test_streaming_input_guardrail_trip_waits_for_the_error_event(
+    client: Client,
+    monkeypatch: pytest.MonkeyPatch,
+    max_cached_workflows: int,
+    cancelled_while: str,
+):
+    """With ``WAIT_CANCELLATION_COMPLETED``, a workflow that returns right after the trip
+    still has the error event at the end of its stream, and the Worker shuts down after
+    the cancel, with or without a Workflow cache. That holds whether the cancel reaches
+    the activity while the model streams or after the model finished, while the activity
+    still publishes its events, stops the stream's background flusher or stops its
+    heartbeats."""
+    model: StreamingTestModel
+    if cancelled_while == "streaming":
+        model = HoldingStreamingModel()
+    elif cancelled_while == "publishing":
+        # The model finishes at once, but the topic gets nothing for 8 s, so the cancel
+        # arrives while the activity is still publishing.
+        model = StreamingTestModel()
+        delay_stream_publishing(monkeypatch, 8)
+    elif cancelled_while == "stopping-the-flusher":
+        # The background flusher's first publish hangs. The model finishes after
+        # 0.3 s, and stopping the flusher takes 8 s, so the cancel arrives while the
+        # stream's context manager waits for the flusher.
+        model = HoldingStreamingModel(hold=0.3)
+        clean_up_first_publish_slowly(monkeypatch, 8)
+    else:
+        # The model finishes after 0.3 s and its events are published, but stopping
+        # the heartbeats takes 8 s, so the cancel arrives while the activity waits for
+        # its heartbeat task.
+        model = HoldingStreamingModel(hold=0.3)
+        stop_heartbeats_slowly(monkeypatch, 8)
+    async with AgentEnvironment(
+        model=model,
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            heartbeat_timeout=timedelta(seconds=3),
+            streaming_topic="events",
+            cancellation_type=ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        workflow_id = f"openai-streaming-guardrail-wait-{uuid.uuid4()}"
+        async with new_worker(
+            client,
+            StreamingInputGuardrailWorkflow,
+            max_cached_workflows=max_cached_workflows,
+        ) as worker:
+            result = await client.execute_workflow(
+                StreamingInputGuardrailWorkflow.run,
+                GuardrailRun(hold_open=False),
+                id=workflow_id,
+                task_queue=worker.task_queue,
+                execution_timeout=timedelta(seconds=30),
+            )
+            stream = WorkflowStreamClient.create(client, workflow_id)
+            offset = await stream.get_offset()
+            last: TResponseStreamEvent | None = None
+            async for item in stream.subscribe(
+                ["events"],
+                from_offset=offset - 1,
+                result_type=TResponseStreamEvent,  # type: ignore[arg-type,call-overload]
+            ):
+                last = item.data
+                break
+
+    assert result == "refused"
+    assert isinstance(last, ResponseErrorEvent)
+    assert last.code == "cancelled"
+    if cancelled_while == "streaming":
+        # The model held after its first delta and was cancelled, so the stream holds
+        # that delta and the error event.
+        assert isinstance(model, HoldingStreamingModel)
+        assert model.cancelled
+        assert offset == 2
+    else:
+        # Two deltas, response.completed, and the error event.
+        if isinstance(model, HoldingStreamingModel):
+            assert not model.cancelled
+        assert offset == 4
+
+
+@pytest.mark.asyncio
+async def test_streaming_worker_shutdown_publishes_no_error_event(client: Client):
+    """A Worker shutdown cancels the streaming activity, but its retry can still answer,
+    so subscribers get no error event before the retry's events."""
+    model = HoldingStreamingModel()
+    async with AgentEnvironment(
+        model=model,
+        model_params=ModelActivityParameters(
+            start_to_close_timeout=timedelta(seconds=30),
+            heartbeat_timeout=timedelta(seconds=3),
+            streaming_topic="events",
+        ),
+    ) as env:
+        client = env.applied_on_client(client)
+        workflow_id = f"openai-streaming-shutdown-{uuid.uuid4()}"
+        task_queue = str(uuid.uuid4())
+
+        # Only one Worker per task queue can be registered in a process at a time.
+        async with new_worker(
+            client,
+            StreamingInputGuardrailWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            handle = await client.start_workflow(
+                StreamingInputGuardrailWorkflow.run,
+                GuardrailRun(trip=False),
+                id=workflow_id,
+                task_queue=task_queue,
+                execution_timeout=timedelta(seconds=50),
+            )
+            published: list[TResponseStreamEvent] = []
+            collect_task = asyncio.create_task(
+                collect_until_the_end(client, workflow_id, published)
+            )
+
+            async def first_delta_read() -> None:
+                assert published
+
+            # Shut the Worker down once the subscriber has the first attempt's delta.
+            await assert_eventually(first_delta_read, timeout=timedelta(seconds=20))
+        async with new_worker(
+            client,
+            StreamingInputGuardrailWorkflow,
+            task_queue=task_queue,
+            max_cached_workflows=0,
+        ):
+            await asyncio.wait_for(collect_task, timeout=30.0)
+            await handle.signal(StreamingInputGuardrailWorkflow.finish)
+            result = await handle.result()
+
+    assert result == "Hello world!"
+    assert model.attempts == [1, 2]
+    assert [e.type for e in published] == [
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.completed",
+    ]

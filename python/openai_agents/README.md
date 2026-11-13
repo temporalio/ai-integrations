@@ -10,10 +10,14 @@ We welcome questions and feedback in the [#python-sdk](https://temporalio.slack.
 uv add temporalio-openai-agents
 ```
 
-This integration requires Temporal 1.34 or later. The SDK extends its package
+This integration requires Python 3.11+ and Temporal 1.36 or later. The SDK extends its package
 search path to support split-directory installations, including editable
 installs, separate user and system sites, layered deployments, and `--target`
 installs.
+
+LiteLLM models require Python 3.11 through 3.14: LiteLLM's
+[`fastuuid`](https://pypi.org/project/fastuuid/) dependency does not yet support
+Python 3.15. Other model providers can use Python 3.15.
 
 ## Introduction
 
@@ -720,13 +724,7 @@ workflow task, and if another branch cancels the caller in the workflow task
 that brings the operation's result, the caller gets the cancellation. A
 caller's own cancellation still cancels the operation, and a cancellation that
 leaves the block wins over the block's `DedicatedWorkerFailure`, though not over
-an `ActivityError` from a session that failed for another reason. On Python
-3.10, the plugin can't tell a workflow cancellation in the workflow task in
-which the session ends from the session's end. So a caller cancelled in that
-task, or a block that ends in it (after a Signal or an Update, or with a
-`WAIT_CANCELLATION_COMPLETED` session whose cancellation completes in it), gets
-`DedicatedWorkerFailure` in place of the cancellation, and code that catches
-it, as above, loses the cancellation.
+an `ActivityError` from a session that failed for another reason.
 
 A run follows its session this way only once it records the patch marker
 `openai-agents-stateful-mcp-session-watch`, which it does at its first
@@ -736,9 +734,9 @@ on this version, with two exceptions. A block whose last timer fired ahead of
 its session's end now raises `DedicatedWorkerFailure` with no cause, as above,
 so a run that hit this and caught the bare `CancelledError`, or that failed
 with it although it catches `ApplicationError` or `Exception` around the
-block, schedules different commands on this version. So can a run on Python
-3.10 that hit one of the cases above in which 3.10 raises
-`DedicatedWorkerFailure` in place of a cancellation. Let such open runs finish
+block, schedules different commands on this version. The same applies to a
+legacy run that raised `DedicatedWorkerFailure` in place of a cancellation
+when its session ended in the same workflow task. Let such open runs finish
 before upgrading, and expect replays of such closed runs (queries, replay
 tests) to fail. A run that continues on this version records the marker at its
 next such operation only if it scheduled none before the upgrade. Otherwise the
@@ -973,7 +971,7 @@ agents-SDK `StreamEvent` union (so raw model events arrive as
 `RawResponsesStreamEvent.data`).
 
 External consumers (UIs, tracing pipelines, etc.) observe events as
-they arrive by hosting a [`WorkflowStream`](https://github.com/temporalio/sdk-python/blob/main/temporalio/contrib/workflow_streams/README.md)
+they arrive by hosting a [`WorkflowStream`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/workflow_streams/README.md)
 in the workflow and subscribing with `WorkflowStreamClient`. The
 streaming activity publishes each event to the topic configured on
 `ModelActivityParameters.streaming_topic`. The topic is required
@@ -1004,7 +1002,7 @@ class MyAgent:
 
 To publish raw model events to external subscribers, host a
 `WorkflowStream` in the workflow and configure
-`OpenAIAgentsPlugin(model_params=ModelActivityParameters(streaming_topic="events"))`. See [`temporalio.contrib.workflow_streams`](https://github.com/temporalio/sdk-python/blob/main/temporalio/contrib/workflow_streams/README.md) for the
+`OpenAIAgentsPlugin(model_params=ModelActivityParameters(streaming_topic="events"))`. See [`temporalio.contrib.workflow_streams`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/workflow_streams/README.md) for the
 publisher and subscriber API.
 
 `RunResultStreaming.stream_events()` yields the agents-SDK
@@ -1026,9 +1024,68 @@ retry attempt publishes a second sequence. `stream_events()` only sees
 the final successful attempt's collected events because it consumes the
 activity's return value. Workflow-stream subscribers should treat
 retries the same way as any other workflow_streams publisher — see
-[Delivery semantics](https://github.com/temporalio/sdk-python/blob/main/temporalio/contrib/workflow_streams/README.md) for the trade and
+[Delivery semantics](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/workflow_streams/README.md) for the trade and
 the conventional `RETRY` event pattern for surfacing the transition to
 consumers.
+
+Streamed results are decoded with the full `TResponseStreamEvent` type,
+so an event that fails the openai SDK's strict validation keeps its
+class in every Worker process. Earlier versions decoded such an event
+as another class in a process that had not parsed one itself. A
+streamed run recorded on an earlier version that decoded a result that
+way can take another path on replay, whether or not it raised: it may
+have caught `ModelBehaviorError`, dropped an output item, or checked an
+event's class. Let such runs finish on the earlier version, or use
+Worker Versioning. Their closed Histories, also of runs that failed
+with `ModelBehaviorError`, no longer replay. Runs that were stuck on
+that decode continue after the upgrade.
+
+Input guardrails run in parallel with the model call by default. When one
+trips while the model is streaming, the plugin cancels the streaming
+activity, and the run raises `InputGuardrailTripwireTriggered` as
+`stream_events()` does. When the guardrail has already tripped, the
+plugin does not start the model call.
+
+The cancel reaches the activity through its heartbeat, so it needs a
+`heartbeat_timeout`, which is 10 seconds by default. The activity then
+stops and publishes an `error` event with the code `cancelled` to the
+topic. Subscribers can still get the events the model sent before that,
+as a native `stream_events()` consumer can. If the model has already
+finished but the activity is still publishing its events when the cancel
+arrives, the `error` event comes after `response.completed`.
+
+Subscribers still get the whole answer and `response.completed`, with no
+`error` event, when:
+
+- `heartbeat_timeout` is `None`: the activity is not told about the
+  cancel;
+- `cancellation_type` is `ABANDON`: no cancel is sent;
+- the activity has already returned.
+
+If the guardrail trips while the activity waits to retry a failed
+attempt, Temporal cancels it without another attempt. The topic then
+ends with the failed attempt's events and no `error` event.
+
+The `error` event ends one model call, not the run. The activity
+publishes it for any cancel the workflow requests while the call runs: a
+guardrail trip, `RunResultStreaming.cancel()`, or a
+`ModelSettings.timeout`. So more events can follow it, from a
+`ModelSettings.retry` or from the run's next model call. Its `param` is
+the ID from that call's `response.created` event, so subscribers can
+tell which response it ends. `param` is empty if the cancel came before
+`response.created`, and Chat Completions and LiteLLM models send the same
+placeholder ID, `__fake_id__`, for every call. Cancels that Temporal
+makes on its own, such as a Worker shutdown or a heartbeat timeout,
+publish no `error` event, because the activity's retry can still answer.
+
+With the default `cancellation_type` (`TRY_CANCEL`), the run raises
+without waiting for the activity to stop. A workflow that completes
+right after the trip can close before the activity publishes the event,
+and the stream then ends without it. If the workflow streams more on
+the same topic, the event can land among those events. Set
+`cancellation_type=ActivityCancellationType.WAIT_CANCELLATION_COMPLETED`
+to make the run raise only after the activity has published it, which
+keeps the event ahead of the next model call's events.
 
 ## Feature Support
 
@@ -1044,6 +1101,9 @@ Certain tools are not suitable for a distributed computing environment, so these
 | OpenAI                                                      |    Yes    |
 | LiteLLM                                                     |    Yes    |
 | Any OpenAI-compatible API, through a custom `ModelProvider` |    Yes    |
+
+`RunConfig.model` overrides every agent's own model, as in the Python Agents SDK. The
+TypeScript plugin follows the JS SDK, where an agent's own model wins.
 
 Pass a custom provider with `OpenAIAgentsPlugin(model_provider=...)`. When an agent names no
 model, the provider's `get_model(None)` chooses it. The Agents SDK gives such an agent the
@@ -1414,6 +1474,10 @@ with plugin.tracing_context():
 ```
 
 The `plugin.tracing_context()` is required when starting traces outside of a worker context. This ensures proper instrumentation setup and trace propagation into the workflow execution.
+
+Headers containing only OpenTelemetry IDs preserve the remote OTel parent without
+reconstructing an Agents SDK trace. Start an Agents SDK `trace()` in the worker
+before creating Agents SDK spans when the caller supplies no Agents trace ID.
 
 If OTEL instrumentation is not enabled, the integration works normally without any OTEL setup.
 

@@ -1,5 +1,6 @@
 """Workflow-specific primitives for working with the OpenAI Agents SDK in a workflow context"""
 
+import asyncio
 import dataclasses
 import functools
 import inspect
@@ -38,16 +39,23 @@ from pydantic import BaseModel, ValidationError
 from temporalio import activity
 from temporalio import workflow as temporal_workflow
 from temporalio.common import Priority, RetryPolicy
-from temporalio.exceptions import ApplicationError, TemporalError
+from temporalio.exceptions import (
+    ApplicationError,
+    CancelledError,
+    NexusOperationError,
+    TemporalError,
+)
 from temporalio.openai_agents._errors import (
     AgentsWorkflowError as AgentsWorkflowError,
 )
+from temporalio.openai_agents._openai_runner import _track_tool_operation
 from temporalio.openai_agents.sandbox._temporal_sandbox_client import (
     TemporalSandboxClient,
 )
 from temporalio.workflow import (
     ActivityCancellationType,
     ActivityConfig,
+    NexusOperationCancellationType,
     VersioningIntent,
 )
 
@@ -135,7 +143,10 @@ def _generated_class_doc(cls: type) -> str | None:
                 # 3.14 left a forward reference in the __init__ dataclasses generated
                 # unevaluated, and the field keeps the reference from that time.
                 annotate = getattr(cls.__init__, "__annotate__", None)
-                if getattr(annotate, "__generated_by_dataclasses__", False):
+                # Python 3.15 generates the docstring lazily from the current signature.
+                if sys.version_info[:2] == (3, 14) and getattr(
+                    annotate, "__generated_by_dataclasses__", False
+                ):
                     types = {n: f.type for n, f in cls.__dataclass_fields__.items()}
                     signature = signature.replace(
                         parameters=[
@@ -164,9 +175,8 @@ def _docstring(fn: Callable | None) -> str | None:
 def _type_hints(fn: Callable) -> dict[str, Any]:
     """Return ``fn``'s annotations resolved in its own module, keeping ``Annotated`` metadata.
 
-    Unlike ``typing.get_type_hints(fn)`` on Python 3.10, this doesn't wrap a parameter with a
-    ``None`` default in ``Optional``, which would hide a context type or ``Annotated`` metadata.
-    Like it, this resolves the function's own type parameters, such as ``T`` in ``def f[T]``.
+    A ``None`` default leaves the declared parameter type and ``Annotated`` metadata intact.
+    This resolves the function's own type parameters, such as ``T`` in ``def f[T]``.
     It skips the return annotation, which the tool doesn't use, so a function marked with
     ``@typing.no_type_check`` whose return type can't be resolved still gets its parameter types.
     """
@@ -434,6 +444,7 @@ def nexus_operation_as_tool(
     service: type[Any],
     endpoint: str,
     schedule_to_close_timeout: timedelta | None = None,
+    cancellation_type: NexusOperationCancellationType = NexusOperationCancellationType.WAIT_COMPLETED,
     strict_json_schema: bool = True,
     failure_error_function: ToolErrorFunction | None = default_tool_error_function,
 ) -> Tool:
@@ -444,10 +455,20 @@ def nexus_operation_as_tool(
     during workflow execution. The tool will automatically handle the conversion
     of inputs and outputs between the agent and the operation.
 
+    When a ``Runner.run`` agent run is cancelled, or stops because another tool
+    failed with an error that fails the Workflow, the tool cancels the operation
+    as ``cancellation_type`` says (``ABANDON`` sends no cancel request; with
+    ``TRY_CANCEL`` the request may not be delivered), and the run waits for it
+    before it raises. With the default, ``WAIT_COMPLETED``, the Workflow closes
+    only after the operation has ended, unless the Workflow itself is cancelled
+    before the operation has started. ``Runner.run_streamed`` does not wait.
+
     Args:
         operation: A Nexus operation to convert into a tool.
         service: The Nexus service class that contains the operation.
         endpoint: The Nexus endpoint to use for the operation.
+        cancellation_type: How the operation is cancelled when the agent run
+            stops. See :py:class:`temporalio.workflow.NexusOperationCancellationType`.
         strict_json_schema: Whether the tool should follow a strict schema
         failure_error_function: Formats the error text returned to the model
             when its arguments are not valid JSON or do not match the
@@ -497,11 +518,26 @@ def nexus_operation_as_tool(
         args, _ = schema.to_call_args(params)
         assert len(args) == 1, "Nexus operations must have exactly one argument"
         [arg] = args
-        result = await nexus_client.execute_operation(
-            operation,
-            arg,
-            schedule_to_close_timeout=schedule_to_close_timeout,
-        )
+        # If a Runner.run agent run is cancelled, or fails with an error that fails the
+        # Workflow, the runner waits for this operation, so Temporal delivers the operation's
+        # cancel request before the Workflow closes. Tracking starts before the start
+        # request: a cancelled task keeps waiting for the start to resolve, unless the
+        # Workflow itself is cancelled.
+        with _track_tool_operation() as tracked:
+            try:
+                handle = await nexus_client.start_operation(
+                    operation,
+                    arg,
+                    schedule_to_close_timeout=schedule_to_close_timeout,
+                    cancellation_type=cancellation_type,
+                )
+                result = await handle
+            except NexusOperationError as e:
+                # The run stopped and the Agents SDK cancelled this call. End it as
+                # cancelled, so that asyncio and the Agents SDK do not log its error.
+                if tracked.cancelled and isinstance(e.cause, CancelledError):
+                    raise asyncio.CancelledError() from e
+                raise
         try:
             return str(result)
         except Exception as e:
@@ -702,7 +738,9 @@ def temporal_mcp_server(
     Args:
         name: Name matching a server factory registered on the plugin.
         activity_config: Activity options for MCP operations. Defaults to a
-            one-minute start-to-close timeout.
+            one-minute start-to-close timeout and a 10-second heartbeat
+            timeout. Set ``heartbeat_timeout`` to ``None`` to turn heartbeats
+            off.
         cache_tools_list: Whether to cache the tool list for this object.
         factory_argument: Non-secret value passed to the worker-side factory.
             A non-None value creates a fresh server for every Activity instead
