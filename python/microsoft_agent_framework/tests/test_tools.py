@@ -432,7 +432,11 @@ def test_activity_as_tool_method_drops_self() -> None:
             """Look a city up."""
             return f"{city} {verbose}"
 
-    as_tool = activity_as_tool(Activities.lookup, name="city_lookup")
+    as_tool = activity_as_tool(
+        Activities.lookup,
+        name="city_lookup",
+        start_to_close_timeout=timedelta(seconds=5),
+    )
     spec = as_tool.to_json_schema_spec()["function"]
     assert spec["name"] == "city_lookup"
     assert spec["description"] == "Look a city up."
@@ -685,3 +689,12 @@ async def test_hosted_mcp_headers_in_workflow_refused(client: Client) -> None:
     # Refused before any Activity: the secret never reached history.
     assert await count_scheduled_activities(handle) == {}
     assert "workflow-secret" not in (await handle.fetch_history()).to_json()
+
+
+def test_activity_as_tool_requires_timeout() -> None:
+    with pytest.raises(
+        ValueError, match="start_to_close_timeout or schedule_to_close_timeout"
+    ):
+        activity_as_tool(fetch_user)
+    # Either timeout satisfies it, as for workflow.execute_activity.
+    activity_as_tool(fetch_user, schedule_to_close_timeout=timedelta(seconds=5))

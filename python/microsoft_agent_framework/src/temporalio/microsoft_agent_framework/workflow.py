@@ -83,7 +83,8 @@ def activity_as_tool(
     Raises:
         ValueError: If ``activity_fn`` is not an ``@activity.defn`` function or
             method, or takes ``*args``, keyword-only arguments or ``**kwargs``,
-            which the tool cannot pass by position.
+            which the tool cannot pass by position; or if neither
+            ``start_to_close_timeout`` nor ``schedule_to_close_timeout`` is set.
     """
     if inspect.isclass(activity_fn) or not (
         inspect.isfunction(activity_fn) or inspect.ismethod(activity_fn)
@@ -123,6 +124,11 @@ def activity_as_tool(
             for p in params
         ]
     )
+    if start_to_close_timeout is None and schedule_to_close_timeout is None:
+        raise ValueError(
+            f"activity_as_tool({activity_name!r}) needs start_to_close_timeout or "
+            "schedule_to_close_timeout, as workflow.execute_activity does"
+        )
     hints = typing.get_type_hints(activity_fn, include_extras=True)
     result_type = hints.get("return")
     tool_name = name or activity_name
