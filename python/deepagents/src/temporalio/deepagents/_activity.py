@@ -218,9 +218,11 @@ def _auto_heartbeater(fn: Callable) -> Callable:
 
 
 def _is_async_callable(fn: Any) -> bool:
-    """Whether calling ``fn`` only creates a coroutine (``async def``, a bound
-    async method, a ``functools.partial`` of one, or an object whose
-    ``__call__`` is ``async def``)."""
+    """Return whether calling ``fn`` only creates a coroutine.
+
+    True for an ``async def``, a bound async method, a ``functools.partial``
+    of one, or an object whose ``__call__`` is ``async def``.
+    """
     return inspect.iscoroutinefunction(fn) or inspect.iscoroutinefunction(
         getattr(fn, "__call__", None)
     )
