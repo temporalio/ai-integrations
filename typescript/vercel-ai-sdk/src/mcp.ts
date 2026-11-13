@@ -9,8 +9,6 @@ export type McpClientFactories = { [serviceName: string]: McpClientFactory };
 
 /**
  * Options for the Temporal MCP Client
- *
- * @experimental The AI SDK plugin is an experimental feature; APIs may change without notice.
  */
 export interface TemporalMCPClientOptions {
   readonly name: string;
@@ -24,8 +22,6 @@ export interface TemporalMCPClientOptions {
  *
  * This is intentionally similar to the AI SDK's ``MCPClient``, but is lacking functions not used by the framework.
  * It doesn't close either since the underlying clients are created in activities.
- *
- * @experimental The AI SDK plugin is an experimental feature; APIs may change without notice.
  */
 export class TemporalMCPClient {
   constructor(readonly options: TemporalMCPClientOptions) {}

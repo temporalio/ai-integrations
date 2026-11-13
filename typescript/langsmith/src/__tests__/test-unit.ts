@@ -7,8 +7,8 @@
  * @module
  */
 
-import { existsSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
 
 import test from 'ava';
 
@@ -105,14 +105,9 @@ test('context propagation codec never throws on malformed input', (t) => {
   t.is(decodeContextString('{"unrelated":true}'), undefined);
 });
 
-test('describeError renders a non-benign ApplicationFailure as "type: message"', (t) => {
+test('describeError renders a non-benign ApplicationFailure as "ClassName: message"', (t) => {
   const err = ApplicationFailure.create({ message: 'boom', type: 'MyError' });
-  t.is(describeError(err), 'MyError: boom');
-});
-
-test('describeError defaults the type to ApplicationError', (t) => {
-  const err = ApplicationFailure.create({ message: 'boom' });
-  t.is(describeError(err), 'ApplicationError: boom');
+  t.is(describeError(err), 'ApplicationFailure: boom');
 });
 
 test('describeError suppresses BENIGN-category failures', (t) => {
@@ -152,6 +147,10 @@ test('plugin registers the workflow interceptor module as an absolute, resolvabl
 
   const bundler = plugin.configureBundler({ workflowsPath: 'wf' } as BundleOptions);
   t.deepEqual(bundler.workflowInterceptorModules, [workflowModule]);
+});
+
+test('plugin reports the package version for worker heartbeats', (t) => {
+  t.is(new LangSmithPlugin().version, JSON.parse(readFileSync(join(__dirname, '../../package.json'), 'utf8')).version);
 });
 
 const run = (id: string, name: string, parent?: string): CollectedRun => ({ id, name, parent_run_id: parent });

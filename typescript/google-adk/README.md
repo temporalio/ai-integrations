@@ -199,7 +199,8 @@ they call the network from the sandbox. The plugin therefore re-registers their
 model-name patterns in the Workflow's `LLMRegistry` to a `TemporalModel`, so an
 agent configured with a raw string — `model: 'gemini-2.5-flash'`,
 `model: 'apigee/…'` — is durable without any change, using `TemporalModel`'s
-default Activity options (a one-minute `startToCloseTimeout`, no streaming). Wrap
+default Activity options (a one-minute `startToCloseTimeout`, a 10-second
+`heartbeatTimeout`, no streaming). Wrap
 the string in `new TemporalModel(name, options)` to customize.
 
 The Worker is untouched: there the real class runs inside the model Activity, so
@@ -387,15 +388,26 @@ const runner = new InMemoryRunner({ agent: graph });
 - **Agent node timeouts.** A `timeout` on an `LlmAgent` node is ADK's own
   deadline, and it never reaches the agent's model call: ADK runs the agent with
   the run's abort signal rather than the node's. When the node times out, its
-  model Activity keeps running, and a `retryConfig` that retries
-  `NodeTimeoutError` starts the next attempt beside it; the calls left open are
-  only cancelled when the run itself fails or is cancelled. Once the retry has
-  answered, a failure from one of them no longer counts, whenever it arrives: the
-  plugin numbers model calls as they start, and ignores the failure of a call
-  that started before the same agent's latest answer in that run. Bound an
-  agent's model call with the model Activity's own `startToCloseTimeout` or
-  `scheduleToCloseTimeout` (`TemporalModel`'s `activity` options) instead, and
-  put a deadline on Activity work with `activityNode`.
+  model Activity keeps running, and so does a tool or model callback it was
+  waiting on; a `retryConfig` that retries `NodeTimeoutError` starts the next
+  attempt beside it, and the work left open is only cancelled when the run
+  itself fails or is cancelled. A cancellation of that work never counts, whenever
+  it arrives: the plugin tracks each node attempt and ignores a cancellation that
+  ADK absorbs in an attempt the node's timeout abandoned, while a retry or another
+  item of a `ParallelWorker` is an attempt of its own. That includes work a retry
+  joins after the abandoned attempt started it, such as a retried `ParallelWorker`
+  or `ctx.runNode` with an explicit `runId`: its cancellation is ignored too.
+  Today any node `timeout` cancelled mid-call fails Workflow Tasks until the node
+  times out and fails the run
+  ([#389](https://github.com/temporalio/ai-integrations/issues/389)); once that
+  is fixed, a run whose retry joined such work fails with
+  `GoogleAdkNodeReportedError` instead of ending CANCELLED.
+  Once the retry has answered, a model failure from that work no longer counts
+  either: the plugin numbers model calls as they start, and ignores the failure
+  of a call that started before the same agent's latest answer in that run.
+  Bound an agent's model call with the model Activity's own
+  `startToCloseTimeout` or `scheduleToCloseTimeout` (`TemporalModel`'s `activity`
+  options) instead, and put a deadline on Activity work with `activityNode`.
 - **Fan-in.** Use a `JoinNode`: it is the node type that waits for every
   predecessor, and its input is the map from predecessor name to that node's
   output. ADK's `waitForOutput` flag is not a fan-in gate (it parks a node that
@@ -589,6 +601,28 @@ an agent node is waiting on, ADK absorbs the cancelled call like any model error
 and reports the node as failed (`NodeReportedError`); the plugin ends the
 execution CANCELLED with the model Activity's own cancellation instead. A
 cancelled Activity node ends it CANCELLED the same way, inside a dynamic run too.
+So does a cancel that ADK absorbs in a tool (its `requireConfirmation` predicate
+included) or a model callback, such as a `LongRunningFunctionTool` waiting for a
+Signal or a `beforeModelCallback` waiting for an Activity: in an agent node it
+ends the execution CANCELLED rather than completing it (a tool) or failing it
+with `GoogleAdkNodeReportedError` (a model callback). A cancel absorbed in a
+Signal handler ends the execution when the main function returns, after its
+cleanup; if the main function has already returned, the execution ends as the
+main function did. A cancellation that the handler's own later step throws
+after that (a `sleep` or an Activity after the ADK turn) is subject to
+[temporalio/sdk-typescript#2639](https://github.com/temporalio/sdk-typescript/issues/2639):
+such a run can stay RUNNING until the SDK fixes it. A Signal handler that
+throws instead, because a later step of its own rejects with the cancel or
+because its ADK graph run reports the node failed (`NodeReportedError`), ends
+the execution CANCELLED at once, before that cleanup: to clean up first, catch
+the error in the handler or run the turn in the main function. Only the
+execution's own cancellation counts, followed from the operation it cancelled: a
+cancel that only an inner scope (`CancellationScope.withTimeout`) caused, or any
+other error a tool or callback throws, leaves the outcome to the Workflow, even
+when the Workflow's cancellation was requested meanwhile. A recorded
+cancellation outranks the errors ADK's runtime throws, but not an error the
+Workflow's own code throws after the turn: that one still decides how the
+execution ends.
 
 A failing sibling does not cancel the execution either. When a graph node fails,
 ADK aborts the run and waits for the nodes still running before failing it. The
@@ -625,6 +659,30 @@ for await (const response of model.generateContentAsync(llmRequest, true)) {
   // `adk-agent-stream`; the Workflow receives the transcript here.
 }
 ```
+
+If a batch of chunks cannot be published, the model call fails with
+`STREAM_ERROR_FAILURE_TYPE` (`GoogleAdkStreamError`, exported from
+`@temporalio/google-adk/workflow`) instead of returning as if every chunk was
+delivered. In an ADK agent run it is recorded like a model failure: it fails the
+Workflow, or rejects the Update that ran the turn, unless an
+`onModelErrorCallback` passes it to `markModelFailureHandled`. It is
+non-retryable when a retry would call the model again and fail the same way:
+
+- **A batch over the server's size limits**: 2 MiB per payload and 4 MiB per
+  gRPC message by default. Configure external storage on the Worker and the
+  subscriber's Client so large batches are stored, or keep responses smaller.
+- **A run past its Signal limit.** Each batch is one Signal, and a run accepts
+  10,000 Signals by default, counting the Workflow's other Signals. With the
+  default `streamingBatchInterval` of 100 milliseconds, a run can reach it after
+  about 17 minutes of streaming in total. A long-running streaming Workflow, such as a
+  chat session, should continue-as-new well before that, or use a longer
+  `streamingBatchInterval`.
+- **A batch Workflow Streams gave up on** after its fixed 10-minute retry limit.
+  This needs a model Activity `startToCloseTimeout` over 10 minutes (the default
+  is 1 minute), and then a server outage that long ends here too.
+
+Other failures, such as a shorter server outage, are retried; the retry calls
+the model again and publishes its stream again.
 
 ### Testing
 
@@ -746,23 +804,39 @@ Cautions:
   observability and governance plugins before this one.
 - The plugin registers Activities named `adk-invokeModel` and
   `adk-invokeModelStreaming`, plus `<name>-listTools`, `<name>-callTool`,
-  `<name>-listResources` and `<name>-readResource` for each MCP toolset. If the
-  Worker already has a different Activity with one of these names (your own
-  Activity, another integration's MCP Activity, or a second `GoogleAdkPlugin`
-  with a different `modelProvider` or toolset factory), `Worker.create` fails
-  with `Duplicate registration of Activity '<name>'`. Earlier versions kept the
-  last one without a warning. Rename the other Activity or MCP server, or put
-  every model provider and toolset in one `GoogleAdkPlugin`. The same instance
-  on the `NativeConnection` and the Worker, or two instances built from the
-  same options object, still work, unless `setActivityOptions` gave their
-  Activities different metadata objects. `modelProvider` is read once, when the
-  plugin is constructed, and is called as a method of the options object.
+  `<name>-listResources` and `<name>-readResource` for each MCP toolset. A
+  different Activity with one of these names now fails with
+  `Duplicate registration of Activity '<name>'`; earlier versions kept the last
+  one without a warning. If it is registered before `GoogleAdkPlugin` (in the
+  Worker's `activities` or by an earlier plugin), `Worker.create` fails. If a
+  plugin applied after `GoogleAdkPlugin` replaces one, `worker.run()` fails
+  before the Worker polls. `Worker.create` applies the Worker's `plugins` in
+  order, then the `NativeConnection`'s. A plugin applied after `GoogleAdkPlugin`
+  that wraps these Activities counts as replacing them; wrap Activity execution
+  with an Activity interceptor (`interceptors.activity`) instead.
+- To fix a collision with your own Activity or another integration's MCP server
+  name, rename one of them, or run the other integration on its own Worker and
+  task queue. Two `GoogleAdkPlugin`s on one Worker must be the same instance or
+  be built from one options object; two without a `modelProvider` also work
+  when every shared toolset name uses the same factory function. Anything else
+  is refused, such as one `modelProvider` in two options objects (two equal
+  object literals, for example) or a plugin without a `modelProvider` next to
+  one with it. Use one `GoogleAdkPlugin` with every MCP toolset instead: its
+  `modelProvider` receives each model name, so one provider can serve several
+  models. Two instances built from one options object are also refused when
+  `setActivityOptions` gave their Activities different metadata objects.
+  `modelProvider` is read once, when the plugin is constructed, and is called
+  as a method of the options object.
 - Model calls use Temporal retries. The plugin disables nested GenAI SDK retries
   for model requests and honors `retry-after` where available.
-- `heartbeatTimeout` detects a dead worker, not a stalled call: when set, the model
-  and MCP Activities heartbeat on a timer at half that timeout — a hung call
-  included — and a streaming model call heartbeats per chunk regardless. The bound
-  on a stalled call is `startToCloseTimeout`, one minute by default.
+- `heartbeatTimeout` defaults to 10 seconds for the model and MCP Activities. It
+  detects a dead worker, not a stalled call: they heartbeat on a timer at half that
+  timeout — a hung call included — and a streaming model call also heartbeats per
+  chunk. A cancel reaches a running call only through a heartbeat. In Temporal
+  Cloud each heartbeat that reaches the service is an Action: with the default, at
+  most one every 8 seconds of a running call. Set `heartbeatTimeout: 0` to turn the
+  timer off. The bound on a stalled call is `startToCloseTimeout`, one minute by
+  default.
 - Streaming topic delivery is at-least-once. The deterministic Workflow value is
   the Activity result, not the stream side channel.
 - ADK's own log lines from inside a Workflow (ADK 2.1 and later: an `[ADK]`

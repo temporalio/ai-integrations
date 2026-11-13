@@ -91,7 +91,6 @@ assert "temporalio.google_adk._mcp" not in sys.modules
 if sys.argv[6] == "True":
     assert not any(name.split(".")[0] in {"anthropic", "litellm", "openai"} for name in sys.modules)
 
-# The SDK bridge can abort during interpreter shutdown on Python 3.10.
 # Match conftest's exit workaround only after execution/replay and all assertions.
 sys.stdout.flush()
 sys.stderr.flush()

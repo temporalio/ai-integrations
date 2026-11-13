@@ -18,7 +18,6 @@ Temporal pattern for state shared between the run method and its handlers.
 from __future__ import annotations
 
 import asyncio
-import sys
 import threading
 import uuid
 from datetime import timedelta
@@ -27,10 +26,6 @@ from typing import Any
 import pytest
 
 from temporalio.testing import WorkflowEnvironment
-
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 
 pytest.importorskip("deepagents")
 pytest.importorskip("langchain_core")
@@ -41,10 +36,8 @@ from temporalio.client import WorkflowExecutionStatus  # noqa: E402
 from temporalio.worker import Replayer, Worker  # noqa: E402
 from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
 
-# Bind deepagents symbols off the module importorskip returns: a static
-# `from deepagents import ...` cannot resolve on Python 3.10 (deepagents
-# needs >= 3.11), and with the package absent the type checkers mis-resolve
-# the name against this same-named test directory.
+# Resolve framework symbols through the imported module to avoid confusing
+# the top-level package with this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
 with workflow.unsafe.imports_passed_through():

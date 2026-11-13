@@ -43,6 +43,9 @@ INVOKE_MODEL_STREAMING = "deepagents.invoke_model_streaming"
 INVOKE_TOOL = "deepagents.invoke_tool"
 BACKEND_OP = "deepagents.backend_op"
 
+CONTEXT_OVERFLOW_ERROR_TYPE = "deepagents.ContextOverflowError"
+"""``ApplicationError.type`` of a model call the provider rejected as too long."""
+
 
 # ---------------------------------------------------------------------------
 # Boundary payloads
@@ -215,6 +218,57 @@ def _translate_api_error(exc: Exception) -> ApplicationError | None:
     )
 
 
+# HTTP statuses and messages that mark a provider's context overflow, as in Deep
+# Agents' summarization middleware since 0.7.14. Its check is private and older
+# 0.7 releases lack it, so the plugin keeps its own copy.
+_CONTEXT_OVERFLOW_STATUSES = frozenset({400, 413, 422})
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context_length_exceeded",
+    "contextwindowexceedederror",
+    "maximum context length",
+    "exceeds the context window",
+    "exceeds the available context size",
+    "context window exceeded",
+    "context limit exceeded",
+    "input tokens exceed the configured limit",
+    "prompt is too long",
+)
+
+
+def _is_context_overflow(exc: Exception) -> bool:
+    """Return whether the provider rejected the request as too long.
+
+    LangChain's ``ContextOverflowError`` covers the typed overflow errors, with
+    or without an HTTP status. An OpenAI-compatible server such as vLLM returns
+    an ordinary 400 instead, so an error with one of the statuses above whose
+    message names an overflow counts too.
+    """
+    from langchain_core.exceptions import ContextOverflowError
+
+    if isinstance(exc, ContextOverflowError):
+        return True
+    if getattr(exc, "status_code", None) not in _CONTEXT_OVERFLOW_STATUSES:
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _CONTEXT_OVERFLOW_MARKERS)
+
+
+def _context_overflow_error(exc: Exception) -> ApplicationError | None:
+    """Mark a provider's context-window overflow so the workflow can recover.
+
+    Deep Agents' summarization middleware summarizes older messages and retries
+    when a model call fails with ``ContextOverflowError``. The provider's
+    exception is only available here, so classify it here and give the failure
+    a type the workflow side rebuilds the overflow from. Retrying the same
+    request cannot succeed, so it is non-retryable.
+    """
+    if not _is_context_overflow(exc):
+        return None
+    return ApplicationError(
+        str(exc), type=CONTEXT_OVERFLOW_ERROR_TYPE, non_retryable=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # The activities
 # ---------------------------------------------------------------------------
@@ -275,9 +329,7 @@ def _default_model_provider(model_name: str) -> Any:
     logical attempt fans out into nested retry storms that Temporal can neither
     see nor bound.
     """
-    # importlib: `langchain` (unlike langchain-core) is absent on Python 3.10
-    # environments where the deepagents extra cannot install; a static import
-    # here fails type-checking there.
+    # Load the provider factory when a model is requested.
     init_chat_model = importlib.import_module("langchain.chat_models").init_chat_model
 
     return init_chat_model(model_name, max_retries=0)
@@ -327,6 +379,9 @@ class DeepAgentActivities:
         try:
             message = await model.ainvoke(messages, config=config)
         except Exception as exc:
+            overflow = _context_overflow_error(exc)
+            if overflow is not None:
+                raise overflow from exc
             translated = _translate_api_error(exc)
             if translated is not None:
                 activity.logger.warning(
@@ -369,6 +424,9 @@ class DeepAgentActivities:
                         topic.publish(_serde.dump_object(chunk))
                     final = chunk if final is None else final + chunk
         except Exception as exc:
+            overflow = _context_overflow_error(exc)
+            if overflow is not None:
+                raise overflow from exc
             translated = _translate_api_error(exc)
             if translated is not None:
                 activity.logger.warning(
