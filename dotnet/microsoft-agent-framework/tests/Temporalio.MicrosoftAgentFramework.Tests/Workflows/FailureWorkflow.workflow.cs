@@ -159,6 +159,17 @@ public class FailureWorkflow
                     return (await agent.RunAsync(input.Prompt)).Text;
                 }
 
+            case "tool-errors-reset":
+                {
+                    // Fails unless the city is "ok": a success between two groups of failures resets the consecutive count.
+                    var flaky = AIFunctionFactory.Create(
+                        (Func<string, string>)(city => city == "ok" ? "fine" : throw new InvalidOperationException($"no data for {city}")),
+                        "get_weather",
+                        "Gets the weather for a city");
+                    var agent = new TemporalAgent(input.Model, new TemporalAgentOptions { ChatOptions = new ChatOptions { Tools = [flaky] } });
+                    return (await agent.RunAsync(input.Prompt)).Text;
+                }
+
             case "declaration-only":
                 {
                     var schema = JsonSerializer.Deserialize<JsonElement>("""{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}""");

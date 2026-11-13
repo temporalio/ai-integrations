@@ -255,6 +255,63 @@ public class ApprovalTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task MixedDecisions_RejectedResultsComeFirst()
+    {
+        var fake = new FakeChatClient(
+            ScriptedResponse.ToolCalls(
+                ("send_email", new Dictionary<string, object?> { ["to"] = "ops@example.com" }),
+                ("delete_file", new Dictionary<string, object?> { ["path"] = "/tmp/report" })),
+            ScriptedResponse.Text("Done"));
+        using var worker = Fixture.NewWorker(TestPlugin.For(fake));
+        await WithWorkerAsync(worker, async () =>
+        {
+            var input = new ApprovalInput("Email ops and clean up", "workflow", TwoApprovalTools: true);
+            var handle = await Client.StartWorkflowAsync((ApprovalWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(worker, "approval-mixed-decisions"));
+            var pending = await WaitForPendingAsync(handle, 2);
+            var email = pending.Single(request => ((FunctionCallContent)request.ToolCall).Name == "send_email");
+            var delete = pending.Single(request => ((FunctionCallContent)request.ToolCall).Name == "delete_file");
+            await handle.SignalAsync(wf => wf.DecideAsync(email.CreateResponse(true)));
+            await handle.SignalAsync(wf => wf.DecideAsync(delete.CreateResponse(false, "keep it")));
+            Assert.Equal("Done", await handle.GetResultAsync());
+            Assert.Equal(1, await handle.QueryAsync(wf => wf.WorkflowToolInvocations()));
+
+            // Rejections first, as FunctionInvokingChatClient orders them: the calls, the rejection result, then the approved result.
+            var view = fake.Calls[1].Messages.ToList();
+            var callMessage = view.Single(m => m.Contents.OfType<FunctionCallContent>().Any());
+            Assert.Equal(["delete_file", "send_email"], callMessage.Contents.OfType<FunctionCallContent>().Select(c => c.Name));
+            var index = view.IndexOf(callMessage);
+            Assert.Equal(ChatRole.Tool, view[index + 1].Role);
+            var rejected = Assert.IsType<FunctionResultContent>(Assert.Single(view[index + 1].Contents));
+            Assert.Equal("call_1_1", rejected.CallId);
+            Assert.Equal("Tool call invocation rejected. keep it", rejected.Result?.ToString());
+            Assert.Equal(ChatRole.Tool, view[index + 2].Role);
+            var approved = Assert.IsType<FunctionResultContent>(Assert.Single(view[index + 2].Contents));
+            Assert.Equal("call_1_0", approved.CallId);
+            Assert.Equal("email sent to ops@example.com", approved.Result?.ToString());
+            Assert.DoesNotContain(view, m => m.Contents.Any(c => c is ToolApprovalRequestContent or ToolApprovalResponseContent));
+        });
+    }
+
+    [Fact]
+    public async Task DecisionMessageWithText_ToolRoundPrecedesTheText()
+    {
+        var fake = EmailFake();
+        using var worker = Fixture.NewWorker(TestPlugin.For(fake));
+        await WithWorkerAsync(worker, async () =>
+        {
+            var input = new ApprovalInput("Email ops", "workflow", DecisionWithText: true);
+            var handle = await Client.StartWorkflowAsync((ApprovalWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(worker, "approval-decision-text"));
+            var pending = await WaitForPendingAsync(handle);
+            await handle.SignalAsync(wf => wf.DecideAsync(pending.CreateResponse(true)));
+            Assert.Equal("Done", await handle.GetResultAsync());
+            var view = fake.Calls[1].Messages.Select(m => $"{m.Role}:{string.Join("|", m.Contents.Select(Describe))}").ToList();
+            Assert.Equal(
+                ["user:text(Email ops)", "assistant:call(send_email)", "tool:result(call_1_0)", "user:text(Also tell me a joke.)"],
+                view);
+        });
+    }
+
+    [Fact]
     public async Task UnansweredApproval_FailsWorkflowWithWorkflowError()
     {
         var fake = new FakeChatClient(
@@ -291,6 +348,30 @@ public class ApprovalTests : WorkflowTestBase
         Assert.Equal("email sent to ops@example.com", results[0].Result?.ToString());
         Assert.Equal("sunny in Kingston", results[1].Result?.ToString());
         Assert.DoesNotContain(providerView, m => m.Contents.Any(c => c is ToolApprovalRequestContent or ToolApprovalResponseContent));
+    }
+
+    private static string Describe(AIContent content) => content switch
+    {
+        TextContent text => $"text({text.Text})",
+        FunctionCallContent call => $"call({call.Name})",
+        FunctionResultContent result => $"result({result.CallId})",
+        _ => content.GetType().Name,
+    };
+
+    private static async Task<IReadOnlyList<ToolApprovalRequestContent>> WaitForPendingAsync(WorkflowHandle<ApprovalWorkflow> handle, int count)
+    {
+        for (var i = 0; i < 200; i++)
+        {
+            var pending = await handle.QueryAsync(wf => wf.PendingApprovals());
+            if (pending.Count >= count)
+            {
+                return pending;
+            }
+
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+        }
+
+        throw new TimeoutException($"{count} approval requests did not become pending.");
     }
 
     private static async Task<ToolApprovalRequestContent> WaitForPendingAsync(WorkflowHandle<ApprovalWorkflow> handle)

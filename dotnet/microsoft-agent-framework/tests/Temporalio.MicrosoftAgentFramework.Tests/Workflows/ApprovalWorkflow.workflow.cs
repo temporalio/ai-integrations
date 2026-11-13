@@ -9,7 +9,7 @@ namespace Temporalio.MicrosoftAgentFramework.Tests.Workflows;
 public class ApprovalWorkflow
 {
     private readonly Dictionary<string, ToolApprovalResponseContent> decisions = new(StringComparer.Ordinal);
-    private ToolApprovalRequestContent? pending;
+    private readonly List<ToolApprovalRequestContent> pending = [];
     private int workflowToolInvocations;
     private int plainToolInvocations;
     private int modelFailures;
@@ -22,7 +22,10 @@ public class ApprovalWorkflow
     }
 
     [WorkflowQuery]
-    public ToolApprovalRequestContent? PendingApproval() => pending;
+    public ToolApprovalRequestContent? PendingApproval() => pending.FirstOrDefault();
+
+    [WorkflowQuery]
+    public IReadOnlyList<ToolApprovalRequestContent> PendingApprovals() => pending.ToList();
 
     [WorkflowQuery]
     public int WorkflowToolInvocations() => workflowToolInvocations;
@@ -39,35 +42,46 @@ public class ApprovalWorkflow
         var agent = new TemporalAgent(TestPlugin.Model, new TemporalAgentOptions { ChatOptions = new ChatOptions { Tools = BuildTools(input) } });
         var session = input.Session is { } carried ? await agent.DeserializeSessionAsync(carried) : await agent.CreateSessionAsync();
         AgentResponse? response = null;
-        var request = input.PendingRequest;
-        if (request is null)
+        List<ToolApprovalRequestContent> requests;
+        if (input.PendingRequest is { } carriedRequest)
+        {
+            requests = [carriedRequest];
+        }
+        else
         {
             response = await agent.RunAsync(input.Prompt, session);
-            request = FirstRequest(response);
+            requests = ApprovalRequests(response);
         }
 
-        while (request is not null)
+        while (requests.Count > 0)
         {
             if (input.ContinueAsNew && input.PendingRequest is null)
             {
                 // Carry the session and the pending request into a new run before waiting for the decision.
-                var next = input with { Session = await agent.SerializeSessionAsync(session), PendingRequest = request };
+                var next = input with { Session = await agent.SerializeSessionAsync(session), PendingRequest = requests[0] };
                 throw Workflow.CreateContinueAsNewException((ApprovalWorkflow wf) => wf.RunAsync(next));
             }
 
-            pending = request;
-            var requestId = request.RequestId;
-            await Workflow.WaitConditionAsync(() => decisions.ContainsKey(requestId));
-            pending = null;
-            response = await RunWithDecisionAsync(agent, session, new ChatMessage(ChatRole.User, [decisions[requestId]]), input.RetryAfterModelFailure);
-            request = FirstRequest(response);
+            // Every request of the round waits for its decision; the decisions go back in one message.
+            pending.AddRange(requests);
+            var ids = requests.Select(request => request.RequestId).ToList();
+            await Workflow.WaitConditionAsync(() => ids.All(decisions.ContainsKey));
+            pending.Clear();
+            var contents = ids.Select(id => (AIContent)decisions[id]).ToList();
+            if (input.DecisionWithText)
+            {
+                contents.Add(new TextContent("Also tell me a joke."));
+            }
+
+            response = await RunWithDecisionAsync(agent, session, new ChatMessage(ChatRole.User, contents), input.RetryAfterModelFailure);
+            requests = ApprovalRequests(response);
         }
 
         return response!.Text;
     }
 
-    private static ToolApprovalRequestContent? FirstRequest(AgentResponse response) =>
-        response.Messages.SelectMany(message => message.Contents).OfType<ToolApprovalRequestContent>().FirstOrDefault();
+    private static List<ToolApprovalRequestContent> ApprovalRequests(AgentResponse response) =>
+        response.Messages.SelectMany(message => message.Contents).OfType<ToolApprovalRequestContent>().ToList();
 
     private async Task<AgentResponse> RunWithDecisionAsync(TemporalAgent agent, AgentSession session, ChatMessage decision, bool retry)
     {
@@ -98,6 +112,18 @@ public class ApprovalWorkflow
                 "send_email",
                 "Sends an email");
         var tools = new List<AITool> { new ApprovalRequiredAIFunction(sendEmail) };
+        if (input.TwoApprovalTools)
+        {
+            tools.Add(new ApprovalRequiredAIFunction(AIFunctionFactory.Create(
+                (string path) =>
+                {
+                    workflowToolInvocations++;
+                    return $"deleted {path}";
+                },
+                "delete_file",
+                "Deletes a file")));
+        }
+
         if (input.WithPlainTool)
         {
             tools.Add(AIFunctionFactory.Create(

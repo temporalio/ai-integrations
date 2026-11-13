@@ -124,6 +124,24 @@ public class FailureTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task ConsecutiveToolErrors_ResetAfterASuccess()
+    {
+        var bad = ("get_weather", (IDictionary<string, object?>)new Dictionary<string, object?> { ["city"] = "bad" });
+        var ok = ("get_weather", (IDictionary<string, object?>)new Dictionary<string, object?> { ["city"] = "ok" });
+        var fake = new FakeChatClient(
+            ScriptedResponse.ToolCalls(bad),
+            ScriptedResponse.ToolCalls(bad),
+            ScriptedResponse.ToolCalls(ok),
+            ScriptedResponse.ToolCalls(bad),
+            ScriptedResponse.ToolCalls(bad),
+            ScriptedResponse.ToolCalls(bad),
+            ScriptedResponse.Text("done"));
+        var (result, _) = await RunAsync(TestPlugin.For(fake), (FailureWorkflow wf) => wf.RunAsync(new FailureInput("tool-errors-reset")));
+        Assert.Equal("done", result);
+        Assert.Equal(7, fake.CallCount);
+    }
+
+    [Fact]
     public async Task ClientResultExceptionWithoutResponse_PropagatesUnchanged()
     {
         var fake = new FakeChatClient(_ => throw new System.ClientModel.ClientResultException("transport failure"));

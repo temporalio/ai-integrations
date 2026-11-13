@@ -10,4 +10,6 @@ public sealed record ApprovalInput(
     bool RetryAfterModelFailure = false,
     bool ContinueAsNew = false,
     JsonElement? Session = null,
-    ToolApprovalRequestContent? PendingRequest = null);
+    ToolApprovalRequestContent? PendingRequest = null,
+    bool TwoApprovalTools = false,
+    bool DecisionWithText = false);
