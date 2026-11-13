@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Microsoft.Extensions.Logging;
+using ModelContextProtocol;
 using ModelContextProtocol.Client;
 using Temporalio.Activities;
 using Temporalio.Exceptions;
@@ -60,7 +61,18 @@ internal sealed class McpConnectionCache : IAsyncDisposable
             }
 
             var client = await entry.ConnectAsync(server, factories[server], cancellationToken);
-            var tools = await client.ListToolsAsync(cancellationToken: cancellationToken);
+            IList<McpClientTool> tools;
+            try
+            {
+                tools = await client.ListToolsAsync(cancellationToken: cancellationToken);
+            }
+            catch (Exception exception) when (IsTransportFailure(exception))
+            {
+                // The lock is held here, so the entry is cleared directly; the next attempt reconnects.
+                await entry.DropLockedAsync(client);
+                throw;
+            }
+
             var declarations = tools
                 .Select(tool => new ToolDeclaration(tool.Name, tool.Description, tool.JsonSchema, tool.ReturnJsonSchema))
                 .ToList();
@@ -101,6 +113,11 @@ internal sealed class McpConnectionCache : IAsyncDisposable
         try
         {
             return await action(client, cancellationToken);
+        }
+        catch (Exception exception) when (IsTransportFailure(exception))
+        {
+            await entry.DropAsync(client);
+            throw;
         }
         finally
         {
@@ -181,6 +198,12 @@ internal sealed class McpConnectionCache : IAsyncDisposable
 
         stop?.Dispose();
     }
+
+    // A JSON-RPC error means the server answered on a live connection; a cancellation is the
+    // caller's. Anything else came from the transport, and a dead connection must not be reused:
+    // each attempt would fail on it and keep the entry from ever looking idle.
+    private static bool IsTransportFailure(Exception exception) =>
+        exception is not McpProtocolException && exception is not OperationCanceledException;
 
     private Entry GetEntry(string server)
     {
@@ -317,6 +340,30 @@ internal sealed class McpConnectionCache : IAsyncDisposable
             Tools = null;
             return client;
         }
+
+        /// <summary>
+        /// Drops <paramref name="failed"/> when it is still the entry's client, so the next call
+        /// reconnects; a call in flight on it fails on its own and finds the entry empty.
+        /// </summary>
+        /// <param name="failed">The client whose transport failed.</param>
+        /// <returns>A task that completes when the client is closed.</returns>
+        public async Task DropAsync(McpClient failed)
+        {
+            await Lock.WaitAsync();
+            try
+            {
+                await DropLockedAsync(failed);
+            }
+            finally
+            {
+                Lock.Release();
+            }
+        }
+
+        /// <summary>Drops <paramref name="failed"/> when it is still the entry's client; the caller holds <see cref="Lock"/>.</summary>
+        /// <param name="failed">The client whose transport failed.</param>
+        /// <returns>A task that completes when the client is closed.</returns>
+        public Task DropLockedAsync(McpClient failed) => ReferenceEquals(Client, failed) ? CloseLockedAsync() : Task.CompletedTask;
 
         /// <summary>
         /// Closes the client when it has been idle for longer than <paramref name="idleTimeout"/>

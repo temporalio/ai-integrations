@@ -250,6 +250,34 @@ public class McpTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task DeadConnection_IsDroppedAndTheNextAttemptReconnects()
+    {
+        await using var mcp = NewServer();
+        var fake = new FakeChatClient(call => call.Messages.Any(m => m.Contents.OfType<FunctionResultContent>().Any())
+            ? new ChatResponse(new ChatMessage(ChatRole.Assistant, "Final: 5"))
+            : new ChatResponse(new ChatMessage(ChatRole.Assistant, [new FunctionCallContent("call_add", "add", new Dictionary<string, object?> { ["a"] = 2, ["b"] = 3 })])));
+        var plugin = TestPlugin.WithMcp(fake, Server, mcp);
+        using var worker = Fixture.NewWorker(plugin);
+        await WithWorkerAsync(worker, async () =>
+        {
+            var first = await Client.ExecuteWorkflowAsync((McpWorkflow wf) => wf.RunAsync(new McpInput(Server, "add 2 and 3")), Fixture.WorkflowOptions(worker, "mcp-dead-1"));
+            Assert.Equal("Final: 5", first.Text);
+            Assert.Equal(1, mcp.ConnectionCount);
+
+            // The server restarts: the cached client is connected to a session that no longer exists.
+            await mcp.CloseSessionsAsync();
+            var retried = new McpInput(Server, "add 2 and 3", MaxAttempts: 3);
+            var handle = await Client.StartWorkflowAsync((McpWorkflow wf) => wf.RunAsync(retried), Fixture.WorkflowOptions(worker, "mcp-dead-2"));
+            var second = await handle.GetResultAsync();
+            Assert.Equal("Final: 5", second.Text);
+            Assert.Equal(2, mcp.ConnectionCount);
+            var history = await handle.FetchHistoryAsync();
+            Assert.Equal(2, HistoryAssert.LastAttempt(history, ModelActivityNames.McpListTools));
+            Assert.Equal(1, HistoryAssert.LastAttempt(history, ModelActivityNames.McpCallTool));
+        });
+    }
+
+    [Fact]
     public async Task ServerDown_RetriedToTheLimit_ThenWorkflowFails()
     {
         var plugin = TestPlugin.For(

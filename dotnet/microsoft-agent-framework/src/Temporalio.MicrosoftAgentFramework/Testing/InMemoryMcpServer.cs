@@ -71,10 +71,11 @@ public sealed class InMemoryMcpServer : IAsyncDisposable
     }
 
     /// <summary>
-    /// Ends every session and waits for the servers to stop.
+    /// Ends every open session, as a server restart would, while new connections keep working.
+    /// A client that was connected to one of them fails on its next call.
     /// </summary>
-    /// <returns>A task that completes when every session is closed.</returns>
-    public async ValueTask DisposeAsync()
+    /// <returns>A task that completes when every open session is closed.</returns>
+    public async Task CloseSessionsAsync()
     {
         List<Session> open;
         lock (sync)
@@ -88,6 +89,12 @@ public sealed class InMemoryMcpServer : IAsyncDisposable
             await session.DisposeAsync();
         }
     }
+
+    /// <summary>
+    /// Ends every session and waits for the servers to stop.
+    /// </summary>
+    /// <returns>A task that completes when every session is closed.</returns>
+    public async ValueTask DisposeAsync() => await CloseSessionsAsync();
 
     private void Count(JsonRpcMessage message)
     {
