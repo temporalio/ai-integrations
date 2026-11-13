@@ -434,10 +434,11 @@ def test_nuget_publishes_only_the_full_matrix_artifact_with_oidc() -> None:
     existing = next(step for step in steps if step.get("id") == "existing")
     assert "nuget-registry-state" in existing["run"] and '--github-output "$GITHUB_OUTPUT"' in existing["run"]
     login = next(step for step in steps if "NuGet/login@" in step.get("uses", ""))
-    assert login["id"] == "login" and login["if"] == "steps.existing.outputs.exists == 'false'"
+    # Both pushes run on every attempt (--skip-duplicate), so a re-run after a partial upload completes the symbols.
+    assert login["id"] == "login" and "if" not in login
     assert login["with"] == {"user": "${{ vars.NUGET_USER }}"}
     push = next(step for step in steps if "dotnet nuget push" in step.get("run", ""))
-    assert push["if"] == "steps.existing.outputs.exists == 'false'"
+    assert "if" not in push
     assert push["env"] == {"NUGET_API_KEY": "${{ steps.login.outputs.NUGET_API_KEY }}"}
     assert '"$PLUGIN_DIR"/dist/*.nupkg' in push["run"] and '"$PLUGIN_DIR"/dist/*.snupkg' in push["run"]
     assert push["run"].count("--skip-duplicate") == 2 and "--no-symbols" in push["run"]

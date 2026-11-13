@@ -411,10 +411,12 @@ gallery.
    isolated packages folder, checking the restored package the same way and
    loading the `[smoke] imports` types. It leaves the reviewed GitHub Release
    unchanged.
-5. Re-run failed jobs after an upload: an existing version is skipped only when
-   its served entries match the tested package. A fresh dispatch on the tag
-   rebuilds; one commit packs to identical bytes on one SDK feature band, so that
-   also passes. If the SDK moved, dispatch on the tag with
+5. Re-run failed jobs after an upload: the job first proves that an existing
+   version serves the tested entries, then repeats both pushes with
+   `--skip-duplicate`, so a run that uploaded the package but not the symbols
+   completes on re-run. A fresh dispatch on the tag rebuilds; one commit packs to
+   identical bytes on one SDK version, so that also passes while the SDK patch is
+   unchanged. If the SDK moved, dispatch on the tag with
    `-f recover-run=<original-run-id>` to reuse the tested artifact without
    rebuilding. Recovery requires a completed release or dispatch run at the tag's
    exact main-reachable commit with every matrix job green and an unexpired

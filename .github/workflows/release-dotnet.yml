@@ -189,17 +189,19 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ needs.prepare.outputs.artifact_run_id }}
       - name: Check whether these exact bytes are already published
+        # Fails on a byte mismatch or an unlisted version, so nothing below can push over a different upload.
         id: existing
         run: uv run --project scripts --locked python scripts/release/release_tool.py nuget-registry-state --coordinate "$COORDINATE" --version "$VERSION" --dist "$PLUGIN_DIR/dist" --github-output "$GITHUB_OUTPUT"
       - name: NuGet login (OIDC to a one-hour API key)
         # Requested right before the push: the temporary key is valid for one hour and one exchange.
         id: login
-        if: steps.existing.outputs.exists == 'false'
         uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
         with:
           user: ${{ vars.NUGET_USER }}
       - name: Publish with NuGet trusted publishing
-        if: steps.existing.outputs.exists == 'false'
+        # Both pushes run on every attempt: --skip-duplicate turns an existing file into a warning, so a
+        # re-run after the package uploaded but the symbols did not completes the upload. Whether nuget.org
+        # answers a second identical .snupkg with 409 or accepts it, the step stays green.
         env:
           NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
         run: |
