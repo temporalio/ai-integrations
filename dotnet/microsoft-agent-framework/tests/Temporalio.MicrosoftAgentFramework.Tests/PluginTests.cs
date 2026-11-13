@@ -143,6 +143,27 @@ public class PluginTests : WorkflowTestBase
         Assert.Null(replayer.Options.WorkflowFailureExceptionTypes);
     }
 
+    [Theory]
+    [InlineData("empty-name", "HostedMcpServerHeaderProviders has an empty server name")]
+    [InlineData("null-provider", "HostedMcpServerHeaderProviders['docs'] has no provider")]
+    [InlineData("both", "'docs' is in both HostedMcpServerHeaders and HostedMcpServerHeaderProviders")]
+    public void Options_WithBadHostedMcpServerHeaderProviders_AreRejected(string kind, string expected)
+    {
+        var options = new MicrosoftAgentFrameworkPluginOptions
+        {
+            ChatClients = new Dictionary<string, Func<Microsoft.Extensions.AI.IChatClient>> { ["gpt"] = () => new FakeChatClient(ScriptedResponse.Text("x")) },
+            HostedMcpServerHeaders = kind == "both"
+                ? new Dictionary<string, IReadOnlyDictionary<string, string>> { ["docs"] = new Dictionary<string, string>() }
+                : new Dictionary<string, IReadOnlyDictionary<string, string>>(),
+            HostedMcpServerHeaderProviders = new Dictionary<string, Func<IReadOnlyDictionary<string, string>>>
+            {
+                [kind == "empty-name" ? " " : "docs"] = kind == "null-provider" ? null! : () => new Dictionary<string, string>(),
+            },
+        };
+        var error = Assert.Throws<ArgumentException>(() => new MicrosoftAgentFrameworkPlugin(options));
+        Assert.Contains(expected, error.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void AgentFrameworkApiGuard_PassesForTheInstalledVersion_AndNamesTheTestedOneOtherwise()
     {

@@ -26,6 +26,7 @@ public sealed class ModelActivities
 
     private readonly IReadOnlyDictionary<string, Func<IChatClient>> factories;
     private readonly IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? hostedMcpServerHeaders;
+    private readonly IReadOnlyDictionary<string, Func<IReadOnlyDictionary<string, string>>>? hostedMcpServerHeaderProviders;
     private readonly ConcurrentDictionary<string, IChatClient> clients = new(StringComparer.Ordinal);
     private readonly object clientLock = new();
 
@@ -40,10 +41,26 @@ public sealed class ModelActivities
     public ModelActivities(
         IReadOnlyDictionary<string, Func<IChatClient>> factories,
         IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? hostedMcpServerHeaders = null)
+        : this(factories, hostedMcpServerHeaders, null)
+    {
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="ModelActivities"/> class with header providers
+    /// that are called before each model call, so a token can be refreshed.
+    /// </summary>
+    /// <param name="factories">Chat client factories by model name.</param>
+    /// <param name="hostedMcpServerHeaders">Fixed headers by server name; see <see cref="MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders"/>.</param>
+    /// <param name="hostedMcpServerHeaderProviders">Header providers by server name; see <see cref="MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaderProviders"/>.</param>
+    public ModelActivities(
+        IReadOnlyDictionary<string, Func<IChatClient>> factories,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? hostedMcpServerHeaders,
+        IReadOnlyDictionary<string, Func<IReadOnlyDictionary<string, string>>>? hostedMcpServerHeaderProviders)
     {
         ArgumentNullException.ThrowIfNull(factories);
         this.factories = factories;
         this.hostedMcpServerHeaders = hostedMcpServerHeaders;
+        this.hostedMcpServerHeaderProviders = hostedMcpServerHeaderProviders;
     }
 
     /// <summary>
@@ -59,7 +76,7 @@ public sealed class ModelActivities
         ArgumentNullException.ThrowIfNull(input);
         var context = ActivityExecutionContext.Current;
         var client = ResolveClient(input.Model, context.Logger);
-        var options = ChatOptionsTransport.Rebuild(input, hostedMcpServerHeaders);
+        var options = ChatOptionsTransport.Rebuild(input, ResolveHostedMcpServerHeaders);
         ChatOptionsTransport.RehydrateToolResults(input.Messages);
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(context.CancellationToken);
         var pump = HeartbeatAsync(context, stop.Token);
@@ -144,6 +161,35 @@ public sealed class ModelActivities
         {
             // The provider call finished; the pump is done.
         }
+    }
+
+    private IReadOnlyDictionary<string, string>? ResolveHostedMcpServerHeaders(string server)
+    {
+        if (hostedMcpServerHeaderProviders is not null && hostedMcpServerHeaderProviders.TryGetValue(server, out var provider))
+        {
+            IReadOnlyDictionary<string, string>? headers;
+            try
+            {
+                headers = provider();
+            }
+#pragma warning disable CA1031 // The provider is user code; its failure is reported once per attempt and the attempt is retried.
+            catch (Exception exception)
+#pragma warning restore CA1031
+            {
+                throw new ApplicationFailureException(
+                    $"The header provider for hosted MCP server '{server}' threw {exception.GetType().Name}: {exception.Message}",
+                    exception,
+                    errorType: MicrosoftAgentFrameworkErrorTypes.ConfigurationError,
+                    nonRetryable: false);
+            }
+
+            return headers ?? throw new ApplicationFailureException(
+                $"The header provider for hosted MCP server '{server}' returned null.",
+                errorType: MicrosoftAgentFrameworkErrorTypes.ConfigurationError,
+                nonRetryable: true);
+        }
+
+        return hostedMcpServerHeaders is not null && hostedMcpServerHeaders.TryGetValue(server, out var fixedHeaders) ? fixedHeaders : null;
     }
 
     private IChatClient ResolveClient(string model, ILogger logger)

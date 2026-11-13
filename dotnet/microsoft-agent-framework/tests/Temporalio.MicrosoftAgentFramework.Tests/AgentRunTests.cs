@@ -1,5 +1,6 @@
 using Microsoft.Extensions.AI;
 using Temporalio.Api.Enums.V1;
+using Temporalio.Client;
 using Temporalio.MicrosoftAgentFramework.Testing;
 using Temporalio.MicrosoftAgentFramework.Tests.Workflows;
 
@@ -242,6 +243,31 @@ public class AgentRunTests : WorkflowTestBase
         Assert.Contains("example.com/mcp", text, StringComparison.Ordinal);
         Assert.DoesNotContain("worker-side-secret", text, StringComparison.Ordinal);
         Assert.DoesNotContain("Authorization", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task HostedMcpServerHeaderProviders_AreCalledBeforeEveryModelCall()
+    {
+        var fake = new FakeChatClient(ScriptedResponse.Text("searched"));
+        var calls = 0;
+        var plugin = TestPlugin.For(
+            new Dictionary<string, IChatClient> { [TestPlugin.Model] = fake },
+            hostedMcpServerHeaderProviders: new Dictionary<string, Func<IReadOnlyDictionary<string, string>>>
+            {
+                ["docs"] = () => new Dictionary<string, string> { ["Authorization"] = $"Bearer token-{Interlocked.Increment(ref calls)}" },
+            });
+        using var worker = Fixture.NewWorker(plugin);
+        await WithWorkerAsync(worker, async () =>
+        {
+            for (var i = 1; i <= 2; i++)
+            {
+                var input = new HostedToolInput("search the docs");
+                await Client.ExecuteWorkflowAsync((HostedToolWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(worker, $"hosted-provider-{i}"));
+            }
+        });
+
+        var headers = fake.Calls.Select(call => ((HostedMcpServerTool)call.Options!.Tools!.Single(tool => tool is HostedMcpServerTool)).Headers!["Authorization"]);
+        Assert.Equal(["Bearer token-1", "Bearer token-2"], headers);
     }
 
     [Fact]

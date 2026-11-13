@@ -312,7 +312,7 @@ public class HostedMcpWorkflow
 }
 ```
 
-The key is the tool's `ServerName`; a server without an entry gets no headers. Nothing else on a hosted tool is treated as a secret: `AdditionalProperties`, inputs and allowed tool names travel in the Activity input like the rest of the request.
+The key is the tool's `ServerName`; a server without an entry gets no headers. For a token that expires, register a provider in `HostedMcpServerHeaderProviders` instead: the worker calls it before every model call that carries the tool, and a server name goes in one of the two dictionaries, not both. Nothing else on a hosted tool is treated as a secret: `AdditionalProperties`, inputs and allowed tool names travel in the Activity input like the rest of the request.
 
 ## Approvals
 

@@ -113,6 +113,25 @@ public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
             }
         }
 
+        ArgumentNullException.ThrowIfNull(options.HostedMcpServerHeaderProviders, nameof(options.HostedMcpServerHeaderProviders));
+        foreach (var (name, provider) in options.HostedMcpServerHeaderProviders)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new ArgumentException("HostedMcpServerHeaderProviders has an empty server name.", nameof(options));
+            }
+
+            if (provider is null)
+            {
+                throw new ArgumentException($"HostedMcpServerHeaderProviders['{name}'] has no provider.", nameof(options));
+            }
+
+            if (options.HostedMcpServerHeaders.ContainsKey(name))
+            {
+                throw new ArgumentException($"'{name}' is in both HostedMcpServerHeaders and HostedMcpServerHeaderProviders; use one of them.", nameof(options));
+            }
+        }
+
         if (options.McpConnectionIdleTimeout <= TimeSpan.Zero)
         {
             throw new ArgumentException("McpConnectionIdleTimeout must be positive.", nameof(options));
@@ -136,7 +155,7 @@ public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
             },
             RunContextAfter = () => connections.ReleaseAsync().AsTask(),
         };
-        pluginOptions.AddAllActivities(new ModelActivities(options.ChatClients, options.HostedMcpServerHeaders));
+        pluginOptions.AddAllActivities(new ModelActivities(options.ChatClients, options.HostedMcpServerHeaders, options.HostedMcpServerHeaderProviders));
         pluginOptions.AddAllActivities(new McpActivities(connections));
         return pluginOptions;
     }

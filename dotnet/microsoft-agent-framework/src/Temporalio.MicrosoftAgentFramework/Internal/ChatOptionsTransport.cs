@@ -103,9 +103,9 @@ internal static class ChatOptionsTransport
     /// Rebuilds the options the provider client receives. Runs on the worker.
     /// </summary>
     /// <param name="input">The Activity input.</param>
-    /// <param name="hostedMcpServerHeaders">HTTP headers for hosted MCP server tools, by server name, or null.</param>
+    /// <param name="hostedMcpServerHeaders">Returns the HTTP headers for a hosted MCP server tool, by server name, or null for none.</param>
     /// <returns>Options with declaration-only function tools and reconstructed hosted tools, or null.</returns>
-    public static ChatOptions? Rebuild(ModelCallInput input, IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? hostedMcpServerHeaders)
+    public static ChatOptions? Rebuild(ModelCallInput input, Func<string, IReadOnlyDictionary<string, string>?> hostedMcpServerHeaders)
     {
         var options = input.Options?.Clone();
         if (options?.AdditionalProperties is { Count: > 0 } properties)
@@ -260,7 +260,7 @@ internal static class ChatOptionsTransport
         };
     }
 
-    private static AITool FromDeclaration(HostedToolDeclaration declaration, IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? hostedMcpServerHeaders)
+    private static AITool FromDeclaration(HostedToolDeclaration declaration, Func<string, IReadOnlyDictionary<string, string>?> hostedMcpServerHeaders)
     {
         var additional = declaration.AdditionalProperties is { } element
             ? element.Deserialize<Dictionary<string, object?>>(AIJsonUtilities.DefaultOptions)
@@ -282,9 +282,7 @@ internal static class ChatOptionsTransport
                 {
                     ServerDescription = declaration.ServerDescription,
                     AllowedTools = declaration.AllowedTools?.ToList(),
-                    Headers = hostedMcpServerHeaders is not null && hostedMcpServerHeaders.TryGetValue(declaration.ServerName!, out var headers)
-                        ? new Dictionary<string, string>(headers)
-                        : null,
+                    Headers = hostedMcpServerHeaders(declaration.ServerName!) is { } headers ? new Dictionary<string, string>(headers) : null,
                     ApprovalMode = declaration.ApprovalMode switch
                     {
                         "always" => HostedMcpServerToolApprovalMode.AlwaysRequire,

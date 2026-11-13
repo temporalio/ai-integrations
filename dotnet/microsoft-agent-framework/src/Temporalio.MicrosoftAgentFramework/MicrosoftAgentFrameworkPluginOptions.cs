@@ -36,6 +36,15 @@ public sealed class MicrosoftAgentFrameworkPluginOptions
         new Dictionary<string, IReadOnlyDictionary<string, string>>();
 
     /// <summary>
+    /// Gets header providers for hosted MCP server tools, by the tool's
+    /// <see cref="HostedMcpServerTool.ServerName"/>: the worker calls one before every model call
+    /// that carries the tool, so a token that expires can be refreshed. A server name goes in this
+    /// dictionary or in <see cref="HostedMcpServerHeaders"/>, not both.
+    /// </summary>
+    public IReadOnlyDictionary<string, Func<IReadOnlyDictionary<string, string>>> HostedMcpServerHeaderProviders { get; init; } =
+        new Dictionary<string, Func<IReadOnlyDictionary<string, string>>>();
+
+    /// <summary>
     /// Gets how long an MCP connection may sit unused before the worker closes it. The next call
     /// reconnects. Defaults to 5 minutes. Every connection is closed when the last worker or
     /// replayer running with this plugin instance stops; workers that share one instance share
