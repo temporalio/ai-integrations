@@ -226,6 +226,17 @@ export async function _evictMcpConnectionsForServer(name: string): Promise<void>
   );
 }
 
+async function createMcpClient(name: string, factory: McpClientFactory, clientArgs: unknown): Promise<MCPClient> {
+  const client = await factory(clientArgs);
+  if (client == null || typeof client.tools !== 'function' || typeof client.close !== 'function') {
+    throw ApplicationFailure.nonRetryable(
+      `MCP client factory '${name}' must return a client with tools() and close() methods.`,
+      'MCPClientFactoryTypeError'
+    );
+  }
+  return client;
+}
+
 /**
  * Acquires the pooled MCP connection for `${name}:${clientArgs}`, creating it if absent, and marks it
  * in-use for the duration of one call. Cancels any pending idle-eviction timer and increments the
@@ -240,7 +251,7 @@ function acquireMcpConnection(
   const key = mcpConnectionKey(name, clientArgs);
   let entry = mcpConnections.get(key);
   if (entry === undefined) {
-    const client = factory(clientArgs);
+    const client = createMcpClient(name, factory, clientArgs);
     entry = { client, refCount: 0, broken: false };
     mcpConnections.set(key, entry);
     // If the connect/factory call fails, drop the rejected promise so the next call retries
@@ -577,7 +588,7 @@ function activitiesForName(name: string, mcpClientFactory: McpClientFactory, idl
   async function listToolsActivity(args: ListToolArgs): Promise<Record<string, ListToolResult>> {
     if (idleMs <= 0) {
       // Opt-out: restore the original create-then-close-per-call behavior.
-      const mcpClient = await mcpClientFactory(args.clientArgs);
+      const mcpClient = await createMcpClient(name, mcpClientFactory, args.clientArgs);
       try {
         return await extractTools(mcpClient);
       } finally {
@@ -601,7 +612,7 @@ function activitiesForName(name: string, mcpClientFactory: McpClientFactory, idl
   async function callToolActivity(args: CallToolArgs): Promise<unknown> {
     if (idleMs <= 0) {
       // Opt-out: restore the original create-then-close-per-call behavior.
-      const mcpClient = await mcpClientFactory(args.clientArgs);
+      const mcpClient = await createMcpClient(name, mcpClientFactory, args.clientArgs);
       try {
         return await callTool(mcpClient, args);
       } finally {

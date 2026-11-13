@@ -43,6 +43,11 @@ streamed `error` part. The Workflow receives an `ActivityFailure` whose `cause`
 is that `ApplicationFailure`. Other errors, such as a 408, 409, 429 or 5xx response or
 a lost connection, are retried under the Activity's retry policy.
 
+MCP client factories must resolve to a client with callable `tools()` and
+`close()` methods. An invalid result now fails the Activity without retries with
+type `MCPClientFactoryTypeError`. Fix these factories before upgrading: the next
+attempt of an in-flight Activity also runs this check.
+
 File data given as a `Uint8Array` crosses the Activity boundary as a base64
 string, because Temporal's JSON payload converter does not keep `Uint8Array`
 values. This applies to prompt file parts and to files the model generates. A
