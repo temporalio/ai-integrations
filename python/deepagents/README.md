@@ -333,11 +333,12 @@ Subscribers read the topic with `WorkflowStreamClient`; each item is an
 
 ## Continue-as-new: what carries and what does not
 
-Long conversations bloat workflow history. `run_deep_agent(agent, input,
-state_snapshot=...)` snapshots state and continues into a fresh run when the
-turn ends with pending todos and the server recommends continuing
+Long agent invocations grow workflow history. `run_deep_agent(agent, input,
+state_snapshot=...)` pauses the graph before its next model step, after the
+preceding tools have finished, when the server recommends continuing
 (`workflow.info().is_continue_as_new_suggested()`, the default and recommended
-mode — it accounts for history length *and* size):
+mode, which accounts for history length and size). It carries the current graph
+checkpoint into a fresh Temporal run and resumes that pending step.
 
 ```python
 from deepagents import create_deep_agent
@@ -360,26 +361,109 @@ class LongResearchAgent:
 Pass `continue_as_new_after=N` instead to trigger on a fixed history-event
 count.
 
-- **Carries forward:** the accumulated messages and the agent's state files
-  (the graph's `files` state, where the default `StateBackend` keeps what
-  `write_file` writes). Messages of the classes in `langchain_core.messages`
-  come back in the next run as the same class (a `ToolMessage` stays a
-  `ToolMessage`). Both ride in the continue-as-new input, so large files count
-  toward its payload size limit; keep large files in a durable backend such as
-  `TemporalBackend`. Repeated identical calls are
-  NOT deduplicated: a call the agent re-issues after the boundary runs its own
-  Activity, so a genuinely new identical request is never served a stale prior
-  result. Your `@workflow.run` must accept `state_snapshot=None` as shown.
-- **Does not carry forward:** todos as state. `TodoListMiddleware` marks
-  `todos` as `OmitFromInput`, so the graph drops it from input and the next
-  run starts with none; the agent's earlier `write_todos` calls are still in
-  the carried messages. Nor does anything
-  held only in an in-memory checkpointer's own structures beyond the messages
-  and files snapshot. The default in-workflow
-  `InMemorySaver` is rehydrated for free by deterministic replay; a durable
-  checkpointer that does its own I/O is not replay-safe from inside a workflow,
-  and the plugin warns if you pass one — prefer the snapshot + continue-as-new
-  path above.
+- **Carries forward:** messages, state-backed files, todos (if present), and
+  serializable middleware state, including fields marked `OmitFromInput`.
+  Invocation-local `UntrackedValue` fields, such as model-call counters and
+  filesystem caches, remain live between model steps and are restored when that
+  same invocation continues in a new run. A new invocation resets them normally.
+  The snapshot retains the graph's execution position and remaining recursion
+  budget. Agent lifecycle hooks therefore run once per logical invocation;
+  `after_agent` runs when the agent finishes, rather than at every rollover.
+  Checkpoint values are materialized, including delta-backed messages and files,
+  so earlier checkpoint history is unnecessary. Message classes and types
+  declared in the graph's state schema are preserved, including nested types.
+  Types used in a snapshot must be importable from their defining module;
+  classes defined inside a workflow method cannot be restored. Unsupported
+  state fails checkpoint creation explicitly instead of silently changing type.
+- **Checkpoint storage:** the driver uses an in-workflow `InMemorySaver`, creating
+  one when the agent has none. An existing saver must also be an `InMemorySaver`.
+  Temporal replay reconstructs it within a run; the checkpoint snapshot crosses
+  continue-as-new as input. Large snapshots count toward payload limits, so keep
+  large files in a durable backend such as `TemporalBackend`. The snapshot uses
+  LangGraph's typed serialization with types allowed by the graph's schema and
+  must be resumed with the same graph and middleware definitions.
+  Mapping inputs omit `messages` and `files` on rollover because the checkpoint
+  already contains them; other input fields remain available to reconstruct the
+  agent. The driver does not mutate the caller's original input.
+- **Completion and interrupts:** completed invocations return their result.
+  Application interrupts, including human approvals, return to the caller.
+  For these flows, supply `checkpointer=InMemorySaver()` and configure a stable
+  `thread_id` with `agent.with_config(...)` so the caller can resume the agent.
+  Explicit static debugging breakpoints disable the driver's automatic rollover.
+  Sub-agent tool calls and a parallel batch of tools finish before a boundary;
+  they are not split. The snapshot covers the parent graph's channels, including
+  completed sub-agent results in its transcript. Sub-agent-local checkpoint
+  history and objects held outside the parent graph state are not carried.
+- **Recursion limits:** the remaining budget applies to the entire unfinished
+  invocation, across all continued runs. Continue-as-new does not reset it.
+  Deep Agents defaults to 9,999 graph steps; configure a larger budget with
+  `agent.with_config({"recursion_limit": 50_000})` for longer invocations.
+  Exhaustion and invalid driver configuration raise `DeepAgentsWorkflowError`
+  and fail the workflow instead of repeatedly failing Workflow Tasks.
+- **Conversation workflows:** your workflow owns its input queue and between-turn
+  rollover policy. This helper resumes an unfinished invocation and expects the
+  workflow signature `(input, state_snapshot=None)` shown above. It does not
+  restart a completed answer to keep a conversation open. Plain agents and
+  wrappers without a compiled graph run once through `ainvoke`.
+- **Replay compatibility:** histories predating
+  `deepagents.checkpoint-continue-as-new` keep the original transcript/todo-based
+  behavior. Old transcript snapshots can seed a fresh graph, but only a graph
+  checkpoint restores its execution position. Repeated identical model, tool,
+  and backend requests continue to run their own Activities; results are not
+  memoized across calls.
+  Use Worker Versioning when changing graph or middleware definitions for
+  chains that will resume saved checkpoints.
+
+The approval example above uses direct `ainvoke`. To combine approvals with
+automatic rollover, use a workflow with the `(input, state_snapshot=None)`
+signature and route both the initial call and the approval through the driver:
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+
+@workflow.run
+async def run(self, input: dict, state_snapshot: dict | None = None) -> dict:
+    agent = create_deep_agent(
+        model="anthropic:claude-sonnet-5-5",
+        checkpointer=InMemorySaver(),
+        interrupt_on={"write_file": True},
+    ).with_config({"configurable": {"thread_id": workflow.info().workflow_id}})
+
+    result = await run_deep_agent(agent, input, state_snapshot=state_snapshot)
+    if result.get("__interrupt__"):
+        # Expose the pending approval and wait for the caller's decision, as above.
+        await workflow.wait_condition(lambda: self._decision is not None)
+        result = await run_deep_agent(
+            agent,
+            Command(resume={"decisions": [{"type": self._decision}]}),
+        )
+    return result
+```
+
+After rollover the driver restores the checkpoint into the supplied saver under
+the same thread ID, so the caller can resume the interrupt through that agent.
+Known human-in-the-loop middleware is validated before the first model call;
+custom dynamic interrupts are checked when they occur.
+
+For between-turn rollover, a completed result can seed the next invocation as a
+transcript/files snapshot. Serialize messages with public LangChain `dumpd` to
+preserve their classes through the payload converter:
+
+```python
+from langchain_core.load import dumpd
+
+snapshot = {
+    "messages": [dumpd(message) for message in result["messages"]],
+    "files": result.get("files", {}),
+}
+workflow.continue_as_new(args=[{"messages": []}, snapshot])
+```
+
+The workflow must pass that snapshot into `run_deep_agent` on its next run.
+This starts a new invocation with the carried transcript and files; it does not
+restore other middleware fields or an unfinished graph's execution position.
 
 ## Runtime behavior
 

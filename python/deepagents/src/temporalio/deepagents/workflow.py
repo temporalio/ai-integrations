@@ -39,8 +39,8 @@ def warn_durable_checkpointer(checkpointer: Any) -> None:
 
     The Deep Agents loop runs inside the workflow, so a checkpointer that does
     its own database / disk I/O would run that I/O from workflow code — not
-    replay-safe. We respect the user's choice (a warning, not a hard failure),
-    and point them at the durability path that *is* safe: the default in-workflow
+    replay-safe. Direct ``agent.ainvoke`` emits this warning;
+    :func:`run_deep_agent` rejects durable checkpointers. Prefer an in-workflow
     ``InMemorySaver`` rehydrated by replay, plus
     :func:`run_deep_agent` with ``continue_as_new_after`` for long conversations.
     """
@@ -54,7 +54,8 @@ def warn_durable_checkpointer(checkpointer: Any) -> None:
         f"workflow, so this checkpointer's I/O would run from workflow code, "
         f"which is not replay-safe. Prefer the default in-workflow InMemorySaver "
         f"(rehydrated by replay) plus run_deep_agent(continue_as_new_after=...) "
-        f"for long-conversation durability.",
+        f"for long-conversation durability. run_deep_agent rejects durable "
+        f"checkpointers.",
         stacklevel=3,
     )
 
@@ -262,7 +263,68 @@ async def run_deep_agent(
     continue_as_new_after: int | None = None,
     state_snapshot: Mapping[str, Any] | None = None,
 ) -> Any:
-    """Drive ``agent.ainvoke(input)`` with continue-as-new state carry.
+    """Run a Deep Agent with checkpoint-based continue-as-new.
+
+    The driver pauses a compiled agent before model steps, after all preceding
+    tools have finished. When Temporal recommends continue-as-new (or history
+    reaches ``continue_as_new_after``), it carries the graph checkpoint into a
+    fresh run and resumes the pending model step. Messages, files, todos and
+    serializable middleware state survive; todos never control continuation.
+    Agent completion hooks run only when the turn actually finishes.
+
+    A completed turn returns its result even when history is large. Conversation
+    loops own their between-turn rollover decisions. Application interrupts are
+    returned to the caller; these flows require an explicit ``InMemorySaver``
+    and a configured ``thread_id`` so the caller can resume. Caller-configured
+    static breakpoints disable automatic rollover. Plain agents or wrappers
+    that do not expose a compiled graph run once. Call ``agent.ainvoke`` directly
+    to omit this driver entirely.
+
+    The graph must use an in-memory checkpointer or none; no external checkpoint
+    I/O runs inside the workflow. The enclosing ``@workflow.run`` method must
+    accept ``(input, state_snapshot=None)``. A checkpoint snapshot resumes the
+    interrupted invocation, retaining its remaining recursion budget, and must
+    be restored with the same graph and middleware definitions.
+
+    Older histories retain their transcript/todo-based behavior through the
+    ``deepagents.checkpoint-continue-as-new`` patch.
+    """
+    if not workflow.patched("deepagents.checkpoint-continue-as-new"):
+        return await _run_deep_agent_legacy(
+            agent,
+            input,
+            continue_as_new_after=continue_as_new_after,
+            state_snapshot=state_snapshot,
+        )
+    if continue_as_new_after is not None and continue_as_new_after <= 0:
+        raise DeepAgentsWorkflowError("continue_as_new_after must be positive or None.")
+    from temporalio.deepagents._checkpoint import run
+
+    _serde.set_result_cache({})
+    try:
+        return await run(
+            agent,
+            input,
+            continue_as_new_after=continue_as_new_after,
+            state_snapshot=state_snapshot,
+        )
+    except ApplicationError:
+        raise
+    except Exception as exc:
+        cause = exc.__cause__
+        if cause is not None and workflow.is_failure_exception(cause):
+            raise DeepAgentsWorkflowError(f"Deep Agents run failed: {exc}") from cause
+        raise
+
+
+async def _run_deep_agent_legacy(
+    agent: Any,
+    input: Any,
+    *,
+    continue_as_new_after: int | None = None,
+    state_snapshot: Mapping[str, Any] | None = None,
+) -> Any:
+    """Replay the original transcript/todo-based continuation driver.
 
     Once a completed turn leaves pending todos and history has grown past the
     limit, its messages and state files are carried into a fresh run via
@@ -408,11 +470,10 @@ def create_temporal_deep_agent(
     ``model_activity_options``); use this wrapper to scope activity options
     to one agent instead of configuring them plugin-wide.
     """
-    with workflow.unsafe.imports_passed_through():
-        # importlib keeps this resolution absolute: a static
-        # `import deepagents` from inside this same-named package directory
-        # is flagged as implicitly relative.
-        deepagents_mod: Any = importlib.import_module("deepagents")
+    # importlib keeps this resolution absolute: a static
+    # `import deepagents` from inside this same-named package directory
+    # is flagged as implicitly relative.
+    deepagents_mod: Any = importlib.import_module("deepagents")
 
     from temporalio.deepagents._model import TemporalModel
 

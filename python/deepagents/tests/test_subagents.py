@@ -30,9 +30,8 @@ from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
 # the top-level package with this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
-with workflow.unsafe.imports_passed_through():
-    from temporalio.deepagents import DeepAgentsPlugin
-    from temporalio.deepagents.testing import mock_model_provider
+from temporalio.deepagents import DeepAgentsPlugin
+from temporalio.deepagents.testing import mock_model_provider
 
 INVOKE_MODEL = "deepagents.invoke_model"
 

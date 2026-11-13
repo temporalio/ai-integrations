@@ -19,19 +19,17 @@ from temporalio.testing import WorkflowEnvironment
 
 pytest.importorskip("langchain_core")
 
+from langchain_core.messages import HumanMessage
+
 from temporalio import workflow  # noqa: E402
+from temporalio.deepagents import DeepAgentsPlugin, TemporalModel
+from temporalio.deepagents._activity import (
+    DeepAgentActivities,
+    ModelActivityInput,
+)
+from temporalio.deepagents.testing import FakeModel, mock_model_provider
 from temporalio.worker import Worker  # noqa: E402
 from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
-
-with workflow.unsafe.imports_passed_through():
-    from langchain_core.messages import HumanMessage
-
-    from temporalio.deepagents import DeepAgentsPlugin, TemporalModel
-    from temporalio.deepagents._activity import (
-        DeepAgentActivities,
-        ModelActivityInput,
-    )
-    from temporalio.deepagents.testing import FakeModel, mock_model_provider
 
 INVOKE_MODEL = "deepagents.invoke_model"
 

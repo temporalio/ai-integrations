@@ -28,6 +28,9 @@ import pytest
 pytest.importorskip("deepagents")
 pytest.importorskip("langchain_core")
 
+from langchain_core.messages import AIMessage
+from langchain_core.tools import tool
+
 from temporalio import workflow
 from temporalio.client import WorkflowHistory
 from temporalio.deepagents import (
@@ -37,10 +40,6 @@ from temporalio.deepagents import (
 )
 from temporalio.deepagents.testing import mock_model_provider
 from temporalio.worker import Replayer
-
-with workflow.unsafe.imports_passed_through():
-    from langchain_core.messages import AIMessage
-    from langchain_core.tools import tool
 
 # Resolve framework symbols through the imported module to avoid confusing
 # the top-level package with this same-named test directory.
@@ -98,9 +97,8 @@ async def test_legacy_dedup_history_replays() -> None:
     await replayer.replay_workflow(history)
 
 
-with workflow.unsafe.imports_passed_through():
-    from langchain_core.messages import HumanMessage
-    from langchain_core.tools import tool as _lc_tool
+from langchain_core.messages import HumanMessage
+from langchain_core.tools import tool as _lc_tool
 
 from temporalio.deepagents import _activity
 from temporalio.deepagents._tools import register_tool

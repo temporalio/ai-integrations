@@ -32,16 +32,15 @@ from tests.helpers.deepagents import count_scheduled_activities  # noqa: E402
 
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
-with workflow.unsafe.imports_passed_through():
-    from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
-    from langchain_core.exceptions import ContextOverflowError
-    from langchain_core.language_models.chat_models import BaseChatModel
-    from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-    from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.callbacks import AsyncCallbackManagerForLLMRun
+from langchain_core.exceptions import ContextOverflowError
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
-    from temporalio.deepagents import DeepAgentsPlugin, _activity
-    from temporalio.deepagents._activity import DeepAgentActivities, ModelActivityInput
-    from temporalio.deepagents._serde import dump_messages
+from temporalio.deepagents import DeepAgentsPlugin, _activity
+from temporalio.deepagents._activity import DeepAgentActivities, ModelActivityInput
+from temporalio.deepagents._serde import dump_messages
 
 INVOKE_MODEL = "deepagents.invoke_model"
 OVERFLOW_TYPE = "deepagents.ContextOverflowError"
