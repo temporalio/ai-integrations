@@ -17,8 +17,8 @@ internal static class ApprovalProcessor
     /// <summary>Prefix of the approval request ids, the one <c>FunctionInvokingChatClient</c> composes.</summary>
     public const string RequestIdPrefix = "ficc_";
 
-    /// <summary>The plugin's result text for a rejected call; the reason, when given, follows it.</summary>
-    public const string RejectedResultText = "Tool call invocation was rejected by the approver and must not be retried.";
+    /// <summary>The result text <c>FunctionInvokingChatClient</c> gives the model for a rejected call; the reason, when given, follows it.</summary>
+    public const string RejectedResultText = "Tool call invocation rejected.";
 
     /// <summary>
     /// Rewrites <paramref name="messages"/> in place.

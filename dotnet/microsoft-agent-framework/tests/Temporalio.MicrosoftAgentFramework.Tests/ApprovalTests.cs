@@ -63,7 +63,7 @@ public class ApprovalTests : WorkflowTestBase
             Assert.Equal("Done", await handle.GetResultAsync());
             Assert.Equal(0, await handle.QueryAsync(wf => wf.WorkflowToolInvocations()));
             var result = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
-            Assert.Equal("Tool call invocation was rejected by the approver and must not be retried. not now", result.Result?.ToString());
+            Assert.Equal("Tool call invocation rejected. not now", result.Result?.ToString());
         });
     }
 
