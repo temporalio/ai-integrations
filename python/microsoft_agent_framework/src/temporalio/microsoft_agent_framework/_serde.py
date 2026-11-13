@@ -96,9 +96,11 @@ def dump_response(response: ChatResponse) -> dict[str, Any]:
     return data
 
 
-def load_response(data: dict[str, Any]) -> ChatResponse:
-    """Rebuild a provider response."""
-    return ChatResponse.from_dict(data)
+def load_response(data: dict[str, Any], response_format: Any = None) -> ChatResponse:
+    """Rebuild a provider response; ``response_format`` is what ``value`` parses with."""
+    if response_format is None:
+        return ChatResponse.from_dict(data)
+    return ChatResponse.from_dict({**data, "response_format": response_format})
 
 
 def dump_update(update: ChatResponseUpdate) -> dict[str, Any]:

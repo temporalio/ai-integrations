@@ -187,17 +187,22 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
                 messages=dumped_messages,
                 options=dumped_options,
                 kwargs=dumped_kwargs,
-            )
+            ),
+            options.get("response_format"),
         )
 
-    async def _get_response(self, input: InvokeModelInput) -> ChatResponse:
+    async def _get_response(
+        self, input: InvokeModelInput, response_format: Any
+    ) -> ChatResponse:
         raw = await workflow.execute_activity(
             INVOKE_MODEL,
             input,
             result_type=dict[str, Any],
             **self._activity_options,
         )
-        return _serde.load_response(raw)
+        # The format does not cross the boundary as a class, so the rebuilt
+        # response gets it here and parses ``value`` like the streamed path.
+        return _serde.load_response(raw, response_format)
 
     async def _get_response_from_stream(
         self, input: InvokeModelStreamingInput, response_format: Any

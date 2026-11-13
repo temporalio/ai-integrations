@@ -136,6 +136,29 @@ class StructuredOutputWorkflow:
 
 
 @workflow.defn
+class DirectClientWorkflow:
+    """``client.get_response`` on a ``TemporalChatClient``, without an ``Agent``."""
+
+    @workflow.run
+    async def run(self, stream: bool) -> Person:
+        client = TemporalChatClient("model")
+        options: dict[str, Any] = {"response_format": Person}
+        if stream:
+            response_stream = client.get_response("Who?", stream=True, options=options)
+            async for _ in response_stream:
+                pass
+            response = await response_stream.get_final_response()
+        else:
+            response = await client.get_response("Who?", options=options)
+        value = response.value
+        if not isinstance(value, Person):
+            raise ApplicationError(
+                f"expected a Person, got {value!r}", non_retryable=True
+            )
+        return value
+
+
+@workflow.defn
 class AgentAsToolWorkflow:
     @workflow.run
     async def run(self, prompt: str) -> dict[str, Any]:
@@ -304,6 +327,22 @@ async def test_response_format(client: Client) -> None:
         "type": "json_schema",
         "json_schema": {"name": "Person", "schema": Person.model_json_schema()},
     }
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["plain", "stream"])
+async def test_direct_client_response_format(client: Client, stream: bool) -> None:
+    factory = fake_chat_client(['{"name": "Ada", "age": 36}'])
+    plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"model": factory})
+    async with new_worker(client, DirectClientWorkflow, plugin=plugin) as worker:
+        result = await client.execute_workflow(
+            DirectClientWorkflow.run,
+            stream,
+            id=workflow_id("direct-client"),
+            task_queue=worker.task_queue,
+        )
+    # A response from the client itself carries the run's format too, so
+    # value parses on both paths.
+    assert result == Person(name="Ada", age=36)
 
 
 async def test_agent_as_tool(client: Client) -> None:

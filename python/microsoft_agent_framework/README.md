@@ -424,7 +424,7 @@ class StructuredWorkflow:
         return response.value
 ```
 
-The plugin sets [`pydantic_data_converter`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/pydantic.py) as the data converter unless your client already has a payload converter of its own, so Pydantic models cross the workflow boundary. `response.value` is parsed by the `Agent` from the run's `response_format`; a `ChatResponse` you get from `client.get_response(...)` directly on a `TemporalChatClient` carries no format and its `value` is `None`.
+The plugin sets [`pydantic_data_converter`](https://github.com/temporalio/sdk-python/blob/1.36.0/temporalio/contrib/pydantic.py) as the data converter unless your client already has a payload converter of its own, so Pydantic models cross the workflow boundary. `response.value` parses with the run's `response_format`, from an `Agent` run or from `client.get_response(...)` on the `TemporalChatClient` itself.
 
 ## Middleware and context providers
 
