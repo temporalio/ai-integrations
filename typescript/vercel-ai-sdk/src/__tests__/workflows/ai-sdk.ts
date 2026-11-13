@@ -219,9 +219,12 @@ export async function streamingMetadataWorkflow(): Promise<LanguageModelV4Stream
   }
 }
 
-export async function slowModelWorkflow(call: 'stream' | 'generate' | 'embed'): Promise<number> {
+export async function slowModelWorkflow(
+  call: 'stream' | 'generate' | 'embed',
+  heartbeatTimeout?: number
+): Promise<number> {
   new WorkflowStream();
-  const activityOptions = { heartbeatTimeout: '1 second', retry: { maximumAttempts: 1 } } as const;
+  const activityOptions = { heartbeatTimeout, retry: { maximumAttempts: 1 } } as const;
   if (call === 'embed') {
     const model = new TemporalEmbeddingModel('slow-model', activityOptions);
     const result = await model.doEmbed({ values: ['test'] });

@@ -83,6 +83,7 @@ export class TemporalLanguageModel implements LanguageModelV4 {
     const activities = workflow.proxyActivities({
       startToCloseTimeout: '10 minutes',
       ...this.options,
+      heartbeatTimeout: this.options?.heartbeatTimeout ?? '10 seconds',
     });
     const result = await activities.invokeModel!({ modelId: this.modelId, options });
     if (result === undefined) {
@@ -110,6 +111,7 @@ export class TemporalLanguageModel implements LanguageModelV4 {
     const activities = workflow.proxyActivities({
       startToCloseTimeout: '10 minutes',
       ...this.options,
+      heartbeatTimeout: this.options?.heartbeatTimeout ?? '10 seconds',
     });
     const result = await activities.invokeModelStreaming!({
       modelId: this.modelId,
@@ -189,6 +191,7 @@ export class TemporalEmbeddingModel implements EmbeddingModelV4 {
     const activities = workflow.proxyActivities({
       startToCloseTimeout: '10 minutes',
       ...this.options,
+      heartbeatTimeout: this.options?.heartbeatTimeout ?? '10 seconds',
     });
     const result = await activities.invokeEmbeddingModel!({
       modelId: this.modelId,
