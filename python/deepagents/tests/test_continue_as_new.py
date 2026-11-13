@@ -10,15 +10,17 @@ fake agent (no LangChain needed) so they boot a real Temporal server and exercis
 the continue-as-new machinery end to end. Two drive a real Deep Agent with a
 scripted model: its transcript holds LangChain message objects that must cross
 the boundary as messages, and its files live in graph state that a fake agent
-does not have.
+does not have. Another checks the warning for an agent without todos state.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -454,9 +456,10 @@ async def test_identical_op_reruns_across_continue_as_new(
     assert desc.status == WorkflowExecutionStatus.CONTINUED_AS_NEW, desc.status
 
 
-# The tests above drive fake agents whose "messages" are strings. A real Deep
-# Agent returns LangChain message objects, and those must survive the plugin's
-# payload converter on their way into the next run. Its default StateBackend
+# The tests above drive fake agents whose "messages" are strings and that report
+# todos themselves. A real Deep Agent returns LangChain message objects, which
+# must survive the plugin's payload converter on their way into the next run,
+# and reports todos only when it has the todo tool. Its default StateBackend
 # also keeps the agent's files in graph state.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
@@ -465,6 +468,75 @@ with workflow.unsafe.imports_passed_through():
     from langchain_core.messages import AIMessage
 
 from temporalio.deepagents.testing import mock_model_provider
+
+
+@workflow.defn
+class TodoStateWorkflow:
+    @workflow.run
+    async def run(self, with_todos: bool) -> str:
+        middleware = [TodoListMiddleware()] if with_todos else []
+        agent = create_deep_agent(model="fake:model", middleware=middleware)
+        result = await run_deep_agent(
+            agent,
+            {"messages": [{"role": "user", "content": "Research."}]},
+            continue_as_new_after=1,
+        )
+        return str(result["messages"][-1].content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_todos", [False, True])
+async def test_todo_state_warning_past_the_limit(
+    env: WorkflowEnvironment, caplog: pytest.LogCaptureFixture, with_todos: bool
+) -> None:
+    """An agent graph with no todos state cannot continue-as-new, so say so.
+
+    deepagents 0.7 left ``TodoListMiddleware`` out of ``create_deep_agent``.
+    The run still completes as before; only the warning is new, and an agent
+    with the todo tool does not get it.
+    """
+    plugin = DeepAgentsPlugin(model_provider=mock_model_provider(["answer"]))
+    with caplog.at_level(logging.WARNING, logger="temporalio.workflow"):
+        async with Worker(
+            env.client,
+            task_queue="da-can-todo-state",
+            workflows=[TodoStateWorkflow],
+            plugins=[plugin],
+        ):
+            handle = await env.client.start_workflow(
+                TodoStateWorkflow.run,
+                with_todos,
+                id=f"da-can-todo-state-{uuid.uuid4()}",
+                task_queue="da-can-todo-state",
+            )
+            result = await handle.result()
+
+    assert result == "answer"
+    desc = await handle.describe()
+    assert desc.status == WorkflowExecutionStatus.COMPLETED, desc.status
+    todo_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "TodoListMiddleware" in r.getMessage()
+    ]
+    assert bool(todo_warnings) == (not with_todos), todo_warnings
+
+
+def test_lacks_todo_state_only_judges_graphs() -> None:
+    """Only a graph whose channels have no ``todos`` counts as lacking them."""
+    from temporalio.deepagents.workflow import _lacks_todo_state
+
+    assert _lacks_todo_state(SimpleNamespace(channels={"messages": None}))
+    assert not _lacks_todo_state(SimpleNamespace(channels={"todos": None}))
+    assert not _lacks_todo_state(FakeAgent())
+    assert not _lacks_todo_state(SimpleNamespace(channels=None))
+
+    class RaisingChannels:
+        @property
+        def channels(self) -> Any:
+            raise RuntimeError("not a graph")
+
+    assert not _lacks_todo_state(RaisingChannels())
 
 
 def _write_todos(status: str, call_id: str) -> AIMessage:
