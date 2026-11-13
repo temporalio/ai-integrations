@@ -18,6 +18,12 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
     maturity classifier/requires-python floor/module-name/required-version)
   * no [tool.uv.sources] path or workspace entries
   * the project's published README has no relative markdown links (PyPI renders it)
+  * every .NET plugin follows the dotnet/<name>/ contract (AGENTS.md, ".NET conventions"): a
+    Directory.Build.props that starts by importing dotnet/_shared/dotnet.props, one <Coordinate>.slnx,
+    global.json and nuget.config policy, the canonical .editorconfig, the library and MTP test csproj
+    rules, a committed packages.lock.json beside each csproj
+  * no Directory.Build.props, Directory.Build.targets, Directory.Packages.props, global.json or
+    nuget.config at dotnet/ itself (MSBuild would apply them to every plugin silently)
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ import re
 import stat
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -45,8 +52,12 @@ MATURITY_CLASSIFIER = {
     "public-preview": "Development Status :: 4 - Beta",
     "pre-release": "Development Status :: 3 - Alpha",
 }
-REGISTRIES = {"python": "pypi", "typescript": "npm", "java": "maven", "go": "goproxy"}
-LANGUAGE_LOCKFILES = ("uv.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "go.sum", "gradle.lockfile")
+REGISTRIES = {"python": "pypi", "typescript": "npm", "java": "maven", "go": "goproxy", "dotnet": "nuget"}
+LANGUAGE_LOCKFILES = ("uv.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "go.sum", "gradle.lockfile", "packages.lock.json")
+# MSBuild imports the nearest of these above a project, so a copy at the language root would apply to every plugin.
+LANGUAGE_ROOT_FORBIDDEN = {
+    "dotnet": ("Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props", "global.json", "nuget.config"),
+}
 RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
 STANDARD_TEST_SUPPORT = {
     "tests/helpers/environment.py": "tests/helpers/environment.py.tmpl",
@@ -64,6 +75,21 @@ JAVA_PLUGIN_MANAGEMENT = """pluginManagement {
     apply from: '../_shared/settings.gradle'
 }
 """
+DOTNET_DEVELOPMENT_VERSION = "0.0.0"
+DOTNET_PREFIX = "Temporalio."
+DOTNET_SHARED_IMPORT = '<Project>\n  <Import Project="$(MSBuildThisFileDirectory)../_shared/dotnet.props" />\n'
+DOTNET_FRAMEWORK = "net10.0"
+NUGET_ID = re.compile(r"\w+([_.-]\w+)*")
+NUGET_ORG = "https://api.nuget.org/v3/index.json"
+# Microsoft.Testing.Platform mode rejects VSTest projects; `xunit` is the v2 package.
+DOTNET_VSTEST_PACKAGES = ("Microsoft.NET.Test.Sdk", "xunit.runner.visualstudio", "xunit", "coverlet.collector")
+# These add SDK-version-pinned implicit PackageReferences, which break locked restores across SDK patches.
+DOTNET_FORBIDDEN_PROPERTIES = ("IsAotCompatible", "PublishAot", "PublishTrimmed", "IsTrimmable")
+# Shared policy from dotnet/_shared/dotnet.props that a csproj may not weaken.
+DOTNET_POLICY_PROPERTIES = {
+    "TreatWarningsAsErrors": "true", "RestorePackagesWithLockFile": "true", "Nullable": "enable",
+    "GenerateDocumentationFile": "true", "IncludeSymbols": "true", "PublishRepositoryUrl": "true",
+}
 
 
 class Checker:
@@ -100,6 +126,10 @@ class Checker:
             for lock in LANGUAGE_LOCKFILES:
                 if (lang_dir / lock).exists():
                     self.fail(f"{language}/{lock}: language-level lockfiles are forbidden; each plugin owns its own")
+            for forbidden in LANGUAGE_ROOT_FORBIDDEN.get(language, ()):
+                if (lang_dir / forbidden).exists():
+                    self.fail(f"{language}/{forbidden}: language-root build files are forbidden; each plugin owns its own "
+                              f"and imports {language}/_shared explicitly")
             for child in lang_dir.iterdir():
                 if child.is_dir() and not child.name.startswith(("_", ".")):
                     if child.name.endswith(("-plugin", "_plugin")):
@@ -396,13 +426,250 @@ class Checker:
         if not isinstance(filename, str) or Path(filename).is_absolute() or ".." in Path(filename).parts:
             self.fail(f"{plugin.rel}: project.readme must name a file inside the plugin directory")
             return
+        self.check_readme_links(plugin, filename, "PyPI")
+
+    def check_readme_links(self, plugin: Plugin, filename: str, renderer: str) -> None:
         readme = plugin.path / filename
         if not readme.is_file():
             self.fail(f"{plugin.rel}: published README {filename} is missing")
             return
         for lineno, line in enumerate(readme.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if RELATIVE_LINK.search(line):
-                self.fail(f"{plugin.rel}/{filename}:{lineno}: relative link; use absolute https://github.com/... URLs (PyPI renders this file)")
+                self.fail(f"{plugin.rel}/{filename}:{lineno}: relative link; use absolute https://github.com/... URLs ({renderer} renders this file)")
+
+    # -- .NET ---------------------------------------------------------------------
+    def check_dotnet_plugin(self, plugin: Plugin) -> None:
+        d, rel = plugin.path, plugin.rel
+        if not (self.root / "dotnet/_shared/dotnet.props").is_file():
+            self.fail("dotnet/_shared/dotnet.props: missing shared build conventions")
+        if not (d / "plugin.toml").is_file():
+            self.fail(f"{rel}: missing plugin.toml")
+            return
+        meta = load_toml(d / "plugin.toml")
+        p = meta.get("plugin", {})
+        coordinate = p.get("coordinate")
+        # NuGet IDs are case-insensitive: the folder fixes the letters, plugin.toml fixes the casing,
+        # and every other rule below is phrased in terms of that coordinate.
+        expected = DOTNET_PREFIX + plugin.name.replace("-", "")
+        if not isinstance(coordinate, str) or coordinate.lower() != expected.lower():
+            self.fail(f"{rel}: plugin.toml coordinate must be {expected!r} up to casing (got {coordinate!r})")
+            return
+        if not coordinate.startswith(DOTNET_PREFIX) or not NUGET_ID.fullmatch(coordinate) or len(coordinate) > 100:
+            self.fail(f"{rel}: plugin.toml coordinate {coordinate!r} must keep the {DOTNET_PREFIX} prefix casing and be a valid NuGet ID")
+        for key, value in {"name": plugin.name, "language": "dotnet", "registry": "nuget", "root-api": coordinate}.items():
+            if p.get(key) != value:
+                self.fail(f"{rel}: plugin.toml {key} must be {value!r}")
+        if p.get("maturity") not in MATURITY_CLASSIFIER:
+            self.fail(f"{rel}: invalid maturity")
+        ci = meta.get("ci", {})
+        for table in (p, ci):
+            for banned in ("owners", "secrets", "live-secrets"):
+                if banned in table:
+                    self.fail(f"{rel}: plugin.toml must not contain {banned!r}")
+        runtimes = ci.get("runtime-versions", [])
+        if not runtimes or not all(isinstance(v, str) and re.fullmatch(r"\d+\.\d+", v) for v in runtimes):
+            self.fail(f"{rel}: runtime-versions must list .NET SDK channels as major.minor strings")
+            runtimes = []
+        imports = meta.get("smoke", {}).get("imports", [])
+        if not imports or not all(isinstance(i, str) and i.startswith(coordinate + ".") for i in imports):
+            self.fail(f"{rel}: smoke imports must name types under {coordinate}")
+
+        library = f"src/{coordinate}/{coordinate}.csproj"
+        tests = f"tests/{coordinate}.Tests/{coordinate}.Tests.csproj"
+        tracked = {path.split("/", 2)[-1] for path in self.tracked_files(rel)}
+        for name in ("Directory.Build.props", "global.json", "nuget.config", ".editorconfig", "Makefile", "README.md",
+                     f"{coordinate}.slnx", library, f"src/{coordinate}/packages.lock.json", tests,
+                     f"tests/{coordinate}.Tests/packages.lock.json"):
+            if not (d / name).is_file():
+                self.fail(f"{rel}: missing {name}")
+            elif name not in tracked:
+                self.fail(f"{rel}: {name} must be committed")
+        solutions = sorted(path.name for path in d.glob("*.slnx"))
+        if solutions != [f"{coordinate}.slnx"]:
+            self.fail(f"{rel}: exactly one {coordinate}.slnx is allowed at the plugin root (found {solutions})")
+        if (d / f"{coordinate}.slnx").is_file():
+            try:
+                paths = {(project.get("Path") or "").replace("\\", "/") for project in ET.parse(d / f"{coordinate}.slnx").getroot().iter("Project")}
+            except ET.ParseError as exc:
+                self.fail(f"{rel}/{coordinate}.slnx: invalid XML ({exc})")
+            else:
+                if not {library, tests} <= paths:
+                    self.fail(f"{rel}/{coordinate}.slnx: must list {library} and {tests}")
+        props = d / "Directory.Build.props"
+        if props.is_file():
+            text = re.sub(r"\A\s*<\?xml[^>]*\?>", "", props.read_text(encoding="utf-8")).lstrip()
+            if not text.startswith(DOTNET_SHARED_IMPORT):
+                self.fail(f"{rel}/Directory.Build.props: must start with the shared import:\n{DOTNET_SHARED_IMPORT.rstrip()}")
+        self.check_dotnet_global_json(plugin, runtimes)
+        self.check_dotnet_nuget_config(plugin)
+        template = self.root / "dotnet/_template/.editorconfig"
+        if not template.is_file():
+            self.fail("dotnet/_template/.editorconfig: missing canonical editorconfig")
+        elif (d / ".editorconfig").is_file() and (d / ".editorconfig").read_bytes() != template.read_bytes():
+            self.fail(f"{rel}/.editorconfig: differs from canonical dotnet/_template/.editorconfig")
+        if (d / library).is_file():
+            self.check_dotnet_library(plugin, coordinate, d / library)
+        if (d / tests).is_file():
+            self.check_dotnet_tests(plugin, d / tests)
+        makefile = d / "Makefile"
+        if makefile.is_file():
+            lines = [line.strip() for line in makefile.read_text(encoding="utf-8").splitlines()]
+            package = next((m.group(1) for m in (re.fullmatch(r"PACKAGE\s*:?=\s*(\S+)", line) for line in lines) if m), None)
+            if package != coordinate:
+                self.fail(f"{rel}/Makefile: must set PACKAGE := {coordinate}")
+            if "include ../_shared/dotnet.mk" not in lines:
+                self.fail(f"{rel}/Makefile: must include ../_shared/dotnet.mk")
+        license_path = d / "LICENSE"
+        if not license_path.is_file() or license_path.is_symlink():
+            self.fail(f"{rel}: LICENSE must be a regular file")
+        elif "LICENSE" not in tracked:
+            self.fail(f"{rel}: LICENSE must be committed")
+        elif license_path.read_bytes() != (self.root / "LICENSE").read_bytes():
+            self.fail(f"{rel}: LICENSE differs from root")
+        if any(path.name.upper().startswith("CHANGELOG") for path in d.iterdir()):
+            self.fail(f"{rel}: release notes are generated; no changelog files")
+        self.check_readme_links(plugin, "README.md", "nuget.org")
+
+    def check_dotnet_global_json(self, plugin: Plugin, runtimes: list[str]) -> None:
+        path = plugin.path / "global.json"
+        if not path.is_file():
+            return
+        rel = f"{plugin.rel}/global.json"
+        try:
+            settings = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            self.fail(f"{rel}: invalid JSON ({exc})")
+            return
+        sdk = settings.get("sdk", {}) if isinstance(settings, dict) else {}
+        version = str(sdk.get("version", ""))
+        if runtimes and ".".join(version.split(".")[:2]) != runtimes[0]:
+            self.fail(f"{rel}: sdk.version {version!r} must be in the floor channel {runtimes[0]} (first [ci] runtime-versions entry)")
+        if sdk.get("rollForward") != "latestFeature":
+            self.fail(f"{rel}: sdk.rollForward must be 'latestFeature' so a newer major SDK is never used silently")
+        if sdk.get("allowPrerelease") is not False:
+            self.fail(f"{rel}: sdk.allowPrerelease must be false")
+        if not isinstance(settings, dict) or settings.get("test", {}).get("runner") != "Microsoft.Testing.Platform":
+            self.fail(f"{rel}: test.runner must be 'Microsoft.Testing.Platform'")
+
+    def check_dotnet_nuget_config(self, plugin: Plugin) -> None:
+        path = plugin.path / "nuget.config"
+        if not path.is_file():
+            return
+        rel = f"{plugin.rel}/nuget.config"
+        try:
+            root = ET.parse(path).getroot()
+        except ET.ParseError as exc:
+            self.fail(f"{rel}: invalid XML ({exc})")
+            return
+        sources = root.find("packageSources")
+        children = list(sources) if sources is not None else []
+        if not children or children[0].tag != "clear":
+            self.fail(f"{rel}: packageSources must start with <clear /> so a developer's feeds never reach the lock")
+        adds = [child for child in children if child.tag == "add"]
+        if [add.get("value") for add in adds] != [NUGET_ORG]:
+            self.fail(f"{rel}: nuget.org ({NUGET_ORG}) must be the only package source")
+        elif not (adds[0].get("minPublishAgeHours") or "").isdigit() or int(adds[0].get("minPublishAgeHours", "0")) <= 0:
+            self.fail(f"{rel}: the nuget.org source must carry minPublishAgeHours (the dependency cooldown)")
+        exceptions = root.find("minPublishAgeExceptions")
+        patterns = [] if exceptions is None else [entry.get("pattern") for entry in exceptions.findall("package")]
+        if "Temporalio*" not in patterns:
+            self.fail(f"{rel}: minPublishAgeExceptions must exempt the Temporalio* pattern")
+
+    def _dotnet_project(self, plugin: Plugin, csproj: Path) -> tuple[dict[str, str], list[tuple[str, dict[str, str]]]] | None:
+        """Parse a csproj into (properties, items) with lower-cased names; conditions are ignored, the last value wins."""
+        try:
+            root = ET.parse(csproj).getroot()
+        except ET.ParseError as exc:
+            self.fail(f"{plugin.rel}/{csproj.relative_to(plugin.path).as_posix()}: invalid XML ({exc})")
+            return None
+        properties: dict[str, str] = {}
+        for group in root.iter("PropertyGroup"):
+            for prop in group:
+                properties[prop.tag.lower()] = (prop.text or "").strip()
+        items: list[tuple[str, dict[str, str]]] = []
+        for group in root.iter("ItemGroup"):
+            for item in group:
+                metadata = {key.lower(): value for key, value in item.attrib.items()}
+                metadata.update({child.tag.lower(): (child.text or "").strip() for child in item})
+                items.append((item.tag.lower(), metadata))
+        return properties, items
+
+    def _dotnet_common_rules(self, plugin: Plugin, csproj: Path, properties: dict[str, str],
+                             items: list[tuple[str, dict[str, str]]], policy: dict[str, str]) -> None:
+        rel = f"{plugin.rel}/{csproj.relative_to(plugin.path).as_posix()}"
+        for name, value in policy.items():
+            actual = properties.get(name.lower())
+            if actual is not None and actual.lower() != value:
+                self.fail(f"{rel}: {name} must stay {value} (shared policy from dotnet/_shared/dotnet.props)")
+        for name in DOTNET_FORBIDDEN_PROPERTIES:
+            if name.lower() in properties:
+                self.fail(f"{rel}: {name} is not allowed; it adds SDK-pinned implicit package references that break locked restores")
+        references = {metadata.get("include", ""): metadata for tag, metadata in items if tag == "packagereference"}
+        stylecop = next((metadata for include, metadata in references.items() if include.lower() == "stylecop.analyzers"), None)
+        if stylecop is None or stylecop.get("privateassets", "").lower() != "all":
+            self.fail(f"{rel}: StyleCop.Analyzers must be referenced with PrivateAssets=\"all\"")
+        for include in references:
+            if "/" in include or "\\" in include:
+                self.fail(f"{rel}: PackageReference {include!r} must name a published coordinate, not a path")
+        for tag, metadata in items:
+            target = metadata.get("include") if tag == "projectreference" else metadata.get("hintpath") if tag == "reference" else None
+            if target and not (csproj.parent / target.replace("\\", "/")).resolve().is_relative_to(plugin.path.resolve()):
+                self.fail(f"{rel}: {target} points outside the plugin; cross-plugin dependencies use published coordinates")
+
+    def check_dotnet_library(self, plugin: Plugin, coordinate: str, csproj: Path) -> None:
+        parsed = self._dotnet_project(plugin, csproj)
+        if parsed is None:
+            return
+        properties, items = parsed
+        rel = f"{plugin.rel}/{csproj.relative_to(plugin.path).as_posix()}"
+        if properties.get("packageid") != coordinate:
+            self.fail(f"{rel}: PackageId must be {coordinate!r} (got {properties.get('packageid')!r})")
+        if properties.get("version") != DOTNET_DEVELOPMENT_VERSION:
+            self.fail(f"{rel}: Version must be the tag-authoritative development placeholder "
+                      f"{DOTNET_DEVELOPMENT_VERSION!r} (got {properties.get('version')!r})")
+        if properties.get("ispackable", "").lower() != "true":
+            self.fail(f"{rel}: IsPackable must be true")
+        frameworks = [part.strip() for part in properties.get("targetframeworks", "").split(";") if part.strip()]
+        frameworks += [properties["targetframework"]] if properties.get("targetframework") else []
+        if DOTNET_FRAMEWORK not in frameworks:
+            self.fail(f"{rel}: TargetFramework(s) must include {DOTNET_FRAMEWORK}")
+        if properties.get("packagelicensefile") != "LICENSE":
+            self.fail(f"{rel}: PackageLicenseFile must be LICENSE")
+        if "packagelicenseexpression" in properties or "packagelicenseurl" in properties:
+            self.fail(f"{rel}: ship the license text; no PackageLicenseExpression or PackageLicenseUrl")
+        if properties.get("packagereadmefile") != "README.md":
+            self.fail(f"{rel}: PackageReadmeFile must be README.md")
+        packed = {metadata.get("include", "").replace("\\", "/") for tag, metadata in items
+                  if tag == "none" and metadata.get("pack", "").lower() == "true"}
+        for name in ("../../LICENSE", "../../README.md"):
+            if name not in packed:
+                self.fail(f"{rel}: must pack {name} (<None Include=\"{name}\" Pack=\"true\" PackagePath=\"\" />)")
+        temporalio = next((metadata for tag, metadata in items if tag == "packagereference" and metadata.get("include", "").lower() == "temporalio"), None)
+        if temporalio is None or not temporalio.get("version"):
+            self.fail(f"{rel}: a PackageReference to Temporalio with an explicit Version is required")
+        self._dotnet_common_rules(plugin, csproj, properties, items, DOTNET_POLICY_PROPERTIES)
+
+    def check_dotnet_tests(self, plugin: Plugin, csproj: Path) -> None:
+        parsed = self._dotnet_project(plugin, csproj)
+        if parsed is None:
+            return
+        properties, items = parsed
+        rel = f"{plugin.rel}/{csproj.relative_to(plugin.path).as_posix()}"
+        if properties.get("usemicrosofttestingplatformrunner", "").lower() != "true":
+            self.fail(f"{rel}: UseMicrosoftTestingPlatformRunner must be true (xunit.v3 under Microsoft.Testing.Platform)")
+        if properties.get("outputtype", "").lower() != "exe":
+            self.fail(f"{rel}: OutputType must be Exe (Microsoft.Testing.Platform test projects are executables)")
+        if properties.get("ispackable", "").lower() == "true":
+            self.fail(f"{rel}: the test project must not be packable")
+        references = {metadata.get("include", "").lower() for tag, metadata in items if tag == "packagereference"}
+        for required in ("xunit.v3", "Microsoft.Testing.Extensions.TrxReport"):
+            if required.lower() not in references:
+                self.fail(f"{rel}: must reference {required}")
+        for banned in DOTNET_VSTEST_PACKAGES:
+            if banned.lower() in references:
+                self.fail(f"{rel}: {banned} is a VSTest package; Microsoft.Testing.Platform mode rejects it")
+        policy = {name: value for name, value in DOTNET_POLICY_PROPERTIES.items() if name != "GenerateDocumentationFile"}
+        self._dotnet_common_rules(plugin, csproj, properties, items, policy)
 
 
     def run(self) -> list[str]:
@@ -414,6 +681,8 @@ class Checker:
             self.check_java_plugin(plugin)
         for plugin in discovered["typescript"]:
             self.check_typescript_plugin(plugin)
+        for plugin in discovered["dotnet"]:
+            self.check_dotnet_plugin(plugin)
         return self.violations
 
 

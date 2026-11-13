@@ -8,7 +8,8 @@ pull requests included:
   ubuntu-latest x {min, max}, macos-latest and windows-latest at max
 
 `dist` marks the ubuntu/max cell: Python builds and uploads distributions there,
-and Go runs race detection there. Output: matrix={"include":[...]}.
+and Go runs race detection there. For .NET the runtime is an SDK channel such as
+`10.0`, installed as `<channel>.x`. Output: matrix={"include":[...]}.
 """
 
 from __future__ import annotations

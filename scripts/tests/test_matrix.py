@@ -54,3 +54,17 @@ def test_cli_preserves_go_patch_floor_and_selects_all_platforms(tmp_path: Path) 
         ("windows-latest", "1.27"),
     ]
     assert [cell["runtime"] for cell in result["include"] if cell["dist"]] == ["1.27"]
+
+
+def test_dotnet_channels_select_all_platforms_with_dist_on_ubuntu(tmp_path: Path) -> None:
+    plugin = tmp_path / "dotnet" / "fakedotnet"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.toml").write_text('[ci]\nruntime-versions = ["10.0"]\n')
+    result = matrix.main(["--plugin-dir", str(plugin)])
+    assert [(cell["os"], cell["runtime"], cell["dist"]) for cell in result["include"]] == [
+        ("ubuntu-latest", "10.0", True), ("macos-latest", "10.0", False), ("windows-latest", "10.0", False),
+    ]
+    (plugin / "plugin.toml").write_text('[ci]\nruntime-versions = ["10.0", "11.0"]\n')
+    result = matrix.main(["--plugin-dir", str(plugin)])
+    assert len(result["include"]) == 4
+    assert [cell["runtime"] for cell in result["include"] if cell["dist"]] == ["11.0"]

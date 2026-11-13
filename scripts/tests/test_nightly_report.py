@@ -104,3 +104,16 @@ def test_java_failures_are_aggregated_by_plugin() -> None:
     )
     assert failing == {"spring-ai"}
     assert not passing
+
+
+def test_dotnet_failures_use_the_language_root_key() -> None:
+    failing, passing = nightly_report.classify(
+        [
+            _job(".NET (agent-framework) / agent-framework (windows-latest, dotnet10.0)", "failure"),
+            _job(".NET (agent-framework) / matrix", "success"),
+            _job(".NET (other) / other (ubuntu-latest, dotnet10.0)", "success"),
+        ]
+    )
+    assert failing == {"dotnet/agent-framework"}
+    assert passing == {"dotnet/other"}
+    assert nightly_report.title_for("dotnet/agent-framework") == release_tool.nightly_issue_title("dotnet", "agent-framework")
