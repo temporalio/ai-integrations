@@ -431,7 +431,7 @@ public class ChatWorkflow
 }
 ```
 
-What carries over: the serialized session (transcript and any provider state in the bag) and whatever you put in the input. What does not: the `TemporalAgent` instance (build a new one), MCP connections (the worker reconnects), and an approval request you have not answered yet (answer it before continuing, or carry the pending request in your own input). The serialized form is `{"stateBag": ...}`, the shape `ChatClientAgent` writes, so a transcript saved by one can be read by the other. Approvals in flight do not carry across: the two keep pending and held requests under different state keys, so finish the approval round before you hand a session to the other side.
+What carries over: the serialized session and whatever you put in the input. The session holds the transcript, any provider state in the bag, an approval request the model made that you have not answered, and the calls held back behind it. What does not: the `TemporalAgent` instance (build a new one), MCP connections (the worker reconnects), and your Workflow's own record of which request is pending. Carry that request in your input, so the new run can show it and wait for the decision; until the request is answered, the next run on the session fails with `MicrosoftAgentFrameworkWorkflowError`, as the Approvals section says. The serialized form is `{"stateBag": ...}`, the shape `ChatClientAgent` writes, so a transcript saved by one can be read by the other. Approvals in flight do not carry across to `ChatClientAgent`: the two keep pending and held requests under different state keys, so finish the approval round before you hand a session to the other side.
 
 ## Structured output
 
