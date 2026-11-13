@@ -7,7 +7,7 @@ coordinate = "Temporalio.MicrosoftAgentFramework"
 registry = "nuget"
 root-api = "Temporalio.MicrosoftAgentFramework"
 maturity = "pre-release"
-docs = "https://github.com/temporalio/ai-integrations/tree/main/dotnet/microsoft-agent-framework"
+docs = "https://docs.temporal.io/develop/dotnet/integrations/microsoft-agent-framework"
 
 [ci]
 # .NET SDK channels (major.minor). First = floor pinned by global.json, last = dist cell.
