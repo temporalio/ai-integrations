@@ -41,7 +41,7 @@ export interface LangSmithTraceContext extends Record<string, string> {
   baggage: string;
 }
 
-/** Case-insensitive key prefixes scrubbed from runs and propagated headers. */
+/** Case-insensitive key prefixes scrubbed from propagated replica settings. */
 const SENSITIVE_KEY_PREFIXES: readonly string[] = [
   'auth',
   'api_key',

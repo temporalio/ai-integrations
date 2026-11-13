@@ -21,7 +21,7 @@ PYTEST_ARGS ?=
 UV_RUN := uv run --locked
 PYTEST := $(UV_RUN) pytest -n auto --dist=worksteal
 
-.PHONY: help sync sync-latest format lint test build clean
+.PHONY: help sync sync-latest check-deps format lint test build clean
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
@@ -34,6 +34,9 @@ sync: ## Install locked dependencies and this plugin (non-editable); creates uv.
 sync-latest: ## Re-lock to the newest allowed versions and install (nightly lane; lock not committed)
 	uv lock --upgrade
 	uv sync --locked
+
+check-deps: ## Check fresh resolution under the dependency cooldown without changing uv.lock
+	uv lock --upgrade --dry-run
 
 format: ## Fix import order and formatting
 	$(UV_RUN) ruff check --select I --fix

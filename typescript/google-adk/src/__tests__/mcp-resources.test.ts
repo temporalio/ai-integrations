@@ -17,7 +17,15 @@ import { MockActivityEnvironment } from '@temporalio/testing';
 import { createMCPActivities } from '../activities';
 import { GoogleAdkPlugin } from '../index';
 import { mockMCPToolset, type MockMCPResourceDefinition } from '../testing';
-import { countScheduledActivities, echoDef, findInCauseChain, setupTestEnv, uid, withWorker } from './helpers';
+import {
+  countScheduledActivities,
+  echoDef,
+  findInCauseChain,
+  getScheduledHeartbeatTimeouts,
+  setupTestEnv,
+  uid,
+  withWorker,
+} from './helpers';
 import * as activities from './test-activities';
 import { graphTestProvider } from './test-models';
 import {
@@ -240,6 +248,9 @@ test.serial('listResources and readResource route through the resource Activitie
   t.is(countScheduledActivities(listEvents ?? [], 'testServer-listResources'), 1);
   const { events: readEvents } = await env.client.workflow.getHandle(readId).fetchHistory();
   t.is(countScheduledActivities(readEvents ?? [], 'testServer-readResource'), 1);
+  // Both resource Activities get the plugin's default heartbeat timeout.
+  t.deepEqual(getScheduledHeartbeatTimeouts(listEvents ?? [], 'testServer-listResources'), [10]);
+  t.deepEqual(getScheduledHeartbeatTimeouts(readEvents ?? [], 'testServer-readResource'), [10]);
 });
 
 test.serial('an unknown resource fails as an MCP error', async (t) => {

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/model"
+	"google.golang.org/adk/v2/tool"
 	"google.golang.org/genai"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -52,7 +55,8 @@ type ModelOption func(*TemporalModel)
 
 // WithModelActivityOptions sets the base Activity options for the InvokeModel
 // Activity (StartToCloseTimeout, RetryPolicy, TaskQueue, ...). A zero
-// StartToCloseTimeout defaults to two minutes.
+// StartToCloseTimeout defaults to two minutes, and a zero HeartbeatTimeout to
+// 10 seconds. A negative HeartbeatTimeout turns heartbeats off.
 func WithModelActivityOptions(o workflow.ActivityOptions) ModelOption {
 	return func(m *TemporalModel) { m.activityOptions = o }
 }
@@ -68,9 +72,8 @@ func WithModelSummary(fn func(*model.LLMRequest) string) ModelOption {
 // consumers; the aggregated final response is still returned into the workflow
 // so replay stays deterministic. Call StreamServer(ctx) once in the workflow
 // when you use this. batchInterval coalesces published chunks (zero uses the
-// library default). Streaming installs a 30-second HeartbeatTimeout default
-// (override via WithModelActivityOptions); InvokeModel heartbeats on a timer
-// derived from the heartbeat timeout, so a model that is slow to produce its
+// library default). InvokeModel heartbeats on a timer derived from the heartbeat
+// timeout (see WithModelActivityOptions), so a model that is slow to produce its
 // first chunk is not falsely timed out.
 func WithStreaming(topic string, batchInterval time.Duration) ModelOption {
 	return func(m *TemporalModel) {
@@ -111,7 +114,7 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 			yield(nil, errMissingContext)
 			return
 		}
-		if err := rejectRemoteAgents(ctx); err != nil {
+		if err := rejectRemoteAgents(ctx, req); err != nil {
 			yield(nil, err)
 			return
 		}
@@ -119,14 +122,7 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 		if ao.StartToCloseTimeout == 0 {
 			ao.StartToCloseTimeout = defaultModelTimeout
 		}
-		// Streamed calls default to a 30s heartbeat timeout so a stuck worker is
-		// detected well before the StartToCloseTimeout. InvokeModel heartbeats on
-		// a timer derived from the heartbeat timeout (not per chunk), so a model
-		// that legitimately takes longer than this to produce its first chunk is
-		// not falsely timed out and retried.
-		if m.streamingTopic != "" && ao.HeartbeatTimeout == 0 {
-			ao.HeartbeatTimeout = defaultStreamHeartbeat
-		}
+		ao = resolveHeartbeatTimeout(ao)
 		ao.Summary = m.modelSummary(req)
 		actx := workflow.WithActivityOptions(wfCtx, ao)
 
@@ -147,53 +143,83 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 }
 
 // rejectRemoteAgents returns an error when an agent below the agent making
-// this model call is a remote A2A agent that sends from Workflow code. History
+// this model call, a sub-agent or an agent that one of the call's tools wraps
+// with agenttool, is a remote A2A agent that sends from Workflow code. History
 // does not record those requests, so a replay sends them again.
-func rejectRemoteAgents(ctx context.Context) error {
-	ic, ok := ctx.(agent.InvocationContext)
-	if !ok {
-		return nil
-	}
-	remote := findRemoteAgent(ic.Agent())
-	if remote == nil {
-		return nil
-	}
-	return remoteAgentError(remote)
-}
-
-// remoteAgentError is the error that refuses remote, a remote A2A agent that
-// sends from Workflow code.
-func remoteAgentError(remote agent.Agent) error {
-	return fmt.Errorf("googleadk: agent %q is a remote A2A agent that sends its requests from "+
-		"Workflow code, and they repeat on replay. Set its ClientProvider to "+
-		"googleadk.NewA2AClientProvider and its AgentCardProvider to "+
-		"googleadk.NewA2AAgentCardProvider (or set a static AgentCard)", remote.Name())
-}
-
-// findRemoteAgent returns the first remote A2A agent below a that sends from
-// Workflow code, or nil.
-func findRemoteAgent(a agent.Agent) agent.Agent {
-	if a == nil {
-		return nil
-	}
-	for _, sub := range a.SubAgents() {
-		if remoteAgentSendsFromWorkflow(sub) {
-			return sub
+func rejectRemoteAgents(ctx context.Context, req *model.LLMRequest) error {
+	if ic, ok := ctx.(agent.InvocationContext); ok && ic.Agent() != nil {
+		if name := findRemoteAgent(ic.Agent().SubAgents()...); name != "" {
+			return remoteAgentError(name)
 		}
-		if found := findRemoteAgent(sub); found != nil {
-			return found
+	}
+	// In name order, so the error names the same agent on every replay.
+	for _, name := range slices.Sorted(maps.Keys(req.Tools)) {
+		if wrapsRemoteAgent(req.Tools[name]) {
+			return remoteAgentError(name)
 		}
 	}
 	return nil
 }
 
-// remoteAgentSendsFromWorkflow reports whether a was built by
+// remoteAgentError is the error that refuses the remote A2A agent named name,
+// which sends from Workflow code.
+func remoteAgentError(name string) error {
+	return fmt.Errorf("googleadk: agent %q is a remote A2A agent that sends its requests from "+
+		"Workflow code, and they repeat on replay. Set its ClientProvider to "+
+		"googleadk.NewA2AClientProvider and its AgentCardProvider to "+
+		"googleadk.NewA2AAgentCardProvider (or set a static AgentCard)", name)
+}
+
+// findRemoteAgent returns the name of the first of agents, or of the agents
+// below them, that is a remote A2A agent sending from Workflow code, or "".
+// Below an agent are its sub-agents and the agents that the tools in its Tools
+// wrap with agenttool, but not the agents below a wrapped agent: see
+// wrapsRemoteAgent.
+func findRemoteAgent(agents ...agent.Agent) string {
+	for _, a := range agents {
+		if a == nil {
+			continue
+		}
+		if remoteAgentSendsFromWorkflow(reflect.ValueOf(a)) {
+			return a.Name()
+		}
+		// llmagent keeps its tools in internal state, read with reflection.
+		if f := reflectField(reflect.ValueOf(a), "Tools"); f.IsValid() && f.CanInterface() {
+			tools, _ := f.Interface().([]tool.Tool)
+			for _, t := range tools {
+				if wrapsRemoteAgent(t) {
+					return t.Name()
+				}
+			}
+		}
+		if name := findRemoteAgent(a.SubAgents()...); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// wrapsRemoteAgent reports whether t was built by ADK's agenttool.New around a
+// remote A2A agent that sends from Workflow code. agenttool keeps the agent in
+// an unexported field. Reflection can read its fields but not call its
+// methods, so the agents below it are not seen, such as a remote agent under a
+// sequential, loop or parallel agent that agenttool wraps. An agent on
+// NewModel below it checks its own sub-agents and tools at its model calls.
+func wrapsRemoteAgent(t any) bool {
+	v := reflect.ValueOf(t)
+	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct ||
+		v.Elem().Type().PkgPath() != "google.golang.org/adk/v2/tool/agenttool" {
+		return false
+	}
+	return remoteAgentSendsFromWorkflow(v.Elem().FieldByName("agent"))
+}
+
+// remoteAgentSendsFromWorkflow reports whether v holds an agent built by
 // remoteagent.NewA2A, which the deprecated agent/remoteagent package also
 // calls, without NewA2AClientProvider, or with a card it fetches without
 // NewA2AAgentCardProvider. ADK keeps the agent type and its A2A config in
 // internal state, so they are read with reflection.
-func remoteAgentSendsFromWorkflow(a agent.Agent) bool {
-	v := reflect.ValueOf(a)
+func remoteAgentSendsFromWorkflow(v reflect.Value) bool {
 	t := reflectField(v, "AgentType")
 	if !t.IsValid() || t.Kind() != reflect.String || t.String() != "RemoteAgent" {
 		return false
@@ -290,7 +316,7 @@ func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*mod
 	if in.Request == nil {
 		return nil, newApplicationError(ErrorTypeModel, false, nil, "InvokeModel: nil request")
 	}
-	// The Activity's HeartbeatTimeout (the streaming default, or one the user set
+	// The Activity's HeartbeatTimeout (the 10-second default, or one the user set
 	// themselves) counts from Activity start, and a model can legitimately stay
 	// silent past it before its first output (thinking models, large-context
 	// prefill). Heartbeat on a timer for the whole call — model resolution (which
@@ -331,19 +357,21 @@ func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*mod
 }
 
 // startPeriodicHeartbeats records Activity heartbeats on a fixed interval until
-// the returned stop function is called. The interval is a third of the
-// Activity's HeartbeatTimeout; when no heartbeat timeout is set it does
+// the returned stop function is called. The interval is half the Activity's
+// HeartbeatTimeout; when no heartbeat timeout is set it does
 // nothing. A model can legitimately take longer than the heartbeat timeout to
 // produce its first output (thinking models, large-context prefill), so
 // heartbeating only on chunk arrival would let the server time out and retry a
 // healthy — and paid — model call. The SDK throttles outgoing heartbeats to
 // 80% of the heartbeat timeout, so the short interval does not spam the server.
+// The first heartbeat comes half the timeout in, still inside it, so a call
+// shorter than that sends none.
 func startPeriodicHeartbeats(ctx context.Context) (stop func()) {
 	timeout := activity.GetInfo(ctx).HeartbeatTimeout
 	if timeout <= 0 {
 		return func() {}
 	}
-	interval := timeout / 3
+	interval := timeout / 2
 	if interval < time.Millisecond {
 		interval = time.Millisecond
 	}
@@ -354,15 +382,13 @@ func startPeriodicHeartbeats(ctx context.Context) (stop func()) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			// Heartbeat first so the window opens covered: the timeout counts from
-			// Activity start, not from the first recorded heartbeat.
-			activity.RecordHeartbeat(ctx)
 			select {
 			case <-done:
 				return
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				activity.RecordHeartbeat(ctx)
 			}
 		}
 	}()

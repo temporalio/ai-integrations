@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-
-# Each branch is unreachable under one interpreter version; basedpyright fails on that warning.
-if sys.version_info >= (3, 11):
-    import tomllib  # type: ignore[reportUnreachable]
-else:  # Python 3.10: tomllib arrived in 3.11
-    import tomli as tomllib  # type: ignore[reportUnreachable]
 
 
 @dataclass(frozen=True)

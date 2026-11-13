@@ -48,17 +48,25 @@ class ModelActivityParameters:
     start_to_close_timeout: timedelta | None = timedelta(seconds=60)
     """Maximum time for the activity to complete."""
 
-    heartbeat_timeout: timedelta | None = None
-    """Maximum time between heartbeats. For streaming
-    (``Runner.run_streamed``), set this lower than
-    ``start_to_close_timeout`` so a stuck model call is detected before the
-    overall activity timeout fires."""
+    heartbeat_timeout: timedelta | None = timedelta(seconds=10)
+    """Maximum time between heartbeats. The model activities heartbeat on a
+    timer at half this timeout, so a cancel reaches a running model call, and a
+    lost worker is noticed, within about this long. It doesn't catch a slow
+    model call. Set it to ``None`` to turn heartbeats off; a cancel then doesn't
+    reach a running model call. For streaming, that includes the cancel when a
+    parallel input guardrail trips, so the activity keeps publishing to
+    ``streaming_topic``."""
 
     retry_policy: RetryPolicy | None = None
     """Policy for retrying failed activities."""
 
     cancellation_type: ActivityCancellationType = ActivityCancellationType.TRY_CANCEL
-    """How the activity handles cancellation."""
+    """How the activity handles cancellation. For streaming, ``TRY_CANCEL``
+    lets the run go on while the activity stops, so the ``error`` event it
+    publishes can come after the workflow closes or among later events on
+    ``streaming_topic``. ``WAIT_CANCELLATION_COMPLETED`` waits until the
+    activity has published it. ``ABANDON`` sends no cancel, so the activity
+    keeps publishing."""
 
     versioning_intent: VersioningIntent | None = None
     """Versioning intent for the activity."""

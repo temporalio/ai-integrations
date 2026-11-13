@@ -8,6 +8,19 @@ import {
   TOOL_META_RESOLVER_UNSUPPORTED_TYPE,
 } from '../common/mcp-types';
 
+/** Check that a factory result has the methods the Worker calls. */
+export function assertMCPServer(name: string, server: unknown): asserts server is MCPServer {
+  const methods = ['connect', 'close', 'listTools', 'callTool'] as const;
+  if (server != null && methods.every((method) => typeof (server as MCPServer)[method] === 'function')) return;
+  throw ApplicationFailure.create({
+    message:
+      `MCP server factory '${name}' returned an invalid server; ` +
+      'expected connect(), close(), listTools() and callTool() methods.',
+    type: 'MCPServerFactoryTypeError',
+    nonRetryable: true,
+  });
+}
+
 /**
  * Fails on a callable `toolFilter` on the server the factory returns. It needs the agent and the
  * run context, which exist only in the Workflow, so the Worker cannot apply it.
@@ -80,6 +93,7 @@ export class StatelessMCPServerProvider {
     return {
       [`${this._name}${MCP_LIST_TOOLS_SUFFIX}`]: async (input?: { factoryArgument?: unknown }) => {
         const s = this.serverFactory(input?.factoryArgument);
+        assertMCPServer(this.name, s);
         rejectCallableToolFilter(s);
         rejectToolMetaResolver(s);
         try {
@@ -96,6 +110,7 @@ export class StatelessMCPServerProvider {
         factoryArgument?: unknown;
       }) => {
         const s = this.serverFactory(input.factoryArgument);
+        assertMCPServer(this.name, s);
         rejectCallableToolFilter(s);
         rejectToolMetaResolver(s);
         try {
