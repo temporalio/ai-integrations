@@ -1,0 +1,3 @@
+<Project>
+  <Import Project="$(MSBuildThisFileDirectory)../_shared/dotnet.props" Condition="Exists('$(MSBuildThisFileDirectory)../_shared/dotnet.props')" />
+</Project>
