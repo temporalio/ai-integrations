@@ -87,19 +87,22 @@ function recordingClient(published: unknown[][]): Client {
 
 async function runStreamingActivity(
   parts: LanguageModelV4StreamPart[]
-): Promise<{ result: InvokeModelResult; published: unknown[][] }> {
+): Promise<{ result: InvokeModelResult; published: unknown[][]; heartbeats: number }> {
   const activities = createActivities(streamingProvider(parts)) as {
     invokeModelStreaming: (args: InvokeModelStreamingArgs) => Promise<InvokeModelResult>;
   };
   const published: unknown[][] = [];
-  const env = new MockActivityEnvironment(undefined, { client: recordingClient(published) });
+  // The heartbeat timeout the plugin schedules by default.
+  const env = new MockActivityEnvironment({ heartbeatTimeoutMs: 10_000 }, { client: recordingClient(published) });
+  let heartbeats = 0;
+  env.on('heartbeat', () => heartbeats++);
   const result = (await env.run(activities.invokeModelStreaming, {
     modelId: 'StreamingTestModel',
     options: { prompt: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] },
     streamingTopic: 'test-topic',
     streamingBatchInterval: '10ms',
   } satisfies InvokeModelStreamingArgs)) as InvokeModelResult;
-  return { result, published };
+  return { result, published, heartbeats };
 }
 
 const usage: LanguageModelV4Usage = {
@@ -124,7 +127,7 @@ test('invokeModelStreaming publishes every part and assembles the final result',
     { type: 'finish', finishReason: { unified: 'stop', raw: undefined }, usage },
   ];
 
-  const { result, published } = await runStreamingActivity(parts);
+  const { result, published, heartbeats } = await runStreamingActivity(parts);
 
   t.deepEqual(result.content, [
     { type: 'text', text: 'Hello, world!', providerMetadata: undefined },
@@ -146,6 +149,9 @@ test('invokeModelStreaming publishes every part and assembles the final result',
   // Every stream part (including `raw`) is published to the topic exactly once.
   const totalPublished = published.reduce((sum, batch) => sum + batch.length, 0);
   t.is(totalPublished, parts.length);
+
+  // The call ends well before half the timeout, so its 12 parts send no heartbeat.
+  t.is(heartbeats, 0);
 });
 
 test('invokeModelStreaming retains the latest text provider metadata', async (t) => {
