@@ -22,7 +22,7 @@ from ._failure_converter import (
     strands_failure_converter_class,
     strands_failure_converter_class_keeping_caller,
 )
-from ._model_activity import ModelActivity
+from ._model_activity import ModelActivity, ModelFactory
 from ._sandbox_activity import SandboxActivities, SandboxFactory
 from ._sync_calls import refuse_sync_calls_in_workflows
 from ._worker_env_ref import AllowAllWorkerEnvVars
@@ -48,8 +48,9 @@ class StrandsPlugin(SimplePlugin):
     When ``models`` is supplied, registers a single pair of model invocation
     activities; each call carries the chosen ``model_name`` in its input and
     the worker resolves it against the factories. Factories are called lazily
-    on first use, then cached for the worker's lifetime. Use the same name in
-    ``TemporalAgent(model=...)`` inside the workflow.
+    on first use, then cached for the worker's lifetime. A synchronous factory
+    runs on a thread; an async one runs on the worker's event loop. Use the
+    same name in ``TemporalAgent(model=...)`` inside the workflow.
 
     When ``mcp_clients`` is supplied, registers the activities of a
     ``temporalio.mcp.MCPPlugin`` (``temporalio.mcp.{server}.list-tools``,
@@ -84,7 +85,7 @@ class StrandsPlugin(SimplePlugin):
     def __init__(
         self,
         *,
-        models: dict[str, Callable[[], Model]] | None = None,
+        models: dict[str, ModelFactory] | None = None,
         mcp_clients: dict[str, Callable[[], Client]] | None = None,
         sandboxes: dict[str, SandboxFactory] | None = None,
         mcp_connection_idle_timeout: timedelta | None = timedelta(minutes=5),

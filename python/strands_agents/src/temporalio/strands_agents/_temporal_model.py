@@ -59,6 +59,9 @@ class TemporalModel(Model):
     ``heartbeat_timeout`` defaults to 10 seconds. The model activities heartbeat
     on a timer at half of it, so a cancel reaches a running model call and a lost
     worker is noticed. Pass ``heartbeat_timeout=None`` to turn heartbeats off.
+    The timer needs the worker's event loop: a model that blocks it, such as
+    Strands' ``SageMakerAIModel``, fails calls longer than the timeout, so turn
+    heartbeats off for it (see the README).
 
     When ``streaming_topic`` is set, each ``StreamEvent`` is also published to
     the named topic on the workflow's

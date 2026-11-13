@@ -3,7 +3,7 @@ import concurrent.futures
 import importlib
 import inspect
 import time
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -24,7 +24,7 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.exceptions import ApplicationError
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent, _sync_calls
-from temporalio.strands_agents._model_activity import ModelActivity
+from temporalio.strands_agents._model_activity import ModelActivity, ModelFactory
 from temporalio.strands_agents._sync_calls import _MESSAGE
 from temporalio.worker import Replayer, Worker
 from temporalio.worker.workflow_sandbox import RestrictedWorkflowAccessError
@@ -155,18 +155,92 @@ async def test_cold_worker_builds_model_without_missing_heartbeats(client: Clien
     ]
 
 
-async def test_concurrent_cold_calls_build_model_once():
-    built: list[MockModel] = []
+async def test_async_factory_builds_model_on_the_event_loop(client: Client):
+    """An async factory can create clients that need the running event loop."""
+    loops: list[asyncio.AbstractEventLoop] = []
 
+    async def factory() -> MockModel:
+        # An aiohttp.ClientSession, for one, needs the running loop when built.
+        loops.append(asyncio.get_running_loop())
+        return MockModel(["Hi!"])
+
+    task_queue = f"test_async_factory-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[ModelWorkflow],
+        plugins=[StrandsPlugin(models={"mock": factory})],
+    ):
+        result = await client.execute_workflow(
+            ModelWorkflow.run,
+            "Hello",
+            id=f"test_async_factory_{uuid4()}",
+            task_queue=task_queue,
+        )
+    assert result == "Hi!\n"
+    assert loops == [asyncio.get_running_loop()]
+
+
+def _sync_factory(built: list[MockModel]) -> Callable[[], MockModel]:
     def factory() -> MockModel:
         time.sleep(0.2)
         built.append(MockModel([]))
         return built[-1]
 
-    model_activity = ModelActivity({"slow": factory})
+    return factory
+
+
+def _async_factory(built: list[MockModel]) -> Callable[[], Awaitable[MockModel]]:
+    async def factory() -> MockModel:
+        await asyncio.sleep(0.2)
+        built.append(MockModel([]))
+        return built[-1]
+
+    return factory
+
+
+@pytest.mark.parametrize("make_factory", [_sync_factory, _async_factory])
+async def test_concurrent_cold_calls_build_model_once(
+    make_factory: Callable[[list[MockModel]], ModelFactory],
+):
+    built: list[MockModel] = []
+    model_activity = ModelActivity({"slow": make_factory(built)})
     models = await asyncio.gather(*(model_activity._model("slow") for _ in range(3)))
     assert len(built) == 1
     assert all(model is built[0] for model in models)
+
+
+@pytest.mark.parametrize("make_factory", [_sync_factory, _async_factory])
+async def test_cancelled_call_keeps_model_build(
+    make_factory: Callable[[list[MockModel]], ModelFactory],
+):
+    built: list[MockModel] = []
+    model_activity = ModelActivity({"slow": make_factory(built)})
+    cancelled = asyncio.create_task(model_activity._model("slow"))
+    await asyncio.sleep(0.05)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    assert await model_activity._model("slow") is built[0]
+    assert len(built) == 1
+
+
+async def test_failed_model_build_is_retried():
+    calls = 0
+
+    def factory() -> MockModel:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("no credentials yet")
+        return MockModel([])
+
+    model_activity = ModelActivity({"flaky": factory})
+    with pytest.raises(RuntimeError, match="no credentials yet"):
+        await model_activity._model("flaky")
+    model = await model_activity._model("flaky")
+    assert await model_activity._model("flaky") is model
+    assert calls == 2
 
 
 @tool

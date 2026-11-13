@@ -1,6 +1,6 @@
 import asyncio
-import threading
-from collections.abc import AsyncIterable, Callable
+import inspect
+from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -19,6 +19,8 @@ from temporalio.strands_agents._bytes_values import (
     encode_messages,
 )
 from temporalio.strands_agents._heartbeat_decorator import auto_heartbeater
+
+ModelFactory = Callable[[], Model | Awaitable[Model]]
 
 
 # Fields are typed as Any because strands TypedDicts (Message, ToolSpec) use
@@ -85,7 +87,7 @@ class ModelActivity:
 
     def __init__(
         self,
-        factories: dict[str, Callable[[], Model]],
+        factories: dict[str, ModelFactory],
         *,
         default_name: str | None = None,
     ) -> None:
@@ -98,17 +100,9 @@ class ModelActivity:
         self._factories = factories
         self._default_name = default_name
         self._models: dict[str, Model] = {}
-        self._build_lock = threading.Lock()
+        self._builds: dict[str, asyncio.Future[Model]] = {}
 
     async def _model(self, name: str | None) -> Model:
-        # Factories are synchronous and can be slow. Build on a thread, so the
-        # event loop keeps heartbeating while a cold worker builds the model.
-        key = self._default_name if name is None else name
-        if key is not None and key in self._models:
-            return self._models[key]
-        return await asyncio.to_thread(self._get_model, name)
-
-    def _get_model(self, name: str | None) -> Model:
         if name is None:
             if self._default_name is None:
                 raise ValueError(
@@ -118,14 +112,34 @@ class ModelActivity:
                     f"Known: {sorted(self._factories)}"
                 )
             name = self._default_name
-        with self._build_lock:
-            if name not in self._models:
-                if name not in self._factories:
-                    raise ValueError(
-                        f"Unknown model name {name!r}. Known: {sorted(self._factories)}"
-                    )
-                self._models[name] = self._factories[name]()
+        if name in self._models:
             return self._models[name]
+        if name not in self._factories:
+            raise ValueError(
+                f"Unknown model name {name!r}. Known: {sorted(self._factories)}"
+            )
+        # Concurrent calls share one build. The shield keeps a cancelled call
+        # from cancelling the build the others wait for.
+        build = self._builds.get(name)
+        if build is None:
+            build = asyncio.ensure_future(self._build(name))
+            self._builds[name] = build
+        return await asyncio.shield(build)
+
+    async def _build(self, name: str) -> Model:
+        try:
+            # Factories can be slow. A synchronous one runs on a thread, so the
+            # event loop keeps heartbeating while a cold worker builds the
+            # model. An async one runs on the event loop, so it can create
+            # clients that need it, such as an aiohttp session.
+            model = await asyncio.to_thread(self._factories[name])
+            if inspect.isawaitable(model):
+                model = await model
+        except BaseException:
+            del self._builds[name]
+            raise
+        self._models[name] = model
+        return model
 
     @activity.defn(name="strands_get_model_config")
     async def get_model_config(self, input: _ModelConfigInput) -> _ModelConfig:

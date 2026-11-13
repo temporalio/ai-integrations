@@ -81,7 +81,7 @@ The error fails the workflow task, so the run stays open until you deploy a fix,
 
 ## Models
 
-`StrandsPlugin(models=...)` takes a mapping of `name → factory`. Each factory is called lazily on first use (on the worker, outside the workflow sandbox, on a thread so a slow factory doesn't hold up heartbeats) and the constructed model is cached for the worker's lifetime. `TemporalAgent(model="name", ...)` selects which factory to invoke and carries the activity options for that agent's model calls. If `models` is omitted, the plugin registers a single `BedrockModel` factory under the name `"bedrock"` with Botocore retries disabled so Temporal owns retries.
+`StrandsPlugin(models=...)` takes a mapping of `name → factory`. Each factory is called lazily on first use, on the worker and outside the workflow sandbox, and the constructed model is cached for the worker's lifetime. A synchronous factory runs on a thread, so a slow one doesn't hold up heartbeats. That thread has no event loop, so if the model needs one when it's built, for example a client with an `aiohttp.ClientSession`, use an `async def` factory: it runs on the worker's event loop. An async factory must not block that loop. `TemporalAgent(model="name", ...)` selects which factory to invoke and carries the activity options for that agent's model calls. If `models` is omitted, the plugin registers a single `BedrockModel` factory under the name `"bedrock"` with Botocore retries disabled so Temporal owns retries.
 
 ```python
 from botocore.config import Config as BotocoreConfig
@@ -111,6 +111,8 @@ Worker(..., plugins=[StrandsPlugin(models={
 ```
 
 Each `TemporalAgent` carries its own activity options (timeouts, retry policy, task queue, streaming topic) and dispatches to the shared model activity, which resolves the model name against the registered factories at runtime. A name not present in `models` raises `ValueError` inside the activity.
+
+`heartbeat_timeout` defaults to 10 seconds. The model activities heartbeat on a timer while the model runs, so a cancel reaches a running model call and a lost worker is noticed before the start-to-close timeout. Pass `heartbeat_timeout=None` to turn heartbeats off. The timer runs on the worker's event loop, so it only works for models that don't block that loop. In Strands 1.56.0, `SageMakerAIModel` and `LlamaAPIModel` call their synchronous clients on the event loop during a model call. A call longer than the heartbeat timeout then fails with a heartbeat timeout on a healthy worker, and every retry does the same. For these models, pass `heartbeat_timeout=None` (or a timeout longer than your longest model call) to their `TemporalAgent`. A cancel then waits for the model call to finish.
 
 Before its first invocation in a workflow, each `TemporalAgent` reads the worker model's `model_id` and `context_window_limit` with the `strands_get_model_config` activity, using the agent's activity options. `agent.model.get_config()` returns them, so proactive compression, `context_manager="auto"` and Strands' tracing use the real model's window and id, as they do natively. No other part of the model's config is sent to the workflow. The read is a new activity, so a run whose agent ran before you deploy this version fails to replay on it: let those runs finish first, or use Worker Versioning.
 

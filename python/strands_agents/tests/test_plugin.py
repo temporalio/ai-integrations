@@ -35,7 +35,7 @@ from tests.common import CompressionCodec
 from tests.mock_model import MockModel
 
 
-def test_default_bedrock_model_disables_botocore_retries(
+async def test_default_bedrock_model_disables_botocore_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_configs: list[BotocoreConfig] = []
@@ -55,7 +55,7 @@ def test_default_bedrock_model_disables_botocore_retries(
         typing.cast(typing.Any, activities[0]).__self__,
     )
 
-    assert model_activity._get_model(None) is model
+    assert await model_activity._model(None) is model
     assert len(captured_configs) == 1
     assert getattr(captured_configs[0], "read_timeout") == DEFAULT_READ_TIMEOUT
     assert getattr(captured_configs[0], "retries") == {"max_attempts": 0}
