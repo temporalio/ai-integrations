@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib.metadata
 from typing import Any
 
 import pytest
@@ -138,7 +139,11 @@ def test_passthrough_modules() -> None:
 def test_version_and_name() -> None:
     plugin = MicrosoftAgentFrameworkPlugin()
     assert plugin.name() == "microsoft.AgentFrameworkPlugin"
-    assert plugin.version() == "0.0.0"
+    # The release workflow injects the tag version before the tests run, so
+    # the assertion follows the installed distribution.
+    assert plugin.version() == importlib.metadata.version(
+        "temporalio-microsoft-agent-framework"
+    )
 
 
 def test_warns_on_replay_unsafe_otel_providers(monkeypatch: pytest.MonkeyPatch) -> None:
