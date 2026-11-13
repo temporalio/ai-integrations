@@ -34,10 +34,14 @@ function abortReason(signal: AbortSignal): unknown {
   return Object.assign(new Error(String(message)), { name });
 }
 
+// An older Event History can hold a model call that ran to its end after its signal
+// aborted. Such a history replays only if the abort still sends no command.
+const ABORT_CANCELS_ACTIVITY_PATCH = 'vercel-ai-sdk-abort-signal-cancels-model-activity';
+
 // An `AbortSignal` can't cross the payload converter, so the caller's signal cancels the
 // Activity from the Workflow instead.
 async function runAbortable<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
-  if (signal === undefined) return await fn();
+  if (signal === undefined || !workflow.patched(ABORT_CANCELS_ACTIVITY_PATCH)) return await fn();
   if (signal.aborted) throw abortReason(signal);
   const scope = new workflow.CancellationScope();
   const onAbort = (): void => scope.cancel();

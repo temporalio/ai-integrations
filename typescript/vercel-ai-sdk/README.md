@@ -154,4 +154,9 @@ fails with `AbortSignal is not defined`, and `stepMs` fails with
 `DOMException is not defined` when its timer fires. Use the Activity
 `startToCloseTimeout` instead.
 
+The cancellation is behind a Workflow patch. An execution that started on an
+earlier version replays as it ran then, when an abort sent no command. The new
+behavior starts with the first model call that is not a replay. A call without
+an `abortSignal` records no patch marker.
+
 Development details are in [typescript/README.md](../README.md).

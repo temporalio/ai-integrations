@@ -72,6 +72,7 @@ import { AiSdkPlugin, createActivities } from '..';
 import { startLocalWithRetry } from './helpers/environment';
 import {
   abortableEmbedWorkflow,
+  abortDuringEmbedWorkflow,
   abortableGenerateWorkflow,
   abortableStreamWorkflow,
   abortRequest,
@@ -1899,6 +1900,43 @@ test('abortSignal that aborts during streamText ends the stream with an abort pa
     await assertEventually(t, (tt) => {
       tt.true(provider.providerAborted);
     }, 10_000);
+  });
+});
+
+test('A history where an abort during embedMany cancelled nothing still replays', async (t) => {
+  // Recorded before an abort cancelled the model Activity. The signal aborted while
+  // `invokeEmbeddingModel` ran, and the Activity then completed.
+  const histories = path.join(__dirname, '../../src/__tests__/histories');
+  const recorded = readFileSync(
+    path.join(histories, 'embed-abort-before-cancel-patch.json'),
+    'utf8'
+  );
+  await CoreWorker.runReplayHistory(
+    {
+      workflowBundle: t.context.workflowBundle,
+      plugins: [new AiSdkPlugin({ modelProvider: new AbortRecordingProvider(false) })],
+    },
+    historyFromJSON(JSON.parse(recorded))
+  );
+  t.pass();
+});
+
+test('An abort during embedMany cancels the Activity in a new execution', async (t) => {
+  const provider = new AbortRecordingProvider(true);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(abortDuringEmbedWorkflow);
+    await assertEventually(t, (tt) => {
+      tt.true(provider.started);
+    }, 10_000);
+    await handle.signal(abortRequest);
+    t.is(await handle.result(), 'error:AbortError|true');
+    const { events } = await handle.fetchHistory();
+    t.true(
+      events!.some((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED)
+    );
   });
 });
 

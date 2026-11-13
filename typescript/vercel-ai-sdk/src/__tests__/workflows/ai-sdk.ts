@@ -385,6 +385,21 @@ export async function abortableEmbedWorkflow(): Promise<number> {
   return result.embeddings.length;
 }
 
+export async function abortDuringEmbedWorkflow(): Promise<string> {
+  const controller = new AbortController();
+  setHandler(abortRequest, () => controller.abort());
+  try {
+    const result = await embedMany({
+      model: abortTestProvider.embeddingModel('text-embedding-3-small'),
+      values: ['a', 'b'],
+      abortSignal: controller.signal,
+    });
+    return `count:${result.embeddings.length}`;
+  } catch (err) {
+    return `error:${describeError(err)}`;
+  }
+}
+
 export async function abortableStreamWorkflow(): Promise<string[]> {
   new WorkflowStream();
   const controller = new AbortController();
