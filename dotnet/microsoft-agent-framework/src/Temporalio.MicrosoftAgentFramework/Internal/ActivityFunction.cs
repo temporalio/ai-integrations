@@ -186,13 +186,11 @@ internal sealed class ActivityFunction : AIFunction
             {
                 args[i] = parameter.DefaultValue;
             }
-            else if (!parameter.ParameterType.IsValueType || Nullable.GetUnderlyingType(parameter.ParameterType) is not null)
-            {
-                args[i] = null;
-            }
             else
             {
-                throw new ArgumentException($"Tool '{Name}' was called without the required argument '{parameter.Name}'.");
+                // The message AIFunctionFactory uses; the loop turns it into "Error: Function failed." for the
+                // model, and no Activity runs with a null where the method expects a value.
+                throw new ArgumentException($"The arguments dictionary is missing a value for the required parameter '{parameter.Name}'.", nameof(arguments));
             }
         }
 

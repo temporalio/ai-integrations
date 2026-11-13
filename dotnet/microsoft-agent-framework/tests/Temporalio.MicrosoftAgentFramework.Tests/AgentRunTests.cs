@@ -255,6 +255,19 @@ public class AgentRunTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task ActivityTool_MissingRequiredArgument_FailsTheCallBeforeAnyActivity()
+    {
+        var fake = new FakeChatClient(
+            ScriptedResponse.ToolCalls(("get_weather", new Dictionary<string, object?>())),
+            ScriptedResponse.Text("Final"));
+        var (result, handle) = await RunAsync(TestPlugin.For(fake), (ToolsWorkflow wf) => wf.RunAsync(new ToolsInput("Weather?", "activity-expression")));
+        Assert.Equal("Final", result.Text);
+        Assert.False(HistoryAssert.ActivityCounts(await handle.FetchHistoryAsync()).ContainsKey("GetWeather"));
+        var toolResult = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
+        Assert.Equal("Error: Function failed.", toolResult.Result?.ToString());
+    }
+
+    [Fact]
     public async Task HostedMcpServerTool_WithHeadersInTheWorkflow_FailsTheRunBeforeAnyActivity()
     {
         var fake = new FakeChatClient(ScriptedResponse.Text("never"));
