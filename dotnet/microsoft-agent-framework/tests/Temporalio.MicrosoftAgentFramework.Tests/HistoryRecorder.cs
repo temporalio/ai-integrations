@@ -17,7 +17,7 @@ public static class HistoryRecorder
         }
 
         var history = await handle.FetchHistoryAsync();
-        var directory = Path.Combine(AppContext.BaseDirectory, "recorded-histories");
+        var directory = Path.Combine(PluginMeta.Root, "TestResults", "recorded-histories");
         Directory.CreateDirectory(directory);
         await File.WriteAllTextAsync(Path.Combine(directory, name + ".json"), history.ToJson());
     }
