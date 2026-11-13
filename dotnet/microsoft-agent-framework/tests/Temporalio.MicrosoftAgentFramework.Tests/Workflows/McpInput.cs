@@ -8,4 +8,5 @@ public sealed record McpInput(
     bool CacheTools = false,
     bool ListTwice = false,
     bool PinnedCatalog = false,
-    int MaxAttempts = 0);
+    int MaxAttempts = 0,
+    string PinnedTool = "add");

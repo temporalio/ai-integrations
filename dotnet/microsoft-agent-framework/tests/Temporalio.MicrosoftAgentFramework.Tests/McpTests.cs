@@ -199,7 +199,7 @@ public class McpTests : WorkflowTestBase
     }
 
     [Fact]
-    public async Task ToolError_NonRetryable_McpError_ModelToldFunctionFailed()
+    public async Task ToolError_GoesBackToTheModel_AsMcpClientToolDelivers()
     {
         await using var mcp = NewServer();
         var fake = new FakeChatClient(
@@ -207,6 +207,38 @@ public class McpTests : WorkflowTestBase
             ScriptedResponse.Text("Recovered"));
         var (result, handle) = await RunAsync(TestPlugin.WithMcp(fake, Server, mcp), (McpWorkflow wf) => wf.RunAsync(new McpInput(Server, "fail")));
         Assert.Equal("Recovered", result.Text);
+        var history = await handle.FetchHistoryAsync();
+        Assert.DoesNotContain(history.Events, e => e.ActivityTaskFailedEventAttributes is not null);
+        Assert.Equal(1, HistoryAssert.LastAttempt(history, ModelActivityNames.McpCallTool));
+
+        // The whole result, error flag included, so the model reads the server's text and can correct the call.
+        var toolResult = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
+        var envelope = Assert.IsType<System.Text.Json.JsonElement>(toolResult.Result);
+        Assert.True(envelope.GetProperty("isError").GetBoolean());
+        var text = envelope.GetProperty("content").EnumerateArray().Single().GetProperty("text").GetString();
+        Assert.Contains("fail", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PlainTextResult_ReachesTheProviderClientAsTextContent()
+    {
+        await using var mcp = NewServer();
+        var fake = AddFake();
+        var (result, _) = await RunAsync(TestPlugin.WithMcp(fake, Server, mcp), (McpWorkflow wf) => wf.RunAsync(new McpInput(Server, "add 2 and 3")));
+        Assert.Equal("Final: 5", result.Text);
+        var toolResult = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
+        var text = Assert.IsType<TextContent>(toolResult.Result);
+        Assert.Equal("5", text.Text);
+    }
+
+    [Fact]
+    public async Task ProtocolError_FailsTheActivity_NonRetryable_ModelToldFunctionFailed()
+    {
+        await using var mcp = NewServer();
+        var fake = AddFake("missing");
+        var input = new McpInput(Server, "add 2 and 3", PinnedCatalog: true, PinnedTool: "missing", MaxAttempts: 3);
+        var (result, handle) = await RunAsync(TestPlugin.WithMcp(fake, Server, mcp), (McpWorkflow wf) => wf.RunAsync(input));
+        Assert.Equal("Final: 5", result.Text);
         var history = await handle.FetchHistoryAsync();
         var failed = Assert.Single(history.Events, e => e.ActivityTaskFailedEventAttributes is not null);
         var info = failed.ActivityTaskFailedEventAttributes!.Failure.ApplicationFailureInfo;

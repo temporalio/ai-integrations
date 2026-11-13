@@ -14,7 +14,9 @@ public static class MicrosoftAgentFrameworkErrorTypes
     public const string ModelError = "MicrosoftAgentFrameworkModelError";
 
     /// <summary>
-    /// An MCP tool call returned <c>isError</c>, or the server does not know the tool. Non-retryable.
+    /// An MCP server rejected a call at the protocol level: an unknown tool, bad arguments or an
+    /// invalid request. Non-retryable. A result with <c>isError</c> is not a failure: it goes back
+    /// to the model as the server returned it.
     /// </summary>
     public const string McpError = "MicrosoftAgentFrameworkMcpError";
 

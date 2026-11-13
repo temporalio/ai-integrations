@@ -29,7 +29,7 @@ public class McpWorkflow
         if (input.PinnedCatalog)
         {
             var schema = JsonSerializer.Deserialize<JsonElement>(AddSchema);
-            tools = [new TemporalMcpTool(input.Server, new ToolDeclaration("add", "Adds two integers", schema), options)];
+            tools = [new TemporalMcpTool(input.Server, new ToolDeclaration(input.PinnedTool, "Adds two integers", schema), options)];
         }
         else
         {

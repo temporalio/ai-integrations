@@ -1,5 +1,8 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Extensions.AI;
+using ModelContextProtocol;
+using ModelContextProtocol.Protocol;
 using Temporalio.MicrosoftAgentFramework.Activities;
 using Temporalio.Workflows;
 
@@ -8,7 +11,10 @@ namespace Temporalio.MicrosoftAgentFramework.Mcp;
 /// <summary>
 /// A tool on an MCP server, callable from a Workflow. Each invocation is one
 /// <c>MicrosoftAgentFramework.McpCallTool</c> Activity. <see cref="TemporalMcpServer.ListToolsAsync"/>
-/// builds these from the server's catalog; build them yourself to pin a catalog in code.
+/// builds these from the server's catalog; build them yourself to pin a catalog in code. The
+/// result reaches the model the way the MCP C# SDK's <c>McpClientTool</c> delivers it: plain
+/// content blocks as <see cref="AIContent"/>, anything with an error flag, structured content or
+/// application metadata as the whole result.
 /// </summary>
 public sealed class TemporalMcpTool : AIFunction
 {
@@ -52,11 +58,43 @@ public sealed class TemporalMcpTool : AIFunction
     public override JsonElement? ReturnJsonSchema { get; }
 
     /// <summary>
-    /// Runs the call-tool Activity. The result is the MCP call result as JSON.
+    /// The mapping <c>McpClientTool.InvokeCoreAsync</c> applies: when the result carries no error
+    /// flag, no structured content and no application metadata, one content block becomes one
+    /// <see cref="AIContent"/> and several become a list; otherwise the whole result is returned,
+    /// so the model reads the server's error text and can correct the call.
+    /// </summary>
+    /// <param name="element">The call result the Activity returned.</param>
+    /// <returns>The function result.</returns>
+    internal static object ToFunctionResult(JsonElement element)
+    {
+        if (element.Deserialize(McpJsonUtilities.DefaultOptions.GetTypeInfo(typeof(CallToolResult))) is not CallToolResult result)
+        {
+            return element;
+        }
+
+        if (result.IsError is not true && result.StructuredContent is null && !HasApplicationResultMetadata(result.Meta))
+        {
+            switch (result.Content.Count)
+            {
+                case 1 when result.Content[0].ToAIContent(McpJsonUtilities.DefaultOptions) is { } content:
+                    return content;
+                case > 1 when result.Content.Select(block => block.ToAIContent(McpJsonUtilities.DefaultOptions)).ToArray() is { } contents
+                              && Array.TrueForAll(contents, content => content is not null):
+                    return contents;
+                default:
+                    break;
+            }
+        }
+
+        return element;
+    }
+
+    /// <summary>
+    /// Runs the call-tool Activity and maps its result as <c>McpClientTool</c> does.
     /// </summary>
     /// <param name="arguments">Arguments the model supplied.</param>
     /// <param name="cancellationToken">Cancels the Activity.</param>
-    /// <returns>The call result as a <see cref="JsonElement"/>.</returns>
+    /// <returns>An <see cref="AIContent"/>, a list of them, or the whole call result as a <see cref="JsonElement"/>.</returns>
     protected override async ValueTask<object?> InvokeCoreAsync(AIFunctionArguments arguments, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(arguments);
@@ -67,7 +105,12 @@ public sealed class TemporalMcpTool : AIFunction
             activityOptions.CancellationToken = cancellationToken;
         }
 
-        return await Workflow.ExecuteActivityAsync(
+        var element = await Workflow.ExecuteActivityAsync(
             (McpActivities activities) => activities.CallToolAsync(call), activityOptions).ConfigureAwait(true);
+        return ToFunctionResult(element);
     }
+
+    // Server identity is protocol metadata; anything else in _meta is application data the model should see.
+    private static bool HasApplicationResultMetadata(JsonObject? meta) =>
+        meta is not null && meta.Any(property => !string.Equals(property.Key, MetaKeys.ServerInfo, StringComparison.Ordinal));
 }

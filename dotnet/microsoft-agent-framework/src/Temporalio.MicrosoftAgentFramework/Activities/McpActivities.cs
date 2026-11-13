@@ -40,11 +40,14 @@ public sealed class McpActivities
     }
 
     /// <summary>
-    /// Calls one tool. A result with <c>isError</c>, or a protocol error for an unknown tool or
-    /// bad arguments, fails with <see cref="MicrosoftAgentFrameworkErrorTypes.McpError"/> and no retry.
+    /// Calls one tool and returns the server's result as it came, error flag included, so the
+    /// Workflow-side tool can hand the model the server's text the way the MCP C# SDK's
+    /// <c>McpClientTool</c> does. A protocol error for an unknown tool or bad arguments fails with
+    /// <see cref="MicrosoftAgentFrameworkErrorTypes.McpError"/> and no retry, as <c>McpClientTool</c>
+    /// throws <c>McpException</c>.
     /// </summary>
     /// <param name="input">Server, tool and arguments.</param>
-    /// <returns>The MCP call result as JSON: its content blocks and structured content.</returns>
+    /// <returns>The MCP call result as JSON: its content blocks, structured content and error flag.</returns>
     [Activity(CallToolActivityName)]
     public async Task<JsonElement> CallToolAsync(McpToolCall input)
     {
@@ -63,15 +66,6 @@ public sealed class McpActivities
             throw new ApplicationFailureException(
                 $"MCP tool '{input.Name}' on server '{input.Server}' rejected the call: {exception.Message}",
                 exception,
-                errorType: MicrosoftAgentFrameworkErrorTypes.McpError,
-                nonRetryable: true);
-        }
-
-        if (result.IsError == true)
-        {
-            var text = string.Join(string.Empty, result.Content.OfType<TextContentBlock>().Select(block => block.Text));
-            throw new ApplicationFailureException(
-                $"MCP tool '{input.Name}' on server '{input.Server}' returned an error: {text}",
                 errorType: MicrosoftAgentFrameworkErrorTypes.McpError,
                 nonRetryable: true);
         }
