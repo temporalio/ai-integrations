@@ -90,11 +90,41 @@ The plugin registers three Activities on the worker: `MicrosoftAgentFramework.In
 
 ## Chat clients and credentials
 
-`MicrosoftAgentFrameworkPluginOptions.ChatClients` maps a model name to a factory. The factory runs once per worker, on the first model call that names it, and the client is reused for the worker's lifetime. The Workflow only ever sees the name: `new TemporalAgent("gpt-4o-mini")` or `new TemporalChatClient("gpt-4o-mini")`. A name without a factory, or a factory that throws (for example when `OPENAI_API_KEY` is not set), fails the Activity with error type `MicrosoftAgentFrameworkConfigurationError` and no retry; the failure carries the factory's exception message, and the Workflow fails unless it catches the `ActivityFailureException`.
+`MicrosoftAgentFrameworkPluginOptions.ChatClients` maps a model name to a factory. The factory runs once per worker, on the first model call that names it, and the client is reused for the worker's lifetime. The Workflow only ever sees the name: `new TemporalAgent("gpt-4o-mini")` or `new TemporalChatClient("gpt-4o-mini")`. A name without a factory, or a factory that returns null, fails the Activity with error type `MicrosoftAgentFrameworkConfigurationError` and no retry. A factory that throws (for example when `OPENAI_API_KEY` is not set) fails the attempt with the same error type, logs the exception on the worker, and is retried under the Activity's retry policy, so a worker fixed in place picks the run up; set `MaximumAttempts` or a schedule-to-close timeout when you want the run to fail instead.
 
 Register as many names as you need; two agents in one Workflow can use two models. Any `ChatClientBuilder` pipeline works in the factory (`UseOpenTelemetry`, `UseLogging`, caching) with one exception: a client that contains `FunctionInvokingChatClient` is rejected with `MicrosoftAgentFrameworkConfigurationError`, because it would run tools inside the model Activity instead of in the Workflow.
 
 For Azure OpenAI, build the client the same way and set `AzureOpenAIClientOptions.RetryPolicy = new ClientRetryPolicy(maxRetries: 0)`.
+
+Credentials stay in the factory. `ChatOptions.AdditionalProperties` and `AgentRunOptions.AdditionalProperties` are recorded in Event History with the model Activity's input, so an entry named `authorization`, `x-api-key` or `api-key`, at the top level or inside a nested headers dictionary, fails the run with `MicrosoftAgentFrameworkWorkflowError` before any Activity is scheduled.
+
+The quickstart's Chat Completions client stores nothing on OpenAI's side. The Responses client (`GetResponsesClient().AsIChatClient(model)`) stores every response there unless told otherwise, and the plugin never reads those copies: it sends the transcript on every call and never sets `previous_response_id` or a conversation id, because the Workflow holds the history. Microsoft.Extensions.AI exposes that switch only through `ChatOptions.RawRepresentationFactory` and the OpenAI SDK's own types, and the plugin references no provider SDK, so turn storage off in the factory with a wrapper:
+
+```csharp
+using System.ClientModel;
+using Microsoft.Extensions.AI;
+using OpenAI;
+using OpenAI.Responses;
+
+#pragma warning disable OPENAI001 // The Responses client is marked experimental in OpenAI 2.13 and Microsoft.Extensions.AI.OpenAI 10.10.
+
+public static class ResponsesClients
+{
+    // Temporal holds the transcript, so the Responses API does not need to keep a copy of each response.
+    public static IChatClient WithoutStoredResponses(string apiKey, string model) =>
+        new OpenAIClient(new ApiKeyCredential(apiKey)).GetResponsesClient().AsIChatClient(model)
+            .AsBuilder()
+            .Use((messages, options, next, cancellationToken) =>
+            {
+                options ??= new ChatOptions();
+                options.RawRepresentationFactory = _ => new CreateResponseOptions { StoredOutputEnabled = false };
+                return next(messages, options, cancellationToken);
+            })
+            .Build();
+}
+```
+
+A reasoning model needs `IncludedProperties` with the encrypted reasoning content on the same options once storage is off, or its reasoning does not carry across the tool rounds of a run; that choice belongs to the factory, which is why the plugin does not set the switch for you. A `RawRepresentationFactory` set in Workflow code is dropped with a warning, because it cannot cross the Activity boundary.
 
 The headers of a hosted MCP server tool follow the same rule: set them on the worker, in `MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders`, never on the `HostedMcpServerTool` in the Workflow. The Hosted tools section below has the details.
 
@@ -125,7 +155,7 @@ public static class ModelOptions
 
 Temporal's default retry policy has no attempt limit, so a retryable provider error retries until the Workflow is closed. Set `MaximumAttempts` when you want the run to fail instead.
 
-Provider errors are classified by HTTP status, never by message text, with the rule the Python plugin uses: 408, 409, 429 and 5xx fail with error type `MicrosoftAgentFrameworkModelError` and are retried; every other 4xx fails with the same error type and `NonRetryable = true`. A provider `x-should-retry` header of `true` or `false` overrides the status rule. When the OpenAI or Azure OpenAI exception carries `retry-after-ms` or `Retry-After` (seconds or an HTTP date), that delay becomes the next retry interval. Exceptions without a status, such as a provider SDK's own exception types, propagate unchanged and retry. The two ways of reading the status come from Cecil Phillip's draft at https://github.com/temporal-community/temporal-dotnet-agents.
+Provider errors are classified by HTTP status, never by message text, with the rule the Python plugin uses: 408, 409, 429 and 5xx fail with error type `MicrosoftAgentFrameworkModelError` and are retried; every other 4xx fails with the same error type and `NonRetryable = true`. A provider `x-should-retry` header of `true` or `false` overrides the status rule. When the OpenAI or Azure OpenAI exception carries `retry-after-ms`, or else `Retry-After` as seconds, with a fraction, or as an HTTP date, that delay becomes the next retry interval, capped at 60 seconds as the OpenAI SDK caps it; a value the plugin cannot read is skipped. Exceptions without a status, such as a provider SDK's own exception types, propagate unchanged and retry. The two ways of reading the status come from Cecil Phillip's draft at https://github.com/temporal-community/temporal-dotnet-agents.
 
 ## Tools
 
@@ -233,9 +263,9 @@ public class McpWorkflow
 }
 ```
 
-`ListToolsAsync` is one `MicrosoftAgentFramework.McpListTools` Activity and returns a `TemporalMcpTool` per tool with the server's full input schema, so the model sees the parameters. Each call is one `MicrosoftAgentFramework.McpCallTool` Activity (60-second start-to-close timeout by default). The plugin opens one `McpClient` per server on first use, shares it across Activities and across every worker running with the same plugin instance, closes it after `McpConnectionIdleTimeout` (default 5 minutes) without a call, and closes everything when the last of those workers (or a replayer) stops; stopping one worker leaves the others' calls running on the connection. `CacheTools = true` lets the worker answer the list Activity from the list it fetched earlier on the same connection; the default lists every time so a changed server is seen. Set `ToolNamePrefix` when two servers share a tool name; calls reach the server under the original name. The prefix is prepended as is, with no separator, so pass `docs_` to get `docs_read_file`. Names in `ChatOptions.Tools` must be unique; when two servers or a server and a local tool share a name, the first match runs.
+`ListToolsAsync` is one `MicrosoftAgentFramework.McpListTools` Activity and returns a `TemporalMcpTool` per tool with the server's full input schema, so the model sees the parameters. Each call is one `MicrosoftAgentFramework.McpCallTool` Activity (60-second start-to-close timeout by default). The plugin opens one `McpClient` per server on first use, shares it across Activities and across every worker running with the same plugin instance, closes it after `McpConnectionIdleTimeout` (default 5 minutes) without a call, and closes everything when the last of those workers (or a replayer) stops; stopping one worker leaves the others' calls running on the connection. `CacheTools = true` lets the worker answer the list Activity from the list it fetched earlier on the same connection; the default lists every time so a changed server is seen. Set `ToolNamePrefix` when two servers share a tool name; calls reach the server under the original name. The names the model sees follow Agent Framework's MCP rule: characters outside `A-Za-z0-9_.-` become `-`, and the prefix is joined with one `_`, so `docs` and `docs_` both give `docs_read_file`. Names in `ChatOptions.Tools` must be unique; when two servers or a server and a local tool share a name, the first match runs.
 
-A result with `isError`, an unknown tool or bad arguments fails the Activity with error type `MicrosoftAgentFrameworkMcpError` and no retry; the model is told the tool failed. A transport that cannot connect retries under the Activity's retry policy. A transport factory that throws fails the Activity with `MicrosoftAgentFrameworkConfigurationError` and no retry, like a chat client factory that throws.
+A result with `isError`, an unknown tool or bad arguments fails the Activity with error type `MicrosoftAgentFrameworkMcpError` and no retry; the model is told the tool failed. A transport that cannot connect retries under the Activity's retry policy. A transport factory that throws is logged and retried under the Activity's retry policy, like a chat client factory that throws; one that returns null fails with `MicrosoftAgentFrameworkConfigurationError` and no retry.
 
 The listed catalog says nothing about which tools have side effects. To pin a catalog instead of discovering it, build `TemporalMcpTool` yourself from a `ToolDeclaration` with the schema you expect, and wrap tools that need a human in `ApprovalRequiredAIFunction`. Sessions are stateless: one connection per plugin instance per server, no session affinity.
 
@@ -523,7 +553,7 @@ Two things follow for you. Call `RunAsync`, `RunAsync<T>` and `RunStreamingAsync
 - `AIAgent` generates a random id on construction. `TemporalAgent` never reads it: `Id` is `TemporalAgentOptions.Id`, then `Name`, then `temporal-agent`, so `AgentResponse.AgentId` is the same on every replay.
 - The plugin calls Agent Framework members marked experimental (`MAAI001`): the `ChatHistoryProvider.InvokingContext`, `ChatHistoryProvider.InvokedContext`, `AIContextProvider.InvokingContext` and `AIContextProvider.InvokedContext` constructors. The dependency floor is `Microsoft.Agents.AI` 1.26.0; a release that changes them shows up in this repository's nightly build.
 - The whole conversation is the input of every model Activity, so a long transcript grows both the per-call payload and the Event History. Continue-as-new bounds the History; only a shorter transcript (a trimmed session, or a summary your code produces) bounds the payload, which Temporal caps at 2 MiB.
-- Values in `AdditionalProperties` cross the Activity boundary as JSON. The plugin turns JSON primitives in `ChatOptions.AdditionalProperties` back into `bool`, `long`, `double` and `string` before the provider client sees them; nested objects there, and the `AdditionalProperties` of messages and responses, arrive as `JsonElement`.
+- Values in `AdditionalProperties` cross the Activity boundary as JSON and are recorded in Event History; an entry named like a credential header fails the run, see Chat clients and credentials. The plugin turns JSON primitives in `ChatOptions.AdditionalProperties` back into `bool`, `long`, `double` and `string` before the provider client sees them; nested objects there, and the `AdditionalProperties` of messages and responses, arrive as `JsonElement`.
 - Only the `AIContent` types Microsoft.Extensions.AI declares serialize. A custom `AIContent` subclass in a message or a provider response fails serialization at the Activity boundary.
 
 ## Composing with other plugins
