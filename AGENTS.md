@@ -138,8 +138,9 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   `typescript/_template/src/__tests__/`; the conventions check keeps each
   plugin's copies byte-identical to the templates.
 - `make sync` preserves the committed lock. `make sync-latest` updates compatible
-  ranges under the two-week pnpm release-age policy. Preserve first-party and
-  exact AI SDK dependency-family cooldown exceptions inherited from the SDK.
+  ranges under the two-week pnpm release-age policy. Preserve the `@temporalio/*`
+  cooldown exception. Temporary security exceptions name exact patched versions;
+  remove them after those versions pass the cooldown.
   `make check-deps` checks fresh resolution with a temporary lockfile and scripts
   disabled, preserving the committed lockfile and installed dependencies.
 - Activity names remain stable for workflow replay compatibility.
