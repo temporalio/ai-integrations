@@ -282,7 +282,7 @@ The key is the tool's `ServerName`; a server without an entry gets no headers. N
 
 ## Approvals
 
-Agent Framework's approval contract applies, with the two differences described below. Wrap a tool in `ApprovalRequiredAIFunction` and the run returns a `ToolApprovalRequestContent` instead of calling it; the request id is `ficc_` plus the call id. Your Workflow decides how the answer arrives. The example uses a Query to show the pending request and an Update with a validator to deliver the decision:
+Agent Framework's approval contract applies, with the two differences described below. Wrap a tool in `ApprovalRequiredAIFunction` and the run returns a `ToolApprovalRequestContent` instead of calling it; the request id is `ficc_` plus the call id. Your Workflow decides how the answer arrives. The example uses a Query to show the pending requests and an Update to deliver each decision:
 
 ```csharp
 using Microsoft.Agents.AI;
@@ -291,29 +291,47 @@ using Temporalio.MicrosoftAgentFramework;
 using Temporalio.Exceptions;
 using Temporalio.Workflows;
 
+public record ApprovalDecision(string RequestId, bool Approved, string? Reason = null);
+
 [Workflow]
 public class ApprovalWorkflow
 {
-    private readonly Dictionary<string, ToolApprovalResponseContent> decisions = new();
-    private ToolApprovalRequestContent? pending;
+    private readonly Dictionary<string, ToolApprovalRequestContent> pending = new();
+    private readonly Dictionary<string, ApprovalDecision> decisions = new();
+    private bool awaitingReply;
 
     [WorkflowQuery]
-    public ToolApprovalRequestContent? PendingApproval() => pending;
+    public IReadOnlyList<ToolApprovalRequestContent> PendingApprovals() => pending.Values.ToList();
 
     [WorkflowUpdateValidator(nameof(DecideAsync))]
-    public void ValidateDecision(ToolApprovalResponseContent decision)
+    public void ValidateDecision(ApprovalDecision decision)
     {
-        if (pending is null || pending.RequestId != decision.RequestId)
+        // Validators run before the Workflow sees the model's reply, so this one checks the input
+        // and not the state. Bad input never enters history.
+        if (string.IsNullOrEmpty(decision.RequestId))
         {
-            throw new ApplicationFailureException($"No pending approval {decision.RequestId}");
+            throw new ApplicationFailureException("RequestId is required");
         }
     }
 
     [WorkflowUpdate]
-    public Task DecideAsync(ToolApprovalResponseContent decision)
+    public async Task<string> DecideAsync(ApprovalDecision decision)
     {
+        // A decision can arrive in the same Workflow Task as the model's reply, before RunAsync has
+        // read the requests in that reply. Judge the id once the reply has been read.
+        await Workflow.WaitConditionAsync(() => !awaitingReply);
+        if (decisions.ContainsKey(decision.RequestId))
+        {
+            throw new ApplicationFailureException($"Approval request '{decision.RequestId}' is already decided");
+        }
+
+        if (!pending.ContainsKey(decision.RequestId))
+        {
+            throw new ApplicationFailureException($"No pending approval request '{decision.RequestId}'");
+        }
+
         decisions[decision.RequestId] = decision;
-        return Task.CompletedTask;
+        return decision.Approved ? "approved" : "rejected";
     }
 
     [WorkflowRun]
@@ -325,26 +343,50 @@ public class ApprovalWorkflow
             ChatOptions = new ChatOptions { Tools = [new ApprovalRequiredAIFunction(sendEmail)] },
         });
         var session = await agent.CreateSessionAsync();
-        var response = await agent.RunAsync(prompt, session);
-        var request = response.Messages.SelectMany(m => m.Contents).OfType<ToolApprovalRequestContent>().FirstOrDefault();
-        while (request is not null)
+        var response = await ReplyAsync(agent, new ChatMessage(ChatRole.User, prompt), session);
+        var requests = ApprovalRequests(response);
+        while (requests.Count > 0)
         {
-            pending = request;
-            var requestId = request.RequestId;
-            await Workflow.WaitConditionAsync(() => decisions.ContainsKey(requestId));
-            pending = null;
-            response = await agent.RunAsync(new ChatMessage(ChatRole.User, [decisions[requestId]]), session);
-            request = response.Messages.SelectMany(m => m.Contents).OfType<ToolApprovalRequestContent>().FirstOrDefault();
+            foreach (var request in requests)
+            {
+                pending[request.RequestId] = request;
+            }
+
+            // No Activity is open while the Workflow waits: the wait costs nothing and survives a worker restart.
+            await Workflow.WaitConditionAsync(() => pending.Keys.All(decisions.ContainsKey));
+            var replies = requests
+                .Select(request => (AIContent)request.CreateResponse(decisions[request.RequestId].Approved, decisions[request.RequestId].Reason))
+                .ToList();
+            pending.Clear();
+            response = await ReplyAsync(agent, new ChatMessage(ChatRole.User, replies), session);
+            requests = ApprovalRequests(response);
         }
 
+        await Workflow.WaitConditionAsync(() => Workflow.AllHandlersFinished);
         return response.Text;
+    }
+
+    private static List<ToolApprovalRequestContent> ApprovalRequests(AgentResponse response) =>
+        response.Messages.SelectMany(m => m.Contents).OfType<ToolApprovalRequestContent>().ToList();
+
+    private async Task<AgentResponse> ReplyAsync(TemporalAgent agent, ChatMessage message, AgentSession session)
+    {
+        awaitingReply = true;
+        try
+        {
+            return await agent.RunAsync(message, session);
+        }
+        finally
+        {
+            awaitingReply = false;
+        }
     }
 }
 ```
 
-The client reads `PendingApproval`, shows the `FunctionCallContent` in `request.ToolCall`, and sends `request.CreateResponse(approved: true)` or `request.CreateResponse(false, "reason")` through the Update. A Signal works the same way when no validation or return value is needed. The next run on the same session executes approved calls, gives the model `Tool call invocation was rejected by the approver and must not be retried.` plus your reason for rejected ones, and never sends the approval contents to the provider.
+The client reads `PendingApprovals`, shows the `FunctionCallContent` in each `request.ToolCall`, and sends an `ApprovalDecision` through the Update; the Workflow turns it into `request.CreateResponse(approved, reason)` and runs the agent again. The validator checks only that an id is present, because validators run before the Workflow has read the model's reply; the handler waits for that, then fails the Update, not the Workflow, for an id that is unknown or already decided. A Signal works the same way when no return value is needed. The next run on the same session executes approved calls, gives the model `Tool call invocation was rejected by the approver and must not be retried.` plus your reason for rejected ones, and never sends the approval contents to the provider.
 
-The plugin binds each response to the request it surfaced, as Agent Framework's default middleware does: the call that runs is the one the session recorded under that request id, with the name and arguments the human saw, so a response that carries a changed `FunctionCallContent` cannot redirect the call. Your Workflow only has to check the request id, as the validator above does. A request that appears only in a run's input cannot authorize anything.
+The plugin binds each response to the request it surfaced, as Agent Framework's default middleware does: the call that runs is the one the session recorded under that request id, with the name and arguments the human saw, so a response that carries a changed `FunctionCallContent` cannot redirect the call. Your Workflow only has to check the request id, as the Update handler above does. A request that appears only in a run's input cannot authorize anything.
 
 Two things differ from `ChatClientAgent`, which rejects an unanswered request on the caller's behalf and ignores a response it did not record. Here a request that reaches the next run without a response, and a response whose request id the session never surfaced, both fail the run with `MicrosoftAgentFrameworkWorkflowError`: a durable Workflow should not drop a pending decision silently. A run that fails after the decision, for example because the final model call failed for good, stores nothing in the session, as under `ChatClientAgent`; retry the same run with the same decision, and expect the approved call to run again.
 

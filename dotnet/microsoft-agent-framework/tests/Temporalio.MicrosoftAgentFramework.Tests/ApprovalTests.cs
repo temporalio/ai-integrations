@@ -75,21 +75,30 @@ public class ApprovalTests : WorkflowTestBase
         await WithWorkerAsync(worker, async () =>
         {
             var handle = await Client.StartWorkflowAsync((ApprovalUpdateWorkflow wf) => wf.RunAsync("Email ops"), Fixture.WorkflowOptions(worker, "approval-update"));
-            ToolApprovalRequestContent? pending = null;
-            for (var i = 0; i < 200 && pending is null; i++)
+            IReadOnlyList<ToolApprovalRequestContent> pending = [];
+            for (var i = 0; i < 200 && pending.Count == 0; i++)
             {
                 await Task.Delay(50, TestContext.Current.CancellationToken);
-                pending = await handle.QueryAsync(wf => wf.PendingApproval());
+                pending = await handle.QueryAsync(wf => wf.PendingApprovals());
             }
 
-            Assert.NotNull(pending);
-            var bogus = new ToolApprovalResponseContent("ficc_nope", true, pending.ToolCall);
-            var rejected = await Assert.ThrowsAsync<WorkflowUpdateFailedException>(() => handle.ExecuteUpdateAsync(wf => wf.DecideAsync(bogus)));
-            Assert.Contains("ficc_nope", rejected.InnerException?.Message, StringComparison.Ordinal);
+            var request = Assert.Single(pending);
+            Assert.Equal("send_email", ((FunctionCallContent)request.ToolCall).Name);
 
-            var text = await handle.ExecuteUpdateAsync(wf => wf.DecideAsync(pending.CreateResponse(true)));
-            Assert.Equal("Done", text);
+            // The validator rejects an empty id; the handler rejects an id that is not pending.
+            var empty = new ApprovalDecision(string.Empty, true);
+            var invalid = await Assert.ThrowsAsync<WorkflowUpdateFailedException>(() => handle.ExecuteUpdateAsync(wf => wf.DecideAsync(empty)));
+            Assert.Contains("RequestId is required", invalid.InnerException?.Message, StringComparison.Ordinal);
+            var bogus = new ApprovalDecision("ficc_nope", true);
+            var rejected = await Assert.ThrowsAsync<WorkflowUpdateFailedException>(() => handle.ExecuteUpdateAsync(wf => wf.DecideAsync(bogus)));
+            Assert.Contains("No pending approval request 'ficc_nope'", rejected.InnerException?.Message, StringComparison.Ordinal);
+
+            var text = await handle.ExecuteUpdateAsync(wf => wf.DecideAsync(new ApprovalDecision(request.RequestId, true)));
+            Assert.Equal("approved", text);
             Assert.Equal("Done", await handle.GetResultAsync());
+            Assert.Equal(2, fake.CallCount);
+            var result = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
+            Assert.Equal("email sent to ops@example.com", result.Result?.ToString());
         });
     }
 
