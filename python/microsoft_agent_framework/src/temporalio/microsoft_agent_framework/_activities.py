@@ -27,9 +27,9 @@ STREAM_ERROR_TYPE = "MicrosoftAgentFrameworkStreamError"
 UNKNOWN_CHAT_CLIENT_TYPE = "MicrosoftAgentFrameworkUnknownChatClient"
 """``ApplicationError.type`` of a call for a model name the worker does not know."""
 CHAT_CLIENT_FACTORY_ERROR_TYPE = "MicrosoftAgentFrameworkChatClientFactoryError"
-"""``ApplicationError.type`` of a call whose chat client factory raised or returned ``None``."""
+"""``ApplicationError.type`` of a call whose chat client factory raised (retryable) or returned ``None`` (not)."""
 MCP_CLIENT_FACTORY_ERROR_TYPE = "MicrosoftAgentFrameworkMCPClientFactoryError"
-"""``ApplicationError.type`` of an MCP Activity whose client factory raised or returned no ``mcp.Client``."""
+"""``ApplicationError.type`` of an MCP Activity whose client factory raised (retryable) or returned no ``mcp.Client`` (not)."""
 
 ChatClientFactory = Callable[[], SupportsChatGetResponse[Any]]
 
@@ -294,19 +294,25 @@ class ChatClientActivities:
             # Typed as Any: a factory can return None, which is checked below.
             built: Any = factory()
         except Exception as err:
-            # A factory that cannot build its client (a missing API key, a bad
-            # endpoint) fails the same way on every attempt; fail the run now
-            # instead of retrying until someone fixes the worker.
+            # A factory can fail for a while (a secret store or a token
+            # endpoint that is down, one worker of many without its
+            # environment), so the attempt fails retryably: the call's retry
+            # policy or schedule-to-close timeout bounds the wait, another
+            # worker can pick the attempt up, and the worker log says why.
             activity.logger.error(
-                "Chat client factory for %r raised %s", model, type(err).__name__
+                "Chat client factory for %r raised %s: %s",
+                model,
+                type(err).__name__,
+                err,
             )
             raise ApplicationError(
                 f"The chat client factory for {model!r} raised "
                 f"{type(err).__name__}: {err}",
                 type=CHAT_CLIENT_FACTORY_ERROR_TYPE,
-                non_retryable=True,
+                non_retryable=False,
             ) from err
         if built is None:
+            # Wrong on every attempt: fail the run now.
             raise ApplicationError(
                 f"The chat client factory for {model!r} returned None instead of a "
                 "chat client.",

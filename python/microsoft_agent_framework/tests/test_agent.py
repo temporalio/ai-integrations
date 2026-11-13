@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
@@ -14,6 +15,7 @@ from pydantic import BaseModel
 
 from temporalio import workflow
 from temporalio.client import Client, WorkflowFailureError
+from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ApplicationError
 from temporalio.microsoft_agent_framework import (
     MicrosoftAgentFrameworkPlugin,
@@ -282,33 +284,66 @@ async def test_unknown_model_name(client: Client) -> None:
     assert started.attempt == 1
 
 
-async def test_chat_client_factory_failure(client: Client) -> None:
-    def broken_factory() -> FakeChatClient:
+@workflow.defn
+class BoundedRetryWorkflow:
+    @workflow.run
+    async def run(self, max_attempts: int) -> str:
+        client = TemporalChatClient(
+            "model",
+            retry_policy=RetryPolicy(
+                maximum_attempts=max_attempts,
+                initial_interval=timedelta(milliseconds=10),
+            ),
+        )
+        return (await Agent(client=client).run("hello")).text
+
+
+@pytest.mark.parametrize("recovers", [True, False], ids=["recovers", "keeps-failing"])
+async def test_chat_client_factory_failure_is_retried(
+    client: Client, caplog: pytest.LogCaptureFixture, recovers: bool
+) -> None:
+    attempts: list[int] = []
+
+    def flaky_factory() -> FakeChatClient:
+        attempts.append(len(attempts) + 1)
+        if recovers and len(attempts) > 1:
+            return FakeChatClient(["Hello."])
         raise KeyError("OPENAI_API_KEY")
 
-    plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"model": broken_factory})
-    async with new_worker(client, ToolLoopWorkflow, plugin=plugin) as worker:
+    plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"model": flaky_factory})
+    async with new_worker(client, BoundedRetryWorkflow, plugin=plugin) as worker:
         handle = await client.start_workflow(
-            ToolLoopWorkflow.run,
-            RunInput(),
+            BoundedRetryWorkflow.run,
+            2,
             id=workflow_id("factory-error"),
             task_queue=worker.task_queue,
         )
-        with pytest.raises(WorkflowFailureError) as excinfo:
-            await handle.result()
-    cause = excinfo.value.cause
-    assert isinstance(cause, ActivityError)
-    failure = cause.__cause__
-    assert isinstance(failure, ApplicationError)
-    # A factory that raises fails the run at once; retrying could not build it.
-    assert failure.type == "MicrosoftAgentFrameworkChatClientFactoryError"
-    assert failure.non_retryable
-    assert "'model'" in failure.message
-    assert "KeyError" in failure.message and "OPENAI_API_KEY" in failure.message
-    assert isinstance(failure.__cause__, ApplicationError)
-    assert failure.__cause__.type == "KeyError"
+        with caplog.at_level(logging.ERROR):
+            if recovers:
+                assert await handle.result() == "Hello."
+            else:
+                with pytest.raises(WorkflowFailureError) as excinfo:
+                    await handle.result()
+    # A factory that raises fails the attempt retryably, logged at ERROR, so
+    # the call's retry policy bounds the wait: a second attempt runs.
     (started,) = await started_activities(handle)
-    assert started.attempt == 1
+    assert started.attempt == 2
+    assert attempts == [1, 2]
+    assert any(
+        "Chat client factory for 'model' raised KeyError" in record.getMessage()
+        for record in caplog.records
+    )
+    if not recovers:
+        cause = excinfo.value.cause
+        assert isinstance(cause, ActivityError)
+        failure = cause.__cause__
+        assert isinstance(failure, ApplicationError)
+        assert failure.type == "MicrosoftAgentFrameworkChatClientFactoryError"
+        assert not failure.non_retryable
+        assert "'model'" in failure.message
+        assert "KeyError" in failure.message and "OPENAI_API_KEY" in failure.message
+        assert isinstance(failure.__cause__, ApplicationError)
+        assert failure.__cause__.type == "KeyError"
 
 
 async def test_response_format(client: Client) -> None:

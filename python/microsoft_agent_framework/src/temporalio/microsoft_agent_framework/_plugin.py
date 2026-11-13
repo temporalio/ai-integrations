@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import inspect
+import logging
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
@@ -36,6 +37,8 @@ from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner
 
 if TYPE_CHECKING:
     from mcp import Client
+
+logger = logging.getLogger(__name__)
 
 # What agent_framework core imports at module load, so workflow files that
 # import it share one copy with the host instead of re-importing it per run.
@@ -174,16 +177,24 @@ def _mcp_client_factory(
     import mcp
 
     def create() -> Client:
-        # A factory that cannot build its client fails the same way on every
-        # attempt; fail the Activity now instead of retrying without limit.
+        # Same policy as the chat client factories: a factory that raises may
+        # recover (a secret store, a token endpoint, one worker of many), so
+        # the attempt fails retryably and the retry policy bounds the wait; a
+        # factory that returns the wrong thing is wrong on every attempt.
         try:
             client = factory()
         except Exception as err:
+            logger.error(
+                "MCP client factory for %r raised %s: %s",
+                server,
+                type(err).__name__,
+                err,
+            )
             raise ApplicationError(
                 f"The MCP client factory for {server!r} raised "
                 f"{type(err).__name__}: {err}",
                 type=MCP_CLIENT_FACTORY_ERROR_TYPE,
-                non_retryable=True,
+                non_retryable=False,
             ) from err
         if not isinstance(client, mcp.Client):
             kind = type(client)

@@ -477,8 +477,12 @@ def test_provider_requires_mcp_extra(monkeypatch: pytest.MonkeyPatch) -> None:
         MicrosoftAgentFrameworkPlugin(mcp_clients={"echo": lambda: MCPClient(server)})
 
 
-@pytest.mark.parametrize("kind", ["raises", "wrong_type"])
-async def test_mcp_factory_failure_fails_once(client: Client, kind: str) -> None:
+@pytest.mark.parametrize(
+    ("kind", "attempts"),
+    [("raises", 2), ("wrong_type", 1)],
+    ids=["raises", "wrong_type"],
+)
+async def test_mcp_factory_failure(client: Client, kind: str, attempts: int) -> None:
     def factory() -> Any:
         if kind == "raises":
             raise KeyError("MCP_TOKEN")
@@ -491,7 +495,7 @@ async def test_mcp_factory_failure_fails_once(client: Client, kind: str) -> None
     async with new_worker(client, MCPWorkflow, plugin=plugin) as worker:
         handle = await client.start_workflow(
             MCPWorkflow.run,
-            MCPInput(),
+            MCPInput(max_attempts=2),
             id=workflow_id("mcp-factory"),
             task_queue=worker.task_queue,
         )
@@ -501,10 +505,13 @@ async def test_mcp_factory_failure_fails_once(client: Client, kind: str) -> None
     assert isinstance(cause, ActivityError)
     failure = cause.__cause__
     assert isinstance(failure, ApplicationError)
-    # The listing fails once, before any model call, instead of retrying forever.
+    # Same policy as the chat client factories: a factory that raises is
+    # retried under the call's retry policy (two attempts here), one that
+    # returns the wrong type fails the listing at once. Either way no model
+    # call runs.
     assert failure.type == "MicrosoftAgentFrameworkMCPClientFactoryError"
-    assert failure.non_retryable
+    assert failure.non_retryable is (kind == "wrong_type")
     assert "'echo'" in failure.message
     assert await count_scheduled_activities(handle) == {LIST_TOOLS: 1}
     (started,) = await started_activities(handle)
-    assert started.attempt == 1
+    assert started.attempt == attempts
