@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Collection
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
@@ -53,10 +54,15 @@ class TemporalMCPToolProvider(ContextProvider):
     restarted with different tools is picked up; ``True`` lists once per
     provider instance. ``tool_name_prefix``, ``allowed_tools``,
     ``approval_mode`` and ``parse_tool_results`` work as on the framework's
-    ``MCPTool``: the agent sees ``{prefix}_{name}``, ``allowed_tools`` matches
-    the server's names, ``approval_mode="always_require"`` makes every tool
-    ask for approval, and ``parse_tool_results`` replaces the default mapping
-    of a ``CallToolResult`` to content.
+    ``MCPTool``. Tool names are normalized the same way: a character outside
+    ``A-Za-z0-9_.-`` becomes ``-`` and the separators between the prefix and
+    the name are trimmed, so ``files/read`` reaches the model as ``files-read``
+    and prefix ``gh_`` gives ``gh_files-read``. ``allowed_tools`` matches the
+    server's own names, ``approval_mode`` is one mode for every tool of the
+    server (the per-tool mapping ``MCPTool`` also takes is rejected), and
+    ``parse_tool_results`` replaces the default mapping of a ``CallToolResult``
+    to content. Server prompts are not loaded, a result's ``_meta`` is not
+    carried, and there is no ``tool_result_content`` choice.
 
     The activity options apply to every MCP Activity of this provider;
     ``summary`` defaults to the server name. Without ``start_to_close_timeout``
@@ -91,6 +97,8 @@ class TemporalMCPToolProvider(ContextProvider):
 
         Raises:
             RuntimeError: If the ``mcp`` extra is not installed.
+            MicrosoftAgentFrameworkWorkflowError: If ``approval_mode`` is not
+                ``"always_require"``, ``"never_require"`` or ``None``.
         """
         try:
             from temporalio.mcp import TemporalMCPClient
@@ -99,6 +107,19 @@ class TemporalMCPToolProvider(ContextProvider):
                 "TemporalMCPToolProvider requires the 'mcp' extra and MCP Python SDK v2; "
                 "install temporalio-microsoft-agent-framework[mcp]"
             ) from err
+        if approval_mode is not None and approval_mode not in (
+            "always_require",
+            "never_require",
+        ):
+            # MCPTool also takes a per-tool mapping; FunctionTool keeps such a
+            # dict as is and no tool asks for approval, so refuse it here.
+            raise MicrosoftAgentFrameworkWorkflowError(
+                f"TemporalMCPToolProvider({server!r}) got approval_mode="
+                f"{approval_mode!r}; it takes 'always_require' or 'never_require' "
+                "for every tool of the server. For per-tool approval, split the "
+                "tools over two providers with different tool_name_prefix and "
+                "allowed_tools."
+            )
         # Two providers of one server need different prefixes anyway, or their
         # tool names collide; the prefix keeps their provider state apart too.
         source_id = f"temporal_mcp:{server}"
@@ -172,9 +193,7 @@ class TemporalMCPToolProvider(ContextProvider):
 
     def _function_tool(self, tool: Tool) -> FunctionTool:
         server_tool_name = tool.name
-        name = (
-            f"{self._prefix}_{server_tool_name}" if self._prefix else server_tool_name
-        )
+        name = _exposed_name(_normalize_name(server_tool_name), self._prefix)
 
         async def call(**arguments: Any) -> str | list[Content]:
             with _propagate_workflow_cancellation():
@@ -229,6 +248,26 @@ class TemporalMCPToolProvider(ContextProvider):
                     "on TemporalMCPToolProvider."
                 )
             taken[tool.name] = f"MCP server {self._server!r}"
+
+
+_NAME_OUTSIDE_SAFE_SET = re.compile(r"[^A-Za-z0-9_.-]")
+_NAME_SEPARATORS = "_.-"
+
+
+def _normalize_name(name: str) -> str:
+    """Replace the characters providers reject in a tool name, as ``MCPTool`` does."""
+    return _NAME_OUTSIDE_SAFE_SET.sub("-", name)
+
+
+def _exposed_name(normalized: str, prefix: str | None) -> str:
+    """Join the prefix and the normalized name the way ``MCPTool`` does."""
+    if not prefix:
+        return normalized
+    normalized_prefix = _normalize_name(prefix).rstrip(_NAME_SEPARATORS)
+    if not normalized_prefix:
+        return normalized
+    trimmed = normalized.lstrip(_NAME_SEPARATORS)
+    return f"{normalized_prefix}_{trimmed}" if trimmed else normalized_prefix
 
 
 def _tool_names(tools: Any) -> list[str]:

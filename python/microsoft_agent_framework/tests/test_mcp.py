@@ -55,6 +55,43 @@ class MCPInput:
     runs: int = 1
     conflict: str | None = None
     max_attempts: int | None = None
+    approval_mapping: bool = False
+    parse: bool = False
+    detailed_errors: bool = False
+
+
+def _count_blocks(result: Any) -> str:
+    """A ``parse_tool_results`` replacement: the number of content blocks."""
+    return f"{len(result.content)} blocks"
+
+
+def _result_items(response: Any) -> list[list[dict[str, Any]]]:
+    """The content items of every function result, as plain dicts.
+
+    For a tool that returns content, the framework joins the text into
+    ``result`` and keeps the full list on ``items``.
+    """
+    items: list[list[dict[str, Any]]] = []
+    for message in response.messages:
+        for content in message.contents:
+            if content.type != "function_result":
+                continue
+            listed = getattr(content, "items", None)
+            if isinstance(listed, list):
+                items.append(
+                    [
+                        {
+                            "type": c.type,
+                            "text": c.text,
+                            "uri": c.uri,
+                            "media_type": c.media_type,
+                        }
+                        for c in listed
+                    ]
+                )
+            else:
+                items.append([{"type": "raw", "text": str(content.result)}])
+    return items
 
 
 @workflow.defn
@@ -69,13 +106,18 @@ class MCPWorkflow:
             if input.max_attempts
             else None
         )
+        approval_mode: Any = "always_require" if input.approval else None
+        if input.approval_mapping:
+            # MCPTool's per-tool form, which the provider refuses.
+            approval_mode = {"always_require_approval": ["echo"]}
         providers = [
             TemporalMCPToolProvider(
                 "echo",
                 cache_tools=input.cache_tools,
                 tool_name_prefix=input.prefix,
                 allowed_tools=input.allowed,
-                approval_mode="always_require" if input.approval else None,
+                approval_mode=approval_mode,
+                parse_tool_results=_count_blocks if input.parse else None,
                 start_to_close_timeout=timedelta(seconds=10),
                 retry_policy=retry_policy,
             )
@@ -95,12 +137,17 @@ class MCPWorkflow:
                 return value
 
             tools = [echo]
-        agent = Agent(
-            client=TemporalChatClient("model"), tools=tools, context_providers=providers
+        chat_client = TemporalChatClient(
+            "model",
+            function_invocation_configuration=(
+                {"include_detailed_errors": True} if input.detailed_errors else None
+            ),
         )
+        agent = Agent(client=chat_client, tools=tools, context_providers=providers)
         session = agent.create_session()
         texts: list[str] = []
         contents: list[list[str]] = []
+        results: list[list[list[dict[str, Any]]]] = []
         for _ in range(input.runs):
             response = await agent.run(input.prompt, session=session)
             if input.approval and response.user_input_requests:
@@ -113,7 +160,8 @@ class MCPWorkflow:
                 )
             texts.append(response.text)
             contents.append(contents_summary(response))
-        return {"texts": texts, "contents": contents}
+            results.append(_result_items(response))
+        return {"texts": texts, "contents": contents, "results": results}
 
 
 def _plugin(
@@ -166,9 +214,18 @@ async def test_mcp_list_and_call(client: Client) -> None:
         LIST_TOOLS: 1,
         CALL_TOOL: 1,
     }
-    # The model received the server's full input schema, not just the names.
+    # The model received the server's full input schema, not just the names,
+    # and the slash in files/read was normalized away.
     tools = {t.name: t for t in chat().calls[0]["options"]["tools"]}
-    assert set(tools) == {"echo", "shout", "fail", "wait"}
+    assert set(tools) == {
+        "echo",
+        "shout",
+        "fail",
+        "wait",
+        "files-read",
+        "mixed",
+        "empty",
+    }
     echo = tools["echo"].parameters()
     assert echo["required"] == ["value"]
     assert echo["properties"]["times"] == {
@@ -239,6 +296,94 @@ async def test_tool_name_conflict(client: Client, conflict: str) -> None:
     assert "'echo'" in cause.message
 
 
+@pytest.mark.parametrize("prefix", [None, "gh_", "gh"])
+async def test_mcp_tool_names_normalized(client: Client, prefix: str | None) -> None:
+    exposed = "files-read" if prefix is None else "gh_files-read"
+    plugin, chat, _ = _plugin(
+        [
+            function_call_response(exposed, {"path": "/etc/hosts"}, call_id="call-1"),
+            text_response("Read."),
+        ]
+    )
+    result, handle = await _run(
+        client, plugin, MCPInput(prefix=prefix, allowed=["files/read"])
+    )
+    # The model sees the normalized name (the slash became a dash, the
+    # separator between the prefix and the name is not doubled); the call
+    # reaches the server under its own name.
+    assert [t.name for t in chat().calls[0]["options"]["tools"]] == [exposed]
+    assert result["contents"][0] == [
+        f"call:{exposed}",
+        'result:{"result": "contents of /etc/hosts"}',
+        "text:Read.",
+    ]
+    assert await count_scheduled_activities(handle) == {
+        INVOKE_MODEL: 2,
+        LIST_TOOLS: 1,
+        CALL_TOOL: 1,
+    }
+
+
+async def test_mcp_approval_mapping_rejected(client: Client) -> None:
+    plugin, _, _ = _plugin([text_response("unused")])
+    with pytest.raises(WorkflowFailureError) as excinfo:
+        await _run(client, plugin, MCPInput(approval_mapping=True))
+    cause = excinfo.value.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "MicrosoftAgentFrameworkWorkflowError"
+    assert "always_require_approval" in cause.message
+
+
+async def test_mcp_mixed_content(client: Client) -> None:
+    plugin, _, _ = _plugin(
+        [
+            function_call_response("mixed", {}, call_id="call-1"),
+            function_call_response("empty", {}, call_id="call-2"),
+            text_response("Seen."),
+        ]
+    )
+    result, _ = await _run(client, plugin, MCPInput())
+    assert result["texts"] == ["Seen."]
+    mixed, empty = result["results"][0]
+    # Text and embedded text become text; images, blobs and links become URIs.
+    assert mixed == [
+        {"type": "text", "text": "hello", "uri": None, "media_type": None},
+        {
+            "type": "data",
+            "text": None,
+            "uri": "data:image/png;base64,aW1n",
+            "media_type": "image/png",
+        },
+        {"type": "text", "text": "embedded", "uri": None, "media_type": None},
+        {
+            "type": "data",
+            "text": None,
+            "uri": "data:application/octet-stream;base64,YmxvYg==",
+            "media_type": "application/octet-stream",
+        },
+        {
+            "type": "uri",
+            "text": None,
+            "uri": "https://example.com/doc",
+            "media_type": "text/html",
+        },
+    ]
+    assert empty == [{"type": "text", "text": "null", "uri": None, "media_type": None}]
+
+
+async def test_mcp_parse_tool_results(client: Client) -> None:
+    plugin, _, _ = _plugin(
+        [
+            function_call_response("mixed", {}, call_id="call-1"),
+            text_response("Counted."),
+        ]
+    )
+    result, _ = await _run(client, plugin, MCPInput(parse=True))
+    assert result["texts"] == ["Counted."]
+    # The replacement parser's string is the whole tool result.
+    assert result["contents"][0][1] == "result:5 blocks"
+
+
 async def test_mcp_error_result_becomes_tool_error(client: Client) -> None:
     plugin, _, _ = _plugin(
         [
@@ -246,10 +391,15 @@ async def test_mcp_error_result_becomes_tool_error(client: Client) -> None:
             text_response("The tool failed."),
         ]
     )
-    result, handle = await _run(client, plugin, MCPInput())
+    result, handle = await _run(client, plugin, MCPInput(detailed_errors=True))
     assert result["texts"] == ["The tool failed."]
     (tool_result,) = [c for c in result["contents"][0] if c.startswith("result:")]
     assert tool_result.startswith("result:Error: Function failed.")
+    # The server's error text reaches the model with include_detailed_errors
+    # (the MCP server prefixes it with the tool's name).
+    assert "MCP tool returned an error: Error executing tool fail: disk full" in (
+        tool_result
+    )
     assert await count_scheduled_activities(handle) == {
         INVOKE_MODEL: 2,
         LIST_TOOLS: 1,
@@ -298,10 +448,9 @@ async def test_mcp_retry_then_tool_error(client: Client) -> None:
 async def test_idle_timeout_closes_connection(
     client: Client, idle_timeout: timedelta | None, connections: int
 ) -> None:
-    kwargs = (
-        {} if idle_timeout is None else {"mcp_connection_idle_timeout": idle_timeout}
-    )
-    plugin, _, opened = _plugin(_ECHO_SCRIPT, **kwargs)
+    # None is passed as such: it keeps the connection until shutdown, where
+    # leaving the argument out would test the 5 minute default instead.
+    plugin, _, opened = _plugin(_ECHO_SCRIPT, mcp_connection_idle_timeout=idle_timeout)
     result, _ = await _run(client, plugin, MCPInput())
     assert result["texts"] == ["Echoed."]
     assert len(opened) == connections
