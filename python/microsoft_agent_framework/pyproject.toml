@@ -29,7 +29,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Lazily imported when MicrosoftAgentFrameworkPlugin(mcp_clients=...) or TemporalMCPToolProvider is used.
-mcp = ["temporalio-mcp>=0.3.0,<0.4", "mcp>=2.2,<3", "mcp-types>=2,<3"]
+mcp = ["temporalio-mcp>=0.4.0,<0.5", "mcp>=2.2,<3", "mcp-types>=2,<3"]
 
 [project.urls]
 Homepage = "https://github.com/temporalio/ai-integrations/tree/main/python/microsoft_agent_framework"
@@ -49,7 +49,7 @@ dev = [
   # The provider-error tests run the real OpenAIChatClient against a local HTTP server.
   "agent-framework-openai>=1.17,<2",
   # Used by the MCP tests.
-  "temporalio-mcp>=0.3.0,<0.4",
+  "temporalio-mcp>=0.4.0,<0.5",
   "mcp>=2.2,<3",
   "mcp-types>=2,<3",
   # Lets the OpenTelemetry warning test install a real SDK provider.
