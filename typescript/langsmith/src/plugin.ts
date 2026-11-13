@@ -257,7 +257,7 @@ export class LangSmithPlugin extends SimplePlugin {
 /** The plugin's explicit `address` or `projectName`, else the destination the env names. */
 function pluginDestination(
   client: Client,
-  address: Address | undefined,
+  address: AgentAddress | undefined,
   projectName: string | undefined
 ): Destination | undefined {
   if (address !== undefined) {

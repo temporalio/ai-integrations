@@ -22,6 +22,7 @@ import type {
 } from '@temporalio/workflow';
 import {
   ContinueAsNew,
+  isCancellation,
   workflowInfo,
   type ActivityInput,
   type Headers,
@@ -142,6 +143,7 @@ function reconstructParent(
 
 /** The `RunTree.end` arguments for a Workflow run whose handler threw `err`; continue-as-new isn't an error. */
 function workflowThrownEnd(err: unknown): RunEnd {
+  if (isCancellation(err)) return [statusOutputs('cancelled'), undefined];
   return err instanceof ContinueAsNew ? [statusOutputs('continued_as_new'), undefined] : thrownEnd(err);
 }
 
