@@ -10,7 +10,7 @@ This Temporal [Plugin](https://docs.temporal.io/develop/plugins-guide) runs a [M
 uv add temporalio-microsoft-agent-framework
 ```
 
-The plugin depends on `agent-framework-core`. Add the provider package you use, for example `agent-framework-openai`.
+The plugin depends on `agent-framework-core` (1.23.0 or newer, below 2; tested with 1.23.0 through 1.26.0). Add the provider package you use, for example `agent-framework-openai`. Replay safety rests on a few private names of the framework, so a worker or replayer fails at start with a message naming the name and the tested range if a release moves one of them.
 
 ## Quickstart
 
@@ -434,7 +434,7 @@ Agent Framework's own exceptions raised in workflow code, such as `MiddlewareFai
 
 ## Limits
 
-- `FileHistoryProvider`, `FileSessionStore` and `SessionStore` do not work in a workflow: they read and write files on a thread, which the workflow event loop does not provide, so the first run fails. Use the default in-memory history and carry `session.to_dict()` across continue-as-new.
+- `FileHistoryProvider` and `FileSessionStore` do not work in a workflow: they read and write files on a thread, which a workflow does not have, so the run fails with `MicrosoftAgentFrameworkWorkflowError` naming the call. Use the default in-memory history and carry `session.to_dict()` across continue-as-new.
 - `MCPStdioTool`, `MCPStreamableHTTPTool` and `MCPWebsocketTool` cannot be passed in `tools=`: they hold a live connection. Use `TemporalMCPToolProvider`.
 - `TemporalMCPToolProvider` exposes tools only: server prompts are not loaded, a result's `_meta` is not carried to the model, and there is no `tool_result_content` choice.
 - Agent Framework creates agent spans and records tool metrics from workflow code through the global OpenTelemetry providers. With the OpenTelemetry SDK's providers set directly as the globals, every replay re-emits them; the plugin warns at worker and replayer start. Use `temporalio.contrib.opentelemetry.create_tracer_provider()` and `ReplaySafeMeterProvider`. The provider client's own chat spans run in the Activity with real timings.
@@ -463,7 +463,7 @@ async def start_worker() -> None:
     await worker.run()
 ```
 
-The plugin passes `agent_framework`, `pydantic_core`, `annotated_types`, `msgspec`, `typing_inspection`, `opentelemetry`, `dotenv`, `mcp` and `mcp_types` through the workflow sandbox, and installs workflow-aware stand-ins for the clock and id reads in Agent Framework's agent code (default agent and session ids, the loop's time budget, span durations) so they replay deterministically. Both apply to Workers and Replayers.
+The plugin passes `agent_framework`, `pydantic_core`, `annotated_types`, `msgspec`, `typing_inspection`, `opentelemetry`, `dotenv`, `mcp` and `mcp_types` through the workflow sandbox, and installs workflow-aware stand-ins for the clock, id and thread reads in Agent Framework's agent code (default agent and session ids, the loop's time budget, span durations, the thread hand-off of synchronous tools and of file-backed sessions) so they replay deterministically. Both apply to Workers and Replayers.
 
 ## Testing
 

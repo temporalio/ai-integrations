@@ -21,6 +21,11 @@ What each seam feeds:
   workflow event loop has no executor, so in a workflow the tool runs inline
   on the workflow task; the tool object is not changed, so one shared with an
   Activity or a plain agent in the same process still runs on a thread there.
+- ``_sessions.asyncio``: ``to_thread``, which the file-backed session store
+  and history provider use for their file reads and writes. In a workflow it
+  raises ``MicrosoftAgentFrameworkWorkflowError`` naming the call, so the run
+  fails instead of the workflow task failing on the loop's
+  ``NotImplementedError``.
 - ``observability.perf_counter``: span durations of the agent telemetry layer.
 
 ``time_ns`` in the same modules only timestamps exceptions on spans, which
@@ -33,6 +38,7 @@ import asyncio
 import importlib
 import importlib.metadata
 import inspect
+import logging
 import threading
 import time
 import uuid
@@ -40,6 +46,14 @@ from collections.abc import Callable
 from typing import Any
 
 from temporalio import workflow
+from temporalio.microsoft_agent_framework.workflow import (
+    MicrosoftAgentFrameworkWorkflowError,
+)
+
+TESTED_VERSIONS = "1.23.0 through 1.26.0"
+"""The ``agent-framework-core`` releases this plugin's test suite ran against."""
+
+logger = logging.getLogger(__name__)
 
 _MISSING = object()
 
@@ -62,6 +76,21 @@ async def _to_thread(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> 
     return await asyncio.to_thread(func, *args, **kwargs)
 
 
+async def _no_thread_in_workflow(
+    func: Callable[..., Any], /, *args: Any, **kwargs: Any
+) -> Any:
+    if workflow.in_workflow():
+        name = getattr(func, "__qualname__", repr(func))
+        raise MicrosoftAgentFrameworkWorkflowError(
+            f"Agent Framework tried to run {name} on a thread inside a workflow, "
+            "which has none. File-backed session stores and history providers "
+            "(FileSessionStore, FileHistoryProvider) do not work in a workflow; "
+            "use the default in-memory history and carry session.to_dict() across "
+            "continue-as-new."
+        )
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
 class _UuidModule:
     """Stands in for the ``uuid`` module where a module imported it whole."""
 
@@ -80,14 +109,25 @@ class _AsyncioModule:
         return getattr(asyncio, name)
 
 
+class _SessionsAsyncioModule:
+    """Stands in for the ``asyncio`` module in the framework's sessions module."""
+
+    to_thread = staticmethod(_no_thread_in_workflow)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(asyncio, name)
+
+
 _uuid_module = _UuidModule()
 _asyncio_module = _AsyncioModule()
+_sessions_asyncio_module = _SessionsAsyncioModule()
 
 # (module, attribute, the stdlib object the attribute holds, the stand-in)
 _SEAMS: tuple[tuple[str, str, Any, Any], ...] = (
     ("agent_framework._agents", "uuid4", uuid.uuid4, _uuid4),
     ("agent_framework._tools", "uuid4", uuid.uuid4, _uuid4),
     ("agent_framework._sessions", "uuid", uuid, _uuid_module),
+    ("agent_framework._sessions", "asyncio", asyncio, _sessions_asyncio_module),
     ("agent_framework._tools", "perf_counter", time.perf_counter, _perf_counter),
     ("agent_framework._tools", "time", time.time, _time),
     ("agent_framework._tools", "asyncio", asyncio, _asyncio_module),
@@ -109,7 +149,8 @@ def _unsupported(seam: str, detail: str) -> RuntimeError:
     return RuntimeError(
         f"agent-framework-core {installed_version()} changed {seam}: {detail}. "
         "The Temporal plugin cannot make this seam replay-safe; pin "
-        "agent-framework-core to a version the plugin supports."
+        f"agent-framework-core to a release the plugin was tested with "
+        f"({TESTED_VERSIONS})."
     )
 
 
@@ -120,13 +161,22 @@ def check_sync_tool_seam() -> None:
     ``_tools.asyncio`` stand-in intercepts. The framework's own harness flips
     the private ``_invoke_sync_on_event_loop`` switch on the tool instead; the
     plugin leaves that switch alone because a tool object can be shared with
-    code outside workflows.
+    code outside workflows. When the source is not available (an install that
+    ships only ``.pyc`` files) the check logs a warning and the seam is
+    installed anyway: the rebind itself does not depend on the source.
     """
     from agent_framework import FunctionTool
 
     try:
         source = inspect.getsource(FunctionTool._invoke_function)
-    except (OSError, TypeError):
+    except (OSError, TypeError) as err:
+        logger.warning(
+            "Cannot read the source of FunctionTool._invoke_function (%s), so the "
+            "agent_framework._tools.asyncio seam is installed unchecked; a "
+            "synchronous tool runs inline in a workflow only while the framework "
+            "hands it to asyncio.to_thread.",
+            err,
+        )
         return
     if "asyncio.to_thread(" not in source:
         raise _unsupported(

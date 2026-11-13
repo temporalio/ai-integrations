@@ -16,6 +16,7 @@ from agent_framework import (
     ChatResponse,
     Content,
     FileHistoryProvider,
+    FileSessionStore,
     FunctionInvocationContext,
     FunctionMiddleware,
     Message,
@@ -25,7 +26,13 @@ from agent_framework import (
 )
 
 from temporalio import workflow
-from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHandle
+from temporalio.client import (
+    Client,
+    WorkflowExecutionStatus,
+    WorkflowFailureError,
+    WorkflowHandle,
+)
+from temporalio.exceptions import ApplicationError
 from temporalio.microsoft_agent_framework import (
     MicrosoftAgentFrameworkPlugin,
     TemporalChatClient,
@@ -126,11 +133,19 @@ class FileHistoryWorkflow:
             context_providers=[FileHistoryProvider(storage_path)],
         )
         session = agent.create_session()
-        try:
-            await agent.run("hello", session=session)
-        except Exception as err:
-            return type(err).__name__
-        return "ran"
+        return (await agent.run("hello", session=session)).text
+
+
+@workflow.defn
+class FileSessionStoreWorkflow:
+    @workflow.run
+    async def run(self, storage_path: str) -> str:
+        agent = Agent(client=TemporalChatClient("model"))
+        store = FileSessionStore(storage_path)
+        session = await store.get("chat-1") or agent.create_session()
+        response = await agent.run("hello", session=session)
+        await store.set("chat-1", session)
+        return response.text
 
 
 async def _wait_for_status(
@@ -219,24 +234,37 @@ async def test_store_defaults_to_false(client: Client) -> None:
     assert [m.text for m in second_call["messages"]] == ["first", "one", "second"]
 
 
-async def test_file_history_provider_fails_clearly(
-    client: Client, tmp_path: Path
+@pytest.mark.parametrize(
+    ("workflow_type", "provider"),
+    [
+        (FileHistoryWorkflow, "FileHistoryProvider"),
+        (FileSessionStoreWorkflow, "FileSessionStore"),
+    ],
+    ids=["history-provider", "session-store"],
+)
+async def test_file_backed_sessions_fail_the_workflow(
+    client: Client, tmp_path: Path, workflow_type: type, provider: str
 ) -> None:
     plugin = MicrosoftAgentFrameworkPlugin(
         chat_clients={"model": fake_chat_client(["unused"])}
     )
-    async with new_worker(client, FileHistoryWorkflow, plugin=plugin) as worker:
+    async with new_worker(client, workflow_type, plugin=plugin) as worker:
         handle = await client.start_workflow(
-            FileHistoryWorkflow.run,
-            str(tmp_path / "history"),
-            id=workflow_id("file-history"),
+            workflow_type.run,  # type: ignore[attr-defined]
+            str(tmp_path / "sessions"),
+            id=workflow_id("file-backed"),
             task_queue=worker.task_queue,
         )
-        result = await handle.result()
-    # The provider reads its file through asyncio.to_thread, which the
-    # workflow event loop does not implement, so the run fails before any
-    # model call. A future release that made this work would double-persist.
-    assert result == "NotImplementedError"
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+    # The provider reads its file through asyncio.to_thread; the plugin's
+    # stand-in turns that into the plugin's own failure, so the workflow fails
+    # (not the workflow task) before any model call, and the message names the
+    # call. A future release that made this work would double-persist.
+    cause = excinfo.value.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == "MicrosoftAgentFrameworkWorkflowError"
+    assert provider in cause.message and "to_dict" in cause.message
     assert await count_scheduled_activities(handle) == {}
 
 
