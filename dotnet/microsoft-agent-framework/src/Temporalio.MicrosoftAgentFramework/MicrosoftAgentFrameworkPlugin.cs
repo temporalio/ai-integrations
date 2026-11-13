@@ -83,6 +83,20 @@ public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
             }
         }
 
+        ArgumentNullException.ThrowIfNull(options.HostedMcpServerHeaders, nameof(options.HostedMcpServerHeaders));
+        foreach (var (name, headers) in options.HostedMcpServerHeaders)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new ArgumentException("HostedMcpServerHeaders has an empty server name.", nameof(options));
+            }
+
+            if (headers is null)
+            {
+                throw new ArgumentException($"HostedMcpServerHeaders['{name}'] has no headers.", nameof(options));
+            }
+        }
+
         if (options.McpConnectionIdleTimeout <= TimeSpan.Zero)
         {
             throw new ArgumentException("McpConnectionIdleTimeout must be positive.", nameof(options));
@@ -101,7 +115,7 @@ public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
             WorkflowFailureExceptionTypes = [typeof(MicrosoftAgentFrameworkWorkflowException)],
             RunContextAfter = () => connections.DisposeAsync().AsTask(),
         };
-        pluginOptions.AddAllActivities(new ModelActivities(options.ChatClients));
+        pluginOptions.AddAllActivities(new ModelActivities(options.ChatClients, options.HostedMcpServerHeaders));
         pluginOptions.AddAllActivities(new McpActivities(connections));
         return pluginOptions;
     }

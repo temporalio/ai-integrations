@@ -10,6 +10,9 @@ namespace Temporalio.MicrosoftAgentFramework.Internal;
 /// <see cref="ToolDeclaration"/>s and provider-executed tools as <see cref="HostedToolDeclaration"/>s;
 /// <c>RawRepresentationFactory</c> and <c>ContinuationToken</c> are dropped with a warning. The
 /// drop list follows Cecil Phillip's draft at https://github.com/temporal-community/temporal-dotnet-agents.
+/// The HTTP headers of a <see cref="HostedMcpServerTool"/> never cross: a tool that carries them on
+/// the Workflow side fails the run, and the worker adds the headers registered under
+/// <see cref="MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders"/> when it rebuilds the tool.
 /// </summary>
 internal static class ChatOptionsTransport
 {
@@ -54,6 +57,11 @@ internal static class ChatOptionsTransport
                     case AIFunctionDeclaration function:
                         (tools ??= []).Add(new ToolDeclaration(function.Name, function.Description, function.JsonSchema, function.ReturnJsonSchema));
                         break;
+                    case HostedMcpServerTool { Headers: { Count: > 0 } headers } mcp:
+                        throw new MicrosoftAgentFrameworkWorkflowException(
+                            $"HostedMcpServerTool '{mcp.ServerName}' has {headers.Count} HTTP header(s) set in the Workflow. " +
+                            "The model Activity's input is recorded in Event History, so the plugin sends no hosted MCP server headers from the Workflow. " +
+                            $"Register them on the worker under MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders[\"{mcp.ServerName}\"] and leave Headers unset here.");
                     case HostedWebSearchTool or HostedCodeInterpreterTool or HostedFileSearchTool or HostedMcpServerTool:
                         (hosted ??= []).Add(ToDeclaration(tool));
                         break;
@@ -72,8 +80,9 @@ internal static class ChatOptionsTransport
     /// Rebuilds the options the provider client receives. Runs on the worker.
     /// </summary>
     /// <param name="input">The Activity input.</param>
+    /// <param name="hostedMcpServerHeaders">HTTP headers for hosted MCP server tools, by server name, or null.</param>
     /// <returns>Options with declaration-only function tools and reconstructed hosted tools, or null.</returns>
-    public static ChatOptions? Rebuild(ModelCallInput input)
+    public static ChatOptions? Rebuild(ModelCallInput input, IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? hostedMcpServerHeaders)
     {
         var options = input.Options?.Clone();
         if (options?.AdditionalProperties is { Count: > 0 } properties)
@@ -98,7 +107,7 @@ internal static class ChatOptionsTransport
 
         foreach (var hosted in input.HostedTools ?? [])
         {
-            (tools ??= []).Add(FromDeclaration(hosted));
+            (tools ??= []).Add(FromDeclaration(hosted, hostedMcpServerHeaders));
         }
 
         if (tools is not null)
@@ -150,7 +159,6 @@ internal static class ChatOptionsTransport
                 ServerAddress = mcp.ServerAddress,
                 ServerDescription = mcp.ServerDescription,
                 AllowedTools = mcp.AllowedTools?.ToList(),
-                Headers = mcp.Headers?.ToDictionary(pair => pair.Key, pair => pair.Value),
                 ApprovalMode = mcp.ApprovalMode switch
                 {
                     HostedMcpServerToolAlwaysRequireApprovalMode => "always",
@@ -165,7 +173,7 @@ internal static class ChatOptionsTransport
         };
     }
 
-    private static AITool FromDeclaration(HostedToolDeclaration declaration)
+    private static AITool FromDeclaration(HostedToolDeclaration declaration, IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? hostedMcpServerHeaders)
     {
         var additional = declaration.AdditionalProperties is { } element
             ? element.Deserialize<Dictionary<string, object?>>(AIJsonUtilities.DefaultOptions)
@@ -187,7 +195,9 @@ internal static class ChatOptionsTransport
                 {
                     ServerDescription = declaration.ServerDescription,
                     AllowedTools = declaration.AllowedTools?.ToList(),
-                    Headers = declaration.Headers?.ToDictionary(pair => pair.Key, pair => pair.Value),
+                    Headers = hostedMcpServerHeaders is not null && hostedMcpServerHeaders.TryGetValue(declaration.ServerName!, out var headers)
+                        ? new Dictionary<string, string>(headers)
+                        : null,
                     ApprovalMode = declaration.ApprovalMode switch
                     {
                         "always" => HostedMcpServerToolApprovalMode.AlwaysRequire,

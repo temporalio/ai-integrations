@@ -15,12 +15,14 @@ public static class TestPlugin
     public static MicrosoftAgentFrameworkPlugin For(
         IReadOnlyDictionary<string, IChatClient> clients,
         IReadOnlyDictionary<string, IClientTransport>? servers = null,
-        TimeSpan? idleTimeout = null) =>
+        TimeSpan? idleTimeout = null,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? hostedMcpServerHeaders = null) =>
         new(new MicrosoftAgentFrameworkPluginOptions
         {
             ChatClients = clients.ToDictionary(pair => pair.Key, pair => (Func<IChatClient>)(() => pair.Value)),
             McpServers = (servers ?? new Dictionary<string, IClientTransport>()).ToDictionary(pair => pair.Key, pair => (Func<IClientTransport>)(() => pair.Value)),
             McpConnectionIdleTimeout = idleTimeout ?? TimeSpan.FromMinutes(5),
+            HostedMcpServerHeaders = hostedMcpServerHeaders ?? new Dictionary<string, IReadOnlyDictionary<string, string>>(),
         });
 
     public static MicrosoftAgentFrameworkPlugin WithMcp(FakeChatClient fake, string server, InMemoryMcpServer mcp, TimeSpan? idleTimeout = null) =>

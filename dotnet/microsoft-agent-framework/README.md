@@ -96,6 +96,8 @@ Register as many names as you need; two agents in one Workflow can use two model
 
 For Azure OpenAI, build the client the same way and set `AzureOpenAIClientOptions.RetryPolicy = new ClientRetryPolicy(maxRetries: 0)`.
 
+The headers of a hosted MCP server tool follow the same rule: set them on the worker, in `MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders`, never on the `HostedMcpServerTool` in the Workflow. The Hosted tools section below has the details.
+
 ## Retries and timeouts
 
 Each model call is one `MicrosoftAgentFramework.InvokeModel` Activity with a 5-minute start-to-close timeout, a 10-second heartbeat timeout and the summary `microsoft-agent-framework model call: {model}`. The Activity heartbeats at least every 3 seconds while the provider call runs and on every streamed update, so a dead worker is noticed within the heartbeat timeout. Change the options per agent or per client:
@@ -234,6 +236,49 @@ public class McpWorkflow
 A result with `isError`, an unknown tool or bad arguments fails the Activity with error type `MicrosoftAgentFrameworkMcpError` and no retry; the model is told the tool failed. A transport that cannot connect retries under the Activity's retry policy. A transport factory that throws fails the Activity with `MicrosoftAgentFrameworkConfigurationError` and no retry, like a chat client factory that throws.
 
 The listed catalog says nothing about which tools have side effects. To pin a catalog instead of discovering it, build `TemporalMcpTool` yourself from a `ToolDeclaration` with the schema you expect, and wrap tools that need a human in `ApprovalRequiredAIFunction`. Sessions are stateless: one connection per worker per server, no session affinity.
+
+## Hosted tools
+
+`HostedWebSearchTool`, `HostedCodeInterpreterTool`, `HostedFileSearchTool` and `HostedMcpServerTool` run on the provider's side, inside the model call. Put them in `ChatOptions.Tools` as usual; the plugin carries each one to the model Activity by kind and options and rebuilds it there, so the provider client receives the same tool.
+
+The exception is `HostedMcpServerTool.Headers`. The model Activity's input is recorded in Event History, so a header set on the tool in the Workflow, an `Authorization` or API key header in practice, would be recorded with it. The plugin sends no hosted MCP server headers from the Workflow: a tool whose `Headers` are set fails the run with `MicrosoftAgentFrameworkWorkflowError` before any Activity is scheduled. Register the headers on the worker by server name instead, and the Activity adds them when it rebuilds the tool:
+
+```csharp
+using Microsoft.Extensions.AI;
+using Temporalio.MicrosoftAgentFramework;
+using Temporalio.Workflows;
+
+public static class HostedMcpSetup
+{
+    public static MicrosoftAgentFrameworkPlugin Plugin(Func<IChatClient> openAi, string docsToken) => new(new MicrosoftAgentFrameworkPluginOptions
+    {
+        ChatClients = new Dictionary<string, Func<IChatClient>> { ["gpt-4o-mini"] = openAi },
+        HostedMcpServerHeaders = new Dictionary<string, IReadOnlyDictionary<string, string>>
+        {
+            ["docs"] = new Dictionary<string, string> { ["Authorization"] = $"Bearer {docsToken}" },
+        },
+    });
+}
+
+[Workflow]
+public class HostedMcpWorkflow
+{
+    [WorkflowRun]
+    public async Task<string> RunAsync(string prompt)
+    {
+        var agent = new TemporalAgent("gpt-4o-mini", new TemporalAgentOptions
+        {
+            ChatOptions = new ChatOptions
+            {
+                Tools = [new HostedMcpServerTool("docs", "https://example.com/mcp") { AllowedTools = ["search"] }],
+            },
+        });
+        return (await agent.RunAsync(prompt)).Text;
+    }
+}
+```
+
+The key is the tool's `ServerName`; a server without an entry gets no headers. Nothing else on a hosted tool is treated as a secret: `AdditionalProperties`, inputs and allowed tool names travel in the Activity input like the rest of the request.
 
 ## Approvals
 
@@ -429,7 +474,7 @@ Two things follow for you. Call `RunAsync`, `RunAsync<T>` and `RunStreamingAsync
 
 - `ChatClientAgent`, `IChatClient.AsAIAgent()` and `ChatClientBuilder.BuildAIAgent()` stall inside a Workflow for the reason above. They keep working inside Activities and outside Temporal.
 - Background responses are not supported: `AgentRunOptions.AllowBackgroundResponses`, `ContinuationToken` and `ChatClientAgentRunOptions.ChatClientFactory` fail the run with `MicrosoftAgentFrameworkWorkflowError`. `ChatOptions.RawRepresentationFactory` and `ContinuationToken` do not cross the Activity boundary and are dropped with a warning.
-- `ChatOptions.Tools` may hold `AIFunction`s, `ActivityAsTool` and `TemporalMcpTool` wrappers, `ApprovalRequiredAIFunction` and the hosted tool types (`HostedWebSearchTool`, `HostedCodeInterpreterTool`, `HostedFileSearchTool`, `HostedMcpServerTool`). Hosted tools are passed through to the provider client by kind and options; any other `AITool` type fails the run.
+- `ChatOptions.Tools` may hold `AIFunction`s, `ActivityAsTool` and `TemporalMcpTool` wrappers, `ApprovalRequiredAIFunction` and the four hosted tool types, with the header rule from the Hosted tools section; any other `AITool` type fails the run.
 - Service-managed conversations (`ConversationId`) are not used; the Workflow holds the history.
 - `AIAgent` generates a random id on construction. `TemporalAgent` never reads it: `Id` is `TemporalAgentOptions.Id`, then `Name`, then `temporal-agent`, so `AgentResponse.AgentId` is the same on every replay.
 - The plugin calls Agent Framework members marked experimental (`MAAI001`): the `ChatHistoryProvider.InvokingContext`, `ChatHistoryProvider.InvokedContext`, `AIContextProvider.InvokingContext` and `AIContextProvider.InvokedContext` constructors. The dependency floor is `Microsoft.Agents.AI` 1.26.0; a release that changes them shows up in this repository's nightly build.

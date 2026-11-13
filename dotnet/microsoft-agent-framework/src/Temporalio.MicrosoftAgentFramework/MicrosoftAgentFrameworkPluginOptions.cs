@@ -26,6 +26,16 @@ public sealed class MicrosoftAgentFrameworkPluginOptions
         new Dictionary<string, Func<IClientTransport>>();
 
     /// <summary>
+    /// Gets the HTTP headers the worker adds to a <see cref="HostedMcpServerTool"/> before the model
+    /// call, by the tool's <see cref="HostedMcpServerTool.ServerName"/>. The Workflow passes the tool
+    /// without headers: a <see cref="HostedMcpServerTool"/> whose <c>Headers</c> are set in the
+    /// Workflow fails the run, because the model Activity's input is recorded in Event History and
+    /// an Authorization or API key header would be recorded with it.
+    /// </summary>
+    public IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> HostedMcpServerHeaders { get; init; } =
+        new Dictionary<string, IReadOnlyDictionary<string, string>>();
+
+    /// <summary>
     /// Gets how long an MCP connection may sit unused before the worker closes it. The next call
     /// reconnects. Defaults to 5 minutes. Every connection is closed when the worker stops.
     /// </summary>

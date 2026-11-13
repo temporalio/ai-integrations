@@ -1,3 +1,6 @@
+using Google.Protobuf;
+using Google.Protobuf.Reflection;
+using Temporalio.Api.Common.V1;
 using Temporalio.Api.Enums.V1;
 using Temporalio.Api.History.V1;
 using Temporalio.Client;
@@ -39,5 +42,64 @@ public static class HistoryAssert
             .Select(e => e.ActivityTaskStartedEventAttributes!.Attempt)
             .DefaultIfEmpty(0)
             .Max();
+    }
+
+    // The history as JSON plus the decoded body of every payload in it (inputs, results, memos, headers,
+    // failure details), so a test can assert that a value never reached the server in any form.
+    public static string AllText(WorkflowHistory history)
+    {
+        var parts = new List<string> { history.ToJson() };
+        foreach (var @event in history.Events)
+        {
+            CollectPayloads(@event, parts);
+        }
+
+        return string.Join("\n", parts);
+    }
+
+    private static void CollectPayloads(IMessage message, List<string> parts)
+    {
+        if (message is Payload payload)
+        {
+            parts.Add(payload.Data.ToStringUtf8());
+            return;
+        }
+
+        foreach (var field in message.Descriptor.Fields.InDeclarationOrder())
+        {
+            if (field.FieldType != FieldType.Message)
+            {
+                continue;
+            }
+
+            switch (field.Accessor.GetValue(message))
+            {
+                case IMessage single:
+                    CollectPayloads(single, parts);
+                    break;
+                case System.Collections.IDictionary map:
+                    foreach (var value in map.Values)
+                    {
+                        if (value is IMessage entry)
+                        {
+                            CollectPayloads(entry, parts);
+                        }
+                    }
+
+                    break;
+                case System.Collections.IEnumerable list:
+                    foreach (var value in list)
+                    {
+                        if (value is IMessage entry)
+                        {
+                            CollectPayloads(entry, parts);
+                        }
+                    }
+
+                    break;
+                default:
+                    break;
+            }
+        }
     }
 }

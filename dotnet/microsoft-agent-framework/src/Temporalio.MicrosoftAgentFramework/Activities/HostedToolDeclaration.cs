@@ -7,7 +7,10 @@ namespace Temporalio.MicrosoftAgentFramework.Activities;
 /// A provider-executed tool (<see cref="HostedWebSearchTool"/>, <see cref="HostedCodeInterpreterTool"/>,
 /// <see cref="HostedFileSearchTool"/> or <see cref="HostedMcpServerTool"/>) carried to the model
 /// Activity by kind and options. The provider runs these inside the model call; the Workflow never
-/// invokes them.
+/// invokes them. The HTTP headers of a <see cref="HostedMcpServerTool"/> are not part of this
+/// record: the worker adds them from
+/// <see cref="MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders"/>, so they never enter
+/// the Activity input or Event History.
 /// </summary>
 public sealed record HostedToolDeclaration
 {
@@ -46,9 +49,6 @@ public sealed record HostedToolDeclaration
 
     /// <summary>Gets the allowed tool names of a hosted MCP server tool.</summary>
     public IReadOnlyList<string>? AllowedTools { get; init; }
-
-    /// <summary>Gets the HTTP headers of a hosted MCP server tool.</summary>
-    public IReadOnlyDictionary<string, string>? Headers { get; init; }
 
     /// <summary>
     /// Gets the approval mode of a hosted MCP server tool: <c>always</c>, <c>never</c>, or null for

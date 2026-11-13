@@ -207,7 +207,7 @@ public class AgentRunTests : WorkflowTestBase
     public async Task HostedToolsAndAdditionalProperties_ReachProviderClient()
     {
         var fake = new FakeChatClient(ScriptedResponse.Text("searched"));
-        var (result, _) = await RunAsync(TestPlugin.For(fake), (HostedToolWorkflow wf) => wf.RunAsync("search the docs"));
+        var (result, _) = await RunAsync(TestPlugin.For(fake), (HostedToolWorkflow wf) => wf.RunAsync(new HostedToolInput("search the docs")));
         Assert.Equal("searched", result);
         var properties = fake.Calls[0].Options!.AdditionalProperties!;
         Assert.Equal(true, properties["strict"]);
@@ -221,6 +221,45 @@ public class AgentRunTests : WorkflowTestBase
         Assert.Equal("Documentation search", mcp.ServerDescription);
         Assert.Equal(["search"], mcp.AllowedTools);
         Assert.IsType<HostedMcpServerToolNeverRequireApprovalMode>(mcp.ApprovalMode);
+        Assert.Null(mcp.Headers);
+    }
+
+    [Fact]
+    public async Task HostedMcpServerHeaders_AddedOnTheWorker_NeverRecorded()
+    {
+        var fake = new FakeChatClient(ScriptedResponse.Text("searched"));
+        var plugin = TestPlugin.For(
+            new Dictionary<string, IChatClient> { [TestPlugin.Model] = fake },
+            hostedMcpServerHeaders: new Dictionary<string, IReadOnlyDictionary<string, string>>
+            {
+                ["docs"] = new Dictionary<string, string> { ["Authorization"] = "Bearer worker-side-secret" },
+            });
+        var (result, handle) = await RunAsync(plugin, (HostedToolWorkflow wf) => wf.RunAsync(new HostedToolInput("search the docs")));
+        Assert.Equal("searched", result);
+        var mcp = Assert.IsType<HostedMcpServerTool>(fake.Calls[0].Options!.Tools!.Single(tool => tool is HostedMcpServerTool));
+        Assert.Equal("Bearer worker-side-secret", mcp.Headers!["Authorization"]);
+        var text = HistoryAssert.AllText(await handle.FetchHistoryAsync());
+        Assert.Contains("example.com/mcp", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("worker-side-secret", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Authorization", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task HostedMcpServerTool_WithHeadersInTheWorkflow_FailsTheRunBeforeAnyActivity()
+    {
+        var fake = new FakeChatClient(ScriptedResponse.Text("never"));
+        var (error, handle) = await RunFailingAsync(TestPlugin.For(fake), (HostedToolWorkflow wf) => wf.RunAsync(new HostedToolInput("search the docs", WorkflowSideHeaders: true)));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal(MicrosoftAgentFrameworkErrorTypes.WorkflowError, failure.ErrorType);
+        Assert.Contains("HostedMcpServerTool 'docs' has 1 HTTP header(s) set in the Workflow", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders[\"docs\"]", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(0, fake.CallCount);
+        var history = await handle.FetchHistoryAsync();
+        Assert.Empty(HistoryAssert.Scheduled(history));
+        var text = HistoryAssert.AllText(history);
+        Assert.DoesNotContain("workflow-side-secret", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("Authorization", text, StringComparison.Ordinal);
     }
 
     private static Dictionary<string, object?> City(string city) => new() { ["city"] = city };

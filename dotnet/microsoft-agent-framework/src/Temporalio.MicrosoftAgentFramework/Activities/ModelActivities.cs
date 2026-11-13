@@ -24,6 +24,7 @@ public sealed class ModelActivities
     private static readonly TimeSpan MinHeartbeatInterval = TimeSpan.FromMilliseconds(100);
 
     private readonly IReadOnlyDictionary<string, Func<IChatClient>> factories;
+    private readonly IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? hostedMcpServerHeaders;
     private readonly ConcurrentDictionary<string, IChatClient> clients = new(StringComparer.Ordinal);
     private readonly object clientLock = new();
 
@@ -31,10 +32,17 @@ public sealed class ModelActivities
     /// Initializes a new instance of the <see cref="ModelActivities"/> class.
     /// </summary>
     /// <param name="factories">Chat client factories by model name.</param>
-    public ModelActivities(IReadOnlyDictionary<string, Func<IChatClient>> factories)
+    /// <param name="hostedMcpServerHeaders">
+    /// HTTP headers added to hosted MCP server tools when the Activity rebuilds them, by server
+    /// name; see <see cref="MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders"/>.
+    /// </param>
+    public ModelActivities(
+        IReadOnlyDictionary<string, Func<IChatClient>> factories,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? hostedMcpServerHeaders = null)
     {
         ArgumentNullException.ThrowIfNull(factories);
         this.factories = factories;
+        this.hostedMcpServerHeaders = hostedMcpServerHeaders;
     }
 
     /// <summary>
@@ -50,7 +58,7 @@ public sealed class ModelActivities
         ArgumentNullException.ThrowIfNull(input);
         var context = ActivityExecutionContext.Current;
         var client = ResolveClient(input.Model);
-        var options = ChatOptionsTransport.Rebuild(input);
+        var options = ChatOptionsTransport.Rebuild(input, hostedMcpServerHeaders);
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(context.CancellationToken);
         var pump = HeartbeatAsync(context, stop.Token);
         try

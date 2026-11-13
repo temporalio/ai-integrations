@@ -82,6 +82,23 @@ public class PluginTests : WorkflowTestBase
     }
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Options_WithBadHostedMcpServerHeaders_AreRejected(bool emptyName)
+    {
+        var options = new MicrosoftAgentFrameworkPluginOptions
+        {
+            ChatClients = new Dictionary<string, Func<Microsoft.Extensions.AI.IChatClient>> { ["gpt"] = () => new FakeChatClient(ScriptedResponse.Text("x")) },
+            HostedMcpServerHeaders = new Dictionary<string, IReadOnlyDictionary<string, string>>
+            {
+                [emptyName ? " " : "docs"] = emptyName ? new Dictionary<string, string>() : null!,
+            },
+        };
+        var error = Assert.Throws<ArgumentException>(() => new MicrosoftAgentFrameworkPlugin(options));
+        Assert.Contains(emptyName ? "HostedMcpServerHeaders has an empty server name" : "HostedMcpServerHeaders['docs'] has no headers", error.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
     [InlineData(0)]
     [InlineData(-5)]
     public void Options_WithNonPositiveIdleTimeout_AreRejected(int seconds)
