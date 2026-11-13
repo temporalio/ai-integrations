@@ -113,10 +113,13 @@ test('Tools workflow can use AI tools', async (t) => {
 class StreamingTestProvider implements ProviderV4 {
   readonly specificationVersion = 'v4';
 
-  constructor(private readonly parts: LanguageModelV4StreamPart[]) {}
+  constructor(
+    private readonly parts: LanguageModelV4StreamPart[],
+    private readonly response?: LanguageModelV4StreamResult['response']
+  ) {}
 
   languageModel(_modelId: string): LanguageModelV4 {
-    const parts = this.parts;
+    const { parts, response } = this;
     return {
       specificationVersion: 'v4',
       provider: 'temporal-test',
@@ -133,6 +136,7 @@ class StreamingTestProvider implements ProviderV4 {
               controller.close();
             },
           }),
+          response,
         };
       },
     };
@@ -181,6 +185,40 @@ test('Streaming text, finish and response metadata survive activity execution an
       },
     ]);
   });
+});
+
+test('Streaming drops an invalid timestamp and keeps a response metadata part', async (t) => {
+  const finish: LanguageModelV4StreamPart = {
+    type: 'finish',
+    finishReason: createFinishReason('stop'),
+    usage: createUsage(),
+  };
+  const { createWorker, executeWorkflow } = helpers(t);
+  for (const [provider, metadata] of [
+    [
+      new StreamingTestProvider([
+        { type: 'response-metadata', id: 'response-1', timestamp: 'not a date' as unknown as Date },
+        finish,
+      ]),
+      [{ type: 'response-metadata', id: 'response-1' }],
+    ],
+    // OpenAI returns `headers` on every call, with or without metadata.
+    [
+      new StreamingTestProvider([finish], { headers: { 'x-test': '1' } }),
+      [{ type: 'response-metadata' }],
+    ],
+  ] as const) {
+    const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+    await worker.runUntil(async () => {
+      const parts = await executeWorkflow(streamingMetadataWorkflow, {
+        workflowExecutionTimeout: '10 seconds',
+      });
+      t.deepEqual(
+        parts.filter((part) => part.type === 'response-metadata'),
+        metadata as unknown as LanguageModelV4StreamPart[]
+      );
+    });
+  }
 });
 
 function* generateObjectWorkflowGenerator(): Generator<ModelResponse> {
