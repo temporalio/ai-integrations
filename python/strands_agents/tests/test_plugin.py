@@ -1,11 +1,17 @@
+import contextlib
 import importlib.metadata
 import typing
+from collections.abc import AsyncGenerator
 from dataclasses import replace
 from datetime import timedelta
 
+import anyio
 import mcp
 import pytest
 from botocore.config import Config as BotocoreConfig
+from mcp.server import Server
+from mcp.shared.memory import create_client_server_memory_streams
+from mcp.types import CallToolResult, JSONRPCResponse, ListToolsResult, Tool
 from strands.interrupt import Interrupt, InterruptException
 from strands.models import Model
 from strands.models.bedrock import DEFAULT_READ_TIMEOUT
@@ -355,6 +361,99 @@ def test_plugin_reports_package_version() -> None:
     assert StrandsPlugin().version() == importlib.metadata.version(
         "temporalio-strands-agents"
     )
+
+
+def _weather_server(temp: object) -> Server[typing.Any]:
+    async def list_tools(_ctx: typing.Any, _params: typing.Any) -> ListToolsResult:
+        return ListToolsResult(
+            tools=[
+                Tool(
+                    name="weather",
+                    input_schema={"type": "object"},
+                    output_schema={
+                        "type": "object",
+                        "properties": {"temp": {"type": "number"}},
+                    },
+                )
+            ]
+        )
+
+    async def call_tool(_ctx: typing.Any, _params: typing.Any) -> CallToolResult:
+        return CallToolResult(content=[], structured_content={"temp": temp})
+
+    return Server("weather", on_list_tools=list_tools, on_call_tool=call_tool)
+
+
+@contextlib.asynccontextmanager
+async def _wire(
+    server: Server[typing.Any], content: object
+) -> AsyncGenerator[typing.Any, None]:
+    """Connect to the server in memory, replacing tool result content on the wire."""
+    async with create_client_server_memory_streams() as (client, server_streams):
+        server_read, server_write = server_streams
+        to_client, from_server = anyio.create_memory_object_stream[typing.Any](10)
+
+        async def forward() -> None:
+            async for message in from_server:
+                if isinstance(message.message, JSONRPCResponse) and (
+                    "content" in message.message.result
+                ):
+                    message.message.result["content"] = content
+                await server_write.send(message)
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(forward)
+            tasks.start_soon(
+                server.run,
+                server_read,
+                to_client,
+                server.create_initialization_options(),
+            )
+            yield client
+            tasks.cancel_scope.cancel()
+
+
+@pytest.mark.parametrize(
+    ("temp", "content", "rejected"),
+    [
+        (21, [], False),
+        # The MCP client cannot parse the result: a retry gets the same answer.
+        (21, "not-a-list", True),
+        # The result parses but breaks the tool's output schema: a retry gets
+        # the same answer too.
+        ("warm", [], True),
+    ],
+    ids=["valid", "malformed", "output-schema-mismatch"],
+)
+async def test_mcp_rejected_results(
+    temp: object, content: object, rejected: bool
+) -> None:
+    plugin = StrandsPlugin(
+        models={},
+        mcp_clients={
+            "weather": lambda: mcp.Client(_wire(_weather_server(temp), content))
+        },
+    )
+    activities = typing.cast(list[typing.Any], plugin.activities)
+    call_tool = next(
+        a
+        for a in activities
+        if a.__temporal_activity_definition.name == "temporalio.mcp.weather.call-tool"
+    )
+    request: dict[str, typing.Any] = {
+        "factory_argument": None,
+        "name": "weather",
+        "arguments": {},
+    }
+
+    if not rejected:
+        result = await ActivityEnvironment().run(call_tool, request)
+        assert result["structured_content"] == {"temp": 21}
+        return
+    with pytest.raises(ApplicationError) as error:
+        await ActivityEnvironment().run(call_tool, request)
+    assert error.value.type == "MCPProtocolError"
+    assert error.value.non_retryable
 
 
 def test_mcp_factory_that_needs_arguments_fails_when_the_plugin_is_built() -> None:

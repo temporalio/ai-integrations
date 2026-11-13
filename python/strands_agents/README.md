@@ -669,7 +669,7 @@ github = TemporalMCPClient(
 )
 ```
 
-A tool that reports an error returns a failed tool result to the agent. Errors a retry cannot fix, such as an unknown tool or invalid arguments, reach the agent at once as a failed tool result. Internal server errors, timeouts and lost connections fail the attempt and are retried under the activity's `retry_policy`, and so is a result the MCP client rejects, such as one that does not match the tool's output schema. See the [`temporalio-mcp` README](https://github.com/temporalio/ai-integrations/tree/main/python/mcp#errors-and-retries) for which errors are retried.
+A tool that reports an error returns a failed tool result to the agent. Errors a retry cannot fix reach the agent at once as a failed tool result, without a retry. These include an unknown tool, invalid arguments, a malformed result that the MCP client cannot parse, such as one whose `content` is not a list, and a result that does not match the tool's output schema. Internal server errors, timeouts and lost connections fail the attempt and are retried under the activity's `retry_policy`. See the [`temporalio-mcp` README](https://github.com/temporalio/ai-integrations/tree/main/python/mcp#errors-and-retries) for which errors are retried.
 
 Without `start_to_close_timeout` or `schedule_to_close_timeout`, the MCP activities get a one-minute `start_to_close_timeout`. The default retry policy retries without limit, so an agent turn waits while its MCP server is down. To give up instead, bound the retries:
 
