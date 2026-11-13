@@ -28,6 +28,8 @@ public static partial class PluginMeta
 
     public static string ReadmePath => Path.Combine(Root, "README.md");
 
+    // Walks up from the test binaries to the plugin directory, so the provenance and README tests need
+    // the repository checkout around them; the test project cannot run from a copied bin/ directory.
     private static string FindRoot()
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);

@@ -24,7 +24,7 @@ public class StreamingWorkflow
         var agent = new TemporalAgent(TestPlugin.Model, new TemporalAgentOptions
         {
             StreamingTopic = input.Topic,
-            StreamingBatchInterval = input.Topic is null ? null : TimeSpan.FromMilliseconds(50),
+            StreamingBatchInterval = input.Topic is null ? null : input.BatchInterval ?? TimeSpan.FromMilliseconds(50),
             ChatOptions = new ChatOptions
             {
                 Tools = input.WithTool ? [AIFunctionFactory.Create((string city) => $"sunny in {city}", "get_weather", "Gets the weather for a city")] : null,

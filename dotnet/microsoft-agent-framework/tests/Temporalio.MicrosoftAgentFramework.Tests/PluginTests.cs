@@ -81,6 +81,20 @@ public class PluginTests : WorkflowTestBase
         Assert.Contains("empty server name", error.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    public void Options_WithNonPositiveIdleTimeout_AreRejected(int seconds)
+    {
+        var options = new MicrosoftAgentFrameworkPluginOptions
+        {
+            ChatClients = new Dictionary<string, Func<Microsoft.Extensions.AI.IChatClient>> { ["gpt"] = () => new FakeChatClient(ScriptedResponse.Text("x")) },
+            McpConnectionIdleTimeout = TimeSpan.FromSeconds(seconds),
+        };
+        var error = Assert.Throws<ArgumentException>(() => new MicrosoftAgentFrameworkPlugin(options));
+        Assert.Contains("McpConnectionIdleTimeout must be positive", error.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Replayer_ConfiguredByPlugin_HasFailureTypes()
     {

@@ -12,11 +12,15 @@ public sealed class ScriptedResponse
     private readonly Func<int, ChatResponse> produce;
     private readonly TimeSpan delay;
 
-    private ScriptedResponse(Func<int, ChatResponse> produce, TimeSpan delay)
+    private ScriptedResponse(Func<int, ChatResponse> produce, TimeSpan delay, TimeSpan streamingDelay)
     {
         this.produce = produce;
         this.delay = delay;
+        StreamingDelay = streamingDelay;
     }
+
+    /// <summary>Gets the pause before each streamed update; zero by default.</summary>
+    internal TimeSpan StreamingDelay { get; }
 
     /// <summary>
     /// A plain assistant message.
@@ -26,7 +30,7 @@ public sealed class ScriptedResponse
     public static ScriptedResponse Text(string text)
     {
         ArgumentNullException.ThrowIfNull(text);
-        return new(call => Build(call, [new TextContent(text)], ChatFinishReason.Stop), TimeSpan.Zero);
+        return new(call => Build(call, [new TextContent(text)], ChatFinishReason.Stop), TimeSpan.Zero, TimeSpan.Zero);
     }
 
     /// <summary>
@@ -42,6 +46,7 @@ public sealed class ScriptedResponse
                 call,
                 calls.Select((tool, index) => (AIContent)new FunctionCallContent($"call_{call}_{index}", tool.Name, tool.Arguments)).ToList(),
                 ChatFinishReason.ToolCalls),
+            TimeSpan.Zero,
             TimeSpan.Zero);
     }
 
@@ -55,7 +60,7 @@ public sealed class ScriptedResponse
     {
         ArgumentNullException.ThrowIfNull(value);
         var json = JsonSerializer.Serialize(value, AIJsonUtilities.DefaultOptions);
-        return new(call => Build(call, [new TextContent(json)], ChatFinishReason.Stop), TimeSpan.Zero);
+        return new(call => Build(call, [new TextContent(json)], ChatFinishReason.Stop), TimeSpan.Zero, TimeSpan.Zero);
     }
 
     /// <summary>
@@ -66,14 +71,21 @@ public sealed class ScriptedResponse
     /// <param name="message">Exception message.</param>
     /// <returns>The scripted response.</returns>
     public static ScriptedResponse Fail(HttpStatusCode status, string? message = null) =>
-        new(_ => throw new HttpRequestException(message ?? $"Scripted provider failure {(int)status}", null, status), TimeSpan.Zero);
+        new(_ => throw new HttpRequestException(message ?? $"Scripted provider failure {(int)status}", null, status), TimeSpan.Zero, TimeSpan.Zero);
 
     /// <summary>
     /// Returns a copy that waits <paramref name="delay"/> before answering, to stand in for a slow provider.
     /// </summary>
     /// <param name="delay">How long to wait.</param>
     /// <returns>The delayed response.</returns>
-    public ScriptedResponse WithDelay(TimeSpan delay) => new(produce, delay);
+    public ScriptedResponse WithDelay(TimeSpan delay) => new(produce, delay, StreamingDelay);
+
+    /// <summary>
+    /// Returns a copy whose streamed updates arrive <paramref name="delay"/> apart, to stand in for a provider that streams slowly.
+    /// </summary>
+    /// <param name="delay">The pause before each update.</param>
+    /// <returns>The response.</returns>
+    public ScriptedResponse WithStreamingDelay(TimeSpan delay) => new(produce, this.delay, delay);
 
     /// <summary>
     /// Produces the response for call number <paramref name="call"/>.

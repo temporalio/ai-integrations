@@ -72,22 +72,8 @@ public sealed partial class FakeChatClient : IChatClient
     /// <inheritdoc />
     public async Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null, CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(messages);
-        var call = new FakeChatClientCall(messages.ToList(), options?.Clone());
-        int number;
-        lock (sync)
-        {
-            calls.Add(call);
-            number = ++callCount;
-        }
-
-        if (responder is not null)
-        {
-            return responder(call);
-        }
-
-        var entry = script[Math.Min(number, script.Length) - 1];
-        return await entry.ProduceAsync(number, cancellationToken).ConfigureAwait(false);
+        var (response, _) = await ProduceAsync(messages, options, cancellationToken).ConfigureAwait(false);
+        return response;
     }
 
     /// <inheritdoc />
@@ -96,7 +82,8 @@ public sealed partial class FakeChatClient : IChatClient
         ChatOptions? options = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var response = await GetResponseAsync(messages, options, cancellationToken).ConfigureAwait(false);
+        var (response, entry) = await ProduceAsync(messages, options, cancellationToken).ConfigureAwait(false);
+        var pause = entry?.StreamingDelay ?? TimeSpan.Zero;
         for (var m = 0; m < response.Messages.Count; m++)
         {
             var message = response.Messages[m];
@@ -116,6 +103,11 @@ public sealed partial class FakeChatClient : IChatClient
 
             for (var i = 0; i < pieces.Count; i++)
             {
+                if (pause > TimeSpan.Zero)
+                {
+                    await Task.Delay(pause, cancellationToken).ConfigureAwait(false);
+                }
+
                 yield return new ChatResponseUpdate(message.Role, [pieces[i]])
                 {
                     ResponseId = response.ResponseId,
@@ -156,4 +148,24 @@ public sealed partial class FakeChatClient : IChatClient
 
     [GeneratedRegex(@"(?<=\s)")]
     private static partial Regex ChunkPattern();
+
+    private async Task<(ChatResponse Response, ScriptedResponse? Entry)> ProduceAsync(IEnumerable<ChatMessage> messages, ChatOptions? options, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+        var call = new FakeChatClientCall(messages.ToList(), options?.Clone());
+        int number;
+        lock (sync)
+        {
+            calls.Add(call);
+            number = ++callCount;
+        }
+
+        if (responder is not null)
+        {
+            return (responder(call), null);
+        }
+
+        var entry = script[Math.Min(number, script.Length) - 1];
+        return (await entry.ProduceAsync(number, cancellationToken).ConfigureAwait(false), entry);
+    }
 }

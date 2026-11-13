@@ -1,4 +1,5 @@
 using Microsoft.Extensions.AI;
+using Temporalio.Api.Enums.V1;
 using Temporalio.Extensions.WorkflowStreams;
 using Temporalio.MicrosoftAgentFramework.Testing;
 using Temporalio.MicrosoftAgentFramework.Tests.Workflows;
@@ -78,6 +79,39 @@ public class StreamingTests : WorkflowTestBase
             Assert.True(received.Count > 1, $"expected several streamed updates, got {received.Count}");
             Assert.Equal(text, string.Concat(received.Select(update => update.Text)));
             await HistoryRecorder.SaveAsync(handle, "streaming");
+        });
+    }
+
+    [Fact]
+    public async Task StreamingTopic_LongStream_FlushesEveryMaxBatchSizeUpdates()
+    {
+        var text = string.Join(' ', Enumerable.Range(1, 300).Select(i => $"w{i}"));
+        var fake = new FakeChatClient(ScriptedResponse.Text(text).WithStreamingDelay(TimeSpan.FromMilliseconds(1)));
+        using var worker = Fixture.NewWorker(TestPlugin.For(fake));
+        await WithWorkerAsync(worker, async () =>
+        {
+            var input = new StreamingInput("hi", "deltas", BatchInterval: TimeSpan.FromSeconds(30));
+            var handle = await Client.StartWorkflowAsync((StreamingWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(worker, "streaming-batches"));
+            var received = new List<ChatResponseUpdate>();
+            await using var streams = new WorkflowStreamClient(Client, handle.Id);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(30));
+            var items = streams.SubscribeAsync<ChatResponseUpdate>(new WorkflowStreamSubscribeOptions { Topics = ["deltas"] });
+            await foreach (var item in items.WithCancellation(timeout.Token))
+            {
+                received.Add(item.Value);
+                if (string.Concat(received.Select(update => update.Text)) == text)
+                {
+                    break;
+                }
+            }
+
+            var result = await handle.GetResultAsync();
+            Assert.Equal(text, result.FinalText);
+
+            // 301 updates (300 text pieces and the usage) at a 30-second interval: one publish Signal when the
+            // 256th update is buffered and one for the rest when the stream ends. Without the bound there would be one.
+            Assert.Equal(2, HistoryAssert.Count(await handle.FetchHistoryAsync(), EventType.WorkflowExecutionSignaled));
         });
     }
 }
