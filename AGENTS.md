@@ -159,7 +159,7 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 - `.github/workflows/_go-plugin.yml`: uses the same matrix generator and platform layout with each plugin's Go `runtime-versions`. Every cell runs `make sync` (or `sync-latest`), `make lint`, `make test`, and `make build`; the ubuntu/max cell enables `-race`. `GOTOOLCHAIN=local` prevents dependencies from silently replacing the runtime under test. Windows runners install GNU make with choco. Go action caching keys include the plugin's `go.mod` and `go.sum`.
 - Dependencies: ordinary CI uses the committed lockfile (`go.mod`/`go.sum` for Go); local `make sync` uses the existing versions. Nightly runs every plugin with the newest allowed dependencies (`sync-latest`) without committing the updated lock; manual dispatch can select that mode too. Python make targets use `uv run --locked`; Go lint, test and build use `-mod=readonly` to preserve the versions selected during sync. Go `sync-latest` runs `go get -u -t ./...`, tidies the module and verifies its checksums.
 - Required checks on `main`: `ci-status`, `Check for CODEOWNERS` and `opengrep/scan` (the last two are org-enforced workflows that run automatically on every PR), plus one approving review from a code owner; `license/cla` joins once the CLA app is installed. Do not add a local opengrep caller; the org one already runs. Repository setup: branch protection, the `testpypi`/`pypi` environments (tag policy `python/*/v*`) and the release-tag ruleset were configured by hand on 2026-09-09. The `pypi` required-reviewer gate was removed on 2026-10-07.
-- Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing plugin from the job names `Python (<plugin>) / ...`, `Java (<plugin>) / ...`, and `Go (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs. Existing Python and Java issue titles stay unchanged; Go keys use `go/<plugin>` so plugins in different languages cannot share an issue.
+- Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing plugin from the job names `Python (<plugin>) / ...`, `Java (<plugin>) / ...`, `Go (<plugin>) / ...`, and `TypeScript (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs. All plugin keys use `<language>/<plugin>` so plugins in different languages cannot share an issue.
 
 ## Releases
 
@@ -175,7 +175,7 @@ approval policy.
 A plugin with an open nightly issue doesn't release. Releases test the committed lock,
 while the nightly run tests the newest versions our ranges allow, which is what users
 install. Each release workflow's `prepare` job runs `release_tool.py check-nightly`, which
-fails while the plugin's `nightly: <plugin> failing (latest)` issue is open. Fix the
+fails while the plugin's `nightly: <language>/<plugin> failing (latest)` issue is open. Fix the
 plugin and wait for a green nightly, which closes the issue. Recovery dispatches
 (`recover-run`, Java's `deployment-id`) skip the check: they publish bytes an earlier run
 already tested. A Go tag is public as soon as it exists, so Go checks only in the branch

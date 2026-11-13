@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import nightly_report
+import pytest
 import release_tool
 import yaml
 
@@ -33,8 +35,8 @@ def test_classify_aggregates_results_by_plugin() -> None:
             _job("ci-status", "failure"),
         ]
     )
-    assert failing == {"openai_agents"}
-    assert passing == {"mcp"}
+    assert failing == {"python/openai_agents"}
+    assert passing == {"python/mcp"}
 
 
 def test_report_matches_ci_workflow_job_names() -> None:
@@ -77,7 +79,7 @@ def test_typescript_and_python_langsmith_have_separate_nightly_issues() -> None:
         ]
     )
     assert failing == {"typescript/langsmith"}
-    assert passing == {"langsmith"}
+    assert passing == {"python/langsmith"}
 
 
 def test_classify_go_failures_and_keep_language_identities_separate() -> None:
@@ -92,7 +94,7 @@ def test_classify_go_failures_and_keep_language_identities_separate() -> None:
         ]
     )
     assert failing == {"go/shared"}
-    assert passing == {"shared", "go/recovered"}
+    assert passing == {"python/shared", "go/recovered"}
 
 
 def test_java_failures_are_aggregated_by_plugin() -> None:
@@ -102,5 +104,46 @@ def test_java_failures_are_aggregated_by_plugin() -> None:
             _job("Java (spring-ai) / matrix", "success"),
         ]
     )
-    assert failing == {"spring-ai"}
+    assert failing == {"java/spring-ai"}
     assert not passing
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "success"])
+@pytest.mark.parametrize("existing_issue", [False, True])
+@pytest.mark.parametrize("language", ["Python", "Java"])
+def test_report_creates_or_reuses_issue_with_qualified_title(
+    monkeypatch: pytest.MonkeyPatch, conclusion: str, existing_issue: bool,
+    language: str,
+) -> None:
+    repo = "temporalio/ai-integrations"
+    run_url = f"https://github.com/{repo}/actions/runs/123"
+    key = f"{language.lower()}/langsmith"
+    title = f"nightly: {key} failing (latest)"
+    issues = [{"number": 500, "title": "nightly: typescript/langsmith failing (latest)"}]
+    if existing_issue:
+        issues.append({"number": 444, "title": title})
+    calls: list[tuple[str, ...]] = []
+
+    def gh(*args: str) -> str:
+        calls.append(args)
+        if args[0] == "api":
+            return json.dumps({"jobs": [_job(f"{language} (langsmith) / matrix", conclusion)]})
+        if args[:2] == ("issue", "list"):
+            return json.dumps(issues)
+        return ""
+
+    monkeypatch.setattr(nightly_report, "_gh", gh)
+    monkeypatch.setattr(nightly_report.subprocess, "run", lambda *args, **kwargs: None)
+    assert nightly_report.main(["--repo", repo, "--run-id", "123"]) == 0
+    actions = calls[2:]
+    if not existing_issue:
+        if conclusion == "failure":
+            assert len(actions) == 1
+            assert actions[0][:6] == ("issue", "create", "--repo", repo, "--title", title)
+        else:
+            assert actions == []
+        return
+    if conclusion == "failure":
+        assert actions == [("issue", "comment", "444", "--repo", repo, "--body", f"Still failing: {run_url}")]
+    else:
+        assert actions == [("issue", "close", "444", "--repo", repo, "--comment", f"Green again: {run_url}")]
