@@ -12,7 +12,7 @@ public class ReplayTests
     {
         var directory = Path.Combine(AppContext.BaseDirectory, "Histories");
         var files = Directory.Exists(directory) ? Directory.GetFiles(directory, "*.json").OrderBy(f => f, StringComparer.Ordinal).ToList() : [];
-        Assert.True(files.Count >= 8, $"expected at least eight recorded histories under {directory}, found {files.Count}");
+        Assert.True(files.Count >= 11, $"expected at least eleven recorded histories under {directory}, found {files.Count}");
 
         var plugin = TestPlugin.For(new FakeChatClient(ScriptedResponse.Text("unused")));
         var options = new WorkflowReplayerOptions { Plugins = [plugin] };
