@@ -357,7 +357,7 @@ If the updates cannot all be published, the Activity fails with an `ApplicationE
 
 ## Sessions and continue-as-new
 
-By default Temporal owns the history: `TemporalChatClient` does not store conversations on the provider's side, so when you pass a session Agent Framework keeps the transcript in the session's in-memory history and resends it on every call. Event history is the durable record and replay rebuilds the session exactly.
+By default Temporal owns the history: unless you set `store` yourself, `TemporalChatClient` sends `store=False` to the provider, so the provider keeps no conversation of its own (the OpenAI Responses API stores one and returns its id when `store` is left unset), and when you pass a session Agent Framework keeps the transcript in the session's in-memory history and resends it on every call. Event history is the durable record and replay rebuilds the session exactly.
 
 A long chat grows the history. Check `workflow.info().is_continue_as_new_suggested()` after each turn and carry the session as `session.to_dict()`; the next run restores it with `AgentSession.from_dict`. The dict carries the transcript, pending approval state and the provider's conversation id. Live `Agent` objects, provider connections and spans do not carry over; build them again in the new run.
 

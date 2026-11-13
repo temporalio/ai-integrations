@@ -108,6 +108,16 @@ class StoredConversationWorkflow:
 
 
 @workflow.defn
+class DefaultStoreWorkflow:
+    @workflow.run
+    async def run(self, prompts: list[str]) -> dict[str, Any]:
+        agent = Agent(client=TemporalChatClient("model"))
+        session = agent.create_session()
+        texts = [(await agent.run(prompt, session=session)).text for prompt in prompts]
+        return {"texts": texts, "service_session_id": session.service_session_id}
+
+
+@workflow.defn
 class FileHistoryWorkflow:
     @workflow.run
     async def run(self, storage_path: str) -> str:
@@ -188,6 +198,25 @@ async def test_store_true_uses_service_conversation(client: Client) -> None:
     assert second_call["options"]["conversation_id"] == "conv-1"
     # The service keeps the history, so the second call carries only the new turn.
     assert [m.text for m in second_call["messages"]] == ["second"]
+
+
+async def test_store_defaults_to_false(client: Client) -> None:
+    factory = fake_chat_client(["one", "two"])
+    plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"model": factory})
+    async with new_worker(client, DefaultStoreWorkflow, plugin=plugin) as worker:
+        result = await client.execute_workflow(
+            DefaultStoreWorkflow.run,
+            ["first", "second"],
+            id=workflow_id("default-store"),
+            task_queue=worker.task_queue,
+        )
+    assert result == {"texts": ["one", "two"], "service_session_id": None}
+    first_call, second_call = factory().calls
+    # With store unset the provider is told not to keep the conversation, so
+    # the session's history is the one transcript and the second call resends it.
+    assert first_call["options"]["store"] is False
+    assert second_call["options"]["store"] is False
+    assert [m.text for m in second_call["messages"]] == ["first", "one", "second"]
 
 
 async def test_file_history_provider_fails_clearly(

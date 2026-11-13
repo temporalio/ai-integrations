@@ -55,6 +55,10 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
     start-to-close and a 10 second heartbeat, and the Activity heartbeats on
     its own at half the heartbeat timeout. A run's ``client_kwargs`` (such as
     ``extra_headers``) cross to the Activity and reach the provider client.
+    Unless the caller sets ``store``, the options reach the provider with
+    ``store=False``, so the provider keeps no conversation of its own and the
+    session's in-memory history is the one transcript; ``store=True`` in the
+    agent's or the run's options keeps the service-side conversation path.
 
     With ``streaming_topic`` set, every call of this client runs as the
     streaming Activity, with or without ``stream=True``, and publishes each
@@ -150,6 +154,12 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
         dumped_kwargs = _serde.dump_kwargs(kwargs)
         dumped_messages = _serde.dump_messages(messages)
         dumped_options = _serde.dump_options(options)
+        if dumped_options.get("store") is None:
+            # The Agent decides who keeps the transcript from an explicit store
+            # only; left unset, a provider that stores by default (the OpenAI
+            # Responses API) would return a conversation id, and the next call
+            # would carry that id and the session's full history both.
+            dumped_options["store"] = False
         if stream or self._streaming_topic is not None:
             streaming_input = InvokeModelStreamingInput(
                 model=self._model,
