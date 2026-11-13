@@ -159,6 +159,22 @@ public class FailureTests : WorkflowTestBase
         Assert.Equal(1, HistoryAssert.Count(history, EventType.WorkflowExecutionFailed));
     }
 
+    [Fact]
+    public async Task ThrowingChatClientFactory_ConfigurationError_NoRetry()
+    {
+        var plugin = new MicrosoftAgentFrameworkPlugin(new MicrosoftAgentFrameworkPluginOptions
+        {
+            ChatClients = new Dictionary<string, Func<IChatClient>> { [TestPlugin.Model] = () => throw new InvalidOperationException("OPENAI_API_KEY is not set") },
+        });
+        var (error, handle) = await RunFailingAsync(plugin, (FailureWorkflow wf) => wf.RunAsync(new FailureInput("model")));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal(MicrosoftAgentFrameworkErrorTypes.ConfigurationError, failure.ErrorType);
+        Assert.True(failure.NonRetryable);
+        Assert.Contains("InvalidOperationException: OPENAI_API_KEY is not set", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(1, HistoryAssert.LastAttempt(await handle.FetchHistoryAsync(), ModelActivityNames.InvokeModel));
+    }
+
     [Theory]
     [InlineData("tool-errors", 4, 0)]
     [InlineData("unanswered-approval", 1, 2)]

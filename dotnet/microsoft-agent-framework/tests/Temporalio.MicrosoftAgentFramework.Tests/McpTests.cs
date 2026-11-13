@@ -50,6 +50,24 @@ public class McpTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task ThrowingTransportFactory_ConfigurationError_NoRetry()
+    {
+        var plugin = new MicrosoftAgentFrameworkPlugin(new MicrosoftAgentFrameworkPluginOptions
+        {
+            ChatClients = new Dictionary<string, Func<IChatClient>> { [TestPlugin.Model] = () => AddFake() },
+            McpServers = new Dictionary<string, Func<IClientTransport>> { [Server] = () => throw new InvalidOperationException("MCP_URL is not set") },
+        });
+        var input = new McpInput(Server, "add 2 and 3", MaxAttempts: 3);
+        var (error, handle) = await RunFailingAsync(plugin, (McpWorkflow wf) => wf.RunAsync(input));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal(MicrosoftAgentFrameworkErrorTypes.ConfigurationError, failure.ErrorType);
+        Assert.True(failure.NonRetryable);
+        Assert.Contains("InvalidOperationException: MCP_URL is not set", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(1, HistoryAssert.LastAttempt(await handle.FetchHistoryAsync(), ModelActivityNames.McpListTools));
+    }
+
+    [Fact]
     public async Task IdleTimeout_EvictsConnection_Reconnects()
     {
         await using var mcp = NewServer();

@@ -158,10 +158,30 @@ public sealed class ModelActivities
                 return existing;
             }
 
-            var client = factory() ?? throw new ApplicationFailureException(
-                $"The chat client factory for model '{model}' returned null.",
-                errorType: MicrosoftAgentFrameworkErrorTypes.ConfigurationError,
-                nonRetryable: true);
+            IChatClient? client;
+            try
+            {
+                client = factory();
+            }
+#pragma warning disable CA1031 // The factory is user code; whatever it throws is a configuration error the Workflow must see once.
+            catch (Exception exception)
+#pragma warning restore CA1031
+            {
+                throw new ApplicationFailureException(
+                    $"The chat client factory for model '{model}' threw {exception.GetType().Name}: {exception.Message}",
+                    exception,
+                    errorType: MicrosoftAgentFrameworkErrorTypes.ConfigurationError,
+                    nonRetryable: true);
+            }
+
+            if (client is null)
+            {
+                throw new ApplicationFailureException(
+                    $"The chat client factory for model '{model}' returned null.",
+                    errorType: MicrosoftAgentFrameworkErrorTypes.ConfigurationError,
+                    nonRetryable: true);
+            }
+
             if (client.GetService<FunctionInvokingChatClient>() is not null)
             {
                 throw new ApplicationFailureException(

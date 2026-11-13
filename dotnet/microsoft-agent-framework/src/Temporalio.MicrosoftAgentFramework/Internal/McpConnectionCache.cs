@@ -52,7 +52,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
                 return cached;
             }
 
-            var client = await entry.ConnectAsync(factories[server], cancellationToken).ConfigureAwait(false);
+            var client = await entry.ConnectAsync(server, factories[server], cancellationToken).ConfigureAwait(false);
             var tools = await client.ListToolsAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
             var declarations = tools
                 .Select(tool => new ToolDeclaration(tool.Name, tool.Description, tool.JsonSchema, tool.ReturnJsonSchema))
@@ -83,7 +83,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
         try
         {
             entry.Touch();
-            client = await entry.ConnectAsync(factories[server], cancellationToken).ConfigureAwait(false);
+            client = await entry.ConnectAsync(server, factories[server], cancellationToken).ConfigureAwait(false);
             entry.InFlight++;
         }
         finally
@@ -230,19 +230,36 @@ internal sealed class McpConnectionCache : IAsyncDisposable
 
         /// <summary>
         /// Returns the client, connecting when there is none. A failed connect leaves the entry
-        /// empty so the next attempt reconnects.
+        /// empty so the next attempt reconnects; a factory that throws is a configuration error
+        /// and is not retried.
         /// </summary>
+        /// <param name="server">Server name, for the error message.</param>
         /// <param name="factory">Transport factory.</param>
         /// <param name="cancellationToken">Cancels the connect.</param>
         /// <returns>The connected client.</returns>
-        public async Task<McpClient> ConnectAsync(Func<IClientTransport> factory, CancellationToken cancellationToken)
+        public async Task<McpClient> ConnectAsync(string server, Func<IClientTransport> factory, CancellationToken cancellationToken)
         {
             if (Client is { } existing)
             {
                 return existing;
             }
 
-            var transport = factory();
+            IClientTransport transport;
+            try
+            {
+                transport = factory();
+            }
+#pragma warning disable CA1031 // The factory is user code; whatever it throws is a configuration error the Workflow must see once.
+            catch (Exception exception)
+#pragma warning restore CA1031
+            {
+                throw new ApplicationFailureException(
+                    $"The transport factory for MCP server '{server}' threw {exception.GetType().Name}: {exception.Message}",
+                    exception,
+                    errorType: MicrosoftAgentFrameworkErrorTypes.ConfigurationError,
+                    nonRetryable: true);
+            }
+
             var client = await McpClient.CreateAsync(transport, cancellationToken: cancellationToken).ConfigureAwait(false);
             Client = client;
             Tools = null;
@@ -304,7 +321,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
 
             try
             {
-                // A transport whose read loop never ends would otherwise hold this entry's gate and
+                // A transport whose read loop never ends would otherwise hold this entry's lock and
                 // block the next call on the same server, or the worker's shutdown.
                 await client.DisposeAsync().AsTask().WaitAsync(DisposeTimeout).ConfigureAwait(false);
             }
