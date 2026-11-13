@@ -2,15 +2,20 @@ using System.ClientModel.Primitives;
 
 namespace Temporalio.MicrosoftAgentFramework.Tests;
 
-/// <summary>A System.ClientModel response with a status and optional Retry-After header, for provider error tests.</summary>
+/// <summary>A System.ClientModel response with a status and optional headers, for provider error tests.</summary>
 public sealed class FakePipelineResponse : PipelineResponse
 {
     private readonly FakeHeaders headers;
 
     public FakePipelineResponse(int status, string? retryAfter)
+        : this(status, retryAfter is null ? new Dictionary<string, string>() : new Dictionary<string, string> { ["Retry-After"] = retryAfter })
+    {
+    }
+
+    public FakePipelineResponse(int status, IReadOnlyDictionary<string, string> headers)
     {
         Status = status;
-        headers = new FakeHeaders(retryAfter);
+        this.headers = new FakeHeaders(headers);
     }
 
     public override int Status { get; }
@@ -35,11 +40,11 @@ public sealed class FakePipelineResponse : PipelineResponse
     {
         private readonly Dictionary<string, string> values = new(StringComparer.OrdinalIgnoreCase);
 
-        public FakeHeaders(string? retryAfter)
+        public FakeHeaders(IReadOnlyDictionary<string, string> headers)
         {
-            if (retryAfter is not null)
+            foreach (var (name, value) in headers)
             {
-                values["Retry-After"] = retryAfter;
+                values[name] = value;
             }
         }
 

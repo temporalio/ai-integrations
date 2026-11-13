@@ -6,16 +6,15 @@ namespace Temporalio.MicrosoftAgentFramework.Internal;
 
 /// <summary>
 /// Turns a provider exception into an <see cref="ApplicationFailureException"/> with
-/// <see cref="MicrosoftAgentFrameworkErrorTypes.ModelError"/>, non-retryable for request errors that
-/// repeat identically on retry, retryable otherwise, with <c>Retry-After</c> honored when the
-/// provider sent one. Classification reads HTTP status codes, never message text. The status
-/// extraction paths follow Cecil Phillip's draft at
+/// <see cref="MicrosoftAgentFrameworkErrorTypes.ModelError"/>. The rule is the one the Python
+/// plugin applies: 408, 409, 429 and 5xx are retryable, every other 4xx is not; a provider
+/// <c>x-should-retry</c> header overrides it, and <c>retry-after-ms</c> or <c>Retry-After</c>
+/// becomes the next retry delay. Classification reads HTTP status codes and headers, never
+/// message text. The status extraction paths follow Cecil Phillip's draft at
 /// https://github.com/temporal-community/temporal-dotnet-agents.
 /// </summary>
 internal static class ModelErrorClassifier
 {
-    private static readonly HashSet<int> NonRetryableStatuses = [400, 401, 403, 404, 422];
-
     /// <summary>
     /// Classifies <paramref name="exception"/>.
     /// </summary>
@@ -30,19 +29,26 @@ internal static class ModelErrorClassifier
         {
             if (TryGetHttpStatus(candidate, out var status))
             {
-                var nonRetryable = NonRetryableStatuses.Contains(status);
-                var retryAfter = nonRetryable ? null : TryGetRetryAfter(candidate);
+                var headers = new ResponseHeaders(candidate);
+                var retryable = headers.Get("x-should-retry") switch
+                {
+                    { } flag when flag.Equals("false", StringComparison.OrdinalIgnoreCase) => false,
+                    { } flag when flag.Equals("true", StringComparison.OrdinalIgnoreCase) => true,
+                    _ => IsRetryableStatus(status),
+                };
                 return new ApplicationFailureException(
                     $"Model call failed with HTTP {status}: {candidate.Message}",
                     exception,
                     errorType: MicrosoftAgentFrameworkErrorTypes.ModelError,
-                    nonRetryable: nonRetryable,
-                    nextRetryDelay: retryAfter);
+                    nonRetryable: !retryable,
+                    nextRetryDelay: retryable ? RetryAfter(headers) : null);
             }
         }
 
         return null;
     }
+
+    private static bool IsRetryableStatus(int status) => status is 408 or 409 or 429 || status >= 500;
 
     private static IEnumerable<Exception> Unwrap(Exception? exception)
     {
@@ -68,31 +74,30 @@ internal static class ModelErrorClassifier
 
     private static bool TryGetHttpStatus(Exception exception, out int status)
     {
-        if (exception is HttpRequestException { StatusCode: { } httpStatus })
-        {
-            status = (int)httpStatus;
-            return true;
-        }
-
-        // System.ClientModel.ClientResultException is the OpenAI and Azure OpenAI error type. It is
-        // read by reflection so the plugin does not depend on the OpenAI package.
-        // Status is 0 when the exception carries no response (a transport failure); that is not a status.
-        if (exception.GetType().FullName == "System.ClientModel.ClientResultException" &&
-            exception.GetType().GetProperty("Status") is { PropertyType.FullName: "System.Int32" } statusProperty &&
-            statusProperty.GetValue(exception) is int clientModelStatus &&
-            clientModelStatus > 0)
-        {
-            status = clientModelStatus;
-            return true;
-        }
-
-        status = 0;
-        return false;
+        status = exception is HttpRequestException { StatusCode: { } httpStatus } ? (int)httpStatus : ClientModelStatus(exception);
+        return status is >= 400 and < 600;
     }
 
-    private static TimeSpan? TryGetRetryAfter(Exception exception)
+    // System.ClientModel.ClientResultException is the OpenAI and Azure OpenAI error type. It is
+    // read by reflection so the plugin does not depend on the OpenAI package. Status is 0 when the
+    // exception carries no response (a transport failure); that is not a status.
+    private static int ClientModelStatus(Exception exception) =>
+        exception.GetType().FullName == "System.ClientModel.ClientResultException" &&
+        exception.GetType().GetProperty("Status") is { PropertyType.FullName: "System.Int32" } statusProperty &&
+        statusProperty.GetValue(exception) is int clientModelStatus
+            ? clientModelStatus
+            : 0;
+
+    private static TimeSpan? RetryAfter(ResponseHeaders headers)
     {
-        var header = TryGetRetryAfterHeader(exception);
+        if (headers.Get("retry-after-ms") is { } millisecondsHeader)
+        {
+            return long.TryParse(millisecondsHeader, NumberStyles.Integer, CultureInfo.InvariantCulture, out var milliseconds) && milliseconds >= 0
+                ? TimeSpan.FromMilliseconds(milliseconds)
+                : null;
+        }
+
+        var header = headers.Get("Retry-After");
         if (string.IsNullOrWhiteSpace(header))
         {
             return null;
@@ -112,35 +117,51 @@ internal static class ModelErrorClassifier
         return null;
     }
 
-    private static string? TryGetRetryAfterHeader(Exception exception)
+    /// <summary>
+    /// Header access on a <c>ClientResultException</c>'s raw response: <c>GetRawResponse()</c>
+    /// returns a <c>PipelineResponse</c> whose <c>Headers</c> expose <c>TryGetValue(string, out string)</c>.
+    /// All of it is reached by reflection; other exception types have no headers.
+    /// </summary>
+    private sealed class ResponseHeaders
     {
-        // ClientResultException.GetRawResponse() returns a PipelineResponse whose Headers expose
-        // TryGetValue(string, out string). All of it is reached by reflection, see above.
-        try
+        private readonly object? headers;
+        private readonly MethodInfo? tryGetValue;
+
+        public ResponseHeaders(Exception exception)
         {
-            var getRawResponse = exception.GetType().GetMethod("GetRawResponse", BindingFlags.Public | BindingFlags.Instance, Type.EmptyTypes);
-            var response = getRawResponse?.Invoke(exception, null);
-            var headers = response?.GetType().GetProperty("Headers")?.GetValue(response);
-            if (headers is null)
+            try
             {
-                return null;
+                var getRawResponse = exception.GetType().GetMethod("GetRawResponse", BindingFlags.Public | BindingFlags.Instance, Type.EmptyTypes);
+                var response = getRawResponse?.Invoke(exception, null);
+                headers = response?.GetType().GetProperty("Headers")?.GetValue(response);
+                tryGetValue = headers?.GetType().GetMethod(
+                    "TryGetValue",
+                    BindingFlags.Public | BindingFlags.Instance,
+                    [typeof(string), typeof(string).MakeByRefType()]);
             }
-
-            var tryGetValue = headers.GetType().GetMethod(
-                "TryGetValue",
-                BindingFlags.Public | BindingFlags.Instance,
-                [typeof(string), typeof(string).MakeByRefType()]);
-            if (tryGetValue is null)
+            catch (TargetInvocationException)
             {
-                return null;
+                headers = null;
+                tryGetValue = null;
             }
-
-            var args = new object?[] { "Retry-After", null };
-            return tryGetValue.Invoke(headers, args) is true ? args[1] as string : null;
         }
-        catch (TargetInvocationException)
+
+        public string? Get(string name)
         {
-            return null;
+            if (headers is null || tryGetValue is null)
+            {
+                return null;
+            }
+
+            try
+            {
+                var args = new object?[] { name, null };
+                return tryGetValue.Invoke(headers, args) is true ? args[1] as string : null;
+            }
+            catch (TargetInvocationException)
+            {
+                return null;
+            }
         }
     }
 }

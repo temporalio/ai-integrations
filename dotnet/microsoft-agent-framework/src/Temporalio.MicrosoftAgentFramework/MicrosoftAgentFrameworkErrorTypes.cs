@@ -7,8 +7,9 @@ namespace Temporalio.MicrosoftAgentFramework;
 public static class MicrosoftAgentFrameworkErrorTypes
 {
     /// <summary>
-    /// The provider returned an HTTP error from a model call. The failure is non-retryable for
-    /// 400, 401, 403, 404 and 422 and retryable for every other status.
+    /// The provider returned an HTTP error from a model call. 408, 409, 429 and 5xx are
+    /// retryable and every other 4xx is not, unless the provider's <c>x-should-retry</c> header
+    /// says otherwise; <c>retry-after-ms</c> or <c>Retry-After</c> sets the next retry delay.
     /// </summary>
     public const string ModelError = "MicrosoftAgentFrameworkModelError";
 

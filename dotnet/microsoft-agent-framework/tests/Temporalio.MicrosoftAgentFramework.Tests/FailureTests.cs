@@ -77,6 +77,52 @@ public class FailureTests : WorkflowTestBase
         Assert.InRange(failure.NextRetryDelay.Value, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(90));
     }
 
+    [Theory]
+    [InlineData(HttpStatusCode.PaymentRequired, true)]
+    [InlineData(HttpStatusCode.RequestEntityTooLarge, true)]
+    [InlineData(HttpStatusCode.RequestTimeout, false)]
+    [InlineData(HttpStatusCode.Conflict, false)]
+    public async Task ModelStatus_FollowsTheSharedRule(HttpStatusCode status, bool nonRetryable)
+    {
+        var fake = new FakeChatClient(ScriptedResponse.Fail(status));
+        var input = new FailureInput("model", MaxAttempts: 2);
+        var (error, handle) = await RunFailingAsync(TestPlugin.For(fake), (FailureWorkflow wf) => wf.RunAsync(input));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal(MicrosoftAgentFrameworkErrorTypes.ModelError, failure.ErrorType);
+        Assert.Equal(nonRetryable, failure.NonRetryable);
+        Assert.Equal(nonRetryable ? 1 : 2, HistoryAssert.LastAttempt(await handle.FetchHistoryAsync(), ModelActivityNames.InvokeModel));
+    }
+
+    [Fact]
+    public async Task RetryAfterMs_WinsOverRetryAfter()
+    {
+        var headers = new Dictionary<string, string> { ["retry-after-ms"] = "1500", ["Retry-After"] = "7" };
+        var fake = new FakeChatClient(_ => throw new System.ClientModel.ClientResultException("rate limited", new FakePipelineResponse(429, headers)));
+        var input = new FailureInput("model", MaxAttempts: 1);
+        var (error, _) = await RunFailingAsync(TestPlugin.For(fake), (FailureWorkflow wf) => wf.RunAsync(input));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.False(failure.NonRetryable);
+        Assert.Equal(TimeSpan.FromMilliseconds(1500), failure.NextRetryDelay);
+    }
+
+    [Theory]
+    [InlineData(503, "false", true)]
+    [InlineData(400, "true", false)]
+    public async Task XShouldRetry_OverridesTheStatusRule(int status, string header, bool nonRetryable)
+    {
+        var headers = new Dictionary<string, string> { ["x-should-retry"] = header };
+        var fake = new FakeChatClient(_ => throw new System.ClientModel.ClientResultException("provider decided", new FakePipelineResponse(status, headers)));
+        var input = new FailureInput("model", MaxAttempts: 2);
+        var (error, handle) = await RunFailingAsync(TestPlugin.For(fake), (FailureWorkflow wf) => wf.RunAsync(input));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal(MicrosoftAgentFrameworkErrorTypes.ModelError, failure.ErrorType);
+        Assert.Equal(nonRetryable, failure.NonRetryable);
+        Assert.Equal(nonRetryable ? 1 : 2, HistoryAssert.LastAttempt(await handle.FetchHistoryAsync(), ModelActivityNames.InvokeModel));
+    }
+
     [Fact]
     public async Task ClientResultExceptionWithoutResponse_PropagatesUnchanged()
     {
