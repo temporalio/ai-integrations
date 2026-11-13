@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Temporalio.Client;
 using Temporalio.MicrosoftAgentFramework.Tests.Workflows;
 using Temporalio.Testing;
@@ -9,9 +10,13 @@ namespace Temporalio.MicrosoftAgentFramework.Tests;
 /// One local dev server for the whole run. Startup follows the repository policy: three
 /// attempts, one second apart, only for the SDK's startup timeout, download and archive errors.
 /// </summary>
-public sealed class DevServerFixture : IAsyncLifetime
+public sealed partial class DevServerFixture : IAsyncLifetime
 {
-    private static readonly string[] RetryableMarkers = ["download", "timed out", "timeout", "extract", "archive"];
+    // The three startup failures as Temporal's core words them, anchored to the start of the
+    // message after an optional "<context>: " prefix. A client error that merely mentions a timeout
+    // is not one of them. dotnet/_template/DevServerFixture.cs carries the same pattern.
+    [GeneratedRegex(@"^(?:[^:]*: )?(?:ephemeral server at \S+ did not start within |failed to download ephemeral server executable:|invalid ephemeral server download: could not (?:read|extract) )", RegexOptions.CultureInvariant)]
+    private static partial Regex RetryableStartupError();
 
     public WorkflowEnvironment Env { get; private set; } = null!;
 
@@ -26,7 +31,7 @@ public sealed class DevServerFixture : IAsyncLifetime
                 Env = await WorkflowEnvironment.StartLocalAsync();
                 return;
             }
-            catch (InvalidOperationException exception) when (attempt < 3 && IsRetryable(exception))
+            catch (InvalidOperationException exception) when (attempt < 3 && IsRetryable(exception.Message))
             {
                 await Task.Delay(TimeSpan.FromSeconds(1));
             }
@@ -69,6 +74,5 @@ public sealed class DevServerFixture : IAsyncLifetime
             RunTimeout = runTimeout ?? TimeSpan.FromMinutes(2),
         };
 
-    private static bool IsRetryable(Exception exception) =>
-        RetryableMarkers.Any(marker => exception.Message.Contains(marker, StringComparison.OrdinalIgnoreCase));
+    internal static bool IsRetryable(string message) => RetryableStartupError().IsMatch(message);
 }
