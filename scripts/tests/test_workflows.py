@@ -73,6 +73,9 @@ def test_non_ga_releases_use_environments_without_required_reviewers() -> None:
     assert python["publish-pypi"]["environment"]["name"] == "pypi"
     go = yaml.safe_load((REPO / ".github/workflows/release-go.yml").read_text())["jobs"]
     assert all("environment" not in job for job in go.values())
+    dotnet = yaml.safe_load((REPO / ".github/workflows/release-dotnet.yml").read_text())["jobs"]
+    assert dotnet["publish"]["environment"]["name"] == "nuget"
+    assert all("environment" not in job for name, job in dotnet.items() if name != "publish")
 
 
 @pytest.mark.parametrize("maturity,requires_approval", [
@@ -273,6 +276,7 @@ def test_go_release_source_must_be_main_reachable_for_tag_runs(plugin_repo: Path
 @pytest.mark.parametrize("language,skip_when", [
     ("python", "github.event_name != 'workflow_dispatch' || inputs.recover-run == ''"),
     ("typescript", "github.event_name != 'workflow_dispatch' || inputs.recover-run == ''"),
+    ("dotnet", "github.event_name != 'workflow_dispatch' || inputs.recover-run == ''"),
     ("java", "github.event_name != 'workflow_dispatch' || inputs.deployment-id == ''"),
     # A Go tag is public once it exists, so only the branch dry run before tagging can stop it.
     ("go", "github.ref_type != 'tag' && github.event_name == 'workflow_dispatch'"),
@@ -342,7 +346,7 @@ def test_published_release_is_verified_before_uploads_and_linked_from_deployment
     assert summary["if"] == verify["if"]
 
 
-@pytest.mark.parametrize("language", ["python", "typescript", "java", "go"])
+@pytest.mark.parametrize("language", ["python", "typescript", "java", "go", "dotnet"])
 def test_publication_does_not_modify_the_reviewed_github_release(language: str) -> None:
     jobs = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())["jobs"]
     for job in jobs.values():
@@ -440,7 +444,7 @@ def test_release_recovery_rejects_dispatch_outside_main(ref_type: str, ref_name:
     assert result.returncode == 1 and "recovery must be dispatched on main" in result.stdout
 
 
-@pytest.mark.parametrize("language", ["python", "java"])
+@pytest.mark.parametrize("language", ["python", "java", "typescript", "go", "dotnet"])
 def test_release_checkouts_do_not_persist_credentials(language: str) -> None:
     doc = yaml.safe_load((REPO / f".github/workflows/release-{language}.yml").read_text())
     for name, job in doc["jobs"].items():

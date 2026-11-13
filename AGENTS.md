@@ -234,7 +234,7 @@ plugin and wait for a green nightly, which closes the issue. Recovery dispatches
 already tested. A Go tag is public as soon as it exists, so Go checks only in the branch
 dry run before tagging.
 
-Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
+Trusted publishing by ecosystem: PyPI uses OIDC trusted publishing (`pypa/gh-action-pypi-publish`, no stored token; PyPI cannot bind a reusable workflow, so publish jobs live inline in `release-python.yml`). npm supports OIDC trusted publishing (GitHub-hosted runners, npm >= 11.5.1, one publisher per package, register the calling workflow's filename; provenance is automatic for a public repo and package). nuget.org supports OIDC trusted publishing (`NuGet/login` exchanges the job's OIDC token for a one-hour, single-use API key; the policy binds repository owner, repository, the workflow file name and the `nuget` environment, and is owned by the nuget.org account that owns the `Temporalio.` prefix). No stored NuGet tokens; `NUGET_USER` is an environment variable holding a public profile name. Maven Central has no OIDC: Central Portal user token plus GPG signing, kept as environment-scoped secrets. Go has nothing to upload: an immutable tag plus `sum.golang.org` is the release.
 
 After a successful dry run, use its full commit SHA as `<tested-sha>` when generating
 notes with `release-notes --ref` and creating the draft with `gh release create
@@ -352,6 +352,68 @@ committed development version `0.0.0`.
    after manually publishing it and prefer re-running failed jobs. If the original
    artifact is unavailable or its bytes differ from npm, fix forward with a new
    version; never move a tag or replace an uploaded artifact.
+
+### .NET releases
+
+`.github/workflows/release-dotnet.yml` handles every NuGet plugin. Published GitHub
+Releases trigger publication; tag pushes alone do not. Branch dispatches always run
+a dry run. NuGet versions are canonical SemVer without build metadata, such as
+`0.0.1` or `0.0.1-rc.1`; nuget.org normalises and lowercases versions, so dotted
+pre-release labels are the only form used. Registry ordering reads the V3 flat
+container index, which includes unlisted versions; the newest exact version may be
+verified again. Keep the committed development version `0.0.0`.
+
+nuget.org appends a repository signature (`.signature.p7s`) to every upload, so the
+served file is not the tested file byte for byte. The workflow proves instead that
+every entry of the served package, in order and with the same bytes, equals the
+tested package and that the signature is the only addition; an unlisted version is
+treated as yanked. Pre-release versions publish to nuget.org as pre-releases
+(consumers opt in with an explicit version or `--prerelease`); there is no staging
+gallery.
+
+1. Configure the shared GitHub environment `nuget` to accept only `dotnet/*/v*`
+   tags, with the environment variable `NUGET_USER` set to the nuget.org profile
+   name that owns the trusted publishing policy, and include the pattern in the
+   immutable release-tag ruleset. On nuget.org, the account that owns the
+   `Temporalio.` prefix registers one trusted publishing policy for repository
+   owner `temporalio`, repository `ai-integrations`, workflow file
+   `release-dotnet.yml`, environment `nuget`, scoped to push new packages and
+   versions matching `Temporalio.*`. The policy covers coordinates that do not
+   exist yet, so no interactive first publish is needed. Reuse the profile that
+   sdk-dotnet's `nugetprod` environment uses, confirmed with the SDK team; the
+   policy deactivates if that profile leaves the organization. No stored tokens.
+2. Merge release changes to main. Dry-run with
+   `gh workflow run release-dotnet.yml --ref main -f tag=dotnet/<name>/v<version>`.
+   The full channel/platform matrix tests the injected version at one pinned
+   commit; Ubuntu/max packs, checks and smoke-restores the package and saves
+   `dist-dotnet-<name>` as an Actions artifact.
+3. Generate notes with `uv run --project scripts --locked python
+   scripts/release/release_tool.py release-notes --plugin-dir dotnet/<name>
+   --tag dotnet/<name>/v<version> --ref <tested-sha> --output /tmp/release-notes.md`.
+   Create the draft with `gh release create dotnet/<name>/v<version>
+   --target <tested-sha> --draft --notes-file /tmp/release-notes.md`, adding
+   `--prerelease` when required.
+4. Publish the reviewed draft with
+   `gh release edit dotnet/<name>/v<version> --draft=false`. GitHub creates the
+   tag on the tested commit and starts the workflow. After the full matrix
+   succeeds, the inline OIDC job requests a one-hour API key, pushes the tested
+   `.nupkg` and `.snupkg` with `--skip-duplicate`, waits up to 30 minutes for
+   nuget.org validation, proves the served entries are the tested bytes and the
+   version is listed, and restores that public version in a clean consumer with an
+   isolated packages folder, checking the restored package the same way and
+   loading the `[smoke] imports` types. It leaves the reviewed GitHub Release
+   unchanged.
+5. Re-run failed jobs after an upload: an existing version is skipped only when
+   its served entries match the tested package. A fresh dispatch on the tag
+   rebuilds; one commit packs to identical bytes on one SDK feature band, so that
+   also passes. If the SDK moved, dispatch on the tag with
+   `-f recover-run=<original-run-id>` to reuse the tested artifact without
+   rebuilding. Recovery requires a completed release or dispatch run at the tag's
+   exact main-reachable commit with every matrix job green and an unexpired
+   `dist-dotnet-<name>` artifact, and the plugin's manifests, csproj files and
+   locks must still match the tag. If the artifact is unavailable or its bytes
+   differ from nuget.org, fix forward with the next version; nuget.org never
+   deletes a version and tags never move.
 
 ### Python releases
 
