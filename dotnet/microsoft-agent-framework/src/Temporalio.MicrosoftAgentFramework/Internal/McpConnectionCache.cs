@@ -6,14 +6,18 @@ using Temporalio.MicrosoftAgentFramework.Activities;
 namespace Temporalio.MicrosoftAgentFramework.Internal;
 
 /// <summary>
-/// One <see cref="McpClient"/> per server name per worker, connected on first use and closed
-/// after <see cref="MicrosoftAgentFrameworkPluginOptions.McpConnectionIdleTimeout"/> without a call.
-/// Also holds the tool list of a connection when the caller asked for caching.
+/// One <see cref="McpClient"/> per server name per plugin instance, shared by every worker running
+/// with it, connected on first use and closed after
+/// <see cref="MicrosoftAgentFrameworkPluginOptions.McpConnectionIdleTimeout"/> without a call or when
+/// the last worker or replayer running with the plugin stops (<see cref="Acquire"/> and
+/// <see cref="ReleaseAsync"/> count them). Also holds the tool list of a connection when the caller
+/// asked for caching.
 /// </summary>
 internal sealed class McpConnectionCache : IAsyncDisposable
 {
     private static readonly TimeSpan MaxSweepInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan DisposeTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan InFlightPollInterval = TimeSpan.FromMilliseconds(20);
 
     private readonly IReadOnlyDictionary<string, Func<IClientTransport>> factories;
     private readonly TimeSpan idleTimeout;
@@ -21,6 +25,7 @@ internal sealed class McpConnectionCache : IAsyncDisposable
     private readonly object sync = new();
     private CancellationTokenSource? sweepStop;
     private Task? sweeper;
+    private int runs;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="McpConnectionCache"/> class.
@@ -105,9 +110,40 @@ internal sealed class McpConnectionCache : IAsyncDisposable
     }
 
     /// <summary>
-    /// Closes every connection and stops the idle sweep. The cache stays usable: the next call
-    /// reconnects and restarts the sweep, so one plugin instance can serve a worker that is
-    /// stopped and started again.
+    /// Counts a worker or replayer that starts running with the plugin. Pairs with <see cref="ReleaseAsync"/>.
+    /// </summary>
+    public void Acquire()
+    {
+        lock (sync)
+        {
+            runs++;
+        }
+    }
+
+    /// <summary>
+    /// Counts a worker or replayer that stopped. When it was the last one running, closes every
+    /// connection through <see cref="DisposeAsync"/>; while others run, the connections stay open
+    /// for their calls.
+    /// </summary>
+    /// <returns>A task that completes when the connections are closed, or at once when others still run.</returns>
+    public async ValueTask ReleaseAsync()
+    {
+        lock (sync)
+        {
+            runs = Math.Max(0, runs - 1);
+            if (runs > 0)
+            {
+                return;
+            }
+        }
+
+        await DisposeAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Closes every connection and stops the idle sweep, waiting up to 10 seconds per connection
+    /// for a call in flight. The cache stays usable: the next call reconnects and restarts the
+    /// sweep, so one plugin instance can serve a worker that is stopped and started again.
     /// </summary>
     /// <returns>A task that completes when every client is disposed.</returns>
     public async ValueTask DisposeAsync()
@@ -293,19 +329,30 @@ internal sealed class McpConnectionCache : IAsyncDisposable
         }
 
         /// <summary>
-        /// Closes the client.
+        /// Closes the client once no call is using it, waiting up to <see cref="DisposeTimeout"/>
+        /// for calls in flight.
         /// </summary>
         /// <returns>A task that completes when the client is disposed.</returns>
         public async Task CloseAsync()
         {
-            await Lock.WaitAsync().ConfigureAwait(false);
-            try
+            var started = Stopwatch.GetTimestamp();
+            while (true)
             {
-                await CloseLockedAsync().ConfigureAwait(false);
-            }
-            finally
-            {
-                Lock.Release();
+                await Lock.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    if (InFlight == 0 || Stopwatch.GetElapsedTime(started) > DisposeTimeout)
+                    {
+                        await CloseLockedAsync().ConfigureAwait(false);
+                        return;
+                    }
+                }
+                finally
+                {
+                    Lock.Release();
+                }
+
+                await Task.Delay(InFlightPollInterval).ConfigureAwait(false);
             }
         }
 

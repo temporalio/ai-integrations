@@ -37,7 +37,9 @@ public sealed class MicrosoftAgentFrameworkPluginOptions
 
     /// <summary>
     /// Gets how long an MCP connection may sit unused before the worker closes it. The next call
-    /// reconnects. Defaults to 5 minutes. Every connection is closed when the worker stops.
+    /// reconnects. Defaults to 5 minutes. Every connection is closed when the last worker or
+    /// replayer running with this plugin instance stops; workers that share one instance share
+    /// its connections.
     /// </summary>
     public TimeSpan McpConnectionIdleTimeout { get; init; } = TimeSpan.FromMinutes(5);
 }

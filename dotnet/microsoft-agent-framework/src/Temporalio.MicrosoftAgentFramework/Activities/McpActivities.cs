@@ -24,7 +24,7 @@ public sealed class McpActivities
     /// <summary>
     /// Initializes a new instance of the <see cref="McpActivities"/> class.
     /// </summary>
-    /// <param name="connections">Per-worker connection cache.</param>
+    /// <param name="connections">Connection cache shared by every worker running with the plugin instance.</param>
     internal McpActivities(McpConnectionCache connections) => this.connections = connections;
 
     /// <summary>

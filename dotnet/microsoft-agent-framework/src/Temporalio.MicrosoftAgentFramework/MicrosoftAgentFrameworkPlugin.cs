@@ -9,7 +9,8 @@ namespace Temporalio.MicrosoftAgentFramework;
 /// The Temporal plugin for Microsoft Agent Framework. Pass one instance to
 /// <c>TemporalClientConnectOptions.Plugins</c> or <c>TemporalWorkerOptions.Plugins</c>. It
 /// registers the model and MCP Activities, marks <see cref="MicrosoftAgentFrameworkWorkflowException"/>
-/// as a Workflow failure, and closes MCP connections when the worker stops.
+/// as a Workflow failure, and closes MCP connections when the last worker or replayer running with
+/// the instance stops. Workers that share one instance share its MCP connections.
 /// </summary>
 public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
 {
@@ -128,13 +129,18 @@ public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
 
     private static SimplePluginOptions BuildOptions(MicrosoftAgentFrameworkPluginOptions options)
     {
-#pragma warning disable CA2000 // The cache lives as long as the plugin; RunContextAfter closes its connections.
+#pragma warning disable CA2000 // The cache lives as long as the plugin; the last ReleaseAsync closes its connections.
         var connections = new McpConnectionCache(options.McpServers, options.McpConnectionIdleTimeout);
 #pragma warning restore CA2000
         var pluginOptions = new SimplePluginOptions
         {
             WorkflowFailureExceptionTypes = [typeof(MicrosoftAgentFrameworkWorkflowException)],
-            RunContextAfter = () => connections.DisposeAsync().AsTask(),
+            RunContextBefore = () =>
+            {
+                connections.Acquire();
+                return Task.CompletedTask;
+            },
+            RunContextAfter = () => connections.ReleaseAsync().AsTask(),
         };
         pluginOptions.AddAllActivities(new ModelActivities(options.ChatClients, options.HostedMcpServerHeaders));
         pluginOptions.AddAllActivities(new McpActivities(connections));

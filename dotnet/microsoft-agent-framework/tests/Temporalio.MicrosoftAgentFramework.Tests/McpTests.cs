@@ -2,6 +2,7 @@ using Microsoft.Extensions.AI;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
+using Temporalio.Api.Enums.V1;
 using Temporalio.Client;
 using Temporalio.MicrosoftAgentFramework.Testing;
 using Temporalio.MicrosoftAgentFramework.Tests.Workflows;
@@ -82,6 +83,67 @@ public class McpTests : WorkflowTestBase
             await Client.ExecuteWorkflowAsync((McpWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(worker, "mcp-idle-2"));
             Assert.Equal(2, mcp.ConnectionCount);
         });
+    }
+
+    [Fact]
+    public async Task TwoWorkersOnePlugin_StoppingOneLeavesTheOthersCallRunning()
+    {
+        await using var mcp = new InMemoryMcpServer(
+            McpServerTool.Create(
+                async (int a, int b) =>
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(2));
+                    return a + b;
+                },
+                new McpServerToolCreateOptions { Name = "add", Description = "Adds two integers after a pause" }));
+        var fake = new FakeChatClient(call => call.Messages.Any(message => message.Contents.OfType<FunctionResultContent>().Any())
+            ? new ChatResponse(new ChatMessage(ChatRole.Assistant, "Final: 5"))
+            : new ChatResponse(new ChatMessage(ChatRole.Assistant, [new FunctionCallContent("call_add", "add", new Dictionary<string, object?> { ["a"] = 2, ["b"] = 3 })])));
+        var plugin = TestPlugin.WithMcp(fake, Server, mcp);
+        var input = new McpInput(Server, "add 2 and 3");
+        using var first = Fixture.NewWorker(plugin);
+        using var second = Fixture.NewWorker(plugin);
+        var stopFirst = new TaskCompletionSource();
+        var firstRun = first.ExecuteAsync(() => stopFirst.Task, TestContext.Current.CancellationToken);
+        try
+        {
+            await WithWorkerAsync(second, async () =>
+            {
+                // The first worker opens the shared connection.
+                await Client.ExecuteWorkflowAsync((McpWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(first, "mcp-shared-first"));
+                Assert.Equal(1, mcp.ConnectionCount);
+
+                // The second worker's tool call is on the wire when the first worker stops.
+                var handle = await Client.StartWorkflowAsync((McpWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(second, "mcp-shared-second"));
+                while (mcp.CallToolRequestCount < 2)
+                {
+                    await Task.Delay(20, TestContext.Current.CancellationToken);
+                }
+
+                stopFirst.SetResult();
+                await firstRun;
+
+                var result = await handle.GetResultAsync();
+                Assert.Equal("Final: 5", result.Text);
+                var history = await handle.FetchHistoryAsync();
+                Assert.Equal(0, HistoryAssert.Count(history, EventType.ActivityTaskFailed));
+                Assert.Equal(1, HistoryAssert.LastAttempt(history, ModelActivityNames.McpCallTool));
+
+                // The connection the first worker opened stays open for the second worker's later calls.
+                await Client.ExecuteWorkflowAsync((McpWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(second, "mcp-shared-second-again"));
+                Assert.Equal(1, mcp.ConnectionCount);
+            });
+        }
+        finally
+        {
+            stopFirst.TrySetResult();
+            await firstRun;
+        }
+
+        // Both runs have ended, so the connection was closed; the next worker reconnects.
+        using var third = Fixture.NewWorker(plugin);
+        await WithWorkerAsync(third, () => Client.ExecuteWorkflowAsync((McpWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(third, "mcp-shared-third")));
+        Assert.Equal(2, mcp.ConnectionCount);
     }
 
     [Fact]
