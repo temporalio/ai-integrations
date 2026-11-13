@@ -131,6 +131,13 @@ dimensions). Set `maxEmbeddingsPerCall` in the `embeddingModel` options of
 this value in a deployed Workflow needs Workflow versioning, because it changes
 the Activities the Workflow schedules.
 
+The split applies to the values only. Each chunk gets the same `providerOptions`
+as the full call. So do not set `maxEmbeddingsPerCall` together with provider
+options that hold one entry for each value, such as
+`providerOptions.google.content`. The provider refuses such a chunk, because the
+counts do not match. For those calls, split the values in the Workflow and call
+`embedMany` one time for each chunk, with the options of that chunk.
+
 ```typescript
 const provider = new TemporalProvider({ embeddingModel: { maxEmbeddingsPerCall: 32 } });
 ```

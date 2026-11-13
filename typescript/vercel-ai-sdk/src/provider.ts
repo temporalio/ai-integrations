@@ -65,6 +65,10 @@ export interface TemporalProviderOptions {
      * When set, `embedMany` splits the values into chunks of this size and runs one Activity per
      * chunk, in parallel up to its `maxParallelCalls`. Unset sends all values to one Activity.
      * Changing it in a deployed Workflow needs Workflow versioning.
+     *
+     * Each chunk gets the full `providerOptions`. The model that can cut per-value options
+     * to a chunk is on the Worker, and it needs all the values to do so. To send them to
+     * each Activity would put the full input in Event History one time for each chunk.
      */
     maxEmbeddingsPerCall?: number;
   };
