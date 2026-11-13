@@ -6,12 +6,6 @@ import { TemporalModel } from './temporal-model';
 import { TemporalMCPClient } from './temporal-mcp-client';
 import { workflowErrorFor } from './strands-errors';
 
-const SNAPSHOT_DISABLED =
-  'TemporalAgent disables takeSnapshot()/loadSnapshot(). Temporal workflows ' +
-  'already persist agent state durably via the event history at a finer ' +
-  'granularity than Strands snapshots. Remove the snapshot call and rely on ' +
-  "Temporal's durable execution instead.";
-
 // Strands' own message, which its Agent throws at construction for a stateful model.
 const STATEFUL_MANAGER_REFUSED =
   'contextManager and conversationManager cannot be used with a stateful model. ' +
@@ -150,14 +144,6 @@ export class TemporalAgent extends Agent {
     } catch (err) {
       throw workflowErrorFor(err);
     }
-  }
-
-  override takeSnapshot(): never {
-    throw new Error(SNAPSHOT_DISABLED);
-  }
-
-  override loadSnapshot(): never {
-    throw new Error(SNAPSHOT_DISABLED);
   }
 }
 

@@ -4,6 +4,7 @@ import { z } from 'zod';
 import {
   AfterToolCallEvent,
   AfterToolsEvent,
+  BeforeInvocationEvent,
   SlidingWindowConversationManager,
   tool,
   type BaseModelConfig,
@@ -25,6 +26,7 @@ import {
   continueAsNew,
   defineSignal,
   defineUpdate,
+  DeterminismViolationError,
   proxyActivities,
   setHandler,
   condition,
@@ -45,6 +47,35 @@ export async function helloAgent(prompt: string): Promise<string> {
   const agent = new TemporalAgent({ model: 'test', printer: false });
   const result = await agent.invoke(prompt);
   return result.toString();
+}
+
+/** Exercise signal composition for direct invokes, including aborts before and after composition. */
+export async function agentWithCancelSignal(mode: 'active' | 'pre-aborted' | 'hook'): Promise<{
+  stopReason: string;
+  isAbortSignal: boolean;
+}> {
+  const controller = new AbortController();
+  const signal = mode === 'pre-aborted' ? AbortSignal.abort('already cancelled') : controller.signal;
+  const agent = new TemporalAgent({ model: 'test', printer: false });
+  if (mode === 'hook') {
+    agent.addHook(BeforeInvocationEvent, () => controller.abort('cancelled in hook'));
+  }
+  const result = await agent.invoke('hello', { cancelSignal: signal });
+  return { stopReason: result.stopReason, isAbortSignal: agent.cancelSignal instanceof AbortSignal };
+}
+
+/** Refuse a native timeout before it can make workflow commands depend on wall-clock time. */
+export async function abortSignalTimeout(): Promise<string> {
+  try {
+    AbortSignal.timeout(500);
+  } catch (error) {
+    if (!(error instanceof DeterminismViolationError)) throw error;
+    await proxyActivities<{ auditTool(message: string): Promise<void> }>({
+      startToCloseTimeout: '10 seconds',
+    }).auditTool(error.message);
+    return error.message;
+  }
+  return 'AbortSignal.timeout() did not throw';
 }
 
 /** Exercise Strands' own offloader and storage inside the Workflow isolate. */
@@ -230,6 +261,46 @@ export async function activityToolAgent(
   });
   const result = await agent.invoke(prompt);
   return result.toString();
+}
+
+/** Run two calls of one subagent, exposing its state before each call and its actual tool results. */
+export async function agentToolAgent(mode: 'default' | 'reset' | 'preserve' | 'implicit'): Promise<{
+  reply: string;
+  appStates: Record<string, JSONValue>[];
+  toolResults: Array<{ status: string; text: string }>;
+}> {
+  const subagent = new TemporalAgent({
+    name: 'specialist',
+    model: 'specialist',
+    printer: false,
+    appState: { calls: 0 },
+    messages: [
+      { role: 'user', content: [{ text: 'baseline prompt' }] },
+      { role: 'assistant', content: [{ text: 'baseline reply' }] },
+    ],
+  });
+  const appStates: Record<string, JSONValue>[] = [];
+  subagent.addHook(BeforeInvocationEvent, () => {
+    appStates.push(subagent.appState.getAll());
+    subagent.appState.set('calls', Number(subagent.appState.get('calls')) + 1);
+    subagent.appState.set('duringCall', 'added');
+  });
+  const wrapped =
+    mode === 'implicit'
+      ? subagent
+      : mode === 'default'
+        ? subagent.asTool()
+        : subagent.asTool({ preserveContext: mode === 'preserve' });
+  const agent = new TemporalAgent({ model: 'parent', printer: false, tools: [wrapped] });
+  const toolResults: Array<{ status: string; text: string }> = [];
+  agent.addHook(AfterToolCallEvent, (event) => {
+    toolResults.push({
+      status: event.result.status,
+      text: event.result.content.map((block) => (block.type === 'textBlock' ? block.text : '')).join(''),
+    });
+  });
+  const result = await agent.invoke('ask the specialist twice');
+  return { reply: result.toString(), appStates, toolResults };
 }
 
 /**

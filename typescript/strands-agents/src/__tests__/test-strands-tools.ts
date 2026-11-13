@@ -3,11 +3,13 @@ import type { TestFn } from 'ava';
 import { ApplicationFailure } from '@temporalio/common';
 import type { BaseContext } from '@temporalio/test-helpers';
 import { test as anyTest, helpers } from '@temporalio/test-helpers';
+import { Worker } from '@temporalio/worker';
 import { StrandsPlugin } from '..';
 import { auditLog, auditTool, getWeather, getWeatherCalls } from './activities/strands';
 import { setupTestEnv, StubModel, textTurn, toolCallTurn } from './helpers/strands';
 import {
   activityToolAgent,
+  agentToolAgent,
   failingActivityToolAgent,
   hooksAgent,
   inWorkflowToolAgent,
@@ -17,6 +19,59 @@ import {
 const test = anyTest as TestFn<BaseContext>;
 
 setupTestEnv(test);
+
+for (const mode of ['default', 'reset', 'implicit', 'preserve'] as const) {
+  test(`agents as tools: ${mode} context behavior and replay`, async (t) => {
+    const { createWorker, startWorkflow } = helpers(t);
+    const calls: string[][] = [];
+    class SpecialistModel extends StubModel {
+      override async *stream(messages: Message[], options?: StreamOptions): AsyncIterable<ModelStreamEvent> {
+        calls.push(
+          messages.map((message) =>
+            message.content.map((block) => (block.type === 'textBlock' ? block.text : '')).join('')
+          )
+        );
+        yield* super.stream(messages, options);
+      }
+    }
+    const plugin = (): StrandsPlugin =>
+      new StrandsPlugin({
+        models: {
+          parent: () =>
+            new StubModel([
+              toolCallTurn('specialist', 'call_1', { input: 'first request' }),
+              toolCallTurn('specialist', 'call_2', { input: 'second request' }),
+              textTurn('done'),
+            ]),
+          specialist: () => new SpecialistModel([textTurn('first answer'), textTurn('second answer')]),
+        },
+      });
+    const worker = await createWorker({ plugins: [plugin()], maxCachedWorkflows: 0 });
+    const history = await worker.runUntil(async () => {
+      const handle = await startWorkflow(agentToolAgent, {
+        args: [mode],
+        workflowExecutionTimeout: '30 seconds',
+      });
+      t.deepEqual(await handle.result(), {
+        reply: 'done',
+        appStates: [{ calls: 0 }, mode === 'preserve' ? { calls: 1, duringCall: 'added' } : { calls: 0 }],
+        toolResults: [
+          { status: 'success', text: 'first answer' },
+          { status: 'success', text: 'second answer' },
+        ],
+      });
+      return handle.fetchHistory();
+    });
+
+    const baseline = ['baseline prompt', 'baseline reply'];
+    t.deepEqual(calls, [
+      [...baseline, 'first request'],
+      [...baseline, ...(mode === 'preserve' ? ['first request', 'first answer'] : []), 'second request'],
+    ]);
+    await Worker.runReplayHistory({ workflowBundle: t.context.workflowBundle, plugins: [plugin()] }, history);
+    t.is(calls.length, 2);
+  });
+}
 
 test('activityAsTool dispatches a registered activity from the agent loop', async (t) => {
   const { createWorker, executeWorkflow } = helpers(t);
