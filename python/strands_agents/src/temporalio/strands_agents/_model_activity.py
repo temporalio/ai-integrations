@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -96,6 +98,15 @@ class ModelActivity:
         self._factories = factories
         self._default_name = default_name
         self._models: dict[str, Model] = {}
+        self._build_lock = threading.Lock()
+
+    async def _model(self, name: str | None) -> Model:
+        # Factories are synchronous and can be slow. Build on a thread, so the
+        # event loop keeps heartbeating while a cold worker builds the model.
+        key = self._default_name if name is None else name
+        if key is not None and key in self._models:
+            return self._models[key]
+        return await asyncio.to_thread(self._get_model, name)
 
     def _get_model(self, name: str | None) -> Model:
         if name is None:
@@ -107,18 +118,19 @@ class ModelActivity:
                     f"Known: {sorted(self._factories)}"
                 )
             name = self._default_name
-        if name not in self._models:
-            if name not in self._factories:
-                raise ValueError(
-                    f"Unknown model name {name!r}. Known: {sorted(self._factories)}"
-                )
-            self._models[name] = self._factories[name]()
-        return self._models[name]
+        with self._build_lock:
+            if name not in self._models:
+                if name not in self._factories:
+                    raise ValueError(
+                        f"Unknown model name {name!r}. Known: {sorted(self._factories)}"
+                    )
+                self._models[name] = self._factories[name]()
+            return self._models[name]
 
     @activity.defn(name="strands_get_model_config")
     async def get_model_config(self, input: _ModelConfigInput) -> _ModelConfig:
         """Return the named model's id and context window limit."""
-        model = self._get_model(input.model_name)
+        model = await self._model(input.model_name)
         config = model.get_config()
         model_id = (
             config.get("model_id")
@@ -142,7 +154,7 @@ class ModelActivity:
         is typed as plain dicts because the tagged form would not validate
         against ``StreamEvent``, whose ``redactedContent`` is ``bytes``.
         """
-        model = self._get_model(input.model_name)
+        model = await self._model(input.model_name)
         return [encode_event(event) async for event in _stream(model, input)]
 
     @activity.defn
@@ -158,7 +170,7 @@ class ModelActivity:
         so each event is published as the payload converter writes it. See
         ``_topic_payload``.
         """
-        model = self._get_model(input.model_name)
+        model = await self._model(input.model_name)
         return await _publish(_stream(model, input), input)
 
     # Stateful calls use their own activity types. A worker without stateful
@@ -172,7 +184,7 @@ class ModelActivity:
         self, input: _InvokeModelInput
     ) -> _InvokeModelResult:
         """Run a stateful model with the agent's model state; return events and the updated state."""
-        model = self._get_model(input.model_name)
+        model = await self._model(input.model_name)
         state = dict(input.model_state or {})
         events = [encode_event(event) async for event in _stream(model, input, state)]
         return _InvokeModelResult(events=events, model_state=state)
@@ -183,7 +195,7 @@ class ModelActivity:
         self, input: _StreamingInvokeModelInput
     ) -> _InvokeModelResult:
         """Run a stateful model, publish each stream event, and return events and the updated state."""
-        model = self._get_model(input.model_name)
+        model = await self._model(input.model_name)
         state = dict(input.model_state or {})
         events = await _publish(_stream(model, input, state), input)
         return _InvokeModelResult(events=events, model_state=state)

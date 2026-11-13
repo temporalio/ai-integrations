@@ -81,7 +81,7 @@ The error fails the workflow task, so the run stays open until you deploy a fix,
 
 ## Models
 
-`StrandsPlugin(models=...)` takes a mapping of `name → factory`. Each factory is called lazily on first use (on the worker, outside the workflow sandbox) and the constructed model is cached for the worker's lifetime. `TemporalAgent(model="name", ...)` selects which factory to invoke and carries the activity options for that agent's model calls. If `models` is omitted, the plugin registers a single `BedrockModel` factory under the name `"bedrock"` with Botocore retries disabled so Temporal owns retries.
+`StrandsPlugin(models=...)` takes a mapping of `name → factory`. Each factory is called lazily on first use (on the worker, outside the workflow sandbox, on a thread so a slow factory doesn't hold up heartbeats) and the constructed model is cached for the worker's lifetime. `TemporalAgent(model="name", ...)` selects which factory to invoke and carries the activity options for that agent's model calls. If `models` is omitted, the plugin registers a single `BedrockModel` factory under the name `"bedrock"` with Botocore retries disabled so Temporal owns retries.
 
 ```python
 from botocore.config import Config as BotocoreConfig

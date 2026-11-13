@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import importlib
 import inspect
+import time
 from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -80,6 +81,92 @@ async def test_model(client: Client):
         workflows=[ModelWorkflow],
         plugins=[plugin],
     ).replay_workflow(history)
+
+
+@workflow.defn
+class ColdWorkerWorkflow:
+    def __init__(self) -> None:
+        self.agent = TemporalAgent(
+            model="slow",
+            start_to_close_timeout=timedelta(seconds=15),
+            heartbeat_timeout=timedelta(seconds=2),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        self.first_done = False
+        self.resumed = False
+
+    @workflow.run
+    async def run(self) -> list[str]:
+        first = await self.agent.invoke_async("First")
+        self.first_done = True
+        await workflow.wait_condition(lambda: self.resumed)
+        second = await self.agent.invoke_async("Second")
+        return [str(first), str(second)]
+
+    @workflow.query
+    def is_first_done(self) -> bool:
+        return self.first_done
+
+    @workflow.signal
+    def resume(self) -> None:
+        self.resumed = True
+
+
+def _slow_model(delay: float, response: str) -> MockModel:
+    time.sleep(delay)
+    return MockModel([response])
+
+
+async def test_cold_worker_builds_model_without_missing_heartbeats(client: Client):
+    """A slow factory on a worker that didn't read the config doesn't time out the call."""
+    task_queue = f"test_cold_worker_builds_model-{uuid4()}"
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[ColdWorkerWorkflow],
+        plugins=[StrandsPlugin(models={"slow": lambda: MockModel(["First!"])})],
+        max_cached_workflows=0,
+    ):
+        handle = await client.start_workflow(
+            ColdWorkerWorkflow.run,
+            id=f"test_cold_worker_builds_model_{uuid4()}",
+            task_queue=task_queue,
+        )
+        while not await handle.query(ColdWorkerWorkflow.is_first_done):
+            await asyncio.sleep(0.1)
+
+    # This worker never built the model, and its factory blocks for twice the
+    # heartbeat timeout. One attempt, so a heartbeat timeout fails the Workflow.
+    async with Worker(
+        client,
+        task_queue=task_queue,
+        workflows=[ColdWorkerWorkflow],
+        plugins=[StrandsPlugin(models={"slow": lambda: _slow_model(4, "Second!")})],
+        max_cached_workflows=0,
+    ):
+        await handle.signal(ColdWorkerWorkflow.resume)
+        assert await handle.result() == ["First!\n", "Second!\n"]
+
+    history = await handle.fetch_history()
+    assert get_activities(history) == [
+        "strands_get_model_config",
+        "invoke_model",
+        "invoke_model",
+    ]
+
+
+async def test_concurrent_cold_calls_build_model_once():
+    built: list[MockModel] = []
+
+    def factory() -> MockModel:
+        time.sleep(0.2)
+        built.append(MockModel([]))
+        return built[-1]
+
+    model_activity = ModelActivity({"slow": factory})
+    models = await asyncio.gather(*(model_activity._model("slow") for _ in range(3)))
+    assert len(built) == 1
+    assert all(model is built[0] for model in models)
 
 
 @tool
