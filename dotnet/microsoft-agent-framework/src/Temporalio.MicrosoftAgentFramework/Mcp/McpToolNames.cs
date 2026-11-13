@@ -3,9 +3,13 @@ using System.Text.RegularExpressions;
 namespace Temporalio.MicrosoftAgentFramework.Mcp;
 
 /// <summary>
-/// Builds the names the model sees for MCP tools, the way Agent Framework's MCP tool builds them:
+/// Builds the names the model sees for MCP tools, the way the Python Agent Framework's
+/// <c>MCPTool</c> builds them (<c>_normalize_mcp_name</c> and <c>_build_prefixed_mcp_name</c>):
 /// characters outside <c>A-Za-z0-9_.-</c> become <c>-</c>, and the prefix is joined to the name with
 /// one <c>_</c>, after the separators at the end of the prefix and the start of the name are removed.
+/// <c>Microsoft.Agents.AI</c> has no prefix rule and the MCP C# SDK's <c>McpClientTool</c> keeps the
+/// server's name as is; one rule serves the Python and .NET plugins, so a prompt or a sample that
+/// names a tool works with both.
 /// </summary>
 internal static partial class McpToolNames
 {
