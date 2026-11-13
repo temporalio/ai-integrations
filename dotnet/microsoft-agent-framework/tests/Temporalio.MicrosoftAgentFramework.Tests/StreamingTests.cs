@@ -53,7 +53,7 @@ public class StreamingTests : WorkflowTestBase
     public async Task StreamingTopic_PublishesUpdatesFromActivity()
     {
         const string text = "The quick brown fox jumps over the lazy dog";
-        var fake = new FakeChatClient(ScriptedResponse.Text(text));
+        var fake = new FakeChatClient(ScriptedResponse.Text(text).WithStreamingDelay(TimeSpan.FromMilliseconds(100)));
         using var worker = Fixture.NewWorker(TestPlugin.For(fake));
         await WithWorkerAsync(worker, async () =>
         {
@@ -61,12 +61,19 @@ public class StreamingTests : WorkflowTestBase
                 (StreamingWorkflow wf) => wf.RunAsync(new StreamingInput("hi", "deltas")),
                 Fixture.WorkflowOptions(worker, "streaming-topic"));
             var received = new List<ChatResponseUpdate>();
+            var activityDoneAtFirstItem = true;
             await using var streams = new WorkflowStreamClient(Client, handle.Id);
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
             timeout.CancelAfter(TimeSpan.FromSeconds(30));
             var items = streams.SubscribeAsync<ChatResponseUpdate>(new WorkflowStreamSubscribeOptions { Topics = ["deltas"] });
             await foreach (var item in items.WithCancellation(timeout.Token))
             {
+                if (received.Count == 0)
+                {
+                    // The stream is nine words at 100 ms each; the first batch must arrive while the Activity still runs.
+                    activityDoneAtFirstItem = HistoryAssert.Count(await handle.FetchHistoryAsync(), EventType.ActivityTaskCompleted) > 0;
+                }
+
                 received.Add(item.Value);
                 if (string.Concat(received.Select(update => update.Text)) == text)
                 {
@@ -76,6 +83,7 @@ public class StreamingTests : WorkflowTestBase
 
             var result = await handle.GetResultAsync();
             Assert.Equal(text, result.FinalText);
+            Assert.False(activityDoneAtFirstItem, "the first update arrived only after the model Activity completed");
             Assert.True(received.Count > 1, $"expected several streamed updates, got {received.Count}");
             Assert.Equal(text, string.Concat(received.Select(update => update.Text)));
             await HistoryRecorder.SaveAsync(handle, "streaming");
