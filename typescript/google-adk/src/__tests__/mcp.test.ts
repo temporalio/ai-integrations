@@ -80,6 +80,31 @@ function makePlugin(): GoogleAdkPlugin {
 
 const getEnv = setupTestEnv(test);
 
+for (const operation of ['listTools', 'callTool', 'listResources', 'readResource']) {
+  test(`${operation} rejects invalid MCP factory results without retries`, async (t) => {
+    const invalidResults: unknown[] = [undefined, null, 42, {}, { type: 'UnknownConnectionParams' }];
+    for (const result of invalidResults) {
+      const activities = createMCPActivities({ testServer: () => result as BaseToolset });
+      const activity = activities[`testServer-${operation}`] as (args: unknown) => Promise<unknown>;
+      const err = await t.throwsAsync(
+        new MockActivityEnvironment().run(activity, { toolName: 'echo', args: {}, name: 'file:///test' }),
+        { instanceOf: ApplicationFailure }
+      );
+      t.true(err!.nonRetryable);
+      t.is(err!.type, 'MCPToolsetFactoryTypeError');
+      t.is(err!.message, "MCP toolset factory 'testServer' must return a BaseToolset or MCPConnectionParams.");
+    }
+  });
+
+  test(`${operation} keeps MCP factory exceptions retryable`, async (t) => {
+    const activities = createMCPActivities({ testServer: () => { throw new Error('factory failed'); } });
+    const activity = activities[`testServer-${operation}`] as () => Promise<unknown>;
+    const err = await t.throwsAsync(new MockActivityEnvironment().run(activity), { instanceOf: ApplicationFailure });
+    t.false(err!.nonRetryable);
+    t.is(err!.message, 'factory failed');
+  });
+}
+
 // TemporalMCPToolset (E2E)
 test.serial('listToolsReturnsFullSchema', async (t) => {
   const env = getEnv();

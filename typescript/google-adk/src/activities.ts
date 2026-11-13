@@ -200,6 +200,21 @@ function resourceCapable(toolset: BaseToolset, name: string): ResourceCapableToo
   );
 }
 
+function createMcpToolset(name: string, factory: MCPToolsetFactory): ReturnType<MCPToolsetFactory> {
+  const produced = factory();
+  if (
+    isBaseToolset(produced) ||
+    (produced != null && typeof produced === 'object' &&
+      (produced.type === 'StdioConnectionParams' || produced.type === 'StreamableHTTPConnectionParams'))
+  ) {
+    return produced;
+  }
+  throw ApplicationFailure.nonRetryable(
+    `MCP toolset factory '${name}' must return a BaseToolset or MCPConnectionParams.`,
+    'MCPToolsetFactoryTypeError'
+  );
+}
+
 function mcpActivitiesForName(
   name: string,
   factory: MCPToolsetFactory
@@ -210,7 +225,7 @@ function mcpActivitiesForName(
       const stopHeartbeat = startAdaptiveHeartbeat();
       let owned: MCPToolset | undefined;
       try {
-        const produced = factory();
+        const produced = createMcpToolset(name, factory);
         const toolset = isBaseToolset(produced) ? produced : (owned = new MCPToolset(produced));
         const tools = await toolset.getTools();
         // `_getDeclaration` is underscore-prefixed by ADK convention but is a
@@ -234,7 +249,7 @@ function mcpActivitiesForName(
       const abortSignal = ActivityContext.current().cancellationSignal;
       const stopHeartbeat = startAdaptiveHeartbeat();
       try {
-        const produced = factory();
+        const produced = createMcpToolset(name, factory);
         if (!isBaseToolset(produced)) {
           return await withOneSession(new MCPSessionManager(produced), (session) =>
             session.callTool({ name: args.toolName, arguments: args.args }, undefined, { signal: abortSignal })
@@ -264,7 +279,7 @@ function mcpActivitiesForName(
       const abortSignal = ActivityContext.current().cancellationSignal;
       const stopHeartbeat = startAdaptiveHeartbeat();
       try {
-        const produced = factory();
+        const produced = createMcpToolset(name, factory);
         if (!isBaseToolset(produced)) {
           return await withOneSession(new MCPSessionManager(produced), (session) =>
             listResourceNames(session, abortSignal)
@@ -288,7 +303,7 @@ function mcpActivitiesForName(
       const abortSignal = ActivityContext.current().cancellationSignal;
       const stopHeartbeat = startAdaptiveHeartbeat();
       try {
-        const produced = factory();
+        const produced = createMcpToolset(name, factory);
         if (!isBaseToolset(produced)) {
           return await withOneSession(new MCPSessionManager(produced), (session) =>
             readResourceByName(session, args.name, abortSignal)
