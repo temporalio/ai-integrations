@@ -285,6 +285,8 @@ test('invokeModelStreaming publishes and returns binary file data as base64', as
     return JSON.parse(decoder.decode(defaultPayloadConverter.fromPayload<Uint8Array>(payload)));
   });
   t.deepEqual(parts.slice(0, 2), result.content);
+});
+
 test('invokeModelStreaming downloads tool-result URLs and restores assistant URLs', async (t) => {
   const seen: LanguageModelV4CallOptions[] = [];
   const model = new StreamingTestModel([

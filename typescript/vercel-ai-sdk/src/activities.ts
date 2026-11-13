@@ -14,6 +14,7 @@ import type {
   ProviderV4,
 } from '@ai-sdk/provider';
 import { APICallError, getErrorMessage } from '@ai-sdk/provider';
+import { detectMediaType, isFullMediaType, isUrlSupported } from '@ai-sdk/provider-utils';
 import { asSchema, createDownload, type Schema, type ToolExecutionOptions } from 'ai';
 import type { MCPClient } from '@ai-sdk/mcp';
 import { ApplicationFailure } from '@temporalio/common';
@@ -286,8 +287,11 @@ export function createActivities(
     async invokeModel(args: InvokeModelArgs): Promise<InvokeModelResult> {
       using _heartbeat = heartbeatUntilDisposed();
       const model = provider.languageModel(args.modelId);
-      await prepareFileUrls(args.options, model, download);
-      return encodeResultFileData(await callProvider(() => model.doGenerate(args.options)));
+      const downloaded = await prepareFileUrls(args.options, model, download);
+      const result = await callProvider(() => model.doGenerate(args.options));
+      return encodeResultFileData(
+        downloaded ? { ...result, request: withoutBody(result.request) } : result
+      );
     },
 
     /**
@@ -309,7 +313,7 @@ export function createActivities(
       const events = stream.topic(args.streamingTopic);
 
       const model = provider.languageModel(args.modelId);
-      await prepareFileUrls(args.options, model, download);
+      const downloaded = await prepareFileUrls(args.options, model, download);
       const streamResult = await callProvider(() => model.doStream(args.options));
 
       const content: LanguageModelV4Content[] = [];
@@ -443,7 +447,7 @@ export function createActivities(
         usage,
         warnings,
         providerMetadata,
-        request: streamResult.request,
+        request: downloaded ? withoutBody(streamResult.request) : streamResult.request,
         response: responseMetadata ? { ...responseMetadata, ...streamResult.response } : streamResult.response,
       };
     },
@@ -475,15 +479,24 @@ export function createActivities(
 
 type PromptFilePart = { data: SharedV4FileData; mediaType: string };
 
+// A provider can echo its HTTP request in the result. After a download that request holds
+// the file bytes, and they must not go into Event History.
+function withoutBody<T extends object>(value: T | undefined): Omit<T, 'body'> | undefined {
+  if (value === undefined) return undefined;
+  const { body: _body, ...rest } = value as T & { body?: unknown };
+  return rest;
+}
+
 /**
  * Restores `URL` objects in prompt file data, then downloads each URL the model does not
- * support, in the prompt locations `generateText` downloads from.
+ * support, in the prompt locations `generateText` downloads from. Returns true when it
+ * downloaded a file.
  */
 async function prepareFileUrls(
   options: LanguageModelV4CallOptions,
   model: LanguageModelV4,
   download: NonNullable<CreateActivitiesOptions['download']>
-): Promise<void> {
+): Promise<boolean> {
   const downloadable: { part: PromptFilePart; url: URL }[] = [];
   const visit = (part: PromptFilePart, canDownload: boolean): void => {
     if (part.data.type !== 'url') return;
@@ -501,59 +514,26 @@ async function prepareFileUrls(
       }
     }
   }
-  if (downloadable.length === 0) return;
+  if (downloadable.length === 0) return false;
   const supportedUrls = await model.supportedUrls;
   const abortSignal = Context.current().cancellationSignal;
-  await Promise.all(
-    downloadable
-      .filter(({ part, url }) => !isUrlSupported(part.mediaType, url.toString(), supportedUrls))
-      .map(async ({ part, url }) => {
-        const file = await download({ url, abortSignal });
-        part.data = { type: 'data', data: file.data };
-        if (file.mediaType != null && !isFullMediaType(part.mediaType)) {
-          part.mediaType = file.mediaType;
-        }
-      })
+  const unsupported = downloadable.filter(
+    ({ part, url }) =>
+      !isUrlSupported({ mediaType: part.mediaType, url: url.toString(), supportedUrls })
   );
-}
-
-// Matches `isUrlSupported` in `@ai-sdk/provider-utils`, which this package does not depend on.
-function isUrlSupported(
-  mediaType: string,
-  url: string,
-  supportedUrls: Record<string, RegExp[]>
-): boolean {
-  const lowerUrl = url.toLowerCase();
-  const lowerMediaType = mediaType.toLowerCase();
-  const isTopLevelOnly = !lowerMediaType.includes('/');
-  return Object.entries(supportedUrls)
-    .filter(([key]) => {
-      const lowerKey = key.toLowerCase();
-      const prefix = lowerKey === '*' || lowerKey === '*/*' ? '' : lowerKey.replace(/\*/, '');
-      if (prefix === '') return true;
-      if (isTopLevelOnly) return `${lowerMediaType}/` === prefix;
-      return prefix.endsWith('/') ? lowerMediaType.startsWith(prefix) : lowerMediaType === prefix;
+  await Promise.all(
+    unsupported.map(async ({ part, url }) => {
+      const file = await download({ url, abortSignal });
+      part.data = { type: 'data', data: file.data };
+      if (file.mediaType != null && !isFullMediaType(part.mediaType)) {
+        part.mediaType = file.mediaType;
+      }
+      // `generateText` trusts an image signature in the bytes over the given media type.
+      const imageType = detectMediaType({ data: file.data, topLevelType: 'image' });
+      if (imageType != null) part.mediaType = imageType;
     })
-    .flatMap(([, patterns]) => patterns)
-    .some((pattern) => testRegExpFromStart(pattern, lowerUrl));
-}
-
-function testRegExpFromStart(pattern: RegExp, value: string): boolean {
-  if (!pattern.global && !pattern.sticky) return pattern.test(value);
-  const lastIndex = pattern.lastIndex;
-  pattern.lastIndex = 0;
-  try {
-    return pattern.test(value);
-  } finally {
-    pattern.lastIndex = lastIndex;
-  }
-}
-
-function isFullMediaType(mediaType: string): boolean {
-  const slashIndex = mediaType.indexOf('/');
-  if (slashIndex === -1) return false;
-  const subtype = mediaType.substring(slashIndex + 1);
-  return subtype.length > 0 && subtype !== '*';
+  );
+  return unsupported.length > 0;
 }
 
 async function extractTools(mcpClient: MCPClient): Promise<Record<string, ListToolResult>> {

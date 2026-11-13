@@ -44,6 +44,7 @@ import { jsonSchema } from 'ai';
 import { temporal } from '@temporalio/proto';
 import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
 import { ActivityFailure, ApplicationFailure, TemporalFailure } from '@temporalio/common';
+import { historyFromJSON } from '@temporalio/common/lib/proto-utils';
 import { optionalTsToMs } from '@temporalio/common/lib/time';
 import type { OpenTelemetrySinks } from '@temporalio/interceptors-opentelemetry';
 import {
@@ -53,7 +54,7 @@ import {
   OpenTelemetryWorkflowClientCallsInterceptor,
   OpenTelemetryWorkflowClientInterceptor,
 } from '@temporalio/interceptors-opentelemetry';
-import { workflowInterceptorModules } from '@temporalio/testing';
+import { MockActivityEnvironment, workflowInterceptorModules } from '@temporalio/testing';
 import { SimplePlugin } from '@temporalio/plugin';
 import { bundleWorkflowCode, DefaultLogger, NativeConnection, Worker as CoreWorker } from '@temporalio/worker';
 import type { InjectedSinks, WorkerOptions } from '@temporalio/worker';
@@ -71,10 +72,12 @@ import { startLocalWithRetry } from './helpers/environment';
 import {
   binaryFileWorkflow,
   embeddingWorkflow,
+  experimentalDownloadWorkflow,
   fileUrlWorkflow,
   generateObjectWorkflow,
   helloWorldAgent,
   imageToolWorkflow,
+  mediaTypeUrlWorkflow,
   mcpSchemaTestWorkflow,
   mcpWorkflow,
   middlewareWorkflow,
@@ -83,7 +86,7 @@ import {
   telemetryWorkflow,
   toolsWorkflow,
 } from './workflows/ai-sdk';
-import { getWeather } from './activities/ai-sdk';
+import { downloadNotes, getWeather } from './activities/ai-sdk';
 import EventType = temporal.api.enums.v1.EventType;
 
 const remoteTests = ['1', 't', 'true'].includes((process.env.AI_SDK_REMOTE_TESTS ?? 'false').toLowerCase());
@@ -450,14 +453,19 @@ test('Binary file data reaches the model and the workflow as the same bytes', as
   const data = file?.data.type === 'data' ? file.data.data : undefined;
   t.is(typeof data, 'string');
   t.deepEqual([...Buffer.from(data as string, 'base64')], promptBytes);
+});
+
 class RecordingProvider implements ProviderV4 {
   readonly specificationVersion = 'v4';
   readonly calls: LanguageModelV4CallOptions[] = [];
 
-  constructor(private readonly supportedUrls: Record<string, RegExp[]>) {}
+  constructor(
+    private readonly supportedUrls: Record<string, RegExp[]>,
+    private readonly request?: { body: unknown }
+  ) {}
 
   languageModel(_modelId: string): LanguageModelV4 {
-    const { calls, supportedUrls } = this;
+    const { calls, request, supportedUrls } = this;
     return {
       specificationVersion: 'v4',
       provider: 'temporal-test',
@@ -465,7 +473,7 @@ class RecordingProvider implements ProviderV4 {
       supportedUrls,
       async doGenerate(options): Promise<LanguageModelV4GenerateResult> {
         calls.push(options);
-        return textResponse('seen');
+        return { ...textResponse('seen'), request };
       },
       async doStream(): Promise<LanguageModelV4StreamResult> {
         throw new Error('Streaming not supported.');
@@ -561,6 +569,88 @@ test('Prompt file URLs the model supports reach the model as URL objects', async
   t.is(image.mediaType, 'image');
   t.like(notes, { mediaType: 'text/plain', data: { type: 'data' } });
   t.deepEqual(requested, ['/notes']);
+});
+
+test('A downloaded image gets the media type that its bytes show', async (t) => {
+  const provider = new RecordingProvider({});
+  const server = await serveFiles(t);
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: provider, download: localDownload })],
+  });
+  await worker.runUntil(() =>
+    executeWorkflow(mediaTypeUrlWorkflow, {
+      args: [server.baseUrl],
+      workflowExecutionTimeout: '10 seconds',
+    })
+  );
+
+  const [message] = provider.calls[0]!.prompt;
+  if (message?.role !== 'user') throw new Error('Expected a user message');
+  t.like(message.content[1], { type: 'file', mediaType: 'image/png' });
+});
+
+test('The request body of a call that downloaded a file is not recorded', async (t) => {
+  const provider = new RecordingProvider({}, { body: { file: 'the downloaded bytes' } });
+  const server = await serveFiles(t);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: provider, download: localDownload })],
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(fileUrlWorkflow, {
+      args: [server.baseUrl],
+      workflowExecutionTimeout: '10 seconds',
+    });
+    await handle.result();
+    const { events } = await handle.fetchHistory();
+    const results = events!.flatMap(
+      (event) => event.activityTaskCompletedEventAttributes?.result?.payloads ?? []
+    );
+    t.is(results.length, 1);
+    const recorded = JSON.parse(Buffer.from(results[0]!.data!).toString());
+    t.false('body' in recorded.request);
+  });
+});
+
+test('A history where experimental_download ran an Activity still replays', async (t) => {
+  // Recorded before the model Activity downloaded URLs. `experimental_download` got each
+  // URL then, and this one ran the `downloadNotes` Activity before the model Activity.
+  const histories = path.join(__dirname, '../../src/__tests__/histories');
+  const recorded = readFileSync(
+    path.join(histories, 'experimental-download-before-url-patch.json'),
+    'utf8'
+  );
+  await CoreWorker.runReplayHistory(
+    {
+      workflowBundle: t.context.workflowBundle,
+      plugins: [new AiSdkPlugin({ modelProvider: new RecordingProvider({}) })],
+    },
+    historyFromJSON(JSON.parse(recorded))
+  );
+  t.pass();
+});
+
+test('A new execution leaves the download of a URL to the model Activity', async (t) => {
+  const provider = new RecordingProvider({});
+  const server = await serveFiles(t);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: provider, download: localDownload })],
+    activities: { downloadNotes },
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(experimentalDownloadWorkflow, {
+      args: [server.baseUrl],
+      workflowExecutionTimeout: '10 seconds',
+    });
+    await handle.result();
+    const { events } = await handle.fetchHistory();
+    const scheduled = events!.flatMap(
+      (event) => event.activityTaskScheduledEventAttributes?.activityType?.name ?? []
+    );
+    t.deepEqual(scheduled, ['invokeModel']);
+  });
 });
 
 test('Streaming text, finish and response metadata survive activity execution and workflow replay', async (t) => {

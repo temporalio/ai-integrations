@@ -17,7 +17,7 @@ import {
 } from '../../workflow';
 import type * as activities from '../activities/ai-sdk';
 
-const { getWeather } = proxyActivities<typeof activities>({
+const { downloadNotes, getWeather } = proxyActivities<typeof activities>({
   startToCloseTimeout: '1 minute',
 });
 
@@ -115,6 +115,52 @@ export async function fileUrlWorkflow(baseUrl: string): Promise<string> {
         ],
       },
     ],
+  });
+  return result.text;
+}
+
+export async function mediaTypeUrlWorkflow(baseUrl: string): Promise<string> {
+  const result = await generateText({
+    model: temporalProvider.languageModel('gpt-4o-mini'),
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Describe the image.' },
+          {
+            type: 'file',
+            data: new URL(`${baseUrl}/image`),
+            mediaType: 'application/octet-stream',
+          },
+        ],
+      },
+    ],
+  });
+  return result.text;
+}
+
+// Downloads through an Activity of its own, which worked before the model Activity did it.
+export async function experimentalDownloadWorkflow(baseUrl: string): Promise<string> {
+  const result = await generateText({
+    model: temporalProvider.languageModel('gpt-4o-mini'),
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Describe the notes.' },
+          { type: 'file', data: new URL(`${baseUrl}/notes`), mediaType: 'text/plain' },
+        ],
+      },
+    ],
+    experimental_download: async (requests) =>
+      await Promise.all(
+        requests.map(async ({ url, isUrlSupportedByModel }) => {
+          if (isUrlSupportedByModel) return null;
+          const text = await downloadNotes(url.toString());
+          const data = Uint8Array.from(text, (char) => char.charCodeAt(0));
+          return { data, mediaType: 'text/plain' };
+        })
+      ),
   });
   return result.text;
 }
