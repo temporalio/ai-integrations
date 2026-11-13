@@ -1,4 +1,6 @@
+using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
+using Temporalio.Exceptions;
 using Temporalio.Workflows;
 
 namespace Temporalio.MicrosoftAgentFramework.Tests.Workflows;
@@ -10,6 +12,7 @@ public class ApprovalWorkflow
     private ToolApprovalRequestContent? pending;
     private int workflowToolInvocations;
     private int plainToolInvocations;
+    private int modelFailures;
 
     [WorkflowSignal]
     public Task DecideAsync(ToolApprovalResponseContent decision)
@@ -27,24 +30,58 @@ public class ApprovalWorkflow
     [WorkflowQuery]
     public int PlainToolInvocations() => plainToolInvocations;
 
+    [WorkflowQuery]
+    public int ModelFailures() => modelFailures;
+
     [WorkflowRun]
     public async Task<string> RunAsync(ApprovalInput input)
     {
         var agent = new TemporalAgent(TestPlugin.Model, new TemporalAgentOptions { ChatOptions = new ChatOptions { Tools = BuildTools(input) } });
-        var session = await agent.CreateSessionAsync();
-        var response = await agent.RunAsync(input.Prompt, session);
-        var request = response.Messages.SelectMany(message => message.Contents).OfType<ToolApprovalRequestContent>().FirstOrDefault();
+        var session = input.Session is { } carried ? await agent.DeserializeSessionAsync(carried) : await agent.CreateSessionAsync();
+        AgentResponse? response = null;
+        var request = input.PendingRequest;
+        if (request is null)
+        {
+            response = await agent.RunAsync(input.Prompt, session);
+            request = FirstRequest(response);
+        }
+
         while (request is not null)
         {
+            if (input.ContinueAsNew && input.PendingRequest is null)
+            {
+                // Carry the session and the pending request into a new run before waiting for the decision.
+                var next = input with { Session = await agent.SerializeSessionAsync(session), PendingRequest = request };
+                throw Workflow.CreateContinueAsNewException((ApprovalWorkflow wf) => wf.RunAsync(next));
+            }
+
             pending = request;
             var requestId = request.RequestId;
             await Workflow.WaitConditionAsync(() => decisions.ContainsKey(requestId));
             pending = null;
-            response = await agent.RunAsync(new ChatMessage(ChatRole.User, [decisions[requestId]]), session);
-            request = response.Messages.SelectMany(message => message.Contents).OfType<ToolApprovalRequestContent>().FirstOrDefault();
+            response = await RunWithDecisionAsync(agent, session, new ChatMessage(ChatRole.User, [decisions[requestId]]), input.RetryAfterModelFailure);
+            request = FirstRequest(response);
         }
 
-        return response.Text;
+        return response!.Text;
+    }
+
+    private static ToolApprovalRequestContent? FirstRequest(AgentResponse response) =>
+        response.Messages.SelectMany(message => message.Contents).OfType<ToolApprovalRequestContent>().FirstOrDefault();
+
+    private async Task<AgentResponse> RunWithDecisionAsync(TemporalAgent agent, AgentSession session, ChatMessage decision, bool retry)
+    {
+        try
+        {
+            return await agent.RunAsync(decision, session);
+        }
+        catch (ActivityFailureException) when (retry)
+        {
+            // The model call after the approved tool failed for good. The failed run stored nothing,
+            // so the same run, with the same decision, can be made again.
+            modelFailures++;
+            return await agent.RunAsync(decision, session);
+        }
     }
 
     private List<AITool> BuildTools(ApprovalInput input)

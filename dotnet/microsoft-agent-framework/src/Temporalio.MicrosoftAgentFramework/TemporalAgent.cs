@@ -379,12 +379,15 @@ public sealed class TemporalAgent : AIAgent
 
     private void ValidateStateKeys()
     {
-        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var seen = new HashSet<string>(StringComparer.Ordinal) { AgentLoop.DeferredApprovalsKey };
         foreach (var key in AIContextProviders.SelectMany(provider => provider.StateKeys).Concat(ChatHistoryProvider.StateKeys))
         {
             if (!seen.Add(key))
             {
-                throw new ArgumentException($"Two providers on this agent share the session state key '{key}'.");
+                throw new ArgumentException(
+                    key == AgentLoop.DeferredApprovalsKey
+                        ? $"A provider on this agent declares the session state key '{key}', which TemporalAgent uses for calls held back behind an approval."
+                        : $"Two providers on this agent share the session state key '{key}'.");
             }
         }
     }

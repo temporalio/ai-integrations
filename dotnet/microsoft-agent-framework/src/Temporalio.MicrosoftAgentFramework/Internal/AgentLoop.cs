@@ -77,19 +77,24 @@ internal sealed class AgentLoop
         var token = cancellationToken.CanBeCanceled ? cancellationToken : enumerationToken;
         var chatOptions = MergeChatOptions();
         var messages = LoadHistory();
+
+        // Only a request in a message the history provider supplied can authorize an approved call.
+        // The provider's base class stamps those messages; this set covers a provider that does not.
+        var inputMessages = new HashSet<ChatMessage>(input, ReferenceEqualityComparer.Instance);
+        var fromHistory = new HashSet<ChatMessage>(messages.Where(message => !inputMessages.Contains(message)), ReferenceEqualityComparer.Instance);
         chatOptions = ApplyContextProviders(chatOptions, ref messages);
 
         // The providers hear about this list at the end of the run, as they do under ChatClientAgent:
         // history, the input and anything the context providers added. Their base classes filter it.
         var requestMessages = messages.ToList();
         var approvalNames = ApprovalRequiredNames(chatOptions?.Tools);
-        var injectedDeferred = InjectDeferredApprovals(messages, chatOptions?.Tools, approvalNames);
+        var held = HeldApprovals(chatOptions?.Tools, approvalNames);
 
         var responseMessages = new List<ChatMessage>();
         ApprovalOutcome approvals;
         try
         {
-            approvals = ApprovalProcessor.Process(messages);
+            approvals = ApprovalProcessor.Process(messages, fromHistory, held);
         }
         catch (MicrosoftAgentFrameworkWorkflowException exception)
         {
@@ -179,7 +184,7 @@ internal sealed class AgentLoop
             Usage = totalUsage,
         };
         NotifySuccess(requestMessages, responseMessages);
-        if (injectedDeferred)
+        if (held.Count > 0)
         {
             session.StateBag.TryRemoveValue(DeferredApprovalsKey);
         }
@@ -482,17 +487,17 @@ internal sealed class AgentLoop
         return chatOptions;
     }
 
-    private bool InjectDeferredApprovals(List<ChatMessage> messages, IList<AITool>? tools, HashSet<string> approvalNames)
+    private List<HeldApproval> HeldApprovals(IList<AITool>? tools, HashSet<string> approvalNames)
     {
         if (!session.StateBag.TryGetValue(DeferredApprovalsKey, out List<ToolApprovalRequestContent>? pending, AgentAbstractionsJsonUtilities.DefaultOptions) ||
             pending is not { Count: > 0 })
         {
-            return false;
+            return [];
         }
 
         // The previous response mixed these calls with ones that needed a decision. Approve them
         // now, unless the tool has since gone or started to need approval, as Agent Framework does.
-        var responses = new List<AIContent>(pending.Count);
+        var held = new List<HeldApproval>(pending.Count);
         foreach (var request in pending)
         {
             var name = (request.ToolCall as FunctionCallContent)?.Name;
@@ -502,11 +507,10 @@ internal sealed class AgentLoop
                 Workflow.Logger.LogWarning("A call to '{Tool}' was held back on the previous run; the tool now needs approval or is gone, so it is rejected instead of run.", name);
             }
 
-            responses.Add(request.CreateResponse(stillPlain));
+            held.Add(new HeldApproval(request, stillPlain));
         }
 
-        messages.Add(new ChatMessage(ChatRole.User, responses));
-        return true;
+        return held;
     }
 
     private void NotifySuccess(IReadOnlyList<ChatMessage> requestMessages, IReadOnlyList<ChatMessage> responseMessages)

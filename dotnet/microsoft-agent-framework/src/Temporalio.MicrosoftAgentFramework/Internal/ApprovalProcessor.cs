@@ -1,3 +1,4 @@
+using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 
 namespace Temporalio.MicrosoftAgentFramework.Internal;
@@ -6,7 +7,10 @@ namespace Temporalio.MicrosoftAgentFramework.Internal;
 /// Applies the <c>FunctionInvokingChatClient</c> approval contract to the messages of a run:
 /// answered <see cref="ToolApprovalRequestContent"/>s become the tool calls and tool results
 /// the provider expects, rejected ones get a rejection result, and the approval contents never
-/// reach the provider.
+/// reach the provider. A response is bound to the request the session surfaced, as Agent
+/// Framework's default middleware binds it: the call that runs is a copy of the one recorded
+/// in the session under the response's request id, never the one the response carries. Nothing
+/// held by the session is changed; a run that fails leaves it as it was.
 /// </summary>
 internal static class ApprovalProcessor
 {
@@ -20,31 +24,44 @@ internal static class ApprovalProcessor
     /// Rewrites <paramref name="messages"/> in place.
     /// </summary>
     /// <param name="messages">History plus the run's input, as the provider would see it.</param>
+    /// <param name="fromHistory">
+    /// The messages the chat history provider supplied. Only a request found in one of them, or
+    /// in <paramref name="held"/>, can authorize a call; a request that appears only in the run's
+    /// input proves nothing about what a human was asked.
+    /// </param>
+    /// <param name="held">Requests the previous run held back in the session, each with the decision this run makes for it.</param>
     /// <returns>What was reconstructed and which approved calls still need to run.</returns>
-    public static ApprovalOutcome Process(List<ChatMessage> messages)
+    public static ApprovalOutcome Process(List<ChatMessage> messages, IReadOnlySet<ChatMessage> fromHistory, IReadOnlyList<HeldApproval> held)
     {
-        var requests = new Dictionary<string, (ChatMessage Message, ToolApprovalRequestContent Request)>(StringComparer.Ordinal);
+        // Requests the session surfaced, by request id: the message they sit in (null for a held one) and the call.
+        var surfaced = new Dictionary<string, (ChatMessage? Message, FunctionCallContent Call)>(StringComparer.Ordinal);
+
+        // Every request in the messages, surfaced or not, with its call id: each needs an answer or a result.
+        var allRequests = new Dictionary<string, string>(StringComparer.Ordinal);
         var responses = new List<ToolApprovalResponseContent>();
-        var unansweredCallIds = new HashSet<string>(StringComparer.Ordinal);
         var executedCallIds = new HashSet<string>(StringComparer.Ordinal);
         var lastApprovalIndex = -1;
         var lastApprovalHasOtherContent = false;
 
         for (var i = 0; i < messages.Count; i++)
         {
+            var message = messages[i];
             var hasApproval = false;
             var hasOther = false;
-            foreach (var content in messages[i].Contents)
+            foreach (var content in message.Contents)
             {
                 switch (content)
                 {
-                    case ToolApprovalRequestContent { ToolCall: FunctionCallContent { InformationalOnly: false } call } request:
-                        unansweredCallIds.Add(call.CallId);
-                        requests[request.RequestId] = (messages[i], request);
+                    case ToolApprovalRequestContent { ToolCall: FunctionCallContent call } request:
+                        allRequests.TryAdd(request.RequestId, call.CallId);
+                        if (IsFromHistory(message, fromHistory))
+                        {
+                            surfaced.TryAdd(request.RequestId, (message, call));
+                        }
+
                         hasApproval = true;
                         break;
-                    case ToolApprovalResponseContent { ToolCall: FunctionCallContent { InformationalOnly: false } call } response:
-                        unansweredCallIds.Remove(call.CallId);
+                    case ToolApprovalResponseContent { ToolCall: FunctionCallContent } response:
                         responses.Add(response);
                         hasApproval = true;
                         break;
@@ -65,44 +82,71 @@ internal static class ApprovalProcessor
             }
         }
 
-        if (responses.Count == 0 && requests.Count == 0)
+        foreach (var entry in held)
+        {
+            if (entry.Request.ToolCall is FunctionCallContent call)
+            {
+                allRequests.TryAdd(entry.Request.RequestId, call.CallId);
+                surfaced.TryAdd(entry.Request.RequestId, (null, call));
+                responses.Add(entry.Request.CreateResponse(entry.Approved));
+            }
+        }
+
+        if (responses.Count == 0 && allRequests.Count == 0)
         {
             return ApprovalOutcome.Empty;
         }
 
-        if (unansweredCallIds.Count > 0)
+        // Bind each response to the surfaced request with its id. The response's own ToolCall is
+        // read for nothing but its call id, and only to recognize a call that already has a result.
+        var answered = new HashSet<string>(StringComparer.Ordinal);
+        var unknown = new List<string>();
+        var decisions = new List<Decision>();
+        foreach (var response in responses)
         {
-            throw new MicrosoftAgentFrameworkWorkflowException(
-                $"ToolApprovalRequestContent found with FunctionCall.CallId(s) '{string.Join(", ", unansweredCallIds)}' that have no matching ToolApprovalResponseContent. " +
-                "Answer every pending request with request.CreateResponse(approved) before the next run.");
+            if (surfaced.TryGetValue(response.RequestId, out var request))
+            {
+                if (answered.Add(response.RequestId) && !executedCallIds.Contains(request.Call.CallId))
+                {
+                    decisions.Add(new Decision(response, Snapshot(request.Call), request.Message));
+                }
+            }
+            else if (response.ToolCall is FunctionCallContent { CallId: var callId } && executedCallIds.Contains(callId))
+            {
+                // Settled history, for example a session written by ChatClientAgent: the result is there and nothing runs.
+                answered.Add(response.RequestId);
+            }
+            else if (!unknown.Contains(response.RequestId))
+            {
+                unknown.Add(response.RequestId);
+            }
+        }
+
+        var unanswered = allRequests
+            .Where(pair => !answered.Contains(pair.Key) && !executedCallIds.Contains(pair.Value) && !unknown.Contains(pair.Key))
+            .Select(pair => pair.Key)
+            .ToList();
+        if (unknown.Count > 0 || unanswered.Count > 0)
+        {
+            throw new MicrosoftAgentFrameworkWorkflowException(Describe(unknown, unanswered));
         }
 
         var trailing = lastApprovalIndex < 0 ? 0 : messages.Count - (lastApprovalIndex + 1) + (lastApprovalHasOtherContent ? 1 : 0);
         RemoveApprovalContents(messages);
         var insertIndex = messages.Count - trailing;
 
-        var rejected = new List<ToolApprovalResponseContent>();
-        var approved = new List<ToolApprovalResponseContent>();
-        foreach (var response in responses)
-        {
-            if (executedCallIds.Contains(response.ToolCall.CallId))
-            {
-                continue;
-            }
-
-            (response.Approved ? approved : rejected).Add(response);
-        }
+        var rejected = decisions.Where(decision => !decision.Response.Approved).ToList();
+        var approved = decisions.Where(decision => decision.Response.Approved).ToList();
 
         // Rebuild the assistant tool-call messages: a response whose request message is in the
-        // history gets a clone of that message; a response without one (an auto-approved call
-        // carried in the session) joins the message being built, as FunctionInvokingChatClient does.
+        // history gets a clone of that message; a held call joins the message being built, as
+        // FunctionInvokingChatClient does. Rejections come first, as there.
         var reconstructed = new List<ChatMessage>();
         var callMessages = new Dictionary<ChatMessage, ChatMessage>(ReferenceEqualityComparer.Instance);
         ChatMessage? current = null;
-        foreach (var response in rejected.Concat(approved))
+        foreach (var decision in rejected.Concat(approved))
         {
-            var requestMessage = requests.TryGetValue(response.RequestId, out var found) ? found.Message : null;
-            if (requestMessage is null)
+            if (decision.RequestMessage is null)
             {
                 if (current is null)
                 {
@@ -110,40 +154,32 @@ internal static class ApprovalProcessor
                     reconstructed.Add(current);
                 }
             }
-            else if (!callMessages.TryGetValue(requestMessage, out current))
+            else if (!callMessages.TryGetValue(decision.RequestMessage, out current))
             {
-                current = requestMessage.Clone();
+                current = decision.RequestMessage.Clone();
                 current.Contents = [];
-                callMessages[requestMessage] = current;
+                callMessages[decision.RequestMessage] = current;
                 reconstructed.Add(current);
             }
 
-            current.Contents.Add(response.ToolCall);
+            current.Contents.Add(decision.Call);
         }
 
         if (rejected.Count > 0)
         {
             var results = new List<AIContent>(rejected.Count);
-            foreach (var response in rejected)
+            foreach (var decision in rejected)
             {
-                var call = (FunctionCallContent)response.ToolCall;
-                var text = string.IsNullOrWhiteSpace(response.Reason) ? RejectedResultText : $"{RejectedResultText} {response.Reason}";
-                call.InformationalOnly = true;
-                MarkRequestInformational(requests, response.RequestId);
-                results.Add(new FunctionResultContent(call.CallId, text));
+                var text = string.IsNullOrWhiteSpace(decision.Response.Reason) ? RejectedResultText : $"{RejectedResultText} {decision.Response.Reason}";
+                decision.Call.InformationalOnly = true;
+                results.Add(new FunctionResultContent(decision.Call.CallId, text));
             }
 
             reconstructed.Add(new ChatMessage(ChatRole.Tool, results));
         }
 
         messages.InsertRange(insertIndex, reconstructed);
-        var approvedCalls = approved.Select(response => (FunctionCallContent)response.ToolCall).ToList();
-        foreach (var response in approved)
-        {
-            MarkRequestInformational(requests, response.RequestId);
-        }
-
-        return new ApprovalOutcome(reconstructed, approvedCalls, insertIndex + reconstructed.Count);
+        return new ApprovalOutcome(reconstructed, approved.Select(decision => decision.Call).ToList(), insertIndex + reconstructed.Count);
     }
 
     /// <summary>
@@ -208,12 +244,35 @@ internal static class ApprovalProcessor
         return true;
     }
 
-    private static void MarkRequestInformational(Dictionary<string, (ChatMessage Message, ToolApprovalRequestContent Request)> requests, string requestId)
-    {
-        if (requests.TryGetValue(requestId, out var found) && found.Request.ToolCall is FunctionCallContent call)
+    private static bool IsFromHistory(ChatMessage message, IReadOnlySet<ChatMessage> fromHistory) =>
+        fromHistory.Contains(message) || message.GetAgentRequestMessageSourceType() == AgentRequestMessageSourceType.ChatHistory;
+
+    private static FunctionCallContent Snapshot(FunctionCallContent call) =>
+        new(call.CallId, call.Name, call.Arguments is null ? null : new Dictionary<string, object?>(call.Arguments))
         {
-            call.InformationalOnly = true;
+            AdditionalProperties = call.AdditionalProperties is null ? null : new(call.AdditionalProperties),
+            RawRepresentation = call.RawRepresentation,
+            Annotations = call.Annotations is null ? null : [.. call.Annotations],
+        };
+
+    private static string Describe(List<string> unknown, List<string> unanswered)
+    {
+        var parts = new List<string>(2);
+        if (unknown.Count > 0)
+        {
+            parts.Add(
+                $"ToolApprovalResponseContent with request id(s) '{string.Join(", ", unknown)}' matches no ToolApprovalRequestContent this session surfaced. " +
+                "A response is bound to the request an earlier run of the same session returned; answer that request with request.CreateResponse(approved).");
         }
+
+        if (unanswered.Count > 0)
+        {
+            parts.Add(
+                $"ToolApprovalRequestContent with request id(s) '{string.Join(", ", unanswered)}' has no matching ToolApprovalResponseContent. " +
+                "Answer every pending request with request.CreateResponse(approved) before the next run.");
+        }
+
+        return string.Join(" ", parts);
     }
 
     private static void RemoveApprovalContents(List<ChatMessage> messages)
@@ -241,6 +300,8 @@ internal static class ApprovalProcessor
     }
 
     private static bool IsFunctionApproval(AIContent content) =>
-        content is ToolApprovalRequestContent { ToolCall: FunctionCallContent { InformationalOnly: false } }
-            or ToolApprovalResponseContent { ToolCall: FunctionCallContent { InformationalOnly: false } };
+        content is ToolApprovalRequestContent { ToolCall: FunctionCallContent } or ToolApprovalResponseContent { ToolCall: FunctionCallContent };
+
+    /// <summary>A bound decision: the response, the copy of the surfaced call it applies to, and the message that call came from.</summary>
+    private sealed record Decision(ToolApprovalResponseContent Response, FunctionCallContent Call, ChatMessage? RequestMessage);
 }

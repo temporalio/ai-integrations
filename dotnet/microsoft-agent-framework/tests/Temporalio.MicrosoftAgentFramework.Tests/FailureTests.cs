@@ -1,6 +1,7 @@
 using System.Net;
 using Microsoft.Extensions.AI;
 using Temporalio.Api.Enums.V1;
+using Temporalio.Exceptions;
 using Temporalio.MicrosoftAgentFramework.Testing;
 using Temporalio.MicrosoftAgentFramework.Tests.Workflows;
 
@@ -159,8 +160,30 @@ public class FailureTests : WorkflowTestBase
     }
 
     [Theory]
+    [InlineData("tool-errors", 4, 0)]
+    [InlineData("unanswered-approval", 1, 2)]
+    public async Task LoopFailure_IsReportedToTheHistoryProvider(string kind, int modelCalls, int storedMessages)
+    {
+        var fake = new FakeChatClient(ScriptedResponse.ToolCalls(("get_weather", new Dictionary<string, object?> { ["city"] = "Kingston" })));
+        using var worker = Fixture.NewWorker(TestPlugin.For(fake));
+        await WithWorkerAsync(worker, async () =>
+        {
+            var input = new FailureInput(kind, ObserveProvider: true);
+            var handle = await Client.StartWorkflowAsync((FailureWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(worker, "failure-provider"));
+            var error = await Assert.ThrowsAsync<WorkflowFailedException>(() => handle.GetResultAsync());
+            Assert.Equal(MicrosoftAgentFrameworkErrorTypes.WorkflowError, AppFailure(error)?.ErrorType);
+            Assert.Equal(modelCalls, fake.CallCount);
+            Assert.Equal([nameof(MicrosoftAgentFrameworkWorkflowException)], await handle.QueryAsync(wf => wf.ProviderFailures()));
+            Assert.Equal(storedMessages, await handle.QueryAsync(wf => wf.ProviderMessageCount()));
+        });
+    }
+
+    [Theory]
     [InlineData("unsupported-run-options", "ChatClientFactory")]
+    [InlineData("background-responses", "AllowBackgroundResponses")]
+    [InlineData("continuation-token", "ContinuationToken")]
     [InlineData("wrong-session", "OtherSession")]
+    [InlineData("fabricated-approval", "ficc_fabricated")]
     public async Task Misuse_FailsWorkflowWithWorkflowError(string kind, string expectedMessagePart)
     {
         var fake = new FakeChatClient(ScriptedResponse.Text("never"));

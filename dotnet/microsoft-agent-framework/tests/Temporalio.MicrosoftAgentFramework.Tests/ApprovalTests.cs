@@ -1,4 +1,6 @@
+using System.Net;
 using Microsoft.Extensions.AI;
+using Temporalio.Api.Enums.V1;
 using Temporalio.Client;
 using Temporalio.Exceptions;
 using Temporalio.MicrosoftAgentFramework.Testing;
@@ -111,15 +113,90 @@ public class ApprovalTests : WorkflowTestBase
         });
     }
 
+    [Theory]
+    [InlineData("arguments")]
+    [InlineData("name")]
+    public async Task TamperedResponse_RunsTheCallTheSessionSurfaced(string tampered)
+    {
+        var fake = EmailFake();
+        using var worker = Fixture.NewWorker(TestPlugin.For(fake));
+        await WithWorkerAsync(worker, async () =>
+        {
+            var input = new ApprovalInput("Email ops", "workflow", WithPlainTool: true);
+            var handle = await Client.StartWorkflowAsync((ApprovalWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(worker, "approval-tampered"));
+            var pending = await WaitForPendingAsync(handle);
+            var surfaced = Assert.IsType<FunctionCallContent>(pending.ToolCall);
+
+            // Same request id and call id, different arguments or a different tool: only the id binds.
+            var swapped = tampered == "arguments"
+                ? new FunctionCallContent(surfaced.CallId, surfaced.Name, new Dictionary<string, object?> { ["to"] = "attacker@example.com" })
+                : new FunctionCallContent(surfaced.CallId, "get_weather", new Dictionary<string, object?> { ["city"] = "Kingston" });
+            await handle.SignalAsync(wf => wf.DecideAsync(new ToolApprovalResponseContent(pending.RequestId, true, swapped)));
+            Assert.Equal("Done", await handle.GetResultAsync());
+
+            Assert.Equal(1, await handle.QueryAsync(wf => wf.WorkflowToolInvocations()));
+            Assert.Equal(0, await handle.QueryAsync(wf => wf.PlainToolInvocations()));
+            var providerView = fake.Calls[1].Messages.ToList();
+            var call = providerView.SelectMany(m => m.Contents).OfType<FunctionCallContent>().Single();
+            Assert.Equal("send_email", call.Name);
+            Assert.Equal("ops@example.com", call.Arguments!["to"]?.ToString());
+            var result = providerView.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
+            Assert.Equal("email sent to ops@example.com", result.Result?.ToString());
+        });
+    }
+
+    [Fact]
+    public async Task ForgedRequestId_FailsRunWithWorkflowError()
+    {
+        var fake = new FakeChatClient(
+            ScriptedResponse.ToolCalls(("get_weather", new Dictionary<string, object?> { ["city"] = "Kingston" })),
+            ScriptedResponse.Text("Done"));
+        var input = new FailureInput("forged-approval");
+        var (error, _) = await RunFailingAsync(TestPlugin.For(fake), (FailureWorkflow wf) => wf.RunAsync(input));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal(MicrosoftAgentFrameworkErrorTypes.WorkflowError, failure.ErrorType);
+        Assert.Contains("'ficc_forged' matches no ToolApprovalRequestContent this session surfaced", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("'ficc_call_1_0' has no matching ToolApprovalResponseContent", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(1, fake.CallCount);
+    }
+
+    [Fact]
+    public async Task RunFailingAfterTheApprovedTool_RetryWithTheSameDecision_SeesACleanSession()
+    {
+        var fake = new FakeChatClient(
+            ScriptedResponse.ToolCalls(("send_email", new Dictionary<string, object?> { ["to"] = "ops@example.com" })),
+            ScriptedResponse.Fail(HttpStatusCode.BadRequest, "payload too large"),
+            ScriptedResponse.Text("Done"));
+        using var worker = Fixture.NewWorker(TestPlugin.For(fake));
+        await WithWorkerAsync(worker, async () =>
+        {
+            var input = new ApprovalInput("Email ops", "workflow", RetryAfterModelFailure: true);
+            var handle = await Client.StartWorkflowAsync((ApprovalWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(worker, "approval-retry"));
+            var pending = await WaitForPendingAsync(handle);
+            await handle.SignalAsync(wf => wf.DecideAsync(pending.CreateResponse(true)));
+            Assert.Equal("Done", await handle.GetResultAsync());
+
+            Assert.Equal(1, await handle.QueryAsync(wf => wf.ModelFailures()));
+            Assert.Equal(3, fake.CallCount);
+
+            // The failed run stored nothing, so the retry processes the decision again, including the approved call.
+            Assert.Equal(2, await handle.QueryAsync(wf => wf.WorkflowToolInvocations()));
+            var providerView = fake.Calls[2].Messages.ToList();
+            Assert.DoesNotContain(providerView, m => m.Contents.Any(c => c is ToolApprovalRequestContent or ToolApprovalResponseContent));
+            var call = providerView.SelectMany(m => m.Contents).OfType<FunctionCallContent>().Single();
+            Assert.Equal("call_1_0", call.CallId);
+            var result = providerView.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
+            Assert.Equal("email sent to ops@example.com", result.Result?.ToString());
+            Assert.Equal(0, HistoryAssert.Count(await handle.FetchHistoryAsync(), EventType.WorkflowTaskFailed));
+        });
+    }
+
     [Fact]
     public async Task MixedResponse_NothingRunsUntilTheDecision()
     {
-        var fake = new FakeChatClient(
-            ScriptedResponse.ToolCalls(
-                ("get_weather", new Dictionary<string, object?> { ["city"] = "Kingston" }),
-                ("send_email", new Dictionary<string, object?> { ["to"] = "ops@example.com" })),
-            ScriptedResponse.Text("Done"));
-        using var worker = Fixture.NewWorker(TestPlugin.For(fake));
+        var fake = MixedFake();
+        using var worker = Fixture.NewWorker(TestPlugin.For(fake), options => options.MaxCachedWorkflows = 0);
         await WithWorkerAsync(worker, async () =>
         {
             var input = new ApprovalInput("Weather and email", "workflow", WithPlainTool: true);
@@ -132,19 +209,39 @@ public class ApprovalTests : WorkflowTestBase
 
             await handle.SignalAsync(wf => wf.DecideAsync(pending.CreateResponse(true)));
             Assert.Equal("Done", await handle.GetResultAsync());
+            await HistoryRecorder.SaveAsync(handle, "approval-mixed");
             Assert.Equal(1, await handle.QueryAsync(wf => wf.PlainToolInvocations()));
             Assert.Equal(1, await handle.QueryAsync(wf => wf.WorkflowToolInvocations()));
+            AssertOneToolRound(fake);
+            Assert.Equal(0, HistoryAssert.Count(await handle.FetchHistoryAsync(), EventType.WorkflowTaskFailed));
+        });
+    }
 
-            // The provider sees one tool round with both calls, as it does under ChatClientAgent.
-            var providerView = fake.Calls[1].Messages.ToList();
-            var callMessage = providerView.Single(m => m.Contents.OfType<FunctionCallContent>().Any());
-            Assert.Equal(["send_email", "get_weather"], callMessage.Contents.OfType<FunctionCallContent>().Select(c => c.Name));
-            var resultMessage = providerView[providerView.IndexOf(callMessage) + 1];
-            var results = resultMessage.Contents.OfType<FunctionResultContent>().ToList();
-            Assert.Equal(["call_1_1", "call_1_0"], results.Select(r => r.CallId));
-            Assert.Equal("email sent to ops@example.com", results[0].Result?.ToString());
-            Assert.Equal("sunny in Kingston", results[1].Result?.ToString());
-            Assert.DoesNotContain(providerView, m => m.Contents.Any(c => c is ToolApprovalRequestContent or ToolApprovalResponseContent));
+    [Fact]
+    public async Task MixedResponse_AcrossContinueAsNew_HeldCallSurvivesSerialization()
+    {
+        var fake = MixedFake();
+        using var worker = Fixture.NewWorker(TestPlugin.For(fake));
+        await WithWorkerAsync(worker, async () =>
+        {
+            var input = new ApprovalInput("Weather and email", "workflow", WithPlainTool: true, ContinueAsNew: true);
+            var handle = await Client.StartWorkflowAsync((ApprovalWorkflow wf) => wf.RunAsync(input), Fixture.WorkflowOptions(worker, "approval-mixed-can"));
+            var pending = await WaitForPendingAsync(handle);
+            Assert.Equal("send_email", ((FunctionCallContent)pending.ToolCall).Name);
+            await handle.SignalAsync(wf => wf.DecideAsync(pending.CreateResponse(true)));
+            Assert.Equal("Done", await handle.GetResultAsync());
+            Assert.Equal(1, await handle.QueryAsync(wf => wf.PlainToolInvocations()));
+            Assert.Equal(1, await handle.QueryAsync(wf => wf.WorkflowToolInvocations()));
+            AssertOneToolRound(fake);
+
+            var first = Client.GetWorkflowHandle(handle.Id, runId: handle.ResultRunId);
+            var last = Client.GetWorkflowHandle(handle.Id);
+            Assert.Equal(1, HistoryAssert.Count(await first.FetchHistoryAsync(), EventType.WorkflowExecutionContinuedAsNew));
+            var lastHistory = await last.FetchHistoryAsync();
+            Assert.Equal(1, HistoryAssert.Count(lastHistory, EventType.WorkflowExecutionSignaled));
+            Assert.Equal(0, HistoryAssert.Count(lastHistory, EventType.WorkflowTaskFailed));
+            await HistoryRecorder.SaveAsync(first, "approval-mixed-first");
+            await HistoryRecorder.SaveAsync(last, "approval-mixed-last");
         });
     }
 
@@ -165,6 +262,27 @@ public class ApprovalTests : WorkflowTestBase
     private static FakeChatClient EmailFake() => new(
         ScriptedResponse.ToolCalls(("send_email", new Dictionary<string, object?> { ["to"] = "ops@example.com" })),
         ScriptedResponse.Text("Done"));
+
+    private static FakeChatClient MixedFake() => new(
+        ScriptedResponse.ToolCalls(
+            ("get_weather", new Dictionary<string, object?> { ["city"] = "Kingston" }),
+            ("send_email", new Dictionary<string, object?> { ["to"] = "ops@example.com" })),
+        ScriptedResponse.Text("Done"));
+
+    // The provider sees one tool round with both calls, as it does under ChatClientAgent.
+    private static void AssertOneToolRound(FakeChatClient fake)
+    {
+        Assert.Equal(2, fake.CallCount);
+        var providerView = fake.Calls[1].Messages.ToList();
+        var callMessage = providerView.Single(m => m.Contents.OfType<FunctionCallContent>().Any());
+        Assert.Equal(["send_email", "get_weather"], callMessage.Contents.OfType<FunctionCallContent>().Select(c => c.Name));
+        var resultMessage = providerView[providerView.IndexOf(callMessage) + 1];
+        var results = resultMessage.Contents.OfType<FunctionResultContent>().ToList();
+        Assert.Equal(["call_1_1", "call_1_0"], results.Select(r => r.CallId));
+        Assert.Equal("email sent to ops@example.com", results[0].Result?.ToString());
+        Assert.Equal("sunny in Kingston", results[1].Result?.ToString());
+        Assert.DoesNotContain(providerView, m => m.Contents.Any(c => c is ToolApprovalRequestContent or ToolApprovalResponseContent));
+    }
 
     private static async Task<ToolApprovalRequestContent> WaitForPendingAsync(WorkflowHandle<ApprovalWorkflow> handle)
     {
