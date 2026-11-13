@@ -235,11 +235,12 @@ def _lenient_construct(type_: typing.Any, value: typing.Any) -> typing.Any:
     ):
         # Validate with the metadata, so a caller's validators on it still run, also on an
         # OpenAI model (see ``_may_hold``). Other Annotated types, such as OpenAI's
-        # discriminated unions, keep their metadata.
+        # discriminated unions, keep their metadata. A value the metadata rejects is not built
+        # without it: it comes back as decoded, as it does inside a caller's model.
         try:
             return _lenient_validate(type_, value)
         except (pydantic.ValidationError, pydantic_core.SchemaError):
-            return _lenient_construct(typing.get_args(type_)[0], value)
+            return value
     if origin in (typing.Union, types.UnionType):  # pyright: ignore[reportDeprecated]
         # Optional fields and the ``str | list[...]`` input field: build the only
         # variant that fits.
@@ -413,7 +414,11 @@ def _lenient_schema(schema: typing.Any, refs: dict[str, typing.Any]) -> typing.A
         # fields receive.
         own_validators = _own_validators(schema)
 
-        def validate(value: typing.Any, handler: typing.Any) -> typing.Any:
+        def validate(
+            value: typing.Any,
+            handler: typing.Any,
+            info: pydantic_core.core_schema.ValidationInfo,
+        ) -> typing.Any:
             check = _variant_check.get()
             # Its own validators may consume the value they read.
             sent = _json_copy(value) if own_validators is not None else value
@@ -426,7 +431,7 @@ def _lenient_schema(schema: typing.Any, refs: dict[str, typing.Any]) -> typing.A
                 value = sent
                 if own_validators is not None:
                     try:
-                        value = own_validators.validate_python(sent)
+                        value = _validate_as(own_validators, sent, info)
                     except pydantic.ValidationError:
                         if check:
                             raise error from None
@@ -436,7 +441,7 @@ def _lenient_schema(schema: typing.Any, refs: dict[str, typing.Any]) -> typing.A
             finally:
                 _variant_check.reset(token)
 
-        return pydantic_core.core_schema.no_info_wrap_validator_function(
+        return pydantic_core.core_schema.with_info_wrap_validator_function(
             validate, copy, ref=ref
         )
     if schema.get("custom_init"):
@@ -732,12 +737,16 @@ def _schema_may_hold(
 
 
 def _shape_fits(schema: dict[str, typing.Any], value: typing.Any) -> bool:
-    """Whether a JSON ``value`` fits a schema past its wrappers by kind and ``Literal`` tags."""
+    """Whether a JSON ``value`` fits a schema past its wrappers by kind and ``Literal`` tags.
+
+    A schema of an unknown kind, such as the JSON-or-Python and lax-or-strict schemas of a
+    ``Sequence`` or a ``deque``, may hold any value; its validation decides.
+    """
     kind = schema.get("type")
     if isinstance(value, list):
-        return kind in ("list", "tuple", "set", "frozenset", "any")
+        return kind not in _OBJECT_SCHEMAS and kind not in _SCALAR_SCHEMAS
     if isinstance(value, dict):
-        if kind not in ("model", "dataclass", "typed-dict", "dict", "any"):
+        if kind in _ARRAY_SCHEMAS or kind in _SCALAR_SCHEMAS:
             return False
         config = schema.get("config") or {}
         return all(
@@ -745,6 +754,31 @@ def _shape_fits(schema: dict[str, typing.Any], value: typing.Any) -> bool:
             for name, field in _schema_fields(schema)
         )
     return True
+
+
+# Core schema types that JSON holds as an array, an object or a scalar. Others are not judged.
+_ARRAY_SCHEMAS = frozenset({"list", "tuple", "set", "frozenset", "generator"})
+_OBJECT_SCHEMAS = frozenset({"model", "dataclass", "typed-dict", "dict"})
+_SCALAR_SCHEMAS = frozenset(
+    {
+        "none",
+        "bool",
+        "int",
+        "float",
+        "decimal",
+        "complex",
+        "str",
+        "bytes",
+        "date",
+        "time",
+        "datetime",
+        "timedelta",
+        "uuid",
+        "url",
+        "multi-host-url",
+        "literal",
+    }
+)
 
 
 # Validator schemas whose function can change the value before the schema inside sees it.
@@ -801,6 +835,27 @@ def _own_validators(
         _past_validators(schema["schema"], pydantic_core.core_schema.any_schema()),
         schema.get("config"),
     )
+
+
+def _validate_as(
+    validator: pydantic_core.SchemaValidator,
+    value: typing.Any,
+    info: pydantic_core.core_schema.ValidationInfo,
+) -> typing.Any:
+    """Validate ``value`` in the mode, and with the context, of the validation ``info`` is from.
+
+    A JSON value is validated as JSON, so validators that read ``info.mode`` see what they would
+    in a strict validation. A value that JSON cannot hold, which an outer validator made, is
+    validated as Python.
+    """
+    if info.mode == "json":
+        try:
+            data = json.dumps(value)
+        except (TypeError, ValueError):
+            pass
+        else:
+            return validator.validate_json(data, context=info.context)
+    return validator.validate_python(value, context=info.context)
 
 
 def _past_validators(schema: dict[str, typing.Any], inner: typing.Any) -> typing.Any:
@@ -974,9 +1029,10 @@ _OBJECTS = (dict, Mapping, MutableMapping)
 def _changes_input(type_: typing.Any) -> bool:
     """Whether ``type_`` has a validator that can change its value first.
 
-    Only types the plugin builds or validates are judged: its own and any ``Annotated`` type,
-    such as an OpenAI model behind a caller's validator. Collections and unions judge their
-    items' and variants' kinds themselves.
+    Only types the plugin builds or validates are judged: its own, any ``Annotated`` type, such
+    as an OpenAI model behind a caller's validator, and OpenAI models, whose own validators run
+    before the lenient union checks them (see ``_lenient_schema``). Collections and unions judge
+    their items' and variants' kinds themselves.
     """
     origin = typing.get_origin(type_)
     if origin in (
@@ -987,7 +1043,11 @@ def _changes_input(type_: typing.Any) -> bool:
         frozenset,
         typing.Union,  # pyright: ignore[reportDeprecated]
         types.UnionType,
-    ) or not (origin is typing.Annotated or _plugin_builds(type_)):
+    ) or not (
+        origin is typing.Annotated
+        or _plugin_builds(type_)
+        or (isinstance(type_, type) and issubclass(type_, openai.BaseModel))
+    ):
         return False
     try:
         schema = pydantic.TypeAdapter(type_).core_schema

@@ -1,12 +1,13 @@
 """Tests for worker environment references in hosted tool secrets."""
 
+import collections
 import dataclasses
 import gc
 import json
 import time
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Collection
+from collections.abc import AsyncIterator, Collection, Sequence
 from datetime import datetime, timezone
 from typing import Annotated, Any, Callable, Generic, Literal, TypeVar, cast
 
@@ -619,6 +620,58 @@ class _LoweredOwnMessageResult(pydantic.BaseModel):
         return {**data, "item": {**data["item"], "type": "MESSAGE"}}
 
 
+class _ScoredResult(pydantic.BaseModel):
+    score: int
+    record: ModelResponse
+
+
+def _non_negative(result: _ScoredResult) -> _ScoredResult:
+    if result.score < 0:
+        raise ValueError("negative score")
+    return result
+
+
+_NonNegativeResult: Any = Annotated[
+    _ScoredResult, pydantic.AfterValidator(_non_negative)
+]
+
+
+class _JsonTaggedMessage(ResponseOutputMessage):
+    @pydantic.model_serializer(mode="wrap")
+    def _upper_type(self, handler: Any, info: pydantic.SerializationInfo) -> Any:
+        # Sends its type in upper case in JSON only.
+        data = handler(self)
+        return {**data, "type": "MESSAGE"} if info.mode == "json" else data
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _lower(cls, value: Any, info: pydantic.ValidationInfo) -> Any:
+        return _lower_type(value) if info.mode == "json" else value
+
+
+class _JsonTaggedEnvelope(pydantic.BaseModel):
+    item: _JsonTaggedMessage | int
+
+
+class _SequenceRoot(pydantic.RootModel[Sequence[ModelResponse]]):
+    pass
+
+
+class _DequeRoot(pydantic.RootModel[collections.deque[ModelResponse]]):
+    pass
+
+
+class _ListedMessage(ResponseOutputMessage):
+    @pydantic.model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> Any:
+        return [handler(self)]
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _restore(cls, value: Any) -> Any:
+        return _first(value)
+
+
 def _extra_side() -> _ExtraSide:
     side = _ExtraSide(name="n")
     cast(Any, side).sentinel = "keep-me"
@@ -999,6 +1052,57 @@ def _is_response(value: Any) -> bool:
             ["item", "content", 0, "annotations"],
             lambda got: isinstance(got.item, _LoweredMessage) and _is_message(got.item),
         ),
+        (
+            _ScoredResult(score=1, record=_response()),
+            _NonNegativeResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got, _ScoredResult)
+                and got.score == 1
+                and _is_response(got.record)
+            ),
+        ),
+        (
+            _ScoredResult.model_construct(score=-1, record=_response()),
+            _NonNegativeResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            # Rejected by the declared validator, so not built as the model.
+            lambda got: isinstance(got, dict) and got["score"] == -1,
+        ),
+        (
+            [_response(), _response()],
+            Annotated[list[ModelResponse], pydantic.Field(max_length=1)],
+            [0, "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, list) and isinstance(got[0], dict),
+        ),
+        (
+            _JsonTaggedEnvelope(
+                item=_JsonTaggedMessage.model_validate(_message().model_dump())
+            ),
+            _JsonTaggedEnvelope,
+            ["item", "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _JsonTaggedMessage) and _is_message(got.item)
+            ),
+        ),
+        (
+            _SequenceRoot([_response()]),
+            _SequenceRoot | list[int],
+            [0, "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _SequenceRoot) and _is_response(got.root[0]),
+        ),
+        (
+            _DequeRoot(collections.deque([_response()])),
+            _DequeRoot | list[int],
+            [0, "output", 0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _DequeRoot) and _is_response(got.root[0]),
+        ),
+        (
+            _ListedMessage.model_validate(_message().model_dump()),
+            _ListedMessage | list[int],
+            [0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _ListedMessage) and _is_message(got),
+        ),
     ],
     ids=[
         "extra",
@@ -1044,6 +1148,13 @@ def _is_response(value: Any) -> bool:
         "declared-optional-tuple",
         "openai-variant-behind-its-own-model-validator",
         "openai-variant-normalized-by-its-own-model-validator",
+        "declared-annotated-validator-allowing-the-value",
+        "declared-annotated-validator-rejecting-the-value",
+        "declared-annotated-constraint-rejecting-the-value",
+        "openai-variant-normalizing-its-json-tag",
+        "declared-union-with-sequence-root-model",
+        "declared-union-with-deque-root-model",
+        "declared-openai-variant-restoring-a-list",
     ],
 )
 def test_lenient_caller_model_shapes(

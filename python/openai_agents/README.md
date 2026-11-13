@@ -245,7 +245,8 @@ you declare it in, and builds only the OpenAI models that fail without validatio
 that a validator returns is kept or revalidated as Pydantic would. Inside a union, it builds a
 variant only if it is the one whose kind and type tag fit the value and that validates; a
 variant's validators that change the value, an OpenAI model's included, run before its kind and
-tag are checked. Earlier versions returned such a value as a plain `dict`. Workflow code that
+tag are checked. A Pydantic model or `Annotated` type whose value still fails, such as one
+its validators reject, comes back as decoded JSON. Earlier versions returned such a value as a plain `dict`. Workflow code that
 worked around that by reading the `dict` behaves differently after an upgrade, so keep runs that
 started on an earlier version on it with Worker Versioning, or let them finish first.
 
