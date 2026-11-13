@@ -26,29 +26,50 @@ public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
     }
 
     /// <summary>
-    /// Adds the plugin's Activities and failure types, then removes Activities that are already
-    /// registered under the same name, so a plugin that reaches the worker through both the client
-    /// and the worker options does not fail the worker.
+    /// Adds the plugin's Activities and failure type. When the same instance reaches the worker
+    /// twice, through the client options and the worker options, the second pass appends the same
+    /// definitions again and this method removes those copies, so the worker starts. Any other
+    /// duplicate Activity name, including a second instance of this plugin, is left for the SDK's
+    /// own check, which fails the worker with <c>Duplicate activity named ...</c>.
     /// </summary>
     /// <param name="options">Worker options to configure.</param>
     public override void ConfigureWorker(TemporalWorkerOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
         base.ConfigureWorker(options);
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        for (var i = 0; i < options.Activities.Count; i++)
+        foreach (var definition in Options.Activities)
         {
-            var name = options.Activities[i].Name;
-            if (name is not null && !seen.Add(name))
-            {
-                options.Activities.RemoveAt(i);
-                i--;
-            }
+            RemoveLaterCopies(options.Activities, definition);
         }
 
         if (options.WorkflowFailureExceptionTypes is { } types)
         {
-            options.WorkflowFailureExceptionTypes = types.Distinct().ToList();
+            var list = types.ToList();
+            RemoveLaterCopies(list, typeof(MicrosoftAgentFrameworkWorkflowException));
+            options.WorkflowFailureExceptionTypes = list;
+        }
+    }
+
+    /// <summary>Removes every occurrence of <paramref name="item"/> after its first, by reference.</summary>
+    private static void RemoveLaterCopies<T>(IList<T> list, T item)
+        where T : class
+    {
+        var first = -1;
+        for (var i = 0; i < list.Count; i++)
+        {
+            if (!ReferenceEquals(list[i], item))
+            {
+                continue;
+            }
+
+            if (first < 0)
+            {
+                first = i;
+                continue;
+            }
+
+            list.RemoveAt(i);
+            i--;
         }
     }
 

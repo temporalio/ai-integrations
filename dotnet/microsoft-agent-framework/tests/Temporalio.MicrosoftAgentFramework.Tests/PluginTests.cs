@@ -1,3 +1,4 @@
+using Temporalio.Activities;
 using Temporalio.Client;
 using Temporalio.MicrosoftAgentFramework.Testing;
 using Temporalio.MicrosoftAgentFramework.Tests.Workflows;
@@ -54,6 +55,28 @@ public class PluginTests : WorkflowTestBase
         Assert.Equal(3, options.Activities.Count);
         Assert.Equal([typeof(MicrosoftAgentFrameworkWorkflowException)], options.WorkflowFailureExceptionTypes);
         Assert.Equal("microsoft.AgentFrameworkPlugin", plugin.Name);
+    }
+
+    [Fact]
+    public void ConfigureWorker_LeavesApplicationDuplicatesToTheSdk()
+    {
+        // A fresh queue: the SDK registers the native worker before its duplicate check throws.
+        var options = new TemporalWorkerOptions($"tq-{Guid.NewGuid():N}")
+            .AddActivity(Colliding.First)
+            .AddActivity(Colliding.Second);
+        options.Plugins = [TestPlugin.For(new FakeChatClient(ScriptedResponse.Text("unused")))];
+        var error = Assert.Throws<ArgumentException>(() => new TemporalWorker(Client, options));
+        Assert.Contains("Duplicate activity named Lookup", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TwoPluginInstances_FailTheWorkerWithTheSdkError()
+    {
+        var fake = new FakeChatClient(ScriptedResponse.Text("unused"));
+        var options = new TemporalWorkerOptions($"tq-{Guid.NewGuid():N}").AddWorkflow<HelloWorkflow>();
+        options.Plugins = [TestPlugin.For(fake), TestPlugin.For(fake)];
+        var error = Assert.Throws<ArgumentException>(() => new TemporalWorker(Client, options));
+        Assert.Contains($"Duplicate activity named {ModelActivityNames.InvokeModel}", error.Message, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -123,4 +146,14 @@ public class PluginTests : WorkflowTestBase
     private TemporalClient ClientWithPlugin(MicrosoftAgentFrameworkPlugin plugin) => new(
         Client.Connection,
         new TemporalClientOptions { Namespace = Client.Options.Namespace, Plugins = [plugin] });
+
+    // Two application Activities that share a name: an error the SDK must still report.
+    private static class Colliding
+    {
+        [Activity("Lookup")]
+        public static string First(string id) => id;
+
+        [Activity("Lookup")]
+        public static string Second(string id) => id.ToUpperInvariant();
+    }
 }
