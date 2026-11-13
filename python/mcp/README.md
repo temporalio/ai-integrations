@@ -132,8 +132,8 @@ running on a worker only through a heartbeat, and the heartbeat timeout is how
 Temporal notices a lost worker before the start-to-close timeout. In Temporal
 Cloud each heartbeat that reaches the service is an Action: with the default, at
 most one every 8 seconds of a running request. Set `heartbeat_timeout` to `None`
-in `activity_config` to turn heartbeats off. Configure the MCP `Client`'s
-`read_timeout_seconds` when the request itself must be bounded.
+or `timedelta(0)` in `activity_config` to turn heartbeats off. Configure the MCP
+`Client`'s `read_timeout_seconds` when the request itself must be bounded.
 
 ## Errors and retries
 
