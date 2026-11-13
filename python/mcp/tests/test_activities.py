@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import json
 import sys
 from datetime import timedelta
@@ -41,6 +42,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.mcp import _activities
 from temporalio.mcp._activities import _MCPActivities
 from temporalio.mcp._client import _mcp_client_backend_factory, _MCPClientBackend
+from temporalio.testing import ActivityEnvironment
 
 if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup  # type: ignore[reportUnreachable]
@@ -195,6 +197,43 @@ async def test_operations_are_plain_json_and_lists_are_fully_paginated() -> None
 
         # call_tool is the only operation that carries request metadata.
         assert client.metas == [{"trace": "value"}]
+    finally:
+        await support._pool.close()
+
+
+# A cancel reaches a running Activity only through a heartbeat, so an operation
+# heartbeats on a timer while its request runs.
+async def test_operation_heartbeats_while_its_request_runs() -> None:
+    heartbeated = asyncio.Event()
+
+    class SlowClient(FakeClient):
+        async def call_tool(
+            self,
+            name: str,
+            _arguments: dict[str, Any] | None,
+            *,
+            meta: dict[str, Any] | None,
+        ) -> CallToolResult:
+            await heartbeated.wait()
+            return await super().call_tool(name, _arguments, meta=meta)
+
+    support = _MCPActivities(
+        {"test": lambda: _MCPClientBackend(cast(Any, SlowClient()))},
+    )
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(
+        env.info, heartbeat_timeout=timedelta(milliseconds=100)
+    )
+    env.on_heartbeat = lambda *_: heartbeated.set()
+    try:
+        result = await asyncio.wait_for(
+            env.run(
+                _activity_by_name(support, "temporalio.mcp.test.call-tool"),
+                {"factory_argument": None, "name": "echo", "arguments": {}},
+            ),
+            timeout=5,
+        )
+        assert result["content"][0]["text"] == "echo"
     finally:
         await support._pool.close()
 
