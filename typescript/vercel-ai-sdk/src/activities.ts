@@ -4,7 +4,9 @@ import type {
   LanguageModelV4FinishReason,
   LanguageModelV4GenerateResult,
   LanguageModelV4Usage,
+  LanguageModelV4,
   EmbeddingModelV4Result,
+  SharedV4FileData,
   SharedV4ProviderMetadata,
   SharedV4ProviderOptions,
   SharedV4Headers,
@@ -12,7 +14,8 @@ import type {
   ProviderV4,
 } from '@ai-sdk/provider';
 import { APICallError, getErrorMessage } from '@ai-sdk/provider';
-import { asSchema, type Schema, type ToolExecutionOptions } from 'ai';
+import { detectMediaType, isFullMediaType, isUrlSupported } from '@ai-sdk/provider-utils';
+import { asSchema, createDownload, type Schema, type ToolExecutionOptions } from 'ai';
 import type { MCPClient } from '@ai-sdk/mcp';
 import { ApplicationFailure } from '@temporalio/common';
 import { Context } from '@temporalio/activity';
@@ -20,6 +23,7 @@ import { WorkflowStreamClient } from '@temporalio/workflow-streams/client';
 import { msOptionalToNumber, type Duration } from '@temporalio/common/lib/time';
 import type { McpClientFactories, McpClientFactory } from './mcp';
 import { withSources } from './activity-sources';
+import { encodeContentFileData, encodeResultFileData } from './file-data';
 
 const encoder = new TextEncoder();
 
@@ -56,6 +60,14 @@ async function callProvider<T>(call: () => PromiseLike<T>): Promise<T> {
     }
     throw error;
   }
+}
+
+// Raw HTTP bodies repeat the prompt and the returned content, and a request body can hold
+// downloaded file bytes. Event History must not record them.
+function withoutBody<T extends object>(value: T | undefined): Omit<T, 'body'> | undefined {
+  if (value === undefined) return undefined;
+  const { body: _body, ...rest } = value as T & { body?: unknown };
+  return rest;
 }
 
 /**
@@ -132,6 +144,15 @@ export interface CreateActivitiesOptions {
    * don't tolerate a reused or concurrent session.
    */
   mcpConnectionIdleTimeout?: Duration;
+
+  /**
+   * Downloads a prompt file or image URL that the model does not support, before the
+   * model activity calls the model. Defaults to `createDownload()` from `ai`.
+   */
+  download?: (options: {
+    url: URL;
+    abortSignal?: AbortSignal;
+  }) => PromiseLike<{ data: Uint8Array; mediaType: string | undefined }>;
 }
 
 /**
@@ -269,11 +290,20 @@ export function createActivities(
   mcpClientFactories?: McpClientFactories,
   options?: CreateActivitiesOptions
 ): object {
+  const download = options?.download ?? createDownload();
   let activities = {
     async invokeModel(args: InvokeModelArgs): Promise<InvokeModelResult> {
       using _heartbeat = heartbeatUntilDisposed();
       const model = provider.languageModel(args.modelId);
-      return await callProvider(() => model.doGenerate(args.options));
+      await prepareFileUrls(args.options, model, download);
+      const result = await callProvider(() =>
+        model.doGenerate({ ...args.options, abortSignal: Context.current().cancellationSignal })
+      );
+      return encodeResultFileData({
+        ...result,
+        request: withoutBody(result.request),
+        response: withoutBody(result.response),
+      });
     },
 
     /**
@@ -295,7 +325,10 @@ export function createActivities(
       const events = stream.topic(args.streamingTopic);
 
       const model = provider.languageModel(args.modelId);
-      const streamResult = await callProvider(() => model.doStream(args.options));
+      await prepareFileUrls(args.options, model, download);
+      const streamResult = await callProvider(() =>
+        model.doStream({ ...args.options, abortSignal: Context.current().cancellationSignal })
+      );
 
       const content: LanguageModelV4Content[] = [];
       let finishReason: LanguageModelV4FinishReason = { unified: 'other', raw: undefined };
@@ -316,8 +349,9 @@ export function createActivities(
       const reader = streamResult.stream.getReader();
 
       while (true) {
-        const { done, value: part } = await callProvider(() => reader.read());
+        const { done, value } = await callProvider(() => reader.read());
         if (done) break;
+        const part = encodeContentFileData(value);
 
         Context.current().heartbeat();
 
@@ -427,24 +461,30 @@ export function createActivities(
         usage,
         warnings,
         providerMetadata,
-        request: streamResult.request,
-        response: responseMetadata ? { ...responseMetadata, ...streamResult.response } : streamResult.response,
+        request: withoutBody(streamResult.request),
+        response: withoutBody(
+          responseMetadata
+            ? { ...responseMetadata, ...streamResult.response }
+            : streamResult.response
+        ),
       };
     },
 
     async invokeEmbeddingModel(args: InvokeEmbeddingModelArgs): Promise<InvokeEmbeddingModelResult> {
       using _heartbeat = heartbeatUntilDisposed();
       const model = provider.embeddingModel(args.modelId);
-      return await callProvider(() =>
+      const result = await callProvider(() =>
         model.doEmbed({
           values: args.values,
           providerOptions: args.providerOptions,
           headers: args.headers,
+          abortSignal: Context.current().cancellationSignal,
         })
       );
+      return { ...result, response: withoutBody(result.response) };
     },
   };
-  withSources(activities, [provider]);
+  withSources(activities, [provider, options?.download]);
   if (mcpClientFactories !== undefined) {
     const idleMs = msOptionalToNumber(options?.mcpConnectionIdleTimeout) ?? MCP_CONNECTION_IDLE_MS;
     Object.entries(mcpClientFactories).forEach(([name, func]) => {
@@ -455,6 +495,57 @@ export function createActivities(
     });
   }
   return activities;
+}
+
+type PromptFilePart = { data: SharedV4FileData; mediaType: string };
+
+/**
+ * Restores `URL` objects in prompt file data, then downloads each URL the model does not
+ * support, in the prompt locations `generateText` downloads from. Returns true when it
+ * downloaded a file.
+ */
+async function prepareFileUrls(
+  options: LanguageModelV4CallOptions,
+  model: LanguageModelV4,
+  download: NonNullable<CreateActivitiesOptions['download']>
+): Promise<boolean> {
+  const downloadable: { part: PromptFilePart; url: URL }[] = [];
+  const visit = (part: PromptFilePart, canDownload: boolean): void => {
+    if (part.data.type !== 'url') return;
+    // The JSON payload converter turns a `URL` into its `href` string.
+    const url = (part.data.url = new URL(part.data.url));
+    if (canDownload) downloadable.push({ part, url });
+  };
+  for (const message of options.prompt) {
+    if (message.role === 'system') continue;
+    for (const part of message.content) {
+      if (part.type === 'file') visit(part, message.role === 'user');
+      else if (part.type === 'reasoning-file') visit(part, false);
+      else if (part.type === 'tool-result' && part.output.type === 'content') {
+        for (const item of part.output.value) if (item.type === 'file') visit(item, true);
+      }
+    }
+  }
+  if (downloadable.length === 0) return false;
+  const supportedUrls = await model.supportedUrls;
+  const abortSignal = Context.current().cancellationSignal;
+  const unsupported = downloadable.filter(
+    ({ part, url }) =>
+      !isUrlSupported({ mediaType: part.mediaType, url: url.toString(), supportedUrls })
+  );
+  await Promise.all(
+    unsupported.map(async ({ part, url }) => {
+      const file = await download({ url, abortSignal });
+      part.data = { type: 'data', data: file.data };
+      if (file.mediaType != null && !isFullMediaType(part.mediaType)) {
+        part.mediaType = file.mediaType;
+      }
+      // `generateText` trusts an image signature in the bytes over the given media type.
+      const imageType = detectMediaType({ data: file.data, topLevelType: 'image' });
+      if (imageType != null) part.mediaType = imageType;
+    })
+  );
+  return unsupported.length > 0;
 }
 
 async function extractTools(mcpClient: MCPClient): Promise<Record<string, ListToolResult>> {

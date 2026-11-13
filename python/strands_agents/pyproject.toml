@@ -26,7 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # Lazily imported when StrandsPlugin(mcp_clients=...) or TemporalMCPClient is used.
-mcp = ["mcp>=2,<3", "mcp-types>=2,<3", "temporalio-mcp>=0.2.0,<0.3"]
+mcp = ["mcp>=2,<3", "mcp-types>=2,<3", "temporalio-mcp>=0.4.0,<0.5"]
 
 [project.urls]
 Homepage = "https://github.com/temporalio/ai-integrations/tree/main/python/strands_agents"
@@ -59,12 +59,12 @@ dev = [
   # Used by the test suite.
   "mcp>=2,<3",
   "mcp-types>=2,<3",
-  "temporalio-mcp>=0.2.0,<0.3",
+  "temporalio-mcp>=0.4.0,<0.5",
 ]
 
 [tool.uv]
 default-groups = ["dev"]
-required-version = ">=0.12.5,<0.13"              # same value in scripts/pyproject.toml; CI reads it via setup-uv version-file
+required-version = ">=0.13.0,<0.14"              # same value in scripts/pyproject.toml; CI reads it via setup-uv version-file
 exclude-newer = "2 weeks"                        # org supply-chain cooldown for third-party packages
 exclude-newer-package = { temporalio = false, temporalio-mcp = false }   # first-party packages are exempt: SDK releases and temporalio-mcp releases must be adoptable on day one
 link-mode = "copy"

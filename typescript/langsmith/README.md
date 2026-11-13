@@ -164,20 +164,28 @@ default client from the environment.
 
 ## Agent and environment destinations
 
-With LangSmith 0.10.8 or later, send traces to an agent's environment:
+With LangSmith 0.10.13 or later, send traces to an agent's environment:
 
 ```typescript
-import { address } from 'langsmith';
+import { AgentAddress } from 'langsmith';
 import { LangSmithPlugin } from '@temporalio/langsmith';
 
 const plugin = new LangSmithPlugin({
-  address: address.agent('support', 'staging'),
+  address: new AgentAddress('support', 'staging'),
 });
 ```
 
 Register the plugin on the Client and Worker as in the quick start. `address`
 and `projectName` are mutually exclusive. Agent addressing is a LangSmith beta
 feature that must be enabled for the workspace.
+
+When upgrading from LangSmith 0.10.8, replace `address.agent(...)` with
+`new AgentAddress(...)`. Addresses are objects in application code; tracing
+headers retain their LRN string format, including headers in existing histories.
+This is a breaking change for Workflows that pass address strings as recorded
+inputs to LangSmith calls. Let those executions finish on the previous plugin
+and LangSmith versions, or keep them on their previous Worker Deployment Version
+when deploying the upgrade.
 
 Native `traceable(fn, { address: ... })` and runtime traceable configuration
 also select destinations for new root traces in Workflows, Activities, and
@@ -197,7 +205,7 @@ const pipeline = traceable(runWorkflow, {
   replicas: [
     { projectName: 'primary', primary: true },
     { projectName: 'audit' },
-    { address: address.agent('support', 'production') },
+    { address: new AgentAddress('support', 'production') },
   ],
 });
 ```

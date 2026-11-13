@@ -19,7 +19,7 @@
  * @module
  */
 
-import { Client, address as addresses, type Address } from 'langsmith';
+import { Client, type AgentAddress } from 'langsmith';
 import { RunTree } from 'langsmith/run_trees';
 
 import type * as nexus from 'nexus-rpc';
@@ -63,7 +63,7 @@ export interface LangSmithPluginOptions {
   /** Default LangSmith project for new root traces. An inherited destination takes precedence. */
   projectName?: string;
   /** Agent/environment destination, mutually exclusive with projectName. LangSmith beta. */
-  address?: Address;
+  address?: AgentAddress;
   /**
    * When `true`, emit first-class runs for Temporal operations themselves
    * (`StartWorkflow:`, `RunActivity:`, `HandleSignal:`, …) in addition to the
@@ -120,14 +120,15 @@ export class LangSmithPlugin extends SimplePlugin {
     if (options.projectName !== undefined && options.address !== undefined) {
       throw new TypeError('projectName and address are mutually exclusive');
     }
-    const address = options.address === undefined ? undefined : addresses.parse(options.address);
     this.client = options.client ?? new Client();
     const defaults = new RunTree({
       name: 'temporal-routing-defaults',
       client: this.client,
       project_name: options.projectName,
-      address,
+      address: options.address,
     });
+    // Let LangSmith validate and normalize its own address objects.
+    const address = options.address === undefined ? undefined : defaults.address;
     const replicas = defaults.replicas;
     const addTemporalRuns = options.addTemporalRuns ?? false;
     this.emitter = {

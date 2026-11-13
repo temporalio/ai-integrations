@@ -6,20 +6,14 @@ import { TemporalModel } from './temporal-model';
 import { TemporalMCPClient } from './temporal-mcp-client';
 import { workflowErrorFor } from './strands-errors';
 
-const SNAPSHOT_DISABLED =
-  'TemporalAgent disables takeSnapshot()/loadSnapshot(). Temporal workflows ' +
-  'already persist agent state durably via the event history at a finer ' +
-  'granularity than Strands snapshots. Remove the snapshot call and rely on ' +
-  "Temporal's durable execution instead.";
-
 // Strands' own message, which its Agent throws at construction for a stateful model.
 const STATEFUL_MANAGER_REFUSED =
   'contextManager and conversationManager cannot be used with a stateful model. ' +
   'The model manages conversation state server-side.';
 
 const RETRY_STRATEGY_DISABLED =
-  'TemporalAgent disables Strands retries; configure retries via retryPolicy ' +
-  'in the model activity options on TemporalAgent, and on the activity options ' +
+  'TemporalAgent disables Strands retries; configure retries via activityOptions.retry ' +
+  'on TemporalAgent, and on the activity options ' +
   'passed to workflow.activityAsTool, workflow.activityAsHook, or TemporalMCPClient. ' +
   'Remove retryStrategy from TemporalAgent(...) or pass retryStrategy: null.';
 
@@ -28,7 +22,7 @@ const RETRY_STRATEGY_DISABLED =
  *
  * Accepts everything {@link AgentConfig} accepts except `model` (which is a
  * factory name selecting a worker-side {@link Model}, not an instance) and
- * `retryStrategy` (always disabled — Temporal handles retries via
+ * `retryStrategy` (only `null` is accepted — Temporal handles retries via
  * `activityOptions.retry`).
  *
  * The {@link ActivityOptions} apply to every model invocation this agent
@@ -37,6 +31,8 @@ const RETRY_STRATEGY_DISABLED =
  */
 export interface TemporalAgentOptions extends Omit<AgentConfig, 'model' | 'retryStrategy'> {
   model?: string;
+  /** Disable Strands retries explicitly; Temporal manages retries via `activityOptions.retry`. */
+  retryStrategy?: null;
   activityOptions?: ActivityOptions;
   streamingTopic?: string;
   streamingBatchInterval?: Duration;
@@ -72,8 +68,8 @@ export class TemporalAgent extends Agent {
   private readonly managerGiven: boolean;
 
   constructor(options: TemporalAgentOptions = {}) {
-    const { model, activityOptions, streamingTopic, streamingBatchInterval, ...rest } = options;
-    if ((rest as { retryStrategy?: unknown }).retryStrategy !== undefined) {
+    const { model, retryStrategy, activityOptions, streamingTopic, streamingBatchInterval, ...rest } = options;
+    if (retryStrategy !== undefined && retryStrategy !== null) {
       throw new Error(RETRY_STRATEGY_DISABLED);
     }
     const temporalModel = new TemporalModel({
@@ -148,14 +144,6 @@ export class TemporalAgent extends Agent {
     } catch (err) {
       throw workflowErrorFor(err);
     }
-  }
-
-  override takeSnapshot(): never {
-    throw new Error(SNAPSHOT_DISABLED);
-  }
-
-  override loadSnapshot(): never {
-    throw new Error(SNAPSHOT_DISABLED);
   }
 }
 

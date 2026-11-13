@@ -37,7 +37,8 @@ async def test_provider_failure_fails_workflow(client: Client, tmp_path: Path) -
                 FailedTurnWorkflow.run, model.config(), id=queue, task_queue=queue
             )
             with pytest.raises(WorkflowFailureError) as raised:
-                await asyncio.wait_for(handle.result(), 10)
+                # Allow for app-server startup and the runtime's reconnect backoff.
+                await asyncio.wait_for(handle.result(), 30)
             error = raised.value.cause
             assert isinstance(error, ApplicationError)
             assert error.type == "CodexError"
