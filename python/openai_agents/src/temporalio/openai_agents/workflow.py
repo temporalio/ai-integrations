@@ -143,7 +143,10 @@ def _generated_class_doc(cls: type) -> str | None:
                 # 3.14 left a forward reference in the __init__ dataclasses generated
                 # unevaluated, and the field keeps the reference from that time.
                 annotate = getattr(cls.__init__, "__annotate__", None)
-                if getattr(annotate, "__generated_by_dataclasses__", False):
+                # Python 3.15 generates the docstring lazily from the current signature.
+                if sys.version_info[:2] == (3, 14) and getattr(
+                    annotate, "__generated_by_dataclasses__", False
+                ):
                     types = {n: f.type for n, f in cls.__dataclass_fields__.items()}
                     signature = signature.replace(
                         parameters=[
@@ -172,9 +175,8 @@ def _docstring(fn: Callable | None) -> str | None:
 def _type_hints(fn: Callable) -> dict[str, Any]:
     """Return ``fn``'s annotations resolved in its own module, keeping ``Annotated`` metadata.
 
-    Unlike ``typing.get_type_hints(fn)`` on Python 3.10, this doesn't wrap a parameter with a
-    ``None`` default in ``Optional``, which would hide a context type or ``Annotated`` metadata.
-    Like it, this resolves the function's own type parameters, such as ``T`` in ``def f[T]``.
+    A ``None`` default leaves the declared parameter type and ``Annotated`` metadata intact.
+    This resolves the function's own type parameters, such as ``T`` in ``def f[T]``.
     It skips the return annotation, which the tool doesn't use, so a function marked with
     ``@typing.no_type_check`` whose return type can't be resolved still gets its parameter types.
     """
@@ -736,7 +738,9 @@ def temporal_mcp_server(
     Args:
         name: Name matching a server factory registered on the plugin.
         activity_config: Activity options for MCP operations. Defaults to a
-            one-minute start-to-close timeout.
+            one-minute start-to-close timeout and a 10-second heartbeat
+            timeout. Set ``heartbeat_timeout`` to ``None`` to turn heartbeats
+            off.
         cache_tools_list: Whether to cache the tool list for this object.
         factory_argument: Non-secret value passed to the worker-side factory.
             A non-None value creates a fresh server for every Activity instead
