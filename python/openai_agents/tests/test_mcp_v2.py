@@ -285,13 +285,14 @@ def create_backend(factory: Callable[[], AgentsMCPServer]) -> _OpenAIMCPServerBa
     )()
 
 
-def test_factory_that_does_not_return_an_mcp_server_fails_with_retry() -> None:
+def test_factory_that_does_not_return_an_mcp_server_is_non_retryable() -> None:
     with pytest.raises(ApplicationError) as err:
         create_backend(lambda: cast(AgentsMCPServer, object()))
     assert err.value.message == (
         "MCP server factory 'hello' returned builtins.object, not agents.mcp.MCPServer"
     )
-    assert not err.value.non_retryable
+    assert err.value.type == "MCPServerFactoryTypeError"
+    assert err.value.non_retryable
 
 
 def test_callable_worker_side_tool_filter_is_rejected() -> None:

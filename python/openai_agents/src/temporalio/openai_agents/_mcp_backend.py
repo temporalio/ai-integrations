@@ -163,11 +163,12 @@ def _mcp_server_backend_factory(
     def create(argument: Any = _NOT_SUPPLIED) -> _OpenAIMCPServerBackend:
         server = invoke(argument)
         if not isinstance(server, MCPServer):
-            # Retryable, so a run waits for the worker to be fixed instead of failing.
             kind = type(server)
             raise ApplicationError(
                 f"MCP server factory {name!r} returned "
-                f"{kind.__module__}.{kind.__qualname__}, not agents.mcp.MCPServer"
+                f"{kind.__module__}.{kind.__qualname__}, not agents.mcp.MCPServer",
+                type="MCPServerFactoryTypeError",
+                non_retryable=True,
             )
         _reject_dynamic_tool_filter(name, server)
         _reject_worker_side_require_approval(name, server, "temporal_mcp_server")
