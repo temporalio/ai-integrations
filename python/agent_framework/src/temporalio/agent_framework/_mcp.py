@@ -138,6 +138,10 @@ class TemporalMCPToolProvider(ContextProvider):
     ) -> None:
         """List the server's tools and add them to this run.
 
+        Tools passed to ``agent.run(tools=...)`` are merged after context
+        providers run, so a collision with one of those raises the framework's
+        own ``ValueError`` instead and fails the workflow task.
+
         Raises:
             AgentFrameworkWorkflowError: If a listed tool has the name of a
                 tool the agent already has, from its own ``tools`` or from

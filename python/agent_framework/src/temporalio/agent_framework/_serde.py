@@ -57,6 +57,17 @@ def load_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return loaded
 
 
+def dump_kwargs(kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    """Serialize the ``client_kwargs`` of one model call.
+
+    Raises:
+        AgentFrameworkWorkflowError: If a value cannot be recorded in workflow
+            history.
+    """
+    _require_json("client_kwargs", kwargs)
+    return dict(kwargs)
+
+
 def dump_response(response: ChatResponse) -> dict[str, Any]:
     """Serialize a provider response."""
     data = response.to_dict()
@@ -90,6 +101,86 @@ def _drop_declaration_markers(contents: list[dict[str, Any]]) -> None:
 def load_update(data: dict[str, Any]) -> ChatResponseUpdate:
     """Rebuild one streamed update."""
     return ChatResponseUpdate.from_dict(data)
+
+
+class StreamRecorder:
+    """Builds the Activity result of one streamed call from the provider's updates.
+
+    Two things differ from the raw update list. The provider's function
+    invocation layer, which sees every tool as declaration-only, follows each
+    function call with a marked copy of it (the framework's pause for caller
+    input); the copy repeats a call already streamed, so it is dropped. Text
+    arrives one token per update, and a long answer would put megabytes of
+    update envelopes into history, so adjacent text-only updates that share
+    their envelope are merged into one entry, which is how
+    ``ChatResponse.from_updates`` merges them anyway. ``add`` returns the
+    serialized update to publish, before merging, or ``None`` for a dropped
+    copy.
+    """
+
+    def __init__(self) -> None:
+        """Start an empty record."""
+        self.updates: list[dict[str, Any]] = []
+        self._streamed_calls: set[str] = set()
+
+    def add(self, update: ChatResponseUpdate) -> dict[str, Any] | None:
+        """Record ``update``; return its serialized form, or ``None`` if dropped."""
+        if self._is_pause_copy(update):
+            return None
+        for content in update.contents:
+            if content.type == "function_call" and content.call_id:
+                self._streamed_calls.add(content.call_id)
+        serialized = dump_update(update)
+        previous = self.updates[-1] if self.updates else None
+        if not _mergeable_text(serialized):
+            self.updates.append(serialized)
+        elif (
+            previous is not None
+            and _mergeable_text(previous)
+            and same_envelope(previous, serialized)
+        ):
+            previous["contents"][0]["text"] += serialized["contents"][0]["text"]
+        else:
+            # The caller publishes ``serialized`` as is; the record gets its own
+            # copy, which later text may be merged into.
+            self.updates.append(
+                {**serialized, "contents": [dict(c) for c in serialized["contents"]]}
+            )
+        return serialized
+
+    def _is_pause_copy(self, update: ChatResponseUpdate) -> bool:
+        if not update.contents:
+            return False
+        return all(
+            content.type == "function_call"
+            and content.user_input_request is True
+            and content.call_id in self._streamed_calls
+            for content in update.contents
+        )
+
+
+_TEXT_CONTENT_KEYS = {"type", "text", "additional_properties"}
+
+
+def _mergeable_text(update: dict[str, Any]) -> bool:
+    """Whether ``update`` is text only, with nothing a merge would lose."""
+    contents = update.get("contents") or []
+    if len(contents) != 1 or update.get("finish_reason") is not None:
+        return False
+    (content,) = contents
+    return (
+        content.get("type") == "text"
+        and isinstance(content.get("text"), str)
+        and set(content) <= _TEXT_CONTENT_KEYS
+        and not content.get("additional_properties")
+    )
+
+
+def same_envelope(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Whether two serialized updates agree on everything but their contents."""
+    return {k: v for k, v in left.items() if k != "contents"} == {
+        k: v for k, v in right.items() if k != "contents"
+    }
 
 
 def _dump_tool(tool: Any) -> dict[str, Any]:

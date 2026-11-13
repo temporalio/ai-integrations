@@ -31,6 +31,10 @@ if TYPE_CHECKING:
     from temporalio.agent_framework.workflow import AgentFrameworkWorkflowError
 
 
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
+
+
 def __getattr__(name: str) -> Any:
     if name == "AgentFrameworkPlugin":
         from temporalio.agent_framework._plugin import AgentFrameworkPlugin

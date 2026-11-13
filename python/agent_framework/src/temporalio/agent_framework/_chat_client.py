@@ -38,6 +38,11 @@ from temporalio.workflow import (
     VersioningIntent,
 )
 
+# Tools with an invocation in flight through _SyncToolsOnWorkflowLoop, by id:
+# how many, and the flag value to put back when the last one finishes. One
+# event loop runs all of it, so the counts need no lock.
+_inline_invocations: dict[int, tuple[int, Any]] = {}
+
 
 class _SyncToolsOnWorkflowLoop(FunctionMiddleware):
     """Run synchronous tools on the workflow event loop.
@@ -45,7 +50,10 @@ class _SyncToolsOnWorkflowLoop(FunctionMiddleware):
     Agent Framework runs a ``def`` tool with ``asyncio.to_thread``, which the
     workflow event loop does not implement, so the tool would fail with
     ``NotImplementedError``. ``_invoke_sync_on_event_loop`` is the framework's
-    own switch for running it inline; its harness sets it the same way.
+    own switch for running it inline; its harness sets it the same way. The
+    switch is set for the duration of the call and restored once no call of
+    the tool is in flight, so a tool object shared with code outside workflows
+    keeps its normal behavior there.
     """
 
     async def process(
@@ -53,8 +61,22 @@ class _SyncToolsOnWorkflowLoop(FunctionMiddleware):
         context: FunctionInvocationContext,
         call_next: Callable[[], Awaitable[None]],
     ) -> None:
-        context.function._invoke_sync_on_event_loop = True
-        await call_next()
+        tool = context.function
+        key = id(tool)
+        count, original = _inline_invocations.get(
+            key, (0, getattr(tool, "_invoke_sync_on_event_loop", False))
+        )
+        _inline_invocations[key] = (count + 1, original)
+        tool._invoke_sync_on_event_loop = True
+        try:
+            await call_next()
+        finally:
+            count, original = _inline_invocations[key]
+            if count == 1:
+                del _inline_invocations[key]
+                tool._invoke_sync_on_event_loop = original
+            else:
+                _inline_invocations[key] = (count - 1, original)
 
 
 class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatClient):  # type: ignore[type-arg]
@@ -70,8 +92,9 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
     ``agent_framework.invoke_model`` Activity (``agent_framework.invoke_model_streaming``
     for ``stream=True``) with the activity options given here. ``summary``
     defaults to the model name; the default timeouts are a 5 minute
-    start-to-close and a 10 second heartbeat, which the Activity heartbeats
-    automatically.
+    start-to-close and a 10 second heartbeat, and the Activity heartbeats on
+    its own at half the heartbeat timeout. A run's ``client_kwargs`` (such as
+    ``extra_headers``) cross to the Activity and reach the provider client.
 
     With ``streaming_topic`` set, a streamed call publishes each update (as its
     dict form) to that topic on the workflow's ``WorkflowStream``, batched at
@@ -159,12 +182,9 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
                 "TemporalChatClient only runs inside a Temporal workflow; outside one, "
                 "use the provider's chat client directly."
             )
-        if kwargs:
-            # The layers above pass their own plumbing here (for example the
-            # session); none of it is part of the provider request.
-            workflow.logger.debug(
-                "Not sending keyword arguments %s to the model Activity", sorted(kwargs)
-            )
+        # What arrives here is the run's client_kwargs, which the provider
+        # client reads (the OpenAI client takes extra_headers from them).
+        dumped_kwargs = _serde.dump_kwargs(kwargs)
         dumped_messages = _serde.dump_messages(messages)
         dumped_options = _serde.dump_options(options)
         if stream:
@@ -172,6 +192,7 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
                 model=self._model,
                 messages=dumped_messages,
                 options=dumped_options,
+                kwargs=dumped_kwargs,
                 streaming_topic=self._streaming_topic,
                 streaming_batch_interval_seconds=self._streaming_batch_interval.total_seconds(),
             )
@@ -183,7 +204,10 @@ class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatC
             )
         return self._get_response(
             InvokeModelInput(
-                model=self._model, messages=dumped_messages, options=dumped_options
+                model=self._model,
+                messages=dumped_messages,
+                options=dumped_options,
+                kwargs=dumped_kwargs,
             )
         )
 

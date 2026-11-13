@@ -35,6 +35,8 @@ class InvokeModelInput:
     model: str
     messages: list[dict[str, Any]]
     options: dict[str, Any] = field(default_factory=dict)
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    """The run's ``client_kwargs``, such as ``extra_headers``, for the provider client."""
 
 
 @dataclass
@@ -157,8 +159,16 @@ def _classify_provider_errors(model: str) -> Generator[None, None, None]:
         translated = classify_provider_error(err)
         if translated is None:
             raise
-        activity.logger.warning(
-            "Model %r failed with an HTTP status error (%s)", model, translated.type
+        log = (
+            activity.logger.error
+            if translated.non_retryable
+            else activity.logger.warning
+        )
+        log(
+            "Model %r failed with %s (HTTP status error, %s)",
+            model,
+            translated.type,
+            "not retried" if translated.non_retryable else "retried",
         )
         raise translated from err
 
@@ -172,6 +182,9 @@ def _stream_publish_error(err: Exception, model: str, topic: str) -> Application
     its gRPC message limit. Other failures, such as a server outage, stay
     retryable.
     """
+    # The gRPC message size limit arrives as RESOURCE_EXHAUSTED with no status
+    # of its own, so the message text tells it apart from rate limiting; the
+    # Google ADK plugin matches the same text.
     non_retryable = isinstance(err, RPCError) and (
         err.status == RPCStatusCode.INVALID_ARGUMENT
         or (
@@ -245,7 +258,9 @@ class ChatClientActivities:
         messages = _serde.load_messages(input.messages)
         options = _serde.load_options(input.options)
         with _classify_provider_errors(input.model):
-            response = await client.get_response(messages, options=options)
+            response = await client.get_response(
+                messages, options=options, client_kwargs=input.kwargs
+            )
         return _serde.dump_response(response)
 
     @activity.defn(name=INVOKE_MODEL_STREAMING)
@@ -253,23 +268,31 @@ class ChatClientActivities:
     async def invoke_model_streaming(
         self, input: InvokeModelStreamingInput
     ) -> list[dict[str, Any]]:
-        """Run one streamed round trip and return the serialized updates.
+        """Run one streamed round trip and return the recorded updates.
 
-        With ``streaming_topic`` set, every update is also published to that
-        topic on the workflow's ``WorkflowStream`` as it arrives, batched at
-        ``streaming_batch_interval_seconds``.
+        The record holds one entry per function call, usage or finish update
+        and one entry per run of text (see ``_serde.StreamRecorder``). With
+        ``streaming_topic`` set, every provider update is also published to
+        that topic on the workflow's ``WorkflowStream`` as it arrives, batched
+        at ``streaming_batch_interval_seconds``.
         """
         client = self._client(input.model)
         messages = _serde.load_messages(input.messages)
         options = _serde.load_options(input.options)
-        updates: list[dict[str, Any]] = []
-        if input.streaming_topic is None:
+        recorder = _serde.StreamRecorder()
+
+        async def consume(publish: Callable[[dict[str, Any]], None] | None) -> None:
             with _classify_provider_errors(input.model):
                 async for update in client.get_response(
-                    messages, stream=True, options=options
+                    messages, stream=True, options=options, client_kwargs=input.kwargs
                 ):
-                    updates.append(_serde.dump_update(update))
-            return updates
+                    serialized = recorder.add(update)
+                    if serialized is not None and publish is not None:
+                        publish(serialized)
+
+        if input.streaming_topic is None:
+            await consume(None)
+            return recorder.updates
 
         stream = WorkflowStreamClient.from_within_activity(
             batch_interval=timedelta(seconds=input.streaming_batch_interval_seconds)
@@ -281,13 +304,7 @@ class ChatClientActivities:
         # had. A model error, or the Activity's cancellation, stays the error.
         await stream.__aenter__()
         try:
-            with _classify_provider_errors(input.model):
-                async for update in client.get_response(
-                    messages, stream=True, options=options
-                ):
-                    serialized = _serde.dump_update(update)
-                    updates.append(serialized)
-                    topic.publish(serialized)
+            await consume(topic.publish)
         except BaseException:
             with suppress(Exception):
                 await stream.__aexit__(None, None, None)
@@ -298,4 +315,4 @@ class ChatClientActivities:
             raise _stream_publish_error(
                 err, input.model, input.streaming_topic
             ) from err
-        return updates
+        return recorder.updates

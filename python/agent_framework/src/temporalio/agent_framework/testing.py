@@ -89,8 +89,8 @@ class FakeChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatClien
     raised from the call. A streamed call splits text into updates of 12
     characters and sends every other content item as one update.
 
-    ``calls`` records every call as a dict with ``messages``, ``options`` and
-    ``stream``, so a test can assert what reached the model.
+    ``calls`` records every call as a dict with ``messages``, ``options``,
+    ``kwargs`` and ``stream``, so a test can assert what reached the model.
     """
 
     OTEL_PROVIDER_NAME: ClassVar[str] = "temporal-fake"
@@ -123,7 +123,12 @@ class FakeChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatClien
         **kwargs: Any,
     ) -> Awaitable[ChatResponse] | ResponseStream[ChatResponseUpdate, ChatResponse]:
         self.calls.append(
-            {"messages": list(messages), "options": dict(options), "stream": stream}
+            {
+                "messages": list(messages),
+                "options": dict(options),
+                "kwargs": dict(kwargs),
+                "stream": stream,
+            }
         )
         entry = self._next()
         if stream:
