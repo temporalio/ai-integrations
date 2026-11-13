@@ -58,7 +58,8 @@ REGISTRIES = {"python": "pypi", "typescript": "npm", "java": "maven", "go": "gop
 LANGUAGE_LOCKFILES = ("uv.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "go.sum", "gradle.lockfile", "packages.lock.json")
 # MSBuild imports the nearest of these above a project, so a copy at the language root would apply to every plugin.
 LANGUAGE_ROOT_FORBIDDEN = {
-    "dotnet": ("Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props", "global.json", "nuget.config"),
+    "dotnet": ("Directory.Build.props", "Directory.Build.targets", "Directory.Packages.props", "Directory.Build.rsp",
+               ".globalconfig", ".editorconfig", "global.json", "nuget.config"),
 }
 RELATIVE_LINK = re.compile(r"\]\((\.\.?/)")
 STANDARD_TEST_SUPPORT = {
@@ -92,7 +93,12 @@ DOTNET_DIRECTORY_FILES = {
     "Directory.Build.props": "a nearer Directory.Build.props replaces the plugin-root one and drops the shared policy",
     "Directory.Build.targets": "Directory.Build.targets is evaluated after the csproj and overrides the shared policy",
     "Directory.Packages.props": "Directory.Packages.props moves package versions out of the csproj files",
+    "Directory.Build.rsp": "Directory.Build.rsp adds MSBuild switches to every build in the tree",
+    ".globalconfig": "a .globalconfig would change analyzer severities outside dotnet/_shared (the build also stops discovering them)",
+    ".editorconfig": "a nested .editorconfig overrides the plugin's formatting and analyzer settings",
 }
+# Files a plugin keeps at its root and nowhere else.
+DOTNET_ROOT_ONLY_FILES = ("Directory.Build.props", ".editorconfig")
 DOTNET_BUILD_OUTPUT = {"bin", "obj"}
 NUGET_ID = re.compile(r"\w+([_.-]\w+)*")
 NUGET_ORG = "https://api.nuget.org/v3/index.json"
@@ -102,11 +108,27 @@ DOTNET_VSTEST_PACKAGES = ("Microsoft.NET.Test.Sdk", "xunit.runner.visualstudio",
 DOTNET_FORBIDDEN_PROPERTIES = ("IsAotCompatible", "PublishAot", "PublishTrimmed", "IsTrimmable")
 # Shared policy from dotnet/_shared/dotnet.props that a csproj may not weaken.
 DOTNET_POLICY_PROPERTIES = {
-    "TreatWarningsAsErrors": "true", "RestorePackagesWithLockFile": "true", "Nullable": "enable",
+    "TreatWarningsAsErrors": "true", "RestorePackagesWithLockFile": "true", "RestoreLockedMode": "true", "Nullable": "enable",
     "GenerateDocumentationFile": "true", "IncludeSymbols": "true", "PublishRepositoryUrl": "true",
-    "EnableNETAnalyzers": "true", "AnalysisMode": "allenabledbydefault", "AnalysisLevel": DOTNET_ANALYSIS_LEVEL,
-    "CodeAnalysisTreatWarningsAsErrors": "true", "MSBuildTreatWarningsAsErrors": "true",
+    "EnableNETAnalyzers": "true", "RunAnalyzers": "true", "AnalysisMode": "allenabledbydefault", "AnalysisLevel": DOTNET_ANALYSIS_LEVEL,
+    "CodeAnalysisTreatWarningsAsErrors": "true", "MSBuildTreatWarningsAsErrors": "true", "NuGetAudit": "true",
+    "DiscoverGlobalAnalyzerConfigFiles": "false",
 }
+
+def _local(tag: str) -> str:
+    """The element name without the MSBuild namespace an older project file may declare."""
+    return tag.rsplit("}", 1)[-1]
+
+
+class DotnetProject:
+    """What a .NET project or props file declares, as the checks read it."""
+
+    def __init__(self, properties: dict[str, str], assignments: list[tuple[str, str]],
+                 items: list[tuple[str, dict[str, str]]], imports: list[str]) -> None:
+        self.properties = properties
+        self.assignments = assignments
+        self.items = items
+        self.imports = imports
 
 
 class Checker:
@@ -522,12 +544,13 @@ class Checker:
         for directory, folders, files in os.walk(d):
             folders[:] = sorted(folder for folder in folders if folder not in DOTNET_BUILD_OUTPUT and not folder.startswith("."))
             for name in sorted(files):
+                path = Path(directory) / name
                 if name.endswith(".csproj"):
-                    projects.append(Path(directory) / name)
-                if name in DOTNET_DIRECTORY_FILES and not (name == "Directory.Build.props" and Path(directory) == d):
-                    nested = (Path(directory) / name).relative_to(d).as_posix()
-                    self.fail(f"{rel}/{nested}: {DOTNET_DIRECTORY_FILES[name]}; the plugin-root Directory.Build.props is the only "
-                              "MSBuild directory file a plugin may have")
+                    projects.append(path)
+                if name in DOTNET_DIRECTORY_FILES and not (name in DOTNET_ROOT_ONLY_FILES and Path(directory) == d):
+                    nested = path.relative_to(d).as_posix()
+                    self.fail(f"{rel}/{nested}: {DOTNET_DIRECTORY_FILES[name]}; the plugin-root Directory.Build.props and "
+                              ".editorconfig are the only build settings files a plugin may have")
         props = d / "Directory.Build.props"
         if props.is_file():
             self.check_dotnet_build_props(plugin, props)
@@ -613,24 +636,36 @@ class Checker:
         if sorted(pattern for pattern in patterns if pattern) != ["Temporalio", "Temporalio.*"]:
             self.fail(f"{rel}: minPublishAgeExceptions must exempt exactly Temporalio and Temporalio.*")
 
-    def _dotnet_project(self, plugin: Plugin, csproj: Path) -> tuple[dict[str, str], list[tuple[str, dict[str, str]]]] | None:
-        """Parse a csproj into (properties, items) with lower-cased names; conditions are ignored, the last value wins."""
+    def _dotnet_project(self, plugin: Plugin, csproj: Path) -> DotnetProject | None:
+        """Parse a project file the way MSBuild reads it: any namespace, every assignment, every import.
+
+        `properties` keeps the last value per lower-cased name for the identity checks; `assignments` keeps
+        every assignment, conditioned or not, so a policy property set twice is checked twice.
+        """
         try:
             root = ET.parse(csproj).getroot()
         except ET.ParseError as exc:
             self.fail(f"{plugin.rel}/{csproj.relative_to(plugin.path).as_posix()}: invalid XML ({exc})")
             return None
         properties: dict[str, str] = {}
-        for group in root.iter("PropertyGroup"):
-            for prop in group:
-                properties[prop.tag.lower()] = (prop.text or "").strip()
+        assignments: list[tuple[str, str]] = []
         items: list[tuple[str, dict[str, str]]] = []
-        for group in root.iter("ItemGroup"):
-            for item in group:
-                metadata = {key.lower(): value for key, value in item.attrib.items()}
-                metadata.update({child.tag.lower(): (child.text or "").strip() for child in item})
-                items.append((item.tag.lower(), metadata))
-        return properties, items
+        imports: list[str] = []
+        for element in root.iter():
+            tag = _local(element.tag)
+            if tag == "PropertyGroup":
+                for prop in element:
+                    name, value = _local(prop.tag).lower(), (prop.text or "").strip()
+                    properties[name] = value
+                    assignments.append((name, value))
+            elif tag == "ItemGroup":
+                for item in element:
+                    metadata = {key.lower(): value for key, value in item.attrib.items()}
+                    metadata.update({_local(child.tag).lower(): (child.text or "").strip() for child in item})
+                    items.append((_local(item.tag).lower(), metadata))
+            elif tag == "Import":
+                imports.append((element.get("Project") or "").replace("\\", "/"))
+        return DotnetProject(properties, assignments, items, imports)
 
     def check_dotnet_build_props(self, plugin: Plugin, props: Path) -> None:
         """The first element is the unconditioned shared import; the body below it applies to every project."""
@@ -648,7 +683,9 @@ class Checker:
         parsed = self._dotnet_project(plugin, props)
         if parsed is None:
             return
-        properties, items = parsed
+        properties, items = parsed.properties, parsed.items
+        for target in parsed.imports[1:] if parsed.imports[:1] == [DOTNET_SHARED_IMPORT_PATH] else parsed.imports:
+            self.fail(f"{rel}: Import of {target!r} adds build settings outside dotnet/_shared; the shared import is the only one allowed")
         if "version" in properties and properties["version"] != DOTNET_DEVELOPMENT_VERSION:
             self.fail(f"{rel}: Version must be the tag-authoritative development placeholder "
                       f"{DOTNET_DEVELOPMENT_VERSION!r} (got {properties['version']!r})")
@@ -656,16 +693,23 @@ class Checker:
             self.fail(f"{rel}: ship the license text; no PackageLicenseExpression or PackageLicenseUrl")
         if properties.get("ispackable", "").lower() == "true":
             self.fail(f"{rel}: IsPackable here would pack the test project too; set it in the library csproj")
-        self._dotnet_common_rules(plugin, props, properties, items, DOTNET_POLICY_PROPERTIES, require_stylecop=False)
+        self._dotnet_common_rules(plugin, props, parsed, DOTNET_POLICY_PROPERTIES, require_stylecop=False)
 
-    def _dotnet_common_rules(self, plugin: Plugin, csproj: Path, properties: dict[str, str],
-                             items: list[tuple[str, dict[str, str]]], policy: dict[str, str], *,
+    def _dotnet_common_rules(self, plugin: Plugin, csproj: Path, project: DotnetProject, policy: dict[str, str], *,
                              require_stylecop: bool = True) -> None:
         rel = f"{plugin.rel}/{csproj.relative_to(plugin.path).as_posix()}"
-        for name, value in policy.items():
-            actual = properties.get(name.lower())
-            if actual is not None and actual.lower() != value:
+        properties, items = project.properties, project.items
+        policy_names = {name.lower(): (name, value) for name, value in policy.items()}
+        reported: set[str] = set()
+        # Every assignment counts, whatever its Condition: MSBuild evaluates conditions the check cannot.
+        for lowered, actual in project.assignments:
+            if lowered in policy_names and actual.lower() != policy_names[lowered][1] and lowered not in reported:
+                name, value = policy_names[lowered]
                 self.fail(f"{rel}: {name} must stay {value} (shared policy from dotnet/_shared/dotnet.props)")
+                reported.add(lowered)
+        if csproj.name != "Directory.Build.props":
+            for target in project.imports:
+                self.fail(f"{rel}: Import of {target!r} adds build settings outside dotnet/_shared and the plugin-root Directory.Build.props")
         for name in DOTNET_FORBIDDEN_PROPERTIES:
             if name.lower() in properties:
                 self.fail(f"{rel}: {name} is not allowed; it adds SDK-pinned implicit package references that break locked restores")
@@ -685,7 +729,7 @@ class Checker:
         parsed = self._dotnet_project(plugin, csproj)
         if parsed is None:
             return
-        properties, items = parsed
+        properties, items = parsed.properties, parsed.items
         rel = f"{plugin.rel}/{csproj.relative_to(plugin.path).as_posix()}"
         if properties.get("packageid") != coordinate:
             self.fail(f"{rel}: PackageId must be {coordinate!r} (got {properties.get('packageid')!r})")
@@ -717,25 +761,25 @@ class Checker:
         temporalio = next((metadata for tag, metadata in items if tag == "packagereference" and metadata.get("include", "").lower() == "temporalio"), None)
         if temporalio is None or not temporalio.get("version"):
             self.fail(f"{rel}: a PackageReference to Temporalio with an explicit Version is required")
-        self._dotnet_common_rules(plugin, csproj, properties, items, DOTNET_POLICY_PROPERTIES)
+        self._dotnet_common_rules(plugin, csproj, parsed, DOTNET_POLICY_PROPERTIES)
 
     def check_dotnet_extra_project(self, plugin: Plugin, csproj: Path) -> None:
         """Any other project the plugin carries (a sample, a benchmark) builds under the same policy."""
         parsed = self._dotnet_project(plugin, csproj)
         if parsed is None:
             return
-        properties, items = parsed
+        properties = parsed.properties
         rel = f"{plugin.rel}/{csproj.relative_to(plugin.path).as_posix()}"
         if properties.get("ispackable", "").lower() == "true":
             self.fail(f"{rel}: only src/<Coordinate> is packable; a second package needs its own plugin")
         policy = {name: value for name, value in DOTNET_POLICY_PROPERTIES.items() if name != "GenerateDocumentationFile"}
-        self._dotnet_common_rules(plugin, csproj, properties, items, policy)
+        self._dotnet_common_rules(plugin, csproj, parsed, policy)
 
     def check_dotnet_tests(self, plugin: Plugin, csproj: Path) -> None:
         parsed = self._dotnet_project(plugin, csproj)
         if parsed is None:
             return
-        properties, items = parsed
+        properties, items = parsed.properties, parsed.items
         rel = f"{plugin.rel}/{csproj.relative_to(plugin.path).as_posix()}"
         if properties.get("usemicrosofttestingplatformrunner", "").lower() != "true":
             self.fail(f"{rel}: UseMicrosoftTestingPlatformRunner must be true (xunit.v3 under Microsoft.Testing.Platform)")
@@ -751,8 +795,7 @@ class Checker:
             if banned.lower() in references:
                 self.fail(f"{rel}: {banned} is a VSTest package; Microsoft.Testing.Platform mode rejects it")
         policy = {name: value for name, value in DOTNET_POLICY_PROPERTIES.items() if name != "GenerateDocumentationFile"}
-        self._dotnet_common_rules(plugin, csproj, properties, items, policy)
-
+        self._dotnet_common_rules(plugin, csproj, parsed, policy)
 
     def run(self) -> list[str]:
         discovered = discover_plugins(self.root)

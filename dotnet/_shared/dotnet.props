@@ -21,6 +21,9 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <NuGetAudit>true</NuGetAudit>
     <NuGetAuditMode>all</NuGetAuditMode>
+    <!-- The two globalconfigs below are listed explicitly; a .globalconfig dropped anywhere in a plugin
+         tree would otherwise be discovered by the compiler and change analyzer severities. -->
+    <DiscoverGlobalAnalyzerConfigFiles>false</DiscoverGlobalAnalyzerConfigFiles>
     <IsPackable>false</IsPackable>
     <Authors>Temporal</Authors>
     <Company>Temporal Technologies Inc.</Company>
@@ -34,9 +37,11 @@
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
   <ItemGroup>
-    <GlobalAnalyzerConfigFiles Include="$(MSBuildThisFileDirectory)analyzers.globalconfig" />
-    <GlobalAnalyzerConfigFiles Include="$(MSBuildThisFileDirectory)analyzers.tests.globalconfig"
-                               Condition="$(MSBuildProjectName.EndsWith('.Tests'))" />
+    <!-- EditorConfigFiles is the list the compiler reads; the SDK only copies GlobalAnalyzerConfigFiles
+         into it while discovery is on. -->
+    <EditorConfigFiles Include="$(MSBuildThisFileDirectory)analyzers.globalconfig" />
+    <EditorConfigFiles Include="$(MSBuildThisFileDirectory)analyzers.tests.globalconfig"
+                       Condition="$(MSBuildProjectName.EndsWith('.Tests'))" />
   </ItemGroup>
   <ItemGroup Condition="'$(IsPackable)' == 'true'">
     <None Include="$(MSBuildThisFileDirectory)icon.png" Pack="true" PackagePath="" Visible="false" />

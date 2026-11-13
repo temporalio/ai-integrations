@@ -172,6 +172,43 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
         lambda r: (r / PLUGIN / "Directory.Build.props").write_text(
             '<Project>\n  <Import Project="$(MSBuildThisFileDirectory)../_shared/dotnet.props" Condition="\'$(CI)\' == \'true\'" />\n</Project>\n'),
         "must be the unconditioned shared import"),
+    # The bypasses MSBuild would honor and a text-level check would miss.
+    "props-xmlns": (
+        lambda r: (r / PLUGIN / "Directory.Build.props").write_text(
+            '<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">\n'
+            '  <Import Project="$(MSBuildThisFileDirectory)../_shared/dotnet.props" />\n'
+            "  <PropertyGroup>\n    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>\n  </PropertyGroup>\n</Project>\n"),
+        "Directory.Build.props: TreatWarningsAsErrors must stay true"),
+    "conditioned-second-assignment": (
+        lambda r: edit(r, LIB, "<IsPackable>true</IsPackable>",
+                       '<IsPackable>true</IsPackable><TreatWarningsAsErrors>true</TreatWarningsAsErrors>'
+                       '<TreatWarningsAsErrors Condition="false">false</TreatWarningsAsErrors>'),
+        "TreatWarningsAsErrors must stay true"),
+    "csproj-import": (
+        lambda r: edit(r, LIB, '<Project Sdk="Microsoft.NET.Sdk">\n', '<Project Sdk="Microsoft.NET.Sdk">\n  <Import Project="../extra.props" />\n'),
+        "Import of '../extra.props' adds build settings outside dotnet/_shared"),
+    "props-second-import": (
+        lambda r: (r / PLUGIN / "Directory.Build.props").write_text(
+            '<Project>\n  <Import Project="$(MSBuildThisFileDirectory)../_shared/dotnet.props" />\n  <Import Project="extra.props" />\n</Project>\n'),
+        "Directory.Build.props: Import of 'extra.props' adds build settings outside dotnet/_shared"),
+    "run-analyzers-off": (lambda r: edit(r, LIB, "<IsPackable>true</IsPackable>", "<IsPackable>true</IsPackable><RunAnalyzers>false</RunAnalyzers>"),
+                          "RunAnalyzers must stay true"),
+    "nuget-audit-off": (lambda r: edit(r, LIB, "<IsPackable>true</IsPackable>", "<IsPackable>true</IsPackable><NuGetAudit>false</NuGetAudit>"),
+                        "NuGetAudit must stay true"),
+    "restore-locked-mode-off": (
+        lambda r: edit(r, TESTS, "<OutputType>Exe</OutputType>", "<OutputType>Exe</OutputType><RestoreLockedMode>false</RestoreLockedMode>"),
+        "RestoreLockedMode must stay true"),
+    "globalconfig-discovery-on": (
+        lambda r: write_root_props(r, "<DiscoverGlobalAnalyzerConfigFiles>true</DiscoverGlobalAnalyzerConfigFiles>"),
+        "DiscoverGlobalAnalyzerConfigFiles must stay false"),
+    "globalconfig-in-plugin": (lambda r: (r / PLUGIN / ".globalconfig").write_text("is_global = true\n"),
+                               ".globalconfig: a .globalconfig would change analyzer severities"),
+    "globalconfig-in-src": (lambda r: (r / PLUGIN / "src/Temporalio.Fakedotnet/.globalconfig").write_text("is_global = true\n"),
+                            "src/Temporalio.Fakedotnet/.globalconfig: a .globalconfig would change analyzer severities"),
+    "build-rsp": (lambda r: (r / PLUGIN / "Directory.Build.rsp").write_text("-p:TreatWarningsAsErrors=false\n"),
+                  "Directory.Build.rsp: Directory.Build.rsp adds MSBuild switches"),
+    "nested-editorconfig": (lambda r: (r / PLUGIN / "src/.editorconfig").write_text("root = true\n"),
+                            "src/.editorconfig: a nested .editorconfig overrides"),
 }
 
 
@@ -248,13 +285,23 @@ def test_uncommitted_required_files_are_reported(dotnet_repo: Path) -> None:
 
 
 def test_language_root_build_files_are_forbidden(dotnet_repo: Path) -> None:
-    for name in ("Directory.Build.props", "global.json", "packages.lock.json"):
+    for name in ("Directory.Build.props", "global.json", "packages.lock.json", ".globalconfig", "Directory.Build.rsp", ".editorconfig"):
         (dotnet_repo / "dotnet" / name).write_text("{}\n")
     violations = Checker(dotnet_repo).run()
-    assert len(violations) == 3, violations
+    assert len(violations) == 6, violations
     assert any("dotnet/Directory.Build.props: language-root build files are forbidden" in v for v in violations)
     assert any("dotnet/global.json: language-root build files are forbidden" in v for v in violations)
     assert any("dotnet/packages.lock.json: language-level lockfiles are forbidden" in v for v in violations)
+    for name in (".globalconfig", "Directory.Build.rsp", ".editorconfig"):
+        assert any(f"dotnet/{name}: language-root build files are forbidden" in v for v in violations), name
+
+
+def test_shared_props_do_not_discover_globalconfigs() -> None:
+    props = ET.parse(REPO_ROOT / "dotnet" / "_shared" / "dotnet.props").getroot()
+    properties = {prop.tag: (prop.text or "").strip() for group in props.iter("PropertyGroup") for prop in group}
+    assert properties["DiscoverGlobalAnalyzerConfigFiles"] == "false"
+    includes = [item.get("Include", "") for group in props.iter("ItemGroup") for item in group if item.tag == "EditorConfigFiles"]
+    assert len(includes) == 2 and all("$(MSBuildThisFileDirectory)analyzers" in include for include in includes)
 
 
 def test_missing_shared_files_are_reported(dotnet_repo: Path) -> None:

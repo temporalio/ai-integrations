@@ -202,8 +202,9 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - Tooling: `make sync`, `make lint` (`dotnet format --verify-no-changes` on the solution; analyzers run
   in the build), `make test`, `make build`, `make lock`, `make check-deps`. Formatting rules live in the
   plugin's `.editorconfig`, kept byte-identical to `dotnet/_template/.editorconfig`; project-wide
-  analyzer severities live in `dotnet/_shared/analyzers.globalconfig` (imported through
-  `GlobalAnalyzerConfigFiles`). `StyleCop.Analyzers` is referenced by each project with
+  analyzer severities live in `dotnet/_shared/analyzers.globalconfig` (listed as
+  `EditorConfigFiles` in `dotnet.props`, with `.globalconfig` discovery off so nothing else reaches the
+  compiler). `StyleCop.Analyzers` is referenced by each project with
   `PrivateAssets="all"`.
 - CI uses `plugin.toml` `[ci] runtime-versions` as the SDK channel. Exactly one channel is allowed:
   `global.json` resolves the floor channel with `latestFeature` in every cell, so a second channel in
