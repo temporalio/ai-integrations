@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import shutil
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from pathlib import Path
 
+import check_conventions
 import pytest
 from check_conventions import Checker
-from conftest import make_dotnet_plugin
+from conftest import REPO_ROOT, make_dotnet_plugin
 
 PLUGIN = "dotnet/fakedotnet"
 LIB = "src/Temporalio.Fakedotnet/Temporalio.Fakedotnet.csproj"
@@ -26,6 +28,17 @@ def write_root_props(repo: Path, body: str) -> None:
     (repo / PLUGIN / "Directory.Build.props").write_text(
         '<Project>\n  <Import Project="$(MSBuildThisFileDirectory)../_shared/dotnet.props" />\n'
         f"  <PropertyGroup>\n    {body}\n  </PropertyGroup>\n</Project>\n"
+    )
+
+
+def write_extra_project(repo: Path, body: str) -> None:
+    project = repo / PLUGIN / "src/Temporalio.Fakedotnet.Extra/Temporalio.Fakedotnet.Extra.csproj"
+    project.parent.mkdir(parents=True, exist_ok=True)
+    project.write_text(
+        '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup>\n    <TargetFramework>net10.0</TargetFramework>\n'
+        f"    {body}\n  </PropertyGroup>\n  <ItemGroup>\n"
+        '    <PackageReference Include="StyleCop.Analyzers" Version="1.3.180" PrivateAssets="all" />\n'
+        "  </ItemGroup>\n</Project>\n"
     )
 
 
@@ -87,10 +100,14 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
     "editorconfig-drift": (lambda r: (r / PLUGIN / ".editorconfig").write_text((r / PLUGIN / ".editorconfig").read_text() + "\n# drift\n"),
                            "differs from canonical dotnet/_template/.editorconfig"),
     "props-import": (lambda r: (r / PLUGIN / "Directory.Build.props").write_text("<Project>\n  <PropertyGroup />\n</Project>\n"),
-                     "must start with the shared import"),
+                     "must be the unconditioned shared import"),
     "nuget-config-cooldown": (lambda r: edit(r, "nuget.config", ' minPublishAgeHours="336"', ""), "must carry minPublishAgeHours"),
-    "nuget-config-exception": (lambda r: edit(r, "nuget.config", '    <package pattern="Temporalio*" />\n', ""),
-                               "must exempt the Temporalio* pattern"),
+    "nuget-config-exception": (lambda r: edit(r, "nuget.config", '    <package pattern="Temporalio.*" />\n', ""),
+                               "must exempt exactly Temporalio and Temporalio.*"),
+    "nuget-config-exception-prefix": (
+        lambda r: edit(r, "nuget.config", '    <package pattern="Temporalio" />\n    <package pattern="Temporalio.*" />\n',
+                       '    <package pattern="Temporalio*" />\n'),
+        "must exempt exactly Temporalio and Temporalio.*"),
     "nuget-config-extra-source": (
         lambda r: edit(r, "nuget.config", "  </packageSources>", '    <add key="mirror" value="https://mirror.example/v3/index.json" />\n  </packageSources>'),
         "must be the only package source"),
@@ -129,6 +146,32 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
                        "src/Temporalio.Fakedotnet/Directory.Build.targets: Directory.Build.targets is evaluated after"),
     "packages-props": (lambda r: (r / PLUGIN / "Directory.Packages.props").write_text("<Project />\n"),
                        "Directory.Packages.props: Directory.Packages.props moves package versions out of the csproj"),
+    "target-framework-floor": (lambda r: edit(r, LIB, "<TargetFramework>net10.0</TargetFramework>", "<TargetFramework>net9.0</TargetFramework>"),
+                               "TargetFramework(s) must include net10.0"),
+    "project-url": (lambda r: edit(r, LIB, "tree/main/dotnet/fakedotnet</PackageProjectUrl>", "tree/main/dotnet/other</PackageProjectUrl>"),
+                    "PackageProjectUrl must be https://github.com/temporalio/ai-integrations/tree/main/dotnet/fakedotnet"),
+    "library-project-reference": (
+        lambda r: edit(r, LIB, '  <ItemGroup>\n    <PackageReference Include="Temporalio"',
+                       '  <ItemGroup>\n    <ProjectReference Include="../Temporalio.Fakedotnet.Extra/Temporalio.Fakedotnet.Extra.csproj" />\n'
+                       '    <PackageReference Include="Temporalio"'),
+        "ProjectReference in the packed library"),
+    "extra-project-weaker-policy": (lambda r: write_extra_project(r, "<TreatWarningsAsErrors>false</TreatWarningsAsErrors>"),
+                                    "Temporalio.Fakedotnet.Extra.csproj: TreatWarningsAsErrors must stay true"),
+    "extra-project-packable": (lambda r: write_extra_project(r, "<IsPackable>true</IsPackable>"), "only src/<Coordinate> is packable"),
+    "root-props-analysis-level-none": (lambda r: write_root_props(r, "<AnalysisLevel>none</AnalysisLevel>"),
+                                       "Directory.Build.props: AnalysisLevel must stay 10.0"),
+    "code-analysis-warnings": (
+        lambda r: edit(r, LIB, "<IsPackable>true</IsPackable>",
+                       "<IsPackable>true</IsPackable><CodeAnalysisTreatWarningsAsErrors>false</CodeAnalysisTreatWarningsAsErrors>"),
+        "CodeAnalysisTreatWarningsAsErrors must stay true"),
+    "msbuild-warnings": (
+        lambda r: edit(r, TESTS, "<OutputType>Exe</OutputType>",
+                       "<OutputType>Exe</OutputType><MSBuildTreatWarningsAsErrors>false</MSBuildTreatWarningsAsErrors>"),
+        "MSBuildTreatWarningsAsErrors must stay true"),
+    "conditioned-import": (
+        lambda r: (r / PLUGIN / "Directory.Build.props").write_text(
+            '<Project>\n  <Import Project="$(MSBuildThisFileDirectory)../_shared/dotnet.props" Condition="\'$(CI)\' == \'true\'" />\n</Project>\n'),
+        "must be the unconditioned shared import"),
 }
 
 
@@ -154,6 +197,36 @@ def test_build_output_is_not_scanned_for_directory_files(dotnet_repo: Path) -> N
     stale.parent.mkdir(parents=True)
     stale.write_text("<Project />\n")
     assert Checker(dotnet_repo).run() == []
+
+
+def test_shared_import_is_matched_as_xml_not_text(dotnet_repo: Path) -> None:
+    (dotnet_repo / PLUGIN / "Directory.Build.props").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n<!-- plugin build settings -->\n<Project>\n'
+        '    <Import Project="$(MSBuildThisFileDirectory)..\\_shared\\dotnet.props"/>\n'
+        "    <PropertyGroup>\n        <Description>Fake plugin (Pre-release)</Description>\n    </PropertyGroup>\n</Project>\n"
+    )
+    assert Checker(dotnet_repo).run() == []
+
+
+def test_makefile_include_may_carry_a_comment(dotnet_repo: Path) -> None:
+    (dotnet_repo / PLUGIN / "Makefile").write_text("PACKAGE := Temporalio.Fakedotnet\ninclude ../_shared/dotnet.mk # shared targets\n")
+    assert Checker(dotnet_repo).run() == []
+
+
+def test_extra_projects_under_the_policy_pass(dotnet_repo: Path) -> None:
+    write_extra_project(dotnet_repo, "<Description>Benchmarks</Description>")
+    assert Checker(dotnet_repo).run() == []
+
+
+def test_shared_props_keep_advisories_warnings_and_pin_the_analysis_level() -> None:
+    props = ET.parse(REPO_ROOT / "dotnet" / "_shared" / "dotnet.props").getroot()
+    properties = {prop.tag: (prop.text or "").strip() for group in props.iter("PropertyGroup") for prop in group}
+    assert {"NU1900", "NU1901", "NU1902", "NU1903", "NU1904"} <= set(properties["WarningsNotAsErrors"].split(";"))
+    assert properties["AnalysisLevel"] == check_conventions.DOTNET_ANALYSIS_LEVEL == "10.0"
+    # The policy the check enforces on plugins is the policy the shared props declare.
+    for name, value in check_conventions.DOTNET_POLICY_PROPERTIES.items():
+        if name in properties:
+            assert properties[name].lower() == value, name
 
 
 def test_root_props_may_add_plugin_specific_properties(dotnet_repo: Path) -> None:

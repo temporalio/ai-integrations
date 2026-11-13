@@ -161,9 +161,11 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   `dotnet/_shared/dotnet.props`, which holds the shared build policy (warnings as errors, nullable,
   analyzers, lock files, audit, Source Link, `snupkg` symbols, icon, authors and repository
   metadata). Dependencies, target frameworks and package identity stay in the plugin's csproj. The
-  conventions check applies the policy rules to the root `Directory.Build.props` body and both csproj
-  files, and rejects a nested `Directory.Build.props`, any `Directory.Build.targets` and any
-  `Directory.Packages.props` inside the plugin.
+  conventions check applies the policy rules to the root `Directory.Build.props` body and every csproj
+  under the plugin, rejects a nested `Directory.Build.props`, any `Directory.Build.targets` and any
+  `Directory.Packages.props`, and forbids a `ProjectReference` in the packed library (it would become
+  a nuspec dependency on a coordinate that is not on nuget.org). The library csproj sets
+  `PackageProjectUrl` to its GitHub tree URL.
 - Coordinates are `Temporalio.<Name>` and the root namespace is the coordinate. The first release
   targets `net10.0` only; .NET 8 and 9 left support on 2026-11-10.
 - The csproj `Version` is `0.0.0`. The release workflow passes `-p:Version=<tag version>` to build,
@@ -176,7 +178,8 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   `PublishTrimmed` and `IsTrimmable` are not allowed because they add SDK-pinned implicit package
   references that break locked restores across SDK patches.
 - Dependency cooldown: `nuget.config` sets `minPublishAgeHours="336"` on the nuget.org source and
-  exempts `Temporalio*` in `<minPublishAgeExceptions>`, the syntax NuGet's accepted cooldown spec
+  exempts `Temporalio` and `Temporalio.*` in `<minPublishAgeExceptions>` (not a `Temporalio*` prefix,
+  which would also cover `TemporalioCommunity.*`), the syntax NuGet's accepted cooldown spec
   (NuGet/Home#14983) defines. NuGet does not enforce it yet; `make check-deps`
   (`scripts/ci/check_dotnet_deps.py`) fails when any version in a committed lock was published less
   than 336 hours ago or is unlisted. `make sync-latest` (nightly) updates every direct dependency to

@@ -20,7 +20,8 @@ NUGET_CONFIG = '''<?xml version="1.0" encoding="utf-8"?>
     <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" minPublishAgeHours="336" />
   </packageSources>
   <minPublishAgeExceptions>
-    <package pattern="Temporalio*" />
+    <package pattern="Temporalio" />
+    <package pattern="Temporalio.*" />
   </minPublishAgeExceptions>
 </configuration>
 '''
@@ -68,6 +69,23 @@ def test_first_party_exception_skips_the_age_check_but_not_the_listing(tmp_path:
         ("Temporalio", "1.22.0"): {"listed": False, "published": "1900-01-01T00:00:00+00:00"},
         ("Temporalio.Mcp", "0.1.0"): {"listed": True, "published": published(1)},
     })
+    failures = check_dotnet_deps.check(plugin, leaves)
+    assert len(failures) == 1 and "Temporalio 1.22.0 is unlisted" in failures[0]
+
+
+def test_prefix_lookalikes_are_not_first_party(tmp_path: Path) -> None:
+    plugin = plugin_with_lock(tmp_path, {"TemporalioCommunity.Something": "1.0.0", "Temporalio.Mcp": "0.1.0"})
+    leaves = registry(tmp_path, {
+        ("TemporalioCommunity.Something", "1.0.0"): {"listed": True, "published": published(1)},
+        ("Temporalio.Mcp", "0.1.0"): {"listed": True, "published": published(1)},
+    })
+    failures = check_dotnet_deps.check(plugin, leaves)
+    assert len(failures) == 1 and failures[0].startswith("TemporalioCommunity.Something 1.0.0 was published")
+
+
+def test_a_1900_publish_date_counts_as_unlisted(tmp_path: Path) -> None:
+    plugin = plugin_with_lock(tmp_path, {"Temporalio": "1.22.0"})
+    leaves = registry(tmp_path, {("Temporalio", "1.22.0"): {"published": "1900-01-01T00:00:00+00:00"}})
     failures = check_dotnet_deps.check(plugin, leaves)
     assert len(failures) == 1 and "Temporalio 1.22.0 is unlisted" in failures[0]
 
@@ -152,7 +170,7 @@ def test_cli_exit_codes_and_summary(tmp_path: Path, capsys: pytest.CaptureFixtur
     })
     assert check_dotnet_deps.main(["--plugin-dir", str(plugin), "--registry-dir", str(leaves)]) == 0
     out = capsys.readouterr().out
-    assert "cooldown 336 hours; exempt ['temporalio*']; 2 locked versions" in out
+    assert "cooldown 336 hours; exempt ['temporalio', 'temporalio.*']; 2 locked versions" in out
     assert "OK: Temporalio 1.22.0 is listed and exempt from the cooldown" in out
     assert out.rstrip().endswith("OK: every locked version is listed and older than the cooldown")
     (plugin / "src" / "Temporalio.Fakedotnet" / "packages.lock.json").write_text(dotnet_lock({"xunit.v3": "4.0.3", "Fresh": "1.0.0"}))

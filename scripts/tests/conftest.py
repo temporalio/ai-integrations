@@ -177,7 +177,8 @@ def make_dotnet_plugin(
             <add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" minPublishAgeHours="336" />
           </packageSources>
           <minPublishAgeExceptions>
-            <package pattern="Temporalio*" />
+            <package pattern="Temporalio" />
+            <package pattern="Temporalio.*" />
           </minPublishAgeExceptions>
         </configuration>
     ''').lstrip())
@@ -196,6 +197,7 @@ def make_dotnet_plugin(
             <Description>Fake plugin (Pre-release)</Description>
             <PackageLicenseFile>LICENSE</PackageLicenseFile>
             <PackageReadmeFile>README.md</PackageReadmeFile>
+            <PackageProjectUrl>https://github.com/temporalio/ai-integrations/tree/main/dotnet/{name}</PackageProjectUrl>
           </PropertyGroup>
           <ItemGroup>
             <None Include="../../LICENSE" Pack="true" PackagePath="" />

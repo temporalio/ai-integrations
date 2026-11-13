@@ -121,11 +121,13 @@ def parse_time(raw: object) -> datetime:
 
 def check_version(package_id: str, version: str, leaf: dict, hours: int, patterns: list[str], now: datetime) -> str:
     """One version against the policy: listed always; old enough unless an exception pattern matches."""
-    if leaf.get("listed") is False:
+    published = parse_time(leaf.get("published"))
+    # nuget.org sets `published` to 1900 for unlisted versions: the flag is the signal, the date the second check.
+    if leaf.get("listed") is False or published.year < 1901:
         raise CooldownError(f"{package_id} {version} is unlisted on nuget.org (the yanked analogue); move to a listed version")
     if any(fnmatch.fnmatchcase(package_id.lower(), pattern) for pattern in patterns):
         return f"OK: {package_id} {version} is listed and exempt from the cooldown"
-    age = now - parse_time(leaf.get("published"))
+    age = now - published
     if age < timedelta(hours=hours):
         raise CooldownError(
             f"{package_id} {version} was published {age.total_seconds() / 3600:.0f} hours ago; "
