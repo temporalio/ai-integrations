@@ -8,9 +8,9 @@ namespace Temporalio.MicrosoftAgentFramework;
 /// <summary>
 /// The Temporal plugin for Microsoft Agent Framework. Pass one instance to
 /// <c>TemporalClientConnectOptions.Plugins</c> or <c>TemporalWorkerOptions.Plugins</c>. It
-/// registers the model and MCP Activities, marks <see cref="MicrosoftAgentFrameworkWorkflowException"/>
-/// as a Workflow failure, and closes MCP connections when the last worker or replayer running with
-/// the instance stops. Workers that share one instance share its MCP connections.
+/// registers the model and MCP Activities and closes MCP connections when the last worker or
+/// replayer running with the instance stops. Workers that share one instance share its MCP
+/// connections.
 /// </summary>
 public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
 {
@@ -27,11 +27,11 @@ public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
     }
 
     /// <summary>
-    /// Adds the plugin's Activities and failure type. When the same instance reaches the worker
-    /// twice, through the client options and the worker options, the second pass appends the same
-    /// definitions again and this method removes those copies, so the worker starts. Any other
-    /// duplicate Activity name, including a second instance of this plugin, is left for the SDK's
-    /// own check, which fails the worker with <c>Duplicate activity named ...</c>.
+    /// Adds the plugin's Activities. When the same instance reaches the worker twice, through the
+    /// client options and the worker options, the second pass appends the same definitions again
+    /// and this method removes those copies, so the worker starts. Any other duplicate Activity
+    /// name, including a second instance of this plugin, is left for the SDK's own check, which
+    /// fails the worker with <c>Duplicate activity named ...</c>.
     /// </summary>
     /// <param name="options">Worker options to configure.</param>
     public override void ConfigureWorker(TemporalWorkerOptions options)
@@ -41,13 +41,6 @@ public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
         foreach (var definition in Options.Activities)
         {
             RemoveLaterCopies(options.Activities, definition);
-        }
-
-        if (options.WorkflowFailureExceptionTypes is { } types)
-        {
-            var list = types.ToList();
-            RemoveLaterCopies(list, typeof(MicrosoftAgentFrameworkWorkflowException));
-            options.WorkflowFailureExceptionTypes = list;
         }
     }
 
@@ -134,7 +127,6 @@ public sealed class MicrosoftAgentFrameworkPlugin : SimplePlugin
 #pragma warning restore CA2000
         var pluginOptions = new SimplePluginOptions
         {
-            WorkflowFailureExceptionTypes = [typeof(MicrosoftAgentFrameworkWorkflowException)],
             RunContextBefore = () =>
             {
                 connections.Acquire();

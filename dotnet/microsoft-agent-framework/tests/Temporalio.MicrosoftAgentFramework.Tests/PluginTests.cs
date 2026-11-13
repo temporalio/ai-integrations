@@ -43,7 +43,7 @@ public class PluginTests : WorkflowTestBase
     }
 
     [Fact]
-    public void ConfigureWorker_RegistersActivitiesOnceAndFailureTypes()
+    public void ConfigureWorker_RegistersActivitiesOnce()
     {
         var plugin = TestPlugin.For(new FakeChatClient(ScriptedResponse.Text("unused")));
         var options = new TemporalWorkerOptions("tq");
@@ -53,7 +53,7 @@ public class PluginTests : WorkflowTestBase
             [ModelActivityNames.InvokeModel, ModelActivityNames.McpListTools, ModelActivityNames.McpCallTool],
             options.Activities.Select(a => a.Name).OrderBy(n => n == ModelActivityNames.InvokeModel ? 0 : n == ModelActivityNames.McpListTools ? 1 : 2));
         Assert.Equal(3, options.Activities.Count);
-        Assert.Equal([typeof(MicrosoftAgentFrameworkWorkflowException)], options.WorkflowFailureExceptionTypes);
+        Assert.Null(options.WorkflowFailureExceptionTypes);
         Assert.Equal("microsoft.AgentFrameworkPlugin", plugin.Name);
     }
 
@@ -136,11 +136,11 @@ public class PluginTests : WorkflowTestBase
     }
 
     [Fact]
-    public void Replayer_ConfiguredByPlugin_HasFailureTypes()
+    public void Replayer_ConfiguredByPlugin_HasItsActivities()
     {
         var plugin = TestPlugin.For(new FakeChatClient(ScriptedResponse.Text("unused")));
         var replayer = new WorkflowReplayer(new WorkflowReplayerOptions { Plugins = [plugin] }.AddWorkflow<HelloWorkflow>());
-        Assert.Contains(typeof(MicrosoftAgentFrameworkWorkflowException), replayer.Options.WorkflowFailureExceptionTypes ?? []);
+        Assert.Null(replayer.Options.WorkflowFailureExceptionTypes);
     }
 
     private TemporalClient ClientWithPlugin(MicrosoftAgentFrameworkPlugin plugin) => new(

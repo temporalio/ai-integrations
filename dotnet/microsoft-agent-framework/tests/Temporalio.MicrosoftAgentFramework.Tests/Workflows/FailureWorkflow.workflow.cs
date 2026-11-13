@@ -159,6 +159,9 @@ public class FailureWorkflow
                     return (await agent.RunAsync(input.Prompt)).Text;
                 }
 
+            case "workflow-exception":
+                throw new MicrosoftAgentFrameworkWorkflowException("thrown by the Workflow");
+
             case "tool-errors-reset":
                 {
                     // Fails unless the city is "ok": a success between two groups of failures resets the consecutive count.

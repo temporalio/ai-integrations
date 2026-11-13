@@ -3,9 +3,9 @@ using Temporalio.Exceptions;
 namespace Temporalio.MicrosoftAgentFramework;
 
 /// <summary>
-/// Failure raised by <see cref="TemporalAgent"/> on the Workflow side. The plugin registers this
-/// type through <c>WorkflowFailureExceptionTypes</c>, so throwing it fails the Workflow Execution
-/// instead of failing the Workflow Task.
+/// Failure raised by <see cref="TemporalAgent"/> on the Workflow side. As an
+/// <see cref="ApplicationFailureException"/> it fails the Workflow Execution, not the Workflow
+/// Task, with <see cref="MicrosoftAgentFrameworkErrorTypes.WorkflowError"/> as the error type.
 /// </summary>
 public sealed class MicrosoftAgentFrameworkWorkflowException : ApplicationFailureException
 {

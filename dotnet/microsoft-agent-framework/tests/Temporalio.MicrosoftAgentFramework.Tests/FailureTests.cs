@@ -138,6 +138,20 @@ public class FailureTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task WorkflowException_FailsTheWorkflow_WithoutAnyRegistration()
+    {
+        // No plugin on this worker: the exception type is an ApplicationFailureException and that is enough.
+        var (error, handle) = await RunFailingAsync(null, (FailureWorkflow wf) => wf.RunAsync(new FailureInput("workflow-exception")));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal(MicrosoftAgentFrameworkErrorTypes.WorkflowError, failure.ErrorType);
+        Assert.Equal("thrown by the Workflow", failure.Message);
+        var history = await handle.FetchHistoryAsync();
+        Assert.Equal(0, HistoryAssert.Count(history, EventType.WorkflowTaskFailed));
+        Assert.Equal(1, HistoryAssert.Count(history, EventType.WorkflowExecutionFailed));
+    }
+
+    [Fact]
     public async Task ConsecutiveToolErrors_ResetAfterASuccess()
     {
         var bad = ("get_weather", (IDictionary<string, object?>)new Dictionary<string, object?> { ["city"] = "bad" });

@@ -22,7 +22,6 @@ public class ReplayTests
         }
 
         var replayer = new WorkflowReplayer(options);
-        Assert.Contains(typeof(MicrosoftAgentFrameworkWorkflowException), replayer.Options.WorkflowFailureExceptionTypes ?? []);
         foreach (var file in files)
         {
             var history = WorkflowHistory.FromJson(Path.GetFileNameWithoutExtension(file), await File.ReadAllTextAsync(file, TestContext.Current.CancellationToken));
