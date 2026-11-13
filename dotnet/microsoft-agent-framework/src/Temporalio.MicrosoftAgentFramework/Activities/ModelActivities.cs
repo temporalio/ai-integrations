@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
 using Temporalio.Activities;
 using Temporalio.Exceptions;
 using Temporalio.Extensions.WorkflowStreams;
@@ -57,7 +58,7 @@ public sealed class ModelActivities
     {
         ArgumentNullException.ThrowIfNull(input);
         var context = ActivityExecutionContext.Current;
-        var client = ResolveClient(input.Model);
+        var client = ResolveClient(input.Model, context.Logger);
         var options = ChatOptionsTransport.Rebuild(input, hostedMcpServerHeaders);
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(context.CancellationToken);
         var pump = HeartbeatAsync(context, stop.Token);
@@ -144,7 +145,7 @@ public sealed class ModelActivities
         }
     }
 
-    private IChatClient ResolveClient(string model)
+    private IChatClient ResolveClient(string model, ILogger logger)
     {
         if (clients.TryGetValue(model, out var existing))
         {
@@ -171,15 +172,18 @@ public sealed class ModelActivities
             {
                 client = factory();
             }
-#pragma warning disable CA1031 // The factory is user code; whatever it throws is a configuration error the Workflow must see once.
+#pragma warning disable CA1031 // The factory is user code; its failure is reported once per attempt and the attempt is retried.
             catch (Exception exception)
 #pragma warning restore CA1031
             {
+                // A missing environment variable or an unreachable key vault can be fixed in place, so
+                // the attempt fails and the Activity's retry policy or schedule-to-close timeout bounds it.
+                logger.LogError(exception, "The chat client factory for model '{Model}' threw; the Activity attempt fails and is retried.", model);
                 throw new ApplicationFailureException(
                     $"The chat client factory for model '{model}' threw {exception.GetType().Name}: {exception.Message}",
                     exception,
                     errorType: MicrosoftAgentFrameworkErrorTypes.ConfigurationError,
-                    nonRetryable: true);
+                    nonRetryable: false);
             }
 
             if (client is null)

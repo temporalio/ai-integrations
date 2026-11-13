@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Client;
+using Temporalio.Activities;
 using Temporalio.Exceptions;
 using Temporalio.MicrosoftAgentFramework.Activities;
 
@@ -266,8 +268,9 @@ internal sealed class McpConnectionCache : IAsyncDisposable
 
         /// <summary>
         /// Returns the client, connecting when there is none. A failed connect leaves the entry
-        /// empty so the next attempt reconnects; a factory that throws is a configuration error
-        /// and is not retried.
+        /// empty so the next attempt reconnects. A factory that throws fails the attempt, which the
+        /// Activity's retry policy bounds; a factory that returns null is a configuration error and
+        /// is not retried.
         /// </summary>
         /// <param name="server">Server name, for the error message.</param>
         /// <param name="factory">Transport factory.</param>
@@ -280,18 +283,31 @@ internal sealed class McpConnectionCache : IAsyncDisposable
                 return existing;
             }
 
-            IClientTransport transport;
+            IClientTransport? transport;
             try
             {
                 transport = factory();
             }
-#pragma warning disable CA1031 // The factory is user code; whatever it throws is a configuration error the Workflow must see once.
+#pragma warning disable CA1031 // The factory is user code; its failure is reported once per attempt and the attempt is retried.
             catch (Exception exception)
 #pragma warning restore CA1031
             {
+                if (ActivityExecutionContext.HasCurrent)
+                {
+                    ActivityExecutionContext.Current.Logger.LogError(exception, "The transport factory for MCP server '{Server}' threw; the Activity attempt fails and is retried.", server);
+                }
+
                 throw new ApplicationFailureException(
                     $"The transport factory for MCP server '{server}' threw {exception.GetType().Name}: {exception.Message}",
                     exception,
+                    errorType: MicrosoftAgentFrameworkErrorTypes.ConfigurationError,
+                    nonRetryable: false);
+            }
+
+            if (transport is null)
+            {
+                throw new ApplicationFailureException(
+                    $"The transport factory for MCP server '{server}' returned null.",
                     errorType: MicrosoftAgentFrameworkErrorTypes.ConfigurationError,
                     nonRetryable: true);
             }

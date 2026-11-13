@@ -19,8 +19,9 @@ public static class MicrosoftAgentFrameworkErrorTypes
     public const string McpError = "MicrosoftAgentFrameworkMcpError";
 
     /// <summary>
-    /// A model or MCP server name has no factory on the worker, or the worker-side chat client is
-    /// built in a way the plugin cannot run. Non-retryable.
+    /// A model or MCP server name has no factory on the worker, a factory returned null, or the
+    /// worker-side chat client is built in a way the plugin cannot run: not retried. A factory that
+    /// threw carries the same type and is retried under the Activity's retry policy.
     /// </summary>
     public const string ConfigurationError = "MicrosoftAgentFrameworkConfigurationError";
 

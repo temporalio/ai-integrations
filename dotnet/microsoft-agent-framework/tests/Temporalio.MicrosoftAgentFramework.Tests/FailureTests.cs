@@ -206,19 +206,29 @@ public class FailureTests : WorkflowTestBase
     }
 
     [Fact]
-    public async Task ThrowingChatClientFactory_ConfigurationError_NoRetry()
+    public async Task ThrowingChatClientFactory_ConfigurationError_RetriedUnderThePolicy()
     {
+        var attempts = 0;
         var plugin = new MicrosoftAgentFrameworkPlugin(new MicrosoftAgentFrameworkPluginOptions
         {
-            ChatClients = new Dictionary<string, Func<IChatClient>> { [TestPlugin.Model] = () => throw new InvalidOperationException("OPENAI_API_KEY is not set") },
+            ChatClients = new Dictionary<string, Func<IChatClient>>
+            {
+                [TestPlugin.Model] = () =>
+                {
+                    attempts++;
+                    throw new InvalidOperationException("OPENAI_API_KEY is not set");
+                },
+            },
         });
-        var (error, handle) = await RunFailingAsync(plugin, (FailureWorkflow wf) => wf.RunAsync(new FailureInput("model")));
+        var input = new FailureInput("model", MaxAttempts: 3);
+        var (error, handle) = await RunFailingAsync(plugin, (FailureWorkflow wf) => wf.RunAsync(input));
         var failure = AppFailure(error);
         Assert.NotNull(failure);
         Assert.Equal(MicrosoftAgentFrameworkErrorTypes.ConfigurationError, failure.ErrorType);
-        Assert.True(failure.NonRetryable);
+        Assert.False(failure.NonRetryable);
         Assert.Contains("InvalidOperationException: OPENAI_API_KEY is not set", failure.Message, StringComparison.Ordinal);
-        Assert.Equal(1, HistoryAssert.LastAttempt(await handle.FetchHistoryAsync(), ModelActivityNames.InvokeModel));
+        Assert.Equal(3, HistoryAssert.LastAttempt(await handle.FetchHistoryAsync(), ModelActivityNames.InvokeModel));
+        Assert.Equal(3, attempts);
     }
 
     [Theory]
