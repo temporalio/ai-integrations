@@ -4,8 +4,9 @@
  * @module
  */
 
-import { isTracingEnabled, type Client } from 'langsmith';
+import type { Client } from 'langsmith';
 import { RunTree, type RunTreeConfig, type WriteReplica } from 'langsmith/run_trees';
+import type { Logger } from '@temporalio/common';
 import type { Sinks } from '@temporalio/workflow';
 import type { InjectedSinks } from '@temporalio/worker';
 import { bindReplicaCredentials, type ReplicaRouting } from './routing';
@@ -76,33 +77,37 @@ function emissionRun(run: SerializedRun, client: Client, replicas: WriteReplica[
   return tree;
 }
 
-/** Build the worker-side {@link InjectedSinks} routing serialized runs to a real LangSmith client. */
-export function createLangSmithSinks(client: Client, replicas?: WriteReplica[]): InjectedSinks<LangSmithSinks> {
+/**
+ * Build the worker-side {@link InjectedSinks} routing serialized runs to a real LangSmith client, and a `drain` that
+ * resolves once every queued write has reached the client.
+ */
+export function createLangSmithSinks(
+  client: Client,
+  replicas: WriteReplica[] | undefined,
+  logger: Logger
+): { sinks: InjectedSinks<LangSmithSinks>; drain: () => Promise<void> } {
+  // Writes run one at a time in call order, so an update never overtakes its create.
+  let writes = Promise.resolve();
+  // The Workflow already decided whether to trace each run, so the env isn't checked again here.
+  const enqueue = (write: () => Promise<void>): void => {
+    // Emission must never fail the workflow.
+    writes = writes.then(write).catch((err: unknown) => {
+      logger.error(`LangSmith background I/O error: ${String(err)}`);
+    });
+  };
   return {
-    [LANGSMITH_SINK_NAME]: {
-      createRun: {
-        fn: (_info, run) => {
-          // Honor the LangSmith tracing gate at the real-env emission point.
-          if (!isTracingEnabled()) {
-            return;
-          }
-          void emissionRun(run, client, replicas).postRun().catch(() => {
-            /* swallow: emission must never fail the workflow */
-          });
+    sinks: {
+      [LANGSMITH_SINK_NAME]: {
+        createRun: {
+          fn: (_info, run) => enqueue(() => emissionRun(run, client, replicas).postRun()),
+          callDuringReplay: false,
         },
-        callDuringReplay: false,
-      },
-      updateRun: {
-        fn: (_info, run, options) => {
-          if (!isTracingEnabled()) {
-            return;
-          }
-          void emissionRun(run, client, replicas).patchRun(options).catch(() => {
-            /* swallow: emission must never fail the workflow */
-          });
+        updateRun: {
+          fn: (_info, run, options) => enqueue(() => emissionRun(run, client, replicas).patchRun(options)),
+          callDuringReplay: false,
         },
-        callDuringReplay: false,
       },
     },
+    drain: () => writes,
   };
 }

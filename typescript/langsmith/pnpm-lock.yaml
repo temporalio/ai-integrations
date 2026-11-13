@@ -26,6 +26,9 @@ importers:
       '@temporalio/workflow':
         specifier: ^1.24.0
         version: 1.24.0
+      uuid:
+        specifier: ^11.1.0
+        version: 11.1.1
     devDependencies:
       '@eslint/js':
         specifier: ^9.26.0

@@ -56,7 +56,8 @@
     "@temporalio/common": "^1.24.0",
     "@temporalio/plugin": "^1.24.0",
     "@temporalio/worker": "^1.24.0",
-    "@temporalio/workflow": "^1.24.0"
+    "@temporalio/workflow": "^1.24.0",
+    "uuid": "^11.1.0"
   },
   "peerDependencies": {
     "langsmith": ">=0.10.13 <0.11.0",

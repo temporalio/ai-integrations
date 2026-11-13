@@ -19,18 +19,21 @@
  * @module
  */
 
-import { Client, type AgentAddress } from 'langsmith';
+import { Client, isTracingEnabled, type AgentAddress } from 'langsmith';
 import { RunTree } from 'langsmith/run_trees';
 
 import type * as nexus from 'nexus-rpc';
 import { SimplePlugin } from '@temporalio/plugin';
 import type { ClientOptions } from '@temporalio/client';
+import { Runtime } from '@temporalio/worker';
 import type { BundleOptions, ReplayWorkerOptions, Worker, WorkerInterceptors, WorkerOptions } from '@temporalio/worker';
 import { createActivityInboundInterceptor, createNexusInboundInterceptor } from './activity-interceptor';
 import { createClientInterceptor } from './client-interceptor';
 import { createLangSmithSinks } from './sinks';
 import type { EmitterConfig } from './sinks';
-import type { Destination } from './run-tree';
+import { requireRunTreeMembers, type Destination } from './run-tree';
+import { WORKER_RUN_TREE_OVERRIDES } from './worker-run-tree';
+import { WORKFLOW_RUN_TREE_OVERRIDES } from './workflow-run-tree';
 import type { WorkflowLangSmithConfig } from './workflow-interceptors';
 import { replicaRouting } from './routing';
 
@@ -108,12 +111,12 @@ export class LangSmithPlugin extends SimplePlugin {
 
   private readonly client: Client;
   private readonly emitter: EmitterConfig;
-  private readonly workflowConfig: Omit<WorkflowLangSmithConfig, 'destination'>;
+  private readonly workflowConfig: WorkflowLangSmithConfig;
+  private readonly drains: (() => Promise<void>)[] = [];
   // Absolute paths so the workflow bundler resolves them under strict pnpm.
   private readonly workflowInterceptorModule = require.resolve('./workflow-interceptors');
   // Target of the `node:async_hooks` rewrite; re-exports the runtime-injected ALS.
   private readonly asyncHooksShimModule = require.resolve('./async-hooks-shim');
-
   constructor(options: LangSmithPluginOptions = {}) {
     // super() reads options.name immediately
     super({ name: 'langchain.LangSmithPlugin' });
@@ -143,6 +146,9 @@ export class LangSmithPlugin extends SimplePlugin {
     };
     this.workflowConfig = {
       addTemporalRuns,
+      // Resolved here, where LangSmith can read env; inside the isolate it can only fall back to `"default"`.
+      destination: pluginDestination(this.client, address, this.emitter.projectName),
+      tracingEnabled: isTracingEnabled(),
       replicas: replicaRouting(replicas),
       tags: options.tags,
       metadata: options.metadata,
@@ -166,10 +172,11 @@ export class LangSmithPlugin extends SimplePlugin {
   }
 
   private withLangSmithWorker<T extends WorkerOptions | ReplayWorkerOptions>(options: T): T {
+    requireRunTreeMembers(WORKFLOW_RUN_TREE_OVERRIDES, WORKER_RUN_TREE_OVERRIDES);
     const interceptors: WorkerInterceptors = options.interceptors ?? {};
 
-    const activityInbound = [...(interceptors.activityInbound ?? [])];
-    activityInbound.push(createActivityInboundInterceptor(this.emitter));
+    const activity = [...(interceptors.activity ?? [])];
+    activity.push((ctx) => ({ inbound: createActivityInboundInterceptor(this.emitter)(ctx) }));
 
     const workflowModules = [...(interceptors.workflowModules ?? [])];
     if (!workflowModules.includes(this.workflowInterceptorModule)) {
@@ -180,12 +187,22 @@ export class LangSmithPlugin extends SimplePlugin {
     const nexusInterceptors = [...(interceptors.nexus ?? [])];
     nexusInterceptors.push((_ctx: nexus.OperationContext) => ({ inbound: nexusInbound }));
 
+    const logger = Runtime.instance().logger;
+    if (this.workflowConfig.destination === undefined) {
+      logger.warn(
+        "LangSmith can't name a destination from the environment, so the Temporal plugin traces nothing that starts " +
+        'without a parent run.'
+      );
+    }
+
+    const { sinks: langsmithSinks, drain } = createLangSmithSinks(this.client, this.emitter.replicas, logger);
+    this.drains.push(drain);
     // The user's own Worker sinks take precedence on any key collision.
-    const sinks = { ...createLangSmithSinks(this.client, this.emitter.replicas), ...(options.sinks ?? {}) };
+    const sinks = { ...langsmithSinks, ...(options.sinks ?? {}) };
 
     return {
       ...options,
-      interceptors: { ...interceptors, activityInbound, workflowModules, nexus: nexusInterceptors },
+      interceptors: { ...interceptors, activity, workflowModules, nexus: nexusInterceptors },
       sinks,
     } as T;
   }
@@ -204,18 +221,8 @@ export class LangSmithPlugin extends SimplePlugin {
     const prevHook = base.webpackConfigHook;
     const webpackConfigHook = (config: WebpackConfiguration): WebpackConfiguration => {
       const merged = prevHook ? prevHook(config) : config;
-      // Resolved here, where LangSmith can read env; inside the isolate it can only fall back to `"default"`.
-      const workflowConfig: WorkflowLangSmithConfig = {
-        ...this.workflowConfig,
-        destination:
-          this.emitter.address !== undefined
-            ? { address: this.emitter.address }
-            : this.emitter.projectName !== undefined
-              ? { project_name: this.emitter.projectName }
-              : envDestination(this.client),
-      };
       // Double-encode so the injected token is a string literal in the bundle.
-      const definitions = { [CONFIG_GLOBAL]: JSON.stringify(JSON.stringify(workflowConfig)) };
+      const definitions = { [CONFIG_GLOBAL]: JSON.stringify(JSON.stringify(this.workflowConfig)) };
       const plugins = [...(merged.plugins ?? [])];
       plugins.push(bundleRewritesPlugin(this.asyncHooksShimModule, definitions) as (typeof plugins)[number]);
       return { ...merged, plugins };
@@ -238,11 +245,28 @@ export class LangSmithPlugin extends SimplePlugin {
 
   private async flush(): Promise<void> {
     try {
+      // Sink writes reach the client one at a time, so hand them all over before flushing it.
+      await Promise.all(this.drains.map((drain) => drain()));
       await this.client.awaitPendingTraceBatches();
     } catch {
       /* swallow: telemetry flush must never fail worker shutdown */
     }
   }
+}
+
+/** The plugin's explicit `address` or `projectName`, else the destination the env names. */
+function pluginDestination(
+  client: Client,
+  address: AgentAddress | undefined,
+  projectName: string | undefined
+): Destination | undefined {
+  if (address !== undefined) {
+    return { address };
+  }
+  if (projectName !== undefined) {
+    return { project_name: projectName };
+  }
+  return envDestination(client);
 }
 
 /**
@@ -287,8 +311,10 @@ interface WebpackCompiler {
 }
 
 /**
- * A webpack plugin that installs the three Workflow-bundle rewrites LangSmith needs:
+ * A webpack plugin that installs the four Workflow-bundle rewrites LangSmith needs:
  *
+ *  - resolve `langsmith` and `langsmith/*` to the CommonJS build this plugin
+ *    patches, so ESM Workflow code doesn't load a second, unpatched copy.
  *  - redirect `node:async_hooks` to the shim module that re-exports the
  *    runtime-injected `AsyncLocalStorage`, so LangSmith's `new AsyncLocalStorage()`
  *    and `AsyncLocalStorage.snapshot()` resolve to the real SDK-provided ALS.
@@ -314,6 +340,10 @@ function bundleRewritesPlugin(asyncHooksShimModule: string, definitions: Record<
   return {
     apply(compiler) {
       const { NormalModuleReplacementPlugin, DefinePlugin } = compiler.webpack;
+
+      new NormalModuleReplacementPlugin(/^langsmith(?:\/|$)/, (resource) => {
+        resource.request = require.resolve(resource.request);
+      }).apply(compiler);
 
       new NormalModuleReplacementPlugin(/^node:async_hooks$/, (resource) => {
         resource.request = asyncHooksShimModule;
