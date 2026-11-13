@@ -62,6 +62,14 @@ async function callProvider<T>(call: () => PromiseLike<T>): Promise<T> {
   }
 }
 
+// Raw HTTP bodies repeat the prompt and the returned content, and a request body can hold
+// downloaded file bytes. Event History must not record them.
+function withoutBody<T extends object>(value: T | undefined): Omit<T, 'body'> | undefined {
+  if (value === undefined) return undefined;
+  const { body: _body, ...rest } = value as T & { body?: unknown };
+  return rest;
+}
+
 /**
  * Arguments for invoking a language model activity.
  */
@@ -287,11 +295,13 @@ export function createActivities(
     async invokeModel(args: InvokeModelArgs): Promise<InvokeModelResult> {
       using _heartbeat = heartbeatUntilDisposed();
       const model = provider.languageModel(args.modelId);
-      const downloaded = await prepareFileUrls(args.options, model, download);
+      await prepareFileUrls(args.options, model, download);
       const result = await callProvider(() => model.doGenerate(args.options));
-      return encodeResultFileData(
-        downloaded ? { ...result, request: withoutBody(result.request) } : result
-      );
+      return encodeResultFileData({
+        ...result,
+        request: withoutBody(result.request),
+        response: withoutBody(result.response),
+      });
     },
 
     /**
@@ -313,7 +323,7 @@ export function createActivities(
       const events = stream.topic(args.streamingTopic);
 
       const model = provider.languageModel(args.modelId);
-      const downloaded = await prepareFileUrls(args.options, model, download);
+      await prepareFileUrls(args.options, model, download);
       const streamResult = await callProvider(() => model.doStream(args.options));
 
       const content: LanguageModelV4Content[] = [];
@@ -447,21 +457,26 @@ export function createActivities(
         usage,
         warnings,
         providerMetadata,
-        request: downloaded ? withoutBody(streamResult.request) : streamResult.request,
-        response: responseMetadata ? { ...responseMetadata, ...streamResult.response } : streamResult.response,
+        request: withoutBody(streamResult.request),
+        response: withoutBody(
+          responseMetadata
+            ? { ...responseMetadata, ...streamResult.response }
+            : streamResult.response
+        ),
       };
     },
 
     async invokeEmbeddingModel(args: InvokeEmbeddingModelArgs): Promise<InvokeEmbeddingModelResult> {
       using _heartbeat = heartbeatUntilDisposed();
       const model = provider.embeddingModel(args.modelId);
-      return await callProvider(() =>
+      const result = await callProvider(() =>
         model.doEmbed({
           values: args.values,
           providerOptions: args.providerOptions,
           headers: args.headers,
         })
       );
+      return { ...result, response: withoutBody(result.response) };
     },
   };
   withSources(activities, [provider, options?.download]);
@@ -478,14 +493,6 @@ export function createActivities(
 }
 
 type PromptFilePart = { data: SharedV4FileData; mediaType: string };
-
-// A provider can echo its HTTP request in the result. After a download that request holds
-// the file bytes, and they must not go into Event History.
-function withoutBody<T extends object>(value: T | undefined): Omit<T, 'body'> | undefined {
-  if (value === undefined) return undefined;
-  const { body: _body, ...rest } = value as T & { body?: unknown };
-  return rest;
-}
 
 /**
  * Restores `URL` objects in prompt file data, then downloads each URL the model does not

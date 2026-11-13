@@ -113,4 +113,33 @@ A subscriber that wants only the last attempt can discard what it has when a
 the first part of every call, but the provider specification does not require
 it, so a custom provider may not send it.
 
+## Event History size
+
+The model Activities leave the raw HTTP bodies out of their results, because
+Event History records every result. The request body repeats the prompt that the
+Activity input already holds, and the response body repeats the content. So
+`request.body` and `response.body` are `undefined` in Workflow code. This holds
+for `generateText` and `streamText` results even when `include.requestBody` or
+`include.responseBody` is set, for `embed` and `embedMany` responses, and for
+middleware that reads the model result. Response headers, `id`, `modelId` and
+`timestamp` are kept.
+
+By default `embedMany` sends all values to one `invokeEmbeddingModel` Activity,
+and Temporal rejects a result over 2 MB (about 70 to 100 embeddings of 1536
+dimensions). Set `maxEmbeddingsPerCall` in the `embeddingModel` options of
+`TemporalProvider` to split the values into one Activity per chunk. Changing
+this value in a deployed Workflow needs Workflow versioning, because it changes
+the Activities the Workflow schedules.
+
+The split applies to the values only. Each chunk gets the same `providerOptions`
+as the full call. So do not set `maxEmbeddingsPerCall` together with provider
+options that hold one entry for each value, such as
+`providerOptions.google.content`. The provider refuses such a chunk, because the
+counts do not match. For those calls, split the values in the Workflow and call
+`embedMany` one time for each chunk, with the options of that chunk.
+
+```typescript
+const provider = new TemporalProvider({ embeddingModel: { maxEmbeddingsPerCall: 32 } });
+```
+
 Development details are in [typescript/README.md](../README.md).

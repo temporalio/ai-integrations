@@ -135,7 +135,8 @@ test('invokeModelStreaming publishes every part and assembles the final result',
   t.deepEqual(result.finishReason, { unified: 'stop', raw: undefined });
   t.deepEqual(result.usage, usage);
   t.deepEqual(result.warnings, [{ type: 'unsupported', feature: 'test-feature' }]);
-  t.deepEqual(result.request, { body: 'test-request-body' });
+  // The request body repeats the prompt, so the result keeps it out of Event History.
+  t.deepEqual(result.request, {});
   // Response metadata from the stream is merged with the model's response info.
   t.deepEqual(result.response, {
     id: 'resp-1',
