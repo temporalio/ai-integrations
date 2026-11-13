@@ -2,6 +2,8 @@
 
 Conventions specific to `python/`; the normative reference is [`AGENTS.md`](../AGENTS.md).
 
+All Python plugins support Python 3.11 through 3.15 and require Temporal SDK 1.36.0 or newer.
+
 ## Layout
 
 ```

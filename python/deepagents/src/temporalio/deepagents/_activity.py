@@ -329,9 +329,7 @@ def _default_model_provider(model_name: str) -> Any:
     logical attempt fans out into nested retry storms that Temporal can neither
     see nor bound.
     """
-    # importlib: `langchain` (unlike langchain-core) is absent on Python 3.10
-    # environments where the deepagents extra cannot install; a static import
-    # here fails type-checking there.
+    # Load the provider factory when a model is requested.
     init_chat_model = importlib.import_module("langchain.chat_models").init_chat_model
 
     return init_chat_model(model_name, max_retries=0)

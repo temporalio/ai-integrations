@@ -86,7 +86,7 @@ def test_plugin_folder_suffix_and_language_lockfile(plugin_repo: Path) -> None:
 def test_python_code_is_forbidden_in_shared(plugin_repo: Path) -> None:
     shared = plugin_repo / "python/_shared"
     shared.mkdir()
-    (shared / "ruff.toml").write_text('target-version = "py310"\n')
+    (shared / "ruff.toml").write_text('target-version = "py311"\n')
     assert run(plugin_repo) == []
     (shared / "fixtures.py").write_text("VALUE = 1\n")
     assert run(plugin_repo) == []
@@ -159,7 +159,7 @@ def test_no_secrets_or_owners_in_plugin_toml(plugin_repo: Path) -> None:
 
 def test_path_sources_and_required_version(plugin_repo: Path) -> None:
     pp = plugin_repo / "python/fakeplug/pyproject.toml"
-    pp.write_text(pp.read_text().replace('required-version = ">=0.12.5,<0.13"', 'required-version = ">=0.11"')
+    pp.write_text(pp.read_text().replace('required-version = ">=0.13.0,<0.14"', 'required-version = ">=0.11"')
                   + '\n[tool.uv.sources]\ntemporalio-mcp = { path = "../mcp" }\n')
     v = run(plugin_repo)
     assert any("path/workspace source" in x for x in v) and any("required-version" in x for x in v)

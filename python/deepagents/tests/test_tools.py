@@ -8,7 +8,6 @@ expected activity.
 from __future__ import annotations
 
 import functools
-import sys
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -19,10 +18,6 @@ from typing import Annotated, Any, Self
 import pytest
 
 from temporalio.testing import WorkflowEnvironment
-
-pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 11), reason="deepagents requires Python >= 3.11"
-)
 
 pytest.importorskip("langchain_core")
 
@@ -49,10 +44,8 @@ INVOKE_TOOL = "deepagents.invoke_tool"
 # Dedicated queue for tool activities, so tests can prove task-queue routing.
 TOOL_TASK_QUEUE = "da-tool-queue"
 
-# Bind deepagents symbols off the module importorskip returns: a static
-# `from deepagents import ...` cannot resolve on Python 3.10 (deepagents
-# needs >= 3.11), and with the package absent the type checkers mis-resolve
-# the name against this same-named test directory.
+# Resolve framework symbols through the imported module to avoid confusing
+# the top-level package with this same-named test directory.
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
 from langchain_core.messages import HumanMessage, ToolMessage  # noqa: E402

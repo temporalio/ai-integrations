@@ -20,6 +20,15 @@ export const TOOL_META_RESOLVER_UNSUPPORTED_TYPE = 'MCPToolMetaResolverUnsupport
  * lifecycle method users invoke from `finally` blocks after `connect()`.
  */
 export interface StatefulTemporalMCPServer extends MCPServer {
+  /**
+   * Ends the server's session. Throws an `ApplicationFailure` of type
+   * `DedicatedWorkerFailure` if the session was refused, unless the caller's
+   * scope, a scope around `cleanup()` but not around `connect()`, or the scope
+   * that connected the server is cancelled. After a Workflow catches a
+   * cancellation, its root scope stays cancelled, so it gets no such failure
+   * for a server connected outside `CancellationScope.nonCancellable()`. A
+   * session that failed for another reason throws its `ActivityFailure`.
+   */
   cleanup(): Promise<void>;
 }
 
