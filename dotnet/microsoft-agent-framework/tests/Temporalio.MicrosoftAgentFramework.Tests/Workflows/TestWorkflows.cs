@@ -6,6 +6,7 @@ public static class TestWorkflows
     public static readonly IReadOnlyList<Type> All =
     [
         typeof(HelloWorkflow),
+        typeof(CancellationWorkflow),
         typeof(ToolsWorkflow),
         typeof(ApprovalWorkflow),
         typeof(ApprovalUpdateWorkflow),

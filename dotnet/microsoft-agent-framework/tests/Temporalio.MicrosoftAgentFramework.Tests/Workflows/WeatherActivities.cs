@@ -17,6 +17,18 @@ public sealed class WeatherActivities
     [Activity]
     public Task<string> SendEmailAsync(string to) => Task.FromResult($"email sent to {to}");
 
+    // Heartbeats until the Workflow cancels it, so a cancellation test can see the cancel reach the Activity.
+    [Activity]
+    public async Task<string> SlowWeatherAsync(string city)
+    {
+        var context = ActivityExecutionContext.Current;
+        while (true)
+        {
+            context.Heartbeat();
+            await Task.Delay(100, context.CancellationToken);
+        }
+    }
+
     // The trailing optional token stays out of the tool schema and of the call; the SDK fills its default.
     [Activity]
     [Description("Gets the weather alerts for a city")]
