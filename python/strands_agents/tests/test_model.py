@@ -2,9 +2,10 @@ import asyncio
 import concurrent.futures
 import importlib
 import inspect
+import logging
 import time
-from collections.abc import AsyncIterable, Awaitable, Callable
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterable
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
@@ -24,8 +25,9 @@ from temporalio.common import RetryPolicy
 from temporalio.contrib.workflow_streams import WorkflowStream
 from temporalio.exceptions import ApplicationError
 from temporalio.strands_agents import StrandsPlugin, TemporalAgent, _sync_calls
-from temporalio.strands_agents._model_activity import ModelActivity, ModelFactory
+from temporalio.strands_agents._model_activity import ModelActivity
 from temporalio.strands_agents._sync_calls import _MESSAGE
+from temporalio.testing import ActivityEnvironment
 from temporalio.worker import Replayer, Worker
 from temporalio.worker.workflow_sandbox import RestrictedWorkflowAccessError
 from temporalio.workflow import NondeterminismError
@@ -83,164 +85,22 @@ async def test_model(client: Client):
     ).replay_workflow(history)
 
 
-@workflow.defn
-class ColdWorkerWorkflow:
-    def __init__(self) -> None:
-        self.agent = TemporalAgent(
-            model="slow",
-            start_to_close_timeout=timedelta(seconds=15),
-            heartbeat_timeout=timedelta(seconds=2),
-            retry_policy=RetryPolicy(maximum_attempts=1),
-        )
-        self.first_done = False
-        self.resumed = False
-
-    @workflow.run
-    async def run(self) -> list[str]:
-        first = await self.agent.invoke_async("First")
-        self.first_done = True
-        await workflow.wait_condition(lambda: self.resumed)
-        second = await self.agent.invoke_async("Second")
-        return [str(first), str(second)]
-
-    @workflow.query
-    def is_first_done(self) -> bool:
-        return self.first_done
-
-    @workflow.signal
-    def resume(self) -> None:
-        self.resumed = True
-
-
-def _slow_model(delay: float, response: str) -> MockModel:
-    time.sleep(delay)
-    return MockModel([response])
-
-
-async def test_cold_worker_builds_model_without_missing_heartbeats(client: Client):
-    """A slow factory on a worker that didn't read the config doesn't time out the call."""
-    task_queue = f"test_cold_worker_builds_model-{uuid4()}"
-    async with Worker(
-        client,
-        task_queue=task_queue,
-        workflows=[ColdWorkerWorkflow],
-        plugins=[StrandsPlugin(models={"slow": lambda: MockModel(["First!"])})],
-        max_cached_workflows=0,
-    ):
-        handle = await client.start_workflow(
-            ColdWorkerWorkflow.run,
-            id=f"test_cold_worker_builds_model_{uuid4()}",
-            task_queue=task_queue,
-        )
-        while not await handle.query(ColdWorkerWorkflow.is_first_done):
-            await asyncio.sleep(0.1)
-
-    # This worker never built the model, and its factory blocks for twice the
-    # heartbeat timeout. One attempt, so a heartbeat timeout fails the Workflow.
-    async with Worker(
-        client,
-        task_queue=task_queue,
-        workflows=[ColdWorkerWorkflow],
-        plugins=[StrandsPlugin(models={"slow": lambda: _slow_model(4, "Second!")})],
-        max_cached_workflows=0,
-    ):
-        await handle.signal(ColdWorkerWorkflow.resume)
-        assert await handle.result() == ["First!\n", "Second!\n"]
-
-    history = await handle.fetch_history()
-    assert get_activities(history) == [
-        "strands_get_model_config",
-        "invoke_model",
-        "invoke_model",
-    ]
-
-
-async def test_async_factory_builds_model_on_the_event_loop(client: Client):
-    """An async factory can create clients that need the running event loop."""
-    loops: list[asyncio.AbstractEventLoop] = []
-
-    async def factory() -> MockModel:
-        # An aiohttp.ClientSession, for one, needs the running loop when built.
-        loops.append(asyncio.get_running_loop())
-        return MockModel(["Hi!"])
-
-    task_queue = f"test_async_factory-{uuid4()}"
-    async with Worker(
-        client,
-        task_queue=task_queue,
-        workflows=[ModelWorkflow],
-        plugins=[StrandsPlugin(models={"mock": factory})],
-    ):
-        result = await client.execute_workflow(
-            ModelWorkflow.run,
-            "Hello",
-            id=f"test_async_factory_{uuid4()}",
-            task_queue=task_queue,
-        )
-    assert result == "Hi!\n"
-    assert loops == [asyncio.get_running_loop()]
-
-
-def _sync_factory(built: list[MockModel]) -> Callable[[], MockModel]:
-    def factory() -> MockModel:
-        time.sleep(0.2)
-        built.append(MockModel([]))
-        return built[-1]
-
-    return factory
-
-
-def _async_factory(built: list[MockModel]) -> Callable[[], Awaitable[MockModel]]:
-    async def factory() -> MockModel:
-        await asyncio.sleep(0.2)
-        built.append(MockModel([]))
-        return built[-1]
-
-    return factory
-
-
-@pytest.mark.parametrize("make_factory", [_sync_factory, _async_factory])
-async def test_concurrent_cold_calls_build_model_once(
-    make_factory: Callable[[list[MockModel]], ModelFactory],
+# A factory blocks the event loop, so the heartbeat timer can't run while it
+# builds the model. One slower than the heartbeat timeout logs why.
+@pytest.mark.parametrize(("seconds", "warns"), [(0.3, True), (0.0, False)])
+def test_slow_model_factory_logs_a_warning(
+    caplog: pytest.LogCaptureFixture, seconds: float, warns: bool
 ):
-    built: list[MockModel] = []
-    model_activity = ModelActivity({"slow": make_factory(built)})
-    models = await asyncio.gather(*(model_activity._model("slow") for _ in range(3)))
-    assert len(built) == 1
-    assert all(model is built[0] for model in models)
-
-
-@pytest.mark.parametrize("make_factory", [_sync_factory, _async_factory])
-async def test_cancelled_call_keeps_model_build(
-    make_factory: Callable[[list[MockModel]], ModelFactory],
-):
-    built: list[MockModel] = []
-    model_activity = ModelActivity({"slow": make_factory(built)})
-    cancelled = asyncio.create_task(model_activity._model("slow"))
-    await asyncio.sleep(0.05)
-    cancelled.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await cancelled
-    assert await model_activity._model("slow") is built[0]
-    assert len(built) == 1
-
-
-async def test_failed_model_build_is_retried():
-    calls = 0
-
     def factory() -> MockModel:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise RuntimeError("no credentials yet")
-        return MockModel([])
+        time.sleep(seconds)
+        return MockModel(["Done!"])
 
-    model_activity = ModelActivity({"flaky": factory})
-    with pytest.raises(RuntimeError, match="no credentials yet"):
-        await model_activity._model("flaky")
-    model = await model_activity._model("flaky")
-    assert await model_activity._model("flaky") is model
-    assert calls == 2
+    model_activity = ModelActivity({"slow": factory})
+    env = ActivityEnvironment()
+    env.info = replace(env.info, heartbeat_timeout=timedelta(milliseconds=100))
+    with caplog.at_level(logging.WARNING):
+        env.run(model_activity._get_model, "slow")
+    assert ("Building model 'slow' took" in caplog.text) == warns
 
 
 @tool

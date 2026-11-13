@@ -1,6 +1,5 @@
-import asyncio
-import inspect
-from collections.abc import AsyncIterable, Awaitable, Callable
+import time
+from collections.abc import AsyncIterable, Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -19,8 +18,6 @@ from temporalio.strands_agents._bytes_values import (
     encode_messages,
 )
 from temporalio.strands_agents._heartbeat_decorator import auto_heartbeater
-
-ModelFactory = Callable[[], Model | Awaitable[Model]]
 
 
 # Fields are typed as Any because strands TypedDicts (Message, ToolSpec) use
@@ -87,7 +84,7 @@ class ModelActivity:
 
     def __init__(
         self,
-        factories: dict[str, ModelFactory],
+        factories: dict[str, Callable[[], Model]],
         *,
         default_name: str | None = None,
     ) -> None:
@@ -100,9 +97,8 @@ class ModelActivity:
         self._factories = factories
         self._default_name = default_name
         self._models: dict[str, Model] = {}
-        self._builds: dict[str, asyncio.Future[Model]] = {}
 
-    async def _model(self, name: str | None) -> Model:
+    def _get_model(self, name: str | None) -> Model:
         if name is None:
             if self._default_name is None:
                 raise ValueError(
@@ -112,39 +108,20 @@ class ModelActivity:
                     f"Known: {sorted(self._factories)}"
                 )
             name = self._default_name
-        if name in self._models:
-            return self._models[name]
-        if name not in self._factories:
-            raise ValueError(
-                f"Unknown model name {name!r}. Known: {sorted(self._factories)}"
-            )
-        # Concurrent calls share one build. The shield keeps a cancelled call
-        # from cancelling the build the others wait for.
-        build = self._builds.get(name)
-        if build is None:
-            build = asyncio.ensure_future(self._build(name))
-            self._builds[name] = build
-        return await asyncio.shield(build)
-
-    async def _build(self, name: str) -> Model:
-        try:
-            # Factories can be slow. A synchronous one runs on a thread, so the
-            # event loop keeps heartbeating while a cold worker builds the
-            # model. An async one runs on the event loop, so it can create
-            # clients that need it, such as an aiohttp session.
-            model = await asyncio.to_thread(self._factories[name])
-            if inspect.isawaitable(model):
-                model = await model
-        except BaseException:
-            del self._builds[name]
-            raise
-        self._models[name] = model
-        return model
+        if name not in self._models:
+            if name not in self._factories:
+                raise ValueError(
+                    f"Unknown model name {name!r}. Known: {sorted(self._factories)}"
+                )
+            start = time.monotonic()
+            self._models[name] = self._factories[name]()
+            _warn_if_slower_than_heartbeat(name, time.monotonic() - start)
+        return self._models[name]
 
     @activity.defn(name="strands_get_model_config")
     async def get_model_config(self, input: _ModelConfigInput) -> _ModelConfig:
         """Return the named model's id and context window limit."""
-        model = await self._model(input.model_name)
+        model = self._get_model(input.model_name)
         config = model.get_config()
         model_id = (
             config.get("model_id")
@@ -168,7 +145,7 @@ class ModelActivity:
         is typed as plain dicts because the tagged form would not validate
         against ``StreamEvent``, whose ``redactedContent`` is ``bytes``.
         """
-        model = await self._model(input.model_name)
+        model = self._get_model(input.model_name)
         return [encode_event(event) async for event in _stream(model, input)]
 
     @activity.defn
@@ -184,7 +161,7 @@ class ModelActivity:
         so each event is published as the payload converter writes it. See
         ``_topic_payload``.
         """
-        model = await self._model(input.model_name)
+        model = self._get_model(input.model_name)
         return await _publish(_stream(model, input), input)
 
     # Stateful calls use their own activity types. A worker without stateful
@@ -198,7 +175,7 @@ class ModelActivity:
         self, input: _InvokeModelInput
     ) -> _InvokeModelResult:
         """Run a stateful model with the agent's model state; return events and the updated state."""
-        model = await self._model(input.model_name)
+        model = self._get_model(input.model_name)
         state = dict(input.model_state or {})
         events = [encode_event(event) async for event in _stream(model, input, state)]
         return _InvokeModelResult(events=events, model_state=state)
@@ -209,10 +186,30 @@ class ModelActivity:
         self, input: _StreamingInvokeModelInput
     ) -> _InvokeModelResult:
         """Run a stateful model, publish each stream event, and return events and the updated state."""
-        model = await self._model(input.model_name)
+        model = self._get_model(input.model_name)
         state = dict(input.model_state or {})
         events = await _publish(_stream(model, input, state), input)
         return _InvokeModelResult(events=events, model_state=state)
+
+
+def _warn_if_slower_than_heartbeat(name: str, seconds: float) -> None:
+    """Say why a heartbeat timeout may follow a slow model factory.
+
+    The factory runs on the worker's event loop, so the heartbeat timer can't
+    run while it builds the model.
+    """
+    timeout = activity.info().heartbeat_timeout if activity.in_activity() else None
+    if timeout and seconds >= timeout.total_seconds():
+        activity.logger.warning(
+            "Building model %r took %.1f s, longer than this Activity's %g s "
+            "heartbeat timeout. The factory blocks the event loop, so no heartbeat "
+            "went out and this attempt may fail with a heartbeat timeout. The next "
+            "attempt reuses the built model. Make the factory faster, or set a "
+            "longer heartbeat_timeout (or None).",
+            name,
+            seconds,
+            timeout.total_seconds(),
+        )
 
 
 async def _publish(
