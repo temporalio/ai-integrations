@@ -415,9 +415,13 @@ test('the plugin passes its hostedToolCredentials to the model Activity it regis
 test('the Activity heartbeats while the callback is asked for credentials, and a quick call sends none', async (t) => {
   // A callback that reads a secret manager can outlast the heartbeat timeout, so
   // the Activity must heartbeat while it is awaited. The first heartbeat comes
-  // half the timeout in, so a call that ends sooner sends none.
-  const heartbeatsFor = async (callbackMs: number) => {
-    const env = new MockActivityEnvironment({ heartbeatTimeoutMs: 200 });
+  // half the timeout after the attempt was scheduled, so a call that ends sooner
+  // sends none, unless the Worker took that long to start it.
+  const heartbeatsFor = async (callbackMs: number, scheduledMsAgo = 0) => {
+    const env = new MockActivityEnvironment({
+      heartbeatTimeoutMs: 200,
+      currentAttemptScheduledTimestampMs: Date.now() - scheduledMsAgo,
+    });
     let heartbeats = 0;
     env.on('heartbeat', () => {
       heartbeats += 1;
@@ -432,6 +436,7 @@ test('the Activity heartbeats while the callback is asked for credentials, and a
 
   t.is(await heartbeatsFor(0), 0);
   t.true((await heartbeatsFor(350)) >= 2);
+  t.is(await heartbeatsFor(0, 150), 1);
 });
 
 test.serial('a credential for a field the Workflow already declared is never read', async (t) => {
