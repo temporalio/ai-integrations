@@ -18,6 +18,9 @@ if TYPE_CHECKING:
     from google.adk.workflow import FunctionNode
 
 _TOOL_CONTEXT_PARAM = "tool_context"
+# Workflows started before this patch pass an activity's empty *args as one
+# extra argument; keep that on replay.
+_VAR_ARGS_PATCH = "google_adk.activity-as-tool-var-args"
 
 
 @dataclass(frozen=True)
@@ -434,7 +437,9 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     callable-class instance, a method passed as ``Class.method``, or a
     callable-class activity passed as its class. The tool offers the parameters
     the activity is called with: without a method's ``self``, and from
-    ``__call__`` for a class. A class whose ``__call__`` is not a function,
+    ``__call__`` for a class. ADK leaves ``*args`` out of the declaration, as
+    it does for a plain function, so the model can't fill it and the activity
+    gets an empty ``*args``. A class whose ``__call__`` is not a function,
     staticmethod, classmethod or ``functools.partialmethod``, can't be read, or
     takes keyword-only arguments or ``**kwargs`` raises ``ValueError``. So does
     a method taking ``self`` whose class can't be reached from the function's
@@ -457,6 +462,10 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
     """
     signature, hints, doc = _tool_signature(activity_def)
     tool_context_param = _tool_context_parameter(activity_def, signature, hints)
+    has_var_args = any(
+        p.kind is inspect.Parameter.VAR_POSITIONAL
+        for p in signature.parameters.values()
+    )
     # ADK passes every argument by name, and the activity gets them by
     # position, so bind positional-only parameters by name too.
     binding = signature.replace(
@@ -492,6 +501,10 @@ def activity_as_tool(activity_def: Callable, **kwargs: Any) -> Callable:
                 return await result
             else:
                 return result
+
+        if has_var_args and workflow.patched(_VAR_ARGS_PATCH):
+            # bound.args spreads *args; bound.arguments holds it as one tuple.
+            activity_args = list(bound.args)
 
         if not activity_args:
             return await workflow.execute_activity(activity_def, **options)

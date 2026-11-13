@@ -43,7 +43,7 @@ INVOKE_TOOL = "deepagents.invoke_tool"
 create_deep_agent = pytest.importorskip("deepagents").create_deep_agent
 
 from langchain_core.messages import HumanMessage, ToolMessage  # noqa: E402
-from langchain_core.tools import tool  # noqa: E402
+from langchain_core.tools import StructuredTool, tool  # noqa: E402
 from langgraph.prebuilt import InjectedState  # noqa: E402
 from pydantic import BaseModel, ConfigDict  # noqa: E402
 
@@ -355,11 +355,6 @@ class KeywordOnlyActivity:
 
 
 @activity.defn
-async def varargs_activity(text: str, *more: str) -> str:
-    return text + "".join(more)
-
-
-@activity.defn
 async def kwargs_activity(text: str, **extra: str) -> str:
     return text + "".join(extra.values())
 
@@ -376,7 +371,6 @@ class BadAnnotationActivity(EchoClass):
         (NoCallActivity, "to have a __call__"),
         (KeywordOnlyActivity, "keyword-only argument 'text'"),
         (PartialKeywordEchoClass, "partialmethod binds an argument by keyword"),
-        (varargs_activity, r"\*more"),
         (kwargs_activity, r"\*\*extra"),
         (BadAnnotationActivity, "name 'Missing' is not defined"),
         (EchoClass("workflow"), "not an instance of it"),
@@ -385,6 +379,41 @@ class BadAnnotationActivity(EchoClass):
 def test_activity_as_tool_rejects(activity_ref: Any, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         activity_as_tool(activity_ref, start_to_close_timeout=timedelta(seconds=10))
+
+
+@activity.defn
+async def varargs_activity(text: str, *more: str) -> str:
+    return text + "".join(more)
+
+
+@activity.defn
+class VarargsClass:
+    async def __call__(self, text: str, *more: str) -> str:
+        return text + "".join(more)
+
+
+@pytest.mark.parametrize("activity_ref", [varargs_activity, VarargsClass])
+@pytest.mark.asyncio
+async def test_activity_as_tool_spreads_var_positional(
+    activity_ref: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # *more is offered as a list, as LangChain's own schema for the function
+    # offers it, and spread into the activity's arguments.
+    calls: list[Any] = []
+
+    async def execute_activity(_: Any, **kwargs: Any) -> str:
+        calls.append(kwargs["args"])
+        return "ok"
+
+    monkeypatch.setattr(workflow, "execute_activity", execute_activity)
+    tool = activity_as_tool(activity_ref, start_to_close_timeout=timedelta(seconds=10))
+    native = StructuredTool.from_function(
+        coroutine=varargs_activity, description="LangChain's schema"
+    )
+    assert tool.args == native.args
+    await tool.ainvoke({"text": "a", "more": ["b", "c"]})
+    await tool.ainvoke({"text": "a"})
+    assert calls == [["a", "b", "c"], ["a"]]
 
 
 @pytest.mark.asyncio
