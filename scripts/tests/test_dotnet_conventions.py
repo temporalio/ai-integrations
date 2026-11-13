@@ -22,6 +22,13 @@ def edit(repo: Path, rel: str, old: str, new: str) -> None:
     path.write_text(text.replace(old, new))
 
 
+def write_root_props(repo: Path, body: str) -> None:
+    (repo / PLUGIN / "Directory.Build.props").write_text(
+        '<Project>\n  <Import Project="$(MSBuildThisFileDirectory)../_shared/dotnet.props" />\n'
+        f"  <PropertyGroup>\n    {body}\n  </PropertyGroup>\n</Project>\n"
+    )
+
+
 def test_fake_dotnet_plugin_passes(dotnet_repo: Path) -> None:
     assert Checker(dotnet_repo).run() == []
 
@@ -101,6 +108,27 @@ CASES: dict[str, tuple[Callable[[Path], None], str]] = {
         "must list src/Temporalio.Fakedotnet/Temporalio.Fakedotnet.csproj and tests/"),
     "lock-missing": (lambda r: (r / PLUGIN / "src/Temporalio.Fakedotnet/packages.lock.json").unlink(),
                      "missing src/Temporalio.Fakedotnet/packages.lock.json"),
+    "two-channels": (lambda r: edit(r, "plugin.toml", 'runtime-versions = ["10.0"]', 'runtime-versions = ["10.0", "11.0"]'),
+                     "exactly one SDK channel"),
+    "root-props-weaker-policy": (lambda r: write_root_props(r, "<TreatWarningsAsErrors>false</TreatWarningsAsErrors>"),
+                                 "Directory.Build.props: TreatWarningsAsErrors must stay true"),
+    "root-props-analyzers-off": (lambda r: write_root_props(r, "<EnableNETAnalyzers>false</EnableNETAnalyzers>"),
+                                 "Directory.Build.props: EnableNETAnalyzers must stay true"),
+    "root-props-version": (lambda r: write_root_props(r, "<Version>0.1.0</Version>"), "Directory.Build.props: Version must be"),
+    "root-props-aot": (lambda r: write_root_props(r, "<PublishAot>true</PublishAot>"), "Directory.Build.props: PublishAot is not allowed"),
+    "root-props-license-expression": (lambda r: write_root_props(r, "<PackageLicenseExpression>MIT</PackageLicenseExpression>"),
+                                      "Directory.Build.props: ship the license text"),
+    "root-props-packable": (lambda r: write_root_props(r, "<IsPackable>true</IsPackable>"), "would pack the test project too"),
+    "nested-props": (lambda r: (r / PLUGIN / "src/Directory.Build.props").write_text("<Project />\n"),
+                     "src/Directory.Build.props: a nearer Directory.Build.props replaces the plugin-root one"),
+    "nested-props-in-project": (lambda r: (r / PLUGIN / "tests/Temporalio.Fakedotnet.Tests/Directory.Build.props").write_text("<Project />\n"),
+                                "tests/Temporalio.Fakedotnet.Tests/Directory.Build.props: a nearer Directory.Build.props"),
+    "targets": (lambda r: (r / PLUGIN / "Directory.Build.targets").write_text("<Project />\n"),
+                "Directory.Build.targets: Directory.Build.targets is evaluated after the csproj"),
+    "nested-targets": (lambda r: (r / PLUGIN / "src/Temporalio.Fakedotnet/Directory.Build.targets").write_text("<Project />\n"),
+                       "src/Temporalio.Fakedotnet/Directory.Build.targets: Directory.Build.targets is evaluated after"),
+    "packages-props": (lambda r: (r / PLUGIN / "Directory.Packages.props").write_text("<Project />\n"),
+                       "Directory.Packages.props: Directory.Packages.props moves package versions out of the csproj"),
 }
 
 
@@ -119,6 +147,18 @@ def test_coordinate_prefix_casing_is_reported_first(dotnet_repo: Path) -> None:
     violations = Checker(dotnet_repo).run()
     assert violations[0] == (f"{PLUGIN}: plugin.toml coordinate 'temporalio.Fakedotnet' must keep the Temporalio. "
                              "prefix casing and be a valid NuGet ID")
+
+
+def test_build_output_is_not_scanned_for_directory_files(dotnet_repo: Path) -> None:
+    stale = dotnet_repo / PLUGIN / "src/Temporalio.Fakedotnet/obj/Directory.Build.props"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("<Project />\n")
+    assert Checker(dotnet_repo).run() == []
+
+
+def test_root_props_may_add_plugin_specific_properties(dotnet_repo: Path) -> None:
+    write_root_props(dotnet_repo, "<Description>Fake plugin (Pre-release)</Description>")
+    assert Checker(dotnet_repo).run() == []
 
 
 def test_xunit_v2_is_rejected_and_xunit_v3_required(dotnet_repo: Path) -> None:

@@ -21,16 +21,16 @@ make build
 
 Plugin Makefiles set `PACKAGE` and include [`_shared/dotnet.mk`](_shared/dotnet.mk). `make help`
 lists the targets. `make sync` restores the committed locks; every other target restores in locked
-mode too, so editing a csproj without `make lock` fails with NU1004. `make lint` runs
+mode too, so after a csproj edit without `make lock`, `make build` and `make test` fail with NU1004
+and `make lint` fails to restore. `make lint` runs
 `dotnet format --verify-no-changes` against the solution; analyzers run as part of the build with
 warnings as errors. `make test` builds in Release and runs the suite under Microsoft.Testing.Platform
 (`TestResults/*.trx`). `make build` packs the tested build into `dist/` (`.nupkg` and `.snupkg`).
 
-CI reads each plugin's SDK channels from `plugin.toml`, testing the minimum and maximum on Ubuntu and
-the maximum on macOS and Windows. The Ubuntu maximum cell also checks the dependency cooldown, packs,
-verifies the package contents and restores it in a clean consumer. Nightly checks use
-`make sync-latest` to update every dependency in the CI checkout; failures are tracked in a `nightly`
-issue keyed `dotnet/<name>`.
+CI reads the plugin's SDK channel from `plugin.toml` (one channel for now) and tests it on Ubuntu,
+macOS and Windows. The Ubuntu cell also checks the dependency cooldown, packs, verifies the package
+contents and restores it in a clean consumer. Nightly checks use `make sync-latest` to update every
+direct dependency in the CI checkout; failures are tracked in a `nightly` issue keyed `dotnet/<name>`.
 
 Tests must not require provider credentials. Use deterministic fakes (an `IChatClient` that replays
 scripted responses, in-process MCP servers) and the Temporal dev server that

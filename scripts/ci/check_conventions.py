@@ -19,9 +19,10 @@ Checks (see AGENTS.md, "Repository invariants" and "Python conventions"):
   * no [tool.uv.sources] path or workspace entries
   * the project's published README has no relative markdown links (PyPI renders it)
   * every .NET plugin follows the dotnet/<name>/ contract (AGENTS.md, ".NET conventions"): a
-    Directory.Build.props that starts by importing dotnet/_shared/dotnet.props, one <Coordinate>.slnx,
-    global.json and nuget.config policy, the canonical .editorconfig, the library and MTP test csproj
-    rules, a committed packages.lock.json beside each csproj
+    Directory.Build.props that starts by importing dotnet/_shared/dotnet.props and whose body keeps
+    the shared policy, no other MSBuild directory file anywhere in the plugin, one <Coordinate>.slnx,
+    one SDK channel, global.json and nuget.config policy, the canonical .editorconfig, the library and
+    MTP test csproj rules, a committed packages.lock.json beside each csproj
   * no Directory.Build.props, Directory.Build.targets, Directory.Packages.props, global.json or
     nuget.config at dotnet/ itself (MSBuild would apply them to every plugin silently)
 """
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import stat
 import subprocess
@@ -78,7 +80,16 @@ JAVA_PLUGIN_MANAGEMENT = """pluginManagement {
 DOTNET_DEVELOPMENT_VERSION = "0.0.0"
 DOTNET_PREFIX = "Temporalio."
 DOTNET_SHARED_IMPORT = '<Project>\n  <Import Project="$(MSBuildThisFileDirectory)../_shared/dotnet.props" />\n'
-DOTNET_FRAMEWORK = "net10.0"
+# MSBuild composes every project from these files along the directory chain: a nearer Directory.Build.props
+# replaces the plugin-root one (and its shared import), Directory.Build.targets is evaluated after the csproj
+# and overrides it, Directory.Packages.props moves versions out of the csproj files. The plugin-root
+# Directory.Build.props is the only one allowed.
+DOTNET_DIRECTORY_FILES = {
+    "Directory.Build.props": "a nearer Directory.Build.props replaces the plugin-root one and drops the shared policy",
+    "Directory.Build.targets": "Directory.Build.targets is evaluated after the csproj and overrides the shared policy",
+    "Directory.Packages.props": "Directory.Packages.props moves package versions out of the csproj files",
+}
+DOTNET_BUILD_OUTPUT = {"bin", "obj"}
 NUGET_ID = re.compile(r"\w+([_.-]\w+)*")
 NUGET_ORG = "https://api.nuget.org/v3/index.json"
 # Microsoft.Testing.Platform mode rejects VSTest projects; `xunit` is the v2 package.
@@ -89,6 +100,7 @@ DOTNET_FORBIDDEN_PROPERTIES = ("IsAotCompatible", "PublishAot", "PublishTrimmed"
 DOTNET_POLICY_PROPERTIES = {
     "TreatWarningsAsErrors": "true", "RestorePackagesWithLockFile": "true", "Nullable": "enable",
     "GenerateDocumentationFile": "true", "IncludeSymbols": "true", "PublishRepositoryUrl": "true",
+    "EnableNETAnalyzers": "true", "AnalysisMode": "allenabledbydefault",
 }
 
 
@@ -470,6 +482,11 @@ class Checker:
         if not runtimes or not all(isinstance(v, str) and re.fullmatch(r"\d+\.\d+", v) for v in runtimes):
             self.fail(f"{rel}: runtime-versions must list .NET SDK channels as major.minor strings")
             runtimes = []
+        elif len(runtimes) != 1:
+            # global.json's latestFeature policy resolves the floor channel in every cell; cells above it
+            # cannot pass until the workflow injects their SDK (plan review decision 7 deferred that).
+            self.fail(f"{rel}: runtime-versions must name exactly one SDK channel until the workflow can inject "
+                      "an SDK above the global.json floor")
         imports = meta.get("smoke", {}).get("imports", [])
         if not imports or not all(isinstance(i, str) and i.startswith(coordinate + ".") for i in imports):
             self.fail(f"{rel}: smoke imports must name types under {coordinate}")
@@ -495,11 +512,19 @@ class Checker:
             else:
                 if not {library, tests} <= paths:
                     self.fail(f"{rel}/{coordinate}.slnx: must list {library} and {tests}")
+        for directory, folders, files in os.walk(d):
+            folders[:] = sorted(folder for folder in folders if folder not in DOTNET_BUILD_OUTPUT and not folder.startswith("."))
+            for name in sorted(files):
+                if name in DOTNET_DIRECTORY_FILES and not (name == "Directory.Build.props" and Path(directory) == d):
+                    nested = (Path(directory) / name).relative_to(d).as_posix()
+                    self.fail(f"{rel}/{nested}: {DOTNET_DIRECTORY_FILES[name]}; the plugin-root Directory.Build.props is the only "
+                              "MSBuild directory file a plugin may have")
         props = d / "Directory.Build.props"
         if props.is_file():
             text = re.sub(r"\A\s*<\?xml[^>]*\?>", "", props.read_text(encoding="utf-8")).lstrip()
             if not text.startswith(DOTNET_SHARED_IMPORT):
                 self.fail(f"{rel}/Directory.Build.props: must start with the shared import:\n{DOTNET_SHARED_IMPORT.rstrip()}")
+            self.check_dotnet_build_props(plugin, props)
         self.check_dotnet_global_json(plugin, runtimes)
         self.check_dotnet_nuget_config(plugin)
         template = self.root / "dotnet/_template/.editorconfig"
@@ -508,7 +533,7 @@ class Checker:
         elif (d / ".editorconfig").is_file() and (d / ".editorconfig").read_bytes() != template.read_bytes():
             self.fail(f"{rel}/.editorconfig: differs from canonical dotnet/_template/.editorconfig")
         if (d / library).is_file():
-            self.check_dotnet_library(plugin, coordinate, d / library)
+            self.check_dotnet_library(plugin, coordinate, d / library, f"net{runtimes[0]}" if runtimes else None)
         if (d / tests).is_file():
             self.check_dotnet_tests(plugin, d / tests)
         makefile = d / "Makefile"
@@ -594,8 +619,25 @@ class Checker:
                 items.append((item.tag.lower(), metadata))
         return properties, items
 
+    def check_dotnet_build_props(self, plugin: Plugin, props: Path) -> None:
+        """The body below the shared import applies to both projects, so it obeys the same policy rules."""
+        parsed = self._dotnet_project(plugin, props)
+        if parsed is None:
+            return
+        properties, items = parsed
+        rel = f"{plugin.rel}/Directory.Build.props"
+        if "version" in properties and properties["version"] != DOTNET_DEVELOPMENT_VERSION:
+            self.fail(f"{rel}: Version must be the tag-authoritative development placeholder "
+                      f"{DOTNET_DEVELOPMENT_VERSION!r} (got {properties['version']!r})")
+        if "packagelicenseexpression" in properties or "packagelicenseurl" in properties:
+            self.fail(f"{rel}: ship the license text; no PackageLicenseExpression or PackageLicenseUrl")
+        if properties.get("ispackable", "").lower() == "true":
+            self.fail(f"{rel}: IsPackable here would pack the test project too; set it in the library csproj")
+        self._dotnet_common_rules(plugin, props, properties, items, DOTNET_POLICY_PROPERTIES, require_stylecop=False)
+
     def _dotnet_common_rules(self, plugin: Plugin, csproj: Path, properties: dict[str, str],
-                             items: list[tuple[str, dict[str, str]]], policy: dict[str, str]) -> None:
+                             items: list[tuple[str, dict[str, str]]], policy: dict[str, str], *,
+                             require_stylecop: bool = True) -> None:
         rel = f"{plugin.rel}/{csproj.relative_to(plugin.path).as_posix()}"
         for name, value in policy.items():
             actual = properties.get(name.lower())
@@ -606,7 +648,7 @@ class Checker:
                 self.fail(f"{rel}: {name} is not allowed; it adds SDK-pinned implicit package references that break locked restores")
         references = {metadata.get("include", ""): metadata for tag, metadata in items if tag == "packagereference"}
         stylecop = next((metadata for include, metadata in references.items() if include.lower() == "stylecop.analyzers"), None)
-        if stylecop is None or stylecop.get("privateassets", "").lower() != "all":
+        if require_stylecop and (stylecop is None or stylecop.get("privateassets", "").lower() != "all"):
             self.fail(f"{rel}: StyleCop.Analyzers must be referenced with PrivateAssets=\"all\"")
         for include in references:
             if "/" in include or "\\" in include:
@@ -616,7 +658,7 @@ class Checker:
             if target and not (csproj.parent / target.replace("\\", "/")).resolve().is_relative_to(plugin.path.resolve()):
                 self.fail(f"{rel}: {target} points outside the plugin; cross-plugin dependencies use published coordinates")
 
-    def check_dotnet_library(self, plugin: Plugin, coordinate: str, csproj: Path) -> None:
+    def check_dotnet_library(self, plugin: Plugin, coordinate: str, csproj: Path, floor: str | None) -> None:
         parsed = self._dotnet_project(plugin, csproj)
         if parsed is None:
             return
@@ -631,8 +673,8 @@ class Checker:
             self.fail(f"{rel}: IsPackable must be true")
         frameworks = [part.strip() for part in properties.get("targetframeworks", "").split(";") if part.strip()]
         frameworks += [properties["targetframework"]] if properties.get("targetframework") else []
-        if DOTNET_FRAMEWORK not in frameworks:
-            self.fail(f"{rel}: TargetFramework(s) must include {DOTNET_FRAMEWORK}")
+        if floor and floor not in frameworks:
+            self.fail(f"{rel}: TargetFramework(s) must include {floor} (the [ci] runtime-versions channel)")
         if properties.get("packagelicensefile") != "LICENSE":
             self.fail(f"{rel}: PackageLicenseFile must be LICENSE")
         if "packagelicenseexpression" in properties or "packagelicenseurl" in properties:
