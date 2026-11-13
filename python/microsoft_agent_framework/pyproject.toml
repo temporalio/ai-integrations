@@ -23,6 +23,8 @@ dependencies = [
   "agent-framework-core>=1.23.0,<2",
   # Imported at module level for response_format schemas and the data converter.
   "pydantic>=2,<3",
+  # Imported at module level by the plugin's OpenTelemetry provider check.
+  "opentelemetry-api>=1.40.0,<2",
 ]
 
 [project.optional-dependencies]
@@ -121,7 +123,3 @@ add_ignore = [
 [tool.ruff]
 extend = "../_shared/ruff.toml"
 src = [".", "src"]
-
-[tool.ruff.lint.isort]
-# The framework shares a name with the plugin folder; it remains a third-party import.
-known-third-party = ["agent_framework"]
