@@ -59,6 +59,23 @@ event of the affected model Activity, for example with
 Activity again, with the bytes intact. A restart of the Workflow has the same
 effect. Other executions need no action.
 
+Prompts can include image and file parts given as URLs. The Workflow does not
+download them, because the Workflow sandbox has no network. The model Activity
+passes each URL that the Worker's model lists in `supportedUrls` to the model
+and downloads the others with `createDownload()` from `ai`, as `generateText`
+does. That download refuses private and local addresses. To change it, pass a
+`download` function to `AiSdkPlugin`. A downloaded image gets the media type
+that its bytes show, as in `generateText`. Downloaded bytes are not recorded in
+Event History, and an Activity retry downloads them again. For that reason a
+model call that downloaded a file returns no `request.body`. An
+`experimental_download` function given to `generateText` runs in the Workflow
+and is told that the model supports every URL.
+
+This change is behind a Workflow patch. An execution that started on an earlier
+version replays as it ran then, so an Activity that its `experimental_download`
+function scheduled still matches its Event History. The new behavior starts
+with the first model call that is not a replay.
+
 The plugin registers Activities named `invokeModel`, `invokeModelStreaming` and
 `invokeEmbeddingModel`, plus `<server>-listTools` and `<server>-callTool` for
 each MCP server. A different Activity with one of these names now fails with

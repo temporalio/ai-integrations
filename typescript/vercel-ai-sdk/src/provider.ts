@@ -16,6 +16,10 @@ import { ApplicationFailure } from '@temporalio/common';
 import type { Duration } from '@temporalio/common/lib/time';
 import { encodeCallOptionsFileData } from './file-data';
 
+// An older Event History can hold an Activity that `experimental_download` scheduled for a
+// URL. Such a history replays only if the model still reports that it supports no URL.
+const DOWNLOAD_IN_ACTIVITY_PATCH = 'vercel-ai-sdk-download-urls-in-model-activity';
+
 // `ReadableStream` is a sandbox global; type-only import keeps `node:stream/web`
 // out of the workflow bundle (es2023 lib has no DOM types).
 declare const ReadableStream: typeof import('node:stream/web').ReadableStream;
@@ -76,8 +80,10 @@ export class TemporalLanguageModel implements LanguageModelV4 {
     this.streamingBatchInterval = options?.streamingBatchInterval;
   }
 
+  // The Workflow sandbox has no network. URL parts go to the model Activity, which downloads
+  // the ones the real model does not support.
   get supportedUrls(): Record<string, RegExp[]> {
-    return {};
+    return workflow.patched(DOWNLOAD_IN_ACTIVITY_PATCH) ? { '*': [/.*/] } : {};
   }
 
   async doGenerate(options: LanguageModelV4CallOptions): Promise<LanguageModelV4GenerateResult> {

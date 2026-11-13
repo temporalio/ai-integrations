@@ -13,6 +13,9 @@ importers:
 
   .:
     dependencies:
+      '@ai-sdk/provider-utils':
+        specifier: ^5.0.53
+        version: 5.0.53(zod@3.25.76)
       '@temporalio/activity':
         specifier: ^1.24.0
         version: 1.24.0
