@@ -229,6 +229,15 @@ export async function _evictMcpConnectionsForServer(name: string): Promise<void>
 async function createMcpClient(name: string, factory: McpClientFactory, clientArgs: unknown): Promise<MCPClient> {
   const client = await factory(clientArgs);
   if (client == null || typeof client.tools !== 'function' || typeof client.close !== 'function') {
+    // A rejected client may still hold a connection; release it before failing. Best-effort, so a
+    // cleanup error can't replace the validation failure.
+    if (typeof client?.close === 'function') {
+      try {
+        await client.close();
+      } catch {
+        // Ignore; report the validation failure below.
+      }
+    }
     throw ApplicationFailure.nonRetryable(
       `MCP client factory '${name}' must return a client with tools() and close() methods.`,
       'MCPClientFactoryTypeError'

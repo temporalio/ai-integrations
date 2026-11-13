@@ -9,15 +9,32 @@ import { helloWorkflowGenerator, TestProvider } from './stubs/ai-sdk';
 for (const idleMs of [0, 60_000]) {
   for (const operation of ['listTools', 'callTool']) {
     test(`${operation} rejects invalid MCP clients without retries (idle timeout ${idleMs})`, async (t) => {
+      let closeCalls = 0;
+      const close = async () => {
+        closeCalls++;
+      };
       const invalidClients: unknown[] = [
         undefined,
         null,
         42,
         {},
         { tools: async () => ({}) },
-        { close: async () => {} },
-        { tools: 1, close: async () => {} },
+        { close },
+        { tools: 1, close },
         { tools: async () => ({}), close: 1 },
+        // A failing close() must not replace the validation failure.
+        {
+          close: async () => {
+            closeCalls++;
+            throw new Error('close failed');
+          },
+        },
+        {
+          close: () => {
+            closeCalls++;
+            throw new Error('close failed');
+          },
+        },
       ];
       let client: unknown;
       let factoryCalls = 0;
@@ -43,6 +60,8 @@ for (const idleMs of [0, 60_000]) {
         t.is(err!.message, `MCP client factory '${name}' must return a client with tools() and close() methods.`);
       }
       t.is(factoryCalls, invalidClients.length);
+      // Rejected clients with a callable close() are closed once each.
+      t.is(closeCalls, 4);
     });
 
     test(`${operation} preserves MCP factory failures (idle timeout ${idleMs})`, async (t) => {
