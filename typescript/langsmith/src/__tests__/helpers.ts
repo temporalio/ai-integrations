@@ -7,7 +7,7 @@
 
 import { randomUUID } from 'crypto';
 import type { TestFn } from 'ava';
-import type { Client as LangSmithClient } from 'langsmith';
+import type { AgentAddress, Client as LangSmithClient } from 'langsmith';
 import { Client } from '@temporalio/client';
 import { TestWorkflowEnvironment } from '@temporalio/testing';
 import { Worker, bundleWorkflowCode, type WorkerOptions, type WorkflowBundle } from '@temporalio/worker';
@@ -43,7 +43,7 @@ export interface CollectedRun {
   extra?: Record<string, unknown>;
   project_name?: string;
   session_name?: string;
-  address?: string;
+  address?: AgentAddress;
   events?: unknown[];
 }
 

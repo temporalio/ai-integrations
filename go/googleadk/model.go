@@ -55,7 +55,8 @@ type ModelOption func(*TemporalModel)
 
 // WithModelActivityOptions sets the base Activity options for the InvokeModel
 // Activity (StartToCloseTimeout, RetryPolicy, TaskQueue, ...). A zero
-// StartToCloseTimeout defaults to two minutes.
+// StartToCloseTimeout defaults to two minutes, and a zero HeartbeatTimeout to
+// 10 seconds. A negative HeartbeatTimeout turns heartbeats off.
 func WithModelActivityOptions(o workflow.ActivityOptions) ModelOption {
 	return func(m *TemporalModel) { m.activityOptions = o }
 }
@@ -71,9 +72,8 @@ func WithModelSummary(fn func(*model.LLMRequest) string) ModelOption {
 // consumers; the aggregated final response is still returned into the workflow
 // so replay stays deterministic. Call StreamServer(ctx) once in the workflow
 // when you use this. batchInterval coalesces published chunks (zero uses the
-// library default). Streaming installs a 30-second HeartbeatTimeout default
-// (override via WithModelActivityOptions); InvokeModel heartbeats on a timer
-// derived from the heartbeat timeout, so a model that is slow to produce its
+// library default). InvokeModel heartbeats on a timer derived from the heartbeat
+// timeout (see WithModelActivityOptions), so a model that is slow to produce its
 // first chunk is not falsely timed out.
 func WithStreaming(topic string, batchInterval time.Duration) ModelOption {
 	return func(m *TemporalModel) {
@@ -122,14 +122,7 @@ func (m *TemporalModel) GenerateContent(ctx context.Context, req *model.LLMReque
 		if ao.StartToCloseTimeout == 0 {
 			ao.StartToCloseTimeout = defaultModelTimeout
 		}
-		// Streamed calls default to a 30s heartbeat timeout so a stuck worker is
-		// detected well before the StartToCloseTimeout. InvokeModel heartbeats on
-		// a timer derived from the heartbeat timeout (not per chunk), so a model
-		// that legitimately takes longer than this to produce its first chunk is
-		// not falsely timed out and retried.
-		if m.streamingTopic != "" && ao.HeartbeatTimeout == 0 {
-			ao.HeartbeatTimeout = defaultStreamHeartbeat
-		}
+		ao = resolveHeartbeatTimeout(ao)
 		ao.Summary = m.modelSummary(req)
 		actx := workflow.WithActivityOptions(wfCtx, ao)
 
@@ -323,7 +316,7 @@ func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*mod
 	if in.Request == nil {
 		return nil, newApplicationError(ErrorTypeModel, false, nil, "InvokeModel: nil request")
 	}
-	// The Activity's HeartbeatTimeout (the streaming default, or one the user set
+	// The Activity's HeartbeatTimeout (the 10-second default, or one the user set
 	// themselves) counts from Activity start, and a model can legitimately stay
 	// silent past it before its first output (thinking models, large-context
 	// prefill). Heartbeat on a timer for the whole call — model resolution (which
@@ -364,19 +357,21 @@ func (a *Activities) InvokeModel(ctx context.Context, in invokeModelInput) (*mod
 }
 
 // startPeriodicHeartbeats records Activity heartbeats on a fixed interval until
-// the returned stop function is called. The interval is a third of the
-// Activity's HeartbeatTimeout; when no heartbeat timeout is set it does
+// the returned stop function is called. The interval is half the Activity's
+// HeartbeatTimeout; when no heartbeat timeout is set it does
 // nothing. A model can legitimately take longer than the heartbeat timeout to
 // produce its first output (thinking models, large-context prefill), so
 // heartbeating only on chunk arrival would let the server time out and retry a
 // healthy — and paid — model call. The SDK throttles outgoing heartbeats to
 // 80% of the heartbeat timeout, so the short interval does not spam the server.
+// The first heartbeat comes half the timeout in, still inside it, so a call
+// shorter than that sends none.
 func startPeriodicHeartbeats(ctx context.Context) (stop func()) {
 	timeout := activity.GetInfo(ctx).HeartbeatTimeout
 	if timeout <= 0 {
 		return func() {}
 	}
-	interval := timeout / 3
+	interval := timeout / 2
 	if interval < time.Millisecond {
 		interval = time.Millisecond
 	}
@@ -387,15 +382,13 @@ func startPeriodicHeartbeats(ctx context.Context) (stop func()) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			// Heartbeat first so the window opens covered: the timeout counts from
-			// Activity start, not from the first recorded heartbeat.
-			activity.RecordHeartbeat(ctx)
 			select {
 			case <-done:
 				return
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				activity.RecordHeartbeat(ctx)
 			}
 		}
 	}()

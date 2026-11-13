@@ -3,6 +3,8 @@
  */
 import { randomUUID } from 'crypto';
 import { readFileSync } from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import type {
   EmbeddingModelV4,
@@ -21,7 +23,7 @@ import type {
 } from '@ai-sdk/provider';
 import { APICallError } from '@ai-sdk/provider';
 import { openai } from '@ai-sdk/openai';
-import type { TestFn } from 'ava';
+import type { ExecutionContext, TestFn } from 'ava';
 import { context, propagation, trace } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { Resource } from '@opentelemetry/resources';
@@ -42,6 +44,7 @@ import { jsonSchema } from 'ai';
 import { temporal } from '@temporalio/proto';
 import { WorkflowClient, WorkflowFailedError } from '@temporalio/client';
 import { ActivityFailure, ApplicationFailure, TemporalFailure } from '@temporalio/common';
+import { historyFromJSON } from '@temporalio/common/lib/proto-utils';
 import { optionalTsToMs } from '@temporalio/common/lib/time';
 import type { OpenTelemetrySinks } from '@temporalio/interceptors-opentelemetry';
 import {
@@ -52,6 +55,7 @@ import {
   OpenTelemetryWorkflowClientInterceptor,
 } from '@temporalio/interceptors-opentelemetry';
 import { MockActivityEnvironment, workflowInterceptorModules } from '@temporalio/testing';
+import { Context } from '@temporalio/activity';
 import { SimplePlugin } from '@temporalio/plugin';
 import { bundleWorkflowCode, DefaultLogger, NativeConnection, Worker as CoreWorker } from '@temporalio/worker';
 import type { InjectedSinks, WorkerOptions } from '@temporalio/worker';
@@ -67,10 +71,20 @@ import {
 import { AiSdkPlugin, createActivities } from '..';
 import { startLocalWithRetry } from './helpers/environment';
 import {
+  abortableEmbedWorkflow,
+  abortDuringEmbedWorkflow,
+  abortableGenerateWorkflow,
+  abortableStreamWorkflow,
+  abortRequest,
+  binaryFileWorkflow,
+  chunkedEmbeddingWorkflow,
   embeddingWorkflow,
+  experimentalDownloadWorkflow,
+  fileUrlWorkflow,
   generateObjectWorkflow,
   helloWorldAgent,
   imageToolWorkflow,
+  mediaTypeUrlWorkflow,
   mcpSchemaTestWorkflow,
   mcpWorkflow,
   middlewareWorkflow,
@@ -79,7 +93,7 @@ import {
   telemetryWorkflow,
   toolsWorkflow,
 } from './workflows/ai-sdk';
-import { getWeather } from './activities/ai-sdk';
+import { downloadNotes, getWeather } from './activities/ai-sdk';
 import EventType = temporal.api.enums.v1.EventType;
 
 const remoteTests = ['1', 't', 'true'].includes((process.env.AI_SDK_REMOTE_TESTS ?? 'false').toLowerCase());
@@ -403,6 +417,246 @@ test('Image tool results are converted inside the workflow sandbox', async (t) =
       workflowExecutionTimeout: '10 seconds',
     });
     t.is(result, 'A transparent image');
+  });
+});
+
+test('Binary file data reaches the model and the workflow as the same bytes', async (t) => {
+  const promptBytes = [137, 80, 78, 71, 0, 255];
+  const generatedBytes = [0, 1, 2, 254, 255];
+  const received: LanguageModelV4CallOptions[] = [];
+  function* generator(): Generator<ModelResponse> {
+    yield contentResponse([
+      {
+        type: 'file',
+        mediaType: 'application/octet-stream',
+        data: { type: 'data', data: new Uint8Array(generatedBytes) },
+      },
+    ]);
+  }
+  const provider = new TestProvider(generator());
+  const languageModel = provider.languageModel.bind(provider);
+  provider.languageModel = (modelId) => {
+    const model = languageModel(modelId);
+    const doGenerate = model.doGenerate.bind(model);
+    model.doGenerate = (options) => {
+      received.push(options);
+      return doGenerate(options);
+    };
+    return model;
+  };
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(binaryFileWorkflow, {
+      args: [promptBytes],
+      workflowExecutionTimeout: '10 seconds',
+    });
+    t.deepEqual(result, generatedBytes);
+  });
+
+  const userParts = received[0]!.prompt.flatMap((m) => (m.role === 'user' ? m.content : []));
+  const file = userParts.find((p) => p.type === 'file');
+  const data = file?.data.type === 'data' ? file.data.data : undefined;
+  t.is(typeof data, 'string');
+  t.deepEqual([...Buffer.from(data as string, 'base64')], promptBytes);
+});
+
+class RecordingProvider implements ProviderV4 {
+  readonly specificationVersion = 'v4';
+  readonly calls: LanguageModelV4CallOptions[] = [];
+
+  constructor(
+    private readonly supportedUrls: Record<string, RegExp[]>,
+    private readonly request?: { body: unknown }
+  ) {}
+
+  languageModel(_modelId: string): LanguageModelV4 {
+    const { calls, request, supportedUrls } = this;
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'recording-test-model',
+      supportedUrls,
+      async doGenerate(options): Promise<LanguageModelV4GenerateResult> {
+        calls.push(options);
+        return { ...textResponse('seen'), request };
+      },
+      async doStream(): Promise<LanguageModelV4StreamResult> {
+        throw new Error('Streaming not supported.');
+      },
+    };
+  }
+
+  embeddingModel(_modelId: string): EmbeddingModelV4 {
+    throw new Error('Not implemented.');
+  }
+
+  imageModel(_modelId: string): ImageModelV4 {
+    throw new Error('Not implemented.');
+  }
+}
+
+const pngBytes = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5E' +
+    'rkJggg==',
+  'base64'
+);
+
+async function serveFiles(t: { teardown(fn: () => Promise<void>): void }) {
+  const requested: string[] = [];
+  const server = http.createServer((req, res) => {
+    requested.push(req.url ?? '');
+    if (req.url === '/image') {
+      res.writeHead(200, { 'content-type': 'image/png' }).end(pngBytes);
+    } else if (req.url === '/notes') {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }).end('some notes');
+    } else {
+      res.writeHead(404).end();
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.teardown(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  return { baseUrl, requested };
+}
+
+// The default `createDownload()` refuses private addresses such as 127.0.0.1.
+async function localDownload({ url, abortSignal }: { url: URL; abortSignal?: AbortSignal }) {
+  const response = await fetch(url, { signal: abortSignal });
+  const data = new Uint8Array(await response.arrayBuffer());
+  return { data, mediaType: response.headers.get('content-type') ?? undefined };
+}
+
+async function runFileUrlWorkflow(t: ExecutionContext<BaseContext>, provider: RecordingProvider) {
+  const server = await serveFiles(t);
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: provider, download: localDownload })],
+  });
+  await worker.runUntil(async () => {
+    const result = await executeWorkflow(fileUrlWorkflow, {
+      args: [server.baseUrl],
+      workflowExecutionTimeout: '10 seconds',
+    });
+    t.is(result, 'seen');
+  });
+  t.is(provider.calls.length, 1);
+  const [message] = provider.calls[0]!.prompt;
+  if (message?.role !== 'user') throw new Error('Expected a user message');
+  return { ...server, content: message.content };
+}
+
+test('Prompt file URLs the model does not support are downloaded in the activity', async (t) => {
+  const { content, requested } = await runFileUrlWorkflow(t, new RecordingProvider({}));
+
+  t.deepEqual(content.slice(1), [
+    {
+      type: 'file',
+      mediaType: 'image/png',
+      data: { type: 'data', data: new Uint8Array(pngBytes) },
+    },
+    {
+      type: 'file',
+      mediaType: 'text/plain',
+      data: { type: 'data', data: new TextEncoder().encode('some notes') },
+    },
+  ]);
+  t.deepEqual(requested.sort(), ['/image', '/notes']);
+});
+
+test('Prompt file URLs the model supports reach the model as URL objects', async (t) => {
+  const provider = new RecordingProvider({ 'image/*': [/^http:\/\/127\.0\.0\.1:/] });
+  const { content, requested, baseUrl } = await runFileUrlWorkflow(t, provider);
+
+  const [, image, notes] = content;
+  if (image?.type !== 'file' || image.data.type !== 'url') throw new Error('Expected a URL part');
+  t.true(image.data.url instanceof URL);
+  t.is(image.data.url.href, `${baseUrl}/image`);
+  t.is(image.mediaType, 'image');
+  t.like(notes, { mediaType: 'text/plain', data: { type: 'data' } });
+  t.deepEqual(requested, ['/notes']);
+});
+
+test('A downloaded image gets the media type that its bytes show', async (t) => {
+  const provider = new RecordingProvider({});
+  const server = await serveFiles(t);
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: provider, download: localDownload })],
+  });
+  await worker.runUntil(() =>
+    executeWorkflow(mediaTypeUrlWorkflow, {
+      args: [server.baseUrl],
+      workflowExecutionTimeout: '10 seconds',
+    })
+  );
+
+  const [message] = provider.calls[0]!.prompt;
+  if (message?.role !== 'user') throw new Error('Expected a user message');
+  t.like(message.content[1], { type: 'file', mediaType: 'image/png' });
+});
+
+test('The request body of a call that downloaded a file is not recorded', async (t) => {
+  const provider = new RecordingProvider({}, { body: { file: 'the downloaded bytes' } });
+  const server = await serveFiles(t);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: provider, download: localDownload })],
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(fileUrlWorkflow, {
+      args: [server.baseUrl],
+      workflowExecutionTimeout: '10 seconds',
+    });
+    await handle.result();
+    const { events } = await handle.fetchHistory();
+    const results = events!.flatMap(
+      (event) => event.activityTaskCompletedEventAttributes?.result?.payloads ?? []
+    );
+    t.is(results.length, 1);
+    const recorded = JSON.parse(Buffer.from(results[0]!.data!).toString());
+    t.false('body' in recorded.request);
+  });
+});
+
+test('A history where experimental_download ran an Activity still replays', async (t) => {
+  // Recorded before the model Activity downloaded URLs. `experimental_download` got each
+  // URL then, and this one ran the `downloadNotes` Activity before the model Activity.
+  const histories = path.join(__dirname, '../../src/__tests__/histories');
+  const recorded = readFileSync(
+    path.join(histories, 'experimental-download-before-url-patch.json'),
+    'utf8'
+  );
+  await CoreWorker.runReplayHistory(
+    {
+      workflowBundle: t.context.workflowBundle,
+      plugins: [new AiSdkPlugin({ modelProvider: new RecordingProvider({}) })],
+    },
+    historyFromJSON(JSON.parse(recorded))
+  );
+  t.pass();
+});
+
+test('A new execution leaves the download of a URL to the model Activity', async (t) => {
+  const provider = new RecordingProvider({});
+  const server = await serveFiles(t);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: provider, download: localDownload })],
+    activities: { downloadNotes },
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(experimentalDownloadWorkflow, {
+      args: [server.baseUrl],
+      workflowExecutionTimeout: '10 seconds',
+    });
+    await handle.result();
+    const { events } = await handle.fetchHistory();
+    const scheduled = events!.flatMap(
+      (event) => event.activityTaskScheduledEventAttributes?.activityType?.name ?? []
+    );
+    t.deepEqual(scheduled, ['invokeModel']);
   });
 });
 
@@ -751,6 +1005,137 @@ test('invokeEmbeddingModel fails without retry on a non-retryable provider error
   t.true(err!.nonRetryable);
   t.is(err!.type, 'APICallError');
   t.true(APICallError.isInstance(err!.cause));
+});
+
+function activityResults(events: temporal.api.history.v1.IHistoryEvent[]): any[] {
+  return events
+    .filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED)
+    .map((e) => {
+      const data = e.activityTaskCompletedEventAttributes!.result!.payloads![0]!.data!;
+      return JSON.parse(Buffer.from(data).toString());
+    });
+}
+
+function* bodiesGenerator(prompt: string): Generator<ModelResponse> {
+  yield {
+    ...textResponse('Test Haiku'),
+    request: { body: { messages: [{ role: 'user', content: prompt }] } },
+    response: {
+      id: 'resp-1',
+      modelId: 'gpt-4o-mini',
+      timestamp: new Date('2026-01-01T00:00:00Z'),
+      headers: { 'x-request-id': 'req-1' },
+      body: { choices: [{ message: { content: 'Test Haiku' } }] },
+    },
+  };
+}
+
+test('invokeModel result in history has no request or response body', async (t) => {
+  const prompt = 'Tell me about recursion in programming.';
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: new TestProvider(bodiesGenerator(prompt)) })],
+  });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(helloWorldAgent, { args: [prompt] });
+    t.is(await handle.result(), 'Test Haiku');
+    const { events } = await handle.fetchHistory();
+    const [result] = activityResults(events!);
+
+    t.deepEqual(result.request, {});
+    t.deepEqual(result.response, {
+      id: 'resp-1',
+      modelId: 'gpt-4o-mini',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      headers: { 'x-request-id': 'req-1' },
+    });
+  });
+});
+
+function* embeddingBodyGenerator(): Generator<EmbeddingResponse> {
+  yield {
+    ...embeddingResponse(['Hello, world!', 'How are you?']),
+    response: { headers: { 'x-request-id': 'req-1' }, body: { data: 'raw embeddings' } },
+  };
+}
+
+test('invokeEmbeddingModel result in history has no response body', async (t) => {
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [
+      new AiSdkPlugin({
+        modelProvider: new TestProvider(helloWorkflowGenerator(), embeddingBodyGenerator()),
+      }),
+    ],
+  });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(embeddingWorkflow, {
+      args: [['Hello, world!', 'How are you?']],
+    });
+    t.is((await handle.result()).count, 2);
+    const { events } = await handle.fetchHistory();
+    const results = activityResults(events!);
+
+    // Without `maxEmbeddingsPerCall`, `embedMany` sends all values to one Activity.
+    t.is(results.length, 1);
+    t.deepEqual(results[0].response, { headers: { 'x-request-id': 'req-1' } });
+    t.is(results[0].embeddings.length, 2);
+  });
+});
+
+class EchoEmbeddingProvider implements ProviderV4 {
+  readonly specificationVersion = 'v4';
+
+  languageModel(_modelId: string): LanguageModelV4 {
+    throw new Error('Not implemented.');
+  }
+
+  embeddingModel(_modelId: string): EmbeddingModelV4 {
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'echo',
+      maxEmbeddingsPerCall: undefined,
+      supportsParallelCalls: true,
+      async doEmbed({ values }) {
+        return { embeddings: values.map((value) => [Number(value)]), warnings: [] };
+      },
+    };
+  }
+
+  imageModel(_modelId: string): ImageModelV4 {
+    throw new Error('Not implemented.');
+  }
+}
+
+function embeddingActivityInputs(events: temporal.api.history.v1.IHistoryEvent[]): string[][] {
+  return events
+    .filter((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED)
+    .map((e) => {
+      const data = e.activityTaskScheduledEventAttributes!.input!.payloads![0]!.data!;
+      return JSON.parse(Buffer.from(data).toString()).values;
+    });
+}
+
+test('maxEmbeddingsPerCall splits embedMany into one Activity per chunk', async (t) => {
+  const values = ['0', '1', '2', '3', '4'];
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({
+    plugins: [new AiSdkPlugin({ modelProvider: new EchoEmbeddingProvider() })],
+  });
+
+  await worker.runUntil(async () => {
+    const chunked = await startWorkflow(chunkedEmbeddingWorkflow, { args: [values, 2] });
+    t.deepEqual(await chunked.result(), [[0], [1], [2], [3], [4]]);
+    const chunkedInputs = embeddingActivityInputs((await chunked.fetchHistory()).events!);
+    t.deepEqual(chunkedInputs, [['0', '1'], ['2', '3'], ['4']]);
+
+    const unset = await startWorkflow(chunkedEmbeddingWorkflow, { args: [values] });
+    t.deepEqual(await unset.result(), [[0], [1], [2], [3], [4]]);
+    t.deepEqual(embeddingActivityInputs((await unset.fetchHistory()).events!), [values]);
+  });
 });
 
 test.serial('Telemetry', async (t) => {
@@ -1198,6 +1583,8 @@ test('configureWorker refuses to replace a different Activity with the same name
   t.throws(() => otherProvider.configureWorker(withMcp), duplicate('invokeModel'));
   const otherFactory = new AiSdkPlugin({ modelProvider: provider, mcpClientFactories: { files: async () => ({}) as any } });
   t.throws(() => otherFactory.configureWorker(withMcp), duplicate('files-listTools'));
+  const otherDownload = new AiSdkPlugin({ modelProvider: provider, download: localDownload });
+  t.throws(() => otherDownload.configureWorker(withMcp), duplicate('invokeModel'));
   // Another operation built from the same provider, registered under this name.
   const aliased = { ...base, activities: { invokeModel: (createActivities(provider) as any).invokeEmbeddingModel } };
   t.throws(() => new AiSdkPlugin({ modelProvider: provider }).configureWorker(aliased), duplicate('invokeModel'));
@@ -1378,4 +1765,217 @@ test('Captured multi-step MCP history replays deterministically', async (t) => {
 
   await CoreWorker.runReplayHistory({ workflowBundle: t.context.workflowBundle, plugins: [plugin()] }, history!);
   t.pass();
+});
+
+// Records the `abortSignal` each model call receives. When `block` is set, a call waits until
+// that signal aborts, heartbeating so the Activity can receive cancellation.
+class AbortRecordingProvider implements ProviderV4 {
+  readonly specificationVersion = 'v4';
+  readonly signals: unknown[] = [];
+  started = false;
+  providerAborted = false;
+
+  constructor(private readonly block: boolean) {}
+
+  private async callModel(signal: AbortSignal | undefined): Promise<void> {
+    this.signals.push(signal);
+    this.started = true;
+    if (!this.block) return;
+    while (!signal!.aborted) {
+      Context.current().heartbeat();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    this.providerAborted = true;
+    throw signal!.reason;
+  }
+
+  languageModel(_modelId: string): LanguageModelV4 {
+    const callModel = this.callModel.bind(this);
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'abort-test-model',
+      supportedUrls: {},
+      async doGenerate(options): Promise<LanguageModelV4GenerateResult> {
+        await callModel(options.abortSignal);
+        return textResponse('not aborted');
+      },
+      async doStream(options): Promise<LanguageModelV4StreamResult> {
+        await callModel(options.abortSignal);
+        return { stream: new ReadableStream({ start: (controller) => controller.close() }) };
+      },
+    };
+  }
+
+  embeddingModel(_modelId: string): EmbeddingModelV4 {
+    const callModel = this.callModel.bind(this);
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'abort-test-embedding-model',
+      maxEmbeddingsPerCall: undefined,
+      supportsParallelCalls: true,
+      async doEmbed(options): Promise<EmbeddingModelV4Result> {
+        await callModel(options.abortSignal);
+        return embeddingResponse(options.values);
+      },
+    };
+  }
+
+  imageModel(_modelId: string): ImageModelV4 {
+    throw new Error('Not implemented.');
+  }
+}
+
+// Serial, because these Workers hold a model call open, and that slows the tests that
+// run at the same time until their Workflows time out.
+test.serial('abortSignal that never aborts does not reach the Activity payload', async (t) => {
+  const provider = new AbortRecordingProvider(false);
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    t.is(await executeWorkflow(abortableGenerateWorkflow, { args: [false] }), 'text:not aborted');
+    t.is(await executeWorkflow(abortableEmbedWorkflow), 2);
+  });
+
+  t.is(provider.signals.length, 2);
+  for (const signal of provider.signals) {
+    t.true(signal instanceof AbortSignal);
+    t.false((signal as AbortSignal).aborted);
+  }
+});
+
+test.serial('abortSignal that is already aborted does not schedule the Activity', async (t) => {
+  const provider = new AbortRecordingProvider(false);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(abortableGenerateWorkflow, { args: [true] });
+    t.is(await handle.result(), 'error:AbortError|true');
+    const { events } = await handle.fetchHistory();
+    t.false(events!.some((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED));
+  });
+  t.is(provider.signals.length, 0);
+});
+
+test.serial('abortSignal that aborts during generateText cancels the Activity', async (t) => {
+  const provider = new AbortRecordingProvider(true);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(abortableGenerateWorkflow, { args: [false] });
+    await assertEventually(t, (tt) => {
+      tt.true(provider.started);
+    }, 10_000);
+    await handle.signal(abortRequest);
+    // The AI SDK rethrows the abort reason, which `isAbortError` must recognize.
+    t.is(await handle.result(), 'error:AbortError|true');
+    await assertEventually(t, (tt) => {
+      tt.true(provider.providerAborted);
+    }, 10_000);
+    const { events } = await handle.fetchHistory();
+    t.true(
+      events!.some((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED)
+    );
+  });
+});
+
+test.serial('abortSignal that aborts during streamText ends the stream with an abort part', async (t) => {
+  const provider = new AbortRecordingProvider(true);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(abortableStreamWorkflow, {
+      workflowExecutionTimeout: '30 seconds',
+    });
+    await assertEventually(t, (tt) => {
+      tt.true(provider.started);
+    }, 10_000);
+    await handle.signal(abortRequest);
+    const types = await handle.result();
+    t.is(types.at(-1), 'abort');
+    t.false(types.includes('error'));
+    await assertEventually(t, (tt) => {
+      tt.true(provider.providerAborted);
+    }, 10_000);
+  });
+});
+
+test('A history where an abort during embedMany cancelled nothing still replays', async (t) => {
+  // Recorded before an abort cancelled the model Activity. The signal aborted while
+  // `invokeEmbeddingModel` ran, and the Activity then completed.
+  const histories = path.join(__dirname, '../../src/__tests__/histories');
+  const recorded = readFileSync(
+    path.join(histories, 'embed-abort-before-cancel-patch.json'),
+    'utf8'
+  );
+  await CoreWorker.runReplayHistory(
+    {
+      workflowBundle: t.context.workflowBundle,
+      plugins: [new AiSdkPlugin({ modelProvider: new AbortRecordingProvider(false) })],
+    },
+    historyFromJSON(JSON.parse(recorded))
+  );
+  t.pass();
+});
+
+test('A history with a model call next to a plain Activity still replays', async (t) => {
+  // Recorded before a model call accepted an `abortSignal`. Both first Activities
+  // completed before one Workflow Task, so the two branches resumed in the same task.
+  const histories = path.join(__dirname, '../../src/__tests__/histories');
+  const recorded = readFileSync(
+    path.join(histories, 'model-next-to-plain-activity.json'),
+    'utf8'
+  );
+  await CoreWorker.runReplayHistory(
+    {
+      workflowBundle: t.context.workflowBundle,
+      plugins: [new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) })],
+    },
+    historyFromJSON(JSON.parse(recorded))
+  );
+  t.pass();
+});
+
+test.serial('An abort during embedMany cancels the Activity in a new execution', async (t) => {
+  const provider = new AbortRecordingProvider(true);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(abortDuringEmbedWorkflow);
+    await assertEventually(t, (tt) => {
+      tt.true(provider.started);
+    }, 10_000);
+    await handle.signal(abortRequest);
+    t.is(await handle.result(), 'error:AbortError|true');
+    const { events } = await handle.fetchHistory();
+    t.true(
+      events!.some((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED)
+    );
+  });
+});
+
+test('model Activities pass the Activity cancellation signal to the model', async (t) => {
+  const provider = new AbortRecordingProvider(false);
+  type Activity = (args: unknown) => Promise<unknown>;
+  const activities = createActivities(provider) as Record<string, Activity>;
+  const env = new MockActivityEnvironment();
+  const prompt: LanguageModelV4CallOptions['prompt'] = [
+    { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+  ];
+  // Histories recorded before the fix hold `abortSignal: {}` in the Activity input.
+  const options = { prompt, abortSignal: {} } as unknown as LanguageModelV4CallOptions;
+
+  await env.run(activities.invokeModel!, { modelId: 'm', options });
+  await env.run(activities.invokeEmbeddingModel!, { modelId: 'e', values: ['a'] });
+
+  t.is(provider.signals.length, 2);
+  for (const signal of provider.signals) t.is(signal, env.context.cancellationSignal);
+  env.cancel();
+  t.true(env.context.cancellationSignal.aborted);
 });

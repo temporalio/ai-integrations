@@ -20,9 +20,8 @@ import sys
 # Job names come from ci.yml (`name: Python`, `name: Java`, `name: Go`, `name: TypeScript`, `name: .NET`)
 # joined with the reusable workflow's job name; test_nightly_report.py asserts the two stay in step.
 JOB_RE = re.compile(r"^(?P<language>Python|Java|Go|TypeScript|\.NET) \((?P<plugin>[^)]+)\) / ")
-# Issue keys for the languages that joined after Python and Java, whose unqualified titles stay as they are.
-# The key is the language root folder, so `.NET` maps to `dotnet` rather than to `.lower()`.
-KEY_PREFIX = {"Go": "go", "TypeScript": "typescript", ".NET": "dotnet"}
+# Issue keys are `<language root folder>/<plugin>`: `.lower()` of the job's language, except `.NET`, whose root is `dotnet`.
+KEY_PREFIX = {".NET": "dotnet"}
 LABEL = "nightly"
 FAILED = {"failure", "timed_out"}
 
@@ -53,10 +52,8 @@ def classify(jobs: list[dict]) -> tuple[set[str], set[str]]:
         m = JOB_RE.match(job.get("name", ""))
         if not m or not job.get("conclusion"):
             continue
-        plugin = m.group("plugin")
-        # Preserve Python and Java issue titles; qualify newer languages to avoid collisions.
-        if m.group("language") in KEY_PREFIX:
-            plugin = f"{KEY_PREFIX[m.group('language')]}/{plugin}"
+        language = m.group("language")
+        plugin = f"{KEY_PREFIX.get(language, language.lower())}/{m.group('plugin')}"
         seen.add(plugin)
         if job["conclusion"] in FAILED:
             failing.add(plugin)
