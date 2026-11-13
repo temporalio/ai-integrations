@@ -112,30 +112,31 @@ class TwoModelWorkflow:
         return (await careful.run(draft.text)).text
 
 
-plugin = AgentFrameworkPlugin(
-    chat_clients={
-        "fast": lambda: OpenAIChatClient(
-            model="gpt-4o-mini", async_client=AsyncOpenAI(max_retries=0)
-        ),
-        "careful": lambda: OpenAIChatClient(
-            model="gpt-4o", async_client=AsyncOpenAI(max_retries=0)
-        ),
-    }
-)
+CHAT_CLIENTS = {
+    "fast": lambda: OpenAIChatClient(
+        model="gpt-4o-mini", async_client=AsyncOpenAI(max_retries=0)
+    ),
+    "careful": lambda: OpenAIChatClient(
+        model="gpt-4o", async_client=AsyncOpenAI(max_retries=0)
+    ),
+}
+plugin = AgentFrameworkPlugin(chat_clients=CHAT_CLIENTS)
 ```
 
 A name the worker does not know fails the Activity with a non-retryable `ApplicationError` of type `AgentFrameworkUnknownChatClient`, so the workflow fails instead of waiting. During a rolling deployment, add the name to every worker on the task queue before workflows start using it.
 
 `TemporalChatClient("gpt-4o").as_agent(instructions=..., tools=...)` is the short form of `Agent(client=TemporalChatClient("gpt-4o"), ...)`. Calling a `TemporalChatClient` outside a workflow raises `RuntimeError`; use the provider's client there.
 
+A run's `client_kwargs`, such as `extra_headers` for the OpenAI client, cross to the Activity and reach the provider client. A value that is not JSON-compatible fails the workflow with `AgentFrameworkWorkflowError`.
+
 ## Retries and timeouts
 
-Each `TemporalChatClient` carries the activity options of its model calls: `start_to_close_timeout` (default 5 minutes), `heartbeat_timeout` (default 10 seconds; the Activity heartbeats on its own at half that interval, so a dead worker is noticed within seconds), `schedule_to_close_timeout`, `retry_policy`, `task_queue`, `summary` (defaults to the model name) and the rest of `workflow.execute_activity`'s options. Give reasoning models a longer `start_to_close_timeout`.
+Each `TemporalChatClient` carries the activity options of its model calls: `start_to_close_timeout` (default 5 minutes), `heartbeat_timeout` (default 10 seconds; the Activity heartbeats on its own at half that interval, so a dead worker is noticed within seconds), `schedule_to_close_timeout`, `retry_policy`, `task_queue`, `summary` (defaults to the model name), `schedule_to_start_timeout`, `cancellation_type`, `versioning_intent` and `priority`. Give reasoning models a longer `start_to_close_timeout`.
 
 ```python
 from temporalio.common import RetryPolicy
 
-client = TemporalChatClient(
+chat_client = TemporalChatClient(
     "gpt-4o",
     start_to_close_timeout=timedelta(minutes=10),
     retry_policy=RetryPolicy(maximum_attempts=3),
@@ -182,19 +183,20 @@ class ToolsWorkflow:
         return (await agent.run(prompt)).text
 
 
-# worker
-Worker(
-    client,
-    task_queue="agent-framework",
-    workflows=[ToolsWorkflow],
-    activities=[fetch_user],
-    plugins=[plugin],
-)
+async def run_worker(client: Client) -> None:
+    worker = Worker(
+        client,
+        task_queue="agent-framework",
+        workflows=[ToolsWorkflow],
+        activities=[fetch_user],
+        plugins=[plugin],
+    )
+    await worker.run()
 ```
 
 `activity_as_tool` takes a function or a method passed as `Class.method` (register the bound method on the worker). Agent Framework infers the tool's parameter schema from the activity's signature, so `Annotated[str, "description"]` parameters and docstrings work as they do for `@tool`. The arguments bind by name and reach the activity by position. `approval_mode="always_require"` works on an activity tool like on any other. A failed activity, including one whose retries ran out, raises its failure cause from the tool, which Agent Framework turns into an error result for the model; cancellation propagates as `asyncio.CancelledError`.
 
-Synchronous `def` tools run on the workflow event loop. Agent Framework would run them on a thread, which the workflow's event loop does not provide, so the plugin's function middleware sets the framework's own switch for running them inline. A tool that blocks for long blocks the workflow task, so keep sync tools quick.
+Synchronous `def` tools run on the workflow event loop. Agent Framework would run them on a thread, which the workflow's event loop does not provide, so the plugin's function middleware sets the framework's own switch for running them inline for the duration of the call and restores it afterwards. A tool that blocks for long blocks the workflow task, so keep sync tools quick.
 
 Declaration-only tools (`FunctionTool(func=None, ...)`) are advertised to the model and the run returns the model's call to you, as in Agent Framework. Hosted tools passed as mappings, such as the provider's web search, pass through to the model Activity and run on the provider's side. `agent.as_tool()` works unchanged: the sub-agent's model calls run as Activities in the same workflow.
 
@@ -211,7 +213,8 @@ uv add "temporalio-agent-framework[mcp]"
 `AgentFrameworkPlugin(mcp_clients=...)` maps a server name to a factory returning an `mcp.Client`, the same shape as `chat_clients`. The plugin registers the `temporalio.mcp.{name}.list-tools` and `temporalio.mcp.{name}.call-tool` Activities (and the other `temporalio-mcp` operations) for each server. Workflow-side, `TemporalMCPToolProvider("name")` is a context provider: before each agent run it lists the server's tools and adds one `FunctionTool` per tool, with the server's full input schema, whose call runs the `call-tool` Activity. It goes in `context_providers`, not `tools`, because Agent Framework drives an `MCPTool` in `tools=` through a live connection that cannot exist in a workflow; a context provider is the framework's public way to add tools to a run.
 
 ```python
-from mcp import Client, StdioServerParameters, stdio_client
+from mcp import Client as MCPClient
+from mcp import StdioServerParameters, stdio_client
 from temporalio.agent_framework import TemporalMCPToolProvider
 
 
@@ -232,7 +235,7 @@ class MCPWorkflow:
 plugin = AgentFrameworkPlugin(
     chat_clients=CHAT_CLIENTS,
     mcp_clients={
-        "echo": lambda: Client(
+        "echo": lambda: MCPClient(
             stdio_client(StdioServerParameters(command="python", args=["echo_server.py"]))
         ),
     },
@@ -241,7 +244,7 @@ plugin = AgentFrameworkPlugin(
 
 `cache_tools=False` (the default) lists the tools on every run, so a server restarted with different tools is picked up; `cache_tools=True` lists once per provider instance. `tool_name_prefix`, `allowed_tools`, `approval_mode` and `parse_tool_results` work as on Agent Framework's `MCPTool`: the agent sees `{prefix}_{name}`, `allowed_tools` matches the server's names, and `approval_mode="always_require"` makes every tool of the server ask for approval. Tool results map to content the way `MCPTool` maps them; a result the server marks as an error becomes an error result for the model.
 
-Tool names must be unique on an agent. A server tool with the name of one of the agent's own tools, or of a tool from another provider, fails the workflow with `AgentFrameworkWorkflowError` before the model call; give that provider a `tool_name_prefix` or an `allowed_tools` list.
+Tool names must be unique on an agent. A server tool with the name of one of the agent's own tools, or of a tool from another provider, fails the workflow with `AgentFrameworkWorkflowError` before the model call; give that provider a `tool_name_prefix` or an `allowed_tools` list. Tools passed to `agent.run(tools=...)` are merged after context providers run, so a collision with one of those raises Agent Framework's own `ValueError` and fails the workflow task instead; put such tools on the `Agent`.
 
 The activity options on `TemporalMCPToolProvider` apply to its list and call Activities; `summary` defaults to the server name. Without `start_to_close_timeout` or `schedule_to_close_timeout`, `temporalio-mcp`'s one-minute default applies. The default retry policy retries without limit, so a run waits while its MCP server is down; bound it with `retry_policy` or `schedule_to_close_timeout`. A `call-tool` Activity that runs out of attempts becomes an error result for the model; a `list-tools` Activity that runs out of attempts raises from `agent.run`. MCP Activities do not heartbeat. The worker reuses one connection per server across Activities and closes it after `mcp_connection_idle_timeout` (default 5 minutes) of idleness; `None` keeps it until shutdown and `timedelta(0)` closes it after every Activity. Do not register the same server name through `MCPPlugin` on the same worker: the Activity names clash.
 
@@ -342,6 +345,8 @@ async def follow(client: Client, workflow_id: str) -> None:
     async for item in WorkflowStreamClient.create(client, workflow_id).subscribe(["events"]):
         print(ChatResponseUpdate.from_dict(item.data).text, end="", flush=True)
 ```
+
+One streamed call records, as its Activity result, one entry per function call, usage or finish update and one entry per run of text, so a long answer does not add one history entry per token; the topic still receives every update. The workflow iterator yields the recorded entries once the Activity completes.
 
 If the updates cannot all be published, the Activity fails with an `ApplicationError` of type `agent_framework.StreamError`. It is non-retryable when a retry would fail the same way: a batch over the server's payload size limit (2 MiB per payload by default) or past the run's Signal limit (each batch is one Signal; a run accepts 10,000 by default). Other publish failures, such as a server outage, are retried, and the retry calls the model again.
 
