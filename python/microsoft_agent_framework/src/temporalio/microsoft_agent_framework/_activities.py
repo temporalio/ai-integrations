@@ -22,7 +22,7 @@ from temporalio.service import RPCError, RPCStatusCode
 
 INVOKE_MODEL = "microsoft_agent_framework.invoke_model"
 INVOKE_MODEL_STREAMING = "microsoft_agent_framework.invoke_model_streaming"
-STREAM_ERROR_TYPE = "microsoft_agent_framework.StreamError"
+STREAM_ERROR_TYPE = "MicrosoftAgentFrameworkStreamError"
 """``ApplicationError.type`` of a streaming call whose updates did not all reach the topic."""
 UNKNOWN_CHAT_CLIENT_TYPE = "MicrosoftAgentFrameworkUnknownChatClient"
 """``ApplicationError.type`` of a call for a model name the worker does not know."""
@@ -30,7 +30,6 @@ CHAT_CLIENT_FACTORY_ERROR_TYPE = "MicrosoftAgentFrameworkChatClientFactoryError"
 """``ApplicationError.type`` of a call whose chat client factory raised or returned ``None``."""
 MCP_CLIENT_FACTORY_ERROR_TYPE = "MicrosoftAgentFrameworkMCPClientFactoryError"
 """``ApplicationError.type`` of an MCP Activity whose client factory raised or returned no ``mcp.Client``."""
-"""``ApplicationError.type`` of a call for a model name the worker does not know."""
 
 ChatClientFactory = Callable[[], SupportsChatGetResponse[Any]]
 

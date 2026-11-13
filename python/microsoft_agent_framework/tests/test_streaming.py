@@ -357,7 +357,7 @@ async def test_stream_publish_failure_types(
                 model="model", messages=_messages(), streaming_topic="events"
             ),
         )
-    assert excinfo.value.type == "microsoft_agent_framework.StreamError"
+    assert excinfo.value.type == "MicrosoftAgentFrameworkStreamError"
     assert excinfo.value.non_retryable is non_retryable
     assert "'model'" in excinfo.value.message and "'events'" in excinfo.value.message
     assert excinfo.value.__cause__ is publish_error
