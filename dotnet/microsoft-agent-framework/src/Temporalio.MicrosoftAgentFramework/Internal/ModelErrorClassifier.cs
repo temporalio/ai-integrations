@@ -9,12 +9,16 @@ namespace Temporalio.MicrosoftAgentFramework.Internal;
 /// <see cref="MicrosoftAgentFrameworkErrorTypes.ModelError"/>. The rule is the one the Python
 /// plugin applies: 408, 409, 429 and 5xx are retryable, every other 4xx is not; a provider
 /// <c>x-should-retry</c> header overrides it, and <c>retry-after-ms</c> or <c>Retry-After</c>
-/// becomes the next retry delay. Classification reads HTTP status codes and headers, never
-/// message text. The status extraction paths follow Cecil Phillip's draft at
-/// https://github.com/temporal-community/temporal-dotnet-agents.
+/// (seconds, with a fraction, or an HTTP date) becomes the next retry delay, capped at 60 seconds
+/// as the OpenAI SDK caps it; a value that cannot be read is skipped. Classification reads HTTP
+/// status codes and headers, never message text. The status extraction paths follow Cecil
+/// Phillip's draft at https://github.com/temporal-community/temporal-dotnet-agents.
 /// </summary>
 internal static class ModelErrorClassifier
 {
+    /// <summary>Longest delay a provider header can ask for; the OpenAI SDK ignores longer ones.</summary>
+    public static readonly TimeSpan MaxRetryAfter = TimeSpan.FromSeconds(60);
+
     /// <summary>
     /// Classifies <paramref name="exception"/>.
     /// </summary>
@@ -90,32 +94,34 @@ internal static class ModelErrorClassifier
 
     private static TimeSpan? RetryAfter(ResponseHeaders headers)
     {
-        if (headers.Get("retry-after-ms") is { } millisecondsHeader)
+        if (headers.Get("retry-after-ms") is { } millisecondsHeader &&
+            double.TryParse(millisecondsHeader, NumberStyles.Float, CultureInfo.InvariantCulture, out var milliseconds) &&
+            milliseconds >= 0)
         {
-            return long.TryParse(millisecondsHeader, NumberStyles.Integer, CultureInfo.InvariantCulture, out var milliseconds) && milliseconds >= 0
-                ? TimeSpan.FromMilliseconds(milliseconds)
-                : null;
+            return Cap(TimeSpan.FromMilliseconds(milliseconds));
         }
 
-        var header = headers.Get("Retry-After");
-        if (string.IsNullOrWhiteSpace(header))
+        var header = headers.Get("Retry-After")?.Trim();
+        if (string.IsNullOrEmpty(header))
         {
             return null;
         }
 
-        if (int.TryParse(header, NumberStyles.Integer, CultureInfo.InvariantCulture, out var seconds) && seconds >= 0)
+        if (double.TryParse(header, NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds) && seconds >= 0)
         {
-            return TimeSpan.FromSeconds(seconds);
+            return Cap(TimeSpan.FromSeconds(seconds));
         }
 
         if (DateTimeOffset.TryParse(header, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var at))
         {
             var delay = at - DateTimeOffset.UtcNow;
-            return delay > TimeSpan.Zero ? delay : null;
+            return delay > TimeSpan.Zero ? Cap(delay) : null;
         }
 
         return null;
     }
+
+    private static TimeSpan Cap(TimeSpan delay) => delay > MaxRetryAfter ? MaxRetryAfter : delay;
 
     /// <summary>
     /// Header access on a <c>ClientResultException</c>'s raw response: <c>GetRawResponse()</c>

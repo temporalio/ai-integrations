@@ -66,7 +66,7 @@ public class FailureTests : WorkflowTestBase
     [Fact]
     public async Task Model429WithRetryAfterDate_SetsNextRetryDelay()
     {
-        var retryAt = DateTimeOffset.UtcNow.AddSeconds(90).ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+        var retryAt = DateTimeOffset.UtcNow.AddSeconds(30).ToString("R", System.Globalization.CultureInfo.InvariantCulture);
         var fake = new FakeChatClient(_ => throw new System.ClientModel.ClientResultException("rate limited", new FakePipelineResponse(429, retryAt)));
         var input = new FailureInput("model", MaxAttempts: 1);
         var (error, _) = await RunFailingAsync(TestPlugin.For(fake), (FailureWorkflow wf) => wf.RunAsync(input));
@@ -74,7 +74,7 @@ public class FailureTests : WorkflowTestBase
         Assert.NotNull(failure);
         Assert.Equal(MicrosoftAgentFrameworkErrorTypes.ModelError, failure.ErrorType);
         Assert.NotNull(failure.NextRetryDelay);
-        Assert.InRange(failure.NextRetryDelay.Value, TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(90));
+        Assert.InRange(failure.NextRetryDelay.Value, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(30));
     }
 
     [Theory]
@@ -219,6 +219,29 @@ public class FailureTests : WorkflowTestBase
         Assert.True(failure.NonRetryable);
         Assert.Contains("InvalidOperationException: OPENAI_API_KEY is not set", failure.Message, StringComparison.Ordinal);
         Assert.Equal(1, HistoryAssert.LastAttempt(await handle.FetchHistoryAsync(), ModelActivityNames.InvokeModel));
+    }
+
+    [Theory]
+    [InlineData("retry-after-ms", "1500", null, null, 1500)]
+    [InlineData("retry-after-ms", "soon", "Retry-After", "2", 2000)]
+    [InlineData("Retry-After", "1.5", null, null, 1500)]
+    [InlineData("Retry-After", "120", null, null, 60000)]
+    [InlineData("retry-after-ms", "900000", null, null, 60000)]
+    public async Task RetryAfter_ReadsEveryFormAndCapsAtSixtySeconds(string name, string value, string? otherName, string? otherValue, int expectedMilliseconds)
+    {
+        var headers = new Dictionary<string, string> { [name] = value };
+        if (otherName is not null)
+        {
+            headers[otherName] = otherValue!;
+        }
+
+        var fake = new FakeChatClient(_ => throw new System.ClientModel.ClientResultException("rate limited", new FakePipelineResponse(429, headers)));
+        var input = new FailureInput("model", MaxAttempts: 1);
+        var (error, _) = await RunFailingAsync(TestPlugin.For(fake), (FailureWorkflow wf) => wf.RunAsync(input));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.False(failure.NonRetryable);
+        Assert.Equal(TimeSpan.FromMilliseconds(expectedMilliseconds), failure.NextRetryDelay);
     }
 
     [Theory]
