@@ -159,11 +159,9 @@ class _ConnectionRecord:
         except BaseException as err:
             # A failed connect should not be cached; drop it so the next call
             # retries instead of awaiting a permanently rejected future.
-            _CONNECTIONS.pop(self._server, None)
             if not self._ready.done():
                 self._ready.set_exception(factory_error or err)
-                # The waiting Activity receives this failure through _ready.
-                return
+            _CONNECTIONS.pop(self._server, None)
             raise
 
     def acquire(self) -> None:
