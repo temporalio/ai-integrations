@@ -27,14 +27,16 @@ import { STREAMING_TOPIC_REQUIRED_FAILURE_TYPE, UNSUPPORTED_FAILURE_TYPE } from 
 export interface TemporalModelOptions {
   /**
    * Per-call Temporal Activity configuration (timeouts, retry, task queue).
+   * `heartbeatTimeout` defaults to 10 seconds. The model Activities heartbeat on
+   * a timer at half of it, so a cancel reaches a running call and a lost worker
+   * is noticed. Set it to `0` to turn the timer off.
    *
    * When ADK aborts the invocation a call belongs to (in a graph, when a sibling
    * node fails), the call's Activity cancellation is requested, and
    * `cancellationType` decides what the agent then waits for. Unset means
    * `TRY_CANCEL`: the call ends at once and the Activity winds down on its own.
    * `WAIT_CANCELLATION_COMPLETED` waits for the Activity to acknowledge, which it
-   * does at its next heartbeat; the model Activities heartbeat at half the
-   * `heartbeatTimeout`, and not at all without one.
+   * does at its next heartbeat: on that timer, or after a streamed chunk.
    *
    * A `timeout` on the agent's graph node is not such an abort. ADK runs the agent
    * with the run's signal, not the node's deadline (`runLlmAgentAsNode`), so a
@@ -103,6 +105,8 @@ export interface ModelActivities {
 
 const DEFAULT_MODEL_START_TO_CLOSE: Duration = '1 minute';
 
+const DEFAULT_HEARTBEAT_TIMEOUT: Duration = '10 seconds';
+
 const ADK_AGENT_NAME_LABEL = 'adk_agent_name';
 
 /**
@@ -154,7 +158,7 @@ export class TemporalModel extends BaseLlm {
     let responses: LlmResponse[];
     try {
       const activities = proxyActivities<ModelActivities>({
-        ...this.options.activity,
+        ...withDefaultHeartbeatTimeout(this.options.activity),
         startToCloseTimeout: this.options.activity?.startToCloseTimeout ?? DEFAULT_MODEL_START_TO_CLOSE,
         summary: this.resolveSummary(llmRequest),
       });
@@ -262,4 +266,16 @@ export function activityOptionsFrom(options: ActivityOptions | undefined, defaul
     startToCloseTimeout: options?.startToCloseTimeout ?? DEFAULT_MODEL_START_TO_CLOSE,
     summary: options?.summary ?? defaultSummary,
   };
+}
+
+/**
+ * Defaults `heartbeatTimeout` for the plugin's own model and MCP Activities,
+ * which heartbeat on a timer at half of it. `0` passes through and turns the
+ * timer off. Not for `activityAsTool` or `activityNode`: they run the user's
+ * own Activities, which may never heartbeat.
+ *
+ * @internal
+ */
+export function withDefaultHeartbeatTimeout(options: ActivityOptions | undefined): ActivityOptions {
+  return { ...options, heartbeatTimeout: options?.heartbeatTimeout ?? DEFAULT_HEARTBEAT_TIMEOUT };
 }
