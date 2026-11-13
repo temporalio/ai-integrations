@@ -19,6 +19,7 @@ internal sealed class ActivityFunction : AIFunction
     private readonly string activityName;
     private readonly ActivityOptions options;
     private readonly ParameterInfo[] parameters;
+    private readonly int argumentCount;
     private readonly Type? resultType;
     private readonly MethodInfo? runWithResult;
 
@@ -44,6 +45,7 @@ internal sealed class ActivityFunction : AIFunction
         Description = description ?? method.GetCustomAttribute<DescriptionAttribute>()?.Description ?? string.Empty;
         UnderlyingMethod = method;
         parameters = method.GetParameters();
+        argumentCount = CountArguments(parameters, Name);
         JsonSchema = AIJsonUtilities.CreateFunctionJsonSchema(method, title: null, description: Description, AIJsonUtilities.DefaultOptions);
         this.options = (ActivityOptions)options.Clone();
         this.options.Summary ??= $"microsoft-agent-framework tool call: {Name}";
@@ -90,6 +92,27 @@ internal sealed class ActivityFunction : AIFunction
 
     private static async Task<object?> RunWithResultAsync<TResult>(string activity, object?[] args, ActivityOptions options) =>
         await Workflow.ExecuteActivityAsync<TResult>(activity, args, options).ConfigureAwait(true);
+
+    private static int CountArguments(ParameterInfo[] parameters, string name)
+    {
+        // A CancellationToken cannot cross the Activity boundary. The SDK fills trailing optional
+        // parameters that get no argument, so trailing token parameters with a default value are
+        // left out of the call; the Activity reads cancellation from ActivityExecutionContext.Current.
+        var count = parameters.Length;
+        while (count > 0 && parameters[count - 1].ParameterType == typeof(CancellationToken) && parameters[count - 1].HasDefaultValue)
+        {
+            count--;
+        }
+
+        if (Array.FindIndex(parameters, 0, count, parameter => parameter.ParameterType == typeof(CancellationToken)) >= 0)
+        {
+            throw new ArgumentException(
+                $"Tool '{name}' wraps an Activity with a CancellationToken parameter that is not a trailing optional one. A token cannot cross the Activity boundary: " +
+                "declare it last with a default value, or read ActivityExecutionContext.Current.CancellationToken inside the Activity.");
+        }
+
+        return count;
+    }
 
     private static Type? UnwrapResultType(Type returnType)
     {
@@ -151,16 +174,11 @@ internal sealed class ActivityFunction : AIFunction
 
     private object?[] BindArguments(AIFunctionArguments arguments)
     {
-        var args = new object?[parameters.Length];
-        for (var i = 0; i < parameters.Length; i++)
+        var args = new object?[argumentCount];
+        for (var i = 0; i < argumentCount; i++)
         {
             var parameter = parameters[i];
-            if (parameter.ParameterType == typeof(CancellationToken))
-            {
-                // Not part of the schema; the Activity gets cancellation through its own context.
-                args[i] = CancellationToken.None;
-            }
-            else if (TryGetArgument(arguments, parameter.Name!, out var value))
+            if (TryGetArgument(arguments, parameter.Name!, out var value))
             {
                 args[i] = Convert(value, parameter.ParameterType);
             }

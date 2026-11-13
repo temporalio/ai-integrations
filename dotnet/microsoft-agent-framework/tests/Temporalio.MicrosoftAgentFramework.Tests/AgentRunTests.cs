@@ -86,6 +86,22 @@ public class AgentRunTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task RunAsync_ActivityAsTool_TrailingToken_LeftOutOfSchemaAndCall()
+    {
+        var fake = new FakeChatClient(
+            ScriptedResponse.ToolCalls(("get_weather", City("Kingston"))),
+            ScriptedResponse.Text("Final"));
+        var (result, handle) = await RunAsync(TestPlugin.For(fake), (ToolsWorkflow wf) => wf.RunAsync(new ToolsInput("Alerts?", "activity-token")));
+        Assert.Equal("Final", result.Text);
+        Assert.Equal(1, HistoryAssert.ActivityCounts(await handle.FetchHistoryAsync())["GetAlerts"]);
+        var schema = ((AIFunctionDeclaration)fake.Calls[0].Options!.Tools![0]).JsonSchema.GetRawText();
+        Assert.Contains("city", schema, StringComparison.Ordinal);
+        Assert.DoesNotContain("cancellationToken", schema, StringComparison.OrdinalIgnoreCase);
+        var toolResult = fake.Calls[1].Messages.SelectMany(m => m.Contents).OfType<FunctionResultContent>().Single();
+        Assert.Equal("no alerts for Kingston", toolResult.Result?.ToString());
+    }
+
+    [Fact]
     public async Task RunAsync_ConcurrentTools_BothScheduledBeforeEitherCompletes()
     {
         var fake = new FakeChatClient(

@@ -16,4 +16,10 @@ public sealed class WeatherActivities
 
     [Activity]
     public Task<string> SendEmailAsync(string to) => Task.FromResult($"email sent to {to}");
+
+    // The trailing optional token stays out of the tool schema and of the call; the SDK fills its default.
+    [Activity]
+    [Description("Gets the weather alerts for a city")]
+    public Task<string> GetAlertsAsync([Description("City name")] string city, CancellationToken cancellationToken = default) =>
+        Task.FromResult(cancellationToken.CanBeCanceled ? $"alerts for {city} (cancellable)" : $"no alerts for {city}");
 }
