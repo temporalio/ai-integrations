@@ -55,6 +55,7 @@ import {
   OpenTelemetryWorkflowClientInterceptor,
 } from '@temporalio/interceptors-opentelemetry';
 import { MockActivityEnvironment, workflowInterceptorModules } from '@temporalio/testing';
+import { Context } from '@temporalio/activity';
 import { SimplePlugin } from '@temporalio/plugin';
 import { bundleWorkflowCode, DefaultLogger, NativeConnection, Worker as CoreWorker } from '@temporalio/worker';
 import type { InjectedSinks, WorkerOptions } from '@temporalio/worker';
@@ -70,6 +71,11 @@ import {
 import { AiSdkPlugin, createActivities } from '..';
 import { startLocalWithRetry } from './helpers/environment';
 import {
+  abortableEmbedWorkflow,
+  abortDuringEmbedWorkflow,
+  abortableGenerateWorkflow,
+  abortableStreamWorkflow,
+  abortRequest,
   binaryFileWorkflow,
   chunkedEmbeddingWorkflow,
   embeddingWorkflow,
@@ -1759,4 +1765,217 @@ test('Captured multi-step MCP history replays deterministically', async (t) => {
 
   await CoreWorker.runReplayHistory({ workflowBundle: t.context.workflowBundle, plugins: [plugin()] }, history!);
   t.pass();
+});
+
+// Records the `abortSignal` each model call receives. When `block` is set, a call waits until
+// that signal aborts, heartbeating so the Activity can receive cancellation.
+class AbortRecordingProvider implements ProviderV4 {
+  readonly specificationVersion = 'v4';
+  readonly signals: unknown[] = [];
+  started = false;
+  providerAborted = false;
+
+  constructor(private readonly block: boolean) {}
+
+  private async callModel(signal: AbortSignal | undefined): Promise<void> {
+    this.signals.push(signal);
+    this.started = true;
+    if (!this.block) return;
+    while (!signal!.aborted) {
+      Context.current().heartbeat();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    this.providerAborted = true;
+    throw signal!.reason;
+  }
+
+  languageModel(_modelId: string): LanguageModelV4 {
+    const callModel = this.callModel.bind(this);
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'abort-test-model',
+      supportedUrls: {},
+      async doGenerate(options): Promise<LanguageModelV4GenerateResult> {
+        await callModel(options.abortSignal);
+        return textResponse('not aborted');
+      },
+      async doStream(options): Promise<LanguageModelV4StreamResult> {
+        await callModel(options.abortSignal);
+        return { stream: new ReadableStream({ start: (controller) => controller.close() }) };
+      },
+    };
+  }
+
+  embeddingModel(_modelId: string): EmbeddingModelV4 {
+    const callModel = this.callModel.bind(this);
+    return {
+      specificationVersion: 'v4',
+      provider: 'temporal-test',
+      modelId: 'abort-test-embedding-model',
+      maxEmbeddingsPerCall: undefined,
+      supportsParallelCalls: true,
+      async doEmbed(options): Promise<EmbeddingModelV4Result> {
+        await callModel(options.abortSignal);
+        return embeddingResponse(options.values);
+      },
+    };
+  }
+
+  imageModel(_modelId: string): ImageModelV4 {
+    throw new Error('Not implemented.');
+  }
+}
+
+// Serial, because these Workers hold a model call open, and that slows the tests that
+// run at the same time until their Workflows time out.
+test.serial('abortSignal that never aborts does not reach the Activity payload', async (t) => {
+  const provider = new AbortRecordingProvider(false);
+  const { createWorker, executeWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    t.is(await executeWorkflow(abortableGenerateWorkflow, { args: [false] }), 'text:not aborted');
+    t.is(await executeWorkflow(abortableEmbedWorkflow), 2);
+  });
+
+  t.is(provider.signals.length, 2);
+  for (const signal of provider.signals) {
+    t.true(signal instanceof AbortSignal);
+    t.false((signal as AbortSignal).aborted);
+  }
+});
+
+test.serial('abortSignal that is already aborted does not schedule the Activity', async (t) => {
+  const provider = new AbortRecordingProvider(false);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(abortableGenerateWorkflow, { args: [true] });
+    t.is(await handle.result(), 'error:AbortError|true');
+    const { events } = await handle.fetchHistory();
+    t.false(events!.some((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED));
+  });
+  t.is(provider.signals.length, 0);
+});
+
+test.serial('abortSignal that aborts during generateText cancels the Activity', async (t) => {
+  const provider = new AbortRecordingProvider(true);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(abortableGenerateWorkflow, { args: [false] });
+    await assertEventually(t, (tt) => {
+      tt.true(provider.started);
+    }, 10_000);
+    await handle.signal(abortRequest);
+    // The AI SDK rethrows the abort reason, which `isAbortError` must recognize.
+    t.is(await handle.result(), 'error:AbortError|true');
+    await assertEventually(t, (tt) => {
+      tt.true(provider.providerAborted);
+    }, 10_000);
+    const { events } = await handle.fetchHistory();
+    t.true(
+      events!.some((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED)
+    );
+  });
+});
+
+test.serial('abortSignal that aborts during streamText ends the stream with an abort part', async (t) => {
+  const provider = new AbortRecordingProvider(true);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(abortableStreamWorkflow, {
+      workflowExecutionTimeout: '30 seconds',
+    });
+    await assertEventually(t, (tt) => {
+      tt.true(provider.started);
+    }, 10_000);
+    await handle.signal(abortRequest);
+    const types = await handle.result();
+    t.is(types.at(-1), 'abort');
+    t.false(types.includes('error'));
+    await assertEventually(t, (tt) => {
+      tt.true(provider.providerAborted);
+    }, 10_000);
+  });
+});
+
+test('A history where an abort during embedMany cancelled nothing still replays', async (t) => {
+  // Recorded before an abort cancelled the model Activity. The signal aborted while
+  // `invokeEmbeddingModel` ran, and the Activity then completed.
+  const histories = path.join(__dirname, '../../src/__tests__/histories');
+  const recorded = readFileSync(
+    path.join(histories, 'embed-abort-before-cancel-patch.json'),
+    'utf8'
+  );
+  await CoreWorker.runReplayHistory(
+    {
+      workflowBundle: t.context.workflowBundle,
+      plugins: [new AiSdkPlugin({ modelProvider: new AbortRecordingProvider(false) })],
+    },
+    historyFromJSON(JSON.parse(recorded))
+  );
+  t.pass();
+});
+
+test('A history with a model call next to a plain Activity still replays', async (t) => {
+  // Recorded before a model call accepted an `abortSignal`. Both first Activities
+  // completed before one Workflow Task, so the two branches resumed in the same task.
+  const histories = path.join(__dirname, '../../src/__tests__/histories');
+  const recorded = readFileSync(
+    path.join(histories, 'model-next-to-plain-activity.json'),
+    'utf8'
+  );
+  await CoreWorker.runReplayHistory(
+    {
+      workflowBundle: t.context.workflowBundle,
+      plugins: [new AiSdkPlugin({ modelProvider: new TestProvider(helloWorkflowGenerator()) })],
+    },
+    historyFromJSON(JSON.parse(recorded))
+  );
+  t.pass();
+});
+
+test.serial('An abort during embedMany cancels the Activity in a new execution', async (t) => {
+  const provider = new AbortRecordingProvider(true);
+  const { createWorker, startWorkflow } = helpers(t);
+  const worker = await createWorker({ plugins: [new AiSdkPlugin({ modelProvider: provider })] });
+
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(abortDuringEmbedWorkflow);
+    await assertEventually(t, (tt) => {
+      tt.true(provider.started);
+    }, 10_000);
+    await handle.signal(abortRequest);
+    t.is(await handle.result(), 'error:AbortError|true');
+    const { events } = await handle.fetchHistory();
+    t.true(
+      events!.some((e) => e.eventType === EventType.EVENT_TYPE_ACTIVITY_TASK_CANCEL_REQUESTED)
+    );
+  });
+});
+
+test('model Activities pass the Activity cancellation signal to the model', async (t) => {
+  const provider = new AbortRecordingProvider(false);
+  type Activity = (args: unknown) => Promise<unknown>;
+  const activities = createActivities(provider) as Record<string, Activity>;
+  const env = new MockActivityEnvironment();
+  const prompt: LanguageModelV4CallOptions['prompt'] = [
+    { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+  ];
+  // Histories recorded before the fix hold `abortSignal: {}` in the Activity input.
+  const options = { prompt, abortSignal: {} } as unknown as LanguageModelV4CallOptions;
+
+  await env.run(activities.invokeModel!, { modelId: 'm', options });
+  await env.run(activities.invokeEmbeddingModel!, { modelId: 'e', values: ['a'] });
+
+  t.is(provider.signals.length, 2);
+  for (const signal of provider.signals) t.is(signal, env.context.cancellationSignal);
+  env.cancel();
+  t.true(env.context.cancellationSignal.aborted);
 });

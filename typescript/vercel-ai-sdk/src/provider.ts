@@ -24,6 +24,45 @@ const DOWNLOAD_IN_ACTIVITY_PATCH = 'vercel-ai-sdk-download-urls-in-model-activit
 // out of the workflow bundle (es2023 lib has no DOM types).
 declare const ReadableStream: typeof import('node:stream/web').ReadableStream;
 
+function abortReason(signal: AbortSignal): unknown {
+  const reason: unknown = signal.reason;
+  if (reason instanceof Error || typeof reason !== 'object' || reason === null) return reason;
+  const { name, message } = reason as { name?: unknown; message?: unknown };
+  if (name !== 'AbortError' && name !== 'TimeoutError') return reason;
+  // The sandbox `AbortController` comes from the host realm, so its reason fails the
+  // `instanceof Error` check in the AI SDK's `isAbortError`. Rebuild it in this realm.
+  return Object.assign(new Error(String(message)), { name });
+}
+
+// An older Event History can hold a model call that ran to its end after its signal
+// aborted. Such a history replays only if the abort still sends no command.
+const ABORT_CANCELS_ACTIVITY_PATCH = 'vercel-ai-sdk-abort-signal-cancels-model-activity';
+
+// An `AbortSignal` can't cross the payload converter, so the caller's signal cancels the
+// Activity from the Workflow instead.
+//
+// Not an `async` function. A call that cancels nothing must resume the Workflow at the
+// same point as a direct Activity call, or its commands can change order on replay.
+function runAbortable<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+  if (signal === undefined || !workflow.patched(ABORT_CANCELS_ACTIVITY_PATCH)) return fn();
+  return cancelOnAbort(signal, fn);
+}
+
+async function cancelOnAbort<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
+  if (signal.aborted) throw abortReason(signal);
+  const scope = new workflow.CancellationScope();
+  const onAbort = (): void => scope.cancel();
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await scope.run(fn);
+  } catch (err) {
+    if (signal.aborted && workflow.isCancellation(err)) throw abortReason(signal);
+    throw err;
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
 /**
  * Options for configuring the TemporalProvider with per-model activity settings.
  */
@@ -104,10 +143,13 @@ export class TemporalLanguageModel implements LanguageModelV4 {
       ...this.options,
       heartbeatTimeout: this.options?.heartbeatTimeout ?? '10 seconds',
     });
-    const result = await activities.invokeModel!({
-      modelId: this.modelId,
-      options: encodeCallOptionsFileData(options),
-    });
+    const { abortSignal, ...callOptions } = options;
+    const result = await runAbortable(abortSignal, () =>
+      activities.invokeModel!({
+        modelId: this.modelId,
+        options: encodeCallOptionsFileData(callOptions),
+      })
+    );
     if (result === undefined) {
       throw ApplicationFailure.nonRetryable('Received undefined response from model activity.');
     }
@@ -135,12 +177,15 @@ export class TemporalLanguageModel implements LanguageModelV4 {
       ...this.options,
       heartbeatTimeout: this.options?.heartbeatTimeout ?? '10 seconds',
     });
-    const result = await activities.invokeModelStreaming!({
-      modelId: this.modelId,
-      options: encodeCallOptionsFileData(options),
-      streamingTopic: this.streamingTopic,
-      streamingBatchInterval: this.streamingBatchInterval,
-    });
+    const { abortSignal, ...callOptions } = options;
+    const result = await runAbortable(abortSignal, () =>
+      activities.invokeModelStreaming!({
+        modelId: this.modelId,
+        options: encodeCallOptionsFileData(callOptions),
+        streamingTopic: this.streamingTopic,
+        streamingBatchInterval: this.streamingBatchInterval,
+      })
+    );
     if (result === undefined) {
       throw ApplicationFailure.nonRetryable('Received undefined response from streaming model activity.');
     }
@@ -219,13 +264,14 @@ export class TemporalEmbeddingModel implements EmbeddingModelV4 {
       ...activityOptions,
       heartbeatTimeout: activityOptions.heartbeatTimeout ?? '10 seconds',
     });
-    const result = await activities.invokeEmbeddingModel!({
-      modelId: this.modelId,
-      values: options.values,
-      providerOptions: options.providerOptions,
-      headers: options.headers,
-      // Note: abortSignal is not serializable, Temporal's cancellation handles this
-    });
+    const result = await runAbortable(options.abortSignal, () =>
+      activities.invokeEmbeddingModel!({
+        modelId: this.modelId,
+        values: options.values,
+        providerOptions: options.providerOptions,
+        headers: options.headers,
+      })
+    );
     if (result === undefined) {
       throw ApplicationFailure.nonRetryable('Received undefined response from embedding model activity.');
     }
