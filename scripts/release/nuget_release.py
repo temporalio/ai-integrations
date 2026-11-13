@@ -38,6 +38,13 @@ class NuGetVersion(GoVersion):
         # match the flat container, and its successors would sort below the served one.
         if self.raw != self.raw.lower():
             raise NuGetReleaseError(f"NuGet version {self.raw!r} must be lowercase, e.g. 0.0.1-rc.1")
+        # Mixed identifiers such as rc1 compare as text (rc10 sorts before rc9); dotted numeric identifiers
+        # compare as numbers, so the label must be words and numbers separated by dots and end in a number.
+        prerelease = self._version.prerelease
+        if prerelease is not None:
+            identifiers = prerelease.split(".")
+            if not identifiers[-1].isdigit() or any(part.isdigit() == part.isalpha() for part in identifiers):
+                raise NuGetReleaseError(f"NuGet version {self.raw!r} must use a dotted pre-release label such as rc.1 or beta.2")
 
 
 def _get(url: str) -> bytes | None:

@@ -24,7 +24,7 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/release-dotn
 
 @pytest.mark.parametrize("version", [
     "0.0.1rc1", "01.0.0", "1.0.0+build", "1.0.0.0", "0.0.1-rc.01", "v0.0.1", "0.1", "0.1.0-", "0.1.0\n", " 0.1.0", "0.1.0 ",
-    "0.0.1-RC.1", "0.0.1-Rc.1", "0.0.1-rc.1+SHA",
+    "0.0.1-RC.1", "0.0.1-Rc.1", "0.0.1-rc.1+SHA", "0.0.1-rc1", "0.0.1-rc", "0.0.1-rc.1a", "0.0.1-beta1.2",
 ])
 def test_nuget_rejects_noncanonical_versions(version: str) -> None:
     with pytest.raises(nuget_release.NuGetReleaseError, match="NuGet version"):
@@ -39,6 +39,13 @@ def test_uppercase_labels_never_reach_nuget_org() -> None:
     with pytest.raises(nuget_release.NuGetReleaseError, match="must be lowercase"):
         nuget_release.NuGetVersion("0.0.1-RC.1")
     assert nuget_release.NuGetVersion("0.0.1-rc.1") in [nuget_release.NuGetVersion("0.0.1-rc.1")]
+
+
+def test_dotted_prerelease_labels_order_numerically() -> None:
+    versions = [nuget_release.NuGetVersion(raw) for raw in ("0.0.1-alpha.2", "0.0.1-beta.1", "0.0.1-rc.9", "0.0.1-rc.10", "0.0.1")]
+    assert sorted(reversed(versions)) == versions
+    assert release_tool.check_policy(versions[3], "pre-release", versions[:3]) is None
+    assert nuget_release.NuGetVersion("0.0.1-preview.1").is_prerelease
 
 
 def test_dotnet_tags_parse_with_the_prerelease_flag() -> None:

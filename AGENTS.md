@@ -366,8 +366,9 @@ committed development version `0.0.0`.
 `.github/workflows/release-dotnet.yml` handles every NuGet plugin. Published GitHub
 Releases trigger publication; tag pushes alone do not. Branch dispatches always run
 a dry run. NuGet versions are canonical SemVer without build metadata, such as
-`0.0.1` or `0.0.1-rc.1`; nuget.org normalises and lowercases versions, so dotted
-pre-release labels are the only form used. Registry ordering reads the V3 flat
+`0.0.1` or `0.0.1-rc.1`; nuget.org lowercases versions and compares undotted
+labels as text (`rc10` sorts before `rc9`), so `parse-tag` accepts only lowercase
+tags with dotted pre-release labels. Registry ordering reads the V3 flat
 container index, which includes unlisted versions; the newest exact version may be
 verified again. Keep the committed development version `0.0.0`.
 
