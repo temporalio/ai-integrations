@@ -140,6 +140,25 @@ public class FailureWorkflow
                     return (await agent.RunAsync(messages)).Text;
                 }
 
+            case "secret-additional-property":
+                {
+                    var agent = new TemporalAgent(input.Model, new TemporalAgentOptions
+                    {
+                        ChatOptions = new ChatOptions { AdditionalProperties = new() { ["Authorization"] = "Bearer secret" } },
+                    });
+                    return (await agent.RunAsync(input.Prompt)).Text;
+                }
+
+            case "secret-nested-header":
+                {
+                    var headers = new Dictionary<string, object?> { ["x-api-key"] = "secret" };
+                    var agent = new TemporalAgent(input.Model, new TemporalAgentOptions
+                    {
+                        ChatOptions = new ChatOptions { AdditionalProperties = new() { ["extra_headers"] = headers } },
+                    });
+                    return (await agent.RunAsync(input.Prompt)).Text;
+                }
+
             case "declaration-only":
                 {
                     var schema = JsonSerializer.Deserialize<JsonElement>("""{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}""");

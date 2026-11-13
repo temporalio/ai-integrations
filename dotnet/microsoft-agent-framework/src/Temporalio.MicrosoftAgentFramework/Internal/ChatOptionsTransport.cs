@@ -13,9 +13,12 @@ namespace Temporalio.MicrosoftAgentFramework.Internal;
 /// The HTTP headers of a <see cref="HostedMcpServerTool"/> never cross: a tool that carries them on
 /// the Workflow side fails the run, and the worker adds the headers registered under
 /// <see cref="MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders"/> when it rebuilds the tool.
+/// An <c>AdditionalProperties</c> entry named like a credential header fails the run the same way.
 /// </summary>
 internal static class ChatOptionsTransport
 {
+    private static readonly HashSet<string> SecretKeys = new(["authorization", "x-api-key", "api-key"], StringComparer.OrdinalIgnoreCase);
+
     /// <summary>
     /// Splits <paramref name="options"/> into the serializable options and the tool declarations.
     /// Runs on the Workflow side.
@@ -32,6 +35,7 @@ internal static class ChatOptionsTransport
         }
 
         var transport = options.Clone();
+        RejectSecrets(transport.AdditionalProperties, "ChatOptions.AdditionalProperties");
         if (transport.RawRepresentationFactory is not null)
         {
             logger.LogWarning("ChatOptions.RawRepresentationFactory is not serializable and is dropped before the model Activity. Configure the provider request in the chat client factory instead.");
@@ -63,6 +67,7 @@ internal static class ChatOptionsTransport
                             "The model Activity's input is recorded in Event History, so the plugin sends no hosted MCP server headers from the Workflow. " +
                             $"Register them on the worker under MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders[\"{mcp.ServerName}\"] and leave Headers unset here.");
                     case HostedWebSearchTool or HostedCodeInterpreterTool or HostedFileSearchTool or HostedMcpServerTool:
+                        RejectSecrets(tool.AdditionalProperties, $"{tool.GetType().Name}.AdditionalProperties");
                         (hosted ??= []).Add(ToDeclaration(tool));
                         break;
                     default:
@@ -117,6 +122,39 @@ internal static class ChatOptionsTransport
         }
 
         return options;
+    }
+
+    // Credentials belong in the worker factory: everything here is recorded in Event History with the
+    // model Activity's input. The check covers the top level and one nested headers dictionary, the
+    // two places a provider client reads such entries from.
+    private static void RejectSecrets(IEnumerable<KeyValuePair<string, object?>>? properties, string where)
+    {
+        if (properties is null)
+        {
+            return;
+        }
+
+        foreach (var (key, value) in properties)
+        {
+            if (SecretKeys.Contains(key))
+            {
+                throw new MicrosoftAgentFrameworkWorkflowException(
+                    $"{where} contains an entry named '{key}'. The model Activity's input is recorded in Event History, so a credential cannot travel in it; " +
+                    "set credentials in the chat client factory on the worker.");
+            }
+
+            switch (value)
+            {
+                case IEnumerable<KeyValuePair<string, object?>> nested:
+                    RejectSecrets(nested, $"{where}['{key}']");
+                    break;
+                case IEnumerable<KeyValuePair<string, string>> nestedStrings:
+                    RejectSecrets(nestedStrings.Select(pair => new KeyValuePair<string, object?>(pair.Key, pair.Value)), $"{where}['{key}']");
+                    break;
+                default:
+                    break;
+            }
+        }
     }
 
     private static object? FromJson(JsonElement element) => element.ValueKind switch
