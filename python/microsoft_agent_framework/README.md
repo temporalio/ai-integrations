@@ -1,6 +1,6 @@
 # Microsoft Agent Framework
 
-> Release stage: [Pre-release](https://docs.temporal.io/develop/python/integrations/microsoft-agent-framework).
+> Release stage: **Pre-release**.
 
 This Temporal [Plugin](https://docs.temporal.io/develop/plugins-guide) runs a [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) `Agent` inside a Temporal Workflow. Each model round trip runs as a Temporal Activity with its own timeout and retries. The agent's own function-invocation loop, tools, middleware, context providers and approvals run in the Workflow, where Temporal records every step and replays it after a crash or a worker restart. You keep writing the agent the way Agent Framework documents it; the one change is the chat client.
 
