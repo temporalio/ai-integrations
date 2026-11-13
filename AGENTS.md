@@ -71,6 +71,17 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
 - Run the framework's own code and hook in through its extension points. Don't copy its objects or depend on their private fields; copies drift from upstream.
 - A behavior change that can alter recorded histories must be gated with a patch, or called out as breaking in the PR with guidance for in-flight runs. This takes precedence over the rules above.
 
+## Plugin contract
+
+These rules apply to every plugin that runs model or tool calls in Activities.
+
+- Every value a plugin sends between Workflow and Activity must survive the configured payload converter. Test it with the real converter and with every non-JSON type the framework's call options and results allow: bytes, `URL`, dates, and abort or cancellation handles. Convert the value, keep it on one side, or refuse it with a clear error. TypeScript plugins check values with `findPayloadChange` from `src/__tests__/helpers/payload-round-trip.ts`, copied from `typescript/_template/`.
+- Model and tool Activities heartbeat on a timer when a heartbeat timeout is set, and pass the Activity's cancellation to the framework call when the call accepts it.
+- A provider error that the framework marks as final is a non-retryable failure. Other errors are left to the retry policy.
+- An Activity result holds no data that the Activity input already holds. The README names every call whose input or result can pass the payload size limit.
+- Every framework option that the plugin's adapter exposes is supported and tested, refused with a clear error when the run starts, or listed in the README as unsupported. A stub value, such as an empty map returned only to satisfy an interface, is not allowed.
+- Before you add a behavior that a sibling plugin already has, read the sibling and follow it, or say in the PR why this plugin differs.
+
 ## Python conventions
 
 - All Python plugins require Python 3.11+ and Temporal SDK 1.36.0+. CI tests Python 3.11 and 3.15.
