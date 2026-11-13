@@ -156,6 +156,25 @@ export function toolCallResponse(toolName: string, args: Record<string, unknown>
   return { output, usage: fakeUsage(20) };
 }
 
+/** A model that answers every request, streamed or not, with a call of `toolName`. */
+export function toolCallModelProvider(toolName: string, args: Record<string, unknown>): ModelProvider {
+  const response = toolCallResponse(toolName, args);
+  const model: Model = {
+    getResponse: async () => response,
+    async *getStreamedResponse() {
+      yield {
+        type: 'response_done',
+        response: {
+          id: `resp_fake_${toolName}`,
+          usage: { requests: 1, inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          output: response.output,
+        },
+      } as StreamEvent;
+    },
+  };
+  return { getModel: () => model };
+}
+
 export function handoffResponse(handoffToolName: string, args: Record<string, unknown> = {}): ModelResponse {
   return toolCallResponse(handoffToolName, args);
 }

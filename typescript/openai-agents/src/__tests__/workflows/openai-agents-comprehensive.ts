@@ -20,6 +20,7 @@ import {
   setHandler,
   workflowInfo,
 } from '@temporalio/workflow';
+import { WorkflowStream } from '@temporalio/workflow-streams/workflow';
 import {
   activityAsTool,
   nexusOperationAsTool,
@@ -507,7 +508,7 @@ export async function nonRetryableModelWorkflow(prompt: string): Promise<string>
  * `AgentsWorkflowError` (Python parity); the failure is NOT fed back to the
  * agent loop. Test 3 asserts the workflow fails with that classification.
  */
-export async function toolFailureWorkflow(prompt: string): Promise<string> {
+export async function toolFailureWorkflow(prompt: string, stream = false): Promise<string> {
   const failingDef = activityAsTool<typeof activities.failingTool>(
     {
       name: 'failingTool',
@@ -529,8 +530,33 @@ export async function toolFailureWorkflow(prompt: string): Promise<string> {
     tools: [failingDef],
   });
 
-  const runner = new TemporalOpenAIRunner();
-  const result = await runner.run(agent, prompt, { maxTurns: 3 });
+  new WorkflowStream();
+  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
+  if (!stream) return (await runner.run(agent, prompt, { maxTurns: 3 })).finalOutput ?? '';
+  const result = await runner.run(agent, prompt, { stream: true, maxTurns: 3 });
+  for await (const _event of result);
+  await result.completed;
+  return result.finalOutput ?? '';
+}
+
+/** An input guardrail awaits `failingTool` before the model is called, so the run fails with `AgentsWorkflowError`. */
+export async function guardrailFailureWorkflow(prompt: string): Promise<string> {
+  const agent = new Agent({
+    name: 'GuardedAgent',
+    instructions: 'Answer.',
+    model: 'gpt-4o-mini',
+    inputGuardrails: [
+      {
+        name: 'failingGuardrail',
+        runInParallel: false,
+        execute: async () => {
+          await acts.failingTool({ reason: 'guardrail' });
+          return { tripwireTriggered: false, outputInfo: null };
+        },
+      },
+    ],
+  });
+  const result = await new TemporalOpenAIRunner().run(agent, prompt);
   return result.finalOutput ?? '';
 }
 

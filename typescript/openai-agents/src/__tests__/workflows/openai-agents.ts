@@ -510,6 +510,23 @@ export async function nestedToolCancelWorkflow(input: {
   return result.finalOutput ?? '';
 }
 
+/** The agent calls `holdTool`, an Activity that runs until the test cancels the Workflow. */
+export async function activityToolCancelWorkflow(stream: boolean): Promise<string> {
+  new WorkflowStream();
+  const holdTool = activityAsTool<() => Promise<string>>({
+    name: 'holdTool',
+    description: 'Hold',
+    parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
+  });
+  const agent = new Agent({ name: 'Holder', model: 'gpt-4o-mini', tools: [holdTool] });
+  const runner = new TemporalOpenAIRunner({ defaultModelParams: { streamingTopic: 'events' } });
+  if (!stream) return (await runner.run(agent, 'go')).finalOutput ?? '';
+  const result = await runner.run(agent, 'go', { stream: true });
+  for await (const _event of result);
+  await result.completed;
+  return result.finalOutput ?? '';
+}
+
 /**
  * `Nested` is both a handoff target and an `asTool()` source of `Parent`, and pauses on an approval.
  * `legacyTool` stands in for the plugin's former `agentAsTool`, a function tool not linked to an agent.
