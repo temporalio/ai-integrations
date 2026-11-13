@@ -419,7 +419,14 @@ def _with_hosted_mcp_headers(
         value = spec.get(key)
         if isinstance(value, str) and value in hosted_mcp_headers:
             headers = hosted_mcp_headers[value]
-            tool["headers"] = dict(headers() if callable(headers) else headers)
+            resolved = dict(headers() if callable(headers) else headers)
+            if spec.get("connector_id"):
+                # An OpenAI connector takes its OAuth token in the tool's
+                # authorization field, not in a header.
+                for name in [n for n in resolved if n.lower() == "authorization"]:
+                    tool["authorization"] = resolved.pop(name)
+            if resolved:
+                tool["headers"] = resolved
             return tool
     return tool
 

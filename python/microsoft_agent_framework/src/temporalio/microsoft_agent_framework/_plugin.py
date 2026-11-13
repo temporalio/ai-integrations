@@ -87,8 +87,11 @@ class MicrosoftAgentFrameworkPlugin(SimplePlugin):
     ``hosted_mcp_headers`` keeps the headers of hosted MCP tools (the
     provider's ``get_mcp_tool(...)`` mappings) on the worker: a mapping from
     the server's label or URL to its headers, or to a callable returning them,
-    which the model Activity adds to the tool before the provider call. A
-    hosted MCP tool that carries ``headers`` or ``authorization`` in workflow
+    which the model Activity adds to the tool before the provider call. For
+    an OpenAI connector (a mapping with ``connector_id``) an entry named
+    ``authorization`` is applied to the tool's ``authorization`` field, where
+    the Responses API takes a connector's OAuth token, and the rest stay
+    headers. A hosted MCP tool that carries ``headers`` or ``authorization`` in workflow
     code fails the run with ``MicrosoftAgentFrameworkWorkflowError``, because
     the tool mapping is recorded in workflow history.
 

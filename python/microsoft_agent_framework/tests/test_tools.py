@@ -109,6 +109,12 @@ HOSTED_MCP = {
     "server_label": "github",
     "server_url": "https://mcp.example.com",
 }
+# An OpenAI connector: no URL, and the OAuth token goes in `authorization`.
+HOSTED_CONNECTOR = {
+    "type": "mcp",
+    "server_label": "drive",
+    "connector_id": "connector_googledrive",
+}
 
 
 @workflow.defn
@@ -166,6 +172,8 @@ class ToolsWorkflow:
             tools = [{"type": "web_search"}]
         elif input.scenario == "hosted_mcp":
             tools = [HOSTED_MCP]
+        elif input.scenario == "hosted_connector":
+            tools = [HOSTED_CONNECTOR]
         elif input.scenario == "hosted_mcp_secret":
             tools = [
                 {**HOSTED_MCP, "headers": {"Authorization": "Bearer workflow-secret"}}
@@ -796,3 +804,37 @@ def test_activity_as_tool_requires_timeout() -> None:
         activity_as_tool(fetch_user)
     # Either timeout satisfies it, as for workflow.execute_activity.
     activity_as_tool(fetch_user, schedule_to_close_timeout=timedelta(seconds=5))
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (
+            {"Authorization": "ya29.token", "X-Trace": "t1"},
+            {"authorization": "ya29.token", "headers": {"X-Trace": "t1"}},
+        ),
+        ({"authorization": "ya29.token"}, {"authorization": "ya29.token"}),
+    ],
+    ids=["with-headers", "token-only"],
+)
+async def test_hosted_mcp_authorization_for_connector(
+    client: Client, configured: dict[str, str], expected: dict[str, Any]
+) -> None:
+    factory = fake_chat_client(["Done."])
+    plugin = MicrosoftAgentFrameworkPlugin(
+        chat_clients={"model": factory}, hosted_mcp_headers={"drive": configured}
+    )
+    async with new_worker(client, ToolsWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            ToolsWorkflow.run,
+            ToolsInput("hosted_connector"),
+            id=workflow_id("hosted-connector"),
+            task_queue=worker.task_queue,
+        )
+        result = await handle.result()
+    assert result["text"] == "Done."
+    # For a connector the authorization entry lands in the tool's own
+    # authorization field, the other entries stay headers, and none of it
+    # reaches history.
+    assert factory().calls[0]["options"]["tools"] == [{**HOSTED_CONNECTOR, **expected}]
+    assert "ya29.token" not in (await handle.fetch_history()).to_json()
