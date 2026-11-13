@@ -185,7 +185,7 @@ def _client_factory(server: str, factory: Callable[[], Client]) -> Callable[[], 
                 factory, annotation_format=annotationlib.Format.STRING
             )
         else:
-            signature = inspect.signature(factory)
+            signature = inspect.signature(factory)  # type: ignore[reportUnreachable]
     except (TypeError, ValueError):
         signature = (
             None  # Some callables have no signature; the call reports a mismatch.
