@@ -82,9 +82,10 @@ def activity_as_tool(
 
     Raises:
         ValueError: If ``activity_fn`` is not an ``@activity.defn`` function or
-            method, or takes ``*args``, keyword-only arguments or ``**kwargs``,
-            which the tool cannot pass by position; or if neither
-            ``start_to_close_timeout`` nor ``schedule_to_close_timeout`` is set.
+            method, or takes ``*args`` or ``**kwargs``, which the tool cannot
+            pass by position (``@activity.defn`` itself rejects keyword-only
+            parameters); or if neither ``start_to_close_timeout`` nor
+            ``schedule_to_close_timeout`` is set.
     """
     if inspect.isclass(activity_fn) or not (
         inspect.isfunction(activity_fn) or inspect.ismethod(activity_fn)
@@ -107,13 +108,12 @@ def activity_as_tool(
     for param in params:
         if param.kind in (
             inspect.Parameter.VAR_POSITIONAL,
-            inspect.Parameter.KEYWORD_ONLY,
             inspect.Parameter.VAR_KEYWORD,
         ):
             raise ValueError(
-                f"Activity {activity_name!r} cannot take *args, keyword-only "
-                f"arguments or **kwargs ({param.name!r}): the tool passes one "
-                "argument per parameter, by position"
+                f"Activity {activity_name!r} cannot take *args or **kwargs "
+                f"({param.name!r}): the tool passes one argument per parameter, "
+                "by position"
             )
     # The model's arguments bind by name; the activity still gets them by position.
     call_signature = signature.replace(

@@ -424,6 +424,104 @@ def test_activity_as_tool_rejects_non_activities() -> None:
     with pytest.raises(ValueError, match=r"\*args"):
         activity_as_tool(variadic)
 
+    @activity.defn
+    async def keyworded(**_kwargs: int) -> int:
+        return 0
+
+    with pytest.raises(ValueError, match=r"\*\*kwargs"):
+        activity_as_tool(keyworded)
+
+
+@activity.defn
+async def current_time() -> str:
+    """Return the current time."""
+    return "2026-11-13T00:00:00Z"
+
+
+@activity.defn
+async def repeat(text: str, times: int = 3, /) -> str:
+    """Repeat the text."""
+    return text * times
+
+
+class LookupActivities:
+    def __init__(self, prefix: str) -> None:
+        self._prefix = prefix
+
+    @activity.defn
+    async def lookup(self, city: str, verbose: bool = False) -> str:
+        """Look a city up."""
+        return f"{self._prefix}:{city}:{verbose}"
+
+
+@workflow.defn
+class BindingWorkflow:
+    @workflow.run
+    async def run(self, scenario: str) -> dict[str, Any]:
+        timeout = timedelta(seconds=10)
+        if scenario == "zero_args":
+            tool = activity_as_tool(current_time, start_to_close_timeout=timeout)
+        elif scenario == "positional_only":
+            tool = activity_as_tool(repeat, start_to_close_timeout=timeout)
+        else:
+            tool = activity_as_tool(
+                LookupActivities.lookup, start_to_close_timeout=timeout
+            )
+        agent = Agent(client=TemporalChatClient("model"), tools=[tool])
+        response = await agent.run("go")
+        return {"text": response.text, "contents": contents_summary(response)}
+
+
+@pytest.mark.parametrize(
+    ("scenario", "call", "activity_name", "result"),
+    [
+        (
+            "zero_args",
+            function_call_response("current_time", {}, call_id="call-1"),
+            "current_time",
+            "2026-11-13T00:00:00Z",
+        ),
+        (
+            "positional_only",
+            function_call_response("repeat", {"text": "ab"}, call_id="call-1"),
+            "repeat",
+            "ababab",
+        ),
+        (
+            "method",
+            function_call_response("lookup", {"city": "Oslo"}, call_id="call-1"),
+            "lookup",
+            "db:Oslo:False",
+        ),
+    ],
+)
+async def test_activity_as_tool_bindings(
+    client: Client, scenario: str, call: Any, activity_name: str, result: str
+) -> None:
+    # No arguments, a positional-only signature with a default the model
+    # left out, and a method registered on the worker as a bound method.
+    factory = fake_chat_client([call, text_response("Done.")])
+    plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"model": factory})
+    async with new_worker(
+        client,
+        BindingWorkflow,
+        plugin=plugin,
+        activities=[current_time, repeat, LookupActivities("db").lookup],
+    ) as worker:
+        handle = await client.start_workflow(
+            BindingWorkflow.run,
+            scenario,
+            id=workflow_id(f"binding-{scenario}"),
+            task_queue=worker.task_queue,
+        )
+        outcome = await handle.result()
+    assert outcome["text"] == "Done."
+    assert outcome["contents"][1] == f"result:{result}"
+    assert await count_scheduled_activities(handle) == {
+        INVOKE_MODEL: 2,
+        activity_name: 1,
+    }
+
 
 def test_activity_as_tool_method_drops_self() -> None:
     class Activities:
