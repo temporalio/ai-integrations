@@ -124,6 +124,20 @@ public class FailureTests : WorkflowTestBase
     }
 
     [Fact]
+    public async Task StatusProperty_OnAnyProviderException_IsClassified()
+    {
+        var fake = new FakeChatClient(_ => throw new FakeRequestFailedException(401, "Unauthorized"));
+        var input = new FailureInput("model", MaxAttempts: 3);
+        var (error, handle) = await RunFailingAsync(TestPlugin.For(fake), (FailureWorkflow wf) => wf.RunAsync(input));
+        var failure = AppFailure(error);
+        Assert.NotNull(failure);
+        Assert.Equal(MicrosoftAgentFrameworkErrorTypes.ModelError, failure.ErrorType);
+        Assert.True(failure.NonRetryable);
+        Assert.Contains("HTTP 401", failure.Message, StringComparison.Ordinal);
+        Assert.Equal(1, HistoryAssert.LastAttempt(await handle.FetchHistoryAsync(), ModelActivityNames.InvokeModel));
+    }
+
+    [Fact]
     public async Task ConsecutiveToolErrors_ResetAfterASuccess()
     {
         var bad = ("get_weather", (IDictionary<string, object?>)new Dictionary<string, object?> { ["city"] = "bad" });

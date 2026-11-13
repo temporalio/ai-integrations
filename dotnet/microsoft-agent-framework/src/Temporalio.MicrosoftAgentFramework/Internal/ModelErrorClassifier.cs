@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Reflection;
 using Temporalio.Exceptions;
 
@@ -18,6 +19,8 @@ internal static class ModelErrorClassifier
 {
     /// <summary>Longest delay a provider header can ask for; the OpenAI SDK ignores longer ones.</summary>
     public static readonly TimeSpan MaxRetryAfter = TimeSpan.FromSeconds(60);
+
+    private static readonly string[] StatusPropertyNames = ["Status", "StatusCode", "HttpStatusCode"];
 
     /// <summary>
     /// Classifies <paramref name="exception"/>.
@@ -78,19 +81,33 @@ internal static class ModelErrorClassifier
 
     private static bool TryGetHttpStatus(Exception exception, out int status)
     {
-        status = exception is HttpRequestException { StatusCode: { } httpStatus } ? (int)httpStatus : ClientModelStatus(exception);
+        status = exception is HttpRequestException { StatusCode: { } httpStatus } ? (int)httpStatus : StatusProperty(exception);
         return status is >= 400 and < 600;
     }
 
-    // System.ClientModel.ClientResultException is the OpenAI and Azure OpenAI error type. It is
-    // read by reflection so the plugin does not depend on the OpenAI package. Status is 0 when the
-    // exception carries no response (a transport failure); that is not a status.
-    private static int ClientModelStatus(Exception exception) =>
-        exception.GetType().FullName == "System.ClientModel.ClientResultException" &&
-        exception.GetType().GetProperty("Status") is { PropertyType.FullName: "System.Int32" } statusProperty &&
-        statusProperty.GetValue(exception) is int clientModelStatus
-            ? clientModelStatus
-            : 0;
+    // The provider SDKs' exception types carry the HTTP status as an int or HttpStatusCode property:
+    // System.ClientModel.ClientResultException (OpenAI, Azure OpenAI) and Azure.RequestFailedException
+    // (Azure AI Inference) expose Status, others StatusCode. Read by reflection, so the plugin depends
+    // on no provider package. A value of 0 means the exception carries no response; that is not a status.
+    private static int StatusProperty(Exception exception)
+    {
+        foreach (var name in StatusPropertyNames)
+        {
+            var property = exception.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(candidate => candidate.Name == name && candidate.GetIndexParameters().Length == 0);
+            switch (property?.GetValue(exception))
+            {
+                case int value:
+                    return value;
+                case HttpStatusCode code:
+                    return (int)code;
+                default:
+                    continue;
+            }
+        }
+
+        return 0;
+    }
 
     private static TimeSpan? RetryAfter(ResponseHeaders headers)
     {
