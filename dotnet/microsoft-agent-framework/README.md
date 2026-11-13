@@ -433,7 +433,7 @@ Two things follow for you. Call `RunAsync`, `RunAsync<T>` and `RunStreamingAsync
 - Service-managed conversations (`ConversationId`) are not used; the Workflow holds the history.
 - `AIAgent` generates a random id on construction. `TemporalAgent` never reads it: `Id` is `TemporalAgentOptions.Id`, then `Name`, then `temporal-agent`, so `AgentResponse.AgentId` is the same on every replay.
 - The plugin calls Agent Framework members marked experimental (`MAAI001`): the `ChatHistoryProvider.InvokingContext`, `ChatHistoryProvider.InvokedContext`, `AIContextProvider.InvokingContext` and `AIContextProvider.InvokedContext` constructors. The dependency floor is `Microsoft.Agents.AI` 1.26.0; a release that changes them shows up in this repository's nightly build.
-- The whole conversation is the input of every model Activity. Long transcripts cost history size on every call; summarize or continue-as-new before Temporal's payload limits are near.
+- The whole conversation is the input of every model Activity, so a long transcript grows both the per-call payload and the Event History. Continue-as-new bounds the History; only a shorter transcript (a trimmed session, or a summary your code produces) bounds the payload, which Temporal caps at 2 MiB.
 - Values in `AdditionalProperties` cross the Activity boundary as JSON. The plugin turns JSON primitives in `ChatOptions.AdditionalProperties` back into `bool`, `long`, `double` and `string` before the provider client sees them; nested objects there, and the `AdditionalProperties` of messages and responses, arrive as `JsonElement`.
 - Only the `AIContent` types Microsoft.Extensions.AI declares serialize. A custom `AIContent` subclass in a message or a provider response fails serialization at the Activity boundary.
 
