@@ -114,7 +114,7 @@ new TemporalAgent({
 });
 ```
 
-Passing `retryStrategy` to `new TemporalAgent(...)` throws; remove the argument and put the retry config on the activity options instead.
+Omit `retryStrategy` or pass `retryStrategy: null` to `new TemporalAgent(...)`. Any non-null strategy throws; put the retry config on the activity options instead.
 
 The plugin turns Strands' terminal errors (`ContextWindowOverflowError`, `MaxTokensError` and `StructuredOutputError`) into non-retryable `ApplicationFailure`s whose `type` is the error's name:
 
