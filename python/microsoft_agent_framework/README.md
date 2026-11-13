@@ -45,7 +45,7 @@ async def main() -> None:
     client = await Client.connect("localhost:7233")
     worker = Worker(
         client,
-        task_queue="agent-framework",
+        task_queue="microsoft-agent-framework",
         workflows=[HelloWorkflow],
         plugins=[
             MicrosoftAgentFrameworkPlugin(
@@ -79,8 +79,8 @@ async def main() -> None:
     result = await client.execute_workflow(
         HelloWorkflow.run,
         "Hello",
-        id="agent-framework-quickstart",
-        task_queue="agent-framework",
+        id="microsoft-agent-framework-quickstart",
+        task_queue="microsoft-agent-framework",
     )
     print(result)
 
@@ -186,7 +186,7 @@ class ToolsWorkflow:
 async def run_worker(client: Client) -> None:
     worker = Worker(
         client,
-        task_queue="agent-framework",
+        task_queue="microsoft-agent-framework",
         workflows=[ToolsWorkflow],
         activities=[fetch_user],
         plugins=[plugin],
@@ -455,7 +455,7 @@ async def start_worker() -> None:
     client = await Client.connect("localhost:7233", plugins=[OpenTelemetryPlugin()])
     worker = Worker(
         client,
-        task_queue="agent-framework",
+        task_queue="microsoft-agent-framework",
         workflows=[HelloWorkflow],
         plugins=[MicrosoftAgentFrameworkPlugin(chat_clients=CHAT_CLIENTS)],
     )
