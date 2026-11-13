@@ -15,7 +15,8 @@ CONFIGURATION ?= Release
 RELEASE_VERSION ?= 0.0.0
 TEST_ARGS ?=
 # Package entry timestamps come from the commit under test, not from checkout mtimes, so a
-# rebuild of the same commit on the same SDK feature band is byte-identical.
+# rebuild of the same commit on the same SDK version is byte-identical (a servicing patch
+# ships a new compiler and changes the assembly).
 DETERMINISTIC_TIMESTAMP ?= $(shell git log -1 --pretty=%ct 2>/dev/null)
 # Normalised source paths are needed for reproducible packages but break local debugging.
 CI_BUILD ?= $(if $(GITHUB_ACTIONS),true,false)

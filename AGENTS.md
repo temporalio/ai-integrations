@@ -190,7 +190,8 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   file), `README.md` (`PackageReadmeFile`; absolute links only, nuget.org renders it), `icon.png`
   from `dotnet/_shared/`, XML docs, Source Link metadata and a `.snupkg`.
   `ContinuousIntegrationBuild=true` is set on CI only; `DeterministicTimestamp` is the commit time, so
-  one commit packs to identical bytes on one SDK feature band.
+  one commit packs to identical bytes on one SDK version (a servicing patch ships a new compiler and
+  changes assembly and PDB bytes; `recover-run` covers that case).
 - Tests use xunit.net v3 under Microsoft.Testing.Platform (`global.json` `test.runner`,
   `UseMicrosoftTestingPlatformRunner`), with `Microsoft.Testing.Extensions.TrxReport` for reports.
   VSTest packages (`Microsoft.NET.Test.Sdk`, `xunit.runner.visualstudio`, xunit 2) are not allowed;
