@@ -24,6 +24,9 @@ STREAM_ERROR_TYPE = "microsoft_agent_framework.StreamError"
 """``ApplicationError.type`` of a streaming call whose updates did not all reach the topic."""
 UNKNOWN_CHAT_CLIENT_TYPE = "MicrosoftAgentFrameworkUnknownChatClient"
 """``ApplicationError.type`` of a call for a model name the worker does not know."""
+CHAT_CLIENT_FACTORY_ERROR_TYPE = "MicrosoftAgentFrameworkChatClientFactoryError"
+"""``ApplicationError.type`` of a call whose chat client factory raised."""
+"""``ApplicationError.type`` of a call for a model name the worker does not know."""
 
 ChatClientFactory = Callable[[], SupportsChatGetResponse[Any]]
 
@@ -237,7 +240,21 @@ class ChatClientActivities:
                 type=UNKNOWN_CHAT_CLIENT_TYPE,
                 non_retryable=True,
             )
-        client = factory()
+        try:
+            client = factory()
+        except Exception as err:
+            # A factory that cannot build its client (a missing API key, a bad
+            # endpoint) fails the same way on every attempt; fail the run now
+            # instead of retrying until someone fixes the worker.
+            activity.logger.error(
+                "Chat client factory for %r raised %s", model, type(err).__name__
+            )
+            raise ApplicationError(
+                f"The chat client factory for {model!r} raised "
+                f"{type(err).__name__}: {err}",
+                type=CHAT_CLIENT_FACTORY_ERROR_TYPE,
+                non_retryable=True,
+            ) from err
         self._clients[model] = client
         retries = _max_retries(client)
         if retries > 0:

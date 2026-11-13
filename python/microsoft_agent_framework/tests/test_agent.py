@@ -259,6 +259,35 @@ async def test_unknown_model_name(client: Client) -> None:
     assert started.attempt == 1
 
 
+async def test_chat_client_factory_failure(client: Client) -> None:
+    def broken_factory() -> FakeChatClient:
+        raise KeyError("OPENAI_API_KEY")
+
+    plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"model": broken_factory})
+    async with new_worker(client, ToolLoopWorkflow, plugin=plugin) as worker:
+        handle = await client.start_workflow(
+            ToolLoopWorkflow.run,
+            RunInput(),
+            id=workflow_id("factory-error"),
+            task_queue=worker.task_queue,
+        )
+        with pytest.raises(WorkflowFailureError) as excinfo:
+            await handle.result()
+    cause = excinfo.value.cause
+    assert isinstance(cause, ActivityError)
+    failure = cause.__cause__
+    assert isinstance(failure, ApplicationError)
+    # A factory that raises fails the run at once; retrying could not build it.
+    assert failure.type == "MicrosoftAgentFrameworkChatClientFactoryError"
+    assert failure.non_retryable
+    assert "'model'" in failure.message
+    assert "KeyError" in failure.message and "OPENAI_API_KEY" in failure.message
+    assert isinstance(failure.__cause__, ApplicationError)
+    assert failure.__cause__.type == "KeyError"
+    (started,) = await started_activities(handle)
+    assert started.attempt == 1
+
+
 async def test_response_format(client: Client) -> None:
     factory = fake_chat_client(['{"name": "Ada", "age": 36}'])
     plugin = MicrosoftAgentFrameworkPlugin(chat_clients={"model": factory})

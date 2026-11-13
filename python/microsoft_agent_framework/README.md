@@ -123,7 +123,7 @@ CHAT_CLIENTS = {
 plugin = MicrosoftAgentFrameworkPlugin(chat_clients=CHAT_CLIENTS)
 ```
 
-A name the worker does not know fails the Activity with a non-retryable `ApplicationError` of type `MicrosoftAgentFrameworkUnknownChatClient`, so the workflow fails instead of waiting. During a rolling deployment, add the name to every worker on the task queue before workflows start using it.
+A name the worker does not know fails the Activity with a non-retryable `ApplicationError` of type `MicrosoftAgentFrameworkUnknownChatClient`, so the workflow fails instead of waiting. A factory that raises (for example `OpenAIChatClient` without `OPENAI_API_KEY` on the worker) fails the Activity the same way, with type `MicrosoftAgentFrameworkChatClientFactoryError` and a message naming the model and the cause; fix the worker and start the workflow again. During a rolling deployment, add the name to every worker on the task queue before workflows start using it.
 
 `TemporalChatClient("gpt-4o").as_agent(instructions=..., tools=...)` is the short form of `Agent(client=TemporalChatClient("gpt-4o"), ...)`. Calling a `TemporalChatClient` outside a workflow raises `RuntimeError`; use the provider's client there.
 
