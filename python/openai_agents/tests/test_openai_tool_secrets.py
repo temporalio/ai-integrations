@@ -672,6 +672,61 @@ class _ListedMessage(ResponseOutputMessage):
         return _first(value)
 
 
+class _InPlaceA(pydantic.BaseModel):
+    kind: Literal["a"]
+    record: ModelResponse
+
+    @pydantic.field_serializer("kind")
+    def _upper(self, kind: str) -> str:
+        return kind.upper()
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _lower(cls, value: Any) -> Any:
+        # Lowers the tag it sent in upper case, in the mapping it reads.
+        if isinstance(value, dict):
+            value["kind"] = value["kind"].lower()
+        return value
+
+
+class _LooseA(pydantic.BaseModel):
+    kind: Literal["a"]
+    record: dict[str, Any]
+
+
+class _InPlaceResult(pydantic.BaseModel):
+    item: _InPlaceA | _LooseA
+
+
+class _InPlaceHolder(pydantic.BaseModel):
+    held: _InPlaceA | _LooseA
+
+
+class _InPlaceHolderResult(pydantic.BaseModel):
+    item: _InPlaceHolder | int
+
+
+class _DeferredResult(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(defer_build=True)
+    record: ModelResponse
+
+
+class _FieldTaggedMessage(ResponseOutputMessage):
+    @pydantic.model_serializer(mode="wrap")
+    def _upper_type(self, handler: Any) -> Any:
+        return {**handler(self), "type": "MESSAGE"}
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _lower(cls, value: Any, info: pydantic.ValidationInfo) -> Any:
+        # Lowers its type only as the envelope's item.
+        return _lower_type(value) if info.field_name == "item" else value
+
+
+class _FieldTaggedEnvelope(pydantic.BaseModel):
+    item: _FieldTaggedMessage | int
+
+
 def _extra_side() -> _ExtraSide:
     side = _ExtraSide(name="n")
     cast(Any, side).sentinel = "keep-me"
@@ -1103,6 +1158,72 @@ def _is_response(value: Any) -> bool:
             [0, "content", 0, "annotations"],
             lambda got: isinstance(got, _ListedMessage) and _is_message(got),
         ),
+        (
+            _ListedMessage.model_validate(_message().model_dump()),
+            _ListedMessage | None,
+            [0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _ListedMessage) and _is_message(got),
+        ),
+        (
+            _ListedMessage.model_validate(_message().model_dump()),
+            _ListedMessage | int,
+            [0, "content", 0, "annotations"],
+            lambda got: isinstance(got, _ListedMessage) and _is_message(got),
+        ),
+        (
+            _ListedMessage.model_validate(_message().model_dump()),
+            _ListedMessage,
+            [0, "content", 0, "annotations"],
+            _is_message,
+        ),
+        (
+            _JsonTaggedMessage.model_validate(_message().model_dump()),
+            _JsonTaggedMessage | None,
+            ["content", 0, "annotations"],
+            lambda got: (
+                isinstance(got, _JsonTaggedMessage)
+                and got.type == "message"
+                and _is_message(got)
+            ),
+        ),
+        (
+            _InPlaceResult(item=_InPlaceA(kind="a", record=_response())),
+            _InPlaceResult,
+            ["item", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _InPlaceA) and _is_response(got.item.record)
+            ),
+        ),
+        (
+            _InPlaceHolderResult(
+                item=_InPlaceHolder(held=_InPlaceA(kind="a", record=_response()))
+            ),
+            _InPlaceHolderResult,
+            ["item", "held", "record", "output", 0, "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _InPlaceHolder)
+                and isinstance(got.item.held, _InPlaceA)
+                and _is_response(got.item.held.record)
+            ),
+        ),
+        (
+            _DeferredResult(record=_response()),
+            _DeferredResult,
+            ["record", "output", 0, "content", 0, "annotations"],
+            lambda got: _is_response(got.record),
+        ),
+        (
+            _FieldTaggedEnvelope(
+                item=_FieldTaggedMessage.model_validate(_message().model_dump())
+            ),
+            _FieldTaggedEnvelope,
+            ["item", "content", 0, "annotations"],
+            lambda got: (
+                isinstance(got.item, _FieldTaggedMessage)
+                and got.item.type == "message"
+                and _is_message(got.item)
+            ),
+        ),
     ],
     ids=[
         "extra",
@@ -1155,6 +1276,14 @@ def _is_response(value: Any) -> bool:
         "declared-union-with-sequence-root-model",
         "declared-union-with-deque-root-model",
         "declared-openai-variant-restoring-a-list",
+        "declared-optional-openai-model-restoring-a-list",
+        "declared-openai-model-or-scalar-restoring-a-list",
+        "declared-openai-model-restoring-a-list",
+        "declared-optional-openai-model-normalizing-its-json-tag",
+        "union-variant-changing-its-tag-in-place",
+        "nested-union-variant-changing-its-tag-in-place",
+        "deferred-model",
+        "openai-variant-normalizing-its-tag-by-field",
     ],
 )
 def test_lenient_caller_model_shapes(
