@@ -43,6 +43,7 @@ with workflow.unsafe.imports_passed_through():
 INVOKE_TOOL = "deepagents.invoke_tool"
 # Dedicated queue for tool activities, so tests can prove task-queue routing.
 TOOL_TASK_QUEUE = "da-tool-queue"
+TEN_SECONDS = ActivityConfig(start_to_close_timeout=timedelta(seconds=10))
 
 # Resolve framework symbols through the imported module to avoid confusing
 # the top-level package with this same-named test directory.
@@ -166,8 +167,10 @@ class ActivityAsToolWorkflow:
         for activity_ref, args in calls:
             tool = activity_as_tool(
                 activity_ref,
-                start_to_close_timeout=timedelta(seconds=10),
-                retry_policy=RetryPolicy(maximum_attempts=1),
+                activity_options=ActivityConfig(
+                    start_to_close_timeout=timedelta(seconds=10),
+                    retry_policy=RetryPolicy(maximum_attempts=1),
+                ),
             )
             results.append(await tool.ainvoke(args))
         return results
@@ -177,12 +180,8 @@ class ActivityAsToolWorkflow:
 class ActivityParametersAsToolWorkflow:
     @workflow.run
     async def run(self) -> list[str]:
-        forecast = activity_as_tool(
-            forecast_activity, start_to_close_timeout=timedelta(seconds=10)
-        )
-        quota = activity_as_tool(
-            quota_activity, start_to_close_timeout=timedelta(seconds=10)
-        )
+        forecast = activity_as_tool(forecast_activity, activity_options=TEN_SECONDS)
+        quota = activity_as_tool(quota_activity, activity_options=TEN_SECONDS)
         return [
             await forecast.ainvoke({"city": "Paris", "days": 3}),
             await forecast.ainvoke({"city": "Oslo", "days": 1, "units": "F"}),
@@ -239,12 +238,8 @@ async def test_activity_as_tool(env: WorkflowEnvironment) -> None:
         "echo_method": 1,
         "EchoClass": 1,
     }, counts
-    # Without activity_options the scheduled attributes keep exactly the shape
-    # this helper always produced — the workflow's own task queue, a zero
-    # heartbeat timeout, the required start-to-close (retry_policy is forwarded
-    # verbatim, None included, so it records the SDK default as before) — so
-    # call sites that predate the argument record (and replay, below)
-    # unchanged.
+    # The tool's own task queue, no heartbeat timeout, the configured
+    # start-to-close and the default "tool:<name>" summary.
     attrs = await scheduled_activity_attrs(handle, "echo_activity")
     assert attrs is not None
     assert attrs.task_queue.name == "da-act-tool"
@@ -255,36 +250,46 @@ async def test_activity_as_tool(env: WorkflowEnvironment) -> None:
     ).replay_workflow(await handle.fetch_history())
 
 
-def test_activity_as_tool_accepts_activity_options() -> None:
-    """The helper takes activity_options for the tool seam's other options.
-    Constructed outside a workflow so that, on code without the argument, the
-    failure is the TypeError itself rather than a failing workflow task; the
-    end-to-end scheduling is covered below.
-    """
+@pytest.mark.parametrize("option", ["arg", "args"])
+def test_activity_as_tool_rejects_reserved_activity_options(option: str) -> None:
+    """arg and args are built from the model's tool call, so the caller can't set them."""
+    options: Any = {"start_to_close_timeout": timedelta(seconds=10), option: "x"}
+    with pytest.raises(ValueError, match=option):
+        activity_as_tool(echo_activity, activity_options=options)
+
+
+def test_activity_as_tool_requires_a_timeout() -> None:
+    """Temporal needs a start-to-close or schedule-to-close timeout; fail at construction."""
+    with pytest.raises(ValueError, match="schedule_to_close_timeout"):
+        activity_as_tool(echo_activity)
+    with pytest.raises(ValueError, match="schedule_to_close_timeout"):
+        activity_as_tool(echo_activity, activity_options=ActivityConfig(task_queue="q"))
+    # schedule_to_close_timeout alone is enough.
     tool = activity_as_tool(
         echo_activity,
-        start_to_close_timeout=timedelta(seconds=10),
-        activity_options={"task_queue": TOOL_TASK_QUEUE},
+        activity_options=ActivityConfig(
+            schedule_to_close_timeout=timedelta(seconds=30)
+        ),
     )
     assert tool.name == "echo_activity"
 
 
-@pytest.mark.parametrize(
-    "option",
-    ["start_to_close_timeout", "retry_policy", "summary", "activity_id", "arg", "args"],
-)
-def test_activity_as_tool_rejects_owned_activity_options(option: str) -> None:
-    """Options the helper owns are rejected at construction: silently dropping
-    a caller's start_to_close_timeout / retry_policy / summary hides the
-    mistake in history, arg/args would collide with the arguments built from
-    the model's call, and one static activity_id cannot serve every invocation
-    of the tool.
-    """
-    with pytest.raises(ValueError, match=option):
+def test_activity_as_tool_deprecated_arguments() -> None:
+    """The former dedicated arguments still work, with a DeprecationWarning,
+    and can't also be set in activity_options."""
+    with pytest.warns(DeprecationWarning, match="start_to_close_timeout"):
+        tool = activity_as_tool(
+            echo_activity,
+            start_to_close_timeout=timedelta(seconds=10),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+            summary="echo",
+        )
+    assert tool.name == "echo_activity"
+    with pytest.raises(ValueError, match="start_to_close_timeout"):
         activity_as_tool(
             echo_activity,
             start_to_close_timeout=timedelta(seconds=10),
-            activity_options={option: "reserved"},
+            activity_options=TEN_SECONDS,
         )
 
 
@@ -293,21 +298,24 @@ class ActivityAsToolOptionsWorkflow:
     @workflow.run
     async def run(self, text: str) -> list[str]:
         options = ActivityConfig(
+            start_to_close_timeout=timedelta(seconds=10),
             heartbeat_timeout=timedelta(seconds=3),
             task_queue=TOOL_TASK_QUEUE,
+            summary="weather lookup",
         )
         tool = activity_as_tool(
             echo_activity,
-            start_to_close_timeout=timedelta(seconds=10),
-            activity_options=options,
+            activity_options=ActivityConfig(
+                start_to_close_timeout=timedelta(seconds=10),
+                heartbeat_timeout=timedelta(seconds=3),
+                task_queue=TOOL_TASK_QUEUE,
+                summary="echo",
+                activity_id="echo-call",
+            ),
         )
         # A multi-parameter activity with a defaulted parameter: the options
         # compose with the per-parameter argument mapping.
-        forecast = activity_as_tool(
-            forecast_activity,
-            start_to_close_timeout=timedelta(seconds=10),
-            activity_options=options,
-        )
+        forecast = activity_as_tool(forecast_activity, activity_options=options)
         return [
             await tool.ainvoke({"text": text}),
             await forecast.ainvoke({"city": "Paris", "days": 3}),
@@ -316,14 +324,10 @@ class ActivityAsToolOptionsWorkflow:
 
 @pytest.mark.asyncio
 async def test_activity_as_tool_activity_options(env: WorkflowEnvironment) -> None:
-    """activity_options carries the full ActivityConfig, not just the timeout:
-    the tool activity lands on the routed task queue with the heartbeat timeout
-    recorded, alongside the explicit start_to_close_timeout. Without it a
-    heartbeating activity tool cannot be routed off the workflow's task queue,
-    and a lost worker is only noticed at start-to-close. Only the workflow's
-    own worker runs the plugin here — the routed activity worker is
-    plugin-free, so the scheduling must work without any plugin-side
-    cooperation.
+    """activity_options carries the full ActivityConfig: the tool activity
+    lands on the routed task queue with the heartbeat timeout, start-to-close,
+    summary and the caller's activity_id. The routed activity worker has no
+    plugin, so the scheduling needs no plugin-side cooperation.
     """
     plugin = DeepAgentsPlugin()
     async with (
@@ -353,10 +357,66 @@ async def test_activity_as_tool_activity_options(env: WorkflowEnvironment) -> No
         assert attrs is not None, name
         assert attrs.task_queue.name == TOOL_TASK_QUEUE
         assert attrs.heartbeat_timeout.ToTimedelta() == timedelta(seconds=3)
-        # Explicit argument and activity_options compose.
         assert attrs.start_to_close_timeout.ToTimedelta() == timedelta(seconds=10)
+    echo_attrs = await scheduled_activity_attrs(handle, "echo_activity")
+    assert echo_attrs is not None
+    assert echo_attrs.activity_id == "echo-call"
     await Replayer(
         workflows=[ActivityAsToolOptionsWorkflow], plugins=[DeepAgentsPlugin()]
+    ).replay_workflow(await handle.fetch_history())
+
+
+@workflow.defn(name="ActivityAsToolMigration")
+class ActivityAsToolLegacyArgumentsWorkflow:
+    @workflow.run
+    async def run(self, text: str) -> str:
+        tool = activity_as_tool(
+            echo_activity,
+            start_to_close_timeout=timedelta(seconds=10),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        return await tool.ainvoke({"text": text})
+
+
+@workflow.defn(name="ActivityAsToolMigration")
+class ActivityAsToolMigratedWorkflow:
+    @workflow.run
+    async def run(self, text: str) -> str:
+        tool = activity_as_tool(
+            echo_activity,
+            activity_options=ActivityConfig(
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=RetryPolicy(maximum_attempts=2),
+            ),
+        )
+        return await tool.ainvoke({"text": text})
+
+
+@pytest.mark.asyncio
+async def test_activity_as_tool_migration_replays(env: WorkflowEnvironment) -> None:
+    """A workflow recorded with the deprecated arguments replays after its
+    call site moves the same settings into activity_options, so in-flight
+    workflows can be migrated without a patch."""
+    async with Worker(
+        env.client,
+        task_queue="da-act-tool-migrate",
+        workflows=[ActivityAsToolLegacyArgumentsWorkflow],
+        activities=[echo_activity],
+        plugins=[DeepAgentsPlugin()],
+    ):
+        handle = await env.client.start_workflow(
+            "ActivityAsToolMigration",
+            "hi",
+            id=f"da-act-tool-migrate-{uuid.uuid4()}",
+            task_queue="da-act-tool-migrate",
+        )
+        assert await handle.result() == "echo:hi"
+
+    legacy = await scheduled_activity_attrs(handle, "echo_activity")
+    assert legacy is not None
+    assert legacy.retry_policy.maximum_attempts == 2
+    await Replayer(
+        workflows=[ActivityAsToolMigratedWorkflow], plugins=[DeepAgentsPlugin()]
     ).replay_workflow(await handle.fetch_history())
 
 
@@ -463,7 +523,7 @@ def test_activity_as_tool_schema(
     activity_ref: Any, args: dict[str, str | None], description: str
 ) -> None:
     # `args` maps each parameter the model is offered to its description.
-    tool = activity_as_tool(activity_ref, start_to_close_timeout=timedelta(seconds=10))
+    tool = activity_as_tool(activity_ref, activity_options=TEN_SECONDS)
     assert {name: arg.get("description") for name, arg in tool.args.items()} == args
     assert tool.description == description
 
@@ -509,7 +569,7 @@ class BadAnnotationActivity(EchoClass):
 )
 def test_activity_as_tool_rejects(activity_ref: Any, message: str) -> None:
     with pytest.raises(ValueError, match=message):
-        activity_as_tool(activity_ref, start_to_close_timeout=timedelta(seconds=10))
+        activity_as_tool(activity_ref, activity_options=TEN_SECONDS)
 
 
 @pytest.mark.asyncio
