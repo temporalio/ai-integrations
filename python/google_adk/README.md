@@ -71,6 +71,12 @@ Model calls are intercepted and executed as Temporal activities with configurabl
 
 Model calls heartbeat on a timer at half the `heartbeat_timeout`, which defaults to 10 seconds. So a cancel reaches a running model call, and a lost worker is noticed, within about 10 seconds. In Temporal Cloud each heartbeat that reaches the service is an Action: with the default, at most one every 8 seconds of a running call, and none for a call shorter than 5 seconds. Set `heartbeat_timeout` to `None` in `activity_config` to turn heartbeats off. The timer runs on the worker's event loop, so a model that blocks the loop for longer than the timeout fails the call with a heartbeat timeout.
 
+**Breaking change when you upgrade or roll back:** earlier versions of this plugin schedule model calls with no `heartbeat_timeout`, and their `invoke_model` never heartbeats (`invoke_model_streaming` heartbeats only when a response arrives). So while Workers of both versions run, a model call that a Workflow on this version schedules and a Worker on an earlier version runs fails with a heartbeat timeout once it runs for 10 seconds without a heartbeat, and each retry can fail the same way. The timeout is recorded when the Activity is scheduled, and retries keep it, so rolling back doesn't remove it from model calls scheduled before.
+
+- To upgrade, put this version on every Worker that runs model Activities before any Workflow Worker. If the same Workers run both, deploy this version with `heartbeat_timeout` set to `None` in `activity_config`, and remove that setting in a later deploy.
+- To roll back, first deploy this version with `heartbeat_timeout` set to `None`, wait until the model calls scheduled before that deploy finish, and then roll back.
+- Runs pinned with Worker Versioning avoid both cases when their model Activities use the Workflow's task queue, since those Activities run on Workers of the same version.
+
 #### 3. Sandbox Compatibility
 - Automatic passthrough for `google.adk`, `google.genai`, `mcp`, and `opentelemetry` modules
 - Works with both sandboxed and unsandboxed workflow runners

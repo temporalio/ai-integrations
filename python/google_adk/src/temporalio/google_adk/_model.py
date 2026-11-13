@@ -346,7 +346,10 @@ class TemporalModel(BaseLlm):
                 shorter than 5 seconds. Set ``heartbeat_timeout`` to ``None``
                 to turn heartbeats off. The timer runs on the worker's event
                 loop, so a model that blocks the loop for longer than the
-                timeout fails the call with a heartbeat timeout.
+                timeout fails the call with a heartbeat timeout. Workers on
+                an earlier version of this plugin don't heartbeat this way,
+                so a model call they run fails after 10 seconds without a
+                heartbeat. The README says how to upgrade and roll back.
             summary_fn: Optional callable that receives the LlmRequest and
                 returns a summary string (or None) for the activity. Must be
                 deterministic as it is called during workflow execution. If
