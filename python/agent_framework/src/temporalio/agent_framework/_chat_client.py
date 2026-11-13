@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from datetime import timedelta
 from typing import Any, ClassVar
@@ -39,9 +40,12 @@ from temporalio.workflow import (
 )
 
 # Tools with an invocation in flight through _SyncToolsOnWorkflowLoop, by id:
-# how many, and the flag value to put back when the last one finishes. One
-# event loop runs all of it, so the counts need no lock.
+# how many, and the flag value to put back when the last one finishes. Workflow
+# tasks run on a thread pool and a tool object can be shared by workflows on
+# different threads, so the counter is guarded; the lock is never held across
+# an await.
 _inline_invocations: dict[int, tuple[int, Any]] = {}
+_inline_lock = threading.Lock()
 
 
 class _SyncToolsOnWorkflowLoop(FunctionMiddleware):
@@ -63,20 +67,22 @@ class _SyncToolsOnWorkflowLoop(FunctionMiddleware):
     ) -> None:
         tool = context.function
         key = id(tool)
-        count, original = _inline_invocations.get(
-            key, (0, getattr(tool, "_invoke_sync_on_event_loop", False))
-        )
-        _inline_invocations[key] = (count + 1, original)
-        tool._invoke_sync_on_event_loop = True
+        with _inline_lock:
+            count, original = _inline_invocations.get(
+                key, (0, getattr(tool, "_invoke_sync_on_event_loop", False))
+            )
+            _inline_invocations[key] = (count + 1, original)
+            tool._invoke_sync_on_event_loop = True
         try:
             await call_next()
         finally:
-            count, original = _inline_invocations[key]
-            if count == 1:
-                del _inline_invocations[key]
-                tool._invoke_sync_on_event_loop = original
-            else:
-                _inline_invocations[key] = (count - 1, original)
+            with _inline_lock:
+                count, original = _inline_invocations[key]
+                if count == 1:
+                    del _inline_invocations[key]
+                    tool._invoke_sync_on_event_loop = original
+                else:
+                    _inline_invocations[key] = (count - 1, original)
 
 
 class TemporalChatClient(FunctionInvocationLayer, ChatMiddlewareLayer, BaseChatClient):  # type: ignore[type-arg]
