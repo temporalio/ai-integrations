@@ -323,9 +323,14 @@ async def test_response_format(client: Client) -> None:
         )
     assert result == Person(name="Ada", age=36)
     (call,) = factory().calls
+    # The class crosses as the strict schema the OpenAI clients send natively.
     assert call["options"]["response_format"] == {
         "type": "json_schema",
-        "json_schema": {"name": "Person", "schema": Person.model_json_schema()},
+        "json_schema": {
+            "name": "Person",
+            "schema": {**Person.model_json_schema(), "additionalProperties": False},
+            "strict": True,
+        },
     }
 
 

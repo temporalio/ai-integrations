@@ -411,7 +411,7 @@ To let the provider keep the conversation instead, pass `store=True` in the agen
 
 ## Structured output
 
-Pass a Pydantic class as `response_format`; its JSON schema crosses to the model Activity and the workflow parses the reply:
+Pass a Pydantic class as `response_format`; it crosses to the model Activity as the strict JSON schema the OpenAI clients send natively for a class (`strict: true` under the class name, every property required, `additionalProperties: false`, `None` defaults dropped), so the provider holds the model to the schema, and the workflow parses the reply:
 
 ```python
 from pydantic import BaseModel

@@ -369,11 +369,16 @@ def _dump_response_format(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, type) and issubclass(value, BaseModel):
+        # The form the OpenAI clients send natively for a Pydantic class: the
+        # strict schema under the class name, with strict=True, so the
+        # provider holds the model to it.
+        schema = value.model_json_schema()
         return {
             "type": "json_schema",
             "json_schema": {
                 "name": value.__name__,
-                "schema": value.model_json_schema(),
+                "schema": _strict_json_schema(schema, root=schema),
+                "strict": True,
             },
         }
     if isinstance(value, Mapping):
@@ -382,6 +387,71 @@ def _dump_response_format(value: Any) -> Any:
         f"response_format {value!r} is not a Pydantic model class or a mapping, "
         "so it cannot be sent to the model Activity."
     )
+
+
+def _strict_json_schema(
+    schema: dict[str, Any], *, root: dict[str, Any]
+) -> dict[str, Any]:
+    """Rewrite ``schema`` in place into the providers' strict form, as the OpenAI SDK does.
+
+    Every object gets ``additionalProperties: false`` and all of its
+    properties required; ``$defs``, ``items``, ``anyOf`` and ``allOf`` are
+    walked, a single-entry ``allOf`` is flattened, a ``None`` default is
+    dropped, and a ``$ref`` with sibling keys is inlined.
+    """
+    for key in ("$defs", "definitions"):
+        definitions = schema.get(key)
+        if isinstance(definitions, dict):
+            for definition in definitions.values():
+                if isinstance(definition, dict):
+                    _strict_json_schema(definition, root=root)
+    if schema.get("type") == "object" and "additionalProperties" not in schema:
+        schema["additionalProperties"] = False
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        schema["required"] = list(properties)
+        for prop in properties.values():
+            if isinstance(prop, dict):
+                _strict_json_schema(prop, root=root)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _strict_json_schema(items, root=root)
+    any_of = schema.get("anyOf")
+    if isinstance(any_of, list):
+        for variant in any_of:
+            if isinstance(variant, dict):
+                _strict_json_schema(variant, root=root)
+    all_of = schema.get("allOf")
+    if isinstance(all_of, list):
+        if len(all_of) == 1 and isinstance(all_of[0], dict):
+            schema.pop("allOf")
+            schema.update(_strict_json_schema(all_of[0], root=root))
+        else:
+            for entry in all_of:
+                if isinstance(entry, dict):
+                    _strict_json_schema(entry, root=root)
+    if "default" in schema and schema["default"] is None:
+        schema.pop("default")
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and len(schema) > 1:
+        resolved = _resolve_ref(root, ref)
+        if isinstance(resolved, dict):
+            # The schema's own keys take priority over the referenced ones.
+            schema.update({**resolved, **schema})
+            schema.pop("$ref")
+            return _strict_json_schema(schema, root=root)
+    return schema
+
+
+def _resolve_ref(root: dict[str, Any], ref: str) -> Any:
+    if not ref.startswith("#/"):
+        return None
+    node: Any = root
+    for part in ref[2:].split("/"):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
 
 
 def _require_json(key: str, value: Any) -> None:
