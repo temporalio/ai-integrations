@@ -15,7 +15,7 @@ link here. Design source: the
 6. Do not hand-edit the committed `0.0.0` development version. Protected release tags are the published version source; never move or delete a tag. A failed pre-release gets the next `rcN`.
 7. Do not write `CHANGELOG.md` files. Release notes are generated from commit messages.
 8. Do not put Python source or stub files in `python/_shared/`. Python test support is duplicated into each plugin (and its source template) so every file resolves against that plugin's environment. Non-Python make logic and tool configuration may be shared there when the format supports composition.
-9. Do not add `Directory.Build.props`, `Directory.Build.targets`, `Directory.Packages.props`, `global.json`, `nuget.config` or a lock at `dotnet/`. MSBuild imports the nearest `Directory.Build.props` above a project, so a language-root file would apply to every plugin silently; each plugin owns these files and imports `dotnet/_shared/dotnet.props` explicitly.
+9. Do not add `Directory.Build.props`, `Directory.Build.targets`, `Directory.Packages.props`, `global.json`, `nuget.config` or a lock at `dotnet/`. MSBuild imports the nearest `Directory.Build.props` above a project, so a language-root file would apply to every plugin silently; each plugin owns these files and imports `dotnet/_shared/dotnet.props` explicitly. Inside a plugin, the plugin-root `Directory.Build.props` is the only MSBuild directory file: a nearer `Directory.Build.props` replaces it and drops the shared policy, `Directory.Build.targets` is evaluated after the csproj and overrides it, and `Directory.Packages.props` moves versions out of the csproj files.
 
 ## Purpose and layout
 
@@ -160,20 +160,26 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   each csproj. `Directory.Build.props` is the discovery manifest and starts by importing
   `dotnet/_shared/dotnet.props`, which holds the shared build policy (warnings as errors, nullable,
   analyzers, lock files, audit, Source Link, `snupkg` symbols, icon, authors and repository
-  metadata). Dependencies, target frameworks and package identity stay in the plugin's csproj.
+  metadata). Dependencies, target frameworks and package identity stay in the plugin's csproj. The
+  conventions check applies the policy rules to the root `Directory.Build.props` body and every csproj
+  under the plugin, rejects a nested `Directory.Build.props`, any `Directory.Build.targets` and any
+  `Directory.Packages.props`, and forbids a `ProjectReference` in the packed library (it would become
+  a nuspec dependency on a coordinate that is not on nuget.org). The library csproj sets
+  `PackageProjectUrl` to its GitHub tree URL.
 - Coordinates are `Temporalio.<Name>` and the root namespace is the coordinate. The first release
   targets `net10.0` only; .NET 8 and 9 left support on 2026-11-10.
 - The csproj `Version` is `0.0.0`. The release workflow passes `-p:Version=<tag version>` to build,
   test and pack; the tested assembly is the packed assembly (`dotnet pack --no-build`). Never commit a
   real version.
 - Each project opts into `RestorePackagesWithLockFile`; `dotnet/_shared/dotnet.mk` exports
-  `RestoreLockedMode=true`, so every restore fails with NU1004 when a csproj drifts from its lock. Edit
-  dependencies, then run `make lock`. `global.json` pins the SDK channel floor with
+  `RestoreLockedMode=true`, so when a csproj drifts from its lock `make build` and `make test` fail with
+  NU1004 and `make lint` fails to restore. Edit dependencies, then run `make lock`. `global.json` pins the SDK channel floor with
   `rollForward: latestFeature` and `allowPrerelease: false`; `IsAotCompatible`, `PublishAot`,
   `PublishTrimmed` and `IsTrimmable` are not allowed because they add SDK-pinned implicit package
   references that break locked restores across SDK patches.
 - Dependency cooldown: `nuget.config` sets `minPublishAgeHours="336"` on the nuget.org source and
-  exempts `Temporalio*` in `<minPublishAgeExceptions>`, the syntax NuGet's accepted cooldown spec
+  exempts `Temporalio` and `Temporalio.*` in `<minPublishAgeExceptions>` (not a `Temporalio*` prefix,
+  which would also cover `TemporalioCommunity.*`), the syntax NuGet's accepted cooldown spec
   (NuGet/Home#14983) defines. NuGet does not enforce it yet; `make check-deps`
   (`scripts/ci/check_dotnet_deps.py`) fails when any version in a committed lock was published less
   than 336 hours ago or is unlisted. `make sync-latest` (nightly) updates every direct dependency to
@@ -184,7 +190,8 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   file), `README.md` (`PackageReadmeFile`; absolute links only, nuget.org renders it), `icon.png`
   from `dotnet/_shared/`, XML docs, Source Link metadata and a `.snupkg`.
   `ContinuousIntegrationBuild=true` is set on CI only; `DeterministicTimestamp` is the commit time, so
-  one commit packs to identical bytes on one SDK feature band.
+  one commit packs to identical bytes on one SDK version (a servicing patch ships a new compiler and
+  changes assembly and PDB bytes; `recover-run` covers that case).
 - Tests use xunit.net v3 under Microsoft.Testing.Platform (`global.json` `test.runner`,
   `UseMicrosoftTestingPlatformRunner`), with `Microsoft.Testing.Extensions.TrxReport` for reports.
   VSTest packages (`Microsoft.NET.Test.Sdk`, `xunit.runner.visualstudio`, xunit 2) are not allowed;
@@ -198,8 +205,10 @@ overall maturity (for example, OpenAI Agents is Generally Available with preview
   analyzer severities live in `dotnet/_shared/analyzers.globalconfig` (imported through
   `GlobalAnalyzerConfigFiles`). `StyleCop.Analyzers` is referenced by each project with
   `PrivateAssets="all"`.
-- CI uses `plugin.toml` `[ci] runtime-versions` as SDK channels: Ubuntu at the minimum and maximum
-  channel, macOS and Windows at the maximum; a cell fails if `dotnet --version` is not in its channel.
+- CI uses `plugin.toml` `[ci] runtime-versions` as the SDK channel. Exactly one channel is allowed until
+  the workflow can inject an SDK above the `global.json` floor (plan review decision 7 deferred that);
+  the matrix tests it on Ubuntu (the dist cell), macOS and Windows, and a cell fails if
+  `dotnet --version` is not in that channel.
 
 ## CI
 
@@ -209,7 +218,7 @@ One entry workflow, one reusable workflow per language, plugin as a parameter, n
 - `.github/workflows/_typescript-plugin.yml`: uses the shared runtime/platform matrix and independent pnpm lockfile for each plugin. Locked runs first use `make check-deps` on ubuntu/max to verify fresh resolution under the dependency cooldown without changing the committed lock. Every cell runs sync, lint and tests; ubuntu/max also packs, verifies contents and smoke-installs the tarball in a clean consumer. Nightly selects compatible latest dependencies. TypeScript nightly issues use `typescript/<plugin>` keys to avoid collisions with Python.
 - `.github/workflows/_python-plugin.yml`: job `matrix` reads `plugin.toml` `runtime-versions` and emits the same matrix for every run, pull requests included (ubuntu at the min and max versions, macOS and Windows at max); locked runs first use `make check-deps` (`uv lock --upgrade --dry-run`) on ubuntu/max to verify fresh resolution under the dependency cooldown without changing the committed lock. Job `test` runs `make sync` (or `sync-latest` on nightly runs), `make lint`, `make test`, then, on the ubuntu/max cell only, the `python-build-check` composite action (`make build`, `check_wheel.py`, isolated `smoke.py` on wheel and sdist). Windows runners install GNU make with choco.
 - `.github/workflows/_go-plugin.yml`: uses the same matrix generator and platform layout with each plugin's Go `runtime-versions`. Every cell runs `make sync` (or `sync-latest`), `make lint`, `make test`, and `make build`; the ubuntu/max cell enables `-race`. `GOTOOLCHAIN=local` prevents dependencies from silently replacing the runtime under test. Windows runners install GNU make with choco. Go action caching keys include the plugin's `go.mod` and `go.sum`.
-- `.github/workflows/_dotnet-plugin.yml`: same matrix generator and platform layout with each plugin's SDK channels (`actions/setup-dotnet` installs `<channel>.x`; the plugin's `global.json` selects it, and a cell fails if `dotnet --version` is outside its channel). Locked runs first use `make check-deps` on ubuntu/max to enforce the dependency cooldown on the committed locks. Every cell runs `make sync` (or `sync-latest`), `make lint`, `make test`; the ubuntu/max cell also runs `make build`, `check_dotnet_dist.py` and `smoke_dotnet.py` (a clean consumer restores the packed `.nupkg` from a local feed with an isolated packages folder) and uploads `dist-dotnet-<plugin>`. Windows runners install GNU make with choco. .NET nightly issues use `dotnet/<plugin>` keys.
+- `.github/workflows/_dotnet-plugin.yml`: same matrix generator and platform layout with the plugin's SDK channel (`actions/setup-dotnet` installs `<channel>.x`; the plugin's `global.json` selects it, and a cell fails if `dotnet --version` is outside its channel). Locked runs first use `make check-deps` on ubuntu/max to enforce the dependency cooldown on the committed locks. Every cell runs `make sync` (or `sync-latest`), `make lint`, `make test`; the ubuntu/max cell also runs `make build`, `check_dotnet_dist.py` and `smoke_dotnet.py` (a clean consumer restores the packed `.nupkg` from a local feed with an isolated packages folder) and uploads `dist-dotnet-<plugin>`. Windows runners install GNU make with choco. .NET nightly issues use `dotnet/<plugin>` keys.
 - Dependencies: ordinary CI uses the committed lockfile (`go.mod`/`go.sum` for Go); local `make sync` uses the existing versions. Nightly runs every plugin with the newest allowed dependencies (`sync-latest`) without committing the updated lock; manual dispatch can select that mode too. Python make targets use `uv run --locked`; Go lint, test and build use `-mod=readonly` to preserve the versions selected during sync. Go `sync-latest` runs `go get -u -t ./...`, tidies the module and verifies its checksums. .NET make targets export `RestoreLockedMode=true`; .NET `sync-latest` runs `dotnet package update` on the solution and `dotnet restore --force-evaluate`.
 - Required checks on `main`: `ci-status`, `Check for CODEOWNERS` and `opengrep/scan` (the last two are org-enforced workflows that run automatically on every PR), plus one approving review from a code owner; `license/cla` joins once the CLA app is installed. Do not add a local opengrep caller; the org one already runs. Repository setup: branch protection, the `testpypi`/`pypi` environments (tag policy `python/*/v*`) and the release-tag ruleset were configured by hand on 2026-09-09. The `pypi` required-reviewer gate was removed on 2026-10-07.
 - Nightly failures: `scripts/ci/nightly_report.py` opens or updates one `nightly` issue per failing plugin from the job names `Python (<plugin>) / ...`, `Java (<plugin>) / ...`, `Go (<plugin>) / ...`, `TypeScript (<plugin>) / ...` and `.NET (<plugin>) / ...`; `scripts/tests/test_nightly_report.py` fails if `ci.yml` renames those jobs. Existing Python and Java issue titles stay unchanged; Go, TypeScript and .NET keys use `go/<plugin>`, `typescript/<plugin>` and `dotnet/<plugin>` so plugins in different languages cannot share an issue.
@@ -358,8 +367,9 @@ committed development version `0.0.0`.
 `.github/workflows/release-dotnet.yml` handles every NuGet plugin. Published GitHub
 Releases trigger publication; tag pushes alone do not. Branch dispatches always run
 a dry run. NuGet versions are canonical SemVer without build metadata, such as
-`0.0.1` or `0.0.1-rc.1`; nuget.org normalises and lowercases versions, so dotted
-pre-release labels are the only form used. Registry ordering reads the V3 flat
+`0.0.1` or `0.0.1-rc.1`; nuget.org lowercases versions and compares undotted
+labels as text (`rc10` sorts before `rc9`), so `parse-tag` accepts only lowercase
+tags with dotted pre-release labels. Registry ordering reads the V3 flat
 container index, which includes unlisted versions; the newest exact version may be
 verified again. Keep the committed development version `0.0.0`.
 
@@ -403,10 +413,12 @@ gallery.
    isolated packages folder, checking the restored package the same way and
    loading the `[smoke] imports` types. It leaves the reviewed GitHub Release
    unchanged.
-5. Re-run failed jobs after an upload: an existing version is skipped only when
-   its served entries match the tested package. A fresh dispatch on the tag
-   rebuilds; one commit packs to identical bytes on one SDK feature band, so that
-   also passes. If the SDK moved, dispatch on the tag with
+5. Re-run failed jobs after an upload: the job first proves that an existing
+   version serves the tested entries, then repeats both pushes with
+   `--skip-duplicate`, so a run that uploaded the package but not the symbols
+   completes on re-run. A fresh dispatch on the tag rebuilds; one commit packs to
+   identical bytes on one SDK version, so that also passes while the SDK patch is
+   unchanged. If the SDK moved, dispatch on the tag with
    `-f recover-run=<original-run-id>` to reuse the tested artifact without
    rebuilding. Recovery requires a completed release or dispatch run at the tag's
    exact main-reachable commit with every matrix job green and an unexpired

@@ -7,10 +7,13 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <!-- Known-vulnerability advisories stay visible as warnings; a new advisory on a transitive
-         dependency must not break unrelated pull requests. -->
-    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
+         dependency, or an outage of the vulnerability feed (NU1900), must not break unrelated
+         pull requests. -->
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);NU1900;NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
     <EnableNETAnalyzers>true</EnableNETAnalyzers>
-    <AnalysisLevel>latest</AnalysisLevel>
+    <!-- Pinned to the floor channel, not `latest`: the rule set must not follow the runner's newest
+         feature band. Move it together with the plugins' global.json floor. -->
+    <AnalysisLevel>10.0</AnalysisLevel>
     <AnalysisMode>AllEnabledByDefault</AnalysisMode>
     <!-- Style rules stay out of the build until dotnet/format#1800 is fixed; `make lint` covers them. -->
     <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>

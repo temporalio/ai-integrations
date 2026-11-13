@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import subprocess
 import zipfile
 from pathlib import Path
@@ -57,7 +58,8 @@ class FakeDotnet:
         self.calls.append(command)
         self.env = env
         consumer = Path(cwd)
-        self.rendered = {name: (consumer / name).read_text() for name in ("Consumer.csproj", "Program.cs", "nuget.config")}
+        self.rendered = {name: (consumer / name).read_text()
+                         for name in ("Consumer.csproj", "Program.cs", "nuget.config", "global.json")}
         code = self.returncodes[min(len(self.calls), len(self.returncodes)) - 1]
         if code == 0 and self.restored is not None:
             target = (Path(env["NUGET_PACKAGES"]) / COORDINATE.lower() / VERSION.lower()
@@ -83,9 +85,17 @@ def test_local_feed_consumer_is_isolated_and_restores_the_tested_bytes(
     assert f'<PackageReference Include="{COORDINATE}" Version="[{VERSION}]" />' in csproj
     assert "<TargetFramework>net10.0</TargetFramework>" in csproj
     assert "<ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>" in csproj
+    # Advisories on the plugin's closure are warnings in the consumer, as in dotnet.props.
+    assert "<WarningsNotAsErrors>NU1900;NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>" in csproj
+    # The consumer builds with the plugin's SDK channel, not the newest SDK on the machine.
+    assert json.loads(fake.rendered["global.json"]) == {
+        "sdk": {"version": "10.0.100", "rollForward": "latestFeature", "allowPrerelease": False},
+    }
     program = fake.rendered["Program.cs"]
     assert f'"{COORDINATE}.FakedotnetPlugin", "{COORDINATE}.Other"' in program
-    assert f'var version = "{VERSION}";' in program and '"lib", "net10.0"' in program
+    assert f'var version = "{VERSION}";' in program
+    # The DLL match searches every lib/<tfm>/ folder, so a package whose best asset is not the consumer TFM passes.
+    assert 'Directory.GetDirectories(Path.Combine(packageRoot, "lib"))' in program and "net10.0" not in program
     config = fake.rendered["nuget.config"]
     assert f'<add key="tested" value="{directory / "dist"}" />' in config
     assert '<add key="nuget.org" value="https://api.nuget.org/v3/index.json" protocolVersion="3" />' in config

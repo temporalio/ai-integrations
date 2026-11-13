@@ -24,12 +24,28 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/release-dotn
 
 @pytest.mark.parametrize("version", [
     "0.0.1rc1", "01.0.0", "1.0.0+build", "1.0.0.0", "0.0.1-rc.01", "v0.0.1", "0.1", "0.1.0-", "0.1.0\n", " 0.1.0", "0.1.0 ",
+    "0.0.1-RC.1", "0.0.1-Rc.1", "0.0.1-rc.1+SHA", "0.0.1-rc1", "0.0.1-rc", "0.0.1-rc.1a", "0.0.1-beta1.2",
 ])
 def test_nuget_rejects_noncanonical_versions(version: str) -> None:
     with pytest.raises(nuget_release.NuGetReleaseError, match="NuGet version"):
         nuget_release.NuGetVersion(version)
     with pytest.raises(release_tool.PolicyError):
         release_tool.parse_tag(f"dotnet/agent-framework/v{version}")
+
+
+def test_uppercase_labels_never_reach_nuget_org() -> None:
+    # nuget.org would serve 0.0.1-rc.1 for an uploaded 0.0.1-RC.1 and the flat container membership test would
+    # never succeed; rejecting the tag keeps the policy and the verification in one case.
+    with pytest.raises(nuget_release.NuGetReleaseError, match="must be lowercase"):
+        nuget_release.NuGetVersion("0.0.1-RC.1")
+    assert nuget_release.NuGetVersion("0.0.1-rc.1") in [nuget_release.NuGetVersion("0.0.1-rc.1")]
+
+
+def test_dotted_prerelease_labels_order_numerically() -> None:
+    versions = [nuget_release.NuGetVersion(raw) for raw in ("0.0.1-alpha.2", "0.0.1-beta.1", "0.0.1-rc.9", "0.0.1-rc.10", "0.0.1")]
+    assert sorted(reversed(versions)) == versions
+    assert release_tool.check_policy(versions[3], "pre-release", versions[:3]) is None
+    assert nuget_release.NuGetVersion("0.0.1-preview.1").is_prerelease
 
 
 def test_dotnet_tags_parse_with_the_prerelease_flag() -> None:
@@ -425,10 +441,11 @@ def test_nuget_publishes_only_the_full_matrix_artifact_with_oidc() -> None:
     existing = next(step for step in steps if step.get("id") == "existing")
     assert "nuget-registry-state" in existing["run"] and '--github-output "$GITHUB_OUTPUT"' in existing["run"]
     login = next(step for step in steps if "NuGet/login@" in step.get("uses", ""))
-    assert login["id"] == "login" and login["if"] == "steps.existing.outputs.exists == 'false'"
+    # Both pushes run on every attempt (--skip-duplicate), so a re-run after a partial upload completes the symbols.
+    assert login["id"] == "login" and "if" not in login
     assert login["with"] == {"user": "${{ vars.NUGET_USER }}"}
     push = next(step for step in steps if "dotnet nuget push" in step.get("run", ""))
-    assert push["if"] == "steps.existing.outputs.exists == 'false'"
+    assert "if" not in push
     assert push["env"] == {"NUGET_API_KEY": "${{ steps.login.outputs.NUGET_API_KEY }}"}
     assert '"$PLUGIN_DIR"/dist/*.nupkg' in push["run"] and '"$PLUGIN_DIR"/dist/*.snupkg' in push["run"]
     assert push["run"].count("--skip-duplicate") == 2 and "--no-symbols" in push["run"]

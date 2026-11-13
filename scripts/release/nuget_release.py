@@ -34,6 +34,17 @@ class NuGetVersion(GoVersion):
             super().__post_init__()
         except GoReleaseError as exc:
             raise NuGetReleaseError(str(exc).replace("Go version", "NuGet version")) from exc
+        # nuget.org lowercases every version it serves; an uppercase label would publish and then never
+        # match the flat container, and its successors would sort below the served one.
+        if self.raw != self.raw.lower():
+            raise NuGetReleaseError(f"NuGet version {self.raw!r} must be lowercase, e.g. 0.0.1-rc.1")
+        # Mixed identifiers such as rc1 compare as text (rc10 sorts before rc9); dotted numeric identifiers
+        # compare as numbers, so the label must be words and numbers separated by dots and end in a number.
+        prerelease = self._version.prerelease
+        if prerelease is not None:
+            identifiers = prerelease.split(".")
+            if not identifiers[-1].isdigit() or any(part.isdigit() == part.isalpha() for part in identifiers):
+                raise NuGetReleaseError(f"NuGet version {self.raw!r} must use a dotted pre-release label such as rc.1 or beta.2")
 
 
 def _get(url: str) -> bytes | None:
@@ -66,6 +77,8 @@ def fetch_versions(coordinate: str, local: Path | None = None) -> list[NuGetVers
     if not isinstance(data, dict) or not isinstance(data.get("versions"), list):
         raise NuGetReleaseError("nuget.org returned an invalid flat container index")
     # A version under our coordinate that is not canonical SemVer is a policy breach, not something to skip.
+    # nuget.org never deletes versions, so a stray manual upload such as 1.0.0.1 blocks the policy for the
+    # coordinate until this code changes; the Go and npm modules make the same choice.
     return [NuGetVersion(str(version)) for version in data["versions"]]
 
 

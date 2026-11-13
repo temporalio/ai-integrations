@@ -7,6 +7,9 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- Advisories stay warnings here as in dotnet.props: the consumer proves restore and load,
+         the plugin build is where the audit is read. -->
+    <WarningsNotAsErrors>NU1900;NU1901;NU1902;NU1903;NU1904</WarningsNotAsErrors>
     <ImportDirectoryBuildProps>false</ImportDirectoryBuildProps>
     <ImportDirectoryBuildTargets>false</ImportDirectoryBuildTargets>
     <ImportDirectoryPackagesProps>false</ImportDirectoryPackagesProps>
