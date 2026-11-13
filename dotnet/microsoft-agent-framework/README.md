@@ -98,9 +98,11 @@ For Azure OpenAI, build the client the same way and set `AzureOpenAIClientOption
 
 The headers of a hosted MCP server tool follow the same rule: set them on the worker, in `MicrosoftAgentFrameworkPluginOptions.HostedMcpServerHeaders`, never on the `HostedMcpServerTool` in the Workflow. The Hosted tools section below has the details.
 
+To keep an MCP connection open for the worker's lifetime, set `McpConnectionIdleTimeout` to a value longer than the worker runs; zero and negative values are rejected.
+
 ## Retries and timeouts
 
-Each model call is one `MicrosoftAgentFramework.InvokeModel` Activity with a 5-minute start-to-close timeout, a 10-second heartbeat timeout and the summary `microsoft-agent-framework model call: {model}`. The Activity heartbeats at least every 3 seconds while the provider call runs and on every streamed update, so a dead worker is noticed within the heartbeat timeout. Change the options per agent or per client:
+Each model call is one `MicrosoftAgentFramework.InvokeModel` Activity with a 5-minute start-to-close timeout, a 10-second heartbeat timeout and the model name as its summary. The Activity heartbeats at least every 3 seconds while the provider call runs and on every streamed update, so a dead worker is noticed within the heartbeat timeout. Change the options per agent or per client:
 
 ```csharp
 using Temporalio.MicrosoftAgentFramework;
@@ -123,7 +125,7 @@ public static class ModelOptions
 
 Temporal's default retry policy has no attempt limit, so a retryable provider error retries until the Workflow is closed. Set `MaximumAttempts` when you want the run to fail instead.
 
-Provider errors are classified by HTTP status, never by message text. 400, 401, 403, 404 and 422 fail with error type `MicrosoftAgentFrameworkModelError` and `NonRetryable = true`; every other status, including 408, 429 and 5xx, fails with the same error type and is retried. When the OpenAI or Azure OpenAI exception carries a `Retry-After` header, that delay becomes the next retry interval. Exceptions without a status, such as a provider SDK's own exception types, propagate unchanged and retry. The status list and the two ways of reading it come from Cecil Phillip's draft at https://github.com/temporal-community/temporal-dotnet-agents.
+Provider errors are classified by HTTP status, never by message text, with the rule the Python plugin uses: 408, 409, 429 and 5xx fail with error type `MicrosoftAgentFrameworkModelError` and are retried; every other 4xx fails with the same error type and `NonRetryable = true`. A provider `x-should-retry` header of `true` or `false` overrides the status rule. When the OpenAI or Azure OpenAI exception carries `retry-after-ms` or `Retry-After` (seconds or an HTTP date), that delay becomes the next retry interval. Exceptions without a status, such as a provider SDK's own exception types, propagate unchanged and retry. The two ways of reading the status come from Cecil Phillip's draft at https://github.com/temporal-community/temporal-dotnet-agents.
 
 ## Tools
 
@@ -231,7 +233,7 @@ public class McpWorkflow
 }
 ```
 
-`ListToolsAsync` is one `MicrosoftAgentFramework.McpListTools` Activity and returns a `TemporalMcpTool` per tool with the server's full input schema, so the model sees the parameters. Each call is one `MicrosoftAgentFramework.McpCallTool` Activity (60-second start-to-close timeout by default). The plugin opens one `McpClient` per server on first use, shares it across Activities and across every worker running with the same plugin instance, closes it after `McpConnectionIdleTimeout` (default 5 minutes) without a call, and closes everything when the last of those workers (or a replayer) stops; stopping one worker leaves the others' calls running on the connection. `CacheTools = true` lets the worker answer the list Activity from the list it fetched earlier on the same connection; the default lists every time so a changed server is seen. Set `ToolNamePrefix` when two servers share a tool name; calls reach the server under the original name.
+`ListToolsAsync` is one `MicrosoftAgentFramework.McpListTools` Activity and returns a `TemporalMcpTool` per tool with the server's full input schema, so the model sees the parameters. Each call is one `MicrosoftAgentFramework.McpCallTool` Activity (60-second start-to-close timeout by default). The plugin opens one `McpClient` per server on first use, shares it across Activities and across every worker running with the same plugin instance, closes it after `McpConnectionIdleTimeout` (default 5 minutes) without a call, and closes everything when the last of those workers (or a replayer) stops; stopping one worker leaves the others' calls running on the connection. `CacheTools = true` lets the worker answer the list Activity from the list it fetched earlier on the same connection; the default lists every time so a changed server is seen. Set `ToolNamePrefix` when two servers share a tool name; calls reach the server under the original name. The prefix is prepended as is, with no separator, so pass `docs_` to get `docs_read_file`. Names in `ChatOptions.Tools` must be unique; when two servers or a server and a local tool share a name, the first match runs.
 
 A result with `isError`, an unknown tool or bad arguments fails the Activity with error type `MicrosoftAgentFrameworkMcpError` and no retry; the model is told the tool failed. A transport that cannot connect retries under the Activity's retry policy. A transport factory that throws fails the Activity with `MicrosoftAgentFrameworkConfigurationError` and no retry, like a chat client factory that throws.
 
@@ -473,7 +475,7 @@ public class ChatWorkflow
 }
 ```
 
-What carries over: the serialized session and whatever you put in the input. The session holds the transcript, any provider state in the bag, an approval request the model made that you have not answered, and the calls held back behind it. What does not: the `TemporalAgent` instance (build a new one), MCP connections (the worker reconnects), and your Workflow's own record of which request is pending. Carry that request in your input, so the new run can show it and wait for the decision; until the request is answered, the next run on the session fails with `MicrosoftAgentFrameworkWorkflowError`, as the Approvals section says. The serialized form is `{"stateBag": ...}`, the shape `ChatClientAgent` writes, so a transcript saved by one can be read by the other. Approvals in flight do not carry across to `ChatClientAgent`: the two keep pending and held requests under different state keys, so finish the approval round before you hand a session to the other side.
+What carries over: the serialized session and whatever you put in the input. The session holds the transcript, any provider state in the bag, and the calls held back behind an approval. What does not: the `TemporalAgent` instance (build a new one), MCP connections (the worker reconnects), and your Workflow's own record of a pending approval. The request itself rides in the transcript, so answer it on the first run of the new execution or that run fails with `MicrosoftAgentFrameworkWorkflowError`; carry the request in your input so the new run can show it and wait for the decision. The serialized form is `{"stateBag": ...}`, the shape `ChatClientAgent` writes, so a transcript saved by one can be read by the other. Approvals in flight do not carry across to `ChatClientAgent`: the two keep pending and held requests under different state keys, so finish the approval round before you hand a session to the other side.
 
 ## Structured output
 
@@ -528,6 +530,26 @@ Two things follow for you. Call `RunAsync`, `RunAsync<T>` and `RunStreamingAsync
 
 The plugin adds Activities, the Workflow failure type `MicrosoftAgentFrameworkWorkflowException`, and run hooks that count the workers using the instance and close MCP connections when the last one stops. It installs no data converter, no interceptor and no header codec, so it composes with other plugins in any order. Pass it once, to `TemporalClientConnectOptions.Plugins` or to `TemporalWorkerOptions.Plugins`. The same instance on both registers its Activities once. Two instances on one worker, or two of your own Activities with one name, fail the worker with the SDK's `Duplicate activity named ...` error: the plugin removes only repeated copies of its own definitions. Tracing from `Temporalio.Extensions.OpenTelemetry` works as with any Workflow: the model and MCP calls appear as Activity spans; provider spans come from `UseOpenTelemetry()` on the client you build in the factory.
 
+## Testing
+
+`Temporalio.MicrosoftAgentFramework.Testing` ships `FakeChatClient`, `ScriptedResponse` and `InMemoryMcpServer`, so your Workflow tests run without a provider or a network:
+
+```csharp
+using Microsoft.Extensions.AI;
+using Temporalio.MicrosoftAgentFramework;
+using Temporalio.MicrosoftAgentFramework.Testing;
+
+var fake = new FakeChatClient(
+    ScriptedResponse.ToolCalls(("get_weather", new Dictionary<string, object?> { ["city"] = "Kingston" })),
+    ScriptedResponse.Text("Sunny."));
+var plugin = new MicrosoftAgentFrameworkPlugin(new MicrosoftAgentFrameworkPluginOptions
+{
+    ChatClients = new Dictionary<string, Func<IChatClient>> { ["gpt-4o-mini"] = () => fake },
+});
+```
+
+Each model call takes the next scripted response; the last one repeats. `fake.Calls` holds every request the model received, with tools as declarations. `ScriptedResponse.Fail(HttpStatusCode)` stands in for a provider error and `InMemoryMcpServer` for an MCP server.
+
 ## Develop
 
 ```sh
@@ -538,4 +560,4 @@ make test
 make build
 ```
 
-`make test` builds in Release and runs the suite under Microsoft.Testing.Platform with a local Temporal dev server that `WorkflowEnvironment.StartLocalAsync` downloads on first run. No provider credentials are needed: the suite uses `Temporalio.MicrosoftAgentFramework.Testing.FakeChatClient`, `ScriptedResponse` and `InMemoryMcpServer`, which are shipped in the package for your own tests. The replay test reads the histories under `tests/Temporalio.MicrosoftAgentFramework.Tests/Histories`; set `MICROSOFT_AGENT_FRAMEWORK_RECORD_HISTORIES=1` while running the suite to write fresh copies under `TestResults/recorded-histories`.
+`make test` builds in Release and runs the suite under Microsoft.Testing.Platform with a local Temporal dev server that `WorkflowEnvironment.StartLocalAsync` downloads on first run. No provider credentials are needed: the suite uses the fakes from the Testing section. The replay test reads the histories under `tests/Temporalio.MicrosoftAgentFramework.Tests/Histories`; set `MICROSOFT_AGENT_FRAMEWORK_RECORD_HISTORIES=1` while running the suite to write fresh copies under `TestResults/recorded-histories`.
