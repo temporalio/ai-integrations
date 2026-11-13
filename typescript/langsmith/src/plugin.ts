@@ -175,8 +175,8 @@ export class LangSmithPlugin extends SimplePlugin {
     requireRunTreeMembers(WORKFLOW_RUN_TREE_OVERRIDES, WORKER_RUN_TREE_OVERRIDES);
     const interceptors: WorkerInterceptors = options.interceptors ?? {};
 
-    const activityInbound = [...(interceptors.activityInbound ?? [])];
-    activityInbound.push(createActivityInboundInterceptor(this.emitter));
+    const activity = [...(interceptors.activity ?? [])];
+    activity.push((ctx) => ({ inbound: createActivityInboundInterceptor(this.emitter)(ctx) }));
 
     const workflowModules = [...(interceptors.workflowModules ?? [])];
     if (!workflowModules.includes(this.workflowInterceptorModule)) {
@@ -202,7 +202,7 @@ export class LangSmithPlugin extends SimplePlugin {
 
     return {
       ...options,
-      interceptors: { ...interceptors, activityInbound, workflowModules, nexus: nexusInterceptors },
+      interceptors: { ...interceptors, activity, workflowModules, nexus: nexusInterceptors },
       sinks,
     } as T;
   }
