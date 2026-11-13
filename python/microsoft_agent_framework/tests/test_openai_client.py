@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
-from agent_framework import Message
+from agent_framework import ChatResponse, Message
 from agent_framework.openai import OpenAIChatClient, OpenAIChatCompletionClient
 from openai import AsyncOpenAI
 from openai.lib._pydantic import to_strict_json_schema
@@ -25,8 +25,9 @@ from temporalio.exceptions import ApplicationError
 from temporalio.microsoft_agent_framework._activities import (
     ChatClientActivities,
     InvokeModelInput,
+    InvokeModelStreamingInput,
 )
-from temporalio.microsoft_agent_framework._serde import dump_options
+from temporalio.microsoft_agent_framework._serde import dump_options, load_update
 from temporalio.testing import ActivityEnvironment
 
 
@@ -184,3 +185,166 @@ async def test_response_format_matches_the_native_request(
     assert sent["schema"]["additionalProperties"] is False
     assert sent["schema"]["required"] == list(_Person.model_fields)
     assert sent["schema"]["$defs"]["_Address"]["required"] == ["city", "zip"]
+
+
+class _SSEHandler(BaseHTTPRequestHandler):
+    """A Responses API endpoint that streams ``deltas`` as server-sent events."""
+
+    deltas: list[str] = []
+    bodies: list[dict[str, Any]] = []
+
+    def do_POST(self) -> None:
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        type(self).bodies.append(json.loads(raw))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for event in self._events():
+            payload = json.dumps(event)
+            self.wfile.write(f"event: {event['type']}\ndata: {payload}\n\n".encode())
+        self.wfile.flush()
+
+    def _events(self) -> Iterator[dict[str, Any]]:
+        sequence = 0
+
+        def event(data: dict[str, Any]) -> dict[str, Any]:
+            nonlocal sequence
+            data["sequence_number"] = sequence
+            sequence += 1
+            return data
+
+        def response(status: str, output: list[Any], usage: Any = None) -> dict:
+            return {
+                "id": "resp_1",
+                "object": "response",
+                "created_at": 1700000000,
+                "status": status,
+                "model": "gpt-4o",
+                "output": output,
+                "error": None,
+                "incomplete_details": None,
+                "instructions": None,
+                "metadata": {},
+                "parallel_tool_calls": True,
+                "temperature": 1.0,
+                "tool_choice": "auto",
+                "tools": [],
+                "top_p": 1.0,
+                "usage": usage,
+            }
+
+        full = "".join(type(self).deltas)
+        part = {"type": "output_text", "text": "", "annotations": [], "logprobs": []}
+        item = {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "status": "in_progress",
+            "content": [],
+        }
+        where = {"item_id": "msg_1", "output_index": 0, "content_index": 0}
+        yield event(
+            {"type": "response.created", "response": response("in_progress", [])}
+        )
+        yield event(
+            {"type": "response.in_progress", "response": response("in_progress", [])}
+        )
+        yield event(
+            {"type": "response.output_item.added", "output_index": 0, "item": item}
+        )
+        yield event({"type": "response.content_part.added", **where, "part": part})
+        for delta in type(self).deltas:
+            yield event(
+                {
+                    "type": "response.output_text.delta",
+                    **where,
+                    "delta": delta,
+                    "logprobs": [],
+                }
+            )
+        yield event(
+            {"type": "response.output_text.done", **where, "text": full, "logprobs": []}
+        )
+        done_part = {**part, "text": full}
+        yield event({"type": "response.content_part.done", **where, "part": done_part})
+        done_item = {**item, "status": "completed", "content": [done_part]}
+        yield event(
+            {"type": "response.output_item.done", "output_index": 0, "item": done_item}
+        )
+        usage = {
+            "input_tokens": 3,
+            "output_tokens": len(type(self).deltas),
+            "total_tokens": 3 + len(type(self).deltas),
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        }
+        yield event(
+            {
+                "type": "response.completed",
+                "response": response("completed", [done_item], usage),
+            }
+        )
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+
+@pytest.fixture
+def sse_server() -> Iterator[tuple[str, type[_SSEHandler]]]:
+    handler = type("SSEHandler", (_SSEHandler,), {"deltas": [], "bodies": []})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/v1", handler
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+async def test_streamed_record_stays_small_with_the_real_client(
+    sse_server: tuple[str, type[_SSEHandler]],
+) -> None:
+    url, handler = sse_server
+    handler.deltas = [f"t{i} " for i in range(200)]
+    text = "".join(handler.deltas)
+    activities = ChatClientActivities(
+        {
+            "model": lambda: OpenAIChatClient(
+                model="gpt-4o",
+                async_client=AsyncOpenAI(api_key="test", base_url=url, max_retries=0),
+            )
+        }
+    )
+    record = await ActivityEnvironment().run(
+        activities.invoke_model_streaming,
+        InvokeModelStreamingInput(
+            model="model",
+            messages=[Message(role="user", contents=["hi"]).to_dict()],
+            options={"store": False},
+        ),
+    )
+    # The real client emits each delta with merge_mode="append" and empty
+    # logprobs; the 200 deltas record as one entry, next to the created,
+    # in-progress, item-added, final-text, part-done, item-done and usage
+    # updates. Unmerged, the same stream was 205 entries and 54 KB for about
+    # 1 KB of text.
+    assert len(record) == 8
+    assert len(json.dumps(record)) < 2 * len(text) + 2048
+    texts = [
+        c["text"] for entry in record for c in entry["contents"] if c["type"] == "text"
+    ]
+    assert texts == [text, text]
+    (merged,) = [
+        c
+        for entry in record
+        for c in entry["contents"]
+        if c["type"] == "text" and c.get("merge_mode") == "append"
+    ]
+    assert "logprobs" not in merged["additional_properties"]
+    rebuilt = ChatResponse.from_updates([load_update(entry) for entry in record])
+    assert rebuilt.text == text.strip()
+    assert rebuilt.usage_details is not None
+    assert rebuilt.usage_details.get("output_token_count") == 200
+    # The option the workflow sends reached the request body.
+    assert handler.bodies[0]["store"] is False

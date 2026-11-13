@@ -11,6 +11,7 @@ them and returns the model's calls without executing anything. A Pydantic
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -164,10 +165,13 @@ class StreamRecorder:
     input); the copy repeats a call already streamed, so it is dropped. Text
     and tool-call arguments arrive one token per update, and a long answer or
     a large argument would put megabytes of update envelopes into history, so
-    adjacent text-only updates that share their envelope are merged into one
-    entry, and so are adjacent ``merge_mode="append"`` argument deltas of one
-    call (matched by ``call_id``, or by the provider's ``tool_call_index`` when
-    a continuation chunk carries no id). A ``replace`` update with the full
+    adjacent text-only updates that share their envelope, their ``merge_mode``
+    (none or ``append``, as the OpenAI clients emit) and their other
+    properties are merged into one entry, with their ``logprobs`` lists
+    concatenated and empty ones dropped; so are adjacent
+    ``merge_mode="append"`` argument deltas of one call (matched by
+    ``call_id``, or by the provider's ``tool_call_index`` when a continuation
+    chunk carries no id). A ``replace`` update with the full text or
     arguments stays its own entry. ``ChatResponse.from_updates`` rebuilds the
     same response either way. ``add`` returns the serialized update to publish,
     before merging, or ``None`` for a dropped copy; ``updates`` is the record.
@@ -202,10 +206,14 @@ class StreamRecorder:
         previous = self._updates[-1] if self._updates else None
         delta = _argument_delta(serialized)
         if previous is not None and same_envelope(previous, serialized):
-            if _mergeable_text(serialized) and _mergeable_text(previous):
-                self._extend_run(
-                    previous["contents"][0], "text", serialized["contents"][0]["text"]
-                )
+            if (
+                _mergeable_text(serialized)
+                and _mergeable_text(previous)
+                and _same_text_run(previous["contents"][0], serialized["contents"][0])
+            ):
+                target = previous["contents"][0]
+                self._extend_run(target, "text", serialized["contents"][0]["text"])
+                _merge_logprobs(target, serialized["contents"][0])
                 return serialized
             earlier = _argument_delta(previous)
             if delta is not None and earlier is not None and _same_call(earlier, delta):
@@ -213,10 +221,14 @@ class StreamRecorder:
                 return serialized
         self._close_run()
         if _mergeable_text(serialized) or delta is not None:
-            # The caller publishes ``serialized`` as is; the record gets its own
-            # copy, which later deltas may be merged into.
+            # The caller publishes ``serialized`` as is, possibly later in a
+            # batch; the record gets its own copy, which later deltas are
+            # merged into.
             self._updates.append(
-                {**serialized, "contents": [dict(c) for c in serialized["contents"]]}
+                {
+                    **serialized,
+                    "contents": [_copy_content(c) for c in serialized["contents"]],
+                }
             )
         else:
             self._updates.append(serialized)
@@ -233,6 +245,8 @@ class StreamRecorder:
     def _close_run(self) -> None:
         if self._run_content is not None:
             self._run_content[self._run_key] = "".join(self._run_pieces)
+            if self._run_key == "text":
+                _drop_empty_logprobs(self._run_content)
             self._run_content = None
             self._run_pieces = []
 
@@ -247,11 +261,11 @@ class StreamRecorder:
         )
 
 
-_TEXT_CONTENT_KEYS = {"type", "text", "additional_properties"}
+_TEXT_CONTENT_KEYS = {"type", "text", "merge_mode", "additional_properties"}
 
 
 def _mergeable_text(update: dict[str, Any]) -> bool:
-    """Whether ``update`` is text only, with nothing a merge would lose."""
+    """Whether ``update`` is one text delta, with nothing a merge would lose."""
     contents = update.get("contents") or []
     if len(contents) != 1 or update.get("finish_reason") is not None:
         return False
@@ -260,8 +274,74 @@ def _mergeable_text(update: dict[str, Any]) -> bool:
         content.get("type") == "text"
         and isinstance(content.get("text"), str)
         and set(content) <= _TEXT_CONTENT_KEYS
-        and not content.get("additional_properties")
+        and content.get("merge_mode") in (None, "append")
+        and isinstance(content.get("additional_properties", {}), dict)
     )
+
+
+def _same_text_run(earlier: dict[str, Any], content: dict[str, Any]) -> bool:
+    """Whether two text deltas agree on everything a merge keeps once: mode and properties."""
+    return earlier.get("merge_mode") == content.get("merge_mode") and (
+        _without_logprobs(earlier.get("additional_properties"))
+        == _without_logprobs(content.get("additional_properties"))
+    )
+
+
+def _without_logprobs(properties: Any) -> dict[str, Any]:
+    if not isinstance(properties, dict):
+        return {}
+    rest = {k: v for k, v in properties.items() if k != "logprobs"}
+    openai = rest.get("openai")
+    if isinstance(openai, dict):
+        openai = {k: v for k, v in openai.items() if k != "logprobs"}
+        if openai:
+            rest["openai"] = openai
+        else:
+            rest.pop("openai")
+    return rest
+
+
+def _merge_logprobs(target: dict[str, Any], incoming: dict[str, Any]) -> None:
+    """Append the incoming delta's ``logprobs`` (top level and under ``openai``) to the record's."""
+    source = incoming.get("additional_properties")
+    if not isinstance(source, dict):
+        return
+    properties = target.setdefault("additional_properties", {})
+    for namespace in (None, "openai"):
+        holder = source if namespace is None else source.get(namespace)
+        if not isinstance(holder, dict) or not isinstance(holder.get("logprobs"), list):
+            continue
+        destination = (
+            properties if namespace is None else properties.setdefault(namespace, {})
+        )
+        existing = destination.get("logprobs")
+        if isinstance(existing, list):
+            existing.extend(holder["logprobs"])
+        else:
+            destination["logprobs"] = list(holder["logprobs"])
+
+
+def _drop_empty_logprobs(content: dict[str, Any]) -> None:
+    properties = content.get("additional_properties")
+    if not isinstance(properties, dict):
+        return
+    if properties.get("logprobs") == []:
+        properties.pop("logprobs")
+    openai = properties.get("openai")
+    if isinstance(openai, dict):
+        if openai.get("logprobs") == []:
+            openai.pop("logprobs")
+        if not openai:
+            properties.pop("openai")
+
+
+def _copy_content(content: dict[str, Any]) -> dict[str, Any]:
+    """Copy a content dict so merging into the record never touches the published one."""
+    copied = dict(content)
+    properties = content.get("additional_properties")
+    if isinstance(properties, dict):
+        copied["additional_properties"] = copy.deepcopy(properties)
+    return copied
 
 
 def _argument_delta(update: dict[str, Any]) -> dict[str, Any] | None:

@@ -161,10 +161,15 @@ async def _updates(entry: ScriptEntry) -> AsyncIterator[ChatResponseUpdate]:
             if content.type == "text" and content.text:
                 text = content.text
                 for start in range(0, len(text), _STREAM_CHUNK_CHARS):
+                    # Text deltas carry merge_mode="append", as the providers'
+                    # clients emit them.
                     yield ChatResponseUpdate(
                         role=cast(Any, message.role),
                         contents=[
-                            Content.from_text(text[start : start + _STREAM_CHUNK_CHARS])
+                            Content.from_text(
+                                text[start : start + _STREAM_CHUNK_CHARS],
+                                merge_mode="append",
+                            )
                         ],
                         response_id=response.response_id,
                         message_id=message.message_id,

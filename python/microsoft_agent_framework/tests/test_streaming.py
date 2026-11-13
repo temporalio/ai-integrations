@@ -517,3 +517,84 @@ async def test_stream_record_merges_argument_deltas(
     assert call[:2] == ("call_1", "write_file")
     arguments = call[2]
     assert json.loads(arguments) if isinstance(arguments, str) else arguments
+
+
+def _provider_text_deltas(
+    parts: list[str], logprobs: list[list[Any]]
+) -> list[ChatResponseUpdate]:
+    # The OpenAI Responses client: each delta is merge_mode="append" with the
+    # event's logprobs under additional_properties, then one replace update
+    # with the whole text.
+    updates = [
+        ChatResponseUpdate(
+            role="assistant",
+            model="gpt-4o",
+            contents=[
+                Content.from_text(
+                    part,
+                    merge_mode="append",
+                    additional_properties={"openai": {"logprobs": lp}, "logprobs": lp},
+                )
+            ],
+        )
+        for part, lp in zip(parts, logprobs, strict=True)
+    ]
+    updates.append(
+        ChatResponseUpdate(
+            role="assistant",
+            model="gpt-4o",
+            contents=[
+                Content.from_text(
+                    "".join(parts),
+                    merge_mode="replace",
+                    additional_properties={"openai": {"logprobs": []}, "logprobs": []},
+                )
+            ],
+        )
+    )
+    return updates
+
+
+@pytest.mark.parametrize("with_logprobs", [False, True], ids=["empty", "present"])
+async def test_stream_record_merges_provider_text_deltas(
+    monkeypatch: pytest.MonkeyPatch, with_logprobs: bool
+) -> None:
+    parts = [f"t{i} " for i in range(200)]
+    logprobs: list[list[Any]] = [
+        [{"token": part.strip(), "logprob": -0.1}] if with_logprobs else []
+        for part in parts
+    ]
+    fake = _FakeStream()
+    _install_fake_stream(monkeypatch, fake)
+    updates = _provider_text_deltas(parts, logprobs)
+    activities = ChatClientActivities({"model": lambda: _DeltaClient(updates)})
+    record = await ActivityEnvironment().run(
+        activities.invoke_model_streaming,
+        InvokeModelStreamingInput(
+            model="model", messages=_messages(), streaming_topic="events"
+        ),
+    )
+    # One merged append entry plus the replace entry, instead of 201.
+    assert len(record) == 2
+    merged, replaced = (entry["contents"][0] for entry in record)
+    assert merged["merge_mode"] == "append" and merged["text"] == "".join(parts)
+    assert replaced["merge_mode"] == "replace"
+    properties = merged.get("additional_properties") or {}
+    if with_logprobs:
+        # The per-delta logprobs lists are concatenated in order, in both places
+        # the Responses client writes them.
+        flat = [lp[0] for lp in logprobs]
+        assert properties["logprobs"] == flat
+        assert properties["openai"]["logprobs"] == flat
+    else:
+        assert "logprobs" not in properties and "openai" not in properties
+    # Every delta reached the topic unchanged, and the response is the same.
+    assert len(fake.published) == len(updates)
+    assert all(
+        item["contents"][0]["additional_properties"]["logprobs"] == lp
+        for item, lp in zip(fake.published[:-1], logprobs, strict=True)
+    )
+    rebuilt = ChatResponse.from_updates([load_update(entry) for entry in record])
+    direct = ChatResponse.from_updates(updates)
+    # ChatResponse.text strips the trailing whitespace of the last delta.
+    assert rebuilt.text == direct.text == "".join(parts).strip()
